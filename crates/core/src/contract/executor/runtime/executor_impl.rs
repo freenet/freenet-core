@@ -2501,6 +2501,9 @@ where
             // reached", which #4681 had relied on. See #5040.
             let notifiers_snapshot = match notifiers_snapshot {
                 None => {
+                    if let Some(op_manager) = self.op_manager.as_ref() {
+                        op_manager.ring.record_notification_no_local_subscriber();
+                    }
                     tracing::debug!(
                         %instance_id,
                         registered_contracts = shared_notifications.len(),
@@ -2578,6 +2581,10 @@ where
             }
 
             let mut failures = Vec::with_capacity(32);
+            // Clients whose notification was dropped because their channel was
+            // full. Their cached summary is invalidated below so the NEXT
+            // notification is sent as full state — see the `Full` arm (#4681).
+            let mut resync_clients: Vec<ClientId> = Vec::new();
             let mut delta_computations = 0usize;
             // Pre-allocate full state once for subscribers that don't get deltas
             let full_state = State::from(new_state.as_ref()).into_owned();
@@ -2624,20 +2631,58 @@ where
                         );
                     }
                     Err(mpsc::error::TrySendError::Full(_)) => {
+                        // #4681 mechanism 2. Dropping this notification is
+                        // recoverable ONLY if the client is later resent the
+                        // whole state. If what we just dropped was a DELTA, the
+                        // client has permanently diverged: deltas are
+                        // incremental, so a missed one is never made up by
+                        // subsequent deltas, and the subscriber stays silently
+                        // wrong rather than merely stale.
+                        //
+                        // So invalidate its cached summary below. An absent or
+                        // `None` summary makes the next notification full state
+                        // (see the `peer_summary` match above), which resyncs
+                        // the client. Deliberately NOT a blocking `send`/
+                        // `send_timeout`: this runs on the serial
+                        // contract-handling loop, and blocking here is the
+                        // #4145 class of wedge that channel-safety.md forbids.
+                        resync_clients.push(*peer_key);
+                        if let Some(op_manager) = self.op_manager.as_ref() {
+                            op_manager.ring.record_notification_dropped_channel_full();
+                        }
                         tracing::warn!(
                             client = %peer_key,
                             contract = %key,
-                            "Subscriber notification channel full — notification dropped"
+                            "Subscriber notification channel full — notification dropped; \
+                             invalidating cached summary so the next update resyncs this \
+                             client with full state"
                         );
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         failures.push(*peer_key);
+                        if let Some(op_manager) = self.op_manager.as_ref() {
+                            op_manager.ring.record_notification_dropped_channel_closed();
+                        }
                         tracing::error!(
                             client = %peer_key,
                             contract = %key,
                             phase = "notification_send_failed_shared",
                             "Failed to send update notification to client (channel closed)"
                         );
+                    }
+                }
+            }
+
+            // Force a full-state resync for every client whose notification was
+            // dropped by a full channel (#4681). The summary is set to `None`
+            // rather than removed so the client stays registered; the
+            // delta/full-state match above reads `None` as "send full state".
+            if !resync_clients.is_empty() {
+                if let Some(mut contract_summaries) = shared_summaries.get_mut(&instance_id) {
+                    for client in &resync_clients {
+                        if let Some(summary) = contract_summaries.get_mut(client) {
+                            *summary = None;
+                        }
                     }
                 }
             }
@@ -2716,6 +2761,10 @@ where
             }
 
             let mut failures = Vec::with_capacity(32);
+            // See the shared arm: clients whose notification a full channel
+            // dropped, whose cached summary is invalidated so the next update
+            // resyncs them with full state (#4681).
+            let mut resync_clients: Vec<ClientId> = Vec::new();
             let mut delta_computations = 0usize;
             // Pre-allocate full state once for subscribers that don't get deltas
             let full_state = State::from(new_state.as_ref()).into_owned();
@@ -2759,14 +2808,27 @@ where
                         );
                     }
                     Err(mpsc::error::TrySendError::Full(_)) => {
+                        // #4681 mechanism 2 — see the shared arm for the full
+                        // rationale. A dropped DELTA diverges the client
+                        // permanently, so invalidate its summary and resync
+                        // with full state on the next update.
+                        resync_clients.push(*peer_key);
+                        if let Some(op_manager) = self.op_manager.as_ref() {
+                            op_manager.ring.record_notification_dropped_channel_full();
+                        }
                         tracing::warn!(
                             client = %peer_key,
                             contract = %key,
-                            "Subscriber notification channel full — notification dropped"
+                            "Subscriber notification channel full — notification dropped; \
+                             invalidating cached summary so the next update resyncs this \
+                             client with full state"
                         );
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         failures.push(*peer_key);
+                        if let Some(op_manager) = self.op_manager.as_ref() {
+                            op_manager.ring.record_notification_dropped_channel_closed();
+                        }
                         tracing::error!(
                             client = %peer_key,
                             contract = %key,
@@ -2774,6 +2836,13 @@ where
                             "Failed to send update notification to client (channel closed)"
                         );
                     }
+                }
+            }
+
+            // Full-channel resync, local twin of the shared arm (#4681).
+            for client in &resync_clients {
+                if let Some(summary) = summaries.get_mut(client) {
+                    *summary = None;
                 }
             }
 
@@ -2829,6 +2898,9 @@ where
                      (local storage); update notification not delivered"
                 );
             } else {
+                if let Some(op_manager) = self.op_manager.as_ref() {
+                    op_manager.ring.record_notification_no_local_subscriber();
+                }
                 tracing::debug!(
                     %instance_id,
                     registered_contracts = self.update_notifications.len(),

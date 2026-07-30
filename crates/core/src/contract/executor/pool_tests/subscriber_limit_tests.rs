@@ -6,6 +6,7 @@
 //! - Sorted-insert correctness
 //! - Reconnection does not inflate counts
 
+use freenet_stdlib::client_api::ContractResponse;
 use freenet_stdlib::prelude::*;
 
 use crate::client_events::ClientId;
@@ -976,6 +977,258 @@ async fn partial_failure_prunes_only_the_dead_subscriber_shared() {
         }
         other => panic!("the live subscriber must receive its notification; got: {other:?}"),
     }
+}
+
+/// Regression for #4681 mechanism 2: a notification dropped because the
+/// subscriber's channel was FULL must invalidate that client's cached summary,
+/// so the NEXT update resyncs it with full state instead of another delta.
+///
+/// Why this is a correctness bug and not just staleness: deltas are
+/// incremental. A missed delta is never made up by subsequent deltas, so
+/// without the invalidation the subscriber is permanently DIVERGED — silently
+/// wrong, not merely behind. The old code dropped the notification with a WARN
+/// and no recovery of any kind.
+///
+/// The mock runtime returns the full state as its "delta", so the payload bytes
+/// are identical either way; the discriminator is the `UpdateData` VARIANT.
+#[tokio::test(flavor = "current_thread")]
+async fn full_channel_drop_forces_full_state_resync_local() {
+    let mut executor = create_executor().await;
+    let contract = test_contract(b"full_channel_resync_4681");
+    let key = contract.key();
+    let instance_id = *key.id();
+
+    let client_id = ClientId::next();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE);
+    executor
+        .update_notifications
+        .insert(instance_id, vec![(client_id, tx.clone())]);
+    // A cached summary is what makes this client eligible for DELTAS.
+    executor.subscriber_summaries.insert(
+        instance_id,
+        std::collections::HashMap::from([(
+            client_id,
+            Some(StateSummary::from(vec![1u8, 2, 3]).into_owned()),
+        )]),
+    );
+
+    // Saturate the channel so the next try_send returns Full.
+    for _ in 0..SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE {
+        tx.try_send(Ok(freenet_stdlib::client_api::HostResponse::Ok))
+            .expect("prefill the subscriber channel to capacity");
+    }
+
+    // Update 1: dropped, because the channel is full.
+    executor
+        .upsert_contract_state(
+            key,
+            either::Either::Left(WrappedState::new(vec![7, 7, 7])),
+            RelatedContracts::default(),
+            Some(contract.clone()),
+        )
+        .await
+        .expect("store contract");
+
+    assert!(
+        executor
+            .subscriber_summaries
+            .get(&instance_id)
+            .and_then(|s| s.get(&client_id))
+            .expect("the client must stay registered")
+            .is_none(),
+        "a full-channel drop must invalidate the cached summary, otherwise the \
+         next update is another delta and the client stays diverged forever"
+    );
+
+    // Drain, so the next notification can actually be delivered.
+    while rx.try_recv().is_ok() {}
+
+    // Update 2: must be FULL STATE, not a delta.
+    executor
+        .upsert_contract_state(
+            key,
+            either::Either::Left(WrappedState::new(vec![8, 8, 8])),
+            RelatedContracts::default(),
+            Some(contract),
+        )
+        .await
+        .expect("store contract");
+
+    let received = rx.try_recv().expect("the resync notification must arrive");
+    match received {
+        Ok(freenet_stdlib::client_api::HostResponse::ContractResponse(
+            ContractResponse::UpdateNotification { update, .. },
+        )) => {
+            assert!(
+                matches!(update, UpdateData::State(_)),
+                "after a full-channel drop the client must be resynced with FULL \
+                 STATE; got {update:?}, which leaves it diverged"
+            );
+        }
+        other => panic!("expected an UpdateNotification; got {other:?}"),
+    }
+}
+
+/// The SHARED-storage twin of the full-channel resync test — the arm
+/// production actually runs (`handler.rs` wires `ContractExecutor =
+/// RuntimePool`, and every pooled executor gets shared storage).
+///
+/// The fix was applied identically to two independently-buggable arms, so a
+/// regression in the shared one would otherwise reach production uncaught.
+#[tokio::test(flavor = "current_thread")]
+async fn full_channel_drop_forces_full_state_resync_shared() {
+    let mut executor = create_executor().await;
+    let shared_notifications = std::sync::Arc::new(dashmap::DashMap::new());
+    let shared_summaries = std::sync::Arc::new(dashmap::DashMap::new());
+    executor.set_shared_notifications(
+        shared_notifications.clone(),
+        shared_summaries.clone(),
+        std::sync::Arc::new(dashmap::DashMap::new()),
+    );
+
+    let contract = test_contract(b"full_channel_resync_shared_4681");
+    let key = contract.key();
+    let instance_id = *key.id();
+
+    let client_id = ClientId::next();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE);
+    shared_notifications.insert(instance_id, vec![(client_id, tx.clone())]);
+    // A cached summary is what makes this client eligible for DELTAS.
+    shared_summaries.insert(
+        instance_id,
+        std::collections::HashMap::from([(
+            client_id,
+            Some(StateSummary::from(vec![1u8, 2, 3]).into_owned()),
+        )]),
+    );
+
+    for _ in 0..SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE {
+        tx.try_send(Ok(freenet_stdlib::client_api::HostResponse::Ok))
+            .expect("prefill the subscriber channel to capacity");
+    }
+
+    // Update 1: dropped, channel full.
+    executor
+        .upsert_contract_state(
+            key,
+            either::Either::Left(WrappedState::new(vec![7, 7, 7])),
+            RelatedContracts::default(),
+            Some(contract.clone()),
+        )
+        .await
+        .expect("store contract");
+
+    assert!(
+        shared_summaries
+            .get(&instance_id)
+            .and_then(|s| s.get(&client_id).cloned())
+            .expect("the client must stay registered")
+            .is_none(),
+        "a full-channel drop must invalidate the cached summary on the SHARED \
+         arm too, otherwise the next update is another delta and the client \
+         stays diverged forever"
+    );
+
+    while rx.try_recv().is_ok() {}
+
+    // Update 2: must be FULL STATE, not a delta.
+    executor
+        .upsert_contract_state(
+            key,
+            either::Either::Left(WrappedState::new(vec![8, 8, 8])),
+            RelatedContracts::default(),
+            Some(contract),
+        )
+        .await
+        .expect("store contract");
+
+    let received = rx.try_recv().expect("the resync notification must arrive");
+    match received {
+        Ok(freenet_stdlib::client_api::HostResponse::ContractResponse(
+            ContractResponse::UpdateNotification { update, .. },
+        )) => {
+            assert!(
+                matches!(update, UpdateData::State(_)),
+                "after a full-channel drop the client must be resynced with FULL \
+                 STATE; got {update:?}, which leaves it diverged"
+            );
+        }
+        other => panic!("expected an UpdateNotification; got {other:?}"),
+    }
+}
+
+/// Source-scrape pin for the #4681 delivery counters.
+///
+/// Why a source pin: every recorder call is gated behind
+/// `if let Some(op_manager) = self.op_manager.as_ref()`, and every executor in
+/// this suite is built by `Executor::new_mock_wasm(.., None, None)` — i.e.
+/// `op_manager = None`. So no behavioral test here can enter the counting
+/// branch, and removing all three calls would leave the suite green. The
+/// gauge test pins only JSON serialization of hand-stamped fields; it never
+/// runs the counting logic.
+///
+/// The PR's own claim is that these counters are the only production visibility
+/// into local notification delivery, so an untested recording path is exactly
+/// the gap worth pinning. Asserts each recorder is called from the arm that
+/// owns it, in BOTH the shared and local fan-out branches.
+#[test]
+fn notification_delivery_counters_are_recorded_from_their_arms() {
+    let whole = include_str!("../runtime/executor_impl.rs");
+    let squash = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+
+    // Scope to `send_update_notification`. The file has a THIRD
+    // `TrySendError::Full` arm, on the delegate-notification path, which is a
+    // different concern with its own counter — an unscoped scrape picks it up
+    // and the pin fails on correct code.
+    let fn_start = whole
+        .find("async fn send_update_notification(")
+        .expect("send_update_notification not found");
+    let fn_end = whole[fn_start..]
+        .find("mod full_state_version_gate_pins")
+        .expect("end-of-function anchor not found")
+        + fn_start;
+    let src = &whole[fn_start..fn_end];
+
+    // Each `Full` arm runs from its match pattern to the `Closed` pattern that
+    // follows it. Two fan-out branches => two of each.
+    let full_arms: Vec<&str> = src
+        .match_indices("Err(mpsc::error::TrySendError::Full(_)) => {")
+        .map(|(i, _)| {
+            let rest = &src[i..];
+            let end = rest
+                .find("Err(mpsc::error::TrySendError::Closed(_))")
+                .expect("a Full arm must be followed by the Closed arm");
+            &rest[..end]
+        })
+        .collect();
+    assert_eq!(
+        full_arms.len(),
+        2,
+        "expected the shared and local fan-out branches to each have a Full arm"
+    );
+    for arm in &full_arms {
+        assert!(
+            squash(arm).contains("record_notification_dropped_channel_full()"),
+            "each full-channel drop must be counted; without it the only \
+             production visibility into this drop disappears silently"
+        );
+    }
+
+    assert_eq!(
+        squash(src)
+            .matches("record_notification_dropped_channel_closed()")
+            .count(),
+        2,
+        "both fan-out branches must count closed-channel drops"
+    );
+    assert_eq!(
+        squash(src)
+            .matches("record_notification_no_local_subscriber()")
+            .count(),
+        2,
+        "both fan-out branches must count the no-local-subscriber case — this is \
+         the counter that replaced the diagnostic #5040 had to remove"
+    );
 }
 
 /// Source-scrape pin for the #5040 TOCTOU fix in

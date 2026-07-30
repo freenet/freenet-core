@@ -1759,6 +1759,15 @@ impl Ring {
             // (CPU / broadcast fan-out) dominated the node's total. Nonzero =
             // the trigger is firing; runaway = floors/share miscalibrated.
             snapshot.hosting_cost_evictions_total = Some(hosting.cost_evictions_total);
+            // Local notification-delivery outcomes (#4681). PER-NODE counters
+            // (see HostingManager), read once per snapshot — no per-event
+            // stream. Read from the manager, not the stats snapshot, for the
+            // same reason `hosting_local_hits_total` does below.
+            let (notif_full, notif_closed, notif_none) =
+                ring.hosting_manager.notification_delivery_counts();
+            snapshot.notifications_dropped_channel_full = Some(notif_full);
+            snapshot.notifications_dropped_channel_closed = Some(notif_closed);
+            snapshot.notifications_no_local_subscriber = Some(notif_none);
             // Phantom-hosting falsifier (SUBSCRIBE-retirement step 10 §1d):
             // current count of contracts in-use via a downstream subscriber with
             // NO state on disk (contract_in_use && !contract_state_present). After
@@ -3131,6 +3140,26 @@ impl Ring {
     /// — see [`HostingManager::record_local_get_forward`]. (#4642 A3)
     pub fn record_get_forwarded(&self) {
         self.hosting_manager.record_local_get_forward();
+    }
+
+    /// Record a local `UpdateNotification` dropped by a FULL subscriber channel
+    /// (#4681) — see [`HostingManager::record_notification_dropped_channel_full`].
+    pub(crate) fn record_notification_dropped_channel_full(&self) {
+        self.hosting_manager
+            .record_notification_dropped_channel_full();
+    }
+
+    /// Record a local `UpdateNotification` dropped by a CLOSED subscriber
+    /// channel (#4681).
+    pub(crate) fn record_notification_dropped_channel_closed(&self) {
+        self.hosting_manager
+            .record_notification_dropped_channel_closed();
+    }
+
+    /// Record a committed update that found NO local subscriber (#4681/#5040).
+    pub(crate) fn record_notification_no_local_subscriber(&self) {
+        self.hosting_manager
+            .record_notification_no_local_subscriber();
     }
 
     /// Number of client GETs this node answered from local hosted state (A3

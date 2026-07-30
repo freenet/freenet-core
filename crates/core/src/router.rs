@@ -275,6 +275,19 @@ pub(crate) struct RouterSnapshotInfo {
     /// contracts. Populated by `Ring` on the snapshot cadence. `None` until the
     /// ring is built. Per-node aggregate scalar.
     pub hosting_cost_evictions_total: Option<u64>,
+    /// Local `UpdateNotification` deliveries dropped because the subscriber's
+    /// channel was FULL (#4681). The subscriber's cached summary is invalidated
+    /// at the same time, so the next update resyncs it with full state; a
+    /// sustained nonzero rate means a client is not draining fast enough.
+    pub notifications_dropped_channel_full: Option<u64>,
+    /// Local `UpdateNotification` deliveries dropped because the subscriber's
+    /// channel was CLOSED (#4681). The subscriber is unregistered at that point.
+    pub notifications_dropped_channel_closed: Option<u64>,
+    /// Committed updates that found NO local subscriber (#4681/#5040). Normal
+    /// for contracts hosted on the network's behalf; surfaced as a counter
+    /// because logging it per occurrence produced 22k lines/day (#5040) and
+    /// `debug!` is compiled out of release builds.
+    pub notifications_no_local_subscriber: Option<u64>,
     /// Phantom-hosting falsifier (SUBSCRIBE-retirement step 10 §1d): the count of
     /// contracts registered as in-use via a downstream subscriber whose state is
     /// NOT present on disk (`contract_in_use && !contract_state_present`). After
@@ -1355,6 +1368,9 @@ impl Router {
             hosting_oom_valve_evictions_total: None,
             hosting_subscribed_evictions_total: None,
             hosting_cost_evictions_total: None,
+            notifications_dropped_channel_full: None,
+            notifications_dropped_channel_closed: None,
+            notifications_no_local_subscriber: None,
             phantom_in_use_contracts: None,
             // Terminal advertisement-consult counters (piece C, #4646),
             // populated by Ring from the network_status singleton on the

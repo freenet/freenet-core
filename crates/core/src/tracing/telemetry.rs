@@ -2353,6 +2353,26 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "hosting_cost_evictions_total".to_string(),
                     serde_json::json!(snapshot.hosting_cost_evictions_total),
                 );
+                // Local notification-delivery outcomes (#4681). These replace a
+                // diagnostic that #5040 had to remove: the no-local-subscriber
+                // case cannot be logged per occurrence (22k lines/day) and its
+                // `debug!` is compiled out of release entirely, so a counter is
+                // the only thing an operator can actually see in production.
+                // Same hand-mirrored footgun — invisible to the collector
+                // unless added here. Pinned by
+                // `router_snapshot_json_includes_notification_delivery_gauges`.
+                obj.insert(
+                    "notifications_dropped_channel_full".to_string(),
+                    serde_json::json!(snapshot.notifications_dropped_channel_full),
+                );
+                obj.insert(
+                    "notifications_dropped_channel_closed".to_string(),
+                    serde_json::json!(snapshot.notifications_dropped_channel_closed),
+                );
+                obj.insert(
+                    "notifications_no_local_subscriber".to_string(),
+                    serde_json::json!(snapshot.notifications_no_local_subscriber),
+                );
                 // Phantom-hosting falsifier (SUBSCRIBE-retirement step 10 §1d):
                 // current count of contracts in-use via a downstream subscriber
                 // with NO state on disk. Should read 0 after register-after-state.
@@ -2899,6 +2919,39 @@ mod tests {
         assert_eq!(
             json["hosting_cost_evictions_total"], 58,
             "hosting_cost_evictions_total must reach the OTLP body"
+        );
+    }
+
+    /// Pin: the notification-delivery gauges (#4681) must reach the
+    /// hand-mirrored OTLP body.
+    ///
+    /// These carry more weight than a usual gauge. #5040 had to stop logging
+    /// the no-local-subscriber case per occurrence (22,413 lines in one day on
+    /// a single node), and its replacement `debug!` is compiled out of release
+    /// builds by `release_max_level_info`. So in production these counters are
+    /// the ONLY visibility into local notification delivery — a silent drop
+    /// here restores exactly the blind spot #4773 was merged to close.
+    #[test]
+    fn router_snapshot_json_includes_notification_delivery_gauges() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.notifications_dropped_channel_full = Some(7);
+        info.notifications_dropped_channel_closed = Some(11);
+        info.notifications_no_local_subscriber = Some(22413);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        assert_eq!(
+            json["notifications_dropped_channel_full"], 7,
+            "notifications_dropped_channel_full must reach the OTLP body"
+        );
+        assert_eq!(
+            json["notifications_dropped_channel_closed"], 11,
+            "notifications_dropped_channel_closed must reach the OTLP body"
+        );
+        assert_eq!(
+            json["notifications_no_local_subscriber"], 22413,
+            "notifications_no_local_subscriber must reach the OTLP body"
         );
     }
 
