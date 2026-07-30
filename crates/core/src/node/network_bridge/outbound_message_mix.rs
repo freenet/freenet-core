@@ -75,7 +75,7 @@ use std::time::Duration;
 use freenet_stdlib::prelude::ContractInstanceId;
 use parking_lot::Mutex;
 
-use crate::message::{InterestMessage, NetMessage, NetMessageV1};
+use crate::message::{InterestMessage, NetMessage, NetMessageV1, SummariesEmitter};
 use crate::node::background_task_monitor::BackgroundTaskMonitor;
 
 /// Per-contract attribution cap for the differing-summary map in one window.
@@ -127,6 +127,11 @@ pub(crate) enum OutboundKind {
     /// `SummaryEntry::summary_bytes` ships a FULL `StateSummary` per shared
     /// contract to every connected peer on every cycle
     /// (`node.rs::handle_interest_sync_message`).
+    ///
+    /// Measured at 49.8% of all outbound bytes on the fleet (v0.2.115, 1,174
+    /// peers), which is what makes it worth a second level of split: this arm
+    /// alone still lumps four unrelated emitters together. See
+    /// [`SummariesEmitter`] and [`Window::summaries_bytes`].
     InterestSyncSummaries,
     /// InterestSync heal leg: `ResyncRequest` / `ResyncResponse`. Separate
     /// because `ResyncResponse` carries full contract STATE, so folding it
@@ -189,36 +194,141 @@ impl OutboundKind {
             OutboundKind::Other => "other",
         }
     }
+}
 
-    /// Classify a message without inspecting its contents.
+/// Which emitter's bytes these are, WITHIN the `interest_sync_summaries` arm.
+///
+/// The arm is 49.8% of all outbound bytes and four unrelated emitters share
+/// it (#5052). Because the emitters have opposite remedies — #5003 for the
+/// per-state-change notification, hash-first (#4965) for the heartbeat reply —
+/// a fix landing in either can be neither credited nor debugged against a
+/// total that both drive.
+///
+/// Attribution rides on the message as a non-wire [`SummariesEmitter`] tag set
+/// at construction, rather than as a `record_*` call added at each emitter.
+/// That is the anti-rot shape: the tag is a MANDATORY field, so a fifth
+/// emitter fails to compile until it names an arm, whereas a mirrored counter
+/// silently stops being called the next time an op path is migrated (see the
+/// manually-mirrored-counter row in `.claude/rules/bug-prevention-patterns.md`,
+/// #4009 / #4010 / #3851).
+///
+/// `Default` is the UNATTRIBUTED detail — [`SummariesEmitter::Other`] with a
+/// zero entry count — which is what the recorder falls back to for a
+/// `Summaries` message that reached it without one. Not reachable from
+/// today's call sites (the tag is mandatory), but the recorder counts such a
+/// message in the residual rather than dropping it, so the sub-arms sum to the
+/// parent by construction rather than by everyone remembering to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct SummariesDetail {
+    emitter: SummariesEmitter,
+    /// `entries.len()` — how many `SummaryEntry` this one message carried.
+    ///
+    /// The independent check on the attribution, and the reason it is worth
+    /// recording: the notification and rejection emitters are single-entry by
+    /// construction while both reply emitters are multi-entry, so a mean of
+    /// entries-per-message far from 1 on a single-entry arm (or exactly 1 on a
+    /// reply arm) means a call site is mislabelled. Byte totals alone cannot
+    /// show that — they look plausible either way, which is precisely how the
+    /// combined arm misled for as long as it did.
+    entries: u64,
+}
+
+/// Telemetry field ordering for the Summaries sub-split.
+///
+/// Kept here rather than on [`SummariesEmitter`] itself: the enum is a
+/// protocol-adjacent type, the index and the field stem are facts about this
+/// rollup's wire-to-telemetry shape.
+const SUMMARIES_ARMS: [SummariesEmitter; 5] = [
+    SummariesEmitter::Notification,
+    SummariesEmitter::InterestsReply,
+    SummariesEmitter::ChangeInterestsReply,
+    SummariesEmitter::Rejection,
+    SummariesEmitter::Other,
+];
+
+const fn summaries_index(emitter: SummariesEmitter) -> usize {
+    match emitter {
+        SummariesEmitter::Notification => 0,
+        SummariesEmitter::InterestsReply => 1,
+        SummariesEmitter::ChangeInterestsReply => 2,
+        SummariesEmitter::Rejection => 3,
+        SummariesEmitter::Other => 4,
+    }
+}
+
+/// Telemetry field stem, nested under the parent arm's stem so a query can
+/// pattern-match `interest_sync_summaries_*` and get the split for free.
+const fn summaries_stem(emitter: SummariesEmitter) -> &'static str {
+    match emitter {
+        SummariesEmitter::Notification => "interest_sync_summaries_notification",
+        SummariesEmitter::InterestsReply => "interest_sync_summaries_interests_reply",
+        SummariesEmitter::ChangeInterestsReply => "interest_sync_summaries_change_interests_reply",
+        SummariesEmitter::Rejection => "interest_sync_summaries_rejection",
+        SummariesEmitter::Other => "interest_sync_summaries_other",
+    }
+}
+
+/// One message's full classification: the arm, plus the Summaries sub-arm.
+///
+/// A single struct rather than two calls so the two levels are decided
+/// together at one site. Splitting them would let the parent arm and the
+/// sub-arm disagree about the same message, which is the one property the
+/// reconciliation (sub-arms sum to parent) depends on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutboundClass {
+    pub(crate) kind: OutboundKind,
+    /// `Some` exactly when `kind == OutboundKind::InterestSyncSummaries`.
+    summaries: Option<SummariesDetail>,
+}
+
+impl OutboundClass {
+    const fn plain(kind: OutboundKind) -> Self {
+        Self {
+            kind,
+            summaries: None,
+        }
+    }
+
+    /// Classify a message. Reads only the enum discriminants plus, for
+    /// `Summaries`, the already-set emitter tag and `entries.len()` — no
+    /// allocation, nothing that scales with payload size, so it stays cheap on
+    /// the per-message send path.
     pub(crate) fn classify(msg: &NetMessage) -> Self {
         match msg {
             NetMessage::V1(v1) => match v1 {
-                NetMessageV1::Connect(_) => OutboundKind::Connect,
-                NetMessageV1::Put(_) => OutboundKind::Put,
-                NetMessageV1::Get(_) => OutboundKind::Get,
-                NetMessageV1::Subscribe(_) => OutboundKind::Subscribe,
-                NetMessageV1::Update(_) => OutboundKind::Update,
+                NetMessageV1::Connect(_) => Self::plain(OutboundKind::Connect),
+                NetMessageV1::Put(_) => Self::plain(OutboundKind::Put),
+                NetMessageV1::Get(_) => Self::plain(OutboundKind::Get),
+                NetMessageV1::Subscribe(_) => Self::plain(OutboundKind::Subscribe),
+                NetMessageV1::Update(_) => Self::plain(OutboundKind::Update),
                 NetMessageV1::InterestSync { message } => match message {
                     // Exhaustive on purpose, same rationale as the outer match:
                     // a new InterestMessage variant must force a deliberate
                     // choice rather than defaulting into whichever arm it
                     // happens to resemble.
                     InterestMessage::Interests { .. } | InterestMessage::ChangeInterests { .. } => {
-                        OutboundKind::InterestSyncInterests
+                        Self::plain(OutboundKind::InterestSyncInterests)
                     }
-                    InterestMessage::Summaries { .. } => OutboundKind::InterestSyncSummaries,
+                    InterestMessage::Summaries { entries, emitter } => Self {
+                        kind: OutboundKind::InterestSyncSummaries,
+                        summaries: Some(SummariesDetail {
+                            emitter: *emitter,
+                            entries: entries.len() as u64,
+                        }),
+                    },
                     InterestMessage::ResyncRequest { .. }
-                    | InterestMessage::ResyncResponse { .. } => OutboundKind::InterestSyncResync,
+                    | InterestMessage::ResyncResponse { .. } => {
+                        Self::plain(OutboundKind::InterestSyncResync)
+                    }
                 },
-                NetMessageV1::NeighborHosting { .. } => OutboundKind::NeighborHosting,
+                NetMessageV1::NeighborHosting { .. } => Self::plain(OutboundKind::NeighborHosting),
                 // Exhaustive on purpose (no `_` arm): a new protocol message
                 // must not silently join `Other` and hide its bytes inside a
                 // bucket nobody investigates. Adding a variant should break
                 // this match and force a deliberate choice.
                 NetMessageV1::Aborted(_)
                 | NetMessageV1::ReadyState { .. }
-                | NetMessageV1::SubscribeHint { .. } => OutboundKind::Other,
+                | NetMessageV1::SubscribeHint { .. } => Self::plain(OutboundKind::Other),
             },
         }
     }
@@ -232,6 +342,29 @@ struct Window {
     /// and a big max mean different things (steady load vs. one whale), and
     /// the InterestSync question specifically hinges on which it is.
     max_bytes: [u64; 10],
+    /// The `interest_sync_summaries` arm split by emitter, indexed by
+    /// [`summaries_index`] (#5052).
+    ///
+    /// These SUM to `bytes[InterestSyncSummaries]` / `msgs[...]` by
+    /// construction: [`OutboundMix::record_sent`] updates a sub-arm in the
+    /// same branch that updates the parent, and folds an unattributed message
+    /// into [`SummariesEmitter::Other`] rather than skipping it. The
+    /// reconciliation is therefore a property of the code path, not a
+    /// convention every future call site has to honour — but it is asserted
+    /// anyway (`summaries_sub_arms_reconcile_with_the_parent_arm`), since a
+    /// silently non-reconciling split is worse than no split.
+    summaries_msgs: [u64; 5],
+    summaries_bytes: [u64; 5],
+    summaries_max_bytes: [u64; 5],
+    /// Total `SummaryEntry` count across the window's messages, per sub-arm.
+    /// Divided by `summaries_msgs` this gives mean entries per message, the
+    /// independent check that a call site is labelled correctly — see
+    /// [`SummariesDetail::entries`].
+    summaries_entries: [u64; 5],
+    /// Largest single message's entry count, per sub-arm. Separates "every
+    /// reply is moderately wide" from "one peer shares 400 contracts with us",
+    /// which the mean cannot.
+    summaries_max_entries: [u64; 5],
     /// InterestSync summary comparisons where both sides held a summary and
     /// the bytes were IDENTICAL. See [`OutboundMix::record_summary_comparison`].
     summary_entries_identical: u64,
@@ -289,15 +422,32 @@ impl OutboundMix {
     /// `bytes` is the serialized `NetMessage` length, not the on-wire size —
     /// see the module docs on what the residual against
     /// `cumulative_bytes_sent` means.
-    pub(crate) fn record_sent(&self, kind: OutboundKind, bytes: usize) {
+    pub(crate) fn record_sent(&self, class: OutboundClass, bytes: usize) {
         let b = bytes as u64;
-        let idx = kind.index();
+        let idx = class.kind.index();
         let mut w = self.window.lock();
         // Saturating throughout: a wrapped counter would report a tiny number
         // for the heaviest arm, the exact opposite of the measurement's point.
         w.msgs[idx] = w.msgs[idx].saturating_add(1);
         w.bytes[idx] = w.bytes[idx].saturating_add(b);
         w.max_bytes[idx] = w.max_bytes[idx].max(b);
+
+        // #5052 sub-split, in the SAME branch as the parent update so the two
+        // levels cannot disagree about a message. Gated on the parent arm
+        // rather than on `class.summaries.is_some()`: a Summaries message that
+        // somehow arrived with no detail must still be counted, in the
+        // residual, or the sub-arms would quietly stop summing to the parent —
+        // the one failure this split cannot afford, since a shortfall would
+        // read as "that emitter got smaller".
+        if class.kind == OutboundKind::InterestSyncSummaries {
+            let detail = class.summaries.unwrap_or_default();
+            let s = summaries_index(detail.emitter);
+            w.summaries_msgs[s] = w.summaries_msgs[s].saturating_add(1);
+            w.summaries_bytes[s] = w.summaries_bytes[s].saturating_add(b);
+            w.summaries_max_bytes[s] = w.summaries_max_bytes[s].max(b);
+            w.summaries_entries[s] = w.summaries_entries[s].saturating_add(detail.entries);
+            w.summaries_max_entries[s] = w.summaries_max_entries[s].max(detail.entries);
+        }
     }
 
     /// Record one InterestSync summary comparison — the #4965 falsifier.
@@ -430,6 +580,30 @@ fn outbound_mix_json(w: &Window, window_secs: u64) -> serde_json::Value {
         body.insert(format!("{stem}_max_bytes"), w.max_bytes[idx].into());
     }
 
+    // #5052: the `interest_sync_summaries` arm again, split by emitter. Fields
+    // on THIS rollup rather than a new event stream — deliberately: the
+    // per-node budget is 10 events/s (`tracing/telemetry.rs`), 3.11% of records
+    // already collide with it, and the collector runs at ~88.8 GB/day, so a
+    // per-event stream is what got #4940 closed. Five extra integers per
+    // node-minute costs nothing measurable.
+    //
+    // Emitted unconditionally including as zeros, same rule as the arms above:
+    // "this emitter sent nothing" and "this build does not report it" must not
+    // look the same, or the split would appear to attribute traffic that it
+    // simply never counted.
+    for emitter in SUMMARIES_ARMS {
+        let s = summaries_index(emitter);
+        let stem = summaries_stem(emitter);
+        body.insert(format!("{stem}_msgs"), w.summaries_msgs[s].into());
+        body.insert(format!("{stem}_bytes"), w.summaries_bytes[s].into());
+        body.insert(format!("{stem}_max_bytes"), w.summaries_max_bytes[s].into());
+        body.insert(format!("{stem}_entries"), w.summaries_entries[s].into());
+        body.insert(
+            format!("{stem}_max_entries"),
+            w.summaries_max_entries[s].into(),
+        );
+    }
+
     // #4965 falsifier. Emitted unconditionally (including as a pair of zeros)
     // so "no comparisons happened this window" is distinguishable from "the
     // field was dropped" — the same reason the arms above emit when idle.
@@ -526,12 +700,45 @@ mod tests {
         )
     }
 
+    /// Record a non-Summaries message, for tests that only care about the
+    /// parent arms.
+    fn record(mix: &OutboundMix, kind: OutboundKind, bytes: usize) {
+        mix.record_sent(OutboundClass::plain(kind), bytes);
+    }
+
+    /// A `Summaries` message as some emitter would actually build it: `n`
+    /// entries carrying `per_entry` summary bytes each.
+    fn summaries_msg(emitter: SummariesEmitter, n: usize, per_entry: usize) -> NetMessage {
+        NetMessage::V1(NetMessageV1::InterestSync {
+            message: InterestMessage::Summaries {
+                entries: (0..n)
+                    .map(|i| crate::message::SummaryEntry {
+                        hash: i as u32,
+                        summary_bytes: Some(vec![0u8; per_entry]),
+                    })
+                    .collect(),
+                emitter,
+            },
+        })
+    }
+
+    /// Record a `Summaries` message the way the production path does: classify
+    /// the real message at the choke point, then record what classify decided.
+    /// Tests must NOT hand-build an `OutboundClass`, or they would assert the
+    /// recorder against their own labelling instead of against `classify`'s.
+    fn record_summaries(mix: &OutboundMix, emitter: SummariesEmitter, n: usize, bytes: usize) {
+        mix.record_sent(
+            OutboundClass::classify(&summaries_msg(emitter, n, 1)),
+            bytes,
+        );
+    }
+
     /// Taking the window leaves the accumulator empty, so consecutive rollups
     /// report windows rather than lifetime totals.
     #[test]
     fn take_window_resets_the_window() {
         let mix = OutboundMix::new();
-        mix.record_sent(OutboundKind::InterestSyncSummaries, 500);
+        record(&mix, OutboundKind::InterestSyncSummaries, 500);
         let first = mix.take_window();
         assert_eq!(first.msgs[OutboundKind::InterestSyncSummaries.index()], 1);
         assert_eq!(
@@ -553,10 +760,10 @@ mod tests {
     #[test]
     fn arms_partition_recorded_bytes() {
         let mix = OutboundMix::new();
-        mix.record_sent(OutboundKind::Get, 10);
-        mix.record_sent(OutboundKind::Put, 20);
-        mix.record_sent(OutboundKind::InterestSyncSummaries, 30);
-        mix.record_sent(OutboundKind::Get, 40);
+        record(&mix, OutboundKind::Get, 10);
+        record(&mix, OutboundKind::Put, 20);
+        record(&mix, OutboundKind::InterestSyncSummaries, 30);
+        record(&mix, OutboundKind::Get, 40);
         let w = mix.take_window();
         assert_eq!(w.bytes.iter().sum::<u64>(), 100);
         assert_eq!(w.msgs.iter().sum::<u64>(), 4);
@@ -568,9 +775,9 @@ mod tests {
     #[test]
     fn max_bytes_tracks_the_largest_single_message() {
         let mix = OutboundMix::new();
-        mix.record_sent(OutboundKind::Update, 100);
-        mix.record_sent(OutboundKind::Update, 900);
-        mix.record_sent(OutboundKind::Update, 50);
+        record(&mix, OutboundKind::Update, 100);
+        record(&mix, OutboundKind::Update, 900);
+        record(&mix, OutboundKind::Update, 50);
         let w = mix.take_window();
         assert_eq!(w.max_bytes[OutboundKind::Update.index()], 900);
         assert_eq!(w.bytes[OutboundKind::Update.index()], 1050);
@@ -601,7 +808,10 @@ mod tests {
                 OutboundKind::InterestSyncInterests,
             ),
             (
-                InterestMessage::Summaries { entries: vec![] },
+                InterestMessage::Summaries {
+                    entries: vec![],
+                    emitter: SummariesEmitter::InterestsReply,
+                },
                 OutboundKind::InterestSyncSummaries,
             ),
             (
@@ -623,7 +833,7 @@ mod tests {
         for (msg, expected) in cases {
             let label = format!("{msg:?}");
             assert_eq!(
-                OutboundKind::classify(&wrap(msg)),
+                OutboundClass::classify(&wrap(msg)).kind,
                 expected,
                 "wrong arm for {label}"
             );
@@ -919,5 +1129,479 @@ mod tests {
         assert_eq!(rollup_window_secs(Duration::from_millis(10)), 1);
         assert_eq!(rollup_window_secs(Duration::from_secs(60)), 60);
         assert_eq!(rollup_window_secs(Duration::from_secs(300)), 300);
+    }
+
+    // ---------------------------------------------------------------------
+    // #5052 — Summaries sub-split by emitter
+    // ---------------------------------------------------------------------
+
+    /// The same sanity property the parent arms have, one level down: distinct
+    /// index, distinct field stem, dense indices. Two sub-arms sharing a stem
+    /// would silently overwrite each other's JSON key and the split would
+    /// report one emitter's bytes under another's name.
+    #[test]
+    fn summaries_sub_arms_have_unique_indices_and_stems() {
+        let mut idxs: Vec<usize> = SUMMARIES_ARMS
+            .iter()
+            .copied()
+            .map(summaries_index)
+            .collect();
+        idxs.sort_unstable();
+        idxs.dedup();
+        assert_eq!(idxs.len(), SUMMARIES_ARMS.len(), "duplicate sub-arm index");
+        assert_eq!(
+            *idxs.last().expect("non-empty"),
+            SUMMARIES_ARMS.len() - 1,
+            "indices must be dense so the fixed-size arrays cover them"
+        );
+
+        let mut stems: Vec<&str> = SUMMARIES_ARMS.iter().copied().map(summaries_stem).collect();
+        stems.sort_unstable();
+        stems.dedup();
+        assert_eq!(
+            stems.len(),
+            SUMMARIES_ARMS.len(),
+            "duplicate sub-arm field stem"
+        );
+
+        // Every sub-arm nests under the parent stem, so a telemetry query can
+        // pattern-match `interest_sync_summaries_*` and get the whole split.
+        // Also guarantees the sub-arm keys can never collide with another
+        // parent arm's keys.
+        let parent = OutboundKind::InterestSyncSummaries.stem();
+        for emitter in SUMMARIES_ARMS {
+            let stem = summaries_stem(emitter);
+            assert!(
+                stem.starts_with(parent),
+                "{stem} must nest under {parent} so the split is discoverable \
+                 from the arm it refines"
+            );
+        }
+    }
+
+    /// The whole point of the split: each emitter's bytes land in its OWN arm.
+    ///
+    /// Distinguishable byte counts per emitter so a swapped or collapsed
+    /// mapping cannot pass — the failure this guards is not a crash but a
+    /// plausible-looking number filed under the wrong emitter, which would
+    /// send #5003 vs. hash-first (#4965) the wrong way exactly as the combined
+    /// arm did.
+    #[test]
+    fn each_emitter_lands_in_its_own_sub_arm() {
+        let mix = OutboundMix::new();
+        record_summaries(&mix, SummariesEmitter::Notification, 1, 100);
+        record_summaries(&mix, SummariesEmitter::InterestsReply, 4, 200);
+        record_summaries(&mix, SummariesEmitter::ChangeInterestsReply, 3, 400);
+        record_summaries(&mix, SummariesEmitter::Rejection, 1, 800);
+        record_summaries(&mix, SummariesEmitter::Other, 1, 1600);
+
+        let w = mix.take_window();
+        let bytes_of = |e| w.summaries_bytes[summaries_index(e)];
+        assert_eq!(bytes_of(SummariesEmitter::Notification), 100);
+        assert_eq!(bytes_of(SummariesEmitter::InterestsReply), 200);
+        assert_eq!(bytes_of(SummariesEmitter::ChangeInterestsReply), 400);
+        assert_eq!(bytes_of(SummariesEmitter::Rejection), 800);
+        assert_eq!(bytes_of(SummariesEmitter::Other), 1600);
+
+        for emitter in SUMMARIES_ARMS {
+            assert_eq!(
+                w.summaries_msgs[summaries_index(emitter)],
+                1,
+                "each emitter sent exactly one message: {emitter:?}"
+            );
+        }
+    }
+
+    /// The sub-arms must SUM to the parent arm, in both bytes and messages.
+    ///
+    /// Without this the split is worse than no split: a shortfall reads as
+    /// "that emitter shrank" rather than "we stopped counting it", which is
+    /// the exact misreading #5052 exists to end. Mixed in with non-Summaries
+    /// traffic so the assertion also catches a sub-arm that double-counts from
+    /// another parent arm.
+    #[test]
+    fn summaries_sub_arms_reconcile_with_the_parent_arm() {
+        let mix = OutboundMix::new();
+        record(&mix, OutboundKind::Update, 5_000);
+        record(&mix, OutboundKind::InterestSyncInterests, 40);
+        record_summaries(&mix, SummariesEmitter::Notification, 1, 100);
+        record_summaries(&mix, SummariesEmitter::Notification, 1, 150);
+        record_summaries(&mix, SummariesEmitter::InterestsReply, 9, 9_000);
+        record_summaries(&mix, SummariesEmitter::ChangeInterestsReply, 2, 300);
+        record_summaries(&mix, SummariesEmitter::Rejection, 1, 120);
+        record(&mix, OutboundKind::InterestSyncResync, 70_000);
+
+        let w = mix.take_window();
+        let parent = OutboundKind::InterestSyncSummaries.index();
+        assert_eq!(
+            w.summaries_bytes.iter().sum::<u64>(),
+            w.bytes[parent],
+            "sub-arm bytes must sum to the parent arm"
+        );
+        assert_eq!(
+            w.summaries_msgs.iter().sum::<u64>(),
+            w.msgs[parent],
+            "sub-arm messages must sum to the parent arm"
+        );
+        // Non-vacuous: the parent arm is a real, non-zero number, and it is
+        // not simply the whole window (so a sub-arm that swept up unrelated
+        // traffic would break the equality above rather than hide in it).
+        assert_eq!(w.bytes[parent], 100 + 150 + 9_000 + 300 + 120);
+        assert!(w.bytes.iter().sum::<u64>() > w.bytes[parent]);
+    }
+
+    /// A `Summaries` message that reaches the recorder with NO attribution is
+    /// counted in the residual arm, not dropped.
+    ///
+    /// The mandatory tag makes this unreachable from today's call sites, which
+    /// is exactly why it needs a test: it is the fallback that keeps the
+    /// reconciliation above true no matter what a future call site does, and
+    /// nothing else would notice if it silently `continue`d instead.
+    #[test]
+    fn an_unattributed_summaries_message_lands_in_the_residual_not_the_void() {
+        let mix = OutboundMix::new();
+        mix.record_sent(
+            OutboundClass {
+                kind: OutboundKind::InterestSyncSummaries,
+                summaries: None,
+            },
+            777,
+        );
+
+        let w = mix.take_window();
+        assert_eq!(
+            w.summaries_bytes[summaries_index(SummariesEmitter::Other)],
+            777,
+            "an unattributed Summaries must land in the residual arm"
+        );
+        assert_eq!(
+            w.summaries_bytes.iter().sum::<u64>(),
+            w.bytes[OutboundKind::InterestSyncSummaries.index()],
+            "the reconciliation must hold even for an unattributed message"
+        );
+    }
+
+    /// Entry counts are recorded per sub-arm, which is the independent check
+    /// that a call site is labelled correctly.
+    ///
+    /// Byte totals alone cannot catch a mislabelled emitter — they look
+    /// plausible under any labelling. Mean entries per message can: the
+    /// notification and rejection emitters are single-entry by construction,
+    /// both reply emitters are multi-entry, so a reply arm reporting a mean of
+    /// 1.0 (or a notification arm reporting 12) says the attribution is wrong
+    /// even though every byte reconciles.
+    #[test]
+    fn entry_counts_are_recorded_per_sub_arm() {
+        let mix = OutboundMix::new();
+        // Two single-entry notifications.
+        record_summaries(&mix, SummariesEmitter::Notification, 1, 100);
+        record_summaries(&mix, SummariesEmitter::Notification, 1, 110);
+        // Two multi-entry heartbeat replies, 12 and 4 entries.
+        record_summaries(&mix, SummariesEmitter::InterestsReply, 12, 12_000);
+        record_summaries(&mix, SummariesEmitter::InterestsReply, 4, 4_000);
+
+        let w = mix.take_window();
+        let notif = summaries_index(SummariesEmitter::Notification);
+        let reply = summaries_index(SummariesEmitter::InterestsReply);
+
+        assert_eq!(w.summaries_entries[notif], 2);
+        assert_eq!(w.summaries_msgs[notif], 2);
+        assert_eq!(
+            w.summaries_max_entries[notif], 1,
+            "a single-entry emitter must never report a wider max"
+        );
+
+        assert_eq!(w.summaries_entries[reply], 16);
+        assert_eq!(w.summaries_msgs[reply], 2);
+        assert_eq!(
+            w.summaries_max_entries[reply], 12,
+            "max_entries must track the widest single reply, not the mean"
+        );
+
+        // The derived quantity the analysis actually reads.
+        assert_eq!(w.summaries_entries[notif] / w.summaries_msgs[notif], 1);
+        assert_eq!(w.summaries_entries[reply] / w.summaries_msgs[reply], 8);
+    }
+
+    /// `classify` — not the caller — decides the sub-arm, and it reads the
+    /// emitter tag off the message rather than guessing from its shape.
+    ///
+    /// This is the seam the whole attribution hangs on. A `classify` that
+    /// returned a constant emitter, or inferred one from `entries.len()`,
+    /// would still produce a reconciling, plausible split — and would be
+    /// wrong, since a single-contract heartbeat reply and a notification are
+    /// shape-identical (one entry each). So the two are asserted to classify
+    /// APART at identical shape.
+    #[test]
+    fn classify_reads_the_emitter_tag_not_the_message_shape() {
+        let detail = |m: &NetMessage| {
+            let class = OutboundClass::classify(m);
+            assert_eq!(class.kind, OutboundKind::InterestSyncSummaries);
+            class.summaries.expect("Summaries must carry a sub-arm")
+        };
+
+        // Identical shape (one entry, same payload size), different emitters.
+        let notification = detail(&summaries_msg(SummariesEmitter::Notification, 1, 64));
+        let reply = detail(&summaries_msg(SummariesEmitter::InterestsReply, 1, 64));
+        assert_eq!(notification.emitter, SummariesEmitter::Notification);
+        assert_eq!(reply.emitter, SummariesEmitter::InterestsReply);
+        assert_eq!(
+            notification.entries, reply.entries,
+            "the two cases must be shape-identical, or this test proves nothing"
+        );
+
+        // Entry count comes from the message, not from a default.
+        assert_eq!(
+            detail(&summaries_msg(SummariesEmitter::InterestsReply, 7, 8)).entries,
+            7
+        );
+
+        // And the sub-arm exists for `Summaries` alone: every other message
+        // carries none, so a stray `unwrap_or_default()` elsewhere could
+        // not inflate the residual with non-Summaries traffic.
+        let others = [
+            NetMessage::V1(NetMessageV1::InterestSync {
+                message: InterestMessage::Interests { hashes: vec![1] },
+            }),
+            NetMessage::V1(NetMessageV1::InterestSync {
+                message: InterestMessage::ResyncRequest {
+                    key: test_contract_key(1),
+                },
+            }),
+            NetMessage::V1(NetMessageV1::ReadyState { ready: true }),
+        ];
+        for msg in others {
+            let class = OutboundClass::classify(&msg);
+            assert_ne!(class.kind, OutboundKind::InterestSyncSummaries);
+            assert!(
+                class.summaries.is_none(),
+                "only Summaries may carry a sub-arm, got one for {class:?}"
+            );
+        }
+    }
+
+    /// Every sub-arm's five counters reach the emitted body under their own
+    /// keys, and an idle window emits them as explicit zeros.
+    ///
+    /// The counters were only ever checked on the `Window` struct. A swapped
+    /// or misspelled key in the body construction would ship one emitter's
+    /// bytes under another's name — every other test still green, and the
+    /// resulting number still reconciles. Distinguishable values per arm so a
+    /// swap cannot pass.
+    #[test]
+    fn sub_arm_counters_reach_the_rollup_body_under_the_right_keys() {
+        let mix = OutboundMix::new();
+        // (emitter, entries, bytes) — all distinct.
+        let sends = [
+            (SummariesEmitter::Notification, 1usize, 11u64),
+            (SummariesEmitter::InterestsReply, 22, 222),
+            (SummariesEmitter::ChangeInterestsReply, 3, 333),
+            (SummariesEmitter::Rejection, 4, 444),
+            (SummariesEmitter::Other, 5, 555),
+        ];
+        for (emitter, entries, bytes) in sends {
+            record_summaries(&mix, emitter, entries, bytes as usize);
+        }
+        let body = outbound_mix_json(&mix.take_window(), 60);
+        let field = |k: &str| {
+            body.get(k)
+                .and_then(|v| v.as_u64())
+                .unwrap_or_else(|| panic!("missing rollup field {k}"))
+        };
+
+        for (emitter, entries, bytes) in sends {
+            let stem = summaries_stem(emitter);
+            assert_eq!(field(&format!("{stem}_msgs")), 1, "{stem}_msgs");
+            assert_eq!(field(&format!("{stem}_bytes")), bytes, "{stem}_bytes");
+            assert_eq!(
+                field(&format!("{stem}_max_bytes")),
+                bytes,
+                "{stem}_max_bytes"
+            );
+            assert_eq!(
+                field(&format!("{stem}_entries")),
+                entries as u64,
+                "{stem}_entries"
+            );
+            assert_eq!(
+                field(&format!("{stem}_max_entries")),
+                entries as u64,
+                "{stem}_max_entries"
+            );
+        }
+
+        // The reconciliation must be checkable FROM THE BODY, since that is
+        // all the telemetry query has.
+        let summed: u64 = SUMMARIES_ARMS
+            .iter()
+            .map(|e| field(&format!("{}_bytes", summaries_stem(*e))))
+            .sum();
+        assert_eq!(
+            summed,
+            field("interest_sync_summaries_bytes"),
+            "the emitted sub-arms must reconcile with the emitted parent arm"
+        );
+
+        // Idle window: explicit zeros, not omitted fields. A missing field and
+        // a zero field look the same to a naive query and mean opposite things
+        // ("this emitter was quiet" vs "this build has no split").
+        let idle = outbound_mix_json(&Window::default(), 60);
+        for emitter in SUMMARIES_ARMS {
+            let stem = summaries_stem(emitter);
+            for suffix in ["msgs", "bytes", "max_bytes", "entries", "max_entries"] {
+                let key = format!("{stem}_{suffix}");
+                assert_eq!(
+                    idle.get(&key).and_then(|v| v.as_u64()),
+                    Some(0),
+                    "an idle window must emit {key} as an explicit zero"
+                );
+            }
+        }
+    }
+
+    /// Emitter-completeness pin: which production files touch
+    /// `InterestMessage::Summaries` at all, and which arm each tagging site
+    /// claims.
+    ///
+    /// The mandatory `emitter` field already stops a fifth emitter from
+    /// SILENTLY landing in the residual — it will not compile without naming
+    /// an arm. What a mandatory field cannot stop is the lazy answer: a new
+    /// emitter that reuses an existing arm because it looked close enough.
+    /// That re-creates the conflation #5052 exists to undo, one level down,
+    /// and it is invisible — the bytes still reconcile, so no other test
+    /// notices.
+    ///
+    /// So this pin walks the crate source (`$CARGO_MANIFEST_DIR/src/**/*.rs`),
+    /// strips `#[cfg(test)]` regions, and asserts two things:
+    ///
+    ///   1. the SET of production files mentioning the variant is unchanged —
+    ///      a new file touching it fails CI even before we look at tags, and
+    ///   2. the arm each tagging site claims, per file.
+    ///
+    /// Known limit, stated rather than papered over: (2) scrapes the literal
+    /// `emitter: SummariesEmitter::<Arm>`, so a site that assigned the tag
+    /// from a variable would escape it. (1) still catches such a site if it
+    /// lives in a new file, and a wrongly-tagged one shows up as an
+    /// entries-per-message anomaly (`entry_counts_are_recorded_per_sub_arm`)
+    /// or in the residual arm. Needles are built with `concat!` so this test's
+    /// own source cannot satisfy the scrape when the walk reaches this file.
+    #[test]
+    fn summaries_emitter_sites_are_pinned() {
+        use crate::node::network_bridge::p2p_protoc::tests::{
+            collect_rs_files, strip_cfg_test_regions,
+        };
+        use std::collections::{BTreeMap, BTreeSet};
+
+        // Production files (relative to `src/`) whose code mentions the
+        // variant, for ANY reason — construction, `match` pattern, `Display`.
+        // Deliberately wider than "emitters": the point is that a new file
+        // touching Summaries at all is a deliberate decision.
+        let expected_files: BTreeSet<&str> = [
+            "message.rs",                                  // variant + Display
+            "node.rs",                                     // both reply emitters + the receive arm
+            "node/network_bridge/outbound_message_mix.rs", // the classify choke point
+            "operations/update.rs",                        // notification + rejection emitters
+        ]
+        .into_iter()
+        .collect();
+
+        // file → the arms it tags, one entry per DISTINCT arm.
+        let expected_arms: BTreeMap<&str, Vec<&str>> = [
+            ("node.rs", vec!["ChangeInterestsReply", "InterestsReply"]),
+            ("operations/update.rs", vec!["Notification", "Rejection"]),
+        ]
+        .into_iter()
+        .collect();
+
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rs_files(&src_root, &mut files);
+        assert!(
+            !files.is_empty(),
+            "#5052: the source walk found no .rs files under {} — the pin \
+             cannot guarantee completeness if it can't read the crate source",
+            src_root.display()
+        );
+
+        let mentions = concat!("InterestMessage::", "Summaries {");
+        let tag = concat!("emitter: ", "SummariesEmitter::");
+
+        let mut found_files: BTreeSet<String> = Default::default();
+        let mut found_arms: BTreeMap<String, Vec<String>> = Default::default();
+        for path in &files {
+            let rel = path
+                .strip_prefix(&src_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            // Whole test files are gated by a parent `#[cfg(test)] mod`, which
+            // `strip_cfg_test_regions` cannot see from inside the file.
+            if rel.ends_with("/tests.rs") || rel == "tests.rs" || rel.contains("/tests/") {
+                continue;
+            }
+            let Ok(src) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let prod = strip_cfg_test_regions(&src);
+            if !prod.contains(mentions) {
+                continue;
+            }
+            found_files.insert(rel.clone());
+
+            let mut arms: Vec<String> = prod
+                .match_indices(tag)
+                .map(|(idx, _)| {
+                    prod[idx + tag.len()..]
+                        .split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .next()
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect();
+            arms.sort();
+            arms.dedup();
+            if !arms.is_empty() {
+                found_arms.insert(rel, arms);
+            }
+        }
+
+        let found_files_view: BTreeSet<&str> = found_files.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            found_files_view, expected_files,
+            "#5052: the set of production files mentioning InterestMessage::Summaries \
+             changed. If this is a NEW emitter, give it its OWN SummariesEmitter arm \
+             rather than reusing one — reusing a tag re-creates exactly the conflation \
+             this split undoes, and the bytes still reconcile so nothing else flags it. \
+             Then register the file here."
+        );
+
+        let found_arms_view: BTreeMap<&str, Vec<&str>> = found_arms
+            .iter()
+            .map(|(f, arms)| (f.as_str(), arms.iter().map(|a| a.as_str()).collect()))
+            .collect();
+        assert_eq!(
+            found_arms_view, expected_arms,
+            "#5052: the emitter→arm mapping changed. Every emitter must claim its own \
+             arm; update this pin only after confirming the new site genuinely belongs \
+             in the arm it names."
+        );
+
+        // Every declared arm except the residual must actually be claimed by a
+        // production site: an arm nothing emits reports a permanent zero,
+        // which reads as "that emitter is free" rather than "it is gone".
+        let claimed: BTreeSet<&str> = found_arms_view.values().flatten().copied().collect();
+        for emitter in SUMMARIES_ARMS {
+            if emitter == SummariesEmitter::Other {
+                continue;
+            }
+            let name = format!("{emitter:?}");
+            assert!(
+                claimed.contains(name.as_str()),
+                "#5052: SummariesEmitter::{name} is declared but no production site \
+                 emits it — it would report a permanent zero, which reads as \
+                 'that emitter costs nothing' rather than 'nothing emits it'. \
+                 Either wire it up or delete the arm. Claimed: {claimed:?}"
+            );
+        }
     }
 }

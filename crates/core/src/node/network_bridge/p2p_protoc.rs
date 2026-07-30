@@ -2981,9 +2981,11 @@ async fn handle_peer_channel_message(
         Left(msg) => {
             tracing::debug!(to=%conn.remote_addr() ,"Sending message to peer. Msg: {msg}");
             // Classify BEFORE the send moves `msg`. Classification only reads
-            // the enum discriminant, so it costs nothing on this hot path.
-            let kind =
-                crate::node::network_bridge::outbound_message_mix::OutboundKind::classify(&msg);
+            // enum discriminants (plus, for InterestSync `Summaries`, the
+            // already-set emitter tag and entry count — #5052), so it costs
+            // nothing on this hot path.
+            let class =
+                crate::node::network_bridge::outbound_message_mix::OutboundClass::classify(&msg);
             match conn.send_message(msg).await {
                 Ok(serialized_len) => {
                     // #4956: attribute the bytes to the message kind that
@@ -2992,7 +2994,7 @@ async fn handle_peer_channel_message(
                     // Recorded only on a successful hand-off to the transport,
                     // matching the payload mix's real-delivery accounting rule
                     // so a failed send never inflates the census.
-                    outbound_mix.record_sent(kind, serialized_len);
+                    outbound_mix.record_sent(class, serialized_len);
                 }
                 Err(error) => {
                     tracing::error!(
@@ -3433,7 +3435,7 @@ fn extract_sender_from_message_mut(msg: &mut NetMessage) -> Option<&mut PeerKeyL
 // TODO: add testing for the network loop, now it should be possible to do since we don't depend upon having real connections
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::config::GlobalExecutor;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4958,7 +4960,7 @@ mod tests {
     /// for this purpose because the only thing we measure afterward is the
     /// count of two specific identifiers, and those never appear inside a
     /// literal in production source.
-    fn strip_cfg_test_regions(src: &str) -> String {
+    pub(crate) fn strip_cfg_test_regions(src: &str) -> String {
         const MARKER: &str = "#[cfg(test)]";
         let bytes = src.as_bytes();
 
@@ -5124,7 +5126,12 @@ mod tests {
     }
 
     /// Recursively collect every `*.rs` file under `dir`.
-    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    ///
+    /// `pub(crate)` alongside [`strip_cfg_test_regions`] so sibling source
+    /// pins can walk the tree without a second copy of the scanner — the
+    /// #5052 emitter-completeness pin in `outbound_message_mix` is the other
+    /// user. Both are `#[cfg(test)]`-only.
+    pub(crate) fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => return,

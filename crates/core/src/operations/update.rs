@@ -846,7 +846,7 @@ pub(crate) async fn send_proactive_summary_notification(
     key: &ContractKey,
     sender_addr: SocketAddr,
 ) {
-    use crate::message::{InterestMessage, SummaryEntry};
+    use crate::message::{InterestMessage, SummariesEmitter, SummaryEntry};
     use crate::ring::interest::contract_hash;
 
     // Throttle: at most one notification per contract per 100ms
@@ -876,6 +876,11 @@ pub(crate) async fn send_proactive_summary_notification(
     let hash = contract_hash(key);
     let message = InterestMessage::Summaries {
         entries: vec![SummaryEntry::from_summary(hash, Some(&summary))],
+        // #5052: this is the per-state-change fan-out, the emitter #5003
+        // targets. It is the only SINGLE-entry emitter that fans across peers,
+        // so its bytes/msgs ratio is what tells a `summary` apart from a
+        // heartbeat reply in the rollup.
+        emitter: SummariesEmitter::Notification,
     };
 
     // Get interested peers and send to each (excluding the sender who just sent us the update)
@@ -972,7 +977,7 @@ pub(crate) async fn send_summary_back_on_rejection(
     target_addr: SocketAddr,
     sender_summary_bytes: Vec<u8>,
 ) {
-    use crate::message::{InterestMessage, SummaryEntry};
+    use crate::message::{InterestMessage, SummariesEmitter, SummaryEntry};
     use crate::ring::interest::contract_hash;
 
     // Throttle BEFORE the WASM `summarize_state` call. Even with call
@@ -1023,6 +1028,11 @@ pub(crate) async fn send_summary_back_on_rejection(
     let hash = contract_hash(key);
     let message = InterestMessage::Summaries {
         entries: vec![SummaryEntry::from_summary(hash, Some(&our_summary))],
+        // #5052: same SHAPE as the notification above (single entry, real
+        // summary) but a different trigger and a much narrower gate, so it
+        // gets its own arm. Sharing one would make the notification arm look
+        // larger than the fan-out #5003 actually changes.
+        emitter: SummariesEmitter::Rejection,
     };
 
     if let Err(e) = op_manager

@@ -454,6 +454,12 @@ pub enum InterestMessage {
         /// Summary bytes is None if we're interested but don't have state yet.
         /// Use `SummaryEntry::from_summary()` to create entries.
         entries: Vec<SummaryEntry>,
+        /// Which code path built this message. NOT part of the wire format
+        /// (`#[serde(skip)]`), so it neither costs bytes nor changes what an
+        /// older peer decodes — see [`SummariesEmitter`] for why it exists and
+        /// what an inbound message's value means.
+        #[serde(skip)]
+        emitter: SummariesEmitter,
     },
 
     /// Incremental changes to our contract interests.
@@ -488,6 +494,74 @@ pub enum InterestMessage {
         /// Sender's current state summary bytes.
         summary_bytes: Vec<u8>,
     },
+}
+
+/// Which code path built an [`InterestMessage::Summaries`] — a NON-WIRE
+/// provenance tag carried alongside the message so the outbound byte census
+/// can attribute it (#5052).
+///
+/// ## Why the tag rides on the message
+///
+/// `interest_sync_summaries` is 49.8% of all outbound bytes on the fleet, and
+/// the arm counts four unrelated emitters together. They have opposite fixes:
+/// if the per-state-change notification dominates, #5003 (skip co-hosts the
+/// broadcast already covered, no wire change) is most of the answer; if the
+/// heartbeat reply dominates, the answer is hash-first (#4965), a wire-format
+/// change. A total that both drive cannot decide between them.
+///
+/// The census is taken at ONE choke point — the single place a `NetMessage` is
+/// handed to a connection ([`OutboundClass::classify`][c]) — where all that
+/// survives of the emitter is the message itself. So the emitter has to travel
+/// with it. Tagging at construction rather than calling a `record_*` at each
+/// site is deliberate: `.claude/rules/bug-prevention-patterns.md` has a whole
+/// row on manually-mirrored telemetry counters silently rotting when an op
+/// path is migrated, and a mandatory field cannot rot — a fifth emitter fails
+/// to COMPILE until it names its own arm, instead of quietly landing in the
+/// residual.
+///
+/// ## What it costs on the wire: nothing
+///
+/// The field is `#[serde(skip)]`, so the encoding of `Summaries` is byte-for-byte
+/// what it was before this tag existed (pinned by
+/// `summaries_emitter_tag_is_not_on_the_wire`). Two consequences worth stating
+/// because the first is easy to forget:
+///
+/// * a peer on any version decodes our messages exactly as before, and
+/// * an INBOUND `Summaries` always arrives as [`SummariesEmitter::Other`],
+///   because that is what `Default` supplies where the wire carries nothing.
+///   That is harmless today (the census only measures what this node SENDS,
+///   and every outbound `Summaries` is built locally), but a future path that
+///   re-sends a decoded message would report it as unattributed rather than
+///   mislabelling it.
+///
+/// [c]: crate::node::network_bridge::outbound_message_mix::OutboundClass::classify
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SummariesEmitter {
+    /// `operations::update::send_proactive_summary_notification` — one entry,
+    /// fanned to every interested peer on every state change.
+    Notification,
+    /// `node::handle_interest_sync_message`, replying to an `Interests`
+    /// advertisement — MULTI-entry, one per shared advertised contract, on
+    /// every ~5-min heartbeat received.
+    InterestsReply,
+    /// `node::handle_interest_sync_message`, replying to a `ChangeInterests`
+    /// delta — also multi-entry, but driven by interest churn rather than by
+    /// the heartbeat clock. Kept apart from [`Self::InterestsReply`] so the
+    /// residual arm below stays a pure residual; folding the two would repeat,
+    /// one level down, exactly the conflation this tag exists to undo.
+    ChangeInterestsReply,
+    /// `operations::update::send_summary_back_on_rejection` — one entry, only
+    /// when a rejected broadcast's summary already matched ours.
+    Rejection,
+    /// Residual: no emitter claimed this message. The `Default`, so it is also
+    /// what a decoded inbound message carries.
+    ///
+    /// A non-zero `interest_sync_summaries_other_bytes` in the rollup means a
+    /// send path exists that this enum does not describe. That is the point of
+    /// having it — an unattributed emitter shows up as a number to chase
+    /// instead of silently inflating one of the named arms.
+    #[default]
+    Other,
 }
 
 /// A summary entry for the Summaries message.
@@ -871,8 +945,8 @@ impl Display for NodeEvent {
                     InterestMessage::Interests { hashes } => {
                         format!("Interests({} hashes)", hashes.len())
                     }
-                    InterestMessage::Summaries { entries } => {
-                        format!("Summaries({} entries)", entries.len())
+                    InterestMessage::Summaries { entries, emitter } => {
+                        format!("Summaries({} entries, {emitter:?})", entries.len())
                     }
                     InterestMessage::ChangeInterests { added, removed } => {
                         format!(
@@ -1235,6 +1309,7 @@ mod tests {
                         summary_bytes: Some(vec![0u8; 10_000]),
                     },
                 ],
+                emitter: SummariesEmitter::InterestsReply,
             },
         };
         let display = format!("{summaries}");
@@ -1244,8 +1319,8 @@ mod tests {
             display.len()
         );
         assert!(
-            display.contains("Summaries(2 entries)"),
-            "Should show entry count: {display}"
+            display.contains("Summaries(2 entries, InterestsReply)"),
+            "Should show entry count and emitter: {display}"
         );
 
         // Interests should show hash count
@@ -1271,6 +1346,80 @@ mod tests {
             display.contains("ChangeInterests(+2 -1 hashes)"),
             "{display}"
         );
+    }
+
+    /// The #5052 emitter tag must cost NOTHING on the wire and must not change
+    /// what any peer decodes.
+    ///
+    /// This is the property that makes the whole attribution safe to ship into
+    /// a mixed-version fleet, and `#[serde(skip)]` is the only thing enforcing
+    /// it — delete the attribute and everything still compiles, every other
+    /// test still passes, and `Summaries` silently grows a field that older
+    /// peers cannot decode. Freenet has shipped exactly that bug before
+    /// (v0.2.11, a protocol-enum change that broke pinned consumers), so the
+    /// encoding is asserted directly rather than assumed:
+    ///
+    /// 1. two messages with identical entries but DIFFERENT tags encode to
+    ///    identical bytes, and
+    /// 2. those bytes are exactly what a tagless `Summaries` encodes to, so
+    ///    the tag adds no discriminant byte either, and
+    /// 3. decoding yields the `Default` tag, which is the residual arm —
+    ///    an inbound message is unattributed, never mislabelled.
+    #[test]
+    fn summaries_emitter_tag_is_not_on_the_wire() {
+        let entries = || {
+            vec![SummaryEntry {
+                hash: 0xDEAD_BEEF,
+                summary_bytes: Some(vec![1, 2, 3, 4, 5]),
+            }]
+        };
+        let tagged = |emitter| InterestMessage::Summaries {
+            entries: entries(),
+            emitter,
+        };
+
+        let notification =
+            bincode::serialize(&tagged(SummariesEmitter::Notification)).expect("serialize");
+        let interests_reply =
+            bincode::serialize(&tagged(SummariesEmitter::InterestsReply)).expect("serialize");
+        let residual = bincode::serialize(&tagged(SummariesEmitter::Other)).expect("serialize");
+
+        assert_eq!(
+            notification, interests_reply,
+            "the emitter tag must not appear on the wire — two messages that \
+             differ only by emitter must encode identically"
+        );
+        assert_eq!(
+            notification, residual,
+            "not even the Default tag may reach the wire"
+        );
+
+        // A sibling variant with the same payload shape is the control: it
+        // shows the byte total above is a real `Summaries` encoding and not
+        // some degenerate empty one, so assertion (1) has something to prove.
+        let interests = bincode::serialize(&InterestMessage::Interests {
+            hashes: vec![0xDEAD_BEEF],
+        })
+        .expect("serialize");
+        assert_ne!(
+            notification, interests,
+            "sanity: Summaries and Interests must not encode identically"
+        );
+
+        let decoded: InterestMessage = bincode::deserialize(&notification).expect("deserialize");
+        match decoded {
+            InterestMessage::Summaries { entries, emitter } => {
+                assert_eq!(entries.len(), 1, "payload must survive the round trip");
+                assert_eq!(entries[0].hash, 0xDEAD_BEEF);
+                assert_eq!(
+                    emitter,
+                    SummariesEmitter::Other,
+                    "a decoded message carries no provenance, so it must land \
+                     in the residual arm rather than claim an emitter"
+                );
+            }
+            other => panic!("expected Summaries, got {other:?}"),
+        }
     }
 
     #[test]
