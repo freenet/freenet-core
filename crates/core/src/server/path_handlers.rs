@@ -387,6 +387,15 @@ struct WebappCacheSweep {
     total_before: u64,
     bytes_freed: u64,
     evicted: Vec<ContractInstanceId>,
+    /// Entries this sweep tried and failed to delete, plus one if the size
+    /// scan itself failed (in which case nothing was attempted).
+    ///
+    /// Counted rather than logged-only because a caller that reports "freed 0
+    /// bytes" cannot otherwise distinguish "already within budget" from "could
+    /// not delete a thing", and those want opposite operator responses. The
+    /// sweep still never propagates either failure — see the rustdoc on
+    /// [`enforce_webapp_cache_budget`].
+    failed: usize,
 }
 
 /// Record that `instance_id` is being served right now, and report whether the
@@ -634,7 +643,10 @@ async fn enforce_webapp_cache_budget(
         Ok(entries) => entries,
         Err(err) => {
             tracing::warn!("webapp cache: size scan failed, skipping sweep: {err}");
-            return WebappCacheSweep::default();
+            return WebappCacheSweep {
+                failed: 1,
+                ..Default::default()
+            };
         }
     };
 
@@ -683,6 +695,7 @@ async fn enforce_webapp_cache_budget(
                 CONTRACT_CACHE_REFRESH.remove(&entry.instance_id);
             }
             Err(err) => {
+                sweep.failed += 1;
                 tracing::warn!(
                     "webapp cache: could not evict {}: {err}",
                     entry.encoded.as_str()
@@ -749,6 +762,168 @@ async fn maybe_enforce_webapp_cache_budget(
         SweepInProgress(Arc::clone(&cache.sweep))
     };
     enforce_webapp_cache_budget(cache, Some(in_use)).await;
+}
+
+/// Sum of every round of one [`reclaim_webapp_cache_at_startup`] call.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebappCacheStartupSweep {
+    /// Cache size before the first round.
+    pub total_before: u64,
+    /// Entries deleted across all rounds.
+    pub evicted: usize,
+    pub bytes_freed: u64,
+    /// Failed deletion ATTEMPTS across all rounds, plus any failed size scan.
+    ///
+    /// Attempts rather than distinct entries: a round re-scans from scratch, so
+    /// an entry that stays undeletable is retried once per subsequent round and
+    /// counted each time. That over-counts only in the pathological case; what
+    /// the number is for is "the sweep hit trouble N times", which is the same
+    /// signal either way.
+    pub failures: usize,
+    /// Rounds actually run, including the final one that evicted nothing.
+    pub rounds: usize,
+    /// The cache was still over budget when the sweep stopped — every
+    /// remaining entry was protected, or the round cap was hit.
+    pub still_over_budget: bool,
+}
+
+/// Most rounds one startup sweep will run.
+///
+/// Each round deletes at most [`WEBAPP_CACHE_MAX_EVICTIONS_PER_SWEEP`] (8)
+/// entries, so this admits 512 evictions — six times the 82-entry legacy cache
+/// that motivated the bound, and far past any cache that fits in a filesystem
+/// worth walking repeatedly. The loop already terminates on its own (a round
+/// that evicts nothing ends it, and every other round removes at least one of a
+/// finite set); this exists so a pathological case — another process writing
+/// entries as fast as we delete them — cannot spin startup indefinitely.
+const WEBAPP_CACHE_MAX_STARTUP_SWEEP_ROUNDS: usize = 64;
+
+/// Bring the webapp cache rooted at `root` within its size bound, before this
+/// node serves anything (#5035).
+///
+/// #5012 bounded the cache but wired enforcement only to request-driven
+/// triggers ([`SweepTrigger::Unpack`] and [`SweepTrigger::Reconcile`], both
+/// fired from the web handlers). A node that serves no webapp requests — the
+/// normal state for a gateway — therefore never enforced the bound at all, so
+/// the 1236 MiB legacy cache that motivated #5012 persisted indefinitely there.
+/// "Already bounded" was true only while requests flowed. This is the missing
+/// trigger.
+///
+/// # Called from the BINARY, not from the serve path
+///
+/// This is deliberately wired into `bin/freenet.rs::run`, the node binary's
+/// single startup entry, rather than into `serve_client_api_in_impl` where the
+/// cache instance actually lives. `ConfigArgs::build` resolves
+/// `webapp_cache_dir` to the process-wide `~/.cache/freenet/webapp_cache` for
+/// every config it produces, and the harness only overrides it for
+/// `#[freenet_test]` nodes — so a dozen in-process integration tests
+/// (`crates/core/tests/*.rs`, the freenet-ping app tests) call
+/// `serve_client_api` with the DEVELOPER'S REAL CACHE as the root. Sweeping
+/// there would make `cargo test` LRU-evict that cache down to the production
+/// budget, which is the exact failure #5012 fixed twice and its
+/// `WebappCache` rustdoc forbids. A `#[cfg(test)]` guard does not help: it is
+/// false when an integration test links the lib as an ordinary dependency,
+/// which is how all of those tests run. The binary is the only entry that
+/// unambiguously means "a real node is starting", so it is where this goes.
+///
+/// It takes a root rather than a [`WebappCache`] for the same reason: the
+/// binary is a separate crate target and cannot name `pub(crate)` items. The
+/// transient cache built here does not share the server's `SweepState`, which
+/// is sound only because of the ordering above — `run` sweeps before it
+/// constructs a server at all, so there is no other sweep to race.
+///
+/// # Why this loops when a request-driven sweep does not
+///
+/// One sweep deletes at most [`WEBAPP_CACHE_MAX_EVICTIONS_PER_SWEEP`] entries,
+/// which is deliberate on the request path: it keeps the first sweep after an
+/// upgrade from doing ~78 `remove_dir_all`s before the shell page returns, and
+/// the backlog drains over the next handful of unpacks. Neither half of that
+/// reasoning holds here. There is no request to stall — nothing is being served
+/// yet — and on the node this fix is FOR there is no "next unpack" to drain the
+/// backlog, which is the whole bug. So the startup sweep repeats until the cache
+/// fits, stops making progress, or hits
+/// [`WEBAPP_CACHE_MAX_STARTUP_SWEEP_ROUNDS`]. Each round re-scans, so the cost
+/// is a directory walk per 8 evictions over a tree that is shrinking; that is
+/// paid once, at startup, off the request path.
+///
+/// Holds the same in-progress guard a request-driven sweep takes, so the two can
+/// never run concurrently and double-count a deficit, and stamps `last_sweep` so
+/// the reconcile debounce accounts for this sweep.
+///
+/// Never fails: an unreadable or missing cache directory and an undeletable
+/// entry are counted in `failures` (the scan case) or logged and skipped, and
+/// the node starts regardless. The cache is recomputable, so nothing here is
+/// worth refusing to boot over.
+pub async fn reclaim_webapp_cache_at_startup(root: PathBuf) -> WebappCacheStartupSweep {
+    // Built directly rather than via `WebappCache::with_root`: that constructor
+    // creates the directory and logs the "cache lives here" line, which the
+    // server does once already. A missing root simply scans as empty.
+    let cache = WebappCache {
+        root,
+        max_bytes: WEBAPP_CACHE_MAX_BYTES,
+        sweep: Arc::new(parking_lot::Mutex::new(SweepState::default())),
+    };
+    sweep_webapp_cache_at_startup(&cache).await
+}
+
+async fn sweep_webapp_cache_at_startup(cache: &WebappCache) -> WebappCacheStartupSweep {
+    let _in_progress = {
+        // Scoped so the (sync) lock is released before the awaits below.
+        let mut state = cache.sweep.lock();
+        if state.in_progress {
+            // Unreachable on the real startup path (nothing is serving yet);
+            // handled rather than asserted because the guard is defensive.
+            debug!("webapp cache: a sweep is already running, skipping the startup sweep");
+            return WebappCacheStartupSweep::default();
+        }
+        state.in_progress = true;
+        state.last_sweep = Some(Instant::now());
+        SweepInProgress(Arc::clone(&cache.sweep))
+    };
+
+    let mut outcome = WebappCacheStartupSweep::default();
+    let mut live = 0u64;
+    for round in 0..WEBAPP_CACHE_MAX_STARTUP_SWEEP_ROUNDS {
+        // `None`: at startup no contract is being served, so nothing is exempt
+        // as the request in flight.
+        let sweep = enforce_webapp_cache_budget(cache, None).await;
+        if round == 0 {
+            outcome.total_before = sweep.total_before;
+        }
+        live = sweep.total_before.saturating_sub(sweep.bytes_freed);
+        outcome.rounds += 1;
+        outcome.evicted += sweep.evicted.len();
+        outcome.bytes_freed = outcome.bytes_freed.saturating_add(sweep.bytes_freed);
+        outcome.failures += sweep.failed;
+        // A round that evicted nothing means either the cache now fits (the
+        // early return in `enforce_webapp_cache_budget`) or nothing left is
+        // evictable. Either way another round would do the same thing again.
+        if sweep.evicted.is_empty() {
+            break;
+        }
+    }
+    outcome.still_over_budget = live > cache.max_bytes;
+
+    if outcome.evicted > 0 || outcome.failures > 0 {
+        tracing::info!(
+            evicted = outcome.evicted,
+            freed_bytes = outcome.bytes_freed,
+            total_before = outcome.total_before,
+            failures = outcome.failures,
+            rounds = outcome.rounds,
+            still_over_budget = outcome.still_over_budget,
+            "webapp cache: reclaimed disk at startup (the size bound is otherwise \
+             only enforced by web requests, so a node serving none never ran it)"
+        );
+    }
+    if outcome.still_over_budget && outcome.rounds >= WEBAPP_CACHE_MAX_STARTUP_SWEEP_ROUNDS {
+        tracing::warn!(
+            rounds = outcome.rounds,
+            "webapp cache: startup sweep hit its round cap with the cache still \
+             over budget; the remainder is left to later sweeps"
+        );
+    }
+    outcome
 }
 
 /// True if the contract was reconciled against the network within the last
@@ -2662,6 +2837,279 @@ mod tests {
             survivors, 4,
             "concurrent sweeps must together evict the deficit exactly once"
         );
+    }
+
+    // ----------------------------------------------------------------------
+    // #5035: the startup sweep — the trigger #5012 never wired, so a node that
+    // serves no webapp requests enforced the size bound not at all.
+    // ----------------------------------------------------------------------
+
+    /// The load-bearing property: a startup sweep must get the cache UNDER
+    /// budget even when that needs more deletions than one sweep may do.
+    ///
+    /// `WEBAPP_CACHE_MAX_EVICTIONS_PER_SWEEP` caps a single sweep at 8, and on
+    /// the node this fix is for there is no later request to drain the rest —
+    /// that is the entire bug. Seeded with an overage of 12 entries so a
+    /// single-sweep implementation leaves the cache over budget and fails here.
+    #[tokio::test]
+    async fn startup_sweep_loops_past_the_per_sweep_eviction_cap() {
+        const KEEP: usize = 4;
+        let overage = WEBAPP_CACHE_MAX_EVICTIONS_PER_SWEEP + 4;
+        let total = KEEP + overage;
+        let root = tempfile::tempdir().expect("tempdir");
+        // Oldest first, so the last KEEP ids are the ones that must survive.
+        let ids: Vec<_> = (0..total).map(|slot| cache_id(30, slot as u8)).collect();
+        let mut entry_size = 0;
+        for (offset, id) in ids.iter().enumerate() {
+            entry_size = seed_cache_entry(
+                root.path(),
+                id,
+                4096,
+                Duration::from_secs((total - offset) as u64 * 86_400),
+            );
+        }
+        let cache = cache(root.path(), entry_size * KEEP as u64);
+
+        let outcome = sweep_webapp_cache_at_startup(&cache).await;
+
+        assert_eq!(
+            outcome.evicted, overage,
+            "the sweep must keep going until the cache fits, not stop at the \
+             per-sweep cap of {WEBAPP_CACHE_MAX_EVICTIONS_PER_SWEEP}: {outcome:?}"
+        );
+        assert!(
+            outcome.rounds > 1,
+            "an overage of {overage} cannot be cleared in one round: {outcome:?}"
+        );
+        assert!(!outcome.still_over_budget, "outcome: {outcome:?}");
+        assert_eq!(outcome.failures, 0, "outcome: {outcome:?}");
+        assert_eq!(
+            outcome.total_before,
+            entry_size * total as u64,
+            "outcome: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.bytes_freed,
+            entry_size * overage as u64,
+            "outcome: {outcome:?}"
+        );
+        // Least-recently-used went first: the survivors are the newest KEEP.
+        for id in &ids[..overage] {
+            assert!(!dir_present(root.path(), id), "{} survived", id.encode());
+        }
+        for id in &ids[overage..] {
+            assert!(dir_present(root.path(), id), "{} was evicted", id.encode());
+        }
+    }
+
+    /// A cache already within budget must be left completely alone — one scan,
+    /// no deletions, nothing reported.
+    #[tokio::test]
+    async fn startup_sweep_leaves_a_cache_under_budget_alone() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let ids: Vec<_> = (0..4).map(|slot| cache_id(31, slot)).collect();
+        let mut entry_size = 0;
+        for (offset, id) in ids.iter().enumerate() {
+            entry_size = seed_cache_entry(
+                root.path(),
+                id,
+                4096,
+                Duration::from_secs((4 - offset) as u64 * 86_400),
+            );
+        }
+        // Budget with room to spare.
+        let cache = cache(root.path(), entry_size * 8);
+
+        let outcome = sweep_webapp_cache_at_startup(&cache).await;
+
+        assert_eq!(
+            outcome,
+            WebappCacheStartupSweep {
+                total_before: entry_size * 4,
+                evicted: 0,
+                bytes_freed: 0,
+                failures: 0,
+                rounds: 1,
+                still_over_budget: false,
+            },
+            "a cache under budget must be scanned once and left alone"
+        );
+        for id in &ids {
+            assert!(dir_present(root.path(), id), "{} was evicted", id.encode());
+        }
+    }
+
+    /// An entry that cannot be deleted is counted, does not abort the sweep,
+    /// and does not spin the loop. A DIRECTORY where the `{key}.hash` sentinel
+    /// belongs makes `remove_file` fail with `EISDIR` deterministically on
+    /// every platform and even as root, unlike a chmod.
+    #[tokio::test]
+    async fn startup_sweep_counts_an_undeletable_entry_and_still_starts() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let stuck = cache_id(32, 0);
+        let evictable = cache_id(32, 1);
+        let entry_size = seed_cache_entry(root.path(), &evictable, 4096, Duration::from_secs(1));
+        // The stuck entry is the OLDEST, so it is the sweep's first candidate.
+        seed_cache_entry(root.path(), &stuck, 4096, Duration::from_secs(90 * 86_400));
+        let sentinel = root.path().join(format!("{}.hash", stuck.encode()));
+        std::fs::remove_file(&sentinel).expect("drop the sentinel file");
+        std::fs::create_dir(&sentinel).expect("occupy the sentinel name with a directory");
+
+        // Budget below either entry, so both are candidates.
+        let cache = cache(root.path(), 1);
+        let outcome = sweep_webapp_cache_at_startup(&cache).await;
+
+        // Two attempts, not two entries: round 1 evicts the good entry and
+        // fails on the stuck one, round 2 re-scans, fails on it again, evicts
+        // nothing, and ends the loop. `failures` counts attempts (see its doc).
+        assert_eq!(
+            outcome.failures, 2,
+            "the undeletable entry must be counted on every attempt, not \
+             swallowed: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.evicted, 1,
+            "one failure must not stop the sweep evicting what it can: {outcome:?}"
+        );
+        assert_eq!(outcome.bytes_freed, entry_size, "outcome: {outcome:?}");
+        assert!(
+            outcome.still_over_budget,
+            "the stuck entry keeps the cache over budget: {outcome:?}"
+        );
+        assert!(
+            outcome.rounds <= WEBAPP_CACHE_MAX_STARTUP_SWEEP_ROUNDS,
+            "an entry that can never be deleted must not spin the loop: {outcome:?}"
+        );
+        assert!(dir_present(root.path(), &stuck));
+        assert!(!dir_present(root.path(), &evictable));
+    }
+
+    /// Over budget with every entry protected by the in-flight guard: the
+    /// sweep must report the fact and stop, not loop trying.
+    #[tokio::test]
+    async fn startup_sweep_stops_when_every_entry_is_protected() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let ids: Vec<_> = (0..3).map(|slot| cache_id(33, slot)).collect();
+        for (offset, id) in ids.iter().enumerate() {
+            seed_cache_entry(
+                root.path(),
+                id,
+                4096,
+                Duration::from_secs((3 - offset) as u64 * 86_400),
+            );
+            // Marks the entry as served just now, inside
+            // `WEBAPP_CACHE_EVICTION_MIN_IDLE`.
+            record_cache_access(*id);
+        }
+
+        let outcome = sweep_webapp_cache_at_startup(&cache(root.path(), 1)).await;
+
+        assert_eq!(outcome.evicted, 0, "outcome: {outcome:?}");
+        assert_eq!(outcome.rounds, 1, "outcome: {outcome:?}");
+        assert!(outcome.still_over_budget, "outcome: {outcome:?}");
+        for id in &ids {
+            assert!(dir_present(root.path(), id));
+            WEBAPP_CACHE_ACCESS.remove(id);
+        }
+    }
+
+    /// The public entry the node binary calls enforces the PRODUCTION budget
+    /// against a bare root path.
+    ///
+    /// The other startup-sweep tests inject a small budget through `cache()`,
+    /// so none of them would catch `reclaim_webapp_cache_at_startup` building
+    /// its cache with the wrong `max_bytes` (or the wrong root). Entries are
+    /// sparse — `set_len` with nothing written — because the scan sums
+    /// `metadata.len()`, so this exercises a 160 MiB cache at ~0 bytes of real
+    /// disk. Sized so the overage needs more than one round's 8 evictions.
+    #[tokio::test]
+    async fn public_startup_reclaim_enforces_the_production_budget() {
+        /// Logical bytes per entry, sentinel included, so exactly 8 entries
+        /// fill `WEBAPP_CACHE_MAX_BYTES`.
+        const ENTRY_BYTES: u64 = 8 * 1024 * 1024;
+        let root = tempfile::tempdir().expect("tempdir");
+        let ids: Vec<_> = (0..20).map(|slot| cache_id(35, slot)).collect();
+        for (offset, id) in ids.iter().enumerate() {
+            // Seeds the sentinel + marker age, then swaps the small payload for
+            // a sparse one of the size this test needs.
+            seed_cache_entry(
+                root.path(),
+                id,
+                0,
+                Duration::from_secs((20 - offset) as u64 * 86_400),
+            );
+            let payload = std::fs::File::create(root.path().join(id.encode()).join("index.html"))
+                .expect("payload");
+            payload
+                .set_len(ENTRY_BYTES - SENTINEL_BYTES)
+                .expect("sparse payload");
+        }
+        assert_eq!(
+            WEBAPP_CACHE_MAX_BYTES / ENTRY_BYTES,
+            8,
+            "premise: the production budget must hold exactly 8 of these entries"
+        );
+
+        let outcome = reclaim_webapp_cache_at_startup(root.path().to_path_buf()).await;
+
+        assert_eq!(
+            outcome.evicted, 12,
+            "20 x 8 MiB against a 64 MiB budget must shed 12: {outcome:?}"
+        );
+        assert!(
+            outcome.rounds > 1,
+            "12 evictions cannot happen in one round: {outcome:?}"
+        );
+        assert!(!outcome.still_over_budget, "outcome: {outcome:?}");
+        // LRU order: the oldest 12 went, the newest 8 stayed.
+        for id in &ids[..12] {
+            assert!(!dir_present(root.path(), id), "{} survived", id.encode());
+        }
+        for id in &ids[12..] {
+            assert!(dir_present(root.path(), id), "{} was evicted", id.encode());
+        }
+    }
+
+    /// A cache root that does not exist is not an error: the node starts, and
+    /// the sweep reports nothing.
+    #[tokio::test]
+    async fn public_startup_reclaim_tolerates_a_missing_root() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let outcome = reclaim_webapp_cache_at_startup(root.path().join("absent")).await;
+        assert_eq!(
+            outcome,
+            WebappCacheStartupSweep {
+                // One round: the scan comes back empty, so the loop ends. Not a
+                // `failures` — a cache root that does not exist yet is the
+                // normal state of a node that has never served a web contract.
+                rounds: 1,
+                ..Default::default()
+            }
+        );
+        assert!(
+            !root.path().join("absent").exists(),
+            "the reclaim must not create the cache directory; the server owns that"
+        );
+    }
+
+    /// The startup sweep takes the same in-progress guard a request-driven
+    /// sweep does, so the two can never each delete a full deficit's worth.
+    #[tokio::test]
+    async fn startup_sweep_defers_to_a_sweep_already_running() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let id = cache_id(34, 0);
+        seed_cache_entry(root.path(), &id, 4096, Duration::from_secs(30 * 86_400));
+        let cache = cache(root.path(), 1);
+        cache.sweep.lock().in_progress = true;
+
+        let outcome = sweep_webapp_cache_at_startup(&cache).await;
+
+        assert_eq!(
+            outcome,
+            WebappCacheStartupSweep::default(),
+            "a sweep already in flight must not be joined by a second one"
+        );
+        assert!(dir_present(root.path(), &id));
     }
 
     /// The debounce decision, isolated from the filesystem. An unpack grew the
