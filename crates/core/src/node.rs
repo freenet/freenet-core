@@ -2870,6 +2870,25 @@ async fn handle_interest_sync_message(
                         // broadcast targets forever. A `None` report keeps the
                         // old clear-only semantics (no entry is created just to
                         // hold `None`).
+                        //
+                        // LOAD-BEARING POSITION, not just a write: this runs
+                        // OUTSIDE the `is_stale` branch, on converged and stale
+                        // peers alike, and it is what refreshes the peer's
+                        // interest TTL here — both `set_summary` and
+                        // `clear_summary` end in `PeerInterest::refresh`. There
+                        // is no explicit `refresh_peer_interest` on this path;
+                        // the refresh is a CONSEQUENCE of the write.
+                        //
+                        // So moving this inside the staleness branch — which
+                        // reads as a pure optimisation ("why rewrite a summary
+                        // we just proved unchanged?") — silently stops
+                        // refreshing every converged peer, and they age out at
+                        // `INTEREST_TTL` while every test stays green. That is
+                        // the #3046/#3093 bug class, which has already appeared
+                        // at two other sites in this same fan-out logic (the
+                        // production and sim-only converged skips, both fixed in
+                        // #5055). Pinned by
+                        // `summaries_arm_writes_summary_outside_staleness_branch_pin`.
                         match their_summary {
                             Some(theirs) => {
                                 op_manager
@@ -4192,6 +4211,80 @@ mod tests {
             "the Summaries arm must ration WASM probes through \
              plan_staleness_probe (MAX_STALENESS_PROBES_PER_SUMMARIES cap) — \
              an uncapped probe per contract is a DoS amplification surface"
+        );
+    }
+
+    /// Source-scrape pin (#3046 / #3093): the `Summaries` arm's summary write
+    /// must stay OUTSIDE the staleness branch, because that write is what
+    /// refreshes the peer's interest TTL on this path.
+    ///
+    /// There is no explicit `refresh_peer_interest` here. `upsert_peer_summary`
+    /// and `clear_peer_summary` both end in `PeerInterest::refresh`, so the TTL
+    /// refresh is a CONSEQUENCE of writing the summary, and it currently reaches
+    /// converged and stale peers alike only because the write sits after the
+    /// verdict rather than inside it.
+    ///
+    /// That makes the obvious "optimisation" — skip the rewrite when we just
+    /// proved the summary unchanged — a silent subscriber-expiry bug: every
+    /// converged peer stops being refreshed and ages out at `INTEREST_TTL`,
+    /// with no test failing. This is the third site of a class that already
+    /// appeared twice in the fan-out logic (the production and sim-only
+    /// converged skips, both fixed in #5055), which is why it is pinned before
+    /// anyone tries it rather than after.
+    #[test]
+    fn summaries_arm_writes_summary_outside_staleness_branch_pin() {
+        let src = include_str!("node.rs");
+        let handler_start = src
+            .find("async fn handle_interest_sync_message(")
+            .expect("handle_interest_sync_message not found");
+        let summaries_off = src[handler_start..]
+            .find("InterestMessage::Summaries { entries, .. }")
+            .expect("Summaries arm not found");
+        let change_off = src[handler_start..]
+            .find("InterestMessage::ChangeInterests")
+            .expect("ChangeInterests arm not found");
+        let summaries_arm = &src[handler_start + summaries_off..handler_start + change_off];
+
+        // Both writes must be present — they are the only thing refreshing the
+        // TTL on this path.
+        let upsert_at = summaries_arm.find("upsert_peer_summary(").expect(
+            "the Summaries arm must cache the peer's reported summary via \
+             upsert_peer_summary — that write is also what refreshes the peer's \
+             interest TTL here (#4952, #3046)",
+        );
+        assert!(
+            summaries_arm.contains("clear_peer_summary("),
+            "the None-report branch must clear via clear_peer_summary — it too \
+             refreshes the TTL, so replacing it with a bare no-op stops \
+             refreshing peers that report no summary"
+        );
+
+        // The load-bearing structural fact: the write is NOT nested inside the
+        // staleness decision. `is_stale` is consumed AFTER the write; if a
+        // refactor moves the write inside an `if is_stale` block, the write
+        // (and with it the refresh) stops running for converged peers.
+        let is_stale_use = summaries_arm.find("if is_stale").expect(
+            "the Summaries arm must still branch on is_stale for the heal \
+             decision — if this moved, re-check where the summary write sits",
+        );
+        assert!(
+            upsert_at < is_stale_use,
+            "the summary write MUST precede (and sit outside) the `if is_stale` \
+             heal branch. Moving it inside skips the write — and therefore the \
+             interest-TTL refresh, which on this path is only a side effect of \
+             the write — for every CONVERGED peer, so they age out at \
+             INTEREST_TTL and silently stop receiving broadcasts (#3046/#3093). \
+             upsert at {upsert_at}, `if is_stale` at {is_stale_use}"
+        );
+
+        // And it must not be conditioned on staleness some other way.
+        let stripped: String = summaries_arm
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            !stripped.contains("ifis_stale{op_manager.interest_manager.upsert_peer_summary("),
+            "the summary write must not be gated on is_stale — see above"
         );
     }
 
