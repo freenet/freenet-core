@@ -854,10 +854,21 @@ pub(crate) async fn update_contract(
 /// they upsert into their cache of us on arrival
 /// (`update/op_ctx_task.rs::drive_relay_broadcast_to` step 1, and the
 /// streaming twin `apply_streaming_broadcast` step 4 — the #4952 upsert).
-/// Sending it a second time as a standalone `Summaries` message was pure
-/// duplication, and an expensive one: `outbound_message_mix` measured
-/// InterestSync at 52-55% of all outbound message bytes on 0.2.112, at a
-/// ~24 KB mean per message, correlating with the update rate at r=0.92.
+/// Sending it again as a standalone `Summaries` message duplicates the
+/// summary bytes on the wire for a peer that just received them. It is NOT a
+/// pure duplicate: the `Summaries` handler ALSO compares our summary against
+/// the receiver's and heals us via a targeted `SyncStateToPeer` if we are
+/// behind (`node.rs`, `Summaries` arm), whereas the broadcast receive path
+/// only upserts (`op_ctx_task.rs`). For co-hosts that reverse probe now falls
+/// to the ~5-min heartbeat anti-entropy — the backstop invariant 1 designates
+/// for exactly this.
+///
+/// `interest_sync_summaries` is the largest outbound arm (49.8% of outbound
+/// bytes, v0.2.115). How much of it THIS emitter accounts for is NOT known:
+/// `outbound_message_mix` buckets all four `Summaries` emitters together, and
+/// the multi-entry heartbeat reply (`node.rs`, `Interests` arm) is a
+/// significant second source. #5052 adds the per-emitter counter. Do not read
+/// a specific saving into this change. See #4965.
 ///
 /// The remaining recipients are the population this notification exists for:
 /// peers interested in the contract that we do NOT advertise-host toward, so
@@ -866,9 +877,18 @@ pub(crate) async fn update_contract(
 ///
 /// If a broadcast is dropped rather than delivered, the excluded co-host
 /// misses this summary — but it also missed the state itself, and the
-/// heartbeat anti-entropy is the designated backstop for exactly that case.
-/// This mirrors `record_delivery_to_interest`, which likewise only seeds on a
-/// real delivery (#4235).
+/// heartbeat anti-entropy is the designated backstop for that case. This
+/// mirrors `record_delivery_to_interest`, which likewise only seeds on a real
+/// delivery (#4235).
+///
+/// That reasoning does NOT cover every case, and the gap is why this
+/// exclusion needs care: `broadcast_to_single_peer` also returns without
+/// sending when `should_broadcast_contract` is false, when `fanout_send_needed`
+/// believes the peer converged, and on an empty delta. In the converged cases
+/// the peer did not miss the STATE, only our new summary — which is the input
+/// to its own delta computation back toward us. `should_broadcast_contract` is
+/// a whole-contract gate with no counterpart here, since this function fetches
+/// a summary unconditionally.
 pub(crate) async fn send_proactive_summary_notification(
     op_manager: &OpManager,
     key: &ContractKey,
@@ -958,7 +978,13 @@ pub(crate) async fn send_proactive_summary_notification(
     tracing::debug!(
         contract = %key,
         interested = interested.len(),
-        cohosts_skipped = advertised_cohosts.len(),
+        resolved = resolved.len(),
+        // NOT `advertised_cohosts.len()`: that counts every advertised co-host
+        // of the contract, including ones not interested and ones that failed
+        // to resolve, so it overstates the saving — and this log is how the
+        // change gets field-validated.
+        cohosts_skipped = resolved.len().saturating_sub(targets.len()),
+        advertised_cohosts = advertised_cohosts.len(),
         peer_count = targets.len(),
         "Sent proactive summary notifications after state change"
     );
@@ -2156,11 +2182,13 @@ mod tests {
 
     // ── #4965: proactive summary notification recipient set ───────────────
     //
-    // `outbound_message_mix` measured InterestSync at 52-55% of all outbound
-    // message bytes on 0.2.112 (~24 KB mean, r=0.92 against the update rate).
-    // The dominant emitter is `send_proactive_summary_notification`, and most
-    // of its recipients are advertised co-hosts that already received the
-    // identical summary inside the broadcast's `sender_summary_bytes`.
+    // `interest_sync_summaries` is the largest outbound arm (49.8% of outbound
+    // bytes, v0.2.115). Which of its four emitters dominates is NOT measured —
+    // `outbound_message_mix` buckets them together (#5052 adds the split).
+    // What this change rests on is narrower and does not need that number:
+    // most recipients of this notification are advertised co-hosts that
+    // already received the identical summary inside the broadcast's
+    // `sender_summary_bytes`.
 
     /// Build a `(pub_key, addr)` pair plus the matching `PeerKeyLocation`.
     fn resolved_peer(port: u16) -> (TransportPublicKey, SocketAddr) {
@@ -2310,7 +2338,12 @@ mod tests {
             .find("pub(crate) async fn send_proactive_summary_notification(")
             .expect("send_proactive_summary_notification not found");
         let fn_src = &prod[fn_start..];
-        let fn_end = fn_src[1..]
+        // `+ 1` rebases the offset: `find` searched `fn_src[1..]`, but the
+        // slice below indexes `fn_src`. Without it the body ends one byte
+        // early — harmless today (it only drops the preceding newline, which
+        // the whitespace filter would strip anyway) but the two indices must
+        // share a base or a future edit to this boundary will cut real source.
+        let fn_end = 1 + fn_src[1..]
             .find("\npub(crate) fn ")
             .expect("expected proactive_summary_targets to follow the emitter");
         // Whitespace-stripped so the pin survives rustfmt reflowing the call.
@@ -2322,8 +2355,7 @@ mod tests {
         assert!(
             body.contains("neighbor_hosting.neighbors_with_contract(key)"),
             "the emitter MUST consult the advertisement layer — without it the \
-             co-host exclusion silently does nothing and InterestSync returns to \
-             ~54% of outbound bytes (#4965)"
+             co-host exclusion silently does nothing (#4965)"
         );
         assert!(
             body.contains("proactive_summary_targets(&resolved,&advertised_cohosts,"),
@@ -2332,8 +2364,14 @@ mod tests {
              production (see .claude/rules/operations.md, #3791)"
         );
         assert!(
-            !body.contains("forpeer_addrin&interested"),
-            "the emitter must not iterate the raw interested-peer set again"
+            // Needle is `in&interested`, NOT `forpeer_addrin&interested`: the
+            // pre-change loop was `for (peer_key, _interest) in &interested {`,
+            // which whitespace-strips to `for(peer_key,_interest)in&interested{`.
+            // The longer needle never matched the code it claimed to guard, so
+            // it could not fail on the reversion named in its own message.
+            !body.contains("in&interested"),
+            "the emitter must not iterate the raw interested-peer set again — \
+             it must send only to the filtered `targets`"
         );
     }
 }
