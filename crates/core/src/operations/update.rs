@@ -1082,6 +1082,11 @@ pub(crate) async fn send_proactive_summary_notification(
     op_manager
         .outbound_mix
         .record_notification_recipients(targets.len() as u64, cohosts_skipped as u64);
+    // Simulation-visible twin of the same number. The sim harness cannot read
+    // per-node `OutboundMix` windows, and the exclusion's effect is invisible
+    // in `delta_sends`/`full_state_sends` — see
+    // `GlobalTestMetrics::record_notification_cohosts_skipped`.
+    crate::config::GlobalTestMetrics::record_notification_cohosts_skipped(cohosts_skipped as u64);
 
     tracing::debug!(
         contract = %key,

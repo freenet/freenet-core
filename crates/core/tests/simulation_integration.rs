@@ -3414,19 +3414,30 @@ fn test_sustained_update_fanout_no_full_state_storm() {
 /// #4965 exclusion now drops real recipients — which is exactly the thing under
 /// test.
 ///
-/// ## What the metric means here
+/// ## The two assertions do DIFFERENT jobs — measured, not assumed
 ///
-/// A peer's broadcast to a neighbor is a DELTA only while it holds a cached
-/// summary for that neighbor. The standalone `Summaries` notification and the
-/// broadcast's own `sender_summary_bytes` are the two paths that seed that
-/// cache. #4965 removes the first for co-hosts on the claim that the second
-/// already covers them. If that claim is wrong — the exclusion over-excludes,
-/// or the broadcast that was supposed to carry the summary never happens — the
-/// peers stop seeding each other's summaries and their broadcasts fall back to
-/// full state. So `delta_sends > full_state_sends` is the discriminator, the
-/// same one the star test uses, on a topology where it is actually sensitive.
+/// **`notification_cohosts_skipped > 0` is the sensitivity assertion.** It is
+/// the only signal here that responds to the change at all.
 ///
-/// ## Premise checks (without these the assertion is vacuous)
+/// **`delta_sends > full_state_sends` is a safety assertion, NOT a
+/// discriminator, and the numbers say so.** A peer's broadcast to a neighbor is
+/// a delta only while it holds a cached summary for that neighbor; the
+/// standalone `Summaries` notification and the broadcast's own
+/// `sender_summary_bytes` both seed that cache, and #4965 removes the first for
+/// co-hosts on the claim that the second already covers them. The claim holds,
+/// so removing the redundant path changes nothing downstream: reverting the
+/// exclusion on this exact scenario produced **bit-identical** `delta_sends=140
+/// / full_state_sends=6`. That is the change being harmless, which is worth
+/// pinning — but a test resting on it alone would pass whether or not the
+/// feature existed, which is precisely the vacuity this suite is supposed to
+/// reject.
+///
+/// So the delta-dominance assertion stays (it catches an over-exclusion that
+/// DID strand peers, which would show up as full-state fallback), and the
+/// skipped-count assertion is what makes the test fail when the exclusion is
+/// removed.
+///
+/// ## Premise checks (without these both assertions are vacuous)
 ///
 /// - `neighbor_hosting_updates() > 0`: the peers really exchanged hosting
 ///   advertisements. If they never did, no peer has any advertised co-host,
@@ -3523,13 +3534,15 @@ fn test_cohost_mesh_update_fanout_stays_delta_dominated() {
     let delta_sends = GlobalTestMetrics::delta_sends();
     let full_state_sends = GlobalTestMetrics::full_state_sends();
     let hosting_updates = GlobalTestMetrics::neighbor_hosting_updates();
+    let cohosts_skipped = GlobalTestMetrics::notification_cohosts_skipped();
 
     tracing::info!(
         "i4965 cohost mesh: delta_sends={}, full_state_sends={}, \
-         neighbor_hosting_updates={}, converged={}/{}",
+         neighbor_hosting_updates={}, cohosts_skipped={}, converged={}/{}",
         delta_sends,
         full_state_sends,
         hosting_updates,
+        cohosts_skipped,
         convergence.converged.len(),
         convergence.total_contracts(),
     );
@@ -3550,7 +3563,25 @@ fn test_cohost_mesh_update_fanout_stays_delta_dominated() {
         "premise: no broadcasts were recorded — the fan-out scenario did not run"
     );
 
-    // THE DISCRIMINATOR.
+    // THE DISCRIMINATOR — the assertion that fails when #4965 is reverted.
+    //
+    // Verified by mutation, not assumed: with the co-host filter removed from
+    // `proactive_summary_targets`, this drops to 0 while delta_sends and
+    // full_state_sends stay bit-identical at 140/6. It is the ONLY metric here
+    // that responds to the change.
+    assert!(
+        cohosts_skipped > 0,
+        "#4965 is not doing anything on a topology built specifically to \
+         exercise it: {hosting_updates} hosting advertisements were exchanged, \
+         so peers ARE advertised co-hosts of each other, yet zero recipients \
+         were skipped. Either the exclusion was removed, or it is reading a \
+         co-host set that never matches the notification's recipients."
+    );
+
+    // SAFETY, not a discriminator (see this test's docs): reverting the
+    // exclusion leaves these two numbers unchanged, so this assertion cannot
+    // tell the change apart. It is here to catch the DAMAGING failure — an
+    // over-exclusion that strands peers, which surfaces as full-state fallback.
     assert!(
         delta_sends > full_state_sends,
         "#4965 REGRESSION: co-hosting peers stopped seeding each other's \
