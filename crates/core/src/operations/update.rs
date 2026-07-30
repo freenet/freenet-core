@@ -2785,28 +2785,32 @@ mod tests {
             .ring
             .host_contract(key, 1024, crate::ring::AccessType::Put);
 
-        // A: advertised co-host AND interested — the excluded population.
-        // B: interested only — the population the notification still exists for.
-        // C: advertised co-host only — a broadcast target we never notify.
+        // A and B: advertised co-hosts AND interested — the excluded
+        //          population. TWO of them, deliberately: with only one, a
+        //          mutation that narrows the broadcast target set to a single
+        //          peer can happen to keep exactly the excluded one, and the
+        //          subset assertion still holds. Mutation testing caught that
+        //          — a `truncate(1)` on the broadcast targets left this test
+        //          green. With two, narrowing to one always strands the other.
+        // C: interested only — the population the notification still exists for.
+        // E: advertised co-host only — a broadcast target we never notify.
         let (a_pk, a_addr) = connect_peer(&op_manager, 19101, 0.11);
         let (b_pk, b_addr) = connect_peer(&op_manager, 19102, 0.12);
-        let (c_pk, _c_addr) = connect_peer(&op_manager, 19103, 0.13);
+        let (c_pk, c_addr) = connect_peer(&op_manager, 19103, 0.13);
+        let (e_pk, _e_addr) = connect_peer(&op_manager, 19105, 0.15);
         let (_d_pk, sender_addr) = connect_peer(&op_manager, 19104, 0.14);
 
         advertise_cohost(&op_manager, &a_pk, &key);
-        advertise_cohost(&op_manager, &c_pk, &key);
-        op_manager.interest_manager.register_peer_interest(
-            &key,
-            crate::ring::PeerKey::from(a_pk.clone()),
-            None,
-            false,
-        );
-        op_manager.interest_manager.register_peer_interest(
-            &key,
-            crate::ring::PeerKey::from(b_pk.clone()),
-            None,
-            false,
-        );
+        advertise_cohost(&op_manager, &b_pk, &key);
+        advertise_cohost(&op_manager, &e_pk, &key);
+        for pk in [&a_pk, &b_pk, &c_pk] {
+            op_manager.interest_manager.register_peer_interest(
+                &key,
+                crate::ring::PeerKey::from(pk.clone()),
+                None,
+                false,
+            );
+        }
 
         let broadcast_targets: HashSet<SocketAddr> = op_manager
             .get_broadcast_targets_update(&key, &sender_addr)
@@ -2820,20 +2824,21 @@ mod tests {
 
         // Premise 1: the scenario really produced a broadcast fan-out.
         assert!(
-            broadcast_targets.contains(&a_addr),
-            "premise: A must be a broadcast target, else the subset assertion \
-             below is vacuous. targets={broadcast_targets:?}"
+            !broadcast_targets.is_empty(),
+            "premise: the broadcast must have targets, else the subset \
+             assertion below is vacuous"
         );
-        // Premise 2: the exclusion really excluded something. Without this the
-        // subset assertion passes trivially on an empty set.
-        let interested_addrs: HashSet<SocketAddr> = [a_addr, b_addr].into_iter().collect();
+        // Premise 2: the exclusion really excluded BOTH co-hosts and kept the
+        // non-co-host. Without this the subset assertion passes trivially on
+        // an empty set.
+        let interested_addrs: HashSet<SocketAddr> = [a_addr, b_addr, c_addr].into_iter().collect();
         let excluded: HashSet<SocketAddr> =
             interested_addrs.difference(&notified).copied().collect();
         assert_eq!(
             excluded,
-            [a_addr].into_iter().collect::<HashSet<_>>(),
-            "the co-host A must be excluded and the non-co-host B kept; \
-             notified={notified:?}"
+            [a_addr, b_addr].into_iter().collect::<HashSet<_>>(),
+            "both advertised co-hosts must be excluded and the non-co-host C \
+             kept; notified={notified:?}"
         );
 
         // The property.
