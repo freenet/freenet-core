@@ -831,6 +831,26 @@ pub(super) async fn broadcast_to_single_peer(
                 "Skipping broadcast - peer already has our state (byte-equal \
                  or logically converged summaries)"
             );
+            // Refresh the interest TTL even though nothing is sent (#3046,
+            // #3093). A CONVERGED peer is more interested than a diverged one,
+            // not less — skipping the payload must not expire the interest.
+            //
+            // Only `record_delivery_to_interest` refreshed the TTL, and it runs
+            // only on a delivered send, so every skip was silently aging the
+            // entry toward `INTEREST_TTL`. That was unreachable in practice
+            // while a renewal wiped the cached summary (no summary → no
+            // `theirs` → no skip). Preserving the summary across renewals makes
+            // the skip reachable, and without this the peer stops receiving
+            // ANYTHING once the interest expires:
+            // `test_interest_ttl_refresh_on_broadcast` caught exactly that,
+            // decaying 98 → 29 → 0 broadcasts across the TTL boundary.
+            //
+            // Refresh ONLY. Do not cache the summary or record delivery
+            // telemetry here: nothing was delivered, and `sent_delta` has no
+            // truthful value for a send that did not happen.
+            op_manager
+                .interest_manager
+                .refresh_peer_interest(&key, &peer_key);
             report_send_cpu(op_manager);
             return;
         }

@@ -3036,7 +3036,6 @@ mod tests {
     /// `broadcast_queue::record_delivery_to_interest` routes through the
     /// upsert, so one delivered full state seeds the summary and every later
     /// broadcast to the same peer can be a delta.
-    #[test]
     /// A subscribe RENEWAL must not wipe the cached delta-sync summary.
     ///
     /// `finalize_originator_subscribe` / `finalize_host_subscribe` previously
@@ -3158,6 +3157,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn upsert_peer_summary_seeds_summary_for_untracked_peer() {
         let (manager, _time) = make_manager();
         let contract = make_contract_key(1);
