@@ -377,10 +377,32 @@ pub(crate) fn announce_contract_unhosted(op_manager: &OpManager, key: &ContractK
 /// one. Holding bytes on disk that no longer belong to any hosted contract is a
 /// reclamation concern, and reclamation keeps its own retries.
 ///
-/// The two guards that DO mean "still a host" are re-checked, matching guards 1
-/// and 2 in `RuntimePool::remove_contract`:
-/// `is_hosting_contract` (a GET/PUT re-hosted it) and `contract_in_use` (a client
-/// or downstream subscriber re-registered). The check runs AFTER the removal — see
+/// Three conditions mean "still a host", and any of them keeps the
+/// advertisement:
+///
+/// - `is_hosting_contract` — a GET/PUT re-hosted it into the hosting cache.
+/// - `contract_in_use` — a client or downstream subscriber re-registered.
+///   (These two match guards 1 and 2 in `RuntimePool::remove_contract`.)
+/// - `is_subscribed` — we hold a live upstream subscription lease, so we are
+///   wired into the contract's update mesh and therefore a host under invariant
+///   1, even with no cache entry and no subscriber of our own yet.
+///
+/// The lease check is what makes the ordering guarantee below hold for the
+/// SUBSCRIBE path, whose announce is gated on the body being present ON DISK
+/// (`finalize_originator_subscribe` → `fetch_contract_if_missing` →
+/// `has_contract`), not on a hosting-cache insert. `ring.subscribe` installs the
+/// lease before both that fetch and that announce, so the lease is the signal
+/// that is reliably set first there. Without it, a contract evicted with its
+/// state still on disk and awaiting reclamation could be re-subscribed, announce,
+/// and then have the pending-reclamation retry retract it right back out — leaving
+/// the node subscribed, holding the body, and unadvertised.
+///
+/// This does not weaken the eviction retraction, because the sweep drops the lease
+/// (`ring.unsubscribe`) before calling into here. It only makes the GET/PUT
+/// insert-eviction funnels defer a lease-holding victim's retraction to the
+/// reclamation-side path, which is where it happened before this fix anyway.
+///
+/// The check runs AFTER the removal — see
 /// `NeighborHostingManager::on_contract_unhosted_unless_rehosted` for why that
 /// ordering is the race-free one.
 ///
@@ -393,7 +415,9 @@ pub(crate) fn retract_advertisement_for_evicted_contract(
     let retraction = op_manager
         .neighbor_hosting
         .on_contract_unhosted_unless_rehosted(key, || {
-            op_manager.ring.is_hosting_contract(key) || op_manager.ring.contract_in_use(key)
+            op_manager.ring.is_hosting_contract(key)
+                || op_manager.ring.contract_in_use(key)
+                || op_manager.ring.is_subscribed(key)
         });
     if let Some(retraction) = retraction {
         tracing::debug!(
@@ -426,12 +450,20 @@ fn emit_hosting_retraction(
         // Best-effort by design — the periodic full-set re-request
         // (piggybacked on `interest_heartbeat`) is the convergence backstop for
         // a dropped retraction. Debug, not warn: benign back-pressure under load.
+        //
+        // The counter, not this log, is the field signal: `debug!` compiles out
+        // in release, and a node under the #5059 broadcast storm is exactly when
+        // this cap-2048 channel is most likely to be full — so without it a slow
+        // heal and a failed fix look identical in production.
+        crate::node::network_status::record_hosting_retraction_dropped();
         tracing::debug!(
             contract = %key,
             error = %err,
             "NEIGHBOR_HOSTING: retraction broadcast dropped (best-effort; \
              healed by periodic full-set re-request)"
         );
+    } else {
+        crate::node::network_status::record_hosting_retraction_emitted();
     }
 }
 
@@ -1369,14 +1401,29 @@ mod reclaim_retraction_pin_tests {
         &src[start..end]
     }
 
+    /// `extract_fn_body` with `//` comments stripped, so a pin asserting the
+    /// ABSENCE of a call cannot be satisfied — or spuriously broken — by prose.
+    /// Both of the absence pins below name their forbidden call in the very
+    /// comment that explains why it is forbidden.
+    fn extract_fn_code(src: &'static str, needle: &str) -> String {
+        extract_fn_body(src, needle)
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(idx) => &line[..idx],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn reclaim_evicted_contract_retracts_through_the_guarded_helper() {
         let src = include_str!("operations.rs");
         // Runtime-compose the needles so these pins do not match themselves.
         let needle = ["fn ", "reclaim_evicted_contract("].concat();
-        let body = extract_fn_body(src, &needle);
+        let code = extract_fn_code(src, &needle);
         assert!(
-            body.contains(&["retract_advertisement_for_evicted", "_contract("].concat()),
+            code.contains(&["retract_advertisement_for_evicted", "_contract(op_manager"].concat()),
             "`reclaim_evicted_contract` MUST retract the co-host advertisement at the \
              eviction decision (#5059). Leaving it to the confirmed-delete path in \
              `RuntimePool::remove_contract` means an evicted contract that keeps \
@@ -1384,35 +1431,75 @@ mod reclaim_retraction_pin_tests {
              the retraction never fires and the fan-out never stops."
         );
         assert!(
-            !body.contains(&["announce_contract_", "unhosted("].concat()),
+            !code.contains(&["announce_contract_", "unhosted(op_manager"].concat()),
             "the eviction-decision retraction must go through \
-             `retract_advertisement_for_evicted_contract` (gated on \
-             re-hosted-or-in-use), NOT the bare `announce_contract_unhosted`, which \
-             retracts unconditionally and would strand a contract the re-host race \
-             kept alive."
+             `retract_advertisement_for_evicted_contract` (gated on re-hosted / \
+             in-use / subscribed), NOT the bare `announce_contract_unhosted`, which \
+             retracts unconditionally and would strand a contract that a re-host or \
+             a re-subscribe kept alive."
         );
     }
 
-    /// The helper's gate must be the two guards that mean "still a host"
-    /// (`is_hosting_contract`, `contract_in_use`) — and NOT the state-generation
-    /// guard, which is what made the delete-side gate unusable for the
-    /// advertisement (#5059). A generation check creeping in here would restore
-    /// the loop.
+    /// The emission must stay INSIDE the guard. The helper's protection is the
+    /// `on_contract_unhosted_unless_rehosted` return value; a refactor that
+    /// inlined `try_notify_node_event` at the call site — or emitted a retraction
+    /// the primitive declined to produce — would send a retraction for a contract
+    /// that is still hosted, which nothing else in this file would catch.
+    #[test]
+    fn eviction_retraction_emits_only_what_the_guard_returned() {
+        let src = include_str!("operations.rs");
+        let needle = ["fn ", "retract_advertisement_for_evicted_contract("].concat();
+        let code = extract_fn_code(src, &needle);
+        assert!(
+            code.contains(&["emit_hosting_", "retraction("].concat()),
+            "the helper must emit through `emit_hosting_retraction`"
+        );
+        assert!(
+            !code.contains("try_notify_node_event"),
+            "the helper must NOT emit the node event directly — that bypasses \
+             `emit_hosting_retraction` and invites emitting outside the guard"
+        );
+        // The emission must be reached only through the `Some(..)` arm of the
+        // guard's return, never unconditionally.
+        let guard_idx = code
+            .find(&["on_contract_unhosted_unless", "_rehosted("].concat())
+            .expect("the guard call must exist");
+        let emit_idx = code
+            .find(&["emit_hosting_", "retraction("].concat())
+            .expect("the emission must exist");
+        assert!(
+            emit_idx > guard_idx,
+            "the emission must come after the guard, not before it"
+        );
+        assert!(
+            code[guard_idx..emit_idx].contains("if let Some("),
+            "the emission must be inside the guard's `Some(..)` arm, so a declined \
+             retraction emits nothing"
+        );
+    }
+
+    /// The helper's gate must be exactly the three conditions that mean "still a
+    /// host" — in the hosting cache, in use, or holding a live upstream lease —
+    /// and NOT the state-generation guard, which is what made the delete-side gate
+    /// unusable for the advertisement (#5059). A generation check creeping in here
+    /// would restore the loop; dropping the lease check would reopen the
+    /// SUBSCRIBE-path window (that path's announce is gated on disk presence, so
+    /// the lease is the only one of the three reliably set before it).
     #[test]
     fn eviction_retraction_helper_gates_on_rehost_and_in_use_only() {
         let src = include_str!("operations.rs");
         let needle = ["fn ", "retract_advertisement_for_evicted_contract("].concat();
-        let body = extract_fn_body(src, &needle);
-        for required in ["is_hosting_contract(", "contract_in_use("] {
+        let code = extract_fn_code(src, &needle);
+        for required in ["is_hosting_contract(", "contract_in_use(", "is_subscribed("] {
             assert!(
-                body.contains(required),
+                code.contains(required),
                 "`retract_advertisement_for_evicted_contract` must re-check `{required}` \
-                 so a contract re-hosted or re-subscribed since the eviction decision \
-                 keeps its advertisement"
+                 so a contract re-hosted, re-subscribed, or holding a live upstream \
+                 lease since the eviction decision keeps its advertisement"
             );
         }
         assert!(
-            !body.contains("state_generation("),
+            !code.contains("state_generation("),
             "the eviction retraction must NOT be gated on the state generation — a \
              contract that keeps receiving updates because it is still advertised \
              advances its generation forever, which is exactly the #5059 loop"
@@ -1422,7 +1509,7 @@ mod reclaim_retraction_pin_tests {
         // `NeighborHostingManager::on_contract_unhosted_unless_rehosted` for why
         // check-then-remove loses the race against a concurrent re-host announce.
         assert!(
-            body.contains(&["on_contract_unhosted_unless", "_rehosted("].concat()),
+            code.contains(&["on_contract_unhosted_unless", "_rehosted("].concat()),
             "the retraction must go through `on_contract_unhosted_unless_rehosted`, \
              which applies the re-host check AFTER removing from `my_contracts`"
         );

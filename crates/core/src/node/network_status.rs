@@ -218,6 +218,8 @@ pub struct NetworkStatus {
     pub nat_stats: NatStats,
     /// Terminal advertisement-consult counters (hosting redesign piece C).
     pub terminal_consult_stats: TerminalConsultStats,
+    /// Eviction-retraction emission counters (#5059).
+    pub hosting_retraction_stats: HostingRetractionStats,
     /// Streamed-transfer abort counters (large-contract failure isolation).
     pub stream_abort_stats: StreamAbortStats,
     /// Relayed-operation counters (routing/hosting attribution).
@@ -396,6 +398,25 @@ pub struct TerminalConsultStats {
     pub resolved_found: u64,
     /// A consult ran but the request still ended NotFound.
     pub still_not_found: u64,
+}
+
+/// Eviction-retraction emission counters (#5059).
+///
+/// The retraction that stops co-hosts fanning updates at an evicted contract is
+/// emitted best-effort on the cap-2048 node-event channel, and the drop is logged
+/// at `debug` — which is compiled out in release builds. A dropped retraction is
+/// self-healing (the ~5-min full-set re-request replays `my_contracts`), but a
+/// node under exactly the broadcast storm #5059 describes is when that channel is
+/// most likely to be full, so without these the field cannot tell a slow heal from
+/// a failed fix. Monotonic lifetime totals; the collector differences them.
+#[derive(Default)]
+pub struct HostingRetractionStats {
+    /// Eviction retractions handed to the node-event channel.
+    pub emitted: u64,
+    /// Eviction retractions dropped because that channel refused them. Healed by
+    /// the next interest-heartbeat full-set re-request; a sustained nonzero rate
+    /// means evicted contracts stay advertised for up to one heartbeat interval.
+    pub dropped: u64,
 }
 
 /// Streamed-transfer (> 64 KB `streaming_threshold`) abort counters, aggregated
@@ -645,6 +666,7 @@ pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: St
         op_stats: OperationStats::default(),
         nat_stats: NatStats::default(),
         terminal_consult_stats: TerminalConsultStats::default(),
+        hosting_retraction_stats: HostingRetractionStats::default(),
         stream_abort_stats: StreamAbortStats::default(),
         relayed_op_stats: RelayedOpStats::default(),
         connect_emit_stats: ConnectEmitStats::default(),
@@ -928,6 +950,36 @@ pub fn terminal_consult_counts() -> Option<(u64, u64, u64, u64)> {
     let s = status.read().ok()?;
     let c = &s.terminal_consult_stats;
     Some((c.attempts, c.hits, c.resolved_found, c.still_not_found))
+}
+
+/// Record one eviction retraction accepted by the node-event channel (#5059).
+pub fn record_hosting_retraction_emitted() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.hosting_retraction_stats.emitted =
+                s.hosting_retraction_stats.emitted.saturating_add(1);
+        }
+    }
+}
+
+/// Record one eviction retraction the node-event channel refused (#5059). The
+/// interest-heartbeat full-set re-request heals it within one interval; a
+/// sustained rate here means evicted contracts stay advertised that long.
+pub fn record_hosting_retraction_dropped() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.hosting_retraction_stats.dropped =
+                s.hosting_retraction_stats.dropped.saturating_add(1);
+        }
+    }
+}
+
+/// `(emitted, dropped)` eviction-retraction totals for the snapshot cadence.
+pub fn hosting_retraction_counts() -> Option<(u64, u64)> {
+    let status = NETWORK_STATUS.get()?;
+    let s = status.read().ok()?;
+    let c = &s.hosting_retraction_stats;
+    Some((c.emitted, c.dropped))
 }
 
 /// Bump the fragment-progress histogram bucket for one receiver abort.

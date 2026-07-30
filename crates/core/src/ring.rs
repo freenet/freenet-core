@@ -1815,6 +1815,18 @@ impl Ring {
                 snapshot.terminal_consult_still_not_found = Some(still_not_found);
             }
 
+            // Eviction-retraction emission counters (#5059). Same hand-mirror
+            // footgun as every counter here: a new `RouterSnapshotInfo` field is
+            // invisible to the collector unless added BOTH here AND in
+            // `event_kind_to_json` (pinned by
+            // `router_snapshot_json_includes_hosting_retraction_counters`).
+            if let Some((emitted, dropped)) =
+                crate::node::network_status::hosting_retraction_counts()
+            {
+                snapshot.hosting_retractions_emitted = Some(emitted);
+                snapshot.hosting_retractions_dropped = Some(dropped);
+            }
+
             // Streamed-transfer abort counters (Group B): isolate the
             // large-contract failure class on the existing snapshot cadence.
             // Same hand-mirror footgun as the counters above — a new
@@ -8690,14 +8702,18 @@ mod cost_pressure_seam_tests {
         retracted
     }
 
-    /// Run the maintenance loop's post-sweep step for one sweep result, exactly as
-    /// `Ring::sweep_get_subscription_cache` does: every expired key goes through
-    /// `reclaim_evicted_contract`.
+    /// Run the maintenance loop's post-sweep step for one sweep result, in the
+    /// same order as `Ring::sweep_get_subscription_cache`: drop the upstream lease
+    /// for each expired key, THEN reclaim it. The order is load-bearing now that
+    /// the retraction treats a live lease as "still a host" — a helper that
+    /// skipped the unsubscribe would suppress the very retraction under test and
+    /// pass for the wrong reason.
     fn reclaim_swept(
         op_manager: &crate::node::OpManager,
         swept: crate::ring::hosting::HostingSweepResult,
     ) {
         for (key, expected_generation) in swept.expired {
+            op_manager.ring.unsubscribe(&key);
             crate::operations::reclaim_evicted_contract(op_manager, key, expected_generation);
         }
     }
@@ -8816,18 +8832,17 @@ mod cost_pressure_seam_tests {
     }
 
     /// The eviction retraction must NOT fire for a contract that is hosted again,
-    /// or wanted again, by the time it runs — the two guards that genuinely mean
-    /// "still a host" (`RuntimePool::remove_contract`'s guards 1 and 2). Retracting
-    /// either would leave a fresh, in-mesh contract unadvertised, which the ~5-min
-    /// full-set re-request cannot heal because that exchange replays the same
-    /// (wrong) `my_contracts`.
+    /// wanted again, or back in the update mesh by the time it runs — the three
+    /// conditions that genuinely mean "still a host". Retracting any of them would
+    /// leave a fresh, in-mesh contract unadvertised, which the ~5-min full-set
+    /// re-request cannot heal because that exchange replays the same (wrong)
+    /// `my_contracts`.
     ///
-    /// Both cases go through the real `reclaim_evicted_contract` funnel, but they
-    /// are stopped at different points: the re-hosted one by the retraction
-    /// helper's own guard, the in-use one by `reclaim_evicted_contract`'s
-    /// pre-existing `contract_in_use` early return (the helper re-checks it too,
-    /// for the window between that return and the removal — that re-check is
-    /// covered directly by
+    /// All three go through the real `reclaim_evicted_contract` funnel, but they
+    /// are stopped at different points: re-hosted and leased by the retraction
+    /// helper's own guard, in-use by `reclaim_evicted_contract`'s pre-existing
+    /// `contract_in_use` early return (the helper re-checks that one too, for the
+    /// window between that return and the removal — covered directly by
     /// `on_contract_unhosted_unless_rehosted_retracts_only_when_still_unhosted`).
     #[tokio::test(start_paused = true)]
     async fn eviction_retraction_skips_a_rehosted_or_in_use_contract() {
@@ -8862,8 +8877,27 @@ mod cost_pressure_seam_tests {
             "precondition: in-use but not in the hosting cache"
         );
 
+        // (3) Re-subscribed: no cache entry and no subscriber of its own, but a
+        // live upstream lease, so it IS in the update mesh. This is the SUBSCRIBE
+        // path's shape — `finalize_originator_subscribe` installs the lease, then
+        // announces on the body being present ON DISK, and the ring-level client
+        // subscription lands later from `client_events`. Without the lease check
+        // a pending-reclamation retry in that window retracts the announce right
+        // back out, leaving the node subscribed, holding the body, unadvertised.
+        let resubscribed = seam_key(6);
+        op_manager
+            .neighbor_hosting
+            .on_contract_hosted(&resubscribed);
+        ring.subscribe(resubscribed);
+        assert!(
+            !ring.is_hosting_contract(&resubscribed)
+                && !ring.contract_in_use(&resubscribed)
+                && ring.is_subscribed(&resubscribed),
+            "precondition: leased only — not cached, no subscriber of our own"
+        );
+
         let _ = drain_retracted_ids(&mut fixture);
-        for key in [rehosted, in_use] {
+        for key in [rehosted, in_use, resubscribed] {
             let generation = ring.state_generation(&key);
             crate::operations::reclaim_evicted_contract(&op_manager, key, generation);
         }
@@ -8871,7 +8905,8 @@ mod cost_pressure_seam_tests {
         let retracted = drain_retracted_ids(&mut fixture);
         assert!(
             retracted.is_empty(),
-            "neither a re-hosted nor an in-use contract may be retracted; got {retracted:?}"
+            "none of a re-hosted, in-use, or leased contract may be retracted; \
+             got {retracted:?}"
         );
         assert!(
             op_manager.neighbor_hosting.is_hosted_locally(&rehosted),
@@ -8880,6 +8915,11 @@ mod cost_pressure_seam_tests {
         assert!(
             op_manager.neighbor_hosting.is_hosted_locally(&in_use),
             "a contract back in use since the eviction decision keeps its advertisement"
+        );
+        assert!(
+            op_manager.neighbor_hosting.is_hosted_locally(&resubscribed),
+            "a contract holding a live upstream lease keeps its advertisement — it \
+             is in the update mesh, so it is a host under invariant 1"
         );
     }
 
