@@ -3414,6 +3414,23 @@ fn test_sustained_update_fanout_no_full_state_storm() {
 /// #4965 exclusion now drops real recipients — which is exactly the thing under
 /// test.
 ///
+/// ## The general rule this test exists to illustrate
+///
+/// **`delta_sends`/`full_state_sends` cannot see a redundancy being removed —
+/// only a redundancy being removed *badly*.**
+///
+/// That generalises, and it is worth recognising BEFORE writing the test rather
+/// than after: **when a change removes redundancy, every downstream health
+/// metric is invariant by design.** That invariance IS the change's thesis. So
+/// health metrics can never discriminate such a change; only a counter of the
+/// removed thing can.
+///
+/// This is unusually easy to miss, because measuring a redundancy-removal with
+/// downstream health metrics yields a vacuous test AND a confirmation that the
+/// change was correct, simultaneously — the green run looks like evidence for
+/// the change when it is evidence of nothing. Anyone facing this shape should
+/// reach for a counter of the removed thing first.
+///
 /// ## The two assertions do DIFFERENT jobs — measured, not assumed
 ///
 /// **`notification_cohosts_skipped > 0` is the sensitivity assertion.** It is
@@ -3429,8 +3446,7 @@ fn test_sustained_update_fanout_no_full_state_storm() {
 /// exclusion on this exact scenario produced **bit-identical** `delta_sends=140
 /// / full_state_sends=6`. That is the change being harmless, which is worth
 /// pinning — but a test resting on it alone would pass whether or not the
-/// feature existed, which is precisely the vacuity this suite is supposed to
-/// reject.
+/// feature existed.
 ///
 /// So the delta-dominance assertion stays (it catches an over-exclusion that
 /// DID strand peers, which would show up as full-state fallback), and the

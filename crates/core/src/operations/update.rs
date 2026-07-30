@@ -912,11 +912,14 @@ pub(crate) async fn update_contract(
 /// mirrors `record_delivery_to_interest`, which likewise only seeds on a real
 /// delivery (#4235).
 ///
-/// That reasoning covers the per-send skips inside `broadcast_to_single_peer`
-/// (`fanout_send_needed` believing the peer converged, an empty delta): the
-/// peer did not miss the STATE, only our new summary, and it already holds an
-/// equivalent one. It does NOT cover `should_broadcast_contract`, which
-/// suppresses the broadcast for the WHOLE contract — hence the gate below.
+/// That reasoning covers the per-send skips inside `broadcast_to_single_peer`.
+/// `plan_fanout_send` skips a peer whose summary is BYTE-IDENTICAL to ours
+/// first; the cached-empty-delta verdict is the backstop for the narrower
+/// converged-but-byte-differing case (a non-deterministically-serialized
+/// summary), not the primary test. Either way the peer did not miss the STATE,
+/// only our new summary, and it already holds an equivalent one. Neither skip
+/// covers `should_broadcast_contract`, which suppresses the broadcast for the
+/// WHOLE contract — hence the gate below.
 ///
 /// # Gate: `should_summarize_or_broadcast`
 ///
@@ -2776,6 +2779,31 @@ mod tests {
     /// gets neither the broadcast nor the standalone summary, and every
     /// single-site test stays green. Asserting the subset relation between the
     /// two real functions is the only thing that fails on that edit.
+    ///
+    /// # Why TWO interested co-hosts, and why you must not simplify to one
+    ///
+    /// **A set-relation assertion cannot be falsified by a fixture whose set
+    /// has one element.** With a single interested co-host, `excluded ⊆
+    /// broadcast_targets` is satisfied by almost any mutation, because there is
+    /// no second element for a narrowing to strand — the assertion reads strong
+    /// and is very nearly unfalsifiable. Two is not a richer scenario, it is
+    /// the MINIMUM CARDINALITY at which the property has any content, the same
+    /// way a commutativity test needs two distinct operands or an ordering test
+    /// two distinct keys.
+    ///
+    /// Verified: a `truncate(1)` on `get_broadcast_targets_update`'s co-host
+    /// list left the one-co-host version of this test GREEN, and fails the
+    /// two-co-host version. Adding the non-co-host (C) and the co-host-only
+    /// peer (E) keeps the two filters distinguishable from each other.
+    ///
+    /// # Why premise 1 is deliberately weak
+    ///
+    /// It asserts only that the broadcast has SOME target, not that a specific
+    /// peer is among them. **A premise that fails before the real assertion
+    /// masks which check actually caught the mutation**, so a premise should be
+    /// the weakest statement that still rules out vacuity. The strict form
+    /// ("A specifically is a target") would fire first under a narrowing
+    /// mutation and hide the fact that the subset property is what detects it.
     #[tokio::test]
     async fn notification_exclusion_is_a_subset_of_broadcast_targets() {
         let (op_manager, mut rx, _guard) =
