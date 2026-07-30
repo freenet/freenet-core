@@ -8611,6 +8611,278 @@ mod cost_pressure_seam_tests {
         );
     }
 
+    /// Everything a seam test needs kept alive for its whole run: the OpManager
+    /// plus the channel ends and task monitor whose drop would tear the Ring's
+    /// background tasks down mid-test.
+    struct SeamFixture {
+        op_manager: std::sync::Arc<crate::node::OpManager>,
+        node_events: tokio::sync::mpsc::Receiver<
+            either::Either<crate::message::NetMessage, crate::message::NodeEvent>,
+        >,
+        /// The remaining channel ends and the task monitor. Never read — held
+        /// only so dropping them does not tear the Ring's background tasks down
+        /// mid-test. Boxed opaquely because several of these types are private to
+        /// their own modules.
+        _keep_alive: Box<dyn std::any::Any + Send>,
+    }
+
+    /// A real `OpManager` over a real `Ring` (production `InstantTimeSrc`, real
+    /// background tasks), with the node-event receiver handed back so a test can
+    /// assert on EMITTED events rather than on internal bookkeeping. `id`
+    /// isolates the on-disk state in its own temp dir.
+    async fn seam_fixture(id: &str) -> SeamFixture {
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        SeamFixture {
+            op_manager,
+            node_events: notification_rx.notifications_receiver,
+            _keep_alive: Box::new((
+                notification_rx.op_execution_receiver,
+                _ch_channel,
+                _wait_for_event,
+                result_router_rx,
+                task_monitor,
+            )),
+        }
+    }
+
+    /// Every contract id retracted by a `HostingAnnounce` queued on the node-event
+    /// channel so far. This is the wire-visible effect co-hosts act on: it is what
+    /// makes them drop us from their fan-out target set.
+    fn drain_retracted_ids(
+        fixture: &mut SeamFixture,
+    ) -> Vec<freenet_stdlib::prelude::ContractInstanceId> {
+        let mut retracted = Vec::new();
+        while let Ok(event) = fixture.node_events.try_recv() {
+            if let either::Either::Right(crate::message::NodeEvent::BroadcastHostingUpdate {
+                message: crate::message::NeighborHostingMessage::HostingAnnounce { removed, .. },
+            }) = event
+            {
+                retracted.extend(removed);
+            }
+        }
+        retracted
+    }
+
+    /// Run the maintenance loop's post-sweep step for one sweep result, exactly as
+    /// `Ring::sweep_get_subscription_cache` does: every expired key goes through
+    /// `reclaim_evicted_contract`.
+    fn reclaim_swept(
+        op_manager: &crate::node::OpManager,
+        swept: crate::ring::hosting::HostingSweepResult,
+    ) {
+        for (key, expected_generation) in swept.expired {
+            crate::operations::reclaim_evicted_contract(op_manager, key, expected_generation);
+        }
+    }
+
+    /// #5059: a cost-pressure eviction must RETRACT the evicted contract's co-host
+    /// advertisement, not just drop its hosting-cache entry.
+    ///
+    /// Broadcast fan-out targets are resolved from `neighbor_hosting` (advertised
+    /// co-hosts) with no interest check, so an evicted-but-still-advertised
+    /// contract keeps being sent updates and keeps applying them. That burns the
+    /// CPU the eviction was supposed to reclaim, AND it bumps the state generation
+    /// on every apply — so the deferred `EvictContract` bails at
+    /// `RuntimePool::remove_contract`'s newer-generation guard and the retraction
+    /// wired behind that guard never runs. Field evidence in #5040: the storm
+    /// contract's per-update warn ran at ~10-11/s continuously through three
+    /// separate cost evictions of it.
+    ///
+    /// The assertion is on the EMITTED EFFECT — a `BroadcastHostingUpdate`
+    /// carrying `HostingAnnounce { removed: [junk] }` — rather than on
+    /// `my_contracts`, because the wire message is what makes co-hosts stop
+    /// sending.
+    ///
+    /// Nothing in this fixture consumes the `EvictContract` event, which is the
+    /// point: it stands in for the field case where reclamation never reaches its
+    /// own retraction. Before this fix the test sees no retraction at all.
+    ///
+    /// `start_paused` for the same reason as the sibling seam test above: the
+    /// virtual clock drives the meter, the sweep, and the background tasks
+    /// together. A background hosting sweep may shed `junk` before the explicit
+    /// sweep below; either way the retraction has to reach the channel, which is
+    /// why the assertion scans everything queued rather than a single event.
+    #[tokio::test(start_paused = true)]
+    async fn cost_evicted_contract_emits_a_co_host_advertisement_retraction() {
+        use crate::topology::meter::ResourceType;
+
+        let mut fixture = seam_fixture("cost-retraction-5059").await;
+        let op_manager = fixture.op_manager.clone();
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test("127.0.0.1:14101".parse().unwrap());
+        let ring = &op_manager.ring;
+
+        let junk = seam_key(1);
+        let subscribed = seam_key(2);
+
+        let _ = ring.host_contract(junk, 121, crate::ring::AccessType::Put);
+        let _ = ring.host_contract(subscribed, 121, crate::ring::AccessType::Put);
+        // Both advertised to co-hosts — the state this fix is about. Set directly
+        // (not via `announce_contract_hosted`) so the only `HostingAnnounce` the
+        // channel can carry is a retraction.
+        op_manager.neighbor_hosting.on_contract_hosted(&junk);
+        op_manager.neighbor_hosting.on_contract_hosted(&subscribed);
+        assert!(
+            op_manager.neighbor_hosting.is_hosted_locally(&junk),
+            "precondition: the storm contract is advertised to co-hosts"
+        );
+
+        tokio::time::advance(super::hosting::COST_RATE_MIN_WINDOW + Duration::from_secs(1)).await;
+        assert!(!matches!(
+            ring.add_downstream_subscriber(
+                &subscribed,
+                crate::ring::interest::PeerKey(crate::transport::TransportPublicKey::from_bytes(
+                    [9u8; 32]
+                )),
+            ),
+            crate::ring::hosting::AddSubscriberOutcome::Rejected
+        ));
+
+        // The FX2j storm profile through the production reporter, identical for
+        // both contracts so demand — not cost share — decides who is shed.
+        for _ in 0..110u32 {
+            for key in [&junk, &subscribed] {
+                ring.report_contract_resource_usage(
+                    *key.id(),
+                    ResourceType::BroadcastMessagesSent,
+                    58.0,
+                );
+            }
+            tokio::time::advance(Duration::from_millis(1600)).await;
+        }
+
+        // The background hosting sweep may have shed `junk` (and reclaimed it)
+        // during the advances above, in which case this explicit sweep finds
+        // nothing left to evict and the retraction is already queued. Either way
+        // it has to be on the channel, which is why the drain below covers the
+        // whole run rather than only the window around this call. Nothing here
+        // ever announces hosting, so every `HostingAnnounce` on the channel is a
+        // retraction.
+        reclaim_swept(&op_manager, ring.sweep_expired_hosting());
+        assert!(
+            !ring.is_hosting_contract(&junk),
+            "precondition for the assertions below: the storm contract was shed"
+        );
+
+        let retracted = drain_retracted_ids(&mut fixture);
+        assert!(
+            retracted.contains(junk.id()),
+            "the cost-evicted contract must emit a co-host advertisement retraction \
+             — without it the fan-out never stops and the eviction reclaims nothing \
+             (#5059). Retractions seen: {retracted:?}"
+        );
+        assert!(
+            !retracted.contains(subscribed.id()),
+            "a contract that was never evicted must not be retracted"
+        );
+        assert!(
+            !op_manager.neighbor_hosting.is_hosted_locally(&junk),
+            "the evicted contract must also leave the locally-advertised set, or the \
+             ~5-min full-set re-request re-asserts the phantom advertisement"
+        );
+        assert!(
+            op_manager.neighbor_hosting.is_hosted_locally(&subscribed),
+            "the surviving subscribed contract keeps its advertisement"
+        );
+    }
+
+    /// The eviction retraction must NOT fire for a contract that is hosted again,
+    /// or wanted again, by the time it runs — the two guards that genuinely mean
+    /// "still a host" (`RuntimePool::remove_contract`'s guards 1 and 2). Retracting
+    /// either would leave a fresh, in-mesh contract unadvertised, which the ~5-min
+    /// full-set re-request cannot heal because that exchange replays the same
+    /// (wrong) `my_contracts`.
+    ///
+    /// Both cases go through the real `reclaim_evicted_contract` funnel, but they
+    /// are stopped at different points: the re-hosted one by the retraction
+    /// helper's own guard, the in-use one by `reclaim_evicted_contract`'s
+    /// pre-existing `contract_in_use` early return (the helper re-checks it too,
+    /// for the window between that return and the removal — that re-check is
+    /// covered directly by
+    /// `on_contract_unhosted_unless_rehosted_retracts_only_when_still_unhosted`).
+    #[tokio::test(start_paused = true)]
+    async fn eviction_retraction_skips_a_rehosted_or_in_use_contract() {
+        let mut fixture = seam_fixture("cost-retraction-guards-5059").await;
+        let op_manager = fixture.op_manager.clone();
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test("127.0.0.1:14102".parse().unwrap());
+        let ring = &op_manager.ring;
+
+        // (1) Re-hosted: present in the hosting cache when the reclaim runs.
+        let rehosted = seam_key(4);
+        let _ = ring.host_contract(rehosted, 121, crate::ring::AccessType::Put);
+        op_manager.neighbor_hosting.on_contract_hosted(&rehosted);
+
+        // (2) Back in use: absent from the hosting cache, but a downstream
+        // subscriber re-registered interest.
+        let in_use = seam_key(5);
+        op_manager.neighbor_hosting.on_contract_hosted(&in_use);
+        assert!(!matches!(
+            ring.add_downstream_subscriber(
+                &in_use,
+                crate::ring::interest::PeerKey(crate::transport::TransportPublicKey::from_bytes(
+                    [7u8; 32]
+                )),
+            ),
+            crate::ring::hosting::AddSubscriberOutcome::Rejected
+        ));
+        assert!(
+            !ring.is_hosting_contract(&in_use) && ring.contract_in_use(&in_use),
+            "precondition: in-use but not in the hosting cache"
+        );
+
+        let _ = drain_retracted_ids(&mut fixture);
+        for key in [rehosted, in_use] {
+            let generation = ring.state_generation(&key);
+            crate::operations::reclaim_evicted_contract(&op_manager, key, generation);
+        }
+
+        let retracted = drain_retracted_ids(&mut fixture);
+        assert!(
+            retracted.is_empty(),
+            "neither a re-hosted nor an in-use contract may be retracted; got {retracted:?}"
+        );
+        assert!(
+            op_manager.neighbor_hosting.is_hosted_locally(&rehosted),
+            "a contract re-hosted since the eviction decision keeps its advertisement"
+        );
+        assert!(
+            op_manager.neighbor_hosting.is_hosted_locally(&in_use),
+            "a contract back in use since the eviction decision keeps its advertisement"
+        );
+    }
+
     /// Drift guard (#4861 Codex round-3): the meter's per-axis cost floors
     /// ([`crate::topology::meter::ResourceType::cost_pressure_floor`]) and its
     /// sustained window ([`crate::topology::meter::COST_SUSTAINED_WINDOW`]) are

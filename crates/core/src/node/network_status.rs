@@ -352,12 +352,13 @@ pub enum ReconcileShadowSite {
 /// contracts the controller would keep alive but production merely deferred this
 /// tick — the intended per-tick reading, not a bug.
 ///
-/// `retract_diffs` CAVEAT: it measures collapse/renewal of a contract that was
-/// EVER announced, not one with a currently-live advertisement — `is_advertised`
-/// (`NeighborHostingManager::is_hosted_locally`) is effectively MONOTONIC in
-/// production today, because its only clearer (`on_contract_unhosted`) is
-/// dead/test-only until the flip wires the `Retract` action. So a nonzero
-/// `retract_diffs` reflects the missing retraction driver, as intended.
+/// `retract_diffs` CAVEAT: `is_advertised`
+/// (`NeighborHostingManager::is_hosted_locally`) IS cleared in production, by the
+/// eviction funnel (`operations::retract_advertisement_for_evicted_contract`, and
+/// the reclamation-side `on_contract_unhosted` behind it). What no on-`main`
+/// driver does is retract on COLLAPSE/RENEWAL teardown — the sites these stats
+/// shadow-compare — so a nonzero `retract_diffs` reflects that missing
+/// site-local retraction, as intended, not a live-advertisement leak.
 #[derive(Default, Clone, Copy)]
 pub struct ReconcileShadowStats {
     /// Total shadow comparisons performed at this site (the denominator — one

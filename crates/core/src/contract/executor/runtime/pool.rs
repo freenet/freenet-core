@@ -995,11 +995,15 @@ impl ContractExecutor for RuntimePool {
         // serve `key`, so we must stop advertising it (Fix 1, #4642 spec step 1;
         // invariant 1: advertise iff a fresh in-mesh host). `Err` (BOTH deletes
         // failed → nothing removed → still fully present) keeps the advertisement
-        // and retries. Wired HERE on the confirmed-delete path, NOT at the eviction
-        // decision, so the three guards above that DELIBERATELY skip the delete
-        // (contract re-hosted / re-subscribed / written to a newer generation in
-        // the eviction→reclaim window) also skip the retraction — a contract kept
-        // alive by that race retains BOTH its state AND its advertisement.
+        // and retries. This is the RECLAMATION-side backstop: the primary
+        // retraction fires at the eviction decision
+        // (`operations::retract_advertisement_for_evicted_contract`), because
+        // gating the advertisement on this delete succeeding let an evicted
+        // contract keep receiving and applying updates forever (#5059 — the
+        // newer-generation guard above is a guard on deleting BYTES, and a still-
+        // advertised contract keeps tripping it). The three guards above still
+        // skip THIS call, and that remains right: a contract kept alive by the
+        // re-host race was re-advertised by its own `announce_contract_hosted`.
         // Best-effort (`try_notify_node_event`), healed by the periodic re-request
         // on drop; idempotent, so a later Full retry after a Partial (or any repeat)
         // re-retracts harmlessly.

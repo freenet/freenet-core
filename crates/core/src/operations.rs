@@ -325,39 +325,113 @@ pub(crate) async fn announce_contract_hosted(op_manager: &OpManager, key: &Contr
 /// actually gone — the confirmed-`ReclaimOutcome::Full | Partial` delete path (a
 /// `Partial` half-delete can no longer be served, so it retracts too; `Err`, with
 /// nothing deleted, does not) — i.e. AFTER the re-host / re-subscribe /
-/// newer-generation guards that would otherwise keep the contract. Wiring it there
-/// (not at the eviction *decision* in [`reclaim_evicted_contract`]) is what keeps
-/// a contract kept alive by that race both fresh AND advertised.
+/// newer-generation guards that would otherwise keep the contract.
 ///
-/// Best-effort and non-blocking (`try_notify_node_event`): unlike
-/// [`announce_contract_hosted`] (a one-shot hosting announce that MUST be
-/// delivered, hence its blocking await), a dropped retraction self-heals within
-/// one interest-heartbeat interval (~5 min) when a co-host re-requests our full
-/// hosted set and full-replaces its view of us (the piggybacked hosting
-/// re-request in `interest_heartbeat`). `on_contract_unhosted` is idempotent, so
-/// a pending-reclamation retry that reaches this after the state is already gone
-/// is a harmless no-op.
+/// This is the RECLAMATION-side retraction and it is now a backstop, not the
+/// primary one: eviction retracts at the eviction decision via
+/// [`retract_advertisement_for_evicted_contract`], because gating the
+/// advertisement on the delete succeeding let an evicted contract keep receiving
+/// and applying updates indefinitely (#5059 — read that function's doc for the
+/// loop). This path still covers a delete that reaches reclamation from anywhere
+/// the eviction funnel did not, and `on_contract_unhosted` is idempotent, so
+/// re-entering it after the advertisement is already gone is a harmless no-op.
+///
+/// Best-effort and non-blocking — see [`emit_hosting_retraction`].
 pub(crate) fn announce_contract_unhosted(op_manager: &OpManager, key: &ContractKey) {
     if let Some(retraction) = op_manager.neighbor_hosting.on_contract_unhosted(key) {
         tracing::debug!(
             %key,
             "NEIGHBOR_HOSTING: Retracting hosting advertisement to neighbors"
         );
-        if let Err(err) =
-            op_manager.try_notify_node_event(crate::message::NodeEvent::BroadcastHostingUpdate {
-                message: retraction,
-            })
-        {
-            // Best-effort by design — the periodic full-set re-request
-            // (piggybacked on `interest_heartbeat`) is the convergence backstop for
-            // a dropped retraction. Debug, not warn: benign back-pressure under load.
-            tracing::debug!(
-                contract = %key,
-                error = %err,
-                "NEIGHBOR_HOSTING: retraction broadcast dropped (best-effort; \
-                 healed by periodic full-set re-request)"
-            );
-        }
+        emit_hosting_retraction(op_manager, key, retraction);
+    }
+}
+
+/// Retract the co-host advertisement for a contract the hosting cache has just
+/// EVICTED, unless it has already been re-hosted or is back in use.
+///
+/// This is the advertisement half of eviction, and it is deliberately NOT gated on
+/// the on-disk delete succeeding. [`announce_contract_unhosted`] fires from
+/// `RuntimePool::remove_contract` on a confirmed delete, behind three guards; the
+/// third of those — "the state generation advanced since eviction" — is a guard on
+/// deleting BYTES, and using it to gate the advertisement created a self-sustaining
+/// loop (#5059):
+///
+/// 1. cost-pressure eviction sheds a zero-demand storm contract, but the
+///    advertisement stays, and co-host fan-out targets come from the advertisement
+///    (`neighbor_hosting`) with no interest check;
+/// 2. so inbound updates keep arriving and keep being applied — which is where the
+///    WASM CPU the eviction was supposed to reclaim actually goes;
+/// 3. every applied update bumps the state generation, so the deferred
+///    `EvictContract` always bails at guard 3, never reaches the retraction, and
+///    re-queues itself for a retry that bails the same way;
+/// 4. and the ~5-min full-set re-request replays `my_contracts`, actively
+///    RE-ASSERTING the phantom advertisement to every co-host.
+///
+/// Field evidence (#5040): a contract's `send_update_notification` warn ran at
+/// ~10-11/s continuously THROUGH three separate cost evictions of that contract,
+/// with no gap at any eviction timestamp.
+///
+/// Retracting here instead is what invariant 1 asks for — advertise iff a fresh
+/// in-mesh host — because eviction is exactly the moment the contract stops being
+/// one. Holding bytes on disk that no longer belong to any hosted contract is a
+/// reclamation concern, and reclamation keeps its own retries.
+///
+/// The two guards that DO mean "still a host" are re-checked, matching guards 1
+/// and 2 in `RuntimePool::remove_contract`:
+/// `is_hosting_contract` (a GET/PUT re-hosted it) and `contract_in_use` (a client
+/// or downstream subscriber re-registered). The check runs AFTER the removal — see
+/// `NeighborHostingManager::on_contract_unhosted_unless_rehosted` for why that
+/// ordering is the race-free one.
+///
+/// Idempotent: a pending-reclamation retry re-entering this is a no-op once the
+/// advertisement is gone. Best-effort emission, like its siblings.
+pub(crate) fn retract_advertisement_for_evicted_contract(
+    op_manager: &OpManager,
+    key: &ContractKey,
+) {
+    let retraction = op_manager
+        .neighbor_hosting
+        .on_contract_unhosted_unless_rehosted(key, || {
+            op_manager.ring.is_hosting_contract(key) || op_manager.ring.contract_in_use(key)
+        });
+    if let Some(retraction) = retraction {
+        tracing::debug!(
+            %key,
+            "NEIGHBOR_HOSTING: Retracting hosting advertisement for an evicted contract"
+        );
+        emit_hosting_retraction(op_manager, key, retraction);
+    }
+}
+
+/// Put a prepared `HostingAnnounce{removed}` on the wire.
+///
+/// Best-effort and non-blocking (`try_notify_node_event`): unlike
+/// [`announce_contract_hosted`] (a one-shot hosting announce that MUST be
+/// delivered, hence its blocking await), a dropped retraction self-heals within
+/// one interest-heartbeat interval (~5 min) when a co-host re-requests our full
+/// hosted set and full-replaces its view of us (the piggybacked hosting
+/// re-request in `interest_heartbeat`) — that replay is only a backstop for a
+/// dropped MESSAGE, never for a `my_contracts` entry that should not be there.
+fn emit_hosting_retraction(
+    op_manager: &OpManager,
+    key: &ContractKey,
+    retraction: crate::message::NeighborHostingMessage,
+) {
+    if let Err(err) =
+        op_manager.try_notify_node_event(crate::message::NodeEvent::BroadcastHostingUpdate {
+            message: retraction,
+        })
+    {
+        // Best-effort by design — the periodic full-set re-request
+        // (piggybacked on `interest_heartbeat`) is the convergence backstop for
+        // a dropped retraction. Debug, not warn: benign back-pressure under load.
+        tracing::debug!(
+            contract = %key,
+            error = %err,
+            "NEIGHBOR_HOSTING: retraction broadcast dropped (best-effort; \
+             healed by periodic full-set re-request)"
+        );
     }
 }
 
@@ -522,22 +596,24 @@ pub(crate) fn reclaim_evicted_contract(
             .pending_reclamation_add(key, expected_generation);
         return;
     }
-    // NOTE (Fix 1 retraction, #4642 spec step 1): the hosting-advertisement
-    // retraction is NOT emitted here at the eviction DECISION. `EvictContract` is
-    // fire-and-forget and the deletion-time guards in `RuntimePool::remove_contract`
-    // DELIBERATELY skip the delete if the contract was re-hosted / re-subscribed /
-    // written to a newer generation in the eviction→reclaim window. Retracting
-    // here would then leave the node holding fresh state it no longer advertises
-    // (an under-advertisement the periodic heartbeat cannot heal). Instead the
-    // retraction is wired on the confirmed-delete path (`ReclaimOutcome::Full |
-    // Partial`) in `RuntimePool::remove_contract`, so it fires exactly when a
-    // required on-disk half is truly gone. That single point covers every eviction
-    // funnel (GET/PUT insert
-    // eviction, the periodic sweep, and — once built — evict-to-admit). (Interest-
+    // Retract the co-host advertisement NOW, at the eviction decision — the node
+    // has stopped hosting `key`, so under invariant 1 it must stop advertising it,
+    // whether or not the bytes come off disk. Deferring this to the confirmed-delete
+    // path in `RuntimePool::remove_contract` was #5059: that path's third guard
+    // ("written since eviction") guards deleting BYTES, and a contract that keeps
+    // receiving updates BECAUSE it is still advertised keeps tripping it, so the
+    // retraction never ran and the fan-out never stopped. The two guards that
+    // genuinely mean "still a host" — re-hosted, or back in use — are re-checked
+    // inside the helper, so a contract kept alive by that race stays advertised.
+    // This covers every eviction funnel (GET/PUT insert eviction, the periodic byte
+    // and cost sweeps, and — once built — evict-to-admit); the reclamation-side
+    // `announce_contract_unhosted` remains as an idempotent backstop.
+    // (Interest-
     // gated COLLAPSE does not stop hosting on current `main`: `send_unsubscribe_
     // upstream` drops only the lease, leaving a still-fresh cached copy that must
     // keep advertising; when the reconcile-core flip makes demand-loss stop
     // hosting, that collapse-then-evict flows through this very funnel too.)
+    retract_advertisement_for_evicted_contract(op_manager, &key);
 
     // Disk reclamation after hosting-cache eviction is best-effort GC —
     // background-tier so it yields the contract loop to client/relay work (#4534).
@@ -1241,18 +1317,27 @@ mod sub_op_subscribe_pin_tests {
 
 #[cfg(test)]
 mod reclaim_retraction_pin_tests {
-    //! Pin tests for the Fix 1 retraction wiring (#4642 spec step 1). The
-    //! hosting-advertisement retraction must fire on the CONFIRMED-delete path
-    //! (`RuntimePool::remove_contract`, gated `ReclaimOutcome::Full | Partial`),
-    //! NOT at the eviction DECISION in `reclaim_evicted_contract`: the deletion-time
-    //! guards
-    //! (re-host / re-subscribe / newer-generation) may skip the delete, and a
-    //! retraction at the decision site would then leave the node holding fresh
-    //! state it no longer advertises. A future refactor — including the
-    //! reconcile-core `Retract` flip — must neither move it back to the decision
-    //! site nor drop it. (Every eviction funnels through `remove_contract`:
-    //! GET/PUT insert eviction, the periodic sweep, and — once built —
-    //! evict-to-admit.)
+    //! Pin tests for the hosting-advertisement retraction wiring (#4642 spec
+    //! step 1, #5059).
+    //!
+    //! Two retraction sites, each with its own gate, and neither may absorb the
+    //! other:
+    //!
+    //! - **Eviction decision** (`reclaim_evicted_contract`) — the PRIMARY one.
+    //!   It must retract, and it must do so through
+    //!   `retract_advertisement_for_evicted_contract`, whose gate is
+    //!   re-hosted-or-in-use. Calling the bare `announce_contract_unhosted` here
+    //!   instead would retract unconditionally and strand a contract that the
+    //!   re-host race kept alive.
+    //! - **Confirmed delete** (`RuntimePool::remove_contract`, gated
+    //!   `ReclaimOutcome::Full | Partial`) — the reclamation-side backstop.
+    //!
+    //! What must never come back is the OLD arrangement, where the delete-side
+    //! gate was the ONLY gate: its third guard ("written since eviction") guards
+    //! deleting bytes, and an evicted-but-still-advertised contract keeps
+    //! receiving updates, keeps bumping the generation, and so keeps that guard
+    //! tripped forever — the #5059 loop. A future refactor, including the
+    //! reconcile-core `Retract` flip, must keep the eviction-decision retraction.
 
     fn extract_fn_body(src: &'static str, needle: &str) -> &'static str {
         let start = src
@@ -1285,17 +1370,61 @@ mod reclaim_retraction_pin_tests {
     }
 
     #[test]
-    fn reclaim_evicted_contract_does_not_retract_at_the_decision_site() {
+    fn reclaim_evicted_contract_retracts_through_the_guarded_helper() {
         let src = include_str!("operations.rs");
-        // Runtime-compose the needle so this pin does not match itself.
+        // Runtime-compose the needles so these pins do not match themselves.
         let needle = ["fn ", "reclaim_evicted_contract("].concat();
         let body = extract_fn_body(src, &needle);
         assert!(
-            !body.contains("announce_contract_unhosted("),
-            "`reclaim_evicted_contract` must NOT retract at the eviction decision — \
-             the deletion-time guards may skip the delete, which would leave the \
-             node holding fresh state it no longer advertises. The retraction is \
-             wired on the confirmed-delete path in `RuntimePool::remove_contract`."
+            body.contains(&["retract_advertisement_for_evicted", "_contract("].concat()),
+            "`reclaim_evicted_contract` MUST retract the co-host advertisement at the \
+             eviction decision (#5059). Leaving it to the confirmed-delete path in \
+             `RuntimePool::remove_contract` means an evicted contract that keeps \
+             receiving updates keeps tripping that path's newer-generation guard, so \
+             the retraction never fires and the fan-out never stops."
+        );
+        assert!(
+            !body.contains(&["announce_contract_", "unhosted("].concat()),
+            "the eviction-decision retraction must go through \
+             `retract_advertisement_for_evicted_contract` (gated on \
+             re-hosted-or-in-use), NOT the bare `announce_contract_unhosted`, which \
+             retracts unconditionally and would strand a contract the re-host race \
+             kept alive."
+        );
+    }
+
+    /// The helper's gate must be the two guards that mean "still a host"
+    /// (`is_hosting_contract`, `contract_in_use`) — and NOT the state-generation
+    /// guard, which is what made the delete-side gate unusable for the
+    /// advertisement (#5059). A generation check creeping in here would restore
+    /// the loop.
+    #[test]
+    fn eviction_retraction_helper_gates_on_rehost_and_in_use_only() {
+        let src = include_str!("operations.rs");
+        let needle = ["fn ", "retract_advertisement_for_evicted_contract("].concat();
+        let body = extract_fn_body(src, &needle);
+        for required in ["is_hosting_contract(", "contract_in_use("] {
+            assert!(
+                body.contains(required),
+                "`retract_advertisement_for_evicted_contract` must re-check `{required}` \
+                 so a contract re-hosted or re-subscribed since the eviction decision \
+                 keeps its advertisement"
+            );
+        }
+        assert!(
+            !body.contains("state_generation("),
+            "the eviction retraction must NOT be gated on the state generation — a \
+             contract that keeps receiving updates because it is still advertised \
+             advances its generation forever, which is exactly the #5059 loop"
+        );
+        // The re-host check must run through the remove-then-check primitive, not
+        // as a plain `if` before an unconditional removal — see
+        // `NeighborHostingManager::on_contract_unhosted_unless_rehosted` for why
+        // check-then-remove loses the race against a concurrent re-host announce.
+        assert!(
+            body.contains(&["on_contract_unhosted_unless", "_rehosted("].concat()),
+            "the retraction must go through `on_contract_unhosted_unless_rehosted`, \
+             which applies the re-host check AFTER removing from `my_contracts`"
         );
     }
 
