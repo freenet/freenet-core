@@ -5347,6 +5347,13 @@ pub(crate) mod tests {
     /// strip can be thrown off by `{`/`}` in earlier test string literals)
     /// would self-trip. Slicing at the single top-level `mod tests {` is
     /// robust and unambiguous.
+    ///
+    /// The anchor includes the `pub(crate)` modifier because this module is
+    /// `pub(crate)` — #5052 shares [`strip_cfg_test_regions`] and
+    /// [`collect_rs_files`] with the sibling `outbound_message_mix` pin rather
+    /// than duplicating the scanner. Keep the two in sync: a mismatch here
+    /// panics on the `expect` below (loudly, not silently), which is how this
+    /// coupling was found in the first place.
     fn production_src() -> String {
         // The `P2pConnManager` impl is split across this module root and its
         // `p2p_protoc/` submodules, so the source-scrape pins below must see
@@ -5354,8 +5361,8 @@ pub(crate) mod tests {
         // moved into a submodule would silently drop out of the scan.
         let full = include_str!("p2p_protoc.rs");
         let cut = full
-            .find("\nmod tests {")
-            .expect("p2p_protoc.rs must have a `mod tests {` block");
+            .find("\npub(crate) mod tests {")
+            .expect("p2p_protoc.rs must have a `pub(crate) mod tests {` block");
         [
             &full[..cut],
             include_str!("p2p_protoc/migration.rs"),
