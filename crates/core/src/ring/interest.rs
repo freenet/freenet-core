@@ -3133,6 +3133,31 @@ mod tests {
         );
     }
 
+    /// Same clobber, third site (#4672): the remote-GET interest registration.
+    ///
+    /// Guarded with plain `refresh_peer_interest`, NOT the `_with_upstream`
+    /// variant — this call passes `is_upstream = false`, and asserting that on
+    /// an existing entry would DOWNGRADE a peer that is legitimately our
+    /// upstream, which is the `Unsubscribe` routing target. A GET requester's
+    /// interest must not clear an upstream edge established by SUBSCRIBE.
+    #[test]
+    fn get_interest_registration_does_not_clobber_or_downgrade() {
+        let src = include_str!("../operations/get/op_ctx_task.rs");
+        let prod = &src[..src.find("\nmod tests {").unwrap_or(src.len())];
+        let stripped: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+
+        assert!(
+            stripped.contains("get_peer_interest(&key,&peer_key).is_some()"),
+            "the remote-GET registration must check for an existing entry before \
+             registering, or it wipes that entry's cached summary (#4672)"
+        );
+        assert!(
+            !stripped.contains("refresh_peer_interest_with_upstream(&key,&peer_key,false)"),
+            "must NOT assert is_upstream=false on an existing entry — that \
+             downgrades a legitimate upstream edge and breaks Unsubscribe routing"
+        );
+    }
+
     fn upsert_peer_summary_seeds_summary_for_untracked_peer() {
         let (manager, _time) = make_manager();
         let contract = make_contract_key(1);
