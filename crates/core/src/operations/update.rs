@@ -1049,7 +1049,10 @@ pub(crate) async fn send_proactive_summary_notification(
         .into_iter()
         .collect();
 
-    let targets = proactive_summary_targets(&resolved, &advertised_cohosts, sender_addr, self_addr);
+    let ProactiveSummaryRecipients {
+        targets,
+        cohosts_skipped,
+    } = proactive_summary_targets(&resolved, &advertised_cohosts, sender_addr, self_addr);
 
     for peer_addr in &targets {
         if let Err(e) = op_manager
@@ -1068,12 +1071,12 @@ pub(crate) async fn send_proactive_summary_notification(
         }
     }
 
-    // NOT `advertised_cohosts.len()`: that counts every advertised co-host of
-    // the contract, including ones not interested and ones that failed to
-    // resolve, so it overstates the saving — and this number is what the
-    // change is judged on.
-    let cohosts_skipped = resolved.len().saturating_sub(targets.len());
-
+    // `cohosts_skipped` comes from `proactive_summary_targets`, which counts
+    // ONLY the #4965 co-host drops. Neither `advertised_cohosts.len()` (counts
+    // co-hosts that were never interested or failed to resolve) nor
+    // `resolved.len() - targets.len()` (also counts the sender and self) is
+    // this number, and both overstate it. This is what the change is judged on.
+    //
     // Release-visible counterpart to the `debug!` below, which `release_max_level_info`
     // compiles out — so in production the debug line measures nothing. Folded into
     // the existing `outbound_message_mix` rollup window rather than emitted per
@@ -1112,25 +1115,57 @@ pub(crate) async fn send_proactive_summary_notification(
 /// Excludes, in order: the update's sender, ourselves, and every advertised
 /// co-host (the broadcast fan-out already delivered this summary to them —
 /// see [`send_proactive_summary_notification`]'s "Recipient set" section).
+///
+/// Returns the co-host skip count SEPARATELY rather than leaving callers to
+/// derive it as `resolved.len() - targets.len()`. That subtraction is wrong,
+/// and wrong in the direction that flatters the change: it also counts the
+/// sender and self, so it stays non-zero even with the co-host filter deleted.
+/// A metric computed that way reports a saving the code is not making, and it
+/// silently defeats any test that asserts on it — mutation testing caught
+/// exactly that here, with the simulation's `cohosts_skipped > 0` assertion
+/// still passing under a mutation that removed the entire exclusion.
 pub(crate) fn proactive_summary_targets(
     resolved_interested: &[(TransportPublicKey, SocketAddr)],
     advertised_cohosts: &HashSet<TransportPublicKey>,
     sender_addr: SocketAddr,
     self_addr: Option<SocketAddr>,
-) -> Vec<SocketAddr> {
-    resolved_interested
-        .iter()
-        .filter(|(pub_key, peer_addr)| {
-            // The sender just gave us this data.
-            *peer_addr != sender_addr
-                // Never notify ourselves.
-                && self_addr.as_ref() != Some(peer_addr)
-                // #4965: the broadcast to this co-host already carried the
-                // summary in `sender_summary_bytes`.
-                && !advertised_cohosts.contains(pub_key)
-        })
-        .map(|(_, peer_addr)| *peer_addr)
-        .collect()
+) -> ProactiveSummaryRecipients {
+    let mut targets = Vec::with_capacity(resolved_interested.len());
+    let mut cohosts_skipped = 0usize;
+
+    for (pub_key, peer_addr) in resolved_interested {
+        // The sender just gave us this data; never notify ourselves. Both
+        // predate #4965 and are NOT co-host skips.
+        if *peer_addr == sender_addr || self_addr.as_ref() == Some(peer_addr) {
+            continue;
+        }
+        // #4965: the broadcast to this co-host already carried the summary in
+        // `sender_summary_bytes`. Counted only here, AFTER the two exclusions
+        // above, so the count is attributable to this change alone.
+        if advertised_cohosts.contains(pub_key) {
+            cohosts_skipped += 1;
+            continue;
+        }
+        targets.push(*peer_addr);
+    }
+
+    ProactiveSummaryRecipients {
+        targets,
+        cohosts_skipped,
+    }
+}
+
+/// Outcome of [`proactive_summary_targets`]: who to notify, and how many
+/// recipients the #4965 co-host exclusion removed.
+///
+/// The count is bundled with the targets rather than recomputed by callers so
+/// there is exactly one definition of "skipped because of #4965" — see that
+/// function's docs for the subtraction that looked equivalent and was not.
+pub(crate) struct ProactiveSummaryRecipients {
+    pub targets: Vec<SocketAddr>,
+    /// Peers dropped BECAUSE they are advertised co-hosts. Excludes the sender
+    /// and self, which are dropped for unrelated, pre-#4965 reasons.
+    pub cohosts_skipped: usize,
 }
 
 /// Send our current summary to the peer whose broadcast we just rejected,
@@ -2321,7 +2356,8 @@ mod tests {
             &cohosts,
             "127.0.0.1:9999".parse().unwrap(),
             None,
-        );
+        )
+        .targets;
 
         assert_eq!(
             targets,
@@ -2345,7 +2381,8 @@ mod tests {
             &HashSet::new(),
             "127.0.0.1:9999".parse().unwrap(),
             None,
-        );
+        )
+        .targets;
 
         assert_eq!(targets, vec![a.1, b.1]);
     }
@@ -2357,7 +2394,8 @@ mod tests {
         let other = resolved_peer(9022);
         let interested = vec![sender.clone(), me.clone(), other.clone()];
 
-        let targets = proactive_summary_targets(&interested, &HashSet::new(), sender.1, Some(me.1));
+        let targets =
+            proactive_summary_targets(&interested, &HashSet::new(), sender.1, Some(me.1)).targets;
 
         assert_eq!(
             targets,
@@ -2381,7 +2419,8 @@ mod tests {
             &cohosts,
             "127.0.0.1:9999".parse().unwrap(),
             None,
-        );
+        )
+        .targets;
 
         assert!(
             targets.is_empty(),
@@ -2396,7 +2435,8 @@ mod tests {
             &HashSet::new(),
             "127.0.0.1:9999".parse().unwrap(),
             Some("127.0.0.1:9998".parse().unwrap()),
-        );
+        )
+        .targets;
         assert!(targets.is_empty());
     }
 
@@ -2414,7 +2454,8 @@ mod tests {
             &cohosts,
             "127.0.0.1:9999".parse().unwrap(),
             None,
-        );
+        )
+        .targets;
         assert!(targets.is_empty());
 
         // Same address, different identity => not the advertised co-host.
@@ -2424,8 +2465,55 @@ mod tests {
             &cohosts,
             "127.0.0.1:9999".parse().unwrap(),
             None,
-        );
+        )
+        .targets;
         assert_eq!(targets, vec![cohost.1]);
+    }
+
+    /// `cohosts_skipped` counts ONLY the #4965 co-host drops — not the sender,
+    /// not self.
+    ///
+    /// Found by mutation testing, not by review. The count was originally
+    /// derived at the call site as `resolved.len() - targets.len()`, which
+    /// looks equivalent and is not: it also counts the sender and self, so it
+    /// stayed non-zero with the entire co-host exclusion deleted. That made
+    /// the number report a saving the code was not making, AND it silently
+    /// defeated the simulation test whose whole job is to fail when the
+    /// exclusion is removed — that test passed under the deletion mutation.
+    ///
+    /// The scenario below is the discriminating one: the sender is ALSO
+    /// interested, so a count that includes sender/self reads 2 where the
+    /// truthful co-host count is 1.
+    #[test]
+    fn cohosts_skipped_counts_only_cohost_drops_not_sender_or_self() {
+        let sender = resolved_peer(9050);
+        let me = resolved_peer(9051);
+        let cohost = resolved_peer(9052);
+        let plain = resolved_peer(9053);
+        let interested = vec![sender.clone(), me.clone(), cohost.clone(), plain.clone()];
+        let cohosts: HashSet<TransportPublicKey> = [cohost.0.clone()].into_iter().collect();
+
+        let out = proactive_summary_targets(&interested, &cohosts, sender.1, Some(me.1));
+
+        assert_eq!(out.targets, vec![plain.1]);
+        assert_eq!(
+            out.cohosts_skipped, 1,
+            "only the advertised co-host counts; the sender and self are \
+             dropped for pre-#4965 reasons and must not inflate the saving"
+        );
+
+        // With no co-hosts advertised the count must be ZERO even though two
+        // peers were still dropped. This is the assertion the old subtraction
+        // failed, and it is what makes the simulation's `cohosts_skipped > 0`
+        // a real discriminator.
+        let out = proactive_summary_targets(&interested, &HashSet::new(), sender.1, Some(me.1));
+        assert_eq!(out.targets, vec![cohost.1, plain.1]);
+        assert_eq!(
+            out.cohosts_skipped, 0,
+            "with the exclusion inactive the co-host skip count MUST be 0 — \
+             a non-zero value here means the metric is measuring the sender/\
+             self drops and cannot detect the exclusion being removed"
+        );
     }
 
     /// Source pin: the production emitter must actually consult the
@@ -2510,7 +2598,9 @@ mod tests {
         // accessor itself. Any other is a site that will not follow a future
         // narrowing of the shared source.
         assert_eq!(
-            stripped.matches("neighbor_hosting.neighbors_with_contract(").count(),
+            stripped
+                .matches("neighbor_hosting.neighbors_with_contract(")
+                .count(),
             1,
             "`neighbors_with_contract` must be read ONLY through \
              `advertised_cohost_pub_keys`. A second direct read means the \
@@ -2770,8 +2860,7 @@ mod tests {
     /// the hosting cache, no local client and no downstream subscriber.
     #[tokio::test]
     async fn proactive_notification_is_gated_like_the_broadcast() {
-        let (op_manager, mut rx, _guard) =
-            build_notification_test_node("notif-gate-4473").await;
+        let (op_manager, mut rx, _guard) = build_notification_test_node("notif-gate-4473").await;
         let key = crate::operations::test_utils::make_contract_key(12);
         // Deliberately NOT hosted and NOT in use.
         assert!(
