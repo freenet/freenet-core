@@ -466,12 +466,29 @@ pub(crate) struct ConnectionManager {
     /// Populated at connection establishment
     /// (`p2p_protoc::connection_lifecycle`, the same call site that populates
     /// `P2pConnManager.connections[addr].remote_version`) via
-    /// `record_remote_version`. Never proactively removed: a stale entry can
-    /// only matter if a different peer later reconnects at the exact same
-    /// socket address with an older version, and any real reconnection at
-    /// that address overwrites the entry before it is ever consulted (lookups
-    /// only target addresses with a live connection). Unknown addresses
-    /// (`None`) fail closed in `version_supports_summary_first_put`.
+    /// `record_remote_version`, which writes the `Option` THROUGH — a `None`
+    /// clears any prior entry.
+    ///
+    /// That unconditional write is load-bearing, and the reasoning this
+    /// rustdoc used to carry was wrong. It claimed a stale entry could not
+    /// matter because "any real reconnection at that address overwrites the
+    /// entry before it is ever consulted". That holds only when the
+    /// reconnection yields `Some`. It does NOT on the joiner->gateway path,
+    /// where the gateway's `AckConnection` carries no version and the
+    /// handshake yields `None`: under the old `if let Some(version)` guard
+    /// nothing was written, so a peer that reconnected on an OLDER build kept
+    /// its stale entry, we kept believing it was current, and it received a
+    /// wire variant it could not decode — which closes the connection
+    /// (`p2p_protoc.rs`, `ConnectionError::Serialization`) and reads as a
+    /// transport fault.
+    ///
+    /// Pre-existing (`SUMMARY_FIRST_PUT_MIN_VERSION` had the same exposure),
+    /// but hash-first (#4965) changes the frequency from rare to persistent:
+    /// summary-first PUT consults the mirror only when PUTting to that peer,
+    /// while hash-first consults it on EVERY interest-sync exchange with it.
+    ///
+    /// Unknown addresses (`None`) fail closed in every
+    /// `version_supports_*` predicate.
     #[allow(clippy::type_complexity)]
     remote_version: Arc<RwLock<BTreeMap<SocketAddr, (u8, u8, u16)>>>,
     /// Test-only override for the summary-first PUT probe version floor,
@@ -1349,16 +1366,30 @@ impl ConnectionManager {
         self.subscribe_hint_floor_override
     }
 
-    /// Record the negotiated protocol version for a peer at `addr`, mirroring
-    /// `P2pConnManager.connections[addr].remote_version` so op drivers can
-    /// read it via `op_manager.ring.connection_manager`. Overwrites any prior
-    /// entry for `addr` (a fresh connection at a reused address always wins).
+    /// Record (or CLEAR) the negotiated protocol version for a peer at `addr`,
+    /// mirroring `P2pConnManager.connections[addr].remote_version` so op
+    /// drivers can read it via `op_manager.ring.connection_manager`.
+    ///
+    /// Takes the `Option` rather than a bare version, and writes it through:
+    /// `Some` overwrites, **`None` REMOVES**. A fresh connection at a reused
+    /// address always wins, including when that connection's version is
+    /// unknown — which is the whole point. Accepting only `Some` let a stale
+    /// entry outlive the connection that created it and made us send an
+    /// undecodable wire variant to a downgraded peer; see the
+    /// `remote_version` field rustdoc for the full failure.
     ///
     /// Called from `p2p_protoc::connection_lifecycle` at the same point
     /// `P2pConnManager` records `remote_version` on its own `connections`
     /// entry — keep the two writes together if that call site changes.
-    pub(crate) fn record_remote_version(&self, addr: SocketAddr, version: (u8, u8, u16)) {
-        self.remote_version.write().insert(addr, version);
+    pub(crate) fn record_remote_version(&self, addr: SocketAddr, version: Option<(u8, u8, u16)>) {
+        match version {
+            Some(v) => {
+                self.remote_version.write().insert(addr, v);
+            }
+            None => {
+                self.remote_version.write().remove(&addr);
+            }
+        }
     }
 
     /// Look up the negotiated protocol version recorded for `addr` via
@@ -2695,7 +2726,7 @@ mod tests {
         let cm = make_connection_manager(Some(make_addr(9000)), 1, 10, false);
         let addr = make_addr(9001);
         assert_eq!(cm.remote_version(addr), None);
-        cm.record_remote_version(addr, (0, 2, 94));
+        cm.record_remote_version(addr, Some((0, 2, 94)));
         assert_eq!(cm.remote_version(addr), Some((0, 2, 94)));
     }
 
@@ -2724,7 +2755,7 @@ mod tests {
         let cm = make_connection_manager(Some(make_addr(9000)), 1, 10, false);
 
         let pre_floor_addr = make_addr(9003);
-        cm.record_remote_version(pre_floor_addr, (0, 2, 80));
+        cm.record_remote_version(pre_floor_addr, Some((0, 2, 80)));
         assert!(!cm.supports_summary_first_put(pre_floor_addr));
 
         // The exact staggered-rollout boundary (#4642 step 3-bis): the probe
@@ -2735,7 +2766,7 @@ mod tests {
         // must therefore fall back to a full-state PUT and NEVER send it a
         // probe. The floor being strictly greater than 0.2.94 enforces this.
         let pre_variant_peer = make_addr(9005);
-        cm.record_remote_version(pre_variant_peer, (0, 2, 94));
+        cm.record_remote_version(pre_variant_peer, Some((0, 2, 94)));
         assert!(
             !cm.supports_summary_first_put(pre_variant_peer),
             "a 0.2.94 peer has no probe variants; a probe would fail to decode \
@@ -2746,7 +2777,10 @@ mod tests {
         // A peer at the floor (0.2.95, the first release carrying the probe
         // variants + handler) is accepted.
         let at_floor_addr = make_addr(9004);
-        cm.record_remote_version(at_floor_addr, crate::node::SUMMARY_FIRST_PUT_MIN_VERSION);
+        cm.record_remote_version(
+            at_floor_addr,
+            Some(crate::node::SUMMARY_FIRST_PUT_MIN_VERSION),
+        );
         assert!(cm.supports_summary_first_put(at_floor_addr));
     }
 
@@ -2778,7 +2812,7 @@ mod tests {
         // 0.2.115 is the highest already-released version at the time this
         // shipped and carries neither variant.
         let pre_floor = make_addr(9102);
-        cm.record_remote_version(pre_floor, (0, 2, 115));
+        cm.record_remote_version(pre_floor, Some((0, 2, 115)));
         assert!(
             !cm.supports_hash_first_summaries(pre_floor),
             "a peer one release below the floor has no SummaryDigests variant \
@@ -2786,7 +2820,10 @@ mod tests {
         );
 
         let at_floor = make_addr(9103);
-        cm.record_remote_version(at_floor, crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION);
+        cm.record_remote_version(
+            at_floor,
+            Some(crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION),
+        );
         assert!(
             cm.supports_hash_first_summaries(at_floor),
             "the floor release itself carries the variants and their handlers, \
@@ -2794,11 +2831,55 @@ mod tests {
         );
 
         let newer = make_addr(9104);
-        cm.record_remote_version(newer, (0, 3, 0));
+        cm.record_remote_version(newer, Some((0, 3, 0)));
         assert!(
             cm.supports_hash_first_summaries(newer),
             "a peer above the floor must stay supported (the floor is a \
              minimum, never an equality test)"
+        );
+    }
+
+    /// A reconnection whose version is UNKNOWN must CLEAR the mirror, not
+    /// leave the previous connection's version standing.
+    ///
+    /// The failure this guards is not hypothetical arithmetic. A peer
+    /// reconnects on an older build; the joiner->gateway handshake yields
+    /// `None` (the gateway's `AckConnection` carries no version); under the
+    /// old `if let Some(version)` write the stale entry survived; we kept
+    /// believing the peer was current and sent it `SummaryDigests`; it could
+    /// not decode the variant and the connection was CLOSED. The visible
+    /// symptom is connection flap that looks like a transport fault.
+    ///
+    /// Pre-existing exposure (summary-first PUT had it too), but hash-first
+    /// consults this mirror on every interest-sync exchange rather than only
+    /// when PUTting to that peer, which turns rare into persistent.
+    #[test]
+    fn unknown_version_on_reconnect_clears_the_mirror() {
+        let cm = make_connection_manager(Some(make_addr(9200)), 1, 10, false);
+        let addr = make_addr(9201);
+
+        // First connection: a current peer.
+        cm.record_remote_version(addr, Some(crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION));
+        assert_eq!(
+            cm.remote_version(addr),
+            Some(crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION)
+        );
+        assert!(
+            cm.supports_hash_first_summaries(addr),
+            "precondition: the peer is believed capable"
+        );
+
+        // Reconnection at the same address with an UNKNOWN version.
+        cm.record_remote_version(addr, None);
+
+        assert_eq!(
+            cm.remote_version(addr),
+            None,
+            "an unknown-version reconnection must REMOVE the stale entry - leaving it makes us send a wire variant the peer may not be able to decode, which closes the connection"
+        );
+        assert!(
+            !cm.supports_hash_first_summaries(addr),
+            "with the version cleared the gate must fail closed again, so the peer goes back to receiving full-bytes Summaries"
         );
     }
 

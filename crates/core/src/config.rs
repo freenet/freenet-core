@@ -3646,7 +3646,23 @@ std::thread_local! {
     static GLOBAL_SUMMARY_DIGEST_MSGS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_SUMMARY_FULL_MSGS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_SUMMARY_FULL_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static GLOBAL_SUMMARY_DIGEST_AGREEMENTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // #4965 agreement rate, split by MESSAGE SHAPE rather than by emitter.
+    //
+    // The emitter tag (#5052) is `#[serde(skip)]`, so an INBOUND SummaryDigests
+    // always decodes as `Other` — the receiver, which is the only side that can
+    // judge agreement, cannot know which send site produced it. Entry count is
+    // the best available proxy and needs no wire change: the notification and
+    // rejection emitters are single-entry BY CONSTRUCTION while both reply
+    // emitters are multi-entry (see `outbound_message_mix::SummariesDetail`).
+    //
+    // Known ambiguity, stated so the number is not over-read: a heartbeat reply
+    // for a peer pair sharing exactly ONE contract is also single-entry, so the
+    // single bucket is "state-change-driven sites PLUS narrow heartbeats", not
+    // a clean partition. It is directional evidence, not attribution.
+    static GLOBAL_SUMMARY_AGREE_SINGLE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_SUMMARY_AGREE_MULTI: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_SUMMARY_MISMATCH_SINGLE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_SUMMARY_MISMATCH_MULTI: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_SUMMARY_BYTE_REQUESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -3699,7 +3715,10 @@ impl GlobalTestMetrics {
         GLOBAL_SUMMARY_DIGEST_MSGS.with(|c| c.set(0));
         GLOBAL_SUMMARY_FULL_MSGS.with(|c| c.set(0));
         GLOBAL_SUMMARY_FULL_BYTES.with(|c| c.set(0));
-        GLOBAL_SUMMARY_DIGEST_AGREEMENTS.with(|c| c.set(0));
+        GLOBAL_SUMMARY_AGREE_SINGLE.with(|c| c.set(0));
+        GLOBAL_SUMMARY_AGREE_MULTI.with(|c| c.set(0));
+        GLOBAL_SUMMARY_MISMATCH_SINGLE.with(|c| c.set(0));
+        GLOBAL_SUMMARY_MISMATCH_MULTI.with(|c| c.set(0));
         GLOBAL_SUMMARY_BYTE_REQUESTS.with(|c| c.set(0));
     }
 
@@ -3973,9 +3992,63 @@ impl GlobalTestMetrics {
     }
 
     /// One advertised digest matched our own summary, settling that contract
-    /// with zero summary bytes exchanged. This is the 98.1% case.
-    pub fn record_summary_digest_agreement() {
-        GLOBAL_SUMMARY_DIGEST_AGREEMENTS.with(|c| c.set(c.get() + 1));
+    /// with zero summary bytes exchanged.
+    ///
+    /// `single_entry` splits by the SHAPE of the message the entry arrived in
+    /// — see the module note on why that is the best available proxy for the
+    /// send site.
+    pub fn record_summary_digest_agreement(single_entry: bool) {
+        if single_entry {
+            GLOBAL_SUMMARY_AGREE_SINGLE.with(|c| c.set(c.get() + 1));
+        } else {
+            GLOBAL_SUMMARY_AGREE_MULTI.with(|c| c.set(c.get() + 1));
+        }
+    }
+
+    /// A digest could NOT settle a contract, so its bytes must be requested.
+    ///
+    /// The denominator half of the agreement rate: without it, a low agreement
+    /// COUNT and a low exchange VOLUME look identical, and the whole question
+    /// (does the state-change-driven site agree less often than the heartbeat
+    /// one?) is about a RATE.
+    pub fn record_summary_digest_mismatch(single_entry: bool) {
+        if single_entry {
+            GLOBAL_SUMMARY_MISMATCH_SINGLE.with(|c| c.set(c.get() + 1));
+        } else {
+            GLOBAL_SUMMARY_MISMATCH_MULTI.with(|c| c.set(c.get() + 1));
+        }
+    }
+
+    /// Agreements observed in SINGLE-entry `SummaryDigests` messages.
+    ///
+    /// Proxy for the state-change-driven send sites (proactive notification,
+    /// rejection summary-back), which are single-entry by construction. This
+    /// is the population #4861 makes us care about: the proactive site fires
+    /// immediately after WE change state, so the receiver may not have applied
+    /// the update yet and could disagree far more often than the fleet-wide
+    /// 98.1% suggests — and every disagreement costs two extra messages on the
+    /// axis that caused the storm.
+    pub fn summary_digest_agreements_single() -> u64 {
+        GLOBAL_SUMMARY_AGREE_SINGLE.with(|c| c.get())
+    }
+
+    /// Agreements observed in MULTI-entry `SummaryDigests` messages — the
+    /// heartbeat / interest-churn replies.
+    pub fn summary_digest_agreements_multi() -> u64 {
+        GLOBAL_SUMMARY_AGREE_MULTI.with(|c| c.get())
+    }
+
+    pub fn summary_digest_mismatches_single() -> u64 {
+        GLOBAL_SUMMARY_MISMATCH_SINGLE.with(|c| c.get())
+    }
+
+    pub fn summary_digest_mismatches_multi() -> u64 {
+        GLOBAL_SUMMARY_MISMATCH_MULTI.with(|c| c.get())
+    }
+
+    /// Total agreements, both shapes.
+    pub fn summary_digest_agreements() -> u64 {
+        Self::summary_digest_agreements_single() + Self::summary_digest_agreements_multi()
     }
 
     /// A digest could not settle some contracts, so their bytes were
@@ -3994,10 +4067,6 @@ impl GlobalTestMetrics {
 
     pub fn summary_full_bytes() -> u64 {
         GLOBAL_SUMMARY_FULL_BYTES.with(|c| c.get())
-    }
-
-    pub fn summary_digest_agreements() -> u64 {
-        GLOBAL_SUMMARY_DIGEST_AGREEMENTS.with(|c| c.get())
     }
 
     pub fn summary_byte_requests() -> u64 {

@@ -3263,6 +3263,17 @@ async fn handle_interest_sync_message(
                     let start = crate::config::GlobalRng::random_range(0..entries.len());
                     entries.rotate_left(start);
                 }
+                // #4965 agreement-rate proxy: single-entry messages come
+                // from the state-change-driven send sites (proactive
+                // notification, rejection summary-back) by construction, while
+                // the heartbeat / interest-churn replies are multi-entry. The
+                // emitter tag is non-wire so the receiver cannot read it; this
+                // is the closest available discriminator. Reads `entries.len()`
+                // — the length of the message the peer actually SENT. The
+                // rotation above reorders but never shortens, and the cap
+                // applies to the processing window rather than to this count,
+                // so a capped message is still classified by its true size.
+                let single_entry = entries.len() == 1;
                 let mut seen_hashes: HashSet<u32> = HashSet::new();
                 let mut compared_contracts: HashSet<ContractInstanceId> = HashSet::new();
                 for entry in entries {
@@ -3312,7 +3323,9 @@ async fn handle_interest_sync_message(
                                     ours.as_ref(),
                                     &mut compared_contracts,
                                 );
-                                crate::config::GlobalTestMetrics::record_summary_digest_agreement();
+                                crate::config::GlobalTestMetrics::record_summary_digest_agreement(
+                                    single_entry,
+                                );
                                 // `None` delta verdict: there is nothing to
                                 // probe. `summary_indicates_stale_peer` sees
                                 // byte-equal summaries and never reaches the
@@ -3346,7 +3359,12 @@ async fn handle_interest_sync_message(
                             // Defer to the full-bytes path: the digest cannot
                             // settle this contract, so ask for the summary and
                             // let the untouched `Summaries` handler decide.
-                            DigestVerdict::NeedBytes => needs_bytes = true,
+                            DigestVerdict::NeedBytes => {
+                                crate::config::GlobalTestMetrics::record_summary_digest_mismatch(
+                                    single_entry,
+                                );
+                                needs_bytes = true;
+                            }
                         }
                     }
                     if needs_bytes {
@@ -8128,10 +8146,10 @@ mod tests {
                     "test peer must be admitted to the ring"
                 );
             }
-            op_manager
-                .ring
-                .connection_manager
-                .record_remote_version(new_peer, crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION);
+            op_manager.ring.connection_manager.record_remote_version(
+                new_peer,
+                Some(crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION),
+            );
 
             let summary_for_handler = our_summary.clone();
             let handler_key = key;
@@ -8603,6 +8621,33 @@ mod tests {
             }
         }
 
+        /// Strip `//` comment lines from a source window before asserting on
+        /// it.
+        ///
+        /// Load-bearing, not tidiness. These pins assert that the arm CALLS
+        /// something; the identifiers they search for also appear in the arm's
+        /// own explanatory comments, so an unstripped window is satisfied by
+        /// PROSE. `digest_arm_shares_the_single_heal_path` was exactly that:
+        /// `summary_indicates_stale_peer` and `record_summary_comparison` both
+        /// appear in comments inside its window, so deleting both calls left it
+        /// green — and the mutation is silent everywhere else, since
+        /// `record_summary_comparison` is pure observation and
+        /// `summary_indicates_stale_peer(&ours, &ours, None)` provably returns
+        /// `false`, so `let is_stale = false;` compiles and breaks nothing.
+        ///
+        /// The sibling pins already guarded the ASSERTION's own source from
+        /// self-matching (via `concat!`); this guards the SCANNED WINDOW, which
+        /// is the half that was missed. Verified by mutation: with the
+        /// predicate call replaced by `let is_stale = false;` and the prose
+        /// left intact, the pin now fails.
+        fn code_only(window: &str) -> String {
+            window
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
         /// Source pin: production code must never construct
         /// `InterestMessage::Summaries` directly — only through
         /// [`full_summaries_message`], which records the summary bytes it puts
@@ -8718,7 +8763,7 @@ mod tests {
             let end = src[arm..]
                 .find("InterestMessage::ChangeInterests { added, removed } => {")
                 .expect("end of SummaryRequest arm not found");
-            let body = &src[arm..arm + end];
+            let body = &code_only(&src[arm..arm + end]);
             assert!(
                 body.contains("get_matching_contracts"),
                 "window extraction is off — the SummaryRequest arm body should \
@@ -8754,7 +8799,7 @@ mod tests {
             let end = src[arm..]
                 .find("InterestMessage::SummaryRequest { hashes } => {")
                 .expect("end of SummaryDigests arm not found");
-            let body = &src[arm..arm + end];
+            let body = &code_only(&src[arm..arm + end]);
             assert!(
                 body.contains("emit_stale_peer_syncs(op_manager, source, stale_contracts)"),
                 "the SummaryDigests arm must delegate healing to the shared \
