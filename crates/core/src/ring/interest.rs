@@ -406,6 +406,60 @@ pub fn contract_hash(contract: &ContractKey) -> u32 {
     hash
 }
 
+/// Length in bytes of a [`SummaryDigest`].
+///
+/// 16 bytes (128 bits). The digest replaces a full `StateSummary` on the wire
+/// (~33 KB for a River room), so the cost of a wide digest is a rounding
+/// error, while a narrow one would make accidental collisions — which read as
+/// "the peer agrees with us" and therefore SUPPRESS a heal — thinkable. At 128
+/// bits they are not.
+pub const SUMMARY_DIGEST_LEN: usize = 16;
+
+/// A digest of a contract's `StateSummary` **bytes**, used by the hash-first
+/// `InterestSync` exchange (#4965) to say "my summary is X" without shipping
+/// the summary itself.
+pub type SummaryDigest = [u8; SUMMARY_DIGEST_LEN];
+
+/// Digest of a contract's state-summary bytes: truncated BLAKE3.
+///
+/// # This is NOT [`contract_hash`]
+///
+/// The two hashes live next to each other on purpose, because conflating them
+/// is the obvious mistake and they answer different questions:
+///
+/// | | [`contract_hash`] | [`summary_digest`] |
+/// |---|---|---|
+/// | input | contract INSTANCE ID | the contract's state SUMMARY bytes |
+/// | answers | *which* contract | *what state* we hold of it |
+/// | changes when | never, for a given contract | every state change |
+/// | algorithm | FNV-1a, 32-bit | BLAKE3, truncated to 128-bit |
+/// | collisions | fine (extra comparisons) | must not happen (suppresses a heal) |
+///
+/// `SummaryDigestEntry` carries BOTH: `hash` identifies the contract,
+/// `summary_digest` describes our state of it.
+///
+/// # Why BLAKE3 and not a `Hasher`
+///
+/// The digest is a WIRE value compared across peers and across restarts, so it
+/// must be identical for identical bytes on every node forever.
+/// `DefaultHasher` is explicitly not stable across releases (and `RandomState`
+/// is per-process random): a digest that varies per node would make every
+/// comparison mismatch, which degrades to "always ship the bytes plus an extra
+/// round trip" — worse than not doing this at all — and re-creates the #4857
+/// storm shape where every heartbeat looks like divergence. BLAKE3 over the
+/// raw bytes has no endianness or platform freedom: the input is a byte slice
+/// and the output is a byte array, so no integer is ever serialized.
+///
+/// The truncation takes the FIRST [`SUMMARY_DIGEST_LEN`] bytes of the 32-byte
+/// BLAKE3 output, which is the standard way to shorten it (BLAKE3's output is
+/// uniformly distributed, so any fixed slice is a sound shorter digest).
+pub fn summary_digest(summary_bytes: &[u8]) -> SummaryDigest {
+    let full = blake3::hash(summary_bytes);
+    let mut digest = [0u8; SUMMARY_DIGEST_LEN];
+    digest.copy_from_slice(&full.as_bytes()[..SUMMARY_DIGEST_LEN]);
+    digest
+}
+
 /// How much smaller full state must be before the post-compute gate
 /// ([`InterestManager::gate_delta_size`]) abandons a computed delta for it.
 ///
@@ -2067,6 +2121,126 @@ mod tests {
         let time_source = SharedMockTimeSource::new();
         let manager = InterestManager::new(time_source.clone());
         (manager, time_source)
+    }
+
+    /// [`summary_digest`] must be a FIXED function of the bytes — identical on
+    /// every node, every platform, and every release (#4965).
+    ///
+    /// Pinned against a hard-coded vector, not merely "two calls agree". Two
+    /// calls agree for `DefaultHasher` too *within one process*, and it is
+    /// exactly the cross-process disagreement that would be catastrophic here:
+    /// a per-node digest makes every comparison mismatch, which degrades to
+    /// "ship the bytes AND an extra round trip" — worse than not doing this at
+    /// all — and re-creates the #4857 shape where every heartbeat looks like
+    /// divergence. Only a pinned vector catches a swap to a non-stable hasher.
+    ///
+    /// If BLAKE3 itself is ever intentionally replaced, this vector changes AND
+    /// `HASH_FIRST_SUMMARIES_MIN_VERSION` must be re-floored, because peers on
+    /// either side of the change would disagree about identical state.
+    #[test]
+    fn summary_digest_is_pinned_to_truncated_blake3() {
+        let got = summary_digest(b"freenet summary digest test vector");
+
+        // The TRUNCATION rule: first SUMMARY_DIGEST_LEN bytes, not last, not
+        // folded. This half is computed with blake3, so it moves with the
+        // implementation — the hard pin is the literal below.
+        let truncated = {
+            let full = blake3::hash(b"freenet summary digest test vector");
+            let mut d = [0u8; SUMMARY_DIGEST_LEN];
+            d.copy_from_slice(&full.as_bytes()[..SUMMARY_DIGEST_LEN]);
+            d
+        };
+        assert_eq!(
+            got, truncated,
+            "summary_digest must be the FIRST {SUMMARY_DIGEST_LEN} bytes of \
+             BLAKE3 over the raw summary bytes"
+        );
+
+        // The ALGORITHM, pinned to a literal. Verified independently of this
+        // codebase with the `b3sum` CLI:
+        //   printf 'freenet summary digest test vector' | b3sum
+        // Swapping BLAKE3 for anything else fails here even though the
+        // truncation assertion above would happily follow the swap.
+        assert_eq!(
+            hex::encode(got),
+            "c6d93b99cde492c9edc177db79b27e2b",
+            "summary_digest changed value for a fixed input — this is a WIRE \
+             change: peers on either side of it disagree about identical \
+             state. If deliberate, re-floor HASH_FIRST_SUMMARIES_MIN_VERSION."
+        );
+    }
+
+    /// Two independently constructed but byte-identical summaries must digest
+    /// identically, and any difference must change the digest.
+    ///
+    /// The first half is the property the exchange relies on for its 98.1%
+    /// win; the second is what keeps a digest match from hiding real
+    /// divergence.
+    #[test]
+    fn summary_digest_agrees_on_equal_bytes_and_differs_otherwise() {
+        // Built by different routes so no shared allocation can mask a bug.
+        let a: Vec<u8> = (0u8..64).collect();
+        let mut b = Vec::with_capacity(64);
+        for i in 0u8..64 {
+            b.push(i);
+        }
+        assert_eq!(a, b, "precondition: the two summaries are byte-identical");
+        assert_eq!(
+            summary_digest(&a),
+            summary_digest(&b),
+            "identical summary bytes MUST digest identically — two peers that \
+             agree must see a digest match"
+        );
+
+        let mut c = a.clone();
+        c[63] ^= 0x01;
+        assert_ne!(
+            summary_digest(&a),
+            summary_digest(&c),
+            "a one-bit difference must change the digest, or divergence goes \
+             undetected and the heal never fires"
+        );
+
+        assert_ne!(
+            summary_digest(b""),
+            summary_digest(&a),
+            "an empty summary must not digest like a populated one"
+        );
+    }
+
+    /// [`summary_digest`] and [`contract_hash`] answer different questions and
+    /// must not be confused: the digest tracks STATE (so it changes when state
+    /// changes) while `contract_hash` identifies a CONTRACT (so it never does).
+    ///
+    /// `SummaryDigestEntry` carries both, and overloading either one for the
+    /// other's job is the obvious way to get this wrong.
+    #[test]
+    fn summary_digest_and_contract_hash_are_different_functions() {
+        let contract = make_contract_key(1);
+        let h = contract_hash(&contract);
+
+        // Same contract, two different states → same contract hash, different
+        // digests.
+        let d1 = summary_digest(b"state one");
+        let d2 = summary_digest(b"state two");
+        assert_eq!(
+            h,
+            contract_hash(&contract),
+            "contract_hash must not depend on state"
+        );
+        assert_ne!(
+            d1, d2,
+            "summary_digest MUST depend on state — a digest that tracked the \
+             contract id instead would report 'agree' for every peer holding \
+             the contract, silently disabling every heal"
+        );
+
+        // And the digest must not be a widened contract hash.
+        assert_ne!(
+            &summary_digest(contract.id().as_bytes())[..4],
+            &h.to_le_bytes()[..],
+            "summary_digest must not reduce to contract_hash"
+        );
     }
 
     #[test]

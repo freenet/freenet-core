@@ -123,15 +123,27 @@ pub(crate) enum OutboundKind {
     /// arm could not tell them apart — the #4965 measurement hinges on which
     /// leg the 53-75% actually sits in.
     InterestSyncInterests,
-    /// InterestSync reply leg: `Summaries`. The leading suspect, because
-    /// `SummaryEntry::summary_bytes` ships a FULL `StateSummary` per shared
-    /// contract to every connected peer on every cycle
-    /// (`node.rs::handle_interest_sync_message`).
+    /// InterestSync reply leg — the WHOLE summary exchange: `Summaries`, plus
+    /// its hash-first legs `SummaryDigests` and `SummaryRequest` (#4965).
+    ///
+    /// The leading suspect, because `SummaryEntry::summary_bytes` ships a FULL
+    /// `StateSummary` per shared contract to every connected peer on every
+    /// cycle (`node.rs::handle_interest_sync_message`).
     ///
     /// Measured at 49.8% of all outbound bytes on the fleet (v0.2.115, 1,174
     /// peers), which is what makes it worth a second level of split: this arm
-    /// alone still lumps four unrelated emitters together. See
+    /// alone still lumps several unrelated emitters together. See
     /// [`SummariesEmitter`] and [`Window::summaries_bytes`].
+    ///
+    /// All THREE hash-first legs land in this one arm on purpose: #4965
+    /// replaces a single `Summaries` with up to three messages
+    /// (`SummaryDigests` -> `SummaryRequest` -> `Summaries`), so splitting them
+    /// across arms would make `interest_sync_summaries_bytes` collapse for a
+    /// trivial reason and hide the extra legs in a bucket that did not exist
+    /// before. Keeping them together makes the same field a like-for-like
+    /// before/after total for the whole mechanism — which is exactly the
+    /// falsifier: if hash-first does not shrink this number, it did not work.
+    /// The per-emitter split below still separates them.
     InterestSyncSummaries,
     /// InterestSync heal leg: `ResyncRequest` / `ResyncResponse`. Separate
     /// because `ResyncResponse` carries full contract STATE, so folding it
@@ -238,11 +250,16 @@ pub(crate) struct SummariesDetail {
 /// Kept here rather than on [`SummariesEmitter`] itself: the enum is a
 /// protocol-adjacent type, the index and the field stem are facts about this
 /// rollup's wire-to-telemetry shape.
-const SUMMARIES_ARMS: [SummariesEmitter; 5] = [
+const SUMMARIES_ARMS: [SummariesEmitter; 7] = [
     SummariesEmitter::Notification,
     SummariesEmitter::InterestsReply,
     SummariesEmitter::ChangeInterestsReply,
     SummariesEmitter::Rejection,
+    // #4965 hash-first legs. Appended so the existing arms keep their indices
+    // and a dashboard query built against the pre-#4965 rollup does not
+    // silently start reading a different arm's numbers.
+    SummariesEmitter::SummaryRequestReply,
+    SummariesEmitter::SummaryRequest,
     SummariesEmitter::Other,
 ];
 
@@ -252,7 +269,9 @@ const fn summaries_index(emitter: SummariesEmitter) -> usize {
         SummariesEmitter::InterestsReply => 1,
         SummariesEmitter::ChangeInterestsReply => 2,
         SummariesEmitter::Rejection => 3,
-        SummariesEmitter::Other => 4,
+        SummariesEmitter::SummaryRequestReply => 4,
+        SummariesEmitter::SummaryRequest => 5,
+        SummariesEmitter::Other => 6,
     }
 }
 
@@ -264,6 +283,8 @@ const fn summaries_stem(emitter: SummariesEmitter) -> &'static str {
         SummariesEmitter::InterestsReply => "interest_sync_summaries_interests_reply",
         SummariesEmitter::ChangeInterestsReply => "interest_sync_summaries_change_interests_reply",
         SummariesEmitter::Rejection => "interest_sync_summaries_rejection",
+        SummariesEmitter::SummaryRequestReply => "interest_sync_summaries_request_reply",
+        SummariesEmitter::SummaryRequest => "interest_sync_summaries_request",
         SummariesEmitter::Other => "interest_sync_summaries_other",
     }
 }
@@ -314,6 +335,28 @@ impl OutboundClass {
                         summaries: Some(SummariesDetail {
                             emitter: *emitter,
                             entries: entries.len() as u64,
+                        }),
+                    },
+                    // #4965: the digest form carries the SAME emitter tag as
+                    // the `Summaries` it replaces, so a send path keeps its
+                    // per-emitter attribution across the hash-first migration
+                    // instead of silently moving into the residual arm.
+                    InterestMessage::SummaryDigests { entries, emitter } => Self {
+                        kind: OutboundKind::InterestSyncSummaries,
+                        summaries: Some(SummariesDetail {
+                            emitter: *emitter,
+                            entries: entries.len() as u64,
+                        }),
+                    },
+                    // The bytes-on-mismatch request leg. Tagged rather than
+                    // left `plain` because the per-emitter arms must SUM to
+                    // this kind's totals; an untagged message would open a gap
+                    // between the split and the arm it splits.
+                    InterestMessage::SummaryRequest { hashes } => Self {
+                        kind: OutboundKind::InterestSyncSummaries,
+                        summaries: Some(SummariesDetail {
+                            emitter: SummariesEmitter::SummaryRequest,
+                            entries: hashes.len() as u64,
                         }),
                     },
                     InterestMessage::ResyncRequest { .. }
