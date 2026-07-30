@@ -320,6 +320,17 @@ pub(crate) struct RouterSnapshotInfo {
     pub terminal_consult_hits: Option<u64>,
     pub terminal_consult_resolved_found: Option<u64>,
     pub terminal_consult_still_not_found: Option<u64>,
+    /// Eviction-retraction emission counters (#5059). The retraction is what
+    /// makes co-hosts stop fanning updates at an evicted contract, and it is
+    /// emitted best-effort on the cap-2048 node-event channel. `dropped` rising
+    /// means evicted contracts keep receiving updates for up to one
+    /// interest-heartbeat interval (~5 min) before the full-set re-request heals
+    /// it — the difference between a slow heal and a failed fix, which the
+    /// `debug!` at the drop site cannot show because it compiles out in release.
+    /// Monotonic lifetime totals; `None` until the ring's snapshot task has
+    /// populated them.
+    pub hosting_retractions_emitted: Option<u64>,
+    pub hosting_retractions_dropped: Option<u64>,
     /// Computed-upstream vs. stored-`is_upstream`-flag divergence counters
     /// (hosting redesign piece D, #4642 / #4671). `comparisons` is the
     /// denominator (one per `send_unsubscribe_upstream`), `divergences` the times
@@ -1379,6 +1390,10 @@ impl Router {
             terminal_consult_hits: None,
             terminal_consult_resolved_found: None,
             terminal_consult_still_not_found: None,
+            // Eviction-retraction emission counters (#5059), same population
+            // path as the consult counters above.
+            hosting_retractions_emitted: None,
+            hosting_retractions_dropped: None,
             // Computed-upstream vs. stored-flag divergence counters (piece D,
             // #4642 / #4671), populated by Ring from the network_status
             // singleton on the snapshot cadence.

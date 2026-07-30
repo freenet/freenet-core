@@ -2407,6 +2407,18 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "terminal_consult_still_not_found".to_string(),
                     serde_json::json!(snapshot.terminal_consult_still_not_found),
                 );
+                // Eviction-retraction emission counters (#5059): whether the
+                // retraction that stops co-host fan-out at an evicted contract
+                // actually reached the wire. Pinned by
+                // `router_snapshot_json_includes_hosting_retraction_counters`.
+                obj.insert(
+                    "hosting_retractions_emitted".to_string(),
+                    serde_json::json!(snapshot.hosting_retractions_emitted),
+                );
+                obj.insert(
+                    "hosting_retractions_dropped".to_string(),
+                    serde_json::json!(snapshot.hosting_retractions_dropped),
+                );
                 // Streamed-transfer abort counters (Group B), routing/hosting
                 // attribution (Group C), and connect-emit counters — same
                 // hand-mirror footgun: a new `RouterSnapshotInfo` field is
@@ -2999,6 +3011,29 @@ mod tests {
             ("terminal_consult_hits", 313),
             ("terminal_consult_resolved_found", 317),
             ("terminal_consult_still_not_found", 331),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// Pin: the eviction-retraction counters (#5059) must reach the
+    /// hand-mirrored OTLP body — same footgun as the counters above. The
+    /// retraction is emitted best-effort on the cap-2048 node-event channel and
+    /// its drop is logged at `debug`, which compiles out in release, so these
+    /// counters are the ONLY production signal distinguishing "retraction
+    /// dropped, healing on the ~5-min heartbeat" from "the fix is not working".
+    #[test]
+    fn router_snapshot_json_includes_hosting_retraction_counters() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.hosting_retractions_emitted = Some(509);
+        info.hosting_retractions_dropped = Some(521);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("hosting_retractions_emitted", 509),
+            ("hosting_retractions_dropped", 521),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }

@@ -181,6 +181,69 @@ impl NeighborHostingManager {
         }
     }
 
+    /// [`Self::on_contract_unhosted`] for a contract we evicted, with the
+    /// re-host check applied AFTER the removal so the two cannot interleave
+    /// into a wrong result.
+    ///
+    /// `still_hosted` is the caller's live re-host / re-subscribe check
+    /// (`is_hosting_contract || contract_in_use`). It is evaluated only once we
+    /// have already taken `key` out of `my_contracts`; when it reports the
+    /// contract is wanted again the removal is undone and `None` is returned, so
+    /// no retraction goes on the wire and the retraction counter is not
+    /// incremented for a retraction that never happened.
+    ///
+    /// # Why remove-then-check, not check-then-remove
+    ///
+    /// A concurrent re-host runs `host_contract` (the hosting-cache insert that
+    /// makes `still_hosted` true) and only THEN
+    /// `operations::announce_contract_hosted` → [`Self::on_contract_hosted`].
+    /// Because our removal happens first, every interleaving lands advertised
+    /// iff the contract is hosted:
+    ///
+    /// - re-host insert lands before our check → we observe it, undo, stay
+    ///   advertised, and its later `on_contract_hosted` is the usual
+    ///   already-present no-op;
+    /// - re-host insert lands after our check → we retract, and its later
+    ///   `on_contract_hosted` finds `my_contracts` empty for the key, so it
+    ///   re-announces (the announce is one-shot per advertised interval, and we
+    ///   just ended that interval).
+    ///
+    /// Check-then-remove has no such ordering: the announce can fire between the
+    /// check and the removal, and the removal then silently deletes it, leaving
+    /// a hosted-but-unadvertised contract that the ~5-min full-set re-request
+    /// CANNOT heal (that exchange replays `my_contracts`, which is the thing
+    /// that is wrong).
+    pub fn on_contract_unhosted_unless_rehosted(
+        &self,
+        contract_key: &ContractKey,
+        still_hosted: impl FnOnce() -> bool,
+    ) -> Option<NeighborHostingMessage> {
+        let contract_id = *contract_key.id();
+        self.my_contracts.remove(&contract_id)?;
+        if still_hosted() {
+            // Re-host / re-subscribe raced us: put the advertisement back and
+            // emit nothing. Neighbors never observed the removal.
+            self.my_contracts.insert(contract_id);
+            trace!(
+                contract = %contract_key,
+                "NEIGHBOR_HOSTING: eviction retraction skipped — contract re-hosted \
+                 or back in use"
+            );
+            return None;
+        }
+        debug!(
+            contract = %contract_key,
+            "NEIGHBOR_HOSTING: Removed contract from locally hosted (retracting advertisement \
+             for an evicted contract)"
+        );
+        crate::config::GlobalTestMetrics::record_neighbor_hosting_retraction();
+        Some(NeighborHostingMessage::HostingAnnounce {
+            added: vec![],
+            removed: vec![contract_id],
+            is_response: false,
+        })
+    }
+
     /// Process an incoming neighbor hosting message from a neighbor.
     ///
     /// Returns a [`NeighborHostingResult`] containing an optional response message
@@ -1450,6 +1513,61 @@ mod tests {
         assert!(
             manager.on_contract_unhosted(&key).is_none(),
             "repeat unhost is a no-op (idempotent) — the retry path must not re-broadcast"
+        );
+    }
+
+    /// The eviction retraction (#5059) must retract when the contract really is
+    /// gone, and must leave the advertisement exactly as it found it when a
+    /// re-host raced the decision — including when the contract was never
+    /// advertised at all, where the guard must not even be consulted.
+    #[test]
+    fn on_contract_unhosted_unless_rehosted_retracts_only_when_still_unhosted() {
+        let manager = NeighborHostingManager::new();
+        let key = test_contract_key();
+
+        // Never advertised: nothing to retract, and the guard is irrelevant.
+        assert!(
+            manager
+                .on_contract_unhosted_unless_rehosted(&key, || panic!(
+                    "the re-host guard must not be consulted for an unadvertised contract"
+                ))
+                .is_none(),
+            "an unadvertised contract yields no retraction"
+        );
+
+        manager.on_contract_hosted(&key);
+        // Re-hosted since the eviction decision: undo, emit nothing, stay advertised.
+        assert!(
+            manager
+                .on_contract_unhosted_unless_rehosted(&key, || true)
+                .is_none(),
+            "a re-hosted contract must not be retracted"
+        );
+        assert!(
+            manager.is_hosted_locally(&key),
+            "the advertisement must be restored intact when the guard fires — a \
+             hosted-but-unadvertised contract is unreachable by fan-out and the \
+             periodic full-set re-request replays this same set, so it cannot heal"
+        );
+
+        // Genuinely gone: retract, naming this contract.
+        let retraction = manager
+            .on_contract_unhosted_unless_rehosted(&key, || false)
+            .expect("an evicted contract must be retracted");
+        assert!(
+            matches!(
+                &retraction,
+                NeighborHostingMessage::HostingAnnounce { removed, added, .. }
+                    if removed == &vec![*key.id()] && added.is_empty()
+            ),
+            "the retraction must name the evicted contract, and only it: {retraction:?}"
+        );
+        assert!(!manager.is_hosted_locally(&key));
+        assert!(
+            manager
+                .on_contract_unhosted_unless_rehosted(&key, || false)
+                .is_none(),
+            "idempotent — a pending-reclamation retry must not re-broadcast"
         );
     }
 }
