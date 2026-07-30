@@ -6972,32 +6972,72 @@ fn test_interest_renewal() {
 ///
 /// ## Test Design
 ///
-/// Uses a minimal network (1 gateway + 2 nodes) with few contracts to
-/// isolate the TTL refresh mechanism. Virtual time spans ~1.5x INTEREST_TTL
-/// (1800s) so that without the broadcast-send TTL refresh, interest entries
-/// would expire and late-phase broadcasts would stop arriving.
+/// Asserts that a quiet fan-out is quiet because peers are CONVERGED, not
+/// because their subscriptions silently died.
 ///
-/// The test splits broadcast-received events into three phases:
-/// - **Early** (first third): baseline broadcast delivery
-/// - **Mid** (second third): crosses the TTL boundary (~1200s)
-/// - **Late** (final third): must still receive broadcasts if TTL was refreshed
+/// ## Why this does NOT count broadcasts
 ///
-/// ## What This Catches
+/// It used to assert `late_broadcasts > 0`, using broadcast VOLUME as a proxy
+/// for interest liveness. That proxy is invalid: suppressing redundant sends to
+/// converged peers is the intended bandwidth win, so volume moves in the SAME
+/// direction as the improvement and cannot discriminate "interest expired"
+/// (the bug) from "peers converged, nothing to send" (the fix working). Once
+/// subscribe renewals stopped wiping the cached delta-sync summary, the
+/// converged-skip became reachable and late-phase volume legitimately went to
+/// zero — the assertion failed on a healthy network.
 ///
-/// - Missing `refresh_peer_interest()` call in broadcast send path (p2p_protoc.rs)
-/// - TTL expiration causing silent subscriber loss
-/// - Regression of the #3093 fix
+/// It therefore asserts the property directly, via the #3046
+/// `BroadcastDeliverySummary` counters, which separate the three reasons a peer
+/// receives nothing: skipped as converged, unresolvable interest, or failed
+/// send. `send_failed == 0` and `interest_resolve_failed == 0` say nothing was
+/// lost; `skipped_summary_match > 0` says peers still held matching cached
+/// summaries; ground-truth convergence with zero diverged contracts says the
+/// skips were correct.
+///
+/// ## What this does NOT cover: #3093
+///
+/// This test cannot detect a missing broadcast-path TTL refresh, and no
+/// assertion here could. `INTEREST_TTL` is DEFINED as four heartbeats
+/// (`ring/interest.rs`: `INTEREST_TTL = INTEREST_HEARTBEAT_INTERVAL * 4`), so
+/// wherever the ~5-minute InterestSync exchange covers a (contract, peer) pair
+/// it refreshes that entry four times per TTL window and the broadcast-path
+/// refresh is not what keeps it alive. Reverting BOTH refreshes (production
+/// `broadcast_queue.rs` and the sim-only `p2p_protoc/broadcast.rs`) leaves every
+/// counter in this scenario byte-identical.
+///
+/// #3093 is carried instead by:
+/// - `broadcast_to_single_peer_refreshes_interest_on_every_skip_pin`
+///   (`broadcast_queue.rs`) and
+///   `broadcast_state_to_peers_uses_semantic_delta_skip` (`p2p_protoc.rs`),
+///   which fail immediately on either revert; and
+/// - the `InterestManager` TTL unit tests in `ring/interest.rs`, which drive
+///   expiry directly against a mock `TimeSource`.
+///
+/// ## Scope: this is a correctness check, not a regression gate
+///
+/// Measured, not assumed: reverting the #5055 renewal guards moves the numbers
+/// (sent 60 -> 108, received 127 -> 218) but does NOT trip any assertion here —
+/// `skipped_summary_match` only falls 256 -> 208, so it stays positive. Every
+/// assertion below states a property that must hold on a healthy network
+/// (nothing lost, interests resolvable, replicas agreed, skip reachable); none
+/// is a tripwire for a specific regression, and a threshold tuned to make one
+/// would be a magic number that flakes with scenario drift.
+///
+/// The regressions are gated by mutation-proven source pins instead:
+/// `subscribe_finalizers_do_not_clobber_cached_summaries` and
+/// `get_interest_registration_does_not_clobber_or_downgrade` (`ring/interest.rs`)
+/// for the renewal clobber, and the two broadcast pins above for #3093.
+///
+/// Do not "restore" a broadcast-count assertion here: it would fail on a
+/// healthy converged network and still not detect an expired interest.
 ///
 /// ## Related
 ///
-/// - Issue #3093: Interest TTL not refreshed on full-state broadcast
-/// - Issue #3107: Add isolated integration test (this test)
-/// - Issue #3141: CI & Testing Redesign
-/// - `test_interest_renewal`: Scale test covering the same mechanism
+/// - #3093 / #3107: the original TTL-refresh regression and this test
+/// - #5055: the renewal clobber, and why the volume proxy stopped working
 ///
-/// Uses `run_direct()` (paused-time single-thread runtime) for efficiency.
-/// Virtual time: 300 iterations × 6s = 1800s (~1.5× INTEREST_TTL).
-/// Wall clock: typically < 15s.
+/// Uses `run_direct()` (paused-time single-thread runtime). Virtual time:
+/// 300 iterations x 6s = 1800s (~1.5x INTEREST_TTL). Wall clock: < 15s.
 #[test_log::test]
 fn test_interest_ttl_refresh_on_broadcast() {
     const SEED: u64 = 0x3107_0BCA_0001;
@@ -7015,93 +7055,105 @@ fn test_interest_ttl_refresh_on_broadcast() {
         .run_direct()
         .assert_ok();
 
-    // Analyze broadcast-received events across three phases of virtual time.
-    // The TTL boundary is at ~1200s (INTEREST_TTL). If refresh is working,
-    // broadcasts should continue in the late phase (1200s-1800s).
-    let rt = create_runtime();
-    let (early_broadcasts, mid_broadcasts, late_broadcasts) = rt.block_on(async {
-        let logs = result.logs_handle.lock().await;
-        let log_count = logs.len();
-        let third = log_count / 3;
+    // Ground truth first: every replica agreed at the end of the run. This is
+    // what makes a quiet fan-out attributable to convergence rather than to
+    // lost delivery — "no broadcasts" plus "states agree" is the bandwidth win;
+    // "no broadcasts" plus divergence would be the bug.
+    assert!(
+        result.convergence.diverged.is_empty(),
+        "contracts diverged, so a quiet fan-out cannot be attributed to \
+         convergence: {:?}. Seed: 0x{:X}",
+        result.convergence.diverged,
+        SEED
+    );
 
-        let mut early = 0usize;
-        let mut mid = 0usize;
-        let mut late = 0usize;
-        for (i, log) in logs.iter().enumerate() {
+    // Read the #3046 delivery breakdown, which distinguishes the three reasons
+    // a peer got nothing: we skipped it (converged), we never resolved it
+    // (interest gone), or the send failed. Broadcast COUNTS cannot tell those
+    // apart; these counters are the whole point of the event.
+    fn field(dbg: &str, name: &str) -> Option<usize> {
+        let pat = format!("{name}: ");
+        let i = dbg.find(&pat)? + pat.len();
+        let rest = &dbg[i..];
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        rest[..end].parse().ok()
+    }
+
+    let rt = create_runtime();
+    let (received, summaries, sent, skipped, send_failed, interest_failed) = rt.block_on(async {
+        let logs = result.logs_handle.lock().await;
+        let (mut recv, mut n, mut sent, mut skip, mut failed, mut ifailed) =
+            (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        for log in logs.iter() {
             if log.kind.is_update_broadcast_received() {
-                if i < third {
-                    early += 1;
-                } else if i < third * 2 {
-                    mid += 1;
-                } else {
-                    late += 1;
-                }
+                recv += 1;
+            }
+            let dbg = format!("{:?}", log.kind);
+            if dbg.contains("BroadcastDeliverySummary") {
+                n += 1;
+                sent += field(&dbg, "targets_sent").unwrap_or(0);
+                skip += field(&dbg, "skipped_summary_match").unwrap_or(0);
+                failed += field(&dbg, "send_failed").unwrap_or(0);
+                ifailed += field(&dbg, "interest_resolve_failed").unwrap_or(0);
             }
         }
-        (early, mid, late)
+        (recv, n, sent, skip, failed, ifailed)
     });
 
-    let total = early_broadcasts + mid_broadcasts + late_broadcasts;
     tracing::info!(
-        "Broadcast received events: {} total (early: {}, mid: {}, late: {})",
-        total,
-        early_broadcasts,
-        mid_broadcasts,
-        late_broadcasts
+        "fan-out over the run: {} delivery summaries, {} targets sent, {} skipped \
+         (summary match), {} send failures, {} interest-resolve failures, {} broadcasts received",
+        summaries,
+        sent,
+        skipped,
+        send_failed,
+        interest_failed,
+        received
     );
 
-    // Must have some broadcasts overall — otherwise the simulation didn't
-    // generate enough update activity to be meaningful.
+    // The simulation must actually have exercised the fan-out; otherwise every
+    // assertion below is vacuous.
     assert!(
-        total > 0,
-        "No BroadcastReceived events found in {} logged events — \
-         simulation may not be generating updates. Seed: 0x{:X}",
-        result.event_count,
-        SEED
+        summaries > 0 && received > 0,
+        "no fan-out activity ({summaries} delivery summaries, {received} broadcasts \
+         received) — the scenario stopped generating updates, so this test proves \
+         nothing. Seed: 0x{SEED:X}"
     );
 
-    // CRITICAL: Late-phase broadcasts must exist. If the TTL refresh on
-    // broadcast send is missing (regression of #3093), interest entries
-    // expire at ~1200s and no broadcasts are delivered after that point.
+    // Nothing was LOST. A converged peer receiving nothing is correct; a send
+    // that was attempted and failed is not, and the two are indistinguishable
+    // in a broadcast count.
+    assert_eq!(
+        send_failed, 0,
+        "{send_failed} broadcast sends FAILED — peers were meant to receive \
+         these and did not. Seed: 0x{SEED:X}"
+    );
+    assert_eq!(
+        interest_failed, 0,
+        "{interest_failed} fan-out targets could not be resolved to an interest \
+         entry. Seed: 0x{SEED:X}"
+    );
+
+    // The converged-skip demonstrably fired: peers still had CACHED SUMMARIES
+    // that matched ours. That is the positive evidence that quiet means
+    // converged. It also guards this PR's own change — if a subscribe renewal
+    // wiped the cached summary again, `theirs` would be absent, the skip could
+    // not fire, and this count would collapse toward zero.
     assert!(
-        late_broadcasts > 0,
-        "No BroadcastReceived events in the final third of simulation \
-         (after INTEREST_TTL boundary). Interest TTL is NOT being refreshed \
-         on broadcast send — subscriptions have silently expired. \
-         See #3093, #3107. Seed: 0x{:X}",
-        SEED
-    );
-
-    // The late/early ratio should be meaningful — at least 10% of early
-    // traffic. A drastic drop indicates partial TTL refresh failure.
-    let late_ratio = late_broadcasts as f64 / early_broadcasts.max(1) as f64;
-    tracing::info!(
-        "Late/early broadcast ratio: {:.2} ({}/{})",
-        late_ratio,
-        late_broadcasts,
-        early_broadcasts
-    );
-
-    assert!(
-        late_ratio > 0.1,
-        "Late broadcast ratio ({:.2}) dropped below 0.1 — \
-         interest TTL refresh may be partially broken. \
-         Early: {}, Mid: {}, Late: {}. See #3093, #3107. Seed: 0x{:X}",
-        late_ratio,
-        early_broadcasts,
-        mid_broadcasts,
-        late_broadcasts,
-        SEED
+        skipped > 0,
+        "the converged-skip never fired ({skipped} skips over {summaries} \
+         fan-outs). Either no peer had a cached summary — the renewal clobber \
+         this PR fixes — or the skip is not reachable. Seed: 0x{SEED:X}"
     );
 
     tracing::info!(
-        "test_interest_ttl_refresh_on_broadcast PASSED: late/early ratio {:.2}, \
-         total broadcasts: {} (early: {}, mid: {}, late: {})",
-        late_ratio,
-        total,
-        early_broadcasts,
-        mid_broadcasts,
-        late_broadcasts
+        "test_interest_ttl_refresh_on_broadcast PASSED: {} sent, {} skipped as \
+         converged, 0 failed, {} contracts converged with 0 diverged",
+        sent,
+        skipped,
+        result.convergence.converged.len()
     );
 }
 
