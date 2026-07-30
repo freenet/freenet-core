@@ -1392,6 +1392,21 @@ pub struct SimNetwork {
     /// untouched: `NodeConfig::new` sets this to `None`, which resolves to
     /// the real `SUMMARY_FIRST_PUT_MIN_VERSION`.
     summary_first_put_floor_override: Option<(u8, u8, u16)>,
+    /// Per-node hash-first summary version-floor override (#4965, see
+    /// [`SimNetwork::enable_hash_first_summaries`]).
+    ///
+    /// **Defaults to `Some(SIM_MIGRATION_ENABLED_FLOOR)` — ON — which is the
+    /// OPPOSITE of the two overrides above.** They gate behavioural cascades
+    /// that pile load onto unrelated sims, so they fail closed. Hash-first
+    /// only changes the ENCODING of the `Summaries` exchange that already
+    /// runs in every sim, with identical convergence semantics, so ON by
+    /// default costs unrelated sims nothing — and it is the only way the
+    /// suite exercises the new wire path before the release that lifts the
+    /// crate version over the production floor. Without it the first
+    /// integration-level run of a Full-tier protocol change would be the
+    /// release PR, where a red sim could not be attributed between the
+    /// feature and the version bump.
+    hash_first_summaries_floor_override: Option<(u8, u8, u16)>,
     /// Optional controllable hosting clock injected into every node's
     /// `HostingManager` (via `NodeConfig::hosting_time_source_override`). When
     /// set, hosting-cache TTL and subscription-lease eviction advance ONLY when
@@ -1585,6 +1600,12 @@ impl SimNetwork {
             // `subscribe_hint_floor_override` above: summary-first PUT is
             // genuinely opt-in per sim via `enable_summary_first_put`.
             summary_first_put_floor_override: Some(Self::SIM_MIGRATION_DISABLED_FLOOR),
+            // Fail-OPEN by default, deliberately unlike the two above (#4965).
+            // See the field's rustdoc: hash-first is an encoding change, not a
+            // load-bearing cascade, and defaulting it ON is what gives a
+            // version-gated wire change simulation coverage BEFORE the release
+            // that lifts the crate version past its floor.
+            hash_first_summaries_floor_override: Some(Self::SIM_MIGRATION_ENABLED_FLOOR),
             hosting_clock: None,
             hosting_budget_override: None,
             shared_rings: HashMap::new(),
@@ -1914,6 +1935,49 @@ impl SimNetwork {
         }
         for (builder, _) in self.nodes.iter_mut() {
             builder.config.summary_first_put_floor_override = floor;
+        }
+        self
+    }
+
+    /// State explicitly that this simulation exercises the hash-first summary
+    /// exchange (#4965) by pinning the per-node floor to the always-passing
+    /// [`Self::SIM_MIGRATION_ENABLED_FLOOR`].
+    ///
+    /// This is ALREADY the default for every `SimNetwork` (see `new_inner`),
+    /// so calling it changes nothing — it exists so a test whose premise
+    /// depends on hash-first being on says so at the call site instead of
+    /// relying on a default that a future edit could flip out from under it.
+    /// Mirrors [`disable_summary_first_put`](Self::disable_summary_first_put)'s
+    /// belt-and-suspenders rationale, in the opposite direction.
+    #[allow(dead_code)]
+    pub fn enable_hash_first_summaries(&mut self) -> &mut Self {
+        let floor = Some(Self::SIM_MIGRATION_ENABLED_FLOOR);
+        self.hash_first_summaries_floor_override = floor;
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.hash_first_summaries_floor_override = floor;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.hash_first_summaries_floor_override = floor;
+        }
+        self
+    }
+
+    /// Force the hash-first summary exchange OFF for this simulation by
+    /// pinning the per-node floor to the unreachable
+    /// [`Self::SIM_MIGRATION_DISABLED_FLOOR`], so every peer falls back to the
+    /// full-bytes `InterestMessage::Summaries`.
+    ///
+    /// This is the PRE-0.2.116 fleet: it reproduces what an un-upgraded peer
+    /// does, which is what makes a mixed-version interop test possible at all.
+    #[allow(dead_code)]
+    pub fn disable_hash_first_summaries(&mut self) -> &mut Self {
+        let floor = Some(Self::SIM_MIGRATION_DISABLED_FLOOR);
+        self.hash_first_summaries_floor_override = floor;
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.hash_first_summaries_floor_override = floor;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.hash_first_summaries_floor_override = floor;
         }
         self
     }
@@ -2570,6 +2634,7 @@ impl SimNetwork {
             config.governance_config_override = self.governance_config_override.clone();
             config.subscribe_hint_floor_override = self.subscribe_hint_floor_override;
             config.summary_first_put_floor_override = self.summary_first_put_floor_override;
+            config.hash_first_summaries_floor_override = self.hash_first_summaries_floor_override;
             config.hosting_time_source_override = self
                 .hosting_clock
                 .clone()
@@ -2670,6 +2735,7 @@ impl SimNetwork {
             config.governance_config_override = self.governance_config_override.clone();
             config.subscribe_hint_floor_override = self.subscribe_hint_floor_override;
             config.summary_first_put_floor_override = self.summary_first_put_floor_override;
+            config.hash_first_summaries_floor_override = self.hash_first_summaries_floor_override;
             config.hosting_time_source_override = self
                 .hosting_clock
                 .clone()

@@ -480,6 +480,13 @@ pub(crate) struct ConnectionManager {
     /// `Some(floor)` only in a sim test that opted in via
     /// `SimNetwork::enable_summary_first_put`. See `NodeConfig`.
     summary_first_put_floor_override: Option<(u8, u8, u16)>,
+    /// Test-only override for the hash-first summary version floor (#4965),
+    /// threaded exactly like `summary_first_put_floor_override`. `None` in
+    /// production (the real `HASH_FIRST_SUMMARIES_MIN_VERSION` applies).
+    /// Simulations default it to an always-passing floor so the suite
+    /// exercises the hash-first path before the crate version reaches the
+    /// production floor. See `NodeConfig`.
+    hash_first_summaries_floor_override: Option<(u8, u8, u16)>,
     /// Rotating start offset for the per-new-peer migration scan. The scan
     /// examines at most `MIGRATION_SCAN_CAP_PER_NEW_PEER` hosted contracts per
     /// event; advancing this cursor each event makes successive events cover
@@ -610,6 +617,7 @@ impl ConnectionManager {
         // sim opted into the migration cascade.
         cm.subscribe_hint_floor_override = config.subscribe_hint_floor_override;
         cm.summary_first_put_floor_override = config.summary_first_put_floor_override;
+        cm.hash_first_summaries_floor_override = config.hash_first_summaries_floor_override;
         cm
     }
 
@@ -646,6 +654,7 @@ impl ConnectionManager {
             remote_version: Arc::new(RwLock::new(BTreeMap::new())),
             // Default off; `new(config)` overrides from config after init.
             summary_first_put_floor_override: None,
+            hash_first_summaries_floor_override: None,
             migration_scan_cursor: Arc::new(AtomicUsize::new(0)),
             transient_connections: Arc::new(DashMap::new()),
             transient_in_use: Arc::new(AtomicUsize::new(0)),
@@ -1396,18 +1405,24 @@ impl ConnectionManager {
     /// existing full-bytes `InterestMessage::Summaries`, so failing closed
     /// costs bandwidth, never convergence.
     ///
-    /// Deliberately has NO floor override: the gate that actually binds is
-    /// `remote_version`, which is only ever populated by the real transport
-    /// handshake (`p2p_protoc::connection_lifecycle`). An override would not
-    /// make the feature reachable anywhere the handshake does not run, so it
-    /// would be dead configuration. The receive-side handlers are unit-tested
-    /// directly against a `ConnectionManager` seeded with
-    /// [`Self::record_remote_version`] — the production mechanism.
+    /// Honours `NodeConfig::hash_first_summaries_floor_override` exactly like
+    /// [`Self::supports_summary_first_put`] does. Simulations run the real
+    /// transport handshake, so `remote_version` IS populated there (with the
+    /// crate version) — which is what makes the override load-bearing rather
+    /// than decorative: it is the only way the simulation suite can exercise
+    /// this path before the release that lifts the crate version over the
+    /// production floor.
+    ///
+    /// Note the asymmetry a sim test must respect: a connection carries the
+    /// version of the peer that introduced itself over it, so only one
+    /// DIRECTION of a sim peer pair may have a known version. A test that
+    /// picks the wrong direction gets `None`, fails closed, and silently
+    /// exercises the fallback instead of the feature.
     pub(crate) fn supports_hash_first_summaries(&self, addr: SocketAddr) -> bool {
-        crate::node::version_supports_hash_first_summaries(
-            self.remote_version(addr),
-            crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION,
-        )
+        let floor = self
+            .hash_first_summaries_floor_override
+            .unwrap_or(crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION);
+        crate::node::version_supports_hash_first_summaries(self.remote_version(addr), floor)
     }
 
     /// Reserve the next `window`-sized slice of the hosting set for a migration

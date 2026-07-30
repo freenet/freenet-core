@@ -3641,6 +3641,13 @@ std::thread_local! {
     static GLOBAL_RESYNC_RESPONSES_SUPPRESSED_PER_PEER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_RESYNC_RESPONSES_SUPPRESSED_GLOBAL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_RESYNC_RESPONSES_UNSOLICITED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // Hash-first summary exchange falsifiers (#4965). See the `record_*`
+    // rustdoc on `GlobalTestMetrics` for what each one proves.
+    static GLOBAL_SUMMARY_DIGEST_MSGS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_SUMMARY_FULL_MSGS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_SUMMARY_FULL_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_SUMMARY_DIGEST_AGREEMENTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_SUMMARY_BYTE_REQUESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Global test metrics for tracking events across the simulation network.
@@ -3689,6 +3696,11 @@ impl GlobalTestMetrics {
         GLOBAL_RESYNC_RESPONSES_SUPPRESSED_PER_PEER.with(|c| c.set(0));
         GLOBAL_RESYNC_RESPONSES_SUPPRESSED_GLOBAL.with(|c| c.set(0));
         GLOBAL_RESYNC_RESPONSES_UNSOLICITED.with(|c| c.set(0));
+        GLOBAL_SUMMARY_DIGEST_MSGS.with(|c| c.set(0));
+        GLOBAL_SUMMARY_FULL_MSGS.with(|c| c.set(0));
+        GLOBAL_SUMMARY_FULL_BYTES.with(|c| c.set(0));
+        GLOBAL_SUMMARY_DIGEST_AGREEMENTS.with(|c| c.set(0));
+        GLOBAL_SUMMARY_BYTE_REQUESTS.with(|c| c.set(0));
     }
 
     /// Records that a ResyncRequest was received.
@@ -3934,6 +3946,62 @@ impl GlobalTestMetrics {
 
     pub fn put_probe_existing_mesh_delta_bytes() -> u64 {
         GLOBAL_PUT_PROBE_EXISTING_MESH_DELTA_BYTES.with(|c| c.get())
+    }
+
+    // === Hash-first summary exchange falsifiers (#4965) ===
+    //
+    // The claim under test is "the common case stops shipping summary bytes".
+    // These counters are fed from the FOUR sites that can construct a
+    // `Summaries`/`SummaryDigests` message — `node::summaries_reply_for_peer`,
+    // the `SummaryRequest` reply arm, and the two `operations::update`
+    // helpers — so `summary_full_bytes() == 0` means no summary byte was put
+    // on the wire by any path, not merely by the one a test happened to
+    // exercise. `hash_first_send_sites_are_all_instrumented` pins the set.
+
+    /// A hash-first `SummaryDigests` message was emitted, advertising
+    /// contracts without their summaries.
+    pub fn record_summary_digest_msg() {
+        GLOBAL_SUMMARY_DIGEST_MSGS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// A full-bytes `Summaries` message was emitted: either the pre-floor
+    /// fallback, or the answer to a `SummaryRequest`. `bytes` is the total
+    /// summary payload it carries — the quantity hash-first exists to avoid.
+    pub fn record_summary_full_msg(bytes: u64) {
+        GLOBAL_SUMMARY_FULL_MSGS.with(|c| c.set(c.get() + 1));
+        GLOBAL_SUMMARY_FULL_BYTES.with(|c| c.set(c.get() + bytes));
+    }
+
+    /// One advertised digest matched our own summary, settling that contract
+    /// with zero summary bytes exchanged. This is the 98.1% case.
+    pub fn record_summary_digest_agreement() {
+        GLOBAL_SUMMARY_DIGEST_AGREEMENTS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// A digest could not settle some contracts, so their bytes were
+    /// requested. Non-zero means the mismatch path ran.
+    pub fn record_summary_byte_request() {
+        GLOBAL_SUMMARY_BYTE_REQUESTS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub fn summary_digest_msgs() -> u64 {
+        GLOBAL_SUMMARY_DIGEST_MSGS.with(|c| c.get())
+    }
+
+    pub fn summary_full_msgs() -> u64 {
+        GLOBAL_SUMMARY_FULL_MSGS.with(|c| c.get())
+    }
+
+    pub fn summary_full_bytes() -> u64 {
+        GLOBAL_SUMMARY_FULL_BYTES.with(|c| c.get())
+    }
+
+    pub fn summary_digest_agreements() -> u64 {
+        GLOBAL_SUMMARY_DIGEST_AGREEMENTS.with(|c| c.get())
+    }
+
+    pub fn summary_byte_requests() -> u64 {
+        GLOBAL_SUMMARY_BYTE_REQUESTS.with(|c| c.get())
     }
 }
 

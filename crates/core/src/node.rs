@@ -363,6 +363,38 @@ pub struct NodeConfig {
     /// `#[serde(skip)]`; never serialized.
     #[serde(skip)]
     pub(crate) summary_first_put_floor_override: Option<(u8, u8, u16)>,
+    /// Test-only override for the hash-first summary version floor
+    /// (`HASH_FIRST_SUMMARIES_MIN_VERSION`, #4965). Threaded exactly like the
+    /// two overrides above and consulted as
+    /// `hash_first_summaries_floor_override().unwrap_or(HASH_FIRST_SUMMARIES_MIN_VERSION)`
+    /// by `ConnectionManager::supports_hash_first_summaries`.
+    ///
+    /// In production this is `None` → the real `(0, 2, 116)` floor (untouched).
+    ///
+    /// **Simulations default this to `SIM_MIGRATION_ENABLED_FLOOR` — ON — which
+    /// is the OPPOSITE of the two overrides above.** The deviation is
+    /// deliberate and is the whole reason this field exists. Those two gate
+    /// behavioural *cascades* (extra directed subscribes, extra probes) that
+    /// pile load onto unrelated sims, so they fail closed. Hash-first changes
+    /// only the ENCODING of an exchange that already runs in every sim, with
+    /// identical convergence semantics — so defaulting it ON costs unrelated
+    /// sims nothing and buys the one thing a version-gated wire change
+    /// otherwise cannot get: the whole simulation suite exercising the new
+    /// path BEFORE the release that lifts the crate version over the floor.
+    /// Without it, the first integration-level run of this code would be the
+    /// release PR itself, where a red sim could not be attributed between the
+    /// feature and the version bump.
+    ///
+    /// `SimNetwork::disable_hash_first_summaries` pins it OFF for a test that
+    /// needs the pre-0.2.116 fallback (mixed-version interop), and
+    /// `enable_hash_first_summaries` states the default explicitly at a call
+    /// site that depends on it.
+    ///
+    /// Not cfg-gated for the same reason as `subscribe_hint_floor_override`:
+    /// `node::testing_impl` sets it and is compiled unconditionally.
+    /// `#[serde(skip)]`; never serialized.
+    #[serde(skip)]
+    pub(crate) hash_first_summaries_floor_override: Option<(u8, u8, u16)>,
     /// Test-only harness flag: when set, a startup-hosted contract
     /// (`SeedHostedContract`, i.e. `append_contracts` with `subscription =
     /// true`) is registered in the neighbor-hosting advertised set so the
@@ -529,6 +561,7 @@ impl NodeConfig {
             governance_config_override: None,
             subscribe_hint_floor_override: None,
             summary_first_put_floor_override: None,
+            hash_first_summaries_floor_override: None,
             advertise_seeded_hosts: false,
             hosting_time_source_override: None,
         })
@@ -2692,13 +2725,41 @@ pub(crate) fn summaries_reply_for_peer(
         .connection_manager
         .supports_hash_first_summaries(target)
     {
+        crate::config::GlobalTestMetrics::record_summary_digest_msg();
         InterestMessage::SummaryDigests {
             entries: entries.iter().map(SummaryDigestEntry::from_entry).collect(),
             emitter,
         }
     } else {
-        InterestMessage::Summaries { entries, emitter }
+        full_summaries_message(entries, emitter)
     }
+}
+
+/// Build a full-bytes [`InterestMessage::Summaries`] and record the summary
+/// payload it puts on the wire (#4965).
+///
+/// **This is the only way production code may construct a `Summaries`**, and
+/// `no_uninstrumented_full_summaries_construction` pins that. The falsifier
+/// for this whole change is "`summary_full_bytes() == 0` means not one summary
+/// byte was sent"; a construction site that bypassed the counter would make
+/// that reading silently false rather than merely untested. Taking the
+/// recording inside the constructor makes the bypass unrepresentable instead
+/// of discouraged — the same reasoning that moved the per-message dedup inside
+/// `record_summary_comparison`.
+pub(crate) fn full_summaries_message(
+    entries: Vec<crate::message::SummaryEntry>,
+    emitter: crate::message::SummariesEmitter,
+) -> crate::message::InterestMessage {
+    // Only the summaries themselves, not the enclosing bincode framing: the
+    // framing is the same handful of bytes in both wire forms, and including
+    // it would blur the one number the falsifier rests on.
+    let payload_bytes: u64 = entries
+        .iter()
+        .filter_map(|e| e.summary_bytes.as_ref())
+        .map(|b| b.len() as u64)
+        .sum();
+    crate::config::GlobalTestMetrics::record_summary_full_msg(payload_bytes);
+    crate::message::InterestMessage::Summaries { entries, emitter }
 }
 
 /// Emit targeted `SyncStateToPeer` heals for the contracts on which `source`
@@ -3251,6 +3312,7 @@ async fn handle_interest_sync_message(
                                     ours.as_ref(),
                                     &mut compared_contracts,
                                 );
+                                crate::config::GlobalTestMetrics::record_summary_digest_agreement();
                                 // `None` delta verdict: there is nothing to
                                 // probe. `summary_indicates_stale_peer` sees
                                 // byte-equal summaries and never reaches the
@@ -3314,6 +3376,7 @@ async fn handle_interest_sync_message(
                 // contract and not one summary byte crossed the wire.
                 None
             } else {
+                crate::config::GlobalTestMetrics::record_summary_byte_request();
                 Some(InterestMessage::SummaryRequest {
                     hashes: request_hashes,
                 })
@@ -3374,10 +3437,10 @@ async fn handle_interest_sync_message(
                 // than replaces, so it gets its own emitter arm — folded into
                 // the heartbeat reply it would look like the heartbeat failing
                 // to shrink, when it is the mismatch tail doing its job.
-                Some(InterestMessage::Summaries {
+                Some(full_summaries_message(
                     entries,
-                    emitter: SummariesEmitter::SummaryRequestReply,
-                })
+                    SummariesEmitter::SummaryRequestReply,
+                ))
             }
         }
 
@@ -8540,6 +8603,100 @@ mod tests {
             }
         }
 
+        /// Source pin: production code must never construct
+        /// `InterestMessage::Summaries` directly — only through
+        /// [`full_summaries_message`], which records the summary bytes it puts
+        /// on the wire.
+        ///
+        /// The whole #4965 falsifier is the reading "`summary_full_bytes() == 0`
+        /// means not one summary byte was sent". A construction site that
+        /// bypassed the constructor would not make that reading untested — it
+        /// would make it FALSE, while every test in this PR stayed green. The
+        /// counter is the only thing standing between "we measured the win" and
+        /// "we assumed it".
+        ///
+        /// Scoped to the production halves of the two files that build these
+        /// messages, cut at their test modules so the test fixtures below
+        /// (which legitimately build `Summaries` by hand to feed the handler)
+        /// do not trip it.
+        #[test]
+        fn no_uninstrumented_full_summaries_construction() {
+            // `node.rs`'s FIRST `#[cfg(test)]` is near the top of the file, so
+            // cutting there would truncate the production code this pin exists
+            // to scan and pass vacuously. Cut at the outer `mod tests` instead.
+            let node_src = include_str!("node.rs");
+            let node_prod = &node_src[..node_src
+                .find("\n#[cfg(test)]\nmod tests {")
+                .expect("node.rs outer test module not found")];
+            assert!(
+                node_prod.contains("fn handle_interest_sync_message("),
+                "the production slice must actually contain the handler — if \
+                 this fails the cut point moved and the scan below is vacuous"
+            );
+
+            let update_src = include_str!("operations/update.rs");
+            let update_prod = &update_src[..update_src
+                .find("\n#[cfg(test)]")
+                .unwrap_or(update_src.len())];
+
+            // The constructor itself is the one legitimate construction site.
+            let ctor = node_prod
+                .find("pub(crate) fn full_summaries_message(")
+                .expect("full_summaries_message constructor not found");
+            let ctor_end = ctor
+                + node_prod[ctor..]
+                    .find("\n}\n")
+                    .expect("constructor body end not found");
+
+            for (name, src, allowed) in [
+                ("node.rs", node_prod, Some((ctor, ctor_end))),
+                ("operations/update.rs", update_prod, None),
+            ] {
+                let needle = concat!("InterestMessage::Summaries", " {");
+                let mut from = 0usize;
+                let mut constructions = 0usize;
+                while let Some(off) = src[from..].find(needle) {
+                    let at = from + off;
+                    from = at + needle.len();
+
+                    // Skip MATCH PATTERNS. `InterestMessage::Summaries { .. }`
+                    // reads identically whether it destructures or constructs,
+                    // and the handler necessarily matches on it. A pattern is
+                    // followed by `=>` after its closing brace; a construction
+                    // is not.
+                    let Some(close) = src[at..].find('}') else {
+                        continue;
+                    };
+                    let after = src[at + close + 1..].trim_start();
+                    if after.starts_with("=>") {
+                        continue;
+                    }
+
+                    constructions += 1;
+                    let inside_ctor = allowed.is_some_and(|(a, b)| at >= a && at <= b);
+                    assert!(
+                        inside_ctor,
+                        "{name} constructs `InterestMessage::Summaries` outside \
+                         `full_summaries_message` (byte offset {at}). Route it \
+                         through the constructor: an uninstrumented site makes \
+                         `summary_full_bytes() == 0` mean nothing, silently."
+                    );
+                }
+
+                // Positive control: node.rs MUST contain the one legitimate
+                // construction. Without this the scan passes vacuously if the
+                // needle or the pattern-skip ever stops matching anything.
+                if allowed.is_some() {
+                    assert_eq!(
+                        constructions, 1,
+                        "expected exactly one `InterestMessage::Summaries` \
+                         construction in {name} (inside full_summaries_message); \
+                         found {constructions}. Zero means this scan is vacuous."
+                    );
+                }
+            }
+        }
+
         /// Source pin: the `SummaryRequest` arm must build its reply as a plain
         /// `InterestMessage::Summaries`, NEVER through
         /// `summaries_reply_for_peer`.
@@ -8568,9 +8725,10 @@ mod tests {
                  contain its get_matching_contracts lookup"
             );
             assert!(
-                body.contains("Some(InterestMessage::Summaries { entries })"),
-                "the SummaryRequest arm must reply with a plain full-bytes \
-                 Summaries"
+                body.contains("full_summaries_message(entries)"),
+                "the SummaryRequest arm must reply through \
+                 full_summaries_message — the instrumented full-bytes \
+                 constructor"
             );
             assert!(
                 !body.contains("summaries_reply_for_peer"),
