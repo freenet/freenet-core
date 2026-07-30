@@ -307,6 +307,23 @@ impl ConfigArgs {
         if !dir.exists() {
             return Ok(None);
         }
+
+        // Prefer an exact `config.toml` / `config.json` match over any other
+        // `config*` name (e.g. `config.bak.toml`).  The non-deterministic
+        // directory iteration order of `read_dir` means the old single-pass
+        // `find_map` could silently pick up a backup file instead of the real
+        // config.  (Issue #5038)
+        const EXACT_NAMES: &[&str] = &["config.toml", "config.json"];
+        for name in EXACT_NAMES {
+            let path = dir.join(name);
+            if path.is_file() {
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                tracing::debug!(path = ?path, "Found exact configuration file");
+                return Self::parse_config_file(&path, ext);
+            }
+        }
+
+        // Fall back to the original fuzzy match for non-standard names.
         let mut read_dir = std::fs::read_dir(dir)?;
         let config_args: Option<(String, String)> = read_dir.find_map(|e| {
             if let Ok(e) = e {
@@ -319,7 +336,7 @@ impl ConfigArgs {
                     if filename.starts_with("config") {
                         match ext.as_str() {
                             "toml" => {
-                                tracing::debug!(filename = %filename, "Found configuration file");
+                                tracing::debug!(filename = %filename, "Found configuration file (fuzzy)");
                                 return Some((filename, ext));
                             }
                             "json" => {
@@ -337,41 +354,46 @@ impl ConfigArgs {
         match config_args {
             Some((filename, ext)) => {
                 let path = dir.join(filename).with_extension(&ext);
-                tracing::debug!(path = ?path, "Reading configuration file");
-                match ext.as_str() {
-                    "toml" => {
-                        let mut file = File::open(&path)?;
-                        let mut content = String::new();
-                        file.read_to_string(&mut content)?;
-                        let mut config = toml::from_str::<Config>(&content).map_err(|e| {
-                            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-                        })?;
-                        let secrets = Self::read_secrets(
-                            config.secrets.transport_keypair_path.clone(),
-                            config.secrets.nonce_path.clone(),
-                            config.secrets.cipher_path.clone(),
-                        )?;
-                        config.secrets = secrets;
-                        Ok(Some(config))
-                    }
-                    "json" => {
-                        let mut file = File::open(&path)?;
-                        let mut config = serde_json::from_reader::<_, Config>(&mut file)?;
-                        let secrets = Self::read_secrets(
-                            config.secrets.transport_keypair_path.clone(),
-                            config.secrets.nonce_path.clone(),
-                            config.secrets.cipher_path.clone(),
-                        )?;
-                        config.secrets = secrets;
-                        Ok(Some(config))
-                    }
-                    ext => Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("Invalid configuration file extension: {ext}"),
-                    )),
-                }
+                Self::parse_config_file(&path, &ext)
             }
             None => Ok(None),
+        }
+    }
+
+    /// Parse a configuration file at the given path with the given extension.
+    fn parse_config_file(path: &Path, ext: &str) -> std::io::Result<Option<Config>> {
+        tracing::debug!(path = ?path, "Reading configuration file");
+        match ext {
+            "toml" => {
+                let mut file = File::open(path)?;
+                let mut content = String::new();
+                file.read_to_string(&mut content)?;
+                let mut config = toml::from_str::<Config>(&content).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                })?;
+                let secrets = Self::read_secrets(
+                    config.secrets.transport_keypair_path.clone(),
+                    config.secrets.nonce_path.clone(),
+                    config.secrets.cipher_path.clone(),
+                )?;
+                config.secrets = secrets;
+                Ok(Some(config))
+            }
+            "json" => {
+                let mut file = File::open(path)?;
+                let mut config = serde_json::from_reader::<_, Config>(&mut file)?;
+                let secrets = Self::read_secrets(
+                    config.secrets.transport_keypair_path.clone(),
+                    config.secrets.nonce_path.clone(),
+                    config.secrets.cipher_path.clone(),
+                )?;
+                config.secrets = secrets;
+                Ok(Some(config))
+            }
+            ext => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Invalid configuration file extension: {ext}"),
+            )),
         }
     }
 
