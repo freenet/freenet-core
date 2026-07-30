@@ -2602,7 +2602,7 @@ async fn handle_interest_sync_message(
     source: std::net::SocketAddr,
     message: crate::message::InterestMessage,
 ) -> Option<crate::message::InterestMessage> {
-    use crate::message::{InterestMessage, SummaryEntry};
+    use crate::message::{InterestMessage, SummariesEmitter, SummaryEntry};
     use crate::ring::interest::contract_hash;
 
     match message {
@@ -2697,11 +2697,17 @@ async fn handle_interest_sync_message(
             if entries.is_empty() {
                 None
             } else {
-                Some(InterestMessage::Summaries { entries })
+                Some(InterestMessage::Summaries {
+                    entries,
+                    // #5052: the heartbeat reply — MULTI-entry, one per shared
+                    // advertised contract, on every `Interests` received. This
+                    // is the emitter hash-first (#4965) would change.
+                    emitter: SummariesEmitter::InterestsReply,
+                })
             }
         }
 
-        InterestMessage::Summaries { entries } => {
+        InterestMessage::Summaries { entries, .. } => {
             tracing::debug!(
                 from = %source,
                 entry_count = entries.len(),
@@ -3104,7 +3110,15 @@ async fn handle_interest_sync_message(
             if entries.is_empty() {
                 None
             } else {
-                Some(InterestMessage::Summaries { entries })
+                Some(InterestMessage::Summaries {
+                    entries,
+                    // #5052: also multi-entry and also built by
+                    // `summary_if_hosted_or_in_use`, but driven by interest
+                    // CHURN rather than the heartbeat clock — a peer joining or
+                    // dropping interest, not a periodic tick. Same bytes, a
+                    // different thing to fix if it is the large one.
+                    emitter: SummariesEmitter::ChangeInterestsReply,
+                })
             }
         }
 
@@ -4129,8 +4143,11 @@ mod tests {
         // Scope to the `Summaries` arm = its match start .. the next arm
         // (`ChangeInterests`), so the assertions can't false-pass on unrelated
         // code elsewhere in the handler.
+        // `{ entries, .. }` since #5052 added the non-wire emitter tag to the
+        // variant — the RECEIVE arm ignores it (an inbound tag is always the
+        // `Default`; see `SummariesEmitter`), so it destructures with `..`.
         let summaries_off = src[handler_start..]
-            .find("InterestMessage::Summaries { entries }")
+            .find("InterestMessage::Summaries { entries, .. }")
             .expect("Summaries arm not found");
         let change_off = src[handler_start..]
             .find("InterestMessage::ChangeInterests")

@@ -2981,9 +2981,11 @@ async fn handle_peer_channel_message(
         Left(msg) => {
             tracing::debug!(to=%conn.remote_addr() ,"Sending message to peer. Msg: {msg}");
             // Classify BEFORE the send moves `msg`. Classification only reads
-            // the enum discriminant, so it costs nothing on this hot path.
-            let kind =
-                crate::node::network_bridge::outbound_message_mix::OutboundKind::classify(&msg);
+            // enum discriminants (plus, for InterestSync `Summaries`, the
+            // already-set emitter tag and entry count — #5052), so it costs
+            // nothing on this hot path.
+            let class =
+                crate::node::network_bridge::outbound_message_mix::OutboundClass::classify(&msg);
             match conn.send_message(msg).await {
                 Ok(serialized_len) => {
                     // #4956: attribute the bytes to the message kind that
@@ -2992,7 +2994,7 @@ async fn handle_peer_channel_message(
                     // Recorded only on a successful hand-off to the transport,
                     // matching the payload mix's real-delivery accounting rule
                     // so a failed send never inflates the census.
-                    outbound_mix.record_sent(kind, serialized_len);
+                    outbound_mix.record_sent(class, serialized_len);
                 }
                 Err(error) => {
                     tracing::error!(
@@ -3433,7 +3435,7 @@ fn extract_sender_from_message_mut(msg: &mut NetMessage) -> Option<&mut PeerKeyL
 // TODO: add testing for the network loop, now it should be possible to do since we don't depend upon having real connections
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::config::GlobalExecutor;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4958,7 +4960,7 @@ mod tests {
     /// for this purpose because the only thing we measure afterward is the
     /// count of two specific identifiers, and those never appear inside a
     /// literal in production source.
-    fn strip_cfg_test_regions(src: &str) -> String {
+    pub(crate) fn strip_cfg_test_regions(src: &str) -> String {
         const MARKER: &str = "#[cfg(test)]";
         let bytes = src.as_bytes();
 
@@ -5124,7 +5126,12 @@ mod tests {
     }
 
     /// Recursively collect every `*.rs` file under `dir`.
-    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    ///
+    /// `pub(crate)` alongside [`strip_cfg_test_regions`] so sibling source
+    /// pins can walk the tree without a second copy of the scanner — the
+    /// #5052 emitter-completeness pin in `outbound_message_mix` is the other
+    /// user. Both are `#[cfg(test)]`-only.
+    pub(crate) fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => return,
@@ -5340,6 +5347,13 @@ mod tests {
     /// strip can be thrown off by `{`/`}` in earlier test string literals)
     /// would self-trip. Slicing at the single top-level `mod tests {` is
     /// robust and unambiguous.
+    ///
+    /// The anchor includes the `pub(crate)` modifier because this module is
+    /// `pub(crate)` — #5052 shares [`strip_cfg_test_regions`] and
+    /// [`collect_rs_files`] with the sibling `outbound_message_mix` pin rather
+    /// than duplicating the scanner. Keep the two in sync: a mismatch here
+    /// panics on the `expect` below (loudly, not silently), which is how this
+    /// coupling was found in the first place.
     fn production_src() -> String {
         // The `P2pConnManager` impl is split across this module root and its
         // `p2p_protoc/` submodules, so the source-scrape pins below must see
@@ -5347,8 +5361,8 @@ mod tests {
         // moved into a submodule would silently drop out of the scan.
         let full = include_str!("p2p_protoc.rs");
         let cut = full
-            .find("\nmod tests {")
-            .expect("p2p_protoc.rs must have a `mod tests {` block");
+            .find("\npub(crate) mod tests {")
+            .expect("p2p_protoc.rs must have a `pub(crate) mod tests {` block");
         [
             &full[..cut],
             include_str!("p2p_protoc/migration.rs"),
