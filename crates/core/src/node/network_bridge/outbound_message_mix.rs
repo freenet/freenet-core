@@ -402,10 +402,11 @@ struct Window {
 /// arms that never coexisted.
 ///
 /// Cost is one uncontended lock acquire plus three integer updates per
-/// message sent. This IS a hotter path than the payload mix (every message,
-/// not every delivered broadcast), so it is deliberately kept to integer work
-/// with no allocation, no map insert, and no formatting — everything else
-/// happens in the aggregator task.
+/// message sent, and eight for an InterestSync `Summaries` (the #5052
+/// sub-split). This IS a hotter path than the payload mix (every message, not
+/// every delivered broadcast), so it is deliberately kept to integer work with
+/// no allocation, no map insert, and no formatting — everything else happens
+/// in the aggregator task.
 pub(crate) struct OutboundMix {
     window: Mutex<Window>,
 }
