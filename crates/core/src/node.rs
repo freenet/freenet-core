@@ -2220,8 +2220,9 @@ where
 /// cycle is re-detected and synced on a later cycle.
 ///
 /// Starvation avoidance: when the stale set exceeds the cap, the emission loop
-/// starts at a random offset and wraps (see the `rotate_left` in the `Summaries`
-/// arm), so the cap window slides across the whole stale set over successive
+/// starts at a random offset and wraps (see the `rotate_left` in
+/// `emit_stale_peer_syncs`, the helper both the `Summaries` and
+/// `SummaryDigests` arms share), so the cap window slides across the whole
 /// cycles instead of always re-processing the same prefix. Without this, a
 /// contract stuck in the leading `cap` positions — e.g. one whose
 /// `SyncStateToPeer` is dropped on a full channel, lost in transit, or not
@@ -3378,6 +3379,15 @@ async fn handle_interest_sync_message(
             // assumed away — same bounded, targeted emission as `Summaries`.
             emit_stale_peer_syncs(op_manager, source, stale_contracts).await;
 
+            // A contract on the mismatch path is confirmed TWICE: once here,
+            // once again when the requested bytes arrive at the `Summaries`
+            // arm. That is idempotent for the convergence checker by
+            // construction rather than by assumption — all three consumers
+            // (`testing_impl.rs:3712`, `:6535`, `simulation_integration.rs:4682`)
+            // fold into `BTreeMap<contract, BTreeMap<peer, hash>>` via
+            // `.insert(peer_addr, hash)`, so a repeat for the same
+            // (contract, peer) overwrites with the same value — or, if our
+            // state moved in between, with the newer and more correct one.
             for (key, state_hash) in confirmed_states {
                 if let Some(event) =
                     crate::tracing::NetEventLog::state_confirmed(&op_manager.ring, key, state_hash)

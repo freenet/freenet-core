@@ -1045,11 +1045,19 @@ pub(crate) async fn send_summary_back_on_rejection(
     // fan-out #5003 actually changes.
     //
     // #4965: this path only runs once we have ALREADY established that
-    // `our_summary == sender_summary_bytes`, so a digest is GUARANTEED to
-    // match on the receiving side, and the seeding this exists to do (their
-    // cache of us flipping `None` -> `Some`) completes from the digest alone —
-    // the receiver caches its own bytes, which the digest proved are ours.
-    // Shipping the bytes would be pure waste in the one case this is reachable.
+    // `our_summary == sender_summary_bytes`, so in the expected case the
+    // digest matches on the receiving side and the seeding this exists to do
+    // (their cache of us flipping `None` -> `Some`) completes from the digest
+    // alone — the receiver caches its own bytes, which the digest proved are
+    // ours, and shipping the bytes would be pure waste.
+    //
+    // NOT guaranteed, deliberately stated: the receiver re-derives its summary
+    // through `summary_if_hosted_or_in_use`, which returns `None` for a
+    // contract it no longer hosts or serves (#4473). It then classifies as
+    // `NeedBytes` and asks — costing one extra round trip, never a lost
+    // update. The rejection that got us here proves the peer HAD the state a
+    // moment ago, so this is a narrow race, but an absolute claim here would
+    // be wrong.
     let full_entry = SummaryEntry::from_summary(hash, Some(&our_summary));
     let message = crate::node::summaries_reply_for_peer(
         op_manager,
