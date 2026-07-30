@@ -950,10 +950,22 @@ pub(crate) async fn update_contract(
 /// cached summary of us (`SummaryMissingReason::ClearedByNoneReport`). That is
 /// the intended #4473 policy (we advertise no summary for a contract we do not
 /// host or serve), and the gate makes all three paths agree on it instead of
-/// leaving this one emitter dissenting. A peer that still broadcasts to us for
-/// such a contract is holding a stale advertisement of us — the separately
-/// tracked #4440 advertisement-hygiene problem, not something to paper over
-/// here.
+/// leaving this one emitter dissenting.
+///
+/// A peer that still broadcasts to us for such a contract is holding a stale
+/// advertisement of us. #5063 closes the main source of those — eviction now
+/// retracts the advertisement at the eviction decision
+/// (`operations::retract_advertisement_for_evicted_contract`) rather than only
+/// at reclamation — so this residual is narrow. Its retention guard is
+/// `is_hosting_contract || contract_in_use || is_subscribed`, which is this
+/// gate's predicate plus `is_subscribed`. The one population where the two
+/// still disagree is a contract held ONLY by a bare upstream network
+/// subscription: #5063 keeps its advertisement, while all three summary paths
+/// (this one, the fan-out, and the heartbeat) report nothing for it, so a
+/// co-host's broadcasts to us stay full-state. That divergence is PRE-EXISTING
+/// — the fan-out and heartbeat already behaved this way — and this gate makes
+/// the third path match them rather than introducing it. Tracked with the rest
+/// of the #4440 advertisement-hygiene work; deliberately not papered over here.
 pub(crate) async fn send_proactive_summary_notification(
     op_manager: &OpManager,
     key: &ContractKey,

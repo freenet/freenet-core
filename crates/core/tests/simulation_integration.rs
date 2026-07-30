@@ -3434,7 +3434,6 @@ fn test_sustained_update_fanout_no_full_state_storm() {
 ///   it exists to improve on.
 /// - `delta_sends + full_state_sends > 0`: broadcasts actually happened.
 #[test_log::test]
-#[cfg(feature = "simulation_tests")]
 fn test_cohost_mesh_update_fanout_stays_delta_dominated() {
     use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
 
