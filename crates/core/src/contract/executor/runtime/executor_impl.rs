@@ -2501,7 +2501,9 @@ where
             // reached", which #4681 had relied on. See #5040.
             let notifiers_snapshot = match notifiers_snapshot {
                 None => {
-                    super::super::notification_stats::record_no_local_subscriber();
+                    if let Some(op_manager) = self.op_manager.as_ref() {
+                        op_manager.ring.record_notification_no_local_subscriber();
+                    }
                     tracing::debug!(
                         %instance_id,
                         registered_contracts = shared_notifications.len(),
@@ -2645,7 +2647,9 @@ where
                         // contract-handling loop, and blocking here is the
                         // #4145 class of wedge that channel-safety.md forbids.
                         resync_clients.push(*peer_key);
-                        super::super::notification_stats::record_dropped_channel_full();
+                        if let Some(op_manager) = self.op_manager.as_ref() {
+                            op_manager.ring.record_notification_dropped_channel_full();
+                        }
                         tracing::warn!(
                             client = %peer_key,
                             contract = %key,
@@ -2656,7 +2660,9 @@ where
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         failures.push(*peer_key);
-                        super::super::notification_stats::record_dropped_channel_closed();
+                        if let Some(op_manager) = self.op_manager.as_ref() {
+                            op_manager.ring.record_notification_dropped_channel_closed();
+                        }
                         tracing::error!(
                             client = %peer_key,
                             contract = %key,
@@ -2807,7 +2813,9 @@ where
                         // permanently, so invalidate its summary and resync
                         // with full state on the next update.
                         resync_clients.push(*peer_key);
-                        super::super::notification_stats::record_dropped_channel_full();
+                        if let Some(op_manager) = self.op_manager.as_ref() {
+                            op_manager.ring.record_notification_dropped_channel_full();
+                        }
                         tracing::warn!(
                             client = %peer_key,
                             contract = %key,
@@ -2818,7 +2826,9 @@ where
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         failures.push(*peer_key);
-                        super::super::notification_stats::record_dropped_channel_closed();
+                        if let Some(op_manager) = self.op_manager.as_ref() {
+                            op_manager.ring.record_notification_dropped_channel_closed();
+                        }
                         tracing::error!(
                             client = %peer_key,
                             contract = %key,
@@ -2888,7 +2898,9 @@ where
                      (local storage); update notification not delivered"
                 );
             } else {
-                super::super::notification_stats::record_no_local_subscriber();
+                if let Some(op_manager) = self.op_manager.as_ref() {
+                    op_manager.ring.record_notification_no_local_subscriber();
+                }
                 tracing::debug!(
                     %instance_id,
                     registered_contracts = self.update_notifications.len(),

@@ -6,6 +6,7 @@
 //! - Sorted-insert correctness
 //! - Reconnection does not inflate counts
 
+use freenet_stdlib::client_api::ContractResponse;
 use freenet_stdlib::prelude::*;
 
 use crate::client_events::ClientId;
@@ -15,7 +16,6 @@ use crate::contract::executor::{
     SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE,
 };
 use crate::wasm_runtime::MockStateStorage;
-use freenet_stdlib::client_api::ContractResponse;
 
 /// Helper to create a MockWasmRuntime executor (uses production bridged_* paths).
 async fn create_executor() -> Executor<MockWasmRuntime, MockStateStorage> {
@@ -1041,6 +1041,94 @@ async fn full_channel_drop_forces_full_state_resync_local() {
     );
 
     // Drain, so the next notification can actually be delivered.
+    while rx.try_recv().is_ok() {}
+
+    // Update 2: must be FULL STATE, not a delta.
+    executor
+        .upsert_contract_state(
+            key,
+            either::Either::Left(WrappedState::new(vec![8, 8, 8])),
+            RelatedContracts::default(),
+            Some(contract),
+        )
+        .await
+        .expect("store contract");
+
+    let received = rx.try_recv().expect("the resync notification must arrive");
+    match received {
+        Ok(freenet_stdlib::client_api::HostResponse::ContractResponse(
+            ContractResponse::UpdateNotification { update, .. },
+        )) => {
+            assert!(
+                matches!(update, UpdateData::State(_)),
+                "after a full-channel drop the client must be resynced with FULL \
+                 STATE; got {update:?}, which leaves it diverged"
+            );
+        }
+        other => panic!("expected an UpdateNotification; got {other:?}"),
+    }
+}
+
+/// The SHARED-storage twin of the full-channel resync test — the arm
+/// production actually runs (`handler.rs` wires `ContractExecutor =
+/// RuntimePool`, and every pooled executor gets shared storage).
+///
+/// The fix was applied identically to two independently-buggable arms, so a
+/// regression in the shared one would otherwise reach production uncaught.
+#[tokio::test(flavor = "current_thread")]
+async fn full_channel_drop_forces_full_state_resync_shared() {
+    let mut executor = create_executor().await;
+    let shared_notifications = std::sync::Arc::new(dashmap::DashMap::new());
+    let shared_summaries = std::sync::Arc::new(dashmap::DashMap::new());
+    executor.set_shared_notifications(
+        shared_notifications.clone(),
+        shared_summaries.clone(),
+        std::sync::Arc::new(dashmap::DashMap::new()),
+    );
+
+    let contract = test_contract(b"full_channel_resync_shared_4681");
+    let key = contract.key();
+    let instance_id = *key.id();
+
+    let client_id = ClientId::next();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE);
+    shared_notifications.insert(instance_id, vec![(client_id, tx.clone())]);
+    // A cached summary is what makes this client eligible for DELTAS.
+    shared_summaries.insert(
+        instance_id,
+        std::collections::HashMap::from([(
+            client_id,
+            Some(StateSummary::from(vec![1u8, 2, 3]).into_owned()),
+        )]),
+    );
+
+    for _ in 0..SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE {
+        tx.try_send(Ok(freenet_stdlib::client_api::HostResponse::Ok))
+            .expect("prefill the subscriber channel to capacity");
+    }
+
+    // Update 1: dropped, channel full.
+    executor
+        .upsert_contract_state(
+            key,
+            either::Either::Left(WrappedState::new(vec![7, 7, 7])),
+            RelatedContracts::default(),
+            Some(contract.clone()),
+        )
+        .await
+        .expect("store contract");
+
+    assert!(
+        shared_summaries
+            .get(&instance_id)
+            .and_then(|s| s.get(&client_id).cloned())
+            .expect("the client must stay registered")
+            .is_none(),
+        "a full-channel drop must invalidate the cached summary on the SHARED \
+         arm too, otherwise the next update is another delta and the client \
+         stays diverged forever"
+    );
+
     while rx.try_recv().is_ok() {}
 
     // Update 2: must be FULL STATE, not a delta.

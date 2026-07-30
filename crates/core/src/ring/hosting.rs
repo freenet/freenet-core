@@ -357,6 +357,15 @@ pub(crate) struct HostingManager {
     /// `serves / (serves + forwards)`. Monotonic per-node scalars.
     local_get_serves: AtomicU64,
     local_get_forwards: AtomicU64,
+    /// Local `UpdateNotification` delivery outcomes (#4681). PER-NODE, not
+    /// process-global: the simulation harness runs many nodes as tasks inside
+    /// ONE process, so a `static` counter here would report the aggregate
+    /// across every simulated node and silently defeat the per-node rate signal
+    /// these exist to give — in exactly the environment this class of bug is
+    /// diagnosed in.
+    notifications_dropped_channel_full: AtomicU64,
+    notifications_dropped_channel_closed: AtomicU64,
+    notifications_no_local_subscriber: AtomicU64,
 
     /// Downstream peers subscribed to contracts we host, with lease timestamps.
     /// Drives `should_unsubscribe_upstream()` decisions.
@@ -511,6 +520,9 @@ impl HostingManager {
             own_location: RwLock::new(None),
             local_get_serves: AtomicU64::new(0),
             local_get_forwards: AtomicU64::new(0),
+            notifications_dropped_channel_full: AtomicU64::new(0),
+            notifications_dropped_channel_closed: AtomicU64::new(0),
+            notifications_no_local_subscriber: AtomicU64::new(0),
             downstream_subscribers: DashMap::new(),
             time_source,
             pending_subscription_requests: DashSet::new(),
@@ -1939,6 +1951,44 @@ impl HostingManager {
     /// by cache membership, so the hit-rate metric reflects real serves. (#4642 A3)
     pub(crate) fn record_local_get_serve(&self) {
         self.local_get_serves.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a local `UpdateNotification` dropped by a FULL subscriber channel
+    /// (#4681). The subscriber's cached summary is invalidated at the same
+    /// time, so the next update resyncs it with full state; a sustained nonzero
+    /// rate means a client is not draining fast enough.
+    pub(crate) fn record_notification_dropped_channel_full(&self) {
+        self.notifications_dropped_channel_full
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a local `UpdateNotification` dropped by a CLOSED subscriber
+    /// channel (#4681). The subscriber is unregistered at that point.
+    pub(crate) fn record_notification_dropped_channel_closed(&self) {
+        self.notifications_dropped_channel_closed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a committed update that found NO local subscriber (#4681/#5040).
+    /// Normal for contracts hosted on the network's behalf; counted because
+    /// logging it per occurrence produced 22k lines/day and its `debug!` is
+    /// compiled out of release builds.
+    pub(crate) fn record_notification_no_local_subscriber(&self) {
+        self.notifications_no_local_subscriber
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(dropped_channel_full, dropped_channel_closed, no_local_subscriber)`
+    /// for this node.
+    pub(crate) fn notification_delivery_counts(&self) -> (u64, u64, u64) {
+        (
+            self.notifications_dropped_channel_full
+                .load(Ordering::Relaxed),
+            self.notifications_dropped_channel_closed
+                .load(Ordering::Relaxed),
+            self.notifications_no_local_subscriber
+                .load(Ordering::Relaxed),
+        )
     }
 
     /// Record that a local-client GET was routed to the network (a miss/forward).
