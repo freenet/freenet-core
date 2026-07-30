@@ -63,6 +63,19 @@
           inherit (pkgs) freenet freenet-autoupdate;
           default = freenet-autoupdate;
         };
+        devShells.default = pkgs.mkShell {
+          inputsFrom = [ self.packages.${system}.freenet ];
+          packages = [
+            pkgs.cargo-nextest
+            pkgs.clippy
+            pkgs.jq
+            pkgs.nixfmt
+            pkgs.pre-commit
+            pkgs.python3
+            pkgs.rustfmt
+            pkgs.shellcheck
+          ];
+        };
       }
     );
 }
