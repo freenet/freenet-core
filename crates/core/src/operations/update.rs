@@ -846,7 +846,7 @@ pub(crate) async fn send_proactive_summary_notification(
     key: &ContractKey,
     sender_addr: SocketAddr,
 ) {
-    use crate::message::{InterestMessage, SummariesEmitter, SummaryEntry};
+    use crate::message::{SummariesEmitter, SummaryEntry};
     use crate::ring::interest::contract_hash;
 
     // Throttle: at most one notification per contract per 100ms
@@ -990,7 +990,7 @@ pub(crate) async fn send_summary_back_on_rejection(
     target_addr: SocketAddr,
     sender_summary_bytes: Vec<u8>,
 ) {
-    use crate::message::{InterestMessage, SummariesEmitter, SummaryEntry};
+    use crate::message::{SummariesEmitter, SummaryEntry};
     use crate::ring::interest::contract_hash;
 
     // Throttle BEFORE the WASM `summarize_state` call. Even with call
