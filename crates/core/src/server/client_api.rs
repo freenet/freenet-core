@@ -569,7 +569,7 @@ async fn web_subpages(
 
     let version_prefix = api_version.prefix();
     let full_path: String = format!("/{version_prefix}/contract/web/{key}/{last_path}");
-    path_handlers::variable_content(
+    let result = path_handlers::variable_content(
         key,
         full_path,
         api_version,
@@ -577,12 +577,26 @@ async fn web_subpages(
         &config.webapp_cache,
     )
     .await
-    .map_err(|e| *e)
-    .map(|r| {
-        let mut response = r.into_response();
-        add_sandbox_cors_headers(&mut response);
-        response
-    })
+    .map_err(|e| *e);
+    // Attach the sandbox CORS headers to BOTH success and error responses. The
+    // sandboxed iframe has a null origin, so a subresource response WITHOUT
+    // `Access-Control-Allow-Origin` is reported by the browser as an opaque
+    // "CORS error" that masks the real status — a plain 404 for a missing asset
+    // (or a 400 for a rejected path) looked like a CORS failure to the app
+    // (user report: SUB0PT1MAL / cirro, 2026-07-29). Building the response from
+    // the error here, and then adding the headers, lets the app see the true
+    // status with CORS allowed.
+    //
+    // SECURITY: error bodies on this route are now cross-origin-readable by a
+    // malicious contract's iframe JS. Keep them non-sensitive — reflected
+    // request path and generic io/parse messages only. Any new error path here
+    // MUST NOT embed internal filesystem paths, config, or secrets.
+    let mut response = match result {
+        Ok(r) => r.into_response(),
+        Err(e) => e.into_response(),
+    };
+    add_sandbox_cors_headers(&mut response);
+    Ok(response)
 }
 
 /// Builds a 303 redirect to the contract's shell root, preserving
@@ -731,15 +745,33 @@ async fn serve_sandbox_response(
         return redirect_to_shell_root(&key, api_version, None);
     }
 
-    let contract_response = path_handlers::serve_sandbox_content(
+    let contract_response = match path_handlers::serve_sandbox_content(
         key,
         api_version,
         sub_path,
         request_sender,
         webapp_cache,
     )
-    .await?;
-    let mut response = contract_response.into_response();
+    .await
+    {
+        Ok(r) => r.into_response(),
+        Err(e) => {
+            // Same null-origin reasoning as `web_subpages`: an error subresource
+            // response without CORS is surfaced by the browser as an opaque
+            // "CORS error" inside the iframe, masking the real status. Attach the
+            // sandbox CORS headers so the app sees the true 4xx/5xx. (CSP is only
+            // meaningful on served content, so it is skipped for the error.)
+            //
+            // SECURITY: as in `web_subpages`, these error bodies are now
+            // cross-origin-readable by a malicious contract's iframe JS. Keep
+            // them non-sensitive — any new error path here MUST NOT embed
+            // internal filesystem paths, config, or secrets.
+            let mut response = e.into_response();
+            add_sandbox_cors_headers(&mut response);
+            return Ok(response);
+        }
+    };
+    let mut response = contract_response;
     add_sandbox_cors_headers(&mut response);
     // See `sandbox_csp_for_origin` for why we interpolate a concrete origin
     // rather than using `'self'`, and `sandbox_origin_from_headers` for why we
@@ -1515,6 +1547,112 @@ mod tests {
                 // not take a redirect branch.
             }
         }
+    }
+
+    /// Regression for the SUB0PT1MAL/cirro CORS report (2026-07-29): an ERROR
+    /// subresource response from `web_subpages` MUST still carry
+    /// `Access-Control-Allow-Origin: *`.
+    ///
+    /// The sandboxed iframe has a null origin, so a subresource fetch whose
+    /// response lacks the CORS header is reported by the browser as an opaque
+    /// "CORS error" that masks the real status. Previously only the SUCCESS
+    /// branch of `web_subpages` added the header; a `variable_content` error
+    /// (e.g. a rejected path, which returns `Err(InvalidParam)` → 400) returned
+    /// a bare response, so the app saw an opaque CORS failure instead of the
+    /// true 400. We drive the error branch with a traversal path (a clean
+    /// `Err`) and assert the response is both 400 AND CORS-allowed.
+    #[tokio::test]
+    async fn web_subpages_error_response_carries_cors_header() {
+        // A UNIQUE non-zero key so this test can't collide on the process-global
+        // webapp cache with another test that might warm the all-zeros key (which
+        // would flip the guard's 400 into a cache-fetch 500). See the three
+        // path_handlers traversal tests, which use the same unique-seed idiom.
+        let key = {
+            use freenet_stdlib::prelude::ContractInstanceId;
+            let mut bytes = [0u8; 32];
+            bytes[0] = 0x3a;
+            bytes[1] = 0x54;
+            ContractInstanceId::new(bytes).to_string()
+        };
+
+        // A `..` traversal makes `variable_content` return Err(InvalidParam).
+        // Non-HTML + no `Sec-Fetch-Dest` so it falls through to
+        // `variable_content` rather than the shell/sandbox branches.
+        let resp = web_subpages(
+            key,
+            "../../../etc/hostname".to_string(),
+            ApiVersion::V1,
+            None,
+            axum::http::HeaderMap::new(),
+            &localhost_config(),
+            dead_request_sender(),
+            false,
+        )
+        .await
+        .expect("web_subpages must convert the inner error into a response, not propagate it");
+
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "a rejected traversal path must surface as 400"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .map(|v| v.to_str().unwrap_or("")),
+            Some("*"),
+            "even an error subresource response must carry the sandbox CORS header, \
+             otherwise the null-origin iframe surfaces it as an opaque CORS error"
+        );
+    }
+
+    /// Companion regression for the OTHER symmetric CORS-on-error branch: an
+    /// HTML sandbox subresource that errors (`serve_sandbox_response` →
+    /// `serve_sandbox_content`) MUST also carry the sandbox CORS header, or the
+    /// null-origin iframe surfaces it as an opaque CORS failure. Drives the
+    /// uncached-contract error (`serve_sandbox_content` returns
+    /// `NodeError("Contract not cached yet")`) via a cold cache + dead sender;
+    /// no `Sec-Fetch-Dest: document`, so it does NOT take the redirect branch.
+    #[tokio::test]
+    async fn serve_sandbox_response_error_carries_cors_header() {
+        // Unique non-zero key so this cold-cache assertion can't collide with
+        // another test on the process-global webapp cache.
+        let key = {
+            use freenet_stdlib::prelude::ContractInstanceId;
+            let mut bytes = [0u8; 32];
+            bytes[0] = 0x3a;
+            bytes[1] = 0x55;
+            ContractInstanceId::new(bytes).to_string()
+        };
+        let config = localhost_config();
+        let headers = axum::http::HeaderMap::new();
+
+        let resp = serve_sandbox_response(
+            key,
+            ApiVersion::V1,
+            Some("page.html"),
+            &headers,
+            dead_request_sender(),
+            &config.webapp_cache,
+        )
+        .await
+        .expect(
+            "serve_sandbox_response must convert the inner error into a response, not propagate it",
+        );
+
+        assert!(
+            !resp.status().is_success(),
+            "an uncached sandbox HTML subresource must be an error status, got {}",
+            resp.status()
+        );
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .map(|v| v.to_str().unwrap_or("")),
+            Some("*"),
+            "the sandbox-HTML error branch must carry the CORS header too, \
+             otherwise the null-origin iframe surfaces it as an opaque CORS error"
+        );
     }
 
     /// Regression test pinning the ordering inside `web_subpages`: a
