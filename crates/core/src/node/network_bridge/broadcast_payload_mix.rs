@@ -222,6 +222,21 @@ struct Window {
     /// Per-contract full-state byte attribution, bounded at
     /// [`MAX_TRACKED_CONTRACTS`].
     contract_full_state_bytes: HashMap<ContractInstanceId, u64>,
+    /// Per-contract TOTAL broadcast bytes and sends, across EVERY arm.
+    ///
+    /// #4979: `contract_full_state_bytes` is written only under
+    /// `arm.is_full_state()`, so it is a numerator with no denominator — it can
+    /// say a contract emitted N full-state bytes but not what share of that
+    /// contract's traffic those were, and it is blind to a contract whose cost
+    /// is entirely in the `delta` arm. That blind spot is not hypothetical:
+    /// #5056 found a contract at 55.6% of all broadcast sends whose "deltas"
+    /// are full-state-sized, and attributing it needed a natural experiment
+    /// over single-contract peers because no counter could answer directly.
+    ///
+    /// Also the input a per-contract outbound budget would be sized from
+    /// (#5057): the ceiling should be chosen from the observed distribution,
+    /// not guessed.
+    contract_total: HashMap<ContractInstanceId, (u64, u64)>,
     /// Per-contract bytes for the [`PayloadArm::FullNotEfficient`] arm ONLY.
     ///
     /// #4956: the aggregate gate-input ratio came back at 1.000 (summary size
@@ -293,6 +308,7 @@ impl Default for Window {
             sends: [0; PayloadArm::COUNT],
             bytes: [0; PayloadArm::COUNT],
             contract_full_state_bytes: HashMap::new(),
+            contract_total: HashMap::new(),
             contract_not_efficient_bytes: HashMap::new(),
             attribution_dropped_sends: 0,
             attribution_dropped_bytes: 0,
@@ -436,6 +452,14 @@ impl PayloadMix {
                 w.contract_not_efficient_bytes.insert(*contract, bytes);
             }
         }
+        // EVERY arm, not just full-state: see `contract_total`'s docs. Same cap
+        // discipline as the other maps — the key is contract-controlled.
+        if let Some(tally) = w.contract_total.get_mut(contract) {
+            tally.0 = tally.0.saturating_add(1);
+            tally.1 = tally.1.saturating_add(bytes);
+        } else if w.contract_total.len() < MAX_TRACKED_CONTRACTS {
+            w.contract_total.insert(*contract, (1, bytes));
+        }
         if arm.is_full_state() {
             if let Some(tally) = w.contract_full_state_bytes.get_mut(contract) {
                 *tally = tally.saturating_add(bytes);
@@ -512,6 +536,25 @@ impl Window {
         tallies
     }
 
+    /// The top [`TOP_CONTRACTS_REPORTED`] contracts by TOTAL broadcast bytes,
+    /// with their send counts. Ranked by bytes, since that is the axis a
+    /// budget would bound.
+    fn top_contracts_total(&self) -> Vec<(ContractInstanceId, u64, u64)> {
+        let mut tallies: Vec<(ContractInstanceId, u64, u64)> = self
+            .contract_total
+            .iter()
+            .map(|(k, (sends, bytes))| (*k, *sends, *bytes))
+            .collect();
+        // Tie-break on raw bytes for the same reason as `top_contracts`: a
+        // reported top-N that reorders on ties looks like churn.
+        tallies.sort_by(|a, b| {
+            b.2.cmp(&a.2)
+                .then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
+        });
+        tallies.truncate(TOP_CONTRACTS_REPORTED);
+        tallies
+    }
+
     /// The top [`TOP_CONTRACTS_REPORTED`] contracts by full-state bytes.
     fn top_contracts(&self) -> Vec<(ContractInstanceId, u64)> {
         let mut tallies: Vec<(ContractInstanceId, u64)> = self
@@ -554,6 +597,7 @@ fn payload_mix_json(
     arms: &[(PayloadArm, u64, u64)],
     contracts: &[(ContractInstanceId, u64)],
     not_efficient_contracts: &[(ContractInstanceId, u64)],
+    total_contracts: &[(ContractInstanceId, u64, u64)],
     tracked_full_state_bytes: u64,
     contracts_tracked: u64,
     attribution_dropped_sends: u64,
@@ -716,6 +760,26 @@ fn payload_mix_json(
     // reconciled while 10 % of its bytes were unaccounted for.
     // #4956: which contracts the gate actually refused on. The aggregate
     // ratio says a state-sized "summary" is being fed in; this says by whom.
+    // #4979 / #5057: TOTAL bytes and sends per contract, across every arm. The
+    // full-state array above is a numerator with no denominator — it cannot see
+    // a contract whose entire cost sits in the `delta` arm, which is exactly the
+    // #5056 case. Ranked by bytes, since that is the axis a per-contract budget
+    // would bound.
+    obj.insert(
+        "top_contracts_by_total_bytes".into(),
+        serde_json::Value::Array(
+            total_contracts
+                .iter()
+                .map(|(id, sends, bytes)| {
+                    serde_json::json!({
+                        "contract": id.to_string(),
+                        "sends": sends,
+                        "bytes": bytes,
+                    })
+                })
+                .collect(),
+        ),
+    );
     obj.insert(
         "top_contracts_by_not_efficient_bytes".into(),
         serde_json::Value::Array(
@@ -761,6 +825,7 @@ pub(crate) fn emit_payload_mix_rollup(
         &window.arms(),
         &window.top_contracts(),
         &window.top_not_efficient_contracts(),
+        &window.top_contracts_total(),
         window.contract_full_state_bytes.values().sum(),
         window.contract_full_state_bytes.len() as u64,
         window.attribution_dropped_sends,
@@ -828,6 +893,63 @@ mod tests {
 
     fn contract(byte: u8) -> ContractInstanceId {
         ContractInstanceId::new([byte; 32])
+    }
+
+    /// #4979 / #5056: a contract whose entire cost sits in the `delta` arm must
+    /// still be attributable.
+    ///
+    /// `contract_full_state_bytes` is written only under `arm.is_full_state()`,
+    /// so it is structurally blind to exactly the contract found in #5056 — one
+    /// at 55.6% of all broadcast sends whose "deltas" are full-state-sized.
+    /// Attributing that needed a natural experiment over single-contract peers
+    /// because no counter could answer directly. This asserts the new total map
+    /// sees it AND that the old map does not, so the gap is pinned rather than
+    /// merely fixed.
+    #[test]
+    fn delta_only_contract_is_attributable_in_totals_but_not_full_state() {
+        let mix = PayloadMix::new();
+        // A contract that only ever sends deltas — the #5056 shape.
+        mix.record_delivered(PayloadArm::Delta, &contract(1), 25_000, None, None);
+        mix.record_delivered(PayloadArm::Delta, &contract(1), 25_000, None, None);
+        // A second contract that only ever sends full state, for contrast.
+        mix.record_delivered(
+            PayloadArm::FullNoOurSummary,
+            &contract(2),
+            1_000,
+            None,
+            None,
+        );
+
+        let w = mix.take_window();
+
+        let totals = w.top_contracts_total();
+        let delta_only = totals.iter().find(|(id, _, _)| *id == contract(1)).expect(
+            "a delta-only contract MUST appear in the total map — this is \
+                     the #5056 blind spot the map exists to close",
+        );
+        assert_eq!(delta_only.1, 2, "both sends must be counted");
+        assert_eq!(delta_only.2, 50_000, "both sends' bytes must be counted");
+
+        // And it must outrank the full-state contract, since ranking by total
+        // bytes is what a per-contract budget (#5057) would be sized from.
+        assert_eq!(
+            totals[0].0,
+            contract(1),
+            "the total map must rank by TOTAL bytes, so the expensive delta-only \
+             contract leads — ranking by full-state bytes would hide it entirely"
+        );
+
+        // The pin: the pre-existing map genuinely cannot see it.
+        assert!(
+            !w.top_contracts().iter().any(|(id, _)| *id == contract(1)),
+            "contract_full_state_bytes must remain full-state-only; if a delta \
+             contract starts appearing there, the two maps have been conflated \
+             and the full-state share becomes unreadable"
+        );
+        assert!(
+            w.top_contracts().iter().any(|(id, _)| *id == contract(2)),
+            "the full-state contract must still be attributed as before"
+        );
     }
 
     /// #4956: the refused-delta arm must be attributable to a CONTRACT, not
@@ -967,6 +1089,7 @@ mod tests {
             &window.arms(),
             &window.top_contracts(),
             &window.top_not_efficient_contracts(),
+            &window.top_contracts_total(),
             window.contract_full_state_bytes.values().sum(),
             window.contract_full_state_bytes.len() as u64,
             window.attribution_dropped_sends,
@@ -1019,6 +1142,7 @@ mod tests {
             &window.arms(),
             &window.top_contracts(),
             &window.top_not_efficient_contracts(),
+            &window.top_contracts_total(),
             window.contract_full_state_bytes.values().sum(),
             window.contract_full_state_bytes.len() as u64,
             window.attribution_dropped_sends,
@@ -1149,6 +1273,7 @@ mod tests {
             &arms,
             &[],
             &[],
+            &[],
             0,
             0,
             0,
@@ -1203,6 +1328,7 @@ mod tests {
             &window.arms(),
             &window.top_contracts(),
             &window.top_not_efficient_contracts(),
+            &window.top_contracts_total(),
             window.contract_full_state_bytes.values().sum(),
             window.contract_full_state_bytes.len() as u64,
             window.attribution_dropped_sends,
@@ -1234,6 +1360,7 @@ mod tests {
             &window.arms(),
             &window.top_contracts(),
             &window.top_not_efficient_contracts(),
+            &window.top_contracts_total(),
             window.contract_full_state_bytes.values().sum(),
             window.contract_full_state_bytes.len() as u64,
             window.attribution_dropped_sends,
@@ -1404,6 +1531,7 @@ mod tests {
             &window.arms(),
             &window.top_contracts(),
             &window.top_not_efficient_contracts(),
+            &window.top_contracts_total(),
             window.contract_full_state_bytes.values().sum(),
             window.contract_full_state_bytes.len() as u64,
             window.attribution_dropped_sends,
@@ -1432,6 +1560,7 @@ mod tests {
             &window.arms(),
             &window.top_contracts(),
             &window.top_not_efficient_contracts(),
+            &window.top_contracts_total(),
             0,
             0,
             0,
@@ -1450,6 +1579,7 @@ mod tests {
         let arms: Vec<_> = PayloadArm::ALL.iter().map(|a| (*a, 0, 0)).collect();
         let json = payload_mix_json(
             &arms,
+            &[],
             &[],
             &[],
             0,
