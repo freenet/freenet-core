@@ -523,9 +523,24 @@ pub(super) async fn finalize_originator_subscribe(
         .get_peer_by_addr(upstream_addr)
     {
         let peer_key = crate::ring::interest::PeerKey::from(pkl.pub_key);
-        let is_new = op_manager
+        // Refresh-if-present, register-if-absent. A bare `register_peer_interest`
+        // inserts a fresh `PeerInterest` over an existing entry and WIPES its
+        // cached delta-sync summary, which then reports `NeverPopulated` and
+        // forces every subsequent broadcast to this peer back to full state.
+        // Renewals reach here at `SUBSCRIPTION_RENEWAL_INTERVAL` (120s) against
+        // an 8-minute lease, so the unguarded form clobbered ~30x per subscribed
+        // contract per hour. Same guard as `node.rs`'s Interests handler and the
+        // downstream registration below.
+        let is_new = if op_manager
             .interest_manager
-            .register_peer_interest(&key, peer_key, None, true);
+            .refresh_peer_interest_with_upstream(&key, &peer_key, true)
+        {
+            false
+        } else {
+            op_manager
+                .interest_manager
+                .register_peer_interest(&key, peer_key, None, true)
+        };
         if is_new {
             // #4359 (MUST-FIX 1): this upstream peer is now a viable broadcast
             // target. If a fresh-contract PUT gave up with no targets and is
@@ -824,9 +839,19 @@ pub(super) async fn finalize_host_subscribe(
     // promptly. `is_new` marks a freshly-viable broadcast target → flush any
     // deferred fresh-contract broadcast (#4359), same as the originator.
     if let Some(peer_key) = upstream_peer {
-        let is_new = op_manager
+        // Refresh-if-present, register-if-absent — see the identical guard in
+        // `finalize_originator_subscribe`. A bare `register_peer_interest` here
+        // wipes the cached summary on every renewal.
+        let is_new = if op_manager
             .interest_manager
-            .register_peer_interest(&key, peer_key, None, true);
+            .refresh_peer_interest_with_upstream(&key, &peer_key, true)
+        {
+            false
+        } else {
+            op_manager
+                .interest_manager
+                .register_peer_interest(&key, peer_key, None, true)
+        };
         if is_new {
             op_manager.flush_pending_broadcast_on_interest(&key).await;
         }

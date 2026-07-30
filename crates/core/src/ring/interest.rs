@@ -883,6 +883,49 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         }
     }
 
+    /// Refresh the TTL for a peer's interest **and** set its `is_upstream`
+    /// flag, preserving any cached summary.
+    ///
+    /// Exists for the subscribe paths, which must assert upstream-ness on an
+    /// entry that may already exist. Their only previous option was a bare
+    /// [`Self::register_peer_interest`], which inserts a fresh
+    /// [`PeerInterest::new`] over the existing one and therefore **wipes the
+    /// cached delta-sync summary** — the entry then reports
+    /// [`SummaryMissingReason::NeverPopulated`], which is both wrong (it WAS
+    /// populated) and expensive (every subsequent broadcast to that peer falls
+    /// back to full state until the summary is re-seeded).
+    ///
+    /// That matters at renewal cadence: `SUBSCRIPTION_RENEWAL_INTERVAL` is 120s
+    /// against an 8-minute lease, and a renewal re-registers through the same
+    /// outbound-SUBSCRIBE machinery as a client request, so an unguarded call
+    /// site clobbers roughly 30 times per subscribed contract per hour.
+    ///
+    /// Deliberately SETS `is_upstream` rather than leaving it alone: the bare
+    /// `register_peer_interest` this replaces also set it, and the flag is the
+    /// `Unsubscribe` routing target. Only the summary-preservation behaviour
+    /// changes. Do NOT "simplify" this into [`Self::refresh_peer_interest`] —
+    /// that one intentionally leaves the flag untouched, and the two call-site
+    /// families rely on the difference.
+    ///
+    /// Returns `true` if an entry existed and was updated, `false` if there was
+    /// nothing to refresh (the caller should then register).
+    pub fn refresh_peer_interest_with_upstream(
+        &self,
+        contract: &ContractKey,
+        peer: &PeerKey,
+        is_upstream: bool,
+    ) -> bool {
+        let now = self.time_source.now();
+        if let Some(mut entry) = self.interested_peers.get_mut(contract) {
+            if let Some(interest) = entry.get_mut(peer) {
+                interest.refresh(now);
+                interest.is_upstream = is_upstream;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Get all peers interested in a contract.
     pub fn get_interested_peers(&self, contract: &ContractKey) -> Vec<(PeerKey, PeerInterest)> {
         let mut peers: Vec<(PeerKey, PeerInterest)> = self
@@ -2994,6 +3037,102 @@ mod tests {
     /// upsert, so one delivered full state seeds the summary and every later
     /// broadcast to the same peer can be a delta.
     #[test]
+    /// A subscribe RENEWAL must not wipe the cached delta-sync summary.
+    ///
+    /// `finalize_originator_subscribe` / `finalize_host_subscribe` previously
+    /// called a bare `register_peer_interest`, which inserts a fresh
+    /// `PeerInterest` over the existing entry. The summary was silently lost and
+    /// the entry then reported `NeverPopulated` — both wrong (it HAD been
+    /// populated) and expensive, since every subsequent broadcast to that peer
+    /// falls back to full state. Renewals run at 120s against an 8-minute lease,
+    /// so this fired ~30x per subscribed contract per hour.
+    #[test]
+    fn refresh_with_upstream_preserves_summary_and_sets_flag() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+
+        // A downstream entry that has since been seeded by a real delivery.
+        manager.register_peer_interest(&contract, peer.clone(), None, false);
+        assert!(manager.upsert_peer_summary(&contract, &peer, StateSummary::from(vec![7u8, 7])));
+
+        // The renewal path asserts upstream-ness on the existing entry.
+        assert!(
+            manager.refresh_peer_interest_with_upstream(&contract, &peer, true),
+            "an existing entry must report as refreshed, so the caller does not \
+             fall through to register_peer_interest"
+        );
+
+        assert_eq!(
+            manager
+                .get_peer_summary(&contract, &peer)
+                .map(|s| s.as_ref().to_vec()),
+            Some(vec![7u8, 7]),
+            "the cached summary MUST survive a renewal — losing it is the \
+             never_populated clobber this method exists to prevent"
+        );
+        let interest = manager
+            .get_peer_interest(&contract, &peer)
+            .expect("entry still present");
+        assert!(
+            interest.is_upstream,
+            "the flag must be SET, not merely left alone: it is the Unsubscribe \
+             routing target and the bare register it replaces also set it"
+        );
+        assert!(
+            interest.summary_missing_reason().is_none(),
+            "a preserved summary must not be tagged with an absence reason"
+        );
+    }
+
+    /// The absent case: nothing to refresh, so the caller must register.
+    #[test]
+    fn refresh_with_upstream_reports_false_for_untracked_peer() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+
+        assert!(
+            !manager.refresh_peer_interest_with_upstream(&contract, &peer, true),
+            "an untracked peer must report false so the caller registers it"
+        );
+        assert!(
+            manager.get_peer_interest(&contract, &peer).is_none(),
+            "the refresh must not create an entry as a side effect"
+        );
+    }
+
+    /// Source pin: neither subscribe finalizer may go back to a bare
+    /// `register_peer_interest` without first trying the refresh. Guarding by
+    /// convention already failed once — three sites had the guard and these two
+    /// did not, and the drift was invisible because the symptom is a bandwidth
+    /// regression rather than a broken test.
+    #[test]
+    fn subscribe_finalizers_do_not_clobber_cached_summaries() {
+        let src = include_str!("../operations/subscribe.rs");
+        let prod = &src[..src.find("\nmod tests {").unwrap_or(src.len())];
+        let stripped: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+
+        let bare = stripped
+            .matches("register_peer_interest(&key,peer_key,None,true)")
+            .count();
+        let guarded = stripped
+            .matches("refresh_peer_interest_with_upstream(&key,&peer_key,true)")
+            .count();
+
+        assert_eq!(
+            guarded, 2,
+            "both subscribe finalizers must consult refresh_peer_interest_with_upstream \
+             before registering (found {guarded})"
+        );
+        assert_eq!(
+            bare, 2,
+            "the two register calls must remain as the else-branch of that guard \
+             (found {bare}); if this changed, re-check that neither path can wipe \
+             a cached summary"
+        );
+    }
+
     fn upsert_peer_summary_seeds_summary_for_untracked_peer() {
         let (manager, _time) = make_manager();
         let contract = make_contract_key(1);
