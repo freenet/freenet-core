@@ -678,15 +678,14 @@ pub(crate) async fn register_downstream_subscriber(
             // an already-tracked peer (every ~8-min lease renewal, or a
             // #4952 delivery-seeded co-host formally subscribing) wiped the
             // summary and forced the next broadcast back to full state.
-            if op_manager
+            // One acquisition via the refresh's own bool — see
+            // `InterestManager::refresh_peer_interest` for why the
+            // `get_peer_interest(..).is_some()` form it replaces was both
+            // expensive (it clones the cached summary) and racy.
+            if !op_manager
                 .interest_manager
-                .get_peer_interest(key, &peer_key)
-                .is_some()
+                .refresh_peer_interest(key, &peer_key)
             {
-                op_manager
-                    .interest_manager
-                    .refresh_peer_interest(key, &peer_key);
-            } else {
                 op_manager
                     .interest_manager
                     .register_peer_interest(key, peer_key, None, false);

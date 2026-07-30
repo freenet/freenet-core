@@ -832,8 +832,9 @@ pub(super) async fn broadcast_to_single_peer(
                  or logically converged summaries)"
             );
             // Refresh the interest TTL even though nothing is sent (#3046,
-            // #3093). A CONVERGED peer is more interested than a diverged one,
-            // not less — skipping the payload must not expire the interest.
+            // #3093). A peer we believe is CONVERGED is not less interested
+            // than a diverged one — skipping the payload must not expire the
+            // interest.
             //
             // Only `record_delivery_to_interest` refreshed the TTL, and it runs
             // only on a delivered send, so every skip was silently aging the
@@ -844,6 +845,18 @@ pub(super) async fn broadcast_to_single_peer(
             // ANYTHING once the interest expires:
             // `test_interest_ttl_refresh_on_broadcast` caught exactly that,
             // decaying 98 → 29 → 0 broadcasts across the TTL boundary.
+            //
+            // TRADEOFF, stated honestly: `theirs` is OUR cached belief about the
+            // peer (`interested_peers`), not evidence from it. So a wedged but
+            // still-connected peer whose cached summary happens to match ours
+            // gets refreshed indefinitely, where the TTL previously reaped it.
+            // Two backstops bound that: disconnect drops the entry outright
+            // (`InterestManager::remove_peer`), and the peer's own ~5-min
+            // `Interests` heartbeat is a full REPLACE (node.rs), so an entry the
+            // peer no longer claims is removed regardless of how recently we
+            // refreshed it. TTL expiry is therefore not the mechanism that
+            // reaps a live-but-wedged peer, and using it as one costs every
+            // converged peer its updates.
             //
             // Refresh ONLY. Do not cache the summary or record delivery
             // telemetry here: nothing was delivered, and `sent_delta` has no
@@ -931,6 +944,16 @@ pub(super) async fn broadcast_to_single_peer(
                         "Skipping broadcast - contract reported empty delta \
                          (peer converged)"
                     );
+                    // Same outcome as the summaries-equal skip above — "the peer
+                    // is converged, send nothing" — so it owes the same TTL
+                    // refresh, for the same reason and with the same tradeoff.
+                    // This exit is self-limiting (the empty delta is cached, so
+                    // the next fan-out takes the `Skip` path above and refreshes
+                    // there), but a skip that ages the entry toward
+                    // `INTEREST_TTL` is the same class of bug either way.
+                    op_manager
+                        .interest_manager
+                        .refresh_peer_interest(&key, &peer_key);
                     // #4903 review P2: the summarize + delta WASM already ran,
                     // so account for the CPU it burned even though nothing is
                     // sent (no bytes). Previously this exit returned without
@@ -2342,6 +2365,86 @@ mod tests {
             2,
             "each delivery-gated bytes report must charge the selected \
              payload_size (delta or full state), not the pre-delta full-state size"
+        );
+    }
+
+    /// Source-scrape pin (#3046 / #3093): BOTH converged skips must refresh the
+    /// peer's interest TTL.
+    ///
+    /// `record_delivery_to_interest` refreshes only on a DELIVERED send, so a
+    /// peer we keep skipping — because we believe it already has our state —
+    /// ages toward `INTEREST_TTL` and is reaped, after which it receives
+    /// nothing at all. The skip is a permanent steady state for a converged
+    /// subscriber, so this is not a rare corner.
+    ///
+    /// Pinned at the source because the behavioural evidence is indirect: the
+    /// TTL decay only shows up as a broadcast count falling to zero across the
+    /// TTL boundary in a long simulation, and the empty-delta exit is
+    /// self-limiting (its verdict is cached, so the next fan-out takes the
+    /// summaries-equal exit instead) — a revert there would leave every
+    /// behavioural test green.
+    #[test]
+    fn broadcast_to_single_peer_refreshes_interest_on_every_skip_pin() {
+        let src = include_str!("broadcast_queue.rs");
+        let fn_start = src
+            .find("pub(super) async fn broadcast_to_single_peer(")
+            .expect("broadcast_to_single_peer not found");
+        let after = &src[fn_start..];
+        let fn_end = after
+            .find("\nmod tests {")
+            .or_else(|| after.find("\n#[cfg(test)]"))
+            .expect("end of broadcast_to_single_peer (start of tests module) not found");
+        let body = &after[..fn_end];
+
+        // Two skip exits (summaries-equal + empty-delta), one refresh each. The
+        // delivered path refreshes via `record_delivery_to_interest`, not here,
+        // so a third occurrence would mean a skip refresh drifted onto the send
+        // path or the delivered path grew a duplicate.
+        let refreshes = body
+            .matches("refresh_peer_interest(&key,&peer_key)")
+            .count()
+            + body
+                .matches("refresh_peer_interest(&key, &peer_key)")
+                .count();
+        assert_eq!(
+            refreshes, 2,
+            "broadcast_to_single_peer must refresh the interest TTL at BOTH \
+             converged-skip exits (summaries-equal and empty-delta) — got \
+             {refreshes}. Skipping the payload must not expire the interest."
+        );
+
+        // Bind each refresh to its own exit: the count alone would stay green
+        // if both landed in the same arm.
+        let equal_skip = body
+            .find("Skipping broadcast - peer already has our state")
+            .expect("summaries-equal skip arm not found");
+        let empty_delta_skip = body
+            .find("Skipping broadcast - contract reported empty delta")
+            .expect("empty-delta skip arm not found");
+        assert!(
+            equal_skip < empty_delta_skip,
+            "unexpected arm order; the offsets below assume summaries-equal \
+             precedes empty-delta"
+        );
+        assert!(
+            body[equal_skip..empty_delta_skip].contains("refresh_peer_interest("),
+            "the summaries-equal skip must refresh the interest TTL before it \
+             returns"
+        );
+        assert!(
+            body[empty_delta_skip..].contains("refresh_peer_interest("),
+            "the empty-delta (converged) skip must refresh the interest TTL \
+             before it returns — same outcome as the skip above, same obligation"
+        );
+
+        // A skip delivered nothing, so it must not record delivery telemetry or
+        // cache the peer's summary: `sent_delta` has no truthful value for a
+        // send that did not happen, and caching our summary for a peer we never
+        // sent to is the #2763/#4235 divergence hazard.
+        assert!(
+            !body[equal_skip..empty_delta_skip].contains("record_delivery_to_interest("),
+            "the summaries-equal skip must refresh ONLY — recording a delivery \
+             that did not happen corrupts the delta/full-state telemetry"
         );
     }
 

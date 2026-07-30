@@ -873,14 +873,31 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         true
     }
 
-    /// Refresh the TTL for a peer's interest.
-    pub fn refresh_peer_interest(&self, contract: &ContractKey, peer: &PeerKey) {
+    /// Refresh the TTL for a peer's interest, leaving `is_upstream` and any
+    /// cached summary untouched.
+    ///
+    /// Returns `true` if an entry existed and was refreshed, `false` if there
+    /// was nothing to refresh — so a caller can express refresh-if-present /
+    /// register-if-absent in ONE map acquisition.
+    ///
+    /// The `get_peer_interest(..).is_some()` form this return value replaces was
+    /// wrong twice over. [`Self::get_peer_interest`] returns an owned
+    /// [`PeerInterest`], so testing presence deep-copied the cached
+    /// `StateSummary` — up to ~840 KB of alloc+memcpy per call for exactly the
+    /// state-sized-summary contracts that make this path expensive — and threw
+    /// the clone away. And the two lookups are not atomic: a
+    /// [`Self::remove_peer_interest`] landing between them makes the refresh a
+    /// silent no-op *and* skips the register, so the caller's interest is never
+    /// recorded at all.
+    pub fn refresh_peer_interest(&self, contract: &ContractKey, peer: &PeerKey) -> bool {
         let now = self.time_source.now();
         if let Some(mut entry) = self.interested_peers.get_mut(contract) {
             if let Some(interest) = entry.get_mut(peer) {
                 interest.refresh(now);
+                return true;
             }
         }
+        false
     }
 
     /// Refresh the TTL for a peer's interest **and** set its `is_upstream`
@@ -3036,6 +3053,57 @@ mod tests {
     /// `broadcast_queue::record_delivery_to_interest` routes through the
     /// upsert, so one delivered full state seeds the summary and every later
     /// broadcast to the same peer can be a delta.
+    #[test]
+    fn upsert_peer_summary_seeds_summary_for_untracked_peer() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+
+        assert!(
+            manager.get_peer_interest(&contract, &peer).is_none(),
+            "precondition: the peer must be untracked"
+        );
+
+        assert!(manager.upsert_peer_summary(&contract, &peer, StateSummary::from(vec![1u8, 2])));
+
+        assert_eq!(
+            manager
+                .get_peer_summary(&contract, &peer)
+                .map(|s| s.as_ref().to_vec()),
+            Some(vec![1u8, 2]),
+            "the upsert must CREATE the entry so the pair escapes to deltas"
+        );
+        let interest = manager
+            .get_peer_interest(&contract, &peer)
+            .expect("entry created");
+        assert!(
+            !interest.is_upstream,
+            "a delivery-seeded entry is not our upstream"
+        );
+
+        // Later deliveries keep the cached summary current.
+        assert!(manager.upsert_peer_summary(&contract, &peer, StateSummary::from(vec![9u8])));
+        assert_eq!(
+            manager
+                .get_peer_summary(&contract, &peer)
+                .map(|s| s.as_ref().to_vec()),
+            Some(vec![9u8]),
+        );
+
+        // The reverse index is maintained, so peer-disconnect cleanup works.
+        assert!(manager.get_contracts_for_peer(&peer).contains(&contract));
+        assert!(manager.remove_peer_interest(&contract, &peer));
+        assert!(manager.get_peer_summary(&contract, &peer).is_none());
+        assert!(!manager.get_contracts_for_peer(&peer).contains(&contract));
+
+        // Summary bookkeeping must not fabricate local demand (invariant 3):
+        // no local-interest entry appears as a side effect.
+        assert!(
+            !manager.has_local_interest(&contract),
+            "upsert must not create local interest / demand state"
+        );
+    }
+
     /// A subscribe RENEWAL must not wipe the cached delta-sync summary.
     ///
     /// `finalize_originator_subscribe` / `finalize_host_subscribe` previously
@@ -3101,6 +3169,58 @@ mod tests {
         );
     }
 
+    /// The production-code slice of a source file: everything before its test
+    /// module.
+    ///
+    /// `subscribe.rs` declares its tests as `#[cfg(test)] mod tests;` — an
+    /// EXTERNAL module with no brace — so a cut at `"\nmod tests {"` finds
+    /// nothing and silently returns the whole file, test modules included.
+    /// `subscribe.rs` also has an INLINE `#[cfg(test)] mod source_pin_tests {`,
+    /// so a needle added to a future pin there would inflate the counts below
+    /// and mask a real drift. Cutting at the EARLIER of the two markers covers
+    /// both shapes (the `cfg-test-cut-disarms-source-pins` trap). Earlier, not
+    /// first-found: `#[cfg(test)]` precedes the `mod tests {` it annotates, so
+    /// preferring the brace form would leave the attribute in the "production"
+    /// slice.
+    fn prod_source(src: &str) -> String {
+        let cut = [src.find("\nmod tests {"), src.find("\n#[cfg(test)]")]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(src.len());
+        src[..cut].chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// The cut above must actually cut. A fallback that silently no-ops leaves
+    /// every count below reading the test modules too, which is how a source
+    /// pin stops pinning without anyone noticing.
+    #[test]
+    fn prod_source_cut_excludes_test_modules() {
+        for (name, src) in [
+            (
+                "subscribe.rs",
+                include_str!("../operations/subscribe.rs") as &str,
+            ),
+            (
+                "get/op_ctx_task.rs",
+                include_str!("../operations/get/op_ctx_task.rs") as &str,
+            ),
+        ] {
+            let prod = prod_source(src);
+            let whole: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(
+                prod.len() < whole.len(),
+                "{name}: prod_source must exclude the test module(s); it returned \
+                 the whole file, so every count derived from it is reading test \
+                 code as production code"
+            );
+            assert!(
+                !prod.contains("#[cfg(test)]"),
+                "{name}: prod_source must cut BEFORE the first #[cfg(test)]"
+            );
+        }
+    }
+
     /// Source pin: neither subscribe finalizer may go back to a bare
     /// `register_peer_interest` without first trying the refresh. Guarding by
     /// convention already failed once — three sites had the guard and these two
@@ -3108,9 +3228,7 @@ mod tests {
     /// regression rather than a broken test.
     #[test]
     fn subscribe_finalizers_do_not_clobber_cached_summaries() {
-        let src = include_str!("../operations/subscribe.rs");
-        let prod = &src[..src.find("\nmod tests {").unwrap_or(src.len())];
-        let stripped: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        let stripped = prod_source(include_str!("../operations/subscribe.rs"));
 
         let bare = stripped
             .matches("register_peer_interest(&key,peer_key,None,true)")
@@ -3130,6 +3248,30 @@ mod tests {
              (found {bare}); if this changed, re-check that neither path can wipe \
              a cached summary"
         );
+        // Bind each guard to its register: the counts alone would stay green if
+        // one finalizer refreshed and then registered unconditionally.
+        assert_eq!(
+            stripped
+                .matches(
+                    "refresh_peer_interest_with_upstream(&key,&peer_key,true){false}else{op_manager.interest_manager.register_peer_interest(&key,peer_key,None,true)"
+                )
+                .count(),
+            2,
+            "each subscribe finalizer's register must be the ELSE branch of its \
+             own refresh guard, not a separate unconditional statement"
+        );
+
+        // Third site, `register_downstream_subscriber`: same clobber, but with
+        // the PLAIN refresh — it registers with is_upstream=false, and
+        // asserting that on an existing entry would downgrade a real upstream.
+        assert!(
+            stripped.contains(
+                "refresh_peer_interest(key,&peer_key){op_manager.interest_manager.register_peer_interest(key,peer_key,None,false)"
+            ),
+            "register_downstream_subscriber must register only when the refresh \
+             reports no existing entry (a bare register wipes the cached summary \
+             on every lease renewal)"
+        );
     }
 
     /// Same clobber, third site (#4672): the remote-GET interest registration.
@@ -3141,70 +3283,47 @@ mod tests {
     /// interest must not clear an upstream edge established by SUBSCRIBE.
     #[test]
     fn get_interest_registration_does_not_clobber_or_downgrade() {
-        let src = include_str!("../operations/get/op_ctx_task.rs");
-        let prod = &src[..src.find("\nmod tests {").unwrap_or(src.len())];
-        let stripped: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        let stripped = prod_source(include_str!("../operations/get/op_ctx_task.rs"));
 
+        // Bind the guard to the register rather than merely asserting both
+        // appear: the needle spans `refresh(..) { false } else { register(..) }`,
+        // so a register that runs regardless of the refresh fails here.
         assert!(
-            stripped.contains("get_peer_interest(&key,&peer_key).is_some()"),
-            "the remote-GET registration must check for an existing entry before \
-             registering, or it wipes that entry's cached summary (#4672)"
-        );
-        assert!(
-            !stripped.contains("refresh_peer_interest_with_upstream(&key,&peer_key,false)"),
-            "must NOT assert is_upstream=false on an existing entry — that \
-             downgrades a legitimate upstream edge and breaks Unsubscribe routing"
-        );
-    }
-
-    #[test]
-    fn upsert_peer_summary_seeds_summary_for_untracked_peer() {
-        let (manager, _time) = make_manager();
-        let contract = make_contract_key(1);
-        let peer = make_peer_key(1);
-
-        assert!(
-            manager.get_peer_interest(&contract, &peer).is_none(),
-            "precondition: the peer must be untracked"
+            stripped.contains(
+                "refresh_peer_interest(&key,&peer_key){false}else{op_manager.interest_manager.register_peer_interest(&key,peer_key,None,false)"
+            ),
+            "the remote-GET registration must register ONLY when the refresh \
+             reports no existing entry — otherwise it inserts a fresh \
+             PeerInterest over the existing one and wipes its cached summary \
+             (#4672)"
         );
 
-        assert!(manager.upsert_peer_summary(&contract, &peer, StateSummary::from(vec![1u8, 2])));
-
+        // Exactly one of each in the whole production file: a second, unguarded
+        // register elsewhere would leave the assertion above green while
+        // reintroducing the clobber.
         assert_eq!(
-            manager
-                .get_peer_summary(&contract, &peer)
-                .map(|s| s.as_ref().to_vec()),
-            Some(vec![1u8, 2]),
-            "the upsert must CREATE the entry so the pair escapes to deltas"
+            stripped.matches("register_peer_interest(").count(),
+            1,
+            "get/op_ctx_task.rs must contain exactly ONE register_peer_interest \
+             call — the guarded one; a second is an unguarded clobber"
         );
-        let interest = manager
-            .get_peer_interest(&contract, &peer)
-            .expect("entry created");
-        assert!(
-            !interest.is_upstream,
-            "a delivery-seeded entry is not our upstream"
-        );
-
-        // Later deliveries keep the cached summary current.
-        assert!(manager.upsert_peer_summary(&contract, &peer, StateSummary::from(vec![9u8])));
         assert_eq!(
-            manager
-                .get_peer_summary(&contract, &peer)
-                .map(|s| s.as_ref().to_vec()),
-            Some(vec![9u8]),
+            stripped.matches("refresh_peer_interest(").count(),
+            1,
+            "exactly one refresh_peer_interest call — the one gating that register"
         );
 
-        // The reverse index is maintained, so peer-disconnect cleanup works.
-        assert!(manager.get_contracts_for_peer(&peer).contains(&contract));
-        assert!(manager.remove_peer_interest(&contract, &peer));
-        assert!(manager.get_peer_summary(&contract, &peer).is_none());
-        assert!(!manager.get_contracts_for_peer(&peer).contains(&contract));
-
-        // Summary bookkeeping must not fabricate local demand (invariant 3):
-        // no local-interest entry appears as a side effect.
-        assert!(
-            !manager.has_local_interest(&contract),
-            "upsert must not create local interest / demand state"
+        // Falsifiable form of "must not downgrade": the `_with_upstream`
+        // variant must not appear here AT ALL. Using it on this path would
+        // assert is_upstream=false on an existing entry, clearing an upstream
+        // edge established by SUBSCRIBE and breaking Unsubscribe routing.
+        assert_eq!(
+            stripped
+                .matches("refresh_peer_interest_with_upstream(")
+                .count(),
+            0,
+            "the remote-GET path must use the plain refresh; the _with_upstream \
+             variant SETS the flag, and this call site's is_upstream is false"
         );
     }
 
@@ -3682,9 +3801,8 @@ mod tests {
     /// `register_peer_interest(.., is_upstream = false)` overwrites the whole
     /// `PeerInterest`, flipping `is_upstream` true -> false and wiping the
     /// cached delta-sync summary to `None`. The handler therefore guards the
-    /// re-registration of an EXISTING entry with
-    /// `get_peer_interest().is_some() -> refresh_peer_interest()`, which
-    /// preserves both.
+    /// re-registration of an EXISTING entry on `refresh_peer_interest()`'s own
+    /// return value, and the refresh preserves both.
     ///
     /// SCOPE: this exercises the InterestManager PRIMITIVES directly, so it is a
     /// characterization of the contract the guard relies on — it PASSES on the

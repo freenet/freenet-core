@@ -3204,14 +3204,16 @@ where
             // would DOWNGRADE a peer that is legitimately our upstream, which is
             // the `Unsubscribe` routing target. A GET requester's interest must
             // not clear an upstream edge established by SUBSCRIBE.
+            //
+            // One acquisition, via the refresh's own bool — NOT
+            // `get_peer_interest(..).is_some()`, which clones the cached
+            // summary (state-sized on the contracts that matter) purely to test
+            // presence, and can lose the registration if the entry is removed
+            // between the two lookups.
             let is_new = if op_manager
                 .interest_manager
-                .get_peer_interest(&key, &peer_key)
-                .is_some()
+                .refresh_peer_interest(&key, &peer_key)
             {
-                op_manager
-                    .interest_manager
-                    .refresh_peer_interest(&key, &peer_key);
                 false
             } else {
                 op_manager

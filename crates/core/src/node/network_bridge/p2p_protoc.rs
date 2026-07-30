@@ -4748,6 +4748,14 @@ pub(crate) mod tests {
     /// = converged) arm SKIPS instead of falling back to full state. Without
     /// this pin the behavioral broadcast simulation tests would diverge from
     /// production and silently regress the storm.
+    ///
+    /// Also pins the #3046/#3093 interest-TTL refresh on both of those skip
+    /// exits. The drift here is worse than usual: `tests/simulation_integration.rs`
+    /// is `#![cfg(feature = "simulation_tests")]`, so THIS body — not
+    /// `broadcast_queue::broadcast_to_single_peer` — is what
+    /// `test_interest_ttl_refresh_on_broadcast` actually exercises. A fix
+    /// applied only to production is therefore untested, and a sim-side revert
+    /// is invisible to production.
     #[test]
     fn broadcast_state_to_peers_uses_semantic_delta_skip() {
         // Lives in the `broadcast` submodule after the p2p_protoc.rs split.
@@ -4794,6 +4802,63 @@ pub(crate) mod tests {
             ok_none_arm.contains("continue;"),
             "the sim fan-out's Ok(None) (empty delta = converged) arm must skip \
              this peer (continue). Arm body:\n{ok_none_arm}"
+        );
+
+        // #3046/#3093: both skip exits must refresh the peer's interest TTL.
+        // The send-success arm's refresh is a third occurrence, so pin each
+        // skip to its own arm rather than counting.
+        let equal_skip = body
+            .find("Skipping broadcast - peer already has our state")
+            .expect("sim summaries-equal skip arm not found");
+        assert!(
+            equal_skip < ok_none_off,
+            "unexpected arm order; the slice below assumes the summaries-equal \
+             skip precedes the compute_delta match"
+        );
+        assert!(
+            body[equal_skip..ok_none_off].contains("refresh_peer_interest("),
+            "the sim fan-out's summaries-equal skip must refresh the interest \
+             TTL — without it the sim path ages the entry toward INTEREST_TTL on \
+             every skip and the peer eventually receives nothing. This is the \
+             body simulation_integration.rs actually runs."
+        );
+        assert!(
+            ok_none_arm.contains("refresh_peer_interest("),
+            "the sim fan-out's Ok(None) (empty delta = converged) arm must \
+             refresh the interest TTL — same converged outcome as the skip \
+             above, same obligation. Arm body:\n{ok_none_arm}"
+        );
+
+        // Anti-drift: the production body must carry the same two refreshes.
+        // These two implementations are selected by cfg and have drifted before
+        // (which is why this pin exists at all), so assert the property on both
+        // from one place — a fix landed on only one side fails here.
+        const PROD: &str = include_str!("broadcast_queue.rs");
+        let prod_start = PROD
+            .find("pub(super) async fn broadcast_to_single_peer(")
+            .expect("broadcast_to_single_peer not found");
+        let prod_after = &PROD[prod_start..];
+        let prod_end = prod_after
+            .find("\nmod tests {")
+            .or_else(|| prod_after.find("\n#[cfg(test)]"))
+            .expect("end of broadcast_to_single_peer not found");
+        let prod_body = &prod_after[..prod_end];
+        let prod_equal = prod_body
+            .find("Skipping broadcast - peer already has our state")
+            .expect("production summaries-equal skip arm not found");
+        let prod_empty = prod_body
+            .find("Skipping broadcast - contract reported empty delta")
+            .expect("production empty-delta skip arm not found");
+        assert!(prod_equal < prod_empty, "unexpected production arm order");
+        assert!(
+            prod_body[prod_equal..prod_empty].contains("refresh_peer_interest("),
+            "the production summaries-equal skip must refresh the interest TTL \
+             too — the sim and production bodies must not drift on this"
+        );
+        assert!(
+            prod_body[prod_empty..].contains("refresh_peer_interest("),
+            "the production empty-delta skip must refresh the interest TTL too \
+             — the sim and production bodies must not drift on this"
         );
     }
 
