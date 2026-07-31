@@ -15,9 +15,9 @@
 #
 # Issue #5084 added a second failure mode: when merge-group CI failed, the
 # waiter ignored that terminal result and reported only an opaque one-hour
-# timeout. The behavioral checks below execute the exact workflow block with
-# mocked `gh` responses, proving that the newest CI attempt for this PR controls
-# the decision and that its failure URL is surfaced before any sleep.
+# timeout. The behavioral checks below execute the same script as the workflow
+# with mocked `gh` responses, proving that the newest CI attempt for this PR
+# controls the decision and that its failure URL is surfaced before any sleep.
 #
 # Run manually with: bash scripts/release_mergequeue_test.sh
 
@@ -25,6 +25,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RELEASE_YML="$SCRIPT_DIR/../.github/workflows/release.yml"
+WAIT_SCRIPT="$SCRIPT_DIR/wait_for_release_pr.sh"
 TEST_TMP=$(mktemp -d)
 trap 'rm -rf "$TEST_TMP"' EXIT
 
@@ -66,32 +67,8 @@ check "wait_for_pr grants Actions read access" \
 # shellcheck disable=SC2016
 check "wait_for_pr uses its least-privilege GITHUB_TOKEN" \
   "$(grep -qF 'GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}' <<< "$WAIT_JOB" && echo correct || echo wrong)" "correct"
-
-# Extract the exact shell block GitHub Actions runs. Blank lines are part of a
-# YAML literal and must not terminate extraction; a nonblank line with fewer
-# than ten leading spaces starts the next workflow key.
-WAIT_BLOCK_RAW="$TEST_TMP/wait-block-raw.sh"
-WAIT_BLOCK="$TEST_TMP/wait-block.sh"
-awk '
-  $0 == "      - name: Wait for PR to be merged" { in_step = 1; next }
-  in_step && $0 == "        run: |" { in_run = 1; next }
-  in_run {
-    if ($0 == "") { print; next }
-    if (substr($0, 1, 10) == "          ") { print substr($0, 11); next }
-    exit
-  }
-' "$RELEASE_YML" > "$WAIT_BLOCK_RAW"
-
-# Replace only workflow/time inputs. All polling, filtering, confirmation, and
-# diagnostics below remain the production code extracted above.
-# The replacement values are intentionally written for the extracted script to
-# expand later, not for this test process to expand now.
-# shellcheck disable=SC2016
-sed -E \
-  -e 's|^PR_NUMBER=.*$|PR_NUMBER="${TEST_PR_NUMBER:?}"|' \
-  -e 's|^MAX_WAIT=.*$|MAX_WAIT="${TEST_MAX_WAIT:-3600}"|' \
-  -e 's|^WAIT_INTERVAL=.*$|WAIT_INTERVAL="${TEST_WAIT_INTERVAL:-30}"|' \
-  "$WAIT_BLOCK_RAW" > "$WAIT_BLOCK"
+check "wait_for_pr invokes the tested waiter script" \
+  "$(grep -qF 'run: scripts/wait_for_release_pr.sh' <<< "$WAIT_JOB" && echo correct || echo wrong)" "correct"
 
 MOCK_BIN="$TEST_TMP/bin"
 mkdir -p "$MOCK_BIN"
@@ -105,11 +82,6 @@ case "${1:-} ${2:-}" in
     ;;
   "run list")
     printf '%s\n' "$MOCK_RUNS_JSON"
-    ;;
-  "pr view")
-    # Keeps this harness capable of demonstrating the regression against the
-    # pre-#5084 workflow block, which queried only `gh pr view`.
-    printf 'OPEN\n'
     ;;
   *)
     echo "unexpected gh invocation: $*" >&2
@@ -136,13 +108,13 @@ run_wait_block() {
     set +e
     PATH="$MOCK_BIN:$PATH" \
       GITHUB_REPOSITORY="freenet/freenet-core" \
-      TEST_PR_NUMBER="5084" \
-      TEST_MAX_WAIT="1" \
-      TEST_WAIT_INTERVAL="1" \
+      PR_NUMBER="5084" \
+      MAX_WAIT="1" \
+      WAIT_INTERVAL="1" \
       MOCK_PR_JSON="$PR_JSON" \
       MOCK_RUNS_JSON="$runs_json" \
       MOCK_SLEEP_MARKER="$sleep_marker" \
-      bash --noprofile --norc -e -o pipefail "$WAIT_BLOCK" > "$output_file" 2>&1
+      bash --noprofile --norc "$WAIT_SCRIPT" > "$output_file" 2>&1
     status=$?
     set -e
     echo "$status"
