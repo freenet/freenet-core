@@ -234,7 +234,7 @@ jobs:
           # This job is read-only and has explicit least-privilege access above.
           # Use GITHUB_TOKEN here because a fine-grained RELEASE_PAT may not
           # carry Actions: read even when it can create and enqueue the bump PR.
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # coalesce-exempt: read-only polling
           PR_NUMBER: ${{ needs.update_versions.outputs.pr_number }}
         run: scripts/wait_for_release_pr.sh
 
