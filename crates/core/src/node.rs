@@ -3373,24 +3373,44 @@ async fn handle_interest_sync_message(
                 // message) inflating the reply, and it is independent of the
                 // per-entry dedup above.
                 let mut requested_hashes: HashSet<u32> = HashSet::new();
-                // Per-message cache of OUR summaries, keyed by contract.
+                // Cache of OUR summaries for the hash CURRENTLY being
+                // processed, keyed by contract. Cleared whenever the hash
+                // changes (see `cached_for_hash`).
                 //
-                // The root bound on the expensive operation. Pair-dedup (above)
-                // is required for correctness but removed the incidental bound
+                // It bounds the expensive operation. Pair-dedup (above) is
+                // required for correctness but removed the incidental bound
                 // hash-dedup used to provide: a peer can name ONE known hash
-                // with up to `MAX_SUMMARY_HASHES_PER_MESSAGE` distinct
-                // fabricated digests, and without this each pair would rerun
-                // `summary_if_hosted_or_in_use` — a contract-handler round trip
-                // — for every contract matching that hash, sequentially, on the
-                // loop the executor needs responsive
-                // (`.claude/rules/code-style.md`, fan-out cost).
+                // with many distinct fabricated digests, and without this each
+                // pair would rerun `summary_if_hosted_or_in_use` — a
+                // contract-handler round trip — for every contract matching
+                // that hash, sequentially, on the loop the executor needs
+                // responsive (`.claude/rules/code-style.md`, fan-out cost).
                 //
-                // With the cache the fetch runs at most ONCE per contract per
-                // message no matter how many pairs name it.
+                // PER-HASH, not per-message, and that scoping is the memory
+                // bound. These are OWNED summary clones; a message-scoped cache
+                // retains one per matched contract until the whole message
+                // finishes, so a peer naming many distinct locally-hosted
+                // hashes accumulates (matched contracts x summary size) —
+                // hundreds of MB at the cap with River-scale summaries. That is
+                // the large-value retention class `contract/executor.rs`
+                // byte-bounds its own summary cache for.
+                //
+                // Per-hash scoping costs nothing real: distinct hashes resolve
+                // to ~disjoint contract sets, so cross-hash caching never had
+                // hits to give. And within one hash the skip below holds
+                // processed pairs to ~2, so stopping the second pair from
+                // refetching is the cache's entire job — which a per-hash cache
+                // does completely. An attacker interleaving A,B,A,B to force
+                // clears gains nothing either: each hash goes inert after its
+                // first mismatch arms the skip.
+                //
+                // Retention is therefore bounded by ONE hash's contract set,
+                // with no byte-budget machinery needed.
                 let mut local_summaries: std::collections::HashMap<
                     ContractInstanceId,
                     Option<freenet_stdlib::prelude::StateSummary<'static>>,
                 > = std::collections::HashMap::new();
+                let mut cached_for_hash: Option<u32> = None;
                 let mut compared_contracts: HashSet<ContractInstanceId> = HashSet::new();
                 // See the sibling set in the `Summaries` arm.
                 let mut one_sided_counted: HashSet<ContractInstanceId> = HashSet::new();
@@ -3421,6 +3441,15 @@ async fn handle_interest_sync_message(
                     if requested_hashes.contains(&entry.hash) {
                         continue;
                     }
+                    // Drop the previous hash's summaries before touching a new
+                    // one. This is the retention bound, not an optimisation.
+                    if cached_for_hash != Some(entry.hash) {
+                        local_summaries.clear();
+                        cached_for_hash = Some(entry.hash);
+                    }
+                    crate::config::GlobalTestMetrics::note_summary_cache_size(
+                        local_summaries.len(),
+                    );
                     // One hash can resolve to several contracts (FNV-1a
                     // collisions), and any one of them needing bytes is enough
                     // to ask — but the hash goes on the request list at most
@@ -3444,6 +3473,9 @@ async fn handle_interest_sync_message(
                         if !local_summaries.contains_key(contract.id()) {
                             let fetched = summary_if_hosted_or_in_use(op_manager, &contract).await;
                             local_summaries.insert(*contract.id(), fetched);
+                            crate::config::GlobalTestMetrics::note_summary_cache_size(
+                                local_summaries.len(),
+                            );
                         }
                         let our_summary = local_summaries
                             .get(contract.id())
@@ -9042,6 +9074,91 @@ mod tests {
                      must be requested; got {other:?}"
                 ),
             }
+        }
+
+        /// Processing many DISTINCT locally-hosted hashes must not accumulate
+        /// their summaries (codex P1, round 3).
+        ///
+        /// # The retention this bounds
+        ///
+        /// The local-summary cache holds OWNED `StateSummary` clones. Scoped to
+        /// the MESSAGE, it retained one per matched contract until the whole
+        /// message finished — so a peer naming many distinct hashes it knows we
+        /// host accumulates (matched contracts x summary size). At the
+        /// per-message cap with River-scale summaries (~33 KB) that is hundreds
+        /// of MB from a single message: the large-value retention class
+        /// `contract/executor.rs` byte-bounds its own summary cache for.
+        ///
+        /// Scoping the cache to the CURRENT hash bounds retention to one hash's
+        /// contract set. This test asserts that directly through the peak cache
+        /// size, rather than through a fetch count — fetches and retention are
+        /// different quantities and only the latter is the OOM risk.
+        ///
+        /// Note the peak is asserted, not the final size: a cache that grew and
+        /// was cleared only at the END of the message would leave a final size
+        /// of ~0 while having held everything at once.
+        #[tokio::test]
+        async fn distinct_hashes_do_not_accumulate_cached_summaries() {
+            use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+
+            let h = build_harness("hf-retain", 17100, vec![5u8; 128]).await;
+
+            // 64 contracts this node hosts, each with its own distinct hash.
+            let mut hashes = Vec::new();
+            for i in 0u8..64 {
+                let k = ContractKey::from_id_and_code(
+                    ContractInstanceId::new([i.wrapping_add(100); 32]),
+                    CodeHash::new([i; 32]),
+                );
+                let _ = h
+                    .op_manager
+                    .ring
+                    .host_contract(k, 128, crate::ring::AccessType::Put);
+                h.op_manager.interest_manager.register_local_hosting(&k);
+                hashes.push(contract_hash(&k));
+            }
+            hashes.sort_unstable();
+            hashes.dedup();
+            assert!(
+                hashes.len() >= 32,
+                "premise: the fixture needs many DISTINCT hashes to accumulate, \
+                 got {} — if they collided this tests the wrong thing",
+                hashes.len()
+            );
+
+            crate::config::GlobalTestMetrics::reset();
+
+            // One entry per hash, each digest divergent so every hash resolves
+            // and caches its contract's summary.
+            let entries: Vec<SummaryDigestEntry> = hashes
+                .iter()
+                .map(|hash| SummaryDigestEntry {
+                    hash: *hash,
+                    summary_digest: Some(summary_digest(b"divergent")),
+                })
+                .collect();
+
+            let _ = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::SummaryDigests {
+                    entries,
+                    emitter: crate::message::SummariesEmitter::Other,
+                },
+            )
+            .await;
+
+            let peak = crate::config::GlobalTestMetrics::summary_cache_peak();
+            assert!(
+                peak <= 4,
+                "the local-summary cache peaked at {peak} entries across \
+                 {} distinct hashes. It must be bounded by ONE hash's contract \
+                 set (1 here), not by how many hashes a peer names — a peak \
+                 tracking the hash count means owned summary clones accumulate \
+                 for the whole message, which is hundreds of MB at the cap with \
+                 real summaries.",
+                hashes.len()
+            );
         }
 
         /// Repeated hashes must be free: a peer that names the same contract

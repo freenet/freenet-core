@@ -3659,6 +3659,11 @@ std::thread_local! {
     // for a peer pair sharing exactly ONE contract is also single-entry, so the
     // single bucket is "state-change-driven sites PLUS narrow heartbeats", not
     // a clean partition. It is directional evidence, not attribution.
+    /// Peak size of the digest arm's per-hash local-summary cache (#4965).
+    /// The observable for the RETENTION bound: the cache holds owned summary
+    /// clones, so its peak entry count is what decides whether a hostile
+    /// message can accumulate hundreds of MB.
+    static GLOBAL_SUMMARY_CACHE_PEAK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_SUMMARY_AGREE_SINGLE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_SUMMARY_AGREE_MULTI: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_SUMMARY_MISMATCH_SINGLE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -3715,6 +3720,7 @@ impl GlobalTestMetrics {
         GLOBAL_SUMMARY_DIGEST_MSGS.with(|c| c.set(0));
         GLOBAL_SUMMARY_FULL_MSGS.with(|c| c.set(0));
         GLOBAL_SUMMARY_FULL_BYTES.with(|c| c.set(0));
+        GLOBAL_SUMMARY_CACHE_PEAK.with(|c| c.set(0));
         GLOBAL_SUMMARY_AGREE_SINGLE.with(|c| c.set(0));
         GLOBAL_SUMMARY_AGREE_MULTI.with(|c| c.set(0));
         GLOBAL_SUMMARY_MISMATCH_SINGLE.with(|c| c.set(0));
@@ -3992,6 +3998,20 @@ impl GlobalTestMetrics {
     pub fn record_summary_full_msg(bytes: u64) {
         GLOBAL_SUMMARY_FULL_MSGS.with(|c| c.set(c.get() + 1));
         GLOBAL_SUMMARY_FULL_BYTES.with(|c| c.set(c.get() + bytes));
+    }
+
+    /// Observe the digest arm's local-summary cache size, keeping the peak.
+    ///
+    /// Records the RETENTION bound directly rather than through a proxy: the
+    /// cache holds owned summary clones, so a peak proportional to the number
+    /// of hashes a peer named — rather than to ONE hash's contract set — is
+    /// the accumulation this is here to catch.
+    pub fn note_summary_cache_size(len: usize) {
+        GLOBAL_SUMMARY_CACHE_PEAK.with(|c| c.set(c.get().max(len as u64)));
+    }
+
+    pub fn summary_cache_peak() -> u64 {
+        GLOBAL_SUMMARY_CACHE_PEAK.with(|c| c.get())
     }
 
     /// One advertised digest matched our own summary, settling that contract
