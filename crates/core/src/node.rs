@@ -64,7 +64,7 @@ pub(crate) use network_bridge::broadcast_queue::BROADCAST_STREAM_METRICS;
 // re-export rather than a path through `network_bridge` directly. Mirrors
 // `BROADCAST_STREAM_METRICS` above.
 pub(crate) use network_bridge::p2p_protoc::{
-    HASH_FIRST_SUMMARIES_MIN_VERSION, SUMMARY_FIRST_PUT_MIN_VERSION,
+    HASH_FIRST_SHIPPED_IN, HASH_FIRST_SUMMARIES_MIN_VERSION, SUMMARY_FIRST_PUT_MIN_VERSION,
     version_supports_hash_first_summaries, version_supports_summary_first_put,
 };
 #[cfg(test)]
@@ -2270,10 +2270,45 @@ fn stale_sync_emit_budget(stale_contracts_len: usize) -> usize {
 /// the same reason: `get_matching_contracts` sorts by contract id, so a fixed
 /// prefix would starve the tail forever).
 ///
-/// 256 is deliberately far above the handful of contracts a healthy pair
-/// actually shares (and 8x the 32-contract heal budget that gates the outcome
-/// of any request), so it binds only on abuse.
-const MAX_SUMMARY_HASHES_PER_MESSAGE: usize = 256;
+/// # Why 4096, measured rather than guessed
+///
+/// This constant was 256, chosen on the assumption that "a healthy pair shares
+/// a handful of contracts". **Production telemetry says otherwise.**
+/// `hosting_contract_count` over 16,578 samples from the deployed collector:
+///
+/// | p50 | p75 | p90 | p95 | p99 | max |
+/// |-----|-----|-----|-----|-----|-----|
+/// | 417 | 698 | 825 | 976 | 2463 | 2814 |
+///
+/// **73% of samples exceed 256.** A median peer hosts 417 contracts, so the
+/// old value would have bound on the common case, not the abuse case.
+///
+/// The reason this was not obvious from the bandwidth data — and the reason
+/// the byte metrics everyone had been staring at could not have revealed it —
+/// is that **entry count is decoupled from message size**:
+/// `summary_if_hosted_or_in_use` returns `None` for any contract the responder
+/// does not host-or-serve, and a `None` entry costs ~5 bytes on the wire. A
+/// pair sharing 400 contracts of which the responder hosts a handful produces
+/// a CHEAP 400-entry message. Byte size bounds nothing here.
+///
+/// 4096 clears the observed maximum (2814) with headroom. The counter that
+/// measures this directly per message, `summaries_entries` (#5061), ships in
+/// this same release and is the ongoing field validation.
+///
+/// # What the cap is, and is not
+///
+/// It is a **backstop, not the operative bound.** The sender's entry count is
+/// naturally bounded by its own tracked set (`get_matching_contracts` iterates
+/// the responder's hash index), and the expensive receive-side work is bounded
+/// the same way: `lookup_by_hash` can only resolve contracts WE already track,
+/// so a peer cannot make us summarize something we do not have. What this cap
+/// actually bounds is a per-entry DashMap-get loop — cheap, which is why a
+/// generous value costs nothing.
+///
+/// There is no send-side chunking at this value; all three uses are
+/// receive-side (the `SummaryDigests` window and the `SummaryRequest` answer),
+/// so the constant moves them together and cannot be raised on one side only.
+const MAX_SUMMARY_HASHES_PER_MESSAGE: usize = 4096;
 
 /// Per-`Summaries`-message cap on semantic-staleness probes — the WASM
 /// `get_state_delta` calls the `Summaries` handler issues to decide, for a
@@ -2713,6 +2748,20 @@ fn classify_summary_digest(
 /// [`crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION`]): the fallback is what
 /// every peer does today, so the cost of guessing wrong is bandwidth, never
 /// convergence.
+///
+/// # Only the two MULTI-ENTRY reply legs use this (#4965 review §2)
+///
+/// `InterestsReply` and `ChangeInterestsReply` route through here. The two
+/// single-entry legs — `Notification` and `Rejection` — call
+/// [`full_summaries_message`] directly and ship full bytes this release.
+///
+/// The reason is evidential, not technical: the 98.1% agreement rate that
+/// justifies hash-first was measured on a heartbeat-dominated population, and
+/// the state-change-driven legs are the population least likely to agree
+/// (their receivers may not have applied the update yet). A mismatch turns 1
+/// message into 3 for the same bytes, which is the wrong direction on the
+/// #4861 messages/s axis. Extend to those legs once the agreement counters
+/// give a field reading.
 pub(crate) fn summaries_reply_for_peer(
     op_manager: &OpManager,
     target: std::net::SocketAddr,
@@ -3039,6 +3088,11 @@ async fn handle_interest_sync_message(
                 // already tracks, so a peer cannot grow it with unknown ids —
                 // and it holds contract ids only, no state.
                 let mut compared_contracts: HashSet<ContractInstanceId> = HashSet::new();
+                // Separate dedup set from `compared_contracts`: a contract is
+                // either a two-sided comparison or a one-sided observation,
+                // never both in one message, and sharing one set would let the
+                // first kind silence the second.
+                let mut one_sided_counted: HashSet<ContractInstanceId> = HashSet::new();
                 for entry in entries {
                     for contract in op_manager.interest_manager.lookup_by_hash(entry.hash) {
                         if !op_manager.interest_manager.has_local_interest(&contract) {
@@ -3145,6 +3199,21 @@ async fn handle_interest_sync_message(
                             }
                             // One side has no summary => no basis to heal
                             // (unchanged from the prior `.zip()` semantics).
+                            //
+                            // #4965 review S2: count the WE-have-nothing /
+                            // THEY-have-something case. It was never in the
+                            // 98.1%-identical denominator (that counted only
+                            // `(Some, Some)`), and it is not neutral under
+                            // hash-first — it classifies as `NeedBytes`, so it
+                            // costs +2 messages for bytes this path delivers
+                            // immediately. Sizing it keeps the headline honest.
+                            (None, Some(_)) => {
+                                op_manager.outbound_mix.record_summary_one_sided(
+                                    contract.id(),
+                                    &mut one_sided_counted,
+                                );
+                                false
+                            }
                             _ => false,
                         };
 
@@ -3277,6 +3346,8 @@ async fn handle_interest_sync_message(
                 let single_entry = entries.len() == 1;
                 let mut seen_hashes: HashSet<u32> = HashSet::new();
                 let mut compared_contracts: HashSet<ContractInstanceId> = HashSet::new();
+                // See the sibling set in the `Summaries` arm.
+                let mut one_sided_counted: HashSet<ContractInstanceId> = HashSet::new();
                 for entry in entries {
                     if seen_hashes.len() >= MAX_SUMMARY_HASHES_PER_MESSAGE {
                         break;
@@ -3364,6 +3435,19 @@ async fn handle_interest_sync_message(
                                 crate::config::GlobalTestMetrics::record_summary_digest_mismatch(
                                     single_entry,
                                 );
+                                // #4965 review S2: separate "we hold nothing,
+                                // they do" from a genuine digest disagreement.
+                                // Only the former sat outside the 98.1%
+                                // denominator, and it is the one costing +2
+                                // messages for bytes the full-bytes path
+                                // shipped immediately (and used to seed our
+                                // peer-summary cache).
+                                if our_summary.is_none() {
+                                    op_manager.outbound_mix.record_summary_one_sided(
+                                        contract.id(),
+                                        &mut one_sided_counted,
+                                    );
+                                }
                                 needs_bytes = true;
                             }
                         }
@@ -4360,6 +4444,33 @@ mod tests {
     use super::*;
     use rstest::rstest;
 
+    /// Strip `//` comment lines from a source window before asserting on it.
+    ///
+    /// Load-bearing, not tidiness. Source-scrape pins assert that an arm CALLS
+    /// something; the identifiers they search for also appear in that arm's own
+    /// explanatory comments, so an unstripped window is satisfied by PROSE.
+    ///
+    /// Two pins in this file were vacuous for exactly this reason:
+    /// `digest_arm_shares_the_single_heal_path` (its window's comments name
+    /// `summary_indicates_stale_peer` and `record_summary_comparison`), and
+    /// `summaries_arm_uses_semantic_staleness_probe_pin` (whose CORRECT window
+    /// still carries comment mentions of `plan_staleness_probe` at node.rs:3032
+    /// and `summary_indicates_stale_peer` at :3074/:3135, alongside the real
+    /// calls at :3095/:3115/:3123/:3140).
+    ///
+    /// Note this is only ONE of the two guards a scrape pin needs. The sibling
+    /// guard is on the NEEDLE — `concat!("record_summary", "_comparison")` — so
+    /// the assertion's own source cannot satisfy its own scrape. Needle guard
+    /// and window guard defend against different self-matches; a pin wants
+    /// both. See #5076.
+    fn code_only(window: &str) -> String {
+        window
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Source-level pins for the three log sites in this file that were
     /// demoted / format-fixed in PR #4252 for issue #4251.
     ///
@@ -4624,9 +4735,18 @@ mod tests {
         // the positive assertions below would have kept passing with those
         // calls deleted from `Summaries` itself.
         let next_off = src[handler_start..]
-            .find("InterestMessage::SummaryDigests { entries }")
+            // `{ entries, .. }`, matching the REAL arm at node.rs:3203. The
+            // bare `{ entries }` form appears NOWHERE in this file except this
+            // line, so `include_str!` made the needle match ITSELF: the window
+            // became 2995..4627 (~1632 lines) instead of ~208, swallowing the
+            // digest arm's own calls and this pin's rustdoc, either of which
+            // satisfies all four assertions with the true `Summaries` arm's
+            // calls deleted. A needle must be verified to resolve to the
+            // INTENDED line, not merely to resolve somewhere (#5076).
+            .find("InterestMessage::SummaryDigests { entries, .. } => {")
             .expect("SummaryDigests arm not found");
-        let summaries_arm = &src[handler_start + summaries_off..handler_start + next_off];
+        let summaries_arm =
+            &code_only(&src[handler_start + summaries_off..handler_start + next_off]);
 
         // #4965: the measurement call must stay wired into this arm. It is
         // pure observation, so deleting it breaks no test and no behavior —
@@ -8629,33 +8749,6 @@ mod tests {
                 }
                 other => panic!("expected Summaries for the one known hash, got {other:?}"),
             }
-        }
-
-        /// Strip `//` comment lines from a source window before asserting on
-        /// it.
-        ///
-        /// Load-bearing, not tidiness. These pins assert that the arm CALLS
-        /// something; the identifiers they search for also appear in the arm's
-        /// own explanatory comments, so an unstripped window is satisfied by
-        /// PROSE. `digest_arm_shares_the_single_heal_path` was exactly that:
-        /// `summary_indicates_stale_peer` and `record_summary_comparison` both
-        /// appear in comments inside its window, so deleting both calls left it
-        /// green — and the mutation is silent everywhere else, since
-        /// `record_summary_comparison` is pure observation and
-        /// `summary_indicates_stale_peer(&ours, &ours, None)` provably returns
-        /// `false`, so `let is_stale = false;` compiles and breaks nothing.
-        ///
-        /// The sibling pins already guarded the ASSERTION's own source from
-        /// self-matching (via `concat!`); this guards the SCANNED WINDOW, which
-        /// is the half that was missed. Verified by mutation: with the
-        /// predicate call replaced by `let is_stale = false;` and the prose
-        /// left intact, the pin now fails.
-        fn code_only(window: &str) -> String {
-            window
-                .lines()
-                .filter(|l| !l.trim_start().starts_with("//"))
-                .collect::<Vec<_>>()
-                .join("\n")
         }
 
         /// Source pin: production code must never construct

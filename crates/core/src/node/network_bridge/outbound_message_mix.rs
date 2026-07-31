@@ -413,6 +413,19 @@ struct Window {
     summary_entries_identical: u64,
     /// Same, but the summary bytes DIFFERED.
     summary_entries_differing: u64,
+    /// Comparisons where exactly ONE side held a summary (#4965 review S2).
+    ///
+    /// The 98.1% identical figure has a structural hole:
+    /// [`OutboundMix::record_summary_comparison`] only fires in the
+    /// `(Some, Some)` arm, so the one-sided case was never in its denominator.
+    /// That case is NOT neutral under hash-first — it classifies as
+    /// `NeedBytes`, costing +2 messages for bytes the full-bytes path shipped
+    /// immediately AND used to seed the peer-summary cache. It is the #4473
+    /// phantom-interest shape, and its size is unmeasured.
+    ///
+    /// Counted so the post-deploy data can size it rather than leaving the
+    /// headline extrapolated over a population it never observed.
+    summary_entries_one_sided: u64,
     /// Which contracts the differing comparisons belonged to, bounded at
     /// [`MAX_TRACKED_CONTRACTS`].
     ///
@@ -581,6 +594,38 @@ impl OutboundMix {
         }
     }
 
+    /// Record a summary comparison where WE hold no summary but the PEER does
+    /// (#4965 review S2).
+    ///
+    /// Deliberately a separate method rather than a third branch inside
+    /// [`Self::record_summary_comparison`]: that function takes two byte
+    /// slices, and the whole point here is that one of them does not exist.
+    /// Forcing a caller to synthesise an empty slice would have made this
+    /// population indistinguishable from a genuine empty-summary comparison.
+    ///
+    /// Why it matters: the 98.1%-identical headline was computed over
+    /// `(Some, Some)` comparisons only, so this case was never in its
+    /// denominator — yet it is not neutral under hash-first. It classifies as
+    /// `NeedBytes`, which costs +2 messages to fetch bytes the full-bytes path
+    /// delivered immediately and used to seed our peer-summary cache. Sizing
+    /// it is the difference between a headline that generalises and one that
+    /// was extrapolated over a population it never saw.
+    ///
+    /// Shares the caller's per-message dedup set for the same reason the
+    /// two-sided counter does: `entries` is peer-supplied and may repeat a
+    /// hash, so without it a peer could inflate this bucket at will.
+    pub(crate) fn record_summary_one_sided(
+        &self,
+        contract: &ContractInstanceId,
+        counted_this_message: &mut HashSet<ContractInstanceId>,
+    ) {
+        if !counted_this_message.insert(*contract) {
+            return;
+        }
+        let mut w = self.window.lock();
+        w.summary_entries_one_sided = w.summary_entries_one_sided.saturating_add(1);
+    }
+
     /// Atomically take the current window, leaving a fresh empty one.
     fn take_window(&self) -> Window {
         std::mem::take(&mut *self.window.lock())
@@ -658,6 +703,10 @@ fn outbound_mix_json(w: &Window, window_secs: u64) -> serde_json::Value {
     body.insert(
         "summary_entries_differing".into(),
         w.summary_entries_differing.into(),
+    );
+    body.insert(
+        "summary_entries_one_sided".into(),
+        w.summary_entries_one_sided.into(),
     );
     body.insert(
         "differing_attribution_dropped".into(),

@@ -2883,19 +2883,100 @@ mod tests {
         );
     }
 
-    /// The hash-first floor must stay strictly ABOVE the last release that
-    /// shipped WITHOUT the variants.
+    /// The hash-first floor must track the release that actually ships it.
     ///
-    /// 0.2.115 is that release — it is the version this feature branched from,
-    /// and it carries neither `SummaryDigests` nor `SummaryRequest`. Every
-    /// peer on 0.2.115 or below drops its connection on receiving one.
+    /// Two failure directions, both fleet-wide and both silent under the
+    /// previous frozen-literal guard:
     ///
-    /// Deliberately pinned against that FROZEN constant rather than against
-    /// `CARGO_PKG_VERSION`: the floor is frozen at the first-shipping release
-    /// while the crate version keeps moving, so a comparison against the
-    /// current crate version would fail on the very next release and train the
-    /// next agent to edit the floor — the exact mistake `docs/RELEASING.md`
-    /// forbids ("set it to the first-shipping release, then freeze").
+    /// - **Floor too LOW** (a release ships at or above the floor WITHOUT the
+    ///   feature): peers on that real release read as at-floor, receive a
+    ///   `SummaryDigests` they have no variant index for, fail to
+    ///   bincode-decode, and the connection is CLOSED.
+    /// - **Floor too HIGH** (the feature ships below its own floor): the gate
+    ///   never opens and the feature is inert against fully-capable peers.
+    ///
+    /// The previous guard compared the floor against a frozen
+    /// `LAST_RELEASE_WITHOUT_VARIANTS = (0,2,115)` literal, which can only
+    /// catch the floor moving DOWN. It cannot notice the RELEASE moving up
+    /// past a floor that stayed put — the actual risk at this project's
+    /// cadence (five releases in the four days before this was written).
+    ///
+    /// This version couples the floor to `CARGO_PKG_VERSION` through
+    /// [`crate::node::HASH_FIRST_SHIPPED_IN`], so a release bump forces a
+    /// conscious decision instead of a silent drift.
+    #[test]
+    fn hash_first_floor_tracks_the_shipping_release() {
+        /// `CARGO_PKG_VERSION` of the `freenet` crate as a comparable triple.
+        /// Pre-release suffixes (`-rc1`) are dropped: they order below the
+        /// release proper, so ignoring them is the conservative direction.
+        fn crate_version() -> (u8, u8, u16) {
+            let v = env!("CARGO_PKG_VERSION");
+            let mut it = v.split('.');
+            let major = it.next().unwrap().parse().expect("major");
+            let minor = it.next().unwrap().parse().expect("minor");
+            let patch = it
+                .next()
+                .unwrap()
+                .split(['-', '+'])
+                .next()
+                .unwrap()
+                .parse()
+                .expect("patch");
+            (major, minor, patch)
+        }
+
+        let floor = crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION;
+        let current = crate_version();
+
+        match crate::node::HASH_FIRST_SHIPPED_IN {
+            None => {
+                // Not shipped yet: the floor is a PREDICTION about a future
+                // release, so it must still be ahead of the crate version.
+                // This is the assertion that fires on the release bump PR.
+                assert!(
+                    floor > current,
+                    "HASH_FIRST_SUMMARIES_MIN_VERSION is {floor:?} but the crate \
+                     is already at {current:?}, and HASH_FIRST_SHIPPED_IN is \
+                     None.\n\n\
+                     The release has caught up with the floor. Decide which is \
+                     true and encode it:\n\
+                     - This release DOES carry hash-first -> set \
+                     HASH_FIRST_SHIPPED_IN = Some({floor:?}) and freeze both.\n\
+                     - It does NOT -> raise HASH_FIRST_SUMMARIES_MIN_VERSION to \
+                     the release that will.\n\n\
+                     Leaving it as-is ships a floor that peers on the real \
+                     {current:?} satisfy without carrying the SummaryDigests \
+                     variant: they cannot decode it, and the connection is \
+                     closed. See HASH_FIRST_SHIPPED_IN."
+                );
+            }
+            Some(shipped) => {
+                assert_eq!(
+                    shipped, floor,
+                    "HASH_FIRST_SHIPPED_IN ({shipped:?}) must EQUAL \
+                     HASH_FIRST_SUMMARIES_MIN_VERSION ({floor:?}). The gate opens \
+                     at the floor, so a mismatch means peers on the shipping \
+                     release either receive a variant they lack, or never \
+                     receive one they have."
+                );
+                assert!(
+                    floor <= current,
+                    "HASH_FIRST_SHIPPED_IN says the feature shipped in \
+                     {shipped:?}, but the crate is only at {current:?} — a \
+                     release cannot have shipped in the future. One of the two \
+                     is wrong."
+                );
+            }
+        }
+    }
+
+    /// Companion to the marker guard: the floor must never drop to or below a
+    /// release known NOT to carry the variants.
+    ///
+    /// Kept alongside the marker test rather than replaced by it, because the
+    /// two catch different mistakes: this one catches the floor being LOWERED
+    /// (e.g. someone "fixing" a gate that seems not to fire), the marker one
+    /// catches the RELEASE advancing past a stationary floor.
     #[test]
     fn hash_first_floor_stays_above_every_release_without_the_variants() {
         /// Last release that does NOT carry the hash-first wire variants.

@@ -125,15 +125,41 @@ Current wire-gated floors:
 - `HASH_FIRST_SUMMARIES_MIN_VERSION` in the same file (hash-first InterestSync
   summary exchange, #4965).
 
-  Set to **`(0, 2, 116)`**, the release that first ships the
+  Set to **`(0, 2, 116)`**, the release intended to first ship the
   `InterestMessage::SummaryDigests` / `SummaryRequest` variants and their
-  handlers. **RELEASE-TIME CHECK:** if the release that first carries this
-  feature is renumbered, update the constant to match BEFORE cutting the tag,
-  then freeze it. A floor below the shipping version sends an undecodable
-  variant to peers on the prior release and drops their connections during the
-  0-4h staggered rollout; a floor above it silently disables the feature.
-  `connection_manager.rs::hash_first_floor_stays_above_every_release_without_the_variants`
-  guards the lower bound.
+  handlers.
+
+  **This one is guarded by a marker, not by a manual check.** Alongside the
+  floor there is `HASH_FIRST_SHIPPED_IN: Option<(u8, u8, u16)>`, currently
+  `None`. The test
+  `connection_manager.rs::hash_first_floor_tracks_the_shipping_release`
+  asserts:
+
+  - while the marker is `None`, the floor must stay **strictly above**
+    `CARGO_PKG_VERSION`;
+  - once it is `Some(v)`, `v` must **equal** the floor and be at or below the
+    crate version.
+
+  So the moment a release bump raises `Cargo.toml` to the floor's value, that
+  test fails and the releaser must consciously choose:
+
+  - **this release carries hash-first** → set
+    `HASH_FIRST_SHIPPED_IN = Some(HASH_FIRST_SUMMARIES_MIN_VERSION)` and freeze
+    both; or
+  - **it does not** → raise `HASH_FIRST_SUMMARIES_MIN_VERSION` to the release
+    that will.
+
+  Why a marker rather than the manual check used above: at this project's
+  cadence (five releases in four days at the time of writing) a floor naming
+  "the next release" goes stale silently. If 0.2.116 ships *without* the
+  feature, peers on the real 0.2.116 satisfy the floor while carrying no
+  `SummaryDigests` variant index — they cannot decode it, and the connection is
+  closed, presenting as fleet-wide transport churn during the 0-4h staggered
+  rollout. The marker makes that state fail a test instead of reaching users.
+
+  `hash_first_floor_stays_above_every_release_without_the_variants` is kept as
+  a companion: it catches the floor being *lowered*, which the marker test does
+  not.
 
 When a NEW wire-gated feature first ships (not this one), set its floor to
 **exactly that release version** and freeze it, as described above.

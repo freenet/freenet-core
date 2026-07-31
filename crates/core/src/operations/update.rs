@@ -915,9 +915,29 @@ pub(crate) async fn send_proactive_summary_notification(
             continue;
         }
 
-        let message = crate::node::summaries_reply_for_peer(
-            op_manager,
-            peer_addr,
+        // FULL BYTES, deliberately — this leg does NOT ship digest-first
+        // this release (#4965 review §2).
+        //
+        // The 98.1% agreement measurement that justifies hash-first comes from
+        // a heartbeat-dominated population. This site is the opposite case: it
+        // fires immediately after WE change state, so its receivers are
+        // precisely the peers least likely to have applied the update yet. A
+        // mismatch here costs 1 message -> 3 (digests, request, bytes) for the
+        // SAME bytes, and defers the heal a round trip — a bad trade on the
+        // #4861 messages/s axis if the agreement rate is materially below the
+        // heartbeat's. Nothing in the field can currently tell us: the
+        // single/multi agreement split lives in thread-local test metrics, not
+        // fleet telemetry, and there is no runtime kill-switch.
+        //
+        // #5003 makes it worse before it makes it better: it removes advertised
+        // co-hosts from this leg's recipients — exactly the peers most likely
+        // to agree.
+        //
+        // So: ship where the evidence is (the two multi-entry reply legs),
+        // extend here next release once `summaries_entries` and the agreement
+        // counters give a field reading. The emitter tag is unchanged, so the
+        // rollup keeps attributing this leg either way.
+        let message = crate::node::full_summaries_message(
             vec![full_entry.clone()],
             SummariesEmitter::Notification,
         );
@@ -1059,12 +1079,15 @@ pub(crate) async fn send_summary_back_on_rejection(
     // moment ago, so this is a narrow race, but an absolute claim here would
     // be wrong.
     let full_entry = SummaryEntry::from_summary(hash, Some(&our_summary));
-    let message = crate::node::summaries_reply_for_peer(
-        op_manager,
-        target_addr,
-        vec![full_entry],
-        SummariesEmitter::Rejection,
-    );
+    // FULL BYTES, same release-scoping as the notification leg above (#4965
+    // review §2): single-entry, state-change-driven, and outside the
+    // population the 98.1% agreement figure was measured on. The digest would
+    // very likely match here (this path only runs once the peer's summary is
+    // known equal to ours), but "very likely" on an unmeasured leg is exactly
+    // what the review declined to ship — and the saving is one summary on a
+    // path that fires ~80-130 times/hour/gateway, not a stream.
+    let message =
+        crate::node::full_summaries_message(vec![full_entry], SummariesEmitter::Rejection);
 
     if let Err(e) = op_manager
         .notify_node_event(NodeEvent::SendInterestMessage {

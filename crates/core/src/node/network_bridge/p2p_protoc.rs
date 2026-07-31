@@ -984,6 +984,38 @@ pub(crate) fn version_supports_summary_first_put(
 /// the release just before, churning live connections during the 0-4h
 /// staggered rollout; a floor ABOVE it silently disables the feature against
 /// fully-capable peers. Once the release ships, FREEZE it.
+/// Has the hash-first exchange actually SHIPPED, and in which release?
+///
+/// `None` — not yet shipped. [`HASH_FIRST_SUMMARIES_MIN_VERSION`] is a
+/// PREDICTION about the next release, and must stay strictly ABOVE the current
+/// crate version.
+///
+/// `Some(v)` — shipped in `v`, which must EQUAL the floor, frozen thereafter.
+///
+/// # Why a marker instead of a manual release-time check
+///
+/// The floor is only correct if this PR ships in exactly the release it names.
+/// Five releases went out in the four days before this was written, so "the
+/// next release" is a moving target and `docs/RELEASING.md`'s manual check is
+/// not enough at that cadence.
+///
+/// The failure it guards is not cosmetic. If 0.2.116 ships WITHOUT this
+/// feature, the floor goes stale while every test stays green — and then a
+/// peer running the real 0.2.116 (which has no `SummaryDigests` variant index)
+/// reads as at-floor, receives a digest, fails to bincode-decode it, and the
+/// connection is CLOSED. During a 0-4h staggered rollout that is fleet-wide
+/// churn presenting as a transport fault.
+///
+/// `hash_first_floor_tracks_the_shipping_release` makes that unrepresentable:
+/// the moment a release bump raises `CARGO_PKG_VERSION` to the floor's value,
+/// the test fails until someone consciously either flips this to `Some(floor)`
+/// (we are shipping it) or raises the floor (we are not). The release cannot
+/// silently outrun the floor in either direction.
+///
+/// RELEASE-TIME ACTION: when the release carrying this feature is cut, set
+/// this to `Some(HASH_FIRST_SUMMARIES_MIN_VERSION)` and freeze both.
+pub(crate) const HASH_FIRST_SHIPPED_IN: Option<(u8, u8, u16)> = None;
+
 pub(crate) const HASH_FIRST_SUMMARIES_MIN_VERSION: (u8, u8, u16) = (0, 2, 116);
 
 /// Pure version-gate for the hash-first summary exchange, mirroring
