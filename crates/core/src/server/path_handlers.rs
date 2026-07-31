@@ -6809,6 +6809,52 @@ mod tests {
         );
     }
 
+    /// Regression test for #5087.
+    ///
+    /// A SAME-ORIGIN `<a target="_blank">` used to return early and fall
+    /// through to the browser. The shell iframe has no
+    /// `allow-popups-to-escape-sandbox` (deliberately, #1499), so that popup
+    /// inherited the sandbox: the top-level shell it landed on had an opaque
+    /// origin, its own `frame-src 'self'` could not match, and the app frame
+    /// stayed `about:blank` — a blank tab.
+    ///
+    /// Every cross-CONTRACT link is same-ORIGIN (one gateway serves them all),
+    /// so that exemption swallowed exactly the breaking case. The same-origin
+    /// new-window branch must route through `open_url` like the cross-origin
+    /// branch above it, matching the `window.open` override further down,
+    /// which already forwards same-origin new-window opens.
+    #[test]
+    fn navigation_interceptor_routes_same_origin_target_blank_through_open_url() {
+        let js = NAVIGATION_INTERCEPTOR_JS;
+
+        let target_attr_idx = js
+            .find("target.target && target.target !== '_self'")
+            .expect("same-origin target check present");
+        let navigate_idx = js
+            .find("type: 'navigate'")
+            .expect("same-origin in-contract navigate branch present");
+        assert!(
+            target_attr_idx < navigate_idx,
+            "the target-attribute check must precede the in-contract navigate branch"
+        );
+        let block = &js[target_attr_idx..navigate_idx];
+
+        // The old bug: `if (...) return;` handed the click to the browser.
+        assert!(
+            !block.contains("!== '_self') return"),
+            "same-origin target=\"_blank\" must not fall through to the browser: the \
+             popup inherits the sandbox and the resulting tab is blank (#5087)"
+        );
+        assert!(
+            block.contains("preventDefault"),
+            "same-origin new-window branch must preventDefault before forwarding (#5087)"
+        );
+        assert!(
+            block.contains("type: 'open_url'"),
+            "same-origin new-window branch must forward via open_url, not navigate (#5087)"
+        );
+    }
+
     /// Regression test for the middle-click half of #3853. Middle-click is
     /// dispatched as `auxclick` in modern browsers, NOT `click`, so the
     /// interceptor must listen on both events. Without the auxclick
