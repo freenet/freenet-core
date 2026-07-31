@@ -123,15 +123,27 @@ pub(crate) enum OutboundKind {
     /// arm could not tell them apart — the #4965 measurement hinges on which
     /// leg the 53-75% actually sits in.
     InterestSyncInterests,
-    /// InterestSync reply leg: `Summaries`. The leading suspect, because
-    /// `SummaryEntry::summary_bytes` ships a FULL `StateSummary` per shared
-    /// contract to every connected peer on every cycle
-    /// (`node.rs::handle_interest_sync_message`).
+    /// InterestSync reply leg — the WHOLE summary exchange: `Summaries`, plus
+    /// its hash-first legs `SummaryDigests` and `SummaryRequest` (#4965).
+    ///
+    /// The leading suspect, because `SummaryEntry::summary_bytes` ships a FULL
+    /// `StateSummary` per shared contract to every connected peer on every
+    /// cycle (`node.rs::handle_interest_sync_message`).
     ///
     /// Measured at 49.8% of all outbound bytes on the fleet (v0.2.115, 1,174
     /// peers), which is what makes it worth a second level of split: this arm
-    /// alone still lumps four unrelated emitters together. See
+    /// alone still lumps several unrelated emitters together. See
     /// [`SummariesEmitter`] and [`Window::summaries_bytes`].
+    ///
+    /// All THREE hash-first legs land in this one arm on purpose: #4965
+    /// replaces a single `Summaries` with up to three messages
+    /// (`SummaryDigests` -> `SummaryRequest` -> `Summaries`), so splitting them
+    /// across arms would make `interest_sync_summaries_bytes` collapse for a
+    /// trivial reason and hide the extra legs in a bucket that did not exist
+    /// before. Keeping them together makes the same field a like-for-like
+    /// before/after total for the whole mechanism — which is exactly the
+    /// falsifier: if hash-first does not shrink this number, it did not work.
+    /// The per-emitter split below still separates them.
     InterestSyncSummaries,
     /// InterestSync heal leg: `ResyncRequest` / `ResyncResponse`. Separate
     /// because `ResyncResponse` carries full contract STATE, so folding it
@@ -238,11 +250,16 @@ pub(crate) struct SummariesDetail {
 /// Kept here rather than on [`SummariesEmitter`] itself: the enum is a
 /// protocol-adjacent type, the index and the field stem are facts about this
 /// rollup's wire-to-telemetry shape.
-const SUMMARIES_ARMS: [SummariesEmitter; 5] = [
+const SUMMARIES_ARMS: [SummariesEmitter; 7] = [
     SummariesEmitter::Notification,
     SummariesEmitter::InterestsReply,
     SummariesEmitter::ChangeInterestsReply,
     SummariesEmitter::Rejection,
+    // #4965 hash-first legs. Appended so the existing arms keep their indices
+    // and a dashboard query built against the pre-#4965 rollup does not
+    // silently start reading a different arm's numbers.
+    SummariesEmitter::SummaryRequestReply,
+    SummariesEmitter::SummaryRequest,
     SummariesEmitter::Other,
 ];
 
@@ -252,7 +269,9 @@ const fn summaries_index(emitter: SummariesEmitter) -> usize {
         SummariesEmitter::InterestsReply => 1,
         SummariesEmitter::ChangeInterestsReply => 2,
         SummariesEmitter::Rejection => 3,
-        SummariesEmitter::Other => 4,
+        SummariesEmitter::SummaryRequestReply => 4,
+        SummariesEmitter::SummaryRequest => 5,
+        SummariesEmitter::Other => 6,
     }
 }
 
@@ -264,6 +283,12 @@ const fn summaries_stem(emitter: SummariesEmitter) -> &'static str {
         SummariesEmitter::InterestsReply => "interest_sync_summaries_interests_reply",
         SummariesEmitter::ChangeInterestsReply => "interest_sync_summaries_change_interests_reply",
         SummariesEmitter::Rejection => "interest_sync_summaries_rejection",
+        SummariesEmitter::SummaryRequestReply => "interest_sync_summaries_request_reply",
+        // `_request_leg`, NOT `_request`: the latter is a strict PREFIX of
+        // `_request_reply` below, so any dashboard glob on
+        // `interest_sync_summaries_request*` would double-count the reply into
+        // the request arm. Free to fix now, breaking once emitted.
+        SummariesEmitter::SummaryRequest => "interest_sync_summaries_request_leg",
         SummariesEmitter::Other => "interest_sync_summaries_other",
     }
 }
@@ -316,6 +341,28 @@ impl OutboundClass {
                             entries: entries.len() as u64,
                         }),
                     },
+                    // #4965: the digest form carries the SAME emitter tag as
+                    // the `Summaries` it replaces, so a send path keeps its
+                    // per-emitter attribution across the hash-first migration
+                    // instead of silently moving into the residual arm.
+                    InterestMessage::SummaryDigests { entries, emitter } => Self {
+                        kind: OutboundKind::InterestSyncSummaries,
+                        summaries: Some(SummariesDetail {
+                            emitter: *emitter,
+                            entries: entries.len() as u64,
+                        }),
+                    },
+                    // The bytes-on-mismatch request leg. Tagged rather than
+                    // left `plain` because the per-emitter arms must SUM to
+                    // this kind's totals; an untagged message would open a gap
+                    // between the split and the arm it splits.
+                    InterestMessage::SummaryRequest { hashes } => Self {
+                        kind: OutboundKind::InterestSyncSummaries,
+                        summaries: Some(SummariesDetail {
+                            emitter: SummariesEmitter::SummaryRequest,
+                            entries: hashes.len() as u64,
+                        }),
+                    },
                     InterestMessage::ResyncRequest { .. }
                     | InterestMessage::ResyncResponse { .. } => {
                         Self::plain(OutboundKind::InterestSyncResync)
@@ -353,23 +400,36 @@ struct Window {
     /// convention every future call site has to honour — but it is asserted
     /// anyway (`summaries_sub_arms_reconcile_with_the_parent_arm`), since a
     /// silently non-reconciling split is worse than no split.
-    summaries_msgs: [u64; 5],
-    summaries_bytes: [u64; 5],
-    summaries_max_bytes: [u64; 5],
+    summaries_msgs: [u64; SUMMARIES_ARMS.len()],
+    summaries_bytes: [u64; SUMMARIES_ARMS.len()],
+    summaries_max_bytes: [u64; SUMMARIES_ARMS.len()],
     /// Total `SummaryEntry` count across the window's messages, per sub-arm.
     /// Divided by `summaries_msgs` this gives mean entries per message, the
     /// independent check that a call site is labelled correctly — see
     /// [`SummariesDetail::entries`].
-    summaries_entries: [u64; 5],
+    summaries_entries: [u64; SUMMARIES_ARMS.len()],
     /// Largest single message's entry count, per sub-arm. Separates "every
     /// reply is moderately wide" from "one peer shares 400 contracts with us",
     /// which the mean cannot.
-    summaries_max_entries: [u64; 5],
+    summaries_max_entries: [u64; SUMMARIES_ARMS.len()],
     /// InterestSync summary comparisons where both sides held a summary and
     /// the bytes were IDENTICAL. See [`OutboundMix::record_summary_comparison`].
     summary_entries_identical: u64,
     /// Same, but the summary bytes DIFFERED.
     summary_entries_differing: u64,
+    /// Comparisons where exactly ONE side held a summary (#4965 review S2).
+    ///
+    /// The 98.1% identical figure has a structural hole:
+    /// [`OutboundMix::record_summary_comparison`] only fires in the
+    /// `(Some, Some)` arm, so the one-sided case was never in its denominator.
+    /// That case is NOT neutral under hash-first — it classifies as
+    /// `NeedBytes`, costing +2 messages for bytes the full-bytes path shipped
+    /// immediately AND used to seed the peer-summary cache. It is the #4473
+    /// phantom-interest shape, and its size is unmeasured.
+    ///
+    /// Counted so the post-deploy data can size it rather than leaving the
+    /// headline extrapolated over a population it never observed.
+    summary_entries_one_sided: u64,
     /// Which contracts the differing comparisons belonged to, bounded at
     /// [`MAX_TRACKED_CONTRACTS`].
     ///
@@ -538,6 +598,38 @@ impl OutboundMix {
         }
     }
 
+    /// Record a summary comparison where WE hold no summary but the PEER does
+    /// (#4965 review S2).
+    ///
+    /// Deliberately a separate method rather than a third branch inside
+    /// [`Self::record_summary_comparison`]: that function takes two byte
+    /// slices, and the whole point here is that one of them does not exist.
+    /// Forcing a caller to synthesise an empty slice would have made this
+    /// population indistinguishable from a genuine empty-summary comparison.
+    ///
+    /// Why it matters: the 98.1%-identical headline was computed over
+    /// `(Some, Some)` comparisons only, so this case was never in its
+    /// denominator — yet it is not neutral under hash-first. It classifies as
+    /// `NeedBytes`, which costs +2 messages to fetch bytes the full-bytes path
+    /// delivered immediately and used to seed our peer-summary cache. Sizing
+    /// it is the difference between a headline that generalises and one that
+    /// was extrapolated over a population it never saw.
+    ///
+    /// Shares the caller's per-message dedup set for the same reason the
+    /// two-sided counter does: `entries` is peer-supplied and may repeat a
+    /// hash, so without it a peer could inflate this bucket at will.
+    pub(crate) fn record_summary_one_sided(
+        &self,
+        contract: &ContractInstanceId,
+        counted_this_message: &mut HashSet<ContractInstanceId>,
+    ) {
+        if !counted_this_message.insert(*contract) {
+            return;
+        }
+        let mut w = self.window.lock();
+        w.summary_entries_one_sided = w.summary_entries_one_sided.saturating_add(1);
+    }
+
     /// Atomically take the current window, leaving a fresh empty one.
     fn take_window(&self) -> Window {
         std::mem::take(&mut *self.window.lock())
@@ -615,6 +707,10 @@ fn outbound_mix_json(w: &Window, window_secs: u64) -> serde_json::Value {
     body.insert(
         "summary_entries_differing".into(),
         w.summary_entries_differing.into(),
+    );
+    body.insert(
+        "summary_entries_one_sided".into(),
+        w.summary_entries_one_sided.into(),
     );
     body.insert(
         "differing_attribution_dropped".into(),
@@ -1194,7 +1290,10 @@ mod tests {
         record_summaries(&mix, SummariesEmitter::InterestsReply, 4, 200);
         record_summaries(&mix, SummariesEmitter::ChangeInterestsReply, 3, 400);
         record_summaries(&mix, SummariesEmitter::Rejection, 1, 800);
-        record_summaries(&mix, SummariesEmitter::Other, 1, 1600);
+        // #4965 legs: the full-bytes answer to a request, and the request.
+        record_summaries(&mix, SummariesEmitter::SummaryRequestReply, 2, 1600);
+        record_summaries(&mix, SummariesEmitter::SummaryRequest, 5, 3200);
+        record_summaries(&mix, SummariesEmitter::Other, 1, 6400);
 
         let w = mix.take_window();
         let bytes_of = |e| w.summaries_bytes[summaries_index(e)];
@@ -1202,7 +1301,9 @@ mod tests {
         assert_eq!(bytes_of(SummariesEmitter::InterestsReply), 200);
         assert_eq!(bytes_of(SummariesEmitter::ChangeInterestsReply), 400);
         assert_eq!(bytes_of(SummariesEmitter::Rejection), 800);
-        assert_eq!(bytes_of(SummariesEmitter::Other), 1600);
+        assert_eq!(bytes_of(SummariesEmitter::SummaryRequestReply), 1600);
+        assert_eq!(bytes_of(SummariesEmitter::SummaryRequest), 3200);
+        assert_eq!(bytes_of(SummariesEmitter::Other), 6400);
 
         for emitter in SUMMARIES_ARMS {
             assert_eq!(
@@ -1479,13 +1580,23 @@ mod tests {
     ///      a new file touching it fails CI even before we look at tags, and
     ///   2. the arm each tagging site claims, per file.
     ///
-    /// Known limit, stated rather than papered over: (2) scrapes the literal
-    /// `emitter: SummariesEmitter::<Arm>`, so a site that assigned the tag
-    /// from a variable would escape it. (1) still catches such a site if it
-    /// lives in a new file, and a wrongly-tagged one shows up as an
-    /// entries-per-message anomaly (`entry_counts_are_recorded_per_sub_arm`)
-    /// or in the residual arm. Needles are built with `concat!` so this test's
-    /// own source cannot satisfy the scrape when the walk reaches this file.
+    /// Known limit, stated rather than papered over: (2) scrapes a literal
+    /// arm reference, so a site that computed the tag from a variable would
+    /// escape it. (1) still catches such a site if it lives in a new file, and
+    /// a wrongly-tagged one shows up as an entries-per-message anomaly
+    /// (`entry_counts_are_recorded_per_sub_arm`) or in the residual arm.
+    /// Needles are built with `concat!` so this test's own source cannot
+    /// satisfy the scrape when the walk reaches this file.
+    ///
+    /// The needle is the BARE `SummariesEmitter::<Arm>` form, not
+    /// `emitter: SummariesEmitter::<Arm>`. #4965 centralised construction
+    /// behind `node::summaries_reply_for_peer` / `full_summaries_message`, so
+    /// an emitter site now names its arm as a call ARGUMENT rather than a
+    /// struct field; the field-form needle found zero arms in both emitter
+    /// files and passed. This file is the one exception, scanned with the
+    /// ASSIGNMENT form instead, because `classify` is where `SummaryRequest`
+    /// gets its arm — that message carries no emitter field, having exactly
+    /// one possible origin.
     #[test]
     fn summaries_emitter_sites_are_pinned() {
         use crate::node::network_bridge::p2p_protoc::tests::{
@@ -1498,18 +1609,44 @@ mod tests {
         // Deliberately wider than "emitters": the point is that a new file
         // touching Summaries at all is a deliberate decision.
         let expected_files: BTreeSet<&str> = [
-            "message.rs",                                  // variant + Display
-            "node.rs",                                     // both reply emitters + the receive arm
-            "node/network_bridge/outbound_message_mix.rs", // the classify choke point
-            "operations/update.rs",                        // notification + rejection emitters
+            "message.rs",           // variant + Display
+            "node.rs", // both reply emitters, the request-reply emitter, the receive arms
+            "operations/update.rs", // notification + rejection emitters
+            // Claimed via `classify`'s emitter ASSIGNMENT only; its stem
+            // tables are not counted. See the scan below.
+            "node/network_bridge/outbound_message_mix.rs",
         ]
         .into_iter()
         .collect();
 
         // file → the arms it tags, one entry per DISTINCT arm.
         let expected_arms: BTreeMap<&str, Vec<&str>> = [
-            ("node.rs", vec!["ChangeInterestsReply", "InterestsReply"]),
+            (
+                "node.rs",
+                // #4965 added SummaryRequestReply: the full-bytes answer to a
+                // `SummaryRequest`, the one full-bytes send hash-first ADDS
+                // rather than replaces.
+                vec![
+                    "ChangeInterestsReply",
+                    "InterestsReply",
+                    "SummaryRequestReply",
+                ],
+            ),
             ("operations/update.rs", vec!["Notification", "Rejection"]),
+            // The rollup's own index/stem tables name every arm. Listing them
+            // here means adding a `SummariesEmitter` variant without wiring it
+            // a telemetry stem fails this pin rather than silently reporting
+            // under a neighbouring field.
+            // The rollup claims exactly the arms `classify` ASSIGNS, not the
+            // seven its stem tables name. Listing all seven made the scan
+            // claim everything unconditionally, silently disabling the
+            // orphan-arm check. `SummaryRequest` is claimed HERE rather than at
+            // a construction site because that message carries no emitter
+            // field — one possible origin, so `classify` assigns it.
+            (
+                "node/network_bridge/outbound_message_mix.rs",
+                vec!["SummaryRequest"],
+            ),
         ]
         .into_iter()
         .collect();
@@ -1525,7 +1662,14 @@ mod tests {
         );
 
         let mentions = concat!("InterestMessage::", "Summaries {");
-        let tag = concat!("emitter: ", "SummariesEmitter::");
+        // Bare `SummariesEmitter::`, not `emitter: SummariesEmitter::`.
+        // #4965 centralised construction behind `node::summaries_reply_for_peer`
+        // / `full_summaries_message`, so the arm is now named as a call
+        // ARGUMENT at the emitter site rather than as a struct field. Matching
+        // only the field form would have silently found zero arms in both
+        // emitter files and passed — this pin would have gone quiet at exactly
+        // the moment it became load-bearing.
+        let tag = concat!("SummariesEmitter", "::");
 
         let mut found_files: BTreeSet<String> = Default::default();
         let mut found_arms: BTreeMap<String, Vec<String>> = Default::default();
@@ -1543,8 +1687,55 @@ mod tests {
             let Ok(src) = std::fs::read_to_string(path) else {
                 continue;
             };
-            let prod = strip_cfg_test_regions(&src);
-            if !prod.contains(mentions) {
+            // Strip COMMENT lines before scanning. An emitter site is code;
+            // prose that merely names an arm is not. Without this, a rustdoc
+            // intra-doc link (`[\`SummariesEmitter::Other\`]` in message.rs)
+            // registers as an emitter, and worse, any future doc edit that
+            // mentions an arm trips a pin about wire attribution.
+            let prod_all = strip_cfg_test_regions(&src);
+            let prod: String = prod_all
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            // The rollup's own index/stem tables name every arm; counting them
+            // as claims makes the orphan-arm check vacuous. See the note on
+            // `expected_arms`.
+            if rel == "node/network_bridge/outbound_message_mix.rs" {
+                // Not simply excluded: `classify` ASSIGNS an emitter to
+                // `SummaryRequest`, which — unlike `Summaries` and
+                // `SummaryDigests` — carries no emitter field on the wire type
+                // because it has exactly one possible origin. That assignment
+                // IS the arm's wiring, so collect it with a needle matching
+                // assignment (`emitter: SummariesEmitter::`) rather than the
+                // stem/index match tables (`SummariesEmitter::X =>`), which
+                // name all seven arms and would claim everything.
+                let assign = concat!("emitter: ", "SummariesEmitter", "::");
+                let mut arms: Vec<String> = prod
+                    .match_indices(assign)
+                    .map(|(idx, _)| {
+                        prod[idx + assign.len()..]
+                            .split(|c: char| !c.is_alphanumeric() && c != '_')
+                            .next()
+                            .unwrap_or("")
+                            .to_string()
+                    })
+                    .collect();
+                arms.sort();
+                arms.dedup();
+                if !arms.is_empty() {
+                    found_arms.insert(rel.clone(), arms);
+                    found_files.insert(rel);
+                }
+                continue;
+            }
+            // A file counts if it CONSTRUCTS/matches the variant OR merely
+            // NAMES an arm. #4965 moved construction behind
+            // `node::summaries_reply_for_peer`, so `operations/update.rs` now
+            // only names its arms — under the old construct-only test it
+            // dropped out of scope entirely and its two emitters stopped being
+            // pinned, silently.
+            if !prod.contains(mentions) && !prod.contains(tag) {
                 continue;
             }
             found_files.insert(rel.clone());

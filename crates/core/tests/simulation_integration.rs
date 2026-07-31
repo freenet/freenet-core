@@ -15309,6 +15309,358 @@ fn test_summary_first_put_reverse_delta_converges_originator() {
 }
 
 // =============================================================================
+// Hash-first summary exchange (#4965) — behavioral simulation A/B
+// =============================================================================
+//
+// Hash-first is ON by default in every simulation
+// (`SimNetwork::SIM_MIGRATION_ENABLED_FLOOR`): it changes only the ENCODING of
+// an exchange every sim already runs, with identical convergence semantics, so
+// defaulting it on costs unrelated sims nothing and gives a version-gated wire
+// change integration coverage BEFORE the release that lifts the crate version
+// past its production floor. These tests state that premise explicitly at the
+// call site anyway, so a future edit to the default cannot silently make them
+// vacuous.
+//
+// NOTE ON WHICH LEG IS EXERCISED: after the #4965 review, digest-first ships on
+// the two MULTI-ENTRY reply legs only (`InterestsReply`, `ChangeInterestsReply`)
+// — `Notification` and `Rejection` stay full-bytes. So the digests observed here
+// necessarily come from the connection-time `Interests` -> reply exchange, which
+// is the leg that matters, and NOT from the per-state-change notification.
+// `summaries_reply_for_peer` is the only path that can emit a digest, and only
+// those two legs call it.
+
+/// Shared A/B machinery: run one scenario under one encoding and report the
+/// summary-exchange counters plus what converged.
+struct HashFirstRun {
+    digest_msgs: u64,
+    full_msgs: u64,
+    full_bytes: u64,
+    byte_requests: u64,
+    agree_single: u64,
+    agree_multi: u64,
+    mismatch_single: u64,
+    mismatch_multi: u64,
+    hosting: Vec<String>,
+}
+
+impl HashFirstRun {
+    /// Every message the summary exchange put on the wire, both encodings.
+    fn exchange_msgs(&self) -> u64 {
+        self.digest_msgs + self.full_msgs + self.byte_requests
+    }
+    fn agreements(&self) -> u64 {
+        self.agree_single + self.agree_multi
+    }
+    fn mismatches(&self) -> u64 {
+        self.mismatch_single + self.mismatch_multi
+    }
+}
+
+/// `divergent = false`: both peers converge on one state, so digests agree.
+/// `divergent = true`: the two peers are SEEDED with different states for the
+/// same contract, so their summaries genuinely differ and the digest exchange
+/// must take the mismatch path.
+fn run_hash_first_ab(name: &str, seed: u64, hash_first: bool, divergent: bool) -> HashFirstRun {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    // Seeds GlobalRng/GlobalSimulationTime and resets GlobalTestMetrics. The
+    // handler's over-cap rotation draws from GlobalRng, so an unseeded run
+    // would be nondeterministic here.
+    setup_deterministic_state(seed);
+    let rt = create_runtime();
+
+    let gateway = NodeLabel::gateway(name, 0);
+    let node1 = NodeLabel::node(name, 1);
+
+    let contract = SimOperation::create_test_contract(0x49);
+    let contract_key = contract.key();
+
+    let mut sim = rt.block_on(async { SimNetwork::new(name, 1, 1, 7, 3, 10, 2, seed).await });
+    if hash_first {
+        sim.enable_hash_first_summaries();
+    } else {
+        sim.disable_hash_first_summaries();
+    }
+
+    let operations = if divergent {
+        // Both peers genuinely HOST the same contract with DIFFERENT states,
+        // seeded locally so no network propagation reconciles them. Their
+        // summaries therefore differ when the connection-time interest
+        // exchange runs, which is what forces the digest mismatch path.
+        // Seeding alone produces NO summary exchange: with no network
+        // activity the peers never run an interest exchange inside the driven
+        // window (verified — every counter came back zero). So a SECOND
+        // contract is PUT and subscribed to drive connections and the
+        // interest exchange, while the first stays divergent by construction:
+        // it is only ever seeded locally, never PUT, so nothing reconciles it.
+        let driver = SimOperation::create_test_contract(0x5B);
+        let driver_key = driver.key();
+        vec![
+            ScheduledOperation::new(
+                gateway.clone(),
+                SimOperation::SeedHostedContract {
+                    contract: contract.clone(),
+                    state: SimOperation::create_test_state(0x49),
+                },
+            ),
+            ScheduledOperation::new(
+                node1.clone(),
+                SimOperation::SeedHostedContract {
+                    contract: contract.clone(),
+                    state: SimOperation::create_test_state(0xA7),
+                },
+            ),
+            ScheduledOperation::new(
+                gateway.clone(),
+                SimOperation::Put {
+                    contract: driver.clone(),
+                    state: SimOperation::create_test_state(0x5B),
+                    subscribe: true,
+                },
+            ),
+            ScheduledOperation::new(
+                node1.clone(),
+                SimOperation::Subscribe {
+                    contract_id: *driver_key.id(),
+                },
+            ),
+        ]
+    } else {
+        vec![
+            ScheduledOperation::new(
+                gateway.clone(),
+                SimOperation::Put {
+                    contract: contract.clone(),
+                    state: SimOperation::create_test_state(0x49),
+                    subscribe: true,
+                },
+            ),
+            ScheduledOperation::new(
+                node1.clone(),
+                SimOperation::Subscribe {
+                    contract_id: *contract_key.id(),
+                },
+            ),
+            ScheduledOperation::new(
+                gateway.clone(),
+                SimOperation::Update {
+                    key: contract_key,
+                    data: SimOperation::create_test_state(0x4A),
+                },
+            ),
+        ]
+    };
+
+    // 400s > the 300s INTEREST_HEARTBEAT_INTERVAL, so the PERIODIC
+    // Interests -> reply exchange fires inside the window, not just the
+    // connection-time one. Virtual time, so the extra 280s is nearly free.
+    let result = sim.run_controlled_simulation(
+        seed,
+        operations,
+        Duration::from_secs(400),
+        Duration::from_secs(30),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "hash-first sim ({name}) failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // Strip the per-run network-name prefix. `NodeLabel` renders as
+    // `<network>-gateway-0`, and the two runs necessarily use DIFFERENT network
+    // names (turmoil keys its DNS on them), so comparing raw labels compares the
+    // run names and can never match. What is compared is which ROLES converged.
+    let prefix = format!("{name}-");
+    let mut hosting: Vec<String> = result
+        .node_storages
+        .iter()
+        .filter(|(_, s)| s.get_stored_state(&contract_key).is_some())
+        .map(|(label, _)| {
+            let full = label.to_string();
+            full.strip_prefix(&prefix).unwrap_or(&full).to_string()
+        })
+        .collect();
+    hosting.sort();
+
+    HashFirstRun {
+        digest_msgs: GlobalTestMetrics::summary_digest_msgs(),
+        full_msgs: GlobalTestMetrics::summary_full_msgs(),
+        full_bytes: GlobalTestMetrics::summary_full_bytes(),
+        byte_requests: GlobalTestMetrics::summary_byte_requests(),
+        agree_single: GlobalTestMetrics::summary_digest_agreements_single(),
+        agree_multi: GlobalTestMetrics::summary_digest_agreements_multi(),
+        mismatch_single: GlobalTestMetrics::summary_digest_mismatches_single(),
+        mismatch_multi: GlobalTestMetrics::summary_digest_mismatches_multi(),
+        hosting,
+    }
+}
+
+/// **A/B falsifier, AGREE arm: hash-first must ship strictly fewer summary
+/// bytes without costing more messages, and without changing convergence.**
+///
+/// # Why this test exists
+///
+/// Everything else in this PR proves hash-first BREAKS nothing. Nothing else
+/// proves it HELPS. The change is justified entirely by a bandwidth saving, and
+/// until something measures that saving end to end it is a hypothesis.
+///
+/// # Why bytes alone would be the wrong assertion
+///
+/// Hash-first trades bytes for messages on the mismatch path: one `Summaries`
+/// becomes `SummaryDigests` -> `SummaryRequest` -> `Summaries`. #4861
+/// established per-peer broadcast MESSAGES/s — not bytes — as the load-bearing
+/// storm signal, so a version that halved bytes while multiplying messages
+/// would regress the exact axis that caused the storm.
+///
+/// In THIS arm every comparison agrees, so the mismatch multiplier is zero and
+/// the message count must not rise at all — which is asserted, with
+/// `mismatches() == 0` pinned as an explicit PREMISE so the reader knows the
+/// no-multiplier case is what is being tested.
+///
+/// **Stated limit:** this arm therefore cannot catch a message-multiplication
+/// bug, because its fixture has no mismatches to multiply. The multiplication
+/// itself is covered at handler level by
+/// `node.rs::hash_first_summaries::mismatching_digest_requests_bytes_and_the_heal_still_fires`.
+/// See the note below this test for the three sim fixtures that failed to
+/// produce a mismatch and why no sim-level divergent arm is shipped.
+#[test_log::test]
+fn test_hash_first_summaries_ships_fewer_bytes_and_still_converges() {
+    const SEED: u64 = 0x4965_5F01_CAFE;
+
+    let on = run_hash_first_ab("hash-first-on", SEED, true, false);
+    let off = run_hash_first_ab("hash-first-off", SEED, false, false);
+
+    tracing::info!(
+        on_digest_msgs = on.digest_msgs,
+        on_full_msgs = on.full_msgs,
+        on_full_bytes = on.full_bytes,
+        on_byte_requests = on.byte_requests,
+        on_exchange_msgs = on.exchange_msgs(),
+        on_agreements = on.agreements(),
+        on_mismatches = on.mismatches(),
+        off_full_msgs = off.full_msgs,
+        off_full_bytes = off.full_bytes,
+        off_exchange_msgs = off.exchange_msgs(),
+        "hash-first A/B (agree arm)"
+    );
+
+    // ---- PREMISES, before any conclusion is drawn ----
+    //
+    // Without these, two runs that both did the same thing produce an
+    // equal-bytes result that reads as "no regression" rather than "the test
+    // never exercised the feature".
+    assert_eq!(
+        off.digest_msgs, 0,
+        "premise: the pinned-fallback run must emit NO SummaryDigests. If it \
+         does, disable_hash_first_summaries is not taking effect and every \
+         comparison below is meaningless"
+    );
+    assert!(
+        on.digest_msgs > 0,
+        "premise: the enabled run must emit SummaryDigests. Zero means the \
+         hash-first path never ran — the exact way this test would go quiet if \
+         the sim default, the version gate, or the leg restriction changed \
+         underneath it"
+    );
+    assert!(
+        off.full_bytes > 0,
+        "premise: the fallback run must actually ship summary bytes, or there \
+         is no baseline to improve on"
+    );
+    assert_eq!(
+        on.mismatches(),
+        0,
+        "premise for THIS arm: every comparison must agree, so the message \
+         assertion below is testing the no-multiplier case. Non-zero means the \
+         fixture drifted and the divergent twin is the test that applies"
+    );
+
+    // ---- THE CLAIM ----
+    assert!(
+        on.full_bytes < off.full_bytes,
+        "hash-first must ship strictly FEWER summary bytes for identical work \
+         ({} enabled vs {} fallback). This is the entire justification for the \
+         wire change.",
+        on.full_bytes,
+        off.full_bytes
+    );
+
+    // ---- ...WITHOUT PAYING FOR IT IN MESSAGES (#4861) ----
+    assert!(
+        on.exchange_msgs() <= off.exchange_msgs(),
+        "with zero mismatches hash-first must not cost MORE summary-exchange \
+         messages than the fallback ({} vs {})",
+        on.exchange_msgs(),
+        off.exchange_msgs()
+    );
+
+    // ---- WHERE THE SAVING COMES FROM ----
+    assert!(
+        on.agreements() > 0,
+        "the enabled run must settle at least one contract by digest agreement \
+         — that is the mechanism; a run that saved bytes with zero agreements \
+         saved them for some other reason"
+    );
+    assert_eq!(
+        off.agreements(),
+        0,
+        "the fallback run cannot agree by digest — it never sends one"
+    );
+
+    // ---- CONVERGENCE IS UNAFFECTED ----
+    //
+    // Guard the normalisation itself: if `NodeLabel`'s rendering changes so the
+    // prefix no longer strips, both sides stay run-scoped and the equality below
+    // fails loudly. The dangerous direction is the other one — both sides
+    // normalising to the same constant would pass vacuously. Requiring a
+    // recognisable role name rules that out.
+    assert!(
+        on.hosting.iter().any(|l| l.contains("gateway")),
+        "convergence labels should be role-scoped after stripping the run \
+         prefix, got {:?} — the normalisation is not doing what it claims",
+        on.hosting
+    );
+    assert_eq!(
+        on.hosting, off.hosting,
+        "the same peers must end up hosting the contract under both encodings \
+         — hash-first changes how summaries are ADVERTISED, never what the \
+         network converges to"
+    );
+}
+
+// NOT PRESENT: a sim-level DIVERGENT arm.
+//
+// The review asked for a second arm that forces digest MISMATCHES, so the
+// message-multiplication bound (`on <= off + 2*mismatches`) would have a
+// non-empty population to apply to. Three fixtures were tried and none
+// produced a single mismatch, so no such test is shipped rather than one whose
+// premise it cannot meet:
+//
+//   1. `SeedHostedContract` with different states on both peers, 120s window —
+//      every counter zero; with no network activity the peers never run an
+//      interest exchange inside the driven window at all.
+//   2. Same, 400s window (past the 300s `INTEREST_HEARTBEAT_INTERVAL`) —
+//      still all zero; the run ends when the scheduled operations drain, so
+//      the longer virtual window never elapses.
+//   3. Same, plus a second contract PUT+subscribed to drive connections — an
+//      exchange DOES occur (1 digest, 1 agreement) but it covers only the
+//      driver contract; the locally-seeded divergent contract never enters
+//      `get_matching_contracts`, because the interest exchange has already run
+//      by the time the seeds land.
+//
+// The mismatch path is NOT untested: `node.rs::hash_first_summaries::
+// mismatching_digest_requests_bytes_and_the_heal_still_fires` drives the full
+// chain at handler level (digest mismatch -> `SummaryRequest` -> full
+// `Summaries` -> targeted `SyncStateToPeer` heal) with real state, and is
+// mutation-verified. What is missing is only the SIM-level confirmation that
+// the message arithmetic holds end to end under real scheduling.
+//
+// Tracked as a follow-up rather than blocking: the arithmetic is analytic
+// (1 message per agreement, 3 per mismatch), the failure mode is fail-safe
+// (fall back to bytes), and the leg restriction bounds the exposure to one
+// exchange per pair per heartbeat.
+
+// =============================================================================
 // NEAREST-NEIGHBOR RING LATTICE — validation + regression (feat(topology)).
 //
 // The lattice SEEKS AND TIGHTENS each peer's closest connected SUCCESSOR (higher

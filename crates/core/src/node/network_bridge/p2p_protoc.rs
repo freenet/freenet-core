@@ -956,6 +956,107 @@ pub(crate) fn version_supports_summary_first_put(
     remote.is_some_and(|v| v >= floor)
 }
 
+/// Minimum reported peer version before this node may emit the hash-first
+/// `InterestSync` variants ([`InterestMessage::SummaryDigests`] /
+/// [`InterestMessage::SummaryRequest`], #4965).
+///
+/// # Emission gate
+///
+/// Consulted by `ConnectionManager::supports_hash_first_summaries`, which the
+/// digest-capable send sites check before choosing the digest form: the
+/// `Interests` and `ChangeInterests` replies in
+/// `node.rs::handle_interest_sync_message`, both via
+/// `node::summaries_reply_for_peer`.
+///
+/// Two send sites deliberately do NOT consult it:
+///
+/// - The **`SummaryRequest` reply** is unconditionally full bytes. Routing it
+///   through the version gate would be worse than pointless — replying to a
+///   request FOR bytes with digests loops the exchange — and
+///   `summary_request_reply_is_always_full_bytes` asserts the chooser is
+///   absent from that arm. It is safe without a version check by inference:
+///   only a peer that already decoded a `SummaryDigests` can have sent us a
+///   `SummaryRequest`, so it is necessarily at or above the floor.
+/// - The **`Notification` and `Rejection`** legs ship full bytes this release
+///   (#4965 review §2), so there is no encoding choice to gate.
+///
+/// A pre-floor peer does not carry these variant indices at all and cannot
+/// bincode-deserialize them; the decode failure DROPS the connection, so it
+/// must never receive one. Below the floor — and whenever the remote version
+/// is UNKNOWN — every site falls back to the existing full-bytes
+/// `Summaries`, which is exactly today's behaviour.
+///
+/// The variants, both send sites and the receive handlers all land together in
+/// this PR; no released version carries them inert. Per the wire-gated-floor
+/// rule in `docs/RELEASING.md` ("set the floor to exactly the release that
+/// first EMITS the feature, then freeze"), the floor is the next release after
+/// the 0.2.115 this branched from: `(0, 2, 116)`.
+///
+/// RELEASE-TIME CHECK (do NOT skip): this constant MUST equal the actual
+/// shipping version. A floor BELOW it sends an undecodable variant to peers on
+/// the release just before, churning live connections during the 0-4h
+/// staggered rollout; a floor ABOVE it silently disables the feature against
+/// fully-capable peers. Once the release ships, FREEZE it.
+/// Has the hash-first exchange actually SHIPPED, and in which release?
+///
+/// `None` — not yet shipped. [`HASH_FIRST_SUMMARIES_MIN_VERSION`] is a
+/// PREDICTION about the next release, and must stay strictly ABOVE the current
+/// crate version.
+///
+/// `Some(v)` — shipped in `v`, which must EQUAL the floor, frozen thereafter.
+///
+/// # Why a marker instead of a manual release-time check
+///
+/// The floor is only correct if this PR ships in exactly the release it names.
+/// Five releases went out in the four days before this was written, so "the
+/// next release" is a moving target and `docs/RELEASING.md`'s manual check is
+/// not enough at that cadence.
+///
+/// The failure it guards is not cosmetic. If 0.2.116 ships WITHOUT this
+/// feature, the floor goes stale while every test stays green — and then a
+/// peer running the real 0.2.116 (which has no `SummaryDigests` variant index)
+/// reads as at-floor, receives a digest, fails to bincode-decode it, and the
+/// connection is CLOSED. During a 0-4h staggered rollout that is fleet-wide
+/// churn presenting as a transport fault.
+///
+/// `hash_first_floor_tracks_the_shipping_release` makes that unrepresentable:
+/// the moment a release bump raises `CARGO_PKG_VERSION` to the floor's value,
+/// the test fails until someone consciously either flips this to `Some(floor)`
+/// (we are shipping it) or raises the floor (we are not). The release cannot
+/// silently outrun the floor in either direction.
+///
+/// RELEASE-TIME ACTION: when the release carrying this feature is cut, set
+/// this to `Some(HASH_FIRST_SUMMARIES_MIN_VERSION)` and freeze both.
+///
+/// Read only by `hash_first_floor_tracks_the_shipping_release`. It carries no
+/// runtime behaviour by design — its whole job is to make a release-time
+/// decision explicit and testable — so the non-test build sees it as dead.
+/// `allow(dead_code)` rather than deletion or a runtime reader: the constant IS
+/// the guard's input, and a runtime reader invented to satisfy the lint would
+/// be the fake dependency this codebase already avoids elsewhere.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const HASH_FIRST_SHIPPED_IN: Option<(u8, u8, u16)> = None;
+
+pub(crate) const HASH_FIRST_SUMMARIES_MIN_VERSION: (u8, u8, u16) = (0, 2, 116);
+
+/// Pure version-gate for the hash-first summary exchange, mirroring
+/// [`version_supports_subscribe_hint`] and
+/// [`version_supports_summary_first_put`]: `true` iff `remote` is known
+/// (`Some`) AND at least `floor`.
+///
+/// Fail-closed on `None` for the reason spelled out on
+/// [`HASH_FIRST_SUMMARIES_MIN_VERSION`]: an unknown version might be a peer
+/// that drops the connection on the undecodable variant, and the fallback
+/// (send the full summary bytes) is merely today's cost, never a correctness
+/// loss. Takes an explicit `floor` so the predicate is unit-testable
+/// independent of the production constant.
+pub(crate) fn version_supports_hash_first_summaries(
+    remote: Option<(u8, u8, u16)>,
+    floor: (u8, u8, u16),
+) -> bool {
+    remote.is_some_and(|v| v >= floor)
+}
+
 /// Upper bound on the number of hosted contracts examined per new-peer
 /// migration trigger. Each examined contract may emit a best-effort
 /// non-blocking `try_send` (the SubscribeHint nudge), so an unbounded scan
@@ -3546,7 +3647,8 @@ pub(crate) mod tests {
 
     mod version_gate {
         use super::super::{
-            SUBSCRIBE_HINT_MIN_VERSION, SUMMARY_FIRST_PUT_MIN_VERSION,
+            HASH_FIRST_SUMMARIES_MIN_VERSION, SUBSCRIBE_HINT_MIN_VERSION,
+            SUMMARY_FIRST_PUT_MIN_VERSION, version_supports_hash_first_summaries,
             version_supports_subscribe_hint, version_supports_summary_first_put,
         };
 
@@ -3662,6 +3764,56 @@ pub(crate) mod tests {
             assert!(version_supports_summary_first_put(
                 Some((1, 0, 0)),
                 SF_FLOOR
+            ));
+        }
+
+        /// The hash-first summary gate (#4965), same three properties as the
+        /// summary-first PUT gate above and for the same reason: a peer that
+        /// predates `InterestMessage::SummaryDigests` cannot deserialize the
+        /// appended variant index and drops the connection.
+        ///
+        /// Covers the mixed-version rollout window explicitly: 0.2.115 is the
+        /// last release with neither variant, and during the 0-4h staggered
+        /// rollout most of the fleet is exactly there.
+        #[test]
+        fn hash_first_summaries_gate_fails_closed_and_discriminates() {
+            const HF_FLOOR: (u8, u8, u16) = (0, 2, 116);
+
+            assert!(
+                !version_supports_hash_first_summaries(None, HF_FLOOR),
+                "unknown remote version must fail CLOSED"
+            );
+            assert!(
+                !version_supports_hash_first_summaries(Some((0, 2, 115)), HF_FLOOR),
+                "0.2.115 is the last release WITHOUT the variants; a \
+                 SummaryDigests sent to it fails to decode and drops the \
+                 connection"
+            );
+            assert!(!version_supports_hash_first_summaries(
+                Some((0, 1, 40)),
+                HF_FLOOR
+            ));
+            assert!(
+                version_supports_hash_first_summaries(Some((0, 2, 116)), HF_FLOOR),
+                "the floor release carries both variants and their handlers"
+            );
+            assert!(version_supports_hash_first_summaries(
+                Some((0, 3, 0)),
+                HF_FLOOR
+            ));
+            assert!(version_supports_hash_first_summaries(
+                Some((1, 0, 0)),
+                HF_FLOOR
+            ));
+
+            // Wired to the production constant, not just the test floor.
+            assert!(!version_supports_hash_first_summaries(
+                None,
+                HASH_FIRST_SUMMARIES_MIN_VERSION
+            ));
+            assert!(version_supports_hash_first_summaries(
+                Some(HASH_FIRST_SUMMARIES_MIN_VERSION),
+                HASH_FIRST_SUMMARIES_MIN_VERSION
             ));
         }
 

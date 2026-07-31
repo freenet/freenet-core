@@ -3641,6 +3641,34 @@ std::thread_local! {
     static GLOBAL_RESYNC_RESPONSES_SUPPRESSED_PER_PEER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_RESYNC_RESPONSES_SUPPRESSED_GLOBAL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_RESYNC_RESPONSES_UNSOLICITED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // Hash-first summary exchange falsifiers (#4965). See the `record_*`
+    // rustdoc on `GlobalTestMetrics` for what each one proves.
+    static GLOBAL_SUMMARY_DIGEST_MSGS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_SUMMARY_FULL_MSGS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_SUMMARY_FULL_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // #4965 agreement rate, split by MESSAGE SHAPE rather than by emitter.
+    //
+    // The emitter tag (#5052) is `#[serde(skip)]`, so an INBOUND SummaryDigests
+    // always decodes as `Other` — the receiver, which is the only side that can
+    // judge agreement, cannot know which send site produced it. Entry count is
+    // the best available proxy and needs no wire change: the notification and
+    // rejection emitters are single-entry BY CONSTRUCTION while both reply
+    // emitters are multi-entry (see `outbound_message_mix::SummariesDetail`).
+    //
+    // Known ambiguity, stated so the number is not over-read: a heartbeat reply
+    // for a peer pair sharing exactly ONE contract is also single-entry, so the
+    // single bucket is "state-change-driven sites PLUS narrow heartbeats", not
+    // a clean partition. It is directional evidence, not attribution.
+    /// Peak size of the digest arm's per-hash local-summary cache (#4965).
+    /// The observable for the RETENTION bound: the cache holds owned summary
+    /// clones, so its peak entry count is what decides whether a hostile
+    /// message can accumulate hundreds of MB.
+    static GLOBAL_SUMMARY_CACHE_PEAK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_SUMMARY_AGREE_SINGLE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_SUMMARY_AGREE_MULTI: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_SUMMARY_MISMATCH_SINGLE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_SUMMARY_MISMATCH_MULTI: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_SUMMARY_BYTE_REQUESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Global test metrics for tracking events across the simulation network.
@@ -3689,6 +3717,15 @@ impl GlobalTestMetrics {
         GLOBAL_RESYNC_RESPONSES_SUPPRESSED_PER_PEER.with(|c| c.set(0));
         GLOBAL_RESYNC_RESPONSES_SUPPRESSED_GLOBAL.with(|c| c.set(0));
         GLOBAL_RESYNC_RESPONSES_UNSOLICITED.with(|c| c.set(0));
+        GLOBAL_SUMMARY_DIGEST_MSGS.with(|c| c.set(0));
+        GLOBAL_SUMMARY_FULL_MSGS.with(|c| c.set(0));
+        GLOBAL_SUMMARY_FULL_BYTES.with(|c| c.set(0));
+        GLOBAL_SUMMARY_CACHE_PEAK.with(|c| c.set(0));
+        GLOBAL_SUMMARY_AGREE_SINGLE.with(|c| c.set(0));
+        GLOBAL_SUMMARY_AGREE_MULTI.with(|c| c.set(0));
+        GLOBAL_SUMMARY_MISMATCH_SINGLE.with(|c| c.set(0));
+        GLOBAL_SUMMARY_MISMATCH_MULTI.with(|c| c.set(0));
+        GLOBAL_SUMMARY_BYTE_REQUESTS.with(|c| c.set(0));
     }
 
     /// Records that a ResyncRequest was received.
@@ -3934,6 +3971,129 @@ impl GlobalTestMetrics {
 
     pub fn put_probe_existing_mesh_delta_bytes() -> u64 {
         GLOBAL_PUT_PROBE_EXISTING_MESH_DELTA_BYTES.with(|c| c.get())
+    }
+
+    // === Hash-first summary exchange falsifiers (#4965) ===
+    //
+    // The claim under test is "the common case stops shipping summary bytes".
+    // These counters are fed from the TWO constructor functions that can build
+    // these messages — `node::summaries_reply_for_peer` (which chooses the
+    // encoding) and `node::full_summaries_message` (which every full-bytes
+    // path routes through, including the `operations::update` helpers, which
+    // are CALLERS rather than construction sites). So
+    // `summary_full_bytes() == 0` means no summary byte was put on the wire by
+    // any path, not merely by the one a test happened to exercise.
+    // `no_uninstrumented_full_summaries_construction` pins that no production
+    // site builds an `InterestMessage::Summaries` outside the constructor.
+
+    /// A hash-first `SummaryDigests` message was emitted, advertising
+    /// contracts without their summaries.
+    pub fn record_summary_digest_msg() {
+        GLOBAL_SUMMARY_DIGEST_MSGS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// A full-bytes `Summaries` message was emitted: either the pre-floor
+    /// fallback, or the answer to a `SummaryRequest`. `bytes` is the total
+    /// summary payload it carries — the quantity hash-first exists to avoid.
+    pub fn record_summary_full_msg(bytes: u64) {
+        GLOBAL_SUMMARY_FULL_MSGS.with(|c| c.set(c.get() + 1));
+        GLOBAL_SUMMARY_FULL_BYTES.with(|c| c.set(c.get() + bytes));
+    }
+
+    /// Observe the digest arm's local-summary cache size, keeping the peak.
+    ///
+    /// Records the RETENTION bound directly rather than through a proxy: the
+    /// cache holds owned summary clones, so a peak proportional to the number
+    /// of hashes a peer named — rather than to ONE hash's contract set — is
+    /// the accumulation this is here to catch.
+    pub fn note_summary_cache_size(len: usize) {
+        GLOBAL_SUMMARY_CACHE_PEAK.with(|c| c.set(c.get().max(len as u64)));
+    }
+
+    pub fn summary_cache_peak() -> u64 {
+        GLOBAL_SUMMARY_CACHE_PEAK.with(|c| c.get())
+    }
+
+    /// One advertised digest matched our own summary, settling that contract
+    /// with zero summary bytes exchanged.
+    ///
+    /// `single_entry` splits by the SHAPE of the message the entry arrived in
+    /// — see the module note on why that is the best available proxy for the
+    /// send site.
+    pub fn record_summary_digest_agreement(single_entry: bool) {
+        if single_entry {
+            GLOBAL_SUMMARY_AGREE_SINGLE.with(|c| c.set(c.get() + 1));
+        } else {
+            GLOBAL_SUMMARY_AGREE_MULTI.with(|c| c.set(c.get() + 1));
+        }
+    }
+
+    /// A digest could NOT settle a contract, so its bytes must be requested.
+    ///
+    /// The denominator half of the agreement rate: without it, a low agreement
+    /// COUNT and a low exchange VOLUME look identical, and the whole question
+    /// (does the state-change-driven site agree less often than the heartbeat
+    /// one?) is about a RATE.
+    pub fn record_summary_digest_mismatch(single_entry: bool) {
+        if single_entry {
+            GLOBAL_SUMMARY_MISMATCH_SINGLE.with(|c| c.set(c.get() + 1));
+        } else {
+            GLOBAL_SUMMARY_MISMATCH_MULTI.with(|c| c.set(c.get() + 1));
+        }
+    }
+
+    /// Agreements observed in SINGLE-entry `SummaryDigests` messages.
+    ///
+    /// Proxy for the state-change-driven send sites (proactive notification,
+    /// rejection summary-back), which are single-entry by construction. This
+    /// is the population #4861 makes us care about: the proactive site fires
+    /// immediately after WE change state, so the receiver may not have applied
+    /// the update yet and could disagree far more often than the fleet-wide
+    /// 98.1% suggests — and every disagreement costs two extra messages on the
+    /// axis that caused the storm.
+    pub fn summary_digest_agreements_single() -> u64 {
+        GLOBAL_SUMMARY_AGREE_SINGLE.with(|c| c.get())
+    }
+
+    /// Agreements observed in MULTI-entry `SummaryDigests` messages — the
+    /// heartbeat / interest-churn replies.
+    pub fn summary_digest_agreements_multi() -> u64 {
+        GLOBAL_SUMMARY_AGREE_MULTI.with(|c| c.get())
+    }
+
+    pub fn summary_digest_mismatches_single() -> u64 {
+        GLOBAL_SUMMARY_MISMATCH_SINGLE.with(|c| c.get())
+    }
+
+    pub fn summary_digest_mismatches_multi() -> u64 {
+        GLOBAL_SUMMARY_MISMATCH_MULTI.with(|c| c.get())
+    }
+
+    /// Total agreements, both shapes.
+    pub fn summary_digest_agreements() -> u64 {
+        Self::summary_digest_agreements_single() + Self::summary_digest_agreements_multi()
+    }
+
+    /// A digest could not settle some contracts, so their bytes were
+    /// requested. Non-zero means the mismatch path ran.
+    pub fn record_summary_byte_request() {
+        GLOBAL_SUMMARY_BYTE_REQUESTS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub fn summary_digest_msgs() -> u64 {
+        GLOBAL_SUMMARY_DIGEST_MSGS.with(|c| c.get())
+    }
+
+    pub fn summary_full_msgs() -> u64 {
+        GLOBAL_SUMMARY_FULL_MSGS.with(|c| c.get())
+    }
+
+    pub fn summary_full_bytes() -> u64 {
+        GLOBAL_SUMMARY_FULL_BYTES.with(|c| c.get())
+    }
+
+    pub fn summary_byte_requests() -> u64 {
+        GLOBAL_SUMMARY_BYTE_REQUESTS.with(|c| c.get())
     }
 }
 

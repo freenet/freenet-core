@@ -846,7 +846,7 @@ pub(crate) async fn send_proactive_summary_notification(
     key: &ContractKey,
     sender_addr: SocketAddr,
 ) {
-    use crate::message::{InterestMessage, SummariesEmitter, SummaryEntry};
+    use crate::message::{SummariesEmitter, SummaryEntry};
     use crate::ring::interest::contract_hash;
 
     // Throttle: at most one notification per contract per 100ms
@@ -872,16 +872,32 @@ pub(crate) async fn send_proactive_summary_notification(
         return;
     };
 
-    // Build the Summaries message with our updated summary
+    // One `SummaryEntry`, built once here and reused for every interested peer
+    // in the loop below — the summary is identical for all of them, so there
+    // is nothing per-peer to compute.
+    //
+    // This leg ships FULL BYTES this release. Hash-first (#4965) does NOT
+    // apply here: digest-first rides the two multi-entry reply legs
+    // (`InterestsReply` / `ChangeInterestsReply`) only, and the send site 40
+    // lines below carries the evidential reasoning for why this one was left
+    // out. There is no per-peer encoding choice on this path, and no version
+    // gate is consulted.
+    //
+    // Worth stating because the opposite is the intuitive guess: this is the
+    // send site that fires on every state change to every interested peer, so
+    // it looks like the biggest available saving. It is deliberately NOT
+    // taken, because its receivers are the population least likely to have
+    // applied the update yet — the one place a digest is most likely to MISS
+    // and cost 1 message -> 3 for the same bytes. It is the strongest
+    // candidate for the NEXT release, once the agreement counters give a field
+    // reading, not a saving already banked.
+    //
+    // #5052: this is also the per-state-change fan-out that #5003 targets. It
+    // is the only SINGLE-entry emitter that fans across peers, so its
+    // bytes/msgs ratio is what tells a notification apart from a heartbeat
+    // reply in the rollup.
     let hash = contract_hash(key);
-    let message = InterestMessage::Summaries {
-        entries: vec![SummaryEntry::from_summary(hash, Some(&summary))],
-        // #5052: this is the per-state-change fan-out, the emitter #5003
-        // targets. It is the only SINGLE-entry emitter that fans across peers,
-        // so its bytes/msgs ratio is what tells a `summary` apart from a
-        // heartbeat reply in the rollup.
-        emitter: SummariesEmitter::Notification,
-    };
+    let full_entry = SummaryEntry::from_summary(hash, Some(&summary));
 
     // Get interested peers and send to each (excluding the sender who just sent us the update)
     let interested = op_manager.interest_manager.get_interested_peers(key);
@@ -909,10 +925,37 @@ pub(crate) async fn send_proactive_summary_notification(
             continue;
         }
 
+        // FULL BYTES, deliberately — this leg does NOT ship digest-first
+        // this release (#4965 review §2).
+        //
+        // The 98.1% agreement measurement that justifies hash-first comes from
+        // a heartbeat-dominated population. This site is the opposite case: it
+        // fires immediately after WE change state, so its receivers are
+        // precisely the peers least likely to have applied the update yet. A
+        // mismatch here costs 1 message -> 3 (digests, request, bytes) for the
+        // SAME bytes, and defers the heal a round trip — a bad trade on the
+        // #4861 messages/s axis if the agreement rate is materially below the
+        // heartbeat's. Nothing in the field can currently tell us: the
+        // single/multi agreement split lives in thread-local test metrics, not
+        // fleet telemetry, and there is no runtime kill-switch.
+        //
+        // #5003 makes it worse before it makes it better: it removes advertised
+        // co-hosts from this leg's recipients — exactly the peers most likely
+        // to agree.
+        //
+        // So: ship where the evidence is (the two multi-entry reply legs),
+        // extend here next release once `summaries_entries` and the agreement
+        // counters give a field reading. The emitter tag is unchanged, so the
+        // rollup keeps attributing this leg either way.
+        let message = crate::node::full_summaries_message(
+            vec![full_entry.clone()],
+            SummariesEmitter::Notification,
+        );
+
         if let Err(e) = op_manager
             .notify_node_event(NodeEvent::SendInterestMessage {
                 target: peer_addr,
-                message: message.clone(),
+                message,
             })
             .await
         {
@@ -977,7 +1020,7 @@ pub(crate) async fn send_summary_back_on_rejection(
     target_addr: SocketAddr,
     sender_summary_bytes: Vec<u8>,
 ) {
-    use crate::message::{InterestMessage, SummariesEmitter, SummaryEntry};
+    use crate::message::{SummariesEmitter, SummaryEntry};
     use crate::ring::interest::contract_hash;
 
     // Throttle BEFORE the WASM `summarize_state` call. Even with call
@@ -1026,14 +1069,35 @@ pub(crate) async fn send_summary_back_on_rejection(
     }
 
     let hash = contract_hash(key);
-    let message = InterestMessage::Summaries {
-        entries: vec![SummaryEntry::from_summary(hash, Some(&our_summary))],
-        // #5052: same SHAPE as the notification above (single entry, real
-        // summary) but a different trigger and a much narrower gate, so it
-        // gets its own arm. Sharing one would make the notification arm look
-        // larger than the fan-out #5003 actually changes.
-        emitter: SummariesEmitter::Rejection,
-    };
+    // #5052: same SHAPE as the notification above (single entry, real summary)
+    // but a different trigger and a much narrower gate, so it gets its own
+    // arm. Sharing one would make the notification arm look larger than the
+    // fan-out #5003 actually changes.
+    //
+    // #4965: this path only runs once we have ALREADY established that
+    // `our_summary == sender_summary_bytes`, so in the expected case the
+    // digest matches on the receiving side and the seeding this exists to do
+    // (their cache of us flipping `None` -> `Some`) completes from the digest
+    // alone — the receiver caches its own bytes, which the digest proved are
+    // ours, and shipping the bytes would be pure waste.
+    //
+    // NOT guaranteed, deliberately stated: the receiver re-derives its summary
+    // through `summary_if_hosted_or_in_use`, which returns `None` for a
+    // contract it no longer hosts or serves (#4473). It then classifies as
+    // `NeedBytes` and asks — costing one extra round trip, never a lost
+    // update. The rejection that got us here proves the peer HAD the state a
+    // moment ago, so this is a narrow race, but an absolute claim here would
+    // be wrong.
+    let full_entry = SummaryEntry::from_summary(hash, Some(&our_summary));
+    // FULL BYTES, same release-scoping as the notification leg above (#4965
+    // review §2): single-entry, state-change-driven, and outside the
+    // population the 98.1% agreement figure was measured on. The digest would
+    // very likely match here (this path only runs once the peer's summary is
+    // known equal to ours), but "very likely" on an unmeasured leg is exactly
+    // what the review declined to ship — and the saving is one summary on a
+    // path that fires ~80-130 times/hour/gateway, not a stream.
+    let message =
+        crate::node::full_summaries_message(vec![full_entry], SummariesEmitter::Rejection);
 
     if let Err(e) = op_manager
         .notify_node_event(NodeEvent::SendInterestMessage {
