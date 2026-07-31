@@ -440,6 +440,17 @@ struct Window {
     /// attributed — the identical side needs no diagnosis, and tracking it
     /// would double the map for no decision.
     differing_by_contract: HashMap<ContractInstanceId, u64>,
+    /// Recipients the proactive summary notification actually sent to, summed
+    /// over the window's notifications. See
+    /// [`OutboundMix::record_notification_recipients`].
+    notification_targets_sent: u64,
+    /// Recipients it SKIPPED because they are advertised co-hosts the
+    /// broadcast already covered (#4965). Paired with
+    /// [`Window::notification_targets_sent`] deliberately: the skipped count
+    /// alone cannot say whether the exclusion is doing much or nothing, since
+    /// a window with 100 skips out of 100 and one with 100 out of 10,000 are
+    /// completely different findings.
+    notification_cohosts_skipped: u64,
     /// Differing comparisons that could NOT be attributed because
     /// [`Window::differing_by_contract`] was already at
     /// [`MAX_TRACKED_CONTRACTS`].
@@ -630,6 +641,32 @@ impl OutboundMix {
         w.summary_entries_one_sided = w.summary_entries_one_sided.saturating_add(1);
     }
 
+    /// Record one proactive summary notification's recipient split (#4965).
+    ///
+    /// `sent` is how many standalone `Summaries` messages went out; `skipped`
+    /// is how many resolved interested peers were dropped because they are
+    /// advertised co-hosts the broadcast already covered.
+    ///
+    /// This is the RELEASE-VISIBLE measurement of the #4965 exclusion. The
+    /// emitter also logs the same pair at `debug!`, which
+    /// `release_max_level_info` compiles out — so in production that log
+    /// measures nothing, and a change judged on "how many sends did we avoid"
+    /// needs a counter that survives the release build.
+    ///
+    /// Lives on the outbound rollup rather than a new event stream for the
+    /// reason the module docs give: the per-node budget is 10 events/s and
+    /// this fires on every state change. Two integers per node-minute.
+    ///
+    /// Recorded even when both are zero — an early return before the fan-out
+    /// (throttled, gated, no summary) does NOT call this, so a zero pair means
+    /// "a notification ran and found nobody", which is a different fact from
+    /// "no notification ran" and the two must stay distinguishable.
+    pub(crate) fn record_notification_recipients(&self, sent: u64, skipped: u64) {
+        let mut w = self.window.lock();
+        w.notification_targets_sent = w.notification_targets_sent.saturating_add(sent);
+        w.notification_cohosts_skipped = w.notification_cohosts_skipped.saturating_add(skipped);
+    }
+
     /// Atomically take the current window, leaving a fresh empty one.
     fn take_window(&self) -> Window {
         std::mem::take(&mut *self.window.lock())
@@ -715,6 +752,20 @@ fn outbound_mix_json(w: &Window, window_secs: u64) -> serde_json::Value {
     body.insert(
         "differing_attribution_dropped".into(),
         w.differing_attribution_dropped.into(),
+    );
+
+    // #4965 co-host exclusion, measured in the release build. Emitted
+    // unconditionally as a PAIR: `skipped` alone cannot be read (100 of 100 and
+    // 100 of 10,000 are different findings), and a dropped field must not look
+    // like a quiet window. `interest_sync_summaries_notification_bytes` above
+    // shows the EFFECT; these two show the CAUSE, on the same node-minute row.
+    body.insert(
+        "notification_targets_sent".into(),
+        w.notification_targets_sent.into(),
+    );
+    body.insert(
+        "notification_cohosts_skipped".into(),
+        w.notification_cohosts_skipped.into(),
     );
     // Top differing contracts by count, so a low identical rate can be read as
     // "specific contracts are non-deterministic" vs "the design is wrong".
@@ -1090,6 +1141,55 @@ mod tests {
                 .and_then(|v| v.as_u64()),
             Some(5),
             "differing count must reach the body under its own key"
+        );
+    }
+
+    /// The #4965 notification split accumulates and reaches the body under
+    /// its own keys.
+    ///
+    /// Distinguishable counts (4 sent vs 9 skipped, and asymmetric per call)
+    /// so a swapped key or a `sent`/`skipped` transposition in
+    /// `record_notification_recipients` cannot pass. That transposition is the
+    /// realistic mistake: the two arguments are both `u64` and the pair is the
+    /// number the change is judged on, so an inverted report would claim a
+    /// saving that never happened while every other test stayed green.
+    #[test]
+    fn notification_recipient_split_reaches_the_rollup_body_under_the_right_keys() {
+        let mix = OutboundMix::new();
+        mix.record_notification_recipients(1, 2);
+        mix.record_notification_recipients(3, 7);
+        let body = outbound_mix_json(&mix.take_window(), 60);
+        assert_eq!(
+            body.get("notification_targets_sent")
+                .and_then(|v| v.as_u64()),
+            Some(4),
+            "sent count must accumulate and reach the body under its own key"
+        );
+        assert_eq!(
+            body.get("notification_cohosts_skipped")
+                .and_then(|v| v.as_u64()),
+            Some(9),
+            "skipped count must accumulate and reach the body under its own key"
+        );
+    }
+
+    /// An idle window still reports the pair, as zeros.
+    ///
+    /// "No notification ran this window" and "this build does not report the
+    /// counter" must not look the same — a dashboard reading a missing field
+    /// as zero would conclude the exclusion is doing nothing.
+    #[test]
+    fn notification_recipient_split_is_emitted_even_when_idle() {
+        let body = outbound_mix_json(&OutboundMix::new().take_window(), 60);
+        assert_eq!(
+            body.get("notification_targets_sent")
+                .and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert_eq!(
+            body.get("notification_cohosts_skipped")
+                .and_then(|v| v.as_u64()),
+            Some(0)
         );
     }
 
