@@ -979,6 +979,7 @@ pub(crate) fn version_supports_summary_first_put(
 ///   `SummaryRequest`, so it is necessarily at or above the floor.
 /// - The **`Notification` and `Rejection`** legs ship full bytes this release
 ///   (#4965 review §2), so there is no encoding choice to gate.
+///
 /// A pre-floor peer does not carry these variant indices at all and cannot
 /// bincode-deserialize them; the decode failure DROPS the connection, so it
 /// must never receive one. Below the floor — and whenever the remote version
@@ -1026,6 +1027,14 @@ pub(crate) fn version_supports_summary_first_put(
 ///
 /// RELEASE-TIME ACTION: when the release carrying this feature is cut, set
 /// this to `Some(HASH_FIRST_SUMMARIES_MIN_VERSION)` and freeze both.
+///
+/// Read only by `hash_first_floor_tracks_the_shipping_release`. It carries no
+/// runtime behaviour by design — its whole job is to make a release-time
+/// decision explicit and testable — so the non-test build sees it as dead.
+/// `allow(dead_code)` rather than deletion or a runtime reader: the constant IS
+/// the guard's input, and a runtime reader invented to satisfy the lint would
+/// be the fake dependency this codebase already avoids elsewhere.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const HASH_FIRST_SHIPPED_IN: Option<(u8, u8, u16)> = None;
 
 pub(crate) const HASH_FIRST_SUMMARIES_MIN_VERSION: (u8, u8, u16) = (0, 2, 116);

@@ -64,9 +64,14 @@ pub(crate) use network_bridge::broadcast_queue::BROADCAST_STREAM_METRICS;
 // re-export rather than a path through `network_bridge` directly. Mirrors
 // `BROADCAST_STREAM_METRICS` above.
 pub(crate) use network_bridge::p2p_protoc::{
-    HASH_FIRST_SHIPPED_IN, HASH_FIRST_SUMMARIES_MIN_VERSION, SUMMARY_FIRST_PUT_MIN_VERSION,
+    HASH_FIRST_SUMMARIES_MIN_VERSION, SUMMARY_FIRST_PUT_MIN_VERSION,
     version_supports_hash_first_summaries, version_supports_summary_first_put,
 };
+// Test-only: the release-timing marker has no runtime reader by design (see
+// its rustdoc), so re-exporting it unconditionally is an unused import in the
+// non-test build.
+#[cfg(test)]
+pub(crate) use network_bridge::p2p_protoc::HASH_FIRST_SHIPPED_IN;
 #[cfg(test)]
 pub(crate) use network_bridge::{EventLoopNotificationsReceiver, event_loop_notification_channel};
 // Re-export types for dev_tool and testing
