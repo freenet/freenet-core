@@ -1968,7 +1968,16 @@ impl SimNetwork {
     /// full-bytes `InterestMessage::Summaries`.
     ///
     /// This is the PRE-0.2.116 fleet: it reproduces what an un-upgraded peer
-    /// does, which is what makes a mixed-version interop test possible at all.
+    /// does.
+    ///
+    /// Note the override is per-node (`builder.config`), so a genuinely MIXED
+    /// simulation — one peer at the floor, one below — is constructible by
+    /// setting the two builders differently rather than using this helper,
+    /// which sets every node uniformly. No such test exists yet; the mixed
+    /// case that IS covered today is incidental rather than constructed: a
+    /// regular node never learns its gateway's version (the gateway's
+    /// `AckConnection` carries none), so every gateway link already runs
+    /// digests one way and full bytes the other.
     #[allow(dead_code)]
     pub fn disable_hash_first_summaries(&mut self) -> &mut Self {
         let floor = Some(Self::SIM_MIGRATION_DISABLED_FLOOR);

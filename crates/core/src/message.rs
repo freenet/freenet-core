@@ -678,6 +678,13 @@ pub struct SummaryDigestEntry {
     /// Truncated-BLAKE3 digest of our summary BYTES for that contract, or
     /// `None` if we're interested but hold no state yet. Says *what state* we
     /// hold.
+    ///
+    /// Fixed 16 bytes, so for a summary SMALLER than ~8 bytes the digest form
+    /// is LARGER than the summary it replaces. Real summaries are orders of
+    /// magnitude bigger (~33 KB for a River room), so this is a curiosity
+    /// rather than a cost — but it means the saving is not monotonic in
+    /// summary size, and a contract with a trivially small summary should not
+    /// be expected to benefit.
     pub summary_digest: Option<crate::ring::interest::SummaryDigest>,
 }
 
@@ -685,11 +692,16 @@ impl SummaryDigestEntry {
     /// Build a digest entry from the full-bytes entry we would otherwise have
     /// sent.
     ///
-    /// This is deliberately the ONLY constructor: every digest is a pure
-    /// function of the exact `SummaryEntry` the fallback `Summaries` form
-    /// would have carried, so the two wire forms cannot describe different
-    /// state and no call site can compute a digest over something other than
-    /// the summary it is advertising. Those summaries in turn always come from
+    /// This is deliberately the only constructor PROVIDED, so every digest is
+    /// a pure function of the exact `SummaryEntry` the fallback `Summaries`
+    /// form would have carried and the two wire forms cannot describe
+    /// different state.
+    ///
+    /// It is a convention, not an invariant: the fields are `pub`, so a caller
+    /// could build the struct literally and pair a digest with an unrelated
+    /// summary. Nothing pins that today. Making the fields private would cost
+    /// the wire-format tests their literal construction, which is why the
+    /// weaker guarantee is stated rather than an enforcement implied. Those summaries in turn always come from
     /// the node's ACTUAL state (`summary_if_hosted_or_in_use` /
     /// `get_contract_summary`), never from a cached belief about a peer.
     pub fn from_entry(entry: &SummaryEntry) -> Self {

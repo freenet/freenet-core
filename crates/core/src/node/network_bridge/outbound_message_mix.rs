@@ -1580,13 +1580,23 @@ mod tests {
     ///      a new file touching it fails CI even before we look at tags, and
     ///   2. the arm each tagging site claims, per file.
     ///
-    /// Known limit, stated rather than papered over: (2) scrapes the literal
-    /// `emitter: SummariesEmitter::<Arm>`, so a site that assigned the tag
-    /// from a variable would escape it. (1) still catches such a site if it
-    /// lives in a new file, and a wrongly-tagged one shows up as an
-    /// entries-per-message anomaly (`entry_counts_are_recorded_per_sub_arm`)
-    /// or in the residual arm. Needles are built with `concat!` so this test's
-    /// own source cannot satisfy the scrape when the walk reaches this file.
+    /// Known limit, stated rather than papered over: (2) scrapes a literal
+    /// arm reference, so a site that computed the tag from a variable would
+    /// escape it. (1) still catches such a site if it lives in a new file, and
+    /// a wrongly-tagged one shows up as an entries-per-message anomaly
+    /// (`entry_counts_are_recorded_per_sub_arm`) or in the residual arm.
+    /// Needles are built with `concat!` so this test's own source cannot
+    /// satisfy the scrape when the walk reaches this file.
+    ///
+    /// The needle is the BARE `SummariesEmitter::<Arm>` form, not
+    /// `emitter: SummariesEmitter::<Arm>`. #4965 centralised construction
+    /// behind `node::summaries_reply_for_peer` / `full_summaries_message`, so
+    /// an emitter site now names its arm as a call ARGUMENT rather than a
+    /// struct field; the field-form needle found zero arms in both emitter
+    /// files and passed. This file is the one exception, scanned with the
+    /// ASSIGNMENT form instead, because `classify` is where `SummaryRequest`
+    /// gets its arm — that message carries no emitter field, having exactly
+    /// one possible origin.
     #[test]
     fn summaries_emitter_sites_are_pinned() {
         use crate::node::network_bridge::p2p_protoc::tests::{

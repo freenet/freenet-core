@@ -36,8 +36,17 @@
 //!
 //! Additional refresh triggers:
 //! - Sending/receiving updates
-//! - Summaries exchange
+//! - Summaries exchange (the TTL refresh rides `PeerInterest::set_summary`,
+//!   so it happens wherever a summary is stored, not as a separate step)
 //! - Receiving `ChangeInterests { added }`
+//!
+//! Caveat for the hash-first exchange (#4965): a digest that AGREES stores the
+//! summary and therefore refreshes the TTL as usual, but a digest that needs
+//! bytes DEFERS both by one round trip — the refresh lands when the requested
+//! `Summaries` arrives. If that request or its reply is lost, the refresh is
+//! lost for the cycle too. Harmless at a 4x-heartbeat TTL (three consecutive
+//! losses are tolerated), but worth knowing before assuming every digest
+//! exchange refreshes.
 //!
 //! This self-healing mechanism catches forgotten cleanup and prevents zombie interests.
 

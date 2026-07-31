@@ -3461,6 +3461,15 @@ async fn handle_interest_sync_message(
             // A digest-match verdict of "stale" is not expected (the predicate
             // short-circuits on equal bytes) but is honoured rather than
             // assumed away — same bounded, targeted emission as `Summaries`.
+            //
+            // ACCEPTED COST, stated plainly: because agreement provably never
+            // heals, every heal that DOES happen on this leg now costs one
+            // extra round trip — the divergence is discovered from a digest,
+            // the bytes are requested, and only then does the `Summaries` arm
+            // run its staleness probe and emit. Against a ~300 s heartbeat a
+            // sub-second RTT is not a convergence risk, but it is a real
+            // regression in heal LATENCY on the legs that ship digests, and it
+            // is the price of not shipping the summary every cycle.
             emit_stale_peer_syncs(op_manager, source, stale_contracts).await;
 
             // A contract on the mismatch path is confirmed TWICE: once here,
@@ -3488,6 +3497,16 @@ async fn handle_interest_sync_message(
                 // contract and not one summary byte crossed the wire.
                 None
             } else {
+                // This is the ONE hash-first send with no version check, and
+                // it is safe by inference rather than by gate: a
+                // `SummaryRequest` is only ever emitted in reply to a
+                // `SummaryDigests` we just decoded, and we only receive one
+                // from a peer that chose the digest encoding — which it can
+                // only do if it read OUR version as at-or-above the floor and
+                // carries the variants itself. So the sender is necessarily
+                // capable of decoding the reply. Gating here would be
+                // redundant; NOT recording the inference would leave the next
+                // reader to wonder whether it was an oversight.
                 crate::config::GlobalTestMetrics::record_summary_byte_request();
                 Some(InterestMessage::SummaryRequest {
                     hashes: request_hashes,
