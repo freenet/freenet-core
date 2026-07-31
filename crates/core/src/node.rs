@@ -3349,15 +3349,41 @@ async fn handle_interest_sync_message(
                 // applies to the processing window rather than to this count,
                 // so a capped message is still classified by its true size.
                 let single_entry = entries.len() == 1;
-                let mut seen_hashes: HashSet<u32> = HashSet::new();
+                // Dedup on the (hash, digest) PAIR, not on the hash alone.
+                //
+                // The sender emits one entry per CONTRACT, and two DISTINCT
+                // contracts can collide on the 32-bit FNV-1a `contract_hash`
+                // — `lookup_by_hash` returns a Vec precisely because that
+                // happens. Deduping on hash alone dropped the second colliding
+                // entry, and that is not a lost optimisation but permanent
+                // silent divergence: with both local summaries byte-identical,
+                // the FIRST entry's digest agrees against BOTH contracts, so
+                // both record as converged while the entry carrying the
+                // genuinely-diverged digest never runs. No request fires, and
+                // every later heartbeat repeats it. The full-bytes `Summaries`
+                // arm has no such dedup, so this was a REGRESSION for the
+                // collision input class, not a pre-existing gap.
+                //
+                // Pinned by `colliding_contract_hashes_do_not_drop_the_second_entry`.
+                let mut seen_pairs: HashSet<(u32, Option<crate::ring::interest::SummaryDigest>)> =
+                    HashSet::new();
+                // Separate from the pair set: the REQUEST list stays deduped by
+                // hash, so N colliding entries still ask for their shared hash
+                // once. That bound is what stops a collision (or a crafted
+                // message) inflating the reply, and it is independent of the
+                // per-entry dedup above.
+                let mut requested_hashes: HashSet<u32> = HashSet::new();
                 let mut compared_contracts: HashSet<ContractInstanceId> = HashSet::new();
                 // See the sibling set in the `Summaries` arm.
                 let mut one_sided_counted: HashSet<ContractInstanceId> = HashSet::new();
                 for entry in entries {
-                    if seen_hashes.len() >= MAX_SUMMARY_HASHES_PER_MESSAGE {
+                    // The cap counts distinct PAIRS, matching what is actually
+                    // processed — counting distinct hashes would no longer
+                    // bound the work now that several pairs can share a hash.
+                    if seen_pairs.len() >= MAX_SUMMARY_HASHES_PER_MESSAGE {
                         break;
                     }
-                    if !seen_hashes.insert(entry.hash) {
+                    if !seen_pairs.insert((entry.hash, entry.summary_digest)) {
                         continue;
                     }
                     // One hash can resolve to several contracts (FNV-1a
@@ -3457,7 +3483,7 @@ async fn handle_interest_sync_message(
                             }
                         }
                     }
-                    if needs_bytes {
+                    if needs_bytes && requested_hashes.insert(entry.hash) {
                         request_hashes.push(entry.hash);
                     }
                 }
@@ -8706,6 +8732,153 @@ mod tests {
                  ignored, not turned into a request. Got {reply:?}"
             );
             assert!(h.drain_heals().is_empty());
+        }
+
+        /// Two DISTINCT contracts whose 32-bit `contract_hash` collides must
+        /// both be considered — dropping the second is permanent silent
+        /// divergence.
+        ///
+        /// # The bug this pins (codex P2)
+        ///
+        /// The digest arm deduplicated on `entry.hash` alone, first-wins. The
+        /// sender emits one entry per CONTRACT, so two contracts colliding on
+        /// FNV-1a produce two entries with the SAME hash and different digests
+        /// — and the second was silently dropped.
+        ///
+        /// That is not merely a missed optimisation. With both local summaries
+        /// byte-identical (two freshly-seeded contracts, say), the FIRST
+        /// entry's digest agrees against BOTH local contracts, so both are
+        /// recorded as converged; the second entry, carrying the digest of the
+        /// contract that actually diverged, never runs. No `SummaryRequest`
+        /// fires, and every subsequent heartbeat repeats the same outcome:
+        /// **permanent divergence, invisible**. That is the stale-copy class
+        /// `hosting-invariants.md` invariant 1 forbids.
+        ///
+        /// It was also a REGRESSION rather than a pre-existing gap: the
+        /// full-bytes `Summaries` arm has no such dedup and processes every
+        /// entry, so this input class worked before hash-first.
+        ///
+        /// The fix deduplicates on the `(hash, digest)` PAIR, so a same-hash
+        /// different-digest entry still runs. It then mismatches at least one
+        /// local summary, which asks for the bytes; the full-bytes reply
+        /// resolves ALL contracts for the hash and disambiguates.
+        #[tokio::test]
+        async fn colliding_contract_hashes_do_not_drop_the_second_entry() {
+            use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+            use std::collections::HashMap;
+
+            // Find ANY pair of instance ids colliding under FNV-1a.
+            //
+            // Two subtleties, both learned by getting them wrong:
+            //
+            // 1. Search for an ARBITRARY colliding pair, not a collision with a
+            //    fixed key — the latter needs ~2^32 trials, the birthday bound
+            //    for a pair is ~2^16.
+            // 2. Vary MORE than 32 bits of the input. FNV-1a's per-byte step
+            //    (xor then multiply by an odd prime mod 2^32) is invertible, so
+            //    over fixed-length inputs differing only in a 4-byte window it
+            //    is a BIJECTION — distinct 32-bit prefixes provably never
+            //    collide, and a search over them runs forever finding nothing.
+            //    Spreading a multiplied counter across 8 bytes puts the domain
+            //    above 2^32 so collisions exist and appear at the birthday rate.
+            let (id_a, id_b) = {
+                let mut seen: HashMap<u32, [u8; 32]> = HashMap::new();
+                let mut found = None;
+                for i in 0u64..2_000_000 {
+                    let mut raw = [7u8; 32];
+                    // Golden-ratio multiply spreads the counter over 64 bits.
+                    raw[..8].copy_from_slice(&i.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes());
+                    let key = ContractKey::from_id_and_code(
+                        ContractInstanceId::new(raw),
+                        CodeHash::new([1u8; 32]),
+                    );
+                    let h = contract_hash(&key);
+                    if let Some(prev) = seen.insert(h, raw) {
+                        if prev != raw {
+                            found = Some((prev, raw));
+                            break;
+                        }
+                    }
+                }
+                found.expect("an FNV-1a collision must exist within 2M candidates")
+            };
+
+            let key_a = ContractKey::from_id_and_code(
+                ContractInstanceId::new(id_a),
+                CodeHash::new([1; 32]),
+            );
+            let key_b = ContractKey::from_id_and_code(
+                ContractInstanceId::new(id_b),
+                CodeHash::new([1; 32]),
+            );
+            assert_ne!(key_a, key_b, "the two contracts must be distinct");
+            assert_eq!(
+                contract_hash(&key_a),
+                contract_hash(&key_b),
+                "premise: the two contracts must COLLIDE under contract_hash, \
+                 or this test is not exercising the collision path at all"
+            );
+            let shared_hash = contract_hash(&key_a);
+
+            // Host BOTH on the node. The stand-in handler answers every
+            // GetSummaryQuery with the same bytes, so their local summaries are
+            // byte-identical — which is what lets one digest agree against both
+            // and makes the dropped entry invisible.
+            let h = build_harness("hf-collision", 17080, vec![3u8; 64]).await;
+            for k in [key_a, key_b] {
+                let _ = h
+                    .op_manager
+                    .ring
+                    .host_contract(k, 128, crate::ring::AccessType::Put);
+                h.op_manager.interest_manager.register_local_hosting(&k);
+            }
+
+            let agreeing = summary_digest(&h.our_summary);
+            let diverged = summary_digest(b"a genuinely different state");
+            assert_ne!(agreeing, diverged);
+
+            // Exactly what a peer hosting both contracts sends: one entry per
+            // CONTRACT, both carrying the same (colliding) hash.
+            let reply = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::SummaryDigests {
+                    emitter: crate::message::SummariesEmitter::Other,
+                    entries: vec![
+                        SummaryDigestEntry {
+                            hash: shared_hash,
+                            summary_digest: Some(agreeing),
+                        },
+                        SummaryDigestEntry {
+                            hash: shared_hash,
+                            summary_digest: Some(diverged),
+                        },
+                    ],
+                },
+            )
+            .await;
+
+            match reply {
+                Some(InterestMessage::SummaryRequest { hashes }) => {
+                    assert!(
+                        hashes.contains(&shared_hash),
+                        "the diverging entry must provoke a SummaryRequest for \
+                         its hash, got {hashes:?}"
+                    );
+                    assert_eq!(
+                        hashes.iter().filter(|x| **x == shared_hash).count(),
+                        1,
+                        "the hash must still appear at most ONCE — the \
+                         collision-inflation bound is independent of the \
+                         per-entry dedup and must survive the fix"
+                    );
+                }
+                other => panic!(
+                    "the second (diverging) entry was dropped: no SummaryRequest \
+                     fired, so this node will report converged forever while the \
+                     peer holds different state. Got {other:?}"
+                ),
+            }
         }
 
         /// Repeated hashes must be free: a peer that names the same contract
