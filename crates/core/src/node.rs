@@ -3414,6 +3414,33 @@ async fn handle_interest_sync_message(
                 let mut compared_contracts: HashSet<ContractInstanceId> = HashSet::new();
                 // See the sibling set in the `Summaries` arm.
                 let mut one_sided_counted: HashSet<ContractInstanceId> = HashSet::new();
+                // WIRE-ORDER INDEPENDENCE — the invariant this grouping exists
+                // to establish.
+                //
+                // The receiver's work must depend on the message's CONTENT, not
+                // on the order the peer chose to send it in. Take the bounded,
+                // pair-deduped set and GROUP IT BY HASH before doing any work,
+                // so every hash is visited exactly once, contiguously.
+                //
+                // This is a root-cause fix, not another patch. Three separate
+                // findings on this arm were all instances of peer-controlled
+                // ordering: with entries walked in wire order, a peer choosing
+                // an interleaving (A, B, A, B, ...) forced the per-hash cache to
+                // clear and refetch on every revisit. An earlier comment here
+                // argued that could not happen because "the skip arms after a
+                // hash's first mismatch" — that argument was WRONG and is
+                // removed: `DigestVerdict::Agree` does not set `needs_bytes`
+                // (only the `NeedBytes` arm does), so a round of non-arming
+                // entries leaves every hash live and revisitable.
+                //
+                // Grouping makes the whole class unreachable rather than
+                // patching its instances, and restores both bounds at once:
+                // <=1 fetch per contract per message (CPU) and retention <= one
+                // hash's contract set (memory). The pair dedup, the request-list
+                // hash dedup and the skip all remain — grouping does not replace
+                // them, it removes the ordering freedom they were being asked to
+                // absorb.
+                let mut bounded: Vec<crate::message::SummaryDigestEntry> = Vec::new();
                 for entry in entries {
                     // The cap counts distinct PAIRS, matching what is actually
                     // processed — counting distinct hashes would no longer
@@ -3424,25 +3451,28 @@ async fn handle_interest_sync_message(
                     if !seen_pairs.insert((entry.hash, entry.summary_digest)) {
                         continue;
                     }
+                    bounded.push(entry);
+                }
+                // Stable sort by hash: equal hashes become contiguous, and the
+                // relative order WITHIN a hash is preserved, so behaviour for a
+                // single hash is unchanged from before the grouping.
+                bounded.sort_by_key(|e| e.hash);
+
+                for entry in bounded {
                     // Once a hash is on the request list, further pairs naming
                     // it are inert: the full-bytes `Summaries` reply we are
                     // about to receive carries OUR summaries for ALL contracts
                     // matching the hash, so any divergence those pairs would
                     // have found is resolved there anyway.
                     //
-                    // This cannot lose a heal — it defers one, to the reply
-                    // that is already on its way. What it removes is the
-                    // attacker's ability to keep the loop busy: only ONE digest
-                    // value can agree with a given local contract (the digest
-                    // IS the hash of our summary bytes), so all but one
-                    // fabricated pair mismatch, the first mismatch arms this
-                    // skip, and the hash goes inert after ~2 productive
-                    // iterations.
+                    // This cannot lose a heal — it defers one, to the reply that
+                    // is already on its way.
                     if requested_hashes.contains(&entry.hash) {
                         continue;
                     }
-                    // Drop the previous hash's summaries before touching a new
-                    // one. This is the retention bound, not an optimisation.
+                    // Drop the previous hash's summaries before moving to the
+                    // next. This is the retention bound, and with the grouping
+                    // above it fires exactly once per distinct hash.
                     if cached_for_hash != Some(entry.hash) {
                         local_summaries.clear();
                         cached_for_hash = Some(entry.hash);
@@ -9158,6 +9188,118 @@ mod tests {
                  for the whole message, which is hundreds of MB at the cap with \
                  real summaries.",
                 hashes.len()
+            );
+        }
+
+        /// INTERLEAVED hashes must cost the same as grouped ones — the
+        /// receiver's work must not depend on the order the peer chose.
+        ///
+        /// # The finding this pins (codex P1, round 4)
+        ///
+        /// Three earlier findings on this arm were all the same root cause:
+        /// with entries walked in WIRE ORDER, a peer choosing an interleaving
+        /// (A, B, A, B, ...) forced the per-hash summary cache to clear and
+        /// refetch on every revisit, reopening the CPU bound the cache was
+        /// added to close.
+        ///
+        /// A prior comment argued this was impossible because "the skip arms
+        /// after a hash's first mismatch, so the hash goes inert". **That
+        /// argument was false.** `DigestVerdict::Agree` does not set
+        /// `needs_bytes` — only the `NeedBytes` arm does — so a round of
+        /// NON-ARMING entries (agreements, or a `None` digest) leaves every
+        /// hash live and revisitable. The reasoning held for mismatching pairs
+        /// and was wrongly generalised to all pairs.
+        ///
+        /// The fix groups entries by hash before any work, so ordering is not
+        /// the peer's to choose. This test asserts that property directly: the
+        /// same entries interleaved must cost ~one fetch per contract, not one
+        /// per pair.
+        #[tokio::test]
+        async fn interleaved_hashes_cost_the_same_as_grouped_ones() {
+            use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+            use std::sync::atomic::Ordering;
+
+            let h = build_harness("hf-interleave", 17110, vec![5u8; 128]).await;
+
+            // 32 hosted contracts, each its own hash.
+            let mut hashes = Vec::new();
+            for i in 0u8..32 {
+                let k = ContractKey::from_id_and_code(
+                    ContractInstanceId::new([i.wrapping_add(160); 32]),
+                    CodeHash::new([i.wrapping_add(3); 32]),
+                );
+                let _ = h
+                    .op_manager
+                    .ring
+                    .host_contract(k, 128, crate::ring::AccessType::Put);
+                h.op_manager.interest_manager.register_local_hosting(&k);
+                hashes.push(contract_hash(&k));
+            }
+            hashes.sort_unstable();
+            hashes.dedup();
+            let n = hashes.len();
+            assert!(n >= 16, "premise: need many distinct hashes, got {n}");
+
+            // Three INTERLEAVED rounds, and the SHAPES matter — this is where
+            // a first attempt at this test went wrong. A round of MISMATCHING
+            // digests arms the skip on its first visit, after which the hash is
+            // inert and never revisited, so a fixture built only from
+            // fabricated digests costs ~one visit per hash even in wire order
+            // and cannot detect the bug at all.
+            //
+            // The revisitable rounds are the NON-ARMING ones: `Agree` (digest
+            // equals our summary's) and `PeerHasNoState` (`None`). Neither sets
+            // `needs_bytes`, so neither arms the skip. Pair dedup means there is
+            // exactly ONE distinct non-arming pair of each kind per hash — the
+            // agreeing digest has only one possible value, and so does `None` —
+            // which also bounds the real-world amplification to ~3 visits per
+            // hash rather than the pair count.
+            let agreeing = summary_digest(&h.our_summary);
+            let mut entries = Vec::new();
+            for hash in &hashes {
+                entries.push(SummaryDigestEntry {
+                    hash: *hash,
+                    summary_digest: Some(agreeing),
+                });
+            }
+            for hash in &hashes {
+                entries.push(SummaryDigestEntry {
+                    hash: *hash,
+                    summary_digest: None,
+                });
+            }
+            for hash in &hashes {
+                entries.push(SummaryDigestEntry {
+                    hash: *hash,
+                    summary_digest: Some(summary_digest(&hash.to_le_bytes())),
+                });
+            }
+            assert!(
+                entries.len() < MAX_SUMMARY_HASHES_PER_MESSAGE,
+                "premise: stay under the cap so the CAP is not what bounds this"
+            );
+
+            let before = h.summary_queries.load(Ordering::Relaxed);
+            let _ = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::SummaryDigests {
+                    entries,
+                    emitter: crate::message::SummariesEmitter::Other,
+                },
+            )
+            .await;
+            let fetches = h.summary_queries.load(Ordering::Relaxed) - before;
+
+            // One contract per hash, so `n` fetches is the content-determined
+            // floor. Without grouping this is ~4n (one per round per hash).
+            assert!(
+                fetches <= n,
+                "interleaving {n} hashes over 3 non-arming rounds caused \
+                 {fetches} summary \
+                 fetches; grouping should hold it to at most {n} — one per \
+                 contract. A count scaling with the ROUND COUNT means the peer's \
+                 chosen ordering still drives our work."
             );
         }
 
