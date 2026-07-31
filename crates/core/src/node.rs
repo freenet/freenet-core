@@ -3373,6 +3373,24 @@ async fn handle_interest_sync_message(
                 // message) inflating the reply, and it is independent of the
                 // per-entry dedup above.
                 let mut requested_hashes: HashSet<u32> = HashSet::new();
+                // Per-message cache of OUR summaries, keyed by contract.
+                //
+                // The root bound on the expensive operation. Pair-dedup (above)
+                // is required for correctness but removed the incidental bound
+                // hash-dedup used to provide: a peer can name ONE known hash
+                // with up to `MAX_SUMMARY_HASHES_PER_MESSAGE` distinct
+                // fabricated digests, and without this each pair would rerun
+                // `summary_if_hosted_or_in_use` — a contract-handler round trip
+                // — for every contract matching that hash, sequentially, on the
+                // loop the executor needs responsive
+                // (`.claude/rules/code-style.md`, fan-out cost).
+                //
+                // With the cache the fetch runs at most ONCE per contract per
+                // message no matter how many pairs name it.
+                let mut local_summaries: std::collections::HashMap<
+                    ContractInstanceId,
+                    Option<freenet_stdlib::prelude::StateSummary<'static>>,
+                > = std::collections::HashMap::new();
                 let mut compared_contracts: HashSet<ContractInstanceId> = HashSet::new();
                 // See the sibling set in the `Summaries` arm.
                 let mut one_sided_counted: HashSet<ContractInstanceId> = HashSet::new();
@@ -3384,6 +3402,23 @@ async fn handle_interest_sync_message(
                         break;
                     }
                     if !seen_pairs.insert((entry.hash, entry.summary_digest)) {
+                        continue;
+                    }
+                    // Once a hash is on the request list, further pairs naming
+                    // it are inert: the full-bytes `Summaries` reply we are
+                    // about to receive carries OUR summaries for ALL contracts
+                    // matching the hash, so any divergence those pairs would
+                    // have found is resolved there anyway.
+                    //
+                    // This cannot lose a heal — it defers one, to the reply
+                    // that is already on its way. What it removes is the
+                    // attacker's ability to keep the loop busy: only ONE digest
+                    // value can agree with a given local contract (the digest
+                    // IS the hash of our summary bytes), so all but one
+                    // fabricated pair mismatch, the first mismatch arms this
+                    // skip, and the hash goes inert after ~2 productive
+                    // iterations.
+                    if requested_hashes.contains(&entry.hash) {
                         continue;
                     }
                     // One hash can resolve to several contracts (FNV-1a
@@ -3401,7 +3436,19 @@ async fn handle_interest_sync_message(
                         // `PeerInterest.summary`: that is our belief about the
                         // peer, and repairing a wrong belief is the entire job
                         // of this exchange.
-                        let our_summary = summary_if_hosted_or_in_use(op_manager, &contract).await;
+                        //
+                        // Memoized per MESSAGE (see `local_summaries`): the
+                        // value cannot change while this handler runs, and
+                        // re-fetching per pair is the amplification the pair
+                        // dedup would otherwise open.
+                        if !local_summaries.contains_key(contract.id()) {
+                            let fetched = summary_if_hosted_or_in_use(op_manager, &contract).await;
+                            local_summaries.insert(*contract.id(), fetched);
+                        }
+                        let our_summary = local_summaries
+                            .get(contract.id())
+                            .expect("just inserted")
+                            .clone();
 
                         if emit_confirmed {
                             if let Some(ref summary) = our_summary {
@@ -8252,6 +8299,11 @@ mod tests {
             /// A connected peer with NO recorded version (an old peer, as far
             /// as the fail-closed gate is concerned).
             old_peer: SocketAddr,
+            /// How many `GetSummaryQuery` round trips the stand-in contract
+            /// handler has answered. The observable for the amplification
+            /// bound: it counts the EXPENSIVE operation directly, rather than
+            /// a proxy that could stay flat while the work still happened.
+            summary_queries: std::sync::Arc<std::sync::atomic::AtomicUsize>,
             _guard: Box<dyn std::any::Any>,
         }
 
@@ -8357,10 +8409,13 @@ mod tests {
 
             let summary_for_handler = our_summary.clone();
             let handler_key = key;
+            let summary_queries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let queries_for_handler = std::sync::Arc::clone(&summary_queries);
             let handler = tokio::spawn(async move {
                 while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
                     let response = match ev {
                         ContractHandlerEvent::GetSummaryQuery { key } => {
+                            queries_for_handler.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             ContractHandlerEvent::GetSummaryResponse {
                                 key,
                                 summary: Ok(StateSummary::from(summary_for_handler.clone())),
@@ -8405,6 +8460,7 @@ mod tests {
                 our_summary,
                 new_peer,
                 old_peer,
+                summary_queries,
                 _guard: guard,
             }
         }
@@ -8877,6 +8933,113 @@ mod tests {
                     "the second (diverging) entry was dropped: no SummaryRequest \
                      fired, so this node will report converged forever while the \
                      peer holds different state. Got {other:?}"
+                ),
+            }
+        }
+
+        /// A peer naming ONE hash with many distinct fabricated digests must
+        /// not multiply the expensive work (codex P1 on the collision fix).
+        ///
+        /// # The amplification this bounds
+        ///
+        /// The collision fix had to dedup on `(hash, digest)` rather than on
+        /// hash alone, which was correct — but hash-dedup had been
+        /// *incidentally* bounding something else: how many times
+        /// `summary_if_hosted_or_in_use` runs. That is a contract-handler round
+        /// trip, sequential, on the loop the executor needs responsive. With
+        /// pair-dedup and no further bound, one message could name a single
+        /// known hash with up to `MAX_SUMMARY_HASHES_PER_MESSAGE` distinct
+        /// digests and force that many fetches per matching contract.
+        ///
+        /// Two mechanisms bound it:
+        ///
+        /// - a per-message summary cache, so a contract is fetched at most once
+        ///   per message however many pairs name it;
+        /// - skip-once-requested, so pairs arriving after the hash is already
+        ///   on the request list are not processed at all.
+        ///
+        /// The skip cannot lose a heal: the full-bytes reply already on its way
+        /// carries our summaries for ALL contracts matching that hash.
+        ///
+        /// # What this test does and does NOT discriminate
+        ///
+        /// Stated because the obvious reading is wrong. Mutation-tested three
+        /// ways: removing the cache alone PASSES, removing the skip alone
+        /// PASSES, removing BOTH fails at 512 fetches. So this test bounds the
+        /// CONJUNCTION, not either mechanism individually.
+        ///
+        /// That is not a defect in the test so much as a property of the fix:
+        /// each mechanism is independently sufficient for this observable. Only
+        /// one digest value can agree with a given local contract (the digest
+        /// IS the hash of our summary bytes), so the first fabricated pair
+        /// mismatches, arms the skip, and the hash goes inert — which holds the
+        /// count to ~1 even with no cache; and the cache holds it to 1 even
+        /// with no skip. They are deliberate defence in depth.
+        ///
+        /// A test that isolated one would need a scenario where the skip cannot
+        /// arm (no request fires) yet many pairs still resolve — and pair-dedup
+        /// makes that unconstructible, since all `None`-digest pairs for a hash
+        /// collapse to one. If a future change makes them separable, split this
+        /// test then.
+        #[tokio::test]
+        async fn many_digests_for_one_hash_do_not_multiply_summary_fetches() {
+            use std::sync::atomic::Ordering;
+
+            let h = build_harness("hf-amp", 17090, vec![5u8; 128]).await;
+            let hash = contract_hash(&h.key);
+
+            // 512 distinct fabricated digests, all naming the ONE hash this
+            // node tracks. Every one of them is a real, distinct pair, so
+            // pair-dedup does not collapse them.
+            let entries: Vec<SummaryDigestEntry> = (0..512u32)
+                .map(|i| SummaryDigestEntry {
+                    hash,
+                    summary_digest: Some(summary_digest(&i.to_le_bytes())),
+                })
+                .collect();
+            assert!(
+                entries.len() < MAX_SUMMARY_HASHES_PER_MESSAGE,
+                "premise: stay under the cap so the CAP is not what bounds \
+                 this — the cache and the skip must be doing the work"
+            );
+
+            let before = h.summary_queries.load(Ordering::Relaxed);
+            let reply = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::SummaryDigests {
+                    entries,
+                    emitter: crate::message::SummariesEmitter::Other,
+                },
+            )
+            .await;
+            let fetches = h.summary_queries.load(Ordering::Relaxed) - before;
+
+            // One contract matches this hash, so one fetch is the floor. The
+            // bound is what matters: NOT proportional to the 512 pairs.
+            assert!(
+                fetches <= 1,
+                "512 fabricated digests for one hash caused {fetches} summary \
+                 fetches; the per-message cache should hold it to at most one \
+                 per matching contract. A count near 512 means the cache is \
+                 gone and a peer can monopolize the contract loop with a single \
+                 message."
+            );
+
+            // And the divergence is still handled: the hash IS requested.
+            match reply {
+                Some(InterestMessage::SummaryRequest { hashes }) => {
+                    assert_eq!(
+                        hashes,
+                        vec![hash],
+                        "the hash must be requested exactly once — bounding the \
+                         work must not cost the request, and must not let 512 \
+                         pairs inflate it either"
+                    );
+                }
+                other => panic!(
+                    "fabricated digests all mismatch our summary, so the bytes \
+                     must be requested; got {other:?}"
                 ),
             }
         }
