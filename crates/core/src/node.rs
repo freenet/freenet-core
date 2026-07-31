@@ -4759,18 +4759,42 @@ mod tests {
         // the positive assertions below would have kept passing with those
         // calls deleted from `Summaries` itself.
         let next_off = src[handler_start..]
-            // `{ entries, .. }`, matching the REAL arm at node.rs:3203. The
-            // bare `{ entries }` form appears NOWHERE in this file except this
-            // line, so `include_str!` made the needle match ITSELF: the window
-            // became 2995..4627 (~1632 lines) instead of ~208, swallowing the
-            // digest arm's own calls and this pin's rustdoc, either of which
-            // satisfies all four assertions with the true `Summaries` arm's
-            // calls deleted. A needle must be verified to resolve to the
-            // INTENDED line, not merely to resolve somewhere (#5076).
+            // `{ entries, .. }` — the destructuring the REAL arm uses. An
+            // earlier revision searched for the bare `{ entries }` form, which
+            // appears NOWHERE in this file except the needle line itself, so
+            // `include_str!` made it match ITS OWN SOURCE: the window widened
+            // roughly eightfold, swallowing the digest arm's own calls and this
+            // pin's rustdoc, either of which satisfies all four assertions with
+            // the true `Summaries` arm's calls deleted. A needle must resolve
+            // to the INTENDED place, not merely resolve somewhere (#5076).
             .find("InterestMessage::SummaryDigests { entries, .. } => {")
             .expect("SummaryDigests arm not found");
-        let summaries_arm =
-            &code_only(&src[handler_start + summaries_off..handler_start + next_off]);
+        let window_end = handler_start + next_off;
+
+        // Hard guard against that failure recurring. If the real arm's shape
+        // ever drifts again, `find` falls through to this pin's own literal
+        // above and the window silently widens to span the test module — which
+        // is exactly how this pin was vacuous twice on this branch. Asserting
+        // the end lands in PRODUCTION code turns the recurrence into a loud
+        // failure instead of a quiet pass.
+        //
+        // Anchored on the outer `mod tests`, not the first `#[cfg(test)]`:
+        // node.rs has a `#[cfg(test)]` near the top, so that marker would put
+        // the boundary BEFORE the handler and make this assertion fire on
+        // correct code. (#5076: a scrape's own scope needs checking too.)
+        let test_mod_start = src
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("node.rs outer test module not found");
+        assert!(
+            window_end < test_mod_start,
+            "the Summaries-arm window ends at byte {window_end}, inside the \
+             test module (starts at {test_mod_start}). The end needle has \
+             fallen through to this pin's own source again — the #5076 \
+             self-match — and the window has silently widened. Re-anchor it on \
+             the arm that immediately follows `Summaries` in production code."
+        );
+
+        let summaries_arm = &code_only(&src[handler_start + summaries_off..window_end]);
 
         // #4965: the measurement call must stay wired into this arm. It is
         // pure observation, so deleting it breaks no test and no behavior —
