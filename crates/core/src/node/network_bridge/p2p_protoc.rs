@@ -1035,7 +1035,8 @@ pub(crate) fn version_supports_summary_first_put(
 /// the guard's input, and a runtime reader invented to satisfy the lint would
 /// be the fake dependency this codebase already avoids elsewhere.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const HASH_FIRST_SHIPPED_IN: Option<(u8, u8, u16)> = None;
+pub(crate) const HASH_FIRST_SHIPPED_IN: Option<(u8, u8, u16)> =
+    Some(HASH_FIRST_SUMMARIES_MIN_VERSION);
 
 pub(crate) const HASH_FIRST_SUMMARIES_MIN_VERSION: (u8, u8, u16) = (0, 2, 116);
 
