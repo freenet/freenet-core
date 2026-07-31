@@ -872,20 +872,30 @@ pub(crate) async fn send_proactive_summary_notification(
         return;
     };
 
-    // The wire form is chosen PER PEER (#4965): a peer whose reported version
-    // clears the hash-first floor gets a `SummaryDigests`, everyone else the
-    // full-bytes `Summaries`. Both are built from this one `SummaryEntry`, so
-    // the two forms can never describe different state.
+    // One `SummaryEntry`, built once here and reused for every interested peer
+    // in the loop below — the summary is identical for all of them, so there
+    // is nothing per-peer to compute.
     //
-    // This is the send site that fires on every state change to every
-    // interested peer, so it is where a ~33 KB summary is most often shipped
-    // to a peer that just received the same update and therefore already
-    // agrees — the single biggest source of the bytes #4965 removes.
+    // This leg ships FULL BYTES this release. Hash-first (#4965) does NOT
+    // apply here: digest-first rides the two multi-entry reply legs
+    // (`InterestsReply` / `ChangeInterestsReply`) only, and the send site 40
+    // lines below carries the evidential reasoning for why this one was left
+    // out. There is no per-peer encoding choice on this path, and no version
+    // gate is consulted.
+    //
+    // Worth stating because the opposite is the intuitive guess: this is the
+    // send site that fires on every state change to every interested peer, so
+    // it looks like the biggest available saving. It is deliberately NOT
+    // taken, because its receivers are the population least likely to have
+    // applied the update yet — the one place a digest is most likely to MISS
+    // and cost 1 message -> 3 for the same bytes. It is the strongest
+    // candidate for the NEXT release, once the agreement counters give a field
+    // reading, not a saving already banked.
     //
     // #5052: this is also the per-state-change fan-out that #5003 targets. It
     // is the only SINGLE-entry emitter that fans across peers, so its
     // bytes/msgs ratio is what tells a notification apart from a heartbeat
-    // reply in the rollup; the tag rides both wire forms.
+    // reply in the rollup.
     let hash = contract_hash(key);
     let full_entry = SummaryEntry::from_summary(hash, Some(&summary));
 
