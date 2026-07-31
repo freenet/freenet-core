@@ -21,7 +21,8 @@ use crate::contract::{ContractHandlerEvent, ExecutorError, StoreResponse};
 use crate::message::{NodeEvent, Transaction};
 use crate::node::OpManager;
 use crate::ring::PeerKeyLocation;
-use std::collections::VecDeque;
+use crate::transport::TransportPublicKey;
+use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 
 use dashmap::DashMap;
@@ -283,6 +284,32 @@ impl OpManager {
         let _tx = super::get::op_ctx_task::start_targeted_sub_op_get(self, instance_id, sender_pkl);
     }
 
+    /// The advertised co-hosts of a contract: peers that announced, via the
+    /// advertisement layer, that they host it.
+    ///
+    /// SINGLE SOURCE OF TRUTH for that population, deliberately shared by the
+    /// two call sites that must agree on it:
+    ///
+    /// - [`OpManager::get_broadcast_targets_update`], which broadcasts the
+    ///   state (carrying our summary in `sender_summary_bytes`) TO them, and
+    /// - [`send_proactive_summary_notification`], which EXCLUDES them from the
+    ///   standalone `Summaries` fan-out precisely because that broadcast
+    ///   already carried the summary (#4965).
+    ///
+    /// The exclusion is only sound while the excluded set is a subset of the
+    /// broadcast target set. If the two sites read different sources, or one
+    /// narrows its set and the other does not, the notification over-excludes:
+    /// a peer gets neither the broadcast nor the standalone summary, and every
+    /// unit test stays green because each site is individually correct. Sharing
+    /// the source is what makes a future narrowing apply to both.
+    ///
+    /// **If you add a filter, add it HERE, not at a call site.** That coupling
+    /// is the point of this function, and it is pinned by
+    /// `cohost_source_is_shared_between_broadcast_and_notification`.
+    pub(crate) fn advertised_cohost_pub_keys(&self, key: &ContractKey) -> Vec<TransportPublicKey> {
+        self.neighbor_hosting.neighbors_with_contract(key)
+    }
+
     /// Resolve the set of peers to broadcast a state update to.
     ///
     /// Targets are the advertised co-hosts from the proximity neighbor cache
@@ -348,7 +375,12 @@ impl OpManager {
         // advertised co-hosts — peers who announced they host this contract via
         // the advertisement layer. The former interest-manager arm (Source 2)
         // was removed in #4642 step 9; see this function's rustdoc.
-        let proximity_pub_keys = self.neighbor_hosting.neighbors_with_contract(key);
+        //
+        // Read through `advertised_cohost_pub_keys` rather than
+        // `neighbor_hosting` directly: `send_proactive_summary_notification`
+        // EXCLUDES this same set, and the shared accessor is what keeps a
+        // future narrowing from over-excluding there. See its rustdoc.
+        let proximity_pub_keys = self.advertised_cohost_pub_keys(key);
         let proximity_found = proximity_pub_keys.len();
 
         for pub_key in proximity_pub_keys {
@@ -841,6 +873,102 @@ pub(crate) async fn update_contract(
 /// consumed even in that case, so a no-summary tick still burns the
 /// contract's 100ms notification slot (acceptable: no summary means there is
 /// nothing to advertise yet, and the next state change retries).
+///
+/// # Recipient set (#4965)
+///
+/// Interested peers, MINUS the update's sender, MINUS ourselves, MINUS every
+/// **advertised co-host** of this contract. The co-host exclusion is the
+/// bandwidth fix: those peers are exactly the broadcast fan-out targets
+/// (`get_broadcast_targets_update` sources them from
+/// `neighbor_hosting::neighbors_with_contract`), and the broadcast we send
+/// them already carries this same summary in `sender_summary_bytes`, which
+/// they upsert into their cache of us on arrival
+/// (`update/op_ctx_task.rs::drive_relay_broadcast_to` step 1, and the
+/// streaming twin `apply_streaming_broadcast` step 4 — the #4952 upsert).
+/// Sending it again as a standalone `Summaries` message duplicates the
+/// summary bytes on the wire for a peer that just received them. It is NOT a
+/// pure duplicate: the `Summaries` handler ALSO compares our summary against
+/// the receiver's and heals us via a targeted `SyncStateToPeer` if we are
+/// behind (`node.rs`, `Summaries` arm), whereas the broadcast receive path
+/// only upserts (`op_ctx_task.rs`). For co-hosts that reverse probe now falls
+/// to the ~5-min heartbeat anti-entropy — the backstop invariant 1 designates
+/// for exactly this.
+///
+/// `interest_sync_summaries` is the largest outbound arm (49.8% of outbound
+/// bytes, v0.2.115). How much of it THIS emitter accounts for is NOT known:
+/// `outbound_message_mix` buckets all four `Summaries` emitters together, and
+/// the multi-entry heartbeat reply (`node.rs`, `Interests` arm) is a
+/// significant second source. #5052 adds the per-emitter counter. Do not read
+/// a specific saving into this change. See #4965.
+///
+/// The remaining recipients are the population this notification exists for:
+/// peers interested in the contract that we do NOT advertise-host toward, so
+/// our summary would otherwise only reach them on the ~5-min InterestSync
+/// heartbeat.
+///
+/// If a broadcast is dropped rather than delivered, the excluded co-host
+/// misses this summary — but it also missed the state itself, and the
+/// heartbeat anti-entropy is the designated backstop for that case. This
+/// mirrors `record_delivery_to_interest`, which likewise only seeds on a real
+/// delivery (#4235).
+///
+/// That reasoning covers the per-send skips inside `broadcast_to_single_peer`.
+/// `plan_fanout_send` skips a peer whose summary is BYTE-IDENTICAL to ours
+/// first; the cached-empty-delta verdict is the backstop for the narrower
+/// converged-but-byte-differing case (a non-deterministically-serialized
+/// summary), not the primary test. Either way the peer did not miss the STATE,
+/// only our new summary, and it already holds an equivalent one. Neither skip
+/// covers `should_broadcast_contract`, which suppresses the broadcast for the
+/// WHOLE contract — hence the gate below.
+///
+/// # Gate: `should_summarize_or_broadcast`
+///
+/// This emitter is gated on the same `(is_hosting_contract || contract_in_use)
+/// && contract_state_present` predicate as its two siblings —
+/// `broadcast_queue::should_broadcast_contract` (the fan-out) and
+/// `node::summary_if_hosted_or_in_use` (the heartbeat / churn replies). It was
+/// the one summary-emitting path #4473/#4610 left ungated.
+///
+/// Two reasons, and the first is what makes the co-host exclusion above sound:
+///
+/// 1. **The exclusion needs a broadcast behind it.** Ungated, a contract with
+///    state on disk but neither hosted nor in use (evicted from the hosting
+///    cache, no local client, no downstream subscriber — the #4440/#4473/#4610
+///    phantom population) attempted ZERO broadcasts, yet post-#4965 excluded
+///    every advertised co-host from the notification. That is exclusion with
+///    no counterpart: the co-host would get neither. Sharing the predicate
+///    makes "excluded because the broadcast covered it" true by construction
+///    rather than by coincidence.
+/// 2. **It closes a `summarize_contract_state` storm hole.** The gate's whole
+///    purpose (#4473) is to stop phantom contracts driving WASM summarize
+///    calls, and `InterestManager::get_contract_summary` below is an ungated
+///    `GetSummaryQuery`. The paragraph above — the broadcast "already issues
+///    the identical `get_contract_summary`, so whichever runs first pays the
+///    one WASM call" — holds ONLY when the broadcast actually runs, exactly
+///    the case `should_broadcast_contract` rules out. For a phantom, this path
+///    paid the full call alone.
+///
+/// What the gate does NOT do is give a co-host our summary for such a contract
+/// — the heartbeat reply reports `None` for it too, and the receiver clears its
+/// cached summary of us (`SummaryMissingReason::ClearedByNoneReport`). That is
+/// the intended #4473 policy (we advertise no summary for a contract we do not
+/// host or serve), and the gate makes all three paths agree on it instead of
+/// leaving this one emitter dissenting.
+///
+/// A peer that still broadcasts to us for such a contract is holding a stale
+/// advertisement of us. #5063 closes the main source of those — eviction now
+/// retracts the advertisement at the eviction decision
+/// (`operations::retract_advertisement_for_evicted_contract`) rather than only
+/// at reclamation — so this residual is narrow. Its retention guard is
+/// `is_hosting_contract || contract_in_use || is_subscribed`, which is this
+/// gate's predicate plus `is_subscribed`. The one population where the two
+/// still disagree is a contract held ONLY by a bare upstream network
+/// subscription: #5063 keeps its advertisement, while all three summary paths
+/// (this one, the fan-out, and the heartbeat) report nothing for it, so a
+/// co-host's broadcasts to us stay full-state. That divergence is PRE-EXISTING
+/// — the fan-out and heartbeat already behaved this way — and this gate makes
+/// the third path match them rather than introducing it. Tracked with the rest
+/// of the #4440 advertisement-hygiene work; deliberately not papered over here.
 pub(crate) async fn send_proactive_summary_notification(
     op_manager: &OpManager,
     key: &ContractKey,
@@ -854,6 +982,22 @@ pub(crate) async fn send_proactive_summary_notification(
         .interest_manager
         .should_send_summary_notification(key)
     {
+        return;
+    }
+
+    // The #4473/#4610 gate, shared with the broadcast fan-out and the
+    // heartbeat replies. Placed AFTER the throttle so a hot contract pays its
+    // synchronous state-store lookup at most 10x/sec, and BEFORE
+    // `get_contract_summary` so a phantom contract never reaches the WASM
+    // summarize. See this function's "Gate" docs for why the co-host exclusion
+    // below depends on it.
+    if !op_manager.ring.should_summarize_or_broadcast(key) {
+        tracing::debug!(
+            contract = %key,
+            "Skipping proactive summary notification — contract is neither \
+             hosted nor in use, or its state is not present (#4473 gate); the \
+             broadcast fan-out is suppressed for it too"
+        );
         return;
     }
 
@@ -899,32 +1043,37 @@ pub(crate) async fn send_proactive_summary_notification(
     let hash = contract_hash(key);
     let full_entry = SummaryEntry::from_summary(hash, Some(&summary));
 
-    // Get interested peers and send to each (excluding the sender who just sent us the update)
+    // Get interested peers and resolve them to addresses. Peers that don't
+    // resolve to a live socket address are dropped here, as before.
     let interested = op_manager.interest_manager.get_interested_peers(key);
     let self_addr = op_manager.ring.connection_manager.get_own_addr();
 
-    for (peer_key, _interest) in &interested {
-        // Resolve peer to socket address
-        let peer_addr = match op_manager
-            .ring
-            .connection_manager
-            .get_peer_by_pub_key(&peer_key.0)
-        {
-            Some(pkl) => match pkl.socket_addr() {
-                Some(addr) => addr,
-                None => continue,
-            },
-            None => continue,
-        };
+    let resolved: Vec<(TransportPublicKey, SocketAddr)> = interested
+        .iter()
+        .filter_map(|(peer_key, _interest)| {
+            let pkl = op_manager
+                .ring
+                .connection_manager
+                .get_peer_by_pub_key(&peer_key.0)?;
+            Some((peer_key.0.clone(), pkl.socket_addr()?))
+        })
+        .collect();
 
-        // Skip sender (they just gave us this data) and ourselves
-        if peer_addr == sender_addr {
-            continue;
-        }
-        if self_addr.as_ref() == Some(&peer_addr) {
-            continue;
-        }
+    // The advertised co-hosts are the broadcast fan-out targets, which already
+    // received this summary inside the broadcast. Read through the SHARED
+    // accessor `get_broadcast_targets_update` also uses — see its rustdoc for
+    // why the two sites must not read the population independently.
+    let advertised_cohosts: HashSet<TransportPublicKey> = op_manager
+        .advertised_cohost_pub_keys(key)
+        .into_iter()
+        .collect();
 
+    let ProactiveSummaryRecipients {
+        targets,
+        cohosts_skipped,
+    } = proactive_summary_targets(&resolved, &advertised_cohosts, sender_addr, self_addr);
+
+    for peer_addr in &targets {
         // FULL BYTES, deliberately — this leg does NOT ship digest-first
         // this release (#4965 review §2).
         //
@@ -954,7 +1103,7 @@ pub(crate) async fn send_proactive_summary_notification(
 
         if let Err(e) = op_manager
             .notify_node_event(NodeEvent::SendInterestMessage {
-                target: peer_addr,
+                target: *peer_addr,
                 message,
             })
             .await
@@ -968,11 +1117,101 @@ pub(crate) async fn send_proactive_summary_notification(
         }
     }
 
+    // `cohosts_skipped` comes from `proactive_summary_targets`, which counts
+    // ONLY the #4965 co-host drops. Neither `advertised_cohosts.len()` (counts
+    // co-hosts that were never interested or failed to resolve) nor
+    // `resolved.len() - targets.len()` (also counts the sender and self) is
+    // this number, and both overstate it. This is what the change is judged on.
+    //
+    // Release-visible counterpart to the `debug!` below, which `release_max_level_info`
+    // compiles out — so in production the debug line measures nothing. Folded into
+    // the existing `outbound_message_mix` rollup window rather than emitted per
+    // notification: the collector's budget is per-event-stream, and this path fires on
+    // every state change (see `outbound_message_mix` module docs).
+    op_manager
+        .outbound_mix
+        .record_notification_recipients(targets.len() as u64, cohosts_skipped as u64);
+    // Simulation-visible twin of the same number. The sim harness cannot read
+    // per-node `OutboundMix` windows, and the exclusion's effect is invisible
+    // in `delta_sends`/`full_state_sends` — see
+    // `GlobalTestMetrics::record_notification_cohosts_skipped`.
+    crate::config::GlobalTestMetrics::record_notification_cohosts_skipped(cohosts_skipped as u64);
+
     tracing::debug!(
         contract = %key,
-        peer_count = interested.len(),
+        interested = interested.len(),
+        resolved = resolved.len(),
+        cohosts_skipped,
+        advertised_cohosts = advertised_cohosts.len(),
+        peer_count = targets.len(),
         "Sent proactive summary notifications after state change"
     );
+}
+
+/// Choose which interested peers still need a standalone `Summaries`
+/// notification after a state change.
+///
+/// Split out as a pure function so the recipient-set decision is unit-testable
+/// without an `OpManager`. `.claude/rules/operations.md` ("Event emission
+/// review") requires the emitted event's recipient set to be asserted
+/// directly rather than inferred from the data layer that feeds it; the
+/// production loop is pinned to route through here by
+/// `proactive_notification_excludes_advertised_cohosts_in_production`.
+///
+/// Excludes, in order: the update's sender, ourselves, and every advertised
+/// co-host (the broadcast fan-out already delivered this summary to them —
+/// see [`send_proactive_summary_notification`]'s "Recipient set" section).
+///
+/// Returns the co-host skip count SEPARATELY rather than leaving callers to
+/// derive it as `resolved.len() - targets.len()`. That subtraction is wrong,
+/// and wrong in the direction that flatters the change: it also counts the
+/// sender and self, so it stays non-zero even with the co-host filter deleted.
+/// A metric computed that way reports a saving the code is not making, and it
+/// silently defeats any test that asserts on it — mutation testing caught
+/// exactly that here, with the simulation's `cohosts_skipped > 0` assertion
+/// still passing under a mutation that removed the entire exclusion.
+pub(crate) fn proactive_summary_targets(
+    resolved_interested: &[(TransportPublicKey, SocketAddr)],
+    advertised_cohosts: &HashSet<TransportPublicKey>,
+    sender_addr: SocketAddr,
+    self_addr: Option<SocketAddr>,
+) -> ProactiveSummaryRecipients {
+    let mut targets = Vec::with_capacity(resolved_interested.len());
+    let mut cohosts_skipped = 0usize;
+
+    for (pub_key, peer_addr) in resolved_interested {
+        // The sender just gave us this data; never notify ourselves. Both
+        // predate #4965 and are NOT co-host skips.
+        if *peer_addr == sender_addr || self_addr.as_ref() == Some(peer_addr) {
+            continue;
+        }
+        // #4965: the broadcast to this co-host already carried the summary in
+        // `sender_summary_bytes`. Counted only here, AFTER the two exclusions
+        // above, so the count is attributable to this change alone.
+        if advertised_cohosts.contains(pub_key) {
+            cohosts_skipped += 1;
+            continue;
+        }
+        targets.push(*peer_addr);
+    }
+
+    ProactiveSummaryRecipients {
+        targets,
+        cohosts_skipped,
+    }
+}
+
+/// Outcome of [`proactive_summary_targets`]: who to notify, and how many
+/// recipients the #4965 co-host exclusion removed.
+///
+/// The count is bundled with the targets rather than recomputed by callers so
+/// there is exactly one definition of "skipped because of #4965" — see that
+/// function's docs for the subtraction that looked equivalent and was not.
+pub(crate) struct ProactiveSummaryRecipients {
+    pub targets: Vec<SocketAddr>,
+    /// Peers dropped BECAUSE they are advertised co-hosts. Excludes the sender
+    /// and self, which are dropped for unrelated, pre-#4965 reasons.
+    pub cohosts_skipped: usize,
 }
 
 /// Send our current summary to the peer whose broadcast we just rejected,
@@ -2149,6 +2388,624 @@ mod tests {
             !d_body.contains("StateSummary::from("),
             "drive_client_update must never build a StateSummary from bytes \
              (#4923)"
+        );
+    }
+
+    // ── #4965: proactive summary notification recipient set ───────────────
+    //
+    // `interest_sync_summaries` is the largest outbound arm (49.8% of outbound
+    // bytes, v0.2.115). Which of its four emitters dominates is NOT measured —
+    // `outbound_message_mix` buckets them together (#5052 adds the split).
+    // What this change rests on is narrower and does not need that number:
+    // most recipients of this notification are advertised co-hosts that
+    // already received the identical summary inside the broadcast's
+    // `sender_summary_bytes`.
+
+    /// Build a `(pub_key, addr)` pair plus the matching `PeerKeyLocation`.
+    fn resolved_peer(port: u16) -> (TransportPublicKey, SocketAddr) {
+        let pkl = crate::operations::test_utils::make_peer(port);
+        (
+            pkl.pub_key.clone(),
+            pkl.socket_addr().expect("test peer has a socket addr"),
+        )
+    }
+
+    #[test]
+    fn proactive_summary_targets_excludes_advertised_cohosts() {
+        let cohost = resolved_peer(9001);
+        let non_cohost = resolved_peer(9002);
+        let interested = vec![cohost.clone(), non_cohost.clone()];
+
+        let cohosts: HashSet<TransportPublicKey> = [cohost.0.clone()].into_iter().collect();
+
+        let targets = proactive_summary_targets(
+            &interested,
+            &cohosts,
+            "127.0.0.1:9999".parse().unwrap(),
+            None,
+        )
+        .targets;
+
+        assert_eq!(
+            targets,
+            vec![non_cohost.1],
+            "an advertised co-host already got this summary in the broadcast's \
+             sender_summary_bytes (#4952); re-sending it standalone is the #4965 waste"
+        );
+    }
+
+    #[test]
+    fn proactive_summary_targets_keeps_interested_non_cohosts() {
+        let a = resolved_peer(9010);
+        let b = resolved_peer(9011);
+        let interested = vec![a.clone(), b.clone()];
+
+        // Nothing advertised: this is the population the notification exists
+        // for — peers we do NOT broadcast to, whose only other path to our
+        // summary is the ~5-min heartbeat.
+        let targets = proactive_summary_targets(
+            &interested,
+            &HashSet::new(),
+            "127.0.0.1:9999".parse().unwrap(),
+            None,
+        )
+        .targets;
+
+        assert_eq!(targets, vec![a.1, b.1]);
+    }
+
+    #[test]
+    fn proactive_summary_targets_still_excludes_sender_and_self() {
+        let sender = resolved_peer(9020);
+        let me = resolved_peer(9021);
+        let other = resolved_peer(9022);
+        let interested = vec![sender.clone(), me.clone(), other.clone()];
+
+        let targets =
+            proactive_summary_targets(&interested, &HashSet::new(), sender.1, Some(me.1)).targets;
+
+        assert_eq!(
+            targets,
+            vec![other.1],
+            "the pre-existing sender/self exclusions must survive the #4965 change"
+        );
+    }
+
+    #[test]
+    fn proactive_summary_targets_is_empty_when_every_peer_is_a_cohost() {
+        // The steady state this fix targets: every interested peer is an
+        // advertised co-host, so the broadcast covered all of them and the
+        // notification fan-out collapses to zero messages.
+        let a = resolved_peer(9030);
+        let b = resolved_peer(9031);
+        let interested = vec![a.clone(), b.clone()];
+        let cohosts: HashSet<TransportPublicKey> = [a.0.clone(), b.0.clone()].into_iter().collect();
+
+        let targets = proactive_summary_targets(
+            &interested,
+            &cohosts,
+            "127.0.0.1:9999".parse().unwrap(),
+            None,
+        )
+        .targets;
+
+        assert!(
+            targets.is_empty(),
+            "expected zero standalone notifications, got {targets:?}"
+        );
+    }
+
+    #[test]
+    fn proactive_summary_targets_handles_empty_interest_set() {
+        let targets = proactive_summary_targets(
+            &[],
+            &HashSet::new(),
+            "127.0.0.1:9999".parse().unwrap(),
+            Some("127.0.0.1:9998".parse().unwrap()),
+        )
+        .targets;
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn proactive_summary_targets_cohost_exclusion_is_by_pub_key_not_addr() {
+        // A co-host whose advertised entry is keyed by pub_key must be
+        // excluded even though nothing about its ADDRESS marks it — matching
+        // `get_broadcast_targets_update`, which also sources targets by
+        // pub_key from `neighbors_with_contract`.
+        let cohost = resolved_peer(9040);
+        let cohosts: HashSet<TransportPublicKey> = [cohost.0.clone()].into_iter().collect();
+
+        let targets = proactive_summary_targets(
+            &[cohost.clone()],
+            &cohosts,
+            "127.0.0.1:9999".parse().unwrap(),
+            None,
+        )
+        .targets;
+        assert!(targets.is_empty());
+
+        // Same address, different identity => not the advertised co-host.
+        let impostor = (resolved_peer(9041).0, cohost.1);
+        let targets = proactive_summary_targets(
+            &[impostor],
+            &cohosts,
+            "127.0.0.1:9999".parse().unwrap(),
+            None,
+        )
+        .targets;
+        assert_eq!(targets, vec![cohost.1]);
+    }
+
+    /// `cohosts_skipped` counts ONLY the #4965 co-host drops — not the sender,
+    /// not self.
+    ///
+    /// Found by mutation testing, not by review. The count was originally
+    /// derived at the call site as `resolved.len() - targets.len()`, which
+    /// looks equivalent and is not: it also counts the sender and self, so it
+    /// stayed non-zero with the entire co-host exclusion deleted. That made
+    /// the number report a saving the code was not making, AND it silently
+    /// defeated the simulation test whose whole job is to fail when the
+    /// exclusion is removed — that test passed under the deletion mutation.
+    ///
+    /// The scenario below is the discriminating one: the sender is ALSO
+    /// interested, so a count that includes sender/self reads 2 where the
+    /// truthful co-host count is 1.
+    #[test]
+    fn cohosts_skipped_counts_only_cohost_drops_not_sender_or_self() {
+        let sender = resolved_peer(9050);
+        let me = resolved_peer(9051);
+        let cohost = resolved_peer(9052);
+        let plain = resolved_peer(9053);
+        let interested = vec![sender.clone(), me.clone(), cohost.clone(), plain.clone()];
+        let cohosts: HashSet<TransportPublicKey> = [cohost.0.clone()].into_iter().collect();
+
+        let out = proactive_summary_targets(&interested, &cohosts, sender.1, Some(me.1));
+
+        assert_eq!(out.targets, vec![plain.1]);
+        assert_eq!(
+            out.cohosts_skipped, 1,
+            "only the advertised co-host counts; the sender and self are \
+             dropped for pre-#4965 reasons and must not inflate the saving"
+        );
+
+        // With no co-hosts advertised the count must be ZERO even though two
+        // peers were still dropped. This is the assertion the old subtraction
+        // failed, and it is what makes the simulation's `cohosts_skipped > 0`
+        // a real discriminator.
+        let out = proactive_summary_targets(&interested, &HashSet::new(), sender.1, Some(me.1));
+        assert_eq!(out.targets, vec![cohost.1, plain.1]);
+        assert_eq!(
+            out.cohosts_skipped, 0,
+            "with the exclusion inactive the co-host skip count MUST be 0 — \
+             a non-zero value here means the metric is measuring the sender/\
+             self drops and cannot detect the exclusion being removed"
+        );
+    }
+
+    /// Source pin: the production emitter must actually consult the
+    /// advertisement layer and route its recipient set through
+    /// `proactive_summary_targets`.
+    ///
+    /// Without this, someone could revert the emitter to iterating
+    /// `get_interested_peers` directly and every pure test above would stay
+    /// green — the exact failure mode `.claude/rules/operations.md` calls out
+    /// for event-emission fixes (#3791).
+    #[test]
+    fn proactive_notification_excludes_advertised_cohosts_in_production() {
+        let src = include_str!("update.rs");
+        // Cut at `mod tests` (NOT `#[cfg(test)]`, whose attribute line sits
+        // above the doc comments) so the needles can't match this test file.
+        let prod = &src[..src.find("\nmod tests {").expect("tests module not found")];
+
+        let fn_start = prod
+            .find("pub(crate) async fn send_proactive_summary_notification(")
+            .expect("send_proactive_summary_notification not found");
+        let fn_src = &prod[fn_start..];
+        // `+ 1` rebases the offset: `find` searched `fn_src[1..]`, but the
+        // slice below indexes `fn_src`. Without it the body ends one byte
+        // early — harmless today (it only drops the preceding newline, which
+        // the whitespace filter would strip anyway) but the two indices must
+        // share a base or a future edit to this boundary will cut real source.
+        let fn_end = 1 + fn_src[1..]
+            .find("\npub(crate) fn ")
+            .expect("expected proactive_summary_targets to follow the emitter");
+        // Whitespace-stripped so the pin survives rustfmt reflowing the call.
+        let body: String = fn_src[..fn_end]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+
+        assert!(
+            body.contains("advertised_cohost_pub_keys(key)"),
+            "the emitter MUST consult the advertisement layer — without it the \
+             co-host exclusion silently does nothing (#4965)"
+        );
+        assert!(
+            body.contains("proactive_summary_targets(&resolved,&advertised_cohosts,"),
+            "the emitter MUST route its recipient set through \
+             proactive_summary_targets so the pure tests above actually guard \
+             production (see .claude/rules/operations.md, #3791)"
+        );
+        assert!(
+            // Needle is `in&interested`, NOT `forpeer_addrin&interested`: the
+            // pre-change loop was `for (peer_key, _interest) in &interested {`,
+            // which whitespace-strips to `for(peer_key,_interest)in&interested{`.
+            // The longer needle never matched the code it claimed to guard, so
+            // it could not fail on the reversion named in its own message.
+            !body.contains("in&interested"),
+            "the emitter must not iterate the raw interested-peer set again — \
+             it must send only to the filtered `targets`"
+        );
+        assert!(
+            body.contains("ring.should_summarize_or_broadcast(key)"),
+            "the emitter MUST share the #4473/#4610 gate with the broadcast \
+             fan-out. Ungated, a contract that broadcasts to NOBODY \
+             (should_broadcast_contract false) still excludes every advertised \
+             co-host here — exclusion with no broadcast behind it, which is \
+             exactly what makes the #4965 skip unsound"
+        );
+    }
+
+    /// The co-host population must come from ONE accessor, shared with
+    /// `get_broadcast_targets_update`.
+    ///
+    /// The behavioural guard is
+    /// `notification_exclusion_is_a_subset_of_broadcast_targets`; this pin is
+    /// the cheap structural half, and it fails on the specific edit that test
+    /// cannot see coming: a second, independent read of `neighbor_hosting` at
+    /// either site, which is how the two sets drift apart in the first place.
+    #[test]
+    fn cohost_source_is_shared_between_broadcast_and_notification() {
+        let src = include_str!("update.rs");
+        let prod = &src[..src.find("\nmod tests {").expect("tests module not found")];
+        let stripped: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+
+        // Exactly one direct read of the advertisement layer in this file: the
+        // accessor itself. Any other is a site that will not follow a future
+        // narrowing of the shared source.
+        assert_eq!(
+            stripped
+                .matches("neighbor_hosting.neighbors_with_contract(")
+                .count(),
+            1,
+            "`neighbors_with_contract` must be read ONLY through \
+             `advertised_cohost_pub_keys`. A second direct read means the \
+             broadcast fan-out and the #4965 notification exclusion can drift \
+             apart, and each site stays individually correct while the peers \
+             between them get neither the broadcast nor the summary"
+        );
+        assert!(
+            stripped.contains("fnadvertised_cohost_pub_keys(&self,key:&ContractKey)"),
+            "the shared accessor must still exist"
+        );
+        // Both consumers go through it.
+        assert!(
+            stripped.contains("letproximity_pub_keys=self.advertised_cohost_pub_keys(key);"),
+            "get_broadcast_targets_update must source its targets from the \
+             shared accessor"
+        );
+        assert!(
+            stripped.contains("op_manager.advertised_cohost_pub_keys(key)"),
+            "send_proactive_summary_notification must source its exclusion set \
+             from the shared accessor"
+        );
+    }
+
+    // ── Behavioural coverage against a real OpManager ─────────────────────
+    //
+    // The pure `proactive_summary_targets` tests above prove the FILTER is
+    // right; the pins prove production calls it. Neither can see the property
+    // the #4965 skip actually rests on, which spans two functions: every peer
+    // the notification EXCLUDES must be a peer the broadcast fan-out would
+    // have reached. These tests assert that against the real emitter.
+
+    /// Build an `OpManager` whose contract handler answers `GetSummaryQuery`,
+    /// returning the event-loop notification receiver so a test can read the
+    /// `SendInterestMessage` events the emitter actually produced.
+    ///
+    /// Deliberately NOT folded into `build_summary_test_node`: that helper
+    /// hides the receiver inside its keep-alive guard, and the whole point
+    /// here is to inspect the emitted recipient set rather than infer it from
+    /// the data layer that feeds it (#3791).
+    async fn build_notification_test_node(
+        id: &str,
+    ) -> (
+        std::sync::Arc<OpManager>,
+        tokio::sync::mpsc::Receiver<
+            either::Either<crate::message::NetMessage, crate::message::NodeEvent>,
+        >,
+        Box<dyn std::any::Any>,
+    ) {
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, mut ch_channel, wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+
+        let summary = StateSummary::from(vec![9u8; 32]);
+        let handler = tokio::spawn(async move {
+            while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                let response = match ev {
+                    ContractHandlerEvent::GetSummaryQuery { key } => {
+                        ContractHandlerEvent::GetSummaryResponse {
+                            key,
+                            summary: Ok(summary.clone()),
+                        }
+                    }
+                    other => panic!("unexpected handler event: {other:?}"),
+                };
+                if ch_channel.send_to_sender(id, response).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Field access rather than a destructuring pattern: the receiver's TYPE
+        // lives in the private `node::network_bridge` module and cannot be
+        // named from here, but its fields are `pub(crate)`.
+        let notifications_receiver = notification_rx.notifications_receiver;
+        let op_execution_receiver = notification_rx.op_execution_receiver;
+
+        let guard: Box<dyn std::any::Any> = Box::new((
+            handler,
+            op_execution_receiver,
+            result_router_rx,
+            task_monitor,
+            wait_for_event,
+        ));
+        (op_manager, notifications_receiver, guard)
+    }
+
+    /// Connect a peer and return `(pub_key, addr)`.
+    fn connect_peer(
+        op_manager: &OpManager,
+        port: u16,
+        loc: f64,
+    ) -> (TransportPublicKey, SocketAddr) {
+        let keypair = crate::transport::TransportKeypair::new();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::new(loc),
+            addr,
+            keypair.public().clone(),
+            false,
+        );
+        (keypair.public().clone(), addr)
+    }
+
+    /// Make `peer` an advertised co-host of `key`, the way an inbound
+    /// `HostingAnnounce` does.
+    fn advertise_cohost(op_manager: &OpManager, peer: &TransportPublicKey, key: &ContractKey) {
+        op_manager.neighbor_hosting.handle_message(
+            peer,
+            crate::message::NeighborHostingMessage::HostingAnnounce {
+                added: vec![*key.id()],
+                removed: vec![],
+                // `is_response: true` so the handler does not try to build a
+                // reply message; we only want the cache mutation.
+                is_response: true,
+            },
+        );
+    }
+
+    /// Drain the notification channel into the `SendInterestMessage` targets.
+    fn drain_interest_targets(
+        rx: &mut tokio::sync::mpsc::Receiver<
+            either::Either<crate::message::NetMessage, crate::message::NodeEvent>,
+        >,
+    ) -> Vec<SocketAddr> {
+        let mut targets = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            if let either::Either::Right(crate::message::NodeEvent::SendInterestMessage {
+                target,
+                ..
+            }) = item
+            {
+                targets.push(target);
+            }
+        }
+        targets.sort();
+        targets
+    }
+
+    /// The load-bearing cross-function property: a peer the notification
+    /// EXCLUDES must be a peer the broadcast fan-out would have reached.
+    ///
+    /// This is what the source pins cannot express. Both sites are
+    /// individually correct today; the failure mode the review names is a
+    /// FILTER added to `get_broadcast_targets_update` (a cap, a health check,
+    /// a location predicate) that narrows the broadcast set while the
+    /// exclusion keeps using the full advertised set. The excluded peer then
+    /// gets neither the broadcast nor the standalone summary, and every
+    /// single-site test stays green. Asserting the subset relation between the
+    /// two real functions is the only thing that fails on that edit.
+    ///
+    /// # Why TWO interested co-hosts, and why you must not simplify to one
+    ///
+    /// **A set-relation assertion cannot be falsified by a fixture whose set
+    /// has one element.** With a single interested co-host, `excluded ⊆
+    /// broadcast_targets` is satisfied by almost any mutation, because there is
+    /// no second element for a narrowing to strand — the assertion reads strong
+    /// and is very nearly unfalsifiable. Two is not a richer scenario, it is
+    /// the MINIMUM CARDINALITY at which the property has any content, the same
+    /// way a commutativity test needs two distinct operands or an ordering test
+    /// two distinct keys.
+    ///
+    /// Verified: a `truncate(1)` on `get_broadcast_targets_update`'s co-host
+    /// list left the one-co-host version of this test GREEN, and fails the
+    /// two-co-host version. Adding the non-co-host (C) and the co-host-only
+    /// peer (E) keeps the two filters distinguishable from each other.
+    ///
+    /// # Why premise 1 is deliberately weak
+    ///
+    /// It asserts only that the broadcast has SOME target, not that a specific
+    /// peer is among them. **A premise that fails before the real assertion
+    /// masks which check actually caught the mutation**, so a premise should be
+    /// the weakest statement that still rules out vacuity. The strict form
+    /// ("A specifically is a target") would fire first under a narrowing
+    /// mutation and hide the fact that the subset property is what detects it.
+    #[tokio::test]
+    async fn notification_exclusion_is_a_subset_of_broadcast_targets() {
+        let (op_manager, mut rx, _guard) =
+            build_notification_test_node("notif-exclusion-subset-4965").await;
+        let key = crate::operations::test_utils::make_contract_key(11);
+        op_manager
+            .ring
+            .host_contract(key, 1024, crate::ring::AccessType::Put);
+
+        // A and B: advertised co-hosts AND interested — the excluded
+        //          population. TWO of them, deliberately: with only one, a
+        //          mutation that narrows the broadcast target set to a single
+        //          peer can happen to keep exactly the excluded one, and the
+        //          subset assertion still holds. Mutation testing caught that
+        //          — a `truncate(1)` on the broadcast targets left this test
+        //          green. With two, narrowing to one always strands the other.
+        // C: interested only — the population the notification still exists for.
+        // E: advertised co-host only — a broadcast target we never notify.
+        let (a_pk, a_addr) = connect_peer(&op_manager, 19101, 0.11);
+        let (b_pk, b_addr) = connect_peer(&op_manager, 19102, 0.12);
+        let (c_pk, c_addr) = connect_peer(&op_manager, 19103, 0.13);
+        let (e_pk, _e_addr) = connect_peer(&op_manager, 19105, 0.15);
+        let (_d_pk, sender_addr) = connect_peer(&op_manager, 19104, 0.14);
+
+        advertise_cohost(&op_manager, &a_pk, &key);
+        advertise_cohost(&op_manager, &b_pk, &key);
+        advertise_cohost(&op_manager, &e_pk, &key);
+        for pk in [&a_pk, &b_pk, &c_pk] {
+            op_manager.interest_manager.register_peer_interest(
+                &key,
+                crate::ring::PeerKey::from(pk.clone()),
+                None,
+                false,
+            );
+        }
+
+        let broadcast_targets: HashSet<SocketAddr> = op_manager
+            .get_broadcast_targets_update(&key, &sender_addr)
+            .targets
+            .iter()
+            .filter_map(|pkl| pkl.socket_addr())
+            .collect();
+
+        send_proactive_summary_notification(&op_manager, &key, sender_addr).await;
+        let notified: HashSet<SocketAddr> = drain_interest_targets(&mut rx).into_iter().collect();
+
+        // Premise 1: the scenario really produced a broadcast fan-out.
+        assert!(
+            !broadcast_targets.is_empty(),
+            "premise: the broadcast must have targets, else the subset \
+             assertion below is vacuous"
+        );
+        // Premise 2: the exclusion really excluded BOTH co-hosts and kept the
+        // non-co-host. Without this the subset assertion passes trivially on
+        // an empty set.
+        let interested_addrs: HashSet<SocketAddr> = [a_addr, b_addr, c_addr].into_iter().collect();
+        let excluded: HashSet<SocketAddr> =
+            interested_addrs.difference(&notified).copied().collect();
+        assert_eq!(
+            excluded,
+            [a_addr, b_addr].into_iter().collect::<HashSet<_>>(),
+            "both advertised co-hosts must be excluded and the non-co-host C \
+             kept; notified={notified:?}"
+        );
+
+        // The property.
+        assert!(
+            excluded.is_subset(&broadcast_targets),
+            "#4965 UNSOUND: {:?} were excluded from the standalone summary \
+             notification but are NOT broadcast targets {:?}, so nothing \
+             delivered them our summary. The exclusion is only valid while the \
+             broadcast covers every peer it drops.",
+            excluded.difference(&broadcast_targets).collect::<Vec<_>>(),
+            broadcast_targets,
+        );
+    }
+
+    /// The gate: a contract that broadcasts to NOBODY must not notify either.
+    ///
+    /// Same topology as the subset test, minus `host_contract` — so
+    /// `should_summarize_or_broadcast` is false, `should_broadcast_contract`
+    /// suppresses the whole fan-out, and (pre-gate) the emitter still ran and
+    /// still excluded every advertised co-host. That is exclusion with no
+    /// broadcast behind it: A gets neither.
+    ///
+    /// Reachable population (#4440/#4473/#4610): state on disk, evicted from
+    /// the hosting cache, no local client and no downstream subscriber.
+    #[tokio::test]
+    async fn proactive_notification_is_gated_like_the_broadcast() {
+        let (op_manager, mut rx, _guard) = build_notification_test_node("notif-gate-4473").await;
+        let key = crate::operations::test_utils::make_contract_key(12);
+        // Deliberately NOT hosted and NOT in use.
+        assert!(
+            !op_manager.ring.should_summarize_or_broadcast(&key),
+            "premise: the gate must be false, else this test proves nothing"
+        );
+
+        let (a_pk, _a_addr) = connect_peer(&op_manager, 19201, 0.21);
+        let (b_pk, _b_addr) = connect_peer(&op_manager, 19202, 0.22);
+        let (_d_pk, sender_addr) = connect_peer(&op_manager, 19203, 0.23);
+        advertise_cohost(&op_manager, &a_pk, &key);
+        op_manager.interest_manager.register_peer_interest(
+            &key,
+            crate::ring::PeerKey::from(a_pk.clone()),
+            None,
+            false,
+        );
+        op_manager.interest_manager.register_peer_interest(
+            &key,
+            crate::ring::PeerKey::from(b_pk.clone()),
+            None,
+            false,
+        );
+
+        // Premise: A really is an advertised co-host, so pre-gate this
+        // contract WOULD have excluded a real peer. Without this the emitter
+        // could be emitting nothing for an unrelated reason.
+        assert_eq!(
+            op_manager.advertised_cohost_pub_keys(&key),
+            vec![a_pk.clone()],
+            "premise: A must be an advertised co-host, else the gate is not \
+             what is suppressing the notification"
+        );
+        // The broadcast fan-out is suppressed for this contract by the SAME
+        // predicate asserted above: `broadcast_queue::should_broadcast_contract`
+        // is a one-line delegation to `ring.should_summarize_or_broadcast`,
+        // pinned there by
+        // `broadcast_single_peer_gates_summarize_on_hosted_or_in_use_pin`.
+        // It is `pub(super)` so it cannot be called from here directly.
+
+        send_proactive_summary_notification(&op_manager, &key, sender_addr).await;
+
+        assert!(
+            drain_interest_targets(&mut rx).is_empty(),
+            "a contract whose broadcast fan-out is suppressed for the WHOLE \
+             contract must not emit standalone summary notifications either — \
+             ungated, this path also pays an unbounded WASM summarize for \
+             every phantom contract, the #4473 storm the gate exists to stop"
         );
     }
 }

@@ -3612,6 +3612,9 @@ std::thread_local! {
     static GLOBAL_PENDING_OP_REMOVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_HWM: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_NEIGHBOR_HOSTING_UPDATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Recipients dropped from a proactive summary notification because they
+    /// are advertised co-hosts the broadcast already covered (#4965).
+    static GLOBAL_NOTIFICATION_COHOSTS_SKIPPED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     // Hosting advertisement retractions emitted on stop-hosting (eviction).
     // Advertisement-layer reliability + retraction, #4642 spec step 1.
     static GLOBAL_NEIGHBOR_HOSTING_RETRACTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -3702,6 +3705,7 @@ impl GlobalTestMetrics {
         GLOBAL_PENDING_OP_REMOVES.with(|c| c.set(0));
         GLOBAL_PENDING_OP_HWM.with(|c| c.set(0));
         GLOBAL_NEIGHBOR_HOSTING_UPDATES.with(|c| c.set(0));
+        GLOBAL_NOTIFICATION_COHOSTS_SKIPPED.with(|c| c.set(0));
         GLOBAL_NEIGHBOR_HOSTING_RETRACTIONS.with(|c| c.set(0));
         GLOBAL_ANTI_STARVATION_TRIGGERS.with(|c| c.set(0));
         GLOBAL_TERMINAL_CONSULT_ATTEMPTS.with(|c| c.set(0));
@@ -3859,6 +3863,26 @@ impl GlobalTestMetrics {
 
     pub fn neighbor_hosting_updates() -> u64 {
         GLOBAL_NEIGHBOR_HOSTING_UPDATES.with(|c| c.get())
+    }
+
+    /// A proactive summary notification skipped `n` advertised co-hosts,
+    /// because the broadcast to them already carried the summary in
+    /// `sender_summary_bytes` (#4965).
+    ///
+    /// Exists because the simulation-level effect of that exclusion is NOT
+    /// visible in `delta_sends` / `full_state_sends`: measured on the co-host
+    /// mesh scenario, reverting the exclusion left both metrics bit-identical
+    /// (140 / 6), so a test asserting on them alone would pass whether or not
+    /// the change was present. This counter is the one signal that actually
+    /// moves, which is what makes
+    /// `test_cohost_mesh_update_fanout_stays_delta_dominated` a test OF the
+    /// change rather than merely a test that runs alongside it.
+    pub fn record_notification_cohosts_skipped(n: u64) {
+        GLOBAL_NOTIFICATION_COHOSTS_SKIPPED.with(|c| c.set(c.get() + n));
+    }
+
+    pub fn notification_cohosts_skipped() -> u64 {
+        GLOBAL_NOTIFICATION_COHOSTS_SKIPPED.with(|c| c.get())
     }
 
     /// A hosting advertisement retraction was emitted because this node stopped

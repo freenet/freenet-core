@@ -3392,6 +3392,231 @@ fn test_sustained_update_fanout_no_full_state_storm() {
     );
 }
 
+/// #4965 sibling of the star test above, on a topology where the co-host
+/// exclusion is not a no-op.
+///
+/// ## Why the star test cannot catch a regression here
+///
+/// `test_sustained_update_fanout_no_full_state_storm` is 1 gateway + 2 DIRECT
+/// subscribers. Each subscriber's only advertised co-host is the gateway — and
+/// the gateway is the update's sender, so it was ALREADY excluded from the
+/// proactive summary notification long before #4965. In that topology the new
+/// exclusion removes nobody. Any regression in it is structurally invisible
+/// there, no matter how many updates the test drives.
+///
+/// ## The topology this needs
+///
+/// 1 gateway + 3 peers, ALL subscribed, with `max_connections` wide enough for
+/// the peers to connect to each other as well as to the gateway. Every peer
+/// then hosts the contract and announces it (`HostingAnnounce`), so each peer's
+/// advertised co-host set contains the OTHER PEERS, not just the sender. When
+/// a peer applies a relayed broadcast and fires its proactive notification, the
+/// #4965 exclusion now drops real recipients — which is exactly the thing under
+/// test.
+///
+/// ## The general rule this test exists to illustrate
+///
+/// **`delta_sends`/`full_state_sends` cannot see a redundancy being removed —
+/// only a redundancy being removed *badly*.**
+///
+/// That generalises, and it is worth recognising BEFORE writing the test rather
+/// than after: **when a change removes redundancy, every downstream health
+/// metric is invariant by design.** That invariance IS the change's thesis. So
+/// health metrics can never discriminate such a change; only a counter of the
+/// removed thing can.
+///
+/// This is unusually easy to miss, because measuring a redundancy-removal with
+/// downstream health metrics yields a vacuous test AND a confirmation that the
+/// change was correct, simultaneously — the green run looks like evidence for
+/// the change when it is evidence of nothing. Anyone facing this shape should
+/// reach for a counter of the removed thing first.
+///
+/// ## The two assertions do DIFFERENT jobs — measured, not assumed
+///
+/// **`notification_cohosts_skipped > 0` is the sensitivity assertion.** It is
+/// the only signal here that responds to the change at all.
+///
+/// **`delta_sends > full_state_sends` is a safety assertion, NOT a
+/// discriminator, and the numbers say so.** A peer's broadcast to a neighbor is
+/// a delta only while it holds a cached summary for that neighbor; the
+/// standalone `Summaries` notification and the broadcast's own
+/// `sender_summary_bytes` both seed that cache, and #4965 removes the first for
+/// co-hosts on the claim that the second already covers them. The claim holds,
+/// so removing the redundant path changes nothing downstream: reverting the
+/// exclusion on this exact scenario produced **bit-identical** `delta_sends=140
+/// / full_state_sends=6`. That is the change being harmless, which is worth
+/// pinning — but a test resting on it alone would pass whether or not the
+/// feature existed.
+///
+/// So the delta-dominance assertion stays (it catches an over-exclusion that
+/// DID strand peers, which would show up as full-state fallback), and the
+/// skipped-count assertion is what makes the test fail when the exclusion is
+/// removed.
+///
+/// ## Premise checks (without these both assertions are vacuous)
+///
+/// - `neighbor_hosting_updates() > 0`: the peers really exchanged hosting
+///   advertisements. If they never did, no peer has any advertised co-host,
+///   the exclusion removes nobody, and the test degenerates into the star case
+///   it exists to improve on.
+/// - `delta_sends + full_state_sends > 0`: broadcasts actually happened.
+#[test_log::test]
+fn test_cohost_mesh_update_fanout_stays_delta_dominated() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    const SEED: u64 = 0x4965_0001_0001;
+    const NETWORK_NAME: &str = "i4965-cohost-mesh";
+    // Three peers so each has TWO non-sender co-hosts; with two, a peer's only
+    // co-host besides the sender is the single other peer, which makes the
+    // exclusion much thinner.
+    const PEERS: usize = 3;
+    const SUSTAINED_UPDATES: usize = 20;
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let (sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            1,     // 1 gateway (the update source)
+            PEERS, // peers that all subscribe AND co-host
+            7,     // max_htl
+            3,     // rnd_if_htl_above
+            // Wide enough that the peers connect to EACH OTHER, not just to the
+            // gateway. This is the whole point: at a narrower cap a pure star
+            // forms and every peer's only co-host is the sender, reproducing the
+            // blind spot this test exists to cover.
+            10, // max_connections
+            2,  // min_connections
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    // CRDT contract so post-bootstrap broadcasts compute real version-aware
+    // deltas — a plain hash contract's "delta" is full state, which would make
+    // the delta/full crossover meaningless.
+    let contract = SimOperation::create_test_contract(0x49);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    let initial_state = SimOperation::create_crdt_state(1, 0x10);
+    let mut operations = Vec::new();
+
+    operations.push(ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: initial_state,
+            subscribe: true,
+        },
+    ));
+    for node_idx in 1..=PEERS {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, node_idx),
+            SimOperation::Subscribe { contract_id },
+        ));
+    }
+
+    for v in 0..SUSTAINED_UPDATES {
+        let version = (v as u64) + 2;
+        operations.push(ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(version, 0x20 + v as u8),
+            },
+        ));
+    }
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(240),
+        Duration::from_secs(90),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let convergence =
+        rt.block_on(async { freenet::dev_tool::check_convergence_from_logs(&logs_handle).await });
+    let delta_sends = GlobalTestMetrics::delta_sends();
+    let full_state_sends = GlobalTestMetrics::full_state_sends();
+    let hosting_updates = GlobalTestMetrics::neighbor_hosting_updates();
+    let cohosts_skipped = GlobalTestMetrics::notification_cohosts_skipped();
+
+    tracing::info!(
+        "i4965 cohost mesh: delta_sends={}, full_state_sends={}, \
+         neighbor_hosting_updates={}, cohosts_skipped={}, converged={}/{}",
+        delta_sends,
+        full_state_sends,
+        hosting_updates,
+        cohosts_skipped,
+        convergence.converged.len(),
+        convergence.total_contracts(),
+    );
+
+    // PREMISE 1: the peers really registered as each other's co-hosts. Without
+    // this the #4965 exclusion drops nobody and the assertion below is vacuous
+    // — the exact defect that makes the star test unable to guard this change.
+    assert!(
+        hosting_updates > 0,
+        "premise: no hosting advertisements were exchanged, so no peer has an \
+         advertised co-host and the #4965 exclusion is a no-op here. This test \
+         would then prove nothing about the change it guards."
+    );
+
+    // PREMISE 2: broadcasts actually happened.
+    assert!(
+        delta_sends + full_state_sends > 0,
+        "premise: no broadcasts were recorded — the fan-out scenario did not run"
+    );
+
+    // THE DISCRIMINATOR — the assertion that fails when #4965 is reverted.
+    //
+    // Verified by mutation, not assumed: with the co-host filter removed from
+    // `proactive_summary_targets`, this drops to 0 while delta_sends and
+    // full_state_sends stay bit-identical at 140/6. It is the ONLY metric here
+    // that responds to the change.
+    assert!(
+        cohosts_skipped > 0,
+        "#4965 is not doing anything on a topology built specifically to \
+         exercise it: {hosting_updates} hosting advertisements were exchanged, \
+         so peers ARE advertised co-hosts of each other, yet zero recipients \
+         were skipped. Either the exclusion was removed, or it is reading a \
+         co-host set that never matches the notification's recipients."
+    );
+
+    // SAFETY, not a discriminator (see this test's docs): reverting the
+    // exclusion leaves these two numbers unchanged, so this assertion cannot
+    // tell the change apart. It is here to catch the DAMAGING failure — an
+    // over-exclusion that strands peers, which surfaces as full-state fallback.
+    assert!(
+        delta_sends > full_state_sends,
+        "#4965 REGRESSION: co-hosting peers stopped seeding each other's \
+         summaries, so broadcasts fell back to full state: \
+         delta_sends={delta_sends} <= full_state_sends={full_state_sends}. \
+         Either the notification exclusion drops peers the broadcast does NOT \
+         cover, or the broadcast that was supposed to carry \
+         `sender_summary_bytes` never ran for them."
+    );
+
+    assert!(
+        convergence.is_converged(),
+        "#4965: peers failed to converge under sustained fan-out. \
+         {} converged, {} diverged",
+        convergence.converged.len(),
+        convergence.diverged.len(),
+    );
+}
+
 // =============================================================================
 // #4233: Event-loop liveness under wide-star sustained UPDATE fan-out
 // =============================================================================
