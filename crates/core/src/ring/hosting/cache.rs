@@ -139,7 +139,10 @@ const FALLBACK_TOTAL_RAM_BYTES: u64 = 1024 * 1024 * 1024;
 ///
 /// The budget tracks hosted contract **state** bytes only. WASM code blobs and
 /// ReDb/SQLite database overhead are additional and not counted against it, so
-/// this is not a hard bound on total on-disk usage.
+/// this is not a hard bound on total on-disk usage. Bounding the whole footprint
+/// is the separate aggregate DISK budget's job ([`disk_budget_for_clamped`] and
+/// `ring/hosting/disk_usage.rs`), which since #5007 measures the database file
+/// itself rather than summing logical state rows.
 pub fn default_hosting_budget_bytes() -> u64 {
     let total_ram = read_total_ram_bytes()
         .map(|v| v as u64)
@@ -692,7 +695,9 @@ pub struct HostedContract {
 /// for the network. The cache has:
 /// - Byte budget: Large contracts consume more budget. The budget is measured
 ///   in tracked contract **state** bytes only; WASM code blobs and database
-///   overhead are not counted against it.
+///   overhead are not counted against it (the aggregate disk budget in
+///   `disk_usage.rs` counts those, and since #5007 measures the database file
+///   rather than summing state rows).
 /// - Subscriber-primary eviction: when over budget the victim is chosen by
 ///   ascending `(local_subscription_count, downstream_subscriber_count,
 ///   recency_seq, key_bytes)` (see [`victim_order`] and the module docs). There

@@ -1313,16 +1313,37 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
         Some(total) => format_bytes(total),
         None => MEASURING.to_string(),
     };
+    // #5007: the breakdown shows the LOGICAL state total next to the MEASURED
+    // database size, because their difference is the database's dead space —
+    // the term that made the old accounting under-count ~10x and the one an
+    // operator can only clear with a restart (startup compaction, #5005). The
+    // webapp cache is shown too, marked as excluded, so "disk used" not moving
+    // when it grows reads as deliberate rather than as another blind spot.
+    //
+    // The parts deliberately do NOT sum to the tile above them: state bytes live
+    // INSIDE the database file, so the aggregate takes the larger of the two
+    // rather than adding them. The tooltip says so, because an operator who
+    // adds the numbers up and gets a different answer has no way to tell a
+    // display bug from the `max` rule.
     let disk_breakdown_title = match (
         h.disk_state_bytes,
+        h.disk_db_bytes,
         h.disk_wasm_bytes,
         h.disk_compile_cache_bytes,
+        h.disk_webapp_cache_bytes,
     ) {
-        (Some(state), Some(wasm), Some(cache)) => format!(
-            "State: {state} · WASM: {wasm} · Compile cache: {cache}",
+        (Some(state), Some(db), Some(wasm), Some(cache), Some(webapp)) => format!(
+            "Disk used counts the LARGER of state and database file (state lives \
+             inside the file), plus WASM and compile cache — so these parts do not \
+             sum to it. State (logical): {state} · Database file: {db} \
+             (dead space: {dead}) · WASM: {wasm} · Compile cache: {cache} · \
+             Webapp cache: {webapp} (not budgeted)",
             state = format_bytes(state),
+            db = format_bytes(db),
+            dead = format_bytes(db.saturating_sub(state)),
             wasm = format_bytes(wasm),
             cache = format_bytes(cache),
+            webapp = format_bytes(webapp),
         ),
         _ => "Disk tracker not yet seeded".to_string(),
     };
