@@ -3193,9 +3193,33 @@ where
             .get_peer_by_addr(upstream_addr)
         {
             let peer_key = crate::ring::interest::PeerKey::from(pkl.pub_key);
-            let is_new = op_manager
+            // Refresh-if-present, register-if-absent (#4672). A bare
+            // `register_peer_interest` inserts a fresh `PeerInterest` over an
+            // existing entry, wiping its cached delta-sync summary and forcing
+            // the next broadcast to this peer back to full state.
+            //
+            // Plain `refresh_peer_interest` here, NOT the `_with_upstream`
+            // variant the subscribe finalizers use: this call passes
+            // `is_upstream = false`, and asserting that on an existing entry
+            // would DOWNGRADE a peer that is legitimately our upstream, which is
+            // the `Unsubscribe` routing target. A GET requester's interest must
+            // not clear an upstream edge established by SUBSCRIBE.
+            //
+            // One acquisition, via the refresh's own bool — NOT
+            // `get_peer_interest(..).is_some()`, which clones the cached
+            // summary (state-sized on the contracts that matter) purely to test
+            // presence, and can lose the registration if the entry is removed
+            // between the two lookups.
+            let is_new = if op_manager
                 .interest_manager
-                .register_peer_interest(&key, peer_key, None, false);
+                .refresh_peer_interest(&key, &peer_key)
+            {
+                false
+            } else {
+                op_manager
+                    .interest_manager
+                    .register_peer_interest(&key, peer_key, None, false)
+            };
             if is_new {
                 // #4359 (MUST-FIX 1): a remote GET with subscribe=false still
                 // registers the requester's interest, making them a viable

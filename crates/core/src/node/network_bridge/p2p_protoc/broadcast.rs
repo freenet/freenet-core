@@ -723,6 +723,19 @@ impl P2pConnManager {
                         "Skipping broadcast - peer already has our state \
                          (byte-equal or logically converged summaries)"
                     );
+                    // Mirror production's converged-skip TTL refresh (#3046,
+                    // #3093). Without it the sim path ages the interest entry
+                    // toward `INTEREST_TTL` on every skip and the peer stops
+                    // receiving anything at all — and because
+                    // `simulation_integration.rs` is `#![cfg(feature =
+                    // "simulation_tests")]`, THIS is the body those tests
+                    // exercise, so a fix applied only to `broadcast_queue.rs`
+                    // is untested. See the rationale and the
+                    // belief-vs-evidence tradeoff at
+                    // `broadcast_queue::broadcast_to_single_peer`'s skip.
+                    op_manager
+                        .interest_manager
+                        .refresh_peer_interest(&key, &peer_key);
                     skipped_summary_match += 1;
                     continue;
                 }
@@ -753,6 +766,12 @@ impl P2pConnManager {
                                 "Skipping broadcast - contract reported empty \
                                  delta (peer converged)"
                             );
+                            // Same converged outcome as the skip above, so the
+                            // same TTL refresh. Mirrors production's
+                            // `Ok(None)` arm in `broadcast_to_single_peer`.
+                            op_manager
+                                .interest_manager
+                                .refresh_peer_interest(&key, &peer_key);
                             skipped_summary_match += 1;
                             continue;
                         }
