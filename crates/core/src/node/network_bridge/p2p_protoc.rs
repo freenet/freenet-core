@@ -962,11 +962,23 @@ pub(crate) fn version_supports_summary_first_put(
 ///
 /// # Emission gate
 ///
-/// Consulted by `ConnectionManager::supports_hash_first_summaries`, which
-/// every `Summaries` send site checks before choosing the digest form:
-/// `node.rs::handle_interest_sync_message` (the `Interests`, `ChangeInterests`
-/// and `SummaryRequest` replies) and the two `operations::update` helpers
-/// (`send_proactive_summary_notification`, `send_summary_back_on_rejection`).
+/// Consulted by `ConnectionManager::supports_hash_first_summaries`, which the
+/// digest-capable send sites check before choosing the digest form: the
+/// `Interests` and `ChangeInterests` replies in
+/// `node.rs::handle_interest_sync_message`, both via
+/// `node::summaries_reply_for_peer`.
+///
+/// Two send sites deliberately do NOT consult it:
+///
+/// - The **`SummaryRequest` reply** is unconditionally full bytes. Routing it
+///   through the version gate would be worse than pointless — replying to a
+///   request FOR bytes with digests loops the exchange — and
+///   `summary_request_reply_is_always_full_bytes` asserts the chooser is
+///   absent from that arm. It is safe without a version check by inference:
+///   only a peer that already decoded a `SummaryDigests` can have sent us a
+///   `SummaryRequest`, so it is necessarily at or above the floor.
+/// - The **`Notification` and `Rejection`** legs ship full bytes this release
+///   (#4965 review §2), so there is no encoding choice to gate.
 /// A pre-floor peer does not carry these variant indices at all and cannot
 /// bincode-deserialize them; the decode failure DROPS the connection, so it
 /// must never receive one. Below the floor — and whenever the remote version

@@ -284,7 +284,11 @@ const fn summaries_stem(emitter: SummariesEmitter) -> &'static str {
         SummariesEmitter::ChangeInterestsReply => "interest_sync_summaries_change_interests_reply",
         SummariesEmitter::Rejection => "interest_sync_summaries_rejection",
         SummariesEmitter::SummaryRequestReply => "interest_sync_summaries_request_reply",
-        SummariesEmitter::SummaryRequest => "interest_sync_summaries_request",
+        // `_request_leg`, NOT `_request`: the latter is a strict PREFIX of
+        // `_request_reply` below, so any dashboard glob on
+        // `interest_sync_summaries_request*` would double-count the reply into
+        // the request arm. Free to fix now, breaking once emitted.
+        SummariesEmitter::SummaryRequest => "interest_sync_summaries_request_leg",
         SummariesEmitter::Other => "interest_sync_summaries_other",
     }
 }
@@ -1595,10 +1599,12 @@ mod tests {
         // Deliberately wider than "emitters": the point is that a new file
         // touching Summaries at all is a deliberate decision.
         let expected_files: BTreeSet<&str> = [
-            "message.rs",                                  // variant + Display
-            "node.rs",                                     // both reply emitters + the receive arm
-            "node/network_bridge/outbound_message_mix.rs", // the classify choke point
-            "operations/update.rs",                        // notification + rejection emitters
+            "message.rs",           // variant + Display
+            "node.rs", // both reply emitters, the request-reply emitter, the receive arms
+            "operations/update.rs", // notification + rejection emitters
+            // Claimed via `classify`'s emitter ASSIGNMENT only; its stem
+            // tables are not counted. See the scan below.
+            "node/network_bridge/outbound_message_mix.rs",
         ]
         .into_iter()
         .collect();
@@ -1621,17 +1627,15 @@ mod tests {
             // here means adding a `SummariesEmitter` variant without wiring it
             // a telemetry stem fails this pin rather than silently reporting
             // under a neighbouring field.
+            // The rollup claims exactly the arms `classify` ASSIGNS, not the
+            // seven its stem tables name. Listing all seven made the scan
+            // claim everything unconditionally, silently disabling the
+            // orphan-arm check. `SummaryRequest` is claimed HERE rather than at
+            // a construction site because that message carries no emitter
+            // field — one possible origin, so `classify` assigns it.
             (
                 "node/network_bridge/outbound_message_mix.rs",
-                vec![
-                    "ChangeInterestsReply",
-                    "InterestsReply",
-                    "Notification",
-                    "Other",
-                    "Rejection",
-                    "SummaryRequest",
-                    "SummaryRequestReply",
-                ],
+                vec!["SummaryRequest"],
             ),
         ]
         .into_iter()
@@ -1684,6 +1688,37 @@ mod tests {
                 .filter(|l| !l.trim_start().starts_with("//"))
                 .collect::<Vec<_>>()
                 .join("\n");
+            // The rollup's own index/stem tables name every arm; counting them
+            // as claims makes the orphan-arm check vacuous. See the note on
+            // `expected_arms`.
+            if rel == "node/network_bridge/outbound_message_mix.rs" {
+                // Not simply excluded: `classify` ASSIGNS an emitter to
+                // `SummaryRequest`, which — unlike `Summaries` and
+                // `SummaryDigests` — carries no emitter field on the wire type
+                // because it has exactly one possible origin. That assignment
+                // IS the arm's wiring, so collect it with a needle matching
+                // assignment (`emitter: SummariesEmitter::`) rather than the
+                // stem/index match tables (`SummariesEmitter::X =>`), which
+                // name all seven arms and would claim everything.
+                let assign = concat!("emitter: ", "SummariesEmitter", "::");
+                let mut arms: Vec<String> = prod
+                    .match_indices(assign)
+                    .map(|(idx, _)| {
+                        prod[idx + assign.len()..]
+                            .split(|c: char| !c.is_alphanumeric() && c != '_')
+                            .next()
+                            .unwrap_or("")
+                            .to_string()
+                    })
+                    .collect();
+                arms.sort();
+                arms.dedup();
+                if !arms.is_empty() {
+                    found_arms.insert(rel.clone(), arms);
+                    found_files.insert(rel);
+                }
+                continue;
+            }
             // A file counts if it CONSTRUCTS/matches the variant OR merely
             // NAMES an arm. #4965 moved construction behind
             // `node::summaries_reply_for_peer`, so `operations/update.rs` now

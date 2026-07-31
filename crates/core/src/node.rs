@@ -8660,19 +8660,26 @@ mod tests {
             assert!(h.drain_heals().is_empty());
         }
 
-        /// The per-message hash cap bounds both the work a peer can force and
-        /// the size of the request it can provoke.
+        /// Repeated hashes must be free: a peer that names the same contract
+        /// 64 times must provoke exactly ONE entry in the request.
         ///
-        /// A digest entry is ~20 bytes for the sender and can cost the
-        /// receiver a contract round trip, an amplification ratio the
-        /// full-bytes `Summaries` never had. Duplicate hashes must be free.
+        /// Entry count is deliberately kept UNDER
+        /// [`MAX_SUMMARY_HASHES_PER_MESSAGE`] so the handler's over-cap
+        /// rotation is the identity and this test is deterministic. The
+        /// over-cap behaviour is the sibling test below; separating them is
+        /// what lets BOTH have hard assertions.
+        ///
+        /// History: this test previously mixed the two concerns — 5,064
+        /// entries against a 256 cap — so its outcome depended on where the
+        /// random rotation landed, and its `None` arm was an unconditional
+        /// pass. It therefore asserted nothing in roughly 94% of runs, and
+        /// `GlobalRng` is unseeded in a plain `#[tokio::test]`, so which runs
+        /// those were varied per invocation.
         #[tokio::test]
-        async fn digest_entries_are_deduplicated_and_capped() {
-            let h = build_harness("hf-cap", 17060, vec![5u8; 128]).await;
+        async fn repeated_digest_hashes_are_deduplicated() {
+            let h = build_harness("hf-dedup", 17060, vec![5u8; 128]).await;
             let hash = contract_hash(&h.key);
 
-            // 5,000 entries: the one real contract repeated, plus a long tail
-            // of unknown hashes.
             let mut entries = vec![
                 SummaryDigestEntry {
                     hash,
@@ -8680,12 +8687,18 @@ mod tests {
                 };
                 64
             ];
-            for i in 0..5_000u32 {
+            // A short tail of unknown hashes, still well under the cap.
+            for i in 0..100u32 {
                 entries.push(SummaryDigestEntry {
                     hash: hash.wrapping_add(i + 1),
                     summary_digest: Some(summary_digest(b"divergent")),
                 });
             }
+            assert!(
+                entries.len() < MAX_SUMMARY_HASHES_PER_MESSAGE,
+                "premise: the fixture must stay under the cap so no rotation \
+                 occurs and this test is deterministic"
+            );
 
             let reply = handle_interest_sync_message(
                 &h.op_manager,
@@ -8699,22 +8712,78 @@ mod tests {
 
             match reply {
                 Some(InterestMessage::SummaryRequest { hashes }) => {
+                    assert_eq!(
+                        hashes.iter().filter(|h| **h == hash).count(),
+                        1,
+                        "a hash repeated 64 times must appear in the request \
+                         exactly once — repetition must buy the sender nothing"
+                    );
+                    assert_eq!(
+                        hashes.len(),
+                        1,
+                        "only the one locally-tracked contract may be \
+                         requested; the 100 unknown hashes resolve to nothing"
+                    );
+                }
+                other => panic!(
+                    "a divergent digest for a tracked contract must provoke a \
+                     SummaryRequest, got {other:?}"
+                ),
+            }
+        }
+
+        /// A massively over-cap digest message must stay bounded and must not
+        /// panic, and the request it provokes must never exceed the cap.
+        ///
+        /// `GlobalRng` is seeded explicitly: the handler rotates its processing
+        /// window by a random offset when the cap binds, and an unseeded
+        /// `#[tokio::test]` falls back to `rand::rng()` (config.rs), making the
+        /// outcome vary per invocation. Any test that depends on rotation or
+        /// sampling must seed.
+        #[tokio::test]
+        async fn over_cap_digest_message_stays_bounded() {
+            crate::config::GlobalRng::set_seed(0x4965_CA9);
+            let h = build_harness("hf-cap", 17065, vec![5u8; 128]).await;
+            let hash = contract_hash(&h.key);
+
+            let mut entries = Vec::new();
+            for i in 0..(MAX_SUMMARY_HASHES_PER_MESSAGE as u32 + 2_000) {
+                entries.push(SummaryDigestEntry {
+                    hash: hash.wrapping_add(i + 1),
+                    summary_digest: Some(summary_digest(b"divergent")),
+                });
+            }
+            assert!(
+                entries.len() > MAX_SUMMARY_HASHES_PER_MESSAGE,
+                "premise: the fixture must EXCEED the cap, or the bound below \
+                 is not being exercised"
+            );
+
+            let reply = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::SummaryDigests {
+                    entries,
+                    emitter: crate::message::SummariesEmitter::Other,
+                },
+            )
+            .await;
+
+            // Every hash here is unknown to this node, so nothing resolves and
+            // no request is warranted. The property under test is that an
+            // over-cap message is absorbed without panic and without
+            // manufacturing work: `lookup_by_hash` yields nothing for any of
+            // them, so the peer's 6,096 entries buy it exactly nothing.
+            match reply {
+                None => {}
+                Some(InterestMessage::SummaryRequest { hashes }) => {
                     assert!(
                         hashes.len() <= MAX_SUMMARY_HASHES_PER_MESSAGE,
                         "the request must stay bounded by \
                          MAX_SUMMARY_HASHES_PER_MESSAGE, got {}",
                         hashes.len()
                     );
-                    assert_eq!(
-                        hashes.iter().filter(|h| **h == hash).count(),
-                        1,
-                        "a repeated hash must appear in the request at most \
-                         once — repetition must buy the sender nothing"
-                    );
                 }
-                // Legitimate: the random rotation may push the one known hash
-                // outside the processed window. The cap is what is under test.
-                None => {}
                 other => panic!("unexpected reply {other:?}"),
             }
         }
