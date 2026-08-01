@@ -127,11 +127,21 @@ tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, features = ["json"], optional = true }
 tracing-appender = { workspace = true, optional = true }
 # Non-optional: the SDK metrics pipeline (tracing::otel) ships in every build.
-# Default features already give us metrics + http-proto + reqwest-blocking-client.
-# The blocking client is load-bearing, not incidental: PeriodicReader exports
-# from a dedicated thread via futures_executor::block_on, where an async reqwest
-# client would have no tokio reactor.
-opentelemetry-otlp = { workspace = true }
+# default-features = false + explicit list keeps the trace/logs exporters (and
+# their prost/opentelemetry-proto deps) out of the default build; only metrics
+# is a goal here (see docs/design/otel-metrics-exporter.md, non-goals).
+# reqwest-blocking-client is load-bearing, not incidental: PeriodicReader
+# exports from a dedicated thread via futures_executor::block_on, where an
+# async reqwest client would have no tokio reactor. reqwest-rustls adds TLS
+# so https:// collector endpoints actually work (otherwise every export to an
+# https endpoint silently fails at connect time).
+opentelemetry-otlp = { workspace = true, features = [
+    "http-proto",
+    "metrics",
+    "reqwest-blocking-client",
+    "reqwest-rustls",
+    "internal-logs",
+] }
 opentelemetry_sdk = { workspace = true }
 
 hkdf = { workspace = true }
