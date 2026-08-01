@@ -575,7 +575,12 @@ function freenetBridge(authToken, userToken, hostedMode) {
       notifyStatusToIframe('dismissed');
       return;
     }
-    if (notifyAffordanceShown) return;
+    if (notifyAffordanceShown) {
+      // The bar is already on screen awaiting a click: the prompt is pending,
+      // not lost. Reply so a client can tell "still deciding" from "dropped".
+      notifyStatusToIframe('default');
+      return;
+    }
     notifyAffordanceShown = true;
 
     var bar = document.createElement('div');
@@ -792,10 +797,31 @@ function freenetBridge(authToken, userToken, hostedMode) {
     });
   }
 
+  // notify-show:BEGIN (extracted verbatim by shell_bridge_notifications.test.mjs)
+  // Every `notification` message gets exactly one status reply: the drop paths
+  // below report WHY nothing was shown, and the display paths re-affirm
+  // 'granted'. That re-affirmation is what retracts an earlier 'undeliverable'
+  // — e.g. the first notification of a session racing the service worker's
+  // activation — which otherwise stuck for the whole session (#5043).
   function showAppNotification(msg) {
-    if (typeof Notification === 'undefined') return;
+    if (typeof Notification === 'undefined') {
+      notifyStatusToIframe('unsupported');
+      return;
+    }
     // Gate on BOTH the browser permission and this contract's own consent.
-    if (Notification.permission !== 'granted' || !contractHasConsent()) return;
+    // A framed app can't read Notification.permission itself (opaque origin),
+    // so a permission revoked in site settings after a 'granted' is only
+    // visible to it if we report it here.
+    if (Notification.permission !== 'granted') {
+      notifyStatusToIframe(
+        Notification.permission === 'denied' ? 'denied' : 'default',
+      );
+      return;
+    }
+    if (!contractHasConsent()) {
+      notifyStatusToIframe('default');
+      return;
+    }
     // Notification renders text only (no markup), so no HTML-injection risk;
     // still cap length to prevent oversized/abusive content.
     var title = String(msg.title).slice(0, 128);
@@ -828,6 +854,7 @@ function freenetBridge(authToken, userToken, hostedMode) {
     // Desktop: use the page-level constructor, UNCHANGED. Mobile: it throws
     // (unsupported), so we fall through to the service-worker path below — the
     // only way to show a notification on mobile.
+    var shownByConstructor = false;
     try {
       var n = new Notification(title, opts);
       n.onclick = function () {
@@ -844,16 +871,25 @@ function freenetBridge(authToken, userToken, hostedMode) {
           n.close();
         } catch (e) {}
       };
-      return;
+      shownByConstructor = true;
     } catch (e) {
       // Mobile Chrome/Firefox: the non-persistent `new Notification()`
       // constructor is unsupported and throws. Deliver via the service worker.
+    }
+    // Report OUTSIDE the try: a throw from the status post must not look like a
+    // constructor failure and fall through to a second, duplicate delivery.
+    if (shownByConstructor) {
+      notifyStatusToIframe('granted');
+      return;
     }
 
     notifyRegistrationReady(1500).then(function (reg) {
       if (reg && typeof reg.showNotification === 'function') {
         reg.showNotification(title, opts).then(
-          function () {},
+          function () {
+            // Delivered: re-affirm, retracting any earlier 'undeliverable'.
+            notifyStatusToIframe('granted');
+          },
           function () {
             // The worker exists but the show failed — nothing else can display
             // it; tell the app so it can rely on the in-app unread badge.
@@ -868,6 +904,7 @@ function freenetBridge(authToken, userToken, hostedMode) {
       }
     });
   }
+  // notify-show:END
 
   // Install the click-forward listener eagerly on every shell load (see
   // installNotifyClickListener) so a click on a persistent notification that

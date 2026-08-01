@@ -5575,9 +5575,11 @@ mod tests {
         // Every notification is gated on BOTH the browser permission AND this
         // contract's own consent, so one contract's gateway-wide browser grant
         // can't notify the user on behalf of a different contract.
+        // (Two separate gates since #5043, so each drop can report its own
+        // `notification_status` back to the app instead of returning silently.)
         assert!(
-            SHELL_BRIDGE_JS
-                .contains("Notification.permission !== 'granted' || !contractHasConsent()"),
+            SHELL_BRIDGE_JS.contains("Notification.permission !== 'granted'")
+                && SHELL_BRIDGE_JS.contains("!contractHasConsent()"),
             "showAppNotification must gate on browser permission AND per-contract consent"
         );
         // "Not now" must be durable so a contract that re-sends the enable prompt

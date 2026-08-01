@@ -38,7 +38,9 @@ if (b < 0 || e < 0 || e < b) {
 const region = src.slice(b, e);
 const fnStart = region.indexOf('function makeNotifyRateLimiter(');
 if (fnStart < 0) {
-  console.error('FAIL: no `function makeNotifyRateLimiter(` between the markers.');
+  console.error(
+    'FAIL: no `function makeNotifyRateLimiter(` between the markers.',
+  );
   process.exit(1);
 }
 const fnSource = region.slice(fnStart);
@@ -66,7 +68,9 @@ if (sb < 0 || se < 0 || se < sb) {
 const storeRegion = src.slice(sb, se);
 const storeFnStart = storeRegion.indexOf('function makeNotifyRateStore(');
 if (storeFnStart < 0) {
-  console.error('FAIL: no `function makeNotifyRateStore(` between the store markers.');
+  console.error(
+    'FAIL: no `function makeNotifyRateStore(` between the store markers.',
+  );
   process.exit(1);
 }
 const storeFnSource = storeRegion.slice(storeFnStart);
@@ -114,7 +118,10 @@ function check(name, cond) {
 {
   const rl = makeNotifyRateLimiter();
   check('same tag t=0 allowed', rl.ok('a', 0) === true);
-  check('same tag t=2999 blocked (throttle window)', rl.ok('a', 2999) === false);
+  check(
+    'same tag t=2999 blocked (throttle window)',
+    rl.ok('a', 2999) === false,
+  );
   check('same tag t=3000 allowed (window elapsed)', rl.ok('a', 3000) === true);
 }
 
@@ -132,16 +139,25 @@ function check(name, cond) {
   let passed = 0;
   for (let i = 0; i < 20; i++) if (rl.ok('tag' + i, 1000 + i)) passed++;
   check('first 20 distinct tags pass', passed === 20);
-  check('21st distinct tag blocked by global cap', rl.ok('tag20', 1500) === false);
+  check(
+    '21st distinct tag blocked by global cap',
+    rl.ok('tag20', 1500) === false,
+  );
 }
 
 // 4. Rolling window: once the oldest entries age past 60s, capacity frees up.
 {
   const rl = makeNotifyRateLimiter();
   for (let i = 0; i < 20; i++) rl.ok('t' + i, 0); // fill the window at t=0
-  check('at capacity blocks a new tag at t=59999', rl.ok('new', 59999) === false);
+  check(
+    'at capacity blocks a new tag at t=59999',
+    rl.ok('new', 59999) === false,
+  );
   // At t=60000 the t=0 entries have aged out (now - t is no longer < 60000).
-  check('window expiry frees capacity at t=60000', rl.ok('new', 60000) === true);
+  check(
+    'window expiry frees capacity at t=60000',
+    rl.ok('new', 60000) === true,
+  );
 }
 
 // 5. Bounded per-tag map: a flood of >128 distinct tags must not throw, the
@@ -157,8 +173,14 @@ function check(name, cond) {
   for (let i = 0; i < 300; i++) {
     if (rl.ok('flood' + i, i * 61000) !== true) allOk = false;
   }
-  check('300 spaced distinct tags all pass (eviction bounded, no throw)', allOk);
-  check('per-tag map stays bounded by MAP_CAP after the flood', rl.tagCount() <= 128);
+  check(
+    '300 spaced distinct tags all pass (eviction bounded, no throw)',
+    allOk,
+  );
+  check(
+    'per-tag map stays bounded by MAP_CAP after the flood',
+    rl.tagCount() <= 128,
+  );
 }
 
 // 6. Reload persistence (#4849): the rolling global window is rehydrated from
@@ -179,7 +201,10 @@ function check(name, cond) {
   let filled = 0;
   for (let i = 0; i < 20; i++) if (before.ok('t' + i, 1000 + i)) filled++;
   check('cap fills on first load', filled === 20);
-  check('window persisted to store', Array.isArray(saved) && saved.length === 20);
+  check(
+    'window persisted to store',
+    Array.isArray(saved) && saved.length === 20,
+  );
   // Simulate the reload: a NEW limiter rehydrates from the same store. The next
   // notification (still inside the 60s window) must be blocked — no reset.
   const afterReload = makeNotifyRateLimiter(store);
@@ -256,7 +281,10 @@ function check(name, cond) {
   );
   // Non-array stored value -> null (the sharp Array.isArray guard).
   h.back[h.key] = JSON.stringify('not-an-array');
-  check('adapter returns null for a non-array stored value', h.store.load() === null);
+  check(
+    'adapter returns null for a non-array stored value',
+    h.store.load() === null,
+  );
   // Corrupt JSON -> null (fail safe).
   h.back[h.key] = '{not valid json';
   check('adapter returns null for corrupt JSON', h.store.load() === null);
@@ -265,7 +293,10 @@ function check(name, cond) {
   const filtered = h.store.load();
   check(
     'adapter filters non-finite / non-number entries',
-    Array.isArray(filtered) && filtered.length === 2 && filtered[0] === 1 && filtered[1] === 2,
+    Array.isArray(filtered) &&
+      filtered.length === 2 &&
+      filtered[0] === 1 &&
+      filtered[1] === 2,
   );
   // Future-dated timestamps (backward clock correction) clamped out.
   h.back[h.key] = JSON.stringify([1000, Date.now() + 10 * 60 * 1000]);
@@ -283,10 +314,209 @@ function check(name, cond) {
     saveThrew = true;
   }
   check('adapter save swallows storage errors', saveThrew === false);
-  check('adapter load returns null when storage throws', h.store.load() === null);
+  check(
+    'adapter load returns null when storage throws',
+    h.store.load() === null,
+  );
   // No contract key -> null store (limiter runs in-memory, no persistence).
   const none = makeStoreHarness('/some/other/path');
-  check('makeNotifyRateStore returns null when there is no contract key', none.store === null);
+  check(
+    'makeNotifyRateStore returns null when there is no contract key',
+    none.store === null,
+  );
+}
+
+// 9. showAppNotification status replies (#5043): every `notification` message
+//    must produce exactly one `notification_status`. Before the fix the three
+//    drop paths returned silently (so a permission revoked in site settings
+//    left a framed app displaying "enabled" forever — it cannot read
+//    Notification.permission across the opaque origin), and there was no status
+//    on the success path, so a transient 'undeliverable' from the service
+//    worker activation race stuck for the whole session.
+{
+  const SBEGIN = 'notify-show:BEGIN';
+  const SEND = 'notify-show:END';
+  const nb = src.indexOf(SBEGIN);
+  const ne = src.indexOf(SEND);
+  if (nb < 0 || ne < 0 || ne < nb) {
+    console.error(
+      `FAIL: could not find ${SBEGIN}/${SEND} markers in ${assetPath}.`,
+    );
+    process.exit(1);
+  }
+  // Slice from the `function` keyword: the BEGIN marker sits inside a `//`
+  // comment, so starting at the marker itself would not parse.
+  const showRegion = src.slice(nb, ne);
+  const showStart = showRegion.indexOf('function showAppNotification(');
+  if (showStart < 0) {
+    console.error(
+      'FAIL: no `function showAppNotification(` between the markers.',
+    );
+    process.exit(1);
+  }
+  const showSource = showRegion.slice(showStart);
+
+  // Build showAppNotification with every collaborator injected. `ctl` drives
+  // the branch under test; `statuses` records what the iframe would receive.
+  function makeShowHarness(ctl) {
+    const statuses = [];
+    const shown = [];
+    const Notification =
+      ctl.permission === undefined
+        ? undefined
+        : Object.assign(
+            function (title, opts) {
+              if (ctl.constructorThrows) throw new Error('unsupported');
+              shown.push({ via: 'constructor', title, opts });
+            },
+            { permission: ctl.permission },
+          );
+    const swShow = (title, opts) => {
+      if (ctl.swShowRejects) return Promise.reject(new Error('show failed'));
+      shown.push({ via: 'sw', title, opts });
+      return Promise.resolve();
+    };
+    const fn = new Function(
+      'Notification',
+      'notifyStatusToIframe',
+      'contractHasConsent',
+      'contractConsentKey',
+      'notifyLimiter',
+      'sendToIframe',
+      'notifyRegistrationReady',
+      'location',
+      'window',
+      `${showSource}\nreturn showAppNotification;`,
+    )(
+      Notification,
+      (s) => statuses.push(s),
+      () => ctl.consent !== false,
+      () => 'freenet_notify:KEY',
+      { ok: () => ctl.limited !== true },
+      () => {},
+      () =>
+        Promise.resolve(ctl.swAvailable ? { showNotification: swShow } : null),
+      { href: 'https://gw.example/v2/contract/web/KEY/' },
+      { focus() {} },
+    );
+    return { fn, statuses, shown };
+  }
+
+  // Drop paths: each reports exactly one status instead of returning silently.
+  {
+    const h = makeShowHarness({ permission: undefined });
+    h.fn({ title: 't' });
+    check(
+      'no Notification API -> exactly one "unsupported"',
+      h.statuses.length === 1 && h.statuses[0] === 'unsupported',
+    );
+  }
+  {
+    const h = makeShowHarness({ permission: 'denied' });
+    h.fn({ title: 't' });
+    check(
+      'permission revoked to denied -> exactly one "denied"',
+      h.statuses.length === 1 && h.statuses[0] === 'denied',
+    );
+  }
+  {
+    const h = makeShowHarness({ permission: 'default' });
+    h.fn({ title: 't' });
+    check(
+      'permission reset to default -> exactly one "default"',
+      h.statuses.length === 1 && h.statuses[0] === 'default',
+    );
+  }
+  {
+    const h = makeShowHarness({ permission: 'granted', consent: false });
+    h.fn({ title: 't' });
+    check(
+      'contract consent withdrawn -> exactly one "default"',
+      h.statuses.length === 1 && h.statuses[0] === 'default',
+    );
+  }
+  // Success paths re-affirm 'granted' — the retraction of a stale
+  // 'undeliverable'. Desktop (page-level constructor):
+  {
+    const h = makeShowHarness({ permission: 'granted' });
+    h.fn({ title: 't' });
+    check(
+      'desktop constructor delivery -> exactly one "granted"',
+      h.statuses.length === 1 &&
+        h.statuses[0] === 'granted' &&
+        h.shown.length === 1 &&
+        h.shown[0].via === 'constructor',
+    );
+  }
+  // Mobile (constructor throws, service worker delivers):
+  {
+    const h = makeShowHarness({
+      permission: 'granted',
+      constructorThrows: true,
+      swAvailable: true,
+    });
+    h.fn({ title: 't' });
+    await new Promise((r) => setTimeout(r, 0));
+    check(
+      'mobile service-worker delivery -> exactly one "granted"',
+      h.statuses.length === 1 &&
+        h.statuses[0] === 'granted' &&
+        h.shown.length === 1 &&
+        h.shown[0].via === 'sw',
+    );
+  }
+  // Genuine failures still report 'undeliverable', and only once.
+  {
+    const h = makeShowHarness({
+      permission: 'granted',
+      constructorThrows: true,
+      swAvailable: false,
+    });
+    h.fn({ title: 't' });
+    await new Promise((r) => setTimeout(r, 0));
+    check(
+      'no worker + constructor throws -> exactly one "undeliverable"',
+      h.statuses.length === 1 && h.statuses[0] === 'undeliverable',
+    );
+  }
+  {
+    const h = makeShowHarness({
+      permission: 'granted',
+      constructorThrows: true,
+      swAvailable: true,
+      swShowRejects: true,
+    });
+    h.fn({ title: 't' });
+    await new Promise((r) => setTimeout(r, 0));
+    check(
+      'worker show rejects -> exactly one "undeliverable"',
+      h.statuses.length === 1 && h.statuses[0] === 'undeliverable',
+    );
+  }
+  // A delivery after a stale 'undeliverable' retracts it: the LAST status a
+  // client sees is 'granted', not the session-long false warning of #5043.
+  {
+    const h = makeShowHarness({
+      permission: 'granted',
+      constructorThrows: true,
+      swAvailable: false,
+    });
+    h.fn({ title: 'first' }); // races SW activation -> undeliverable
+    await new Promise((r) => setTimeout(r, 0));
+    const h2 = makeShowHarness({
+      permission: 'granted',
+      constructorThrows: true,
+      swAvailable: true,
+    });
+    h2.statuses.push(...h.statuses); // same session, same client
+    h2.fn({ title: 'second' }); // worker now active -> delivered
+    await new Promise((r) => setTimeout(r, 0));
+    check(
+      'a later delivery retracts an earlier "undeliverable"',
+      h2.statuses[0] === 'undeliverable' &&
+        h2.statuses[h2.statuses.length - 1] === 'granted',
+    );
+  }
 }
 
 if (failures > 0) {
