@@ -5439,14 +5439,21 @@ pub(crate) mod tests {
                 Err(_) => continue,
             };
             let prod = strip_cfg_test_regions(&src);
-            let reg_count = prod.matches("register_peer_interest(").count();
+            let unsourced_reg_count = prod.matches(".register_peer_interest(").count();
+            assert_eq!(
+                unsourced_reg_count, 0,
+                "production file {rel} calls the compatibility registration wrapper, which \
+                 records telemetry source as Unknown and evades this source-aware inventory; \
+                 use register_peer_interest_from with an explicit source"
+            );
+            let reg_count = prod.matches("register_peer_interest_from(").count();
             if reg_count == 0 {
                 continue;
             }
             // The interest-manager method *definition* itself lives in
             // ring/interest.rs and is not a call site; ignore it. Detect by the
             // presence of the `pub fn register_peer_interest` definition.
-            if prod.contains("fn register_peer_interest(") {
+            if prod.contains("fn register_peer_interest_from(") {
                 continue;
             }
             found_with_register.insert(rel.clone());

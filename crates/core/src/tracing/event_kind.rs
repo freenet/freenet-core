@@ -8,6 +8,33 @@ use crate::{
     router::RouteEvent,
 };
 
+/// Inclusive upper bounds for the fixed contract-state size histogram used by
+/// the large-state diagnostics (#5090). The final bucket contains values above
+/// the current 50 MiB hard limit, making a persisted over-limit state visible
+/// without introducing a contract-key dimension.
+pub(crate) const STATE_SIZE_BUCKET_UPPER_BOUNDS: [u64; 8] = [
+    64 * 1024,
+    500 * 1024,
+    1024 * 1024,
+    3 * 1024 * 1024,
+    10 * 1024 * 1024,
+    25 * 1024 * 1024,
+    40 * 1024 * 1024,
+    50 * 1024 * 1024,
+];
+
+/// Number of fixed contract-state size buckets, including the unbounded final
+/// bucket above the largest inclusive upper bound.
+pub(crate) const STATE_SIZE_BUCKET_COUNT: usize = STATE_SIZE_BUCKET_UPPER_BOUNDS.len() + 1;
+
+/// Return the fixed histogram bucket for `size_bytes`.
+pub(crate) fn state_size_bucket(size_bytes: u64) -> usize {
+    STATE_SIZE_BUCKET_UPPER_BOUNDS
+        .iter()
+        .position(|upper| size_bytes <= *upper)
+        .unwrap_or(STATE_SIZE_BUCKET_UPPER_BOUNDS.len())
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 #[non_exhaustive]

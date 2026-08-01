@@ -635,6 +635,7 @@ impl P2pConnManager {
                 key,
                 new_state,
                 target,
+                None,
             )
             .await;
         }
@@ -977,10 +978,11 @@ impl P2pConnManager {
                 // (`record_delivery_to_interest`) — an untracked co-host must
                 // escape full state after one delivered broadcast in sims too.
                 if let Some(summary) = &our_summary {
-                    op_manager.interest_manager.upsert_peer_summary(
+                    op_manager.interest_manager.upsert_peer_summary_from(
                         &key,
                         &peer_key,
                         summary.clone(),
+                        crate::ring::interest::SummaryPopulationSource::Delivery,
                     );
                 }
             }

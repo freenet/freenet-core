@@ -3216,9 +3216,13 @@ where
             {
                 false
             } else {
-                op_manager
-                    .interest_manager
-                    .register_peer_interest(&key, peer_key, None, false)
+                op_manager.interest_manager.register_peer_interest_from(
+                    &key,
+                    peer_key,
+                    None,
+                    false,
+                    crate::ring::interest::InterestRegistrationSource::Get,
+                )
             };
             if is_new {
                 // #4359 (MUST-FIX 1): a remote GET with subscribe=false still

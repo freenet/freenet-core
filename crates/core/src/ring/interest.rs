@@ -133,6 +133,19 @@ pub(crate) const RESYNC_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(30)
 /// which is safe.
 const RESYNC_THROTTLE_CACHE_SIZE: usize = 4096;
 
+/// Bounds diagnostic correlation state influenced by remote (contract, peer)
+/// pairs. Eviction only loses classification detail; it never changes routing.
+const MISSING_SUMMARY_HISTORY_SIZE: usize = 4096;
+
+/// Bounds in-flight missing-summary send correlation. At capacity sends still
+/// proceed, and the visible overflow counter records the lost correlation.
+const MISSING_SUMMARY_ACTIVE_SIZE: usize = 256;
+
+/// Telemetry field order for the first missing-summary send age histogram:
+/// <1s, 1-9s, 10-59s, 60-299s, and >=300s.
+pub(crate) const FIRST_MISSING_SUMMARY_SEND_AGE_LABELS: [&str; 5] =
+    ["lt_1s", "1_9s", "10_59s", "60_299s", "gte_300s"];
+
 /// Node-wide cap on concurrently-outstanding queue-full-resync retry tasks
 /// (#4862 P1). The per-(contract, peer) throttle above is a bounded LRU; under
 /// saturation plus key churn (a peer cycling through more than
@@ -218,8 +231,10 @@ pub enum SummaryMissingReason {
 }
 
 impl SummaryMissingReason {
+    pub const COUNT: usize = 4;
+
     /// Every reason, in telemetry field order.
-    pub const ALL: [SummaryMissingReason; 4] = [
+    pub const ALL: [SummaryMissingReason; Self::COUNT] = [
         SummaryMissingReason::NeverPopulated,
         SummaryMissingReason::ClearedByNoneReport,
         SummaryMissingReason::ClearedByResync,
@@ -247,6 +262,294 @@ impl SummaryMissingReason {
     }
 }
 
+/// Stable, fixed-cardinality origin of an interest registration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InterestRegistrationSource {
+    Interests,
+    ChangeInterests,
+    SubscribeOriginator,
+    SubscribeDownstream,
+    SubscribeRelay,
+    Get,
+    Unknown,
+}
+
+impl InterestRegistrationSource {
+    pub(crate) const COUNT: usize = 7;
+    pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::Interests,
+        Self::ChangeInterests,
+        Self::SubscribeOriginator,
+        Self::SubscribeDownstream,
+        Self::SubscribeRelay,
+        Self::Get,
+        Self::Unknown,
+    ];
+
+    pub(crate) const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Interests => "interests",
+            Self::ChangeInterests => "change_interests",
+            Self::SubscribeOriginator => "subscribe_originator",
+            Self::SubscribeDownstream => "subscribe_downstream",
+            Self::SubscribeRelay => "subscribe_relay",
+            Self::Get => "get",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Stable reason an interest stopped being tracked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InterestRemovalCause {
+    InterestsReplace,
+    ChangeInterests,
+    Unsubscribe,
+    DisconnectGrace,
+    TtlExpiry,
+    Eviction,
+    Unknown,
+}
+
+impl InterestRemovalCause {
+    pub(crate) const COUNT: usize = 7;
+    pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::InterestsReplace,
+        Self::ChangeInterests,
+        Self::Unsubscribe,
+        Self::DisconnectGrace,
+        Self::TtlExpiry,
+        Self::Eviction,
+        Self::Unknown,
+    ];
+
+    pub(crate) const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::InterestsReplace => "interests_replace",
+            Self::ChangeInterests => "change_interests",
+            Self::Unsubscribe => "unsubscribe",
+            Self::DisconnectGrace => "disconnect_grace",
+            Self::TtlExpiry => "ttl_expiry",
+            Self::Eviction => "eviction",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Stable source of a peer-summary write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SummaryPopulationSource {
+    Delivery,
+    InterestSummary,
+    DigestAgreement,
+    InboundBroadcast,
+    ResyncResponse,
+    Unknown,
+}
+
+impl SummaryPopulationSource {
+    pub(crate) const COUNT: usize = 6;
+    pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::Delivery,
+        Self::InterestSummary,
+        Self::DigestAgreement,
+        Self::InboundBroadcast,
+        Self::ResyncResponse,
+        Self::Unknown,
+    ];
+
+    pub(crate) const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Delivery => "delivery",
+            Self::InterestSummary => "interest_summary",
+            Self::DigestAgreement => "digest_agreement",
+            Self::InboundBroadcast => "inbound_broadcast",
+            Self::ResyncResponse => "resync_response",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Result of a summary population attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SummaryPopulationOutcome {
+    FilledMissing,
+    RefreshedKnown,
+    CreatedUntracked,
+    RejectedAtCap,
+}
+
+impl SummaryPopulationOutcome {
+    pub(crate) const COUNT: usize = 4;
+    pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::FilledMissing,
+        Self::RefreshedKnown,
+        Self::CreatedUntracked,
+        Self::RejectedAtCap,
+    ];
+
+    pub(crate) const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::FilledMissing => "filled_missing",
+            Self::RefreshedKnown => "refreshed_known",
+            Self::CreatedUntracked => "created_untracked",
+            Self::RejectedAtCap => "rejected_at_cap",
+        }
+    }
+}
+
+/// Why a delivered broadcast had no usable peer summary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MissingSummaryClass {
+    TrackedFirstNew,
+    TrackedFirstRecreated,
+    TrackedFirstOverwriteKnown,
+    TrackedFirstOverwriteMissing,
+    TrackedRepeatInflight,
+    TrackedRepeatSequential,
+    UntrackedFirstObserved,
+    UntrackedFirstRecreated,
+    UntrackedRepeatInflight,
+    UntrackedRepeatSequential,
+}
+
+impl MissingSummaryClass {
+    pub(crate) const COUNT: usize = 10;
+    pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::TrackedFirstNew,
+        Self::TrackedFirstRecreated,
+        Self::TrackedFirstOverwriteKnown,
+        Self::TrackedFirstOverwriteMissing,
+        Self::TrackedRepeatInflight,
+        Self::TrackedRepeatSequential,
+        Self::UntrackedFirstObserved,
+        Self::UntrackedFirstRecreated,
+        Self::UntrackedRepeatInflight,
+        Self::UntrackedRepeatSequential,
+    ];
+
+    pub(crate) const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::TrackedFirstNew => "tracked_first_new",
+            Self::TrackedFirstRecreated => "tracked_first_recreated",
+            Self::TrackedFirstOverwriteKnown => "tracked_first_overwrite_known",
+            Self::TrackedFirstOverwriteMissing => "tracked_first_overwrite_missing",
+            Self::TrackedRepeatInflight => "tracked_repeat_inflight",
+            Self::TrackedRepeatSequential => "tracked_repeat_sequential",
+            Self::UntrackedFirstObserved => "untracked_first_observed",
+            Self::UntrackedFirstRecreated => "untracked_first_recreated",
+            Self::UntrackedRepeatInflight => "untracked_repeat_inflight",
+            Self::UntrackedRepeatSequential => "untracked_repeat_sequential",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NeverPopulatedOrigin {
+    New { recreated: bool },
+    OverwriteKnown,
+    OverwriteMissing,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MissingPairHistory {
+    send_starts: u32,
+    last_observed: Option<Instant>,
+    recent_removal: Option<(InterestRemovalCause, Instant)>,
+}
+
+/// Fixed-cardinality lifecycle counters copied into telemetry snapshots.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InterestLifecycleSnapshot {
+    pub(crate) delivered_sends: [u64; MissingSummaryClass::COUNT],
+    pub(crate) delivered_bytes: [u64; MissingSummaryClass::COUNT],
+    pub(crate) first_send_age: [u64; 5],
+    pub(crate) registration_overwrite_known: [u64; InterestRegistrationSource::COUNT],
+    pub(crate) registration_overwrite_missing: [u64; InterestRegistrationSource::COUNT],
+    pub(crate) registration_new_known: [u64; InterestRegistrationSource::COUNT],
+    pub(crate) registration_new_missing: [u64; InterestRegistrationSource::COUNT],
+    pub(crate) removals: [u64; InterestRemovalCause::COUNT],
+    pub(crate) recreated_after_removal: [u64; InterestRemovalCause::COUNT],
+    pub(crate) population: [[u64; SummaryPopulationOutcome::COUNT]; SummaryPopulationSource::COUNT],
+    pub(crate) registration_cap_rejected: [u64; InterestRegistrationSource::COUNT],
+    /// Current entries: known, then missing by `SummaryMissingReason::ALL`.
+    pub(crate) current_summary_state: [u64; SummaryMissingReason::COUNT + 1],
+    pub(crate) history_overflow: u64,
+    pub(crate) active_overflow: u64,
+}
+
+struct InterestLifecycleMetrics {
+    delivered_sends: [AtomicU64; MissingSummaryClass::COUNT],
+    delivered_bytes: [AtomicU64; MissingSummaryClass::COUNT],
+    first_send_age: [AtomicU64; 5],
+    registration_overwrite_known: [AtomicU64; InterestRegistrationSource::COUNT],
+    registration_overwrite_missing: [AtomicU64; InterestRegistrationSource::COUNT],
+    registration_new_known: [AtomicU64; InterestRegistrationSource::COUNT],
+    registration_new_missing: [AtomicU64; InterestRegistrationSource::COUNT],
+    removals: [AtomicU64; InterestRemovalCause::COUNT],
+    recreated_after_removal: [AtomicU64; InterestRemovalCause::COUNT],
+    population: [[AtomicU64; SummaryPopulationOutcome::COUNT]; SummaryPopulationSource::COUNT],
+    registration_cap_rejected: [AtomicU64; InterestRegistrationSource::COUNT],
+    history_overflow: AtomicU64,
+    active_overflow: AtomicU64,
+}
+
+pub(crate) struct MissingSummaryAttempt {
+    key: (ContractKey, PeerKey),
+    class: MissingSummaryClass,
+    first_age_bucket: Option<usize>,
+    active_tracked: bool,
+}
+
+/// One atomic observation of the cached peer summary used by a broadcast.
+pub(crate) enum PeerSummaryForBroadcast {
+    Known(StateSummary<'static>),
+    Missing {
+        reason: Option<SummaryMissingReason>,
+        attempt: Option<MissingSummaryAttempt>,
+    },
+}
+
+impl InterestLifecycleMetrics {
+    fn new() -> Self {
+        Self {
+            delivered_sends: std::array::from_fn(|_| AtomicU64::new(0)),
+            delivered_bytes: std::array::from_fn(|_| AtomicU64::new(0)),
+            first_send_age: std::array::from_fn(|_| AtomicU64::new(0)),
+            registration_overwrite_known: std::array::from_fn(|_| AtomicU64::new(0)),
+            registration_overwrite_missing: std::array::from_fn(|_| AtomicU64::new(0)),
+            registration_new_known: std::array::from_fn(|_| AtomicU64::new(0)),
+            registration_new_missing: std::array::from_fn(|_| AtomicU64::new(0)),
+            removals: std::array::from_fn(|_| AtomicU64::new(0)),
+            recreated_after_removal: std::array::from_fn(|_| AtomicU64::new(0)),
+            population: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+            registration_cap_rejected: std::array::from_fn(|_| AtomicU64::new(0)),
+            history_overflow: AtomicU64::new(0),
+            active_overflow: AtomicU64::new(0),
+        }
+    }
+}
+
 /// Tracking information for a peer's interest in a specific contract.
 #[derive(Clone, Debug)]
 pub struct PeerInterest {
@@ -257,6 +560,13 @@ pub struct PeerInterest {
     /// is `Some` — always read it via [`Self::summary_missing_reason`], which
     /// returns `None` in that case rather than a misleading last-clear cause.
     summary_absence: SummaryMissingReason,
+
+    /// Diagnostic-only provenance for the current NeverPopulated epoch.
+    never_populated_origin: NeverPopulatedOrigin,
+
+    /// Start time and send-attempt count for that epoch.
+    never_populated_since: Instant,
+    never_populated_send_starts: u32,
 
     /// When this interest entry was last refreshed.
     /// Used for TTL-based expiration.
@@ -277,6 +587,9 @@ impl PeerInterest {
         Self {
             summary,
             summary_absence: SummaryMissingReason::NeverPopulated,
+            never_populated_origin: NeverPopulatedOrigin::New { recreated: false },
+            never_populated_since: now,
+            never_populated_send_starts: 0,
             last_refreshed: now,
             is_upstream,
         }
@@ -312,6 +625,11 @@ impl PeerInterest {
     pub fn clear_summary(&mut self, reason: SummaryMissingReason, now: Instant) {
         self.summary = None;
         self.summary_absence = reason;
+        if reason == SummaryMissingReason::NeverPopulated {
+            self.never_populated_origin = NeverPopulatedOrigin::New { recreated: false };
+            self.never_populated_since = now;
+            self.never_populated_send_starts = 0;
+        }
         self.refresh(now);
     }
 }
@@ -680,6 +998,42 @@ pub struct InterestManager<T: TimeSource> {
     /// outlive the borrow (it is moved into the spawned retry task and
     /// decrements the count on drop).
     resync_retry_slots: Arc<AtomicUsize>,
+
+    /// Bounded diagnostic-only state used to distinguish first, recreated,
+    /// in-flight duplicate, and sequential missing-summary sends.
+    missing_summary_history: Mutex<LruCache<(ContractKey, PeerKey), MissingPairHistory>>,
+    /// Per-key entries are updated through DashMap's shard-local `entry()`
+    /// API, so same-key increment/decrement stays atomic. The total-size
+    /// bound checked in `begin_active_attempt` is a soft diagnostic cap (not
+    /// a security invariant): `.len()` is read before the per-key `entry()`
+    /// lock is taken, so concurrent first-time inserts for distinct new keys
+    /// can race past `MISSING_SUMMARY_ACTIVE_SIZE` (bounded by the number of
+    /// concurrent racers, not fixed at one).
+    missing_summary_active: DashMap<(ContractKey, PeerKey), u16>,
+    interest_lifecycle_metrics: InterestLifecycleMetrics,
+}
+
+/// Delivery-gated lifecycle accounting. Dropping an unmarked guard records no
+/// bytes, so failed or cancelled sends cannot masquerade as network impact.
+pub(crate) struct MissingSummaryAttemptGuard<'a, T: TimeSource + Sync> {
+    manager: &'a InterestManager<T>,
+    attempt: Option<MissingSummaryAttempt>,
+    delivered_bytes: Option<u64>,
+}
+
+impl<T: TimeSource + Sync> MissingSummaryAttemptGuard<'_, T> {
+    pub(crate) fn mark_delivered(&mut self, bytes: usize) {
+        self.delivered_bytes = Some(bytes as u64);
+    }
+}
+
+impl<T: TimeSource + Sync> Drop for MissingSummaryAttemptGuard<'_, T> {
+    fn drop(&mut self) {
+        if let Some(attempt) = self.attempt.take() {
+            self.manager
+                .finish_missing_summary_attempt(attempt, self.delivered_bytes);
+        }
+    }
 }
 
 impl<T: TimeSource + Sync> InterestManager<T> {
@@ -705,6 +1059,12 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 NonZeroUsize::new(RESYNC_THROTTLE_CACHE_SIZE)
                     .expect("RESYNC_THROTTLE_CACHE_SIZE must be > 0"),
             )),
+            missing_summary_history: Mutex::new(LruCache::new(
+                NonZeroUsize::new(MISSING_SUMMARY_HISTORY_SIZE)
+                    .expect("MISSING_SUMMARY_HISTORY_SIZE must be > 0"),
+            )),
+            missing_summary_active: DashMap::new(),
+            interest_lifecycle_metrics: InterestLifecycleMetrics::new(),
         }
     }
 
@@ -744,6 +1104,274 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         self.time_source.now()
     }
 
+    /// Atomically reads the peer summary and, when it is NeverPopulated (or
+    /// the peer is untracked), starts bounded lifecycle correlation for the
+    /// broadcast that will use that observation.
+    pub(crate) fn begin_peer_summary_broadcast(
+        &self,
+        contract: &ContractKey,
+        peer: &PeerKey,
+    ) -> PeerSummaryForBroadcast {
+        let now = self.time_source.now();
+        // The overwhelmingly common known-summary path is read-only. Keep it
+        // on a shared shard guard; only NeverPopulated needs mutation for the
+        // bounded attempt correlation below.
+        if let Some(peers) = self.interested_peers.get(contract)
+            && let Some(interest) = peers.get(peer)
+        {
+            if let Some(summary) = interest.summary.clone() {
+                return PeerSummaryForBroadcast::Known(summary);
+            }
+            let reason = interest.summary_missing_reason();
+            if reason != Some(SummaryMissingReason::NeverPopulated) {
+                return PeerSummaryForBroadcast::Missing {
+                    reason,
+                    attempt: None,
+                };
+            }
+        }
+
+        // Re-check after upgrading to an exclusive guard: a population or
+        // removal may have raced the shared observation above.
+        if let Some(mut peers) = self.interested_peers.get_mut(contract)
+            && let Some(interest) = peers.get_mut(peer)
+        {
+            if let Some(summary) = interest.summary.clone() {
+                return PeerSummaryForBroadcast::Known(summary);
+            }
+            let reason = interest.summary_missing_reason();
+            if reason != Some(SummaryMissingReason::NeverPopulated) {
+                return PeerSummaryForBroadcast::Missing {
+                    reason,
+                    attempt: None,
+                };
+            }
+
+            let key = (*contract, peer.clone());
+            let (inflight, active_tracked) = self.begin_active_attempt(&key);
+            let first = interest.never_populated_send_starts == 0;
+            let class = if inflight {
+                MissingSummaryClass::TrackedRepeatInflight
+            } else if !first {
+                MissingSummaryClass::TrackedRepeatSequential
+            } else {
+                match interest.never_populated_origin {
+                    NeverPopulatedOrigin::New { recreated: false } => {
+                        MissingSummaryClass::TrackedFirstNew
+                    }
+                    NeverPopulatedOrigin::New { recreated: true } => {
+                        MissingSummaryClass::TrackedFirstRecreated
+                    }
+                    NeverPopulatedOrigin::OverwriteKnown => {
+                        MissingSummaryClass::TrackedFirstOverwriteKnown
+                    }
+                    NeverPopulatedOrigin::OverwriteMissing => {
+                        MissingSummaryClass::TrackedFirstOverwriteMissing
+                    }
+                }
+            };
+            interest.never_populated_send_starts =
+                interest.never_populated_send_starts.saturating_add(1);
+            let first_age_bucket = first.then(|| {
+                Self::first_send_age_bucket(
+                    now.saturating_duration_since(interest.never_populated_since),
+                )
+            });
+            return PeerSummaryForBroadcast::Missing {
+                reason,
+                attempt: Some(MissingSummaryAttempt {
+                    key,
+                    class,
+                    first_age_bucket,
+                    active_tracked,
+                }),
+            };
+        }
+
+        let key = (*contract, peer.clone());
+        let mut history = self.missing_summary_history.lock();
+        let was_present = history.peek(&key).is_some();
+        let mut record = history.get(&key).copied().unwrap_or_default();
+        if record
+            .last_observed
+            .is_some_and(|observed| now.saturating_duration_since(observed) > INTEREST_TTL)
+        {
+            record.send_starts = 0;
+            record.recent_removal = None;
+        }
+        let first = record.send_starts == 0;
+        let recreated = record
+            .recent_removal
+            .filter(|(_, removed_at)| now.saturating_duration_since(*removed_at) <= INTEREST_TTL)
+            .is_some();
+        let (inflight, active_tracked) = self.begin_active_attempt(&key);
+        let class = if inflight {
+            MissingSummaryClass::UntrackedRepeatInflight
+        } else if !first {
+            MissingSummaryClass::UntrackedRepeatSequential
+        } else if recreated {
+            MissingSummaryClass::UntrackedFirstRecreated
+        } else {
+            MissingSummaryClass::UntrackedFirstObserved
+        };
+        record.send_starts = record.send_starts.saturating_add(1);
+        record.last_observed = Some(now);
+        if !was_present && history.len() == MISSING_SUMMARY_HISTORY_SIZE {
+            self.interest_lifecycle_metrics
+                .history_overflow
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        history.put(key.clone(), record);
+        PeerSummaryForBroadcast::Missing {
+            reason: None,
+            attempt: Some(MissingSummaryAttempt {
+                key,
+                class,
+                first_age_bucket: None,
+                active_tracked,
+            }),
+        }
+    }
+
+    fn begin_active_attempt(&self, key: &(ContractKey, PeerKey)) -> (bool, bool) {
+        // `.len()` is read BEFORE `.entry()` so no shard guard is held while
+        // it runs (it read-locks every shard; doing that while holding a
+        // write lock on one of them, from `entry()` below, would
+        // self-deadlock — DashMap's shard RwLock is not reentrant). The one
+        // `entry()` match that follows then holds a single shard's guard for
+        // its whole arm, so the occupied-increment and vacant-insert are each
+        // atomic per key: two callers racing on the same never-before-seen
+        // key can no longer clobber each other (only the cross-key cap
+        // check above stays a benign soft race, documented on the field).
+        let over_cap = self.missing_summary_active.len() >= MISSING_SUMMARY_ACTIVE_SIZE;
+        match self.missing_summary_active.entry(key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                let count = entry.get_mut();
+                let inflight = *count > 0;
+                *count = count.saturating_add(1);
+                (inflight, true)
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                if over_cap {
+                    self.interest_lifecycle_metrics
+                        .active_overflow
+                        .fetch_add(1, Ordering::Relaxed);
+                    return (false, false);
+                }
+                entry.insert(1);
+                (false, true)
+            }
+        }
+    }
+
+    fn first_send_age_bucket(age: Duration) -> usize {
+        match age.as_secs() {
+            0 => 0,
+            1..=9 => 1,
+            10..=59 => 2,
+            60..=299 => 3,
+            _ => 4,
+        }
+    }
+
+    pub(crate) fn missing_summary_attempt_guard(
+        &self,
+        attempt: MissingSummaryAttempt,
+    ) -> MissingSummaryAttemptGuard<'_, T> {
+        MissingSummaryAttemptGuard {
+            manager: self,
+            attempt: Some(attempt),
+            delivered_bytes: None,
+        }
+    }
+
+    fn finish_missing_summary_attempt(
+        &self,
+        attempt: MissingSummaryAttempt,
+        delivered_bytes: Option<u64>,
+    ) {
+        if attempt.active_tracked {
+            // Single `entry()` match: decrement-or-remove stays atomic per
+            // key, so a concurrent `begin_active_attempt` increment on this
+            // exact key can never be silently dropped by this decrement.
+            if let dashmap::mapref::entry::Entry::Occupied(mut entry) =
+                self.missing_summary_active.entry(attempt.key.clone())
+            {
+                let count = entry.get_mut();
+                if *count <= 1 {
+                    entry.remove();
+                } else {
+                    *count -= 1;
+                }
+            }
+        }
+        if let Some(bytes) = delivered_bytes {
+            let index = attempt.class.index();
+            self.interest_lifecycle_metrics.delivered_sends[index].fetch_add(1, Ordering::Relaxed);
+            self.interest_lifecycle_metrics.delivered_bytes[index]
+                .fetch_add(bytes, Ordering::Relaxed);
+            if let Some(bucket) = attempt.first_age_bucket {
+                self.interest_lifecycle_metrics.first_send_age[bucket]
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub(crate) fn interest_lifecycle_snapshot(&self) -> InterestLifecycleSnapshot {
+        let load = |value: &AtomicU64| value.load(Ordering::Relaxed);
+        let mut current_summary_state = [0u64; SummaryMissingReason::COUNT + 1];
+        for contract_entry in &self.interested_peers {
+            for interest in contract_entry.value().values() {
+                let index = interest
+                    .summary_missing_reason()
+                    .map_or(0, |reason| reason.index() + 1);
+                current_summary_state[index] = current_summary_state[index].saturating_add(1);
+            }
+        }
+        InterestLifecycleSnapshot {
+            delivered_sends: std::array::from_fn(|i| {
+                load(&self.interest_lifecycle_metrics.delivered_sends[i])
+            }),
+            delivered_bytes: std::array::from_fn(|i| {
+                load(&self.interest_lifecycle_metrics.delivered_bytes[i])
+            }),
+            first_send_age: std::array::from_fn(|i| {
+                load(&self.interest_lifecycle_metrics.first_send_age[i])
+            }),
+            registration_overwrite_known: std::array::from_fn(|i| {
+                load(&self.interest_lifecycle_metrics.registration_overwrite_known[i])
+            }),
+            registration_overwrite_missing: std::array::from_fn(|i| {
+                load(
+                    &self
+                        .interest_lifecycle_metrics
+                        .registration_overwrite_missing[i],
+                )
+            }),
+            registration_new_known: std::array::from_fn(|i| {
+                load(&self.interest_lifecycle_metrics.registration_new_known[i])
+            }),
+            registration_new_missing: std::array::from_fn(|i| {
+                load(&self.interest_lifecycle_metrics.registration_new_missing[i])
+            }),
+            removals: std::array::from_fn(|i| load(&self.interest_lifecycle_metrics.removals[i])),
+            recreated_after_removal: std::array::from_fn(|i| {
+                load(&self.interest_lifecycle_metrics.recreated_after_removal[i])
+            }),
+            population: std::array::from_fn(|source| {
+                std::array::from_fn(|outcome| {
+                    load(&self.interest_lifecycle_metrics.population[source][outcome])
+                })
+            }),
+            registration_cap_rejected: std::array::from_fn(|i| {
+                load(&self.interest_lifecycle_metrics.registration_cap_rejected[i])
+            }),
+            current_summary_state,
+            history_overflow: load(&self.interest_lifecycle_metrics.history_overflow),
+            active_overflow: load(&self.interest_lifecycle_metrics.active_overflow),
+        }
+    }
+
     /// Register a peer's interest in a contract.
     ///
     /// Returns true if this is a new interest (peer wasn't previously tracked).
@@ -753,6 +1381,23 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         peer: PeerKey,
         summary: Option<StateSummary<'static>>,
         is_upstream: bool,
+    ) -> bool {
+        self.register_peer_interest_from(
+            contract,
+            peer,
+            summary,
+            is_upstream,
+            InterestRegistrationSource::Unknown,
+        )
+    }
+
+    pub(crate) fn register_peer_interest_from(
+        &self,
+        contract: &ContractKey,
+        peer: PeerKey,
+        summary: Option<StateSummary<'static>>,
+        is_upstream: bool,
+        source: InterestRegistrationSource,
     ) -> bool {
         let now = self.time_source.now();
         // Hold the `interested_peers` shard guard across `peer_contracts`
@@ -774,6 +1419,8 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         // Returns `is_new = false` so a rejected adversary is not treated as a
         // new viable target and cannot trigger the #4359 pending-broadcast flush.
         if is_new && entry.len() >= MAX_INTERESTED_PEERS_PER_CONTRACT {
+            self.interest_lifecycle_metrics.registration_cap_rejected[source.index()]
+                .fetch_add(1, Ordering::Relaxed);
             drop(entry);
             tracing::warn!(
                 contract = %contract,
@@ -783,7 +1430,47 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             return false;
         }
 
-        entry.insert(peer.clone(), PeerInterest::new(summary, is_upstream, now));
+        if is_new {
+            let counters = if summary.is_some() {
+                &self.interest_lifecycle_metrics.registration_new_known
+            } else {
+                &self.interest_lifecycle_metrics.registration_new_missing
+            };
+            counters[source.index()].fetch_add(1, Ordering::Relaxed);
+        }
+
+        let mut interest = PeerInterest::new(summary, is_upstream, now);
+        if interest.summary.is_none() {
+            if let Some(previous) = entry.get(&peer) {
+                if previous.summary.is_some() {
+                    interest.never_populated_origin = NeverPopulatedOrigin::OverwriteKnown;
+                    self.interest_lifecycle_metrics.registration_overwrite_known[source.index()]
+                        .fetch_add(1, Ordering::Relaxed);
+                } else {
+                    interest.never_populated_origin = NeverPopulatedOrigin::OverwriteMissing;
+                    self.interest_lifecycle_metrics
+                        .registration_overwrite_missing[source.index()]
+                    .fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                let recreated = self
+                    .missing_summary_history
+                    .lock()
+                    .get(&(*contract, peer.clone()))
+                    .and_then(|history| history.recent_removal)
+                    .filter(|(_, removed_at)| {
+                        now.saturating_duration_since(*removed_at) <= INTEREST_TTL
+                    });
+                interest.never_populated_origin = NeverPopulatedOrigin::New {
+                    recreated: recreated.is_some(),
+                };
+                if let Some((cause, _)) = recreated {
+                    self.interest_lifecycle_metrics.recreated_after_removal[cause.index()]
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        entry.insert(peer.clone(), interest);
 
         // Maintain reverse index for O(1) peer disconnect cleanup
         self.peer_contracts
@@ -802,10 +1489,42 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     ///
     /// Returns true if the peer was actually removed.
     pub fn remove_peer_interest(&self, contract: &ContractKey, peer: &PeerKey) -> bool {
+        self.remove_peer_interest_for(contract, peer, InterestRemovalCause::Unknown)
+    }
+
+    pub(crate) fn remove_peer_interest_for(
+        &self,
+        contract: &ContractKey,
+        peer: &PeerKey,
+        cause: InterestRemovalCause,
+    ) -> bool {
         if let Some(mut entry) = self.interested_peers.get_mut(contract) {
-            let removed = entry.remove(peer).is_some();
+            let removed_interest = entry.remove(peer);
+            let removed = removed_interest.is_some();
 
             if removed {
+                self.interest_lifecycle_metrics.removals[cause.index()]
+                    .fetch_add(1, Ordering::Relaxed);
+                let now = self.time_source.now();
+                let key = (*contract, peer.clone());
+                let mut history = self.missing_summary_history.lock();
+                let was_present = history.peek(&key).is_some();
+                let mut record = history.get(&key).copied().unwrap_or_default();
+                if let Some(interest) = removed_interest.as_ref()
+                    && interest.summary_missing_reason()
+                        == Some(SummaryMissingReason::NeverPopulated)
+                {
+                    record.send_starts =
+                        record.send_starts.max(interest.never_populated_send_starts);
+                }
+                record.recent_removal = Some((cause, now));
+                if !was_present && history.len() == MISSING_SUMMARY_HISTORY_SIZE {
+                    self.interest_lifecycle_metrics
+                        .history_overflow
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                history.put(key, record);
+
                 // Maintain reverse index
                 if let Some(mut peer_entry) = self.peer_contracts.get_mut(peer) {
                     peer_entry.remove(contract);
@@ -900,6 +1619,17 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         peer: &PeerKey,
         summary: StateSummary<'static>,
     ) -> bool {
+        self.upsert_peer_summary_from(contract, peer, summary, SummaryPopulationSource::Unknown)
+            != SummaryPopulationOutcome::RejectedAtCap
+    }
+
+    pub(crate) fn upsert_peer_summary_from(
+        &self,
+        contract: &ContractKey,
+        peer: &PeerKey,
+        summary: StateSummary<'static>,
+        source: SummaryPopulationSource,
+    ) -> SummaryPopulationOutcome {
         let now = self.time_source.now();
         // Hold the `interested_peers` shard guard across the `peer_contracts`
         // and hash-index writes — same #4129/#4171 discipline as
@@ -907,8 +1637,18 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         // leaving a zombie reverse-index entry.
         let mut entry = self.interested_peers.entry(*contract).or_default();
         if let Some(interest) = entry.get_mut(peer) {
+            let outcome = if interest.summary.is_some() {
+                SummaryPopulationOutcome::RefreshedKnown
+            } else {
+                SummaryPopulationOutcome::FilledMissing
+            };
             interest.set_summary(summary, now);
-            return true;
+            self.missing_summary_history
+                .lock()
+                .pop(&(*contract, peer.clone()));
+            self.interest_lifecycle_metrics.population[source.index()][outcome.index()]
+                .fetch_add(1, Ordering::Relaxed);
+            return outcome;
         }
         if entry.len() >= MAX_INTERESTED_PEERS_PER_CONTRACT {
             // At cap the entry is non-empty, so no cleanup is needed; the
@@ -924,7 +1664,10 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 limit = MAX_INTERESTED_PEERS_PER_CONTRACT,
                 "upsert_peer_summary: at interested-peer cap, peer stays untracked (full-state sends continue)"
             );
-            return false;
+            let outcome = SummaryPopulationOutcome::RejectedAtCap;
+            self.interest_lifecycle_metrics.population[source.index()][outcome.index()]
+                .fetch_add(1, Ordering::Relaxed);
+            return outcome;
         }
         entry.insert(peer.clone(), PeerInterest::new(Some(summary), false, now));
         self.peer_contracts
@@ -932,8 +1675,14 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             .or_default()
             .insert(*contract);
         self.index_contract_hash(contract);
+        self.missing_summary_history
+            .lock()
+            .pop(&(*contract, peer.clone()));
+        let outcome = SummaryPopulationOutcome::CreatedUntracked;
+        self.interest_lifecycle_metrics.population[source.index()][outcome.index()]
+            .fetch_add(1, Ordering::Relaxed);
         drop(entry);
-        true
+        outcome
     }
 
     /// Refresh the TTL for a peer's interest, leaving `is_upstream` and any
@@ -1194,6 +1943,10 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// `peer ∈ peer_contracts[peer] ⇔ peer ∈ interested_peers[contract]`
     /// is preserved even under a concurrent re-registration.
     pub fn remove_all_peer_interests(&self, peer: &PeerKey) -> usize {
+        self.remove_all_peer_interests_for(peer, InterestRemovalCause::Unknown)
+    }
+
+    fn remove_all_peer_interests_for(&self, peer: &PeerKey, cause: InterestRemovalCause) -> usize {
         // Snapshot the contracts this peer is interested in WITHOUT
         // removing the reverse-index entry — `remove_peer_interest`
         // owns the `peer_contracts` update for each contract so the
@@ -1213,7 +1966,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         // already cleared an entry between the snapshot and here).
         let removed_count = contracts
             .iter()
-            .filter(|contract| self.remove_peer_interest(contract, peer))
+            .filter(|contract| self.remove_peer_interest_for(contract, peer, cause))
             .count();
 
         if removed_count > 0 {
@@ -1272,7 +2025,8 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             // already removed it (peer reconnected between collect and here), skip
             // the interest removal to avoid a TOCTOU race.
             if self.pending_removals.remove(peer).is_some() {
-                let removed = self.remove_all_peer_interests(peer);
+                let removed =
+                    self.remove_all_peer_interests_for(peer, InterestRemovalCause::DisconnectGrace);
                 tracing::info!(
                     peer = %peer.0,
                     removed_interests = removed,
@@ -1418,7 +2172,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         local_client_count: usize,
     ) {
         for peer in downstream_peers {
-            self.remove_peer_interest(contract, peer);
+            self.remove_peer_interest_for(contract, peer, InterestRemovalCause::Eviction);
             self.remove_downstream_subscriber(contract);
         }
         for _ in 0..local_client_count {
@@ -1507,7 +2261,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
 
         // Remove expired entries
         for (contract, peer) in &expired {
-            self.remove_peer_interest(contract, peer);
+            self.remove_peer_interest_for(contract, peer, InterestRemovalCause::TtlExpiry);
         }
 
         if !expired.is_empty() {
@@ -2335,6 +3089,249 @@ mod tests {
 
         // Remove again returns false
         assert!(!manager.remove_peer_interest(&contract, &peer));
+    }
+
+    #[test]
+    fn missing_summary_lifecycle_is_delivery_gated_and_classifies_repeats() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(71);
+        let peer = make_peer_key(71);
+        manager.register_peer_interest_from(
+            &contract,
+            peer.clone(),
+            None,
+            false,
+            InterestRegistrationSource::Interests,
+        );
+
+        let PeerSummaryForBroadcast::Missing {
+            attempt: Some(attempt),
+            ..
+        } = manager.begin_peer_summary_broadcast(&contract, &peer)
+        else {
+            panic!("new summaryless interest must start lifecycle accounting");
+        };
+        assert_eq!(attempt.class, MissingSummaryClass::TrackedFirstNew);
+        // A failed/cancelled send must release the in-flight slot but record no
+        // delivered bytes.
+        drop(manager.missing_summary_attempt_guard(attempt));
+        assert_eq!(
+            manager.interest_lifecycle_snapshot().delivered_sends,
+            [0; MissingSummaryClass::COUNT]
+        );
+
+        let PeerSummaryForBroadcast::Missing {
+            attempt: Some(attempt),
+            ..
+        } = manager.begin_peer_summary_broadcast(&contract, &peer)
+        else {
+            panic!("summary is still missing");
+        };
+        assert_eq!(attempt.class, MissingSummaryClass::TrackedRepeatSequential);
+        let mut guard = manager.missing_summary_attempt_guard(attempt);
+        guard.mark_delivered(3 * 1024 * 1024);
+        drop(guard);
+        let snapshot = manager.interest_lifecycle_snapshot();
+        assert_eq!(
+            snapshot.delivered_sends[MissingSummaryClass::TrackedRepeatSequential.index()],
+            1
+        );
+        assert_eq!(
+            snapshot.delivered_bytes[MissingSummaryClass::TrackedRepeatSequential.index()],
+            3 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn lifecycle_records_overwrite_recreation_and_population_sources() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(72);
+        let peer = make_peer_key(72);
+        let summary = StateSummary::from(vec![1, 2, 3]);
+        manager.register_peer_interest_from(
+            &contract,
+            peer.clone(),
+            Some(summary.clone()),
+            false,
+            InterestRegistrationSource::Interests,
+        );
+        assert!(!manager.register_peer_interest_from(
+            &contract,
+            peer.clone(),
+            None,
+            false,
+            InterestRegistrationSource::ChangeInterests,
+        ));
+        let snapshot = manager.interest_lifecycle_snapshot();
+        assert_eq!(
+            snapshot.registration_overwrite_known
+                [InterestRegistrationSource::ChangeInterests.index()],
+            1
+        );
+
+        assert!(manager.remove_peer_interest_for(
+            &contract,
+            &peer,
+            InterestRemovalCause::InterestsReplace,
+        ));
+        assert!(manager.register_peer_interest_from(
+            &contract,
+            peer.clone(),
+            None,
+            false,
+            InterestRegistrationSource::Interests,
+        ));
+        let PeerSummaryForBroadcast::Missing {
+            attempt: Some(attempt),
+            ..
+        } = manager.begin_peer_summary_broadcast(&contract, &peer)
+        else {
+            panic!("recreated entry must be summaryless");
+        };
+        assert_eq!(attempt.class, MissingSummaryClass::TrackedFirstRecreated);
+        drop(manager.missing_summary_attempt_guard(attempt));
+
+        assert_eq!(
+            manager.upsert_peer_summary_from(
+                &contract,
+                &peer,
+                summary,
+                SummaryPopulationSource::InterestSummary,
+            ),
+            SummaryPopulationOutcome::FilledMissing
+        );
+        let snapshot = manager.interest_lifecycle_snapshot();
+        assert_eq!(
+            snapshot.recreated_after_removal[InterestRemovalCause::InterestsReplace.index()],
+            1
+        );
+        assert_eq!(
+            snapshot.population[SummaryPopulationSource::InterestSummary.index()]
+                [SummaryPopulationOutcome::FilledMissing.index()],
+            1
+        );
+    }
+
+    #[test]
+    fn lifecycle_snapshot_has_registration_removal_current_and_inflight_denominators() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(73);
+        let known_peer = make_peer_key(73);
+        let missing_peer = make_peer_key(74);
+        assert!(manager.register_peer_interest_from(
+            &contract,
+            known_peer.clone(),
+            Some(StateSummary::from(vec![1])),
+            false,
+            InterestRegistrationSource::Get,
+        ));
+        assert!(manager.register_peer_interest_from(
+            &contract,
+            missing_peer.clone(),
+            None,
+            false,
+            InterestRegistrationSource::SubscribeRelay,
+        ));
+
+        let first = match manager.begin_peer_summary_broadcast(&contract, &missing_peer) {
+            PeerSummaryForBroadcast::Missing {
+                attempt: Some(attempt),
+                ..
+            } => attempt,
+            _ => panic!("missing peer must produce a tracked attempt"),
+        };
+        let second = match manager.begin_peer_summary_broadcast(&contract, &missing_peer) {
+            PeerSummaryForBroadcast::Missing {
+                attempt: Some(attempt),
+                ..
+            } => attempt,
+            _ => panic!("overlapping missing send must produce another attempt"),
+        };
+        assert_eq!(second.class, MissingSummaryClass::TrackedRepeatInflight);
+        drop(manager.missing_summary_attempt_guard(first));
+        drop(manager.missing_summary_attempt_guard(second));
+        assert!(manager.remove_peer_interest_for(
+            &contract,
+            &known_peer,
+            InterestRemovalCause::Unsubscribe,
+        ));
+
+        let snapshot = manager.interest_lifecycle_snapshot();
+        assert_eq!(
+            snapshot.registration_new_known[InterestRegistrationSource::Get.index()],
+            1
+        );
+        assert_eq!(
+            snapshot.registration_new_missing[InterestRegistrationSource::SubscribeRelay.index()],
+            1
+        );
+        assert_eq!(
+            snapshot.removals[InterestRemovalCause::Unsubscribe.index()],
+            1
+        );
+        assert_eq!(snapshot.current_summary_state[0], 0);
+        assert_eq!(
+            snapshot.current_summary_state[SummaryMissingReason::NeverPopulated.index() + 1],
+            1
+        );
+    }
+
+    #[test]
+    fn lifecycle_first_send_age_bucket_boundaries_are_exact() {
+        for (seconds, expected) in [
+            (0, 0),
+            (1, 1),
+            (9, 1),
+            (10, 2),
+            (59, 2),
+            (60, 3),
+            (299, 3),
+            (300, 4),
+        ] {
+            assert_eq!(
+                TestInterestManager::first_send_age_bucket(Duration::from_secs(seconds)),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_correlation_overflow_is_bounded_and_observable() {
+        let (manager, _time) = make_manager();
+
+        for seed in 0..=MISSING_SUMMARY_HISTORY_SIZE as u32 {
+            let attempt = match manager.begin_peer_summary_broadcast(
+                &make_unique_contract_key(seed),
+                &make_unique_peer_key(seed),
+            ) {
+                PeerSummaryForBroadcast::Missing {
+                    attempt: Some(attempt),
+                    ..
+                } => attempt,
+                _ => panic!("untracked pair must produce an attempt"),
+            };
+            drop(manager.missing_summary_attempt_guard(attempt));
+        }
+
+        let mut guards = Vec::new();
+        for seed in 10_000..10_000 + MISSING_SUMMARY_ACTIVE_SIZE as u32 + 1 {
+            let attempt = match manager.begin_peer_summary_broadcast(
+                &make_unique_contract_key(seed),
+                &make_unique_peer_key(seed),
+            ) {
+                PeerSummaryForBroadcast::Missing {
+                    attempt: Some(attempt),
+                    ..
+                } => attempt,
+                _ => panic!("untracked pair must produce an attempt"),
+            };
+            guards.push(manager.missing_summary_attempt_guard(attempt));
+        }
+
+        let snapshot = manager.interest_lifecycle_snapshot();
+        assert!(snapshot.history_overflow >= 1);
+        assert_eq!(snapshot.active_overflow, 1);
+        drop(guards);
     }
 
     /// Regression for the InterestManager desync on subscribed eviction
@@ -3414,7 +4411,7 @@ mod tests {
         let stripped = prod_source(include_str!("../operations/subscribe.rs"));
 
         let bare = stripped
-            .matches("register_peer_interest(&key,peer_key,None,true)")
+            .matches("register_peer_interest_from(&key,peer_key,None,true,")
             .count();
         let guarded = stripped
             .matches("refresh_peer_interest_with_upstream(&key,&peer_key,true)")
@@ -3436,7 +4433,7 @@ mod tests {
         assert_eq!(
             stripped
                 .matches(
-                    "refresh_peer_interest_with_upstream(&key,&peer_key,true){false}else{op_manager.interest_manager.register_peer_interest(&key,peer_key,None,true)"
+                    "refresh_peer_interest_with_upstream(&key,&peer_key,true){false}else{op_manager.interest_manager.register_peer_interest_from(&key,peer_key,None,true,"
                 )
                 .count(),
             2,
@@ -3449,7 +4446,7 @@ mod tests {
         // asserting that on an existing entry would downgrade a real upstream.
         assert!(
             stripped.contains(
-                "refresh_peer_interest(key,&peer_key){op_manager.interest_manager.register_peer_interest(key,peer_key,None,false)"
+                "refresh_peer_interest(key,&peer_key){op_manager.interest_manager.register_peer_interest_from(key,peer_key,None,false,"
             ),
             "register_downstream_subscriber must register only when the refresh \
              reports no existing entry (a bare register wipes the cached summary \
@@ -3473,7 +4470,7 @@ mod tests {
         // so a register that runs regardless of the refresh fails here.
         assert!(
             stripped.contains(
-                "refresh_peer_interest(&key,&peer_key){false}else{op_manager.interest_manager.register_peer_interest(&key,peer_key,None,false)"
+                "refresh_peer_interest(&key,&peer_key){false}else{op_manager.interest_manager.register_peer_interest_from(&key,peer_key,None,false,"
             ),
             "the remote-GET registration must register ONLY when the refresh \
              reports no existing entry — otherwise it inserts a fresh \
@@ -3485,7 +4482,7 @@ mod tests {
         // register elsewhere would leave the assertion above green while
         // reintroducing the clobber.
         assert_eq!(
-            stripped.matches("register_peer_interest(").count(),
+            stripped.matches("register_peer_interest_from(").count(),
             1,
             "get/op_ctx_task.rs must contain exactly ONE register_peer_interest \
              call — the guarded one; a second is an unguarded clobber"

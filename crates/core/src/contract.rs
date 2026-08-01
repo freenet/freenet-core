@@ -17,6 +17,7 @@ pub(crate) use fair_queue::Priority;
 pub(crate) use fair_queue::{FairQueueStats, global_stats as fair_queue_stats};
 pub(crate) mod governance;
 mod handler;
+mod state_size_metrics;
 pub mod storages;
 pub(crate) mod user_input;
 
@@ -42,6 +43,9 @@ pub(crate) use handler::{
 
 pub use executor::{ContractQueueFull, Executor, ExecutorError, OperationMode};
 pub use handler::reset_event_id_counter;
+pub(crate) use state_size_metrics::{
+    StateSizeRejectionStage, record_state_size_rejection, state_size_rejection_snapshot,
+};
 
 use freenet_stdlib::client_api::DelegateRequest;
 use tracing::Instrument;

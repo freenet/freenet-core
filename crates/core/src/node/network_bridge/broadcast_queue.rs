@@ -30,6 +30,20 @@ use super::p2p_protoc::P2pBridge;
 /// `queue` submodule.
 const STREAM_COMPLETION_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The queued state size used to choose the small or large concurrency pool.
+/// The actual delta/full payload may be much smaller; telemetry records that
+/// mismatch at the point where the wire payload is known.
+const BROADCAST_QUEUE_PAYLOAD_SIZE_THRESHOLD: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// The simulation feature replaces the production queue, but keeps the shared
+// payload-selection path and its public signature compiled.
+#[cfg_attr(feature = "simulation_tests", allow(dead_code))]
+pub(super) enum QueuedPayloadClass {
+    Small,
+    Large,
+}
+
 /// Process-global UPDATE-broadcast stream-assembly telemetry (#4440).
 ///
 /// The streaming broadcast path (`broadcast_to_single_peer`'s `use_streaming`
@@ -325,6 +339,8 @@ pub(super) async fn fanout_send_needed(
 mod queue {
     use std::collections::{HashMap, VecDeque};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
 
     use freenet_stdlib::prelude::{ContractKey, WrappedState};
     use tokio::sync::{Mutex, Notify, Semaphore};
@@ -333,7 +349,7 @@ mod queue {
     use crate::ring::PeerKeyLocation;
 
     use super::super::p2p_protoc::P2pBridge;
-    use super::broadcast_to_single_peer;
+    use super::{QueuedPayloadClass, broadcast_to_single_peer};
 
     /// Maximum concurrent outbound broadcast streams for small payloads (< 64KB).
     /// Small payloads (deltas, chat messages) can fan out aggressively without
@@ -343,10 +359,6 @@ mod queue {
     /// Maximum concurrent outbound broadcast streams for large payloads (>= 64KB).
     /// Large payloads (full state) are rate-limited to avoid uplink saturation.
     const DEFAULT_LARGE_PAYLOAD_CONCURRENCY: usize = 2;
-
-    /// Payload size threshold for choosing the small vs large concurrency pool.
-    /// Matches the streaming threshold used elsewhere in the broadcast path.
-    const PAYLOAD_SIZE_THRESHOLD: usize = 64 * 1024;
 
     /// Maximum entries in the queue before oldest are dropped.
     const DEFAULT_MAX_QUEUE_DEPTH: usize = 256;
@@ -369,6 +381,107 @@ mod queue {
         order: VecDeque<DedupeKey>,
         /// Actual entries, keyed by (contract, peer). Dedup replaces the state in-place.
         entries: HashMap<DedupeKey, BroadcastEntry>,
+        /// Pairs already removed from the queue but waiting for a permit or
+        /// actively sending. Observation-only: enqueue still behaves exactly
+        /// as before, while telemetry can identify duplicates that queued
+        /// deduplication cannot see.
+        active: HashMap<DedupeKey, u64>,
+        /// Number of nominal-small entries still queued. Maintained under the
+        /// queue lock so head-of-line observation is O(1).
+        small_queued: usize,
+        /// Time integral for the one FIFO worker waiting at a large-payload
+        /// permit. Updated on every small-queue population change, so arrivals
+        /// during the wait are included rather than sampled away.
+        hol_block: Option<HolBlockHandle>,
+    }
+
+    #[derive(Clone)]
+    struct HolBlockHandle(Arc<HolBlockState>);
+
+    struct HolBlockState {
+        finished: AtomicBool,
+        observation: std::sync::Mutex<HolBlockObservation>,
+    }
+
+    struct HolBlockObservation {
+        started: Instant,
+        last_updated: Instant,
+        small_queued: usize,
+        small_entry_millis: u128,
+        observed_small: bool,
+    }
+
+    impl HolBlockHandle {
+        fn is_finished(&self) -> bool {
+            self.0.finished.load(Ordering::Acquire)
+        }
+
+        fn set_small_queued(&self, next: usize, now: Instant) {
+            if self.is_finished() {
+                return;
+            }
+            let mut block = self.0.observation.lock().unwrap();
+            // `finish_now` may have won the mutex after the fast-path load.
+            if self.is_finished() {
+                return;
+            }
+            block.advance(now);
+            block.small_queued = next;
+            block.observed_small |= next > 0;
+        }
+
+        /// Freeze the integral and its end timestamp as one linearized action.
+        /// Capturing `now` only after taking the same mutex used by queue-size
+        /// updates prevents a later-timestamp update from being incorporated
+        /// before an older semaphore-acquisition cutoff can be applied.
+        fn finish_now(&self) -> Option<(u64, u64)> {
+            let mut block = self.0.observation.lock().unwrap();
+            if self.is_finished() {
+                return None;
+            }
+            let now = Instant::now();
+            self.finish_locked(&mut block, now)
+        }
+
+        #[cfg(test)]
+        fn finish_at(&self, now: Instant) -> Option<(u64, u64)> {
+            let mut block = self.0.observation.lock().unwrap();
+            if self.is_finished() {
+                return None;
+            }
+            self.finish_locked(&mut block, now)
+        }
+
+        fn finish_locked(
+            &self,
+            block: &mut HolBlockObservation,
+            now: Instant,
+        ) -> Option<(u64, u64)> {
+            block.advance(now);
+            let result = block.observed_small.then(|| {
+                let blocked_millis = now
+                    .saturating_duration_since(block.started)
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64;
+                let small_entry_millis = block.small_entry_millis.min(u128::from(u64::MAX)) as u64;
+                (blocked_millis, small_entry_millis)
+            });
+            self.0.finished.store(true, Ordering::Release);
+            result
+        }
+    }
+
+    impl HolBlockObservation {
+        fn advance(&mut self, now: Instant) {
+            if now <= self.last_updated {
+                return;
+            }
+            let millis = now.saturating_duration_since(self.last_updated).as_millis();
+            self.small_entry_millis = self
+                .small_entry_millis
+                .saturating_add(millis.saturating_mul(self.small_queued as u128));
+            self.last_updated = now;
+        }
     }
 
     impl QueueState {
@@ -376,6 +489,9 @@ mod queue {
             Self {
                 order: VecDeque::new(),
                 entries: HashMap::new(),
+                active: HashMap::new(),
+                small_queued: 0,
+                hol_block: None,
             }
         }
 
@@ -384,14 +500,105 @@ mod queue {
         }
 
         /// Pop the oldest entry. Skips stale keys (removed by eviction or dedup).
-        fn pop_front(&mut self) -> Option<BroadcastEntry> {
+        fn pop_front(&mut self, now: Instant) -> Option<BroadcastEntry> {
             while let Some(key) = self.order.pop_front() {
                 if let Some(entry) = self.entries.remove(&key) {
+                    if entry.payload_size < super::BROADCAST_QUEUE_PAYLOAD_SIZE_THRESHOLD {
+                        self.set_small_queued(self.small_queued.saturating_sub(1), now);
+                    }
                     return Some(entry);
                 }
                 // Stale key (was evicted or already popped), skip
             }
             None
+        }
+
+        fn set_small_queued(&mut self, next: usize, now: Instant) {
+            self.small_queued = next;
+            if self
+                .hol_block
+                .as_ref()
+                .is_some_and(HolBlockHandle::is_finished)
+            {
+                self.hol_block = None;
+            }
+            if let Some(block) = &self.hol_block {
+                block.set_small_queued(next, now);
+            }
+        }
+
+        fn start_hol(&mut self, now: Instant) -> HolBlockHandle {
+            let block = HolBlockHandle(Arc::new(HolBlockState {
+                finished: AtomicBool::new(false),
+                observation: std::sync::Mutex::new(HolBlockObservation {
+                    started: now,
+                    last_updated: now,
+                    small_queued: self.small_queued,
+                    small_entry_millis: 0,
+                    observed_small: self.small_queued > 0,
+                }),
+            }));
+            self.hol_block = Some(block.clone());
+            block
+        }
+
+        fn track_active(&mut self, key: DedupeKey) -> bool {
+            if let Some(count) = self.active.get_mut(&key) {
+                *count = count.saturating_add(1);
+                return true;
+            }
+            if self.active.len() >= DEFAULT_MAX_QUEUE_DEPTH {
+                return false;
+            }
+            self.active.insert(key, 1);
+            true
+        }
+
+        fn untrack_active(&mut self, key: &DedupeKey) {
+            if let Some(count) = self.active.get_mut(key) {
+                if *count > 1 {
+                    *count -= 1;
+                } else {
+                    self.active.remove(key);
+                }
+            }
+        }
+    }
+
+    struct ActiveSendGuard {
+        queue: Arc<Mutex<QueueState>>,
+        key: DedupeKey,
+        tracked: bool,
+    }
+
+    impl ActiveSendGuard {
+        /// Normal completion path: update the refcount directly and disarm the
+        /// cancellation fallback. The caller releases its semaphore permit
+        /// first, so diagnostic cleanup never holds scheduler capacity idle.
+        async fn finish(mut self) {
+            if self.tracked {
+                self.queue.lock().await.untrack_active(&self.key);
+                self.tracked = false;
+            }
+        }
+    }
+
+    impl Drop for ActiveSendGuard {
+        fn drop(&mut self) {
+            if !self.tracked {
+                return;
+            }
+            if let Ok(mut queue) = self.queue.try_lock() {
+                queue.untrack_active(&self.key);
+                return;
+            }
+            let queue = self.queue.clone();
+            let key = self.key.clone();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    queue.lock().await.untrack_active(&key);
+                });
+            }
         }
     }
 
@@ -435,9 +642,14 @@ mod queue {
             let dedup_key = (key, target.clone());
             let mut queue = self.queue.lock().await;
 
+            if queue.active.contains_key(&dedup_key) {
+                crate::node::BROADCAST_QUEUE_EFFICIENCY_METRICS.record_enqueue_while_active();
+            }
+
             // Replace-on-dedup: if same contract+peer exists, update state in-place
             if let Some(existing) = queue.entries.get_mut(&dedup_key) {
                 existing.new_state = new_state;
+                crate::node::BROADCAST_QUEUE_EFFICIENCY_METRICS.record_dedup_replacement();
                 tracing::trace!(
                     contract = %dedup_key.0,
                     peer = ?target.socket_addr(),
@@ -446,7 +658,8 @@ mod queue {
             } else {
                 // Evict oldest if at capacity
                 while queue.len() >= self.max_queue_depth {
-                    if let Some(entry) = queue.pop_front() {
+                    if let Some(entry) = queue.pop_front(Instant::now()) {
+                        crate::node::BROADCAST_QUEUE_EFFICIENCY_METRICS.record_capacity_eviction();
                         tracing::warn!(
                             contract = %entry.key,
                             peer = ?entry.target.socket_addr(),
@@ -458,6 +671,10 @@ mod queue {
                     }
                 }
                 let payload_size = new_state.size();
+                if payload_size < super::BROADCAST_QUEUE_PAYLOAD_SIZE_THRESHOLD {
+                    let next = queue.small_queued.saturating_add(1);
+                    queue.set_small_queued(next, Instant::now());
+                }
                 queue.entries.insert(
                     dedup_key.clone(),
                     BroadcastEntry {
@@ -503,13 +720,21 @@ mod queue {
                     // Drain all available entries
                     let mut drained_any = false;
                     loop {
-                        let entry = {
+                        let (entry, active_tracked) = {
                             let mut q = queue.lock().await;
-                            let entry = q.pop_front();
+                            let entry = q.pop_front(Instant::now());
+                            let active_tracked = entry.as_ref().is_none_or(|entry| {
+                                let tracked = q.track_active((entry.key, entry.target.clone()));
+                                if !tracked {
+                                    crate::node::BROADCAST_QUEUE_EFFICIENCY_METRICS
+                                        .record_active_tracking_overflow();
+                                }
+                                tracked
+                            });
                             // Phase 1.6 (#4074): publish post-drain depth
                             // under the lock for the shadow demand gauge.
                             crate::transport::shadow_demand::record_broadcast_queue_depth(q.len());
-                            entry
+                            (entry, active_tracked)
                         };
 
                         let Some(entry) = entry else {
@@ -520,7 +745,16 @@ mod queue {
                         // Select concurrency pool based on payload size.
                         // Small payloads (deltas, chat messages) get high concurrency for
                         // fast fan-out. Large payloads get low concurrency to avoid saturation.
-                        let sem = if entry.payload_size < PAYLOAD_SIZE_THRESHOLD {
+                        let nominally_large =
+                            entry.payload_size >= super::BROADCAST_QUEUE_PAYLOAD_SIZE_THRESHOLD;
+                        let queued_class = if nominally_large {
+                            QueuedPayloadClass::Large
+                        } else {
+                            QueuedPayloadClass::Small
+                        };
+                        crate::node::BROADCAST_QUEUE_EFFICIENCY_METRICS
+                            .record_scheduled(nominally_large, entry.payload_size);
+                        let sem = if !nominally_large {
                             small_semaphore.clone()
                         } else {
                             large_semaphore.clone()
@@ -528,8 +762,25 @@ mod queue {
 
                         // Acquire semaphore permit to limit concurrent streams.
                         // This blocks until a slot is available.
+                        let blocked = nominally_large && sem.available_permits() == 0;
+                        let hol_block = if blocked {
+                            Some(queue.lock().await.start_hol(Instant::now()))
+                        } else {
+                            None
+                        };
+                        let active_guard = ActiveSendGuard {
+                            queue: queue.clone(),
+                            key: (entry.key, entry.target.clone()),
+                            tracked: active_tracked,
+                        };
                         let permit = sem.acquire_owned().await;
+                        let hol_metrics = hol_block.as_ref().and_then(HolBlockHandle::finish_now);
                         let Ok(permit) = permit else {
+                            if let Some((blocked_millis, small_entry_millis)) = hol_metrics {
+                                crate::node::BROADCAST_QUEUE_EFFICIENCY_METRICS
+                                    .record_large_head_block(blocked_millis, small_entry_millis);
+                            }
+                            active_guard.finish().await;
                             tracing::error!("Broadcast queue semaphore closed unexpectedly");
                             return;
                         };
@@ -538,17 +789,28 @@ mod queue {
                         let op_manager = op_manager.clone();
 
                         tokio::spawn(async move {
-                            let _permit = permit; // Held until this task completes
-
                             broadcast_to_single_peer(
                                 &bridge,
                                 &op_manager,
                                 entry.key,
                                 entry.new_state,
                                 entry.target,
+                                Some(queued_class),
                             )
                             .await;
+                            // Release scheduler capacity before diagnostic
+                            // cleanup can wait on the queue lock.
+                            drop(permit);
+                            active_guard.finish().await;
                         });
+
+                        // The transfer is runnable before diagnostic counter
+                        // publication. `finish_now` already froze the exact
+                        // semaphore/HOL interval at permit acquisition.
+                        if let Some((blocked_millis, small_entry_millis)) = hol_metrics {
+                            crate::node::BROADCAST_QUEUE_EFFICIENCY_METRICS
+                                .record_large_head_block(blocked_millis, small_entry_millis);
+                        }
                     }
 
                     if !drained_any {
@@ -559,6 +821,84 @@ mod queue {
                     // (the pre-registered notified future is dropped, which is fine)
                 }
             })
+        }
+    }
+
+    #[cfg(test)]
+    mod observation_tests {
+        use super::*;
+        use std::time::Duration;
+
+        #[test]
+        fn hol_integral_includes_small_entries_arriving_during_wait() {
+            let start = Instant::now();
+            let mut queue = QueueState::new();
+            let hol = queue.start_hol(start);
+            queue.set_small_queued(1, start + Duration::from_millis(10));
+            queue.set_small_queued(2, start + Duration::from_millis(20));
+
+            assert_eq!(
+                hol.finish_at(start + Duration::from_millis(30)),
+                Some((30, 30)),
+                "integral is 0×10ms + 1×10ms + 2×10ms"
+            );
+            queue.set_small_queued(9, start + Duration::from_millis(40));
+            assert!(hol.is_finished());
+            assert!(
+                queue.hol_block.is_none(),
+                "first later mutation clears the handle"
+            );
+            assert_eq!(hol.finish_at(start + Duration::from_millis(40)), None);
+        }
+
+        #[test]
+        fn active_refcount_survives_one_of_two_overlapping_completions() {
+            let mut queue = QueueState::new();
+            let code = freenet_stdlib::prelude::ContractCode::from(vec![7]);
+            let params = freenet_stdlib::prelude::Parameters::from(vec![9]);
+            let key = (
+                ContractKey::from_params_and_code(&params, &code),
+                PeerKeyLocation::random(),
+            );
+            assert!(queue.track_active(key.clone()));
+            assert!(queue.track_active(key.clone()));
+            queue.untrack_active(&key);
+            assert_eq!(queue.active.get(&key), Some(&1));
+            queue.untrack_active(&key);
+            assert!(!queue.active.contains_key(&key));
+        }
+
+        #[test]
+        fn worker_wires_hol_boundaries_and_direct_normal_cleanup() {
+            let src = include_str!("broadcast_queue.rs");
+            let start = src.find("pub(crate) fn start_worker(").unwrap();
+            let end = src[start..].find("} // end `mod queue`").unwrap() + start;
+            let worker = &src[start..end];
+            let hol_start = worker.find("start_hol(Instant::now())").unwrap();
+            let acquire = worker.find("sem.acquire_owned().await").unwrap();
+            assert!(
+                hol_start < acquire,
+                "HOL observation must start before waiting"
+            );
+
+            let freeze = worker.find("and_then(HolBlockHandle::finish_now)").unwrap();
+            let permit_match = worker.find("let Ok(permit) = permit").unwrap();
+            assert!(
+                acquire < freeze && freeze < permit_match,
+                "linearize the integral immediately after permit acquisition"
+            );
+            assert!(
+                !worker[acquire + "sem.acquire_owned().await".len()..freeze].contains(".await"),
+                "no further await may separate permit acquisition from HOL linearization"
+            );
+            let success = &worker[worker.find("let Ok(permit) = permit").unwrap()..];
+            let spawn = success.find("tokio::spawn(async move").unwrap();
+            let task = &success[spawn..];
+            assert!(
+                task.find("drop(permit);").unwrap()
+                    < task.find("active_guard.finish().await").unwrap(),
+                "normal tracking cleanup must run directly after releasing capacity"
+            );
         }
     }
 } // end `mod queue` (cfg-gated)
@@ -710,7 +1050,12 @@ fn record_delivery_to_interest<T: crate::util::time_source::TimeSource + Sync>(
     // fixed point: full state on every update, forever. The upsert creates the
     // entry (capped, no demand-counter writes) so the next send is a delta.
     if let Some(summary) = our_summary {
-        interest_manager.upsert_peer_summary(key, peer_key, summary.clone());
+        interest_manager.upsert_peer_summary_from(
+            key,
+            peer_key,
+            summary.clone(),
+            crate::ring::interest::SummaryPopulationSource::Delivery,
+        );
     }
 }
 
@@ -728,6 +1073,7 @@ pub(super) async fn broadcast_to_single_peer(
     key: ContractKey,
     new_state: WrappedState,
     target: PeerKeyLocation,
+    queued_class: Option<QueuedPayloadClass>,
 ) {
     use crate::message::{DeltaOrFullState, NetMessage};
     use crate::node::network_bridge::NetworkBridge;
@@ -800,10 +1146,29 @@ pub(super) async fn broadcast_to_single_peer(
         .get_contract_summary(op_manager, &key)
         .await;
 
-    // Get peer's cached summary
-    let their_summary = op_manager
-        .interest_manager
-        .get_peer_summary(&key, &peer_key);
+    // Read and classify the peer-summary state in one interest-manager
+    // critical section. The optional RAII guard below only records impact if
+    // the send reaches its real delivery gate.
+    let (their_summary, tracked_missing_reason, missing_attempt) = if our_summary.is_some() {
+        match op_manager
+            .interest_manager
+            .begin_peer_summary_broadcast(&key, &peer_key)
+        {
+            crate::ring::interest::PeerSummaryForBroadcast::Known(summary) => {
+                (Some(summary), None, None)
+            }
+            crate::ring::interest::PeerSummaryForBroadcast::Missing { reason, attempt } => {
+                (None, reason, attempt)
+            }
+        }
+    } else {
+        (None, None, None)
+    };
+    let mut missing_attempt_guard = missing_attempt.map(|attempt| {
+        op_manager
+            .interest_manager
+            .missing_summary_attempt_guard(attempt)
+    });
 
     // Semantic skip (#4894's fan-out counterpart). Byte-identical summaries
     // skip as before; byte-DIFFERING summaries are no longer trusted as proof
@@ -904,7 +1269,6 @@ pub(super) async fn broadcast_to_single_peer(
     let mut not_efficient_gate_inputs: Option<(usize, usize)> = None;
     // #4961: WHY a tracked peer has no cached summary. Set only on the
     // `FullNoTheirSummaryTracked` arm below, where the entry exists to be read.
-    let mut tracked_missing_reason: Option<crate::ring::interest::SummaryMissingReason> = None;
     let (payload, sent_delta, payload_arm) = match (&our_summary, &their_summary) {
         // Scoped to the both-summaries-present case ON PURPOSE. When a summary
         // is missing a delta was impossible regardless of the memo, so letting
@@ -1029,21 +1393,7 @@ pub(super) async fn broadcast_to_single_peer(
             PayloadArm::FullNoOurSummary,
         ),
         (Some(_), None) => {
-            let arm = if let Some(interest) = op_manager
-                .interest_manager
-                .get_peer_interest(&key, &peer_key)
-            {
-                // #4961 needs this to tell the three clear paths apart, since
-                // they have three different fixes and this is the largest
-                // broadcast-byte arm.
-                //
-                // Usually `Some`: this match arm means `their_summary` was
-                // `None`. But that was read further up, before an `.await`, so
-                // a concurrent upsert in between leaves the entry holding a
-                // summary and this reads `None`. That send is then counted in
-                // `tracked_missing_unattributed_*` rather than being charged to
-                // a cause that did not produce it.
-                tracked_missing_reason = interest.summary_missing_reason();
+            let arm = if tracked_missing_reason.is_some() {
                 PayloadArm::FullNoTheirSummaryTracked
             } else {
                 PayloadArm::FullNoTheirSummaryUntracked
@@ -1056,6 +1406,20 @@ pub(super) async fn broadcast_to_single_peer(
         }
     };
     let payload_size = payload.size();
+    match (
+        queued_class,
+        payload_size < BROADCAST_QUEUE_PAYLOAD_SIZE_THRESHOLD,
+    ) {
+        (Some(QueuedPayloadClass::Large), true) => {
+            crate::node::BROADCAST_QUEUE_EFFICIENCY_METRICS
+                .record_queued_large_actual_small(payload_size);
+        }
+        (Some(QueuedPayloadClass::Small), false) => {
+            crate::node::BROADCAST_QUEUE_EFFICIENCY_METRICS
+                .record_queued_small_actual_large(payload_size);
+        }
+        _ => {}
+    }
     // Attribute the summarize + delta WASM (CPU) burned to produce this send.
     // Reported for EVERY attempt (the WASM work ran regardless of whether the
     // send lands). The payload BYTES are charged separately, ONLY on a real
@@ -1207,6 +1571,9 @@ pub(super) async fn broadcast_to_single_peer(
                 // v0.2.73 incident.
                 BROADCAST_STREAM_METRICS.record_attempt(delivered);
                 if delivered {
+                    if let Some(guard) = missing_attempt_guard.as_mut() {
+                        guard.mark_delivered(payload_size);
+                    }
                     // #4903 review round-3 Fix 4: charge the fan-out payload
                     // bytes ONLY on a real delivery. A dropped/timed-out stream
                     // put no bytes on the wire; the send CPU was already charged
@@ -1257,6 +1624,9 @@ pub(super) async fn broadcast_to_single_peer(
         // successful enqueue is the terminal state we can observe, so delivery
         // tracks the send result (unchanged pre-#4235 behavior for this path).
         if res.is_ok() {
+            if let Some(guard) = missing_attempt_guard.as_mut() {
+                guard.mark_delivered(payload_size);
+            }
             // #4903 review round-3 Fix 4: charge the fan-out payload bytes on a
             // successful send only. For the inline path a successful enqueue is
             // the terminal delivery signal (see the branch comment above); the
@@ -1854,7 +2224,9 @@ mod tests {
             .expect("end of record_delivery_to_interest not found");
         let body: String = after[..fn_end].split_whitespace().collect();
         assert!(
-            body.contains("interest_manager.upsert_peer_summary(key,peer_key,summary.clone())"),
+            body.contains(
+                "interest_manager.upsert_peer_summary_from(key,peer_key,summary.clone(),"
+            ),
             "post-delivery cache must upsert (create-if-absent) the peer summary"
         );
         assert!(
@@ -2490,18 +2862,16 @@ mod tests {
             );
         }
 
-        // #4961: the tracked arm must READ the reason where it is decided, not
-        // merely pass the variable along. Dropping the assignment leaves it at
-        // `None` forever, so every tracked send lands in
-        // `tracked_missing_unattributed_*` — the split still emits, still
-        // reconciles, and answers nothing. That mutation passes every other
-        // test here, so it needs its own pin.
-        assert!(
-            body.contains("tracked_missing_reason = interest.summary_missing_reason()"),
-            "the FullNoTheirSummaryTracked arm must read the peer's \
-             summary_missing_reason where the arm is decided — without it the \
-             per-reason split is uniformly unattributed and #4961 stays \
-             unanswered"
+        // #5090: summary presence, missing-reason classification, and attempt
+        // correlation must come from one atomic interest-manager operation.
+        // Reintroducing separate reads would let population/removal race the
+        // observation and make the lifecycle evidence internally inconsistent.
+        assert_eq!(
+            body.matches("begin_peer_summary_broadcast(&key, &peer_key)")
+                .count(),
+            1,
+            "broadcast payload selection must use the atomic missing-summary \
+             observation/classification operation exactly once"
         );
 
         // The mix is recorded at exactly the two real-delivery sites, the same
@@ -2552,8 +2922,9 @@ mod tests {
         );
 
         // The no-summary split must stay decided by WHICH side is missing, and
-        // the untracked/tracked sub-split must keep consulting the interest
-        // map. Collapsing either one re-creates the single `full_no_summary`
+        // the atomic peer-summary observation must preserve tracked (reason is
+        // Some) versus untracked (reason is None). Collapsing either one
+        // re-creates the single `full_no_summary`
         // bucket that the 2026-07-25 measurement could not act on: it was the
         // largest consumer of wire bytes on the network with no way to tell a
         // contract-handler failure from a permanent peer-tracking gap.
@@ -2563,12 +2934,11 @@ mod tests {
              missing — a catch-all `_` arm re-blinds the split"
         );
         assert!(
-            collapsed.contains("get_peer_interest(&key,&peer_key)"),
-            "the missing-their-summary arm must consult get_peer_interest to \
-             separate an UNTRACKED peer (whose update_peer_summary write is a \
-             silent no-op — permanent full state until the #4952 upsert; now \
-             transient, first send per pair) from a \
-             TRACKED cold-start peer (which repairs itself on next delivery)"
+            collapsed.contains(
+                "PeerSummaryForBroadcast::Missing{reason,attempt}=>{(None,reason,attempt)}"
+            ),
+            "the atomic peer-summary result must carry the reason through so \
+             tracked and untracked missing-summary sends remain distinct"
         );
     }
 }

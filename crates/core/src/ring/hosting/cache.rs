@@ -72,6 +72,7 @@ use tokio::time::Instant;
 
 use super::demand::NEUTRAL_DEMAND;
 use crate::ring::interest::PeerKey;
+use crate::tracing::event_kind::{STATE_SIZE_BUCKET_COUNT, state_size_bucket};
 use crate::util::time_source::TimeSource;
 use crate::wasm_runtime::read_total_ram_bytes;
 
@@ -331,6 +332,10 @@ pub(crate) struct HostingCacheStats {
     /// means the floors / share threshold are miscalibrated and churning cheap
     /// contracts.
     pub cost_evictions_total: u64,
+    /// Monotonic eviction victims by reason × state-size bucket. Reason order:
+    /// byte-budget zero-demand, byte-budget in-use, cost pressure.
+    pub eviction_victim_counts: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
+    pub eviction_victim_bytes: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
 }
 
 /// Per-contract Greedy-Dual priority row for the local-peer dashboard.
@@ -766,6 +771,8 @@ pub struct HostingCache<T: TimeSource> {
     /// #4861). Only [`Self::evict_cost_pressure`] increments it. See
     /// [`HostingCacheStats::cost_evictions_total`].
     cost_evictions_total: u64,
+    eviction_victim_counts: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
+    eviction_victim_bytes: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
     /// Time source for testability
     time_source: T,
 }
@@ -1008,6 +1015,8 @@ impl<T: TimeSource> HostingCache<T> {
             oom_valve_evictions_total: 0,
             subscribed_evictions_total: 0,
             cost_evictions_total: 0,
+            eviction_victim_counts: [[0; STATE_SIZE_BUCKET_COUNT]; 3],
+            eviction_victim_bytes: [[0; STATE_SIZE_BUCKET_COUNT]; 3],
             time_source,
         }
     }
@@ -1017,6 +1026,14 @@ impl<T: TimeSource> HostingCache<T> {
     fn next_seq(&mut self) -> u64 {
         self.access_seq = self.access_seq.saturating_add(1);
         self.access_seq
+    }
+
+    fn record_eviction_victim(&mut self, reason: usize, size_bytes: u64) {
+        let bucket = state_size_bucket(size_bytes);
+        self.eviction_victim_counts[reason][bucket] =
+            self.eviction_victim_counts[reason][bucket].saturating_add(1);
+        self.eviction_victim_bytes[reason][bucket] =
+            self.eviction_victim_bytes[reason][bucket].saturating_add(size_bytes);
     }
 
     /// Evict contracts while the cache is over budget, choosing victims
@@ -1152,6 +1169,7 @@ impl<T: TimeSource> HostingCache<T> {
                 let was_in_use = local + downstream > 0;
                 self.current_bytes = self.current_bytes.saturating_sub(entry.size_bytes);
                 self.budget_evictions_total = self.budget_evictions_total.saturating_add(1);
+                self.record_eviction_victim(usize::from(was_in_use), entry.size_bytes);
                 // Field falsifier for the single riskiest new behavior: shedding a
                 // subscribed contract. Counted by the captured subscriber split
                 // (not by pressure), so it covers the normal AtCapacity last-resort
@@ -1741,10 +1759,31 @@ impl<T: TimeSource> HostingCache<T> {
             budget_evictions_total: self.budget_evictions_total,
             subscribed_evictions_total: self.subscribed_evictions_total,
             cost_evictions_total: self.cost_evictions_total,
+            eviction_victim_counts: self.eviction_victim_counts,
+            eviction_victim_bytes: self.eviction_victim_bytes,
             evictions_of_recently_read_total: self.evictions_of_recently_read_total,
             evicted_unread_total: self.evicted_unread_total,
             evicted_unread_age_secs_sum: self.evicted_unread_age_secs_sum,
             oom_valve_evictions_total: self.oom_valve_evictions_total,
+        }
+    }
+
+    /// Current hosted rows for fixed-cardinality cost-eviction eligibility
+    /// telemetry. Contract identities stay local and are aggregated by the
+    /// hosting manager before export.
+    pub(crate) fn for_each_cost_eligibility_row(
+        &self,
+        mut visit: impl FnMut(&ContractKey, u64, bool),
+    ) {
+        let now = self.time_source.now();
+        for (key, entry) in &self.contracts {
+            let recently_accessed = entry
+                .last_genuine_access
+                .is_some_and(|at| now.saturating_duration_since(at) < COST_RATE_MIN_WINDOW)
+                || entry.local_client_last_access.is_some_and(|at| {
+                    now.saturating_duration_since(at) < super::SUBSCRIPTION_LEASE_DURATION
+                });
+            visit(key, entry.size_bytes, recently_accessed);
         }
     }
 
@@ -1964,6 +2003,7 @@ impl<T: TimeSource> HostingCache<T> {
                 if let Some(entry) = self.contracts.remove(&key) {
                     self.current_bytes = self.current_bytes.saturating_sub(entry.size_bytes);
                     self.cost_evictions_total = self.cost_evictions_total.saturating_add(1);
+                    self.record_eviction_victim(2, entry.size_bytes);
                     // Operator-facing: this is the storm diagnosis surfacing in
                     // the field. read_count is logged (not gated on) so the
                     // field can tell whether cost eviction is hitting contracts
@@ -2345,6 +2385,8 @@ mod tests {
         assert!(cache.get(&junk).is_none());
         let stats = cache.stats();
         assert_eq!(stats.cost_evictions_total, 1);
+        assert_eq!(stats.eviction_victim_counts[2][state_size_bucket(121)], 1);
+        assert_eq!(stats.eviction_victim_bytes[2][state_size_bucket(121)], 121);
         assert_eq!(
             stats.budget_evictions_total, 0,
             "cost evictions must not masquerade as byte-budget evictions"
@@ -3675,6 +3717,8 @@ mod tests {
         assert_eq!(result.evicted, vec![(key2, 0)]);
         let stats = cache.stats();
         assert_eq!(stats.budget_evictions_total, 2);
+        assert_eq!(stats.eviction_victim_counts[0][state_size_bucket(100)], 2);
+        assert_eq!(stats.eviction_victim_bytes[0][state_size_bucket(100)], 200);
         assert_eq!(stats.current_bytes, 200);
         assert_eq!(stats.contract_count, 2);
         assert_eq!(stats.budget_bytes, 200);

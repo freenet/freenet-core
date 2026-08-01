@@ -85,6 +85,7 @@ use parking_lot::Mutex;
 
 use crate::node::background_task_monitor::BackgroundTaskMonitor;
 use crate::ring::interest::SummaryMissingReason;
+use crate::tracing::event_kind::{STATE_SIZE_BUCKET_COUNT, state_size_bucket};
 
 /// Rollup cadence. Broadcasts are far less frequent than packets, so this is
 /// a minute rather than the 1 Hz sampling the `shadow_demand` aggregators use;
@@ -387,13 +388,160 @@ impl Default for Window {
 /// required.
 pub(crate) struct PayloadMix {
     window: Mutex<Window>,
+    /// Cumulative receiver-side outcomes. Unlike `window`, this is never
+    /// drained: the existing router snapshot can recover the full monotonic
+    /// value after a locally dropped telemetry sample (#5090).
+    receiver_applies: Mutex<ReceiverApplyStats>,
+}
+
+/// Fixed receiver outcome axes. There are deliberately no peer or contract
+/// identifiers here: each successful merge selects exactly one of four arms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReceiverApplyClass {
+    DeltaChanged,
+    DeltaNoOp,
+    FullChanged,
+    FullNoOp,
+}
+
+impl ReceiverApplyClass {
+    pub(crate) const ALL: [Self; 4] = [
+        Self::DeltaChanged,
+        Self::DeltaNoOp,
+        Self::FullChanged,
+        Self::FullNoOp,
+    ];
+    pub(crate) const COUNT: usize = Self::ALL.len();
+
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::DeltaChanged => 0,
+            Self::DeltaNoOp => 1,
+            Self::FullChanged => 2,
+            Self::FullNoOp => 3,
+        }
+    }
+
+    pub(crate) const fn from_apply(is_delta: bool, changed: bool) -> Self {
+        match (is_delta, changed) {
+            (true, true) => Self::DeltaChanged,
+            (true, false) => Self::DeltaNoOp,
+            (false, true) => Self::FullChanged,
+            (false, false) => Self::FullNoOp,
+        }
+    }
+}
+
+/// Monotonic, fixed-cardinality receiver-side apply totals. The second array
+/// dimension uses the shared state-size histogram taxonomy from `event_kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ReceiverApplyStats {
+    pub(crate) counts: [[u64; STATE_SIZE_BUCKET_COUNT]; ReceiverApplyClass::COUNT],
+    /// Delta/full × terminal outcome × incoming-payload size, flattened with
+    /// delta outcomes first. Within each kind: changed, no-op, dedup, backoff,
+    /// failed. Keeping the dimensions joint is what lets telemetry answer
+    /// whether a 49 MiB no-op was a full state or an oversized delta.
+    pub(crate) terminal_counts: [[u64; STATE_SIZE_BUCKET_COUNT]; 10],
+    pub(crate) terminal_bytes: [[u64; STATE_SIZE_BUCKET_COUNT]; 10],
+}
+
+#[derive(Clone, Copy)]
+enum ReceiverTerminalOutcome {
+    Changed,
+    NoOp,
+    Dedup,
+    Backoff,
+    Failed,
+}
+
+impl ReceiverTerminalOutcome {
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+pub(crate) struct ReceiverTerminalGuard<'a> {
+    mix: &'a PayloadMix,
+    is_delta: bool,
+    payload_bytes: usize,
+    outcome: ReceiverTerminalOutcome,
+}
+
+impl ReceiverTerminalGuard<'_> {
+    pub(crate) fn mark_dedup(&mut self) {
+        self.outcome = ReceiverTerminalOutcome::Dedup;
+    }
+
+    pub(crate) fn mark_backoff(&mut self) {
+        self.outcome = ReceiverTerminalOutcome::Backoff;
+    }
+
+    pub(crate) fn mark_applied(&mut self, changed: bool, state_size: usize) {
+        self.mix
+            .record_receiver_apply(self.is_delta, changed, state_size);
+        self.outcome = if changed {
+            ReceiverTerminalOutcome::Changed
+        } else {
+            ReceiverTerminalOutcome::NoOp
+        };
+    }
+}
+
+impl Drop for ReceiverTerminalGuard<'_> {
+    fn drop(&mut self) {
+        self.mix
+            .record_receiver_terminal(self.is_delta, self.outcome, self.payload_bytes);
+    }
 }
 
 impl PayloadMix {
     pub(crate) fn new() -> Self {
         Self {
             window: Mutex::new(Window::default()),
+            receiver_applies: Mutex::new(ReceiverApplyStats::default()),
         }
+    }
+
+    fn record_receiver_apply(&self, is_delta: bool, changed: bool, state_size: usize) {
+        let class = ReceiverApplyClass::from_apply(is_delta, changed).index();
+        let bucket = state_size_bucket(state_size as u64);
+        let mut stats = self.receiver_applies.lock();
+        stats.counts[class][bucket] = stats.counts[class][bucket].saturating_add(1);
+    }
+
+    pub(crate) fn receiver_terminal_guard(
+        &self,
+        is_delta: bool,
+        payload_bytes: usize,
+    ) -> ReceiverTerminalGuard<'_> {
+        ReceiverTerminalGuard {
+            mix: self,
+            is_delta,
+            payload_bytes,
+            outcome: ReceiverTerminalOutcome::Failed,
+        }
+    }
+
+    fn record_receiver_terminal(
+        &self,
+        is_delta: bool,
+        outcome: ReceiverTerminalOutcome,
+        payload_bytes: usize,
+    ) {
+        let outcome_index = outcome.index();
+        let kind_index = usize::from(!is_delta) * 5 + outcome_index;
+        let bucket = state_size_bucket(payload_bytes as u64);
+        let bytes = u64::try_from(payload_bytes).unwrap_or(u64::MAX);
+        let mut stats = self.receiver_applies.lock();
+        stats.terminal_counts[kind_index][bucket] =
+            stats.terminal_counts[kind_index][bucket].saturating_add(1);
+        stats.terminal_bytes[kind_index][bucket] =
+            stats.terminal_bytes[kind_index][bucket].saturating_add(bytes);
+    }
+
+    /// Read cumulative receiver totals without resetting them.
+    pub(crate) fn receiver_apply_stats(&self) -> ReceiverApplyStats {
+        *self.receiver_applies.lock()
     }
 
     /// Record one **delivered** broadcast.
@@ -975,6 +1123,93 @@ mod tests {
 
     fn contract(byte: u8) -> ContractInstanceId {
         ContractInstanceId::new([byte; 32])
+    }
+
+    #[test]
+    fn receiver_applies_classify_all_outcomes_and_state_size_boundaries() {
+        let mix = PayloadMix::new();
+        let last_bounded = *crate::tracing::event_kind::STATE_SIZE_BUCKET_UPPER_BOUNDS
+            .last()
+            .unwrap() as usize;
+
+        for (is_delta, changed, state_size, payload_bytes) in [
+            (true, true, 64 * 1024, 11),
+            (true, false, 64 * 1024 + 1, 22),
+            (false, true, last_bounded, 33),
+            (false, false, last_bounded + 1, 44),
+        ] {
+            let mut terminal = mix.receiver_terminal_guard(is_delta, payload_bytes);
+            terminal.mark_applied(changed, state_size);
+        }
+
+        let stats = mix.receiver_apply_stats();
+        let delta_changed = ReceiverApplyClass::DeltaChanged.index();
+        let delta_no_op = ReceiverApplyClass::DeltaNoOp.index();
+        let full_changed = ReceiverApplyClass::FullChanged.index();
+        let full_no_op = ReceiverApplyClass::FullNoOp.index();
+
+        assert_eq!(stats.counts[delta_changed][0], 1);
+        assert_eq!(stats.counts[delta_no_op][1], 1);
+        assert_eq!(stats.counts[full_changed][STATE_SIZE_BUCKET_COUNT - 2], 1);
+        assert_eq!(stats.counts[full_no_op][STATE_SIZE_BUCKET_COUNT - 1], 1);
+
+        let total_count: u64 = stats.counts.iter().flatten().sum();
+        let total_payload_bytes: u64 = stats.terminal_bytes.iter().flatten().sum();
+        assert_eq!(total_count, 4);
+        assert_eq!(total_payload_bytes, 110);
+    }
+
+    #[test]
+    fn receiver_apply_totals_are_cumulative_across_sender_window_drains() {
+        let mix = PayloadMix::new();
+        mix.receiver_terminal_guard(false, 100)
+            .mark_applied(false, 3 * 1024 * 1024);
+        let first = mix.receiver_apply_stats();
+
+        // The legacy sender payload mix remains a drained one-minute window.
+        // Draining it must not erase the cumulative router-snapshot source.
+        let _ = mix.take_window();
+        assert_eq!(mix.receiver_apply_stats(), first);
+
+        mix.receiver_terminal_guard(false, 250)
+            .mark_applied(false, 3 * 1024 * 1024);
+        let second = mix.receiver_apply_stats();
+        let class = ReceiverApplyClass::FullNoOp.index();
+        let terminal_class = 5 + ReceiverTerminalOutcome::NoOp.index();
+        let result_state_bucket = state_size_bucket(3 * 1024 * 1024);
+        let incoming_payload_bucket = state_size_bucket(100);
+        assert_eq!(second.counts[class][result_state_bucket], 2);
+        assert_eq!(
+            second.terminal_bytes[terminal_class][incoming_payload_bucket],
+            350
+        );
+    }
+
+    #[test]
+    fn receiver_terminal_guard_accounts_for_dedup_backoff_and_failure_bytes() {
+        let mix = PayloadMix::new();
+        let large = 4 * 1024 * 1024;
+
+        let mut dedup = mix.receiver_terminal_guard(true, large);
+        dedup.mark_dedup();
+        drop(dedup);
+
+        let mut backoff = mix.receiver_terminal_guard(false, large + 1);
+        backoff.mark_backoff();
+        drop(backoff);
+
+        // The default terminal outcome is failure, including early returns and
+        // unwinds that occur before an explicit outcome is selected.
+        drop(mix.receiver_terminal_guard(false, large + 2));
+
+        let stats = mix.receiver_apply_stats();
+        let bucket = state_size_bucket(large as u64);
+        assert_eq!(stats.terminal_counts[2][bucket], 1);
+        assert_eq!(stats.terminal_bytes[2][bucket], large as u64);
+        assert_eq!(stats.terminal_counts[8][bucket], 1);
+        assert_eq!(stats.terminal_bytes[8][bucket], (large + 1) as u64);
+        assert_eq!(stats.terminal_counts[9][bucket], 1);
+        assert_eq!(stats.terminal_bytes[9][bucket], (large + 2) as u64);
     }
 
     /// #4979 / #5056: a contract whose entire cost sits in the `delta` arm must

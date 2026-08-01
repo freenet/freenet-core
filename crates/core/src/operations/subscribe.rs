@@ -537,9 +537,13 @@ pub(super) async fn finalize_originator_subscribe(
         {
             false
         } else {
-            op_manager
-                .interest_manager
-                .register_peer_interest(&key, peer_key, None, true)
+            op_manager.interest_manager.register_peer_interest_from(
+                &key,
+                peer_key,
+                None,
+                true,
+                crate::ring::interest::InterestRegistrationSource::SubscribeOriginator,
+            )
         };
         if is_new {
             // #4359 (MUST-FIX 1): this upstream peer is now a viable broadcast
@@ -686,9 +690,13 @@ pub(crate) async fn register_downstream_subscriber(
                 .interest_manager
                 .refresh_peer_interest(key, &peer_key)
             {
-                op_manager
-                    .interest_manager
-                    .register_peer_interest(key, peer_key, None, false);
+                op_manager.interest_manager.register_peer_interest_from(
+                    key,
+                    peer_key,
+                    None,
+                    false,
+                    crate::ring::interest::InterestRegistrationSource::SubscribeDownstream,
+                );
             }
             // Key the demand-counter increment on HOSTING-map newness
             // (NewAdd vs Renewal), NOT on interest-map newness: a #4952
@@ -847,9 +855,13 @@ pub(super) async fn finalize_host_subscribe(
         {
             false
         } else {
-            op_manager
-                .interest_manager
-                .register_peer_interest(&key, peer_key, None, true)
+            op_manager.interest_manager.register_peer_interest_from(
+                &key,
+                peer_key,
+                None,
+                true,
+                crate::ring::interest::InterestRegistrationSource::SubscribeRelay,
+            )
         };
         if is_new {
             op_manager.flush_pending_broadcast_on_interest(&key).await;
@@ -931,7 +943,11 @@ pub(crate) async fn handle_unsubscribe_inbound(
         // from one of those (or from a peer the lease sweep already
         // decremented) would otherwise steal a decrement from a real
         // subscriber's count and under-report demand to eviction ranking.
-        let _was_interested = op_manager.interest_manager.remove_peer_interest(&key, peer);
+        let _was_interested = op_manager.interest_manager.remove_peer_interest_for(
+            &key,
+            peer,
+            crate::ring::interest::InterestRemovalCause::Unsubscribe,
+        );
         if was_downstream {
             let lost_interest = op_manager
                 .interest_manager
