@@ -42,13 +42,6 @@ Source: [github.com/freenet/paper-1](https://github.com/freenet/paper-1).
 
 ## Build Instructions
 
-Before installing anything you need to run the following in the repository,
-or the commands will fail:
-
-```bash
-$ git submodule update --init --recursive
-```
-
 To install the Freenet core:
 
 ```bash
