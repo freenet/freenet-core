@@ -190,12 +190,19 @@ The provider is registered globally; nothing is stored on `Node`.
   reqwest 0.13, a separate major version from the workspace's reqwest 0.12.
   `opentelemetry-otlp` is trimmed to `default-features = false` plus exactly
   the metrics/http-proto/reqwest-blocking-client/reqwest-rustls/internal-logs
-  features, so the trace/logs exporters (explicit non-goals) and their
-  prost/opentelemetry-proto deps stay out of the default build. The bounded
-  remaining cost is a second reqwest major version plus the metrics-only OTLP
-  exporter — confirm cross-compile targets still build
+  features. That drops the logs exporter only: `http-proto` mandates `trace`,
+  `prost` and `opentelemetry-proto`, so those remain in the default build and
+  the trim is narrower than "metrics-only". The remaining cost is a second
+  reqwest major version plus the trace+metrics OTLP exporter — confirm
+  cross-compile targets still build
   (`.github/workflows/cross-compile.yml`,
   `crates/core/tests/cross_compile_feature_split.rs`).
+- `reqwest-rustls` pulls `aws-lc-rs`/`aws-lc-sys`, which builds C sources via
+  CMake, and rustls 0.23 unification turns it on workspace-wide. Prebuilt musl
+  bindings ship for both release targets and the musl jobs are native-arch, so
+  this is expected to work — but `cross-compile.yml` never runs on PRs and does
+  not install `cmake`, so a failure would land after merge on the release path.
+  Verify with a `workflow_dispatch` run on the branch before merging.
 - `global::set_meter_provider` is process-global. A `trace-ot` build also sets
   OTel globals (tracer provider, not meter provider) — confirm no conflict.
 - `reqwest/blocking` gets enabled workspace-wide by feature unification, which
