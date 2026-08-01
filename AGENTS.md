@@ -328,6 +328,35 @@ until a runtime path actually reads it.
 Operator-facing documentation (encryption model, migration matrix,
 `freenet secrets` CLI) lives in [`docs/secrets-at-rest.md`](docs/secrets-at-rest.md).
 
+## Two independent telemetry pipelines
+
+`telemetry-enabled` / `telemetry-endpoint` feed the project's central
+dashboard through a hand-rolled OTLP-JSON log POST (`tracing/telemetry.rs`).
+
+`otel-telemetry-enabled` / `otel-endpoint` are a **separate, unrelated**
+OpenTelemetry SDK metrics pipeline (`tracing/otel.rs`). The two share no
+config, no endpoint, and no fallback in either direction — enabling or
+disabling one has no effect on the other, and `otel-endpoint` must never
+default to the dashboard collector.
+
+The otel pipeline honors the standard variables, which take priority over
+`otel-endpoint` in `config.toml`:
+`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_EXPORTER_OTLP_ENDPOINT`,
+`OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_SERVICE_NAME`,
+`OTEL_RESOURCE_ATTRIBUTES`, `OTEL_METRIC_EXPORT_INTERVAL`. Without any of
+them it exports to `http://localhost:4318`.
+
+The proof-of-life gauge `freenet.process.memory.rss` is sourced from
+`node::resource_metrics::rss_bytes()`, which is implemented for Linux only.
+On macOS and Windows the gauge registers but reports no datapoints — an
+empty series there is expected, not a broken pipeline.
+
+Adding an instrument is one call at the site — no registry, no wrapper:
+
+    opentelemetry::global::meter("freenet").u64_counter("freenet.some.thing").build()
+
+Design: [`docs/design/otel-metrics-exporter.md`](docs/design/otel-metrics-exporter.md).
+
 ## External Resources
 
 - API docs: https://docs.rs/freenet
