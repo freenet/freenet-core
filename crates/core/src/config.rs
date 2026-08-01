@@ -247,6 +247,9 @@ pub struct ConfigArgs {
 
     #[command(flatten)]
     pub telemetry: TelemetryArgs,
+
+    #[command(flatten)]
+    pub otel: OtelArgs,
 }
 
 impl Default for ConfigArgs {
@@ -316,6 +319,7 @@ impl Default for ConfigArgs {
             shutdown_drain_secs: None,
             disable_auto_update: false,
             telemetry: Default::default(),
+            otel: Default::default(),
         }
     }
 }
@@ -982,6 +986,16 @@ impl ConfigArgs {
             if cfg.telemetry.iface_tx_enabled {
                 self.telemetry.iface_tx_enabled = true;
             }
+            // otel-telemetry-enabled defaults to false via clap, so only the
+            // file-says-true direction needs handling — same one-directional
+            // override as reference-ping/iface-tx above. Kept separate from the
+            // telemetry merge on purpose: the two features are independent.
+            if cfg.otel.enabled {
+                self.otel.enabled = true;
+            }
+            if let Some(endpoint) = cfg.otel.endpoint {
+                self.otel.endpoint.get_or_insert(endpoint);
+            }
         }
 
         // Validate the effective config (CLI + values merged from config.toml).
@@ -1491,6 +1505,13 @@ impl ConfigArgs {
                 reference_ping_enabled: self.telemetry.reference_ping_enabled,
                 iface_tx_enabled: self.telemetry.iface_tx_enabled,
             },
+            otel: OtelConfig {
+                enabled: self.otel.enabled,
+                endpoint: self.otel.endpoint,
+                // Same --id rule as telemetry: simulated networks and
+                // integration tests must not ship data to a collector.
+                is_test_environment: self.id.is_some(),
+            },
         };
 
         fs::create_dir_all(this.config_dir())?;
@@ -1731,6 +1752,12 @@ pub struct Config {
     /// Telemetry configuration
     #[serde(flatten)]
     pub telemetry: TelemetryConfig,
+
+    /// OpenTelemetry SDK metrics exporter settings. Strictly isolated from
+    /// `telemetry` above — see `docs/design/otel-metrics-exporter.md`.
+    #[serde(default)]
+    pub otel: OtelConfig,
+
     /// Maximum seconds to wait on graceful shutdown for in-flight
     /// client-originated operations (PUT/UPDATE/GET/SUBSCRIBE) to
     /// finish before tearing down peer connections.
@@ -2891,6 +2918,77 @@ fn default_reference_ping_enabled() -> bool {
 
 fn default_iface_tx_enabled() -> bool {
     false
+}
+
+/// Default OTLP/HTTP endpoint for the SDK metrics pipeline, used when neither
+/// the standard `OTEL_EXPORTER_OTLP_*` env vars nor `otel-endpoint` are set.
+///
+/// Deliberately NOT `DEFAULT_TELEMETRY_ENDPOINT`: `otel-telemetry-enabled` and
+/// `telemetry-enabled` are strictly isolated features that are not expected to
+/// share a backend. Pointing this pipeline at the central dashboard collector
+/// must always be an explicit operator choice.
+pub const DEFAULT_OTEL_ENDPOINT: &str = "http://localhost:4318";
+
+/// CLI/file args for the OpenTelemetry SDK metrics exporter.
+///
+/// Strictly independent of [`TelemetryArgs`]: no shared field, no shared
+/// default, no fallback in either direction.
+#[derive(clap::Parser, Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OtelArgs {
+    /// Enable the OpenTelemetry SDK metrics exporter. Independent of
+    /// `telemetry-enabled`; enabling or disabling one has no effect on the
+    /// other.
+    ///
+    /// `num_args`/`default_missing_value` rather than a bare flag: with an
+    /// `env` binding, clap's `SetTrue` action treats ANY value of the variable
+    /// as true, so `FREENET_OTEL_TELEMETRY_ENABLED=false` would silently turn
+    /// the exporter ON. This form accepts `--otel-telemetry-enabled`,
+    /// `--otel-telemetry-enabled=false`, and a properly parsed env value.
+    #[arg(
+        id = "otel_telemetry_enabled",
+        long = "otel-telemetry-enabled",
+        env = "FREENET_OTEL_TELEMETRY_ENABLED",
+        num_args = 0..=1,
+        default_value = "false",
+        default_missing_value = "true",
+        action = clap::ArgAction::Set
+    )]
+    #[serde(rename = "otel-telemetry-enabled", default)]
+    pub enabled: bool,
+
+    /// OTLP/HTTP collector base URL (e.g. `http://collector:4318`).
+    ///
+    /// No clap `env =` binding on purpose. The standard
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`
+    /// variables must take priority over this file-level value, and binding
+    /// them here would merge them into the config layer and invert that
+    /// precedence. They are resolved in `tracing::otel` instead.
+    #[arg(id = "otel_endpoint", long = "otel-endpoint")]
+    #[serde(rename = "otel-endpoint", skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+}
+
+/// Resolved configuration for the OpenTelemetry SDK metrics exporter.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OtelConfig {
+    /// Whether the SDK metrics exporter is enabled.
+    #[serde(default, rename = "otel-telemetry-enabled")]
+    pub enabled: bool,
+
+    /// Operator-configured OTLP/HTTP collector base URL, if any. `None` means
+    /// "let the SDK resolve it" — see `tracing::otel::resolve_metrics_endpoint`.
+    #[serde(
+        default,
+        rename = "otel-endpoint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub endpoint: Option<String>,
+
+    /// Whether this is a test environment (detected via `--id`). Mirrors
+    /// [`TelemetryConfig::is_test_environment`]; suppresses export so test
+    /// networks can't ship data to a collector.
+    #[serde(skip)]
+    pub is_test_environment: bool,
 }
 
 impl Default for TelemetryConfig {
@@ -6610,6 +6708,54 @@ shutdown-drain-secs = 42
         }
     }
 
+    #[test]
+    fn otel_args_default_is_off_and_endpointless() {
+        // The new pipeline exports nothing yet, so shipping it on would be a
+        // behavior change. Operators opt in explicitly.
+        let args = OtelArgs::default();
+        assert!(
+            !args.enabled,
+            "otel-telemetry-enabled must default to false"
+        );
+        assert_eq!(args.endpoint, None, "no implicit collector");
+    }
+
+    #[test]
+    fn otel_flag_parses_from_cli() {
+        use clap::Parser;
+        let none = ConfigArgs::try_parse_from(["freenet"]).expect("bare parse");
+        assert!(!none.otel.enabled, "no flag -> off");
+        let set = ConfigArgs::try_parse_from(["freenet", "--otel-telemetry-enabled"])
+            .expect("flag parse");
+        assert!(set.otel.enabled, "--otel-telemetry-enabled -> on");
+        // Explicit `=false` must parse and mean false. Without this form the flag
+        // would be a bare ArgAction::SetTrue, and clap turns ANY value of the bound
+        // env var — including "false" — into true.
+        let off = ConfigArgs::try_parse_from(["freenet", "--otel-telemetry-enabled=false"])
+            .expect("explicit false parse");
+        assert!(!off.otel.enabled, "--otel-telemetry-enabled=false -> off");
+        let with_ep = ConfigArgs::try_parse_from([
+            "freenet",
+            "--otel-endpoint",
+            "http://collector.example:4318",
+        ])
+        .expect("endpoint parse");
+        assert_eq!(
+            with_ep.otel.endpoint.as_deref(),
+            Some("http://collector.example:4318")
+        );
+    }
+
+    #[test]
+    fn otel_endpoint_never_defaults_to_the_dashboard_collector() {
+        // Hard isolation requirement: the two pipelines share no backend.
+        assert_ne!(
+            DEFAULT_OTEL_ENDPOINT, DEFAULT_TELEMETRY_ENDPOINT,
+            "otel must not default to the central dashboard collector"
+        );
+        assert_eq!(DEFAULT_OTEL_ENDPOINT, "http://localhost:4318");
+    }
+
     #[tokio::test]
     async fn test_serde_config_args() {
         // Use tempfile for a guaranteed-writable directory (avoids CI permission issues on /tmp)
@@ -7589,6 +7735,7 @@ shutdown-drain-secs = 42
             shutdown_drain_secs: None,
             disable_auto_update: false,
             telemetry: Default::default(),
+            otel: Default::default(),
         }
     }
 
@@ -7747,6 +7894,11 @@ shutdown-drain-secs = 42
                 reference_ping_enabled: true,
                 iface_tx_enabled: true,
             },
+            otel: OtelConfig {
+                enabled: true,
+                endpoint: Some("http://example.invalid:4319".to_string()),
+                is_test_environment: false, // #[serde(skip)] — derived from --id
+            },
             shutdown_drain_secs: 77,
             disable_auto_update: true, // #[serde(skip)] — see destructure below
         }
@@ -7801,6 +7953,7 @@ shutdown-drain-secs = 42
             module_cache_budget_bytes,
             enable_event_log,
             telemetry,
+            otel,
             shutdown_drain_secs,
             // #[serde(skip)] runtime CLI/env flag — set from --disable-auto-update
             // at build() time, intentionally not persisted, so it does not
@@ -7850,6 +8003,12 @@ shutdown-drain-secs = 42
         assert_eq!(
             shutdown_drain_secs, seed.shutdown_drain_secs,
             "shutdown_drain_secs"
+        );
+        assert_eq!(otel.enabled, seed.otel.enabled, "otel.enabled");
+        assert_eq!(
+            otel.endpoint, seed.otel.endpoint,
+            "otel.endpoint — an operator's collector URL must survive the \
+             config.toml merge"
         );
 
         let NetworkApiConfig {
