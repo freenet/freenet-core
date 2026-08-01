@@ -1005,8 +1005,10 @@ pub struct InterestManager<T: TimeSource> {
     /// Per-key entries are updated through DashMap's shard-local `entry()`
     /// API, so same-key increment/decrement stays atomic. The total-size
     /// bound checked in `begin_active_attempt` is a soft diagnostic cap (not
-    /// a security invariant), so a benign cross-key race can occasionally
-    /// admit one entry past `MISSING_SUMMARY_ACTIVE_SIZE`.
+    /// a security invariant): `.len()` is read before the per-key `entry()`
+    /// lock is taken, so concurrent first-time inserts for distinct new keys
+    /// can race past `MISSING_SUMMARY_ACTIVE_SIZE` (bounded by the number of
+    /// concurrent racers, not fixed at one).
     missing_summary_active: DashMap<(ContractKey, PeerKey), u16>,
     interest_lifecycle_metrics: InterestLifecycleMetrics,
 }
@@ -1232,27 +1234,34 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     }
 
     fn begin_active_attempt(&self, key: &(ContractKey, PeerKey)) -> (bool, bool) {
-        // NOTE: the occupied/vacant checks below are deliberately two
-        // separate DashMap calls (not a single `entry()` match) because
-        // `entry()` holds a write lock on the key's shard for the whole
-        // match arm, and calling `.len()` (or `.insert()`, which also locks
-        // a shard) from inside that arm risks a self-deadlock if it hashes
-        // to the same shard. Dropping the guard before checking `.len()` is
-        // deadlock-free at the cost of the benign cross-key race described
-        // on `missing_summary_active` above.
-        if let Some(mut count) = self.missing_summary_active.get_mut(key) {
-            let inflight = *count > 0;
-            *count = count.saturating_add(1);
-            return (inflight, true);
+        // `.len()` is read BEFORE `.entry()` so no shard guard is held while
+        // it runs (it read-locks every shard; doing that while holding a
+        // write lock on one of them, from `entry()` below, would
+        // self-deadlock — DashMap's shard RwLock is not reentrant). The one
+        // `entry()` match that follows then holds a single shard's guard for
+        // its whole arm, so the occupied-increment and vacant-insert are each
+        // atomic per key: two callers racing on the same never-before-seen
+        // key can no longer clobber each other (only the cross-key cap
+        // check above stays a benign soft race, documented on the field).
+        let over_cap = self.missing_summary_active.len() >= MISSING_SUMMARY_ACTIVE_SIZE;
+        match self.missing_summary_active.entry(key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                let count = entry.get_mut();
+                let inflight = *count > 0;
+                *count = count.saturating_add(1);
+                (inflight, true)
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                if over_cap {
+                    self.interest_lifecycle_metrics
+                        .active_overflow
+                        .fetch_add(1, Ordering::Relaxed);
+                    return (false, false);
+                }
+                entry.insert(1);
+                (false, true)
+            }
         }
-        if self.missing_summary_active.len() >= MISSING_SUMMARY_ACTIVE_SIZE {
-            self.interest_lifecycle_metrics
-                .active_overflow
-                .fetch_add(1, Ordering::Relaxed);
-            return (false, false);
-        }
-        self.missing_summary_active.insert(key.clone(), 1);
-        (false, true)
     }
 
     fn first_send_age_bucket(age: Duration) -> usize {
@@ -1282,21 +1291,18 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         delivered_bytes: Option<u64>,
     ) {
         if attempt.active_tracked {
-            // Drop the shard guard before `.remove()` — see the deadlock
-            // note in `begin_active_attempt`.
-            let should_remove =
-                if let Some(mut count) = self.missing_summary_active.get_mut(&attempt.key) {
-                    if *count <= 1 {
-                        true
-                    } else {
-                        *count -= 1;
-                        false
-                    }
+            // Single `entry()` match: decrement-or-remove stays atomic per
+            // key, so a concurrent `begin_active_attempt` increment on this
+            // exact key can never be silently dropped by this decrement.
+            if let dashmap::mapref::entry::Entry::Occupied(mut entry) =
+                self.missing_summary_active.entry(attempt.key.clone())
+            {
+                let count = entry.get_mut();
+                if *count <= 1 {
+                    entry.remove();
                 } else {
-                    false
-                };
-            if should_remove {
-                self.missing_summary_active.remove(&attempt.key);
+                    *count -= 1;
+                }
             }
         }
         if let Some(bytes) = delivered_bytes {
