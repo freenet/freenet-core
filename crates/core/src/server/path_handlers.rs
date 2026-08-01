@@ -5572,16 +5572,41 @@ mod tests {
             SHELL_BRIDGE_JS.contains(r"/\/v[12]\/contract\/web\/([^/?#]+)/"),
             "notification consent key must derive from the /v[12]/contract/web/<key> path"
         );
+        // The markers bracket showAppNotification so shell_bridge_notifications
+        // .test.mjs can extract and drive it. Pin them here: without this,
+        // deleting the markers AND the .mjs cases together leaves CI green with
+        // the #5043 status coverage silently gone.
+        let show_start = SHELL_BRIDGE_JS
+            .find("notify-show:BEGIN")
+            .expect("notify-show:BEGIN marker must bracket showAppNotification");
+        let show_end = SHELL_BRIDGE_JS[show_start..]
+            .find("notify-show:END")
+            .expect("notify-show:END marker must bracket showAppNotification");
+        let show_slice = &SHELL_BRIDGE_JS[show_start..show_start + show_end];
+        // Same for the enable-prompt ladder (#5043 item 3).
+        let offer_start = SHELL_BRIDGE_JS
+            .find("notify-offer:BEGIN")
+            .expect("notify-offer:BEGIN marker must bracket maybeOfferNotifications");
+        assert!(
+            SHELL_BRIDGE_JS[offer_start..].contains("notify-offer:END"),
+            "notify-offer:END marker must bracket maybeOfferNotifications"
+        );
         // Every notification is gated on BOTH the browser permission AND this
-        // contract's own consent, so one contract's gateway-wide browser grant
-        // can't notify the user on behalf of a different contract.
+        // contract's own consent. Asserted against the marker-bounded slice, so
+        // the gates must live INSIDE showAppNotification — two file-wide
+        // `contains` calls would stay green if a refactor moved them out.
         // (Two separate gates since #5043, so each drop can report its own
         // `notification_status` back to the app instead of returning silently.)
         assert!(
-            SHELL_BRIDGE_JS.contains("Notification.permission !== 'granted'")
-                && SHELL_BRIDGE_JS.contains("!contractHasConsent()"),
+            show_slice.contains("Notification.permission !== 'granted'")
+                && show_slice.contains("!contractHasConsent()"),
             "showAppNotification must gate on browser permission AND per-contract consent"
         );
+        // Note: "exactly one status per message" is asserted BEHAVIORALLY in
+        // shell_bridge_notifications.test.mjs (cases 9 and 10), which drives the
+        // extracted functions and counts the posts. A substring count here would
+        // be a weaker restatement of that, so it deliberately isn't duplicated.
+        //
         // "Not now" must be durable so a contract that re-sends the enable prompt
         // can't re-pin the host-owned bar over the app.
         assert!(

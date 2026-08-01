@@ -326,13 +326,18 @@ function check(name, cond) {
   );
 }
 
-// 9. showAppNotification status replies (#5043): every `notification` message
-//    must produce exactly one `notification_status`. Before the fix the three
-//    drop paths returned silently (so a permission revoked in site settings
-//    left a framed app displaying "enabled" forever — it cannot read
-//    Notification.permission across the opaque origin), and there was no status
-//    on the success path, so a transient 'undeliverable' from the service
-//    worker activation race stuck for the whole session.
+// 9. showAppNotification status replies (#5043): every well-formed
+//    `notification` message must produce exactly one `notification_status`.
+//    Before the fix, showAppNotification returned silently on three conditions
+//    (no Notification API, permission not granted, contract consent withdrawn),
+//    so a permission revoked in site settings left a framed app displaying
+//    "enabled" forever — it cannot read Notification.permission across the
+//    opaque origin. And there was no status on the success path, so a transient
+//    'undeliverable' from the service-worker activation race stuck for the
+//    whole session.
+//
+//    Every check below asserts `statuses.length === 1`, not just the value: a
+//    deleted post and a duplicated post must both fail.
 {
   const SBEGIN = 'notify-show:BEGIN';
   const SEND = 'notify-show:END';
@@ -373,8 +378,19 @@ function check(name, cond) {
           );
     const swShow = (title, opts) => {
       if (ctl.swShowRejects) return Promise.reject(new Error('show failed'));
+      if (ctl.swShowThrows) throw new Error('illegal invocation');
       shown.push({ via: 'sw', title, opts });
-      return Promise.resolve();
+      // A worker whose showNotification returns a non-thenable would make a
+      // bare `.then()` on the result throw — the chain must still reply.
+      return ctl.swShowNonThenable ? undefined : Promise.resolve();
+    };
+    // `statusThrowsOn` makes the Nth (0-indexed) status post throw, standing in
+    // for a postMessage into a torn-down iframe. The value is still recorded, so
+    // a check can assert what WOULD have been sent.
+    let statusCalls = 0;
+    const postStatus = (s) => {
+      statuses.push(s);
+      if (statusCalls++ === ctl.statusThrowsOn) throw new Error('post failed');
     };
     const fn = new Function(
       'Notification',
@@ -386,18 +402,26 @@ function check(name, cond) {
       'notifyRegistrationReady',
       'location',
       'window',
+      // Stubbed so the (expected) mobile-path constructor throw doesn't spray
+      // the diagnostic log over the test output.
+      'console',
       `${showSource}\nreturn showAppNotification;`,
     )(
       Notification,
-      (s) => statuses.push(s),
-      () => ctl.consent !== false,
-      () => 'freenet_notify:KEY',
+      postStatus,
+      () => ctl.consent !== false && ctl.noContractKey !== true,
+      () => (ctl.noContractKey ? null : 'freenet_notify:KEY'),
       { ok: () => ctl.limited !== true },
       () => {},
       () =>
-        Promise.resolve(ctl.swAvailable ? { showNotification: swShow } : null),
+        ctl.regRejects
+          ? Promise.reject(new Error('SecurityError'))
+          : Promise.resolve(
+              ctl.swAvailable ? { showNotification: swShow } : null,
+            ),
       { href: 'https://gw.example/v2/contract/web/KEY/' },
       { focus() {} },
+      { debug() {} },
     );
     return { fn, statuses, shown };
   }
@@ -493,28 +517,237 @@ function check(name, cond) {
       h.statuses.length === 1 && h.statuses[0] === 'undeliverable',
     );
   }
-  // A delivery after a stale 'undeliverable' retracts it: the LAST status a
-  // client sees is 'granted', not the session-long false warning of #5043.
   {
     const h = makeShowHarness({
       permission: 'granted',
       constructorThrows: true,
-      swAvailable: false,
+      swAvailable: true,
+      swShowThrows: true,
     });
-    h.fn({ title: 'first' }); // races SW activation -> undeliverable
+    h.fn({ title: 't' });
     await new Promise((r) => setTimeout(r, 0));
-    const h2 = makeShowHarness({
+    check(
+      'worker show throws synchronously -> exactly one "undeliverable"',
+      h.statuses.length === 1 && h.statuses[0] === 'undeliverable',
+    );
+  }
+  {
+    const h = makeShowHarness({
       permission: 'granted',
       constructorThrows: true,
       swAvailable: true,
+      swShowNonThenable: true,
     });
-    h2.statuses.push(...h.statuses); // same session, same client
-    h2.fn({ title: 'second' }); // worker now active -> delivered
+    h.fn({ title: 't' });
     await new Promise((r) => setTimeout(r, 0));
     check(
-      'a later delivery retracts an earlier "undeliverable"',
-      h2.statuses[0] === 'undeliverable' &&
-        h2.statuses[h2.statuses.length - 1] === 'granted',
+      'worker show returns a non-promise -> exactly one "undeliverable"',
+      h.statuses.length === 1 && h.statuses[0] === 'undeliverable',
+    );
+  }
+  {
+    // notifyRegistrationReady itself rejecting (a SecurityError from a
+    // sandboxed navigator.serviceWorker read, #4945) must not strand the app.
+    const h = makeShowHarness({
+      permission: 'granted',
+      constructorThrows: true,
+      regRejects: true,
+    });
+    h.fn({ title: 't' });
+    await new Promise((r) => setTimeout(r, 0));
+    check(
+      'registration lookup rejects -> exactly one "undeliverable"',
+      h.statuses.length === 1 && h.statuses[0] === 'undeliverable',
+    );
+  }
+  {
+    // No contract key to gate consent on: permanent, so report it as
+    // 'undeliverable' the way maybeOfferNotifications does — NOT 'default',
+    // which would send the app into a re-prompt loop it can never win.
+    const h = makeShowHarness({ permission: 'granted', noContractKey: true });
+    h.fn({ title: 't' });
+    check(
+      'no contract key -> exactly one "undeliverable"',
+      h.statuses.length === 1 && h.statuses[0] === 'undeliverable',
+    );
+  }
+  {
+    // Rate-limited: the shell coalesced it, but permission and consent are both
+    // intact, so the app must not read it as a delivery problem. This branch
+    // fires constantly in a busy room (3s per-tag throttle), so leaving it
+    // silent would be the biggest hole in the one-status-per-message rule.
+    const h = makeShowHarness({ permission: 'granted', limited: true });
+    h.fn({ title: 't' });
+    check(
+      'rate-limited -> exactly one "granted", nothing shown',
+      h.statuses.length === 1 &&
+        h.statuses[0] === 'granted' &&
+        h.shown.length === 0,
+    );
+  }
+  {
+    // Pins the hoist of the constructor-path status post out of the `try`: if
+    // the post throws from INSIDE it, the catch reads as "constructor
+    // unsupported" and the worker path shows the SAME notification a second
+    // time. With the post outside, the throw escapes and there is exactly one
+    // delivery. Reverting the hoist makes this the only failing check.
+    const h = makeShowHarness({
+      permission: 'granted',
+      swAvailable: true,
+      statusThrowsOn: 0,
+    });
+    let threw = false;
+    try {
+      h.fn({ title: 't' });
+    } catch (e) {
+      threw = true;
+    }
+    await new Promise((r) => setTimeout(r, 0));
+    check(
+      'a throwing status post cannot cause a duplicate delivery',
+      threw === true &&
+        h.shown.length === 1 &&
+        h.shown[0].via === 'constructor',
+    );
+  }
+  {
+    // The #5043 headline scenario end to end, on ONE harness so the sequence is
+    // real: the session's first notification loses the service-worker
+    // activation race, the worker then activates, and the second notification
+    // delivers. The client's status stream must be exactly
+    // ['undeliverable', 'granted'] — the false warning is retracted, and
+    // neither message produced zero or two replies.
+    const ctl = { permission: 'granted', constructorThrows: true };
+    const h = makeShowHarness(ctl);
+    ctl.swAvailable = false; // worker not active yet
+    h.fn({ title: 'first' });
+    await new Promise((r) => setTimeout(r, 0));
+    ctl.swAvailable = true; // worker activated
+    h.fn({ title: 'second' });
+    await new Promise((r) => setTimeout(r, 0));
+    check(
+      'stale "undeliverable" is retracted by the next delivery',
+      h.statuses.length === 2 &&
+        h.statuses[0] === 'undeliverable' &&
+        h.statuses[1] === 'granted' &&
+        h.shown.length === 1 &&
+        h.shown[0].via === 'sw',
+    );
+  }
+}
+
+// 10. maybeOfferNotifications status replies (#5043 item 3): every
+//     `notification_enable_prompt` gets exactly one reply too. The
+//     already-showing branch used to return silently, which a client cannot
+//     distinguish from its message being lost. Driven with a stub `document`
+//     so the DOM-building tail runs without a browser.
+{
+  const OBEGIN = 'notify-offer:BEGIN';
+  const OEND = 'notify-offer:END';
+  const ob = src.indexOf(OBEGIN);
+  const oe = src.indexOf(OEND);
+  if (ob < 0 || oe < 0 || oe < ob) {
+    console.error(
+      `FAIL: could not find ${OBEGIN}/${OEND} markers in ${assetPath}.`,
+    );
+    process.exit(1);
+  }
+  const offerRegion = src.slice(ob, oe);
+  const offerStart = offerRegion.indexOf('function maybeOfferNotifications(');
+  if (offerStart < 0) {
+    console.error(
+      'FAIL: no `function maybeOfferNotifications(` between the markers.',
+    );
+    process.exit(1);
+  }
+  const offerSource = offerRegion.slice(offerStart);
+
+  function makeOfferHarness(ctl) {
+    const statuses = [];
+    const clicks = {};
+    const node = () => ({
+      style: {},
+      setAttribute() {},
+      appendChild() {},
+      removeChild() {},
+      addEventListener(ev, cb) {
+        clicks[this.textContent] = cb;
+      },
+    });
+    const body = node();
+    const document = { createElement: node, body };
+    // `notifyAffordanceShown` lives at module scope in the asset; declare it in
+    // the prelude so the extracted function keeps its across-call state.
+    const fn = new Function(
+      'Notification',
+      'notifyStatusToIframe',
+      'contractHasConsent',
+      'isNotifySnoozed',
+      'setNotifySnoozed',
+      'setContractConsent',
+      'ensureNotifyServiceWorker',
+      'document',
+      `var notifyAffordanceShown = false;\n${offerSource}\nreturn maybeOfferNotifications;`,
+    )(
+      ctl.permission === undefined
+        ? undefined
+        : { permission: ctl.permission, requestPermission: () => {} },
+      (s) => statuses.push(s),
+      () => ctl.consent === true,
+      () => ctl.snoozed === true,
+      () => {},
+      () => true,
+      () => {},
+      document,
+    );
+    return { fn, statuses };
+  }
+
+  {
+    const h = makeOfferHarness({ permission: undefined });
+    h.fn();
+    check(
+      'prompt with no Notification API -> exactly one "unsupported"',
+      h.statuses.length === 1 && h.statuses[0] === 'unsupported',
+    );
+  }
+  {
+    const h = makeOfferHarness({ permission: 'denied' });
+    h.fn();
+    check(
+      'prompt when already denied -> exactly one "denied"',
+      h.statuses.length === 1 && h.statuses[0] === 'denied',
+    );
+  }
+  {
+    const h = makeOfferHarness({ permission: 'granted', consent: true });
+    h.fn();
+    check(
+      'prompt when already opted in -> exactly one "granted"',
+      h.statuses.length === 1 && h.statuses[0] === 'granted',
+    );
+  }
+  {
+    const h = makeOfferHarness({ permission: 'default', snoozed: true });
+    h.fn();
+    check(
+      'prompt while snoozed -> exactly one "dismissed"',
+      h.statuses.length === 1 && h.statuses[0] === 'dismissed',
+    );
+  }
+  {
+    // The bar goes up on the first prompt (no status — the user is being asked,
+    // and the answer arrives on the button handlers). A SECOND prompt while it
+    // is still on screen must reply rather than return silently.
+    const h = makeOfferHarness({ permission: 'default' });
+    h.fn();
+    const afterFirst = h.statuses.length;
+    h.fn();
+    check(
+      'a re-sent prompt while the bar is showing -> exactly one "default"',
+      afterFirst === 0 &&
+        h.statuses.length === 1 &&
+        h.statuses[0] === 'default',
     );
   }
 }
