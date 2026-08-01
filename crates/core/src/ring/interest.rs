@@ -1002,7 +1002,12 @@ pub struct InterestManager<T: TimeSource> {
     /// Bounded diagnostic-only state used to distinguish first, recreated,
     /// in-flight duplicate, and sequential missing-summary sends.
     missing_summary_history: Mutex<LruCache<(ContractKey, PeerKey), MissingPairHistory>>,
-    missing_summary_active: Mutex<HashMap<(ContractKey, PeerKey), u16>>,
+    /// Per-key entries are updated through DashMap's shard-local `entry()`
+    /// API, so same-key increment/decrement stays atomic. The total-size
+    /// bound checked in `begin_active_attempt` is a soft diagnostic cap (not
+    /// a security invariant), so a benign cross-key race can occasionally
+    /// admit one entry past `MISSING_SUMMARY_ACTIVE_SIZE`.
+    missing_summary_active: DashMap<(ContractKey, PeerKey), u16>,
     interest_lifecycle_metrics: InterestLifecycleMetrics,
 }
 
@@ -1056,7 +1061,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 NonZeroUsize::new(MISSING_SUMMARY_HISTORY_SIZE)
                     .expect("MISSING_SUMMARY_HISTORY_SIZE must be > 0"),
             )),
-            missing_summary_active: Mutex::new(HashMap::new()),
+            missing_summary_active: DashMap::new(),
             interest_lifecycle_metrics: InterestLifecycleMetrics::new(),
         }
     }
@@ -1227,19 +1232,26 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     }
 
     fn begin_active_attempt(&self, key: &(ContractKey, PeerKey)) -> (bool, bool) {
-        let mut active = self.missing_summary_active.lock();
-        if let Some(count) = active.get_mut(key) {
+        // NOTE: the occupied/vacant checks below are deliberately two
+        // separate DashMap calls (not a single `entry()` match) because
+        // `entry()` holds a write lock on the key's shard for the whole
+        // match arm, and calling `.len()` (or `.insert()`, which also locks
+        // a shard) from inside that arm risks a self-deadlock if it hashes
+        // to the same shard. Dropping the guard before checking `.len()` is
+        // deadlock-free at the cost of the benign cross-key race described
+        // on `missing_summary_active` above.
+        if let Some(mut count) = self.missing_summary_active.get_mut(key) {
             let inflight = *count > 0;
             *count = count.saturating_add(1);
             return (inflight, true);
         }
-        if active.len() >= MISSING_SUMMARY_ACTIVE_SIZE {
+        if self.missing_summary_active.len() >= MISSING_SUMMARY_ACTIVE_SIZE {
             self.interest_lifecycle_metrics
                 .active_overflow
                 .fetch_add(1, Ordering::Relaxed);
             return (false, false);
         }
-        active.insert(key.clone(), 1);
+        self.missing_summary_active.insert(key.clone(), 1);
         (false, true)
     }
 
@@ -1270,13 +1282,21 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         delivered_bytes: Option<u64>,
     ) {
         if attempt.active_tracked {
-            let mut active = self.missing_summary_active.lock();
-            if let Some(count) = active.get_mut(&attempt.key) {
-                if *count <= 1 {
-                    active.remove(&attempt.key);
+            // Drop the shard guard before `.remove()` — see the deadlock
+            // note in `begin_active_attempt`.
+            let should_remove =
+                if let Some(mut count) = self.missing_summary_active.get_mut(&attempt.key) {
+                    if *count <= 1 {
+                        true
+                    } else {
+                        *count -= 1;
+                        false
+                    }
                 } else {
-                    *count -= 1;
-                }
+                    false
+                };
+            if should_remove {
+                self.missing_summary_active.remove(&attempt.key);
             }
         }
         if let Some(bytes) = delivered_bytes {
