@@ -13,7 +13,6 @@ use crate::config::OtelConfig;
 /// data from a test process, but the decision is computed from `OtelConfig`
 /// alone — the two flags never consult each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum OtelSuppression {
     /// Operator left `otel-telemetry-enabled` off (the default).
     Disabled,
@@ -35,7 +34,6 @@ pub(crate) enum OtelSuppression {
 /// the shipped binary through Cargo feature unification with `fdev` and
 /// silently disabled telemetry across the fleet once already (#4366, the
 /// 0.2.81 blackout). See `telemetry::telemetry_suppression_reason`.
-#[allow(dead_code)]
 pub(crate) fn otel_suppression_reason(
     config: &OtelConfig,
     is_test_build: bool,
@@ -63,7 +61,6 @@ pub(crate) fn otel_suppression_reason(
 /// So whenever either variable is set we return `None` and stay out of the
 /// way. It also appends the `/v1/metrics` signal path only on the env-var
 /// path, so a config-file value gets the path appended here.
-#[allow(dead_code)]
 pub(crate) fn resolve_metrics_endpoint(
     cfg_endpoint: Option<&str>,
     metrics_env: Option<&str>,
@@ -75,6 +72,117 @@ pub(crate) fn resolve_metrics_endpoint(
     }
     let base = cfg_endpoint.map(str::trim).filter(|s| !s.is_empty())?;
     Some(format!("{}/v1/metrics", base.trim_end_matches('/')))
+}
+
+use opentelemetry::{KeyValue, global};
+use opentelemetry_otlp::{ExporterBuildError, MetricExporter, WithExportConfig};
+use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider};
+
+/// Instrumentation scope name for every instrument this crate registers.
+const METER_NAME: &str = "freenet";
+
+/// Start the OpenTelemetry SDK metrics pipeline and install it as the
+/// process-global meter provider.
+///
+/// No-op when suppressed (see [`otel_suppression_reason`]) and best-effort
+/// otherwise: an exporter that cannot be built logs a warning and the node
+/// starts anyway. Metrics export must never be a startup dependency.
+///
+/// After this returns, instrumentation anywhere in the crate is just
+/// `opentelemetry::global::meter("freenet")` — there is deliberately no wrapper
+/// type or registry to keep in sync.
+pub fn init(config: &OtelConfig, local_peer_id: String) {
+    if let Some(reason) = otel_suppression_reason(
+        config,
+        cfg!(test),
+        super::telemetry::running_under_cargo_test(),
+    ) {
+        tracing::debug!(?reason, "OTel metrics exporter not started");
+        return;
+    }
+
+    let endpoint = resolve_metrics_endpoint(
+        config.endpoint.as_deref(),
+        std::env::var(opentelemetry_otlp::OTEL_EXPORTER_OTLP_METRICS_ENDPOINT)
+            .ok()
+            .as_deref(),
+        std::env::var(opentelemetry_otlp::OTEL_EXPORTER_OTLP_ENDPOINT)
+            .ok()
+            .as_deref(),
+    );
+
+    match build_provider(endpoint.as_deref(), local_peer_id) {
+        Ok(provider) => {
+            // ponytail: no shutdown hook. `set_meter_provider` holds a
+            // reference for the process lifetime and PeriodicReader exports
+            // every 60s (OTEL_METRIC_EXPORT_INTERVAL), so at most one partial
+            // interval is lost at exit. If that tail ever matters, keep the
+            // provider in a OnceLock and call `shutdown()` from the graceful
+            // shutdown path in `bin/freenet.rs`.
+            global::set_meter_provider(provider);
+            register_process_metrics();
+            tracing::info!(
+                endpoint = endpoint
+                    .as_deref()
+                    .unwrap_or("<resolved by OTEL_* env or SDK default>"),
+                "OTel metrics exporter started"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "OTel metrics exporter failed to start; node continues without metrics"
+            );
+        }
+    }
+}
+
+/// Build the OTLP/HTTP exporter and meter provider.
+///
+/// `endpoint` is `None` when the standard env vars should win — see
+/// [`resolve_metrics_endpoint`] for why calling `with_endpoint` at all would
+/// override them.
+pub(crate) fn build_provider(
+    endpoint: Option<&str>,
+    local_peer_id: String,
+) -> Result<SdkMeterProvider, ExporterBuildError> {
+    let mut builder = MetricExporter::builder().with_http();
+    if let Some(endpoint) = endpoint {
+        builder = builder.with_endpoint(endpoint);
+    }
+    let exporter = builder.build()?;
+
+    // `service.name` is overridden by OTEL_SERVICE_NAME / OTEL_RESOURCE_ATTRIBUTES
+    // when the operator sets them; the SDK reads those itself.
+    let resource = Resource::builder()
+        .with_service_name("freenet-peer")
+        .with_attribute(KeyValue::new("peer.id", local_peer_id))
+        .build();
+
+    Ok(SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter)
+        .with_resource(resource)
+        .build())
+}
+
+/// Register the instruments this crate owns.
+///
+/// Must run AFTER `global::set_meter_provider`: `global::meter` binds to
+/// whatever provider is installed at call time.
+fn register_process_metrics() {
+    let meter = global::meter(METER_NAME);
+    // The handle is dropped on purpose — the callback is registered into the
+    // pipeline at `build()` and observed on every collection cycle regardless.
+    let _rss = meter
+        .u64_observable_gauge("freenet.process.memory.rss")
+        .with_unit("By")
+        .with_description("Resident set size of the freenet process")
+        .with_callback(|observer| {
+            if let Some(rss) = crate::node::resource_metrics::rss_bytes() {
+                observer.observe(rss, &[]);
+            }
+        })
+        .build();
 }
 
 #[cfg(test)]
@@ -177,5 +285,21 @@ mod tests {
             None,
             "a blank endpoint is not a configuration"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_builds_inside_a_tokio_runtime() {
+        // Two things under test. First, exporter construction must not panic
+        // when it happens inside an async context — the OTLP HTTP exporter uses
+        // reqwest's BLOCKING client because PeriodicReader exports from its own
+        // thread. Second, an unreachable collector must not surface as a build
+        // error: export failures are asynchronous and must never fail node
+        // startup. Port 1 is chosen because nothing can be listening there.
+        let provider = build_provider(
+            Some("http://127.0.0.1:1/v1/metrics"),
+            "peer-under-test".to_string(),
+        )
+        .expect("exporter build must succeed against an unreachable collector");
+        provider.shutdown().expect("clean shutdown");
     }
 }

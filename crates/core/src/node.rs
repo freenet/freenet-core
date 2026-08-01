@@ -817,6 +817,13 @@ impl NodeConfig {
                 registers.push(Box::new(telemetry));
             }
 
+            // Independent of the TelemetryReporter above: a separate opt-in
+            // (`otel-telemetry-enabled`), a separate endpoint, and a separate
+            // collector. It is not a NetEventRegister — it installs a global
+            // meter provider that instrumentation reaches via
+            // `opentelemetry::global::meter`.
+            crate::tracing::otel::init(&self.config.otel, self.local_peer_id_string());
+
             (DynamicRegister::new(registers), flush_handle)
         };
         let cfg = self.config.clone();
