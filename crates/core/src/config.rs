@@ -1755,7 +1755,7 @@ pub struct Config {
 
     /// OpenTelemetry SDK metrics exporter settings. Strictly isolated from
     /// `telemetry` above — see `docs/design/otel-metrics-exporter.md`.
-    #[serde(default)]
+    #[serde(flatten)]
     pub otel: OtelConfig,
 
     /// Maximum seconds to wait on graceful shutdown for in-flight
@@ -6674,6 +6674,55 @@ shutdown-drain-secs = 42
         assert_eq!(
             with_ep.otel.endpoint.as_deref(),
             Some("http://collector.example:4318")
+        );
+    }
+
+    /// C1 regression: the round-trip guard test above only round-trips the
+    /// serializer's OWN output, so a key-shape mismatch (nested `[otel]`
+    /// table vs. the flat keys the design spec and AGENTS.md document) is
+    /// invisible to it. Write the literal documented `config.toml` text and
+    /// confirm the flat keys actually parse into `Config::otel`.
+    #[tokio::test]
+    async fn otel_flat_config_toml_keys_are_honored() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Base build to create the on-disk secrets + a valid config.toml for
+        // every OTHER field (all of them are `#[serde(flatten)]`d scalars, so
+        // this baseline has no `[table]` headers at all).
+        clap_bare_args(temp_dir.path()).build().await.unwrap();
+        let base = tokio::fs::read_to_string(temp_dir.path().join("config.toml"))
+            .await
+            .unwrap();
+
+        // Strip whatever otel shape build() just wrote (pre-fix: a nested
+        // `[otel]` header + its two keys; post-fix: the two flat keys) so the
+        // literal lines appended below are unambiguous root-level keys.
+        let base: String = base
+            .lines()
+            .filter(|line| {
+                *line != "[otel]"
+                    && !line.starts_with("otel-telemetry-enabled")
+                    && !line.starts_with("otel-endpoint")
+            })
+            .map(|line| format!("{line}\n"))
+            .collect();
+
+        // The literal config.toml the design spec (Configuration table) and
+        // AGENTS.md document: flat keys at the file root, no `[otel]` table.
+        let literal = format!(
+            "{base}otel-telemetry-enabled = true\notel-endpoint = \"http://collector.example:4318\"\n"
+        );
+        std::fs::write(temp_dir.path().join("config.toml"), literal).unwrap();
+
+        let rebuilt = clap_bare_args(temp_dir.path()).build().await.unwrap();
+        assert!(
+            rebuilt.otel.enabled,
+            "documented flat `otel-telemetry-enabled` key must be honored"
+        );
+        assert_eq!(
+            rebuilt.otel.endpoint.as_deref(),
+            Some("http://collector.example:4318"),
+            "documented flat `otel-endpoint` key must be honored"
         );
     }
 

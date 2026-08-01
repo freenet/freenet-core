@@ -185,10 +185,16 @@ The provider is registered globally; nothing is stored on `Node`.
 
 ## Risks
 
-- Making the two crates non-optional grows the default build. Both already
-  compile in any `trace-ot` build and share reqwest with the existing HTTP
-  client, so the marginal cost is small — confirm cross-compile targets still
-  build (`.github/workflows/cross-compile.yml`,
+- Making the two crates non-optional grows the default build. They do NOT
+  share reqwest with the existing HTTP client: `opentelemetry-otlp` pulls
+  reqwest 0.13, a separate major version from the workspace's reqwest 0.12.
+  `opentelemetry-otlp` is trimmed to `default-features = false` plus exactly
+  the metrics/http-proto/reqwest-blocking-client/reqwest-rustls/internal-logs
+  features, so the trace/logs exporters (explicit non-goals) and their
+  prost/opentelemetry-proto deps stay out of the default build. The bounded
+  remaining cost is a second reqwest major version plus the metrics-only OTLP
+  exporter — confirm cross-compile targets still build
+  (`.github/workflows/cross-compile.yml`,
   `crates/core/tests/cross_compile_feature_split.rs`).
 - `global::set_meter_provider` is process-global. A `trace-ot` build also sets
   OTel globals (tracer provider, not meter provider) — confirm no conflict.
