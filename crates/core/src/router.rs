@@ -9,7 +9,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::GlobalRng;
 use crate::node::network_status::OpType;
+use crate::ring::interest::{
+    InterestRegistrationSource, InterestRemovalCause, MissingSummaryClass,
+    SummaryPopulationOutcome, SummaryPopulationSource,
+};
 use crate::ring::{Distance, Location, PeerKeyLocation};
+use crate::tracing::event_kind::STATE_SIZE_BUCKET_COUNT;
 pub(crate) use isotonic_estimator::{
     AdjustmentMode, EstimatorType, IsotonicEstimator, IsotonicEvent,
 };
@@ -125,10 +130,101 @@ pub(crate) struct PerOpCurves {
     pub transfer_rate_points: Vec<(f64, f64)>,
 }
 
+/// Compact, fixed-cardinality evidence for the large-state architecture
+/// decision (#5090).
+///
+/// Field names are intentionally short because every reporting peer sends this
+/// block every 30 minutes. Array orders are the corresponding enum `ALL`
+/// constants in `ring::interest`, receiver order is
+/// `[delta_changed, delta_noop, full_changed, full_noop]`, state-size order is
+/// `tracing::event_kind::STATE_SIZE_BUCKET_UPPER_BOUNDS` plus the overflow bin,
+/// queue order is documented at the population site, and shadow-rollup order is
+/// `tracing::telemetry::KnownShadowRollup::ALL`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub(crate) struct NetworkEfficiencyV1 {
+    /// Schema version.
+    pub v: u8,
+    /// Delivered missing-summary sends and bytes by `MissingSummaryClass`.
+    pub ms_s: [u64; MissingSummaryClass::COUNT],
+    pub ms_b: [u64; MissingSummaryClass::COUNT],
+    /// First-send entry-age buckets: <1s, 1-9s, 10-59s, 1-4m59s, >=5m.
+    pub ms_age: [u64; 5],
+    /// Registration overwrites of populated/empty entries, and cap rejects.
+    pub reg_ow_k: [u64; InterestRegistrationSource::COUNT],
+    pub reg_ow_m: [u64; InterestRegistrationSource::COUNT],
+    pub reg_new_k: [u64; InterestRegistrationSource::COUNT],
+    pub reg_new_m: [u64; InterestRegistrationSource::COUNT],
+    pub reg_cap: [u64; InterestRegistrationSource::COUNT],
+    /// Successful removals by cause and current known/missing population.
+    pub removed: [u64; InterestRemovalCause::COUNT],
+    pub current: [u64; crate::ring::interest::SummaryMissingReason::COUNT + 1],
+    /// Recreated pairs by their preceding removal cause.
+    pub recreated: [u64; InterestRemovalCause::COUNT],
+    /// Summary-population outcomes by source then outcome.
+    pub populated: [[u64; SummaryPopulationOutcome::COUNT]; SummaryPopulationSource::COUNT],
+    /// Missing-pair history and active-attempt correlation overflows.
+    pub corr_ovf: [u64; 2],
+    /// Queue counters: capacity eviction, queued dedup, enqueue while active,
+    /// large-head incidents, large-head blocked ms, small-entry-ms blocked,
+    /// queued-large/actual-small count, queued-small/actual-large count, their
+    /// respective actual payload bytes, scheduled small/large counts, their
+    /// respective state bytes, then active-key tracking overflow.
+    pub queue: [u64; 15],
+    /// Successful apply counts by delta/full x changed/no-op x resulting-state
+    /// size bucket.
+    pub recv_n: [[u64; STATE_SIZE_BUCKET_COUNT]; 4],
+    /// Every received payload by delta/full x terminal outcome (changed,
+    /// no-op, dedup, backoff, failed) x incoming-payload size bucket. Delta's
+    /// five outcome rows come first, then full state's five rows.
+    pub recv_tn: [[u64; STATE_SIZE_BUCKET_COUNT]; 10],
+    pub recv_tb: [[u64; STATE_SIZE_BUCKET_COUNT]; 10],
+    /// Persisted state counts and bytes by fixed size bucket.
+    pub state_n: [u64; STATE_SIZE_BUCKET_COUNT],
+    pub state_b: [u64; STATE_SIZE_BUCKET_COUNT],
+    /// State inventory summary: count, max bytes, over-limit count,
+    /// over-limit bytes, hard limit, then pre-WASM and post-merge hard-limit
+    /// rejection count/max pairs.
+    pub state: [u64; 9],
+    /// Cost-eviction eligibility by state size: eligible zero-demand,
+    /// subscribed, recent-but-unsubscribed.
+    pub evict_n: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
+    pub evict_b: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
+    /// Monotonic actual eviction victims by byte-budget zero-demand,
+    /// byte-budget in-use, and cost-pressure reason × state-size bucket.
+    pub vict_n: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
+    pub vict_b: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
+    /// Per cost axis: total rate, floor, max attributed rate, max eligible
+    /// rate, and number of sustained attributed contracts.
+    pub cost: [[u64; 5]; 3],
+    /// Per cost axis × state-size bucket maximum attributed rate, first for
+    /// every hosted contract and then restricted to eviction-eligible ones.
+    pub cost_ba: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
+    pub cost_be: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
+    /// Local telemetry pipeline totals in the order documented where populated.
+    pub tel: [u64; 15],
+    /// Per known shadow rollup: generated/enqueue attempts, enqueue full,
+    /// enqueue closed, rate-limit admitted, aggregate-limit drop,
+    /// shadow-subbudget drop, backoff-buffer drop, retry truncation, final sent.
+    pub shadow: [[u64; 9]; 7],
+    /// Delivery path for this diagnostic block itself; order is documented in
+    /// `TelemetryLocalMetricsSnapshot::network_efficiency_delivery`.
+    pub eff: [u64; 8],
+}
+
 /// Periodic snapshot of the router model state for telemetry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub(crate) struct RouterSnapshotInfo {
+    /// Versioned fixed-cardinality network-efficiency evidence. `None` on five
+    /// of every six router snapshots (the wide block exports every 30 minutes)
+    /// and before the production sources are initialized. As with the
+    /// snapshot's earlier added fields, this changes positional bincode AOF decoding:
+    /// buffered pre-upgrade RouterSnapshot records can be skipped once during
+    /// upgrade, while live/self-describing OTLP JSON is unaffected. The AOF
+    /// reader already treats an undecodable telemetry record as skippable.
+    #[serde(default)]
+    pub network_efficiency_v1: Option<NetworkEfficiencyV1>,
     pub failure_events: usize,
     pub success_events: usize,
     pub transfer_rate_events: usize,
@@ -1277,6 +1373,7 @@ impl Router {
     /// Produce a snapshot of the router model state for telemetry.
     pub fn snapshot(&self) -> RouterSnapshotInfo {
         RouterSnapshotInfo {
+            network_efficiency_v1: None,
             failure_events: self.failure_estimator.len(),
             success_events: self.response_start_time_estimator.len(),
             transfer_rate_events: self.transfer_rate_estimator.len(),

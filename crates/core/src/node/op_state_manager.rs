@@ -1344,8 +1344,11 @@ impl OpManager {
                 "Upstream peer address not found, cleaning up locally"
             );
             self.ring.unsubscribe(contract);
-            self.interest_manager
-                .remove_peer_interest(contract, &peer_key);
+            self.interest_manager.remove_peer_interest_for(
+                contract,
+                &peer_key,
+                crate::ring::interest::InterestRemovalCause::Unsubscribe,
+            );
             return;
         };
 
@@ -1355,8 +1358,11 @@ impl OpManager {
                 "Upstream peer has no known address, cleaning up locally"
             );
             self.ring.unsubscribe(contract);
-            self.interest_manager
-                .remove_peer_interest(contract, &peer_key);
+            self.interest_manager.remove_peer_interest_for(
+                contract,
+                &peer_key,
+                crate::ring::interest::InterestRemovalCause::Unsubscribe,
+            );
             return;
         };
 
@@ -1391,8 +1397,11 @@ impl OpManager {
 
         // Clean up local state regardless of send result.
         self.ring.unsubscribe(contract);
-        self.interest_manager
-            .remove_peer_interest(contract, &peer_key);
+        self.interest_manager.remove_peer_interest_for(
+            contract,
+            &peer_key,
+            crate::ring::interest::InterestRemovalCause::Unsubscribe,
+        );
     }
 
     /// Build a per-transaction [`OpCtx`] bound to `tx`.
@@ -3178,8 +3187,7 @@ mod tests {
         // M >> cap in-use contracts, ALL co-hosted by ONE hub peer. Kept within the
         // per-drop SAMPLE cap so the scan returns them all and it is the per-drop
         // re-root cap (not the scan cap) that does the bounding this test measures.
-        const _: () =
-            assert!(MAX_PROMPT_REROOTS_PER_DROP * 3 + 1 <= CONNECTION_DROP_SHADOW_SAMPLE_CAP);
+        const _: () = assert!(MAX_PROMPT_REROOTS_PER_DROP * 3 < CONNECTION_DROP_SHADOW_SAMPLE_CAP);
         let m = MAX_PROMPT_REROOTS_PER_DROP * 3 + 1;
         let mut instance_ids = Vec::new();
         for i in 0..m {

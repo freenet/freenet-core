@@ -1643,6 +1643,12 @@ impl Ring {
         let mut prev_broadcast_stream_failures_total: u64 = crate::node::BROADCAST_STREAM_METRICS
             .snapshot()
             .streaming_failures_total;
+        // The diagnostic block is substantially wider than the ordinary
+        // snapshot gauges. Its counters are lifetime-monotonic, so collecting
+        // locally on every event but exporting one in six snapshots preserves
+        // counter evidence while bounding collector/storage load. Start at five
+        // so a newly started node reports after its first five-minute snapshot.
+        let mut network_efficiency_tick = 5u8;
 
         loop {
             if sleep_or_shutdown(&shutdown, async {
@@ -1789,7 +1795,8 @@ impl Ring {
             // WASM blobs + wasmtime compile cache (both du-measured) + their sum.
             // `None` until the tracker is configured and seeded (early startup),
             // in which case the fields stay unset. Observational only in this PR.
-            if let Some(disk) = ring.hosting_manager.disk_usage_stats() {
+            let disk_usage = ring.hosting_manager.disk_usage_stats();
+            if let Some(disk) = disk_usage {
                 snapshot.hosting_disk_state_bytes = Some(disk.state_bytes);
                 snapshot.hosting_disk_wasm_bytes = Some(disk.wasm_bytes);
                 snapshot.hosting_disk_compile_cache_bytes = Some(disk.compile_cache_bytes);
@@ -2049,6 +2056,154 @@ impl Ring {
             snapshot.subscribe_hint_refused_cache = Some(pm.received_refused_cache_admission);
             snapshot.subscribe_hint_acted_succeeded = Some(pm.acted_succeeded);
             snapshot.subscribe_hint_acted_failed = Some(pm.acted_failed);
+
+            // Large-state decision evidence (#5090). The fixed-cardinality
+            // block rides the existing snapshot event once every six ticks
+            // (30 minutes), with no new event stream, peer identifiers, or
+            // contract-key map. Lifetime-monotonic counters recover both local
+            // snapshot drops and the deliberately skipped five-minute ticks.
+            network_efficiency_tick = (network_efficiency_tick + 1) % 6;
+            if network_efficiency_tick == 0
+                && let (Some(op_manager), Some(disk), Some(telemetry)) = (
+                    ring.upgrade_op_manager(),
+                    disk_usage,
+                    crate::tracing::telemetry::telemetry_local_metrics_snapshot(),
+                )
+            {
+                let lifecycle = op_manager.interest_manager.interest_lifecycle_snapshot();
+                let receiver = op_manager.payload_mix.receiver_apply_stats();
+                let queue = crate::node::BROADCAST_QUEUE_EFFICIENCY_METRICS.snapshot();
+                let state_rejections = crate::contract::state_size_rejection_snapshot();
+                let rate_to_u64 = |rate: f64| {
+                    if !rate.is_finite() || rate <= 0.0 {
+                        0
+                    } else if rate >= u64::MAX as f64 {
+                        u64::MAX
+                    } else {
+                        rate.round() as u64
+                    }
+                };
+                let cost_axes = ring.hosting_cost_pressure_axes();
+                let eligibility = ring.hosting_manager.cost_eligibility_stats(&cost_axes);
+                let cost = std::array::from_fn(|index| {
+                    cost_axes.get(index).map_or([0; 5], |axis| {
+                        let max_any = axis.rates.values().copied().fold(0.0, f64::max);
+                        let max_eligible = eligibility.max_eligible_rate[index]
+                            .iter()
+                            .copied()
+                            .fold(0.0, f64::max);
+                        [
+                            rate_to_u64(axis.total_rate),
+                            rate_to_u64(axis.floor),
+                            rate_to_u64(max_any),
+                            rate_to_u64(max_eligible),
+                            axis.rates.len() as u64,
+                        ]
+                    })
+                });
+                let cost_bucket_any = std::array::from_fn(|axis| {
+                    std::array::from_fn(|bucket| {
+                        rate_to_u64(eligibility.max_attributed_rate[axis][bucket])
+                    })
+                });
+                let cost_bucket_eligible = std::array::from_fn(|axis| {
+                    std::array::from_fn(|bucket| {
+                        rate_to_u64(eligibility.max_eligible_rate[axis][bucket])
+                    })
+                });
+
+                let tel = [
+                    telemetry.enqueue_attempts_total,
+                    telemetry.enqueue_succeeded_total,
+                    telemetry.enqueue_dropped_full_total,
+                    telemetry.enqueue_dropped_closed_total,
+                    telemetry.rate_limit_admitted_operational_total,
+                    telemetry.rate_limit_admitted_shadow_total,
+                    telemetry.dropped_aggregate_limit_operational_total,
+                    telemetry.dropped_aggregate_limit_shadow_total,
+                    telemetry.dropped_shadow_limit_total,
+                    telemetry.dropped_backoff_buffer_full_total,
+                    telemetry.batch_send_attempts_total,
+                    telemetry.batch_send_successes_total,
+                    telemetry.batch_send_failures_total,
+                    telemetry.batch_events_sent_total,
+                    telemetry.batch_retry_truncated_events_total,
+                ];
+                let shadow = std::array::from_fn(|index| {
+                    let stream = telemetry.known_shadow_rollups[index];
+                    [
+                        stream.enqueue_attempts_total,
+                        stream.enqueue_dropped_full_total,
+                        stream.enqueue_dropped_closed_total,
+                        stream.rate_limit_admitted_total,
+                        stream.dropped_aggregate_limit_total,
+                        stream.dropped_shadow_limit_total,
+                        stream.dropped_backoff_buffer_full_total,
+                        stream.retry_truncated_total,
+                        stream.sent_total,
+                    ]
+                });
+
+                snapshot.network_efficiency_v1 = Some(crate::router::NetworkEfficiencyV1 {
+                    v: 1,
+                    ms_s: lifecycle.delivered_sends,
+                    ms_b: lifecycle.delivered_bytes,
+                    ms_age: lifecycle.first_send_age,
+                    reg_ow_k: lifecycle.registration_overwrite_known,
+                    reg_ow_m: lifecycle.registration_overwrite_missing,
+                    reg_new_k: lifecycle.registration_new_known,
+                    reg_new_m: lifecycle.registration_new_missing,
+                    reg_cap: lifecycle.registration_cap_rejected,
+                    removed: lifecycle.removals,
+                    current: lifecycle.current_summary_state,
+                    recreated: lifecycle.recreated_after_removal,
+                    populated: lifecycle.population,
+                    corr_ovf: [lifecycle.history_overflow, lifecycle.active_overflow],
+                    queue: [
+                        queue.capacity_evictions,
+                        queue.dedup_replacements,
+                        queue.enqueues_while_pair_active,
+                        queue.large_head_blocking_incidents,
+                        queue.large_head_blocked_millis,
+                        queue.small_entry_millis_blocked,
+                        queue.queued_large_actual_small,
+                        queue.queued_small_actual_large,
+                        queue.queued_large_actual_small_bytes,
+                        queue.queued_small_actual_large_bytes,
+                        queue.scheduled_small,
+                        queue.scheduled_large,
+                        queue.scheduled_small_state_bytes,
+                        queue.scheduled_large_state_bytes,
+                        queue.active_tracking_overflow,
+                    ],
+                    recv_n: receiver.counts,
+                    recv_tn: receiver.terminal_counts,
+                    recv_tb: receiver.terminal_bytes,
+                    state_n: disk.state_size_bucket_counts,
+                    state_b: disk.state_size_bucket_bytes,
+                    state: [
+                        disk.state_count,
+                        disk.state_max_bytes,
+                        disk.state_over_limit_count,
+                        disk.state_over_limit_bytes,
+                        disk.state_limit_bytes,
+                        state_rejections.pre_wasm_count,
+                        state_rejections.pre_wasm_max_bytes,
+                        state_rejections.post_merge_count,
+                        state_rejections.post_merge_max_bytes,
+                    ],
+                    evict_n: eligibility.counts,
+                    evict_b: eligibility.bytes,
+                    vict_n: hosting.eviction_victim_counts,
+                    vict_b: hosting.eviction_victim_bytes,
+                    cost,
+                    cost_ba: cost_bucket_any,
+                    cost_be: cost_bucket_eligible,
+                    tel,
+                    shadow,
+                    eff: telemetry.network_efficiency_delivery,
+                });
+            }
 
             tracing::info!(
                 failure_events = snapshot.failure_events,

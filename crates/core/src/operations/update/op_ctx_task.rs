@@ -1663,11 +1663,12 @@ fn seed_sender_summary_from_broadcast(
     // sender population is by definition co-hosts we often don't
     // interest-track. Seeding here lets OUR next broadcast to them be a delta
     // without waiting for a delivered send.
-    op_manager.interest_manager.upsert_peer_summary(
+    op_manager.interest_manager.upsert_peer_summary_from(
         key,
         &sender_key,
         StateSummary::from(sender_summary_bytes.to_vec()),
-    )
+        crate::ring::interest::SummaryPopulationSource::InboundBroadcast,
+    ) != crate::ring::interest::SummaryPopulationOutcome::RejectedAtCap
 }
 
 /// Inner driver for `BroadcastTo`. Mirrors `update.rs:595-825`.
@@ -1716,6 +1717,9 @@ async fn drive_relay_broadcast_to(
         }
     };
     let is_delta = matches!(payload, DeltaOrFullState::Delta(_));
+    let mut receiver_terminal = op_manager
+        .payload_mix
+        .receiver_terminal_guard(is_delta, payload_bytes.len());
     let state_for_telemetry = WrappedState::from(payload_bytes.clone());
 
     // ── Step 2: telemetry — broadcast received ─────────────────────────────
@@ -1745,6 +1749,7 @@ async fn drive_relay_broadcast_to(
         is_delta,
         op_manager.interest_manager.now(),
     ) {
+        receiver_terminal.mark_dedup();
         tracing::debug!(
             tx = %incoming_tx,
             %key,
@@ -1775,6 +1780,7 @@ async fn drive_relay_broadcast_to(
         crate::ring::merge_backoff::MergeDecision::Allow => {}
         decision @ (crate::ring::merge_backoff::MergeDecision::InBackoff
         | crate::ring::merge_backoff::MergeDecision::KnownFailedPayload) => {
+            receiver_terminal.mark_backoff();
             crate::config::GlobalTestMetrics::record_merge_suppressed_by_backoff();
             tracing::debug!(
                 tx = %incoming_tx,
@@ -2029,6 +2035,7 @@ async fn drive_relay_broadcast_to(
     );
 
     // ── Step 5: telemetry — broadcast applied ─────────────────────────────
+    receiver_terminal.mark_applied(changed, updated_value.len());
     if let Some(event) = NetEventLog::update_broadcast_applied(
         &incoming_tx,
         &op_manager.ring,
@@ -2626,6 +2633,9 @@ async fn apply_streaming_broadcast(
     sender_summary_bytes: Vec<u8>,
     sender_addr: SocketAddr,
 ) -> Result<(), OpError> {
+    let mut receiver_terminal = op_manager
+        .payload_mix
+        .receiver_terminal_guard(false, state_bytes.len());
     // Step 4: update sender's cached summary. Same self-reported provenance
     // and the same empty-means-could-not-summarize guard as the non-streaming
     // BroadcastTo arm above.
@@ -2641,6 +2651,7 @@ async fn apply_streaming_broadcast(
         false,
         op_manager.interest_manager.now(),
     ) {
+        receiver_terminal.mark_dedup();
         tracing::debug!(
             tx = %incoming_tx,
             %key,
@@ -2661,6 +2672,7 @@ async fn apply_streaming_broadcast(
         crate::ring::merge_backoff::MergeDecision::Allow => {}
         decision @ (crate::ring::merge_backoff::MergeDecision::InBackoff
         | crate::ring::merge_backoff::MergeDecision::KnownFailedPayload) => {
+            receiver_terminal.mark_backoff();
             crate::config::GlobalTestMetrics::record_merge_suppressed_by_backoff();
             tracing::debug!(
                 tx = %incoming_tx,
@@ -2800,6 +2812,7 @@ async fn apply_streaming_broadcast(
     };
 
     // Step 8: telemetry — broadcast applied + proactive summary.
+    receiver_terminal.mark_applied(changed, updated_value.len());
     if let Some(event) = NetEventLog::update_broadcast_applied(
         &incoming_tx,
         &op_manager.ring,
@@ -6543,6 +6556,53 @@ mod tests {
              apply_streaming_broadcast (#4857). A direct call here would \
              double-count the streaming path. Issue #4828."
         );
+    }
+
+    /// #5090: every received payload is terminally classified by an RAII guard,
+    /// and successful no-ops are marked before returning.
+    #[test]
+    fn both_broadcast_apply_paths_record_receiver_outcome_before_noop_return() {
+        let full = include_str!("op_ctx_task.rs");
+        let src = production_source(full);
+        for sig in [
+            "async fn drive_relay_broadcast_to(",
+            "async fn apply_streaming_broadcast(",
+        ] {
+            let body = extract_fn_body(src, sig);
+            assert_eq!(
+                body.matches("receiver_terminal_guard(").count(),
+                1,
+                "{sig} must create exactly one terminal receiver guard"
+            );
+            let record = body
+                .find("receiver_terminal.mark_applied(changed, updated_value.len())")
+                .unwrap_or_else(|| panic!("{sig} must classify successful apply outcome"));
+            let no_op_return = body
+                .find("if !changed {")
+                .unwrap_or_else(|| panic!("{sig} must retain its no-op early return"));
+            assert!(
+                record < no_op_return,
+                "{sig} must count a successfully executed no-op before returning"
+            );
+            for marker in [
+                "receiver_terminal.mark_dedup();",
+                "receiver_terminal.mark_backoff();",
+            ] {
+                let marker_offset = body.find(marker).unwrap_or_else(|| {
+                    panic!("{sig} must classify {marker} before its early return")
+                });
+                let return_offset =
+                    body[marker_offset..]
+                        .find("return Ok(());")
+                        .unwrap_or_else(|| {
+                            panic!("{sig} must retain the early return following {marker}")
+                        });
+                assert!(
+                    return_offset > 0,
+                    "{sig} must classify {marker} before its early return"
+                );
+            }
+        }
     }
 
     /// Pin (telemetry accuracy / scope): `relayed_updates_total` counts

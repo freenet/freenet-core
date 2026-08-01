@@ -83,6 +83,19 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
+
+use crate::tracing::event_kind::{STATE_SIZE_BUCKET_COUNT, state_size_bucket};
+
+/// Current cost-eviction eligibility by state-size bucket. Class order is
+/// `[eligible_zero_demand, subscribed, recent_unsubscribed]`.
+pub(crate) struct CostEligibilityStats {
+    pub counts: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
+    pub bytes: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
+    /// Per cost axis × state-size bucket maxima for every attributed contract.
+    pub max_attributed_rate: [[f64; STATE_SIZE_BUCKET_COUNT]; 3],
+    /// Same maxima restricted to cost-eviction-eligible zero-demand contracts.
+    pub max_eligible_rate: [[f64; STATE_SIZE_BUCKET_COUNT]; 3],
+}
 use tracing::{debug, info};
 
 use super::Location;
@@ -882,6 +895,48 @@ impl HostingManager {
             return None;
         }
         Some(tracker.stats())
+    }
+
+    pub(crate) fn cost_eligibility_stats(
+        &self,
+        cost_axes: &[CostAxisPressure],
+    ) -> CostEligibilityStats {
+        let mut counts = [[0u64; STATE_SIZE_BUCKET_COUNT]; 3];
+        let mut bytes = [[0u64; STATE_SIZE_BUCKET_COUNT]; 3];
+        let mut max_attributed_rate = [[0.0f64; STATE_SIZE_BUCKET_COUNT]; 3];
+        let mut max_eligible_rate = [[0.0f64; STATE_SIZE_BUCKET_COUNT]; 3];
+        self.hosting_cache
+            .read()
+            .for_each_cost_eligibility_row(|key, size, recently_accessed| {
+                let (local, downstream) = self.local_and_downstream_counts(key);
+                let class = if local + downstream > 0 {
+                    1
+                } else if recently_accessed {
+                    2
+                } else {
+                    0
+                };
+                let bucket = state_size_bucket(size);
+                counts[class][bucket] = counts[class][bucket].saturating_add(1);
+                bytes[class][bucket] = bytes[class][bucket].saturating_add(size);
+                for (axis_index, axis) in cost_axes.iter().take(3).enumerate() {
+                    let rate = axis.rates.get(key.id()).copied().unwrap_or(0.0);
+                    if rate.is_finite() && rate > 0.0 {
+                        max_attributed_rate[axis_index][bucket] =
+                            max_attributed_rate[axis_index][bucket].max(rate);
+                        if class == 0 {
+                            max_eligible_rate[axis_index][bucket] =
+                                max_eligible_rate[axis_index][bucket].max(rate);
+                        }
+                    }
+                }
+            });
+        CostEligibilityStats {
+            counts,
+            bytes,
+            max_attributed_rate,
+            max_eligible_rate,
+        }
     }
 
     /// Test-only: install a disk tracker on nonexistent paths (so the du-walks
@@ -6439,6 +6494,65 @@ mod tests {
         assert!(
             !needs_renewal.contains(&relay_contract),
             "Relay-cached contract should NOT be in renewal list"
+        );
+    }
+
+    #[test]
+    fn cost_eligibility_stats_separate_zero_demand_subscribed_and_recent_by_size() {
+        use crate::util::time_source::SharedMockTimeSource;
+
+        let clock = SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(
+            DEFAULT_HOSTING_BUDGET_BYTES,
+            std::sync::Arc::new(clock.clone()),
+        );
+        let eligible = make_contract_key(11);
+        let subscribed = make_contract_key(12);
+        let recent = make_contract_key(13);
+        let eligible_size = 100;
+        let subscribed_size = 3 * 1024 * 1024;
+        let recent_size = 4 * 1024 * 1024;
+
+        manager.record_contract_access(eligible, eligible_size, AccessType::Get);
+        manager.record_contract_access(subscribed, subscribed_size, AccessType::Get);
+        manager.record_contract_access(recent, recent_size, AccessType::Get);
+        manager.add_downstream_subscriber(&subscribed, make_peer_key(12));
+
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+        manager.mark_local_client_access(&recent);
+
+        let axes = [CostAxisPressure {
+            axis: "test",
+            total_rate: 60.0,
+            floor: 1.0,
+            rates: [(*eligible.id(), 10.0), (*subscribed.id(), 50.0)]
+                .into_iter()
+                .collect(),
+        }];
+        let stats = manager.cost_eligibility_stats(&axes);
+        assert_eq!(stats.counts[0][state_size_bucket(eligible_size)], 1);
+        assert_eq!(
+            stats.bytes[0][state_size_bucket(eligible_size)],
+            eligible_size
+        );
+        assert_eq!(stats.counts[1][state_size_bucket(subscribed_size)], 1);
+        assert_eq!(
+            stats.bytes[1][state_size_bucket(subscribed_size)],
+            subscribed_size
+        );
+        assert_eq!(stats.counts[2][state_size_bucket(recent_size)], 1);
+        assert_eq!(stats.bytes[2][state_size_bucket(recent_size)], recent_size);
+        assert_eq!(
+            stats.max_eligible_rate[0][state_size_bucket(eligible_size)],
+            10.0
+        );
+        assert_eq!(
+            stats.max_eligible_rate[0][state_size_bucket(subscribed_size)],
+            0.0
+        );
+        assert_eq!(
+            stats.max_attributed_rate[0][state_size_bucket(subscribed_size)],
+            50.0
         );
     }
 

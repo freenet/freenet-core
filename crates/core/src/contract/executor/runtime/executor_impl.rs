@@ -375,6 +375,10 @@ where
                 // happen at the node level before any WASM execution.
                 let incoming_size = incoming_state.as_ref().len();
                 if incoming_size > MAX_STATE_SIZE {
+                    crate::contract::record_state_size_rejection(
+                        crate::contract::StateSizeRejectionStage::PreWasmFullState,
+                        incoming_size,
+                    );
                     tracing::warn!(
                         contract = %key,
                         size_bytes = incoming_size,
@@ -1891,6 +1895,10 @@ where
 
         let state_size = new_state.as_ref().len();
         if state_size > MAX_STATE_SIZE {
+            crate::contract::record_state_size_rejection(
+                crate::contract::StateSizeRejectionStage::PostMergeCommit,
+                state_size,
+            );
             tracing::warn!(
                 contract = %key,
                 size_bytes = state_size,

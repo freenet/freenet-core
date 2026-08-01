@@ -18,6 +18,7 @@ use crate::message::{NetMessage, NodeEvent};
 
 pub(crate) mod broadcast_payload_mix;
 pub(crate) mod broadcast_queue;
+pub(crate) mod broadcast_queue_metrics;
 mod handshake;
 pub(crate) mod in_memory;
 pub(crate) mod outbound_message_mix;

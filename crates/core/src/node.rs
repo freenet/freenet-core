@@ -57,6 +57,7 @@ pub(crate) use network_bridge::{
 // (The module-cache metrics were a sibling process-global until #4488 made them
 // a per-node `Arc`.)
 pub(crate) use network_bridge::broadcast_queue::BROADCAST_STREAM_METRICS;
+pub(crate) use network_bridge::broadcast_queue_metrics::BROADCAST_QUEUE_EFFICIENCY_METRICS;
 // Re-export the summary-first PUT version gate (#4642 step 3-bis) so
 // `ring::connection_manager::ConnectionManager::supports_summary_first_put`
 // can consult it — the gate lives behind the private `network_bridge`
@@ -2966,9 +2967,11 @@ async fn handle_interest_sync_message(
                 for contract in &current_contracts {
                     let h = contract_hash(contract);
                     if !incoming_hashes.contains(&h) {
-                        op_manager
-                            .interest_manager
-                            .remove_peer_interest(contract, pk);
+                        op_manager.interest_manager.remove_peer_interest_for(
+                            contract,
+                            pk,
+                            crate::ring::interest::InterestRemovalCause::InterestsReplace,
+                        );
                         removed += 1;
                     }
                 }
@@ -3010,11 +3013,12 @@ async fn handle_interest_sync_message(
                         .interest_manager
                         .refresh_peer_interest(&contract, pk)
                     {
-                        let is_new = op_manager.interest_manager.register_peer_interest(
+                        let is_new = op_manager.interest_manager.register_peer_interest_from(
                             &contract,
                             pk.clone(),
                             None, // New entry; summary arrives in their Summaries response
                             false,
+                            crate::ring::interest::InterestRegistrationSource::Interests,
                         );
                         if is_new {
                             // #4359 (MUST-FIX 1): an Interests-sync registration
@@ -3250,9 +3254,12 @@ async fn handle_interest_sync_message(
                         // `summaries_arm_writes_summary_outside_staleness_branch_pin`.
                         match their_summary {
                             Some(theirs) => {
-                                op_manager
-                                    .interest_manager
-                                    .upsert_peer_summary(&contract, &pk, theirs);
+                                op_manager.interest_manager.upsert_peer_summary_from(
+                                    &contract,
+                                    &pk,
+                                    theirs,
+                                    crate::ring::interest::SummaryPopulationSource::InterestSummary,
+                                );
                             }
                             None => op_manager.interest_manager.clear_peer_summary(
                                 &contract,
@@ -3570,9 +3577,12 @@ async fn handle_interest_sync_message(
                                 // full-state broadcast target. Fact, not
                                 // belief: the digest established that these
                                 // bytes are what the peer holds.
-                                op_manager
-                                    .interest_manager
-                                    .upsert_peer_summary(&contract, &pk, ours);
+                                op_manager.interest_manager.upsert_peer_summary_from(
+                                    &contract,
+                                    &pk,
+                                    ours,
+                                    crate::ring::interest::SummaryPopulationSource::DigestAgreement,
+                                );
                                 if is_stale && !stale_contracts.contains(&contract) {
                                     stale_contracts.push(contract);
                                 }
@@ -3749,9 +3759,11 @@ async fn handle_interest_sync_message(
                 for hash in removed {
                     // Handle hash collisions - remove interest from all matching contracts
                     for contract in op_manager.interest_manager.lookup_by_hash(hash) {
-                        op_manager
-                            .interest_manager
-                            .remove_peer_interest(&contract, pk);
+                        op_manager.interest_manager.remove_peer_interest_for(
+                            &contract,
+                            pk,
+                            crate::ring::interest::InterestRemovalCause::ChangeInterests,
+                        );
                     }
                 }
             }
@@ -3804,11 +3816,12 @@ async fn handle_interest_sync_message(
                         {
                             false
                         } else {
-                            op_manager.interest_manager.register_peer_interest(
+                            op_manager.interest_manager.register_peer_interest_from(
                                 &contract,
                                 pk.clone(),
                                 None,
                                 false,
+                                crate::ring::interest::InterestRegistrationSource::ChangeInterests,
                             )
                         };
                         if is_new {
@@ -4211,9 +4224,12 @@ async fn handle_interest_sync_message(
                 // #4952: upsert — a ResyncResponse sender self-reported the
                 // summary of the full state it just shipped us; seed it even
                 // when we don't interest-track that co-host.
-                op_manager
-                    .interest_manager
-                    .upsert_peer_summary(&key, &pk, summary);
+                op_manager.interest_manager.upsert_peer_summary_from(
+                    &key,
+                    &pk,
+                    summary,
+                    crate::ring::interest::SummaryPopulationSource::ResyncResponse,
+                );
             }
 
             // No response needed
@@ -4797,7 +4813,7 @@ mod tests {
                 .expect("end of handler region not found");
         let body: String = src[handler_start..handler_end].split_whitespace().collect();
         assert!(
-            body.contains("upsert_peer_summary(&contract,&pk,theirs)"),
+            body.contains("upsert_peer_summary_from(&contract,&pk,theirs,"),
             "Summaries arm must upsert a Some(summary) report (seeds untracked \
              co-hosts, #4952)"
         );
@@ -5024,7 +5040,7 @@ mod tests {
 
         // Both writes must be present — they are the only thing refreshing the
         // TTL on this path.
-        let upsert_at = summaries_arm.find("upsert_peer_summary(").expect(
+        let upsert_at = summaries_arm.find("upsert_peer_summary_from(").expect(
             "the Summaries arm must cache the peer's reported summary via \
              upsert_peer_summary — that write is also what refreshes the peer's \
              interest TTL here (#4952, #3046)",
@@ -5060,7 +5076,7 @@ mod tests {
             .filter(|c| !c.is_whitespace())
             .collect();
         assert!(
-            !stripped.contains("ifis_stale{op_manager.interest_manager.upsert_peer_summary("),
+            !stripped.contains("ifis_stale{op_manager.interest_manager.upsert_peer_summary_from("),
             "the summary write must not be gated on is_stale — see above"
         );
     }
@@ -5258,7 +5274,7 @@ mod tests {
              cached summary) and registering ONLY in the else branch. Arm:\n{arm}"
         );
         assert!(
-            stripped.contains("else{op_manager.interest_manager.register_peer_interest("),
+            stripped.contains("else{op_manager.interest_manager.register_peer_interest_from("),
             "the register MUST be the else-branch fallback of that guard, not a \
              separate statement that runs regardless (D2). Arm:\n{arm}"
         );
@@ -5268,7 +5284,7 @@ mod tests {
         // refresh would mean the guard needle above matched a different call
         // than the one gating the register.
         assert_eq!(
-            arm.matches("register_peer_interest(").count(),
+            arm.matches("register_peer_interest_from(").count(),
             1,
             "ChangeInterests arm must contain exactly one (guarded, else-branch) \
              register_peer_interest call; a second would be an unguarded clobber (D2)"
@@ -9478,7 +9494,7 @@ mod tests {
         /// sampling must seed.
         #[tokio::test]
         async fn over_cap_digest_message_stays_bounded() {
-            crate::config::GlobalRng::set_seed(0x4965_CA9);
+            crate::config::GlobalRng::set_seed(0x0496_5CA9);
             let h = build_harness("hf-cap", 17065, vec![5u8; 128]).await;
             let hash = contract_hash(&h.key);
 
