@@ -126,8 +126,13 @@ tracing-core = { workspace = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, features = ["json"], optional = true }
 tracing-appender = { workspace = true, optional = true }
-opentelemetry-otlp = { workspace = true, optional = true }
-opentelemetry_sdk = { workspace = true, optional = true }
+# Non-optional: the SDK metrics pipeline (tracing::otel) ships in every build.
+# Default features already give us metrics + http-proto + reqwest-blocking-client.
+# The blocking client is load-bearing, not incidental: PeriodicReader exports
+# from a dedicated thread via futures_executor::block_on, where an async reqwest
+# client would have no tokio reactor.
+opentelemetry-otlp = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 
 hkdf = { workspace = true }
 keyring = { workspace = true }
@@ -243,7 +248,7 @@ winres = "0.1"
 default = ["redb", "trace", "websocket", "wasmtime-backend"]
 sqlite = ["sqlx"]
 trace = ["tracing-subscriber", "tracing-appender"]
-trace-ot = ["opentelemetry-jaeger", "trace", "tracing-opentelemetry", "opentelemetry-otlp"]
+trace-ot = ["opentelemetry-jaeger", "trace", "tracing-opentelemetry"]
 websocket = ["axum/ws"]
 testing = ["freenet-stdlib/testing", "parking_lot/deadlock_detection"]
 console-subscriber = ["dep:console-subscriber"]
