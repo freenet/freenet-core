@@ -73,6 +73,15 @@ pub struct TransportMetrics {
     cumulative_bytes_sent: AtomicU64,
     cumulative_bytes_received: AtomicU64,
 
+    // Cumulative wire-packet counters (never reset). Metered at exactly the
+    // same two call sites as the cumulative byte counters above, so the same
+    // send-at-socket / receive-post-auth asymmetry applies. Kept here rather
+    // than incremented as an OTel counter at the call site because these fire
+    // once per UDP datagram — an observable counter reading these costs
+    // nothing on the hot path.
+    cumulative_packets_sent: AtomicU64,
+    cumulative_packets_received: AtomicU64,
+
     // Timing accumulators (for computing averages)
     total_transfer_time_ms: AtomicU64,
 
@@ -163,6 +172,8 @@ impl TransportMetrics {
             bytes_received: AtomicU64::new(0),
             cumulative_bytes_sent: AtomicU64::new(0),
             cumulative_bytes_received: AtomicU64::new(0),
+            cumulative_packets_sent: AtomicU64::new(0),
+            cumulative_packets_received: AtomicU64::new(0),
             total_transfer_time_ms: AtomicU64::new(0),
             peak_throughput_bps: AtomicU64::new(0),
             peak_cwnd_bytes: AtomicU32::new(0),
@@ -185,6 +196,7 @@ impl TransportMetrics {
 
     /// Record a completed outbound transfer.
     pub fn record_transfer_completed(&self, stats: &super::TransferStats) {
+        crate::tracing::otel::record_transfer("completed");
         // Use saturating arithmetic to prevent overflow (though extremely unlikely
         // in practice - would require billions of transfers or exabytes of data)
         self.transfers_completed
@@ -269,6 +281,7 @@ impl TransportMetrics {
     /// and the bytes it did put on the wire are already counted at the socket
     /// layer by `record_packet_sent`.
     pub fn record_transfer_failed(&self) {
+        crate::tracing::otel::record_transfer("failed");
         // Saturating, matching `record_transfer_completed` — a pinned u32::MAX
         // is a better failure mode than wrapping to 0 and reporting a healthy
         // node.
@@ -281,11 +294,13 @@ impl TransportMetrics {
 
     /// Record the start of an outbound NAT traversal attempt.
     pub fn record_nat_traversal_attempt(&self) {
+        crate::tracing::otel::record_nat_traversal("attempt");
         self.nat_traversal_attempts.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a NAT traversal attempt that established a connection.
     pub fn record_nat_traversal_established(&self) {
+        crate::tracing::otel::record_nat_traversal("established");
         self.nat_traversal_established
             .fetch_add(1, Ordering::Relaxed);
     }
@@ -293,6 +308,7 @@ impl TransportMetrics {
     /// Record a NAT traversal attempt that failed for a non-version reason
     /// (unreachable / symmetric-NAT / generic transport error).
     pub fn record_nat_traversal_failed_error(&self) {
+        crate::tracing::otel::record_nat_traversal("failed_error");
         self.nat_traversal_failed_error
             .fetch_add(1, Ordering::Relaxed);
     }
@@ -300,12 +316,14 @@ impl TransportMetrics {
     /// Record a NAT traversal attempt that failed due to a protocol version
     /// mismatch.
     pub fn record_nat_traversal_failed_version(&self) {
+        crate::tracing::otel::record_nat_traversal("failed_version");
         self.nat_traversal_failed_version
             .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a cwnd sample (called periodically or on transfer completion).
     pub(crate) fn record_cwnd_sample(&self, cwnd_bytes: u32) {
+        crate::tracing::otel::record_cwnd(cwnd_bytes as u64);
         self.cwnd_sum
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_add(cwnd_bytes as u64))
@@ -337,6 +355,7 @@ impl TransportMetrics {
     /// keep-alive path is what keeps RTT statistics populated for quiet,
     /// long-lived connections that rarely complete a stream transfer (#4000).
     pub(crate) fn record_rtt_sample(&self, rtt_us: u64) {
+        crate::tracing::otel::record_rtt_ms(rtt_us as f64 / 1000.0);
         self.rtt_sum_us
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_add(rtt_us))
@@ -412,6 +431,7 @@ impl TransportMetrics {
     pub fn record_packet_sent(&self, remote_addr: SocketAddr, bytes: u64) {
         self.cumulative_bytes_sent
             .fetch_add(bytes, Ordering::Relaxed);
+        self.cumulative_packets_sent.fetch_add(1, Ordering::Relaxed);
         self.record_per_peer(remote_addr, bytes, |s| &s.bytes_sent);
     }
 
@@ -428,12 +448,22 @@ impl TransportMetrics {
     pub fn record_packet_received(&self, remote_addr: SocketAddr, bytes: u64) {
         self.cumulative_bytes_received
             .fetch_add(bytes, Ordering::Relaxed);
+        self.cumulative_packets_received
+            .fetch_add(1, Ordering::Relaxed);
         self.record_per_peer(remote_addr, bytes, |s| &s.bytes_received);
     }
 
     /// Read cumulative bytes downloaded without resetting counters.
     pub fn cumulative_bytes_received(&self) -> u64 {
         self.cumulative_bytes_received.load(Ordering::Relaxed)
+    }
+
+    /// Read cumulative packets sent/received without resetting counters.
+    pub(crate) fn cumulative_packets(&self) -> (u64, u64) {
+        (
+            self.cumulative_packets_sent.load(Ordering::Relaxed),
+            self.cumulative_packets_received.load(Ordering::Relaxed),
+        )
     }
 
     /// Record per-peer bytes for the given direction.
