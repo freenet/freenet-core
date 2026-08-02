@@ -135,11 +135,33 @@ const RESYNC_THROTTLE_CACHE_SIZE: usize = 4096;
 
 /// Bounds diagnostic correlation state influenced by remote (contract, peer)
 /// pairs. Eviction only loses classification detail; it never changes routing.
-const MISSING_SUMMARY_HISTORY_SIZE: usize = 4096;
+///
+/// Sized from live production data (2026-08-01/02, v0.2.117 field telemetry,
+/// #5090/#5091): a single busy gateway (nova) hosts ~2,811 contracts across
+/// ~150 active connections, and the fleet-wide overflow counter
+/// (`NetworkEfficiencyV1::corr_ovf[0]`) fired on ~31% of new-registration
+/// events at the previous 4,096 cap. That overflow rate means a meaningful,
+/// unquantified share of `MissingSummaryClass::*FirstObserved` telemetry is
+/// actually a recurrence whose correlation entry was evicted under load, not
+/// a genuine first contact — undermining the one diagnostic property this
+/// bound exists to provide. 65,536 gives a busy gateway roughly the working
+/// set implied by that measurement; memory cost stays trivial (tens of MB at
+/// most for `MissingPairHistory` entries) relative to the multi-GB working
+/// set already in use. Re-measure `corr_ovf` after deploying this to confirm
+/// the overflow rate actually drops before considering a further bump or an
+/// unbounded-but-swept alternative.
+const MISSING_SUMMARY_HISTORY_SIZE: usize = 65536;
 
 /// Bounds in-flight missing-summary send correlation. At capacity sends still
 /// proceed, and the visible overflow counter records the lost correlation.
-const MISSING_SUMMARY_ACTIVE_SIZE: usize = 256;
+///
+/// Bumped alongside [`MISSING_SUMMARY_HISTORY_SIZE`] (see its doc comment for
+/// the production sizing rationale). This bound tracks concurrently in-flight
+/// attempts, not the full historical set, so it does not need the same 16x
+/// factor — 16x keeps it proportionate and still comfortably covers observed
+/// `corr_ovf[1]` (active-tracking overflow), which was 0 in the same
+/// measurement window even at the old 256 cap.
+const MISSING_SUMMARY_ACTIVE_SIZE: usize = 4096;
 
 /// Telemetry field order for the first missing-summary send age histogram:
 /// <1s, 1-9s, 10-59s, 60-299s, and >=300s.
