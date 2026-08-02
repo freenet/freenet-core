@@ -2169,27 +2169,30 @@ mod tests {
     }
 
     #[test]
-    fn js_update_check_backs_off_after_a_failure() {
+    fn js_update_check_core_stays_extractable_for_its_behavioral_test() {
         // #5102: caching only SUCCESS meant a rate-limited browser re-requested
         // on every single page load — the dashboard knocked hardest exactly
-        // while the IP was already being refused. Failures must be remembered
-        // too, so the client goes quiet and recovers on its own.
+        // while the IP was already being refused. This check cannot move off
+        // api.github.com the way the node's poll did (it runs in a browser, and
+        // the quota-free github.com redirect sends no CORS headers), so backing
+        // off is the only lever available here.
         //
-        // This check cannot move off api.github.com the way the node's poll did:
-        // it runs in a browser, and the quota-free github.com redirect sends no
-        // CORS headers, so fetch() cannot read it. Backing off is the only lever
-        // available here, which is why it is pinned.
+        // The back-off is a small state machine, and substring pins cannot catch
+        // a wiring error in one — so the real coverage is the executable
+        // `update_check.test.mjs`, which extracts `createUpdateChecker` between
+        // these markers and drives it under Node (mutation-verified: removing
+        // the back-off fails it). What this Rust test guards is only that the
+        // markers and the injectable factory survive, since silently losing them
+        // would strand that test on code it can no longer extract.
         assert!(
-            JS.contains("failedAt"),
-            "JS must record failed update checks so it can back off (#5102)"
+            JS.contains("update-check:BEGIN") && JS.contains("update-check:END"),
+            "the update-check core must stay bracketed by the update-check:BEGIN/END \
+             markers so update_check.test.mjs can extract it (#5102)"
         );
         assert!(
-            JS.contains("FAIL_TTL_MS"),
-            "JS must define a failure cooldown window (#5102)"
-        );
-        assert!(
-            JS.contains("rememberFailure"),
-            "the failure path must persist the cooldown, not just log (#5102)"
+            JS.contains("function createUpdateChecker(deps)"),
+            "the update-check core must stay a dependency-injected factory so it can \
+             be driven under Node without a browser (#5102)"
         );
     }
 

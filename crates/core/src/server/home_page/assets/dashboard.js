@@ -184,78 +184,123 @@ function showUpdateBadge(latestTag) {
   el.hidden = false;
 }
 
+/* Update-check core, extracted so the caching/back-off state machine can be
+   driven under Node by update_check.test.mjs. All browser dependencies are
+   injected, so this stays free of direct window/document/fetch references —
+   keep it that way, and keep it bracketed by the markers.
+
+   Invariants (tested behaviorally in update_check.test.mjs):
+   - a fresh SUCCESS within TTL_MS is served from cache with no request;
+   - a FAILURE is remembered and suppresses further requests for FAIL_TTL_MS
+     (#5102: previously only success was cached, so a rate-limited browser
+     re-requested on every single page load — knocking hardest exactly while
+     the IP was already being refused);
+   - the failure window expires, so a limited client recovers on its own;
+   - a 200 carrying no usable tag counts as a failure, so a malformed
+     response cannot drive a per-reload retry loop;
+   - the badge is shown only when the fetched tag is strictly newer. */
+/* update-check:BEGIN */
+function createUpdateChecker(deps) {
+  var TTL_MS = 12 * 60 * 60 * 1000;
+  var FAIL_TTL_MS = 60 * 60 * 1000;
+
+  function readCache() {
+    try {
+      var raw = deps.getItem('freenet-update-check');
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function write(entry) {
+    try {
+      deps.setItem('freenet-update-check', JSON.stringify(entry));
+    } catch (e) {
+      /* storage unavailable (private mode / quota) — degrade to no caching */
+    }
+  }
+
+  /* Returns a promise so callers/tests can await settling; the production
+     caller ignores it. */
+  function check(current) {
+    if (!current || current === '?') return Promise.resolve('skipped');
+    var now = deps.now();
+    var cached = readCache();
+
+    if (
+      cached &&
+      cached.tag &&
+      cached.checkedAt &&
+      now - cached.checkedAt < TTL_MS
+    ) {
+      if (deps.compareSemver(cached.tag, current) > 0)
+        deps.showBadge(cached.tag);
+      return Promise.resolve('cached');
+    }
+    /* Back off after a failed check. GitHub's core limit resets hourly, so one
+       retry per hour per browser is both polite and enough to recover without
+       the user doing anything. */
+    if (cached && cached.failedAt && now - cached.failedAt < FAIL_TTL_MS) {
+      return Promise.resolve('backoff');
+    }
+
+    var rememberFailure = function () {
+      write({ failedAt: now });
+      return 'failed';
+    };
+
+    return deps
+      .fetchLatest()
+      .then(function (data) {
+        var tag = data && data.tag_name;
+        if (!tag) return rememberFailure();
+        write({ tag: tag, checkedAt: now });
+        if (deps.compareSemver(tag, current) > 0) deps.showBadge(tag);
+        return 'fetched';
+      })
+      .catch(function () {
+        /* Network blocked / GitHub rate-limited (403/429) — go quiet for
+           FAIL_TTL_MS rather than retrying on every page load. */
+        return rememberFailure();
+      });
+  }
+
+  return { check: check };
+}
+/* update-check:END */
+
 function checkForUpdate() {
   var badge = document.getElementById('version-badge');
   if (!badge) return;
-  var current = badge.getAttribute('data-version') || '';
-  if (!current || current === '?') return;
-  var TTL_MS = 12 * 60 * 60 * 1000;
-  /* Negative-cache window (#5102). This check must stay on api.github.com —
-     unlike the node's own poll it runs in a browser, and the quota-free
-     github.com redirect sends no CORS headers so fetch() cannot read it. It
-     therefore spends from the same 60/hr per-IP REST budget the node used to,
-     and that budget is shared with every other machine behind the same
-     NAT/CGNAT or VPN exit. Before this, only SUCCESS was cached: once GitHub
-     started refusing, every dashboard reload issued another doomed request,
-     so the one client that should have gone quiet instead knocked hardest
-     exactly while the IP was limited. Remember failures too. */
-  var FAIL_TTL_MS = 60 * 60 * 1000;
-  var now = Date.now();
-  var cached = null;
-  try {
-    var raw = localStorage.getItem('freenet-update-check');
-    if (raw) cached = JSON.parse(raw);
-  } catch (e) {}
-  if (
-    cached &&
-    cached.tag &&
-    cached.checkedAt &&
-    now - cached.checkedAt < TTL_MS
-  ) {
-    if (compareSemver(cached.tag, current) > 0) showUpdateBadge(cached.tag);
-    return;
-  }
-  /* Back off after a failed check. GitHub's core limit resets hourly, so one
-     retry per hour per browser is both polite and enough to recover on its
-     own without the user doing anything. */
-  if (cached && cached.failedAt && now - cached.failedAt < FAIL_TTL_MS) return;
-  var rememberFailure = function () {
-    try {
-      localStorage.setItem(
-        'freenet-update-check',
-        JSON.stringify({ failedAt: now }),
-      );
-    } catch (e) {}
-  };
-  fetch('https://api.github.com/repos/freenet/freenet-core/releases/latest', {
-    headers: { Accept: 'application/vnd.github+json' },
-  })
-    .then(function (r) {
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      return r.json();
-    })
-    .then(function (data) {
-      var tag = data && data.tag_name;
-      /* A 200 with no usable tag is still a wasted request; treat it as a
-         failure so a malformed response cannot drive a per-reload retry loop. */
-      if (!tag) {
-        rememberFailure();
-        return;
-      }
-      try {
-        localStorage.setItem(
-          'freenet-update-check',
-          JSON.stringify({ tag: tag, checkedAt: now }),
-        );
-      } catch (e) {}
-      if (compareSemver(tag, current) > 0) showUpdateBadge(tag);
-    })
-    .catch(function (e) {
-      /* Network blocked / GitHub rate-limited (403/429) — go quiet for
-         FAIL_TTL_MS rather than retrying on every page load. */
-      rememberFailure();
-      console.debug('Update check failed:', e);
-    });
+  /* This check must stay on api.github.com — unlike the node's own poll it
+     runs in a browser, and the quota-free github.com redirect sends no CORS
+     headers so fetch() cannot read it. It therefore spends from the same
+     60/hr per-IP REST budget, shared with every other machine behind the same
+     NAT/CGNAT or VPN exit — hence the failure back-off above. */
+  var checker = createUpdateChecker({
+    now: function () {
+      return Date.now();
+    },
+    getItem: function (k) {
+      return localStorage.getItem(k);
+    },
+    setItem: function (k, v) {
+      localStorage.setItem(k, v);
+    },
+    compareSemver: compareSemver,
+    showBadge: showUpdateBadge,
+    fetchLatest: function () {
+      return fetch(
+        'https://api.github.com/repos/freenet/freenet-core/releases/latest',
+        { headers: { Accept: 'application/vnd.github+json' } },
+      ).then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      });
+    },
+  });
+  checker.check(badge.getAttribute('data-version') || '');
 }
 
 /* A version string is "known" when it is non-empty and not the '?'

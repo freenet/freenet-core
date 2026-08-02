@@ -457,7 +457,7 @@ impl UpdateCommand {
         // gnu→musl fallback search and the macOS DMG lookup). Requested by exact
         // tag rather than `/releases/latest` so we install the release we just
         // decided about, even if a newer one is published in between.
-        let latest = fetch_release_assets(latest_version).await?;
+        let latest = fetch_release_assets(latest_version, self.quiet).await?;
         // #4073 per-target-version install-failure gate. Count a DETERMINISTIC
         // install failure of this version — a checksum mismatch or invalid
         // release signature (`ReleaseVerificationError`) — toward the gate. After
@@ -1278,7 +1278,7 @@ async fn probe_latest_tag(force: bool, quiet: bool) -> Result<String> {
 /// runs only when an install is actually going ahead (#5102). Keyed by exact tag
 /// rather than `latest` so the assets we install match the version we decided to
 /// install, even if a new release lands between the probe and here.
-async fn fetch_release_assets(tag: &str) -> Result<Release> {
+async fn fetch_release_assets(tag: &str, quiet: bool) -> Result<Release> {
     let url = format!("{GITHUB_API_TAG_URL_PREFIX}v{tag}");
 
     let client = reqwest::Client::builder()
@@ -1300,8 +1300,7 @@ async fn fetch_release_assets(tag: &str) -> Result<Release> {
 
     let status = response.status();
     if super::auto_update::is_rate_limited_status(status) {
-        // Record the cooldown so subsequent polls (from any path) stay quiet,
-        // then surface the legible message rather than a bare status line.
+        // Record the cooldown so subsequent polls (from any path) stay quiet.
         let rate_limited = super::auto_update::note_rate_limited_response(|name| {
             response
                 .headers()
@@ -1309,7 +1308,19 @@ async fn fetch_release_assets(tag: &str) -> Result<Release> {
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_owned)
         });
-        anyhow::bail!("{}", rate_limited.user_message());
+        // Exit as up-to-date rather than returning an error, matching
+        // `probe_latest_tag`. Being rate-limited is "we could not find out", not
+        // "the install failed": bailing here would propagate a hard error out of
+        // `freenet update`, which the supervisor sees as a failed update — so an
+        // external limit, caused by any other client sharing this IP, could push
+        // a healthy node toward the #3934 lockout. It also previously flattened
+        // the typed `GithubRateLimitedError` into a string, so no caller could
+        // tell this apart from a genuine install failure.
+        if !quiet {
+            eprintln!("{}", rate_limited.user_message());
+        }
+        tracing::warn!("Update deferred: {}", rate_limited.user_message());
+        std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
     }
 
     if !status.is_success() {

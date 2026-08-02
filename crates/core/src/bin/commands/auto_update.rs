@@ -593,6 +593,49 @@ pub(crate) async fn fetch_latest_release_tag(bypass_cached_cooldown: bool) -> Re
         }
     }
 
+    match probe_release_tag_at(GITHUB_LATEST_REDIRECT_URL).await? {
+        ProbeResult::Tag(tag) => Ok(tag),
+        ProbeResult::RateLimited { retry_after } => {
+            // GitHub told us to stop. Persist the reset instant it handed back so
+            // every poll path on this machine — including the short-lived
+            // `freenet update` processes the supervisor spawns — stays quiet
+            // until then.
+            record_github_cooldown(retry_after);
+            Err(GithubRateLimitedError { retry_after }.into())
+        }
+        ProbeResult::Unusable { status, location } => anyhow::bail!(
+            "GitHub returned {status} with no parseable release tag in Location ({})",
+            location.as_deref().unwrap_or("<absent>")
+        ),
+    }
+}
+
+/// Outcome of one release-tag probe, including the data needed to act on it.
+///
+/// Deliberately carries no side effects: [`probe_release_tag_at`] performs the
+/// HTTP request and nothing else, so the whole network layer can be exercised
+/// against a local server without touching `state_dir()` or any real cooldown.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ProbeResult {
+    Tag(String),
+    RateLimited {
+        retry_after: Option<Duration>,
+    },
+    Unusable {
+        status: u16,
+        location: Option<String>,
+    },
+}
+
+/// Perform a release-tag probe against `url`. Pure I/O — no disk, no state.
+///
+/// Split out from [`fetch_latest_release_tag`] so tests can drive the real
+/// `reqwest` client (including its `Policy::none()` redirect behaviour, which
+/// the entire #5102 change depends on) against a local HTTP server. That
+/// behaviour is an assumption about a third-party crate, and an untested
+/// assumption about how we read a redirect is exactly the kind that breaks
+/// silently and takes fleet-wide auto-update with it.
+pub(crate) async fn probe_release_tag_at(url: &str) -> Result<ProbeResult> {
     let client = reqwest::Client::builder()
         .user_agent(GITHUB_USER_AGENT)
         // We want the `Location` header, not the page it points at: following the
@@ -602,35 +645,27 @@ pub(crate) async fn fetch_latest_release_tag(bypass_cached_cooldown: bool) -> Re
         .timeout(Duration::from_secs(10))
         .build()?;
 
-    let response = client.get(GITHUB_LATEST_REDIRECT_URL).send().await?;
+    let response = client.get(url).send().await?;
     let status = response.status();
-    let location = response
-        .headers()
-        .get(reqwest::header::LOCATION)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+    let location = header("location");
 
-    match classify_probe_response(status, location.as_deref()) {
-        ProbeOutcome::Tag(tag) => Ok(tag),
-        ProbeOutcome::RateLimited => {
-            // GitHub told us to stop. Persist the reset instant it handed back so
-            // every poll path on this machine — including the short-lived
-            // `freenet update` processes the supervisor spawns — stays quiet
-            // until then.
-            Err(note_rate_limited_response(|name| {
-                response
-                    .headers()
-                    .get(name)
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_owned)
-            })
-            .into())
-        }
-        ProbeOutcome::Unusable => anyhow::bail!(
-            "GitHub returned {status} with no parseable release tag in Location ({})",
-            location.as_deref().unwrap_or("<absent>")
-        ),
-    }
+    Ok(match classify_probe_response(status, location.as_deref()) {
+        ProbeOutcome::Tag(tag) => ProbeResult::Tag(tag),
+        ProbeOutcome::RateLimited => ProbeResult::RateLimited {
+            retry_after: parse_retry_after(header),
+        },
+        ProbeOutcome::Unusable => ProbeResult::Unusable {
+            status: status.as_u16(),
+            location,
+        },
+    })
 }
 
 /// What a release-probe response means.
@@ -2019,17 +2054,62 @@ mod tests {
         );
     }
 
+    /// Slice out a function body: from `signature` to the function's closing
+    /// brace (the next `\n}\n`, i.e. a `}` at column 0).
+    ///
+    /// **Why this exists.** A source-scrape pin that scopes itself with a bare
+    /// `split_once(anchor)` is only scoped by luck. If the anchor later moves
+    /// out of the function, `split_once` does not fail — it silently matches a
+    /// LATER occurrence, very often the pin's own string literal down in the
+    /// test module. The "scoped" region then balloons to the rest of the file
+    /// and the assertion passes vacuously, because somewhere in those thousands
+    /// of lines the searched-for symbol certainly appears.
+    ///
+    /// That is not hypothetical. #5102 moved `reqwest::Client::builder()` out of
+    /// `get_latest_version` into `fetch_latest_release_tag`, and
+    /// `test_get_latest_version_consults_rate_limit_bucket` — which anchored on
+    /// exactly that string — silently became vacuous: deleting the
+    /// `try_consume_node_poll()` guard entirely still passed. The #4073 bound
+    /// was left with no regression protection at all, and it shipped that way.
+    ///
+    /// Bounding to the function body converts that silent pass into a LOUD
+    /// failure: a moved anchor is no longer inside the body, so the caller's
+    /// `.expect()` panics. Prefer this over a bare `split_once` for any pin that
+    /// means "within function F".
+    fn fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        let (_, after) = src
+            .split_once(signature)
+            .unwrap_or_else(|| panic!("definition not found: {signature}"));
+        let (body, _) = after
+            .split_once("\n}\n")
+            .unwrap_or_else(|| panic!("could not locate end of: {signature}"));
+        // Vacuity detector: a correctly-bounded function body can never contain
+        // the test-module attribute. If it does, the `\n}\n` search ran past the
+        // function and this pin is measuring the whole file.
+        assert!(
+            !body.contains("#[cfg(test)]"),
+            "scoped region for `{signature}` escaped into the test module — this \
+             pin would pass vacuously"
+        );
+        body
+    }
+
     #[test]
     fn test_get_latest_version_consults_rate_limit_bucket() {
         // Source pin: the in-node GitHub fetch MUST gate on the persistent token
         // bucket at its top, or the loop's GitHub spam is unbounded again (#4073).
-        let src = include_str!("auto_update.rs");
-        let (_, body) = src
-            .split_once("async fn get_latest_version() -> Result<String> {")
-            .expect("get_latest_version definition not found");
+        //
+        // Anchored on `fetch_latest_release_tag(` — the call that actually
+        // reaches GitHub since #5102 — and scoped with `fn_body` so that a future
+        // move of that call out of this function fails loudly instead of
+        // silently voiding the pin (see `fn_body`, and the incident it records).
+        let body = fn_body(
+            include_str!("auto_update.rs"),
+            "async fn get_latest_version() -> Result<String> {",
+        );
         let (head, _) = body
-            .split_once("reqwest::Client::builder()")
-            .expect("client builder not found");
+            .split_once("fetch_latest_release_tag(")
+            .expect("get_latest_version must reach GitHub via fetch_latest_release_tag");
         assert!(
             head.contains("try_consume_node_poll()"),
             "get_latest_version must consume a rate-limit token before hitting GitHub"
@@ -2077,13 +2157,10 @@ mod tests {
         // must be spent on the PROBE: that is the call every invocation makes, so
         // it is the one that bounds a restart loop. Gating only the asset fetch
         // would leave the crash-loop path unbounded.
-        let src = include_str!("update.rs");
-        let (_, body) = src
-            .split_once("async fn probe_latest_tag(")
-            .expect("probe_latest_tag definition not found");
+        let body = fn_body(include_str!("update.rs"), "async fn probe_latest_tag(");
         let (head, _) = body
             .split_once("fetch_latest_release_tag(")
-            .expect("tag fetch call not found");
+            .expect("probe_latest_tag must reach GitHub via fetch_latest_release_tag");
         assert!(
             head.contains("try_consume_install_poll()"),
             "probe_latest_tag must consume an INSTALL-bucket token before hitting GitHub"
@@ -2514,6 +2591,143 @@ mod tests {
             after.contains("fetch_latest_release_tag(false)"),
             "the automated node poll must NOT waive the cooldown — staying quiet \
              while the IP is limited is the entire point of it"
+        );
+    }
+
+    // ── Real HTTP-level tests for the probe (#5102 follow-up) ──────────────
+    //
+    // The change rests on an assumption about a third-party crate: that a
+    // `reqwest` client built with `Policy::none()` surfaces the 302 itself,
+    // with a readable `Location`, rather than following or erroring. Every
+    // other test here is a pure-function or source-scrape test and would keep
+    // passing if that assumption broke. These drive the real client against a
+    // local server so the assumption is actually verified.
+    //
+    // `probe_release_tag_at` does no disk I/O, so these never touch the real
+    // `state_dir()` or write a cooldown.
+
+    #[tokio::test]
+    async fn probe_reads_the_tag_from_a_real_302_without_following_it() {
+        use httptest::{Expectation, Server, matchers::*, responders::*};
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/releases/latest"))
+                // Exactly one request: if the client followed the redirect it
+                // would issue a second one and this expectation would fail.
+                .times(1)
+                .respond_with(status_code(302).append_header(
+                    "location",
+                    "https://github.com/freenet/freenet-core/releases/tag/v0.2.118",
+                )),
+        );
+
+        let got = probe_release_tag_at(&server.url_str("/releases/latest"))
+            .await
+            .expect("probe must succeed on a 302 carrying a release Location");
+        assert_eq!(got, ProbeResult::Tag("0.2.118".to_string()));
+    }
+
+    #[tokio::test]
+    async fn probe_reports_rate_limiting_with_the_retry_after_it_was_given() {
+        use httptest::{Expectation, Server, matchers::*, responders::*};
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/releases/latest")).respond_with(
+                status_code(429)
+                    .append_header("retry-after", "600")
+                    .body("rate limited"),
+            ),
+        );
+
+        let got = probe_release_tag_at(&server.url_str("/releases/latest"))
+            .await
+            .expect("a 429 is a normal outcome, not a transport error");
+        assert_eq!(
+            got,
+            ProbeResult::RateLimited {
+                retry_after: Some(Duration::from_secs(600)),
+            },
+            "the Retry-After GitHub sends must survive all the way out of the probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_falls_back_to_ratelimit_reset_on_a_403() {
+        use httptest::{Expectation, Server, matchers::*, responders::*};
+        // GitHub signals the PRIMARY hourly limit with 403 + x-ratelimit-reset
+        // (an absolute Unix second) and no Retry-After. This is the exact shape
+        // the reported incident would have produced.
+        let reset = now_unix() + 1_500;
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/releases/latest")).respond_with(
+                status_code(403)
+                    .append_header("x-ratelimit-remaining", "0")
+                    .append_header("x-ratelimit-reset", reset.to_string()),
+            ),
+        );
+
+        let got = probe_release_tag_at(&server.url_str("/releases/latest"))
+            .await
+            .expect("a 403 is a normal outcome, not a transport error");
+        match got {
+            ProbeResult::RateLimited { retry_after } => {
+                let secs = retry_after
+                    .expect("reset header must yield a wait")
+                    .as_secs();
+                // Converted from absolute to delta; allow a second of clock drift
+                // between the header being built and being parsed.
+                assert!(
+                    (1_499..=1_500).contains(&secs),
+                    "expected ~1500s derived from x-ratelimit-reset, got {secs}"
+                );
+            }
+            other => panic!("403 must classify as rate-limited, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_refuses_to_invent_a_version_from_a_non_redirect() {
+        use httptest::{Expectation, Server, matchers::*, responders::*};
+        // The captive-portal / proxy-interstitial case: a 200 with an HTML body
+        // and no Location. Must be Unusable, never a version — a bogus version
+        // compares as newer and drives a pointless exit-42 update cycle.
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/releases/latest"))
+                .respond_with(status_code(200).body("<html>sign in to your wifi</html>")),
+        );
+
+        let got = probe_release_tag_at(&server.url_str("/releases/latest"))
+            .await
+            .expect("a 200 is a normal outcome, not a transport error");
+        assert_eq!(
+            got,
+            ProbeResult::Unusable {
+                status: 200,
+                location: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_accepts_a_permanent_redirect_too() {
+        use httptest::{Expectation, Server, matchers::*, responders::*};
+        // GitHub sends 302 today; 301 carries the same header and must work, so
+        // a server-side change to the redirect code cannot black out updates.
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/releases/latest")).respond_with(
+                status_code(301)
+                    .append_header("location", "/freenet/freenet-core/releases/tag/v1.2.3"),
+            ),
+        );
+
+        assert_eq!(
+            probe_release_tag_at(&server.url_str("/releases/latest"))
+                .await
+                .expect("301 must be handled"),
+            ProbeResult::Tag("1.2.3".to_string())
         );
     }
 
