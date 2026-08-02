@@ -135,10 +135,38 @@ const RESYNC_THROTTLE_CACHE_SIZE: usize = 4096;
 
 /// Bounds diagnostic correlation state influenced by remote (contract, peer)
 /// pairs. Eviction only loses classification detail; it never changes routing.
-const MISSING_SUMMARY_HISTORY_SIZE: usize = 4096;
+///
+/// Live production data (2026-08-01/02, v0.2.117 field telemetry, #5090/#5091)
+/// showed the previous 4,096-entry cap saturated on busy nodes: the overflow
+/// counter (`NetworkEfficiencyV1::corr_ovf[0]`) fired on ~31% of new-pair
+/// registrations fleet-wide, and a single busy gateway (nova) hosts ~2,811
+/// contracts across ~150 connections — a theoretical (contract, peer) space
+/// (~421K) far above the old cap; real overlap is sparser than that upper
+/// bound, but no density measurement pins it down precisely. Once an LRU of
+/// this shape is saturated, eviction is continuous (every new never-seen pair
+/// evicts the least-recent entry), so the overflow counter reflects steady-
+/// state new-pair *arrival rate*, not a one-time capacity breach — it will
+/// not reach exactly zero at any finite cap, only a lower rate. 65,536 (16x)
+/// is a substantial headroom increase chosen to reduce that rate
+/// significantly, not a precise working-set derivation; memory cost is a
+/// worst-case ~14 MB fully populated (up from ~1 MB), paid on every node
+/// including small ones since this is a single fleet-wide constant rather
+/// than one scaled per-node from `max_connections` (a possible future
+/// refinement, matching the code-style.md "derive thresholds from
+/// configuration" convention, if a fleet-wide constant proves insufficient).
+/// Re-measure `corr_ovf[0]` after deploying this to see how much the rate
+/// actually drops before considering a further bump or an unbounded-but-swept
+/// alternative.
+const MISSING_SUMMARY_HISTORY_SIZE: usize = 65536;
 
 /// Bounds in-flight missing-summary send correlation. At capacity sends still
 /// proceed, and the visible overflow counter records the lost correlation.
+///
+/// Left UNCHANGED from its original value: the same production measurement
+/// that justified bumping [`MISSING_SUMMARY_HISTORY_SIZE`] showed
+/// `corr_ovf[1]` (active-tracking overflow) at exactly 0 even under the old
+/// cap — no evidence this bound is a bottleneck, so it is not bumped
+/// speculatively.
 const MISSING_SUMMARY_ACTIVE_SIZE: usize = 256;
 
 /// Telemetry field order for the first missing-summary send age histogram:
@@ -3314,7 +3342,12 @@ mod tests {
         }
 
         let mut guards = Vec::new();
-        for seed in 10_000..10_000 + MISSING_SUMMARY_ACTIVE_SIZE as u32 + 1 {
+        // Seeds must stay disjoint from the first loop's `0..=HISTORY_SIZE`
+        // range (freenet-core#5097) — otherwise these "untracked" pairs are
+        // actually already-tracked recreations, breaking the panic below.
+        let active_probe_start = MISSING_SUMMARY_HISTORY_SIZE as u32 + 10_000;
+        for seed in active_probe_start..active_probe_start + MISSING_SUMMARY_ACTIVE_SIZE as u32 + 1
+        {
             let attempt = match manager.begin_peer_summary_broadcast(
                 &make_unique_contract_key(seed),
                 &make_unique_peer_key(seed),
@@ -3332,6 +3365,49 @@ mod tests {
         assert!(snapshot.history_overflow >= 1);
         assert_eq!(snapshot.active_overflow, 1);
         drop(guards);
+    }
+
+    /// Regression for the undersized correlation cache (freenet-core#5097).
+    /// Live production telemetry showed the OLD 4,096-entry
+    /// `MISSING_SUMMARY_HISTORY_SIZE` overflowing on ~31% of new
+    /// registrations on a single busy gateway. This test registers a
+    /// working set (8,192 distinct pairs) that comfortably exceeds that old
+    /// cap but stays well under the new one: it fails (asserts wrongly)
+    /// against the pre-fix 4,096 cap, and passes against the current one.
+    #[test]
+    fn lifecycle_correlation_survives_realistic_working_set_without_overflow() {
+        let (manager, _time) = make_manager();
+        const WORKING_SET: u32 = 8_192;
+        assert!(
+            WORKING_SET as usize > 4_096,
+            "must exceed the pre-fix cap to be a real regression test"
+        );
+        assert!(
+            WORKING_SET as usize <= MISSING_SUMMARY_HISTORY_SIZE,
+            "must stay within the current cap or this test degenerates into \
+             the overflow test above"
+        );
+
+        for seed in 0..WORKING_SET {
+            let attempt = match manager.begin_peer_summary_broadcast(
+                &make_unique_contract_key(seed),
+                &make_unique_peer_key(seed),
+            ) {
+                PeerSummaryForBroadcast::Missing {
+                    attempt: Some(attempt),
+                    ..
+                } => attempt,
+                _ => panic!("untracked pair must produce an attempt"),
+            };
+            drop(manager.missing_summary_attempt_guard(attempt));
+        }
+
+        let snapshot = manager.interest_lifecycle_snapshot();
+        assert_eq!(
+            snapshot.history_overflow, 0,
+            "a working set well within the current cap must not overflow \
+             the correlation history"
+        );
     }
 
     /// Regression for the InterestManager desync on subscribed eviction
