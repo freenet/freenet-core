@@ -190,6 +190,16 @@ function checkForUpdate() {
   var current = badge.getAttribute('data-version') || '';
   if (!current || current === '?') return;
   var TTL_MS = 12 * 60 * 60 * 1000;
+  /* Negative-cache window (#5102). This check must stay on api.github.com —
+     unlike the node's own poll it runs in a browser, and the quota-free
+     github.com redirect sends no CORS headers so fetch() cannot read it. It
+     therefore spends from the same 60/hr per-IP REST budget the node used to,
+     and that budget is shared with every other machine behind the same
+     NAT/CGNAT or VPN exit. Before this, only SUCCESS was cached: once GitHub
+     started refusing, every dashboard reload issued another doomed request,
+     so the one client that should have gone quiet instead knocked hardest
+     exactly while the IP was limited. Remember failures too. */
+  var FAIL_TTL_MS = 60 * 60 * 1000;
   var now = Date.now();
   var cached = null;
   try {
@@ -205,6 +215,18 @@ function checkForUpdate() {
     if (compareSemver(cached.tag, current) > 0) showUpdateBadge(cached.tag);
     return;
   }
+  /* Back off after a failed check. GitHub's core limit resets hourly, so one
+     retry per hour per browser is both polite and enough to recover on its
+     own without the user doing anything. */
+  if (cached && cached.failedAt && now - cached.failedAt < FAIL_TTL_MS) return;
+  var rememberFailure = function () {
+    try {
+      localStorage.setItem(
+        'freenet-update-check',
+        JSON.stringify({ failedAt: now }),
+      );
+    } catch (e) {}
+  };
   fetch('https://api.github.com/repos/freenet/freenet-core/releases/latest', {
     headers: { Accept: 'application/vnd.github+json' },
   })
@@ -214,7 +236,12 @@ function checkForUpdate() {
     })
     .then(function (data) {
       var tag = data && data.tag_name;
-      if (!tag) return;
+      /* A 200 with no usable tag is still a wasted request; treat it as a
+         failure so a malformed response cannot drive a per-reload retry loop. */
+      if (!tag) {
+        rememberFailure();
+        return;
+      }
       try {
         localStorage.setItem(
           'freenet-update-check',
@@ -224,7 +251,9 @@ function checkForUpdate() {
       if (compareSemver(tag, current) > 0) showUpdateBadge(tag);
     })
     .catch(function (e) {
-      /* Network blocked / GitHub rate-limited — silently skip */
+      /* Network blocked / GitHub rate-limited (403/429) — go quiet for
+         FAIL_TTL_MS rather than retrying on every page load. */
+      rememberFailure();
       console.debug('Update check failed:', e);
     });
 }
