@@ -570,16 +570,27 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
 ///   asked for, or when this response is itself a `403`/`429`. Callers must
 ///   treat this as "we did not learn anything", never as "no update exists".
 /// * Any transport / parse failure otherwise.
-pub(crate) async fn fetch_latest_release_tag() -> Result<String> {
+pub(crate) async fn fetch_latest_release_tag(bypass_cached_cooldown: bool) -> Result<String> {
     // Honour a cooldown GitHub asked for earlier (possibly in a previous
     // process). Checked BEFORE the request so a limited IP goes quiet instead of
     // continuing to knock — continuing to knock while limited is what escalates a
     // soft per-hour limit into a longer secondary block.
-    if let Some(remaining) = github_cooldown_remaining() {
-        return Err(GithubRateLimitedError {
-            retry_after: Some(remaining),
+    //
+    // `bypass_cached_cooldown` is for `freenet update --force` ONLY. The stored
+    // deadline is our *cached belief* about GitHub, and it can be stale — GitHub
+    // may have reset early, or the limit may have been another client's doing.
+    // `--force` is the documented operator escape hatch (both the token-bucket
+    // message and the crash-loop rollback advice tell users to run it), so it
+    // must not be blocked by our own cache. It does NOT bypass a LIVE 403/429:
+    // the request below still runs, and a real refusal is still honoured and
+    // still re-records the cooldown.
+    if !bypass_cached_cooldown {
+        if let Some(remaining) = github_cooldown_remaining() {
+            return Err(GithubRateLimitedError {
+                retry_after: Some(remaining),
+            }
+            .into());
         }
-        .into());
     }
 
     let client = reqwest::Client::builder()
@@ -593,36 +604,69 @@ pub(crate) async fn fetch_latest_release_tag() -> Result<String> {
 
     let response = client.get(GITHUB_LATEST_REDIRECT_URL).send().await?;
     let status = response.status();
-
-    if is_rate_limited_status(status) {
-        // GitHub told us to stop. Persist the reset instant it handed back so
-        // every poll path on this machine — including the short-lived `freenet
-        // update` processes the supervisor spawns — stays quiet until then.
-        return Err(note_rate_limited_response(|name| {
-            response
-                .headers()
-                .get(name)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned)
-        })
-        .into());
-    }
-
     let location = response
         .headers()
         .get(reqwest::header::LOCATION)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
-    match location
-        .as_deref()
-        .and_then(parse_tag_from_release_location)
-    {
-        Some(tag) => Ok(tag),
-        None => anyhow::bail!(
+    match classify_probe_response(status, location.as_deref()) {
+        ProbeOutcome::Tag(tag) => Ok(tag),
+        ProbeOutcome::RateLimited => {
+            // GitHub told us to stop. Persist the reset instant it handed back so
+            // every poll path on this machine — including the short-lived
+            // `freenet update` processes the supervisor spawns — stays quiet
+            // until then.
+            Err(note_rate_limited_response(|name| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned)
+            })
+            .into())
+        }
+        ProbeOutcome::Unusable => anyhow::bail!(
             "GitHub returned {status} with no parseable release tag in Location ({})",
             location.as_deref().unwrap_or("<absent>")
         ),
+    }
+}
+
+/// What a release-probe response means.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ProbeOutcome {
+    /// A usable release tag (leading `v` already stripped).
+    Tag(String),
+    /// GitHub is rate-limiting us; the caller records the cooldown.
+    RateLimited,
+    /// Anything else — no usable tag. Deliberately NOT a version, so a captive
+    /// portal, proxy interstitial, or an unexpected GitHub response can never be
+    /// mistaken for a release and trigger a pointless exit-42 update cycle.
+    Unusable,
+}
+
+/// Classify a `releases/latest` probe response from its status and `Location`.
+///
+/// Pure, so the whole decision is unit-testable without a network round trip —
+/// the status/redirect handling is the part most likely to break silently if
+/// GitHub's response shape ever shifts.
+///
+/// The tag is read from `Location` for ANY non-rate-limited status that supplies
+/// a parseable one, rather than only for `302`. GitHub sends `302` today, but
+/// `301`/`303`/`307`/`308` are all legitimate redirect responses and all carry
+/// the same header; pinning to one code would turn a harmless server-side change
+/// into a fleet-wide update outage.
+pub(crate) fn classify_probe_response(
+    status: reqwest::StatusCode,
+    location: Option<&str>,
+) -> ProbeOutcome {
+    if is_rate_limited_status(status) {
+        return ProbeOutcome::RateLimited;
+    }
+    match location.and_then(parse_tag_from_release_location) {
+        Some(tag) => ProbeOutcome::Tag(tag),
+        None => ProbeOutcome::Unusable,
     }
 }
 
@@ -640,7 +684,9 @@ async fn get_latest_version() -> Result<String> {
         return Err(RateLimitedError.into());
     }
 
-    fetch_latest_release_tag().await
+    // Never bypasses the cooldown: this is the automated path, and the whole
+    // point of the cooldown is to keep it quiet while the IP is limited.
+    fetch_latest_release_tag(false).await
 }
 
 /// Get the state directory for update tracking files.
@@ -2036,7 +2082,7 @@ mod tests {
             .split_once("async fn probe_latest_tag(")
             .expect("probe_latest_tag definition not found");
         let (head, _) = body
-            .split_once("fetch_latest_release_tag()")
+            .split_once("fetch_latest_release_tag(")
             .expect("tag fetch call not found");
         assert!(
             head.contains("try_consume_install_poll()"),
@@ -2377,6 +2423,98 @@ mod tests {
         // bound us, and failing closed here would wedge detection permanently.
         fs::write(tmp.path().join(GITHUB_COOLDOWN_FILE), "not-a-number").unwrap();
         assert_eq!(github_cooldown_remaining_at(tmp.path(), now), None);
+    }
+
+    #[test]
+    fn probe_response_yields_a_tag_for_any_redirect_status() {
+        // GitHub sends 302 today, but every redirect status carries the same
+        // Location. Pinning to one code would turn a harmless server-side change
+        // into a fleet-wide update outage, so the tag is read from the header
+        // regardless of which redirect status arrived.
+        let loc = Some("https://github.com/freenet/freenet-core/releases/tag/v0.2.118");
+        for code in [301u16, 302, 303, 307, 308] {
+            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            assert_eq!(
+                classify_probe_response(status, loc),
+                ProbeOutcome::Tag("0.2.118".to_string()),
+                "status {code} carrying a valid Location must yield the tag"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_response_never_invents_a_version() {
+        // The dangerous failure is a bogus "version": it would compare as newer
+        // and drive a pointless exit-42 update cycle against a release that does
+        // not exist. Every shape that is not a real release redirect must be
+        // Unusable, which the caller surfaces as an error (retry under backoff).
+        let ok = reqwest::StatusCode::OK;
+        // A captive portal / proxy answering 200 with a page instead of a redirect.
+        assert_eq!(classify_probe_response(ok, None), ProbeOutcome::Unusable);
+        // A redirect to somewhere that is not a release tag (e.g. a login wall).
+        assert_eq!(
+            classify_probe_response(
+                reqwest::StatusCode::FOUND,
+                Some("https://github.com/login?return_to=%2Ffreenet")
+            ),
+            ProbeOutcome::Unusable
+        );
+        // Server errors carry no tag either.
+        assert_eq!(
+            classify_probe_response(reqwest::StatusCode::INTERNAL_SERVER_ERROR, None),
+            ProbeOutcome::Unusable
+        );
+        assert_eq!(
+            classify_probe_response(reqwest::StatusCode::NOT_FOUND, None),
+            ProbeOutcome::Unusable
+        );
+    }
+
+    #[test]
+    fn probe_response_reports_rate_limiting_before_reading_location() {
+        // A 403/429 must classify as RateLimited even if a Location is somehow
+        // present, so the cooldown is recorded rather than the response being
+        // silently treated as a successful check.
+        for code in [403u16, 429] {
+            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            assert_eq!(
+                classify_probe_response(
+                    status,
+                    Some("https://github.com/freenet/freenet-core/releases/tag/v9.9.9")
+                ),
+                ProbeOutcome::RateLimited,
+                "status {code} must be treated as rate-limited"
+            );
+        }
+    }
+
+    #[test]
+    fn force_waives_the_cached_cooldown_but_the_automated_path_honours_it() {
+        // Regression guard for the `--force` escape hatch. The stored deadline is
+        // only our CACHED belief about GitHub and can be stale for up to
+        // MAX_GITHUB_COOLDOWN. Two separate operator-facing messages tell users
+        // to run `freenet update --force` to override — if our own marker
+        // silently refused it and reported "already up to date", that advice
+        // would be wrong and an operator could not apply an urgent fix.
+        //
+        // Source pin, because the gate itself lives on the network path: the
+        // bypass flag must be threaded from `force`, and the automated node poll
+        // must pass `false`.
+        let update_src = include_str!("update.rs");
+        assert!(
+            update_src.contains("fetch_latest_release_tag(force)"),
+            "`freenet update --force` must waive the cached cooldown"
+        );
+
+        let this_src = include_str!("auto_update.rs");
+        let (_, after) = this_src
+            .split_once("async fn get_latest_version()")
+            .expect("get_latest_version not found");
+        assert!(
+            after.contains("fetch_latest_release_tag(false)"),
+            "the automated node poll must NOT waive the cooldown — staying quiet \
+             while the IP is limited is the entire point of it"
+        );
     }
 
     #[test]

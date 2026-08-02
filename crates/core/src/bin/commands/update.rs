@@ -1220,8 +1220,9 @@ async fn probe_latest_tag(force: bool, quiet: bool) -> Result<String> {
     // below, because the probe is the call every invocation makes — it is what
     // bounds a restart loop. The asset fetch happens only on a real install.
     //
-    // `--force` (an explicit operator action) bypasses OUR limiter. It does not,
-    // and must not, bypass a cooldown GitHub itself asked for: see below.
+    // `--force` (an explicit operator action) bypasses OUR local self-restraint —
+    // both this token bucket and the cached rate-limit cooldown below. It does
+    // NOT bypass a live 403/429 from GitHub, which is still honoured.
     if !force && !super::auto_update::try_consume_install_poll() {
         if !quiet {
             eprintln!(
@@ -1235,7 +1236,14 @@ async fn probe_latest_tag(force: bool, quiet: bool) -> Result<String> {
         std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
     }
 
-    match super::auto_update::fetch_latest_release_tag().await {
+    // `force` also waives the CACHED cooldown. Without this, an operator running
+    // `freenet update --force` after a rate-limit episode would be refused by our
+    // own stale marker for up to MAX_GITHUB_COOLDOWN — even once GitHub had
+    // recovered — and told "already up to date". That would break the escape
+    // hatch two separate messages point users at ("Run `freenet update --force`
+    // to override", and the crash-loop rollback's "run it once a fixed release is
+    // available"). A live 403/429 still refuses and still re-arms the cooldown.
+    match super::auto_update::fetch_latest_release_tag(force).await {
         Ok(tag) => Ok(tag),
         Err(e) => {
             // #5102: GitHub rate-limiting is NOT an install failure — it is "we
@@ -1245,11 +1253,11 @@ async fn probe_latest_tag(force: bool, quiet: bool) -> Result<String> {
             // restart-looping. This is the path the user hit as a bare
             // "429 Too Many Requests"; it now explains itself.
             //
-            // Note this is checked even under `--force`: `--force` overrides our
-            // own politeness budget, but knocking harder at a server that is
-            // already refusing us is what escalates toward an IP block, and there
-            // is nothing the operator can do here that waiting would not do
-            // better.
+            // Reached under `--force` too — but only from a LIVE refusal, since
+            // force waives the cached marker above. Retrying immediately against
+            // a server that is actively refusing us is what escalates toward an
+            // IP block, and there is nothing the operator can do here that
+            // waiting would not do better.
             if let Some(rate_limited) =
                 e.downcast_ref::<super::auto_update::GithubRateLimitedError>()
             {
