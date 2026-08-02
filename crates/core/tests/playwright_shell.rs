@@ -142,12 +142,34 @@ fn strip_ansi(s: &str) -> String {
 // fdev website publish helpers
 // ---------------------------------------------------------------------------
 
+/// An `fdev` command whose signing-key store is redirected into `config_home`.
+///
+/// `fdev website` resolves its key directory through `dirs::config_dir()`, which
+/// honours `XDG_CONFIG_HOME` only on Linux — on macOS it is `$HOME/Library/
+/// Application Support`, and on Windows `%APPDATA%`. Setting `XDG_CONFIG_HOME`
+/// alone therefore left this test writing `smoke-fixture.toml` into the
+/// developer's REAL config dir on macOS: the run polluted a directory this
+/// harness promises not to touch, and the NEXT run failed with "Key
+/// 'smoke-fixture' already exists" because `website init` refuses to overwrite a
+/// signing key. Redirect the home/appdata vars too, so the isolation holds
+/// wherever the test runs and the suite stays re-runnable.
+///
+/// Safe to redirect wholesale because `fdev website` shells out to nothing —
+/// no cargo, no toolchain lookup — so a synthetic HOME can't break a child
+/// build.
+fn isolated_fdev(config_home: &Path) -> Command {
+    let mut cmd = Command::new(fdev_bin());
+    cmd.env("XDG_CONFIG_HOME", config_home) // Linux
+        .env("HOME", config_home) // macOS (and the XDG fallback)
+        .env("APPDATA", config_home); // Windows
+    cmd
+}
+
 /// Run `fdev website init <FIXTURE_KEY_NAME>` against an isolated config dir
-/// (`XDG_CONFIG_HOME = config_home`) and return the contract key printed on the
-/// "Your website contract key: <key>" line.
+/// and return the contract key printed on the "Your website contract key:
+/// <key>" line.
 fn website_init(config_home: &Path) -> anyhow::Result<String> {
-    let output = Command::new(fdev_bin())
-        .env("XDG_CONFIG_HOME", config_home)
+    let output = isolated_fdev(config_home)
         .args(["website", "init", FIXTURE_KEY_NAME])
         .output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -191,8 +213,7 @@ fn website_init(config_home: &Path) -> anyhow::Result<String> {
 /// timeout while the insert still lands. We confirm the real outcome by
 /// polling the HTTP shell route instead.
 fn website_publish_observed(config_home: &Path, ws_url: &str) {
-    let output = Command::new(fdev_bin())
-        .env("XDG_CONFIG_HOME", config_home)
+    let output = isolated_fdev(config_home)
         .args(["--node-url", ws_url, "website", "publish"])
         .arg(fixture_webapp_dir())
         .args(["--key", FIXTURE_KEY_NAME])
