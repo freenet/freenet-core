@@ -120,8 +120,115 @@ const MAX_BACKOFF: Duration = Duration::from_secs(3600);
 /// Maximum consecutive update failures before disabling auto-update.
 const MAX_UPDATE_FAILURES: u32 = 3;
 
-/// GitHub API URL for latest release.
-const GITHUB_API_URL: &str = "https://api.github.com/repos/freenet/freenet-core/releases/latest";
+/// Non-API "latest release" URL (#5102).
+///
+/// This is deliberately **not** `api.github.com`. GitHub's REST API allows only
+/// **60 unauthenticated requests per hour per source IP**, and that budget is
+/// *collective*: every Freenet node behind the same NAT/CGNAT/VPN egress — plus
+/// every unrelated tool on that IP — draws from the same 60. A single node could
+/// previously consume up to ~12 of those 60 per hour (see the token-bucket
+/// section below), so a handful of peers sharing an apparent IP exhausted it and
+/// auto-update started failing with `403`/`429`.
+///
+/// `https://github.com/{repo}/releases/latest` answers with a `302` whose
+/// `Location` header carries the tag (`.../releases/tag/v0.2.118`). It is served
+/// by the web front end, carries **no `x-ratelimit-*` headers at all**, and does
+/// not draw on the REST budget — so version *detection*, which is the part that
+/// runs on a timer, now costs nothing that can be exhausted.
+///
+/// Do NOT "simplify" this back to `api.github.com`: the JSON body is not needed
+/// to learn the tag, and paying REST quota for it is precisely the bug.
+const GITHUB_LATEST_REDIRECT_URL: &str = "https://github.com/freenet/freenet-core/releases/latest";
+
+/// Marker inside the redirect `Location` that precedes the release tag.
+const RELEASE_TAG_PATH_MARKER: &str = "/releases/tag/";
+
+/// User-Agent sent on every GitHub request. GitHub rejects unidentified clients,
+/// and a stable, identifiable agent is what lets them tell us apart from a
+/// runaway crawler if our aggregate load ever does become a problem.
+pub(crate) const GITHUB_USER_AGENT: &str = "freenet-updater";
+
+/// Extract the release tag from a `releases/latest` redirect `Location`.
+///
+/// Accepts absolute (`https://github.com/o/r/releases/tag/v1.2.3`) and relative
+/// (`/o/r/releases/tag/v1.2.3`) forms, tolerates a trailing slash, and strips
+/// any `?`/`#` suffix. Returns the tag with a leading `v` removed, or `None` if
+/// the header does not look like a release-tag redirect at all.
+///
+/// Pure so the parsing contract is unit-testable without touching the network.
+pub(crate) fn parse_tag_from_release_location(location: &str) -> Option<String> {
+    let after = location.split_once(RELEASE_TAG_PATH_MARKER)?.1;
+    let tag = after
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(after)
+        .trim_end_matches('/')
+        .trim();
+    if tag.is_empty() {
+        return None;
+    }
+    Some(tag.trim_start_matches('v').to_string())
+}
+
+/// Whether a status means "GitHub is rate-limiting this IP".
+///
+/// GitHub signals the primary (per-hour) limit with **`403`** and secondary /
+/// abuse limits with **`429`**; both mean "stop asking". We deliberately do not
+/// try to distinguish a rate-limit `403` from an authorization `403` here: we
+/// send no credentials, so an authorization `403` on a public release redirect is
+/// not a case that arises, and treating an ambiguous `403` as "back off" is the
+/// safe direction — the cost is a delayed update, the cost of guessing the other
+/// way is escalating toward an IP block.
+pub(crate) fn is_rate_limited_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
+/// Longest cooldown we will honour from a server header.
+///
+/// GitHub's core window is one hour, so anything past this is either a secondary
+/// limit with a long fuse or a bad header; clamping keeps a hostile or buggy
+/// value from silently disabling auto-update for days.
+const MAX_GITHUB_COOLDOWN: Duration = Duration::from_secs(6 * 3600);
+
+/// Shortest cooldown worth persisting — below this the normal backoff already
+/// spaces polls out further than the header asks for.
+const MIN_GITHUB_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Derive how long to stay quiet from a rate-limited response's headers.
+///
+/// Prefers `Retry-After` (whole seconds; GitHub sends the delta form) and falls
+/// back to `x-ratelimit-reset` (absolute Unix seconds). Returns `None` when
+/// neither is present or parseable, so the caller can apply its own default
+/// rather than inventing a number here.
+///
+/// `header` is a lookup closure rather than a `HeaderMap` so this stays pure and
+/// directly unit-testable.
+pub(crate) fn parse_retry_after_at<F>(header: F, now_unix: u64) -> Option<Duration>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let from_retry_after = header("retry-after")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs);
+
+    let from_reset = header("x-ratelimit-reset")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        // Absolute instant → delta. `saturating_sub` covers a reset already in
+        // the past (clock skew), which yields a zero delta and is then clamped up
+        // to MIN_GITHUB_COOLDOWN below.
+        .map(|reset| Duration::from_secs(reset.saturating_sub(now_unix)));
+
+    let raw = from_retry_after.or(from_reset)?;
+    Some(raw.clamp(MIN_GITHUB_COOLDOWN, MAX_GITHUB_COOLDOWN))
+}
+
+/// [`parse_retry_after_at`] against the live wall clock.
+fn parse_retry_after<F>(header: F) -> Option<Duration>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    parse_retry_after_at(header, now_unix())
+}
 
 /// Error returned when an update is needed.
 /// The main function catches this and exits with EXIT_CODE_UPDATE_NEEDED.
@@ -158,6 +265,58 @@ impl std::fmt::Display for RateLimitedError {
 }
 
 impl std::error::Error for RateLimitedError {}
+
+/// Error returned when **GitHub itself** rate-limited us (`403`/`429`), or when
+/// we are still inside a cooldown GitHub asked for earlier (#5102).
+///
+/// Distinct from [`RateLimitedError`] (our own local token bucket) because the
+/// two say different things to an operator: the local bucket is self-imposed and
+/// clears on a fixed refill schedule, whereas this one means the machine's *IP*
+/// has exhausted a budget shared with every other client on it. Both, however,
+/// mean "we did not learn whether an update exists", so both must map to
+/// [`UpdateCheckResult::RateLimited`] and must never be mistaken for "no update".
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GithubRateLimitedError {
+    /// How long GitHub asked us to wait, when it said.
+    pub(crate) retry_after: Option<Duration>,
+}
+
+impl GithubRateLimitedError {
+    /// Operator-facing explanation. The bare `429 Too Many Requests` this
+    /// replaces told users nothing about the cause (a *shared* IP budget) or the
+    /// remedy, so they read it as "Freenet is broken" and reinstalled by hand.
+    pub(crate) fn user_message(&self) -> String {
+        let when = match self.retry_after {
+            Some(d) if d.as_secs() >= 120 => format!("in about {} minutes", d.as_secs() / 60),
+            Some(d) => format!("in about {} seconds", d.as_secs().max(1)),
+            None => "within the hour".to_string(),
+        };
+        format!(
+            "GitHub is rate-limiting release checks from this network address, so Freenet could \
+             not confirm the latest version. This is a per-IP limit shared by everything on your \
+             connection (and by every other machine behind the same NAT/CGNAT or VPN exit), not a \
+             limit on your node specifically. Nothing is broken and no action is needed: the node \
+             keeps running on its current version and will retry automatically {when}. To update \
+             immediately anyway, download a release directly from \
+             https://github.com/freenet/freenet-core/releases/latest"
+        )
+    }
+}
+
+impl std::fmt::Display for GithubRateLimitedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.retry_after {
+            Some(d) => write!(
+                f,
+                "GitHub rate-limited this IP; retrying in {}s",
+                d.as_secs()
+            ),
+            None => write!(f, "GitHub rate-limited this IP"),
+        }
+    }
+}
+
+impl std::error::Error for GithubRateLimitedError {}
 
 /// Result of an update check attempt.
 #[derive(Debug, PartialEq)]
@@ -345,6 +504,25 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
                 UpdateCheckResult::Skipped
             }
         }
+        Err(e) if e.downcast_ref::<GithubRateLimitedError>().is_some() => {
+            // GitHub itself refused (403/429), or we are inside the cooldown it
+            // asked for (#5102). Same handling as our own bucket denial — no
+            // check time recorded, no backoff growth, and crucially NOT a
+            // `Skipped`, so this can never reach the "max backoff + 0
+            // connections -> trust the gateway, exit 42" fallback. Exiting 42
+            // here would hand off to a `freenet update` that shares this very
+            // cooldown and would immediately no-op, i.e. a restart loop driven
+            // by an external rate limit.
+            //
+            // Logged at warn! (not debug!) precisely once per occurrence because
+            // this is the state the user reported as an inscrutable "too many
+            // requests": an operator reading the log should learn that their IP
+            // is limited, that it is shared, and that nothing needs fixing.
+            if let Some(rate_limited) = e.downcast_ref::<GithubRateLimitedError>() {
+                tracing::warn!("Update check deferred: {}", rate_limited.user_message());
+            }
+            UpdateCheckResult::RateLimited
+        }
         Err(e) if e.downcast_ref::<RateLimitedError>().is_some() => {
             // Our OWN rate limiter denied the poll — NOT a GitHub failure, and no
             // network call was made. Deliberately do NOT record a check time or
@@ -373,37 +551,96 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
     }
 }
 
-/// Fetch the latest version string from GitHub releases API.
+/// Fetch the latest release tag from GitHub **without spending REST API quota**
+/// (#5102).
+///
+/// Issues a non-following `GET` to [`GITHUB_LATEST_REDIRECT_URL`] and reads the
+/// tag out of the `302`'s `Location` header. See that constant for why this is
+/// not `api.github.com`.
+///
+/// Shared by the node's detection path ([`get_latest_version`]) and the
+/// supervisor-side installer (`commands::update::get_latest_release`), so both
+/// observe the same server-signalled cooldown.
+///
+/// Returns the version string with any leading `v` stripped.
+///
+/// # Errors
+///
+/// * [`GithubRateLimitedError`] when we are inside a cooldown GitHub previously
+///   asked for, or when this response is itself a `403`/`429`. Callers must
+///   treat this as "we did not learn anything", never as "no update exists".
+/// * Any transport / parse failure otherwise.
+pub(crate) async fn fetch_latest_release_tag() -> Result<String> {
+    // Honour a cooldown GitHub asked for earlier (possibly in a previous
+    // process). Checked BEFORE the request so a limited IP goes quiet instead of
+    // continuing to knock — continuing to knock while limited is what escalates a
+    // soft per-hour limit into a longer secondary block.
+    if let Some(remaining) = github_cooldown_remaining() {
+        return Err(GithubRateLimitedError {
+            retry_after: Some(remaining),
+        }
+        .into());
+    }
+
+    let client = reqwest::Client::builder()
+        .user_agent(GITHUB_USER_AGENT)
+        // We want the `Location` header, not the page it points at: following the
+        // redirect would download the whole HTML release page for a value that is
+        // already in the header.
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10))
+        .build()?;
+
+    let response = client.get(GITHUB_LATEST_REDIRECT_URL).send().await?;
+    let status = response.status();
+
+    if is_rate_limited_status(status) {
+        // GitHub told us to stop. Persist the reset instant it handed back so
+        // every poll path on this machine — including the short-lived `freenet
+        // update` processes the supervisor spawns — stays quiet until then.
+        return Err(note_rate_limited_response(|name| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        })
+        .into());
+    }
+
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
+    match location
+        .as_deref()
+        .and_then(parse_tag_from_release_location)
+    {
+        Some(tag) => Ok(tag),
+        None => anyhow::bail!(
+            "GitHub returned {status} with no parseable release tag in Location ({})",
+            location.as_deref().unwrap_or("<absent>")
+        ),
+    }
+}
+
+/// Fetch the latest version string for the node's own detection path.
 async fn get_latest_version() -> Result<String> {
-    // Global persistent rate limit (#4073): refuse to hit GitHub when the shared
-    // token bucket is empty. This is the in-node choke point (the node's startup
-    // check, the #4589 re-poll, and the peer-signal loop all reach GitHub through
-    // here); the supervisor-side `freenet update` is bounded by the same bucket
-    // at `get_latest_release`. A denied poll returns Err so the caller
-    // (`check_if_update_available`) treats it as `Skipped` and retries later —
-    // the node keeps running, it just does not poll GitHub this tick.
+    // Local aggregate-load bound (#4073), kept as defence in depth on top of the
+    // #5102 endpoint switch: refuse to hit GitHub when this node's token bucket
+    // is empty. This is the in-node choke point (the node's startup check, the
+    // #4589 re-poll, and the peer-signal loop all reach GitHub through here); the
+    // supervisor-side `freenet update` is bounded by its own bucket at
+    // `get_latest_release`. A denied poll returns Err so the caller
+    // (`check_if_update_available`) treats it as `RateLimited` and retries later
+    // — the node keeps running, it just does not poll GitHub this tick.
     if !try_consume_node_poll() {
         return Err(RateLimitedError.into());
     }
 
-    let client = reqwest::Client::builder()
-        .user_agent("freenet-updater")
-        .timeout(Duration::from_secs(10))
-        .build()?;
-
-    let response = client.get(GITHUB_API_URL).send().await?;
-
-    if !response.status().is_success() {
-        anyhow::bail!("GitHub API returned {}", response.status());
-    }
-
-    #[derive(serde::Deserialize)]
-    struct Release {
-        tag_name: String,
-    }
-
-    let release: Release = response.json().await?;
-    Ok(release.tag_name.trim_start_matches('v').to_string())
+    fetch_latest_release_tag().await
 }
 
 /// Get the state directory for update tracking files.
@@ -747,6 +984,113 @@ pub(crate) fn try_consume_node_poll() -> bool {
 /// Independent of the node bucket so the node can never starve the installer.
 pub(crate) fn try_consume_install_poll() -> bool {
     try_consume_poll_bucket(INSTALL_POLL_BUCKET_FILE)
+}
+
+// ── Server-signalled GitHub cooldown (#5102) ───────────────────────────────
+//
+// The token buckets above bound what THIS node does. This cooldown records what
+// GITHUB told us to do, and is deliberately **shared** by every poll path on the
+// machine — unlike the two buckets, which are separate on purpose.
+//
+// The asymmetry is the point. The buckets are separate so the node cannot starve
+// the installer of its own self-imposed allowance. But a `403`/`429` is not a
+// property of a code path, it is a property of the IP: if GitHub is refusing the
+// node's detection poll, it will equally refuse the installer's, and letting the
+// installer knock anyway is exactly the behaviour that turns a one-hour primary
+// limit into a longer secondary block. One file, honoured by both.
+
+/// On-disk marker holding the Unix second before which no path may poll GitHub.
+const GITHUB_COOLDOWN_FILE: &str = "github_ratelimit_cooldown";
+
+/// Cooldown applied when GitHub rate-limits us without a usable `Retry-After` /
+/// `x-ratelimit-reset` header. Short enough that a transient limit does not
+/// noticeably delay updates, long enough to stop a restart loop from knocking.
+const DEFAULT_GITHUB_COOLDOWN: Duration = Duration::from_secs(900);
+
+/// Remaining cooldown at `now_unix`, if any. Pure over an explicit directory and
+/// clock so the expiry arithmetic is unit-testable.
+///
+/// A stored instant further out than [`MAX_GITHUB_COOLDOWN`] is clamped rather
+/// than trusted: a backwards clock step or a torn write must not be able to
+/// disable auto-update indefinitely.
+pub(crate) fn github_cooldown_remaining_at(
+    dir: &std::path::Path,
+    now_unix: u64,
+) -> Option<Duration> {
+    let until = fs::read_to_string(dir.join(GITHUB_COOLDOWN_FILE))
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    let remaining = until.checked_sub(now_unix)?;
+    if remaining == 0 {
+        return None;
+    }
+    Some(Duration::from_secs(remaining).min(MAX_GITHUB_COOLDOWN))
+}
+
+/// Live-clock, live-state-dir variant of [`github_cooldown_remaining_at`].
+///
+/// Fails **open** (returns `None`, i.e. "not cooling down") when there is no
+/// resolvable state dir: the cooldown is an optimisation to be polite to GitHub,
+/// and an unresolvable state dir already denies every poll via the token buckets,
+/// which fail closed. Failing closed here too would permanently disable update
+/// detection on such a machine.
+fn github_cooldown_remaining() -> Option<Duration> {
+    github_cooldown_remaining_at(&state_dir()?, now_unix())
+}
+
+/// Persist "do not poll GitHub until `now + retry_after`".
+///
+/// Never shortens an existing cooldown — concurrent processes (the node and a
+/// supervisor-spawned `freenet update`) can both observe a limit, and the later
+/// writer must not walk back the more conservative deadline.
+pub(crate) fn record_github_cooldown_at(
+    dir: &std::path::Path,
+    retry_after: Option<Duration>,
+    now_unix: u64,
+) {
+    let wait = retry_after
+        .unwrap_or(DEFAULT_GITHUB_COOLDOWN)
+        .clamp(MIN_GITHUB_COOLDOWN, MAX_GITHUB_COOLDOWN);
+    let candidate = now_unix.saturating_add(wait.as_secs());
+    let existing = github_cooldown_remaining_at(dir, now_unix)
+        .map(|d| now_unix.saturating_add(d.as_secs()))
+        .unwrap_or(0);
+    let until = candidate.max(existing);
+
+    if fs::create_dir_all(dir)
+        .and_then(|()| fs::write(dir.join(GITHUB_COOLDOWN_FILE), until.to_string()))
+        .is_err()
+    {
+        // Best-effort: the token buckets still bound us if this cannot persist.
+        tracing::debug!("Could not persist GitHub rate-limit cooldown");
+    }
+}
+
+/// Live-clock, live-state-dir variant of [`record_github_cooldown_at`].
+fn record_github_cooldown(retry_after: Option<Duration>) {
+    if let Some(dir) = state_dir() {
+        record_github_cooldown_at(&dir, retry_after, now_unix());
+    }
+}
+
+/// Record the cooldown implied by a rate-limited response's headers and build
+/// the corresponding error.
+///
+/// Exposed so the installer's `api.github.com` asset fetch funnels its `403`/
+/// `429` handling through the same place as the redirect probe — a second,
+/// hand-rolled copy of "parse the header, persist the deadline" is exactly how
+/// one of the two paths ends up quietly not backing off.
+///
+/// `header` is a name → value lookup over the response headers.
+pub(crate) fn note_rate_limited_response<F>(header: F) -> GithubRateLimitedError
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let retry_after = parse_retry_after(header);
+    record_github_cooldown(retry_after);
+    GithubRateLimitedError { retry_after }
 }
 
 /// Check if we should attempt an update based on failure history.
@@ -1676,20 +2020,27 @@ mod tests {
     }
 
     #[test]
-    fn test_get_latest_release_consults_install_bucket() {
+    fn test_installer_probe_consults_install_bucket() {
         // Source pin: the supervisor-side installer fetch must gate on the
         // SEPARATE install bucket (not the node bucket), so the node cannot
         // starve it (#4073 Codex P1).
+        //
+        // Renamed with the #5102 split of `get_latest_release` into
+        // `probe_latest_tag` (quota-free tag probe, runs every invocation) and
+        // `fetch_release_assets` (REST, runs only on a real install). The token
+        // must be spent on the PROBE: that is the call every invocation makes, so
+        // it is the one that bounds a restart loop. Gating only the asset fetch
+        // would leave the crash-loop path unbounded.
         let src = include_str!("update.rs");
         let (_, body) = src
-            .split_once("async fn get_latest_release(")
-            .expect("get_latest_release definition not found");
+            .split_once("async fn probe_latest_tag(")
+            .expect("probe_latest_tag definition not found");
         let (head, _) = body
-            .split_once("reqwest::Client::builder()")
-            .expect("client builder not found");
+            .split_once("fetch_latest_release_tag()")
+            .expect("tag fetch call not found");
         assert!(
             head.contains("try_consume_install_poll()"),
-            "get_latest_release must consume an INSTALL-bucket token before hitting GitHub"
+            "probe_latest_tag must consume an INSTALL-bucket token before hitting GitHub"
         );
     }
 
@@ -1779,17 +2130,280 @@ mod tests {
 
     #[test]
     fn test_repoll_interval_is_under_github_rate_limit() {
-        // GitHub's unauthenticated REST limit is 60 requests/hour/IP. Even at
-        // the jittered minimum, the periodic re-poll alone must stay far under
-        // that (the bursty peer-signal checks share the same IP budget). We
-        // assert the minimum interval is >= 1 hour, i.e. <= 1 periodic request
-        // per hour — a >=60x safety margin.
+        // Keeps the periodic re-poll infrequent in absolute terms.
+        //
+        // NOTE (#5102): the "60x safety margin" this test originally claimed was
+        // measured against the WRONG denominator. GitHub's 60 req/hr limit is
+        // per SOURCE IP and *collective* — every node behind the same NAT/CGNAT
+        // or VPN exit, plus every unrelated tool on that IP, draws from one
+        // shared 60. A per-node margin says nothing about a shared budget, which
+        // is how a "far under the limit" updater still got users 403/429'd. The
+        // real fix was to stop spending REST quota for detection at all (see
+        // `GITHUB_LATEST_REDIRECT_URL`); this bound remains as ordinary
+        // politeness, not as the rate-limit defence it was once mistaken for.
         let min =
             jittered_repoll_interval(UPDATE_REPOLL_INTERVAL, UPDATE_REPOLL_JITTER_FRACTION, 0.0);
         assert!(
             min >= Duration::from_secs(3600),
-            "minimum re-poll interval {min:?} must be >= 1h to stay well under \
-             GitHub's 60 req/hr unauthenticated limit"
+            "minimum re-poll interval {min:?} must be >= 1h"
         );
+    }
+
+    // ── #5102: quota-free version detection ────────────────────────────────
+
+    #[test]
+    fn detection_endpoint_does_not_use_the_rest_api() {
+        // The regression this guards: the detection path polls on a timer, so
+        // pointing it at api.github.com spends a budget shared with every other
+        // client on the IP. The redirect endpoint costs none of it. Verified
+        // empirically against live GitHub when this landed: the api.github.com
+        // form increments `core.used`, this one does not.
+        assert!(
+            !GITHUB_LATEST_REDIRECT_URL.contains("api.github.com"),
+            "version detection must not use the rate-limited REST API, got \
+             {GITHUB_LATEST_REDIRECT_URL}"
+        );
+        assert!(
+            GITHUB_LATEST_REDIRECT_URL.starts_with("https://github.com/"),
+            "detection must use the web redirect endpoint, got {GITHUB_LATEST_REDIRECT_URL}"
+        );
+    }
+
+    #[test]
+    fn parse_tag_from_location_handles_the_shapes_github_sends() {
+        // Absolute form — what GitHub actually returns today.
+        assert_eq!(
+            parse_tag_from_release_location(
+                "https://github.com/freenet/freenet-core/releases/tag/v0.2.118"
+            )
+            .as_deref(),
+            Some("0.2.118"),
+            "the leading 'v' must be stripped, matching the old tag_name handling"
+        );
+        // Relative form — permitted by RFC 7231 even though GitHub sends absolute.
+        assert_eq!(
+            parse_tag_from_release_location("/freenet/freenet-core/releases/tag/v1.2.3").as_deref(),
+            Some("1.2.3")
+        );
+        // A tag without the conventional 'v' must survive intact.
+        assert_eq!(
+            parse_tag_from_release_location("https://github.com/o/r/releases/tag/1.2.3").as_deref(),
+            Some("1.2.3")
+        );
+        // Trailing slash and query/fragment noise must not end up in the version,
+        // or the semver parse downstream fails and the update is silently skipped.
+        assert_eq!(
+            parse_tag_from_release_location("https://github.com/o/r/releases/tag/v1.2.3/")
+                .as_deref(),
+            Some("1.2.3")
+        );
+        assert_eq!(
+            parse_tag_from_release_location("https://github.com/o/r/releases/tag/v1.2.3?x=1")
+                .as_deref(),
+            Some("1.2.3")
+        );
+    }
+
+    #[test]
+    fn parse_tag_from_location_rejects_non_release_redirects() {
+        // Anything that is not a release-tag redirect must be None, NOT a bogus
+        // version string: a bogus version compares as "newer" and would trigger
+        // a pointless exit-42 update cycle.
+        assert_eq!(parse_tag_from_release_location(""), None);
+        assert_eq!(
+            parse_tag_from_release_location("https://github.com/login?return_to=%2Ffreenet"),
+            None
+        );
+        assert_eq!(
+            parse_tag_from_release_location("https://github.com/o/r/releases/tag/"),
+            None,
+            "an empty tag must not parse as a version"
+        );
+        assert_eq!(
+            parse_tag_from_release_location("https://github.com/o/r/releases/latest"),
+            None
+        );
+    }
+
+    #[test]
+    fn rate_limited_statuses_cover_both_github_signals() {
+        // GitHub uses 403 for the primary per-hour limit and 429 for secondary /
+        // abuse limits. Missing either one means we keep knocking while limited,
+        // which is what escalates toward a longer block.
+        assert!(is_rate_limited_status(reqwest::StatusCode::FORBIDDEN));
+        assert!(is_rate_limited_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        // Everything else must stay an ordinary error, not a silent cooldown.
+        assert!(!is_rate_limited_status(reqwest::StatusCode::OK));
+        assert!(!is_rate_limited_status(reqwest::StatusCode::FOUND));
+        assert!(!is_rate_limited_status(reqwest::StatusCode::NOT_FOUND));
+        assert!(!is_rate_limited_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+    }
+
+    #[test]
+    fn retry_after_header_is_preferred_over_ratelimit_reset() {
+        let headers = |name: &str| match name {
+            "retry-after" => Some("300".to_string()),
+            "x-ratelimit-reset" => Some("9999999999".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            parse_retry_after_at(headers, 1_000),
+            Some(Duration::from_secs(300)),
+            "Retry-After is the more specific instruction and must win"
+        );
+    }
+
+    #[test]
+    fn ratelimit_reset_is_converted_from_absolute_to_delta() {
+        // x-ratelimit-reset is an ABSOLUTE Unix second. Treating it as a delta
+        // (the easy mistake) would produce a ~56-year cooldown and silently
+        // disable auto-update forever.
+        let now = 1_785_700_000;
+        let headers = |name: &str| match name {
+            "x-ratelimit-reset" => Some((now + 1_800).to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            parse_retry_after_at(headers, now),
+            Some(Duration::from_secs(1_800))
+        );
+    }
+
+    #[test]
+    fn rate_limit_wait_is_clamped_at_both_ends() {
+        let now = 1_785_700_000;
+        // A reset already in the past (clock skew) must not yield a zero wait
+        // that lets us knock again immediately.
+        let past = |name: &str| match name {
+            "x-ratelimit-reset" => Some((now - 500).to_string()),
+            _ => None,
+        };
+        assert_eq!(parse_retry_after_at(past, now), Some(MIN_GITHUB_COOLDOWN));
+
+        // An absurd value must not disable updates for days.
+        let absurd = |name: &str| match name {
+            "retry-after" => Some("99999999".to_string()),
+            _ => None,
+        };
+        assert_eq!(parse_retry_after_at(absurd, now), Some(MAX_GITHUB_COOLDOWN));
+
+        // Nothing parseable → None, so the caller applies its own default rather
+        // than this function inventing one.
+        assert_eq!(parse_retry_after_at(|_| None, now), None);
+        assert_eq!(
+            parse_retry_after_at(
+                |n: &str| (n == "retry-after").then(|| "soon".to_string()),
+                now
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn cooldown_blocks_until_it_expires() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = 1_785_700_000;
+        assert_eq!(
+            github_cooldown_remaining_at(tmp.path(), now),
+            None,
+            "no marker means no cooldown"
+        );
+
+        record_github_cooldown_at(tmp.path(), Some(Duration::from_secs(600)), now);
+        assert_eq!(
+            github_cooldown_remaining_at(tmp.path(), now),
+            Some(Duration::from_secs(600))
+        );
+        // Still blocking one second before expiry...
+        assert_eq!(
+            github_cooldown_remaining_at(tmp.path(), now + 599),
+            Some(Duration::from_secs(1))
+        );
+        // ...and released exactly at expiry, so a limited node does recover on
+        // its own without operator intervention.
+        assert_eq!(github_cooldown_remaining_at(tmp.path(), now + 600), None);
+        assert_eq!(github_cooldown_remaining_at(tmp.path(), now + 9_999), None);
+    }
+
+    #[test]
+    fn cooldown_is_never_shortened_by_a_later_writer() {
+        // The node and a supervisor-spawned `freenet update` can both hit the
+        // limit. If the second writer overwrote the deadline with its own
+        // shorter wait, the pair would ratchet the cooldown DOWN and keep
+        // knocking — the exact failure the shared marker exists to prevent.
+        let tmp = tempfile::tempdir().unwrap();
+        let now = 1_785_700_000;
+
+        record_github_cooldown_at(tmp.path(), Some(Duration::from_secs(3_000)), now);
+        record_github_cooldown_at(tmp.path(), Some(Duration::from_secs(120)), now);
+
+        assert_eq!(
+            github_cooldown_remaining_at(tmp.path(), now),
+            Some(Duration::from_secs(3_000)),
+            "a shorter later cooldown must not walk back the longer one"
+        );
+    }
+
+    #[test]
+    fn cooldown_without_a_header_uses_the_bounded_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = 1_785_700_000;
+        record_github_cooldown_at(tmp.path(), None, now);
+        assert_eq!(
+            github_cooldown_remaining_at(tmp.path(), now),
+            Some(DEFAULT_GITHUB_COOLDOWN),
+            "a 403/429 with no usable header must still produce a real cooldown"
+        );
+    }
+
+    #[test]
+    fn corrupt_or_skewed_cooldown_cannot_disable_updates_forever() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = 1_785_700_000;
+
+        // A far-future deadline (backwards clock step, torn write) is clamped
+        // rather than trusted, so the node resumes checking within hours.
+        fs::write(tmp.path().join(GITHUB_COOLDOWN_FILE), u64::MAX.to_string()).unwrap();
+        assert_eq!(
+            github_cooldown_remaining_at(tmp.path(), now),
+            Some(MAX_GITHUB_COOLDOWN)
+        );
+
+        // Unparseable content fails OPEN (no cooldown): the token buckets still
+        // bound us, and failing closed here would wedge detection permanently.
+        fs::write(tmp.path().join(GITHUB_COOLDOWN_FILE), "not-a-number").unwrap();
+        assert_eq!(github_cooldown_remaining_at(tmp.path(), now), None);
+    }
+
+    #[test]
+    fn rate_limit_message_explains_cause_and_remedy() {
+        // The reported symptom was a bare "too many requests", which users read
+        // as "Freenet is broken" and responded to by reinstalling by hand. The
+        // replacement must name the shared-IP cause, say it is not fatal, and
+        // give a manual route.
+        let msg = GithubRateLimitedError {
+            retry_after: Some(Duration::from_secs(1_800)),
+        }
+        .user_message();
+        assert!(
+            msg.contains("30 minutes"),
+            "must say when it retries: {msg}"
+        );
+        assert!(
+            msg.contains("shared") || msg.contains("NAT"),
+            "must explain the per-IP/shared cause: {msg}"
+        );
+        assert!(
+            msg.contains("https://github.com/freenet/freenet-core/releases/latest"),
+            "must offer the manual download route: {msg}"
+        );
+
+        // With no header we still promise a retry rather than leaving it open.
+        let vague = GithubRateLimitedError { retry_after: None }.user_message();
+        assert!(vague.contains("within the hour"), "{vague}");
     }
 }

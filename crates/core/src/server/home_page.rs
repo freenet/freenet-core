@@ -2168,6 +2168,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn js_update_check_backs_off_after_a_failure() {
+        // #5102: caching only SUCCESS meant a rate-limited browser re-requested
+        // on every single page load — the dashboard knocked hardest exactly
+        // while the IP was already being refused. Failures must be remembered
+        // too, so the client goes quiet and recovers on its own.
+        //
+        // This check cannot move off api.github.com the way the node's poll did:
+        // it runs in a browser, and the quota-free github.com redirect sends no
+        // CORS headers, so fetch() cannot read it. Backing off is the only lever
+        // available here, which is why it is pinned.
+        assert!(
+            JS.contains("failedAt"),
+            "JS must record failed update checks so it can back off (#5102)"
+        );
+        assert!(
+            JS.contains("FAIL_TTL_MS"),
+            "JS must define a failure cooldown window (#5102)"
+        );
+        assert!(
+            JS.contains("rememberFailure"),
+            "the failure path must persist the cooldown, not just log (#5102)"
+        );
+    }
+
     // ─── Governance card (Phase 4.5) ───────────────────────────────
 
     use crate::node::network_status::{
