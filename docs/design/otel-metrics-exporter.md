@@ -25,7 +25,54 @@ untouched.
 - Migrating existing events onto the new pipeline.
 - Logs and traces exporters. The endpoint resolution is designed to serve all
   three signals; only metrics ships now.
-- Any instrumentation beyond the single proof-of-life gauge.
+- Per-connection metrics. Identifying the remote end of a connection is a
+  per-datapoint attribute, multiplied by bucket count on histograms; the
+  aggregate signals below answer the operational questions without it. Transfer
+  and connection *events*, if wanted, belong on a log pipeline rather than as
+  metric series.
+- Operation and contract-execution latency histograms. No driver measures its
+  own elapsed time today, and raw `Instant::now()` is banned in `crates/core/`
+  (`.claude/rules/testing.md`), so adding them means threading `TimeSource`
+  through every `op_ctx_task`. `freenet.operation.results` ships the outcome
+  counter now; the duration histogram is deferred until someone needs
+  percentiles.
+
+## Instruments
+
+Registered in `tracing/otel.rs::register_metrics`.
+
+| Instrument | Kind | Attributes | Source |
+|---|---|---|---|
+| `freenet.process.memory.rss` | gauge | — | `node::resource_metrics::rss_bytes` (Linux only) |
+| `freenet.transport.bytes` | counter | `direction` | `cumulative_bytes_{sent,received}` |
+| `freenet.transport.packets` | counter | `direction` | `cumulative_packets_{sent,received}` |
+| `freenet.transport.transfers` | counter | `result` | `record_transfer_{completed,failed}` |
+| `freenet.transport.nat_traversal` | counter | `result` | `record_nat_traversal_*` |
+| `freenet.transport.rtt` | histogram | — | `record_rtt_sample` |
+| `freenet.transport.cwnd` | histogram | — | `record_cwnd_sample` |
+| `freenet.operation.results` | counter | `op`, `result` | `network_status::record_op_result` |
+| `freenet.ring.connections` | gauge | — | `RingStatsSnapshot` |
+| `freenet.node.contracts.hosted` | gauge | — | `RingStatsSnapshot` |
+| `freenet.connect.attempts` | counter | — | `NetworkStatus` |
+| `freenet.ring.lattice.neighbor` | gauge | `position` | `RingStatsSnapshot` |
+| `freenet.ring.lattice.neighbor.distance` | gauge | `position` | `RingStatsSnapshot` |
+| `freenet.ring.lattice.probes` | counter | `result` | `RingStatsSnapshot` |
+| `freenet.contract.updates` | counter | `result` | `RingStatsSnapshot` |
+| `freenet.contract.queue.depth` | gauge | `queue` | `FairQueueStats` |
+| `freenet.contract.queue.depth.high_water` | gauge | — | `FairQueueStats` |
+| `freenet.contract.queue.rejected` | counter | `reason` | `FairQueueStats` |
+| `freenet.contract.queue.background_shed` | counter | — | `FairQueueStats` |
+
+Everything but the histograms and the four synchronous counters is an
+observable callback over state that already existed for the local dashboard.
+
+Resource attributes: `service.instance.id` (transport public key fingerprint —
+never a `PeerId`, which embeds our socket address), `service.version`,
+`os.type`, `host.arch`, plus whatever `OTEL_RESOURCE_ATTRIBUTES` adds.
+
+Not instrumented: `TransportMetrics::slowdowns_triggered` is read and reset but
+never incremented anywhere in the tree, so it is dead and was left out rather
+than exported as a permanent zero.
 
 ## Isolation requirement (hard)
 

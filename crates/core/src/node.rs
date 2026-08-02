@@ -823,7 +823,11 @@ impl NodeConfig {
             // collector. It is not a NetEventRegister — it installs a global
             // meter provider that instrumentation reaches via
             // `opentelemetry::global::meter`.
-            crate::tracing::otel::init(&self.config.otel, self.local_peer_id_string());
+            // Public-key fingerprint, NOT `local_peer_id_string()`: a PeerId
+            // renders as `{pub_key}@{addr}`, which would put this node's socket
+            // address on every exported batch and re-identify the node on every
+            // address change.
+            crate::tracing::otel::init(&self.config.otel, self.key_pair.public().to_string());
 
             (DynamicRegister::new(registers), flush_handle)
         };
