@@ -136,32 +136,38 @@ const RESYNC_THROTTLE_CACHE_SIZE: usize = 4096;
 /// Bounds diagnostic correlation state influenced by remote (contract, peer)
 /// pairs. Eviction only loses classification detail; it never changes routing.
 ///
-/// Sized from live production data (2026-08-01/02, v0.2.117 field telemetry,
-/// #5090/#5091): a single busy gateway (nova) hosts ~2,811 contracts across
-/// ~150 active connections, and the fleet-wide overflow counter
-/// (`NetworkEfficiencyV1::corr_ovf[0]`) fired on ~31% of new-registration
-/// events at the previous 4,096 cap. That overflow rate means a meaningful,
-/// unquantified share of `MissingSummaryClass::*FirstObserved` telemetry is
-/// actually a recurrence whose correlation entry was evicted under load, not
-/// a genuine first contact — undermining the one diagnostic property this
-/// bound exists to provide. 65,536 gives a busy gateway roughly the working
-/// set implied by that measurement; memory cost stays trivial (tens of MB at
-/// most for `MissingPairHistory` entries) relative to the multi-GB working
-/// set already in use. Re-measure `corr_ovf` after deploying this to confirm
-/// the overflow rate actually drops before considering a further bump or an
-/// unbounded-but-swept alternative.
+/// Live production data (2026-08-01/02, v0.2.117 field telemetry, #5090/#5091)
+/// showed the previous 4,096-entry cap saturated on busy nodes: the overflow
+/// counter (`NetworkEfficiencyV1::corr_ovf[0]`) fired on ~31% of new-pair
+/// registrations fleet-wide, and a single busy gateway (nova) hosts ~2,811
+/// contracts across ~150 connections — a theoretical (contract, peer) space
+/// (~421K) far above the old cap; real overlap is sparser than that upper
+/// bound, but no density measurement pins it down precisely. Once an LRU of
+/// this shape is saturated, eviction is continuous (every new never-seen pair
+/// evicts the least-recent entry), so the overflow counter reflects steady-
+/// state new-pair *arrival rate*, not a one-time capacity breach — it will
+/// not reach exactly zero at any finite cap, only a lower rate. 65,536 (16x)
+/// is a substantial headroom increase chosen to reduce that rate
+/// significantly, not a precise working-set derivation; memory cost is a
+/// worst-case ~14 MB fully populated (up from ~1 MB), paid on every node
+/// including small ones since this is a single fleet-wide constant rather
+/// than one scaled per-node from `max_connections` (a possible future
+/// refinement, matching the code-style.md "derive thresholds from
+/// configuration" convention, if a fleet-wide constant proves insufficient).
+/// Re-measure `corr_ovf[0]` after deploying this to see how much the rate
+/// actually drops before considering a further bump or an unbounded-but-swept
+/// alternative.
 const MISSING_SUMMARY_HISTORY_SIZE: usize = 65536;
 
 /// Bounds in-flight missing-summary send correlation. At capacity sends still
 /// proceed, and the visible overflow counter records the lost correlation.
 ///
-/// Bumped alongside [`MISSING_SUMMARY_HISTORY_SIZE`] (see its doc comment for
-/// the production sizing rationale). This bound tracks concurrently in-flight
-/// attempts, not the full historical set, so it does not need the same 16x
-/// factor — 16x keeps it proportionate and still comfortably covers observed
-/// `corr_ovf[1]` (active-tracking overflow), which was 0 in the same
-/// measurement window even at the old 256 cap.
-const MISSING_SUMMARY_ACTIVE_SIZE: usize = 4096;
+/// Left UNCHANGED from its original value: the same production measurement
+/// that justified bumping [`MISSING_SUMMARY_HISTORY_SIZE`] showed
+/// `corr_ovf[1]` (active-tracking overflow) at exactly 0 even under the old
+/// cap — no evidence this bound is a bottleneck, so it is not bumped
+/// speculatively.
+const MISSING_SUMMARY_ACTIVE_SIZE: usize = 256;
 
 /// Telemetry field order for the first missing-summary send age histogram:
 /// <1s, 1-9s, 10-59s, 60-299s, and >=300s.
@@ -3336,7 +3342,12 @@ mod tests {
         }
 
         let mut guards = Vec::new();
-        for seed in 10_000..10_000 + MISSING_SUMMARY_ACTIVE_SIZE as u32 + 1 {
+        // Seeds must stay disjoint from the first loop's `0..=HISTORY_SIZE`
+        // range (freenet-core#5097) — otherwise these "untracked" pairs are
+        // actually already-tracked recreations, breaking the panic below.
+        let active_probe_start = MISSING_SUMMARY_HISTORY_SIZE as u32 + 10_000;
+        for seed in active_probe_start..active_probe_start + MISSING_SUMMARY_ACTIVE_SIZE as u32 + 1
+        {
             let attempt = match manager.begin_peer_summary_broadcast(
                 &make_unique_contract_key(seed),
                 &make_unique_peer_key(seed),
