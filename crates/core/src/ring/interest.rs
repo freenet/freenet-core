@@ -3356,6 +3356,49 @@ mod tests {
         drop(guards);
     }
 
+    /// Regression for the undersized correlation cache (freenet-core#5097).
+    /// Live production telemetry showed the OLD 4,096-entry
+    /// `MISSING_SUMMARY_HISTORY_SIZE` overflowing on ~31% of new
+    /// registrations on a single busy gateway. This test registers a
+    /// working set (8,192 distinct pairs) that comfortably exceeds that old
+    /// cap but stays well under the new one: it fails (asserts wrongly)
+    /// against the pre-fix 4,096 cap, and passes against the current one.
+    #[test]
+    fn lifecycle_correlation_survives_realistic_working_set_without_overflow() {
+        let (manager, _time) = make_manager();
+        const WORKING_SET: u32 = 8_192;
+        assert!(
+            WORKING_SET as usize > 4_096,
+            "must exceed the pre-fix cap to be a real regression test"
+        );
+        assert!(
+            WORKING_SET as usize <= MISSING_SUMMARY_HISTORY_SIZE,
+            "must stay within the current cap or this test degenerates into \
+             the overflow test above"
+        );
+
+        for seed in 0..WORKING_SET {
+            let attempt = match manager.begin_peer_summary_broadcast(
+                &make_unique_contract_key(seed),
+                &make_unique_peer_key(seed),
+            ) {
+                PeerSummaryForBroadcast::Missing {
+                    attempt: Some(attempt),
+                    ..
+                } => attempt,
+                _ => panic!("untracked pair must produce an attempt"),
+            };
+            drop(manager.missing_summary_attempt_guard(attempt));
+        }
+
+        let snapshot = manager.interest_lifecycle_snapshot();
+        assert_eq!(
+            snapshot.history_overflow, 0,
+            "a working set well within the current cap must not overflow \
+             the correlation history"
+        );
+    }
+
     /// Regression for the InterestManager desync on subscribed eviction
     /// (PR #4734 Fix 1). When a subscriber-primary eviction shed + tore down a
     /// still-in-use contract, the hosting maps are cleared by
