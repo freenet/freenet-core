@@ -4319,6 +4319,41 @@ done
     }
 
     #[test]
+    fn no_supervisor_path_invokes_update_with_force() {
+        // Load-bearing for the whole rate-limit bound (#5102). `--force` waives
+        // BOTH local limiters — the #4073 install token bucket and the cached
+        // GitHub cooldown — because it is an explicit operator action. That is
+        // only safe while it stays operator-only.
+        //
+        // If a supervisor ever gained `--force` (say, to "make auto-update more
+        // reliable"), every crash in a crash-loop would knock at GitHub with no
+        // local bound at all, which is precisely the runaway this PR exists to
+        // stop. Every automated invocation must use `update --quiet`.
+        let sources: [(&str, &str); 4] = [
+            ("service/wrapper.rs", include_str!("service/wrapper.rs")),
+            ("service/linux.rs", include_str!("service/linux.rs")),
+            ("service/macos.rs", include_str!("service/macos.rs")),
+            ("service.rs", include_str!("service.rs")),
+        ];
+        for (name, src) in sources {
+            for (i, line) in src.lines().enumerate() {
+                let code = match line.find("//") {
+                    Some(at) if at == 0 || !line[..at].ends_with(':') => &line[..at],
+                    _ => line,
+                };
+                assert!(
+                    !code.contains("--force"),
+                    "{name}:{} passes --force to an automated `freenet update`; that waives \
+                     both the token bucket and the GitHub cooldown, removing every local \
+                     bound on GitHub polling (#5102). Automated paths must use \
+                     `update --quiet`.\n  {line}",
+                    i + 1
+                );
+            }
+        }
+    }
+
+    #[test]
     fn only_the_install_asset_fetch_uses_api_github_com() {
         // Any NEW api.github.com URL in this file is a regression unless it is
         // similarly gated behind "we are actually installing". Keeping the count
