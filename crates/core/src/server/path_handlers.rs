@@ -7130,6 +7130,95 @@ mod tests {
         );
     }
 
+    /// The interceptor's `isLoopbackHost` and the shell `open_url` handler's
+    /// loopback refusal must name the SAME hosts. `isLoopbackHost` exists only
+    /// to predict what the shell will refuse, so that `window.open` falls back
+    /// to native instead of forwarding an open that will be dropped — its own
+    /// comment says "Kept in sync with the loopback block in shell_bridge.js's
+    /// open_url handler", but nothing enforced that until now.
+    ///
+    /// Drift in either direction is a silent user-visible bug:
+    ///   - shell refuses a host the interceptor does not list → the forwarded
+    ///     open vanishes and the click does nothing. That is exactly the
+    ///     failure #5106 hit through the anchor path, which had no such list
+    ///     at all.
+    ///   - interceptor lists a host the shell would open → the open needlessly
+    ///     falls back to a sandbox-inheriting native popup (#4645).
+    ///
+    /// #4846 proposes completing this allow-list (it is exact-match today, so
+    /// e.g. `127.0.0.2` is not covered). Whoever does that must change both
+    /// sides; this test is what tells them so.
+    #[test]
+    fn interceptor_loopback_list_matches_shell_open_url_refusal() {
+        // Collect the host literals from each `h === '<host>'` comparison in a
+        // region. Both sides normalize into a local `h` before comparing, so
+        // this picks up the comparison chain and nothing else (scheme checks
+        // use `u.protocol`, not `h`).
+        fn loopback_hosts(region: &str) -> Vec<String> {
+            const NEEDLE: &str = "h === '";
+            let mut out = Vec::new();
+            let mut rest = region;
+            while let Some(i) = rest.find(NEEDLE) {
+                let after = &rest[i + NEEDLE.len()..];
+                match after.find('\'') {
+                    Some(end) => {
+                        out.push(after[..end].to_string());
+                        rest = &after[end..];
+                    }
+                    None => break,
+                }
+            }
+            out.sort();
+            out.dedup();
+            out
+        }
+
+        let interceptor_fn_idx = NAVIGATION_INTERCEPTOR_JS
+            .find("function isLoopbackHost")
+            .expect("interceptor isLoopbackHost helper present");
+        let interceptor_region = &NAVIGATION_INTERCEPTOR_JS[interceptor_fn_idx..];
+        // The helper is short; bound the region at its closing brace so a later
+        // `h === ...` elsewhere in the file can't leak in.
+        let interceptor_end = interceptor_region
+            .find("\n  }")
+            .expect("isLoopbackHost helper is brace-terminated");
+        let interceptor_hosts = loopback_hosts(&interceptor_region[..interceptor_end]);
+
+        // Anchor tightly on the refusal itself — `var h = u.hostname` up to the
+        // `return;` that drops the message. The sibling tests here bound the
+        // open_url branch with the next `} else if`, but open_url is the LAST
+        // arm of that chain, so that bound silently runs to end-of-file; a
+        // stray `h === 'string'` further down would then be read as a loopback
+        // host. Slicing to the `return;` keeps this to the comparison chain.
+        let refusal_idx = SHELL_BRIDGE_JS
+            .find("var h = u.hostname")
+            .expect("shell open_url loopback normalization present");
+        let rest = &SHELL_BRIDGE_JS[refusal_idx..];
+        let refusal_end = rest
+            .find("return;")
+            .expect("shell open_url loopback refusal returns");
+        let shell_hosts = loopback_hosts(&rest[..refusal_end]);
+
+        // Guard against the comparison going vacuous: if a refactor renames the
+        // local or restructures the chain, both sides would extract nothing and
+        // the equality below would pass while guarding nothing (#5076).
+        assert!(
+            shell_hosts.contains(&"localhost".to_string()),
+            "extracted no loopback hosts from the shell open_url handler — the \
+             `h === '...'` chain moved or was renamed, so this test is no longer \
+             comparing anything. Re-anchor it. Got: {shell_hosts:?}"
+        );
+        assert_eq!(
+            interceptor_hosts, shell_hosts,
+            "isLoopbackHost and the shell's open_url loopback refusal have \
+             drifted. A host the shell refuses but the interceptor does not \
+             list makes window.open forward an open the shell then drops \
+             silently (#5106); the reverse forwards to a sandbox-inheriting \
+             native popup (#4645). Update both, or #4846 when completing the \
+             allow-list."
+        );
+    }
+
     /// Direct postMessages from a malicious iframe can synthesize an
     /// `open_url` payload without going through the upstream
     /// `NAVIGATION_INTERCEPTOR_JS` scheme filter, so the shell-side
