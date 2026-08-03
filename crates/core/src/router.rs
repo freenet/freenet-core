@@ -146,6 +146,16 @@ pub(crate) struct NetworkEfficiencyV1 {
     /// Schema version.
     pub v: u8,
     /// Delivered missing-summary sends and bytes by `MissingSummaryClass`.
+    ///
+    /// Four rows changed MEANING (not definition, recording site, or position)
+    /// at #5117: the untracked staleness reset used to wipe a pair's recorded
+    /// removal, so a pair whose removal was recent but whose last untracked
+    /// observation was stale classified as "never seen before". Sends move
+    /// `UntrackedFirstObserved` → `UntrackedFirstRecreated` and, via the same
+    /// field's second reader, `TrackedFirstNew` → `TrackedFirstRecreated`; see
+    /// also [`Self::recreated`]. TOTALS are unaffected — only the splits — and
+    /// the First-vs-Repeat split is untouched. Read pre- and post-#5117 series
+    /// separately; a step at that boundary is the fix, not a regression.
     pub ms_s: [u64; MissingSummaryClass::COUNT],
     pub ms_b: [u64; MissingSummaryClass::COUNT],
     /// First-send entry-age buckets: <1s, 1-9s, 10-59s, 1-4m59s, >=5m.
@@ -160,6 +170,12 @@ pub(crate) struct NetworkEfficiencyV1 {
     pub removed: [u64; InterestRemovalCause::COUNT],
     pub current: [u64; crate::ring::interest::SummaryMissingReason::COUNT + 1],
     /// Recreated pairs by their preceding removal cause.
+    ///
+    /// Steps UP at #5117 for the same reason as [`Self::ms_s`] — the recorded
+    /// removal this counts is no longer wiped by the untracked staleness reset,
+    /// so recreations that were previously invisible are now counted. Read pre-
+    /// and post-#5117 series separately. Still an undercount either way: the
+    /// removal is only honoured within `INTEREST_TTL` and lives in a bounded LRU.
     pub recreated: [u64; InterestRemovalCause::COUNT],
     /// Summary-population outcomes by source then outcome.
     pub populated: [[u64; SummaryPopulationOutcome::COUNT]; SummaryPopulationSource::COUNT],
