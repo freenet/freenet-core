@@ -71,17 +71,29 @@
     //
     // What this costs, so the next person prices it honestly: the tab the
     // browser opens inherits this frame's sandbox, so it has an opaque
-    // origin. On a HOSTED node that means it can't read the per-user access
-    // key and dead-ends on the "Open this app in a normal tab" panel, in
-    // every engine (#4645). On WebKit it renders blank (#5087). #5089 fixed
-    // both for this path as a side effect; reverting restores both.
+    // origin. Three consequences, not one:
+    //   1. On WebKit it renders blank (#5087).
+    //   2. On a HOSTED node it can't read the per-user access key and
+    //      dead-ends on the "Open this app in a normal tab" panel, in every
+    //      engine (#4645).
+    //   3. Its permission surface is dead, in every engine. An opaque origin
+    //      sends `Origin: null`, which the shell's endpoints reject; notably
+    //      `/permission/pending` answers 200 with an EMPTY LIST rather than
+    //      an error, so there is no console message and no failed request --
+    //      the prompt simply never appears. This bites hardest on a LOCAL
+    //      node in Firefox/Chrome, i.e. the case this branch is optimised
+    //      for: the app frame loads fine, so it looks like it works.
+    // (3) is not introduced here -- the window.open loopback fallback below
+    // already yields the same opaque-origin tab on a local node. #5089 fixed
+    // all three for this path as a side effect; reverting restores them.
     //
     // Two constraints on any future fix. Do not re-route through the bridge
     // without a loopback fallback. And `allow-popups-to-escape-sandbox` on
     // the app iframe -- the obvious alternative -- was deliberately REMOVED
-    // by #1499: an escaped popup gains the node's real origin, letting a
-    // malicious app reach other apps' data and bypass permission prompts
-    // (pinned by a test in path_handlers.rs). That road has to answer #1499.
+    // by #3818 (motivated by #1499): an escaped popup gains the node's real
+    // origin, letting a malicious app reach other apps' data and bypass
+    // permission prompts. Its absence is pinned by a test in
+    // path_handlers.rs. That road has to answer #3818.
     if (target.target && target.target !== '_self') return;
     // Same-origin in-contract link: request navigation via shell
     e.preventDefault();

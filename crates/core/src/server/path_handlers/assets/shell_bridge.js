@@ -1197,7 +1197,18 @@ function freenetBridge(authToken, userToken, hostedMode) {
         // window.open override (#4645). Popups the sandboxed iframe opens
         // itself inherit the opaque origin, breaking CORS on target sites and
         // (hosted) losing the per-user key. The shell opens the URL instead,
-        // giving proper origin. See issue #1499.
+        // giving proper origin. See PR #3818, which removed the popup
+        // sandbox-escape flag from the app iframe and introduced this bridge
+        // in its place. (This cited "#1499" until #5107; that is the
+        // delegate-user-interaction feature request which motivated #3818,
+        // not the hardening itself.)
+        //
+        // Deliberately NOT naming that flag in full here: this file is
+        // inlined verbatim into the shell page, and
+        // `shell_page_contains_iframe_and_bridge` asserts the rendered page
+        // does not contain the flag name anywhere — a comment mentioning it
+        // fails that test. Fail-safe (a false alarm, not a silent pass), but
+        // do not "fix" it by loosening the assertion.
         //
         // Security model: this scheme allow-list is the PRIMARY gate, not
         // defence in depth. A malicious contract iframe can postMessage
