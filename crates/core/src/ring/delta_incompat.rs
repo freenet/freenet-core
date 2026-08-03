@@ -315,15 +315,26 @@ impl DeltaIncompat {
     /// Should the broadcast path skip delta computation and send full state
     /// for `contract`? `true` while the memo is armed and unexpired.
     pub fn suppress_deltas(&self, contract: &ContractInstanceId) -> bool {
-        let now = self.time_source.now();
-        let suppressed = self
-            .contracts
-            .get(contract)
-            .is_some_and(|e| matches!(e.armed_until, Some(until) if until > now));
+        let suppressed = self.deltas_suppressed_peek(contract);
         if suppressed {
             self.suppressed_total.fetch_add(1, Ordering::Relaxed);
         }
         suppressed
+    }
+
+    /// The same question as [`Self::suppress_deltas`], but WITHOUT counting a
+    /// suppression against `suppressed_total`.
+    ///
+    /// `suppressed_total` counts the sends that actually took the full-state
+    /// path because of the memo. A caller that merely *predicts* the payload
+    /// shape (the broadcast queue's lane classification, which runs at enqueue
+    /// time and is followed by the real `suppress_deltas` call at send time)
+    /// must use this, or every suppressed send would be counted twice.
+    pub fn deltas_suppressed_peek(&self, contract: &ContractInstanceId) -> bool {
+        let now = self.time_source.now();
+        self.contracts
+            .get(contract)
+            .is_some_and(|e| matches!(e.armed_until, Some(until) if until > now))
     }
 
     /// A delta for `contract` applied cleanly — the contract demonstrably
@@ -394,6 +405,32 @@ mod tests {
         let ts = SharedMockTimeSource::new();
         let memo = DeltaIncompat::new(Arc::new(ts.clone()));
         (ts, memo)
+    }
+
+    /// `deltas_suppressed_peek` answers the same question as
+    /// `suppress_deltas` but must NOT count a suppression: the broadcast
+    /// queue calls it once per enqueue to predict the payload shape, and the
+    /// real send calls `suppress_deltas` again. Counting both would report
+    /// twice as many full-state fallbacks as actually happened.
+    #[test]
+    fn peek_does_not_count_a_suppression() {
+        let (_ts, memo) = setup();
+        let c = contract(3);
+        for i in 0..INCOMPAT_TRIP_THRESHOLD {
+            memo.record_delta_sent(c, peer(5000 + i as u16));
+            memo.note_resync_request(c, peer(5000 + i as u16));
+        }
+
+        assert!(memo.deltas_suppressed_peek(&c), "the memo is armed");
+        assert!(memo.deltas_suppressed_peek(&c), "...and stays armed");
+        assert_eq!(
+            memo.suppressed_total(),
+            0,
+            "a peek is a prediction, not a suppressed send"
+        );
+
+        assert!(memo.suppress_deltas(&c));
+        assert_eq!(memo.suppressed_total(), 1, "only the real send path counts");
     }
 
     /// The core Bug-2 repro: repeated resync-after-delta signals from

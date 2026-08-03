@@ -1828,6 +1828,20 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             .and_then(|entry| entry.get(peer).and_then(|i| i.summary.clone()))
     }
 
+    /// Whether we hold a cached summary for `peer` on `contract`, WITHOUT
+    /// cloning it.
+    ///
+    /// [`Self::get_peer_summary`] clones the summary, which for a large-state
+    /// contract is exactly the allocation the caller is trying to avoid. The
+    /// broadcast queue only needs the yes/no answer to predict whether the
+    /// wire payload will be a delta or the full state, so it takes this
+    /// (DashMap read, no clone) instead.
+    pub fn has_peer_summary(&self, contract: &ContractKey, peer: &PeerKey) -> bool {
+        self.interested_peers
+            .get(contract)
+            .is_some_and(|entry| entry.get(peer).is_some_and(|i| i.summary.is_some()))
+    }
+
     /// Check if enough time has elapsed to send a proactive summary notification
     /// for this contract. Returns `true` if at least 100ms has passed since the last
     /// notification (or if no notification was ever sent). Updates the timestamp on success.
@@ -3587,6 +3601,42 @@ mod tests {
         let retrieved = manager.get_peer_summary(&contract, &peer);
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().as_ref(), summary.as_ref());
+    }
+
+    /// `has_peer_summary` is the clone-free form of `get_peer_summary`, used by
+    /// the broadcast queue to predict whether a send will carry a delta (#4961).
+    /// It must agree with `get_peer_summary` in every state, including the two
+    /// that differ: no interest entry at all, and an entry with no summary.
+    #[test]
+    fn has_peer_summary_agrees_with_get_peer_summary() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+
+        for stage in ["untracked", "tracked-without-summary", "with-summary"] {
+            match stage {
+                "tracked-without-summary" => {
+                    assert!(manager.register_peer_interest(&contract, peer.clone(), None, false));
+                }
+                "with-summary" => {
+                    manager.update_peer_summary(
+                        &contract,
+                        &peer,
+                        StateSummary::from(vec![1, 2, 3]),
+                    );
+                }
+                _ => {}
+            }
+            assert_eq!(
+                manager.has_peer_summary(&contract, &peer),
+                manager.get_peer_summary(&contract, &peer).is_some(),
+                "[{stage}] the cheap predicate must not drift from the cloning one"
+            );
+        }
+        assert!(
+            manager.has_peer_summary(&contract, &peer),
+            "sanity: the loop above ended with a cached summary"
+        );
     }
 
     /// Issue #4857: `begin_resync_request` must emit at most one

@@ -1375,7 +1375,7 @@ impl P2pConnManager {
         // Start the broadcast queue worker (production only).
         // In simulation tests, broadcasts are sent inline for deterministic ordering.
         #[cfg(not(feature = "simulation_tests"))]
-        let _broadcast_worker_handle =
+        let _broadcast_worker_handles =
             broadcast_queue.start_worker(ctx.bridge.clone(), op_manager.clone());
 
         // Track whether we exit via graceful shutdown (Disconnect or ClosedChannel)

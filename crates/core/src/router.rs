@@ -166,10 +166,22 @@ pub(crate) struct NetworkEfficiencyV1 {
     /// Missing-pair history and active-attempt correlation overflows.
     pub corr_ovf: [u64; 2],
     /// Queue counters: capacity eviction, queued dedup, enqueue while active,
-    /// large-head incidents, large-head blocked ms, small-entry-ms blocked,
-    /// queued-large/actual-small count, queued-small/actual-large count, their
-    /// respective actual payload bytes, scheduled small/large counts, their
-    /// respective state bytes, then active-key tracking overflow.
+    /// large-head incidents, large-head blocked ms, small-entry-ms over that
+    /// window, queued-large/actual-small count, queued-small/actual-large
+    /// count, their respective actual payload bytes, scheduled small/large
+    /// counts, their respective state bytes, then active-key tracking overflow.
+    ///
+    /// Two of these changed MEANING (not definition or position) when #4961
+    /// gave each payload lane its own drain worker, so read pre- and post-fix
+    /// series separately:
+    ///   * small-entry-ms was small entries BLOCKED behind a large-lane permit
+    ///     wait; it is now merely small entries queued DURING one, since the
+    ///     small lane drains them concurrently. Collapsing toward zero is the
+    ///     fix landing.
+    ///   * queued-small/actual-large was structurally zero (the lane came from
+    ///     the contract state size, which bounds the payload from above); it is
+    ///     now the payload-prediction miss rate and is expected to be non-zero.
+    ///     Those sends still take a large-lane permit before hitting the wire.
     pub queue: [u64; 15],
     /// Successful apply counts by delta/full x changed/no-op x resulting-state
     /// size bucket.

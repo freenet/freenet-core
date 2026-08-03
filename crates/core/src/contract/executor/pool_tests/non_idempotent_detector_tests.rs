@@ -213,8 +213,10 @@ fn egress_paths_gated_on_is_contract_broken() {
     let heal_gate = body
         .find("is_contract_broken")
         .expect("handle_sync_state_to_peer must gate on is_contract_broken");
+    // Anchor on the method, not `broadcast_queue.enqueue`: rustfmt breaks the
+    // receiver onto its own line once the argument list grows.
     let heal_send = body
-        .find("broadcast_queue.enqueue")
+        .find(".enqueue(")
         .expect("handle_sync_state_to_peer must still enqueue the heal send");
     assert!(
         heal_gate < heal_send,

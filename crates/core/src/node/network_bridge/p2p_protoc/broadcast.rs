@@ -518,7 +518,7 @@ impl P2pConnManager {
         {
             for target in &target_result.targets {
                 self.broadcast_queue
-                    .enqueue(key, target.clone(), new_state.clone())
+                    .enqueue(op_manager, key, target.clone(), new_state.clone())
                     .await;
             }
             // Emit broadcast emitted telemetry (issue #3622)
@@ -625,7 +625,9 @@ impl P2pConnManager {
 
         #[cfg(not(feature = "simulation_tests"))]
         {
-            self.broadcast_queue.enqueue(key, target, new_state).await;
+            self.broadcast_queue
+                .enqueue(op_manager, key, target, new_state)
+                .await;
         }
         #[cfg(feature = "simulation_tests")]
         {
