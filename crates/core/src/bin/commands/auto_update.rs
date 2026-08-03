@@ -2495,6 +2495,28 @@ mod tests {
             None,
             "an empty tag must not parse as a version"
         );
+        // The exact case `version_from_tag(tag).is_empty()` exists for: a tag
+        // that is nothing but the `v` prefix. Before that guard this returned
+        // `Some("")` (emptiness was checked BEFORE the prefix was considered),
+        // which is a "version" that fails semver parsing downstream — safe by
+        // luck, not by contract.
+        assert_eq!(
+            parse_tag_from_release_location("https://github.com/o/r/releases/tag/v"),
+            None,
+            "a bare `v` carries no version and must not parse"
+        );
+        assert_eq!(
+            parse_tag_from_release_location("https://github.com/o/r/releases/tag/v/"),
+            None,
+            "...including with a trailing slash"
+        );
+        // A tag that merely STARTS with v is fine and must survive verbatim.
+        assert_eq!(
+            parse_tag_from_release_location("https://github.com/o/r/releases/tag/version-2")
+                .as_deref(),
+            Some("version-2"),
+            "only a lone `v` is empty; `version-2` is a real tag"
+        );
         assert_eq!(
             parse_tag_from_release_location("https://github.com/o/r/releases/latest"),
             None
