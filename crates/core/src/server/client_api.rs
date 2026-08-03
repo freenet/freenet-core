@@ -50,14 +50,65 @@ const SHELL_PAGE_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; fr
 /// notifications via `ServiceWorkerRegistration.showNotification()` instead.
 const NOTIFY_SW_JS: &str = include_str!("path_handlers/assets/notify_sw.js");
 
+/// The `sandbox` CSP directive served with EVERY response that carries
+/// contract-authored bytes, so their opaque origin is decided here rather than
+/// by whichever browsing context happens to embed them.
+///
+/// # Why this is not redundant with the iframe `sandbox` attribute
+///
+/// The attribute only constrains the frame *the shell creates*. Since the shell
+/// iframe carries `allow-popups-to-escape-sandbox` (needed so `target="_blank"`
+/// opens a real tab in every browser — see `navigation_interceptor.js`), a
+/// contract can obtain a browsing context that the attribute does not reach:
+///
+/// 1. from a click, `window.open('about:blank')` — the popup escapes the
+///    sandbox, so it is a top-level context with NO sandboxing flags, and its
+///    `about:blank` document inherits the opener's origin, so the contract can
+///    script it;
+/// 2. in that popup, `document.write` an `<iframe src="…/contract/web/KEY/…">`.
+///    That is a *nested* navigable, not a top-level document, so it carries
+///    `Sec-Fetch-Dest: iframe` — and because its parent has no sandboxing
+///    flags, it inherits none;
+/// 3. the contract's own bytes therefore execute at the node's REAL origin:
+///    `localStorage` (the hosted per-user access key), same-origin `fetch` of
+///    any node route including another app's shell page and its auth token.
+///
+/// Confirmed reproducible in chromium, firefox and webkit before this header
+/// existed; blocked in all three after. Step 2 works with any contract asset —
+/// a scriptable `image/svg+xml`, or plain HTML the contract wrote — so gating
+/// on `Sec-Fetch-Dest: document` alone does not close it. That is exactly the
+/// escape #3818 removed `allow-popups-to-escape-sandbox` to prevent, and this
+/// header is what allows the flag back.
+///
+/// The token list mirrors the iframe's `sandbox` attribute so in-frame
+/// behaviour is unchanged: the effective policy is the intersection of the two,
+/// and an app that works framed keeps working. Keep them in sync — the pin is
+/// `shell_page_iframe_sandbox_matches_contract_content_csp` in
+/// `path_handlers.rs`.
+pub(super) const CONTRACT_CONTENT_SANDBOX_CSP: &str = "sandbox allow-scripts allow-forms allow-popups \
+     allow-popups-to-escape-sandbox allow-downloads allow-modals";
+
+/// The stricter variant for a contract asset loaded as a TOP-LEVEL document.
+///
+/// Nothing legitimate lands there — HTML sub-paths are routed to the shell and
+/// `?__sandbox=1` top-level loads are redirected, so what remains is a URL a
+/// contract navigated a tab to. An opaque origin alone would already deny it
+/// the node's data; withholding `allow-scripts` additionally denies it a
+/// scripted full-page UI displayed under the node's own address.
+const CONTRACT_DOCUMENT_SANDBOX_CSP: &str = "sandbox";
+
 /// Content-Security-Policy served with the sandboxed iframe that actually
 /// runs a webapp. The iframe has an opaque (null) origin because the
 /// sandbox attribute omits `allow-same-origin`, so CSP `'self'` would not
 /// match the local API server's origin. We therefore interpolate the
 /// concrete origin derived from the request Host header.
+///
+/// Prefixed with `CONTRACT_CONTENT_SANDBOX_CSP` so the opaque origin survives
+/// being embedded somewhere other than the shell's own iframe — see that
+/// constant for the attack it closes.
 fn sandbox_csp_for_origin(origin: &str) -> String {
     format!(
-        "default-src {origin} 'unsafe-inline' 'unsafe-eval' blob: data:; connect-src {origin} blob: data:"
+        "{CONTRACT_CONTENT_SANDBOX_CSP}; default-src {origin} 'unsafe-inline' 'unsafe-eval' blob: data:; connect-src {origin} blob: data:"
     )
 }
 
@@ -596,27 +647,34 @@ async fn web_subpages(
         Err(e) => e.into_response(),
     };
     add_sandbox_cors_headers(&mut response);
-    // A top-level document load that reaches THIS branch is a non-HTML asset
-    // (HTML pages were routed to the shell above): `evil.svg`, served as
-    // `image/svg+xml`, is contract-controlled markup that executes script when
-    // navigated to directly. At the node's own origin that script could read the
-    // hosted per-user access key out of `localStorage`, or fetch a shell page and
-    // scrape its auth token. `nosniff` does not help — the type is genuinely
-    // scriptable.
+    // Everything served from here is contract-authored, so it is sandboxed
+    // unconditionally: the node decides its origin, not whichever context
+    // embeds it. See `CONTRACT_CONTENT_SANDBOX_CSP` for why the iframe's
+    // `sandbox` attribute is not sufficient on its own, and why keying this on
+    // `Sec-Fetch-Dest: document` would leave the hole open — a contract that
+    // escapes to an unsandboxed popup embeds these bytes as an `iframe` dest,
+    // not a `document` one.
     //
-    // This was reachable before only by getting a victim to paste the URL, but
-    // the app iframe now carries `allow-popups-to-escape-sandbox` (so that
-    // `target="_blank"` opens a real tab in every browser), which lets a contract
-    // navigate there itself. `CSP: sandbox` with no `allow-scripts` gives such a
-    // document an opaque origin and no script execution, closing both routes.
-    // Subresource fetches (`Sec-Fetch-Dest` = script/style/image/…) are untouched,
-    // so assets loaded BY the app inside its frame are unaffected.
-    if fetch_dest == "document" {
-        response.headers_mut().insert(
-            axum::http::header::CONTENT_SECURITY_POLICY,
-            axum::http::HeaderValue::from_static("sandbox"),
-        );
-    }
+    // Two shapes, because a top-level document is the one case where nothing
+    // legitimate arrives:
+    //   - `document`: no `allow-scripts`. A contract-authored `evil.svg`, served
+    //     as `image/svg+xml`, executes script when it IS the document, and
+    //     `nosniff` does not help — the type is genuinely scriptable.
+    //   - anything else: the full token list, matching the app iframe, so the
+    //     app's own subresources and any HTML it frames itself behave exactly
+    //     as before. On a non-document response the `sandbox` directive has no
+    //     effect at all (it applies to documents and workers), so this is inert
+    //     for scripts, styles and images; it is the `iframe`/`embed`/`object`
+    //     and header-less cases it is there for.
+    let sandbox_csp = if fetch_dest == "document" {
+        CONTRACT_DOCUMENT_SANDBOX_CSP
+    } else {
+        CONTRACT_CONTENT_SANDBOX_CSP
+    };
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_static(sandbox_csp),
+    );
     Ok(response)
 }
 
@@ -789,6 +847,15 @@ async fn serve_sandbox_response(
             // internal filesystem paths, config, or secrets.
             let mut response = e.into_response();
             add_sandbox_cors_headers(&mut response);
+            // The body reflects the request path, so sandbox it too rather than
+            // reasoning about whether the current error renderer can be coaxed
+            // into emitting markup. Origin-CSP is skipped (there is no contract
+            // content to load subresources for); the sandbox directive is the
+            // part that matters.
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_SECURITY_POLICY,
+                axum::http::HeaderValue::from_static(CONTRACT_CONTENT_SANDBOX_CSP),
+            );
             return Ok(response);
         }
     };
@@ -1220,6 +1287,49 @@ mod tests {
         );
     }
 
+    /// The contract HTML served into the app frame must carry the `sandbox`
+    /// directive itself, not merely inherit the iframe attribute.
+    ///
+    /// The attribute governs only the frame the shell creates. A contract that
+    /// escapes to a popup it controls (possible since the iframe regained
+    /// `allow-popups-to-escape-sandbox`) can re-embed this very response in an
+    /// unsandboxed context; without the header the app's own HTML then runs at
+    /// the node's real origin, with `localStorage` and same-origin `fetch`.
+    /// That is the #3818 escape, and it needs no SVG or other exotic type —
+    /// the contract's ordinary index page is enough.
+    ///
+    /// Pin the directive first, and the token list second: the tokens must
+    /// match the iframe's `sandbox` attribute, because the effective policy is
+    /// the INTERSECTION of the two. A token missing here silently withdraws a
+    /// capability from every contract app (dropping `allow-forms` breaks every
+    /// form; dropping `allow-popups` breaks the new-tab fix this shipped with).
+    #[test]
+    fn sandbox_csp_sandboxes_the_contract_document_itself() {
+        let csp = sandbox_csp_for_origin("http://127.0.0.1:7509");
+        let sandbox = csp
+            .split(';')
+            .map(str::trim)
+            .find(|d| d.starts_with("sandbox"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "contract content must be served a `sandbox` CSP directive so its \
+                     opaque origin does not depend on who embeds it (#3818); got: {csp}"
+                )
+            });
+        assert_eq!(
+            sandbox, CONTRACT_CONTENT_SANDBOX_CSP,
+            "the contract document's sandbox tokens must match the app iframe's \
+             `sandbox` attribute exactly — the effective policy is the intersection, \
+             so any token dropped here is withdrawn from every contract app"
+        );
+        // No `allow-same-origin`: that single token would hand the contract the
+        // node's real origin directly and undo the whole isolation model.
+        assert!(
+            !sandbox.contains("allow-same-origin"),
+            "allow-same-origin would give contract content the node's own origin"
+        );
+    }
+
     /// The sandbox iframe has an opaque (null) origin because the sandbox
     /// attribute omits `allow-same-origin`, so CSP `'self'` wouldn't match
     /// the local API server. `sandbox_csp_for_origin` must interpolate the
@@ -1627,27 +1737,25 @@ mod tests {
         );
     }
 
-    /// Guard for the escaped-popup companion fix.
+    /// Guard for the companion fix that lets `allow-popups-to-escape-sandbox`
+    /// back onto the app iframe (#3818).
     ///
-    /// The app iframe carries `allow-popups-to-escape-sandbox` so a new tab is
-    /// a real top-level document at the node origin — that is what makes
-    /// `target="_blank"` work in Firefox as well as Chrome/Safari. The cost is
-    /// that a contract can now navigate a tab to any URL the node serves. HTML
-    /// sub-paths and `?__sandbox=1` are already forced back through the shell,
-    /// but a NON-HTML contract asset falls through to `variable_content` — and
-    /// a contract-authored `evil.svg`, served as `image/svg+xml`, executes
-    /// script when it is the document. At the node's own origin that script
-    /// could read the hosted per-user access key from `localStorage` or scrape
-    /// an auth token out of a fetched shell page. `nosniff` does not help: the
-    /// type is genuinely scriptable.
+    /// The flag is what makes `target="_blank"` open a real tab in Firefox as
+    /// well as Chrome/Safari, and it costs the iframe `sandbox` attribute its
+    /// standing as the thing that keeps contract bytes off the node's origin: a
+    /// contract can escape to a popup it fully controls and re-embed its own
+    /// assets there, unsandboxed. So the sandbox is served as a HEADER on every
+    /// response carrying contract bytes — see `CONTRACT_CONTENT_SANDBOX_CSP`
+    /// for the full three-step attack and the cross-engine reproduction.
     ///
-    /// Any asset served as a top-level DOCUMENT must therefore carry
-    /// `Content-Security-Policy: sandbox` (no `allow-scripts`), which gives it
-    /// an opaque origin and no script execution. Subresource fetches — the app
-    /// loading its own assets inside the frame — must NOT get the header, or
-    /// every script/style/image in every contract app breaks.
+    /// The cases below are the ones a narrower guard gets wrong. Keying on
+    /// `Sec-Fetch-Dest: document`, which is where this started, covers only the
+    /// pasted-URL shape and misses the nested-navigable shape the escape
+    /// actually uses. `document` keeps the stricter no-`allow-scripts` policy
+    /// because nothing legitimate arrives there; everything else gets the app
+    /// iframe's own token list so in-frame behaviour is untouched.
     #[tokio::test]
-    async fn web_subpages_sandboxes_top_level_asset_documents() {
+    async fn web_subpages_sandboxes_contract_assets() {
         // Unique non-zero key so the cold-cache error path can't collide with
         // another test on the process-global webapp cache.
         let key = {
@@ -1680,6 +1788,30 @@ mod tests {
             }
         };
 
+        // Same request, but able to express "no `Sec-Fetch-Dest` header at
+        // all" as well as a named destination.
+        let subpage_dest = |dest: &'static str| {
+            let key = key.clone();
+            async move {
+                let mut headers = axum::http::HeaderMap::new();
+                if !dest.is_empty() {
+                    headers.insert("sec-fetch-dest", dest.parse().unwrap());
+                }
+                web_subpages(
+                    key,
+                    "evil.svg".to_string(),
+                    ApiVersion::V1,
+                    None,
+                    headers,
+                    &localhost_config(),
+                    dead_request_sender(),
+                    false,
+                )
+                .await
+                .expect("web_subpages must respond, not propagate")
+            }
+        };
+
         let csp = |resp: &axum::response::Response| {
             resp.headers()
                 .get(axum::http::header::CONTENT_SECURITY_POLICY)
@@ -1689,17 +1821,48 @@ mod tests {
         // Top-level document load of a scriptable asset: opaque origin, no script.
         assert_eq!(
             csp(&subpage("document").await).as_deref(),
-            Some("sandbox"),
+            Some(CONTRACT_DOCUMENT_SANDBOX_CSP),
             "a contract asset loaded as a top-level document must be sandboxed, \
              or a contract-authored SVG runs script at the node's own origin"
         );
 
-        // The same asset fetched as a subresource by the app is untouched.
+        // A NESTED navigable is the one the escaped-popup attack uses: the
+        // contract writes `<iframe src=…>` into an unsandboxed popup it owns,
+        // and the request carries `Sec-Fetch-Dest: iframe`, not `document`.
+        // Gating on `document` alone left contract bytes executing at the
+        // node's real origin — reproduced in all three engines. It must be
+        // sandboxed, but WITH `allow-scripts`, because this is also how an app
+        // frames its own HTML sub-page from inside the shell.
+        for dest in ["iframe", "frame", "embed", "object"] {
+            assert_eq!(
+                csp(&subpage_dest(dest).await).as_deref(),
+                Some(CONTRACT_CONTENT_SANDBOX_CSP),
+                "a contract asset loaded as a `{dest}` navigable must still be \
+                 sandboxed: an escaped popup embeds it exactly this way, and \
+                 without the header it runs at the node's own origin (#3818)"
+            );
+        }
+
+        // A client that sends no `Sec-Fetch-Dest` at all (curl, and browsers
+        // predating Fetch Metadata) must not be the way around it either. CSP
+        // is inert for non-browsers, so this costs them nothing.
         assert_eq!(
-            csp(&subpage("image").await),
-            None,
-            "subresource fetches must not be sandboxed — that would break every \
-             asset the app loads inside its own frame"
+            csp(&subpage_dest("").await).as_deref(),
+            Some(CONTRACT_CONTENT_SANDBOX_CSP),
+            "a request without `Sec-Fetch-Dest` must fail CLOSED: the header is \
+             the only signal, and an older browser that omits it would otherwise \
+             be served unsandboxed contract bytes"
+        );
+
+        // Subresource fetches are sandboxed too, which is INERT for them — the
+        // `sandbox` directive applies to documents and workers, not to an image
+        // or a stylesheet. Asserting it here keeps the rule "every response on
+        // this route carries the header" simple enough to hold, rather than an
+        // allow-list of destinations that a new dest name would silently escape.
+        assert_eq!(
+            csp(&subpage("image").await).as_deref(),
+            Some(CONTRACT_CONTENT_SANDBOX_CSP),
+            "the header is unconditional on this route"
         );
     }
 

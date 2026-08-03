@@ -327,6 +327,101 @@ test("contract JS calling window.open() gets a real top-level tab", async ({
   expect((await shellMessages(page)).map((m) => m.type)).toEqual([]);
 });
 
+// Does this document hold the node's real origin, or an opaque one? Storage is
+// the sharpest available test: an opaque origin throws SecurityError on any
+// `localStorage` access, and the node's origin is where the hosted per-user
+// access key lives.
+const STORAGE_PROBE = () => {
+  try {
+    window.localStorage.setItem("__probe", "1");
+    window.localStorage.removeItem("__probe");
+    return "NODE-ORIGIN";
+  } catch (e) {
+    return "OPAQUE";
+  }
+};
+
+test("a contract cannot reach a node-origin context by escaping the sandbox (#3818)", async ({
+  page,
+}) => {
+  await page.goto(shellUrl!);
+  // Wait for the fixture to render before reaching for the Frame handle: the
+  // FrameLocator helper is what knows how to wait, but only a Frame can
+  // `evaluate`.
+  await fixtureFrame(page);
+  const appFrame = page.frames().find((f) => f.url().includes("__sandbox=1"));
+  expect(appFrame, "the app frame must be loaded").toBeTruthy();
+
+  // Controls first, so a probe that stopped distinguishing anything shows up
+  // here rather than as a silent pass below.
+  expect(
+    await page.evaluate(STORAGE_PROBE),
+    "the shell IS the node origin — if this is not NODE-ORIGIN the probe is broken, not the sandbox",
+  ).toBe("NODE-ORIGIN");
+  expect(
+    await appFrame!.evaluate(STORAGE_PROBE),
+    "the app frame must be opaque-origin",
+  ).toBe("OPAQUE");
+
+  // `allow-popups-to-escape-sandbox` is load-bearing for the new-tab fix, and
+  // it hands a contract an unsandboxed top-level context it can script (the
+  // `about:blank` popup inherits this frame's origin). The sandbox ATTRIBUTE
+  // cannot reach what happens in there. What must hold is that the contract's
+  // own bytes are still opaque-origin when re-embedded from it, because the
+  // server sandboxes them itself (CONTRACT_CONTENT_SANDBOX_CSP).
+  //
+  // Without that header this reproduces in chromium, firefox and webkit: the
+  // nested frame reports NODE-ORIGIN, and from there localStorage yields the
+  // hosted access key and same-origin fetch yields another app's auth token.
+  const [popup] = await Promise.all([
+    page.waitForEvent("popup"),
+    appFrame!.click("#escape-sandbox"),
+  ]);
+  const escape = await appFrame!.evaluate(() => ({
+    opened: !!(window as unknown as { __escapeOpened?: boolean }).__escapeOpened,
+    wrote: !!(window as unknown as { __escapeWrote?: boolean }).__escapeWrote,
+    error:
+      (window as unknown as { __escapeWriteError?: string })
+        .__escapeWriteError ?? null,
+  }));
+  expect(
+    escape.opened,
+    "the popup must open, or this test is not exercising the escape at all",
+  ).toBe(true);
+
+  // Give the nested frame time to load before enumerating. It may legitimately
+  // never appear: some engines refuse the cross-document write once the opener
+  // is itself CSP-sandboxed, which blocks the escape one step earlier.
+  await popup.waitForTimeout(1000);
+  const nested = popup.frames().filter((f) => f !== popup.mainFrame());
+  const reports: string[] = [];
+  for (const f of nested) {
+    reports.push(
+      await f
+        .evaluate(STORAGE_PROBE)
+        .catch((e) => `UNREACHABLE: ${String(e).split("\n")[0]}`),
+    );
+  }
+  const detail = `escape=${JSON.stringify(escape)} frames=${JSON.stringify(
+    nested.map((f) => f.url()),
+  )} probes=${JSON.stringify(reports)}`;
+
+  if (escape.wrote) {
+    // The write landed, so the nested frame is the thing under test and must
+    // actually be there — otherwise the assertion below passes on an empty set.
+    expect(
+      nested.length,
+      `the escaped popup accepted the write but embedded nothing, so nothing was probed: ${detail}`,
+    ).toBeGreaterThan(0);
+  }
+  expect(
+    reports,
+    `contract content reached the node's own origin from an escaped popup: ${detail}`,
+  ).not.toContain("NODE-ORIGIN");
+
+  await popup.close();
+});
+
 test("same-origin in-contract link performs an in-place navigate hop", async ({
   page,
 }) => {

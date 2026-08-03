@@ -92,6 +92,16 @@
 -->
 <button id="programmatic-open">window.open()</button>
 
+<!--
+  The #3818 escape, played out by a hostile contract. `allow-popups-to-escape-sandbox`
+  means a popup this frame opens is top-level with NO sandboxing flags, and an
+  `about:blank` popup inherits this frame's origin — so the contract can script
+  it and, from there, re-embed its own bytes in a nested frame that inherits no
+  sandboxing either. If the server does not sandbox contract content itself,
+  that frame runs at the node's real origin.
+-->
+<button id="escape-sandbox">escape</button>
+
 <!-- Result sink the Playwright tests read via page.evaluate. -->
 <pre id="poll-result">pending</pre>
 
@@ -105,10 +115,32 @@
   // We surface the outcome in #poll-result so the test can also confirm the
   // fetch actually ran (a CSP block rejects the promise rather than returning
   // a response).
+
   // Programmatic new-window open, invoked from a real click so the gesture is
   // live (the same condition a contract app's own button would have).
   document.getElementById('programmatic-open').addEventListener('click', function () {
     window.open('https://example.com/programmatic', '_blank');
+  });
+
+  // Attempt the escape described above. Each step records what it managed to
+  // do, so the test can tell "blocked" apart from "never ran".
+  document.getElementById('escape-sandbox').addEventListener('click', function () {
+    var w = window.open('about:blank', 'escape-probe');
+    window.__escapeOpened = !!w;
+    if (!w) return;
+    try {
+      // Resolved against the base, so it drops `?__sandbox=1` and the request
+      // lands on the plain asset route — as `Sec-Fetch-Dest: iframe`, which is
+      // the destination a `document`-only guard does not see.
+      var src = new URL('page2.html', document.baseURI).href;
+      w.document.write(
+        '<!doctype html><title>escape</title><iframe id="probe" src="' + src + '"></iframe>'
+      );
+      w.document.close();
+      window.__escapeWrote = true;
+    } catch (err) {
+      window.__escapeWriteError = String((err && err.name) || err);
+    }
   });
 
   (function () {

@@ -4587,6 +4587,54 @@ mod tests {
         );
     }
 
+    /// The iframe's `sandbox` attribute and the `sandbox` CSP directive served
+    /// with contract content must name the SAME tokens.
+    ///
+    /// Both apply to the app frame, and the effective policy is their
+    /// INTERSECTION, so they are not independent knobs:
+    ///   - a token in the attribute but not the CSP is withdrawn from every
+    ///     contract app the moment the CSP is the narrower of the two (drop
+    ///     `allow-forms` there and every form in every app stops submitting);
+    ///   - a token in the CSP but not the attribute is dead weight that reads
+    ///     as a granted capability.
+    ///
+    /// They exist for different reasons and neither replaces the other: the
+    /// attribute is what the shell asserts about the frame it creates, the CSP
+    /// is what the server asserts about the bytes wherever they are embedded
+    /// (see `CONTRACT_CONTENT_SANDBOX_CSP`). Keeping them literally equal is
+    /// what makes "the app behaves the same either way" checkable rather than
+    /// asserted.
+    #[tokio::test]
+    async fn shell_page_iframe_sandbox_matches_contract_content_csp() {
+        let token = AuthToken::generate();
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, None, None, false).unwrap(),
+        )
+        .await;
+
+        let attr_start = html
+            .find(r#"sandbox=""#)
+            .expect("app iframe carries a sandbox attribute");
+        let rest = &html[attr_start + r#"sandbox=""#.len()..];
+        let attr = &rest[..rest.find('"').expect("sandbox attribute is quoted")];
+
+        let mut attr_tokens: Vec<&str> = attr.split_whitespace().collect();
+        let mut csp_tokens: Vec<&str> = super::super::client_api::CONTRACT_CONTENT_SANDBOX_CSP
+            .split_whitespace()
+            .skip(1) // the directive name itself
+            .collect();
+        attr_tokens.sort_unstable();
+        csp_tokens.sort_unstable();
+        assert_eq!(
+            attr_tokens, csp_tokens,
+            "the iframe sandbox attribute and CONTRACT_CONTENT_SANDBOX_CSP have \
+             drifted. The browser applies BOTH to the app frame and takes the \
+             intersection, so whichever is narrower silently wins: add the token \
+             to both, or remove it from both, and say which capability you are \
+             changing for contract apps"
+        );
+    }
+
     #[tokio::test]
     async fn shell_page_iframe_sandbox_allows_downloads() {
         // Regression for freenet/mail#TBD: webapps that emit blob/object-URL
@@ -4720,7 +4768,7 @@ mod tests {
             html.contains("__freenet_shell__"),
             "bridge JS must handle shell-level messages (title/favicon)"
         );
-// `allow-popups-to-escape-sandbox` MUST be present: it is what makes a
+        // `allow-popups-to-escape-sandbox` MUST be present: it is what makes a
         // new tab open identically in every browser. The popup carries a real
         // user gesture from the frame that got the click, and lands on the shell
         // at the node's real origin. Routing new-window opens through the shell's
@@ -6984,6 +7032,7 @@ mod tests {
     /// lives in `navigation_interceptor_matches_expected_contract`; it strictly
     /// subsumes the per-handler forward COUNT this test used to carry while the
     /// cross-origin branch still forwarded, so that count is not repeated here.
+    #[test]
     fn navigation_interceptor_leaves_same_origin_target_blank_to_the_browser() {
         let js = NAVIGATION_INTERCEPTOR_JS;
 
