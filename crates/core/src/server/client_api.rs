@@ -596,6 +596,27 @@ async fn web_subpages(
         Err(e) => e.into_response(),
     };
     add_sandbox_cors_headers(&mut response);
+    // A top-level document load that reaches THIS branch is a non-HTML asset
+    // (HTML pages were routed to the shell above): `evil.svg`, served as
+    // `image/svg+xml`, is contract-controlled markup that executes script when
+    // navigated to directly. At the node's own origin that script could read the
+    // hosted per-user access key out of `localStorage`, or fetch a shell page and
+    // scrape its auth token. `nosniff` does not help — the type is genuinely
+    // scriptable.
+    //
+    // This was reachable before only by getting a victim to paste the URL, but
+    // the app iframe now carries `allow-popups-to-escape-sandbox` (so that
+    // `target="_blank"` opens a real tab in every browser), which lets a contract
+    // navigate there itself. `CSP: sandbox` with no `allow-scripts` gives such a
+    // document an opaque origin and no script execution, closing both routes.
+    // Subresource fetches (`Sec-Fetch-Dest` = script/style/image/…) are untouched,
+    // so assets loaded BY the app inside its frame are unaffected.
+    if fetch_dest == "document" {
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            axum::http::HeaderValue::from_static("sandbox"),
+        );
+    }
     Ok(response)
 }
 
@@ -1603,6 +1624,82 @@ mod tests {
             Some("*"),
             "even an error subresource response must carry the sandbox CORS header, \
              otherwise the null-origin iframe surfaces it as an opaque CORS error"
+        );
+    }
+
+    /// Guard for the escaped-popup companion fix.
+    ///
+    /// The app iframe carries `allow-popups-to-escape-sandbox` so a new tab is
+    /// a real top-level document at the node origin — that is what makes
+    /// `target="_blank"` work in Firefox as well as Chrome/Safari. The cost is
+    /// that a contract can now navigate a tab to any URL the node serves. HTML
+    /// sub-paths and `?__sandbox=1` are already forced back through the shell,
+    /// but a NON-HTML contract asset falls through to `variable_content` — and
+    /// a contract-authored `evil.svg`, served as `image/svg+xml`, executes
+    /// script when it is the document. At the node's own origin that script
+    /// could read the hosted per-user access key from `localStorage` or scrape
+    /// an auth token out of a fetched shell page. `nosniff` does not help: the
+    /// type is genuinely scriptable.
+    ///
+    /// Any asset served as a top-level DOCUMENT must therefore carry
+    /// `Content-Security-Policy: sandbox` (no `allow-scripts`), which gives it
+    /// an opaque origin and no script execution. Subresource fetches — the app
+    /// loading its own assets inside the frame — must NOT get the header, or
+    /// every script/style/image in every contract app breaks.
+    #[tokio::test]
+    async fn web_subpages_sandboxes_top_level_asset_documents() {
+        // Unique non-zero key so the cold-cache error path can't collide with
+        // another test on the process-global webapp cache.
+        let key = {
+            use freenet_stdlib::prelude::ContractInstanceId;
+            let mut bytes = [0u8; 32];
+            bytes[0] = 0x3a;
+            bytes[1] = 0x56;
+            ContractInstanceId::new(bytes).to_string()
+        };
+
+        let subpage = |dest: &'static str| {
+            let key = key.clone();
+            async move {
+                let mut headers = axum::http::HeaderMap::new();
+                headers.insert("sec-fetch-dest", dest.parse().unwrap());
+                web_subpages(
+                    key,
+                    // Non-HTML, so `should_serve_shell_for_subpage` is false and
+                    // this reaches `variable_content` for both dests.
+                    "evil.svg".to_string(),
+                    ApiVersion::V1,
+                    None,
+                    headers,
+                    &localhost_config(),
+                    dead_request_sender(),
+                    false,
+                )
+                .await
+                .expect("web_subpages must respond, not propagate")
+            }
+        };
+
+        let csp = |resp: &axum::response::Response| {
+            resp.headers()
+                .get(axum::http::header::CONTENT_SECURITY_POLICY)
+                .map(|v| v.to_str().unwrap_or("").to_string())
+        };
+
+        // Top-level document load of a scriptable asset: opaque origin, no script.
+        assert_eq!(
+            csp(&subpage("document").await).as_deref(),
+            Some("sandbox"),
+            "a contract asset loaded as a top-level document must be sandboxed, \
+             or a contract-authored SVG runs script at the node's own origin"
+        );
+
+        // The same asset fetched as a subresource by the app is untouched.
+        assert_eq!(
+            csp(&subpage("image").await),
+            None,
+            "subresource fetches must not be sandboxed — that would break every \
+             asset the app loads inside its own frame"
         );
     }
 

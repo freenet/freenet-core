@@ -1,4 +1,10 @@
-import { test, expect, type Page, type ConsoleMessage } from "@playwright/test";
+import {
+  test,
+  expect,
+  type BrowserContext,
+  type Page,
+  type ConsoleMessage,
+} from "@playwright/test";
 
 // Smoke tests for the Freenet gateway shell + sandboxed iframe postMessage
 // contract (freenet/freenet-core#3856).
@@ -13,10 +19,14 @@ import { test, expect, type Page, type ConsoleMessage } from "@playwright/test";
 // with only a Rust-level HTML-string assertion guarding it:
 //   - #3842 — shell CSP must allow same-origin fetches (connect-src 'self').
 //   - #3852 — cross-origin target="_blank" links must not open null-origin
-//             sandboxed popups; they go through the shell's open_url bridge.
-//   - #3854 — middle-click (auxclick) and shift-click must also be
-//             intercepted, not just primary-button click (the merged fix;
-//             #3853 was the closed predecessor PR for the same work).
+//             sandboxed popups. They now open natively, and
+//             `allow-popups-to-escape-sandbox` is what gives them a real origin.
+//   - #3854 — middle-click (auxclick) must be classified like click.
+//   - #5087 — same-origin target="_blank" (i.e. every cross-CONTRACT link) must
+//             open a working tab. Its first fix routed the click through the
+//             shell's open_url bridge, which put window.open inside a `message`
+//             handler — blocked by Firefox's popup blocker, so the link died
+//             there while Chrome/Safari kept working.
 
 const shellUrl = process.env.FREENET_SHELL_URL;
 
@@ -51,13 +61,20 @@ function cspViolations(messages: ConsoleMessage[]): string[] {
 // side effects. Must run before any interaction.
 async function captureShellMessages(page: Page): Promise<void> {
   await page.evaluate(() => {
-    (window as unknown as { __freenetMessages: unknown[] }).__freenetMessages = [];
+    (window as unknown as { __freenetMessages: unknown[] }).__freenetMessages =
+      [];
     window.addEventListener(
       "message",
       (e) => {
         const d = e.data;
-        if (d && typeof d === "object" && (d as { __freenet_shell__?: boolean }).__freenet_shell__) {
-          (window as unknown as { __freenetMessages: unknown[] }).__freenetMessages.push(d);
+        if (
+          d &&
+          typeof d === "object" &&
+          (d as { __freenet_shell__?: boolean }).__freenet_shell__
+        ) {
+          (
+            window as unknown as { __freenetMessages: unknown[] }
+          ).__freenetMessages.push(d);
         }
       },
       true,
@@ -65,29 +82,32 @@ async function captureShellMessages(page: Page): Promise<void> {
   });
 }
 
-type ShellMessage = { type: string; url?: string; href?: string; shiftKey?: boolean };
+type ShellMessage = {
+  type: string;
+  url?: string;
+  href?: string;
+  shiftKey?: boolean;
+};
 
 async function shellMessages(page: Page): Promise<ShellMessage[]> {
   return page.evaluate(
-    () => (window as unknown as { __freenetMessages: ShellMessage[] }).__freenetMessages,
+    () =>
+      (window as unknown as { __freenetMessages: ShellMessage[] })
+        .__freenetMessages,
   );
 }
 
-// Override window.open on the shell page so an open_url that the bridge
-// honours is observable (and so the test never actually launches a popup to
-// example.com). Returns nothing; read the calls via openCalls().
-async function stubWindowOpen(page: Page): Promise<void> {
-  await page.evaluate(() => {
-    (window as unknown as { __openCalls: string[] }).__openCalls = [];
-    window.open = ((url?: string | URL) => {
-      (window as unknown as { __openCalls: string[] }).__openCalls.push(String(url ?? ""));
-      return null;
-    }) as typeof window.open;
-  });
-}
-
-async function openCalls(page: Page): Promise<string[]> {
-  return page.evaluate(() => (window as unknown as { __openCalls: string[] }).__openCalls);
+// Serve the RFC 2606 documentation domain from the test itself, so the tabs
+// these tests open resolve instantly and offline. The point of the assertions
+// is that a real top-level document opens with a real origin — not that
+// example.com is reachable from CI.
+async function stubExternal(context: BrowserContext): Promise<void> {
+  await context.route("https://example.com/**", (route) =>
+    route.fulfill({
+      contentType: "text/html",
+      body: "<title>external</title>ok",
+    }),
+  );
 }
 
 // The shell wraps the contract in an iframe#app. Wait for the iframe to load
@@ -118,7 +138,11 @@ test("shell page loads and embeds the sandboxed iframe", async ({ page }) => {
   expect(sandbox, `iframe sandbox: ${sandbox}`).toContain("allow-scripts");
   expect(sandbox).toContain("allow-popups");
   expect(sandbox).not.toContain("allow-same-origin");
-  expect(sandbox).not.toContain("allow-popups-to-escape-sandbox");
+  // Popups MUST escape the sandbox. Without it a new tab inherits the opaque
+  // origin and dead-ends (blank shell, no localStorage for the hosted access
+  // key), and the workaround — letting the shell open the tab from a
+  // `message` handler — is refused by Firefox's popup blocker.
+  expect(sandbox).toContain("allow-popups-to-escape-sandbox");
 
   await fixtureFrame(page);
   expect(
@@ -127,7 +151,9 @@ test("shell page loads and embeds the sandboxed iframe", async ({ page }) => {
   ).toEqual([]);
 });
 
-test("same-origin permission poll fetch is allowed by the shell CSP (#3842)", async ({ page }) => {
+test("same-origin permission poll fetch is allowed by the shell CSP (#3842)", async ({
+  page,
+}) => {
   const consoleMessages = trackConsole(page);
   await page.goto(shellUrl!);
   const frame = await fixtureFrame(page);
@@ -147,63 +173,163 @@ test("same-origin permission poll fetch is allowed by the shell CSP (#3842)", as
   ).toEqual([]);
 });
 
-test("left-click on a cross-origin link routes through the open_url bridge (#3852)", async ({
+test('cross-origin target="_blank" opens natively as a real top-level tab (#3852, river#208)', async ({
   page,
+  context,
 }) => {
+  await stubExternal(context);
   await page.goto(shellUrl!);
   await captureShellMessages(page);
-  await stubWindowOpen(page);
   const frame = await fixtureFrame(page);
 
+  const opened = context.waitForEvent("page");
   await frame.locator("#cross-origin-link").click();
+  const popup = await opened;
+  await popup.waitForLoadState();
 
-  // The interceptor must postMessage open_url to the shell ...
-  await expect
-    .poll(async () => (await shellMessages(page)).map((m) => m.type))
-    .toContain("open_url");
-  const msgs = await shellMessages(page);
-  const openUrl = msgs.find((m) => m.type === "open_url");
-  expect(openUrl?.url).toBe("https://example.com/external");
-  expect(openUrl?.shiftKey).toBe(false);
+  // A REAL top-level document, not a sandbox-inheriting popup: the stub route
+  // served it, and its origin is example.com rather than "null" (the
+  // null-origin popup is what broke CORS on logged-in sites in river#208).
+  expect(popup.url()).toBe("https://example.com/external");
+  expect(await popup.evaluate(() => location.origin)).toBe(
+    "https://example.com",
+  );
+  await popup.close();
 
-  // ... and the shell must honour it via window.open with the real origin
-  // (not a sandboxed null-origin popup).
-  await expect.poll(async () => await openCalls(page)).toContain("https://example.com/external");
+  // The click must NOT have been handed to the shell: `window.open` from a
+  // `message` handler is popup-blocked in Firefox, which is what made these
+  // links dead there while Chrome/Safari kept working.
+  expect((await shellMessages(page)).map((m) => m.type)).toEqual([]);
 });
 
-test("middle-click (auxclick) on a cross-origin link is also intercepted (#3854)", async ({
+test('middle-click on a cross-origin target="_blank" link also opens a tab (#3854)', async ({
   page,
+  context,
+}) => {
+  await stubExternal(context);
+  await page.goto(shellUrl!);
+  await captureShellMessages(page);
+  const frame = await fixtureFrame(page);
+
+  // Middle-click dispatches `auxclick`, not `click`. The interceptor listens on
+  // both so the classification is identical; a targeted link stays native
+  // either way, and the browser gives it real background-tab placement — which
+  // the old postMessage route could not preserve.
+  const opened = context.waitForEvent("page");
+  await frame.locator("#cross-origin-link").click({ button: "middle" });
+  const popup = await opened;
+  // A middle-click opens a BACKGROUND tab, which starts at about:blank and
+  // commits its navigation later than a foreground one — `waitForLoadState()`
+  // can resolve on the initial empty document. Wait for the URL itself.
+  await popup.waitForURL("https://example.com/external");
+  await popup.close();
+  expect((await shellMessages(page)).map((m) => m.type)).toEqual([]);
+});
+
+test("cross-origin link with NO target is opened in a tab by the interceptor", async ({
+  page,
+  context,
+}) => {
+  await stubExternal(context);
+  await page.goto(shellUrl!);
+  await captureShellMessages(page);
+  const frame = await fixtureFrame(page);
+
+  // Left native this would navigate the app frame to a foreign origin, which
+  // the shell's `frame-src 'self'` refuses — a dead click. The interceptor
+  // calls window.open itself, inside the click handler, so the gesture is live
+  // (Firefox allows window.open from `click`, never from `message`).
+  const opened = context.waitForEvent("page");
+  await frame.locator("#cross-origin-untargeted-link").click();
+  const popup = await opened;
+  await popup.waitForLoadState();
+  expect(popup.url()).toBe("https://example.com/plain");
+  await popup.close();
+
+  // Still no shell round-trip, and the app frame stayed put.
+  expect((await shellMessages(page)).map((m) => m.type)).toEqual([]);
+  await expect(page.frameLocator("iframe#app").locator("#title")).toBeVisible();
+});
+
+test('same-origin target="_blank" opens a working new tab, not a blank one (#5087)', async ({
+  page,
+  context,
 }) => {
   await page.goto(shellUrl!);
   await captureShellMessages(page);
-  await stubWindowOpen(page);
   const frame = await fixtureFrame(page);
 
-  // Middle-click dispatches `auxclick`, not `click`. Pre-#3854 only `click`
-  // was listened for, so the browser opened a null-origin sandboxed popup.
-  await frame.locator("#cross-origin-link").click({ button: "middle" });
+  // The regression this pins, in both its forms:
+  //   - Before #5087 the popup inherited the sandbox, so the shell it landed on
+  //     had an opaque origin, its `frame-src 'self'` could not match, and the
+  //     app frame stayed about:blank — a blank tab.
+  //   - #5087 routed the click through the shell's `open_url` bridge, which put
+  //     `window.open` inside a `message` handler: blocked outright by Firefox's
+  //     popup blocker, so the click did nothing at all there.
+  // With `allow-popups-to-escape-sandbox` the native popup is a real top-level
+  // document and the shell inside it loads the contract normally.
+  const opened = context.waitForEvent("page");
+  await frame.locator("#same-origin-blank-link").click();
+  const popup = await opened;
+  await popup.waitForLoadState();
 
-  await expect
-    .poll(async () => (await shellMessages(page)).map((m) => m.type))
-    .toContain("open_url");
-  const openUrl = (await shellMessages(page)).find((m) => m.type === "open_url");
-  expect(openUrl?.url).toBe("https://example.com/external");
+  expect(popup.url()).toContain("page2.html");
+  // Not a blank tab: the new tab rendered its own shell + app frame.
+  await expect(popup.locator("iframe#app")).toBeAttached();
+  await expect(
+    popup.frameLocator("iframe#app").locator("#page2-title"),
+  ).toBeVisible();
+  await popup.close();
+
+  expect((await shellMessages(page)).map((m) => m.type)).toEqual([]);
 });
 
-test("shift-click on a cross-origin link forwards shiftKey (#3854)", async ({ page }) => {
+test("contract JS calling window.open() gets a real top-level tab", async ({
+  page,
+  context,
+}) => {
+  await stubExternal(context);
   await page.goto(shellUrl!);
   await captureShellMessages(page);
-  await stubWindowOpen(page);
   const frame = await fixtureFrame(page);
 
-  await frame.locator("#cross-origin-link").click({ modifiers: ["Shift"] });
+  // The anchor interceptor never sees this — the app calls window.open() from
+  // its own script. Before #5100 an override forwarded it to the shell, because
+  // a popup from the sandboxed frame inherited the sandbox: opaque origin, no
+  // localStorage, dead-ending on the per-user-isolation page (#4645). With
+  // `allow-popups-to-escape-sandbox` the native call is enough, so the override
+  // was removed — this test is what proves removing it was safe.
+  const opened = context.waitForEvent("page");
+  await frame.locator("#programmatic-open").click();
+  const popup = await opened;
+  await popup.waitForURL("https://example.com/programmatic");
 
-  await expect
-    .poll(async () => (await shellMessages(page)).some((m) => m.type === "open_url" && m.shiftKey === true))
-    .toBeTruthy();
+  // A real top-level context, not a sandbox-inheriting one: a genuine origin
+  // (never "null") and working storage, which is what #4645 was about.
+  expect(await popup.evaluate(() => location.origin)).toBe(
+    "https://example.com",
+  );
+  expect(
+    await popup.evaluate(() => {
+      try {
+        localStorage.setItem("__probe", "1");
+        localStorage.removeItem("__probe");
+        return "usable";
+      } catch (e) {
+        return "denied";
+      }
+    }),
+    "an opaque-origin (sandbox-inherited) tab throws on localStorage — that dead end is #4645",
+  ).toBe("usable");
+  await popup.close();
+
+  // No shell round-trip: nothing was forwarded.
+  expect((await shellMessages(page)).map((m) => m.type)).toEqual([]);
 });
 
-test("same-origin in-contract link performs an in-place navigate hop", async ({ page }) => {
+test("same-origin in-contract link performs an in-place navigate hop", async ({
+  page,
+}) => {
   await page.goto(shellUrl!);
   await captureShellMessages(page);
   const frame = await fixtureFrame(page);
@@ -214,20 +340,28 @@ test("same-origin in-contract link performs an in-place navigate hop", async ({ 
   await expect
     .poll(async () => (await shellMessages(page)).map((m) => m.type))
     .toContain("navigate");
-  const navigate = (await shellMessages(page)).find((m) => m.type === "navigate");
-  expect(navigate?.href, `navigate href: ${navigate?.href}`).toContain("page2.html");
+  const navigate = (await shellMessages(page)).find(
+    (m) => m.type === "navigate",
+  );
+  expect(navigate?.href, `navigate href: ${navigate?.href}`).toContain(
+    "page2.html",
+  );
 
   // The shell performs the hop in place: the iframe now shows page 2 and the
   // top-level URL no longer carries __sandbox (issue #3839). Use Playwright's
   // polling toHaveURL (not a synchronous page.url() snapshot) because the
   // pushState that updates the address bar runs in the bridge's message
   // handler, which can settle a tick after the iframe content loads.
-  await expect(page.frameLocator("iframe#app").locator("#page2-title")).toBeVisible();
+  await expect(
+    page.frameLocator("iframe#app").locator("#page2-title"),
+  ).toBeVisible();
   await expect(page).toHaveURL(/page2\.html/);
   await expect(page).not.toHaveURL(/__sandbox/);
 });
 
-test("a link carrying a download attribute is NOT intercepted", async ({ page }) => {
+test("a link carrying a download attribute is NOT intercepted", async ({
+  page,
+}) => {
   await page.goto(shellUrl!);
   await captureShellMessages(page);
   const frame = await fixtureFrame(page);
@@ -250,7 +384,9 @@ test("a link carrying a download attribute is NOT intercepted", async ({ page })
 
   // (1) Control: same element minus `download` IS intercepted → listener live,
   // and the element/selector themselves are wired correctly.
-  await frame.locator("#download-link").evaluate((el) => el.removeAttribute("download"));
+  await frame
+    .locator("#download-link")
+    .evaluate((el) => el.removeAttribute("download"));
   await frame.locator("#download-link").click();
   await expect
     .poll(async () => (await shellMessages(page)).map((m) => m.type))
@@ -343,7 +479,9 @@ test("browser Back restores the previous subpage via the popstate handler (#3839
 
   // Navigate forward to page 2 (in-place hop, pushes a history entry).
   await frame.locator("#same-origin-link").click();
-  await expect(page.frameLocator("iframe#app").locator("#page2-title")).toBeVisible();
+  await expect(
+    page.frameLocator("iframe#app").locator("#page2-title"),
+  ).toBeVisible();
   await expect(page).toHaveURL(/page2\.html/);
 
   // Browser Back must fire the bridge's popstate handler, which restores the
@@ -361,5 +499,7 @@ test("browser Back restores the previous subpage via the popstate handler (#3839
   // pins the address-bar behaviour for the push direction.
   await page.evaluate(() => window.history.back());
   await expect(page.frameLocator("iframe#app").locator("#title")).toBeVisible();
-  await expect(page.frameLocator("iframe#app").locator("#page2-title")).toHaveCount(0);
+  await expect(
+    page.frameLocator("iframe#app").locator("#page2-title"),
+  ).toHaveCount(0);
 });

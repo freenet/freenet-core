@@ -3,14 +3,18 @@
 //! Contract web apps are served inside sandboxed iframes to provide origin isolation.
 //! The local API server returns a "shell" page that holds the auth token and
 //! proxies WebSocket connections via postMessage, while the contract runs in an
-//! `<iframe sandbox="allow-scripts allow-forms allow-popups allow-downloads allow-modals"
+//! `<iframe sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox
+//!                   allow-downloads allow-modals"
 //!         allow="clipboard-read; clipboard-write">`
 //! with an opaque origin that cannot access other contracts' data.
-//! Popups inherit the sandbox (no `allow-popups-to-escape-sandbox`); external links
-//! are opened via the `open_url` shell bridge message to avoid CORS issues. The
-//! injected interceptor also overrides programmatic `window.open` in the iframe,
-//! routing http(s) opens through the same `open_url` bridge so a new tab gets the
-//! shell's real origin instead of a sandbox-inheriting opaque one (freenet-core#4645).
+//! Popups ESCAPE the sandbox: a new tab opened from the iframe is a normal
+//! top-level document at the node's real origin, which re-wraps the target
+//! contract in a fresh shell + sandboxed frame. That is what makes
+//! `target="_blank"` work identically in every browser — the tab is opened by a
+//! real user gesture in the frame that received the click, not by the shell from
+//! a `message` handler (which Firefox's popup blocker rejects outright, since
+//! `message` is not in `dom.popup_allowed_events`). See the head comment in
+//! `navigation_interceptor.js`.
 //! Sandbox content is protected from top-level access via Sec-Fetch-Dest checks in client_api.rs.
 
 use std::{
@@ -1825,39 +1829,34 @@ const WEBSOCKET_SHIM_JS: &str = include_str!("path_handlers/assets/websocket_shi
 
 /// JavaScript navigation interceptor injected into sandboxed iframe HTML pages.
 ///
-/// Intercepts clicks on `<a>` elements and sends a postMessage to the shell
-/// page, which either opens the URL in a new window (cross-origin) or updates
-/// the iframe's `src` (same-origin). This enables multi-page website
-/// navigation without weakening the sandbox (no `allow-top-navigation` nor
-/// `allow-popups-to-escape-sandbox` needed).
+/// Intercepts clicks on same-origin in-contract `<a>` elements and asks the
+/// shell to move the iframe (`type: 'navigate'`), which is what makes
+/// multi-page contract websites work without `allow-top-navigation`.
 ///
-/// Cross-origin links MUST be handled regardless of their `target` attribute,
-/// because without `allow-popups-to-escape-sandbox` a `target="_blank"` click
-/// would open a sandboxed popup with a null origin and the destination site
-/// would see CORS failures. This was freenet/river#208: River webapps added
-/// `target="_blank"` to every external link, the old interceptor skipped any
-/// anchor with an explicit target, and the resulting sandboxed popups broke
-/// logged-in pages like GitHub. The `open_url` bridge hands the URL to the
-/// shell page, which opens it with a proper origin via `window.open`.
+/// It deliberately does NOT touch new-window activations — an explicit
+/// non-`_self` `target`, or a ctrl/cmd/shift/middle-click. Those open natively.
+/// The iframe carries `allow-popups-to-escape-sandbox`, so the popup is a
+/// normal top-level document at the node's real origin: the shell loads (its
+/// `frame-src 'self'` matches), `localStorage` and the hosted per-user access
+/// key work (freenet-core#4645), and a cross-origin destination sees a real
+/// Origin rather than `null` (freenet/river#208).
 ///
-/// Same-origin links with an explicit non-`_self` target are left to the
-/// browser, so webapps that want multi-tab navigation within their own
-/// contract get their tab. That tab inherits the sandbox, though, so it has
-/// an opaque origin: on a hosted node it can't read the per-user access key
-/// and dead-ends (#4645), and on WebKit it renders blank (#5087). #5089
-/// routed this branch through `open_url` to fix that and was reverted in
-/// #5106, because the bridge refuses loopback hosts and the click then did
-/// nothing at all on a local node. See the comment on that branch in
-/// `navigation_interceptor.js` for the full trade.
+/// Routing new-window opens through the shell's `open_url` bridge instead is
+/// what broke Firefox: the shell's `window.open` then runs inside a `message`
+/// handler, and Firefox's popup blocker allows `window.open` only from events
+/// in `dom.popup_allowed_events` (click, auxclick, mouseup, …) — `message` is
+/// not one, so the popup was blocked and the click did nothing. Chrome and
+/// Safari allowed it only because they propagate user activation across the
+/// whole frame tree. A real gesture in the frame that received the click is the
+/// only mechanism that works in every browser. #5089 took that route and was
+/// reverted in #5107, which also priced a second cost of it: the bridge refuses
+/// loopback hosts, so on a local node the forwarded open was dropped outright.
 ///
-/// The interceptor also overrides programmatic `window.open`: an app that opens
-/// a new tab from its own JS bypasses the click/auxclick listeners, and on a
-/// hosted node the resulting opaque-origin popup can't read the per-user access
-/// key and dead-ends (freenet-core#4645). http(s) new-window opens are forwarded
-/// through the same `open_url` bridge (real origin); `_self`/`_parent`/`_top`,
-/// non-http(s) schemes, and loopback targets (which `open_url` refuses) fall back
-/// to the native open. The returned WindowProxy is dropped (null), matching the
-/// shell's `noopener` open.
+/// The one cross-origin case still intercepted is a link with NO new-window
+/// target: navigating the app frame itself to a foreign origin is refused by
+/// the shell's `frame-src 'self'`, so the click would silently do nothing. It
+/// is turned into `window.open(..., '_blank', 'noopener,noreferrer')` from
+/// inside the click handler, where the gesture is live.
 const NAVIGATION_INTERCEPTOR_JS: &str =
     include_str!("path_handlers/assets/navigation_interceptor.js");
 
@@ -4670,7 +4669,7 @@ mod tests {
         // Shell page must contain sandboxed iframe
         assert!(
             html.contains(
-                r#"sandbox="allow-scripts allow-forms allow-popups allow-downloads allow-modals""#
+                r#"sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads allow-modals""#
             ),
             "iframe sandbox attribute missing or wrong allowlist"
         );
@@ -4721,25 +4720,33 @@ mod tests {
             html.contains("__freenet_shell__"),
             "bridge JS must handle shell-level messages (title/favicon)"
         );
-        // allow-popups-to-escape-sandbox must NOT be present. It was removed because
-        // escaped popups gain localhost:7509 origin, allowing malicious web apps to
-        // access other apps' data and bypass permission prompts. External links are
-        // now opened via the open_url shell bridge message instead.
+// `allow-popups-to-escape-sandbox` MUST be present: it is what makes a
+        // new tab open identically in every browser. The popup carries a real
+        // user gesture from the frame that got the click, and lands on the shell
+        // at the node's real origin. Routing new-window opens through the shell's
+        // `open_url` bridge instead (the previous design) put `window.open`
+        // inside a `message` handler, which Firefox's popup blocker refuses
+        // outright — `message` is not in `dom.popup_allowed_events`.
         //
-        // Citation corrected in #5107: this said "#1499", but that is the
-        // delegate-user-interaction feature request. The flag was removed by
-        // PR #3818 (`ec140e09c`, "browser-based permission prompts with iframe
-        // security hardening"), which is also the commit that wrote the
-        // original "#1499" pointer here. #1499 is the motivation; #3818 is the
-        // change and the place to argue with.
+        // The flag was removed by PR #3818 (`ec140e09c`, "browser-based
+        // permission prompts with iframe security hardening"), motivated by
+        // #1499 — citation corrected in #5107, which found the old comment here
+        // pointed at #1499 (the delegate-user-interaction feature request)
+        // rather than at the change itself.
+        //
+        // #3818's concern — CONTRACT script executing at the node's real origin
+        // — is what re-adding the flag has to answer, and the iframe `sandbox`
+        // attribute cannot answer it: an escaped popup is a context we do not
+        // control, and from there a contract can re-embed its own bytes itself.
+        // The answer is `CONTRACT_CONTENT_SANDBOX_CSP` in `client_api.rs`: every
+        // response carrying contract-authored bytes is served a `sandbox` CSP
+        // directive, so the opaque origin is decided by this server rather than
+        // by whichever context happens to embed it. Do NOT drop that header, and
+        // do NOT narrow it to `Sec-Fetch-Dest: document`, without re-deriving
+        // the argument — the concrete attack is in the header's comment.
         assert!(
-            !html.contains("allow-popups-to-escape-sandbox"),
-            "allow-popups-to-escape-sandbox must not be set (security: #3818)"
-        );
-        // open_url handler must be present in shell bridge JS for external links
-        assert!(
-            html.contains("open_url"),
-            "shell bridge must handle open_url messages for external links"
+            html.contains("allow-popups-to-escape-sandbox"),
+            "escaped popups are required for cross-browser target=\"_blank\""
         );
     }
 
@@ -6712,22 +6719,117 @@ mod tests {
             NAVIGATION_INTERCEPTOR_JS.contains("e.preventDefault()"),
             "interceptor must prevent default link behavior"
         );
-        // Cross-origin links should use open_url instead of navigate
+        // New-window activations are NOT routed through the shell: they open
+        // natively so the browser sees a real user gesture (see
+        // `navigation_interceptor_leaves_new_window_activations_native`).
         assert!(
-            NAVIGATION_INTERCEPTOR_JS.contains("type: 'open_url'"),
-            "interceptor must route cross-origin links through open_url"
+            !NAVIGATION_INTERCEPTOR_JS.contains("type: 'open_url'"),
+            "interceptor must not post open_url: the shell would then call \
+             window.open from a `message` handler, which Firefox's popup \
+             blocker refuses (#5087 follow-up)"
         );
-        // Same-origin links: must respect explicit non-_self target so
-        // webapps that open multiple tabs within their own contract still
-        // work.
+        // An explicit non-_self target must be recognized and left alone.
         assert!(
             NAVIGATION_INTERCEPTOR_JS.contains("target.target"),
-            "interceptor must respect target attribute on same-origin links"
+            "interceptor must respect target attribute"
         );
         // Must walk up DOM to handle clicks on child elements of <a>
         assert!(
             NAVIGATION_INTERCEPTOR_JS.contains("target.parentElement"),
             "interceptor must walk up DOM to find <a> ancestor"
+        );
+    }
+
+    /// Regression test for freenet/river#208, under the escaped-popup design.
+    ///
+    /// A cross-origin link with NO new-window target would, left alone,
+    /// navigate the app frame itself to a foreign origin — which the shell's
+    /// `frame-src 'self'` refuses, so the click silently does nothing. It must
+    /// therefore open a tab. The open has to happen HERE, inside the
+    /// click/auxclick handler, because that is the only place a live user
+    /// gesture exists: Firefox allows `window.open` only from events in
+    /// `dom.popup_allowed_events`, which includes `click`/`auxclick` but NOT
+    /// `message`, so the old "post `open_url` and let the shell open it" route
+    /// was blocked outright in Firefox.
+    ///
+    /// The popup escapes the sandbox (`allow-popups-to-escape-sandbox` on the
+    /// shell iframe), so the destination sees a real Origin instead of the
+    /// `null` one that broke logged-in sites in river#208.
+    #[test]
+    fn navigation_interceptor_opens_untargeted_cross_origin_links_in_a_tab() {
+        let js = NAVIGATION_INTERCEPTOR_JS;
+
+        let cross_origin_idx = js
+            .find("target.origin !== location.origin")
+            .expect("cross-origin check present");
+        // Bound the slice at the start of the same-origin branch so its
+        // `postMessage` can't satisfy the assertions below.
+        let same_origin_idx = js
+            .find("// Same-origin in-contract link")
+            .expect("same-origin in-contract branch present");
+        let block = &js[cross_origin_idx..same_origin_idx];
+
+        assert!(
+            block.contains("preventDefault"),
+            "cross-origin branch must preventDefault before opening the tab"
+        );
+        assert!(
+            block.contains("window.open(target.href, '_blank', 'noopener,noreferrer')"),
+            "cross-origin branch must open the tab itself, from the click \
+             handler, with noopener/noreferrer (freenet/river#208)"
+        );
+        assert!(
+            !block.contains("postMessage"),
+            "cross-origin branch must not hand the open to the shell: \
+             window.open from a `message` handler is popup-blocked in Firefox"
+        );
+    }
+
+    /// Regression test for the Firefox half of #5087.
+    ///
+    /// #5087 fixed a blank tab on same-origin `target="_blank"` by routing the
+    /// click through the shell's `open_url` bridge. That put `window.open`
+    /// inside a `message` handler, and Firefox's popup blocker keys on the
+    /// dispatching event type (`dom.popup_allowed_events` — no `message`), so
+    /// every such click became a no-op in Firefox while Chrome/Safari kept
+    /// working by propagating user activation across the frame tree. Users had
+    /// to right-click → "Open in new tab", which bypasses JS entirely.
+    ///
+    /// The fix is `allow-popups-to-escape-sandbox` on the shell iframe: the
+    /// natively-opened popup is a real top-level document at the node origin,
+    /// so the shell's `frame-src 'self'` matches and the app frame loads. Pin
+    /// that new-window activations are left to the browser, and that modifier
+    /// clicks (which the postMessage route could never preserve) are too.
+    #[test]
+    fn navigation_interceptor_leaves_new_window_activations_native() {
+        let js = NAVIGATION_INTERCEPTOR_JS;
+
+        let target_attr_idx = js
+            .find("target.target && target.target !== '_self'")
+            .expect("target-attribute check present");
+        let cross_origin_idx = js
+            .find("target.origin !== location.origin")
+            .expect("cross-origin check present");
+        assert!(
+            target_attr_idx < cross_origin_idx,
+            "the new-window skip must run BEFORE origin classification, or a \
+             cross-origin target=\"_blank\" gets intercepted again"
+        );
+
+        let block = &js[target_attr_idx..cross_origin_idx];
+        assert!(
+            block.contains("!== '_self') return"),
+            "an explicit new-window target must fall through to the browser so \
+             the tab is opened by a real user gesture (#5087 follow-up)"
+        );
+        assert!(
+            block.contains("e.button === 1")
+                && block.contains("e.ctrlKey")
+                && block.contains("e.metaKey")
+                && block.contains("e.shiftKey"),
+            "middle/ctrl/cmd/shift-click must also fall through, restoring the \
+             background-tab and new-window placement the postMessage route \
+             collapsed into a plain foreground tab (#3853)"
         );
     }
 
@@ -6742,6 +6844,16 @@ mod tests {
     ///
     /// Pin the contract: the cross-origin branch MUST be reached before
     /// the target-attribute check, i.e. the origin classification dominates.
+    // SUPERSEDED by PR #5100: new-window activations are no longer routed
+    // through the shell's `open_url` bridge, and the `window.open` override is
+    // gone. Retained (ignored) as historical documentation of the pre-#5100
+    // contract, per the project rule that superseded tests are #[ignore]d with
+    // an explanation rather than deleted. The behaviour they pinned is what
+    // broke `target="_blank"` in Firefox: `window.open` from a `message`
+    // handler is refused by its popup blocker. Current contract is pinned by
+    // `navigation_interceptor_leaves_new_window_activations_native` and
+    // `navigation_interceptor_opens_untargeted_cross_origin_links_in_a_tab`.
+    #[ignore]
     #[test]
     fn navigation_interceptor_handles_cross_origin_target_blank() {
         let js = NAVIGATION_INTERCEPTOR_JS;
@@ -6807,6 +6919,16 @@ mod tests {
     ///      the posted message, sourced from the MouseEvent.
     ///   3. The shell bridge's `open_url` handler reads `msg.shiftKey` and
     ///      uses the `popup` window feature when it's true.
+    // SUPERSEDED by PR #5100: new-window activations are no longer routed
+    // through the shell's `open_url` bridge, and the `window.open` override is
+    // gone. Retained (ignored) as historical documentation of the pre-#5100
+    // contract, per the project rule that superseded tests are #[ignore]d with
+    // an explanation rather than deleted. The behaviour they pinned is what
+    // broke `target="_blank"` in Firefox: `window.open` from a `message`
+    // handler is refused by its popup blocker. Current contract is pinned by
+    // `navigation_interceptor_leaves_new_window_activations_native` and
+    // `navigation_interceptor_opens_untargeted_cross_origin_links_in_a_tab`.
+    #[ignore]
     #[test]
     fn navigation_interceptor_forwards_shift_key_for_open_url() {
         let js = NAVIGATION_INTERCEPTOR_JS;
@@ -6836,67 +6958,32 @@ mod tests {
         );
     }
 
-    /// Regression test for #5106 — the fallout of #5089, which is reverted here.
+    /// Pins the same-origin new-window branch as the browser's job, through
+    /// three attempts at it.
     ///
-    /// #5089 routed the same-origin new-window branch through the shell's
-    /// `open_url` bridge to fix a blank tab (#5087). Two measured facts make
-    /// that trade net-negative:
+    /// Before #5089 this branch fell through to the browser, and the resulting
+    /// popup INHERITED the iframe sandbox: opaque origin, so WebKit rendered it
+    /// blank (#5087), a hosted node could not read the per-user access key and
+    /// dead-ended (#4645), and `/permission/pending` answered 200 with an empty
+    /// list to its `Origin: null`, so prompts silently never appeared.
     ///
-    ///  1. `open_url` REFUSES loopback hosts (`localhost` / `127.0.0.1` /
-    ///     `::1` / `0.0.0.0`) — see the handler in `shell_bridge.js`. That is
-    ///     the documented way a local node is reached (the service prints
-    ///     `Open http://127.0.0.1:7509/` on start), so forwarding meant the
-    ///     click was `preventDefault`-ed and then silently dropped by the
-    ///     shell: NOTHING opened, in every engine. The `window.open` override
-    ///     further down never had this hole — it checks `isLoopbackHost` and
-    ///     falls back to native. The anchor branch has no such fallback, so
-    ///     it must not forward.
-    ///  2. The blank tab it fixed is WebKit-only. Driving the real
-    ///     interceptor inside a sandboxed-shell harness in all three engines,
-    ///     the pre-#5089 native popup was opaque-origin everywhere, but only
-    ///     WebKit's `frame-src 'self'` refused the app frame; Gecko and Blink
-    ///     loaded it. Firefox and Chrome users were therefore traded a
-    ///     working tab for a dead click.
+    /// #5089 routed it through the shell's `open_url` bridge instead. That put
+    /// `window.open` inside a `message` handler — refused outright by Firefox's
+    /// popup blocker, which gates on the dispatching event type — so the click
+    /// became a no-op there (#5106). It also dead-ended on a loopback node,
+    /// because the bridge's `open_url` handler refuses `localhost`/`127.0.0.1`
+    /// and the anchor branch had no fallback. #5107 reverted it.
     ///
-    /// Two things NOT to repeat from earlier drafts of this reasoning, both
-    /// retracted after review re-ran the measurements: popup blocking has
-    /// nothing to do with any of it (the matrix is identical with blockers on
-    /// and off; the zero-popup cells are the loopback refusal), and "loopback
-    /// is how most desktop users browse" was never established — #5087's own
-    /// reporter was on `10.44.101.1`, i.e. the configuration where #5089
-    /// helped and this revert does not.
+    /// #5100 (this) keeps the fall-through and removes the reason it was ever
+    /// costly: with `allow-popups-to-escape-sandbox` on the shell iframe the
+    /// natively-opened popup is a real top-level document at the node origin,
+    /// which fixes all three of the pre-#5089 symptoms without a bridge hop.
     ///
-    /// The revert is not free, and this test should not be read as saying the
-    /// current behaviour is good. The tab the browser opens inherits the
-    /// sandbox, so it has an opaque origin, which costs three things: WebKit
-    /// renders it blank (#5087); on a HOSTED node it can't read the per-user
-    /// access key and dead-ends on the "Open this app in a normal tab" panel
-    /// in every engine (#4645); and its permission surface is dead in every
-    /// engine, because `Origin: null` is refused and `/permission/pending`
-    /// answers 200 with an empty list rather than an error, so the prompt
-    /// silently never appears. That last one bites hardest on a LOCAL node in
-    /// Firefox/Chrome — the very case this pins — where the app frame loads
-    /// fine and so looks healthy. #5089 fixed all three for this path
-    /// incidentally. This test pins the lesser failure, not a good one, until
-    /// a fix lands that has neither.
-    ///
-    /// Two constraints on that fix. `allow-popups-to-escape-sandbox` on the
-    /// app iframe was deliberately REMOVED by #3818 (motivated by #1499) — an
-    /// escaped popup gains the node's real origin, letting a malicious app
-    /// reach other apps' data and bypass permission prompts (its absence is
-    /// pinned in `shell_page_*` above) — so that route has to answer #3818
-    /// first. A bridge re-route needs a loopback fallback mirroring
-    /// `window.open`'s `isLoopbackHost`.
-    ///
-    /// Note that such a fix WILL fail both assertions below, and that is
-    /// correct — they pin today's behaviour, not a permanent invariant.
-    /// Whoever lands it should replace this test, not weaken it. The first
-    /// assertion is the load-bearing one; the second is a cheap belt-and-
-    /// braces check. What it uniquely covers is a forward inserted BETWEEN
-    /// the `return` and the `navigate` postMessage — reachable code, just
-    /// for untargeted same-origin links rather than for this branch. A
-    /// forward ahead of the `return` is already caught by the first.
-    #[test]
+    /// So the branch must still `return`, and must still not grow a forward.
+    /// The whole-file "no `type: 'open_url'` anywhere in the interceptor" pin
+    /// lives in `navigation_interceptor_matches_expected_contract`; it strictly
+    /// subsumes the per-handler forward COUNT this test used to carry while the
+    /// cross-origin branch still forwarded, so that count is not repeated here.
     fn navigation_interceptor_leaves_same_origin_target_blank_to_the_browser() {
         let js = NAVIGATION_INTERCEPTOR_JS;
 
@@ -6921,10 +7008,11 @@ mod tests {
         assert!(
             !block.contains("type: 'open_url'"),
             "no open_url forward may be added to the same-origin new-window branch ahead \
-             of the `return` (#5106). If you are DELIBERATELY re-routing this branch — \
-             with a loopback fallback like the window.open override's isLoopbackHost \
-             check, or after removing the sandbox inheritance — this test is pinning the \
-             old behaviour and should be replaced, not deleted piecemeal"
+             of the `return` (#5106). A bridge hop here runs `window.open` from a \
+             `message` handler, which Firefox's popup blocker refuses, and is dropped \
+             outright for a loopback host. If you are DELIBERATELY re-routing this \
+             branch, this test is pinning the old behaviour and should be replaced, \
+             not deleted piecemeal"
         );
 
         // Both assertions above scope to the branch, which leaves an evasion:
@@ -6937,78 +7025,13 @@ mod tests {
         //     if (target.target === '_blank') { e.preventDefault(); /* open_url */ return; }
         //     if (target.target && target.target !== '_self') return;
         //
-        // So also pin the whole-handler count. `handleAnchorClick` must post
-        // open_url from exactly ONE place: the cross-origin branch.
-        //
-        // Scope, precisely — this counts DIRECT forwards, i.e. the literal
-        // postMessage. It does NOT catch a re-route written through the
-        // patched `window.open` (`if (target.target === '_blank') { …
-        // window.open(target.href); return; }`), which passes this and the two
-        // branch assertions. That is deliberate: such a re-route inherits the
-        // override's `isLoopbackHost` fallback, so it is the shape the branch
-        // comment invites rather than the bug this guards.
-        //
-        // It is also NOT a standalone guard against extracting the forward
-        // into a helper — `navigation_interceptor_handles_cross_origin_target_blank`
-        // is what fires there, because it requires the literal INSIDE the
-        // cross-origin block. Do not prune that test as redundant with this
-        // one; it is the half that keeps river#208 closed.
-        //
-        // What this does add is the asymmetry with `window.open` being
-        // DELIBERATE rather than an accident of two reverts: the override
-        // below forwards same-origin new-window opens (#4645) and this handler
-        // does not. The anchor path pays #4645's dead-end on hosted nodes to
-        // avoid the loopback dead click (#5106); the override avoids both
-        // because it has that fallback. Whoever unifies them lands here and
-        // chooses on purpose.
-        let handler_start = js
-            .find("function handleAnchorClick")
-            .expect("anchor click handler present");
-        let handler_end = js
-            .find("document.addEventListener('click'")
-            .expect("anchor click listener registration present");
-        // Function declarations hoist, so moving the listener registrations
-        // above the handler is a legal tidy-up that would invert these bounds.
-        // Catch it with a message rather than a raw slice panic.
-        assert!(
-            handler_start < handler_end,
-            "expected `function handleAnchorClick` before the listener \
-             registration; if the registrations were hoisted above the handler, \
-             re-anchor this bound rather than dropping the check"
-        );
-        let forwards = js[handler_start..handler_end]
-            .matches("type: 'open_url'")
-            .count();
-        assert_eq!(
-            forwards, 1,
-            "handleAnchorClick must forward open_url from exactly one place — the \
-             cross-origin branch (freenet/river#208). Too many means a same-origin \
-             new-window re-route slipped in outside the branch this test's other \
-             assertions scope to (#5106). Zero most likely means the forward moved \
-             into a helper, which is fine behaviour but leaves this count guarding \
-             nothing — re-anchor it rather than deleting it"
-        );
-    }
-
-    /// Regression test for the middle-click half of #3853. Middle-click is
-    /// dispatched as `auxclick` in modern browsers, NOT `click`, so the
-    /// interceptor must listen on both events. Without the auxclick
-    /// listener, middle-clicks on cross-origin `<a target="_blank">` links
-    /// bypass the `open_url` routing and fall through to the browser's
-    /// default handling, producing a null-origin sandboxed popup (exactly
-    /// what #3852 was meant to prevent).
-    #[test]
-    fn navigation_interceptor_listens_on_click_and_auxclick() {
-        let js = NAVIGATION_INTERCEPTOR_JS;
-        assert!(
-            js.contains("addEventListener('click'"),
-            "interceptor must register a click listener"
-        );
-        assert!(
-            js.contains("addEventListener('auxclick'"),
-            "interceptor must register an auxclick listener so middle-click \
-             on cross-origin links is also routed through open_url (#3853)"
-        );
+        // While the cross-origin branch still forwarded, the only way to catch
+        // that was to count forwards across the whole handler and require
+        // exactly one. #5100 removed the last forward, so the file-wide
+        // assertion in `navigation_interceptor_matches_expected_contract` —
+        // NO `type: 'open_url'` anywhere in the interceptor — catches the
+        // same evasion and every variant of it. Restore a scoped count here if
+        // a forward is ever legitimately reintroduced.
     }
 
     /// Regression test for freenet/freenet-core#4645.
@@ -7037,6 +7060,16 @@ mod tests {
     ///   5. `_self`/`_parent`/`_top` (in-place navigation) fall back to native.
     ///   6. Loopback targets fall back to native (open_url refuses them).
     ///   7. The arg is coerced to a string so URL objects are forwarded.
+    // SUPERSEDED by PR #5100: new-window activations are no longer routed
+    // through the shell's `open_url` bridge, and the `window.open` override is
+    // gone. Retained (ignored) as historical documentation of the pre-#5100
+    // contract, per the project rule that superseded tests are #[ignore]d with
+    // an explanation rather than deleted. The behaviour they pinned is what
+    // broke `target="_blank"` in Firefox: `window.open` from a `message`
+    // handler is refused by its popup blocker. Current contract is pinned by
+    // `navigation_interceptor_leaves_new_window_activations_native` and
+    // `navigation_interceptor_opens_untargeted_cross_origin_links_in_a_tab`.
+    #[ignore]
     #[test]
     fn navigation_interceptor_overrides_window_open() {
         let js = NAVIGATION_INTERCEPTOR_JS;
@@ -7124,6 +7157,31 @@ mod tests {
         assert!(
             override_block.contains("return null;"),
             "window.open override must return null for the forwarded case (#4645)"
+        );
+    }
+
+    /// Regression test for the middle-click half of #3853. Middle-click is
+    /// dispatched as `auxclick` in modern browsers, NOT `click`, so a
+    /// `click`-only listener never sees it.
+    ///
+    /// Today middle-click is deliberately left native (it is a new-window
+    /// activation), so both listeners reach the same early return and the
+    /// auxclick registration is not what produces the current behaviour. It
+    /// stays because the two events must be CLASSIFIED alike: if the
+    /// modifier/button skip is ever narrowed, a `click`-only interceptor would
+    /// silently stop covering middle-click again, which is exactly how #3853
+    /// happened.
+    #[test]
+    fn navigation_interceptor_listens_on_click_and_auxclick() {
+        let js = NAVIGATION_INTERCEPTOR_JS;
+        assert!(
+            js.contains("addEventListener('click'"),
+            "interceptor must register a click listener"
+        );
+        assert!(
+            js.contains("addEventListener('auxclick'"),
+            "interceptor must register an auxclick listener so middle-click is \
+             classified too (#3853)"
         );
     }
 
@@ -7255,35 +7313,32 @@ mod tests {
         );
     }
 
-    /// The interceptor's `isLoopbackHost` and the shell `open_url` handler's
-    /// loopback refusal must name the SAME hosts. `isLoopbackHost` exists only
-    /// to predict what the shell will refuse, so that `window.open` falls back
-    /// to native instead of forwarding an open that will be dropped — its own
-    /// comment says "Kept in sync with the loopback block in shell_bridge.js's
-    /// open_url handler", but nothing enforced that until now.
+    /// The shell `open_url` handler's loopback refusal is a SECURITY control:
+    /// host in the list ⇒ refuse. It is what stops a contract forging an
+    /// `{__freenet_shell__: true, type: 'open_url'}` message aimed at the
+    /// viewer's own loopback services — the local node's API included. Any
+    /// contract can post that message directly, so the control is live whether
+    /// or not the injected interceptor ever sends one.
     ///
-    /// Drift in either direction is a silent user-visible bug:
-    ///   - shell refuses a host the interceptor does not list → the forwarded
-    ///     open vanishes and the click does nothing. That is exactly the
-    ///     failure #5106 hit through the anchor path, which had no such list
-    ///     at all.
-    ///   - interceptor lists a host the shell would open → the open needlessly
-    ///     falls back to a sandbox-inheriting native popup (#4645).
+    /// #5100 removed the interceptor's `isLoopbackHost`, which existed only to
+    /// PREDICT this refusal so the `window.open` override could fall back to
+    /// native rather than forward an open the shell would drop. With the
+    /// override gone there is no second list, so the parity half of this test
+    /// (added in #5107) has nothing left to compare and is dropped with it —
+    /// deliberately, not by accident. What survives is the floor: the refusal
+    /// must still name every loopback host.
     ///
-    /// #4846 proposes completing this allow-list (it is exact-match today, so
-    /// e.g. `127.0.0.2` is not covered). Whoever does that one-sidedly will
-    /// trip this test. Note the limit, though: it compares LITERALS, so if
-    /// #4846 is implemented as a rule (`h.startsWith('127.')`) on both sides,
-    /// both literal sets shrink together and this test goes green without
-    /// having checked the new rule. It catches one-sided literal drift — the
-    /// common case — not a symmetric refactor. Two more divergences it cannot
-    /// see, both of which keep identical literals: flipping `||` to `&&` on
-    /// one side (uncovered anywhere), and dropping the bracket-strip
-    /// normalization so `[::1]` stops matching (covered for the shell by
-    /// `shell_open_url_handler_blocks_ipv6_loopback`, and behaviourally for
-    /// the interceptor by window-open.spec.ts). Do not over-trust the parity.
+    /// Limits, so this is not over-trusted. It reads LITERALS, so #4846
+    /// (complete the allow-list; it is exact-match today, e.g. `127.0.0.2` is
+    /// not covered) implemented as a rule — `h.startsWith('127.')` — would
+    /// remove the literals and trip this test even though the rule is strictly
+    /// wider. That is the intended failure: come here and re-express the floor
+    /// against the new shape rather than deleting it. It also cannot see a `||`
+    /// flipped to `&&`, which is uncovered anywhere; the bracket-strip
+    /// normalization that makes `[::1]` match is covered by
+    /// `shell_open_url_handler_blocks_ipv6_loopback` above.
     #[test]
-    fn interceptor_loopback_list_matches_shell_open_url_refusal() {
+    fn shell_open_url_refusal_names_every_loopback_host() {
         // Collect the host literals from each `h === '<host>'` comparison in a
         // region.
         //
@@ -7291,7 +7346,6 @@ mod tests {
         // `hash === '` and `iframePath === '`, which occur elsewhere in
         // shell_bridge.js. What makes this sound is purely the REGION BOUNDS
         // chosen below — do not loosen them on the theory that `h` is unique.
-        // That mistake is live: see the note on the shell anchor.
         fn loopback_hosts(region: &str) -> Vec<String> {
             const NEEDLE: &str = "h === '";
             let mut out = Vec::new();
@@ -7314,21 +7368,6 @@ mod tests {
             out
         }
 
-        // The `function ` prefix is load-bearing: the name `isLoopbackHost`
-        // also appears in prose in the same-origin branch's comment ABOVE the
-        // declaration, so anchoring on the bare name would slice from the
-        // comment and miss the helper entirely.
-        let interceptor_fn_idx = NAVIGATION_INTERCEPTOR_JS
-            .find("function isLoopbackHost")
-            .expect("interceptor isLoopbackHost helper present");
-        let interceptor_region = &NAVIGATION_INTERCEPTOR_JS[interceptor_fn_idx..];
-        // The helper is short; bound the region at its closing brace so a later
-        // `h === ...` elsewhere in the file can't leak in.
-        let interceptor_end = interceptor_region
-            .find("\n  }")
-            .expect("isLoopbackHost helper is brace-terminated");
-        let interceptor_hosts = loopback_hosts(&interceptor_region[..interceptor_end]);
-
         // Anchor tightly on the refusal itself — `var h = u.hostname` up to the
         // `return;` that drops the message. The sibling tests here bound the
         // open_url branch with the next `} else if`, but open_url is the LAST
@@ -7344,23 +7383,6 @@ mod tests {
             .expect("shell open_url loopback refusal returns");
         let shell_hosts = loopback_hosts(&rest[..refusal_end]);
 
-        // The two lists have OPPOSITE polarity, so a bare equality is not
-        // enough. The shell side is a SECURITY control: host in list ->
-        // refuse, which is what stops a contract forging an `open_url` at the
-        // viewer's own loopback services, the local node's API included (see
-        // `shell_open_url_handler_blocks_ipv6_loopback`, and note the handler
-        // deliberately does NOT block RFC1918 — loopback is the one network
-        // class it guards). The interceptor side blocks nothing at all: it is
-        // only a PREDICTION of the shell's refusal so `window.open` can fall
-        // back to native.
-        //
-        // So equality must never be reachable by SHRINKING the shell list.
-        // Drop `127.0.0.1`/`::1`/`0.0.0.0` from both and a bare assert_eq is
-        // green while `open_url` will happily open `http://127.0.0.1:7509/…`
-        // for any contract that asks. Pin a floor on the security side first,
-        // and make the equality message name the correct repair direction —
-        // someone red on #4846 otherwise has an easier wrong fix available
-        // (delete an arm) than the right one.
         for host in ["localhost", "127.0.0.1", "::1", "0.0.0.0"] {
             assert!(
                 shell_hosts.iter().any(|h| h == host),
@@ -7368,23 +7390,9 @@ mod tests {
                  extraction above truncated, e.g. because the chain was split into \
                  per-host `if (h === '…') return;` lines, which the `return;` bound \
                  would cut short (check shell_bridge.js by eye). This list is a \
-                 security boundary. If you are here because the equality below went \
-                 red, the fix is to WIDEN isLoopbackHost in navigation_interceptor.js \
-                 — never to narrow this one. Got: {shell_hosts:?}"
+                 security boundary: widen it, never narrow it. Got: {shell_hosts:?}"
             );
         }
-        assert_eq!(
-            interceptor_hosts, shell_hosts,
-            "isLoopbackHost and the shell's open_url loopback refusal have drifted \
-             (or a region bound truncated one of them — compare the two lists above \
-             before assuming drift). Correct repair direction: make \
-             navigation_interceptor.js's isLoopbackHost match shell_bridge.js, not \
-             the reverse. A host the shell refuses but the interceptor omits makes \
-             window.open forward an open the shell then drops silently (#5106); the \
-             reverse merely falls back to a sandbox-inheriting native popup (#4645). \
-             When completing the allow-list per #4846, widen BOTH, starting with the \
-             shell."
-        );
     }
 
     /// Direct postMessages from a malicious iframe can synthesize an
