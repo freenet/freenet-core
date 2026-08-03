@@ -291,6 +291,7 @@ async fn drive_client_update(
                 update_data,
                 related_contracts,
                 crate::contract::Priority::ClientLocal,
+                crate::node::ApplyOrigin::ClientLocal,
             )
             .await
             {
@@ -409,6 +410,7 @@ async fn drive_client_update(
                 update_data.clone(),
                 related_contracts.clone(),
                 crate::contract::Priority::ClientLocal,
+                crate::node::ApplyOrigin::ClientLocal,
             )
             .await;
 
@@ -975,6 +977,7 @@ async fn drive_relay_request_update(
             UpdateData::State(State::from(value.clone())),
             related_contracts.clone(),
             crate::contract::Priority::NetworkRelay,
+            crate::node::ApplyOrigin::NetworkRelay,
         )
         .await?;
 
@@ -1799,6 +1802,7 @@ async fn drive_relay_broadcast_to(
         update_data,
         RelatedContracts::default(),
         crate::contract::Priority::NetworkRelay,
+        crate::node::ApplyOrigin::NetworkRelay,
     )
     .await;
 
@@ -2468,6 +2472,7 @@ async fn drive_relay_request_update_streaming(
         UpdateData::State(State::from(value.clone())),
         related_contracts,
         crate::contract::Priority::NetworkRelay,
+        crate::node::ApplyOrigin::NetworkRelay,
     )
     .await?;
 
@@ -2710,6 +2715,7 @@ async fn apply_streaming_broadcast(
         UpdateData::State(State::from(state_bytes.clone())),
         RelatedContracts::default(),
         crate::contract::Priority::NetworkRelay,
+        crate::node::ApplyOrigin::NetworkRelay,
     )
     .await;
 
