@@ -22,14 +22,11 @@ pub(super) enum WebSocketApiError {
 }
 
 impl WebSocketApiError {
-    pub fn status_code(&self) -> StatusCode {
-        match self {
-            WebSocketApiError::InvalidParam { .. } => StatusCode::BAD_REQUEST,
-            WebSocketApiError::NodeError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-            WebSocketApiError::AxumError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-            WebSocketApiError::MissingContract { .. } => StatusCode::NOT_FOUND,
-        }
-    }
+    // `status_code()` lived here and was used only by `From<_> for Response`,
+    // which now delegates to `IntoResponse`. It had also drifted: it answered
+    // 500 for a `NodeError` that `into_response` renders as 404 ("Contract not
+    // found"), and knew nothing of the 503 retry/connecting pages. Deleted
+    // rather than kept in sync — one status decision, in `into_response`.
 
     pub fn error_message(&self) -> String {
         match self {
@@ -52,9 +49,17 @@ impl Display for WebSocketApiError {
 }
 
 impl From<WebSocketApiError> for Response {
+    /// Delegates to `IntoResponse` rather than rendering its own body.
+    ///
+    /// It used to build `Html(error.error_message())` directly, which is a
+    /// SECOND rendering path for the same type that skipped the escaping in
+    /// `into_response` — so a future handler returning `Result<_, Response>`
+    /// and reaching this `impl` via `?` would have silently reintroduced the
+    /// injection that escaping closes. It also skipped the retry/connecting
+    /// pages and the no-store headers. No caller uses it today; keeping the two
+    /// paths in sync by construction is cheaper than remembering to.
     fn from(error: WebSocketApiError) -> Self {
-        let body = Html(error.error_message());
-        (error.status_code(), body).into_response()
+        error.into_response()
     }
 }
 
@@ -101,6 +106,11 @@ impl IntoResponse for WebSocketApiError {
             }
         );
 
+        // `true` when the body below is node-authored MARKUP (the retry page)
+        // rather than a message built from request-derived text. Only the
+        // latter is escaped — escaping the retry page would render its
+        // meta-refresh tag as visible text and break the auto-reload.
+        let mut body_is_trusted_markup = false;
         let (status, error_message) = if is_transient {
             // Log the cause so operators can distinguish a fast op error
             // from a slow-loading contract without changing the user-facing
@@ -108,6 +118,7 @@ impl IntoResponse for WebSocketApiError {
             if let WebSocketApiError::AxumError { error } = &self {
                 tracing::info!(%error, "serving retry page for transient contract-fetch error");
             }
+            body_is_trusted_markup = true;
             (StatusCode::SERVICE_UNAVAILABLE, retry_loading_page())
         } else {
             match self {
@@ -133,7 +144,19 @@ impl IntoResponse for WebSocketApiError {
             }
         };
 
-        let body = Html(error_message);
+        // These bodies are served as text/html at the NODE's own origin, and
+        // several carry request-derived text: `web_subpages`' "Page not found:
+        // {page}" reflects the requested sub-path verbatim, and an
+        // `AxumError`'s `Display` can surface a rejected byte. Escape before
+        // wrapping in `Html`, so a crafted URL cannot become markup on a
+        // node-origin page — this is the one response class on the contract-web
+        // routes that carries no CSP, no `nosniff` and no `X-Frame-Options`,
+        // i.e. exactly where an injection would be worth the most.
+        let body = if body_is_trusted_markup {
+            Html(error_message)
+        } else {
+            Html(html_escape(&error_message))
+        };
 
         // Prevent intermediaries/service-workers from pinning a stale retry
         // page, and signal the client when it may retry.
@@ -207,6 +230,57 @@ fn retry_loading_page() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// Regression test for the reflected-HTML gap the escaped-popup review
+    /// found: these bodies are served as `text/html` at the NODE's own origin,
+    /// and several carry request-derived text — `web_subpages` renders
+    /// "Page not found: {page}" with the requested sub-path verbatim.
+    #[tokio::test]
+    async fn error_bodies_escape_request_derived_text() {
+        for error in [
+            WebSocketApiError::InvalidParam {
+                error_cause: "Page not found: <script>alert(1)</script>".to_string(),
+            },
+            WebSocketApiError::NodeError {
+                error_cause: "<img src=x onerror=alert(1)>".to_string(),
+            },
+        ] {
+            let raw = axum::body::to_bytes(error.into_response().into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8_lossy(&raw).to_string();
+            assert!(
+                !body.contains("<script>") && !body.contains("<img "),
+                "error bodies must not render request-derived text as markup; got: {body}"
+            );
+            assert!(
+                body.contains("&lt;") && body.contains("&gt;"),
+                "the payload must survive, escaped, so the message is still \
+                 readable; got: {body}"
+            );
+        }
+    }
+
+    /// `From<WebSocketApiError> for Response` must go through the same
+    /// rendering as `IntoResponse`, or it is a second path that skips the
+    /// escaping above.
+    #[tokio::test]
+    async fn from_impl_renders_identically_to_into_response() {
+        let payload = "<script>alert(1)</script>";
+        let via_from: axum::response::Response = WebSocketApiError::InvalidParam {
+            error_cause: payload.to_string(),
+        }
+        .into();
+        let raw = axum::body::to_bytes(via_from.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&raw).to_string();
+        assert!(
+            !body.contains("<script>"),
+            "the `From` conversion must escape too; got: {body}"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -396,4 +470,17 @@ mod tests {
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
+}
+
+/// Minimal HTML entity escaping for error bodies rendered at the node origin.
+///
+/// Deliberately duplicated from `permission_prompts::html_escape` rather than
+/// shared: this module is on the error path of every route and must not depend
+/// on a sibling that may itself fail to build.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
 }

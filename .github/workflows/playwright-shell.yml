@@ -110,9 +110,16 @@ jobs:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
 
+      # All three engines, because this suite's subject is per-engine
+      # behaviour. #5087 (a blank new tab) reproduces only in WebKit, #5106 (a
+      # dead click) only in Firefox, and the #3818 escape guard passes
+      # VACUOUSLY in Chromium — there the escape dies a step earlier, so the
+      # assertion runs against an empty set and the header it exists to protect
+      # could be deleted with the suite still green. A chromium-only matrix is
+      # how #5087 shipped green in the first place.
       - name: Install Playwright browsers
         working-directory: crates/core/tests/playwright
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install --with-deps chromium firefox webkit
 
       - name: Clean test directories
         run: rm -rf /tmp/freenet /tmp/freenet-* 2>/dev/null || true

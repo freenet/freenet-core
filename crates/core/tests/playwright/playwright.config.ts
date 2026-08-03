@@ -40,10 +40,25 @@ export default defineConfig({
     // Capture console + page errors for the CSP-violation assertions.
     ignoreHTTPSErrors: true,
   },
+  // All three engines. This suite exists because the shell's behaviour differs
+  // BETWEEN engines: #5087 (blank new tab) reproduces only in WebKit, #5106
+  // (dead click) only in Firefox, and the #3818 sandbox-escape guard in
+  // shell.spec.ts passes vacuously in Chromium — there the escape is refused a
+  // step earlier, so the assertion runs against an empty set and the header it
+  // guards could be deleted with the run still green. Only Firefox actually
+  // exercises it. A chromium-only matrix is how #5087 shipped green.
   projects: [
     {
       name: "chromium",
       use: { ...devices["Desktop Chrome"] },
+    },
+    {
+      name: "firefox",
+      use: { ...devices["Desktop Firefox"] },
+    },
+    {
+      name: "webkit",
+      use: { ...devices["Desktop Safari"] },
     },
   ],
 });

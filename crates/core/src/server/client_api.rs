@@ -50,14 +50,65 @@ const SHELL_PAGE_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; fr
 /// notifications via `ServiceWorkerRegistration.showNotification()` instead.
 const NOTIFY_SW_JS: &str = include_str!("path_handlers/assets/notify_sw.js");
 
+/// The `sandbox` CSP directive served with EVERY response that carries
+/// contract-authored bytes, so their opaque origin is decided here rather than
+/// by whichever browsing context happens to embed them.
+///
+/// # Why this is not redundant with the iframe `sandbox` attribute
+///
+/// The attribute only constrains the frame *the shell creates*. Since the shell
+/// iframe carries `allow-popups-to-escape-sandbox` (needed so `target="_blank"`
+/// opens a real tab in every browser — see `navigation_interceptor.js`), a
+/// contract can obtain a browsing context that the attribute does not reach:
+///
+/// 1. from a click, `window.open('about:blank')` — the popup escapes the
+///    sandbox, so it is a top-level context with NO sandboxing flags, and its
+///    `about:blank` document inherits the opener's origin, so the contract can
+///    script it;
+/// 2. in that popup, `document.write` an `<iframe src="…/contract/web/KEY/…">`.
+///    That is a *nested* navigable, not a top-level document, so it carries
+///    `Sec-Fetch-Dest: iframe` — and because its parent has no sandboxing
+///    flags, it inherits none;
+/// 3. the contract's own bytes therefore execute at the node's REAL origin:
+///    `localStorage` (the hosted per-user access key), same-origin `fetch` of
+///    any node route including another app's shell page and its auth token.
+///
+/// Confirmed reproducible in chromium, firefox and webkit before this header
+/// existed; blocked in all three after. Step 2 works with any contract asset —
+/// a scriptable `image/svg+xml`, or plain HTML the contract wrote — so gating
+/// on `Sec-Fetch-Dest: document` alone does not close it. That is exactly the
+/// escape #3818 removed `allow-popups-to-escape-sandbox` to prevent, and this
+/// header is what allows the flag back.
+///
+/// The token list mirrors the iframe's `sandbox` attribute so in-frame
+/// behaviour is unchanged: the effective policy is the intersection of the two,
+/// and an app that works framed keeps working. Keep them in sync — the pin is
+/// `shell_page_iframe_sandbox_matches_contract_content_csp` in
+/// `path_handlers.rs`.
+pub(super) const CONTRACT_CONTENT_SANDBOX_CSP: &str = "sandbox allow-scripts allow-forms allow-popups \
+     allow-popups-to-escape-sandbox allow-downloads allow-modals";
+
+/// The stricter variant for a contract asset loaded as a TOP-LEVEL document.
+///
+/// Nothing legitimate lands there — HTML sub-paths are routed to the shell and
+/// `?__sandbox=1` top-level loads are redirected, so what remains is a URL a
+/// contract navigated a tab to. An opaque origin alone would already deny it
+/// the node's data; withholding `allow-scripts` additionally denies it a
+/// scripted full-page UI displayed under the node's own address.
+const CONTRACT_DOCUMENT_SANDBOX_CSP: &str = "sandbox";
+
 /// Content-Security-Policy served with the sandboxed iframe that actually
 /// runs a webapp. The iframe has an opaque (null) origin because the
 /// sandbox attribute omits `allow-same-origin`, so CSP `'self'` would not
 /// match the local API server's origin. We therefore interpolate the
 /// concrete origin derived from the request Host header.
+///
+/// Prefixed with `CONTRACT_CONTENT_SANDBOX_CSP` so the opaque origin survives
+/// being embedded somewhere other than the shell's own iframe — see that
+/// constant for the attack it closes.
 fn sandbox_csp_for_origin(origin: &str) -> String {
     format!(
-        "default-src {origin} 'unsafe-inline' 'unsafe-eval' blob: data:; connect-src {origin} blob: data:"
+        "{CONTRACT_CONTENT_SANDBOX_CSP}; default-src {origin} 'unsafe-inline' 'unsafe-eval' blob: data:; connect-src {origin} blob: data:"
     )
 }
 
@@ -378,6 +429,7 @@ async fn web_home(
             key,
             api_version,
             None,
+            query_string.as_deref(),
             &req_headers,
             rs,
             &config.webapp_cache,
@@ -522,6 +574,7 @@ async fn web_subpages(
             key,
             api_version,
             Some(&last_path),
+            query_string.as_deref(),
             &req_headers,
             request_sender,
             &config.webapp_cache,
@@ -596,6 +649,34 @@ async fn web_subpages(
         Err(e) => e.into_response(),
     };
     add_sandbox_cors_headers(&mut response);
+    // Everything served from here is contract-authored, so it is sandboxed
+    // unconditionally: the node decides its origin, not whichever context
+    // embeds it. See `CONTRACT_CONTENT_SANDBOX_CSP` for why the iframe's
+    // `sandbox` attribute is not sufficient on its own, and why keying this on
+    // `Sec-Fetch-Dest: document` would leave the hole open — a contract that
+    // escapes to an unsandboxed popup embeds these bytes as an `iframe` dest,
+    // not a `document` one.
+    //
+    // Two shapes, because a top-level document is the one case where nothing
+    // legitimate arrives:
+    //   - `document`: no `allow-scripts`. A contract-authored `evil.svg`, served
+    //     as `image/svg+xml`, executes script when it IS the document, and
+    //     `nosniff` does not help — the type is genuinely scriptable.
+    //   - anything else: the full token list, matching the app iframe, so the
+    //     app's own subresources and any HTML it frames itself behave exactly
+    //     as before. On a non-document response the `sandbox` directive has no
+    //     effect at all (it applies to documents and workers), so this is inert
+    //     for scripts, styles and images; it is the `iframe`/`embed`/`object`
+    //     and header-less cases it is there for.
+    let sandbox_csp = if fetch_dest == "document" {
+        CONTRACT_DOCUMENT_SANDBOX_CSP
+    } else {
+        CONTRACT_CONTENT_SANDBOX_CSP
+    };
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_static(sandbox_csp),
+    );
     Ok(response)
 }
 
@@ -622,7 +703,7 @@ fn redirect_to_shell_root(
     api_version: ApiVersion,
     query_string: Option<&str>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
-    let shell_url = build_canonical_shell_url(key, api_version, query_string)?;
+    let shell_url = build_canonical_shell_url(key, api_version, None, query_string)?;
     Ok(axum::response::Redirect::to(&shell_url).into_response())
 }
 
@@ -648,6 +729,7 @@ fn redirect_to_shell_root(
 pub(super) fn build_canonical_shell_url(
     key: &str,
     api_version: ApiVersion,
+    sub_path: Option<&str>,
     query_string: Option<&str>,
 ) -> Result<String, WebSocketApiError> {
     if key.is_empty() {
@@ -670,23 +752,100 @@ pub(super) fn build_canonical_shell_url(
         })
         .filter(|s| !s.is_empty());
 
+    // A sub-path lands the shell on the page that was actually requested
+    // instead of the contract root. Sanitized with the SAME check `shell_page`
+    // applies before interpolating it into the iframe `data-src`, so a crafted
+    // path cannot break out of the URL's path component and into the `Location`
+    // header (`?`, `#`, control chars, CRLF, `.`/`..` segments are all
+    // rejected).
+    let sub_path = sub_path
+        .filter(|sp| !sp.is_empty())
+        .map(path_handlers::sanitize_shell_sub_path)
+        .transpose()?
+        .unwrap_or_default();
+
     let prefix = api_version.prefix();
     Ok(match filtered_query {
-        Some(qs) => format!("/{prefix}/contract/web/{key}/?{qs}"),
-        None => format!("/{prefix}/contract/web/{key}/"),
+        Some(qs) => format!("/{prefix}/contract/web/{key}/{sub_path}?{qs}"),
+        None => format!("/{prefix}/contract/web/{key}/{sub_path}"),
     })
+}
+
+/// Builds a 303 redirect to the shell for a specific contract SUB-PAGE,
+/// preserving the inbound query minus the sensitive params.
+///
+/// Used when a `?__sandbox=1` URL is loaded as a top-level document. Redirecting
+/// to the contract ROOT there is lossy in a way users notice: an app that opens
+/// its own current page in a new tab (`window.open(location.href)`, or a
+/// hash-only open that inherits `__sandbox=1` from the base) lands on the
+/// contract root with its query dropped — losing, for example, an invitation
+/// parameter. Before #5100 the interceptor's `window.open` override hid this by
+/// stripping `__sandbox` and forwarding the clean URL; the override is gone, so
+/// the server has to land the redirect on the right page itself.
+fn redirect_to_shell_sub_page(
+    key: &str,
+    api_version: ApiVersion,
+    sub_path: Option<&str>,
+    query_string: Option<&str>,
+) -> Result<axum::response::Response, WebSocketApiError> {
+    let shell_url = build_canonical_shell_url(key, api_version, sub_path, query_string)?;
+    Ok(axum::response::Redirect::to(&shell_url).into_response())
 }
 
 /// Query parameters that must be stripped before forwarding a user URL
 /// into the shell. `__sandbox` is a server-interpreted routing flag;
 /// `authToken` is the shell's auth credential and must only come from
 /// `AuthToken::generate()`, never from an attacker-controlled URL.
-fn is_sensitive_query_param(param: &str) -> bool {
+///
+/// The NAME is percent-decoded before the check. A raw prefix match is
+/// bypassable by encoding one character of the name — `authT%6Fken=evil`
+/// survives it, and `new URLSearchParams(...).get("authToken")` in the iframe
+/// then returns `evil`, which is exactly the webapp-reads-its-credential-from-
+/// `location.search` case this exists to prevent. Only the name is decoded; the
+/// value is forwarded byte-for-byte, since re-encoding it could break a signed
+/// or opaque app parameter.
+pub(super) fn is_sensitive_query_param(param: &str) -> bool {
     // Prefix-match so variants like `__sandbox_debug` or `authTokenExtra`
     // (from a future refactor or an adversarial URL) are also stripped.
-    // Matches the filter in `path_handlers::shell_page` that forwards
-    // query params into the iframe.
-    param.starts_with("__sandbox") || param.starts_with("authToken")
+    // Shared with `path_handlers::shell_page`, which forwards query params into
+    // the iframe — the two filters used to be separate copies of this rule.
+    let name = param.split('=').next().unwrap_or(param);
+    let decoded = percent_decode_ascii(name);
+    decoded.starts_with("__sandbox") || decoded.starts_with("authToken")
+}
+
+/// Percent-decodes the ASCII escapes in a query-parameter NAME so it can be
+/// compared against a literal. Deliberately minimal: invalid escapes are left
+/// as-is (they cannot form the names we are looking for), and non-ASCII bytes
+/// are passed through, because the only decision this feeds is a prefix match
+/// against two ASCII literals.
+fn percent_decode_ascii(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // Read the two hex digits as BYTES. Slicing `&s[i + 1..i + 3]` would
+        // panic whenever `%` is followed by a multi-byte character (`%é`), and
+        // a query string is attacker-controlled on every request.
+        if let (Some(b'%'), Some(hi), Some(lo)) = (
+            bytes.get(i).copied(),
+            bytes.get(i + 1).copied(),
+            bytes.get(i + 2).copied(),
+        ) {
+            if let (Some(hi), Some(lo)) = ((hi as char).to_digit(16), (lo as char).to_digit(16)) {
+                out.push((hi as u8 * 16 + lo as u8) as char);
+                i += 3;
+                continue;
+            }
+        }
+        // Byte-wise passthrough: a non-ASCII byte becomes its Latin-1 char.
+        // That mangles multi-byte text, which is fine and deliberate — the only
+        // consumer prefix-compares the result against two ASCII literals, and a
+        // mangled non-ASCII name cannot equal either.
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
 
 /// Returns true if a contract sub-path request is a top-level HTML
@@ -727,10 +886,12 @@ fn is_html_page(path: &str) -> bool {
 /// Includes `Sec-Fetch-Dest` check: if a sandbox URL is loaded as a top-level
 /// document (e.g. pasted in the address bar), redirect to the shell page instead
 /// of serving raw sandbox content outside the iframe.
+#[allow(clippy::too_many_arguments)]
 async fn serve_sandbox_response(
     key: String,
     api_version: ApiVersion,
     sub_path: Option<&str>,
+    query_string: Option<&str>,
     req_headers: &axum::http::HeaderMap,
     request_sender: HttpClientApiRequest,
     webapp_cache: &path_handlers::WebappCache,
@@ -742,7 +903,13 @@ async fn serve_sandbox_response(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if fetch_dest == "document" {
-        return redirect_to_shell_root(&key, api_version, None);
+        // Land on the requested page, not the contract root — see
+        // `redirect_to_shell_sub_page`. A sub-path the sanitizer rejects falls
+        // back to the root rather than erroring: this branch exists to keep raw
+        // sandbox content off a top-level document, and that job is done by
+        // redirecting at all, whatever the target.
+        return redirect_to_shell_sub_page(&key, api_version, sub_path, query_string)
+            .or_else(|_| redirect_to_shell_root(&key, api_version, query_string));
     }
 
     let contract_response = match path_handlers::serve_sandbox_content(
@@ -768,6 +935,15 @@ async fn serve_sandbox_response(
             // internal filesystem paths, config, or secrets.
             let mut response = e.into_response();
             add_sandbox_cors_headers(&mut response);
+            // The body reflects the request path, so sandbox it too rather than
+            // reasoning about whether the current error renderer can be coaxed
+            // into emitting markup. Origin-CSP is skipped (there is no contract
+            // content to load subresources for); the sandbox directive is the
+            // part that matters.
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_SECURITY_POLICY,
+                axum::http::HeaderValue::from_static(CONTRACT_CONTENT_SANDBOX_CSP),
+            );
             return Ok(response);
         }
     };
@@ -1199,6 +1375,69 @@ mod tests {
         );
     }
 
+    /// The contract HTML served into the app frame must carry the `sandbox`
+    /// directive itself, not merely inherit the iframe attribute.
+    ///
+    /// The attribute governs only the frame the shell creates. A contract that
+    /// escapes to a popup it controls (possible since the iframe regained
+    /// `allow-popups-to-escape-sandbox`) can re-embed this very response in an
+    /// unsandboxed context; without the header the app's own HTML then runs at
+    /// the node's real origin, with `localStorage` and same-origin `fetch`.
+    /// That is the #3818 escape, and it needs no SVG or other exotic type —
+    /// the contract's ordinary index page is enough.
+    ///
+    /// Pin the directive first, and the token list second: the tokens must
+    /// match the iframe's `sandbox` attribute, because the effective policy is
+    /// the INTERSECTION of the two. A token missing here silently withdraws a
+    /// capability from every contract app (dropping `allow-forms` breaks every
+    /// form; dropping `allow-popups` breaks the new-tab fix this shipped with).
+    #[test]
+    fn sandbox_csp_sandboxes_the_contract_document_itself() {
+        let csp = sandbox_csp_for_origin("http://127.0.0.1:7509");
+        let sandbox = csp
+            .split(';')
+            .map(str::trim)
+            .find(|d| d.starts_with("sandbox"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "contract content must be served a `sandbox` CSP directive so its \
+                     opaque origin does not depend on who embeds it (#3818); got: {csp}"
+                )
+            });
+        assert_eq!(
+            sandbox, CONTRACT_CONTENT_SANDBOX_CSP,
+            "the contract document's sandbox tokens must match the app iframe's \
+             `sandbox` attribute exactly — the effective policy is the intersection, \
+             so any token dropped here is withdrawn from every contract app"
+        );
+        // No `allow-same-origin`: that single token would hand the contract the
+        // node's real origin directly and undo the whole isolation model.
+        assert!(
+            !sandbox.contains("allow-same-origin"),
+            "allow-same-origin would give contract content the node's own origin"
+        );
+
+        // The top-level-document policy is STRICTER, and must be pinned against
+        // something other than itself. `web_subpages_sandboxes_contract_assets`
+        // compares the served header to this constant, so widening the constant
+        // moves both sides together and nothing goes red — verified by mutation:
+        // setting it equal to CONTRACT_CONTENT_SANDBOX_CSP left the whole suite
+        // green. What it uniquely buys is that a contract-authored `evil.svg`
+        // navigated to directly cannot run script, and cannot paint a scripted
+        // full-page UI under the node's own address.
+        assert!(
+            !CONTRACT_DOCUMENT_SANDBOX_CSP.contains("allow-scripts"),
+            "a contract asset loaded as a TOP-LEVEL document must not be allowed \
+             to run script: nothing legitimate arrives there, and the opaque \
+             origin alone would still leave a scripted page under the node's URL"
+        );
+        assert!(
+            !CONTRACT_DOCUMENT_SANDBOX_CSP.contains("allow-same-origin"),
+            "allow-same-origin would give a navigated-to contract asset the \
+             node's own origin"
+        );
+    }
+
     /// The sandbox iframe has an opaque (null) origin because the sandbox
     /// attribute omits `allow-same-origin`, so CSP `'self'` wouldn't match
     /// the local API server. `sandbox_csp_for_origin` must interpolate the
@@ -1604,6 +1843,285 @@ mod tests {
             "even an error subresource response must carry the sandbox CORS header, \
              otherwise the null-origin iframe surfaces it as an opaque CORS error"
         );
+        // The Err arm of the route gets the sandbox directive too. Its sibling
+        // test drives only Ok responses, so without this a header attached to
+        // just one arm would go unnoticed — mutation-confirmed.
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_SECURITY_POLICY)
+                .map(|v| v.to_str().unwrap_or("")),
+            Some(CONTRACT_CONTENT_SANDBOX_CSP),
+            "the error arm must be sandboxed as well: the body reflects the \
+             request path and the response is reachable from a context we do \
+             not control (#3818)"
+        );
+    }
+
+    /// Guard for the companion fix that lets `allow-popups-to-escape-sandbox`
+    /// back onto the app iframe (#3818).
+    ///
+    /// The flag is what makes `target="_blank"` open a real tab in Firefox as
+    /// well as Chrome/Safari, and it costs the iframe `sandbox` attribute its
+    /// standing as the thing that keeps contract bytes off the node's origin: a
+    /// contract can escape to a popup it fully controls and re-embed its own
+    /// assets there, unsandboxed. So the sandbox is served as a HEADER on every
+    /// response carrying contract bytes — see `CONTRACT_CONTENT_SANDBOX_CSP`
+    /// for the full three-step attack and the cross-engine reproduction.
+    ///
+    /// The cases below are the ones a narrower guard gets wrong. Keying on
+    /// `Sec-Fetch-Dest: document`, which is where this started, covers only the
+    /// pasted-URL shape and misses the nested-navigable shape the escape
+    /// actually uses. `document` keeps the stricter no-`allow-scripts` policy
+    /// because nothing legitimate arrives there; everything else gets the app
+    /// iframe's own token list so in-frame behaviour is untouched.
+    #[tokio::test]
+    async fn web_subpages_sandboxes_contract_assets() {
+        // Unique non-zero key so the cold-cache error path can't collide with
+        // another test on the process-global webapp cache.
+        let key = {
+            use freenet_stdlib::prelude::ContractInstanceId;
+            let mut bytes = [0u8; 32];
+            bytes[0] = 0x3a;
+            bytes[1] = 0x56;
+            ContractInstanceId::new(bytes).to_string()
+        };
+
+        // Non-HTML, so `should_serve_shell_for_subpage` is false and every case
+        // below reaches `variable_content`. An empty `dest` means "no
+        // `Sec-Fetch-Dest` header at all", which is its own case.
+        let subpage_dest = |dest: &'static str| {
+            let key = key.clone();
+            async move {
+                let mut headers = axum::http::HeaderMap::new();
+                if !dest.is_empty() {
+                    headers.insert("sec-fetch-dest", dest.parse().unwrap());
+                }
+                web_subpages(
+                    key,
+                    "evil.svg".to_string(),
+                    ApiVersion::V1,
+                    None,
+                    headers,
+                    &localhost_config(),
+                    dead_request_sender(),
+                    false,
+                )
+                .await
+                .expect("web_subpages must respond, not propagate")
+            }
+        };
+
+        let csp = |resp: &axum::response::Response| {
+            resp.headers()
+                .get(axum::http::header::CONTENT_SECURITY_POLICY)
+                .map(|v| v.to_str().unwrap_or("").to_string())
+        };
+
+        // Top-level document load of a scriptable asset: opaque origin, no script.
+        assert_eq!(
+            csp(&subpage_dest("document").await).as_deref(),
+            Some(CONTRACT_DOCUMENT_SANDBOX_CSP),
+            "a contract asset loaded as a top-level document must be sandboxed, \
+             or a contract-authored SVG runs script at the node's own origin"
+        );
+
+        // A NESTED navigable is the one the escaped-popup attack uses: the
+        // contract writes `<iframe src=…>` into an unsandboxed popup it owns,
+        // and the request carries `Sec-Fetch-Dest: iframe`, not `document`.
+        // Gating on `document` alone left contract bytes executing at the
+        // node's real origin — reproduced in all three engines. It must be
+        // sandboxed, but WITH `allow-scripts`, because this is also how an app
+        // frames its own HTML sub-page from inside the shell.
+        for dest in ["iframe", "frame", "embed", "object"] {
+            assert_eq!(
+                csp(&subpage_dest(dest).await).as_deref(),
+                Some(CONTRACT_CONTENT_SANDBOX_CSP),
+                "a contract asset loaded as a `{dest}` navigable must still be \
+                 sandboxed: an escaped popup embeds it exactly this way, and \
+                 without the header it runs at the node's own origin (#3818)"
+            );
+        }
+
+        // A client that sends no `Sec-Fetch-Dest` at all (curl, and browsers
+        // predating Fetch Metadata) must not be the way around it either. CSP
+        // is inert for non-browsers, so this costs them nothing.
+        assert_eq!(
+            csp(&subpage_dest("").await).as_deref(),
+            Some(CONTRACT_CONTENT_SANDBOX_CSP),
+            "a request without `Sec-Fetch-Dest` must fail CLOSED: the header is \
+             the only signal, and an older browser that omits it would otherwise \
+             be served unsandboxed contract bytes"
+        );
+
+        // Subresource fetches are sandboxed too, which is INERT for them — the
+        // `sandbox` directive applies to documents and workers, not to an image
+        // or a stylesheet. Asserting it here keeps the rule "every response on
+        // this route carries the header" simple enough to hold, rather than an
+        // allow-list of destinations that a new dest name would silently escape.
+        assert_eq!(
+            csp(&subpage_dest("image").await).as_deref(),
+            Some(CONTRACT_CONTENT_SANDBOX_CSP),
+            "the header is unconditional on this route"
+        );
+    }
+
+    /// A percent-encoded parameter NAME must not slip the sensitive-param
+    /// filter. `authT%6Fken=evil` reads back as `authToken` from
+    /// `new URLSearchParams(location.search)` inside the iframe, which is
+    /// precisely the "webapp reads its credential from `location.search`" case
+    /// the filter exists for; a raw `starts_with` never sees it.
+    #[test]
+    fn sensitive_query_params_are_matched_after_decoding_the_name() {
+        for evil in [
+            "authT%6Fken=evil",
+            "%61uthToken=evil",
+            "%5F%5Fsandbox=1",
+            "__sandbo%78=1",
+            "%61uthTokenExtra=evil",
+        ] {
+            assert!(
+                is_sensitive_query_param(evil),
+                "{evil} must be stripped: the browser decodes the name before a \
+                 webapp reads it back"
+            );
+        }
+        // Ordinary app params are untouched, including ones that merely
+        // CONTAIN an escape in their value.
+        for ok in [
+            "invitation=abc",
+            "room=%2Fpath",
+            "q=authToken",
+            "myauthToken=x",
+        ] {
+            assert!(!is_sensitive_query_param(ok), "{ok} must be preserved");
+        }
+        // A malformed escape is not a decode, and must not become one.
+        assert!(!is_sensitive_query_param("auth%zzToken=x"));
+        // Multi-byte characters around a `%` must not panic: a query string is
+        // attacker-controlled on every request, and byte-slicing the two hex
+        // digits would land mid-character.
+        for odd in [
+            // 3-byte char after `%`: byte index i+3 lands INSIDE it, so a
+            // `&str` slice of the two hex digits panics. Reachable with one
+            // unauthenticated GET carrying raw non-ASCII in the query — hyper
+            // accepts it, browsers just never send it.
+            "%\u{20ac}=1",
+            "a%\u{20ac}b=1",
+            // 4-byte char.
+            "%\u{1f600}=1",
+            "%é=1",
+            "auth%é=1",
+            "%",
+            "%2",
+            "a%",
+            "%e2%82%ac=1",
+            "authToken%=1",
+            "π=1",
+        ] {
+            let _ = is_sensitive_query_param(odd);
+        }
+        // …and one that must still be caught despite the neighbouring escape.
+        assert!(is_sensitive_query_param("authT%6Fken%é=1"));
+    }
+
+    /// Regression test for the sub-page loss that removing the `window.open`
+    /// override exposed (#5100 review).
+    ///
+    /// An app that opens its own current page in a new tab — `window.open(
+    /// location.href)`, or a hash-only open that inherits `__sandbox=1` from
+    /// the base — now reaches the server as a TOP-LEVEL document load of a
+    /// `?__sandbox=1` URL. That must not be served raw (it is contract HTML
+    /// outside its iframe), so it redirects; the bug is redirecting to the
+    /// contract ROOT, which silently drops both the page and the app's own
+    /// query params. The deleted override used to hide this by stripping
+    /// `__sandbox` client-side and forwarding the clean URL.
+    ///
+    /// `__sandbox` and `authToken` must still be stripped from the target:
+    /// this URL is attacker-reachable (a pasted deep link), and the shell must
+    /// mint its own token rather than adopt one from the URL.
+    #[tokio::test]
+    async fn top_level_sandbox_url_redirects_to_the_same_page_not_the_root() {
+        let key = {
+            use freenet_stdlib::prelude::ContractInstanceId;
+            let mut bytes = [0u8; 32];
+            bytes[0] = 0x3a;
+            bytes[1] = 0x57;
+            ContractInstanceId::new(bytes).to_string()
+        };
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("sec-fetch-dest", "document".parse().unwrap());
+        let config = localhost_config();
+
+        let resp = serve_sandbox_response(
+            key.clone(),
+            ApiVersion::V1,
+            Some("rooms/index.html"),
+            Some("__sandbox=1&invitation=abc&authToken=stolen"),
+            &headers,
+            dead_request_sender(),
+            &config.webapp_cache,
+        )
+        .await
+        .expect("a top-level sandbox URL must redirect, not error");
+
+        let location = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .expect("redirect carries a Location")
+            .to_string();
+
+        assert_eq!(
+            location,
+            format!("/v1/contract/web/{key}/rooms/index.html?invitation=abc"),
+            "the redirect must land on the requested page with the app's own \
+             query preserved, and must strip `__sandbox` and `authToken`"
+        );
+    }
+
+    /// A sub-path the shell sanitizer rejects must still redirect — the point
+    /// of this branch is that raw sandbox content never becomes a top-level
+    /// document, and that holds whatever the redirect target is. Falling back
+    /// to the contract root is the safe answer; erroring would turn a hostile
+    /// URL into a 400 that leaks nothing but also serves the user nothing.
+    #[tokio::test]
+    async fn top_level_sandbox_url_with_an_unusable_sub_path_falls_back_to_root() {
+        let key = {
+            use freenet_stdlib::prelude::ContractInstanceId;
+            let mut bytes = [0u8; 32];
+            bytes[0] = 0x3a;
+            bytes[1] = 0x58;
+            ContractInstanceId::new(bytes).to_string()
+        };
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("sec-fetch-dest", "document".parse().unwrap());
+        let config = localhost_config();
+
+        for bad in ["../escape/index.html", "a\rb/index.html"] {
+            let resp = serve_sandbox_response(
+                key.clone(),
+                ApiVersion::V1,
+                Some(bad),
+                Some("__sandbox=1"),
+                &headers,
+                dead_request_sender(),
+                &config.webapp_cache,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("`{bad}` must redirect, not error: {e:?}"));
+
+            let location = resp
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert_eq!(
+                location,
+                format!("/v1/contract/web/{key}/"),
+                "`{bad}` must fall back to the contract root"
+            );
+        }
     }
 
     /// Companion regression for the OTHER symmetric CORS-on-error branch: an
@@ -1614,7 +2132,7 @@ mod tests {
     /// `NodeError("Contract not cached yet")`) via a cold cache + dead sender;
     /// no `Sec-Fetch-Dest: document`, so it does NOT take the redirect branch.
     #[tokio::test]
-    async fn serve_sandbox_response_error_carries_cors_header() {
+    async fn serve_sandbox_response_error_carries_cors_and_sandbox_headers() {
         // Unique non-zero key so this cold-cache assertion can't collide with
         // another test on the process-global webapp cache.
         let key = {
@@ -1631,6 +2149,7 @@ mod tests {
             key,
             ApiVersion::V1,
             Some("page.html"),
+            None,
             &headers,
             dead_request_sender(),
             &config.webapp_cache,
@@ -1652,6 +2171,18 @@ mod tests {
             Some("*"),
             "the sandbox-HTML error branch must carry the CORS header too, \
              otherwise the null-origin iframe surfaces it as an opaque CORS error"
+        );
+        // …and the sandbox directive, for the same reason the success branch
+        // carries it: the body reflects the request path, and this response is
+        // reachable from a context we do not control once popups can escape the
+        // sandbox. Cheaper to sandbox every response on the route than to keep
+        // re-deriving whether the current error renderer can emit markup.
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_SECURITY_POLICY)
+                .map(|v| v.to_str().unwrap_or("")),
+            Some(CONTRACT_CONTENT_SANDBOX_CSP),
+            "the sandbox-HTML error branch must also be sandboxed (#3818)"
         );
     }
 
