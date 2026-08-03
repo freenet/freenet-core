@@ -4387,6 +4387,8 @@ async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Res
 mod tests {
     use httptest::{Expectation, Server, matchers::*, responders::*};
 
+    use std::collections::BTreeSet;
+
     use crate::node::NodeConfig;
     use crate::transport::TransportKeypair;
 
@@ -4593,6 +4595,17 @@ shutdown-drain-secs = 42
         );
         assert!(cfg.is_gateway);
         assert_eq!(cfg.max_blocking_threads, 17);
+        // Single-word keys, so this change cannot move them — but they are the
+        // operator's key material, and nothing else in these tests asserts they
+        // still bind.
+        assert_eq!(
+            cfg.secrets.nonce_path.as_deref(),
+            Some(Path::new("/tmp/freenet-5124/secrets/nonce"))
+        );
+        assert_eq!(
+            cfg.secrets.cipher_path.as_deref(),
+            Some(Path::new("/tmp/freenet-5124/secrets/delegate_cipher"))
+        );
         // Keys that were always kebab-case, spot-checked so the documents are
         // exercised beyond the renamed set.
         assert_eq!(cfg.network_api.congestion_control, "bbr");
@@ -4655,10 +4668,13 @@ shutdown-drain-secs = 42
     /// remembering to extend a document — which is the exact discipline that
     /// failed and produced this bug.
     ///
-    /// Runs against [`config_with_every_field_seeded`], whose no-`..` struct
-    /// literal will not compile until a new field is given a value, so fields
-    /// carrying `skip_serializing_if` are emitted here rather than silently
-    /// skipped and left uninspected.
+    /// Limit worth knowing: this compares re-serialized bytes, so it can only
+    /// see a lost binding whose value DIFFERS from what the field falls back
+    /// to. A field seeded to its own default round-trips identically and slips
+    /// past — see [`config_with_every_field_seeded`]'s seeding contract, and
+    /// the set-equality check in
+    /// `emitted_config_toml_keys_keep_their_released_spelling`, which catches
+    /// that case for any always-emitted key regardless of its value.
     #[tokio::test]
     async fn every_emitted_config_key_is_also_accepted_in_kebab_case() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -4667,10 +4683,17 @@ shutdown-drain-secs = 42
 
         let emitted = toml::to_string(&seeded).unwrap();
         let table: toml::Table = toml::from_str(&emitted).unwrap();
-        let kebabbed: toml::Table = table
-            .iter()
-            .map(|(key, value)| (key.replace('_', "-"), value.clone()))
-            .collect();
+        let mut kebabbed = toml::Table::new();
+        for (key, value) in &table {
+            // Not `.collect()`: that would silently swallow a future pair of
+            // keys that kebab to the same string, dropping one from the check.
+            assert!(
+                kebabbed
+                    .insert(key.replace('_', "-"), value.clone())
+                    .is_none(),
+                "two emitted keys collide when hyphenated, at `{key}`"
+            );
+        }
 
         let renamed = table.keys().filter(|k| k.contains('_')).count();
         assert!(
@@ -4706,28 +4729,113 @@ shutdown-drain-secs = 42
     /// rollback could restore already accepts the new one. This release makes
     /// the hyphenated spellings accepted; #5130 flips what is emitted, one
     /// release later. Until then this guard fails if the emitted format moves.
+    /// The number of keys #5127 shipped emitting with an underscore.
+    ///
+    /// Pinned as a literal ON PURPOSE, and separately from
+    /// [`CONFIG_KEY_SPELLINGS`], because the table alone cannot guard itself:
+    /// deleting a row makes the guard blind to that key, and deleting the row
+    /// *and* moving the key's emitted spelling leaves the table
+    /// self-consistent. Both were demonstrated green against an earlier version
+    /// of this test. #5130 is exactly the change that edits the table — row by
+    /// row, as it flips each key — so the failure mode is one row removed a
+    /// release early.
+    ///
+    /// Lowering this number means the node now writes a key under a spelling
+    /// shipped releases cannot read. Do it only as part of #5130's rollout,
+    /// having confirmed the release rollback would restore already accepts the
+    /// new spelling.
+    const KEYS_EMITTED_WITH_AN_UNDERSCORE: usize = 21;
+
     #[tokio::test]
     async fn emitted_config_toml_keys_keep_their_released_spelling() {
         let temp_dir = tempfile::tempdir().unwrap();
         let base = clap_bare_args(temp_dir.path()).build().await.unwrap();
+        // Everything in the table must actually be emitted for this guard to
+        // see it; `transport_keypair` is the one key sourced from the real
+        // build rather than the seed, so assert the premise instead of
+        // skipping it — a filter would fail open if `build()` ever stopped
+        // setting it.
+        assert!(
+            base.secrets.transport_keypair_path.is_some(),
+            "the seeded config must carry a transport_keypair path, or this \
+             guard silently stops covering that key"
+        );
         let seeded = config_with_every_field_seeded(&base);
         let table: toml::Table = toml::from_str(&toml::to_string(&seeded).unwrap()).unwrap();
 
-        let missing: Vec<&str> = UNDERSCORED_EMITTED_KEYS
-            .iter()
-            .map(|(underscored, _)| *underscored)
-            // `transport_keypair` comes from the real build's secrets, which
-            // only sets the path when one was configured; skip when unset.
-            .filter(|key| {
-                *key != "transport_keypair" || base.secrets.transport_keypair_path.is_some()
-            })
-            .filter(|key| !table.contains_key(*key))
+        let emitted_underscored: BTreeSet<&str> = table
+            .keys()
+            .filter(|key| key.contains('_'))
+            .map(String::as_str)
             .collect();
+        let tabled: BTreeSet<&str> = CONFIG_KEY_SPELLINGS
+            .iter()
+            .map(|group| group[0])
+            .filter(|key| key.contains('_'))
+            .collect();
+
+        // Set equality, not "every tabled key is emitted": the reverse
+        // direction is what catches a NEW field landing with an underscored
+        // key, and it catches it whatever value it was seeded with — unlike a
+        // round-trip comparison, which cannot see a field whose lost binding
+        // reproduces the same bytes.
+        assert_eq!(
+            emitted_underscored, tabled,
+            "the set of keys WRITTEN with an underscore has changed. A key \
+             here but not in CONFIG_KEY_SPELLINGS is a new field that should \
+             have been named kebab-case from the start; a key there but not \
+             here means the emitted spelling MOVED, which breaks crash-loop \
+             rollback (#4073) — see this test's rustdoc and #5130."
+        );
+        assert_eq!(
+            CONFIG_KEY_SPELLINGS.len(),
+            KEYS_EMITTED_WITH_AN_UNDERSCORE,
+            "CONFIG_KEY_SPELLINGS changed size; read \
+             KEYS_EMITTED_WITH_AN_UNDERSCORE's rustdoc before touching it"
+        );
+    }
+
+    /// ROLLBACK SAFETY, the operator-edit direction: a config hand-written in
+    /// kebab-case is normalized back to the emitted spelling on the first boot.
+    ///
+    /// That is what keeps an operator's edit from creating a file only new
+    /// binaries can read — the same brick #4073 would otherwise hit, arrived at
+    /// from the other side. It is a consequence of writing `Config` back out
+    /// rather than an explicit mechanism, so it is easy to remove by accident;
+    /// pinned so #5130 has to do it deliberately.
+    #[tokio::test]
+    async fn a_kebab_written_config_is_normalized_to_the_emitted_spelling() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+        let kebab = kebab_config_toml()
+            .lines()
+            .filter(|line| {
+                !["transport-keypair = ", "nonce = ", "cipher = "]
+                    .iter()
+                    .any(|key| line.starts_with(key))
+            })
+            // Point the paths at the temp dir so the build does not touch the
+            // developer's real data directories.
+            .map(|line| line.replace("/tmp/freenet-5124", &dir.display().to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.join("config.toml"), kebab).unwrap();
+
+        clap_bare_args(dir).build().await.unwrap();
+
+        let rewritten: toml::Table =
+            toml::from_str(&std::fs::read_to_string(dir.join("config.toml")).unwrap()).unwrap();
+        for group in CONFIG_KEY_SPELLINGS {
+            let (emitted, kebab) = (group[0], group[1]);
+            assert!(
+                !rewritten.contains_key(kebab) || kebab == emitted,
+                "`{kebab}` survived the write-back; a released binary cannot \
+                 read it, so a rollback onto one would not start"
+            );
+        }
         assert!(
-            missing.is_empty(),
-            "these keys are no longer WRITTEN under the spelling shipped \
-             releases read, which breaks crash-loop rollback (#4073): \
-             {missing:?}. See this test's rustdoc and #5130."
+            rewritten.contains_key("log_level"),
+            "the rewritten file must use the emitted spelling"
         );
     }
 
@@ -5892,9 +6000,24 @@ shutdown-drain-secs = 42
     ///  - `emitted_config_toml_keys_keep_their_released_spelling` — is the key
     ///    it is WRITTEN under still the one older releases can read? (#5124)
     ///
-    /// Seeding every `Option` to `Some` matters for the latter two: a field
-    /// carrying `skip_serializing_if` emits no key when unset, and a key that
-    /// is never emitted is a key neither guard can inspect.
+    /// # Seed every field to a NON-DEFAULT value, and every `Option` to `Some`
+    ///
+    /// The compile gate forces you to write *a* value; it cannot force a
+    /// *distinct* one, and that is the difference between the guards working
+    /// and passing vacuously:
+    ///
+    ///  - An `Option` carrying `skip_serializing_if` that is seeded `None`
+    ///    emits no key at all, so no guard can inspect it. This is the one
+    ///    residual hole — nothing but this paragraph stops it.
+    ///  - A field seeded to the value it would fall back to anyway round-trips
+    ///    byte-identically, so the round-trip guard cannot see a lost binding.
+    ///    (The set-equality check in
+    ///    `emitted_config_toml_keys_keep_their_released_spelling` does catch
+    ///    this for any field that is always emitted, whatever it was seeded
+    ///    with.)
+    ///
+    /// `secrets` is the known exception: it is taken from the real build rather
+    /// than seeded, so `nonce` is absent whenever the build left it unset.
     fn config_with_every_field_seeded(base: &Config) -> Config {
         Config {
             mode: OperationMode::Local,
