@@ -221,10 +221,12 @@ pub(crate) struct NetworkEfficiencyV1 {
     ///     small-lane entry being queued, and that population widened with the
     ///     lane definition (large-state delta sends are now small-lane
     ///     entries), so all three move for a second reason as well.
-    ///   * active-key overflow was structurally unreachable pre-fix (in-flight
-    ///     sends were capped by the 12+2 permits, far under the 256-key cap);
-    ///     it is now reachable only by the lane-correction parking area, so a
-    ///     non-zero value means mispredicted sends piled up.
+    ///   * active-key overflow STAYS structurally unreachable, but for a new
+    ///     reason: in-flight sends were capped by the 12+2 permits, and are now
+    ///     capped by those plus the lane-correction parking area (12), still an
+    ///     order of magnitude under the 256-key cap. It remains a pure invariant
+    ///     check — a non-zero value means a leaked tracking guard, NOT a
+    ///     scheduling backlog.
     ///   * enqueue-while-pair-active keeps its definition, but the window it
     ///     samples — how long a pair stays in `active` — now includes any
     ///     lane-correction wait, so it inflates for a reason unrelated to
