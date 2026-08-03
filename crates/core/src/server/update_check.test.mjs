@@ -85,6 +85,7 @@ function harness(initialNow) {
     // Only the ordering matters here, not real semver parsing.
     compareSemver: (a, bb) => (String(a) === String(bb) ? 0 : 1),
     showBadge: (t) => state.badges.push(t),
+    onError: () => {},
     fetchLatest: () => {
       state.fetches++;
       return state.respond();
@@ -113,6 +114,7 @@ function harness(initialNow) {
       setItem: (k, v) => state.store.set(k, v),
       compareSemver: () => 1,
       showBadge: (t) => state.badges.push(t),
+      onError: () => {},
       fetchLatest: () => {
         state.fetches++;
         return Promise.reject(new Error('HTTP 429'));
@@ -144,6 +146,7 @@ function harness(initialNow) {
       setItem: (k, v) => state.store.set(k, v),
       compareSemver: () => 1,
       showBadge: (t) => state.badges.push(t),
+      onError: () => {},
       fetchLatest: () => {
         state.fetches++;
         return Promise.resolve({ tag_name: 'v9.9.9' });
@@ -176,6 +179,7 @@ function harness(initialNow) {
     setItem: (k, v) => state.store.set(k, v),
     compareSemver: () => 1,
     showBadge: (t) => state.badges.push(t),
+    onError: () => {},
     fetchLatest: () => {
       state.fetches++;
       return Promise.resolve({ tag_name: 'v9.9.9' });
@@ -229,6 +233,7 @@ function harness(initialNow) {
     },
     compareSemver: () => 1,
     showBadge: () => {},
+    onError: () => {},
     fetchLatest: () => {
       fetches++;
       return Promise.resolve({ tag_name: 'v9.9.9' });
@@ -238,6 +243,67 @@ function harness(initialNow) {
   ok(
     outcome === 'fetched' && fetches === 1,
     'private-mode storage failures degrade to no caching rather than throwing',
+  );
+}
+
+// --- 7. The badge is withheld unless the tag is strictly newer ---------------
+// dashboard.js lists this under "tested behaviorally", and it was not: every
+// harness stubbed compareSemver to always return 1, so no test ever drove it to
+// <= 0 and nothing asserted the badge is NOT shown. Claiming coverage you do not
+// have is the same failure this PR is about, in miniature.
+{
+  const mk = (cmp) => {
+    const badges = [];
+    const store = new Map();
+    return {
+      badges,
+      checker: createUpdateChecker({
+        now: () => 1_000,
+        getItem: (k) => (store.has(k) ? store.get(k) : null),
+        setItem: (k, v) => store.set(k, v),
+        compareSemver: () => cmp,
+        showBadge: (t) => badges.push(t),
+        onError: () => {},
+        fetchLatest: () => Promise.resolve({ tag_name: 'v0.2.118' }),
+      }),
+    };
+  };
+
+  const older = mk(-1);
+  await older.checker.check('0.2.118');
+  ok(older.badges.length === 0, 'an OLDER fetched tag must not show the badge');
+
+  const same = mk(0);
+  await same.checker.check('0.2.118');
+  ok(same.badges.length === 0, 'an EQUAL fetched tag must not show the badge');
+
+  const newer = mk(1);
+  await newer.checker.check('0.2.118');
+  ok(newer.badges.length === 1, 'a strictly NEWER fetched tag shows the badge');
+}
+
+// --- 8. A cached newer tag still shows the badge on a later load -------------
+// Test 3 asserted the 'cached' outcome and the request count but never that the
+// badge actually renders from cache — so a regression that served the cache and
+// silently skipped the badge would have passed.
+{
+  const store = new Map();
+  const badges = [];
+  const mk = (nowAt) =>
+    createUpdateChecker({
+      now: () => nowAt,
+      getItem: (k) => (store.has(k) ? store.get(k) : null),
+      setItem: (k, v) => store.set(k, v),
+      compareSemver: () => 1,
+      showBadge: (t) => badges.push(t),
+      onError: () => {},
+      fetchLatest: () => Promise.resolve({ tag_name: 'v9.9.9' }),
+    });
+  await mk(2_000).check('0.2.118');
+  await mk(2_000 + 60_000).check('0.2.118');
+  ok(
+    badges.length === 2 && badges[1] === 'v9.9.9',
+    'a cache hit still renders the badge, not just returns early',
   );
 }
 

@@ -259,9 +259,12 @@ function createUpdateChecker(deps) {
         if (deps.compareSemver(tag, current) > 0) deps.showBadge(tag);
         return 'fetched';
       })
-      .catch(function () {
+      .catch(function (e) {
         /* Network blocked / GitHub rate-limited (403/429) — go quiet for
-           FAIL_TTL_MS rather than retrying on every page load. */
+           FAIL_TTL_MS rather than retrying on every page load. Keep the debug
+           line: it is the only client-side signal for a silently missing badge,
+           and its sibling checkVersionMismatch() still logs one. */
+        deps.onError(e);
         return rememberFailure();
       });
   }
@@ -290,6 +293,9 @@ function checkForUpdate() {
     },
     compareSemver: compareSemver,
     showBadge: showUpdateBadge,
+    onError: function (e) {
+      console.debug('Update check failed:', e);
+    },
     fetchLatest: function () {
       return fetch(
         'https://api.github.com/repos/freenet/freenet-core/releases/latest',

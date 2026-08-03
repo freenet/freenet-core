@@ -374,7 +374,12 @@ impl UpdateCommand {
         //     REST quota once per crash), and
         //   * `--check`, which never installs by definition.
         let latest_tag = probe_latest_tag(self.force, self.quiet).await?;
-        let latest_version = latest_tag.as_str();
+        // `latest_tag` is the tag verbatim (`v0.2.118`); `latest_version` is its
+        // semver part. Both are kept: the version is what we compare and what
+        // the rollback/pin bookkeeping keys on, while the RAW tag is what
+        // addresses the release. Deriving the URL by re-adding a `v` instead
+        // would 404 for any tag the strip/re-add round trip does not reproduce.
+        let latest_version = super::auto_update::version_from_tag(&latest_tag);
         if !self.quiet {
             println!("Latest version: {}", latest_version);
         }
@@ -457,7 +462,7 @@ impl UpdateCommand {
         // gnu→musl fallback search and the macOS DMG lookup). Requested by exact
         // tag rather than `/releases/latest` so we install the release we just
         // decided about, even if a newer one is published in between.
-        let latest = fetch_release_assets(latest_version, self.quiet).await?;
+        let latest = fetch_release_assets(&latest_tag, self.quiet).await?;
         // #4073 per-target-version install-failure gate. Count a DETERMINISTIC
         // install failure of this version — a checksum mismatch or invalid
         // release signature (`ReleaseVerificationError`) — toward the gate. After
@@ -1223,6 +1228,22 @@ async fn probe_latest_tag(force: bool, quiet: bool) -> Result<String> {
     // `--force` (an explicit operator action) bypasses OUR local self-restraint —
     // both this token bucket and the cached rate-limit cooldown below. It does
     // NOT bypass a live 403/429 from GitHub, which is still honoured.
+    // Cooldown before the token, for the same reason as the node path: a
+    // token spent during a cooldown we will not act on just delays recovery
+    // once the cooldown lifts. `--force` waives both.
+    if !force {
+        if let Some(remaining) = super::auto_update::github_cooldown_remaining_public() {
+            let rate_limited = super::auto_update::GithubRateLimitedError {
+                retry_after: Some(remaining),
+            };
+            if !quiet {
+                eprintln!("{}", rate_limited.user_message());
+            }
+            tracing::warn!("Update check deferred: {}", rate_limited.user_message());
+            std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
+        }
+    }
+
     if !force && !super::auto_update::try_consume_install_poll() {
         if !quiet {
             eprintln!(
@@ -1279,7 +1300,9 @@ async fn probe_latest_tag(force: bool, quiet: bool) -> Result<String> {
 /// rather than `latest` so the assets we install match the version we decided to
 /// install, even if a new release lands between the probe and here.
 async fn fetch_release_assets(tag: &str, quiet: bool) -> Result<Release> {
-    let url = format!("{GITHUB_API_TAG_URL_PREFIX}v{tag}");
+    // `tag` is verbatim from the redirect, so it is used as-is — no `v` is
+    // re-added. See `version_from_tag` for why the round trip was removed.
+    let url = format!("{GITHUB_API_TAG_URL_PREFIX}{tag}");
 
     let client = reqwest::Client::builder()
         .user_agent(super::auto_update::GITHUB_USER_AGENT)
@@ -1310,12 +1333,24 @@ async fn fetch_release_assets(tag: &str, quiet: bool) -> Result<Release> {
         });
         // Exit as up-to-date rather than returning an error, matching
         // `probe_latest_tag`. Being rate-limited is "we could not find out", not
-        // "the install failed": bailing here would propagate a hard error out of
-        // `freenet update`, which the supervisor sees as a failed update — so an
-        // external limit, caused by any other client sharing this IP, could push
-        // a healthy node toward the #3934 lockout. It also previously flattened
-        // the typed `GithubRateLimitedError` into a string, so no caller could
-        // tell this apart from a genuine install failure.
+        // "the install failed".
+        //
+        // The mechanism that makes this matter is the macOS launchd wrapper
+        // (`service/macos.rs`): it counts CONSECUTIVE_FAILURES on a non-zero
+        // updater exit and, past MAX_CONSECUTIVE_FAILURES, `give_up_if_failing`
+        // exits 0 — which under `SuccessfulExit=false` STOPS the node
+        // permanently. Exit code 2 (ALREADY_UP_TO_DATE) is explicitly exempt
+        // there. So without this, a rate limit caused by any other client
+        // sharing the IP could take a perfectly healthy node offline for good.
+        //
+        // (An earlier version of this comment blamed the #3934 lockout counter.
+        // That was wrong and a reviewer traced it: `classify_update_subprocess`
+        // maps this to `OtherFailure` -> `NoChange`, deliberately not counting
+        // transient network errors. The macOS path is the real hazard, and a
+        // bigger one.)
+        //
+        // It also previously flattened the typed `GithubRateLimitedError` into a
+        // string, so no caller could tell it from a genuine install failure.
         if !quiet {
             eprintln!("{}", rate_limited.user_message());
         }

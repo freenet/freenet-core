@@ -152,8 +152,19 @@ pub(crate) const GITHUB_USER_AGENT: &str = "freenet-updater";
 ///
 /// Accepts absolute (`https://github.com/o/r/releases/tag/v1.2.3`) and relative
 /// (`/o/r/releases/tag/v1.2.3`) forms, tolerates a trailing slash, and strips
-/// any `?`/`#` suffix. Returns the tag with a leading `v` removed, or `None` if
-/// the header does not look like a release-tag redirect at all.
+/// any `?`/`#` suffix.
+///
+/// Returns the tag **verbatim** (`v1.2.3`, not `1.2.3`). Callers wanting a
+/// semver string use [`version_from_tag`]; callers addressing the release over
+/// the API use the tag as-is. Keeping the raw form removes a strip-then-re-add
+/// round trip: an earlier version stripped here and rebuilt the URL with
+/// `format!("v{tag}")`, which silently 404s for any tag the round trip does not
+/// reproduce exactly — a bare `1.2.3`, or `vv1.2.3` under the greedy
+/// `trim_start_matches` it used.
+///
+/// Returns `None` when the header is not a release-tag redirect, or when the tag
+/// carries no version at all (`.../releases/tag/v`) — never a bogus version,
+/// since one parsing as newer would drive a pointless exit-42 update cycle.
 ///
 /// Pure so the parsing contract is unit-testable without touching the network.
 pub(crate) fn parse_tag_from_release_location(location: &str) -> Option<String> {
@@ -164,10 +175,20 @@ pub(crate) fn parse_tag_from_release_location(location: &str) -> Option<String> 
         .unwrap_or(after)
         .trim_end_matches('/')
         .trim();
-    if tag.is_empty() {
+    if tag.is_empty() || version_from_tag(tag).is_empty() {
         return None;
     }
-    Some(tag.trim_start_matches('v').to_string())
+    Some(tag.to_string())
+}
+
+/// The semver-comparable part of a release tag: `v1.2.3` -> `1.2.3`.
+///
+/// Uses `strip_prefix`, which removes **at most one** leading `v` — unlike
+/// `trim_start_matches`, which is greedy and would turn `vv1.2.3` into `1.2.3`,
+/// losing what is needed to address the release again. `update.rs` already
+/// documents this exact hazard on `macos_dmg_asset_name`.
+pub(crate) fn version_from_tag(tag: &str) -> &str {
+    tag.strip_prefix('v').unwrap_or(tag)
 }
 
 /// Whether a status means "GitHub is rate-limiting this IP".
@@ -638,34 +659,87 @@ pub(crate) enum ProbeResult {
 pub(crate) async fn probe_release_tag_at(url: &str) -> Result<ProbeResult> {
     let client = reqwest::Client::builder()
         .user_agent(GITHUB_USER_AGENT)
-        // We want the `Location` header, not the page it points at: following the
-        // redirect would download the whole HTML release page for a value that is
-        // already in the header.
+        // We want the `Location` header, not the page it points at: following
+        // blindly would download the whole HTML release page for a value already
+        // in the header. Hops are instead followed SELECTIVELY below, only when
+        // a redirect does not carry a tag.
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(10))
         .build()?;
 
-    let response = client.get(url).send().await?;
-    let status = response.status();
-    let header = |name: &str| {
-        response
-            .headers()
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned)
-    };
-    let location = header("location");
+    let mut current = url.to_string();
 
-    Ok(match classify_probe_response(status, location.as_deref()) {
-        ProbeOutcome::Tag(tag) => ProbeResult::Tag(tag),
-        ProbeOutcome::RateLimited => ProbeResult::RateLimited {
-            retry_after: parse_retry_after(header),
-        },
-        ProbeOutcome::Unusable => ProbeResult::Unusable {
-            status: status.as_u16(),
-            location,
-        },
+    for _ in 0..=MAX_PROBE_REDIRECTS {
+        let response = client.get(&current).send().await?;
+        let status = response.status();
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let location = header("location");
+
+        match classify_probe_response(status, location.as_deref()) {
+            ProbeOutcome::Tag(tag) => return Ok(ProbeResult::Tag(tag)),
+            ProbeOutcome::RateLimited => {
+                return Ok(ProbeResult::RateLimited {
+                    retry_after: parse_retry_after(header),
+                });
+            }
+            ProbeOutcome::Unusable => {
+                // A redirect whose Location carries NO tag is the repository
+                // RENAME case — and it is not hypothetical for this project:
+                // `github.com/freenet/locutus/releases/latest` still answers 301
+                // to `.../freenet-core/releases/latest` today. Refusing to follow
+                // it would mean that the day this repo is renamed or transferred,
+                // detection dies on every deployed node at once, and the only
+                // mechanism that could ship the fix is the one that broke.
+                //
+                // The REST endpoint this replaced survived a rename for free,
+                // because reqwest follows redirects by default; `Policy::none()`
+                // is what took that away, so it has to be given back — bounded,
+                // so a redirect loop cannot hang the probe.
+                match location
+                    .as_deref()
+                    .and_then(|loc| resolve_redirect_target(&current, loc))
+                {
+                    Some(next) if status.is_redirection() => {
+                        tracing::debug!(from = %current, to = %next, "following release redirect");
+                        current = next;
+                    }
+                    _ => {
+                        return Ok(ProbeResult::Unusable {
+                            status: status.as_u16(),
+                            location,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(ProbeResult::Unusable {
+        status: 0,
+        location: Some(format!("redirect limit ({MAX_PROBE_REDIRECTS}) exceeded")),
     })
+}
+
+/// Hops followed when a redirect carries no release tag (the rename case in
+/// [`probe_release_tag_at`]). Small: GitHub needs one for a rename, and an
+/// unbounded chain is a hang.
+const MAX_PROBE_REDIRECTS: usize = 3;
+
+/// Resolve a `Location` against the URL it came from, so relative headers work.
+/// `None` if the result is not a usable absolute HTTP(S) URL — we never follow a
+/// redirect out of HTTP(S).
+fn resolve_redirect_target(current: &str, location: &str) -> Option<String> {
+    let next = reqwest::Url::parse(current).ok()?.join(location).ok()?;
+    match next.scheme() {
+        "http" | "https" => Some(next.into()),
+        _ => None,
+    }
 }
 
 /// What a release-probe response means.
@@ -699,6 +773,13 @@ pub(crate) fn classify_probe_response(
     if is_rate_limited_status(status) {
         return ProbeOutcome::RateLimited;
     }
+    // A tag is believed only from a redirect or a success. An error response
+    // that happens to carry a `/releases/tag/` Location is not a release
+    // announcement, and treating it as one would let a broken or hostile
+    // intermediary hand us a version.
+    if !(status.is_redirection() || status.is_success()) {
+        return ProbeOutcome::Unusable;
+    }
     match location.and_then(parse_tag_from_release_location) {
         Some(tag) => ProbeOutcome::Tag(tag),
         None => ProbeOutcome::Unusable,
@@ -715,12 +796,26 @@ async fn get_latest_version() -> Result<String> {
     // `get_latest_release`. A denied poll returns Err so the caller
     // (`check_if_update_available`) treats it as `RateLimited` and retries later
     // — the node keeps running, it just does not poll GitHub this tick.
+    // Cooldown FIRST, token second. The reverse order wastes a token on every
+    // 60s tick of a cooldown we were never going to act on: the
+    // GithubRateLimitedError arm deliberately records no check time and grows no
+    // backoff, so the loop re-enters every tick, drains the 8-token bucket in
+    // ~8 minutes, and then keeps detection throttled for ~10 more minutes per
+    // token after GitHub would already have accepted a free request.
+    if let Some(remaining) = github_cooldown_remaining() {
+        return Err(GithubRateLimitedError {
+            retry_after: Some(remaining),
+        }
+        .into());
+    }
+
     if !try_consume_node_poll() {
         return Err(RateLimitedError.into());
     }
 
     // Never bypasses the cooldown: this is the automated path, and the whole
-    // point of the cooldown is to keep it quiet while the IP is limited.
+    // point of the cooldown is to keep it quiet while the IP is limited. (The
+    // check above already returned; the flag covers the re-check inside.)
     fetch_latest_release_tag(false).await
 }
 
@@ -1091,9 +1186,23 @@ const DEFAULT_GITHUB_COOLDOWN: Duration = Duration::from_secs(900);
 /// Remaining cooldown at `now_unix`, if any. Pure over an explicit directory and
 /// clock so the expiry arithmetic is unit-testable.
 ///
-/// A stored instant further out than [`MAX_GITHUB_COOLDOWN`] is clamped rather
-/// than trusted: a backwards clock step or a torn write must not be able to
-/// disable auto-update indefinitely.
+/// A stored instant further out than [`MAX_GITHUB_COOLDOWN`] is treated as
+/// **corrupt and ignored**, not clamped.
+///
+/// The distinction is load-bearing and was originally got wrong, in a way two
+/// independent reviewers caught only after it had shipped. Clamping the
+/// *returned* value (`Some(remaining.min(MAX))`) leaves the *stored* deadline
+/// untouched, so a far-future `until` reports "6 hours left" at every future
+/// instant — forever. It never expires, nothing else rewrites the file, and the
+/// automated path never bypasses it, so auto-update on that node is dead
+/// permanently and silently. A dead RTC, a BIOS reset, or a restored VM snapshot
+/// is enough to write such a deadline.
+///
+/// Ignoring it makes the bound real: a nonsensical deadline behaves as no
+/// deadline, and the worst case is one extra poll rather than a node that can
+/// never update again. This is the AGENTS.md "cleanup exemptions MUST be
+/// time-bounded" rule — the bound has to apply to the persisted marker, not just
+/// to whatever the getter happens to return.
 pub(crate) fn github_cooldown_remaining_at(
     dir: &std::path::Path,
     now_unix: u64,
@@ -1104,10 +1213,18 @@ pub(crate) fn github_cooldown_remaining_at(
         .parse::<u64>()
         .ok()?;
     let remaining = until.checked_sub(now_unix)?;
-    if remaining == 0 {
+    if remaining == 0 || remaining > MAX_GITHUB_COOLDOWN.as_secs() {
+        // Expired, or further out than any cooldown we would ever legitimately
+        // write. Both mean: not cooling down.
         return None;
     }
-    Some(Duration::from_secs(remaining).min(MAX_GITHUB_COOLDOWN))
+    Some(Duration::from_secs(remaining))
+}
+
+/// Public wrapper so the installer path can consult the cooldown before it
+/// spends an install token (see `update::probe_latest_tag`).
+pub(crate) fn github_cooldown_remaining_public() -> Option<Duration> {
+    github_cooldown_remaining()
 }
 
 /// Live-clock, live-state-dir variant of [`github_cooldown_remaining_at`].
@@ -2074,12 +2191,48 @@ mod tests {
     ///
     /// Bounding to the function body converts that silent pass into a LOUD
     /// failure: a moved anchor is no longer inside the body, so the caller's
-    /// `.expect()` panics. Prefer this over a bare `split_once` for any pin that
-    /// means "within function F".
+    /// `.expect()` panics.
+    ///
+    /// **Only valid for free functions at column 0.** The end anchor is the first
+    /// `\n}\n`, which for a method inside an `impl` is the *impl block's* closing
+    /// brace — silently returning every sibling method (measured: `run_async` and
+    /// `download_and_install` in `update.rs` each balloon to the whole ~650-line
+    /// `impl UpdateCommand`). The assertion below rejects that outright rather
+    /// than returning a wrong answer.
+    ///
+    /// **Prefer a cross-file scrape where possible.** A pin living in
+    /// `auto_update.rs` that scrapes `update.rs` cannot be satisfied by its own
+    /// assertion literal at all — a structural guarantee rather than a check
+    /// somebody has to remember.
     fn fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
-        let (_, after) = src
-            .split_once(signature)
+        let at = src
+            .find(signature)
             .unwrap_or_else(|| panic!("definition not found: {signature}"));
+        // Only valid for FREE functions at column 0. A method's closing brace is
+        // indented, so the first `\n}\n` after it is the enclosing `impl`'s —
+        // which silently balloons the region across every sibling method (all six
+        // methods of `impl UpdateCommand` slice to the same ~650-line block) and
+        // is invisible to the `#[cfg(test)]` detector below. Refuse rather than
+        // return a wrong answer.
+        // The failure that caused #5103 was the ANCHOR falling through into the
+        // test module and matching the pin's own string literal. The
+        // `#[cfg(test)]` check below cannot see that case — by then the region
+        // starts *after* the attribute, so it is never inside it. Catch it here
+        // instead, by position.
+        if let Some(tests_at) = src.find("#[cfg(test)]") {
+            assert!(
+                at < tests_at,
+                "`{signature}` matched inside the test module — this pin is \
+                 scraping its own source and would pass vacuously"
+            );
+        }
+        assert!(
+            at == 0 || src.as_bytes()[at - 1] == b'\n',
+            "fn_body only supports column-0 free functions; `{signature}` is \
+             indented (a method?), where the `\\n}}\\n` end-anchor would slice to \
+             the end of the enclosing impl instead"
+        );
+        let after = &src[at + signature.len()..];
         let (body, _) = after
             .split_once("\n}\n")
             .unwrap_or_else(|| panic!("could not locate end of: {signature}"));
@@ -2300,13 +2453,13 @@ mod tests {
                 "https://github.com/freenet/freenet-core/releases/tag/v0.2.118"
             )
             .as_deref(),
-            Some("0.2.118"),
-            "the leading 'v' must be stripped, matching the old tag_name handling"
+            Some("v0.2.118"),
+            "the tag is returned VERBATIM; `version_from_tag` does the stripping"
         );
         // Relative form — permitted by RFC 7231 even though GitHub sends absolute.
         assert_eq!(
             parse_tag_from_release_location("/freenet/freenet-core/releases/tag/v1.2.3").as_deref(),
-            Some("1.2.3")
+            Some("v1.2.3")
         );
         // A tag without the conventional 'v' must survive intact.
         assert_eq!(
@@ -2318,12 +2471,12 @@ mod tests {
         assert_eq!(
             parse_tag_from_release_location("https://github.com/o/r/releases/tag/v1.2.3/")
                 .as_deref(),
-            Some("1.2.3")
+            Some("v1.2.3")
         );
         assert_eq!(
             parse_tag_from_release_location("https://github.com/o/r/releases/tag/v1.2.3?x=1")
                 .as_deref(),
-            Some("1.2.3")
+            Some("v1.2.3")
         );
     }
 
@@ -2488,12 +2641,42 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let now = 1_785_700_000;
 
-        // A far-future deadline (backwards clock step, torn write) is clamped
-        // rather than trusted, so the node resumes checking within hours.
+        // A far-future deadline (dead RTC, BIOS reset, restored VM snapshot,
+        // torn write) must be IGNORED, not clamped.
+        //
+        // The original version of this assertion expected `Some(MAX_GITHUB_COOLDOWN)`
+        // under a test named "cannot disable updates forever" — but that value is
+        // precisely what the buggy code returned at EVERY future instant, so it
+        // pinned the defect rather than its absence, while its name told the next
+        // maintainer the case was handled. Two independent reviewers found the
+        // real bug only after it shipped. The rewrite below proves expiry the
+        // only way that actually works: by ADVANCING THE CLOCK and requiring None.
         fs::write(tmp.path().join(GITHUB_COOLDOWN_FILE), u64::MAX.to_string()).unwrap();
         assert_eq!(
             github_cooldown_remaining_at(tmp.path(), now),
+            None,
+            "a nonsensical far-future deadline must read as 'not cooling down'"
+        );
+
+        // A deadline just past the maximum is equally untrustworthy...
+        let over = now + MAX_GITHUB_COOLDOWN.as_secs() + 1;
+        fs::write(tmp.path().join(GITHUB_COOLDOWN_FILE), over.to_string()).unwrap();
+        assert_eq!(github_cooldown_remaining_at(tmp.path(), now), None);
+
+        // ...while one exactly at the maximum is legitimate (it is what
+        // `record_github_cooldown_at` writes at its own clamp) and is honoured.
+        let at_max = now + MAX_GITHUB_COOLDOWN.as_secs();
+        fs::write(tmp.path().join(GITHUB_COOLDOWN_FILE), at_max.to_string()).unwrap();
+        assert_eq!(
+            github_cooldown_remaining_at(tmp.path(), now),
             Some(MAX_GITHUB_COOLDOWN)
+        );
+        // And it genuinely EXPIRES as the clock advances — the property the old
+        // assertion never checked, and the one whose absence was the bug.
+        assert_eq!(github_cooldown_remaining_at(tmp.path(), at_max), None);
+        assert_eq!(
+            github_cooldown_remaining_at(tmp.path(), at_max + 10_000),
+            None
         );
 
         // Unparseable content fails OPEN (no cooldown): the token buckets still
@@ -2513,7 +2696,7 @@ mod tests {
             let status = reqwest::StatusCode::from_u16(code).unwrap();
             assert_eq!(
                 classify_probe_response(status, loc),
-                ProbeOutcome::Tag("0.2.118".to_string()),
+                ProbeOutcome::Tag("v0.2.118".to_string()),
                 "status {code} carrying a valid Location must yield the tag"
             );
         }
@@ -2583,12 +2766,19 @@ mod tests {
             "`freenet update --force` must waive the cached cooldown"
         );
 
-        let this_src = include_str!("auto_update.rs");
-        let (_, after) = this_src
-            .split_once("async fn get_latest_version()")
-            .expect("get_latest_version not found");
+        // Scoped with `fn_body`. The first version of THIS test used a bare
+        // `split_once("async fn get_latest_version()")`, which left an 86k-char
+        // region running to EOF — so the only surviving match under the very
+        // mutation it names (`fetch_latest_release_tag(true)`) was the assertion
+        // string on the next line, and it passed. That is the identical
+        // self-satisfying-literal shape this PR exists to remove, written into
+        // the PR that removes it; caught by review, not by me.
+        let body = fn_body(
+            include_str!("auto_update.rs"),
+            "async fn get_latest_version() -> Result<String> {",
+        );
         assert!(
-            after.contains("fetch_latest_release_tag(false)"),
+            body.contains("fetch_latest_release_tag(false)"),
             "the automated node poll must NOT waive the cooldown — staying quiet \
              while the IP is limited is the entire point of it"
         );
@@ -2614,17 +2804,25 @@ mod tests {
             Expectation::matching(request::method_path("GET", "/releases/latest"))
                 // Exactly one request: if the client followed the redirect it
                 // would issue a second one and this expectation would fail.
+                //
+                // The Location is RELATIVE on purpose. With an absolute
+                // github.com URL a client that *did* follow would leave for the
+                // real internet and never return here, so `.times(1)` would still
+                // be satisfied and would prove nothing — and the test would make
+                // a live outbound request, failing misleadingly on an offline
+                // runner. Relative keeps a followed redirect pointed at this
+                // server, where the second request breaks `.times(1)`.
                 .times(1)
-                .respond_with(status_code(302).append_header(
-                    "location",
-                    "https://github.com/freenet/freenet-core/releases/tag/v0.2.118",
-                )),
+                .respond_with(
+                    status_code(302)
+                        .append_header("location", "/freenet/freenet-core/releases/tag/v0.2.118"),
+                ),
         );
 
         let got = probe_release_tag_at(&server.url_str("/releases/latest"))
             .await
             .expect("probe must succeed on a 302 carrying a release Location");
-        assert_eq!(got, ProbeResult::Tag("0.2.118".to_string()));
+        assert_eq!(got, ProbeResult::Tag("v0.2.118".to_string()));
     }
 
     #[tokio::test]
@@ -2687,6 +2885,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn probe_follows_a_repo_rename_redirect() {
+        use httptest::{Expectation, Server, matchers::*, responders::*};
+        // The repository-rename case, and it is real for this project:
+        // github.com/freenet/locutus/releases/latest still answers 301 to
+        // .../freenet-core/releases/latest today. The first hop carries NO tag,
+        // so without following it every deployed node's detection would die the
+        // day the repo is renamed — and the only mechanism that could ship the
+        // fix is the one that broke. The REST endpoint this replaced survived a
+        // rename for free (reqwest follows by default); Policy::none() took that
+        // away, so the probe gives it back, bounded.
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/old/releases/latest"))
+                .times(1)
+                .respond_with(status_code(301).append_header("location", "/new/releases/latest")),
+        );
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/new/releases/latest"))
+                .times(1)
+                .respond_with(
+                    status_code(302).append_header("location", "/new/releases/tag/v0.2.118"),
+                ),
+        );
+
+        assert_eq!(
+            probe_release_tag_at(&server.url_str("/old/releases/latest"))
+                .await
+                .expect("a rename redirect must resolve, not error"),
+            ProbeResult::Tag("v0.2.118".to_string()),
+            "a redirect whose Location carries no tag must be followed"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_gives_up_on_a_redirect_loop() {
+        use httptest::{Expectation, Server, matchers::*, responders::*};
+        // Following tagless redirects must stay bounded, or a misconfigured or
+        // hostile server hangs the probe (and with it the node's update loop).
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/loop"))
+                .times(..)
+                .respond_with(status_code(302).append_header("location", "/loop")),
+        );
+
+        match probe_release_tag_at(&server.url_str("/loop"))
+            .await
+            .expect("a redirect loop must terminate, not error out")
+        {
+            ProbeResult::Unusable { location, .. } => {
+                assert!(
+                    location.unwrap_or_default().contains("redirect limit"),
+                    "giving up on a loop should say so"
+                );
+            }
+            other => panic!("a redirect loop must end Unusable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn probe_refuses_to_invent_a_version_from_a_non_redirect() {
         use httptest::{Expectation, Server, matchers::*, responders::*};
         // The captive-portal / proxy-interstitial case: a 200 with an HTML body
@@ -2727,7 +2985,49 @@ mod tests {
             probe_release_tag_at(&server.url_str("/releases/latest"))
                 .await
                 .expect("301 must be handled"),
-            ProbeResult::Tag("1.2.3".to_string())
+            ProbeResult::Tag("v1.2.3".to_string())
+        );
+    }
+
+    #[test]
+    fn rate_limited_paths_persist_the_cooldown_and_exit_without_failing() {
+        // #5102/#5104 split the previously-atomic `note_rate_limited_response`
+        // (parse header + persist deadline + build error) into two call sites.
+        // Its own rustdoc warns that a second hand-rolled copy of "parse the
+        // header, persist the deadline" is exactly how one of the two paths
+        // quietly stops backing off — and the split shipped without a test. Pin
+        // all three obligations.
+        let probe_body = fn_body(
+            include_str!("auto_update.rs"),
+            "pub(crate) async fn fetch_latest_release_tag(",
+        );
+        assert!(
+            probe_body.contains("record_github_cooldown(retry_after)"),
+            "the probe path must PERSIST the cooldown, not merely report it — \
+             otherwise the node keeps knocking while GitHub is refusing it"
+        );
+
+        // Both installer paths must exit ALREADY_UP_TO_DATE on a rate limit
+        // rather than returning an error. A non-zero updater exit is counted by
+        // the macOS launchd wrapper's give_up_if_failing, which past its
+        // threshold stops the node PERMANENTLY — so a rate limit caused by
+        // another client sharing the IP could take a healthy node offline for
+        // good. Exit code 2 is explicitly exempt there.
+        let update_src = include_str!("update.rs");
+        let probe = fn_body(update_src, "async fn probe_latest_tag(");
+        assert!(
+            probe.contains("EXIT_CODE_ALREADY_UP_TO_DATE"),
+            "probe_latest_tag must exit ALREADY_UP_TO_DATE when GitHub rate-limits"
+        );
+        let assets = fn_body(update_src, "async fn fetch_release_assets(");
+        assert!(
+            assets.contains("EXIT_CODE_ALREADY_UP_TO_DATE"),
+            "fetch_release_assets must exit ALREADY_UP_TO_DATE when GitHub \
+             rate-limits rather than bail — see the macOS give_up_if_failing path"
+        );
+        assert!(
+            assets.contains("note_rate_limited_response"),
+            "the asset-fetch path must persist the cooldown too"
         );
     }
 

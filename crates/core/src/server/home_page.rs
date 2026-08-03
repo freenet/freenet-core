@@ -2194,6 +2194,23 @@ mod tests {
             "the update-check core must stay a dependency-injected factory so it can \
              be driven under Node without a browser (#5102)"
         );
+
+        // Wiring, not just existence. update_check.test.mjs drives the factory in
+        // ISOLATION, so a refactor that inlined a broken check into
+        // checkForUpdate and orphaned the factory would keep both that test and
+        // the assertions above green while shipping the bug. Pin that the
+        // production entry point actually goes through the tested code.
+        let (_, body) = JS
+            .split_once("function checkForUpdate() {")
+            .expect("checkForUpdate not found");
+        let (body, _) = body
+            .split_once("\n}\n")
+            .expect("could not locate end of checkForUpdate");
+        assert!(
+            body.contains("createUpdateChecker({") && body.contains("checker.check("),
+            "checkForUpdate must delegate to the tested createUpdateChecker factory, \
+             not re-implement the check inline (#5102)"
+        );
     }
 
     // ─── Governance card (Phase 4.5) ───────────────────────────────
