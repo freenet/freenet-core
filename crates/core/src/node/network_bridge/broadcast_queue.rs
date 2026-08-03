@@ -147,8 +147,17 @@ impl SendLanePermit {
     /// state), so treating them as independent events would be wrong.
     ///
     /// While waiting without a permit the send holds no pool capacity and is
-    /// putting nothing on the wire; the in-flight count is then bounded by the
-    /// `active` tracking cap rather than by the pools.
+    /// putting nothing on the wire.
+    ///
+    /// It is NOT, however, bounded by anything. An earlier version of this
+    /// comment said the in-flight count is "bounded by the `active` tracking
+    /// cap rather than by the pools" — it is not: `track_active` reporting full
+    /// does not stop the drain loop dispatching, it only sets `tracked: false`
+    /// for untrack bookkeeping. So the number of senders parked here is
+    /// unbounded, they contend with the large drain worker on the same
+    /// FIFO-fair semaphore, and the large lane can back up into `evict_oldest`.
+    /// Tracked as #5118, with the fan-out-eviction consequence for the #5062
+    /// multiplier written up in `broadcast_payload_mix`'s module docs.
     ///
     /// Cancellation: this is awaited inline by the send that OWNS the
     /// `SendLanePermit`, so dropping that send drops the permit too — mid-wait
