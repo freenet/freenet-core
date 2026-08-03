@@ -371,18 +371,21 @@ const GATEWAY_KEY_SPELLINGS: &[&[&str]] = &[&["public_key", "public-key"]];
 fn redundant_key_spellings(
     groups: &[&[&'static str]],
     source: &str,
-    value_of: impl Fn(&str) -> Option<String>,
+    contains: impl Fn(&str) -> bool,
+    // Separate from `contains` so it runs only on the rare ambiguous path.
+    // Rendering a value goes through `toml::Value`'s `Display`, which carries
+    // an internal `unwrap`, and there is no reason to put that on every boot
+    // over operator-controlled data to build a message almost never shown.
+    value_of: impl Fn(&str) -> String,
 ) -> Vec<&'static str> {
     let mut redundant = Vec::new();
     for group in groups {
-        let mut present = group
-            .iter()
-            .copied()
-            .filter_map(|key| value_of(key).map(|value| (key, value)));
-        let Some((keep, kept_value)) = present.next() else {
+        let mut present = group.iter().copied().filter(|key| contains(key));
+        let Some(keep) = present.next() else {
             continue;
         };
-        for (ignored, ignored_value) in present {
+        for ignored in present {
+            let (kept_value, ignored_value) = (value_of(keep), value_of(ignored));
             // Name both VALUES, not just both keys. The precedence rule spends
             // the operator's newly-typed setting to buy upgrade safety, and
             // this message is the whole of what they get back for it: without
@@ -428,7 +431,7 @@ fn redundant_key_spellings(
 /// run happily for months and then refuse to start the first time freenet.org
 /// was unreachable — the exact outage in which the cache is supposed to save
 /// it, and long after the edit that caused it.
-fn parse_gateways_toml(content: &str) -> Result<Gateways, toml::de::Error> {
+fn parse_gateways_toml(content: &str, source: &str) -> Result<Gateways, toml::de::Error> {
     let mut table = toml::from_str::<toml::Table>(content)?;
     let mut normalized = false;
     if let Some(toml::Value::Array(entries)) = table.get_mut("gateways") {
@@ -436,10 +439,12 @@ fn parse_gateways_toml(content: &str) -> Result<Gateways, toml::de::Error> {
             let Some(map) = entry.as_table_mut() else {
                 continue;
             };
-            let redundant =
-                redundant_key_spellings(GATEWAY_KEY_SPELLINGS, "gateways.toml", |key| {
-                    map.get(key).map(|value| value.to_string())
-                });
+            let redundant = redundant_key_spellings(
+                GATEWAY_KEY_SPELLINGS,
+                source,
+                |key| map.contains_key(key),
+                |key| map[key].to_string(),
+            );
             for key in redundant {
                 map.remove(key);
                 normalized = true;
@@ -508,10 +513,12 @@ impl ConfigArgs {
                         // line/column spans that a Value-level parse loses.
                         let mut table =
                             toml::from_str::<toml::Table>(&content).map_err(invalid_data)?;
-                        let redundant =
-                            redundant_key_spellings(CONFIG_KEY_SPELLINGS, "config.toml", |key| {
-                                table.get(key).map(|value| value.to_string())
-                            });
+                        let redundant = redundant_key_spellings(
+                            CONFIG_KEY_SPELLINGS,
+                            "config.toml",
+                            |key| table.contains_key(key),
+                            |key| table[key].to_string(),
+                        );
                         let mut config = if redundant.is_empty() {
                             toml::from_str::<Config>(&content).map_err(invalid_data)?
                         } else {
@@ -544,7 +551,8 @@ impl ConfigArgs {
                                 redundant_key_spellings(
                                     CONFIG_KEY_SPELLINGS,
                                     "config.json",
-                                    |key| map.get(key).map(|value| value.to_string()),
+                                    |key| map.contains_key(key),
+                                    |key| map[key].to_string(),
                                 )
                             })
                             .unwrap_or_default();
@@ -911,7 +919,7 @@ impl ConfigArgs {
             // them. The remote index still wins; --skip-load-from-network keeps
             // a custom peer set.
             if let Ok(content) = fs::read_to_string(&gateways_file) {
-                if let Ok(local_cache) = parse_gateways_toml(&content) {
+                if let Ok(local_cache) = parse_gateways_toml(&content, "gateways.toml") {
                     let dropped = gateways_dropped_by_remote_replace(
                         &local_cache.gateways,
                         &remotely_loaded_gateways.gateways,
@@ -998,7 +1006,7 @@ impl ConfigArgs {
                 Ok(mut file) => {
                     let mut content = String::new();
                     file.read_to_string(&mut content)?;
-                    parse_gateways_toml(&content).map_err(|e| {
+                    parse_gateways_toml(&content, "gateways.toml").map_err(|e| {
                         std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
                     })?
                 }
@@ -4392,7 +4400,10 @@ async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Res
         .error_for_status()?
         .text()
         .await?;
-    let mut gateways: Gateways = parse_gateways_toml(&response)?;
+    // Name the remote index, not a local file: a duplicate spelling published
+    // there would otherwise have every node on the network tell its operator to
+    // go edit an innocent gateways.toml, on every boot.
+    let mut gateways: Gateways = parse_gateways_toml(&response, url)?;
     let mut base_url = reqwest::Url::parse(url)?;
     base_url.set_path("");
     let mut valid_gateways = Vec::new();
@@ -4872,12 +4883,16 @@ shutdown-drain-secs = 42
         let rewritten: toml::Table =
             toml::from_str(&std::fs::read_to_string(dir.join("config.toml")).unwrap()).unwrap();
         for group in CONFIG_KEY_SPELLINGS {
-            let (emitted, kebab) = (group[0], group[1]);
-            assert!(
-                !rewritten.contains_key(kebab) || kebab == emitted,
-                "`{kebab}` survived the write-back; a released binary cannot \
-                 read it, so a rollback onto one would not start"
-            );
+            let emitted = group[0];
+            // Every alias, not just the first: `public_port` has two, and the
+            // second would otherwise never be checked here.
+            for alias in &group[1..] {
+                assert!(
+                    !rewritten.contains_key(*alias) || *alias == emitted,
+                    "`{alias}` survived the write-back; a released binary \
+                     cannot read it, so a rollback onto one would not start"
+                );
+            }
         }
         assert!(
             rewritten.contains_key("log_level"),
@@ -4984,9 +4999,12 @@ shutdown-drain-secs = 42
         for doc in [RELEASED_CONFIG_TOML.to_string(), kebab_config_toml()] {
             let table: toml::Table = toml::from_str(&doc).unwrap();
             assert!(
-                redundant_key_spellings(CONFIG_KEY_SPELLINGS, "config.toml", |key| table
-                    .get(key)
-                    .map(|value| value.to_string()))
+                redundant_key_spellings(
+                    CONFIG_KEY_SPELLINGS,
+                    "config.toml",
+                    |key| table.contains_key(key),
+                    |key| table[key].to_string()
+                )
                 .is_empty(),
                 "no key is spelled twice here, so nothing may be dropped"
             );
@@ -5099,8 +5117,8 @@ shutdown-drain-secs = 42
             toml::from_str::<Gateways>(doc).is_err(),
             "precondition: raw serde rejects the ambiguous file"
         );
-        let gateways =
-            parse_gateways_toml(doc).expect("a gateways.toml naming one key twice must still load");
+        let gateways = parse_gateways_toml(doc, "gateways.toml")
+            .expect("a gateways.toml naming one key twice must still load");
         assert_eq!(
             gateways.gateways[0].public_key_path,
             PathBuf::from("/tmp/freenet-5124/vega.pub"),
