@@ -1189,7 +1189,7 @@ pub struct Config {
     pub ws_api: WebsocketApiConfig,
     #[serde(flatten)]
     pub secrets: Secrets,
-    #[serde(with = "serde_log_level_filter")]
+    #[serde(with = "serde_log_level_filter", alias = "log-level")]
     pub log_level: tracing::log::LevelFilter,
     #[serde(flatten)]
     config_paths: Arc<ConfigPaths>,
@@ -1197,10 +1197,14 @@ pub struct Config {
     pub(crate) peer_id: Option<PeerId>,
     #[serde(skip)]
     pub(crate) gateways: Vec<GatewayConfig>,
+    #[serde(alias = "is-gateway")]
     pub(crate) is_gateway: bool,
     pub(crate) location: Option<f64>,
     /// Maximum number of threads for blocking operations (WASM execution, etc.).
-    #[serde(default = "default_max_blocking_threads")]
+    #[serde(
+        default = "default_max_blocking_threads",
+        alias = "max-blocking-threads"
+    )]
     pub max_blocking_threads: usize,
     /// Budget in bytes for hosted contract *state*. Once exceeded, contracts
     /// are evicted (least-valuable-first) and their on-disk state reclaimed.
@@ -1734,12 +1738,21 @@ pub struct NetworkApiConfig {
     /// Public external address for the network, mandatory for gateways.
     #[serde(
         rename = "public_network_address",
+        alias = "public-network-address",
         skip_serializing_if = "Option::is_none"
     )]
     pub public_address: Option<IpAddr>,
 
     /// Public external port for the network, mandatory for gateways.
-    #[serde(rename = "public_port", skip_serializing_if = "Option::is_none")]
+    /// Both kebab spellings are accepted: `public-network-port` (which matches
+    /// the `--public-network-port` flag and is the key this will be WRITTEN as
+    /// once #5130 lands) and the direct `public-port`.
+    #[serde(
+        rename = "public_port",
+        alias = "public-network-port",
+        alias = "public-port",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub public_port: Option<u16>,
 
     /// Whether to ignore protocol version compatibility routine while initiating connections.
@@ -1753,7 +1766,7 @@ pub struct NetworkApiConfig {
     ///
     /// If `total_bandwidth_limit` is set, this field is ignored and per-connection rates
     /// are derived from: `total_bandwidth_limit / active_connections`.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "bandwidth-limit", skip_serializing_if = "Option::is_none")]
     pub bandwidth_limit: Option<usize>,
 
     /// Total bandwidth limit across ALL connections (in bytes per second).
@@ -1762,7 +1775,10 @@ pub struct NetworkApiConfig {
     ///
     /// Example: With 50 MB/s total and 5 connections, each gets 10 MB/s.
     /// Default: None (use per-connection `bandwidth_limit` instead)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        alias = "total-bandwidth-limit",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub total_bandwidth_limit: Option<usize>,
 
     /// Minimum bandwidth per connection when using `total_bandwidth_limit` (bytes/sec).
@@ -1770,17 +1786,23 @@ pub struct NetworkApiConfig {
     ///
     /// If `total / N < min`, each connection gets `min` (exceeding total is possible).
     /// Default: 1 MB/s (1,000,000 bytes/second)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        alias = "min-bandwidth-per-connection",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub min_bandwidth_per_connection: Option<usize>,
 
     /// List of IP:port addresses to refuse connections to/from.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "blocked-addresses", skip_serializing_if = "Option::is_none")]
     pub blocked_addresses: Option<HashSet<SocketAddr>>,
 
     /// Capacity for the event loop notification and op execution channels.
     /// Default: 2048. Increase under sustained multi-client load to reduce
     /// channel saturation and associated context-switch spikes.
-    #[serde(default = "default_event_loop_channel_capacity")]
+    #[serde(
+        default = "default_event_loop_channel_capacity",
+        alias = "event-loop-channel-capacity"
+    )]
     pub event_loop_channel_capacity: usize,
 
     /// Maximum number of concurrent transient connections accepted by a gateway.
@@ -1855,7 +1877,7 @@ pub struct NetworkApiConfig {
     /// neither, the on-disk gateways.toml is still read — the test-harness
     /// contract preserved for callers like freenet-test-network's Docker NAT
     /// path that pre-populate the file in a custom `--config-dir`.
-    #[serde(default)]
+    #[serde(default, alias = "skip-load-from-network")]
     pub skip_load_from_network: bool,
 }
 
@@ -2697,20 +2719,27 @@ impl ConfigPathsArgs {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigPaths {
+    #[serde(alias = "contracts-dir")]
     contracts_dir: PathBuf,
+    #[serde(alias = "delegates-dir")]
     delegates_dir: PathBuf,
+    #[serde(alias = "secrets-dir")]
     secrets_dir: PathBuf,
+    #[serde(alias = "db-dir")]
     db_dir: PathBuf,
+    #[serde(alias = "event-log")]
     event_log: PathBuf,
+    #[serde(alias = "data-dir")]
     data_dir: PathBuf,
+    #[serde(alias = "config-dir")]
     config_dir: PathBuf,
-    #[serde(default = "get_log_dir")]
+    #[serde(default = "get_log_dir", alias = "log-dir")]
     log_dir: Option<PathBuf>,
     /// Relocated wasmtime compile-cache directory (#4683). `#[serde(default)]`
     /// so a `config.toml` persisted before this field existed deserializes with
     /// an empty path; `build()` always re-derives the real one from the data
     /// dir, so the persisted value is never load-bearing.
-    #[serde(default)]
+    #[serde(default, alias = "wasmtime-cache-dir")]
     wasmtime_cache_dir: PathBuf,
 }
 
@@ -4238,6 +4267,356 @@ mod tests {
 
     use super::*;
 
+    // ---------------------------------------------------------------------
+    // #5124 — `config.toml` key convention.
+    //
+    // Keys in `config.toml` mix hyphens and underscores with no pattern
+    // distinguishing them (`total-bandwidth-limit` and `bandwidth_limit` sit
+    // adjacent in the same file), so a setting nobody can spell is a setting
+    // nobody can use. Step 1 makes EVERY key accept its kebab-case spelling,
+    // so any guess works. Emitting one consistent spelling is step 2 (#5130) —
+    // see `emitted_config_toml_keys_keep_their_released_spelling` for why the
+    // two cannot land together.
+    // ---------------------------------------------------------------------
+
+    /// Every `config.toml` key that a release has EMITTED with an underscore,
+    /// paired with the kebab-case spelling now also accepted for it.
+    ///
+    /// The left-hand column is the on-disk format as shipped: it is what the
+    /// node still writes, and changing that is #5130's job, not this table's.
+    /// The right-hand column is what an operator gets to type instead.
+    const UNDERSCORED_EMITTED_KEYS: &[(&str, &str)] = &[
+        ("public_network_address", "public-network-address"),
+        // Also accepts the direct `public-port`; see the field's rustdoc.
+        ("public_port", "public-network-port"),
+        ("bandwidth_limit", "bandwidth-limit"),
+        ("total_bandwidth_limit", "total-bandwidth-limit"),
+        (
+            "min_bandwidth_per_connection",
+            "min-bandwidth-per-connection",
+        ),
+        ("blocked_addresses", "blocked-addresses"),
+        ("event_loop_channel_capacity", "event-loop-channel-capacity"),
+        ("skip_load_from_network", "skip-load-from-network"),
+        ("transport_keypair", "transport-keypair"),
+        ("log_level", "log-level"),
+        ("contracts_dir", "contracts-dir"),
+        ("delegates_dir", "delegates-dir"),
+        ("secrets_dir", "secrets-dir"),
+        ("db_dir", "db-dir"),
+        ("event_log", "event-log"),
+        ("data_dir", "data-dir"),
+        ("config_dir", "config-dir"),
+        ("log_dir", "log-dir"),
+        ("wasmtime_cache_dir", "wasmtime-cache-dir"),
+        ("is_gateway", "is-gateway"),
+        ("max_blocking_threads", "max-blocking-threads"),
+    ];
+
+    /// A `config.toml` in the exact spelling releases write, with every
+    /// optional key set to a value distinct from its default — so a key that
+    /// fails to bind shows up as a wrong value rather than a coincidental
+    /// match against a default.
+    const RELEASED_CONFIG_TOML: &str = r#"
+mode = "network"
+network-address = "0.0.0.0"
+network-port = 31338
+public_network_address = "203.0.113.7"
+public_port = 31339
+bandwidth_limit = 3000001
+total_bandwidth_limit = 2000002
+min_bandwidth_per_connection = 250003
+blocked_addresses = ["198.51.100.9:1234"]
+event_loop_channel_capacity = 4096
+transient-budget = 1024
+transient-ttl-secs = 45
+min-number-of-connections = 25
+max-number-of-connections = 200
+streaming-threshold = 65537
+ledbat-min-ssthresh = 102401
+congestion-control = "bbr"
+bbr-startup-rate = 12345678
+skip_load_from_network = true
+ws-api-address = "127.0.0.1"
+ws-api-port = 7510
+token-ttl-seconds = 86401
+token-cleanup-interval-seconds = 301
+allowed-host = ["example.invalid"]
+allowed-source-cidrs = ["100.64.0.0/10"]
+hosted-mode = true
+per-user-op-rate-limit = 11
+per-user-op-burst = 101
+per-user-export-min-interval-secs = 12
+transport_keypair = "/tmp/freenet-5124/secrets/transport_keypair"
+nonce = "/tmp/freenet-5124/secrets/nonce"
+cipher = "/tmp/freenet-5124/secrets/delegate_cipher"
+log_level = "debug"
+contracts_dir = "/tmp/freenet-5124/contracts"
+delegates_dir = "/tmp/freenet-5124/delegates"
+secrets_dir = "/tmp/freenet-5124/secrets"
+db_dir = "/tmp/freenet-5124/db"
+event_log = "/tmp/freenet-5124/_EVENT_LOG"
+data_dir = "/tmp/freenet-5124"
+config_dir = "/tmp/freenet-5124/config"
+log_dir = "/tmp/freenet-5124/logs"
+wasmtime_cache_dir = "/tmp/freenet-5124/wasmtime-cache"
+is_gateway = true
+location = 0.25
+max_blocking_threads = 17
+max-hosting-storage = 12345678
+hosting-disk-pct = 0.25
+max-hosting-disk = 23456789
+per-user-secret-quota = 4194305
+per-user-inactive-ttl = 2592001
+inactive-user-sweep-interval = 3601
+module-cache-budget-bytes = 4294967296
+enable-event-log = true
+telemetry-enabled = true
+telemetry-endpoint = "http://127.0.0.1:14318"
+transport-snapshot-interval-secs = 31
+reference-ping-enabled = true
+iface-tx-enabled = true
+shutdown-drain-secs = 42
+"#;
+
+    /// [`RELEASED_CONFIG_TOML`] with every underscored key rewritten to the
+    /// kebab-case spelling from [`UNDERSCORED_EMITTED_KEYS`]. Asserts each
+    /// rewrite fires, so a typo in either constant cannot quietly reduce this
+    /// to a copy of the released document.
+    fn kebab_config_toml() -> String {
+        let mut doc = RELEASED_CONFIG_TOML.to_string();
+        for (underscored, kebab) in UNDERSCORED_EMITTED_KEYS {
+            let from = format!("\n{underscored} = ");
+            let to = format!("\n{kebab} = ");
+            assert!(
+                doc.contains(&from),
+                "RELEASED_CONFIG_TOML is missing the `{underscored}` key that \
+                 UNDERSCORED_EMITTED_KEYS pairs with `{kebab}`"
+            );
+            doc = doc.replace(&from, &to);
+        }
+        doc
+    }
+
+    /// The value every key in [`UNDERSCORED_EMITTED_KEYS`] carries, asserted
+    /// against a parsed `Config`.
+    ///
+    /// Shared by the released-spelling and kebab-spelling tests so both are
+    /// held to the same explicit expectation. Comparing the two parses against
+    /// each OTHER is not enough on its own: if a key were ignored under BOTH
+    /// spellings, both would fall back to the same default and the comparison
+    /// would pass while the setting did nothing.
+    fn assert_seeded_values_bound(cfg: &Config) {
+        assert_eq!(
+            cfg.network_api.public_address,
+            Some("203.0.113.7".parse::<IpAddr>().unwrap())
+        );
+        assert_eq!(cfg.network_api.public_port, Some(31339));
+        assert_eq!(cfg.network_api.bandwidth_limit, Some(3_000_001));
+        assert_eq!(cfg.network_api.total_bandwidth_limit, Some(2_000_002));
+        assert_eq!(cfg.network_api.min_bandwidth_per_connection, Some(250_003));
+        assert_eq!(
+            cfg.network_api.blocked_addresses,
+            Some(HashSet::from(["198.51.100.9:1234".parse().unwrap()]))
+        );
+        assert_eq!(cfg.network_api.event_loop_channel_capacity, 4096);
+        assert!(cfg.network_api.skip_load_from_network);
+        assert_eq!(
+            cfg.secrets.transport_keypair_path.as_deref(),
+            Some(Path::new("/tmp/freenet-5124/secrets/transport_keypair"))
+        );
+        assert_eq!(cfg.log_level, tracing::log::LevelFilter::Debug);
+        assert_eq!(
+            cfg.config_paths.contracts_dir,
+            PathBuf::from("/tmp/freenet-5124/contracts")
+        );
+        assert_eq!(
+            cfg.config_paths.delegates_dir,
+            PathBuf::from("/tmp/freenet-5124/delegates")
+        );
+        assert_eq!(
+            cfg.config_paths.secrets_dir,
+            PathBuf::from("/tmp/freenet-5124/secrets")
+        );
+        assert_eq!(
+            cfg.config_paths.db_dir,
+            PathBuf::from("/tmp/freenet-5124/db")
+        );
+        assert_eq!(
+            cfg.config_paths.event_log,
+            PathBuf::from("/tmp/freenet-5124/_EVENT_LOG")
+        );
+        assert_eq!(
+            cfg.config_paths.data_dir,
+            PathBuf::from("/tmp/freenet-5124")
+        );
+        assert_eq!(
+            cfg.config_paths.config_dir,
+            PathBuf::from("/tmp/freenet-5124/config")
+        );
+        assert_eq!(
+            cfg.config_paths.log_dir,
+            Some(PathBuf::from("/tmp/freenet-5124/logs"))
+        );
+        assert_eq!(
+            cfg.config_paths.wasmtime_cache_dir,
+            PathBuf::from("/tmp/freenet-5124/wasmtime-cache")
+        );
+        assert!(cfg.is_gateway);
+        assert_eq!(cfg.max_blocking_threads, 17);
+        // Keys that were always kebab-case, spot-checked so the documents are
+        // exercised beyond the renamed set.
+        assert_eq!(cfg.network_api.congestion_control, "bbr");
+        assert_eq!(cfg.ws_api.per_user_op_burst, 101);
+        assert_eq!(cfg.shutdown_drain_secs, 42);
+    }
+
+    /// THE BUG (#5124): a `config.toml` key could not be spelled the way the
+    /// rest of the file demonstrates. Following the hyphenated convention got
+    /// you a silently-ignored setting (for keys with a default) or a refusal to
+    /// start (for `log_level` / `is_gateway` / the `ConfigPaths` keys, which
+    /// have none). Every key must now accept its kebab-case spelling.
+    #[test]
+    fn kebab_case_config_toml_keys_are_accepted() {
+        let cfg: Config = toml::from_str(&kebab_config_toml())
+            .expect("every config.toml key must be accepted in kebab-case");
+        assert_seeded_values_bound(&cfg);
+    }
+
+    /// BACK-COMPAT: accepting the hyphenated spelling must not cost the
+    /// underscored one. Every `config.toml` any release has ever written keeps
+    /// working, unchanged and indefinitely.
+    #[test]
+    fn released_underscored_config_toml_keys_still_bind() {
+        let cfg: Config = toml::from_str(RELEASED_CONFIG_TOML)
+            .expect("a config.toml written by any release must still parse");
+        assert_seeded_values_bound(&cfg);
+    }
+
+    /// The two spellings must be genuinely interchangeable, not merely both
+    /// parseable. (Read with `assert_seeded_values_bound`, which is what stops
+    /// this from passing on two identically-defaulted configs.)
+    #[test]
+    fn released_and_kebab_config_toml_are_equivalent() {
+        let released: Config = toml::from_str(RELEASED_CONFIG_TOML).unwrap();
+        let kebab: Config = toml::from_str(&kebab_config_toml()).unwrap();
+        assert_eq!(
+            toml::to_string(&released).unwrap(),
+            toml::to_string(&kebab).unwrap(),
+        );
+    }
+
+    /// `public-port` is accepted alongside `public-network-port`: the file's
+    /// released key is `public_port`, so that is the spelling an operator
+    /// hyphenating what they see will reach for, while the flag they read in
+    /// `--help` is `--public-network-port`. Both work.
+    #[test]
+    fn both_kebab_spellings_of_public_port_are_accepted() {
+        for key in ["public-network-port", "public-port"] {
+            let doc = RELEASED_CONFIG_TOML.replace("\npublic_port = ", &format!("\n{key} = "));
+            let cfg: Config =
+                toml::from_str(&doc).unwrap_or_else(|e| panic!("`{key}` must be accepted: {e}"));
+            assert_eq!(cfg.network_api.public_port, Some(31339), "{key}");
+        }
+    }
+
+    /// STRUCTURAL GUARD (#5124): every key the node WRITES is also accepted
+    /// hyphenated. Derived from the serialized output rather than from a
+    /// hand-written fixture, so a field added later is covered without anyone
+    /// remembering to extend a document — which is the exact discipline that
+    /// failed and produced this bug.
+    ///
+    /// Runs against [`config_with_every_field_seeded`], whose no-`..` struct
+    /// literal will not compile until a new field is given a value, so fields
+    /// carrying `skip_serializing_if` are emitted here rather than silently
+    /// skipped and left uninspected.
+    #[tokio::test]
+    async fn every_emitted_config_key_is_also_accepted_in_kebab_case() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base = clap_bare_args(temp_dir.path()).build().await.unwrap();
+        let seeded = config_with_every_field_seeded(&base);
+
+        let emitted = toml::to_string(&seeded).unwrap();
+        let table: toml::Table = toml::from_str(&emitted).unwrap();
+        let kebabbed: toml::Table = table
+            .iter()
+            .map(|(key, value)| (key.replace('_', "-"), value.clone()))
+            .collect();
+
+        let renamed = table.keys().filter(|k| k.contains('_')).count();
+        assert!(
+            renamed >= UNDERSCORED_EMITTED_KEYS.len(),
+            "expected at least {} underscored keys to rewrite, saw {renamed} — \
+             if emitted keys became kebab-case, this guard and #5130's rollout \
+             both need revisiting",
+            UNDERSCORED_EMITTED_KEYS.len()
+        );
+
+        let reparsed: Config = toml::from_str(&toml::to_string(&kebabbed).unwrap())
+            .expect("the kebab-case spelling of every emitted key must be accepted");
+        assert_eq!(
+            toml::to_string(&reparsed).unwrap(),
+            emitted,
+            "a key lost its value when spelled in kebab-case — it is missing a \
+             #[serde(alias = \"...\")] for the hyphenated form"
+        );
+    }
+
+    /// ROLLBACK SAFETY (#5124 / #5130): the node must keep WRITING the key
+    /// spellings older releases can read.
+    ///
+    /// Crash-loop auto-rollback (#4073, `bin/commands/rollback.rs`) reinstalls
+    /// the immediately-previous binary when a freshly-updated node crashes
+    /// during probation. `config.toml` is rewritten on the first boot after an
+    /// update, so if that rewrite used keys the previous release cannot parse,
+    /// the rolled-back binary exits 1 on `missing field ...` — and rollback
+    /// does not fire twice, so the node stays down until an operator edits the
+    /// file by hand. That turns the brick-safety mechanism into the brick.
+    ///
+    /// So the emitted spelling may only change once EVERY release that
+    /// rollback could restore already accepts the new one. This release makes
+    /// the hyphenated spellings accepted; #5130 flips what is emitted, one
+    /// release later. Until then this guard fails if the emitted format moves.
+    #[tokio::test]
+    async fn emitted_config_toml_keys_keep_their_released_spelling() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base = clap_bare_args(temp_dir.path()).build().await.unwrap();
+        let seeded = config_with_every_field_seeded(&base);
+        let table: toml::Table = toml::from_str(&toml::to_string(&seeded).unwrap()).unwrap();
+
+        let missing: Vec<&str> = UNDERSCORED_EMITTED_KEYS
+            .iter()
+            .map(|(underscored, _)| *underscored)
+            // `transport_keypair` comes from the real build's secrets, which
+            // only sets the path when one was configured; skip when unset.
+            .filter(|key| {
+                *key != "transport_keypair" || base.secrets.transport_keypair_path.is_some()
+            })
+            .filter(|key| !table.contains_key(*key))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these keys are no longer WRITTEN under the spelling shipped \
+             releases read, which breaks crash-loop rollback (#4073): \
+             {missing:?}. See this test's rustdoc and #5130."
+        );
+    }
+
+    /// A file carrying BOTH spellings of one key is ambiguous, and serde is
+    /// right to refuse it. Pinned because the alternative — silently binding
+    /// one of the two — would make an operator's edit a coin flip, and this is
+    /// a state hand-editing after reading about the new spelling can produce.
+    #[test]
+    fn a_key_given_in_both_spellings_is_rejected() {
+        let doc = format!("{RELEASED_CONFIG_TOML}bandwidth-limit = 999\n");
+        let err = toml::from_str::<Config>(&doc)
+            .expect_err("both spellings of one key must be rejected, not silently resolved");
+        assert!(
+            err.to_string().contains("duplicate"),
+            "expected a duplicate-field error, got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_serde_config_args() {
         // Use tempfile for a guaranteed-writable directory (avoids CI permission issues on /tmp)
@@ -5237,23 +5616,28 @@ mod tests {
         assert!(set.disable_auto_update, "--disable-auto-update → OFF");
     }
 
-    #[tokio::test]
-    async fn all_persisted_config_fields_round_trip_through_build() {
-        // #4275 guard against the recurring bug class (#3890, #4275): build()'s
-        // field-by-field merge silently drops any persisted field it doesn't
-        // list. Seeds a non-default value for EVERY persisted field, writes it,
-        // rebuilds from a clap-bare ConfigArgs, and asserts each one survives.
-        //
-        // The destructuring below has NO `..`: adding a field to any of these
-        // structs fails to COMPILE until the author classifies it (round-trips
-        // -> merge + assert; skip-by-design -> bind to `_`). Keeps it honest.
-        let temp_dir = tempfile::tempdir().unwrap();
-
-        // Valid base build: creates the on-disk secret files (and gives us real
-        // secrets + resolved paths) that the rebuild will read back.
-        let base = clap_bare_args(temp_dir.path()).build().await.unwrap();
-
-        let seed = Config {
+    /// A [`Config`] with EVERY persisted field seeded to a non-default value,
+    /// on top of a real `build()` result for the fields that must be genuine
+    /// (`secrets`, `config_paths`).
+    ///
+    /// This is a struct literal with NO `..`, so a new field on `Config` or on
+    /// any struct flattened into it fails to COMPILE here until the author
+    /// gives it a value. That compile-time gate is what makes all three callers
+    /// exhaustive rather than dependent on someone remembering to extend a
+    /// hand-written fixture:
+    ///
+    ///  - [`all_persisted_config_fields_round_trip_through_build`] — does the
+    ///    value survive the `config.toml` merge? (#4275)
+    ///  - `every_emitted_config_key_is_also_accepted_in_kebab_case` — is the
+    ///    key it is written under also accepted hyphenated? (#5124)
+    ///  - `emitted_config_toml_keys_keep_their_released_spelling` — is the key
+    ///    it is WRITTEN under still the one older releases can read? (#5124)
+    ///
+    /// Seeding every `Option` to `Some` matters for the latter two: a field
+    /// carrying `skip_serializing_if` emits no key when unset, and a key that
+    /// is never emitted is a key neither guard can inspect.
+    fn config_with_every_field_seeded(base: &Config) -> Config {
+        Config {
             mode: OperationMode::Local,
             network_api: NetworkApiConfig {
                 address: "10.1.2.3".parse().unwrap(),
@@ -5323,7 +5707,26 @@ mod tests {
             },
             shutdown_drain_secs: 77,
             disable_auto_update: true, // #[serde(skip)] — see destructure below
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn all_persisted_config_fields_round_trip_through_build() {
+        // #4275 guard against the recurring bug class (#3890, #4275): build()'s
+        // field-by-field merge silently drops any persisted field it doesn't
+        // list. Seeds a non-default value for EVERY persisted field, writes it,
+        // rebuilds from a clap-bare ConfigArgs, and asserts each one survives.
+        //
+        // The destructuring below has NO `..`: adding a field to any of these
+        // structs fails to COMPILE until the author classifies it (round-trips
+        // -> merge + assert; skip-by-design -> bind to `_`). Keeps it honest.
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Valid base build: creates the on-disk secret files (and gives us real
+        // secrets + resolved paths) that the rebuild will read back.
+        let base = clap_bare_args(temp_dir.path()).build().await.unwrap();
+
+        let seed = config_with_every_field_seeded(&base);
 
         std::fs::write(
             temp_dir.path().join("config.toml"),
