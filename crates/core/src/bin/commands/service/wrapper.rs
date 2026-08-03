@@ -3,7 +3,7 @@ use std::path::Path;
 
 #[cfg(target_os = "macos")]
 use super::launch_at_login::macos_launch_at_login_startup;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use super::single_instance::{AcquireWrapperLockOutcome, acquire_wrapper_single_instance_lock};
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -461,40 +461,86 @@ pub(super) fn run_wrapper(version: &str) -> Result<()> {
     std::fs::create_dir_all(&log_dir)
         .with_context(|| format!("Failed to create log directory: {}", log_dir.display()))?;
 
-    // macOS wrapper single-instance guard. MUST run before
+    // Wrapper single-instance guard (macOS + Windows). MUST run before
     // `kill_stale_freenet_processes` and before anything user-visible.
-    // The kill helper uses `pkill -f "freenet network"` which matches
-    // the CURRENTLY-RUNNING backend child of a live wrapper, not just
-    // stale orphans; if we were to kill_stale before the single-
-    // instance check, a second wrapper would happily murder the first
-    // wrapper's backend, then see a free port, then proceed to build a
-    // duplicate tray. The flock-based guard is immune to that race
-    // because it inspects wrapper-level state (the lockfile held by
-    // the first wrapper process) not backend state.
+    // The kill helper matches the CURRENTLY-RUNNING backend child of a
+    // live wrapper, not just stale orphans; if we were to kill_stale
+    // before the single-instance check, a second wrapper would happily
+    // murder the first wrapper's backend, then see a free port/process
+    // slot, then proceed to build a duplicate tray — or, on Windows,
+    // race a freshly spawned `freenet network` against the first
+    // wrapper's own respawn of its just-killed child, both reading and
+    // (pre-#5132-fix) non-atomically rewriting config.toml. The guard is
+    // immune to that race because it inspects wrapper-level state (a
+    // lockfile on macOS, a named kernel mutex on Windows, held by the
+    // first wrapper process) rather than backend state.
     //
-    // Phase-1 smoke test on 2026-04-22 reproduced the duplicate tray
-    // whenever launchd's RunAtLoad fired while the user's open-
-    // launched wrapper was still alive; this guard prevents that
+    // macOS: phase-1 smoke test on 2026-04-22 reproduced a duplicate
+    // tray whenever launchd's RunAtLoad fired while the user's open-
+    // launched wrapper was still alive; the flock guard prevents that
     // overlap without changing the LAL agent's `RunAtLoad=true`
     // semantics (login-time auto-start still works; only the in-
     // session overlap is suppressed).
     //
-    // Linux has no tray and Windows has install-time guards; the
-    // overlap race only manifests on macOS where launchd can spawn a
-    // concurrent wrapper via RunAtLoad.
-    #[cfg(target_os = "macos")]
-    let _wrapper_lock = match acquire_wrapper_single_instance_lock() {
+    // Windows: #5132 — every relaunch (the downloaded exe, or the
+    // installed `%localappdata%\Freenet\bin\freenet.exe`) fell straight
+    // through to `kill_stale_freenet_processes` with no guard at all,
+    // so relaunching while Freenet was already running (e.g. via
+    // autostart) killed the running node and started a new one on every
+    // single launch. The mutex guard closes that gap the same way the
+    // macOS flock does.
+    //
+    // Linux has no tray and no autostart mechanism that can spawn a
+    // concurrent wrapper, so the overlap race does not apply there.
+    //
+    // A deliberate self-relaunch (auto-update, crash-loop rollback — see
+    // spawn_new_wrapper's call sites below) spawns the new wrapper process
+    // BEFORE the old one releases this lock: the old process's shutdown
+    // sequencing runs on the tray's ~100ms status-poll loop and, on the
+    // "UpdatedRestarting" terminal status, sleeps a further hard-coded 1s
+    // before quitting (see tray.rs) so the "Updated! Restarting..." status
+    // is visible — reliably longer than how fast the freshly-spawned new
+    // process reaches this same acquire call. A single-shot acquire would
+    // almost always lose that handoff, so self-relaunch would silently
+    // fail to start a replacement wrapper every time. Retry for a few
+    // seconds to ride out the old process's own bounded shutdown window
+    // before concluding a second, genuinely unrelated wrapper is running
+    // (in which case the extra few seconds before exiting are invisible —
+    // the user is looking at the ALREADY-running instance either way).
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let lock_outcome = {
+        const RETRY_ATTEMPTS: u32 = 20;
+        const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+        let mut outcome = acquire_wrapper_single_instance_lock();
+        for _ in 1..RETRY_ATTEMPTS {
+            if !matches!(outcome, AcquireWrapperLockOutcome::AnotherWrapperRunning) {
+                break;
+            }
+            std::thread::sleep(RETRY_INTERVAL);
+            outcome = acquire_wrapper_single_instance_lock();
+        }
+        outcome
+    };
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let _wrapper_lock = match lock_outcome {
         AcquireWrapperLockOutcome::Acquired(guard) => Some(guard),
         AcquireWrapperLockOutcome::AnotherWrapperRunning => {
+            #[cfg(target_os = "macos")]
+            let holder_detail = "lockfile at ~/Library/Caches/Freenet/wrapper.lock is held; \
+                 try `lsof ~/Library/Caches/Freenet/wrapper.lock` to find the holder";
+            #[cfg(target_os = "windows")]
+            let holder_detail = format!(
+                "named mutex \"{}\" is held by another process",
+                super::single_instance::WRAPPER_MUTEX_NAME
+            );
             log_wrapper_event(
                 &log_dir,
                 &format!(
                     "Wrapper pid={} exiting: another Freenet wrapper is already \
-                     running (lockfile at ~/Library/Caches/Freenet/wrapper.lock is \
-                     held). Expected if launchd fired RunAtLoad while an existing \
-                     wrapper is alive, or if Freenet.app was double-launched. \
-                     If Freenet's menu bar icon is not visible, another process may \
-                     be holding the lock; try `lsof ~/Library/Caches/Freenet/wrapper.lock`.",
+                     running ({holder_detail}). Expected if Freenet was launched \
+                     while already running (e.g. via autostart), or double-launched. \
+                     If Freenet's tray icon is not visible, another process may be \
+                     holding the lock.",
                     std::process::id()
                 ),
             );
@@ -504,7 +550,7 @@ pub(super) fn run_wrapper(version: &str) -> Result<()> {
             log_wrapper_event(
                 &log_dir,
                 "Wrapper single-instance lock unavailable; proceeding without guard. \
-                 Dup-tray risk if RunAtLoad fires while another wrapper is alive.",
+                 Dup-launch risk if another wrapper is started concurrently.",
             );
             None
         }
