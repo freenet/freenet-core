@@ -4398,10 +4398,14 @@ mod tests {
     // Keys in `config.toml` mix hyphens and underscores with no pattern
     // distinguishing them (`total-bandwidth-limit` and `bandwidth_limit` sit
     // adjacent in the same file), so a setting nobody can spell is a setting
-    // nobody can use. Step 1 makes EVERY key accept its kebab-case spelling,
-    // so any guess works. Emitting one consistent spelling is step 2 (#5130) —
-    // see `emitted_config_toml_keys_keep_their_released_spelling` for why the
-    // two cannot land together.
+    // nobody can use. Step 1 makes every key in `config.toml` accept its
+    // kebab-case spelling, so either guess works — plus `public_key` in
+    // `gateways.toml`, the one key outside this file with the same problem.
+    // Emitting one consistent spelling is step 2 (#5130) — see
+    // `emitted_config_toml_keys_keep_their_released_spelling` for why the two
+    // cannot land together.
+    //
+    // A wholly unknown key is still ignored in silence; that is #5131.
     // ---------------------------------------------------------------------
 
     /// Every `config.toml` key that a release has EMITTED with an underscore,
