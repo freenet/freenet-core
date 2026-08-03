@@ -6809,22 +6809,35 @@ mod tests {
         );
     }
 
-    /// Regression test for #5087.
+    /// Regression test for #5106 — the fallout of #5089, which is reverted here.
     ///
-    /// A SAME-ORIGIN `<a target="_blank">` used to return early and fall
-    /// through to the browser. The shell iframe has no
-    /// `allow-popups-to-escape-sandbox` (deliberately, #1499), so that popup
-    /// inherited the sandbox: the top-level shell it landed on had an opaque
-    /// origin, its own `frame-src 'self'` could not match, and the app frame
-    /// stayed `about:blank` — a blank tab.
+    /// #5089 routed the same-origin new-window branch through the shell's
+    /// `open_url` bridge to fix a blank tab (#5087). Two measured facts make
+    /// that trade net-negative:
     ///
-    /// Every cross-CONTRACT link is same-ORIGIN (one gateway serves them all),
-    /// so that exemption swallowed exactly the breaking case. The same-origin
-    /// new-window branch must route through `open_url` like the cross-origin
-    /// branch above it, matching the `window.open` override further down,
-    /// which already forwards same-origin new-window opens.
+    ///  1. `open_url` REFUSES loopback hosts (`localhost` / `127.0.0.1` /
+    ///     `::1` / `0.0.0.0`) — see the handler in `shell_bridge.js`. A local
+    ///     node is served from loopback, which is how most desktop users
+    ///     browse, so forwarding meant the click was `preventDefault`-ed and
+    ///     then silently dropped by the shell: NOTHING opened, in every
+    ///     engine. The `window.open` override further down never had this
+    ///     hole — it checks `isLoopbackHost` and falls back to native. The
+    ///     anchor branch has no such fallback, so it must not forward.
+    ///  2. The blank tab it fixed is WebKit-only. Driving the real
+    ///     interceptor inside a sandboxed-shell harness in all three engines
+    ///     (popup blockers on), the pre-#5089 native popup was opaque-origin
+    ///     everywhere, but only WebKit's `frame-src 'self'` refused the app
+    ///     frame; Gecko and Blink loaded it. Firefox and Chrome users were
+    ///     therefore traded a working tab for a dead click.
+    ///
+    /// So: keep this branch a plain `return` — hand the click back to the
+    /// browser. Re-routing it needs either `allow-popups-to-escape-sandbox`
+    /// on the app iframe (so the popup is not sandboxed in the first place)
+    /// or a loopback fallback mirroring `window.open`'s. Both assertions
+    /// below must stay: the first fails if the `return` is replaced, the
+    /// second if a forward is added alongside it.
     #[test]
-    fn navigation_interceptor_routes_same_origin_target_blank_through_open_url() {
+    fn navigation_interceptor_leaves_same_origin_target_blank_to_the_browser() {
         let js = NAVIGATION_INTERCEPTOR_JS;
 
         let target_attr_idx = js
@@ -6839,19 +6852,16 @@ mod tests {
         );
         let block = &js[target_attr_idx..navigate_idx];
 
-        // The old bug: `if (...) return;` handed the click to the browser.
         assert!(
-            !block.contains("!== '_self') return"),
-            "same-origin target=\"_blank\" must not fall through to the browser: the \
-             popup inherits the sandbox and the resulting tab is blank (#5087)"
+            block.contains("!== '_self') return"),
+            "same-origin target=\"_blank\" must fall through to the browser. Routing it \
+             through open_url dead-ends on a loopback node, where the shell's open_url \
+             handler refuses the host and the click does nothing at all (#5106)"
         );
         assert!(
-            block.contains("preventDefault"),
-            "same-origin new-window branch must preventDefault before forwarding (#5087)"
-        );
-        assert!(
-            block.contains("type: 'open_url'"),
-            "same-origin new-window branch must forward via open_url, not navigate (#5087)"
+            !block.contains("type: 'open_url'"),
+            "the same-origin new-window branch must not forward to open_url without a \
+             loopback fallback like the window.open override's isLoopbackHost check (#5106)"
         );
     }
 

@@ -271,6 +271,51 @@ test("a link carrying a download attribute is NOT intercepted", async ({ page })
   ).toEqual([]);
 });
 
+test("same-origin link with target=_blank is NOT intercepted (#5106)", async ({ page }) => {
+  await page.goto(shellUrl!);
+  await captureShellMessages(page);
+  const frame = await fixtureFrame(page);
+
+  // `#same-origin-blank-link` is the SAME href as `#same-origin-link`
+  // (page2.html) plus `target="_blank"`. The interceptor early-returns on a
+  // non-`_self` target, so the click must produce NO interception postMessage
+  // — neither `navigate` nor `open_url` — and the browser opens the tab itself.
+  //
+  // #5089 made this branch post `open_url` instead. On a real local node
+  // (`127.0.0.1`/`localhost`) the shell's open_url handler refuses the host, so
+  // the click was cancelled and then silently dropped: no tab, no error. This
+  // harness's node binds `127.x.y.1`, which is not in that refusal list
+  // (#4846), so asserting on the popup would pass either way. Asserting on the
+  // postMessage contract is what actually distinguishes the two.
+  //
+  // Same delta-based shape as the download-link test above, and for the same
+  // reason: the click may natively load page2 and tear down the in-iframe
+  // listeners, so the control click has to come first.
+
+  // (1) Control: the same element minus `target` IS intercepted → the listener
+  // is live and the selector is wired correctly, so a later empty capture is
+  // attributable to the target attribute and not to a dead listener.
+  await frame.locator("#same-origin-blank-link").evaluate((el) => el.removeAttribute("target"));
+  await frame.locator("#same-origin-blank-link").click();
+  await expect
+    .poll(async () => (await shellMessages(page)).map((m) => m.type))
+    .toContain("navigate");
+
+  // (2) Reload to restore the original DOM (with `target="_blank"`) and a
+  // fresh capture buffer, then click the unmodified link.
+  await page.goto(shellUrl!);
+  await captureShellMessages(page);
+  const frame2 = await fixtureFrame(page);
+  await frame2.locator("#same-origin-blank-link").click();
+  // Give any (erroneous) interception postMessage a tick to arrive.
+  await page.waitForTimeout(300);
+  const types = (await shellMessages(page)).map((m) => m.type);
+  expect(
+    types,
+    `same-origin target="_blank" must not be intercepted, but got messages: ${types.join(", ")}`,
+  ).toEqual([]);
+});
+
 test("browser Back restores the previous subpage via the popstate handler (#3839)", async ({
   page,
 }) => {

@@ -59,6 +59,21 @@
 -->
 <a id="download-link" href="page2.html" download="hello.txt">Download</a>
 
+<!--
+  Same-origin link carrying an explicit new-window target. The interceptor must
+  NOT intercept this: it early-returns on a non-`_self` target and hands the
+  click back to the browser (freenet/freenet-core#5106).
+
+  #5089 routed this branch through the shell's `open_url` bridge instead. That
+  bridge refuses loopback hosts, and a real local node is served from
+  `127.0.0.1`/`localhost`, so the click was preventDefault-ed and then dropped:
+  nothing opened at all. Note the E2E node here binds `127.x.y.1`, which is NOT
+  in that refusal list (#4846), so the popup outcome cannot distinguish the two
+  behaviours in this harness — the test asserts the interception contract (no
+  postMessage) instead, which does.
+-->
+<a id="same-origin-blank-link" href="page2.html" target="_blank">In-contract page 2, new tab</a>
+
 <!-- Result sink the Playwright tests read via page.evaluate. -->
 <pre id="poll-result">pending</pre>
 
