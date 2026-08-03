@@ -407,12 +407,15 @@ test("a contract cannot reach a node-origin context by escaping the sandbox (#38
   )} probes=${JSON.stringify(reports)}`;
 
   if (escape.wrote) {
-    // The write landed, so the nested frame is the thing under test and must
+    // The write landed, so the nested frames are the thing under test and must
     // actually be there — otherwise the assertion below passes on an empty set.
+    // BOTH must be probed: the plain asset route and the `?__sandbox=1` route
+    // are guarded in different places, and the second one is the sharper attack
+    // (the contract's own page, no exotic type needed).
     expect(
       nested.length,
-      `the escaped popup accepted the write but embedded nothing, so nothing was probed: ${detail}`,
-    ).toBeGreaterThan(0);
+      `the escaped popup accepted the write but embedded fewer frames than it asked for, so a route went unprobed: ${detail}`,
+    ).toBe(2);
   }
   expect(
     reports,

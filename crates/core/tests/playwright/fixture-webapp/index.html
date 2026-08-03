@@ -129,12 +129,23 @@
     window.__escapeOpened = !!w;
     if (!w) return;
     try {
-      // Resolved against the base, so it drops `?__sandbox=1` and the request
-      // lands on the plain asset route — as `Sec-Fetch-Dest: iframe`, which is
-      // the destination a `document`-only guard does not see.
-      var src = new URL('page2.html', document.baseURI).href;
+      // Probe BOTH routes that serve contract bytes, because they are guarded
+      // in different places:
+      //   - `page2.html` resolved against the base drops `?__sandbox=1`, so it
+      //     lands on the plain asset route (`variable_content`) — as
+      //     `Sec-Fetch-Dest: iframe`, the destination a `document`-only guard
+      //     does not see.
+      //   - `index.html?__sandbox=1` is the sandbox-content route
+      //     (`serve_sandbox_response`), which blocks TOP-LEVEL loads but not
+      //     nested ones, and which relied entirely on the iframe attribute for
+      //     its opaque origin. This is the sharper attack: no scriptable SVG or
+      //     other exotic type needed, just the contract's own page.
+      var asset = new URL('page2.html', document.baseURI).href;
+      var app = new URL('index.html?__sandbox=1', document.baseURI).href;
       w.document.write(
-        '<!doctype html><title>escape</title><iframe id="probe" src="' + src + '"></iframe>'
+        '<!doctype html><title>escape</title>' +
+        '<iframe id="probe-asset" src="' + asset + '"></iframe>' +
+        '<iframe id="probe-app" src="' + app + '"></iframe>'
       );
       w.document.close();
       window.__escapeWrote = true;

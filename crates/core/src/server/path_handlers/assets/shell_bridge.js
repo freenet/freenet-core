@@ -1192,23 +1192,22 @@ function freenetBridge(authToken, userToken, hostedMode) {
           }
         } catch (e) {}
       } else if (msg.type === 'open_url' && typeof msg.url === 'string') {
-        // Open a URL in a new tab. External links come here from the anchor
-        // interceptor; same-origin (in-app) URLs also arrive from the
-        // window.open override (#4645). Popups the sandboxed iframe opens
-        // itself inherit the opaque origin, breaking CORS on target sites and
-        // (hosted) losing the per-user key. The shell opens the URL instead,
-        // giving proper origin. See PR #3818, which removed the popup
-        // sandbox-escape flag from the app iframe and introduced this bridge
-        // in its place. (This cited "#1499" until #5107; that is the
-        // delegate-user-interaction feature request which motivated #3818,
-        // not the hardening itself.)
+        // Open a URL in a new tab.
         //
-        // Deliberately NOT naming that flag in full here: this file is
-        // inlined verbatim into the shell page, and
-        // `shell_page_contains_iframe_and_bridge` asserts the rendered page
-        // does not contain the flag name anywhere — a comment mentioning it
-        // fails that test. Fail-safe (a false alarm, not a silent pass), but
-        // do not "fix" it by loosening the assertion.
+        // Nothing the node injects posts this any more. PR #3818 removed the
+        // popup sandbox-escape flag from the app iframe and introduced this
+        // bridge in its place, because a popup the sandboxed iframe opened
+        // itself inherited the opaque origin — breaking CORS on target sites,
+        // and on a hosted node losing the per-user key. #5100 put the flag
+        // back (a natively-opened popup is now a real top-level document at
+        // this origin, which is the only shape that works in every browser),
+        // so both the anchor interceptor and the `window.open` override that
+        // used to forward here are gone.
+        //
+        // The handler stays because it is still REACHABLE, and that is the
+        // whole point of the gate below: any contract can postMessage
+        // `open_url` directly. Deleting it would be fine only if nothing could
+        // send it, which is not the case.
         //
         // Security model: this scheme allow-list is the PRIMARY gate, not
         // defence in depth. A malicious contract iframe can postMessage
@@ -1232,14 +1231,6 @@ function freenetBridge(authToken, userToken, hostedMode) {
         // for the project's public domain and fails on ANY occurrence,
         // comments included (external-origin / CORS guard). The live URL
         // lives in scripts/check-endpoints.sh.
-        //
-        // Same hazard, same test, second string: do not write the popup
-        // sandbox-escape flag's full name in this file either. That test also
-        // asserts the rendered page never contains it, to prove it is not set
-        // on the iframe. Writing it in a comment fails the test — which is
-        // easy to walk into, since naming the flag is the natural instinct
-        // when documenting why it is absent. It happened in #5107. See the
-        // note in the open_url handler above.
         //
         // Private networks (RFC1918 192.168/16, 10/8, 172.16-31/12 and
         // RFC4193 fc00::/7, link-local fe80::/10) are deliberately NOT
