@@ -22,14 +22,11 @@ pub(super) enum WebSocketApiError {
 }
 
 impl WebSocketApiError {
-    pub fn status_code(&self) -> StatusCode {
-        match self {
-            WebSocketApiError::InvalidParam { .. } => StatusCode::BAD_REQUEST,
-            WebSocketApiError::NodeError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-            WebSocketApiError::AxumError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-            WebSocketApiError::MissingContract { .. } => StatusCode::NOT_FOUND,
-        }
-    }
+    // `status_code()` lived here and was used only by `From<_> for Response`,
+    // which now delegates to `IntoResponse`. It had also drifted: it answered
+    // 500 for a `NodeError` that `into_response` renders as 404 ("Contract not
+    // found"), and knew nothing of the 503 retry/connecting pages. Deleted
+    // rather than kept in sync — one status decision, in `into_response`.
 
     pub fn error_message(&self) -> String {
         match self {
@@ -52,9 +49,17 @@ impl Display for WebSocketApiError {
 }
 
 impl From<WebSocketApiError> for Response {
+    /// Delegates to `IntoResponse` rather than rendering its own body.
+    ///
+    /// It used to build `Html(error.error_message())` directly, which is a
+    /// SECOND rendering path for the same type that skipped the escaping in
+    /// `into_response` — so a future handler returning `Result<_, Response>`
+    /// and reaching this `impl` via `?` would have silently reintroduced the
+    /// injection that escaping closes. It also skipped the retry/connecting
+    /// pages and the no-store headers. No caller uses it today; keeping the two
+    /// paths in sync by construction is cheaper than remembering to.
     fn from(error: WebSocketApiError) -> Self {
-        let body = Html(error.error_message());
-        (error.status_code(), body).into_response()
+        error.into_response()
     }
 }
 
@@ -225,6 +230,57 @@ fn retry_loading_page() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// Regression test for the reflected-HTML gap the escaped-popup review
+    /// found: these bodies are served as `text/html` at the NODE's own origin,
+    /// and several carry request-derived text — `web_subpages` renders
+    /// "Page not found: {page}" with the requested sub-path verbatim.
+    #[tokio::test]
+    async fn error_bodies_escape_request_derived_text() {
+        for error in [
+            WebSocketApiError::InvalidParam {
+                error_cause: "Page not found: <script>alert(1)</script>".to_string(),
+            },
+            WebSocketApiError::NodeError {
+                error_cause: "<img src=x onerror=alert(1)>".to_string(),
+            },
+        ] {
+            let raw = axum::body::to_bytes(error.into_response().into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8_lossy(&raw).to_string();
+            assert!(
+                !body.contains("<script>") && !body.contains("<img "),
+                "error bodies must not render request-derived text as markup; got: {body}"
+            );
+            assert!(
+                body.contains("&lt;") && body.contains("&gt;"),
+                "the payload must survive, escaped, so the message is still \
+                 readable; got: {body}"
+            );
+        }
+    }
+
+    /// `From<WebSocketApiError> for Response` must go through the same
+    /// rendering as `IntoResponse`, or it is a second path that skips the
+    /// escaping above.
+    #[tokio::test]
+    async fn from_impl_renders_identically_to_into_response() {
+        let payload = "<script>alert(1)</script>";
+        let via_from: axum::response::Response = WebSocketApiError::InvalidParam {
+            error_cause: payload.to_string(),
+        }
+        .into();
+        let raw = axum::body::to_bytes(via_from.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&raw).to_string();
+        assert!(
+            !body.contains("<script>"),
+            "the `From` conversion must escape too; got: {body}"
+        );
+    }
+
     use super::*;
 
     #[test]
