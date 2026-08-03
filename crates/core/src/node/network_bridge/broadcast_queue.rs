@@ -19,13 +19,21 @@
 //! measurements that drove all three of those; before it, one worker drained
 //! one FIFO and picked the pool from the full contract STATE size.
 //!
-//! The correction is the one remaining cross-lane coupling, and it is BOUNDED
-//! rather than absent: a send that was queued small and turns out to be full
-//! state keeps its small-lane slot for at most
+//! The correction is the one remaining cross-lane coupling. A send that was
+//! queued small and turns out to be full state keeps its small-lane slot for
 //! [`UPGRADE_SLOT_HOLD_WINDOW`] while it waits for large-lane capacity, then
-//! gives the slot back and keeps waiting without one. So mispredictions cost
-//! the small lane a bounded stall instead of an unbounded one, and never put
-//! large payloads on the wire outside the large-payload limit.
+//! moves into a bounded parking area ([`MAX_PARKED_LANE_UPGRADES`]) and waits
+//! there holding no slot at all. It never puts large payloads on the wire
+//! outside the large-payload limit.
+//!
+//! Stated plainly, because it is the one guarantee this module gives up: while
+//! parking has room, a misprediction costs unrelated small broadcasts at most
+//! `UPGRADE_SLOT_HOLD_WINDOW`. Once parking is full — sustained misprediction
+//! against a saturated large lane — sends wait for a parking slot while still
+//! holding their small-lane slots, and the small lane applies backpressure at
+//! the large lane's drain rate. That is deliberate: the alternative is an
+//! unbounded set of parked sends each retaining a serialized payload, and
+//! bounded work beats unbounded memory.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -116,12 +124,13 @@ pub(super) struct SendLanePermit {
 /// changed to remove. Give it up immediately and the drain dispatches a
 /// replacement at once, so sends pile up holding serialized payloads.
 ///
-/// This is NOT sized to cover a typical large-lane occupancy: a full-state
-/// stream is >= 64 KiB at the ~1.25 MB/s a rate-limited stream gets, so a
-/// large-lane slot frequently takes longer than this to turn over and phase 2 is
-/// a normal outcome, not an exceptional one. Its job is narrower — absorb
-/// momentary contention without ever handing an unrelated small broadcast a
-/// stall longer than this, however many mispredictions arrive at once.
+/// This is NOT sized to cover a typical large-lane occupancy: the ~1 MB states
+/// this path exists for take the better part of a second at the ~1.25 MB/s a
+/// rate-limited stream gets, so a large-lane slot usually takes longer than this
+/// to turn over and phase 2 is a normal outcome, not an exceptional one. Its job
+/// is narrower — absorb momentary contention, and cap what a misprediction costs
+/// an unrelated small broadcast at this much FOR AS LONG AS the parking area has
+/// room (see [`MAX_PARKED_LANE_UPGRADES`], which is where that cap ends).
 const UPGRADE_SLOT_HOLD_WINDOW: Duration = Duration::from_millis(250);
 
 /// How many mispredicted sends may be parked at once waiting for large-lane
@@ -180,13 +189,18 @@ impl SendLanePermit {
     ///
     /// The wait is in two phases (see [`UPGRADE_SLOT_HOLD_WINDOW`]): first
     /// briefly holding the small-lane slot, then — if the large lane is
-    /// genuinely congested — after handing that slot back, so a burst of
-    /// mispredictions cannot occupy the wide pool and stall small sends behind
-    /// it. Mispredictions ARE bursty: they come from conditions that hit every
-    /// peer of a contract at once (a `get_contract_summary` timeout, an
-    /// `Interests` full-replace wiping cached summaries, the delta-incompat
-    /// memo arming, or a contract whose deltas are never smaller than its
-    /// state), so treating them as independent events would be wrong.
+    /// genuinely congested — in a bounded parking area, after handing that slot
+    /// back. A burst of mispredictions therefore cannot occupy the wide pool.
+    /// Mispredictions ARE bursty, and worse: they come from conditions that hit
+    /// every peer of a contract at once (a `get_contract_summary` timeout, an
+    /// `Interests` full-replace wiping cached summaries, the delta-incompat memo
+    /// arming), and one of them — a contract whose deltas are never smaller than
+    /// its state — mispredicts on every send to every peer permanently. So
+    /// treating them as independent events would be wrong.
+    ///
+    /// Past the parking area's capacity the small-lane slot IS held for the
+    /// whole wait and the small lane applies backpressure; see the module
+    /// header, that is the deliberate end of the hold-window bound.
     ///
     /// A parked send holds no pool capacity and is putting nothing on the wire,
     /// so the pools no longer bound how many sends are in flight — that is what
@@ -224,12 +238,25 @@ impl SendLanePermit {
         // free we keep the small-lane slot and wait under it: the small lane
         // applies backpressure, which is bounded work, rather than the node
         // accumulating unbounded parked payloads.
-        let _parked = self.upgrade_slots.clone().try_acquire_owned().ok();
-        if _parked.is_some() {
-            // Assigning `None` drops the permit; the send is now holding no
-            // pool capacity and sending nothing.
-            self.permit = None;
-        }
+        //
+        // This WAITS for a slot rather than sampling once. A one-shot
+        // `try_acquire` would pin the small-lane slot for the whole remaining
+        // wait of any send that merely happened to arrive while parking was
+        // full, even if a slot freed a millisecond later. Waiting cannot
+        // deadlock: slots are released by sends that already hold a large permit
+        // and are waiting on nothing else, so parking always drains at the large
+        // lane's rate.
+        let _parked = match self.upgrade_slots.clone().acquire_owned().await {
+            Ok(slot) => {
+                // Assigning `None` drops the permit; the send is now holding no
+                // pool capacity and sending nothing.
+                self.permit = None;
+                Some(slot)
+            }
+            // Closed parking (nothing closes it today): keep the small-lane slot
+            // rather than parking unbounded.
+            Err(_) => None,
+        };
         match self.large_pool.clone().acquire_owned().await {
             Ok(large) => self.take_large(large),
             Err(_) => self.large_pool_closed(payload_size),
@@ -710,9 +737,9 @@ mod queue {
     /// it could not `pop` anything at all while waiting — the head-of-line half
     /// of #4961 (1,887 incidents and a 7,260 s small-entry wait integral per
     /// node-day on the 0.2.118 fleet). (A dispatched send correcting a
-    /// mispredicted lane can still hold a small-lane permit briefly; that
-    /// residual is bounded by [`UPGRADE_SLOT_HOLD_WINDOW`], not by the large
-    /// lane's drain rate.)
+    /// mispredicted lane can still hold a small-lane permit — for
+    /// [`UPGRADE_SLOT_HOLD_WINDOW`] while parking has room, and for the whole
+    /// wait once it does not. See `SendLanePermit`.)
     ///
     /// Ordering is by a global monotonic sequence number so the two FIFOs stay
     /// comparable: capacity eviction still drops the globally oldest entry, and
@@ -1015,8 +1042,9 @@ mod queue {
     /// state) get low concurrency (2 slots) to avoid saturating the uplink.
     /// Each pool has its OWN FIFO and its OWN drain worker, so a QUEUED send
     /// waiting for large-lane capacity never delays a small one. (A dispatched
-    /// send correcting a mispredicted lane holds its small-lane permit for at
-    /// most [`UPGRADE_SLOT_HOLD_WINDOW`] — see `SendLanePermit`.)
+    /// send correcting a mispredicted lane does hold a small-lane permit while
+    /// it waits — bounded by [`UPGRADE_SLOT_HOLD_WINDOW`] only while the
+    /// parking area has room; see `SendLanePermit`.)
     #[derive(Clone)]
     pub(crate) struct BroadcastQueue {
         queue: Arc<Mutex<QueueState>>,
@@ -1472,6 +1500,43 @@ mod queue {
                 body.contains("spawn_lane(QueuedPayloadClass::Large, large_semaphore"),
                 "the large lane must be given the LARGE pool"
             );
+            // ONE parking pool for the node. Constructing it per dispatch
+            // instead would make the parked set unbounded again while every
+            // behavioural test stayed green — so pin BOTH halves: created once
+            // at the top, and only CLONED per lane.
+            assert_eq!(
+                body.matches("Arc::new(Semaphore::new(super::MAX_PARKED_LANE_UPGRADES))")
+                    .count(),
+                1,
+                "the parking area must be constructed exactly once in start_worker"
+            );
+            let created = body
+                .find("let upgrade_slots = Arc::new(Semaphore::new(")
+                .expect("the parking area must be created here");
+            let per_lane = body
+                .find("let upgrade_slots = upgrade_slots.clone();")
+                .expect("each drain must CLONE the shared parking area, not build its own");
+            assert!(
+                created < per_lane,
+                "the shared parking area must be created before the per-lane clone"
+            );
+
+            // And `enqueue` must still route through `lane_for`. Substituting a
+            // constant there restores the whole classification defect; only a
+            // dead-code lint on `lane_for` would notice, and only because its
+            // other caller is a test.
+            let enq = src
+                .find("        pub(crate) async fn enqueue(")
+                .expect("enqueue renamed or removed");
+            let enq_end = src[enq..]
+                .find("\n        /// The lane-agnostic half")
+                .expect("end of enqueue not found")
+                + enq;
+            assert!(
+                src[enq..enq_end].contains("let lane = lane_for("),
+                "enqueue must derive the lane it enqueues with from lane_for — not \
+                 merely mention it"
+            );
         }
 
         // ---- scheduling regressions (#4961) ----
@@ -1841,7 +1906,9 @@ mod queue {
         /// `notify_one`, an enqueue can wake the idle lane and leave its own
         /// entry sitting until something else happens to wake the right worker.
         /// Directed: only the LARGE lane has work, so only a large-lane wakeup
-        /// can dispatch it.
+        /// can dispatch it. (Under a reverted shared `Notify` this fails
+        /// because `spawn_lanes` starts the small drain first, so it is first in
+        /// the waiter FIFO and `notify_one` wakes the wrong worker.)
         #[tokio::test(start_paused = true)]
         #[serial_test::serial(broadcast_queue_depth_gauge)]
         async fn each_lane_is_woken_by_its_own_enqueue() {
@@ -1867,15 +1934,20 @@ mod queue {
         }
 
         fn small_lane_permit(small: &Arc<Semaphore>, large: &Arc<Semaphore>) -> SendLanePermit {
-            parked_small_lane_permit(small, large, super::super::MAX_PARKED_LANE_UPGRADES)
+            parked_small_lane_permit(
+                small,
+                large,
+                &Arc::new(Semaphore::new(super::super::MAX_PARKED_LANE_UPGRADES)),
+            )
         }
 
-        /// As above, but with an explicit number of parking slots so a test can
-        /// drive the exhausted-parking path.
+        /// As above, but against a caller-owned parking pool. Tests SHARE one —
+        /// production has exactly one for the whole node, and that sharing is
+        /// the entire reason the parked set is bounded.
         fn parked_small_lane_permit(
             small: &Arc<Semaphore>,
             large: &Arc<Semaphore>,
-            parking: usize,
+            parking: &Arc<Semaphore>,
         ) -> SendLanePermit {
             SendLanePermit::new(
                 QueuedPayloadClass::Small,
@@ -1884,7 +1956,7 @@ mod queue {
                     .try_acquire_owned()
                     .expect("small pool has capacity"),
                 large.clone(),
-                Arc::new(Semaphore::new(parking)),
+                parking.clone(),
             )
         }
 
@@ -2020,49 +2092,105 @@ mod queue {
             assert_eq!(large.available_permits(), 1);
         }
 
-        /// The parking bound. Once `MAX_PARKED_LANE_UPGRADES` sends are parked,
-        /// the next one must KEEP its small-lane slot rather than park too:
-        /// parked sends hold no pool permit, so without this the small drain
-        /// keeps dispatching replacements and the parked set — one serialized
-        /// payload each — grows without limit.
+        /// The parking bound, driven through a SHARED pool the way production
+        /// has it. Parked sends hold no pool permit, so if the pool were
+        /// per-send — or if the slot were released as soon as it was taken —
+        /// the small drain would keep dispatching replacements and the parked
+        /// set would grow without limit, each one retaining a serialized
+        /// payload. Also pins that a slot goes BACK when its send leaves.
         #[tokio::test(start_paused = true)]
-        async fn parking_area_is_bounded_and_falls_back_to_holding_the_slot() {
+        async fn parking_area_is_bounded_and_returns_its_slots() {
             let small = Arc::new(Semaphore::new(12));
             let large = Arc::new(Semaphore::new(1));
+            // One parking slot, shared, so the second upgrader must contend.
+            let parking = Arc::new(Semaphore::new(1));
             let occupied = large
                 .clone()
                 .acquire_owned()
                 .await
                 .expect("large pool open");
 
-            // Parking capacity 0: the only choice left is to hold the slot.
-            let mut permit = parked_small_lane_permit(&small, &large, 0);
+            let mut first = parked_small_lane_permit(&small, &large, &parking);
+            let mut second = parked_small_lane_permit(&small, &large, &parking);
+            assert_eq!(small.available_permits(), 10, "both hold a small slot");
+
+            let mut parked = tokio::spawn(async move {
+                first.ensure_capacity_for(BIG).await;
+                first
+            });
+            // Let the first one get through its hold window and park.
+            assert!(
+                tokio::time::timeout(super::super::UPGRADE_SLOT_HOLD_WINDOW * 2, &mut parked)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                parking.available_permits(),
+                0,
+                "the parked send is holding the only parking slot"
+            );
+            assert_eq!(
+                small.available_permits(),
+                11,
+                "and gave its small-lane slot back"
+            );
+
+            // The second one finds parking full, so it must keep its small slot
+            // rather than parking too.
             let mut waiting = tokio::spawn(async move {
-                permit.ensure_capacity_for(BIG).await;
-                permit
+                second.ensure_capacity_for(BIG).await;
+                second
             });
             assert!(
                 tokio::time::timeout(super::super::UPGRADE_SLOT_HOLD_WINDOW * 4, &mut waiting)
                     .await
                     .is_err(),
-                "still no large-lane capacity, so it must still be waiting"
+                "no large-lane capacity yet, so it is still waiting"
             );
             assert_eq!(
                 small.available_permits(),
                 11,
-                "with no parking slot free the send keeps its small-lane slot, so \
-                 the drain cannot dispatch a replacement — backpressure, not \
-                 unbounded parked payloads"
+                "with parking full the second send keeps its small-lane slot — \
+                 backpressure, not an unbounded parked set"
             );
 
+            // The first send gets large-lane capacity and leaves the parking
+            // area; its slot must go back — and go straight to the send that was
+            // waiting for one, which then gives up ITS small-lane slot. That
+            // hand-off is the difference between waiting for a parking slot and
+            // sampling availability once: with a one-shot check the second send
+            // would keep pinning a small-lane slot for the rest of its wait,
+            // even though the area now has room.
             drop(occupied);
-            let permit = tokio::time::timeout(Duration::from_secs(5), waiting)
+            let first = tokio::time::timeout(Duration::from_secs(5), parked)
                 .await
-                .expect("completes once large-lane capacity frees up")
-                .expect("upgrade task");
+                .expect("first send completes")
+                .expect("task");
+            assert_eq!(
+                parking.available_permits(),
+                0,
+                "the released slot goes straight to the send waiting for one"
+            );
+            assert_eq!(
+                small.available_permits(),
+                12,
+                "so the second send parks too, and the small lane is free again"
+            );
+
+            drop(first);
+            let second = tokio::time::timeout(Duration::from_secs(5), waiting)
+                .await
+                .expect("second send completes once capacity frees up")
+                .expect("task");
             assert_eq!(small.available_permits(), 12);
             assert_eq!(large.available_permits(), 0);
-            drop(permit);
+            assert_eq!(
+                parking.available_permits(),
+                1,
+                "and the parking area is empty once both sends have left it"
+            );
+            drop(second);
+            assert_eq!(large.available_permits(), 1);
         }
 
         /// Cancellation safety, which `ensure_capacity_for`'s doc claims: a send
@@ -2072,13 +2200,14 @@ mod queue {
             for park_first in [false, true] {
                 let small = Arc::new(Semaphore::new(12));
                 let large = Arc::new(Semaphore::new(1));
-                let occupied = large
+                let parking = Arc::new(Semaphore::new(1));
+                let _occupied = large
                     .clone()
                     .acquire_owned()
                     .await
                     .expect("large pool open");
-                let mut permit = small_lane_permit(&small, &large);
-                let waiting = tokio::spawn(async move {
+                let mut permit = parked_small_lane_permit(&small, &large, &parking);
+                let mut waiting = tokio::spawn(async move {
                     permit.ensure_capacity_for(BIG).await;
                     permit
                 });
@@ -2090,18 +2219,43 @@ mod queue {
                     super::super::UPGRADE_SLOT_HOLD_WINDOW / 2
                 };
                 assert!(
-                    tokio::time::timeout(elapse, waiting).await.is_err(),
+                    tokio::time::timeout(elapse, &mut waiting).await.is_err(),
                     "[park_first={park_first}] precondition: still waiting"
                 );
-                // The timeout dropped the JoinHandle's future, but the task
-                // keeps running; abort it the way a shutdown would.
-                tokio::task::yield_now().await;
-                drop(occupied);
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                assert_eq!(
+                    parking.available_permits(),
+                    usize::from(!park_first),
+                    "[park_first={park_first}] precondition: parked iff past the window"
+                );
+
+                // Cancel it the way a shutdown would. `timeout` alone would NOT
+                // do this — dropping a JoinHandle detaches the task, it does not
+                // abort it — and the large permit is deliberately still held, so
+                // nothing but the abort can end this wait.
+                waiting.abort();
+                let cancelled = match waiting.await {
+                    Err(err) => err.is_cancelled(),
+                    Ok(_) => false,
+                };
+                assert!(
+                    cancelled,
+                    "[park_first={park_first}] the send must have been cancelled mid-wait"
+                );
+
                 assert_eq!(
                     small.available_permits(),
                     12,
                     "[park_first={park_first}] the small-lane slot must come back"
+                );
+                assert_eq!(
+                    parking.available_permits(),
+                    1,
+                    "[park_first={park_first}] and so must the parking slot"
+                );
+                assert_eq!(
+                    large.available_permits(),
+                    0,
+                    "[park_first={park_first}] the cancelled send took no large permit"
                 );
             }
         }
@@ -2124,6 +2278,46 @@ mod queue {
                 small.available_permits(),
                 12,
                 "and the small-lane permit is still released exactly once"
+            );
+        }
+
+        /// The same, but closing the pool AFTER the send has already parked —
+        /// the one path where a send proceeds holding no permit at all. Phase 1
+        /// and phase 2 take different exits, and the test above only covers
+        /// phase 1.
+        #[tokio::test(start_paused = true)]
+        async fn large_pool_closing_mid_park_does_not_strand_the_send() {
+            let small = Arc::new(Semaphore::new(12));
+            let large = Arc::new(Semaphore::new(1));
+            let parking = Arc::new(Semaphore::new(1));
+            let _occupied = large
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("large pool open");
+            let mut permit = parked_small_lane_permit(&small, &large, &parking);
+            let mut waiting = tokio::spawn(async move {
+                permit.ensure_capacity_for(BIG).await;
+                permit
+            });
+            assert!(
+                tokio::time::timeout(super::super::UPGRADE_SLOT_HOLD_WINDOW * 2, &mut waiting)
+                    .await
+                    .is_err(),
+                "precondition: parked, waiting on a pool that will never free"
+            );
+            assert_eq!(small.available_permits(), 12, "precondition: parked");
+
+            large.close();
+            let permit = tokio::time::timeout(Duration::from_secs(5), waiting)
+                .await
+                .expect("closing the pool must release the parked send")
+                .expect("task");
+            drop(permit);
+            assert_eq!(
+                parking.available_permits(),
+                1,
+                "and the parking slot goes back"
             );
         }
 
@@ -4119,7 +4313,7 @@ mod tests {
     /// `broadcast_to_single_peer` (it needs a live bridge and OpManager), so
     /// deleting the call, or sliding it past a send, leaves the whole suite
     /// green while up to 12 concurrent full-state streams go out on the
-    /// small lane. Same reason the seven other pins in this file exist.
+    /// small lane. Same reason the other source-scrape pins here exist.
     #[test]
     fn broadcast_to_single_peer_gates_wire_payload_on_lane_capacity_pin() {
         let src = include_str!("broadcast_queue.rs");
