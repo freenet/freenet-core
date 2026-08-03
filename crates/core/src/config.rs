@@ -336,6 +336,13 @@ const CONFIG_KEY_SPELLINGS: &[&[&str]] = &[
     &["max_blocking_threads", "max-blocking-threads"],
 ];
 
+/// The same, for the `[[gateways]]` entries of `gateways.toml`.
+///
+/// Separate from [`CONFIG_KEY_SPELLINGS`] because these keys are NESTED — they
+/// live inside an array of tables, not at the document root — so the two are
+/// applied by different walkers and must not be mixed.
+const GATEWAY_KEY_SPELLINGS: &[&[&str]] = &[&["public_key", "public-key"]];
+
 /// The redundant spellings to drop when a config file gives one setting under
 /// more than one of its accepted names. Empty for the overwhelmingly common
 /// case of a file that spells each key once.
@@ -357,19 +364,35 @@ const CONFIG_KEY_SPELLINGS: &[&[&str]] = &[
 /// changes a node's effective configuration: the value that wins is the value
 /// the previous release was already using. The loser is dropped with a warning
 /// naming both, and the next write-back removes it from the file for good.
-fn redundant_key_spellings(contains: impl Fn(&str) -> bool) -> Vec<&'static str> {
+fn redundant_key_spellings(
+    groups: &[&[&'static str]],
+    source: &str,
+    value_of: impl Fn(&str) -> Option<String>,
+) -> Vec<&'static str> {
     let mut redundant = Vec::new();
-    for group in CONFIG_KEY_SPELLINGS {
-        let mut present = group.iter().copied().filter(|key| contains(key));
-        let Some(keep) = present.next() else {
+    for group in groups {
+        let mut present = group
+            .iter()
+            .copied()
+            .filter_map(|key| value_of(key).map(|value| (key, value)));
+        let Some((keep, kept_value)) = present.next() else {
             continue;
         };
-        for ignored in present {
+        for (ignored, ignored_value) in present {
+            // Name both VALUES, not just both keys. The precedence rule spends
+            // the operator's newly-typed setting to buy upgrade safety, and
+            // this message is the whole of what they get back for it: without
+            // the values it does not say which line to delete to get the
+            // outcome they were reaching for. Deliberately does NOT promise the
+            // ignored key is removed automatically — that only happens for
+            // `config.toml`, and telling an operator it is handled reads as
+            // "nothing to do here", which is the confusion this all started as.
             let message = format!(
-                "config key `{ignored}` ignored: `{keep}` is set too and takes \
-                 precedence. They are two spellings of the same setting (#5124) \
-                 — delete one. `{ignored}` will be dropped when the config is \
-                 next written."
+                "`{ignored} = {ignored_value}` in {source} is ignored: \
+                 `{keep} = {kept_value}` is also set and wins. They are two \
+                 spellings of one setting (#5124), and the node is using \
+                 {kept_value}. To use {ignored_value} instead, delete the \
+                 `{keep}` line."
             );
             // Both, deliberately. `read_config` runs inside `ConfigArgs::build`,
             // which the node calls one line BEFORE `set_logger`
@@ -385,6 +408,46 @@ fn redundant_key_spellings(contains: impl Fn(&str) -> bool) -> Vec<&'static str>
         }
     }
     redundant
+}
+
+/// Parse `gateways.toml`, resolving duplicate key spellings the same way
+/// [`ConfigArgs::read_config`] does for `config.toml`.
+///
+/// `public_key` accepts `public-key` (#5124), which makes a file carrying both
+/// ambiguous — and `gateways.toml` is hand-edited (pinned peers, isolated
+/// networks, test harnesses pre-populating a `--config-dir`), so such a file is
+/// exactly as reachable as the `config.toml` case.
+///
+/// Getting this wrong here is worse than in `config.toml`, because the failure
+/// is INTERMITTENT: the local-cache read on the remote-index-success path
+/// swallows parse errors, while the fallback path propagates them. A node would
+/// run happily for months and then refuse to start the first time freenet.org
+/// was unreachable — the exact outage in which the cache is supposed to save
+/// it, and long after the edit that caused it.
+fn parse_gateways_toml(content: &str) -> Result<Gateways, toml::de::Error> {
+    let mut table = toml::from_str::<toml::Table>(content)?;
+    let mut normalized = false;
+    if let Some(toml::Value::Array(entries)) = table.get_mut("gateways") {
+        for entry in entries {
+            let Some(map) = entry.as_table_mut() else {
+                continue;
+            };
+            let redundant =
+                redundant_key_spellings(GATEWAY_KEY_SPELLINGS, "gateways.toml", |key| {
+                    map.get(key).map(|value| value.to_string())
+                });
+            for key in redundant {
+                map.remove(key);
+                normalized = true;
+            }
+        }
+    }
+    if normalized {
+        toml::Value::Table(table).try_into::<Gateways>()
+    } else {
+        // Unambiguous file: keep the parse whose errors carry line/column.
+        toml::from_str::<Gateways>(content)
+    }
 }
 
 impl ConfigArgs {
@@ -441,7 +504,10 @@ impl ConfigArgs {
                         // line/column spans that a Value-level parse loses.
                         let mut table =
                             toml::from_str::<toml::Table>(&content).map_err(invalid_data)?;
-                        let redundant = redundant_key_spellings(|key| table.contains_key(key));
+                        let redundant =
+                            redundant_key_spellings(CONFIG_KEY_SPELLINGS, "config.toml", |key| {
+                                table.get(key).map(|value| value.to_string())
+                            });
                         let mut config = if redundant.is_empty() {
                             toml::from_str::<Config>(&content).map_err(invalid_data)?
                         } else {
@@ -470,7 +536,13 @@ impl ConfigArgs {
                         let mut object = serde_json::from_str::<serde_json::Value>(&content)?;
                         let redundant = object
                             .as_object()
-                            .map(|map| redundant_key_spellings(|key| map.contains_key(key)))
+                            .map(|map| {
+                                redundant_key_spellings(
+                                    CONFIG_KEY_SPELLINGS,
+                                    "config.json",
+                                    |key| map.get(key).map(|value| value.to_string()),
+                                )
+                            })
                             .unwrap_or_default();
                         let mut config = if redundant.is_empty() {
                             serde_json::from_str::<Config>(&content)?
@@ -835,7 +907,7 @@ impl ConfigArgs {
             // them. The remote index still wins; --skip-load-from-network keeps
             // a custom peer set.
             if let Ok(content) = fs::read_to_string(&gateways_file) {
-                if let Ok(local_cache) = toml::from_str::<Gateways>(&content) {
+                if let Ok(local_cache) = parse_gateways_toml(&content) {
                     let dropped = gateways_dropped_by_remote_replace(
                         &local_cache.gateways,
                         &remotely_loaded_gateways.gateways,
@@ -922,7 +994,7 @@ impl ConfigArgs {
                 Ok(mut file) => {
                     let mut content = String::new();
                     file.read_to_string(&mut content)?;
-                    toml::from_str::<Gateways>(&content).map_err(|e| {
+                    parse_gateways_toml(&content).map_err(|e| {
                         std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
                     })?
                 }
@@ -4316,7 +4388,7 @@ async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Res
         .error_for_status()?
         .text()
         .await?;
-    let mut gateways: Gateways = toml::from_str(&response)?;
+    let mut gateways: Gateways = parse_gateways_toml(&response)?;
     let mut base_url = reqwest::Url::parse(url)?;
     base_url.set_path("");
     let mut valid_gateways = Vec::new();
@@ -4932,7 +5004,10 @@ shutdown-drain-secs = 42
         for doc in [RELEASED_CONFIG_TOML.to_string(), kebab_config_toml()] {
             let table: toml::Table = toml::from_str(&doc).unwrap();
             assert!(
-                redundant_key_spellings(|key| table.contains_key(key)).is_empty(),
+                redundant_key_spellings(CONFIG_KEY_SPELLINGS, "config.toml", |key| table
+                    .get(key)
+                    .map(|value| value.to_string()))
+                .is_empty(),
                 "no key is spelled twice here, so nothing may be dropped"
             );
         }
@@ -4960,6 +5035,34 @@ shutdown-drain-secs = 42
                 });
             }
         }
+    }
+
+    /// REGRESSION (found in review): the same duplicate-spelling case as
+    /// `config.toml`, but nested inside `[[gateways]]` — and nastier, because
+    /// the failure is INTERMITTENT. The local-cache read on the
+    /// remote-index-success path swallows parse errors while the fallback path
+    /// propagates them, so a node with such a file runs for months and then
+    /// refuses to start the first time freenet.org is unreachable.
+    #[test]
+    fn gateways_toml_public_key_spelled_two_ways_still_loads() {
+        let doc = "[[gateways]]\n\
+                   public_key = \"/tmp/freenet-5124/vega.pub\"\n\
+                   public-key = \"/tmp/freenet-5124/stale.pub\"\n\
+                   \n\
+                   [gateways.address]\n\
+                   host = \"vega.locut.us\"\n\
+                   port = 31337\n";
+        assert!(
+            toml::from_str::<Gateways>(doc).is_err(),
+            "precondition: raw serde rejects the ambiguous file"
+        );
+        let gateways =
+            parse_gateways_toml(doc).expect("a gateways.toml naming one key twice must still load");
+        assert_eq!(
+            gateways.gateways[0].public_key_path,
+            PathBuf::from("/tmp/freenet-5124/vega.pub"),
+            "the spelling the node writes must win, as it does for config.toml"
+        );
     }
 
     /// `gateways.toml` is hand-edited by operators too, and its `public_key`
