@@ -1831,11 +1831,11 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// Whether we hold a cached summary for `peer` on `contract`, WITHOUT
     /// cloning it.
     ///
-    /// [`Self::get_peer_summary`] clones the summary, which for a large-state
-    /// contract is exactly the allocation the caller is trying to avoid. The
-    /// broadcast queue only needs the yes/no answer to predict whether the
-    /// wire payload will be a delta or the full state, so it takes this
-    /// (DashMap read, no clone) instead.
+    /// [`Self::get_peer_summary`] clones the summary; the broadcast queue only
+    /// needs the yes/no answer to predict whether the wire payload will be a
+    /// delta or the full state, and it asks once per fan-out TARGET on the
+    /// event-loop path, so the clone is pure waste there. This is the same
+    /// DashMap read without it.
     pub fn has_peer_summary(&self, contract: &ContractKey, peer: &PeerKey) -> bool {
         self.interested_peers
             .get(contract)

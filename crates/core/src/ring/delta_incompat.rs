@@ -325,11 +325,18 @@ impl DeltaIncompat {
     /// The same question as [`Self::suppress_deltas`], but WITHOUT counting a
     /// suppression against `suppressed_total`.
     ///
-    /// `suppressed_total` counts the sends that actually took the full-state
-    /// path because of the memo. A caller that merely *predicts* the payload
-    /// shape (the broadcast queue's lane classification, which runs at enqueue
-    /// time and is followed by the real `suppress_deltas` call at send time)
-    /// must use this, or every suppressed send would be counted twice.
+    /// `suppressed_total` counts send attempts that reached payload selection
+    /// while the memo was armed. (Not "sends the memo forced to full state":
+    /// `suppress_deltas` is called before the payload match, and a send with no
+    /// cached summary would have gone full state regardless — see the
+    /// `FullDeltaSuppressed` scoping comment in `broadcast_queue.rs`.)
+    ///
+    /// A caller that merely *predicts* the payload shape must use this instead.
+    /// The broadcast queue's lane classification runs at ENQUEUE time and the
+    /// real `suppress_deltas` runs again at send time, so counting the
+    /// prediction would inflate the total — by more than 2x, since dedup
+    /// replacement can enqueue many times per eventual send and a queued entry
+    /// can be evicted without ever sending.
     pub fn deltas_suppressed_peek(&self, contract: &ContractInstanceId) -> bool {
         let now = self.time_source.now();
         self.contracts

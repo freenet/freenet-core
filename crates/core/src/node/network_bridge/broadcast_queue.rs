@@ -11,13 +11,21 @@
 //! older entries with newer state when a duplicate is enqueued.
 //!
 //! The limit is two pools — 12 concurrent small payloads, 2 concurrent large
-//! ones — and each pool has its OWN FIFO and its OWN drain worker, so a send
-//! waiting for large-payload capacity cannot delay small sends behind it. The
-//! pool is chosen from the PREDICTED wire payload (a large-state contract sends
-//! a small delta to any peer whose summary we hold), and corrected against the
-//! real payload before any bytes go out. See #4961 for the measurements that
-//! drove all three of those; before it, one worker drained one FIFO and picked
-//! the pool from the full contract STATE size.
+//! ones — and each pool has its OWN FIFO and its OWN drain worker, so a queued
+//! send waiting for large-payload capacity cannot delay small sends behind it.
+//! The pool is chosen from the PREDICTED wire payload (a large-state contract
+//! sends a small delta to any peer whose summary we hold), and corrected
+//! against the real payload before any bytes go out. See #4961 for the
+//! measurements that drove all three of those; before it, one worker drained
+//! one FIFO and picked the pool from the full contract STATE size.
+//!
+//! The correction is the one remaining cross-lane coupling, and it is BOUNDED
+//! rather than absent: a send that was queued small and turns out to be full
+//! state keeps its small-lane slot for at most
+//! [`UPGRADE_SLOT_HOLD_WINDOW`] while it waits for large-lane capacity, then
+//! gives the slot back and keeps waiting without one. So mispredictions cost
+//! the small lane a bounded stall instead of an unbounded one, and never put
+//! large payloads on the wire outside the large-payload limit.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -75,12 +83,31 @@ pub(super) enum QueuedPayloadClass {
 #[cfg_attr(feature = "simulation_tests", allow(dead_code))]
 pub(super) struct SendLanePermit {
     /// The permit currently held. Dropping `self` releases it.
-    permit: tokio::sync::OwnedSemaphorePermit,
+    ///
+    /// `None` only while waiting out a congested large lane — see
+    /// [`Self::ensure_capacity_for`]. Nothing is on the wire during that
+    /// window, so an absent permit never means unmetered bytes.
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
     /// Which pool `permit` came from.
     lane: QueuedPayloadClass,
     /// The large-payload pool, for the upgrade path.
     large_pool: Arc<tokio::sync::Semaphore>,
 }
+
+/// How long a mispredicted send keeps its small-lane slot while waiting for
+/// large-lane capacity, before handing the slot back and waiting without one.
+///
+/// The two failure modes this sits between: hold the slot indefinitely and
+/// enough simultaneous mispredictions tie up all 12 small permits, stalling
+/// unrelated small broadcasts — the very head-of-line failure this module was
+/// changed to remove. Hand it back immediately and the drain keeps dispatching,
+/// so the number of in-flight sends (each holding a serialized payload) is
+/// bounded only by the queue depth rather than by the pools.
+///
+/// A quarter second covers the common case — the large lane is briefly busy and
+/// a slot frees up — while capping the small lane's exposure to a burst of
+/// mispredictions at 250 ms even if every one of its permits is caught in one.
+const UPGRADE_SLOT_HOLD_WINDOW: Duration = Duration::from_millis(250);
 
 #[cfg_attr(feature = "simulation_tests", allow(dead_code))]
 impl SendLanePermit {
@@ -90,7 +117,7 @@ impl SendLanePermit {
         large_pool: Arc<tokio::sync::Semaphore>,
     ) -> Self {
         Self {
-            permit,
+            permit: Some(permit),
             lane,
             large_pool,
         }
@@ -102,45 +129,75 @@ impl SendLanePermit {
     ///
     /// This is what keeps the uplink guarantee independent of the prediction's
     /// accuracy: the small pool's 12 permits may only ever admit small
-    /// payloads, so a mispredicted send blocks here until large-lane capacity
-    /// exists, exactly as if it had been queued as large.
+    /// payloads, so a mispredicted send waits here until large-lane capacity
+    /// exists, exactly as if it had been queued as large. It is a no-op for a
+    /// correctly-classified send and for anything already in the large lane —
+    /// without that second guard a large-lane send would wait for a SECOND
+    /// large permit while holding one, and two of them would wedge the pool
+    /// permanently.
     ///
-    /// The small permit is held ACROSS the wait and released only once the
-    /// large permit is in hand (assigning `self.permit` drops the old one).
-    /// Releasing first would let the worker dispatch further entries while this
-    /// task parks, so the number of in-flight sends — each holding a clone of a
-    /// contract state — would be bounded only by the queue depth (256) instead
-    /// of by the pools (14). Holding it costs one small-lane slot for the
-    /// duration of the wait, which is bounded by large-lane drain rate.
+    /// The wait is in two phases (see [`UPGRADE_SLOT_HOLD_WINDOW`]): first
+    /// briefly holding the small-lane slot, then — if the large lane is
+    /// genuinely congested — after handing that slot back, so a burst of
+    /// mispredictions cannot occupy the wide pool and stall small sends behind
+    /// it. Mispredictions ARE bursty: they come from conditions that hit every
+    /// peer of a contract at once (a `get_contract_summary` timeout, an
+    /// `Interests` full-replace wiping cached summaries, the delta-incompat
+    /// memo arming, or a contract whose deltas are never smaller than its
+    /// state), so treating them as independent events would be wrong.
+    ///
+    /// While waiting without a permit the send holds no pool capacity and is
+    /// putting nothing on the wire; the in-flight count is then bounded by the
+    /// `active` tracking cap rather than by the pools.
     ///
     /// Cancellation: this is awaited inline by the send that OWNS the
     /// `SendLanePermit`, so dropping that send drops the permit too — mid-wait
     /// or mid-send, whichever permit is currently held is released exactly
-    /// once. Neither pool can leak a slot or be double-charged.
+    /// once, and a dropped `acquire_owned` future consumes nothing. Neither
+    /// pool can leak a slot or be double-charged.
     async fn ensure_capacity_for(&mut self, payload_size: usize) {
         if payload_size < BROADCAST_QUEUE_PAYLOAD_SIZE_THRESHOLD
             || matches!(self.lane, QueuedPayloadClass::Large)
         {
             return;
         }
-        match self.large_pool.clone().acquire_owned().await {
-            Ok(large) => {
-                // Swap, then drop: the small permit is released by this
-                // assignment, after the large one is already held.
-                self.permit = large;
-                self.lane = QueuedPayloadClass::Large;
-            }
-            Err(_) => {
-                // The pool is closed, which only happens at shutdown. Keep the
-                // small permit and let the send proceed rather than stalling
-                // forever; the worker logs the closure separately.
-                tracing::debug!(
-                    payload_size,
-                    "Large broadcast pool closed; sending mispredicted payload \
-                     under the small-lane permit"
-                );
-            }
+        // Phase 1: hold the small-lane slot across a brief wait. Giving it up
+        // for a large lane that is about to free a permit anyway would let the
+        // drain dispatch more concurrent sends than the pools are sized for.
+        let acquire = self.large_pool.clone().acquire_owned();
+        match tokio::time::timeout(UPGRADE_SLOT_HOLD_WINDOW, acquire).await {
+            Ok(Ok(large)) => return self.take_large(large),
+            Ok(Err(_)) => return self.large_pool_closed(payload_size),
+            Err(_elapsed) => {}
         }
+        // Phase 2: the large lane is genuinely congested. Release the
+        // small-lane slot BEFORE parking, so mispredicted sends cannot tie up
+        // the wide pool. Assigning `None` drops the permit; the send is now
+        // holding no capacity and sending nothing.
+        self.permit = None;
+        match self.large_pool.clone().acquire_owned().await {
+            Ok(large) => self.take_large(large),
+            Err(_) => self.large_pool_closed(payload_size),
+        }
+    }
+
+    /// Adopt `large` as the held permit. Assigning drops whatever was held
+    /// before, so the small-lane slot (if still held) is released only AFTER
+    /// large-lane capacity is in hand.
+    fn take_large(&mut self, large: tokio::sync::OwnedSemaphorePermit) {
+        self.permit = Some(large);
+        self.lane = QueuedPayloadClass::Large;
+    }
+
+    /// The large pool is closed, which happens only at shutdown. Let the send
+    /// proceed under whatever it still holds rather than stalling forever; the
+    /// lane worker logs the closure separately and is about to exit.
+    fn large_pool_closed(&self, payload_size: usize) {
+        tracing::debug!(
+            payload_size,
+            "Large broadcast pool closed; sending mispredicted payload without \
+             large-lane capacity"
+        );
     }
 }
 
@@ -515,23 +572,34 @@ mod queue {
 
     /// Whether the send for `(key, target)` is expected to carry a delta.
     ///
-    /// Mirrors the two conditions `broadcast_to_single_peer` itself applies
-    /// before it can compute a delta: we must hold a cached summary for the
-    /// target, and deltas must not be suppressed for the contract by the
-    /// delta-incompat memo. Both are in-memory reads (a DashMap lookup with no
-    /// summary clone, and a non-counting peek at the memo — using the counting
-    /// `suppress_deltas` here would double-count every suppressed send).
+    /// Mirrors TWO OF the conditions `broadcast_to_single_peer` applies before
+    /// it can compute a delta: we must hold a cached summary for the target,
+    /// and deltas must not be suppressed for the contract by the delta-incompat
+    /// memo. Both are in-memory reads (a DashMap lookup with no summary clone,
+    /// and a NON-counting peek at the memo — using the counting
+    /// `suppress_deltas` here would inflate `suppressed_total` with predictions
+    /// that never became sends).
+    ///
+    /// It deliberately does NOT mirror the third condition — that OUR OWN
+    /// summary is available. That one comes from `get_contract_summary`, a
+    /// contract-handler round trip that can time out under load, so it is
+    /// neither knowable at enqueue time nor affordable per target. The
+    /// prediction is therefore optimistic by construction, and every gap is
+    /// caught downstream by [`SendLanePermit::ensure_capacity_for`].
+    ///
+    /// Takes the two collections rather than `&OpManager` so the truth table is
+    /// unit-testable without standing up a node.
     fn delta_send_expected(
-        op_manager: &OpManager,
+        interest_manager: &crate::ring::interest::InterestManager<
+            crate::util::time_source::DynTimeSource,
+        >,
+        delta_incompat: &crate::ring::delta_incompat::DeltaIncompat,
         key: &ContractKey,
         target: &PeerKeyLocation,
     ) -> bool {
         let peer_key = PeerKey::from(target.pub_key().clone());
-        op_manager.interest_manager.has_peer_summary(key, &peer_key)
-            && !op_manager
-                .ring
-                .delta_incompat
-                .deltas_suppressed_peek(key.id())
+        interest_manager.has_peer_summary(key, &peer_key)
+            && !delta_incompat.deltas_suppressed_peek(key.id())
     }
 
     /// A pending broadcast entry in the queue.
@@ -559,7 +627,10 @@ mod queue {
     /// one shared FIFO the single worker awaited the large semaphore INLINE, so
     /// it could not `pop` anything at all while waiting — the head-of-line half
     /// of #4961 (1,887 incidents and a 7,260 s small-entry wait integral per
-    /// node-day on the 0.2.118 fleet).
+    /// node-day on the 0.2.118 fleet). (A dispatched send correcting a
+    /// mispredicted lane can still hold a small-lane permit briefly; that
+    /// residual is bounded by [`UPGRADE_SLOT_HOLD_WINDOW`], not by the large
+    /// lane's drain rate.)
     ///
     /// Ordering is by a global monotonic sequence number so the two FIFOs stay
     /// comparable: capacity eviction still drops the globally oldest entry, and
@@ -855,8 +926,10 @@ mod queue {
     /// (< 64KB) get high concurrency (12 slots) for fast fan-out of
     /// deltas/chat messages, while predicted-large sends (>= 64KB, i.e. full
     /// state) get low concurrency (2 slots) to avoid saturating the uplink.
-    /// Each pool has its OWN FIFO and its OWN drain worker, so a send waiting
-    /// for large-lane capacity never delays a small one.
+    /// Each pool has its OWN FIFO and its OWN drain worker, so a QUEUED send
+    /// waiting for large-lane capacity never delays a small one. (A dispatched
+    /// send correcting a mispredicted lane holds its small-lane permit for at
+    /// most [`UPGRADE_SLOT_HOLD_WINDOW`] — see `SendLanePermit`.)
     #[derive(Clone)]
     pub(crate) struct BroadcastQueue {
         queue: Arc<Mutex<QueueState>>,
@@ -907,7 +980,12 @@ mod queue {
         ) {
             let lane = classify_payload_lane(
                 new_state.size(),
-                delta_send_expected(op_manager, &key, &target),
+                delta_send_expected(
+                    &op_manager.interest_manager,
+                    &op_manager.ring.delta_incompat,
+                    &key,
+                    &target,
+                ),
             );
             self.enqueue_in_lane(lane, key, target, new_state).await;
         }
@@ -1006,14 +1084,19 @@ mod queue {
         /// awaited its entry's semaphore inline, before `tokio::spawn`, so
         /// while it waited for one of the 2 large-lane permits it could not
         /// `pop` anything at all — including small entries whose 12 permits
-        /// were entirely free. Splitting the drain per lane makes cross-lane
+        /// were entirely free. Splitting the drain per lane makes QUEUED-entry
         /// head-of-line blocking impossible by construction rather than by
         /// scheduling luck; moving the acquire INSIDE the spawn would have
         /// fixed the stall too, but at the cost of unbounded spawned tasks and
         /// of the replace-on-dedup that keeps a hot contract from queueing a
         /// send per update.
         ///
-        /// The workers run forever; they are spawned as background tasks.
+        /// The workers run forever; they are spawned as background tasks. The
+        /// handles are not registered with a monitor (pre-existing), and there
+        /// are two of them now, so if one ever returned — only possible on a
+        /// closed semaphore, i.e. shutdown — the other would keep draining and
+        /// that lane would silently stop. Worth revisiting if the pools ever
+        /// gain a real close path.
         pub(crate) fn start_worker(
             &self,
             bridge: P2pBridge,
@@ -1280,10 +1363,19 @@ mod queue {
                 2,
                 "start_worker must spawn exactly one drain per lane"
             );
+            // Pin the lane→pool WIRING, not just the lane count. Handing the
+            // small lane the large semaphore is a one-token slip that caps
+            // small broadcasts at 2 concurrent and puts them back in contention
+            // with full-state sends — i.e. reinstates #4961 at full strength —
+            // while every behavioural test still passes, because they build
+            // their own semaphores instead of going through `start_worker`.
             assert!(
-                body.contains("spawn_lane(QueuedPayloadClass::Small")
-                    && body.contains("spawn_lane(QueuedPayloadClass::Large"),
-                "both lanes must get their own drain"
+                body.contains("spawn_lane(QueuedPayloadClass::Small, small_semaphore)"),
+                "the small lane must be given the SMALL pool"
+            );
+            assert!(
+                body.contains("spawn_lane(QueuedPayloadClass::Large, large_semaphore"),
+                "the large lane must be given the LARGE pool"
             );
         }
 
@@ -1382,6 +1474,10 @@ mod queue {
         /// a large permit freed up (1,887 incidents and a 7,260 s small-entry
         /// wait integral per node-day on the 0.2.118 fleet).
         #[tokio::test(start_paused = true)]
+        // Publishes the process-global broadcast-queue depth gauge; serialized
+        // against `shadow_demand::tests::broadcast_queue_depth_gauge_round_trips`,
+        // which asserts an exact value of it.
+        #[serial_test::serial(broadcast_queue_depth_gauge)]
         async fn small_entry_is_scheduled_while_the_large_lane_is_saturated() {
             let queue = BroadcastQueue::new();
             let mut lanes = spawn_lanes(&queue, 12, 2);
@@ -1446,6 +1542,10 @@ mod queue {
         /// permits — 64.5% of large-lane traffic on the 0.2.118 fleet was this
         /// case, averaging ~950 actual payload bytes.
         #[tokio::test(start_paused = true)]
+        // Publishes the process-global broadcast-queue depth gauge; serialized
+        // against `shadow_demand::tests::broadcast_queue_depth_gauge_round_trips`,
+        // which asserts an exact value of it.
+        #[serial_test::serial(broadcast_queue_depth_gauge)]
         async fn large_state_with_an_expected_delta_takes_the_small_lane() {
             assert_eq!(
                 classify_payload_lane(BIG, true),
@@ -1493,10 +1593,14 @@ mod queue {
                 Some((QueuedPayloadClass::Small, key)),
                 "a delta send on a large-state contract must not queue behind full-state capacity"
             );
+            // Asserting `large_permits == 0` here would prove nothing —
+            // `blocker` holds both for the whole test. What discriminates is
+            // which pool the dispatched send drew from: the parked dispatch is
+            // holding a SMALL permit.
             assert_eq!(
-                lanes.large_permits.available_permits(),
-                0,
-                "and it must not have taken a large-lane permit"
+                lanes.small_permits.available_permits(),
+                11,
+                "and it must have taken a small-lane permit, not a large one"
             );
             drop(blocker);
         }
@@ -1506,6 +1610,10 @@ mod queue {
         /// left the lane (and the scheduled-bytes attribution) stale the moment
         /// a state crossed the threshold — the third defect in #4961.
         #[tokio::test(start_paused = true)]
+        // Publishes the process-global broadcast-queue depth gauge; serialized
+        // against `shadow_demand::tests::broadcast_queue_depth_gauge_round_trips`,
+        // which asserts an exact value of it.
+        #[serial_test::serial(broadcast_queue_depth_gauge)]
         async fn dedup_replacement_relanes_and_refreshes_state_size() {
             let queue = BroadcastQueue::new();
             let key = contract(5);
@@ -1555,6 +1663,10 @@ mod queue {
         /// Capacity eviction still drops the globally oldest entry, which with
         /// two FIFOs means comparing their heads rather than popping one.
         #[tokio::test(start_paused = true)]
+        // Publishes the process-global broadcast-queue depth gauge; serialized
+        // against `shadow_demand::tests::broadcast_queue_depth_gauge_round_trips`,
+        // which asserts an exact value of it.
+        #[serial_test::serial(broadcast_queue_depth_gauge)]
         async fn capacity_eviction_drops_the_globally_oldest_across_lanes() {
             let queue = BroadcastQueue {
                 max_queue_depth: 2,
@@ -1591,54 +1703,81 @@ mod queue {
             assert_eq!(q.small_queued, 2);
         }
 
+        fn small_lane_permit(small: &Arc<Semaphore>, large: &Arc<Semaphore>) -> SendLanePermit {
+            SendLanePermit::new(
+                QueuedPayloadClass::Small,
+                small
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("small pool has capacity"),
+                large.clone(),
+            )
+        }
+
         /// The prediction decides scheduling; it must NOT decide how many bytes
         /// may be in flight. A send whose payload turns out to be full state
         /// after all has to take a large-lane permit before anything goes on
         /// the wire, or 12 concurrent full-state streams saturate the uplink.
+        ///
+        /// Also pins the threshold boundary — `ensure_capacity_for`'s
+        /// comparison must agree with `classify_payload_lane`'s, or a payload
+        /// exactly at the threshold ships under whichever one is looser — and
+        /// the two-phase wait that keeps a burst of mispredictions from
+        /// occupying the small pool.
         #[tokio::test(start_paused = true)]
         async fn mispredicted_large_payload_waits_for_large_lane_capacity() {
             let small = Arc::new(Semaphore::new(12));
             let large = Arc::new(Semaphore::new(1));
-            let mut permit = SendLanePermit::new(
-                QueuedPayloadClass::Small,
-                small
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .expect("small pool open"),
-                large.clone(),
-            );
+            let mut permit = small_lane_permit(&small, &large);
 
-            // A correctly-predicted small payload never touches the large lane.
+            // A correctly-predicted small payload never touches the large lane,
+            // and neither does one a single byte under the threshold.
             permit.ensure_capacity_for(1_000).await;
+            permit.ensure_capacity_for(BIG - 2).await;
             assert_eq!(
                 large.available_permits(),
                 1,
-                "no upgrade for a small payload"
+                "no upgrade for a payload below the threshold"
             );
             assert_eq!(small.available_permits(), 11);
 
-            // Now the payload turns out to be a full state while the large lane
-            // is busy.
+            // Now the payload turns out to be full state while the large lane
+            // is busy. `BIG - 1` is exactly the threshold — the boundary case.
             let occupied = large
                 .clone()
                 .acquire_owned()
                 .await
                 .expect("large pool open");
             let mut upgrading = tokio::spawn(async move {
-                permit.ensure_capacity_for(BIG).await;
+                permit.ensure_capacity_for(BIG - 1).await;
                 permit
             });
             assert!(
-                tokio::time::timeout(Duration::from_secs(5), &mut upgrading)
+                tokio::time::timeout(super::super::UPGRADE_SLOT_HOLD_WINDOW / 2, &mut upgrading)
                     .await
                     .is_err(),
-                "a mispredicted full state must wait for large-lane capacity"
+                "a payload at the threshold must wait for large-lane capacity"
             );
             assert_eq!(
                 small.available_permits(),
                 11,
-                "the small permit is held across the wait, bounding in-flight sends by the pools"
+                "within the hold window the small permit is kept, so the drain \
+                 cannot dispatch more concurrent sends than the pools are sized for"
+            );
+
+            // Past the hold window the slot goes back, so a burst of
+            // mispredictions cannot occupy the wide pool. Nothing is on the
+            // wire while it waits.
+            assert!(
+                tokio::time::timeout(super::super::UPGRADE_SLOT_HOLD_WINDOW * 2, &mut upgrading)
+                    .await
+                    .is_err(),
+                "and it still must not send without large-lane capacity"
+            );
+            assert_eq!(
+                small.available_permits(),
+                12,
+                "past the hold window the small-lane slot is released"
             );
 
             drop(occupied);
@@ -1651,13 +1790,110 @@ mod queue {
                 0,
                 "the send now holds the large-lane permit"
             );
+            assert_eq!(small.available_permits(), 12);
+            drop(permit);
+            assert_eq!(large.available_permits(), 1, "and releases it when done");
+        }
+
+        /// A send ALREADY in the large lane must not try to upgrade: it would
+        /// wait for a SECOND large permit while holding one, and two such sends
+        /// — the whole pool — would wedge full-state broadcasting permanently.
+        #[tokio::test(start_paused = true)]
+        async fn large_lane_send_does_not_upgrade_against_itself() {
+            let large = Arc::new(Semaphore::new(1));
+            let mut permit = SendLanePermit::new(
+                QueuedPayloadClass::Large,
+                large
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("large pool has capacity"),
+                large.clone(),
+            );
+            assert_eq!(large.available_permits(), 0, "the pool is now empty");
+
+            tokio::time::timeout(Duration::from_secs(5), permit.ensure_capacity_for(BIG))
+                .await
+                .expect("a large-lane send must not wait on its own pool");
+            drop(permit);
+            assert_eq!(large.available_permits(), 1);
+        }
+
+        /// Shutdown: a closed large pool must not strand the send forever. It
+        /// proceeds without large-lane capacity — a deliberate, documented
+        /// bypass, because the lane worker is exiting anyway.
+        #[tokio::test(start_paused = true)]
+        async fn closed_large_pool_does_not_strand_the_send() {
+            let small = Arc::new(Semaphore::new(12));
+            let large = Arc::new(Semaphore::new(1));
+            let mut permit = small_lane_permit(&small, &large);
+            large.close();
+
+            tokio::time::timeout(Duration::from_secs(5), permit.ensure_capacity_for(BIG))
+                .await
+                .expect("a closed pool must not block the send forever");
+            drop(permit);
             assert_eq!(
                 small.available_permits(),
                 12,
-                "and released the small one once the large was in hand"
+                "and the small-lane permit is still released exactly once"
             );
-            drop(permit);
-            assert_eq!(large.available_permits(), 1, "and releases it when done");
+        }
+
+        /// The production classifier INPUT. `classify_payload_lane` is pure and
+        /// pinned above; this pins the predicate that feeds it, which is what
+        /// `BroadcastQueue::enqueue` actually calls. Dropping the `!`, swapping
+        /// `&&` for `||`, or hard-coding either term would otherwise leave every
+        /// other test in the crate green.
+        #[test]
+        fn delta_send_expected_requires_a_cached_summary_and_an_unarmed_memo() {
+            use crate::ring::delta_incompat::{DeltaIncompat, INCOMPAT_TRIP_THRESHOLD};
+            use crate::ring::interest::InterestManager;
+            use crate::util::time_source::{DynTimeSource, SharedMockTimeSource};
+            use freenet_stdlib::prelude::StateSummary;
+
+            let clock = SharedMockTimeSource::new();
+            let time: DynTimeSource = Arc::new(clock);
+            let interest = InterestManager::new(time.clone());
+            let memo = DeltaIncompat::new(time);
+
+            let key = contract(3);
+            let target = PeerKeyLocation::random();
+            let peer = PeerKey::from(target.pub_key().clone());
+
+            assert!(
+                !delta_send_expected(&interest, &memo, &key, &target),
+                "no interest entry at all: the first send must be full state"
+            );
+
+            interest.register_peer_interest(&key, peer.clone(), None, false);
+            assert!(
+                !delta_send_expected(&interest, &memo, &key, &target),
+                "interested but summary-less: nothing to compute a delta against"
+            );
+
+            interest.update_peer_summary(&key, &peer, StateSummary::from(vec![1, 2, 3]));
+            assert!(
+                delta_send_expected(&interest, &memo, &key, &target),
+                "a cached summary is what makes the send a delta"
+            );
+
+            // Arm the delta-incompat memo for this contract: it rejects deltas,
+            // so the send is full state despite the cached summary.
+            let addr = |port: u16| -> std::net::SocketAddr {
+                format!("127.0.0.1:{port}").parse().unwrap()
+            };
+            for i in 0..INCOMPAT_TRIP_THRESHOLD {
+                memo.record_delta_sent(*key.id(), addr(6000 + i as u16));
+                memo.note_resync_request(*key.id(), addr(6000 + i as u16));
+            }
+            assert!(
+                memo.deltas_suppressed_peek(key.id()),
+                "precondition: the memo is armed"
+            );
+            assert!(
+                !delta_send_expected(&interest, &memo, &key, &target),
+                "an armed memo means full state, cached summary or not"
+            );
         }
     }
 } // end `mod queue` (cfg-gated)
@@ -2195,16 +2431,6 @@ pub(super) async fn broadcast_to_single_peer(
         }
         _ => {}
     }
-    // The lane was picked from a PREDICTION of this payload. Now that the real
-    // size is known, make the permit match it before any bytes go out: a
-    // mispredicted full state must wait for large-lane capacity exactly as if
-    // it had been queued large, or 12 concurrent full-state streams saturate
-    // the uplink — the failure this queue exists to prevent. Counted above
-    // first, so the prediction's accuracy stays measurable independently of the
-    // correction. No-op for a correctly-classified send.
-    if let Some(permit) = lane_permit.as_mut() {
-        permit.ensure_capacity_for(payload_size).await;
-    }
     // Attribute the summarize + delta WASM (CPU) burned to produce this send.
     // Reported for EVERY attempt (the WASM work ran regardless of whether the
     // send lands). The payload BYTES are charged separately, ONLY on a real
@@ -2212,7 +2438,27 @@ pub(super) async fn broadcast_to_single_peer(
     // failed send never charges phantom fan-out bytes. `payload_size` is the
     // real delta/full-state size chosen above, not a `full-state × targets`
     // over-estimate.
+    //
+    // MUST stay ABOVE `ensure_capacity_for`: all the WASM work is done by this
+    // point, and that call can park for seconds waiting on uplink capacity.
+    // `report_send_cpu` measures WALL time since `send_wasm_started`, so
+    // reporting after the wait would bill a scheduler queue as contract CPU —
+    // on the very axis (`ExecCpuMicros`) that cost-pressure eviction reads,
+    // whose per-node floor is 50 ms/s. One 5 s wait would be 100× that floor
+    // and could evict a contract for work it never did. Pinned by
+    // `broadcast_to_single_peer_gates_wire_payload_on_lane_capacity_pin`.
     report_send_cpu(op_manager);
+
+    // The lane was picked from a PREDICTION of this payload. Now that the real
+    // size is known, make the permit match it before any bytes go out: a
+    // mispredicted full state must wait for large-lane capacity exactly as if
+    // it had been queued large, or 12 concurrent full-state streams saturate
+    // the uplink — the failure this queue exists to prevent. The mismatch is
+    // counted above first, so the prediction's accuracy stays measurable
+    // independently of the correction. No-op for a correctly-classified send.
+    if let Some(permit) = lane_permit.as_mut() {
+        permit.ensure_capacity_for(payload_size).await;
+    }
 
     let update_tx = crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
 
@@ -3525,6 +3771,63 @@ mod tests {
         );
     }
 
+    /// The uplink bound now depends on ONE call in `broadcast_to_single_peer`
+    /// — the lane correction — and on it running in the right place. Neither
+    /// is covered by a behavioural test: nothing in the crate calls
+    /// `broadcast_to_single_peer` (it needs a live bridge and OpManager), so
+    /// deleting the call, or sliding it past a send, leaves the whole suite
+    /// green while up to 12 concurrent full-state streams go out on the
+    /// small lane. Same reason the seven other pins in this file exist.
+    #[test]
+    fn broadcast_to_single_peer_gates_wire_payload_on_lane_capacity_pin() {
+        let src = include_str!("broadcast_queue.rs");
+        // Column-0 anchor. This test lives in the module AFTER the function, as
+        // its sibling pins do, so a bare `find` would work — but it must stay
+        // that way: an earlier copy of this string (e.g. moving this test into
+        // `mod queue`'s test module, which precedes the function) silently
+        // re-slices the SIBLING pins onto the wrong region. Two of them failed
+        // exactly that way while this test was being written.
+        let start = src
+            .find("\npub(super) async fn broadcast_to_single_peer(")
+            .expect("broadcast_to_single_peer renamed or removed");
+        let end = src[start..]
+            .find("\n#[cfg(test)]")
+            .expect("end of broadcast_to_single_peer not found")
+            + start;
+        let body = &src[start..end];
+
+        let upgrade = body
+            .find("ensure_capacity_for(payload_size)")
+            .expect("the actual wire payload must be gated on lane capacity");
+
+        // Before EVERY send. `bridge.send` covers both the inline broadcast
+        // and the streaming metadata; the fragments follow it.
+        for send in ["bridge.send(peer_addr", "send_stream_with_completion("] {
+            let at = body
+                .find(send)
+                .unwrap_or_else(|| panic!("send site `{send}` not found"));
+            assert!(
+                upgrade < at,
+                "the lane correction (offset {upgrade}) must run BEFORE `{send}` \
+                 (offset {at}) — bytes must never reach the wire under a permit \
+                 that does not cover them"
+            );
+        }
+
+        // ...and AFTER the CPU report. `report_send_cpu` measures wall time
+        // since the summarize/delta work started, so reporting it on the far
+        // side of an uplink-capacity wait bills scheduler queueing to the
+        // contract's ExecCpuMicros — the axis cost-pressure eviction reads.
+        let cpu = body
+            .rfind("report_send_cpu(op_manager);")
+            .expect("send-CPU report not found");
+        assert!(
+            cpu < upgrade,
+            "report_send_cpu (offset {cpu}) must run BEFORE the lane correction \
+             (offset {upgrade}), or a semaphore wait is charged as contract CPU"
+        );
+    }
+
     /// Source-scrape pin (#3046 / #3093): BOTH converged skips must refresh the
     /// peer's interest TTL.
     ///
@@ -3540,6 +3843,7 @@ mod tests {
     /// self-limiting (its verdict is cached, so the next fan-out takes the
     /// summaries-equal exit instead) — a revert there would leave every
     /// behavioural test green.
+
     #[test]
     fn broadcast_to_single_peer_refreshes_interest_on_every_skip_pin() {
         let src = include_str!("broadcast_queue.rs");
