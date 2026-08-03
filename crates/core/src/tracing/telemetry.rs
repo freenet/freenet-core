@@ -3377,6 +3377,7 @@ mod tests {
             tel: [value; 15],
             shadow: [[value; 9]; 7],
             eff: [value; 8],
+            retain: [value; 6],
         };
 
         let mut u = arbitrary::Unstructured::new(&[0_u8; 32_768]);
@@ -3390,7 +3391,7 @@ mod tests {
         let object = block
             .as_object()
             .expect("network_efficiency_v1 must remain a JSON object");
-        assert_eq!(object.len(), 31, "schema must remain fixed-cardinality");
+        assert_eq!(object.len(), 32, "schema must remain fixed-cardinality");
         let encoded = serde_json::to_vec(block).expect("serialize diagnostic block");
         assert!(
             encoded.len() <= MAX_BUSY_JSON_BYTES,
