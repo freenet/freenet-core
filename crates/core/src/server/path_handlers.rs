@@ -1493,6 +1493,28 @@ pub(super) fn sanitize_shell_sub_path(sub_path: &str) -> Result<String, WebSocke
             error_cause: "deep-link sub-path must not contain '.' or '..' segments".to_string(),
         });
     }
+    // …and reject a surviving `%`, because the dot-segment check above sees the
+    // path exactly ONCE-decoded (axum's `PercentDecodedStr` decodes path params
+    // a single time) while the browser decodes the URL we hand back again. So
+    // `%252e%252e` on the wire arrives here as the literal text `%2e%2e` —
+    // neither `.` nor `..`, so it passes — and the WHATWG URL parser then
+    // treats it as a dot segment and normalizes it away. Measured end to end:
+    // `/v1/contract/web/KEYA/%252e%252e/KEYB/index.html` produced an iframe
+    // `data-src` the browser resolved to KEYB's page, so KEYB's app ran inside
+    // a shell holding KEYA's auth token — the cross-contract confusion this
+    // whole function exists to prevent (#3841).
+    //
+    // Rejecting `%` outright rather than enumerating the encodings of `.`: this
+    // path is already once-decoded, so a legitimate sub-path reaches us with
+    // its escapes resolved (a filename with a space arrives as a space — and is
+    // rejected by the whitespace check above, so that is the established bar).
+    // A literal `%` in a contract filename is vanishingly rare, and the cost is
+    // a 400 on a deep link, not a broken app.
+    if sub_path.contains('%') {
+        return Err(WebSocketApiError::InvalidParam {
+            error_cause: "deep-link sub-path must not contain percent escapes".to_string(),
+        });
+    }
     Ok(sub_path.to_string())
 }
 
@@ -1540,10 +1562,12 @@ fn shell_page(
                 continue;
             }
             // Strip any `__sandbox*` param (server-interpreted routing
-            // flag) and the auth credential `authToken`. Both are
-            // prefix-checked since a future refactor might add
-            // variants like `__sandbox_debug` or `authToken2`.
-            if param.starts_with("__sandbox") || param.starts_with("authToken") {
+            // flag) and the auth credential `authToken`. Shared with the
+            // redirect filter rather than duplicated, so the two cannot
+            // drift — and so both get the percent-decoding of the name that
+            // a raw prefix match misses (`authT%6Fken=evil` reads back as
+            // `authToken` from `location.search` inside the iframe).
+            if super::client_api::is_sensitive_query_param(param) {
                 continue;
             }
             iframe_params.push(param.to_string());
@@ -5114,6 +5138,28 @@ mod tests {
     /// browser into a different contract's prefix.
     #[test]
     fn sanitize_shell_sub_path_accepts_safe_paths_and_rejects_dangerous() {
+        // A percent-escape that SURVIVES axum's single decode is a second,
+        // browser-side decode waiting to happen: `%252e%252e` on the wire
+        // arrives here as the literal `%2e%2e`, passes the dot-segment check,
+        // and is then normalized to `..` by the URL parser in whatever we hand
+        // back — the iframe `data-src`, or the sub-page redirect. Measured
+        // end to end: it resolved to ANOTHER contract's page inside a shell
+        // holding this contract's auth token.
+        for encoded in [
+            "%2e%2e/OTHERKEY/index.html",
+            "%2E%2E/OTHERKEY/index.html",
+            ".%2e/OTHERKEY/index.html",
+            "%2e/index.html",
+            "sub/%2e%2e/%2e%2e/index.html",
+            "a%25b.html",
+        ] {
+            assert!(
+                sanitize_shell_sub_path(encoded).is_err(),
+                "{encoded} must be rejected: it is once-decoded here but decoded \
+                 again by the browser"
+            );
+        }
+
         // Safe relative paths used by real multi-page webapps.
         for ok in ["news/", "about/team", "page2", "index.html", "a/b/c/"] {
             assert_eq!(
@@ -6910,12 +6956,15 @@ mod tests {
             block.contains("e.button ||")
                 && block.contains("e.ctrlKey")
                 && block.contains("e.metaKey")
-                && block.contains("e.shiftKey"),
+                && block.contains("e.shiftKey")
+                && block.contains("e.altKey"),
             "middle/ctrl/cmd/shift-click must also fall through, restoring the \
              background-tab and new-window placement the postMessage route \
              collapsed into a plain foreground tab (#3853). Test `e.button` for \
              truthiness, not `=== 1`: `auxclick` fires for the secondary button \
-             too, and preventDefault there does not suppress the context menu"
+             too, and preventDefault there does not suppress the context menu. \
+             `altKey` is here for a different reason — it is the save-link \
+             gesture, not a new window — but the same conclusion applies"
         );
         assert!(
             !block.contains("e.button === 1"),
@@ -7092,8 +7141,20 @@ mod tests {
         );
         let block = &js[target_attr_idx..navigate_idx];
 
+        // Scope the `return;` to the target check itself. A block that runs to
+        // the `navigate` branch also spans the modifier skip's `return;` and the
+        // cross-origin branch's, so the conjunct would hold with the early
+        // return deleted — mutation-confirmed.
+        let button_idx = js
+            .find("if (e.button ||")
+            .expect("modifier/button skip present");
         assert!(
-            block.contains("targetName !== '_self'") && block.contains("return;"),
+            target_attr_idx < button_idx,
+            "the target check must precede the modifier skip"
+        );
+        let target_block = &js[target_attr_idx..button_idx];
+        assert!(
+            target_block.contains("targetName !== '_self'") && target_block.contains("return;"),
             "same-origin target=\"_blank\" must fall through to the browser. Routing it \
              through open_url dead-ends on a loopback node, where the shell's open_url \
              handler refuses the host and the click does nothing at all (#5106)"

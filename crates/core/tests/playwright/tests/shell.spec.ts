@@ -428,7 +428,7 @@ test("a contract cannot reach a node-origin context by escaping the sandbox (#38
     expect(
       reports,
       `every embedded frame must actually be probed and report an opaque origin: ${detail}`,
-    ).toEqual(reports.map(() => "OPAQUE"));
+    ).toEqual(nested.map(() => "OPAQUE"));
   }
 
   await popup.close();

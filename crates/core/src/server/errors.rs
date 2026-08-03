@@ -101,6 +101,11 @@ impl IntoResponse for WebSocketApiError {
             }
         );
 
+        // `true` when the body below is node-authored MARKUP (the retry page)
+        // rather than a message built from request-derived text. Only the
+        // latter is escaped — escaping the retry page would render its
+        // meta-refresh tag as visible text and break the auto-reload.
+        let mut body_is_trusted_markup = false;
         let (status, error_message) = if is_transient {
             // Log the cause so operators can distinguish a fast op error
             // from a slow-loading contract without changing the user-facing
@@ -108,6 +113,7 @@ impl IntoResponse for WebSocketApiError {
             if let WebSocketApiError::AxumError { error } = &self {
                 tracing::info!(%error, "serving retry page for transient contract-fetch error");
             }
+            body_is_trusted_markup = true;
             (StatusCode::SERVICE_UNAVAILABLE, retry_loading_page())
         } else {
             match self {
@@ -133,7 +139,19 @@ impl IntoResponse for WebSocketApiError {
             }
         };
 
-        let body = Html(error_message);
+        // These bodies are served as text/html at the NODE's own origin, and
+        // several carry request-derived text: `web_subpages`' "Page not found:
+        // {page}" reflects the requested sub-path verbatim, and an
+        // `AxumError`'s `Display` can surface a rejected byte. Escape before
+        // wrapping in `Html`, so a crafted URL cannot become markup on a
+        // node-origin page — this is the one response class on the contract-web
+        // routes that carries no CSP, no `nosniff` and no `X-Frame-Options`,
+        // i.e. exactly where an injection would be worth the most.
+        let body = if body_is_trusted_markup {
+            Html(error_message)
+        } else {
+            Html(html_escape(&error_message))
+        };
 
         // Prevent intermediaries/service-workers from pinning a stale retry
         // page, and signal the client when it may retry.
@@ -396,4 +414,17 @@ mod tests {
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
+}
+
+/// Minimal HTML entity escaping for error bodies rendered at the node origin.
+///
+/// Deliberately duplicated from `permission_prompts::html_escape` rather than
+/// shared: this module is on the error path of every route and must not depend
+/// on a sibling that may itself fail to build.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
 }

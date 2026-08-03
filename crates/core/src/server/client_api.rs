@@ -796,12 +796,46 @@ fn redirect_to_shell_sub_page(
 /// into the shell. `__sandbox` is a server-interpreted routing flag;
 /// `authToken` is the shell's auth credential and must only come from
 /// `AuthToken::generate()`, never from an attacker-controlled URL.
-fn is_sensitive_query_param(param: &str) -> bool {
+///
+/// The NAME is percent-decoded before the check. A raw prefix match is
+/// bypassable by encoding one character of the name — `authT%6Fken=evil`
+/// survives it, and `new URLSearchParams(...).get("authToken")` in the iframe
+/// then returns `evil`, which is exactly the webapp-reads-its-credential-from-
+/// `location.search` case this exists to prevent. Only the name is decoded; the
+/// value is forwarded byte-for-byte, since re-encoding it could break a signed
+/// or opaque app parameter.
+pub(super) fn is_sensitive_query_param(param: &str) -> bool {
     // Prefix-match so variants like `__sandbox_debug` or `authTokenExtra`
     // (from a future refactor or an adversarial URL) are also stripped.
-    // Matches the filter in `path_handlers::shell_page` that forwards
-    // query params into the iframe.
-    param.starts_with("__sandbox") || param.starts_with("authToken")
+    // Shared with `path_handlers::shell_page`, which forwards query params into
+    // the iframe — the two filters used to be separate copies of this rule.
+    let name = param.split('=').next().unwrap_or(param);
+    let decoded = percent_decode_ascii(name);
+    decoded.starts_with("__sandbox") || decoded.starts_with("authToken")
+}
+
+/// Percent-decodes the ASCII escapes in a query-parameter NAME so it can be
+/// compared against a literal. Deliberately minimal: invalid escapes are left
+/// as-is (they cannot form the names we are looking for), and non-ASCII bytes
+/// are passed through, because the only decision this feeds is a prefix match
+/// against two ASCII literals.
+fn percent_decode_ascii(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = &s[i + 1..i + 3];
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte as char);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
 
 /// Returns true if a contract sub-path request is a top-level HTML
@@ -865,7 +899,7 @@ async fn serve_sandbox_response(
         // sandbox content off a top-level document, and that job is done by
         // redirecting at all, whatever the target.
         return redirect_to_shell_sub_page(&key, api_version, sub_path, query_string)
-            .or_else(|_| redirect_to_shell_root(&key, api_version, None));
+            .or_else(|_| redirect_to_shell_root(&key, api_version, query_string));
     }
 
     let contract_response = match path_handlers::serve_sandbox_content(
@@ -1919,6 +1953,40 @@ mod tests {
             Some(CONTRACT_CONTENT_SANDBOX_CSP),
             "the header is unconditional on this route"
         );
+    }
+
+    /// A percent-encoded parameter NAME must not slip the sensitive-param
+    /// filter. `authT%6Fken=evil` reads back as `authToken` from
+    /// `new URLSearchParams(location.search)` inside the iframe, which is
+    /// precisely the "webapp reads its credential from `location.search`" case
+    /// the filter exists for; a raw `starts_with` never sees it.
+    #[test]
+    fn sensitive_query_params_are_matched_after_decoding_the_name() {
+        for evil in [
+            "authT%6Fken=evil",
+            "%61uthToken=evil",
+            "%5F%5Fsandbox=1",
+            "__sandbo%78=1",
+            "%61uthTokenExtra=evil",
+        ] {
+            assert!(
+                is_sensitive_query_param(evil),
+                "{evil} must be stripped: the browser decodes the name before a \
+                 webapp reads it back"
+            );
+        }
+        // Ordinary app params are untouched, including ones that merely
+        // CONTAIN an escape in their value.
+        for ok in [
+            "invitation=abc",
+            "room=%2Fpath",
+            "q=authToken",
+            "myauthToken=x",
+        ] {
+            assert!(!is_sensitive_query_param(ok), "{ok} must be preserved");
+        }
+        // A malformed escape is not a decode, and must not become one.
+        assert!(!is_sensitive_query_param("auth%zzToken=x"));
     }
 
     /// Regression test for the sub-page loss that removing the `window.open`

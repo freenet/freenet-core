@@ -80,7 +80,12 @@
     // the menu AND an unwanted tab (cross-origin) or an app-frame navigation
     // (same-origin). Right-clicking a link is also exactly the workaround
     // users adopted while `target="_blank"` was broken.
-    if (e.button || e.ctrlKey || e.metaKey || e.shiftKey) return;
+    //
+    // `altKey` is in the list for a different reason than the others: it is not
+    // a new-window activation, it is the browser's save-link gesture. Same
+    // conclusion though — the browser already has a meaning for it, so taking
+    // the click and turning it into an in-frame hop is wrong.
+    if (e.button || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
     // Classify by origin.
     //
     // Fail-safe default: if the origin comparison throws (pathological URLs
