@@ -400,9 +400,19 @@ fn redundant_key_spellings(
             // write attacker-chosen lines — including a forged `warning:`
             // prefix — into the node's stderr and journal.
             let render = |key| {
-                let value = format!("{:?}", value_of(key));
+                let value = value_of(key);
+                // `value_of` already yields the TOML rendering — a string comes
+                // back quoted, a number bare. Escaping unconditionally would
+                // double-quote every path and turn every integer into a quoted
+                // string, making the message harder to read than before. Only a
+                // value that could forge a log line needs it.
+                let value = if value.contains(['\n', '\r']) {
+                    format!("{value:?}")
+                } else {
+                    value
+                };
                 match value.char_indices().nth(200) {
-                    Some((cut, _)) => format!("{}…", &value[..cut]),
+                    Some((cut, _)) => format!("{}… (truncated)", &value[..cut]),
                     None => value,
                 }
             };
@@ -583,29 +593,39 @@ impl ConfigArgs {
                         // the same reason: the direct parse reports line/column,
                         // the value-level one does not.
                         let mut object = serde_json::from_str::<serde_json::Value>(&content)?;
-                        let redundant = object
-                            .as_object()
-                            .map(|map| {
-                                redundant_key_spellings(
-                                    CONFIG_KEY_SPELLINGS,
-                                    &path.display().to_string(),
-                                    // An explicit `null` is not a
-                                    // setting; TOML has no equivalent, so
-                                    // only the JSON path needs to say so.
-                                    |key| map.get(key).is_some_and(|v| !v.is_null()),
-                                    |key| map.get(key).map(|v| v.to_string()).unwrap_or_default(),
-                                )
-                            })
-                            .unwrap_or_default();
-                        let mut config = if redundant.is_empty() {
-                            serde_json::from_str::<Config>(&content)?
-                        } else {
-                            if let Some(map) = object.as_object_mut() {
-                                for (key, _) in redundant {
-                                    map.remove(key);
-                                }
+                        let mut rewritten = false;
+                        if let Some(map) = object.as_object_mut() {
+                            // An explicit `null` is not a setting, and TOML has
+                            // no equivalent, so only this path needs to say so.
+                            // It must be REMOVED rather than merely ignored: a
+                            // null-valued key is still the field appearing
+                            // twice as far as serde is concerned, so leaving it
+                            // in place would make the document fail to parse
+                            // even after the other spelling wins.
+                            let nulls: Vec<&str> = CONFIG_KEY_SPELLINGS
+                                .iter()
+                                .flat_map(|group| group.iter().copied())
+                                .filter(|key| map.get(*key).is_some_and(|value| value.is_null()))
+                                .collect();
+                            for key in nulls {
+                                map.remove(key);
+                                rewritten = true;
                             }
+                            let redundant = redundant_key_spellings(
+                                CONFIG_KEY_SPELLINGS,
+                                &path.display().to_string(),
+                                |key| map.contains_key(key),
+                                |key| map.get(key).map(|v| v.to_string()).unwrap_or_default(),
+                            );
+                            for (key, _) in redundant {
+                                map.remove(key);
+                                rewritten = true;
+                            }
+                        }
+                        let mut config = if rewritten {
                             serde_json::from_value::<Config>(object)?
+                        } else {
+                            serde_json::from_str::<Config>(&content)?
                         };
                         let secrets = Self::read_secrets(
                             config.secrets.transport_keypair_path.clone(),
@@ -5206,6 +5226,68 @@ shutdown-drain-secs = 42
         );
     }
 
+    /// REGRESSION (introduced and caught within this PR): a JSON `null` under
+    /// one spelling, beside a real value under the other.
+    ///
+    /// Treating the `null` as merely absent left it in the document, so serde
+    /// still saw the field twice and `read_config` failed with `duplicate
+    /// field` — the node would not start, on a file that booted before. The
+    /// null has to be REMOVED for the surviving spelling to bind.
+    #[tokio::test]
+    async fn config_json_null_does_not_shadow_or_break_the_other_spelling() {
+        for (name, null_key, value_key) in [
+            (
+                "null under the emitted spelling",
+                "bandwidth_limit",
+                "bandwidth-limit",
+            ),
+            ("null under the alias", "bandwidth-limit", "bandwidth_limit"),
+        ] {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let table = toml::from_str::<toml::Table>(&released_config_toml_without_secret_paths())
+                .unwrap();
+            let mut doc = serde_json::to_value(table).unwrap();
+            let object = doc.as_object_mut().unwrap();
+            object.insert(null_key.to_string(), serde_json::Value::Null);
+            object.insert(value_key.to_string(), 999.into());
+            std::fs::write(
+                temp_dir.path().join("config.json"),
+                serde_json::to_string(&doc).unwrap(),
+            )
+            .unwrap();
+
+            let cfg = ConfigArgs::read_config(&temp_dir.path().to_path_buf())
+                .unwrap_or_else(|e| panic!("{name}: the node must still start: {e}"))
+                .unwrap_or_else(|| panic!("{name}: config.json is present"));
+            assert_eq!(
+                cfg.network_api.bandwidth_limit,
+                Some(999),
+                "{name}: the real value must win over a null"
+            );
+        }
+    }
+
+    /// A lone `null` still means unset, as it always did.
+    #[tokio::test]
+    async fn config_json_lone_null_leaves_the_setting_unset() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table =
+            toml::from_str::<toml::Table>(&released_config_toml_without_secret_paths()).unwrap();
+        let mut doc = serde_json::to_value(table).unwrap();
+        doc.as_object_mut()
+            .unwrap()
+            .insert("bandwidth_limit".to_string(), serde_json::Value::Null);
+        std::fs::write(
+            temp_dir.path().join("config.json"),
+            serde_json::to_string(&doc).unwrap(),
+        )
+        .unwrap();
+        let cfg = ConfigArgs::read_config(&temp_dir.path().to_path_buf())
+            .expect("a lone null must not be an error")
+            .expect("config.json is present");
+        assert_eq!(cfg.network_api.bandwidth_limit, None);
+    }
+
     /// REGRESSION (found in review): the same duplicate-spelling case as
     /// `config.toml`, but nested inside `[[gateways]]` — and nastier, because
     /// the failure is INTERMITTENT. The local-cache read on the
@@ -5386,9 +5468,9 @@ shutdown-drain-secs = 42
         assert_eq!(*ignored, "bandwidth-limit");
         for expected in [
             "bandwidth-limit",                   // the key being ignored
-            "50000000",                          // ... and its value
+            "= 50000000",                        // ... its value, bare not re-quoted
             "bandwidth_limit",                   // the key that wins
-            "10000000",                          // ... and the value now in effect
+            "= 10000000",                        // ... and the value now in effect
             "delete the `bandwidth_limit` line", // the remedy
             "config.toml",                       // where to do it
         ] {
@@ -5397,6 +5479,47 @@ shutdown-drain-secs = 42
                 "the warning must mention `{expected}`; got: {message}"
             );
         }
+
+        // A string value keeps exactly ONE level of quoting. Escaping the TOML
+        // rendering a second time turned every path into `"\"/srv\""` and every
+        // integer into a quoted string — making the message worse than it was
+        // before it was made safe.
+        let table: toml::Table =
+            toml::from_str("data_dir = \"/var/lib/freenet\"\ndata-dir = \"/srv/freenet\"\n")
+                .unwrap();
+        let reported = redundant_key_spellings(
+            CONFIG_KEY_SPELLINGS,
+            "config.toml",
+            |key| table.contains_key(key),
+            |key| table.get(key).map(|v| v.to_string()).unwrap_or_default(),
+        );
+        let [(_, message)] = reported.as_slice() else {
+            panic!("expected one redundant spelling");
+        };
+        assert!(
+            message.contains("= \"/srv/freenet\""),
+            "a string value must be quoted once, not escaped twice; got: {message}"
+        );
+
+        // ...but a value that could forge a log line is escaped onto one line.
+        let table: toml::Table = toml::from_str(
+            "data_dir = \"/var/lib/freenet\"\ndata-dir = \"\"\"\nwarning: forged\n/srv\"\"\"\n",
+        )
+        .unwrap();
+        let reported = redundant_key_spellings(
+            CONFIG_KEY_SPELLINGS,
+            "config.toml",
+            |key| table.contains_key(key),
+            |key| table.get(key).map(|v| v.to_string()).unwrap_or_default(),
+        );
+        let [(_, message)] = reported.as_slice() else {
+            panic!("expected one redundant spelling");
+        };
+        assert!(
+            !message.contains('\n'),
+            "a newline-bearing value must not break the message onto a second \
+             line, or a remote index could forge log entries; got: {message}"
+        );
     }
 
     /// Every `#[serde(alias = "...")]` in the config types must appear in
@@ -5434,10 +5557,15 @@ shutdown-drain-secs = 42
                         continue;
                     };
                     // Skip the illustrative `alias = "..."` in prose.
+                    // `_` included deliberately: every alias #5130 adds is
+                    // the UNDERSCORED spelling of a key it flips to kebab, so
+                    // excluding them would blind this guard in exactly the
+                    // scenario its rustdoc names. The illustrative
+                    // `alias = "..."` in prose is still skipped, by the `.`.
                     if spelling.is_empty()
-                        || !spelling
-                            .chars()
-                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                        || !spelling.chars().all(|c| {
+                            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_'
+                        })
                     {
                         continue;
                     }
