@@ -198,9 +198,10 @@ impl SendLanePermit {
     /// its state — mispredicts on every send to every peer permanently. So
     /// treating them as independent events would be wrong.
     ///
-    /// Past the parking area's capacity the small-lane slot IS held for the
-    /// whole wait and the small lane applies backpressure; see the module
-    /// header, that is the deliberate end of the hold-window bound.
+    /// Past the parking area's capacity the small-lane slot is held until a
+    /// parking slot frees and only then given up, so while parking stays full
+    /// the small lane applies backpressure; see the module header, that is the
+    /// deliberate end of the hold-window bound.
     ///
     /// A parked send holds no pool capacity and is putting nothing on the wire,
     /// so the pools no longer bound how many sends are in flight — that is what
@@ -277,7 +278,7 @@ impl SendLanePermit {
     /// stalling forever.
     ///
     /// UNREACHABLE today: nothing closes these semaphores (grep `.close()` in
-    /// this file — the only hit is a test). It exists so that adding a real
+    /// this file — the only hits are tests). It exists so that adding a real
     /// shutdown path later cannot silently strand in-flight sends, and it is
     /// the one documented way a large payload can reach the wire without
     /// large-lane capacity.
@@ -738,8 +739,8 @@ mod queue {
     /// of #4961 (1,887 incidents and a 7,260 s small-entry wait integral per
     /// node-day on the 0.2.118 fleet). (A dispatched send correcting a
     /// mispredicted lane can still hold a small-lane permit — for
-    /// [`UPGRADE_SLOT_HOLD_WINDOW`] while parking has room, and for the whole
-    /// wait once it does not. See `SendLanePermit`.)
+    /// [`UPGRADE_SLOT_HOLD_WINDOW`] while parking has room, and until a parking
+    /// slot frees once it does not. See `SendLanePermit`.)
     ///
     /// Ordering is by a global monotonic sequence number so the two FIFOs stay
     /// comparable: capacity eviction still drops the globally oldest entry, and
@@ -1467,6 +1468,18 @@ mod queue {
                     < task.find("active_guard.finish().await").unwrap(),
                 "normal tracking cleanup must run directly after releasing capacity"
             );
+
+            // The parking area must arrive here already shared, not be built
+            // per dispatch — a per-send pool bounds nothing, and no behavioural
+            // test drives two mispredicting dispatches through this loop.
+            assert!(
+                worker.contains("upgrade_slots.clone(),"),
+                "each dispatched send must get a clone of the SHARED parking area"
+            );
+            assert!(
+                !worker.contains("Semaphore::new("),
+                "the drain loop must not construct a pool of its own"
+            );
         }
 
         /// The structural half of #4961: one drain per lane. A single worker
@@ -1532,10 +1545,15 @@ mod queue {
                 .find("\n        /// The lane-agnostic half")
                 .expect("end of enqueue not found")
                 + enq;
+            let enq_body = &src[enq..enq_end];
             assert!(
-                src[enq..enq_end].contains("let lane = lane_for("),
-                "enqueue must derive the lane it enqueues with from lane_for — not \
-                 merely mention it"
+                enq_body.contains("let lane = lane_for("),
+                "enqueue must derive its lane from lane_for — not merely mention it"
+            );
+            assert!(
+                enq_body.contains("self.enqueue_in_lane(lane,"),
+                "...and must enqueue with THAT lane; deriving it and then passing a \
+                 different one would pass the check above"
             );
         }
 
@@ -2194,25 +2212,46 @@ mod queue {
         }
 
         /// Cancellation safety, which `ensure_capacity_for`'s doc claims: a send
-        /// dropped mid-wait must release whatever it holds, in either phase.
+        /// aborted mid-wait must release whatever it holds, in every state it
+        /// can be waiting in.
+        #[derive(Debug, Clone, Copy)]
+        enum Phase {
+            /// Phase 1: holding the small-lane slot, waiting on the large pool.
+            HoldingSlot,
+            /// Phase 2, parked: holding a parking slot and no lane permit.
+            Parked,
+            /// Phase 2, queued: still holding the small-lane slot while waiting
+            /// for a parking slot.
+            QueuedForParking,
+        }
+
         #[tokio::test(start_paused = true)]
         async fn cancelling_a_waiting_send_releases_its_permit_in_either_phase() {
-            for park_first in [false, true] {
+            for phase in [Phase::HoldingSlot, Phase::Parked, Phase::QueuedForParking] {
+                let park_first = !matches!(phase, Phase::HoldingSlot);
                 let small = Arc::new(Semaphore::new(12));
-                let large = Arc::new(Semaphore::new(1));
-                let parking = Arc::new(Semaphore::new(1));
+                // TWO large permits, one left free, so the "took no large
+                // permit" assertion below can actually fail.
+                let large = Arc::new(Semaphore::new(2));
                 let _occupied = large
                     .clone()
-                    .acquire_owned()
+                    .acquire_many_owned(2)
                     .await
                     .expect("large pool open");
+                let parking = Arc::new(Semaphore::new(1));
+                // For the queued-for-parking case, someone else already holds
+                // the only parking slot, so the send under test blocks on the
+                // parking acquire itself — the wait this round introduced.
+                let _squatter = matches!(phase, Phase::QueuedForParking)
+                    .then(|| parking.clone().try_acquire_owned().expect("parking free"));
                 let mut permit = parked_small_lane_permit(&small, &large, &parking);
                 let mut waiting = tokio::spawn(async move {
                     permit.ensure_capacity_for(BIG).await;
                     permit
                 });
 
-                // Phase 1 holds the small slot; phase 2 has parked without one.
+                // Phase 1 holds the small slot; phase 2 has parked without one,
+                // or is still queued for a slot while holding one.
                 let elapse = if park_first {
                     super::super::UPGRADE_SLOT_HOLD_WINDOW * 2
                 } else {
@@ -2222,10 +2261,16 @@ mod queue {
                     tokio::time::timeout(elapse, &mut waiting).await.is_err(),
                     "[park_first={park_first}] precondition: still waiting"
                 );
+                let parked_now = matches!(phase, Phase::Parked);
                 assert_eq!(
                     parking.available_permits(),
-                    usize::from(!park_first),
-                    "[park_first={park_first}] precondition: parked iff past the window"
+                    usize::from(matches!(phase, Phase::HoldingSlot)),
+                    "[{phase:?}] precondition: holds a parking slot iff parked"
+                );
+                assert_eq!(
+                    small.available_permits(),
+                    if parked_now { 12 } else { 11 },
+                    "[{phase:?}] precondition: still holds its small-lane slot unless parked"
                 );
 
                 // Cancel it the way a shutdown would. `timeout` alone would NOT
@@ -2239,23 +2284,24 @@ mod queue {
                 };
                 assert!(
                     cancelled,
-                    "[park_first={park_first}] the send must have been cancelled mid-wait"
+                    "[{phase:?}] the send must have been cancelled mid-wait"
                 );
 
                 assert_eq!(
                     small.available_permits(),
                     12,
-                    "[park_first={park_first}] the small-lane slot must come back"
+                    "[{phase:?}] the small-lane slot must come back"
                 );
+                drop(_squatter);
                 assert_eq!(
                     parking.available_permits(),
                     1,
-                    "[park_first={park_first}] and so must the parking slot"
+                    "[{phase:?}] and so must the parking slot"
                 );
                 assert_eq!(
                     large.available_permits(),
                     0,
-                    "[park_first={park_first}] the cancelled send took no large permit"
+                    "[{phase:?}] the cancelled send took no large permit"
                 );
             }
         }
