@@ -171,12 +171,20 @@ const MISSING_SUMMARY_ACTIVE_SIZE: usize = 256;
 
 /// How long a summary preserved across a disconnect-grace removal stays usable.
 ///
-/// Deliberately equal to [`INTEREST_TTL`]: a LIVE interest entry can already
-/// carry a summary this old before the sweep expires it (nothing refreshes the
-/// cached summary itself — `refresh_peer_interest` only bumps the TTL), so a
-/// retained summary is never staler than a belief the broadcast path already
-/// acts on today. Bounding it makes the added staleness explicit rather than
-/// open-ended.
+/// This bounds the staleness this feature ADDS, not the total. A live entry's
+/// cached summary already has no age bound at all: nothing refreshes the summary
+/// itself, and `broadcast_queue`'s converged-skip calls `refresh_peer_interest`
+/// on every skip specifically so the TTL sweep will not reap a converged peer.
+/// So the honest statement is: retained age = (already-unbounded live age) +
+/// grace + at most this. Equal to [`INTEREST_TTL`] because that is the interval
+/// the rest of this module already treats as "recent enough to correlate", and
+/// three missed 5-minute heartbeats is the point at which we stop believing
+/// anything else about a peer either.
+///
+/// Enforced lazily, on read: an entry that expires unclaimed keeps its slot
+/// until entry-count or byte-budget pressure evicts it. There is no sweep — the
+/// cache is small and bounded on both axes, so dead weight costs a slot, never
+/// unbounded memory.
 const RETAINED_SUMMARY_TTL: Duration = INTEREST_TTL;
 
 /// Max (contract, peer) pairs whose summary survives a disconnect-grace removal.
@@ -189,8 +197,10 @@ const RETAINED_SUMMARY_TTL: Duration = INTEREST_TTL;
 ///
 /// Sized against the fleet rather than guessed: the 0.2.118 outbound rollup
 /// (`interest_sync_summaries_*`, 1,414 peers, 228M entries) measured a **262-byte
-/// mean per `Summaries` entry**, so this cap costs ~4.3 MB at the typical size
-/// and the byte budget below bounds the atypical one. As with
+/// mean per `Summaries` entry**, so at the typical size this cap costs ~4.3 MB
+/// of payload plus roughly 3 MB of keys and LRU nodes (a `ContractKey`, a
+/// 32-byte public key and a link pair per entry), and the payload budget below
+/// bounds the atypical case. As with
 /// [`MISSING_SUMMARY_HISTORY_SIZE`], the resize signal is the visible overflow
 /// counter (`NetworkEfficiencyV1::retain`, `Evicted` slot), not a re-derivation
 /// from first principles: a saturated LRU of this shape evicts continuously, so
@@ -210,12 +220,18 @@ const RETAINED_SUMMARY_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 /// Largest single summary worth retaining.
 ///
-/// Above this, one entry would monopolise
-/// [`RETAINED_SUMMARY_CACHE_MAX_BYTES`], and a summary that large is unlikely
-/// to yield a delta smaller than the state anyway (the post-compute efficiency
-/// gate would discard it — see [`is_delta_efficient`] and #4923). Skipping is
-/// the same outcome as today: full state on the next send.
-const MAX_RETAINED_SUMMARY_BYTES: usize = 64 * 1024;
+/// Purely a per-entry share of [`RETAINED_SUMMARY_CACHE_MAX_BYTES`], so one
+/// pathological summary cannot evict everything else. It is deliberately NOT a
+/// delta-efficiency judgement: [`is_delta_efficient`]'s own rustdoc records that
+/// the summary-size proxy was removed as a pre-compute refusal in #4923 (it made
+/// full-state sends 41% of all wire bytes) and must not be re-wired as one, and
+/// the post-compute gate keys on the DELTA's size, not the summary's — a
+/// state-sized summary can still yield a three-byte delta. The bound is 1 MiB so
+/// it stays above the large-state population this change exists for (the module
+/// records summaries and state-sized deltas in the 550-840 KB range), which is
+/// exactly the population paying ~300 KiB per full-state send. Skipping is the
+/// same outcome as today: full state on the next send.
+const MAX_RETAINED_SUMMARY_BYTES: usize = 1024 * 1024;
 
 /// Telemetry field order for the first missing-summary send age histogram:
 /// <1s, 1-9s, 10-59s, 60-299s, and >=300s.
@@ -556,16 +572,19 @@ struct MissingPairHistory {
 
 /// Fate of one entry in the across-disconnect summary retention cache.
 ///
-/// `Stored + SkippedOversized` accounts for every disconnect-grace removal that
-/// carried a summary; `Restored + Expired + Discarded + Evicted` accounts for
-/// every stored entry that has left the cache, so the residual is what is still
-/// resident. `Restored` is the counter that measures whether the retention is
-/// actually buying full-state sends back.
+/// `Restored + Expired + Discarded + Evicted` accounts for EVERY stored entry
+/// that has left the cache — including one replaced by a later store for the
+/// same pair, which is counted `Discarded` — so
+/// `Stored - (Restored + Expired + Discarded + Evicted)` is exactly what is
+/// still resident. `Restored` is the counter that measures whether the retention
+/// is buying anything; `Evicted` is the resize signal for
+/// [`RETAINED_SUMMARY_CACHE_SIZE`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RetainedSummaryOutcome {
-    /// A disconnect-grace removal's cached summary was preserved.
+    /// A disconnect-grace removal's peer-asserted summary was preserved.
     Stored,
     /// The removed entry's summary exceeded [`MAX_RETAINED_SUMMARY_BYTES`].
+    /// Counted instead of, not as well as, `Stored`.
     SkippedOversized,
     /// A recreated pair was seeded from its retained summary.
     Restored,
@@ -573,8 +592,10 @@ pub(crate) enum RetainedSummaryOutcome {
     Expired,
     /// Dropped under entry-count or byte-budget pressure before it was claimed.
     Evicted,
-    /// Popped without being used: the registration brought its own summary, or
-    /// it targeted an entry that already existed.
+    /// Dropped without being used, because something superseded it: a removal
+    /// that does not qualify for retention, a fresh `upsert_peer_summary_from`
+    /// write, a registration carrying its own summary, a registration landing on
+    /// an existing entry, or a later store for the same pair.
     Discarded,
 }
 
@@ -605,6 +626,41 @@ impl RetainedSummaryOutcome {
     }
 }
 
+/// Where a cached peer summary came from — evidence, or our own assumption.
+///
+/// The distinction only matters for retention. Everywhere else a cached summary
+/// is used identically, and a wrong one is corrected by the InterestSync
+/// exchange or the delta-apply-failure → `ResyncRequest` path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SummaryProvenance {
+    /// The PEER asserted this summary: its `Summaries` report, a matching
+    /// `SummaryDigests` agreement, the `sender_summary_bytes` on a broadcast it
+    /// sent us, or a `ResyncResponse`. Evidence about the peer's own state.
+    PeerReported,
+
+    /// WE assumed it — `record_delivery_to_interest` caching our own summary as
+    /// theirs on sender-side send completion, which is documented as wrong
+    /// whenever a stream tail is lost or a queue-full drop is silent.
+    SelfAssumed,
+}
+
+impl SummaryProvenance {
+    /// Classify a population source. Anything not positively known to be
+    /// peer-asserted is `SelfAssumed`, so a future source added without
+    /// thinking about retention defaults to the conservative side.
+    const fn of(source: SummaryPopulationSource) -> Self {
+        match source {
+            SummaryPopulationSource::InterestSummary
+            | SummaryPopulationSource::DigestAgreement
+            | SummaryPopulationSource::InboundBroadcast
+            | SummaryPopulationSource::ResyncResponse => Self::PeerReported,
+            SummaryPopulationSource::Delivery | SummaryPopulationSource::Unknown => {
+                Self::SelfAssumed
+            }
+        }
+    }
+}
+
 /// A peer summary preserved across a disconnect-grace interest removal.
 #[derive(Clone, Debug)]
 struct RetainedSummary {
@@ -624,6 +680,15 @@ struct RetainedSummaryCache {
     total_bytes: usize,
 }
 
+/// Departures caused by one [`RetainedSummaryCache::store`].
+#[derive(Clone, Copy, Debug, Default)]
+struct StoreOutcome {
+    /// Entries dropped under entry-count or byte-budget pressure.
+    evicted: u64,
+    /// 1 when this store replaced a live entry for the SAME key.
+    replaced: u64,
+}
+
 impl RetainedSummaryCache {
     fn new() -> Self {
         Self {
@@ -636,15 +701,18 @@ impl RetainedSummaryCache {
         }
     }
 
-    /// Store `summary` for `key`, returning how many entries were evicted to
-    /// make room.
+    /// Store `summary` for `key`, reporting how many entries left the cache to
+    /// make room and whether this call replaced an existing entry for the same
+    /// key. Both are counted by the caller, so every departure is accounted for
+    /// and the telemetry residual matches what is actually resident.
     fn store(
         &mut self,
         key: (ContractKey, PeerKey),
         summary: StateSummary<'static>,
         now: Instant,
-    ) -> u64 {
+    ) -> StoreOutcome {
         let bytes = summary.as_ref().len();
+        let mut outcome = StoreOutcome::default();
         if let Some(previous) = self.entries.put(
             key,
             RetainedSummary {
@@ -652,18 +720,25 @@ impl RetainedSummaryCache {
                 retained_at: now,
             },
         ) {
-            // Same key replaced: not an eviction, just a byte-count fixup.
             self.total_bytes = self
                 .total_bytes
                 .saturating_sub(previous.summary.as_ref().len());
+            outcome.replaced = 1;
         }
         self.total_bytes = self.total_bytes.saturating_add(bytes);
-        self.trim()
+        outcome.evicted = self.trim();
+        outcome
     }
 
-    /// Evict least-recently-used entries until both caps hold. Never evicts the
-    /// entry just inserted below one entry, so a single oversized summary
-    /// cannot spin here (callers reject those before calling `store`).
+    /// Evict least-recently-used entries until both caps hold.
+    ///
+    /// `pop_lru` strictly decreases `len`, so this always terminates. The
+    /// `len() > 1` term on the byte clause is what keeps it from evicting the
+    /// entry just inserted (which is MRU, hence popped last) when that single
+    /// entry is itself over the byte budget — unreachable while
+    /// `MAX_RETAINED_SUMMARY_BYTES` stays below
+    /// `RETAINED_SUMMARY_CACHE_MAX_BYTES`, and cheap insurance if it ever does
+    /// not.
     fn trim(&mut self) -> u64 {
         let mut evicted = 0;
         while self.entries.len() > RETAINED_SUMMARY_CACHE_SIZE
@@ -780,6 +855,11 @@ pub struct PeerInterest {
     /// returns `None` in that case rather than a misleading last-clear cause.
     summary_absence: SummaryMissingReason,
 
+    /// Whether [`Self::summary`] is evidence from the peer or our own
+    /// assumption. Read only by the across-disconnect retention decision; stale
+    /// (and unread) whenever `summary` is `None`.
+    summary_provenance: SummaryProvenance,
+
     /// Diagnostic-only provenance for the current NeverPopulated epoch.
     never_populated_origin: NeverPopulatedOrigin,
 
@@ -805,6 +885,11 @@ impl PeerInterest {
     pub fn new(summary: Option<StateSummary<'static>>, is_upstream: bool, now: Instant) -> Self {
         Self {
             summary,
+            // Conservative default. No production registration site supplies a
+            // summary (`reg_new_k` is 0 fleet-wide) — the one caller that does
+            // supply one is the retention restore, which overrides this with
+            // the provenance it preserved.
+            summary_provenance: SummaryProvenance::SelfAssumed,
             summary_absence: SummaryMissingReason::NeverPopulated,
             never_populated_origin: NeverPopulatedOrigin::New { recreated: false },
             never_populated_since: now,
@@ -830,8 +915,17 @@ impl PeerInterest {
     }
 
     /// Cache a summary for this peer and refresh TTL.
-    pub fn set_summary(&mut self, summary: StateSummary<'static>, now: Instant) {
+    ///
+    /// `provenance` records whether the peer asserted this summary or we merely
+    /// assumed it; only the across-disconnect retention decision reads it.
+    pub fn set_summary(
+        &mut self,
+        summary: StateSummary<'static>,
+        provenance: SummaryProvenance,
+        now: Instant,
+    ) {
         self.summary = Some(summary);
+        self.summary_provenance = provenance;
         self.refresh(now);
     }
 
@@ -1631,17 +1725,37 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             .fetch_add(count, Ordering::Relaxed);
     }
 
-    /// Preserve `summary` for a (contract, peer) pair whose interest entry is
-    /// being torn down because the peer went away.
+    /// Preserve the cached summary of a (contract, peer) pair whose interest
+    /// entry is being torn down because the peer went away.
     ///
-    /// Scoped to [`InterestRemovalCause::DisconnectGrace`] by its only caller.
-    /// That cause is the one where the peer never withdrew its interest — the
-    /// transport dropped, the 90s grace lapsed, and nothing the peer said
-    /// invalidated what we believed about its state. The withdrawal causes
-    /// (`Unsubscribe`, `ChangeInterests`, `InterestsReplace`) are deliberately
-    /// NOT retained: there the peer told us it stopped tracking the contract, so
-    /// a later re-registration may follow a re-fetch that moved its state
-    /// somewhere our old belief does not describe.
+    /// Two conditions, both load-bearing:
+    ///
+    /// **The cause must be [`InterestRemovalCause::DisconnectGrace`].** That is
+    /// the one removal where the peer never withdrew its interest — the transport
+    /// dropped, the 90s grace lapsed, and nothing the peer said invalidated what
+    /// we believed. The withdrawal causes (`Unsubscribe`, `ChangeInterests`,
+    /// `InterestsReplace`) are removals where the peer told us it stopped
+    /// tracking the contract, so a later re-registration may follow a re-fetch
+    /// that moved its state somewhere our old belief does not describe.
+    ///
+    /// **The provenance must be [`SummaryProvenance::PeerReported`].** A
+    /// `SelfAssumed` summary is what `record_delivery_to_interest` writes on
+    /// sender-side send completion, which is wrong whenever a stream tail is lost
+    /// — and transport loss is precisely the event that puts us on this path, so
+    /// the disconnecting population is ENRICHED in such beliefs. Today the
+    /// teardown destroys them unconditionally, which is a real repair: the
+    /// converged-skip in `broadcast_queue::broadcast_to_single_peer` sends
+    /// NOTHING when the cached belief matches our own summary, so a wrong-and-
+    /// matching belief is silent, and the teardown is what breaks that silence.
+    /// Retaining only peer-asserted summaries preserves that repair exactly where
+    /// it matters while keeping ~95% of the population (fleet: `Delivery` is
+    /// 23.8M of 585M summary writes; `DigestAgreement` + `InterestSummary` +
+    /// `InboundBroadcast` are the rest).
+    ///
+    /// Callers that do not meet both conditions must call
+    /// [`Self::discard_retained_summary`] instead — a removal that does not store
+    /// must not leave an older entry resident, or that entry could seed a
+    /// recreation which followed a cause this function refuses to retain.
     fn retain_summary_for_disconnect(
         &self,
         contract: &ContractKey,
@@ -1649,16 +1763,35 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         summary: StateSummary<'static>,
         now: Instant,
     ) {
-        if summary.as_ref().len() > MAX_RETAINED_SUMMARY_BYTES {
-            self.note_retained_summary(RetainedSummaryOutcome::SkippedOversized, 1);
-            return;
-        }
         let evicted = self
             .retained_summaries
             .lock()
             .store((*contract, peer.clone()), summary, now);
         self.note_retained_summary(RetainedSummaryOutcome::Stored, 1);
-        self.note_retained_summary(RetainedSummaryOutcome::Evicted, evicted);
+        self.note_retained_summary(RetainedSummaryOutcome::Evicted, evicted.evicted);
+        self.note_retained_summary(RetainedSummaryOutcome::Discarded, evicted.replaced);
+    }
+
+    /// Drop any retained entry for this pair without using it.
+    ///
+    /// Called on every removal that does NOT store (wrong cause, no summary,
+    /// self-assumed provenance, oversized) and when `upsert_peer_summary_from`
+    /// recreates the entry from a fresh write. Together with the store above,
+    /// this makes the invariant exact: **a resident retained entry always comes
+    /// from the pair's most recent interest teardown, and that teardown was a
+    /// disconnect.** `remove_peer_interest_for` is the single removal chokepoint
+    /// — `sweep_expired_interests`, `remove_evicted_in_use` and
+    /// `remove_all_peer_interests_for` all delegate to it — so there is no path
+    /// that drops an entry without passing here.
+    fn discard_retained_summary(&self, contract: &ContractKey, peer: &PeerKey) {
+        if self
+            .retained_summaries
+            .lock()
+            .take(&(*contract, peer.clone()))
+            .is_some()
+        {
+            self.note_retained_summary(RetainedSummaryOutcome::Discarded, 1);
+        }
     }
 
     /// Claim the summary preserved for `(contract, peer)` across a disconnect.
@@ -1667,29 +1800,35 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// summary seeds exactly one recreated entry, after which the ordinary
     /// population sources own it. `want_restore = false` still pops — a
     /// registration that carries its own summary, or one that lands on an entry
-    /// that already exists, SUPERSEDES the retained belief, and leaving it
-    /// behind would let it be applied to some later, unrelated recreation.
+    /// that already exists, SUPERSEDES the retained belief.
     ///
     /// # Why a stale summary is safe here
     ///
-    /// A cached peer summary is a BELIEF, never evidence, everywhere in this
-    /// module: `record_delivery_to_interest` caches our own summary as theirs on
-    /// sender-side send completion, which is already wrong whenever a stream tail
-    /// is lost. Two backstops correct a wrong belief — the ~5-min InterestSync
-    /// summary/digest exchange, and the delta-apply-failure → `ResyncRequest`
-    /// path that clears the sender's cache. Retention adds no new failure mode,
-    /// only a longer staleness window, which [`RETAINED_SUMMARY_TTL`] bounds to
-    /// what a live entry could already carry.
+    /// The retained summary is always one the PEER asserted about its own state
+    /// (see [`Self::retain_summary_for_disconnect`]), so restoring it is a claim
+    /// the peer itself made, merely older. A cached peer summary is a BELIEF
+    /// rather than live evidence everywhere in this module — the InterestSync
+    /// summary/digest exchange and the delta-apply-failure → `ResyncRequest` path
+    /// exist to correct wrong ones — and [`RETAINED_SUMMARY_TTL`] bounds how much
+    /// staleness this adds.
     ///
-    /// The two directions of wrongness are not symmetric, and both are bounded:
-    /// - the peer moved AHEAD (the common case: it kept syncing with others
-    ///   while disconnected from us) — the delta we compute is a superset of what
-    ///   it needs, and if it is not smaller than our state the post-compute
-    ///   efficiency gate discards it and we send full state exactly as today, so
-    ///   this direction can never cost MORE bytes than the current behaviour;
-    /// - the peer moved BACK (it lost or re-fetched state) — we would send too
-    ///   small a delta, which is the same exposure the delivery-cached summary
-    ///   already carries, healed by the two backstops above.
+    /// The two directions of wrongness are not symmetric:
+    /// - the peer moved AHEAD (the common case: it kept syncing with others while
+    ///   disconnected from us) — the delta we compute is a superset of what it
+    ///   needs, and if it is not smaller than our state the post-compute
+    ///   efficiency gate discards it and we send full state exactly as today. On
+    ///   the send itself this can never cost more bytes than current behaviour.
+    /// - the peer moved BACK (it lost, evicted, or re-fetched state — the
+    ///   transport keypair survives a db-only wipe, so this is reachable) — we
+    ///   send too small a delta. If the contract REJECTS it the total cost is
+    ///   delta + `ResyncRequest` + full-state `ResyncResponse`, i.e. two extra
+    ///   round trips MORE than sending full state up front, and repeated
+    ///   `Invalid`-class rejections feed the per-CONTRACT `delta_incompat` memo
+    ///   that then forces full state to every peer of that contract for its TTL.
+    ///   That is the real cost ceiling of being wrong; production says it is
+    ///   rarely paid (`ClearedByDeltaApplyFailure` holds 32 entries fleet-wide,
+    ///   `ClearedByResync` 413, against 12.84M known summaries), and restricting
+    ///   retention to peer-asserted summaries keeps it that way.
     fn take_retained_summary(
         &self,
         contract: &ContractKey,
@@ -1717,10 +1856,25 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         self.retained_summaries.lock().entries.len()
     }
 
-    /// Total retained-summary payload bytes currently held (test-only).
+    /// Total retained-summary payload bytes as TRACKED by the cache (test-only).
     #[cfg(test)]
     pub(crate) fn retained_summary_bytes(&self) -> usize {
         self.retained_summaries.lock().total_bytes
+    }
+
+    /// Total retained-summary payload bytes RECOMPUTED from the resident entries
+    /// (test-only). Tests assert this equals [`Self::retained_summary_bytes`]:
+    /// the running counter drifting LOW is the dangerous direction, since the
+    /// cache would then exceed its memory budget while reporting compliance, and
+    /// every `saturating_sub` in the bookkeeping would hide it.
+    #[cfg(test)]
+    pub(crate) fn retained_summary_payload_sum(&self) -> usize {
+        self.retained_summaries
+            .lock()
+            .entries
+            .iter()
+            .map(|(_, retained)| retained.summary.as_ref().len())
+            .sum()
     }
 
     /// The cause of this pair's most recent interest removal, when one was
@@ -1823,9 +1977,16 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         // with pre-retention field data.
         let restore_wanted = is_new && summary.is_none();
         let restored = self.take_retained_summary(contract, &peer, restore_wanted, now);
+        let was_restored = restored.is_some();
         let summary = summary.or(restored);
 
         let mut interest = PeerInterest::new(summary, is_upstream, now);
+        if was_restored {
+            // Only peer-asserted summaries are retained, so a restored one is
+            // still peer-asserted — and must stay eligible for retention if this
+            // peer disconnects again before reporting a fresh summary.
+            interest.summary_provenance = SummaryProvenance::PeerReported;
+        }
         if interest.summary.is_none() {
             if let Some(previous) = entry.get(&peer) {
                 if previous.summary.is_some() {
@@ -1899,15 +2060,40 @@ impl<T: TimeSource + Sync> InterestManager<T> {
 
                 // Preserve the cached summary across a transport-loss teardown so
                 // the peer's next registration does not start summary-less (which
-                // forces a FULL STATE on the next broadcast). Only the
-                // disconnect cause qualifies — see
+                // forces a FULL STATE on the next broadcast). Every other removal
+                // DISCARDS instead, which is what makes the scope real: a
+                // resident retained entry always comes from the pair's most
+                // recent teardown, and that teardown was a disconnect. See
                 // `retain_summary_for_disconnect`.
-                if cause == InterestRemovalCause::DisconnectGrace
-                    && let Some(summary) = removed_interest
-                        .as_ref()
-                        .and_then(|interest| interest.summary.clone())
-                {
-                    self.retain_summary_for_disconnect(contract, peer, summary, now);
+                //
+                // Eligibility is decided WITHOUT cloning: `StateSummary` is a
+                // `Cow<[u8]>`, summaries reach the hundreds of KB, and this runs
+                // per contract of every departing peer under the shard guard, so
+                // a clone-then-reject would memcpy for nothing.
+                let retainable = removed_interest.as_ref().and_then(|interest| {
+                    let summary = interest.summary.as_ref()?;
+                    (cause == InterestRemovalCause::DisconnectGrace
+                        && interest.summary_provenance == SummaryProvenance::PeerReported
+                        && summary.as_ref().len() <= MAX_RETAINED_SUMMARY_BYTES)
+                        .then_some(summary)
+                });
+                match retainable {
+                    Some(summary) => {
+                        let summary = summary.clone();
+                        self.retain_summary_for_disconnect(contract, peer, summary, now);
+                    }
+                    None => {
+                        if cause == InterestRemovalCause::DisconnectGrace
+                            && removed_interest.as_ref().is_some_and(|interest| {
+                                interest.summary.as_ref().is_some_and(|summary| {
+                                    summary.as_ref().len() > MAX_RETAINED_SUMMARY_BYTES
+                                })
+                            })
+                        {
+                            self.note_retained_summary(RetainedSummaryOutcome::SkippedOversized, 1);
+                        }
+                        self.discard_retained_summary(contract, peer);
+                    }
                 }
 
                 let key = (*contract, peer.clone());
@@ -1956,6 +2142,11 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     }
 
     /// Update a peer's summary for a contract and refresh TTL.
+    ///
+    /// Carries no population source, so the write is recorded as
+    /// [`SummaryProvenance::SelfAssumed`] and will not be retained across a
+    /// disconnect. Callers that hold peer-asserted evidence should use
+    /// [`Self::upsert_peer_summary_from`] with the matching source.
     pub fn update_peer_summary(
         &self,
         contract: &ContractKey,
@@ -1965,7 +2156,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         let now = self.time_source.now();
         if let Some(mut entry) = self.interested_peers.get_mut(contract) {
             if let Some(interest) = entry.get_mut(peer) {
-                interest.set_summary(summary, now);
+                interest.set_summary(summary, SummaryProvenance::SelfAssumed, now);
             }
         }
     }
@@ -2046,7 +2237,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             } else {
                 SummaryPopulationOutcome::FilledMissing
             };
-            interest.set_summary(summary, now);
+            interest.set_summary(summary, SummaryProvenance::of(source), now);
             self.missing_summary_history
                 .lock()
                 .pop(&(*contract, peer.clone()));
@@ -2073,7 +2264,9 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 .fetch_add(1, Ordering::Relaxed);
             return outcome;
         }
-        entry.insert(peer.clone(), PeerInterest::new(Some(summary), false, now));
+        let mut interest = PeerInterest::new(Some(summary), false, now);
+        interest.summary_provenance = SummaryProvenance::of(source);
+        entry.insert(peer.clone(), interest);
         self.peer_contracts
             .entry(peer.clone())
             .or_default()
@@ -2082,6 +2275,12 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         self.missing_summary_history
             .lock()
             .pop(&(*contract, peer.clone()));
+        // This is the OTHER way a torn-down pair comes back — and it bypasses
+        // registration entirely, so it is where a retained summary would
+        // otherwise be orphaned. The summary just written is at least as good
+        // (it is the reason this call happened), so drop the retained one rather
+        // than leaving it resident to seed some later, unrelated recreation.
+        self.discard_retained_summary(contract, peer);
         let outcome = SummaryPopulationOutcome::CreatedUntracked;
         self.interest_lifecycle_metrics.population[source.index()][outcome.index()]
             .fetch_add(1, Ordering::Relaxed);
@@ -5795,7 +5994,32 @@ mod tests {
         manager.interest_lifecycle_snapshot().retained_summaries[outcome.index()]
     }
 
-    /// Drive one full disconnect → grace-expiry → reconnect cycle.
+    /// Track a peer's interest and cache a summary the PEER asserted, which is
+    /// the only provenance eligible for retention. Mirrors the production shape:
+    /// the `Interests` heartbeat registers, then the peer's `Summaries` reply
+    /// upserts.
+    fn seed_peer_reported(
+        manager: &TestInterestManager,
+        contract: &ContractKey,
+        peer: &PeerKey,
+        summary: StateSummary<'static>,
+    ) {
+        manager.register_peer_interest_from(
+            contract,
+            peer.clone(),
+            None,
+            false,
+            InterestRegistrationSource::Interests,
+        );
+        manager.upsert_peer_summary_from(
+            contract,
+            peer,
+            summary,
+            SummaryPopulationSource::InterestSummary,
+        );
+    }
+
+    /// Drive one full disconnect → grace-expiry cycle for `peer`.
     fn disconnect_grace_cycle(
         manager: &TestInterestManager,
         time: &SharedMockTimeSource,
@@ -5810,9 +6034,36 @@ mod tests {
         );
     }
 
+    /// Every departure from the cache is counted, so what telemetry reports as
+    /// resident matches what is resident, and `total_bytes` matches the payload
+    /// actually held. Asserted after every scenario below that churns the cache:
+    /// an under-counted `total_bytes` is the dangerous direction — the cache
+    /// would silently exceed its memory budget while reporting compliance.
+    fn assert_retention_bookkeeping(manager: &TestInterestManager) {
+        let snapshot = manager.interest_lifecycle_snapshot().retained_summaries;
+        let stored = snapshot[RetainedSummaryOutcome::Stored.index()];
+        let departed = snapshot[RetainedSummaryOutcome::Restored.index()]
+            + snapshot[RetainedSummaryOutcome::Expired.index()]
+            + snapshot[RetainedSummaryOutcome::Evicted.index()]
+            + snapshot[RetainedSummaryOutcome::Discarded.index()];
+        assert_eq!(
+            stored - departed,
+            manager.retained_summary_count() as u64,
+            "stored - departures must equal residency"
+        );
+        assert_eq!(
+            manager.retained_summary_bytes(),
+            manager.retained_summary_payload_sum(),
+            "total_bytes must equal the sum of resident payload lengths"
+        );
+        if manager.retained_summary_count() == 0 {
+            assert_eq!(manager.retained_summary_bytes(), 0);
+        }
+    }
+
     /// The core regression: a peer that reconnects after the grace period must
     /// NOT start summary-less. Without the retention cache this fails —
-    /// `get_peer_summary` returns `None` and the broadcast path takes the
+    /// the broadcast path observes `Missing` and takes the
     /// `FullNoTheirSummaryTracked` arm.
     #[test]
     fn summary_survives_disconnect_grace_removal_and_reconnect() {
@@ -5821,8 +6072,7 @@ mod tests {
         let peer = make_peer_key(1);
         let summary = StateSummary::from(vec![1u8, 2, 3, 4]);
 
-        manager.register_peer_interest(&contract, peer.clone(), Some(summary.clone()), false);
-        assert!(manager.get_peer_summary(&contract, &peer).is_some());
+        seed_peer_reported(&manager, &contract, &peer, summary.clone());
 
         disconnect_grace_cycle(&manager, &time, &peer);
         assert!(
@@ -5844,14 +6094,19 @@ mod tests {
             InterestRegistrationSource::Interests,
         );
 
-        assert_eq!(
-            manager
-                .get_peer_summary(&contract, &peer)
-                .as_ref()
-                .map(|s| s.as_ref().to_vec()),
-            Some(summary.as_ref().to_vec()),
-            "the recreated entry must be seeded from the retained summary"
-        );
+        // Assert on the PRODUCTION read path, not just the accessor: the
+        // broadcast selector must see a usable summary and open no
+        // missing-summary attempt.
+        match manager.begin_peer_summary_broadcast(&contract, &peer) {
+            PeerSummaryForBroadcast::Known(restored) => assert_eq!(
+                restored.as_ref(),
+                summary.as_ref(),
+                "the recreated entry must be seeded from the retained summary"
+            ),
+            PeerSummaryForBroadcast::Missing { reason, .. } => {
+                panic!("recreated pair still summary-less ({reason:?}) — full state would be sent")
+            }
+        }
         assert_eq!(
             retained_outcome(&manager, RetainedSummaryOutcome::Restored),
             1
@@ -5861,6 +6116,109 @@ mod tests {
             0,
             "a restored summary is claimed, not left behind for a later recreation"
         );
+        assert_retention_bookkeeping(&manager);
+    }
+
+    /// A restored summary stays retention-eligible: a peer that reconnects and
+    /// disconnects again before reporting a fresh summary must not silently lose
+    /// the belief on the second cycle.
+    #[test]
+    fn a_restored_summary_survives_a_second_disconnect() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(20);
+        let peer = make_peer_key(20);
+        let summary = StateSummary::from(vec![2u8; 6]);
+
+        seed_peer_reported(&manager, &contract, &peer, summary.clone());
+        disconnect_grace_cycle(&manager, &time, &peer);
+        manager.register_peer_interest(&contract, peer.clone(), None, false);
+        assert!(manager.get_peer_summary(&contract, &peer).is_some());
+
+        disconnect_grace_cycle(&manager, &time, &peer);
+        assert_eq!(
+            retained_outcome(&manager, RetainedSummaryOutcome::Stored),
+            2,
+            "a restored belief is still peer-asserted and must be retained again"
+        );
+        manager.register_peer_interest(&contract, peer.clone(), None, false);
+        assert_eq!(
+            manager
+                .get_peer_summary(&contract, &peer)
+                .as_ref()
+                .map(|s| s.as_ref().to_vec()),
+            Some(summary.as_ref().to_vec())
+        );
+        assert_retention_bookkeeping(&manager);
+    }
+
+    /// A belief WE assumed is not retained. `record_delivery_to_interest` writes
+    /// our own summary as the peer's on sender-side send completion, which is
+    /// wrong whenever a stream tail is lost — and transport loss is exactly what
+    /// puts us on the retention path. Today's unconditional teardown is the
+    /// repair that breaks the converged-skip's silence for those; retention must
+    /// not remove it.
+    #[test]
+    fn a_self_assumed_summary_is_not_retained() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(21);
+        let peer = make_peer_key(21);
+
+        manager.register_peer_interest(&contract, peer.clone(), None, false);
+        manager.upsert_peer_summary_from(
+            &contract,
+            &peer,
+            StateSummary::from(vec![3u8; 4]),
+            SummaryPopulationSource::Delivery,
+        );
+        assert!(manager.get_peer_summary(&contract, &peer).is_some());
+
+        disconnect_grace_cycle(&manager, &time, &peer);
+        assert_eq!(manager.retained_summary_count(), 0);
+        assert_eq!(
+            retained_outcome(&manager, RetainedSummaryOutcome::Stored),
+            0
+        );
+
+        manager.register_peer_interest(&contract, peer.clone(), None, false);
+        assert!(
+            manager.get_peer_summary(&contract, &peer).is_none(),
+            "a self-assumed belief must not survive the teardown"
+        );
+        assert_retention_bookkeeping(&manager);
+    }
+
+    /// Every population source is classified deliberately, and anything not
+    /// positively peer-asserted defaults to the conservative side.
+    #[test]
+    fn only_peer_asserted_population_sources_are_retention_eligible() {
+        for (source, eligible) in [
+            (SummaryPopulationSource::InterestSummary, true),
+            (SummaryPopulationSource::DigestAgreement, true),
+            (SummaryPopulationSource::InboundBroadcast, true),
+            (SummaryPopulationSource::ResyncResponse, true),
+            (SummaryPopulationSource::Delivery, false),
+            (SummaryPopulationSource::Unknown, false),
+        ] {
+            let (manager, time) = make_manager();
+            let contract = make_contract_key(22);
+            let peer = make_peer_key(22);
+
+            manager.register_peer_interest(&contract, peer.clone(), None, false);
+            manager.upsert_peer_summary_from(
+                &contract,
+                &peer,
+                StateSummary::from(vec![4u8; 4]),
+                source,
+            );
+            disconnect_grace_cycle(&manager, &time, &peer);
+
+            assert_eq!(
+                manager.retained_summary_count(),
+                usize::from(eligible),
+                "{} eligibility",
+                source.as_str()
+            );
+        }
     }
 
     /// A reconnect that beats the grace period never removes the entry, so
@@ -5873,7 +6231,7 @@ mod tests {
         let peer = make_peer_key(2);
         let summary = StateSummary::from(vec![9u8; 8]);
 
-        manager.register_peer_interest(&contract, peer.clone(), Some(summary.clone()), false);
+        seed_peer_reported(&manager, &contract, &peer, summary.clone());
         manager.schedule_deferred_removal(&peer);
         time.advance_time(INTEREST_DISCONNECT_GRACE_PERIOD - Duration::from_secs(1));
         assert!(manager.cancel_deferred_removal(&peer));
@@ -5897,26 +6255,20 @@ mod tests {
     /// the PEER told us it stopped tracking the contract, so a later
     /// re-registration may follow a re-fetch that moved its state somewhere our
     /// old belief does not describe.
+    ///
+    /// Iterates `InterestRemovalCause::ALL` rather than a hand-written list, so
+    /// a future variant is covered the moment it is added.
     #[test]
     fn only_disconnect_grace_retains_the_summary() {
-        for cause in [
-            InterestRemovalCause::InterestsReplace,
-            InterestRemovalCause::ChangeInterests,
-            InterestRemovalCause::Unsubscribe,
-            InterestRemovalCause::TtlExpiry,
-            InterestRemovalCause::Eviction,
-            InterestRemovalCause::Unknown,
-        ] {
+        for cause in InterestRemovalCause::ALL
+            .into_iter()
+            .filter(|cause| *cause != InterestRemovalCause::DisconnectGrace)
+        {
             let (manager, _time) = make_manager();
             let contract = make_contract_key(3);
             let peer = make_peer_key(3);
 
-            manager.register_peer_interest(
-                &contract,
-                peer.clone(),
-                Some(StateSummary::from(vec![7u8, 7])),
-                false,
-            );
+            seed_peer_reported(&manager, &contract, &peer, StateSummary::from(vec![7u8, 7]));
             assert!(manager.remove_peer_interest_for(&contract, &peer, cause));
 
             assert_eq!(
@@ -5935,60 +6287,132 @@ mod tests {
         }
     }
 
-    /// A removal of a summary-LESS entry has nothing to retain.
+    /// The scope cut must survive INTERLEAVING, not just a single removal.
+    ///
+    /// This is the sequence that made an earlier revision of this change unsound:
+    /// the retained entry was claimed only by registration, but on the real
+    /// reconnect path the entry is often recreated by `upsert_peer_summary_from`
+    /// instead — so the retained belief was orphaned, and a LATER withdrawal
+    /// removal (which deliberately retains nothing) could still be followed by a
+    /// registration that restored the orphan. That restores a belief across
+    /// exactly the cause the scope refuses to retain.
+    #[test]
+    fn a_withdrawal_removal_cannot_resurrect_a_belief_retained_at_an_earlier_disconnect() {
+        for withdrawal in [
+            InterestRemovalCause::Unsubscribe,
+            InterestRemovalCause::ChangeInterests,
+            InterestRemovalCause::InterestsReplace,
+            InterestRemovalCause::TtlExpiry,
+        ] {
+            let (manager, time) = make_manager();
+            let contract = make_contract_key(23);
+            let peer = make_peer_key(23);
+            let old = StateSummary::from(vec![1u8; 4]);
+
+            // T0: peer-asserted belief; T1: disconnect grace retains it.
+            seed_peer_reported(&manager, &contract, &peer, old);
+            disconnect_grace_cycle(&manager, &time, &peer);
+            assert_eq!(manager.retained_summary_count(), 1);
+
+            // T2: the peer reconnects and its Summaries reply recreates the entry
+            // WITHOUT going through registration. This is the orphaning shape.
+            manager.upsert_peer_summary_from(
+                &contract,
+                &peer,
+                StateSummary::from(vec![2u8; 4]),
+                SummaryPopulationSource::InterestSummary,
+            );
+            assert_eq!(
+                manager.retained_summary_count(),
+                0,
+                "a fresh peer-asserted write supersedes the retained belief"
+            );
+
+            // T3: the peer withdraws. T4: it comes back and re-registers.
+            assert!(manager.remove_peer_interest_for(&contract, &peer, withdrawal));
+            time.advance_time(Duration::from_secs(1));
+            manager.register_peer_interest(&contract, peer.clone(), None, false);
+
+            assert!(
+                manager.get_peer_summary(&contract, &peer).is_none(),
+                "a registration after {} must not be seeded from any earlier \
+                 disconnect's belief",
+                withdrawal.as_str()
+            );
+            assert_retention_bookkeeping(&manager);
+        }
+    }
+
+    /// A removal of a summary-LESS entry has nothing to retain, and must also
+    /// clear any older entry so it cannot outlive the teardown that superseded it.
     #[test]
     fn disconnect_grace_retains_nothing_when_the_entry_had_no_summary() {
         let (manager, time) = make_manager();
         let contract = make_contract_key(4);
         let peer = make_peer_key(4);
 
-        manager.register_peer_interest(&contract, peer.clone(), None, false);
+        seed_peer_reported(&manager, &contract, &peer, StateSummary::from(vec![5u8; 4]));
+        disconnect_grace_cycle(&manager, &time, &peer);
+        assert_eq!(manager.retained_summary_count(), 1);
+
+        // Recreated summary-less, then torn down again: the second teardown knows
+        // the peer held nothing, which supersedes the first teardown's belief.
+        manager.register_peer_interest_from(
+            &contract,
+            peer.clone(),
+            None,
+            false,
+            InterestRegistrationSource::Interests,
+        );
+        manager.clear_peer_summary(&contract, &peer, SummaryMissingReason::ClearedByNoneReport);
         disconnect_grace_cycle(&manager, &time, &peer);
 
         assert_eq!(manager.retained_summary_count(), 0);
-        assert_eq!(
-            retained_outcome(&manager, RetainedSummaryOutcome::Stored),
-            0
-        );
+        assert_retention_bookkeeping(&manager);
     }
 
     /// A retained summary older than [`RETAINED_SUMMARY_TTL`] is discarded, not
     /// applied: the bound is what keeps the added staleness explicit rather than
-    /// open-ended.
+    /// open-ended. Exactly AT the TTL is still usable (the check is `>`).
     #[test]
     fn retained_summary_expires_after_its_ttl() {
-        let (manager, time) = make_manager();
-        let contract = make_contract_key(5);
-        let peer = make_peer_key(5);
+        for (age, expect_restore) in [
+            (RETAINED_SUMMARY_TTL, true),
+            (RETAINED_SUMMARY_TTL + Duration::from_secs(1), false),
+        ] {
+            let (manager, time) = make_manager();
+            let contract = make_contract_key(5);
+            let peer = make_peer_key(5);
 
-        manager.register_peer_interest(
-            &contract,
-            peer.clone(),
-            Some(StateSummary::from(vec![3u8; 16])),
-            false,
-        );
-        disconnect_grace_cycle(&manager, &time, &peer);
+            seed_peer_reported(
+                &manager,
+                &contract,
+                &peer,
+                StateSummary::from(vec![3u8; 16]),
+            );
+            disconnect_grace_cycle(&manager, &time, &peer);
 
-        time.advance_time(RETAINED_SUMMARY_TTL + Duration::from_secs(1));
-        manager.register_peer_interest(&contract, peer.clone(), None, false);
+            // The entry is stamped at the moment of the removal, i.e. at the END
+            // of the grace cycle, so the age is measured from here.
+            time.advance_time(age);
+            manager.register_peer_interest(&contract, peer.clone(), None, false);
 
-        assert!(
-            manager.get_peer_summary(&contract, &peer).is_none(),
-            "an expired retained summary must not seed the recreated entry"
-        );
-        assert_eq!(
-            retained_outcome(&manager, RetainedSummaryOutcome::Expired),
-            1
-        );
-        assert_eq!(
-            retained_outcome(&manager, RetainedSummaryOutcome::Restored),
-            0
-        );
-        assert_eq!(
-            manager.retained_summary_count(),
-            0,
-            "expired entries are dropped"
-        );
+            assert_eq!(
+                manager.get_peer_summary(&contract, &peer).is_some(),
+                expect_restore,
+                "restore at age {age:?}"
+            );
+            assert_eq!(
+                retained_outcome(&manager, RetainedSummaryOutcome::Expired),
+                u64::from(!expect_restore)
+            );
+            assert_eq!(
+                manager.retained_summary_count(),
+                0,
+                "claimed either way — an expired entry is dropped, not left behind"
+            );
+            assert_retention_bookkeeping(&manager);
+        }
     }
 
     /// A registration that carries its own summary WINS, and must also claim the
@@ -5998,10 +6422,9 @@ mod tests {
         let (manager, time) = make_manager();
         let contract = make_contract_key(6);
         let peer = make_peer_key(6);
-        let stale = StateSummary::from(vec![1u8; 4]);
         let fresh = StateSummary::from(vec![2u8; 4]);
 
-        manager.register_peer_interest(&contract, peer.clone(), Some(stale), false);
+        seed_peer_reported(&manager, &contract, &peer, StateSummary::from(vec![1u8; 4]));
         disconnect_grace_cycle(&manager, &time, &peer);
         assert_eq!(manager.retained_summary_count(), 1);
 
@@ -6026,25 +6449,19 @@ mod tests {
             0,
             "the superseded belief must not survive to seed a later recreation"
         );
+        assert_retention_bookkeeping(&manager);
     }
 
     /// A registration landing on an ALREADY-TRACKED peer is not a recreation, so
     /// it must not be seeded from the retention cache — and must still claim the
     /// entry so the stale belief cannot survive to a later recreation.
-    ///
-    /// This shape is reachable in production: the reconnecting peer's own
-    /// `Summaries` reply routes through `upsert_peer_summary_from`, which CREATES
-    /// the entry without going through registration, so the retained belief is
-    /// still resident when the next `Interests` heartbeat registers the pair.
     #[test]
     fn retained_summary_is_not_applied_to_an_existing_entry() {
         let (manager, time) = make_manager();
         let contract = make_contract_key(7);
         let peer = make_peer_key(7);
-        let stale = StateSummary::from(vec![5u8; 4]);
-        let reported = StateSummary::from(vec![6u8; 4]);
 
-        manager.register_peer_interest(&contract, peer.clone(), Some(stale.clone()), false);
+        seed_peer_reported(&manager, &contract, &peer, StateSummary::from(vec![5u8; 4]));
         disconnect_grace_cycle(&manager, &time, &peer);
         assert_eq!(manager.retained_summary_count(), 1);
 
@@ -6052,13 +6469,19 @@ mod tests {
         manager.register_peer_interest(&contract, make_peer_key(70), None, false);
         assert_eq!(manager.retained_summary_count(), 1);
 
-        // The peer's own Summaries report re-creates the entry with GROUND TRUTH,
-        // bypassing registration and leaving the retained belief resident.
-        assert!(manager.upsert_peer_summary(&contract, &peer, reported.clone()));
-        assert_eq!(manager.retained_summary_count(), 1);
+        // Registration on an entry that already exists: recreate it summary-less
+        // through a path that does NOT claim the cache (a peer we already track),
+        // then register again.
+        manager.register_peer_interest_from(
+            &contract,
+            peer.clone(),
+            None,
+            false,
+            InterestRegistrationSource::Interests,
+        );
+        assert!(manager.get_peer_summary(&contract, &peer).is_some());
+        manager.clear_peer_summary(&contract, &peer, SummaryMissingReason::ClearedByNoneReport);
 
-        // The next Interests heartbeat registers the (now existing) pair. The
-        // retained belief must be claimed and DISCARDED, never applied.
         manager.register_peer_interest_from(
             &contract,
             peer.clone(),
@@ -6070,15 +6493,7 @@ mod tests {
             manager.get_peer_summary(&contract, &peer).is_none(),
             "an overwrite of an existing entry must not resurrect a retained belief"
         );
-        assert_eq!(
-            retained_outcome(&manager, RetainedSummaryOutcome::Discarded),
-            1
-        );
-        assert_eq!(
-            retained_outcome(&manager, RetainedSummaryOutcome::Restored),
-            0
-        );
-        assert_eq!(manager.retained_summary_count(), 0);
+        assert_retention_bookkeeping(&manager);
     }
 
     /// `recreated_after_removal` must keep counting the same population once
@@ -6090,12 +6505,7 @@ mod tests {
         let contract = make_contract_key(8);
         let peer = make_peer_key(8);
 
-        manager.register_peer_interest(
-            &contract,
-            peer.clone(),
-            Some(StateSummary::from(vec![4u8; 4])),
-            false,
-        );
+        seed_peer_reported(&manager, &contract, &peer, StateSummary::from(vec![4u8; 4]));
         disconnect_grace_cycle(&manager, &time, &peer);
         manager.register_peer_interest(&contract, peer.clone(), None, false);
 
@@ -6117,11 +6527,11 @@ mod tests {
         let overflow = RETAINED_SUMMARY_CACHE_SIZE + 64;
 
         for seed in 0..overflow as u32 {
-            manager.register_peer_interest(
+            seed_peer_reported(
+                &manager,
                 &make_unique_contract_key(seed),
-                peer.clone(),
-                Some(StateSummary::from(vec![1u8, 2])),
-                false,
+                &peer,
+                StateSummary::from(vec![1u8, 2]),
             );
         }
         disconnect_grace_cycle(&manager, &time, &peer);
@@ -6135,6 +6545,7 @@ mod tests {
             (overflow - RETAINED_SUMMARY_CACHE_SIZE) as u64,
             "over-cap stores must be visibly evicted, not silently dropped"
         );
+        assert_retention_bookkeeping(&manager);
 
         // Exactly the cap survives; the remaining pairs fall back to the pre-fix
         // behaviour (one full-state send each). WHICH pairs are evicted is
@@ -6149,6 +6560,34 @@ mod tests {
             .count();
         assert_eq!(restored, RETAINED_SUMMARY_CACHE_SIZE);
         assert_eq!(manager.retained_summary_count(), 0);
+        assert_retention_bookkeeping(&manager);
+    }
+
+    /// At exactly the cap nothing is evicted — the bound is `>`, not `>=`.
+    #[test]
+    fn retention_cache_at_exact_capacity_evicts_nothing() {
+        let (manager, time) = make_manager();
+        let peer = make_peer_key(24);
+
+        for seed in 0..RETAINED_SUMMARY_CACHE_SIZE as u32 {
+            seed_peer_reported(
+                &manager,
+                &make_unique_contract_key(seed),
+                &peer,
+                StateSummary::from(vec![1u8, 2]),
+            );
+        }
+        disconnect_grace_cycle(&manager, &time, &peer);
+
+        assert_eq!(
+            manager.retained_summary_count(),
+            RETAINED_SUMMARY_CACHE_SIZE
+        );
+        assert_eq!(
+            retained_outcome(&manager, RetainedSummaryOutcome::Evicted),
+            0
+        );
+        assert_retention_bookkeeping(&manager);
     }
 
     /// Summary bytes are contract-defined and partly remote-influenced, so an
@@ -6161,11 +6600,11 @@ mod tests {
         let needed = RETAINED_SUMMARY_CACHE_MAX_BYTES / per_summary + 8;
 
         for seed in 0..needed as u32 {
-            manager.register_peer_interest(
+            seed_peer_reported(
+                &manager,
                 &make_unique_contract_key(seed),
-                peer.clone(),
-                Some(StateSummary::from(vec![0xAB; per_summary])),
-                false,
+                &peer,
+                StateSummary::from(vec![0xAB; per_summary]),
             );
         }
         disconnect_grace_cycle(&manager, &time, &peer);
@@ -6177,27 +6616,44 @@ mod tests {
         );
         assert!(manager.retained_summary_count() < needed);
         assert!(retained_outcome(&manager, RetainedSummaryOutcome::Evicted) > 0);
+        assert_retention_bookkeeping(&manager);
     }
 
-    /// A single oversized summary must not monopolise the byte budget.
+    /// A single oversized summary must not monopolise the byte budget, and must
+    /// not leave an older belief behind either.
     #[test]
     fn oversized_summaries_are_not_retained() {
         let (manager, time) = make_manager();
         let contract = make_contract_key(11);
         let peer = make_peer_key(11);
 
-        manager.register_peer_interest(
+        // Exactly at the bound is retained; one byte over is not.
+        seed_peer_reported(
+            &manager,
             &contract,
-            peer.clone(),
-            Some(StateSummary::from(vec![
-                0xCD;
-                MAX_RETAINED_SUMMARY_BYTES + 1
-            ])),
-            false,
+            &peer,
+            StateSummary::from(vec![0xCD; MAX_RETAINED_SUMMARY_BYTES]),
+        );
+        disconnect_grace_cycle(&manager, &time, &peer);
+        assert_eq!(manager.retained_summary_count(), 1);
+        assert_eq!(
+            retained_outcome(&manager, RetainedSummaryOutcome::SkippedOversized),
+            0
+        );
+
+        seed_peer_reported(
+            &manager,
+            &contract,
+            &peer,
+            StateSummary::from(vec![0xCD; MAX_RETAINED_SUMMARY_BYTES + 1]),
         );
         disconnect_grace_cycle(&manager, &time, &peer);
 
-        assert_eq!(manager.retained_summary_count(), 0);
+        assert_eq!(
+            manager.retained_summary_count(),
+            0,
+            "an oversized teardown must also discard the older belief it supersedes"
+        );
         assert_eq!(manager.retained_summary_bytes(), 0);
         assert_eq!(
             retained_outcome(&manager, RetainedSummaryOutcome::SkippedOversized),
@@ -6205,8 +6661,34 @@ mod tests {
         );
         assert_eq!(
             retained_outcome(&manager, RetainedSummaryOutcome::Stored),
-            0
+            1
         );
+        assert_retention_bookkeeping(&manager);
+    }
+
+    /// An empty summary is a legitimate value (a contract may summarize empty
+    /// state as no bytes) and must round-trip, not be confused with absence.
+    #[test]
+    fn empty_summary_is_retained_and_restored() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(25);
+        let peer = make_peer_key(25);
+
+        seed_peer_reported(&manager, &contract, &peer, StateSummary::from(Vec::new()));
+        disconnect_grace_cycle(&manager, &time, &peer);
+        assert_eq!(manager.retained_summary_count(), 1);
+        assert_eq!(manager.retained_summary_bytes(), 0);
+
+        manager.register_peer_interest(&contract, peer.clone(), None, false);
+        assert_eq!(
+            manager
+                .get_peer_summary(&contract, &peer)
+                .as_ref()
+                .map(|s| s.as_ref().to_vec()),
+            Some(Vec::new()),
+            "an empty summary must restore as Some(empty), not None"
+        );
+        assert_retention_bookkeeping(&manager);
     }
 
     /// Retention is keyed on the peer's transport PUBLIC KEY, so a different
@@ -6221,12 +6703,7 @@ mod tests {
         let peer = make_peer_key(12);
         let impostor = make_peer_key(120);
 
-        manager.register_peer_interest(
-            &contract,
-            peer.clone(),
-            Some(StateSummary::from(vec![6u8; 4])),
-            false,
-        );
+        seed_peer_reported(&manager, &contract, &peer, StateSummary::from(vec![6u8; 4]));
         disconnect_grace_cycle(&manager, &time, &peer);
 
         manager.register_peer_interest(&contract, impostor.clone(), None, false);
@@ -6238,6 +6715,7 @@ mod tests {
 
         manager.register_peer_interest(&contract, peer.clone(), None, false);
         assert!(manager.get_peer_summary(&contract, &peer).is_some());
+        assert_retention_bookkeeping(&manager);
     }
 
     /// The retained belief is per (contract, peer): disconnecting must not let a
@@ -6249,11 +6727,11 @@ mod tests {
         let contract_b = make_contract_key(14);
         let peer = make_peer_key(13);
 
-        manager.register_peer_interest(
+        seed_peer_reported(
+            &manager,
             &contract_a,
-            peer.clone(),
-            Some(StateSummary::from(vec![8u8; 4])),
-            false,
+            &peer,
+            StateSummary::from(vec![8u8; 4]),
         );
         manager.register_peer_interest(&contract_b, peer.clone(), None, false);
         disconnect_grace_cycle(&manager, &time, &peer);
@@ -6269,6 +6747,91 @@ mod tests {
             manager.get_peer_summary(&contract_a, &peer).is_some(),
             "contract A's own retained summary must still be claimable"
         );
+        assert_retention_bookkeeping(&manager);
+    }
+
+    /// The cache is shared mutable state on the interest hot path: stores come
+    /// from the disconnect sweep, takes from registration, discards from both
+    /// plus `upsert_peer_summary_from`. Hammer all three concurrently and assert
+    /// the byte counter and the counter-vs-residency identity still hold —
+    /// `total_bytes` drifting LOW would let the cache exceed its memory budget
+    /// while reporting compliance, and every `saturating_sub` would hide it.
+    #[test]
+    fn concurrent_store_take_and_discard_keep_the_bookkeeping_consistent() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let (manager, _time) = make_manager();
+        let manager = Arc::new(manager);
+        let contract = make_contract_key(26);
+        let rounds = 2_000u32;
+
+        let workers: Vec<_> = (0..4u32)
+            .map(|worker| {
+                let manager = Arc::clone(&manager);
+                thread::spawn(move || {
+                    for round in 0..rounds {
+                        // Deliberately overlapping key spaces: adjacent workers
+                        // contend on the same pairs.
+                        let peer = make_unique_peer_key((round % 8) + worker);
+                        manager.register_peer_interest_from(
+                            &contract,
+                            peer.clone(),
+                            None,
+                            false,
+                            InterestRegistrationSource::Interests,
+                        );
+                        manager.upsert_peer_summary_from(
+                            &contract,
+                            &peer,
+                            StateSummary::from(vec![worker as u8; (round % 32) as usize + 1]),
+                            SummaryPopulationSource::InterestSummary,
+                        );
+                        manager.remove_peer_interest_for(
+                            &contract,
+                            &peer,
+                            if round % 3 == 0 {
+                                InterestRemovalCause::Unsubscribe
+                            } else {
+                                InterestRemovalCause::DisconnectGrace
+                            },
+                        );
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("worker panicked");
+        }
+
+        assert_retention_bookkeeping(&manager);
+        assert!(manager.retained_summary_bytes() <= RETAINED_SUMMARY_CACHE_MAX_BYTES);
+        assert!(manager.retained_summary_count() <= RETAINED_SUMMARY_CACHE_SIZE);
+    }
+
+    /// The `retain` telemetry array is decoded positionally by the dashboard
+    /// against `RetainedSummaryOutcome::ALL` (see `router.rs`), but the wire
+    /// order actually comes from `index()`. Pin that the two agree, and that the
+    /// labels are distinct — same guard shape as
+    /// `summary_missing_reason_indices_and_labels_are_distinct`.
+    #[test]
+    fn retained_summary_outcome_indices_and_labels_are_distinct() {
+        let mut seen_labels = std::collections::HashSet::new();
+        for (position, outcome) in RetainedSummaryOutcome::ALL.into_iter().enumerate() {
+            assert_eq!(
+                outcome.index(),
+                position,
+                "{} must sit at its ALL position — the telemetry array is decoded \
+                 positionally against ALL",
+                outcome.as_str()
+            );
+            assert!(
+                seen_labels.insert(outcome.as_str()),
+                "duplicate label {}",
+                outcome.as_str()
+            );
+        }
+        assert_eq!(seen_labels.len(), RetainedSummaryOutcome::COUNT);
     }
 
     /// The untracked-path staleness reset must not wipe `recent_removal`.

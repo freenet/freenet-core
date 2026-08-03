@@ -212,7 +212,9 @@ pub(crate) struct NetworkEfficiencyV1 {
     pub eff: [u64; 8],
     /// Across-disconnect peer-summary retention, in `RetainedSummaryOutcome::ALL`
     /// order: stored, skipped_oversized, restored, expired, evicted, discarded.
-    /// `restored` is the count of recreated pairs that skipped a full-state send.
+    /// `restored` counts recreated pairs SEEDED from the cache — whether the
+    /// resulting broadcast was a delta or fell back to full state is decided
+    /// later, by the post-compute efficiency gate, and is reported by `ms_s`.
     pub retain: [u64; RetainedSummaryOutcome::COUNT],
 }
 
