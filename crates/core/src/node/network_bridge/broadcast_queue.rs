@@ -160,6 +160,9 @@ const UPGRADE_SLOT_HOLD_WINDOW: Duration = Duration::from_millis(250);
 /// Not derived from that constant directly because the pool sizes live in the
 /// `queue` submodule, which is cfg'd out under `simulation_tests` while this
 /// type stays compiled.
+// Only referenced from the production queue, which is cfg'd out under
+// `simulation_tests`; the doc-links from `SendLanePermit` do not count as uses.
+#[cfg_attr(feature = "simulation_tests", allow(dead_code))]
 const MAX_PARKED_LANE_UPGRADES: usize = 12;
 
 #[cfg_attr(feature = "simulation_tests", allow(dead_code))]
@@ -264,8 +267,8 @@ impl SendLanePermit {
                 self.permit = None;
                 Some(slot)
             }
-            // Closed parking (nothing closes it today): keep the small-lane slot
-            // rather than parking unbounded.
+            // Closed parking (only `LaneGroup::shutdown` does that): keep the
+            // small-lane slot rather than parking unbounded.
             Err(_) => None,
         };
         match self.large_pool.clone().acquire_owned().await {
@@ -287,8 +290,10 @@ impl SendLanePermit {
     /// holds — possibly nothing, if it had already parked — rather than
     /// stalling forever.
     ///
-    /// UNREACHABLE today: nothing closes these semaphores (grep `.close()` in
-    /// this file — the only hits are tests). It exists so that adding a real
+    /// Reachable only via [`LaneGroup::shutdown`], which fires when a lane
+    /// drain stops — and a drain only stops on an already-closed pool or a
+    /// panic. So in a healthy node this never runs; after a drain panics it
+    /// can, which is why it releases the send rather than stranding it. It exists so that adding a real
     /// shutdown path later cannot silently strand in-flight sends, and it is
     /// the one documented way a large payload can reach the wire without
     /// large-lane capacity.
@@ -1219,9 +1224,11 @@ mod queue {
         /// handles are not registered with a monitor (pre-existing), and there
         /// are two of them now, so if one ever stopped the other would keep
         /// draining and only that lane would silently go quiet. Two ways it
-        /// could: a closed semaphore (nothing closes them today), or a panic on
-        /// `pop_lane`'s `.expect` if the order maps ever drifted from
-        /// `entries`. Worth revisiting if the pools gain a real close path.
+        /// could: a closed semaphore (only `LaneGroup::shutdown` closes them),
+        /// or a panic on `pop_lane`'s `.expect` if the order maps ever drifted
+        /// from `entries`. Both are covered — `LaneDrainGuard` stops the
+        /// sibling on any exit, panic included — so one lane cannot outlive the
+        /// other and quietly carry half the traffic.
         pub(crate) fn start_worker(
             &self,
             bridge: P2pBridge,
@@ -1238,7 +1245,7 @@ mod queue {
                 large_notify: self.large_notify.clone(),
             };
 
-            let spawn_lane = |lane, _semaphore: Arc<Semaphore>| {
+            let spawn_lane = |lane| {
                 let queue = self.queue.clone();
                 let group = group.clone();
                 let bridge = bridge.clone();
@@ -1266,8 +1273,8 @@ mod queue {
             };
 
             [
-                spawn_lane(QueuedPayloadClass::Small, small_semaphore),
-                spawn_lane(QueuedPayloadClass::Large, large_semaphore.clone()),
+                spawn_lane(QueuedPayloadClass::Small),
+                spawn_lane(QueuedPayloadClass::Large),
             ]
         }
     }
@@ -1320,6 +1327,24 @@ mod queue {
         }
     }
 
+    /// Runs [`LaneGroup::shutdown`] when a drain stops for ANY reason.
+    ///
+    /// The two explicit `shutdown()` calls cover the semaphore-closed returns,
+    /// but those are unreachable in production (nothing closes a pool except
+    /// this mechanism). The exit that CAN happen is a panic — `pop_lane`'s
+    /// `.expect`, or anything else unwinding — and a panic skips both of them,
+    /// leaving the sibling draining and restoring exactly the half-silent
+    /// asymmetry this exists to prevent. `p2p_protoc` discards the handles and
+    /// holds no `BackgroundTaskMonitor`, so nothing else would notice either.
+    /// A `Drop` guard covers panic, abort and normal return alike.
+    struct LaneDrainGuard(LaneGroup);
+
+    impl Drop for LaneDrainGuard {
+        fn drop(&mut self) {
+            self.0.shutdown();
+        }
+    }
+
     /// Drain loop for ONE lane: pop that lane's FIFO, take one of that lane's
     /// permits, and hand the entry to `dispatch` on a spawned task.
     ///
@@ -1342,6 +1367,9 @@ mod queue {
         D: Fn(BroadcastEntry, QueueScheduling) -> F,
         F: Future<Output = ()> + Send + 'static,
     {
+        // Stops the sibling however this drain ends — including a panic, which
+        // skips the explicit `shutdown()` calls below.
+        let _stop_sibling_on_exit = LaneDrainGuard(group.clone());
         let notify = group.notify(lane).clone();
         let semaphore = group.pool(lane).clone();
         let large_pool = group.large_pool.clone();
@@ -1580,20 +1608,26 @@ mod queue {
                 2,
                 "start_worker must spawn exactly one drain per lane"
             );
-            // Pin the lane→pool WIRING, not just the lane count. Handing the
-            // small lane the large semaphore is a one-token slip that caps
-            // small broadcasts at 2 concurrent and puts them back in contention
-            // with full-state sends — i.e. reinstates #4961 at full strength —
-            // while every behavioural test still passes, because they build
-            // their own semaphores instead of going through `start_worker`.
-            assert!(
-                body.contains("spawn_lane(QueuedPayloadClass::Small, small_semaphore)"),
-                "the small lane must be given the SMALL pool"
-            );
-            assert!(
-                body.contains("spawn_lane(QueuedPayloadClass::Large, large_semaphore"),
-                "the large lane must be given the LARGE pool"
-            );
+            // Pin the lane→pool and lane→notify WIRING, which lives in the
+            // `LaneGroup` literal. Transposing either pair here is a one-token
+            // slip: swapping the pools caps small broadcasts at 2 concurrent —
+            // #4961 at full strength — and swapping the notifies makes each
+            // drain wait on the other lane's wakeup, so a lane silently stops
+            // draining. Neither is caught behaviourally, because `start_worker`
+            // has no test caller: every behavioural test builds its own
+            // `LaneGroup`. (`LaneGroup::pool`/`notify` themselves ARE covered —
+            // swapping their match arms fails the scheduling tests.)
+            for wiring in [
+                "small_pool: small_semaphore",
+                "large_pool: large_semaphore",
+                "small_notify: self.small_notify",
+                "large_notify: self.large_notify",
+            ] {
+                assert!(
+                    body.contains(wiring),
+                    "start_worker must wire the shared LaneGroup as `{wiring}`"
+                );
+            }
             // ONE parking pool for the node. Constructing it per dispatch
             // instead would make the parked set unbounded again while every
             // behavioural test stayed green — so pin BOTH halves: created once
@@ -1648,6 +1682,12 @@ mod queue {
             let code = freenet_stdlib::prelude::ContractCode::from(vec![seed]);
             let params = freenet_stdlib::prelude::Parameters::from(vec![seed]);
             ContractKey::from_params_and_code(&params, &code)
+        }
+
+        fn lane_of(
+            dispatched: Option<(QueuedPayloadClass, ContractKey)>,
+        ) -> Option<QueuedPayloadClass> {
+            dispatched.map(|(lane, _)| lane)
         }
 
         fn state(size: usize) -> WrappedState {
@@ -1811,41 +1851,26 @@ mod queue {
             }
         }
 
-        /// The escalation from #5112's author: parked upgraders queue on the
-        /// same FIFO pool as the large lane's own drain, so if they could
-        /// accumulate without limit they would starve it, `large_order` would
-        /// back up against the shared depth cap, and `evict_oldest` would start
-        /// dropping the globally oldest entry — whole fan-outs, since
-        /// mispredictions are correlated across every peer of a contract. That
-        /// is an update-propagation failure, not just RSS growth.
-        ///
-        /// The parking bound is what prevents it: at most
-        /// `MAX_PARKED_LANE_UPGRADES` upgraders can be queued ahead of the large
-        /// drain, so it keeps getting turns and the queue keeps draining. This
-        /// drives a sustained burst of mispredicting sends through the REAL
-        /// `ensure_capacity_for` and asserts the large lane still makes
-        /// progress and the queue does not fill.
+        /// A drain that stops WITHOUT reaching either explicit `shutdown()`
+        /// call must still stop the sibling. That is the exit which can
+        /// actually happen — a panic unwinding out of the drain — since the
+        /// semaphore-closed exits are unreachable in a healthy node. Only
+        /// `LaneDrainGuard`'s `Drop` covers it. Abort is the testable proxy: it
+        /// drops the drain future and runs exactly the same `Drop` path.
         #[tokio::test(start_paused = true)]
         #[serial_test::serial(broadcast_queue_depth_gauge)]
-        async fn mispredicting_burst_does_not_starve_the_large_lane_into_evicting() {
-            let queue = BroadcastQueue {
-                max_queue_depth: 8,
-                ..BroadcastQueue::new()
-            };
+        async fn a_drain_that_stops_without_shutting_down_still_stops_the_other() {
+            let queue = BroadcastQueue::new();
             let small_permits = Arc::new(Semaphore::new(12));
             let large_permits = Arc::new(Semaphore::new(2));
-            let upgrade_slots = Arc::new(Semaphore::new(super::super::MAX_PARKED_LANE_UPGRADES));
-            let (tx, mut dispatched) = tokio::sync::mpsc::unbounded_channel();
             let group = LaneGroup {
                 small_pool: small_permits.clone(),
                 large_pool: large_permits.clone(),
-                upgrade_slots,
+                upgrade_slots: Arc::new(Semaphore::new(2)),
                 small_notify: queue.small_notify.clone(),
                 large_notify: queue.large_notify.clone(),
             };
-            // Every SMALL-lane send mispredicts: it runs the real correction and
-            // ends up needing large-lane capacity. Large-lane sends complete
-            // immediately, so the large pool keeps turning over.
+            let (tx, mut ran) = tokio::sync::mpsc::unbounded_channel();
             let workers: Vec<_> = [QueuedPayloadClass::Small, QueuedPayloadClass::Large]
                 .into_iter()
                 .map(|lane| {
@@ -1854,71 +1879,232 @@ mod queue {
                         lane,
                         queue.queue.clone(),
                         group.clone(),
-                        move |entry: BroadcastEntry, mut scheduling: QueueScheduling| {
+                        move |entry: BroadcastEntry, _s: QueueScheduling| {
                             let tx = tx.clone();
                             async move {
-                                if matches!(lane, QueuedPayloadClass::Small) {
-                                    scheduling.permit.ensure_capacity_for(BIG).await;
-                                }
                                 let _ = tx.send((lane, entry.key));
                             }
                         },
                     ))
                 })
                 .collect();
+            let [small, large]: [_; 2] = workers.try_into().expect("two drains");
 
-            // A sustained correlated burst: far more mispredicting small sends
-            // than the parking area can hold, interleaved with genuine
-            // large-lane entries.
-            for seed in 0..40u8 {
-                let lane = if seed % 4 == 0 {
-                    QueuedPayloadClass::Large
-                } else {
-                    QueuedPayloadClass::Small
-                };
+            // The drain future must actually be POLLED before aborting, or
+            // there is no guard in it yet to drop. Wait until it dispatches.
+            queue
+                .enqueue_in_lane(
+                    QueuedPayloadClass::Large,
+                    contract(40),
+                    PeerKeyLocation::random(),
+                    state(BIG),
+                )
+                .await;
+            assert_eq!(
+                lane_of(
+                    tokio::time::timeout(Duration::from_secs(5), ran.recv())
+                        .await
+                        .expect("the large drain must run before we stop it")
+                ),
+                Some(QueuedPayloadClass::Large),
+            );
+
+            large.abort();
+            let _ = large.await;
+
+            assert!(
+                small_permits.is_closed(),
+                "the surviving drain's pool must be closed by the guard, so it \
+                 cannot keep carrying half the traffic"
+            );
+            tokio::time::timeout(Duration::from_secs(5), small)
+                .await
+                .expect("the sibling drain must stop too")
+                .expect("it must return rather than panic");
+        }
+
+        /// The escalation from #5118 / #5112's author: parked upgraders queue on
+        /// the same FIFO pool as the large lane's own drain, so if they could
+        /// accumulate without limit they would starve it, `large_order` would
+        /// back up against the shared depth cap, and `evict_oldest` would start
+        /// dropping the globally oldest entry — whole fan-outs, since
+        /// mispredictions are correlated across every peer of a contract. That
+        /// is an update-propagation failure, not just RSS growth.
+        ///
+        /// Drives a sustained burst of mispredicting sends through the REAL
+        /// `ensure_capacity_for` and asserts the parking area caps how many park
+        /// at once, that the overflow keeps its small-lane slot rather than
+        /// parking too, and that the large lane keeps draining throughout.
+        ///
+        /// Getting this to actually reach phase 2 is fiddly and the first
+        /// version did not: the large-lane dispatch must HOLD its permit (a
+        /// closure that returns immediately hands every upgrader a large permit
+        /// in phase 1), and the enqueue loop must not `yield_now` per entry (a
+        /// perpetually-ready task keeps the runtime from idling, so the paused
+        /// clock never advances to the hold window and phase 2 is unreachable).
+        /// Three reviewers independently caught that; the `upgrade_slots` handle
+        /// is retained here specifically so the test can prove it got there.
+        #[tokio::test(start_paused = true)]
+        #[serial_test::serial(broadcast_queue_depth_gauge)]
+        async fn mispredicting_burst_parks_boundedly_without_starving_the_large_lane() {
+            let queue = BroadcastQueue {
+                max_queue_depth: 256,
+                ..BroadcastQueue::new()
+            };
+            let small_permits = Arc::new(Semaphore::new(12));
+            let large_permits = Arc::new(Semaphore::new(2));
+            // Two parking slots, so the burst overflows it quickly and the
+            // overflow behaviour is what gets exercised.
+            let upgrade_slots = Arc::new(Semaphore::new(2));
+            let (tx, mut dispatched) = tokio::sync::mpsc::unbounded_channel();
+            let group = LaneGroup {
+                small_pool: small_permits.clone(),
+                large_pool: large_permits.clone(),
+                upgrade_slots: upgrade_slots.clone(),
+                small_notify: queue.small_notify.clone(),
+                large_notify: queue.large_notify.clone(),
+            };
+            // Large-lane sends HOLD their permit until the test releases them,
+            // so the large pool stays saturated and every small send mispredicts
+            // into a real wait.
+            let release = Arc::new(Semaphore::new(0));
+            let workers: Vec<_> = [QueuedPayloadClass::Small, QueuedPayloadClass::Large]
+                .into_iter()
+                .map(|lane| {
+                    let tx = tx.clone();
+                    let release = release.clone();
+                    tokio::spawn(drain_lane(
+                        lane,
+                        queue.queue.clone(),
+                        group.clone(),
+                        move |entry: BroadcastEntry, mut scheduling: QueueScheduling| {
+                            let tx = tx.clone();
+                            let release = release.clone();
+                            async move {
+                                let _ = tx.send((lane, entry.key));
+                                if matches!(lane, QueuedPayloadClass::Large) {
+                                    let _ = release.acquire_owned().await;
+                                } else {
+                                    scheduling.permit.ensure_capacity_for(BIG).await;
+                                }
+                            }
+                        },
+                    ))
+                })
+                .collect();
+
+            // Saturate the large lane first.
+            for seed in 0..2u8 {
                 queue
-                    .enqueue_in_lane(lane, contract(seed), PeerKeyLocation::random(), state(BIG))
+                    .enqueue_in_lane(
+                        QueuedPayloadClass::Large,
+                        contract(seed),
+                        PeerKeyLocation::random(),
+                        state(BIG),
+                    )
                     .await;
-                tokio::task::yield_now().await;
+            }
+            for _ in 0..2 {
+                assert_eq!(
+                    lane_of(dispatched.recv().await),
+                    Some(QueuedPayloadClass::Large),
+                    "both large permits must be taken and held"
+                );
+            }
+            assert_eq!(large_permits.available_permits(), 0);
+
+            // Now a correlated burst of mispredicting small sends — more than
+            // the small pool, so the overflow path is reached too.
+            for seed in 10..26u8 {
+                queue
+                    .enqueue_in_lane(
+                        QueuedPayloadClass::Small,
+                        contract(seed),
+                        PeerKeyLocation::random(),
+                        state(BIG),
+                    )
+                    .await;
+            }
+            for _ in 0..12 {
+                assert_eq!(
+                    lane_of(dispatched.recv().await),
+                    Some(QueuedPayloadClass::Small),
+                    "the small lane dispatches up to its pool width"
+                );
             }
 
-            // Drain what the workers produced.
-            let mut large_dispatched = 0usize;
-            let mut total = 0usize;
+            // Let the hold window elapse so the dispatched sends reach phase 2.
+            tokio::time::sleep(super::super::UPGRADE_SLOT_HOLD_WINDOW * 2).await;
+
+            assert_eq!(
+                upgrade_slots.available_permits(),
+                0,
+                "the burst must actually REACH the parking area — this is the \
+                 assertion the first version of this test could not make"
+            );
+            // The discriminating count. Every dispatched send mispredicts, so
+            // with UNBOUNDED parking each one parks, hands its small-lane slot
+            // straight back, and the drain dispatches a replacement — all 16
+            // would be in flight. With the bound, only as many as parking can
+            // hold ever give their slot back, so dispatch stops at
+            // pool width + parking capacity.
+            let mut dispatched_small = 12usize;
             while let Ok(Some((lane, _))) =
-                tokio::time::timeout(Duration::from_secs(5), dispatched.recv()).await
+                tokio::time::timeout(Duration::from_millis(1), dispatched.recv()).await
             {
-                total += 1;
-                if matches!(lane, QueuedPayloadClass::Large) {
-                    large_dispatched += 1;
-                }
-                if total == 40 {
-                    break;
+                if matches!(lane, QueuedPayloadClass::Small) {
+                    dispatched_small += 1;
                 }
             }
+            assert_eq!(
+                dispatched_small, 14,
+                "dispatch must stop at 12 small permits + 2 parking slots; \
+                 unbounded parking would have put all 16 in flight"
+            );
 
-            assert_eq!(
-                total, 40,
-                "every entry must be dispatched — a starved large lane would leave \
-                 entries queued until the depth cap evicted them"
+            // The large lane must still be able to make progress: release one
+            // large send and a queued entry must take its permit.
+            release.add_permits(1);
+            let key = contract(2);
+            queue
+                .enqueue_in_lane(
+                    QueuedPayloadClass::Large,
+                    key,
+                    PeerKeyLocation::random(),
+                    state(BIG),
+                )
+                .await;
+            let mut saw_large = false;
+            for _ in 0..4 {
+                match tokio::time::timeout(Duration::from_secs(5), dispatched.recv()).await {
+                    Ok(Some((QueuedPayloadClass::Large, k))) if k == key => {
+                        saw_large = true;
+                        break;
+                    }
+                    Ok(Some(_)) => continue,
+                    _ => break,
+                }
+            }
+            assert!(
+                saw_large,
+                "the large lane must keep draining while upgraders contend for \
+                 its pool — starving it is what backs `large_order` up into \
+                 evict_oldest and drops whole fan-outs (#5118)"
             );
-            assert_eq!(
-                large_dispatched, 10,
-                "and the large lane specifically must keep making progress while \
-                 mispredicted upgraders contend for its pool"
-            );
+
             let q = queue.queue.lock().await;
             assert!(
-                q.entries.is_empty(),
-                "the queue must have drained rather than backed up to the cap"
+                q.entries.len() < 256,
+                "and the queue must not have backed up to the depth cap"
             );
             drop(q);
+            release.add_permits(64);
             for worker in workers {
                 worker.abort();
             }
         }
 
-        /// #4961, head-of-line half. A small entry queued behind a large entry
+        /// #4961, head-of-line half.        /// #4961, head-of-line half. A small entry queued behind a large entry
         /// that is waiting for large-lane capacity must still be scheduled.
         ///
         /// Pre-fix, ONE worker drained both lanes and awaited the large

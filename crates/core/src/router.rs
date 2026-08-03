@@ -202,8 +202,9 @@ pub(crate) struct NetworkEfficiencyV1 {
     ///   * queued-small/actual-large read 0 fleet-wide pre-fix and was close to
     ///     structurally so (the lane came from the state size, which bounds the
     ///     payload from above to within `MIN_FULL_STATE_SAVING_BYTES`); the one
-    ///     way it could fire was the stale-dedup-lane defect this PR also
-    ///     fixes. It is now the payload-misprediction count and is EXPECTED to
+    ///     ways it could fire were a delta exceeding the state by up to
+    ///     `MIN_FULL_STATE_SAVING_BYTES`, and the stale-dedup-lane defect fixed
+    ///     alongside this in #5108. It is now the payload-misprediction count and is EXPECTED to
     ///     be non-zero. Those sends still take a large-lane permit before
     ///     hitting the wire. It is a COUNT, not a rate: nothing counts correct
     ///     predictions, and `scheduled_small` is not a usable denominator
@@ -211,7 +212,11 @@ pub(crate) struct NetworkEfficiencyV1 {
     ///   * small-entry-ms was small entries BLOCKED behind a large-lane permit
     ///     wait; it is now merely small entries queued DURING one, since the
     ///     small lane drains them concurrently. Collapsing toward zero is the
-    ///     fix landing.
+    ///     fix landing — but read it narrowly: the observation is armed ONLY by
+    ///     the large lane's drain, so a small entry waiting on a small-lane
+    ///     permit (including one held by a send correcting its lane) opens no
+    ///     observation at all. A zero here is evidence about CROSS-lane
+    ///     blocking, not about small-lane latency in general.
     ///   * large-head incidents/ms keep their trigger (the large drain waiting
     ///     on an empty pool with small entries queued), but the pool has a
     ///     second consumer now — a mispredicted small-lane send correcting its

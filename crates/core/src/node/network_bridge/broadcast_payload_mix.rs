@@ -155,19 +155,29 @@
 //! do it by different routes:
 //!
 //! `BroadcastQueue`'s small-to-large permit upgrade (`ensure_capacity_for`
-//! phase 2) releases its permit and awaits the large pool with no timeout and
-//! no bound on how many senders may be parked there at once. The small drain
-//! worker reclaims the freed permit and dispatches another entry, which may
-//! also mispredict and park. Nothing limits the parked count: `track_active`
+//! phase 2) used to release its permit and await the large pool with no bound
+//! on how many senders could be parked there at once — the small drain worker
+//! reclaimed the freed permit and dispatched another entry, which could also
+//! mispredict and park, without limit. `track_active` does not stop that: it
 //! reports full at the depth cap but the drain loop dispatches anyway (it sets
 //! `tracked: false` for untrack bookkeeping; it is not an admission gate).
-//! Parked upgraders queue ahead of the large drain worker on the same
-//! FIFO-fair semaphore, the large lane backs up against the shared depth cap,
-//! and `evict_oldest` drops entries. Eviction walks `seq` order, and a
-//! fan-out's per-peer entries are enqueued in a tight loop, so they form a
-//! temporal cluster — concurrent fan-outs interleave their `seq` allocations,
-//! so this is a tendency rather than a guarantee, but what gets dropped is
-//! typically most of a FAN-OUT rather than scattered targets. See #5118.
+//! Parked upgraders queue with the large drain worker on the same FIFO-fair
+//! semaphore, so an unbounded parked set could starve it, the large lane would
+//! back up against the shared depth cap, and `evict_oldest` would drop entries.
+//! Eviction walks `seq` order, and a fan-out's per-peer entries are enqueued in
+//! a tight loop, so they form a temporal cluster — concurrent fan-outs
+//! interleave their `seq` allocations, so this is a tendency rather than a
+//! guarantee, but what would get dropped is typically most of a FAN-OUT rather
+//! than scattered targets.
+//!
+//! That was #5118, and it is FIXED: the parked set is now capped at
+//! `MAX_PARKED_LANE_UPGRADES`, and a send that cannot get a parking slot keeps
+//! its small-lane permit and waits rather than adding to the parked set. So at
+//! most a bounded number of upgraders sit ahead of the large drain, which keeps
+//! getting turns. The paragraphs below still describe what to check before
+//! trusting a LOW R/C, because eviction remains possible under genuine
+//! overload — it is simply no longer unbounded, and no longer a reason to
+//! distrust the number outright.
 //!
 //! A dropped fan-out means the receiving peers never apply, so
 //! `applies_network_relay_changed` never fires: **R/C is biased DOWN, and
@@ -201,9 +211,10 @@
 //!
 //! Before trusting a LOW reading, check the broadcast queue: `capacity_evictions`
 //! (the one that licenses the conclusion — it counts the actual drops),
-//! `large_head_blocking_incidents`, and `active_tracking_overflow` (closest to
-//! the #5118 parking mechanism, though it only fires at the depth cap, so
-//! parking can hurt well before it moves). They live in
+//! `large_head_blocking_incidents`, and `active_tracking_overflow` (which the
+//! #5118 parking bound now keeps structurally unreachable — in-flight sends are
+//! capped well under the depth cap — so a non-zero reading means a leaked
+//! tracking guard, not a scheduling backlog). They live in
 //! `BroadcastQueueEfficiencySnapshot` (`broadcast_queue_metrics.rs`), shipped
 //! as a POSITIONAL array in the 30-minute wide `router_snapshot` diagnostic —
 //! not in this 60 s event, so they cannot be aligned window-for-window, and
@@ -211,9 +222,11 @@
 //! consecutive snapshots is ~zero, not that the raw value is.
 //!
 //! If they are moving, a low R/C may be the queue evicting fan-outs rather
-//! than propagation converging; fix #5118 before reading the number at all.
-//! This applies to a first cold measurement just as much as to a fall — there
-//! is no prior to have fallen from, and the number will still look reasonable.
+//! than propagation converging, so read `capacity_evictions` before drawing a
+//! conclusion. This applies to a first cold measurement just as much as to a
+//! fall — there is no prior to have fallen from, and the number will still look
+//! reasonable. (Before #5118 was fixed this was a reason to discard the number
+//! outright; now it is a check, not a blocker.)
 //!
 //! **What flat counters do NOT buy you.** They exclude the queue-eviction
 //! bias specifically. They say nothing about the other downward effects in
@@ -233,8 +246,7 @@
 //!
 //! The follow-ups that would make R/C tight, rather than merely readable with
 //! the procedure above, are that
-//! `heal_sends` split at `record_delivered`, a PUT-path apply counter, and
-//! #5118.
+//! `heal_sends` split at `record_delivered` and a PUT-path apply counter.
 //!
 //! ### `total_sends / applies_client_local_changed` is looser still
 //!
@@ -442,7 +454,7 @@ impl PayloadArm {
 /// biased in both directions: mostly inflated (heals booked as relayed applies
 /// with no origination behind them; client PUTs originating fan-out without
 /// ever calling `update_contract`), but also deflated by the broadcast queue's
-/// fan-out eviction (#5118), load-correlated, which can make a queue problem
+/// fan-out eviction under overload, load-correlated, which can make a queue problem
 /// look like a clean result.
 ///
 /// The derivation, the full bias list, and the procedure for reading the
@@ -1496,7 +1508,7 @@ fn payload_mix_json(
     //
     // Read the module docs before using either. Both are biased in BOTH
     // directions: mostly upward, but the broadcast queue's fan-out eviction
-    // (#5118) pushes down and is load-correlated, so a FALL in R/C can be a
+    // under overload pushes down and is load-correlated, so a FALL in R/C can be a
     // queue problem wearing the shape of a clean result. The docs give the
     // three queue counters to check first. Do not read either ratio bare, and
     // do not read it to three significant figures.
