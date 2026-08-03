@@ -406,7 +406,12 @@ fn redundant_key_spellings(
                 // double-quote every path and turn every integer into a quoted
                 // string, making the message harder to read than before. Only a
                 // value that could forge a log line needs it.
-                let value = if value.contains(['\n', '\r']) {
+                // `\u{2028}`/`\u{2029}` are belt-and-braces: journald and stderr
+                // split on `\n` only, so they cannot forge a line there, but a
+                // downstream consumer that treats them as breaks is cheap to
+                // rule out. TOML's own Display escapes every other control
+                // character already, and renders only `\n` raw.
+                let value = if value.contains(['\n', '\r', '\u{2028}', '\u{2029}']) {
                     format!("{value:?}")
                 } else {
                     value
@@ -595,15 +600,24 @@ impl ConfigArgs {
                         let mut object = serde_json::from_str::<serde_json::Value>(&content)?;
                         let mut rewritten = false;
                         if let Some(map) = object.as_object_mut() {
-                            // An explicit `null` is not a setting, and TOML has
-                            // no equivalent, so only this path needs to say so.
-                            // It must be REMOVED rather than merely ignored: a
-                            // null-valued key is still the field appearing
-                            // twice as far as serde is concerned, so leaving it
-                            // in place would make the document fail to parse
-                            // even after the other spelling wins.
+                            // A JSON `null` beside another spelling of the same
+                            // key has to be REMOVED, not merely ignored: it is
+                            // still the field appearing twice as far as serde is
+                            // concerned, so leaving it in place fails the parse
+                            // even after the other spelling wins. (TOML has no
+                            // null, so only this path needs any of it.)
+                            //
+                            // Scoped to groups that are ACTUALLY ambiguous. A
+                            // lone null keeps exactly the meaning it always had
+                            // — including staying an error on a key whose type
+                            // rejects it — and a document with no duplicate
+                            // spelling keeps the direct parse, so it keeps its
+                            // line/column spans.
                             let nulls: Vec<&str> = CONFIG_KEY_SPELLINGS
                                 .iter()
+                                .filter(|group| {
+                                    group.iter().filter(|key| map.contains_key(**key)).count() > 1
+                                })
                                 .flat_map(|group| group.iter().copied())
                                 .filter(|key| map.get(*key).is_some_and(|value| value.is_null()))
                                 .collect();
@@ -5286,6 +5300,56 @@ shutdown-drain-secs = 42
             .expect("a lone null must not be an error")
             .expect("config.json is present");
         assert_eq!(cfg.network_api.bandwidth_limit, None);
+    }
+
+    /// The null handling is scoped to groups that are actually ambiguous, so a
+    /// lone null keeps exactly the meaning it had before this change — and a
+    /// document with no duplicate spelling keeps the direct parse, and with it
+    /// its line/column spans.
+    ///
+    /// Sweeping every null unconditionally, as the first version did, silently
+    /// widened two things: a null on a defaulted key started falling back to
+    /// the default instead of erroring, and any document containing one lost
+    /// its spans.
+    #[tokio::test]
+    async fn a_lone_json_null_neither_widens_nor_costs_the_spans() {
+        let write =
+            |dir: &Path, mutate: &dyn Fn(&mut serde_json::Map<String, serde_json::Value>)| {
+                let table =
+                    toml::from_str::<toml::Table>(&released_config_toml_without_secret_paths())
+                        .unwrap();
+                let mut doc = serde_json::to_value(table).unwrap();
+                mutate(doc.as_object_mut().unwrap());
+                std::fs::write(
+                    dir.join("config.json"),
+                    serde_json::to_string(&doc).unwrap(),
+                )
+                .unwrap();
+            };
+
+        // A lone null on a key whose type rejects it is still an error.
+        let temp_dir = tempfile::tempdir().unwrap();
+        write(temp_dir.path(), &|object| {
+            object.insert("max_blocking_threads".to_string(), serde_json::Value::Null);
+        });
+        ConfigArgs::read_config(&temp_dir.path().to_path_buf())
+            .expect_err("a lone null on a non-Option key must stay an error");
+
+        // And an unrelated type error in a document containing a lone null
+        // still reports where it is.
+        let temp_dir = tempfile::tempdir().unwrap();
+        write(temp_dir.path(), &|object| {
+            object.insert("bandwidth_limit".to_string(), serde_json::Value::Null);
+            object.insert("ws-api-port".to_string(), "not a port".into());
+        });
+        let err = ConfigArgs::read_config(&temp_dir.path().to_path_buf())
+            .expect_err("a type error must still be an error")
+            .to_string();
+        assert!(
+            err.contains("line") && err.contains("column"),
+            "a document with no duplicate spelling must keep the \
+             span-preserving parse; got: {err}"
+        );
     }
 
     /// REGRESSION (found in review): the same duplicate-spelling case as
