@@ -77,12 +77,24 @@ function freenetBridge(authToken, userToken, hostedMode) {
     // (sandboxed) origin, which is the tell-tale of the DOMINANT case: this
     // page was opened as a NEW TAB/WINDOW from inside a Freenet app (the
     // browser's "open link in new tab", a middle-click, a right-click menu,
-    // window.open, or a target=_blank link). Such a context inherits the app
-    // iframe's sandbox, so it has an opaque origin, so localStorage throws and
-    // the per-user token can't be read. Re-opening the SAME address as a
-    // normal top-level tab gets a real origin and works. The other two cases
-    // (served over plain http, or storage genuinely disabled) can't be fixed
-    // by re-opening, so they get their own guidance.
+    // window.open, or a target=_blank link) back when such a context INHERITED
+    // the app iframe's sandbox: opaque origin, so localStorage throws and the
+    // per-user token can't be read. Re-opening the SAME address as a normal
+    // top-level tab got a real origin and worked.
+    //
+    // #5100 removed that cause: the app iframe carries
+    // `allow-popups-to-escape-sandbox`, so a tab opened from inside an app is a
+    // real top-level document at this origin, and the shell itself is never
+    // framed (X-Frame-Options: DENY). This branch should therefore be
+    // unreachable now. It stays as a fail-safe rather than being deleted,
+    // because the only thing standing between here and the old behaviour is
+    // that one attribute — if it is ever dropped again, this is the guidance
+    // that keeps a hosted user from a silent dead end. If you are reading this
+    // because you saw the panel in the wild, the escape flag is gone or a
+    // browser is ignoring it, and that is the bug to chase.
+    //
+    // The other two cases (served over plain http, or storage genuinely
+    // disabled) are unaffected and remain live.
     var opaqueOrigin = window.origin === 'null';
     var plaintext = location.protocol !== 'https:';
     // Plaintext is the HARD blocker: over http the token is never minted or

@@ -429,6 +429,7 @@ async fn web_home(
             key,
             api_version,
             None,
+            query_string.as_deref(),
             &req_headers,
             rs,
             &config.webapp_cache,
@@ -573,6 +574,7 @@ async fn web_subpages(
             key,
             api_version,
             Some(&last_path),
+            query_string.as_deref(),
             &req_headers,
             request_sender,
             &config.webapp_cache,
@@ -701,7 +703,7 @@ fn redirect_to_shell_root(
     api_version: ApiVersion,
     query_string: Option<&str>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
-    let shell_url = build_canonical_shell_url(key, api_version, query_string)?;
+    let shell_url = build_canonical_shell_url(key, api_version, None, query_string)?;
     Ok(axum::response::Redirect::to(&shell_url).into_response())
 }
 
@@ -727,6 +729,7 @@ fn redirect_to_shell_root(
 pub(super) fn build_canonical_shell_url(
     key: &str,
     api_version: ApiVersion,
+    sub_path: Option<&str>,
     query_string: Option<&str>,
 ) -> Result<String, WebSocketApiError> {
     if key.is_empty() {
@@ -749,11 +752,44 @@ pub(super) fn build_canonical_shell_url(
         })
         .filter(|s| !s.is_empty());
 
+    // A sub-path lands the shell on the page that was actually requested
+    // instead of the contract root. Sanitized with the SAME check `shell_page`
+    // applies before interpolating it into the iframe `data-src`, so a crafted
+    // path cannot break out of the URL's path component and into the `Location`
+    // header (`?`, `#`, control chars, CRLF, `.`/`..` segments are all
+    // rejected).
+    let sub_path = sub_path
+        .filter(|sp| !sp.is_empty())
+        .map(path_handlers::sanitize_shell_sub_path)
+        .transpose()?
+        .unwrap_or_default();
+
     let prefix = api_version.prefix();
     Ok(match filtered_query {
-        Some(qs) => format!("/{prefix}/contract/web/{key}/?{qs}"),
-        None => format!("/{prefix}/contract/web/{key}/"),
+        Some(qs) => format!("/{prefix}/contract/web/{key}/{sub_path}?{qs}"),
+        None => format!("/{prefix}/contract/web/{key}/{sub_path}"),
     })
+}
+
+/// Builds a 303 redirect to the shell for a specific contract SUB-PAGE,
+/// preserving the inbound query minus the sensitive params.
+///
+/// Used when a `?__sandbox=1` URL is loaded as a top-level document. Redirecting
+/// to the contract ROOT there is lossy in a way users notice: an app that opens
+/// its own current page in a new tab (`window.open(location.href)`, or a
+/// hash-only open that inherits `__sandbox=1` from the base) lands on the
+/// contract root with its query dropped — losing, for example, an invitation
+/// parameter. Before #5100 the interceptor's `window.open` override hid this by
+/// stripping `__sandbox` and forwarding the clean URL; the override is gone, so
+/// the server has to land the redirect on the right page itself.
+fn redirect_to_shell_sub_page(
+    key: &str,
+    api_version: ApiVersion,
+    sub_path: Option<&str>,
+    query_string: Option<&str>,
+) -> Result<axum::response::Response, WebSocketApiError> {
+    let shell_url = build_canonical_shell_url(key, api_version, sub_path, query_string)?;
+    Ok(axum::response::Redirect::to(&shell_url).into_response())
 }
 
 /// Query parameters that must be stripped before forwarding a user URL
@@ -806,10 +842,12 @@ fn is_html_page(path: &str) -> bool {
 /// Includes `Sec-Fetch-Dest` check: if a sandbox URL is loaded as a top-level
 /// document (e.g. pasted in the address bar), redirect to the shell page instead
 /// of serving raw sandbox content outside the iframe.
+#[allow(clippy::too_many_arguments)]
 async fn serve_sandbox_response(
     key: String,
     api_version: ApiVersion,
     sub_path: Option<&str>,
+    query_string: Option<&str>,
     req_headers: &axum::http::HeaderMap,
     request_sender: HttpClientApiRequest,
     webapp_cache: &path_handlers::WebappCache,
@@ -821,7 +859,13 @@ async fn serve_sandbox_response(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if fetch_dest == "document" {
-        return redirect_to_shell_root(&key, api_version, None);
+        // Land on the requested page, not the contract root — see
+        // `redirect_to_shell_sub_page`. A sub-path the sanitizer rejects falls
+        // back to the root rather than erroring: this branch exists to keep raw
+        // sandbox content off a top-level document, and that job is done by
+        // redirecting at all, whatever the target.
+        return redirect_to_shell_sub_page(&key, api_version, sub_path, query_string)
+            .or_else(|_| redirect_to_shell_root(&key, api_version, None));
     }
 
     let contract_response = match path_handlers::serve_sandbox_content(
@@ -1328,6 +1372,26 @@ mod tests {
             !sandbox.contains("allow-same-origin"),
             "allow-same-origin would give contract content the node's own origin"
         );
+
+        // The top-level-document policy is STRICTER, and must be pinned against
+        // something other than itself. `web_subpages_sandboxes_contract_assets`
+        // compares the served header to this constant, so widening the constant
+        // moves both sides together and nothing goes red — verified by mutation:
+        // setting it equal to CONTRACT_CONTENT_SANDBOX_CSP left the whole suite
+        // green. What it uniquely buys is that a contract-authored `evil.svg`
+        // navigated to directly cannot run script, and cannot paint a scripted
+        // full-page UI under the node's own address.
+        assert!(
+            !CONTRACT_DOCUMENT_SANDBOX_CSP.contains("allow-scripts"),
+            "a contract asset loaded as a TOP-LEVEL document must not be allowed \
+             to run script: nothing legitimate arrives there, and the opaque \
+             origin alone would still leave a scripted page under the node's URL"
+        );
+        assert!(
+            !CONTRACT_DOCUMENT_SANDBOX_CSP.contains("allow-same-origin"),
+            "allow-same-origin would give a navigated-to contract asset the \
+             node's own origin"
+        );
     }
 
     /// The sandbox iframe has an opaque (null) origin because the sandbox
@@ -1735,6 +1799,18 @@ mod tests {
             "even an error subresource response must carry the sandbox CORS header, \
              otherwise the null-origin iframe surfaces it as an opaque CORS error"
         );
+        // The Err arm of the route gets the sandbox directive too. Its sibling
+        // test drives only Ok responses, so without this a header attached to
+        // just one arm would go unnoticed — mutation-confirmed.
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_SECURITY_POLICY)
+                .map(|v| v.to_str().unwrap_or("")),
+            Some(CONTRACT_CONTENT_SANDBOX_CSP),
+            "the error arm must be sandboxed as well: the body reflects the \
+             request path and the response is reachable from a context we do \
+             not control (#3818)"
+        );
     }
 
     /// Guard for the companion fix that lets `allow-popups-to-escape-sandbox`
@@ -1766,30 +1842,9 @@ mod tests {
             ContractInstanceId::new(bytes).to_string()
         };
 
-        let subpage = |dest: &'static str| {
-            let key = key.clone();
-            async move {
-                let mut headers = axum::http::HeaderMap::new();
-                headers.insert("sec-fetch-dest", dest.parse().unwrap());
-                web_subpages(
-                    key,
-                    // Non-HTML, so `should_serve_shell_for_subpage` is false and
-                    // this reaches `variable_content` for both dests.
-                    "evil.svg".to_string(),
-                    ApiVersion::V1,
-                    None,
-                    headers,
-                    &localhost_config(),
-                    dead_request_sender(),
-                    false,
-                )
-                .await
-                .expect("web_subpages must respond, not propagate")
-            }
-        };
-
-        // Same request, but able to express "no `Sec-Fetch-Dest` header at
-        // all" as well as a named destination.
+        // Non-HTML, so `should_serve_shell_for_subpage` is false and every case
+        // below reaches `variable_content`. An empty `dest` means "no
+        // `Sec-Fetch-Dest` header at all", which is its own case.
         let subpage_dest = |dest: &'static str| {
             let key = key.clone();
             async move {
@@ -1820,7 +1875,7 @@ mod tests {
 
         // Top-level document load of a scriptable asset: opaque origin, no script.
         assert_eq!(
-            csp(&subpage("document").await).as_deref(),
+            csp(&subpage_dest("document").await).as_deref(),
             Some(CONTRACT_DOCUMENT_SANDBOX_CSP),
             "a contract asset loaded as a top-level document must be sandboxed, \
              or a contract-authored SVG runs script at the node's own origin"
@@ -1860,10 +1915,110 @@ mod tests {
         // this route carries the header" simple enough to hold, rather than an
         // allow-list of destinations that a new dest name would silently escape.
         assert_eq!(
-            csp(&subpage("image").await).as_deref(),
+            csp(&subpage_dest("image").await).as_deref(),
             Some(CONTRACT_CONTENT_SANDBOX_CSP),
             "the header is unconditional on this route"
         );
+    }
+
+    /// Regression test for the sub-page loss that removing the `window.open`
+    /// override exposed (#5100 review).
+    ///
+    /// An app that opens its own current page in a new tab — `window.open(
+    /// location.href)`, or a hash-only open that inherits `__sandbox=1` from
+    /// the base — now reaches the server as a TOP-LEVEL document load of a
+    /// `?__sandbox=1` URL. That must not be served raw (it is contract HTML
+    /// outside its iframe), so it redirects; the bug is redirecting to the
+    /// contract ROOT, which silently drops both the page and the app's own
+    /// query params. The deleted override used to hide this by stripping
+    /// `__sandbox` client-side and forwarding the clean URL.
+    ///
+    /// `__sandbox` and `authToken` must still be stripped from the target:
+    /// this URL is attacker-reachable (a pasted deep link), and the shell must
+    /// mint its own token rather than adopt one from the URL.
+    #[tokio::test]
+    async fn top_level_sandbox_url_redirects_to_the_same_page_not_the_root() {
+        let key = {
+            use freenet_stdlib::prelude::ContractInstanceId;
+            let mut bytes = [0u8; 32];
+            bytes[0] = 0x3a;
+            bytes[1] = 0x57;
+            ContractInstanceId::new(bytes).to_string()
+        };
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("sec-fetch-dest", "document".parse().unwrap());
+        let config = localhost_config();
+
+        let resp = serve_sandbox_response(
+            key.clone(),
+            ApiVersion::V1,
+            Some("rooms/index.html"),
+            Some("__sandbox=1&invitation=abc&authToken=stolen"),
+            &headers,
+            dead_request_sender(),
+            &config.webapp_cache,
+        )
+        .await
+        .expect("a top-level sandbox URL must redirect, not error");
+
+        let location = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .expect("redirect carries a Location")
+            .to_string();
+
+        assert_eq!(
+            location,
+            format!("/v1/contract/web/{key}/rooms/index.html?invitation=abc"),
+            "the redirect must land on the requested page with the app's own \
+             query preserved, and must strip `__sandbox` and `authToken`"
+        );
+    }
+
+    /// A sub-path the shell sanitizer rejects must still redirect — the point
+    /// of this branch is that raw sandbox content never becomes a top-level
+    /// document, and that holds whatever the redirect target is. Falling back
+    /// to the contract root is the safe answer; erroring would turn a hostile
+    /// URL into a 400 that leaks nothing but also serves the user nothing.
+    #[tokio::test]
+    async fn top_level_sandbox_url_with_an_unusable_sub_path_falls_back_to_root() {
+        let key = {
+            use freenet_stdlib::prelude::ContractInstanceId;
+            let mut bytes = [0u8; 32];
+            bytes[0] = 0x3a;
+            bytes[1] = 0x58;
+            ContractInstanceId::new(bytes).to_string()
+        };
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("sec-fetch-dest", "document".parse().unwrap());
+        let config = localhost_config();
+
+        for bad in ["../escape/index.html", "a\rb/index.html"] {
+            let resp = serve_sandbox_response(
+                key.clone(),
+                ApiVersion::V1,
+                Some(bad),
+                Some("__sandbox=1"),
+                &headers,
+                dead_request_sender(),
+                &config.webapp_cache,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("`{bad}` must redirect, not error: {e:?}"));
+
+            let location = resp
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert_eq!(
+                location,
+                format!("/v1/contract/web/{key}/"),
+                "`{bad}` must fall back to the contract root"
+            );
+        }
     }
 
     /// Companion regression for the OTHER symmetric CORS-on-error branch: an
@@ -1891,6 +2046,7 @@ mod tests {
             key,
             ApiVersion::V1,
             Some("page.html"),
+            None,
             &headers,
             dead_request_sender(),
             &config.webapp_cache,

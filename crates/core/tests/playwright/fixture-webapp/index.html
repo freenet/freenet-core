@@ -49,6 +49,17 @@
 </a>
 
 <!--
+  Cross-origin link with `target="_top"`. `_top` names an ANCESTOR context, not
+  a new one, and the sandbox forbids navigating it — so "any non-`_self` target
+  is a new-window activation, hand it to the browser" makes this a silently dead
+  click. It must be classified like an untargeted cross-origin link and opened
+  in a tab.
+-->
+<a id="cross-origin-top-link" href="https://example.com/top" target="_top">
+  External cross-origin link, target=_top
+</a>
+
+<!--
   Same-origin link with an explicit new-window target. This is the #5087 case:
   every cross-CONTRACT link is same-ORIGIN, so this is what a thumbnail or
   cross-app link looks like. It must open natively as a real top-level tab that

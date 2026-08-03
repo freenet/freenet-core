@@ -295,7 +295,7 @@ fn run_playwright(shell_url: &str) -> anyhow::Result<()> {
 // Budget: the harness times the WHOLE test, including the `fdev website
 // publish` step (which can burn its full ~90s single-shot Put timeout before
 // the insert lands — see `website_publish_observed`), the shell-readiness poll
-// (up to 120s), and the Playwright suite (~70s for the 9 specs in
+// (up to 120s), and the Playwright suite (~90s for the 16 specs in
 // shell.spec.ts, plus the two node-free suites). An observed local
 // run finished in ~282s, so 300s left almost no slack on a contended runner;
 // 600s gives comfortable headroom without masking a genuine hang (the

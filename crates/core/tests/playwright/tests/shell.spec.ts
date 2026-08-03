@@ -421,6 +421,15 @@ test("a contract cannot reach a node-origin context by escaping the sandbox (#38
     reports,
     `contract content reached the node's own origin from an escaped popup: ${detail}`,
   ).not.toContain("NODE-ORIGIN");
+  // `not.toContain` alone also passes on "UNREACHABLE: …", which is what a
+  // frame that 404s or never loads produces — so a broken fixture would read as
+  // a security pass. Require the positive result whenever a frame is there.
+  if (nested.length > 0) {
+    expect(
+      reports,
+      `every embedded frame must actually be probed and report an opaque origin: ${detail}`,
+    ).toEqual(reports.map(() => "OPAQUE"));
+  }
 
   await popup.close();
 });
@@ -458,6 +467,22 @@ test("a modifier-click on an untargeted in-contract link opens a real tab", asyn
     "a modifier-click must not be turned into an in-place navigate hop",
   ).toEqual([]);
 
+  // Shift-click is the other half of #3853. Its e2e coverage on main asserted
+  // the interceptor FORWARDED shiftKey to the shell; that route is gone, so the
+  // contract to pin is that the browser gets the click. Kept here rather than
+  // deleted with the old spec.
+  const shiftOpened = context.waitForEvent("page");
+  await frame
+    .locator("#same-origin-link")
+    .click({ modifiers: ["Shift"] });
+  const shiftWindow = await shiftOpened;
+  await shiftWindow.waitForURL(/page2\.html/);
+  await shiftWindow.close();
+  expect(
+    (await shellMessages(page)).map((m) => m.type),
+    "shift-click must reach the browser too, so it can place a new WINDOW",
+  ).toEqual([]);
+
   // Control, in the SAME document: an UNMODIFIED click on the very same link IS
   // intercepted. Without this the assertion above would also pass if the
   // interceptor had simply stopped running.
@@ -467,6 +492,73 @@ test("a modifier-click on an untargeted in-contract link opens a real tab", asyn
       message:
         "the plain click on the same link must still produce the navigate hop",
     })
+    .toEqual(["navigate"]);
+});
+
+test('target="_top" on a cross-origin link is not a dead click', async ({
+  page,
+  context,
+}) => {
+  await stubExternal(context);
+  await page.goto(shellUrl!);
+  await captureShellMessages(page);
+  const frame = await fixtureFrame(page);
+
+  // `_top` and `_parent` name an ANCESTOR context. The sandbox has no
+  // `allow-top-navigation`, so left to the browser the click does nothing at
+  // all — measured in chromium and firefox, where `main` opened a tab. They
+  // must therefore fall through to origin classification and be opened like an
+  // untargeted cross-origin link.
+  const opened = context.waitForEvent("page");
+  await frame.locator("#cross-origin-top-link").click();
+  const popup = await opened;
+  await popup.waitForLoadState();
+  expect(popup.url()).toBe("https://example.com/top");
+  await popup.close();
+
+  // The app frame is untouched, and nothing went through the shell.
+  await expect(frame.locator("#title")).toBeVisible();
+  expect((await shellMessages(page)).map((m) => m.type)).toEqual([]);
+});
+
+test("right-click is not intercepted: no stray tab, no frame navigation", async ({
+  page,
+  context,
+}) => {
+  await page.goto(shellUrl!);
+  await captureShellMessages(page);
+  const frame = await fixtureFrame(page);
+
+  // `auxclick` fires for the SECONDARY button as well as the middle one, and
+  // `preventDefault` on it does not suppress the context menu (that comes from
+  // mousedown). So an interceptor that skips only `e.button === 1` gives the
+  // user the menu AND a side effect: a stray tab for a cross-origin link, an
+  // app-frame navigation for a same-origin one. Measured in chromium and
+  // firefox before the fix.
+  //
+  // Right-clicking a link is also precisely the workaround users adopted while
+  // `target="_blank"` was broken, so it is the last click that should misbehave.
+  const strayTabs: string[] = [];
+  context.on("page", (p) => strayTabs.push(p.url()));
+
+  await frame.locator("#cross-origin-untargeted-link").click({ button: "right" });
+  await frame.locator("#same-origin-link").click({ button: "right" });
+  await page.waitForTimeout(500);
+
+  expect(strayTabs, "right-click must not open anything").toEqual([]);
+  expect(
+    (await shellMessages(page)).map((m) => m.type),
+    "right-click must not be intercepted at all",
+  ).toEqual([]);
+  // The app frame is still showing the fixture — a `navigate` hop would have
+  // replaced it with page2.
+  await expect(frame.locator("#title")).toBeVisible();
+
+  // Control, same document: a plain LEFT click on the same same-origin link IS
+  // intercepted, so the emptiness above is about the button, not a dead listener.
+  await frame.locator("#same-origin-link").click();
+  await expect
+    .poll(async () => (await shellMessages(page)).map((m) => m.type))
     .toEqual(["navigate"]);
 });
 

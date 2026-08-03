@@ -110,7 +110,7 @@ async fn web_root_redirect_v1(
     Path(key): Path<String>,
     RawQuery(query): RawQuery,
 ) -> Result<axum::response::Response, WebSocketApiError> {
-    let canonical = build_canonical_shell_url(&key, ApiVersion::V1, query.as_deref())?;
+    let canonical = build_canonical_shell_url(&key, ApiVersion::V1, None, query.as_deref())?;
     Ok(axum::response::Redirect::permanent(&canonical).into_response())
 }
 

@@ -1467,7 +1467,7 @@ fn html_escape_attr(s: &str) -> String {
 ///   *different contract* under the current shell's token/origin. We
 ///   must therefore reject traversal segments here rather than relying
 ///   on later file-path canonicalization (Codex review, #3841).
-fn sanitize_shell_sub_path(sub_path: &str) -> Result<String, WebSocketApiError> {
+pub(super) fn sanitize_shell_sub_path(sub_path: &str) -> Result<String, WebSocketApiError> {
     if sub_path.starts_with('/') {
         return Err(WebSocketApiError::InvalidParam {
             error_cause: "deep-link sub-path must be relative".to_string(),
@@ -1842,15 +1842,15 @@ const WEBSOCKET_SHIM_JS: &str = include_str!("path_handlers/assets/websocket_shi
 /// Origin rather than `null` (freenet/river#208).
 ///
 /// Routing new-window opens through the shell's `open_url` bridge instead is
-/// what broke Firefox: the shell's `window.open` then runs inside a `message`
-/// handler, and Firefox's popup blocker allows `window.open` only from events
-/// in `dom.popup_allowed_events` (click, auxclick, mouseup, …) — `message` is
-/// not one, so the popup was blocked and the click did nothing. Chrome and
-/// Safari allowed it only because they propagate user activation across the
-/// whole frame tree. A real gesture in the frame that received the click is the
-/// only mechanism that works in every browser. #5089 took that route and was
-/// reverted in #5107, which also priced a second cost of it: the bridge refuses
-/// loopback hosts, so on a local node the forwarded open was dropped outright.
+/// what broke the click (#5106). Which mechanism did it is NOT settled: the
+/// popup-blocker account (Firefox allows `window.open` only from events in
+/// `dom.popup_allowed_events`, and `message` is not one) is a diagnosis from
+/// the symptom that no harness reproduces, while #5107 measured that the
+/// bridge's loopback refusal drops the forwarded open on a local node in every
+/// engine. Both are consequences of the round-trip, and this design removes the
+/// round-trip: a real gesture in the frame that received the click opens a tab
+/// everywhere, whichever explanation is right. See the head comment in
+/// `navigation_interceptor.js`.
 ///
 /// The one cross-origin case still intercepted is a link with NO new-window
 /// target: navigating the app frame itself to a foreign origin is refused by
@@ -6815,6 +6815,14 @@ mod tests {
         let same_origin_idx = js
             .find("// Same-origin in-contract link")
             .expect("same-origin in-contract branch present");
+        // Fail with a message rather than a raw slice panic if the two branches
+        // are ever reordered, the same way the sibling bound below does.
+        assert!(
+            cross_origin_idx < same_origin_idx,
+            "expected the cross-origin classification before the same-origin \
+             in-contract branch; if they were reordered, re-anchor this bound \
+             rather than dropping the check"
+        );
         let block = &js[cross_origin_idx..same_origin_idx];
 
         assert!(
@@ -6848,12 +6856,31 @@ mod tests {
     /// so the shell's `frame-src 'self'` matches and the app frame loads. Pin
     /// that new-window activations are left to the browser, and that modifier
     /// clicks (which the postMessage route could never preserve) are too.
+    ///
+    /// Pin the two boundaries of "new-window activation" as well, because
+    /// review found both drawn wrong on the first attempt and both failures
+    /// were silent:
+    ///
+    ///   - A target is a new-window request only if it names a NEW context.
+    ///     `_top`/`_parent` name an ANCESTOR, which the sandbox forbids
+    ///     navigating, so returning early for them is a dead click — measured
+    ///     in chromium and firefox, where `main` opened a tab and the first
+    ///     draft of this branch did nothing at all. The comparison is also
+    ///     lowercased, because browsers match the reserved keywords
+    ///     ASCII-case-insensitively: `target="_SELF"` read as a new-window
+    ///     request sent a cross-origin click into the app frame, which
+    ///     `frame-src 'self'` then refused (chromium replaced the frame with
+    ///     its error page).
+    ///   - `e.button` must be tested for truthiness, not `=== 1`. `auxclick`
+    ///     fires for the secondary button too, and `preventDefault` there does
+    ///     not suppress the context menu, so a middle-button-only check left
+    ///     right-click intercepted: menu AND unwanted tab.
     #[test]
     fn navigation_interceptor_leaves_new_window_activations_native() {
         let js = NAVIGATION_INTERCEPTOR_JS;
 
         let target_attr_idx = js
-            .find("target.target && target.target !== '_self'")
+            .find("var targetName = target.target")
             .expect("target-attribute check present");
         let cross_origin_idx = js
             .find("target.origin !== location.origin")
@@ -6866,18 +6893,35 @@ mod tests {
 
         let block = &js[target_attr_idx..cross_origin_idx];
         assert!(
-            block.contains("!== '_self') return"),
-            "an explicit new-window target must fall through to the browser so \
-             the tab is opened by a real user gesture (#5087 follow-up)"
+            block.contains(".toLowerCase()"),
+            "the target keyword must be compared lowercased, or `target=\"_SELF\"` \
+             is treated as a new-window request and a cross-origin click lands in \
+             the app frame, which `frame-src 'self'` refuses"
         );
         assert!(
-            block.contains("e.button === 1")
+            block.contains("targetName !== '_self'")
+                && block.contains("targetName !== '_top'")
+                && block.contains("targetName !== '_parent'"),
+            "only a target naming a NEW context may fall through: `_top` and \
+             `_parent` name an ancestor the sandbox forbids navigating, so \
+             handing one back to the browser is a silently dead click"
+        );
+        assert!(
+            block.contains("e.button ||")
                 && block.contains("e.ctrlKey")
                 && block.contains("e.metaKey")
                 && block.contains("e.shiftKey"),
             "middle/ctrl/cmd/shift-click must also fall through, restoring the \
              background-tab and new-window placement the postMessage route \
-             collapsed into a plain foreground tab (#3853)"
+             collapsed into a plain foreground tab (#3853). Test `e.button` for \
+             truthiness, not `=== 1`: `auxclick` fires for the secondary button \
+             too, and preventDefault there does not suppress the context menu"
+        );
+        assert!(
+            !block.contains("e.button === 1"),
+            "a middle-button-only check leaves right-click intercepted — the \
+             user gets the context menu AND an unwanted tab or app-frame \
+             navigation, measured in chromium and firefox"
         );
     }
 
@@ -7029,7 +7073,7 @@ mod tests {
     ///
     /// So the branch must still `return`, and must still not grow a forward.
     /// The whole-file "no `type: 'open_url'` anywhere in the interceptor" pin
-    /// lives in `navigation_interceptor_matches_expected_contract`; it strictly
+    /// lives in `navigation_interceptor_js_intercepts_clicks`; it strictly
     /// subsumes the per-handler forward COUNT this test used to carry while the
     /// cross-origin branch still forwarded, so that count is not repeated here.
     #[test]
@@ -7037,7 +7081,7 @@ mod tests {
         let js = NAVIGATION_INTERCEPTOR_JS;
 
         let target_attr_idx = js
-            .find("target.target && target.target !== '_self'")
+            .find("var targetName = target.target")
             .expect("same-origin target check present");
         let navigate_idx = js
             .find("type: 'navigate'")
@@ -7049,7 +7093,7 @@ mod tests {
         let block = &js[target_attr_idx..navigate_idx];
 
         assert!(
-            block.contains("!== '_self') return"),
+            block.contains("targetName !== '_self'") && block.contains("return;"),
             "same-origin target=\"_blank\" must fall through to the browser. Routing it \
              through open_url dead-ends on a loopback node, where the shell's open_url \
              handler refuses the host and the click does nothing at all (#5106)"
@@ -7077,7 +7121,7 @@ mod tests {
         // While the cross-origin branch still forwarded, the only way to catch
         // that was to count forwards across the whole handler and require
         // exactly one. #5100 removed the last forward, so the file-wide
-        // assertion in `navigation_interceptor_matches_expected_contract` —
+        // assertion in `navigation_interceptor_js_intercepts_clicks` —
         // NO `type: 'open_url'` anywhere in the interceptor — catches the
         // same evasion and every variant of it. Restore a scoped count here if
         // a forward is ever legitimately reintroduced.
