@@ -101,8 +101,11 @@ pub(super) struct SendLanePermit {
 /// enough simultaneous mispredictions tie up all 12 small permits, stalling
 /// unrelated small broadcasts — the very head-of-line failure this module was
 /// changed to remove. Hand it back immediately and the drain keeps dispatching,
-/// so the number of in-flight sends (each holding a serialized payload) is
-/// bounded only by the queue depth rather than by the pools.
+/// so the number of in-flight sends (each holding a serialized payload) grows
+/// without bound — NOT, as an earlier version of this comment said, "bounded
+/// only by the queue depth": entries leave `entries` when popped, so the depth
+/// cap bounds QUEUED work, not dispatched-and-parked senders. See #5118 and
+/// the note on `ensure_capacity_for` below.
 ///
 /// A quarter second covers the common case — the large lane is briefly busy and
 /// a slot frees up — while capping the small lane's exposure to a burst of
@@ -147,8 +150,15 @@ impl SendLanePermit {
     /// state), so treating them as independent events would be wrong.
     ///
     /// While waiting without a permit the send holds no pool capacity and is
-    /// putting nothing on the wire; the in-flight count is then bounded by the
-    /// `active` tracking cap rather than by the pools.
+    /// putting nothing on the wire.
+    ///
+    /// The number of senders parked here is NOT bounded by anything.
+    /// `track_active` reporting full does not stop the drain loop dispatching —
+    /// it only sets `tracked: false` for untrack bookkeeping, so it is not an
+    /// admission gate. Parked senders contend with the large drain worker on
+    /// the same FIFO-fair semaphore, and the large lane can back up into
+    /// `evict_oldest`. Tracked as #5118; the consequence for the #5062 fan-out
+    /// multiplier is written up in `broadcast_payload_mix`'s module docs.
     ///
     /// Cancellation: this is awaited inline by the send that OWNS the
     /// `SendLanePermit`, so dropping that send drops the permit too — mid-wait
