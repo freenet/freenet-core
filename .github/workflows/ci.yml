@@ -618,6 +618,9 @@ jobs:
     env:
       RUST_LOG: error
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # Increase rustc stack size to prevent SIGSEGV during compilation
+      # 256MB required for LLVM optimization passes on large workspaces (rustc suggests this value)
+      RUST_MIN_STACK: 268435456
 
     steps:
       - uses: actions/checkout@v7

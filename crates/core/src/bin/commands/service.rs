@@ -607,6 +607,34 @@ mod tests {
         );
     }
 
+    /// Regression guard for the ordering invariant the single-instance
+    /// guard depends on: `acquire_wrapper_single_instance_lock` MUST run
+    /// before `kill_stale_freenet_processes` in `run_wrapper` (#5132) — a
+    /// second wrapper has to detect the first one is still alive BEFORE
+    /// force-killing what it (wrongly) assumes are only stale orphans. This
+    /// is a call-order invariant inside one function, not something a
+    /// behavioral unit test can exercise, so pin it textually — mirrors the
+    /// `windows_first_run_wiring_is_present` source-scrape pattern above and
+    /// runs on every platform even though the guarded code is
+    /// macOS/Windows-only.
+    #[test]
+    fn wrapper_lock_is_acquired_before_killing_stale_processes() {
+        let wrapper = include_str!("service/wrapper.rs");
+        let acquire_pos = wrapper
+            .find("acquire_wrapper_single_instance_lock()")
+            .expect("run_wrapper must call acquire_wrapper_single_instance_lock");
+        let kill_pos = wrapper
+            .find("kill_stale_freenet_processes(&log_dir)")
+            .expect("run_wrapper must call kill_stale_freenet_processes");
+        assert!(
+            acquire_pos < kill_pos,
+            "acquire_wrapper_single_instance_lock must run BEFORE \
+             kill_stale_freenet_processes in run_wrapper, or a second wrapper \
+             can kill the first wrapper's live backend before the guard has a \
+             chance to detect it and exit"
+        );
+    }
+
     // Pull test-helper functions from submodules that are not re-exported at the
     // service.rs level (they are pub(super) in their submodule, making them
     // visible here via explicit `use`).

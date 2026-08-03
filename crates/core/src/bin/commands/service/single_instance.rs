@@ -167,6 +167,15 @@ impl Drop for WrapperSingleInstanceLock {
 /// service on Windows — see `install_service`), and an unprefixed name
 /// is scoped to the caller's session, avoiding any cross-user collision
 /// or the extra privilege `Global\` names can require.
+///
+/// Known limitation: this does NOT guard across sessions for the SAME
+/// user (e.g. RDP'd into a machine where that user is also logged in at
+/// the console) — each session gets its own mutex namespace, so two
+/// wrappers in different sessions would each acquire successfully. Given
+/// config.toml persistence is already made atomic (see config.rs), that
+/// scenario can no longer scrub config.toml; it can still race on which
+/// node ends up running. Out of scope for #5132 (a single-session
+/// relaunch), but worth knowing about if this ever needs revisiting.
 #[cfg(target_os = "windows")]
 pub(super) const WRAPPER_MUTEX_NAME: &str = "FreenetWrapperSingleInstance";
 

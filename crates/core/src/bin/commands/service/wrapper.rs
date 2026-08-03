@@ -492,8 +492,37 @@ pub(super) fn run_wrapper(version: &str) -> Result<()> {
     //
     // Linux has no tray and no autostart mechanism that can spawn a
     // concurrent wrapper, so the overlap race does not apply there.
+    //
+    // A deliberate self-relaunch (auto-update, crash-loop rollback — see
+    // spawn_new_wrapper's call sites below) spawns the new wrapper process
+    // BEFORE the old one releases this lock: the old process's shutdown
+    // sequencing runs on the tray's ~100ms status-poll loop and, on the
+    // "UpdatedRestarting" terminal status, sleeps a further hard-coded 1s
+    // before quitting (see tray.rs) so the "Updated! Restarting..." status
+    // is visible — reliably longer than how fast the freshly-spawned new
+    // process reaches this same acquire call. A single-shot acquire would
+    // almost always lose that handoff, so self-relaunch would silently
+    // fail to start a replacement wrapper every time. Retry for a few
+    // seconds to ride out the old process's own bounded shutdown window
+    // before concluding a second, genuinely unrelated wrapper is running
+    // (in which case the extra few seconds before exiting are invisible —
+    // the user is looking at the ALREADY-running instance either way).
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    let _wrapper_lock = match acquire_wrapper_single_instance_lock() {
+    let lock_outcome = {
+        const RETRY_ATTEMPTS: u32 = 20;
+        const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+        let mut outcome = acquire_wrapper_single_instance_lock();
+        for _ in 1..RETRY_ATTEMPTS {
+            if !matches!(outcome, AcquireWrapperLockOutcome::AnotherWrapperRunning) {
+                break;
+            }
+            std::thread::sleep(RETRY_INTERVAL);
+            outcome = acquire_wrapper_single_instance_lock();
+        }
+        outcome
+    };
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let _wrapper_lock = match lock_outcome {
         AcquireWrapperLockOutcome::Acquired(guard) => Some(guard),
         AcquireWrapperLockOutcome::AnotherWrapperRunning => {
             #[cfg(target_os = "macos")]
