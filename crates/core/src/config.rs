@@ -5621,6 +5621,27 @@ shutdown-drain-secs = 42
             "a newline-bearing value must not break the message onto a second \
              line, or a remote index could forge log entries; got: {message}"
         );
+
+        // ...and a very long one is capped. The third leg of the same
+        // hardening: without it a hostile index can flood the journal with a
+        // single enormous value rather than with extra lines.
+        let long = "x".repeat(400);
+        let table: toml::Table =
+            toml::from_str(&format!("data_dir = \"/var\"\ndata-dir = \"{long}\"\n")).unwrap();
+        let reported = redundant_key_spellings(
+            CONFIG_KEY_SPELLINGS,
+            "config.toml",
+            |key| table.contains_key(key),
+            |key| table.get(key).map(|v| v.to_string()).unwrap_or_default(),
+        );
+        let [(_, message)] = reported.as_slice() else {
+            panic!("expected one redundant spelling");
+        };
+        assert!(
+            message.contains("(truncated)") && !message.contains(&long),
+            "a very long value must be capped; got {} chars",
+            message.len()
+        );
     }
 
     /// Every `#[serde(alias = "...")]` in the config types must appear in
