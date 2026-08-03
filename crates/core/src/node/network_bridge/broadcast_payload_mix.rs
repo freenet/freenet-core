@@ -97,14 +97,18 @@
 //! most nodes serve no local clients, so a per-node per-window ratio is `0/0`
 //! far more often than not.
 //!
-//! ### R/C IS BIASED UPWARD. Read it as an upper bound.
+//! ### R/C IS BIASED. Mostly upward, but not only.
 //!
 //! Both halves come out of the same function, but NOT out of the same
-//! population, and the residuals do not cancel — they push the same way. An
-//! earlier revision of this doc called the ratio "sound" on the same-function
-//! argument; that was wrong, and wrong in the direction that costs money,
-//! because every effect below inflates R/C toward the ≫17 reading whose remedy
-//! is the expensive one.
+//! population. An earlier revision of this doc called the ratio "sound" on the
+//! same-function argument; that was wrong, and wrong in the direction that
+//! costs money, because most of what follows inflates R/C toward the ≫17
+//! reading whose remedy is the expensive one.
+//!
+//! A later revision then over-corrected, asserting the biases "can only push it
+//! up" — also wrong: see "A downward bias, and how it can be misread" below,
+//! which is the one that can turn a queue problem into a clean-looking result.
+//! Both mistakes came from wanting a single arrow. There isn't one.
 //!
 //! Numerator gets relayed `changed` applies with no origination behind them:
 //!
@@ -132,11 +136,39 @@
 //! on poison contracts — again the churn being measured); and fair-queue
 //! shedding drops sub-`ClientLocal` work first.
 //!
-//! Practical reading: **R/C ≈ 17 is strong evidence of one-hop reach**, because
-//! the biases can only push it up. **R/C ≫ 17 is suggestive, not conclusive** —
-//! before spending on propagation topology, bound the heal and PUT-origination
-//! contribution. The follow-ups that would make this tight are a `heal_sends`
-//! split at `record_delivered` and a PUT-path apply counter.
+//! ### A downward bias, and how it can be misread
+//!
+//! One effect pushes the other way, so the "biases can only inflate it"
+//! reasoning an earlier revision of this doc relied on does NOT hold.
+//!
+//! `BroadcastQueue`'s small-to-large permit upgrade (`broadcast_queue.rs`,
+//! `ensure_capacity_for` phase 2) releases its permit and awaits the large pool
+//! unboundedly. The small drain worker immediately reclaims that permit and
+//! dispatches another entry, which may also mispredict and park. Nothing bounds
+//! the parked count — `track_active`'s cap is a telemetry counter and the drain
+//! loop proceeds when it reports full — so parked upgraders queue ahead of the
+//! large worker on the same fair semaphore, the large lane backs up against the
+//! shared cap, and `evict_oldest` drops entries. Size mispredictions are bursty
+//! and correlated across every peer of a contract, so what gets dropped is
+//! WHOLE FAN-OUTS.
+//!
+//! A dropped fan-out means the receiving peers never apply, so
+//! `applies_network_relay_changed` never fires: **R/C is biased DOWN, and
+//! load-correlated**, hardest exactly when the queue is under pressure.
+//!
+//! The trap this sets: a fall in R/C toward ~17 after a payload fix reads as
+//! "one-hop reach confirmed, we are done", when it can equally mean the
+//! broadcast queue started evicting fan-outs. R/C is coupled to broadcast-queue
+//! scheduling health. Before concluding anything from a DROP in this number,
+//! check the queue's eviction and HOL counters for the same window.
+//!
+//! Practical reading: **R/C ≫ 17 is suggestive, not conclusive** — bound the
+//! heal and PUT-origination contribution before spending on propagation
+//! topology. **R/C ≈ 17 is consistent with one-hop reach but no longer proof of
+//! it**, because the downward bias above can produce the same number from a
+//! genuinely amplifying network with a saturated queue. The follow-ups that
+//! would make this tight are a `heal_sends` split at `record_delivered`, a
+//! PUT-path apply counter, and bounding the parked-upgrader count.
 //!
 //! ### `total_sends / applies_client_local_changed` is looser still
 //!
@@ -366,9 +398,20 @@ impl PayloadArm {
 /// bytes); ≫17 means state keeps genuinely moving across hops (a propagation-
 /// topology problem, a different remedy entirely).
 ///
-/// That ratio is the SOUND one: both halves come from the same instrumented
-/// function, with the same drop and failure semantics. See the module docs for
-/// why `total_sends / applies_client_local_changed` is only an upper bound.
+/// **Both readings are biased, and NOT in the same direction.** Read the
+/// module docs before acting on either — this rustdoc used to say the ratio was
+/// "SOUND" because both halves come from the same instrumented function, which
+/// was already retracted in those docs when it shipped. Same function is not
+/// the same population. The short version:
+///
+///   * most residuals push R/C **UP**, toward the ≫17 reading whose remedy is
+///     the expensive one — heals booked as relayed applies with no origination
+///     behind them, and client PUTs originating fan-out without ever calling
+///     `update_contract`;
+///   * the broadcast queue's capacity eviction pushes it **DOWN**, and
+///     load-correlated. See "A downward bias, and how it can be misread" in the
+///     module docs, because that one can make a queue problem look like a
+///     clean result.
 ///
 /// ## Why the counter can be taken here at all
 ///
@@ -408,10 +451,31 @@ impl PayloadArm {
 ///     pressure being measured, so it biases the multiplier DOWN when the
 ///     signal is strongest.
 ///   * the broken-invariant suppression (`ring::broken_invariants`) can
-///     swallow a commit on a flag flip that races the merge's own check.
-///   * the first-install branch broadcasts via `Executor::broadcast_state_change`
-///     and the queued-op replay loop commits once per replayed op, so one
-///     `changed` apply can correspond to more than one broadcast.
+///     swallow a commit on a flag flip that races the merge's own check —
+///     `commit_state_update`'s gate returns `Ok(())`, so the apply still
+///     reports `changed`. There is a THIRD such gate at the handler
+///     (`p2p_protoc/broadcast.rs`), which swallows the fan-out AFTER a
+///     successful commit; its own comment says it exists because the
+///     re-emission funnels below bypass the executor's gates.
+///   * the contract-BAN egress gate (`p2p_protoc/broadcast.rs`) silently
+///     returns the entire fan-out for a banned contract. Every
+///     `update_contract` call site is ban-gated upstream and the executor has
+///     no ban check, so this is reachable as a race: a ban landing between the
+///     upstream gate and the handler dequeue yields a `changed` apply with zero
+///     fan-out. Widest window is the streaming pair, which gates on the header
+///     and then awaits `assemble()` for seconds before applying. Bans arrive on
+///     a 60 s governance tick, so it is a one-shot burst per ban, not a leak.
+///   * a fan-out that finds NO targets retries three times and is then stashed
+///     in `pending_broadcasts` awaiting an interest flush that is TTL- and
+///     size-bounded and may never arrive — zero deliveries for a counted
+///     `changed` apply.
+///   * MORE than one broadcast per apply comes from four places, not one: the
+///     first-install branch broadcasts via `Executor::broadcast_state_change`,
+///     the queued-op replay loop commits once per replayed op, and three
+///     re-emission funnels re-fire an already-counted apply — the no-target
+///     retry loop (up to `MAX_BROADCAST_RETRIES` further events),
+///     the stash-recheck re-emit, and the `PendingBroadcastStore` interest
+///     flush.
 ///   * an UPDATE arriving mid-initialization returns `NoChange` without
 ///     merging, and is replayed at init completion where it does merge and
 ///     does broadcast — so it lands in `_total` once and its real apply is
