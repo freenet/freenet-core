@@ -1224,8 +1224,34 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             .last_observed
             .is_some_and(|observed| now.saturating_duration_since(observed) > INTEREST_TTL)
         {
+            // Reset the SEND counter only. `recent_removal` must NOT be wiped
+            // here: `last_observed` is stamped exclusively on this untracked
+            // path, so it says nothing about when the pair's interest entry was
+            // removed. Its freshness is enforced independently, by the
+            // `removed_at` filter in BOTH readers — the one immediately below,
+            // and `register_peer_interest_from`'s, which drives
+            // `NeverPopulatedOrigin::New { recreated }` and
+            // `recreated_after_removal`. So the wipe was redundant with those
+            // filters and could only ever suppress true positives.
+            //
+            // Wiping it conflated the two clocks and hid recreation: a pair
+            // observed untracked at T0, tracked, removed at T1, then broadcast
+            // to again at T2 > T0 + INTEREST_TTL lost its T1 removal and
+            // reported `UntrackedFirstObserved` however recent T1 was.
+            //
+            // Scope of the correction, stated precisely because it is easy to
+            // overclaim: this moves sends between `UntrackedFirstObserved` and
+            // `UntrackedFirstRecreated` (and, via the second reader, between
+            // `TrackedFirstNew` and `TrackedFirstRecreated`). It does NOT
+            // change the First-vs-Repeat split, which is decided by
+            // `send_starts` — still reset on the line below — and it does not
+            // change the total number of missing-summary sends or bytes. The
+            // affected population is only pairs that were broadcast to while
+            // untracked more than INTEREST_TTL ago AND removed within the last
+            // INTEREST_TTL AND whose history entry survived the LRU across
+            // both; a pair with `last_observed == None` never tripped the wipe
+            // and already classified correctly.
             record.send_starts = 0;
-            record.recent_removal = None;
         }
         let first = record.send_starts == 0;
         let recreated = record
@@ -3131,6 +3157,140 @@ mod tests {
 
         // Remove again returns false
         assert!(!manager.remove_peer_interest(&contract, &peer));
+    }
+
+    /// The untracked-path staleness reset must not wipe `recent_removal`.
+    ///
+    /// `last_observed` is stamped only when a pair is broadcast to while
+    /// UNTRACKED, so it measures a different clock from the removal. Wiping the
+    /// removal alongside the send counter made a pair whose removal was recent,
+    /// but whose last untracked observation was stale, report
+    /// `UntrackedFirstObserved` ("never seen before") rather than
+    /// `UntrackedFirstRecreated`. Without the fix, step T2 below observes
+    /// `UntrackedFirstObserved`.
+    ///
+    /// Three things are pinned, because each guards a different way this can
+    /// regress:
+    /// - T2: a recent removal survives a stale-`last_observed` reset.
+    /// - T3: a removal older than `INTEREST_TTL` is still refused — the
+    ///   `removed_at` filter is the remaining guard, so the fix cannot drift
+    ///   into honouring an arbitrarily old removal.
+    /// - T4: the SECOND reader (`register_peer_interest_from`) sees it too.
+    ///   That reader drives `recreated_after_removal` and the tracked-arm
+    ///   `TrackedFirstNew`/`TrackedFirstRecreated` split, so it steps on this
+    ///   change as well and would otherwise be unpinned.
+    #[test]
+    fn untracked_staleness_reset_preserves_a_recent_removal() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(15);
+        let peer = make_peer_key(15);
+
+        // T0: broadcast to an untracked pair — stamps `last_observed`.
+        let PeerSummaryForBroadcast::Missing {
+            attempt: Some(attempt),
+            ..
+        } = manager.begin_peer_summary_broadcast(&contract, &peer)
+        else {
+            panic!("an untracked pair must start lifecycle accounting");
+        };
+        assert_eq!(attempt.class, MissingSummaryClass::UntrackedFirstObserved);
+        drop(manager.missing_summary_attempt_guard(attempt));
+
+        // T1 = T0 + 21m: the pair becomes tracked and is then torn down. This is
+        // PAST `INTEREST_TTL` from T0, so the next untracked observation trips
+        // the staleness reset.
+        time.advance_time(INTEREST_TTL + Duration::from_secs(60));
+        manager.register_peer_interest(&contract, peer.clone(), None, false);
+        assert!(manager.remove_peer_interest_for(
+            &contract,
+            &peer,
+            InterestRemovalCause::DisconnectGrace
+        ));
+
+        // T2 = T1 + 1m: the removal is RECENT, even though the last untracked
+        // observation is not.
+        time.advance_time(Duration::from_secs(60));
+        let PeerSummaryForBroadcast::Missing {
+            attempt: Some(attempt),
+            ..
+        } = manager.begin_peer_summary_broadcast(&contract, &peer)
+        else {
+            panic!("the pair is untracked again");
+        };
+        assert_eq!(
+            attempt.class,
+            MissingSummaryClass::UntrackedFirstRecreated,
+            "a removal one minute ago must classify as a recreation regardless of \
+             how long ago the pair was last observed untracked"
+        );
+        drop(manager.missing_summary_attempt_guard(attempt));
+
+        // T3 = T2 + 21m: the removal is now STALE. The surviving `removed_at`
+        // filter must still refuse to call this a recreation.
+        time.advance_time(INTEREST_TTL + Duration::from_secs(60));
+        let PeerSummaryForBroadcast::Missing {
+            attempt: Some(attempt),
+            ..
+        } = manager.begin_peer_summary_broadcast(&contract, &peer)
+        else {
+            panic!("the pair is still untracked");
+        };
+        assert_eq!(
+            attempt.class,
+            MissingSummaryClass::UntrackedFirstObserved,
+            "a removal older than INTEREST_TTL must not be honoured just because \
+             the wipe is gone — the removed_at filter is the remaining guard"
+        );
+        drop(manager.missing_summary_attempt_guard(attempt));
+
+        // T4: the SECOND reader. `register_peer_interest_from` reads the same
+        // field to set `NeverPopulatedOrigin::New { recreated }` and to bump
+        // `recreated_after_removal`, so it steps on this change too. Re-run the
+        // T0→T2 shape and assert on the counter rather than the class.
+        let contract = make_contract_key(16);
+        let peer = make_peer_key(16);
+        let PeerSummaryForBroadcast::Missing {
+            attempt: Some(attempt),
+            ..
+        } = manager.begin_peer_summary_broadcast(&contract, &peer)
+        else {
+            panic!("an untracked pair must start lifecycle accounting");
+        };
+        drop(manager.missing_summary_attempt_guard(attempt));
+
+        time.advance_time(INTEREST_TTL + Duration::from_secs(60));
+        manager.register_peer_interest(&contract, peer.clone(), None, false);
+        assert!(manager.remove_peer_interest_for(
+            &contract,
+            &peer,
+            InterestRemovalCause::DisconnectGrace
+        ));
+
+        time.advance_time(Duration::from_secs(60));
+        // Trip the staleness reset on the untracked path first, exactly as
+        // production would before the peer re-registers.
+        let PeerSummaryForBroadcast::Missing {
+            attempt: Some(attempt),
+            ..
+        } = manager.begin_peer_summary_broadcast(&contract, &peer)
+        else {
+            panic!("the pair is untracked again");
+        };
+        drop(manager.missing_summary_attempt_guard(attempt));
+
+        let before = manager
+            .interest_lifecycle_snapshot()
+            .recreated_after_removal[InterestRemovalCause::DisconnectGrace.index()];
+        manager.register_peer_interest(&contract, peer.clone(), None, false);
+        let after = manager
+            .interest_lifecycle_snapshot()
+            .recreated_after_removal[InterestRemovalCause::DisconnectGrace.index()];
+        assert_eq!(
+            after - before,
+            1,
+            "the registration reader must also see the preserved removal — \
+             without the fix this counter does not move"
+        );
     }
 
     #[test]
