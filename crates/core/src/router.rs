@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::GlobalRng;
 use crate::node::network_status::OpType;
 use crate::ring::interest::{
-    InterestRegistrationSource, InterestRemovalCause, MissingSummaryClass,
+    InterestRegistrationSource, InterestRemovalCause, MissingSummaryClass, RetainedSummaryOutcome,
     SummaryPopulationOutcome, SummaryPopulationSource,
 };
 use crate::ring::{Distance, Location, PeerKeyLocation};
@@ -210,6 +210,12 @@ pub(crate) struct NetworkEfficiencyV1 {
     /// Delivery path for this diagnostic block itself; order is documented in
     /// `TelemetryLocalMetricsSnapshot::network_efficiency_delivery`.
     pub eff: [u64; 8],
+    /// Across-disconnect peer-summary retention, in `RetainedSummaryOutcome::ALL`
+    /// order: stored, skipped_oversized, restored, expired, evicted, discarded.
+    /// `restored` counts recreated pairs SEEDED from the cache — whether the
+    /// resulting broadcast was a delta or fell back to full state is decided
+    /// later, by the post-compute efficiency gate, and is reported by `ms_s`.
+    pub retain: [u64; RetainedSummaryOutcome::COUNT],
 }
 
 /// Periodic snapshot of the router model state for telemetry.

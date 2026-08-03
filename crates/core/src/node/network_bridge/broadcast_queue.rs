@@ -1215,13 +1215,23 @@ pub(super) async fn broadcast_to_single_peer(
             // peer (`interested_peers`), not evidence from it. So a wedged but
             // still-connected peer whose cached summary happens to match ours
             // gets refreshed indefinitely, where the TTL previously reaped it.
-            // Two backstops bound that: disconnect drops the entry outright
-            // (`InterestManager::remove_peer`), and the peer's own ~5-min
-            // `Interests` heartbeat is a full REPLACE (node.rs), so an entry the
-            // peer no longer claims is removed regardless of how recently we
-            // refreshed it. TTL expiry is therefore not the mechanism that
-            // reaps a live-but-wedged peer, and using it as one costs every
+            // Two backstops bound that: the disconnect-grace teardown drops the
+            // entry (`InterestManager::execute_pending_removals`), and the peer's
+            // own ~5-min `Interests` heartbeat is a full REPLACE (node.rs), so an
+            // entry the peer no longer claims is removed regardless of how
+            // recently we refreshed it. TTL expiry is therefore not the mechanism
+            // that reaps a live-but-wedged peer, and using it as one costs every
             // converged peer its updates.
+            //
+            // The first backstop is now PARTIAL, and deliberately so. The
+            // teardown preserves the cached summary across the disconnect when
+            // the PEER asserted it (`retain_summary_for_disconnect`), so a
+            // reconnecting peer can be sent a delta instead of a full state. It
+            // still drops a `SelfAssumed` belief — the one this comment is about,
+            // written by `record_delivery_to_interest` below on sender-side send
+            // completion and therefore wrong exactly when a stream tail is lost.
+            // That is the case where a matching-but-wrong belief makes this skip
+            // silent, so that case keeps its unconditional repair.
             //
             // Refresh ONLY. Do not cache the summary or record delivery
             // telemetry here: nothing was delivered, and `sent_delta` has no

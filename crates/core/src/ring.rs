@@ -2202,6 +2202,7 @@ impl Ring {
                     tel,
                     shadow,
                     eff: telemetry.network_efficiency_delivery,
+                    retain: lifecycle.retained_summaries,
                 });
             }
 
