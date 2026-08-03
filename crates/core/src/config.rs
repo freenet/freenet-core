@@ -5622,6 +5622,28 @@ shutdown-drain-secs = 42
              line, or a remote index could forge log entries; got: {message}"
         );
 
+        // The same for the Unicode line separators. They cannot forge a line in
+        // journald or stderr, which split on `\n` — this is for a downstream
+        // consumer that treats them as breaks, and it is here so the belt-and-
+        // braces cannot be dropped silently.
+        let table: toml::Table =
+            toml::from_str("data_dir = \"/var/lib/freenet\"\ndata-dir = \"a\\u2028b\\u2029c\"\n")
+                .unwrap();
+        let reported = redundant_key_spellings(
+            CONFIG_KEY_SPELLINGS,
+            "config.toml",
+            |key| table.contains_key(key),
+            |key| table.get(key).map(|v| v.to_string()).unwrap_or_default(),
+        );
+        let [(_, message)] = reported.as_slice() else {
+            panic!("expected one redundant spelling");
+        };
+        assert!(
+            !message.contains(['\u{2028}', '\u{2029}']),
+            "Unicode line separators must be escaped out of the message; got: \
+             {message}"
+        );
+
         // ...and a very long one is capped. The third leg of the same
         // hardening: without it a hostile index can flood the journal with a
         // single enormous value rather than with extra lines.
