@@ -52,24 +52,36 @@
       );
       return;
     }
-    // Same-origin link. Respect explicit non-_self targets so webapps
-    // that open multiple tabs within their own contract still work.
+    // Same-origin link with an explicit non-_self target: hand it back to the
+    // browser. That is NOT cost-free -- see "what this costs" below -- but it
+    // is the lesser of the two failures currently available.
     //
-    // #5089 routed this branch through `open_url` too, to fix a Safari-only
-    // blank tab (#5087), and is reverted here (#5106) because that trade was
-    // net-negative:
+    // #5089 routed this branch through `open_url` instead, to fix a blank tab
+    // (#5087). Reverted in #5106 because that trade was net-negative:
     //   - The shell's `open_url` handler REFUSES loopback hosts
-    //     (localhost / 127.0.0.1 / ::1 / 0.0.0.0). On a local node -- how
-    //     most desktop users browse -- forwarding meant the click was
-    //     preventDefault-ed and then silently dropped: nothing happened at
-    //     all, in every engine. The `window.open` override below avoids this
-    //     by falling back to native for loopback hosts; this branch had no
-    //     such fallback.
+    //     (localhost / 127.0.0.1 / ::1 / 0.0.0.0), which is exactly where a
+    //     local node is reached. Forwarding meant the click was
+    //     preventDefault-ed and then silently dropped by the shell: nothing
+    //     happened at all, in every engine. The window.open override below
+    //     avoids precisely this by falling back to native for loopback hosts
+    //     (isLoopbackHost); this branch had no such fallback.
     //   - The blank tab it fixed reproduces only in WebKit. Gecko and Blink
     //     load the app frame fine from the opaque-origin shell, so Firefox
     //     and Chrome users were traded a working tab for a dead click.
-    // Do not re-route this branch without a loopback fallback; the real fix
-    // is expected to be `allow-popups-to-escape-sandbox` on the app iframe.
+    //
+    // What this costs, so the next person prices it honestly: the tab the
+    // browser opens inherits this frame's sandbox, so it has an opaque
+    // origin. On a HOSTED node that means it can't read the per-user access
+    // key and dead-ends on the "Open this app in a normal tab" panel, in
+    // every engine (#4645). On WebKit it renders blank (#5087). #5089 fixed
+    // both for this path as a side effect; reverting restores both.
+    //
+    // Two constraints on any future fix. Do not re-route through the bridge
+    // without a loopback fallback. And `allow-popups-to-escape-sandbox` on
+    // the app iframe -- the obvious alternative -- was deliberately REMOVED
+    // by #1499: an escaped popup gains the node's real origin, letting a
+    // malicious app reach other apps' data and bypass permission prompts
+    // (pinned by a test in path_handlers.rs). That road has to answer #1499.
     if (target.target && target.target !== '_self') return;
     // Same-origin in-contract link: request navigation via shell
     e.preventDefault();

@@ -6830,12 +6830,28 @@ mod tests {
     ///     frame; Gecko and Blink loaded it. Firefox and Chrome users were
     ///     therefore traded a working tab for a dead click.
     ///
-    /// So: keep this branch a plain `return` — hand the click back to the
-    /// browser. Re-routing it needs either `allow-popups-to-escape-sandbox`
-    /// on the app iframe (so the popup is not sandboxed in the first place)
-    /// or a loopback fallback mirroring `window.open`'s. Both assertions
-    /// below must stay: the first fails if the `return` is replaced, the
-    /// second if a forward is added alongside it.
+    /// The revert is not free, and this test should not be read as saying the
+    /// current behaviour is good: the tab the browser opens inherits the
+    /// sandbox, so on a HOSTED node it can't read the per-user access key and
+    /// dead-ends on the "Open this app in a normal tab" panel in every engine
+    /// (#4645), and on WebKit it renders blank (#5087). #5089 fixed both for
+    /// this path incidentally. This test pins the lesser failure, not a good
+    /// one, until a fix lands that has neither.
+    ///
+    /// Two constraints on that fix. `allow-popups-to-escape-sandbox` on the
+    /// app iframe was deliberately REMOVED by #1499 — an escaped popup gains
+    /// the node's real origin, letting a malicious app reach other apps' data
+    /// and bypass permission prompts (pinned in `shell_page_*` above) — so
+    /// that route has to answer #1499 first. A bridge re-route needs a
+    /// loopback fallback mirroring `window.open`'s `isLoopbackHost`.
+    ///
+    /// Note that such a fix WILL fail both assertions below, and that is
+    /// correct — they pin today's behaviour, not a permanent invariant.
+    /// Whoever lands it should replace this test, not weaken it. The first
+    /// assertion is the load-bearing one; the second is a cheap belt-and-
+    /// braces check that a forward was not added ahead of the `return`
+    /// (anything added after it would be unreachable, so it catches less
+    /// than the first).
     #[test]
     fn navigation_interceptor_leaves_same_origin_target_blank_to_the_browser() {
         let js = NAVIGATION_INTERCEPTOR_JS;
@@ -6860,8 +6876,11 @@ mod tests {
         );
         assert!(
             !block.contains("type: 'open_url'"),
-            "the same-origin new-window branch must not forward to open_url without a \
-             loopback fallback like the window.open override's isLoopbackHost check (#5106)"
+            "no open_url forward may be added to the same-origin new-window branch ahead \
+             of the `return` (#5106). If you are DELIBERATELY re-routing this branch — \
+             with a loopback fallback like the window.open override's isLoopbackHost \
+             check, or after removing the sandbox inheritance — this test is pinning the \
+             old behaviour and should be replaced, not deleted piecemeal"
         );
     }
 
@@ -7146,27 +7165,38 @@ mod tests {
     ///     falls back to a sandbox-inheriting native popup (#4645).
     ///
     /// #4846 proposes completing this allow-list (it is exact-match today, so
-    /// e.g. `127.0.0.2` is not covered). Whoever does that must change both
-    /// sides; this test is what tells them so.
+    /// e.g. `127.0.0.2` is not covered). Whoever does that one-sidedly will
+    /// trip this test. Note the limit, though: it compares LITERALS, so if
+    /// #4846 is implemented as a rule (`h.startsWith('127.')`) on both sides,
+    /// both literal sets shrink together and this test goes green without
+    /// having checked the new rule. It catches one-sided literal drift — the
+    /// common case — not a symmetric refactor.
     #[test]
     fn interceptor_loopback_list_matches_shell_open_url_refusal() {
         // Collect the host literals from each `h === '<host>'` comparison in a
-        // region. Both sides normalize into a local `h` before comparing, so
-        // this picks up the comparison chain and nothing else (scheme checks
-        // use `u.protocol`, not `h`).
+        // region.
+        //
+        // The needle is NOT self-limiting: it also matches the tail of
+        // `hash === '` and `iframePath === '`, which occur elsewhere in
+        // shell_bridge.js. What makes this sound is purely the REGION BOUNDS
+        // chosen below — do not loosen them on the theory that `h` is unique.
+        // That mistake is live: see the note on the shell anchor.
         fn loopback_hosts(region: &str) -> Vec<String> {
             const NEEDLE: &str = "h === '";
             let mut out = Vec::new();
             let mut rest = region;
             while let Some(i) = rest.find(NEEDLE) {
                 let after = &rest[i + NEEDLE.len()..];
-                match after.find('\'') {
-                    Some(end) => {
-                        out.push(after[..end].to_string());
-                        rest = &after[end..];
-                    }
-                    None => break,
-                }
+                let end = after.find('\'').expect(
+                    "unterminated host literal in a loopback comparison — the region \
+                     bounds or the JS shape changed; failing loudly rather than \
+                     comparing a silently truncated list",
+                );
+                out.push(after[..end].to_string());
+                // Advances by at least NEEDLE.len() each iteration, so this
+                // terminates; all indices are ASCII-needle finds, so every
+                // slice lands on a char boundary.
+                rest = &after[end..];
             }
             out.sort();
             out.dedup();
