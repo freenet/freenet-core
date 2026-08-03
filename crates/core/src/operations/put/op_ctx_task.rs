@@ -780,6 +780,12 @@ async fn try_summary_first_put(
             UpdateData::Delta(reverse_delta),
             RelatedContracts::default(),
             crate::contract::Priority::ClientLocal,
+            // Provenance, deliberately NOT derived from the `Priority` above:
+            // this delta is what the REMOTE HOLDER sent back, so for #5062 it
+            // is relayed content this node re-broadcasts. The `ClientLocal`
+            // tag is a scheduling-lane choice (see the comment above), and
+            // the two are free to disagree.
+            crate::node::ApplyOrigin::NetworkRelay,
         )
         .await
         {
@@ -4200,6 +4206,7 @@ async fn drive_relay_probe_reconcile(
             UpdateData::Delta(delta),
             RelatedContracts::default(),
             crate::contract::Priority::NetworkRelay,
+            crate::node::ApplyOrigin::NetworkRelay,
         )
         .await
         {

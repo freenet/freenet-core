@@ -685,6 +685,7 @@ pub(crate) async fn update_contract(
     update_data: UpdateData<'static>,
     related_contracts: RelatedContracts<'static>,
     priority: crate::contract::Priority,
+    origin: crate::node::ApplyOrigin,
 ) -> Result<UpdateExecution, OpError> {
     let previous_state = match op_manager
         .notify_contract_handler_prioritized(
@@ -731,6 +732,13 @@ pub(crate) async fn update_contract(
                 new_val.size() > 0,
                 "update_contract: state must be non-empty after successful UPDATE for contract {key}"
             );
+            // #5062: attribute this apply to where its CONTENT came from —
+            // `origin`, never the `priority` above. Those are free to diverge
+            // (a scheduling lane is not a provenance claim) and at one call
+            // site they already do; see `ApplyOrigin`. `state_changed` is what
+            // causes the executor to emit a fan-out, modulo the residuals
+            // enumerated there.
+            op_manager.payload_mix.record_apply(origin, state_changed);
             // #4923: no summary is computed here — never relabel the state
             // bytes as a summary (the self-poisoning full-state-broadcast
             // loop), and no per-apply summary fetch on this hot path either
@@ -748,6 +756,14 @@ pub(crate) async fn update_contract(
             Err(err.into())
         }
         Ok(ContractHandlerEvent::UpdateNoChange { .. }) => {
+            // #5062: recorded at the TOP of the arm, before the state-recovery
+            // fallback below. The apply itself is already terminal and already
+            // decided — the handler merged and the state did not move, so no
+            // broadcast was emitted. The fallback's own failure paths are
+            // about reconstructing a value to RETURN, not about whether the
+            // apply happened, so an early error there must not silently drop
+            // this arm from the denominator.
+            op_manager.payload_mix.record_apply(origin, false);
             // Helper to extract state from UpdateData variants that contain state
             fn extract_state_from_update_data(
                 update_data: &UpdateData<'static>,
@@ -2139,6 +2155,7 @@ mod tests {
     async fn build_summary_test_node(
         id: &str,
         summary_ok: bool,
+        update_changes_state: bool,
     ) -> (
         std::sync::Arc<OpManager>,
         WrappedState,
@@ -2199,10 +2216,17 @@ mod tests {
                             },
                         }
                     }
-                    ContractHandlerEvent::UpdateQuery { .. } => {
-                        ContractHandlerEvent::UpdateResponse {
-                            new_value: Ok(handler_state.clone()),
-                            state_changed: true,
+                    ContractHandlerEvent::UpdateQuery { key, .. } => {
+                        if update_changes_state {
+                            ContractHandlerEvent::UpdateResponse {
+                                new_value: Ok(handler_state.clone()),
+                                state_changed: true,
+                            }
+                        } else {
+                            // The merged-to-no-change reply. `update_contract`
+                            // answers this by re-fetching state via GetQuery,
+                            // which this stand-in already serves.
+                            ContractHandlerEvent::UpdateNoChange { key }
                         }
                     }
                     other => panic!("unexpected handler event: {other:?}"),
@@ -2236,7 +2260,7 @@ mod tests {
     #[tokio::test]
     async fn client_facing_summary_is_the_contract_summary_not_the_state() {
         let (op_manager, merged_state, contract_summary, _guard) =
-            build_summary_test_node("update-summary-poison-4923", true).await;
+            build_summary_test_node("update-summary-poison-4923", true, true).await;
 
         let key = make_contract_key(1);
         let execution = update_contract(
@@ -2245,6 +2269,7 @@ mod tests {
             UpdateData::Delta(StateDelta::from(vec![1u8, 2, 3])),
             RelatedContracts::default(),
             crate::contract::Priority::ClientLocal,
+            crate::node::ApplyOrigin::ClientLocal,
         )
         .await
         .expect("update must succeed");
@@ -2280,6 +2305,98 @@ mod tests {
         );
     }
 
+    /// #5062: driving the REAL `update_contract` must move the apply counter
+    /// that matches the origin it was called with, on BOTH terminal outcomes.
+    ///
+    /// The source-scrape pin in `broadcast_payload_mix` cannot establish this.
+    /// A pin counts text, so it stays green if the recording calls are
+    /// commented out, moved into dead code, or handed a hardcoded origin. This
+    /// exercises the production function end to end against a real
+    /// `OpManager`, so the counter either moves or the test fails.
+    #[tokio::test]
+    async fn update_contract_records_the_apply_against_the_origin_it_was_given() {
+        use crate::node::ApplyOrigin;
+
+        // Index into `applies_snapshot()`: [origin][changed as usize].
+        const CHANGED: usize = 1;
+        const UNCHANGED: usize = 0;
+        const CLIENT: usize = 0;
+        const RELAY: usize = 1;
+
+        // --- state-changing merges ---
+        let (op_manager, _state, _summary, _guard) =
+            build_summary_test_node("update-applies-5062-changed", true, true).await;
+        let key = make_contract_key(1);
+
+        for (origin, arm) in [
+            (ApplyOrigin::ClientLocal, CLIENT),
+            (ApplyOrigin::NetworkRelay, RELAY),
+        ] {
+            let before = op_manager.payload_mix.applies_snapshot();
+            update_contract(
+                &op_manager,
+                key,
+                UpdateData::Delta(StateDelta::from(vec![1u8, 2, 3])),
+                RelatedContracts::default(),
+                // Priority deliberately held CONSTANT across both iterations
+                // while the origin varies: if the counter were still derived
+                // from the scheduling class rather than the explicit origin,
+                // the relay iteration would book into the client arm and this
+                // test would fail.
+                crate::contract::Priority::ClientLocal,
+                origin,
+            )
+            .await
+            .expect("update must succeed");
+            let after = op_manager.payload_mix.applies_snapshot();
+
+            assert_eq!(
+                after[arm][CHANGED],
+                before[arm][CHANGED] + 1,
+                "{origin:?}: a state-changing apply must increment its own \
+                 changed counter"
+            );
+            let other = 1 - arm;
+            assert_eq!(
+                after[other], before[other],
+                "{origin:?}: no other origin's counters may move"
+            );
+            assert_eq!(
+                after[arm][UNCHANGED], before[arm][UNCHANGED],
+                "{origin:?}: a changed apply must not touch the unchanged slot"
+            );
+        }
+
+        // --- merged-to-no-change ---
+        let (op_manager, _state, _summary, _guard) =
+            build_summary_test_node("update-applies-5062-nochange", true, false).await;
+
+        let before = op_manager.payload_mix.applies_snapshot();
+        let execution = update_contract(
+            &op_manager,
+            key,
+            UpdateData::Delta(StateDelta::from(vec![1u8, 2, 3])),
+            RelatedContracts::default(),
+            crate::contract::Priority::NetworkRelay,
+            ApplyOrigin::NetworkRelay,
+        )
+        .await
+        .expect("a no-change merge is still a successful apply");
+        assert!(!execution.changed, "stand-in reports an unchanged state");
+
+        let after = op_manager.payload_mix.applies_snapshot();
+        assert_eq!(
+            after[RELAY][UNCHANGED],
+            before[RELAY][UNCHANGED] + 1,
+            "a merged-to-no-change apply must be counted in the total"
+        );
+        assert_eq!(
+            after[RELAY][CHANGED], before[RELAY][CHANGED],
+            "a no-op merge emits no broadcast, so it must NOT be counted as \
+             changed — that slot is the fan-out multiplier's denominator"
+        );
+    }
+
     /// MINOR 6 error path: when the summarize fails (saturated executor,
     /// WASM error, missing state), `contract_summary_or_empty` must return
     /// the EMPTY summary — never the state bytes, which would re-open the
@@ -2287,7 +2404,7 @@ mod tests {
     #[tokio::test]
     async fn contract_summary_or_empty_error_path_returns_empty_not_state() {
         let (op_manager, merged_state, _contract_summary, _guard) =
-            build_summary_test_node("update-summary-poison-4923-errpath", false).await;
+            build_summary_test_node("update-summary-poison-4923-errpath", false, true).await;
 
         let key = make_contract_key(1);
         let summary =
