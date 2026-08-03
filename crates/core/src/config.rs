@@ -303,7 +303,11 @@ impl Default for ConfigArgs {
 ///
 /// The FIRST entry of each group is the spelling the node writes; the rest are
 /// aliases accepted on read. Declaration order is load-bearing — it is the
-/// precedence order [`redundant_key_spellings`] applies.
+/// precedence order [`redundant_key_spellings`] applies, and it is what makes
+/// the resolution preserve the value the previous release was using.
+///
+/// When #5130 flips what is emitted, the first entry must move with it, or that
+/// property silently inverts and an upgrade starts changing effective configs.
 ///
 /// Kept beside [`ConfigArgs::read_config`], which needs it, and re-used by the
 /// tests so the `#[serde(alias = ...)]` attributes and this list cannot drift
@@ -4482,40 +4486,6 @@ mod tests {
     // A wholly unknown key is still ignored in silence; that is #5131.
     // ---------------------------------------------------------------------
 
-    /// Every `config.toml` key that a release has EMITTED with an underscore,
-    /// paired with the kebab-case spelling now also accepted for it.
-    ///
-    /// The left-hand column is the on-disk format as shipped: it is what the
-    /// node still writes, and changing that is #5130's job, not this table's.
-    /// The right-hand column is what an operator gets to type instead.
-    const UNDERSCORED_EMITTED_KEYS: &[(&str, &str)] = &[
-        ("public_network_address", "public-network-address"),
-        // Also accepts the direct `public-port`; see the field's rustdoc.
-        ("public_port", "public-network-port"),
-        ("bandwidth_limit", "bandwidth-limit"),
-        ("total_bandwidth_limit", "total-bandwidth-limit"),
-        (
-            "min_bandwidth_per_connection",
-            "min-bandwidth-per-connection",
-        ),
-        ("blocked_addresses", "blocked-addresses"),
-        ("event_loop_channel_capacity", "event-loop-channel-capacity"),
-        ("skip_load_from_network", "skip-load-from-network"),
-        ("transport_keypair", "transport-keypair"),
-        ("log_level", "log-level"),
-        ("contracts_dir", "contracts-dir"),
-        ("delegates_dir", "delegates-dir"),
-        ("secrets_dir", "secrets-dir"),
-        ("db_dir", "db-dir"),
-        ("event_log", "event-log"),
-        ("data_dir", "data-dir"),
-        ("config_dir", "config-dir"),
-        ("log_dir", "log-dir"),
-        ("wasmtime_cache_dir", "wasmtime-cache-dir"),
-        ("is_gateway", "is-gateway"),
-        ("max_blocking_threads", "max-blocking-threads"),
-    ];
-
     /// A `config.toml` in the exact spelling releases write, with every
     /// optional key set to a value distinct from its default — so a key that
     /// fails to bind shows up as a wrong value rather than a coincidental
@@ -4582,26 +4552,30 @@ iface-tx-enabled = true
 shutdown-drain-secs = 42
 "#;
 
-    /// [`RELEASED_CONFIG_TOML`] with every underscored key rewritten to the
-    /// kebab-case spelling from [`UNDERSCORED_EMITTED_KEYS`]. Asserts each
-    /// rewrite fires, so a typo in either constant cannot quietly reduce this
-    /// to a copy of the released document.
+    /// [`RELEASED_CONFIG_TOML`] with every underscored key rewritten to its
+    /// kebab-case spelling, taken from [`CONFIG_KEY_SPELLINGS`].
+    ///
+    /// Derived from the production table rather than a second copy of it: three
+    /// hand-maintained encodings of one fact (the serde attributes, this, and
+    /// the table) is one too many, and review proved a key dropped from the
+    /// test-side copy was caught by nothing. Asserts each rewrite fires, so a
+    /// typo cannot quietly reduce this to a copy of the released document.
     fn kebab_config_toml() -> String {
         let mut doc = RELEASED_CONFIG_TOML.to_string();
-        for (underscored, kebab) in UNDERSCORED_EMITTED_KEYS {
+        for (underscored, kebab) in CONFIG_KEY_SPELLINGS.iter().map(|g| (g[0], g[1])) {
             let from = format!("\n{underscored} = ");
             let to = format!("\n{kebab} = ");
             assert!(
                 doc.contains(&from),
                 "RELEASED_CONFIG_TOML is missing the `{underscored}` key that \
-                 UNDERSCORED_EMITTED_KEYS pairs with `{kebab}`"
+                 CONFIG_KEY_SPELLINGS pairs with `{kebab}`"
             );
             doc = doc.replace(&from, &to);
         }
         doc
     }
 
-    /// The value every key in [`UNDERSCORED_EMITTED_KEYS`] carries, asserted
+    /// The value every renamed key carries, asserted
     /// against a parsed `Config`.
     ///
     /// Shared by the released-spelling and kebab-spelling tests so both are
@@ -4769,11 +4743,11 @@ shutdown-drain-secs = 42
 
         let renamed = table.keys().filter(|k| k.contains('_')).count();
         assert!(
-            renamed >= UNDERSCORED_EMITTED_KEYS.len(),
+            renamed >= CONFIG_KEY_SPELLINGS.len(),
             "expected at least {} underscored keys to rewrite, saw {renamed} — \
              if emitted keys became kebab-case, this guard and #5130's rollout \
              both need revisiting",
-            UNDERSCORED_EMITTED_KEYS.len()
+            CONFIG_KEY_SPELLINGS.len()
         );
 
         let reparsed: Config = toml::from_str(&toml::to_string(&kebabbed).unwrap())
@@ -4985,9 +4959,15 @@ shutdown-drain-secs = 42
     #[test]
     fn two_aliases_of_one_key_resolve_deterministically() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let doc = released_config_toml_without_secret_paths()
-            .replace("\npublic_port = 31339\n", "\npublic-network-port = 31339\n")
+        let base = released_config_toml_without_secret_paths();
+        let doc = base.replace("\npublic_port = ", "\npublic-network-port = ")
             + "\npublic-port = 31999\n";
+        assert!(
+            doc != base,
+            "the substitution did not fire, so this would silently collapse \
+             into a duplicate of the emitted-vs-alias test and stop covering \
+             alias-vs-alias precedence"
+        );
         std::fs::write(temp_dir.path().join("config.toml"), doc).unwrap();
 
         let cfg = ConfigArgs::read_config(&temp_dir.path().to_path_buf())
@@ -5020,6 +5000,8 @@ shutdown-drain-secs = 42
     /// silently drop a key the file legitimately uses.
     #[test]
     fn key_spelling_groups_match_the_serde_aliases() {
+        let baseline =
+            toml::to_string(&toml::from_str::<Config>(RELEASED_CONFIG_TOML).unwrap()).unwrap();
         for group in CONFIG_KEY_SPELLINGS {
             let emitted = group[0];
             for spelling in *group {
@@ -5030,11 +5012,72 @@ shutdown-drain-secs = 42
                     "RELEASED_CONFIG_TOML does not carry `{emitted}`, so this \
                      group is untested"
                 );
-                toml::from_str::<Config>(&doc).unwrap_or_else(|e| {
+                let parsed = toml::from_str::<Config>(&doc).unwrap_or_else(|e| {
                     panic!("`{spelling}` is in CONFIG_KEY_SPELLINGS but is not accepted: {e}")
                 });
+                // `is_ok()` alone would prove nothing: `Config` flattens and
+                // sets no `deny_unknown_fields`, so an unknown key parses
+                // happily and is discarded. Compare against the baseline
+                // instead — that is what proves the spelling bound to THIS
+                // field with the same value, rather than being ignored.
+                assert_eq!(
+                    toml::to_string(&parsed).unwrap(),
+                    baseline,
+                    "`{spelling}` parsed but did not bind to the same field \
+                     and value as `{emitted}` — it is being ignored as an \
+                     unknown key"
+                );
             }
         }
+    }
+
+    /// The `config.json` branch of `read_config` got the same two-path rewrite
+    /// as the TOML one and had no coverage at all — every other test here is
+    /// TOML. Covers both halves: the hyphenated spelling is accepted, and an
+    /// ambiguous file resolves to the spelling the node emits.
+    #[tokio::test]
+    async fn config_json_accepts_both_spellings_and_resolves_duplicates() {
+        let as_json = || {
+            let table = toml::from_str::<toml::Table>(&released_config_toml_without_secret_paths())
+                .unwrap();
+            serde_json::to_value(table).unwrap()
+        };
+
+        // (a) hyphenated only — the key must bind.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut doc = as_json();
+        let object = doc.as_object_mut().unwrap();
+        let value = object.remove("bandwidth_limit").unwrap();
+        object.insert("bandwidth-limit".to_string(), value);
+        std::fs::write(
+            temp_dir.path().join("config.json"),
+            serde_json::to_string_pretty(&doc).unwrap(),
+        )
+        .unwrap();
+        let cfg = ConfigArgs::read_config(&temp_dir.path().to_path_buf())
+            .expect("a config.json using the hyphenated key must load")
+            .expect("config.json is present");
+        assert_eq!(cfg.network_api.bandwidth_limit, Some(3_000_001));
+
+        // (b) both spellings — the emitted one wins, and the file still loads.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut doc = as_json();
+        doc.as_object_mut()
+            .unwrap()
+            .insert("bandwidth-limit".to_string(), 999.into());
+        std::fs::write(
+            temp_dir.path().join("config.json"),
+            serde_json::to_string_pretty(&doc).unwrap(),
+        )
+        .unwrap();
+        let cfg = ConfigArgs::read_config(&temp_dir.path().to_path_buf())
+            .expect("a config.json naming one key twice must still load")
+            .expect("config.json is present");
+        assert_eq!(
+            cfg.network_api.bandwidth_limit,
+            Some(3_000_001),
+            "the spelling the node emits must win, as it does for TOML"
+        );
     }
 
     /// REGRESSION (found in review): the same duplicate-spelling case as
