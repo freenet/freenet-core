@@ -271,6 +271,70 @@ test("a link carrying a download attribute is NOT intercepted", async ({ page })
   ).toEqual([]);
 });
 
+test("same-origin link with target=_blank is NOT intercepted (#5106)", async ({ page }) => {
+  await page.goto(shellUrl!);
+  await captureShellMessages(page);
+  const frame = await fixtureFrame(page);
+
+  // `#same-origin-blank-link` is the SAME href as `#same-origin-link`
+  // (page2.html) plus `target="_blank"`. The interceptor early-returns on a
+  // non-`_self` target, so the click must (a) open a real tab, because the
+  // browser handles it, and (b) produce NO interception postMessage.
+  //
+  // BOTH halves are load-bearing, and asserting only (b) was the first version
+  // of this test's mistake. A regression of the shape
+  //
+  //     if (target.target && target.target !== '_self') { e.preventDefault(); return; }
+  //
+  // — cancel, forward nothing — posts no message either, so (b) alone stays
+  // green on it. That shape IS #5106's user-visible symptom: the dead click.
+  // (a) is what actually catches it.
+  //
+  // Conversely (b) is what catches #5089, which posted `open_url` here. On a
+  // real local node the shell's open_url handler refuses the loopback host and
+  // drops it, so nothing opened; this harness's node binds `127.x.y.1`, which
+  // is NOT in that refusal list (#4846), so under #5089 a tab would still open
+  // here and (a) alone would not distinguish it. Neither assertion subsumes
+  // the other — keep both.
+  //
+  // Unlike the download-link test above, no reload is needed between the
+  // subject click and its control: `target="_blank"` opens a NEW browsing
+  // context, so this document and its injected listener survive intact. Doing
+  // both clicks in ONE document is strictly stronger — it proves the listener
+  // was live in the very document the negative assertion is made about.
+
+  // (1) The subject: the interceptor must NOT cancel the click, so the click
+  // reaches the browser and a popup is created.
+  //
+  // Read this as "the interceptor did not preventDefault", not as "a real user
+  // gets a tab" — Playwright leaves Chromium's popup blocker off, so a popup
+  // here does not establish what a blocker-on user sees. Whether the browser
+  // ultimately grants the tab is the browser's business; what this pins is that
+  // the decision was left to it.
+  const [popup] = await Promise.all([
+    page.waitForEvent("popup"),
+    frame.locator("#same-origin-blank-link").click(),
+  ]);
+  await popup.waitForLoadState("domcontentloaded");
+  expect(
+    popup.url(),
+    `target="_blank" must reach the browser and resolve to the link's own href; got ${popup.url()}`,
+  ).toContain("page2.html");
+
+  // (2) Control, in the SAME document: the same href WITHOUT a new-window
+  // target is intercepted as `navigate`. This is a happens-after barrier for
+  // the subject click too — any postMessage it wrongly sent is a message the
+  // shell received before this one, so the exact-equality below cannot pass by
+  // simply having raced ahead of a late delivery.
+  await frame.locator("#same-origin-link").click();
+  await expect
+    .poll(async () => (await shellMessages(page)).map((m) => m.type), {
+      message:
+        'exactly one message expected: the control click\'s `navigate`. An extra `open_url` means the target="_blank" click was intercepted (#5089); no messages at all means the interceptor never ran, so the negative half of this test would have been vacuous',
+    })
+    .toEqual(["navigate"]);
+});
+
 test("browser Back restores the previous subpage via the popstate handler (#3839)", async ({
   page,
 }) => {

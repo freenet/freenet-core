@@ -1197,7 +1197,18 @@ function freenetBridge(authToken, userToken, hostedMode) {
         // window.open override (#4645). Popups the sandboxed iframe opens
         // itself inherit the opaque origin, breaking CORS on target sites and
         // (hosted) losing the per-user key. The shell opens the URL instead,
-        // giving proper origin. See issue #1499.
+        // giving proper origin. See PR #3818, which removed the popup
+        // sandbox-escape flag from the app iframe and introduced this bridge
+        // in its place. (This cited "#1499" until #5107; that is the
+        // delegate-user-interaction feature request which motivated #3818,
+        // not the hardening itself.)
+        //
+        // Deliberately NOT naming that flag in full here: this file is
+        // inlined verbatim into the shell page, and
+        // `shell_page_contains_iframe_and_bridge` asserts the rendered page
+        // does not contain the flag name anywhere — a comment mentioning it
+        // fails that test. Fail-safe (a false alarm, not a silent pass), but
+        // do not "fix" it by loosening the assertion.
         //
         // Security model: this scheme allow-list is the PRIMARY gate, not
         // defence in depth. A malicious contract iframe can postMessage
@@ -1221,6 +1232,14 @@ function freenetBridge(authToken, userToken, hostedMode) {
         // for the project's public domain and fails on ANY occurrence,
         // comments included (external-origin / CORS guard). The live URL
         // lives in scripts/check-endpoints.sh.
+        //
+        // Same hazard, same test, second string: do not write the popup
+        // sandbox-escape flag's full name in this file either. That test also
+        // asserts the rendered page never contains it, to prove it is not set
+        // on the iframe. Writing it in a comment fails the test — which is
+        // easy to walk into, since naming the flag is the natural instinct
+        // when documenting why it is absent. It happened in #5107. See the
+        // note in the open_url handler above.
         //
         // Private networks (RFC1918 192.168/16, 10/8, 172.16-31/12 and
         // RFC4193 fc00::/7, link-local fe80::/10) are deliberately NOT

@@ -52,29 +52,49 @@
       );
       return;
     }
-    // Same-origin link with an explicit new-window target. A popup opened
-    // natively from this frame INHERITS the sandbox (the shell iframe has no
-    // `allow-popups-to-escape-sandbox`, deliberately -- see #1499), so the
-    // top-level shell it lands on has an opaque origin and its own
-    // `frame-src 'self'` can never match: the app frame stays about:blank and
-    // the tab renders empty. Every cross-CONTRACT link is same-ORIGIN, so the
-    // old blanket exemption here swallowed exactly the breaking case. Route
-    // through the shell instead, as the cross-origin branch above does; this
-    // mirrors the window.open override below, which already forwards
-    // same-origin new-window opens.
-    if (target.target && target.target !== '_self') {
-      e.preventDefault();
-      window.parent.postMessage(
-        {
-          __freenet_shell__: true,
-          type: 'open_url',
-          url: target.href,
-          shiftKey: !!e.shiftKey,
-        },
-        '*',
-      );
-      return;
-    }
+    // Same-origin link with an explicit non-_self target: hand it back to the
+    // browser. That is NOT cost-free -- see "what this costs" below -- but it
+    // is the lesser of the two failures currently available.
+    //
+    // #5089 routed this branch through `open_url` instead, to fix a blank tab
+    // (#5087). Reverted in #5106 because that trade was net-negative:
+    //   - The shell's `open_url` handler REFUSES loopback hosts
+    //     (localhost / 127.0.0.1 / ::1 / 0.0.0.0), which is exactly where a
+    //     local node is reached. Forwarding meant the click was
+    //     preventDefault-ed and then silently dropped by the shell: nothing
+    //     happened at all, in every engine. The window.open override below
+    //     avoids precisely this by falling back to native for loopback hosts
+    //     (isLoopbackHost); this branch had no such fallback.
+    //   - The blank tab it fixed reproduces only in WebKit. Gecko and Blink
+    //     load the app frame fine from the opaque-origin shell, so Firefox
+    //     and Chrome users were traded a working tab for a dead click.
+    //
+    // What this costs, so the next person prices it honestly: the tab the
+    // browser opens inherits this frame's sandbox, so it has an opaque
+    // origin. Three consequences, not one:
+    //   1. On WebKit it renders blank (#5087).
+    //   2. On a HOSTED node it can't read the per-user access key and
+    //      dead-ends on the "Open this app in a normal tab" panel, in every
+    //      engine (#4645).
+    //   3. Its permission surface is dead, in every engine. An opaque origin
+    //      sends `Origin: null`, which the shell's endpoints reject; notably
+    //      `/permission/pending` answers 200 with an EMPTY LIST rather than
+    //      an error, so there is no console message and no failed request --
+    //      the prompt simply never appears. This bites hardest on a LOCAL
+    //      node in Firefox/Chrome, i.e. the case this branch is optimised
+    //      for: the app frame loads fine, so it looks like it works.
+    // (3) is not introduced here -- the window.open loopback fallback below
+    // already yields the same opaque-origin tab on a local node. #5089 fixed
+    // all three for this path as a side effect; reverting restores them.
+    //
+    // Two constraints on any future fix. Do not re-route through the bridge
+    // without a loopback fallback. And `allow-popups-to-escape-sandbox` on
+    // the app iframe -- the obvious alternative -- was deliberately REMOVED
+    // by #3818 (motivated by #1499): an escaped popup gains the node's real
+    // origin, letting a malicious app reach other apps' data and bypass
+    // permission prompts. Its absence is pinned by a test in
+    // path_handlers.rs. That road has to answer #3818.
+    if (target.target && target.target !== '_self') return;
     // Same-origin in-contract link: request navigation via shell
     e.preventDefault();
     window.parent.postMessage(
