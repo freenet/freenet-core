@@ -1233,6 +1233,14 @@ function freenetBridge(authToken, userToken, hostedMode) {
         // comments included (external-origin / CORS guard). The live URL
         // lives in scripts/check-endpoints.sh.
         //
+        // Same hazard, same test, second string: do not write the popup
+        // sandbox-escape flag's full name in this file either. That test also
+        // asserts the rendered page never contains it, to prove it is not set
+        // on the iframe. Writing it in a comment fails the test — which is
+        // easy to walk into, since naming the flag is the natural instinct
+        // when documenting why it is absent. It happened in #5107. See the
+        // note in the open_url handler above.
+        //
         // Private networks (RFC1918 192.168/16, 10/8, 172.16-31/12 and
         // RFC4193 fc00::/7, link-local fe80::/10) are deliberately NOT
         // blocked. A user who pastes a link to their home router or NAS
