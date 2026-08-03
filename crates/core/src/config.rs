@@ -347,6 +347,14 @@ const CONFIG_KEY_SPELLINGS: &[&[&str]] = &[
 /// applied by different walkers and must not be mixed.
 const GATEWAY_KEY_SPELLINGS: &[&[&str]] = &[&["public_key", "public-key"]];
 
+/// The same again, for the nested `[gateways.address]` table.
+///
+/// `host_address` is the legacy single-string form, and it is what the node
+/// EMITS for `Address::HostAddress` — so an operator hyphenating the key their
+/// own `gateways.toml` contains hits the identical hard failure `public_key`
+/// did. Separate table because it is one level deeper still.
+const GATEWAY_ADDRESS_KEY_SPELLINGS: &[&[&str]] = &[&["host_address", "host-address"]];
+
 /// The redundant spellings to drop when a config file gives one setting under
 /// more than one of its accepted names. Empty for the overwhelmingly common
 /// case of a file that spells each key once.
@@ -377,7 +385,7 @@ fn redundant_key_spellings(
     // an internal `unwrap`, and there is no reason to put that on every boot
     // over operator-controlled data to build a message almost never shown.
     value_of: impl Fn(&str) -> String,
-) -> Vec<&'static str> {
+) -> Vec<(&'static str, String)> {
     let mut redundant = Vec::new();
     for group in groups {
         let mut present = group.iter().copied().filter(|key| contains(key));
@@ -424,7 +432,10 @@ fn redundant_key_spellings(
             // `node/p2p_impl.rs`.
             tracing::warn!("{message}");
             eprintln!("warning: {message}");
-            redundant.push(ignored);
+            // Returned as well as emitted, so a test can pin the wording — the
+            // message is the whole compensation for the precedence rule
+            // ignoring the operator's newer line.
+            redundant.push((ignored, message));
         }
     }
     redundant
@@ -456,11 +467,25 @@ fn parse_gateways_toml(content: &str, source: &str) -> Result<Gateways, toml::de
                 GATEWAY_KEY_SPELLINGS,
                 source,
                 |key| map.contains_key(key),
-                |key| map[key].to_string(),
+                |key| map.get(key).map(|v| v.to_string()).unwrap_or_default(),
             );
-            for key in redundant {
+            for (key, _) in redundant {
                 map.remove(key);
                 normalized = true;
+            }
+            // And one level deeper: `[gateways.address]` has its own key with
+            // the same history.
+            if let Some(address) = map.get_mut("address").and_then(|a| a.as_table_mut()) {
+                let redundant = redundant_key_spellings(
+                    GATEWAY_ADDRESS_KEY_SPELLINGS,
+                    source,
+                    |key| address.contains_key(key),
+                    |key| address.get(key).map(|v| v.to_string()).unwrap_or_default(),
+                );
+                for (key, _) in redundant {
+                    address.remove(key);
+                    normalized = true;
+                }
             }
         }
     }
@@ -530,12 +555,12 @@ impl ConfigArgs {
                             CONFIG_KEY_SPELLINGS,
                             &path.display().to_string(),
                             |key| table.contains_key(key),
-                            |key| table[key].to_string(),
+                            |key| table.get(key).map(|v| v.to_string()).unwrap_or_default(),
                         );
                         let mut config = if redundant.is_empty() {
                             toml::from_str::<Config>(&content).map_err(invalid_data)?
                         } else {
-                            for key in redundant {
+                            for (key, _) in redundant {
                                 table.remove(key);
                             }
                             toml::Value::Table(table)
@@ -564,8 +589,11 @@ impl ConfigArgs {
                                 redundant_key_spellings(
                                     CONFIG_KEY_SPELLINGS,
                                     &path.display().to_string(),
-                                    |key| map.contains_key(key),
-                                    |key| map[key].to_string(),
+                                    // An explicit `null` is not a
+                                    // setting; TOML has no equivalent, so
+                                    // only the JSON path needs to say so.
+                                    |key| map.get(key).is_some_and(|v| !v.is_null()),
+                                    |key| map.get(key).map(|v| v.to_string()).unwrap_or_default(),
                                 )
                             })
                             .unwrap_or_default();
@@ -573,7 +601,7 @@ impl ConfigArgs {
                             serde_json::from_str::<Config>(&content)?
                         } else {
                             if let Some(map) = object.as_object_mut() {
-                                for key in redundant {
+                                for (key, _) in redundant {
                                     map.remove(key);
                                 }
                             }
@@ -3323,6 +3351,7 @@ impl<'de> Deserialize<'de> for Address {
             host: Option<String>,
             port: Option<u16>,
             hostname: Option<String>,
+            #[serde(alias = "host-address")]
             host_address: Option<SocketAddr>,
         }
 
@@ -4507,8 +4536,9 @@ mod tests {
     // distinguishing them (`total-bandwidth-limit` and `bandwidth_limit` sit
     // adjacent in the same file), so a setting nobody can spell is a setting
     // nobody can use. Step 1 makes every key in `config.toml` accept its
-    // kebab-case spelling, so either guess works — plus `public_key` in
-    // `gateways.toml`, the one key outside this file with the same problem.
+    // kebab-case spelling, so either guess works — plus the two keys in
+    // `gateways.toml` with the same history, `public_key` and the nested
+    // `host_address`.
     // Emitting one consistent spelling is step 2 (#5130) — see
     // `emitted_config_toml_keys_keep_their_released_spelling` for why the two
     // cannot land together.
@@ -4739,6 +4769,11 @@ shutdown-drain-secs = 42
     fn both_kebab_spellings_of_public_port_are_accepted() {
         for key in ["public-network-port", "public-port"] {
             let doc = RELEASED_CONFIG_TOML.replace("\npublic_port = ", &format!("\n{key} = "));
+            assert_ne!(
+                doc, RELEASED_CONFIG_TOML,
+                "the substitution did not fire, so `{key}` is not actually \
+                 being exercised"
+            );
             let cfg: Config =
                 toml::from_str(&doc).unwrap_or_else(|e| panic!("`{key}` must be accepted: {e}"));
             assert_eq!(cfg.network_api.public_port, Some(31339), "{key}");
@@ -5038,10 +5073,14 @@ shutdown-drain-secs = 42
     fn two_aliases_of_one_key_resolve_deterministically() {
         let temp_dir = tempfile::tempdir().unwrap();
         let base = released_config_toml_without_secret_paths();
-        let doc = base.replace("\npublic_port = ", "\npublic-network-port = ")
-            + "\npublic-port = 31999\n";
+        // Assert on the SUBSTITUTION, before appending: `doc != base` would
+        // hold either way because of the appended line, so that check could
+        // never fail. (Which is the defect it was added to prevent — caught in
+        // review of the commit that added it.)
+        let substituted = base.replace("\npublic_port = ", "\npublic-network-port = ");
+        let doc = substituted.clone() + "\npublic-port = 31999\n";
         assert!(
-            doc != base,
+            substituted != base,
             "the substitution did not fire, so this would silently collapse \
              into a duplicate of the emitted-vs-alias test and stop covering \
              alias-vs-alias precedence"
@@ -5066,7 +5105,7 @@ shutdown-drain-secs = 42
                     CONFIG_KEY_SPELLINGS,
                     "config.toml",
                     |key| table.contains_key(key),
-                    |key| table[key].to_string()
+                    |key| table.get(key).map(|v| v.to_string()).unwrap_or_default()
                 )
                 .is_empty(),
                 "no key is spelled twice here, so nothing may be dropped"
@@ -5189,6 +5228,104 @@ shutdown-drain-secs = 42
         );
     }
 
+    /// `host_address` is `gateways.toml`'s OTHER key with this history — the
+    /// legacy single-string address form, and what the node emits for
+    /// `Address::HostAddress`. Hyphenating the key their own file contains gave
+    /// operators `gateway address must specify one of ...` naming the key they
+    /// had just specified.
+    #[test]
+    fn gateways_toml_host_address_is_accepted_in_both_spellings() {
+        for key in ["host_address", "host-address"] {
+            let doc = format!(
+                "[[gateways]]\npublic_key = \"/tmp/freenet-5124/vega.pub\"\n\
+                 \n[gateways.address]\n{key} = \"203.0.113.1:31337\"\n"
+            );
+            let gateways = parse_gateways_toml(&doc, "gateways.toml")
+                .unwrap_or_else(|e| panic!("`{key}` must be accepted: {e}"));
+            assert_eq!(
+                gateways.gateways[0].address,
+                Address::HostAddress("203.0.113.1:31337".parse().unwrap()),
+                "{key}"
+            );
+        }
+    }
+
+    /// ... and naming it both ways must not stop the node booting, the same as
+    /// one level up.
+    #[test]
+    fn gateways_toml_host_address_spelled_two_ways_still_loads() {
+        let doc = "[[gateways]]\n\
+                   public_key = \"/tmp/freenet-5124/vega.pub\"\n\
+                   \n\
+                   [gateways.address]\n\
+                   host_address = \"203.0.113.1:31337\"\n\
+                   host-address = \"198.51.100.9:1234\"\n";
+        assert!(
+            toml::from_str::<Gateways>(doc).is_err(),
+            "precondition: raw serde rejects the ambiguous nested table"
+        );
+        let gateways = parse_gateways_toml(doc, "gateways.toml")
+            .expect("a nested address naming one key twice must still load");
+        assert_eq!(
+            gateways.gateways[0].address,
+            Address::HostAddress("203.0.113.1:31337".parse().unwrap()),
+            "the spelling the node writes must win"
+        );
+    }
+
+    /// The two-path parse exists so an ordinary broken file keeps its
+    /// line/column span, which a value-level parse loses. Pinned, because once
+    /// #5130 makes normalization common someone will read the direct branch as
+    /// dead weight.
+    #[test]
+    fn an_unambiguous_broken_config_keeps_its_line_and_column() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let doc = released_config_toml_without_secret_paths().replace(
+            "max_blocking_threads = 17",
+            "max_blocking_threads = \"not a number\"",
+        );
+        std::fs::write(temp_dir.path().join("config.toml"), doc).unwrap();
+        let err = ConfigArgs::read_config(&temp_dir.path().to_path_buf())
+            .expect_err("a type error must still be an error")
+            .to_string();
+        assert!(
+            err.contains("line") && err.contains("column"),
+            "an unambiguous file must take the span-preserving parse; got: {err}"
+        );
+    }
+
+    /// The warning is the whole compensation for the precedence rule ignoring
+    /// the operator's newer line, so pin what it says: both keys, both values,
+    /// which one is in effect, and which line to delete.
+    #[test]
+    fn the_duplicate_spelling_warning_names_both_values_and_the_remedy() {
+        let table: toml::Table =
+            toml::from_str("bandwidth_limit = 10000000\nbandwidth-limit = 50000000\n").unwrap();
+        let reported = redundant_key_spellings(
+            CONFIG_KEY_SPELLINGS,
+            "config.toml",
+            |key| table.contains_key(key),
+            |key| table.get(key).map(|v| v.to_string()).unwrap_or_default(),
+        );
+        let [(ignored, message)] = reported.as_slice() else {
+            panic!("expected exactly one redundant spelling, got {reported:?}");
+        };
+        assert_eq!(*ignored, "bandwidth-limit");
+        for expected in [
+            "bandwidth-limit",                   // the key being ignored
+            "50000000",                          // ... and its value
+            "bandwidth_limit",                   // the key that wins
+            "10000000",                          // ... and the value now in effect
+            "delete the `bandwidth_limit` line", // the remedy
+            "config.toml",                       // where to do it
+        ] {
+            assert!(
+                message.contains(expected),
+                "the warning must mention `{expected}`; got: {message}"
+            );
+        }
+    }
+
     /// Every `#[serde(alias = "...")]` in the config types must appear in
     /// [`CONFIG_KEY_SPELLINGS`] or [`GATEWAY_KEY_SPELLINGS`].
     ///
@@ -5207,6 +5344,7 @@ shutdown-drain-secs = 42
         let listed: BTreeSet<&str> = CONFIG_KEY_SPELLINGS
             .iter()
             .chain(GATEWAY_KEY_SPELLINGS.iter())
+            .chain(GATEWAY_ADDRESS_KEY_SPELLINGS.iter())
             .flat_map(|group| group.iter().copied())
             .collect();
 
@@ -5244,7 +5382,9 @@ shutdown-drain-secs = 42
         }
         // A floor, so a scraper that silently stops matching cannot pass by
         // finding nothing. Every group contributes at least one alias.
-        let expected = CONFIG_KEY_SPELLINGS.len() + GATEWAY_KEY_SPELLINGS.len();
+        let expected = CONFIG_KEY_SPELLINGS.len()
+            + GATEWAY_KEY_SPELLINGS.len()
+            + GATEWAY_ADDRESS_KEY_SPELLINGS.len();
         assert!(
             found >= expected,
             "scraped only {found} aliases but {expected} spelling groups exist \
