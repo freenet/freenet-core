@@ -1841,8 +1841,14 @@ const WEBSOCKET_SHIM_JS: &str = include_str!("path_handlers/assets/websocket_shi
 /// shell page, which opens it with a proper origin via `window.open`.
 ///
 /// Same-origin links with an explicit non-`_self` target are left to the
-/// browser so webapps that legitimately want multi-tab navigation within
-/// their own contract still work.
+/// browser, so webapps that want multi-tab navigation within their own
+/// contract get their tab. That tab inherits the sandbox, though, so it has
+/// an opaque origin: on a hosted node it can't read the per-user access key
+/// and dead-ends (#4645), and on WebKit it renders blank (#5087). #5089
+/// routed this branch through `open_url` to fix that and was reverted in
+/// #5106, because the bridge refuses loopback hosts and the click then did
+/// nothing at all on a local node. See the comment on that branch in
+/// `navigation_interceptor.js` for the full trade.
 ///
 /// The interceptor also overrides programmatic `window.open`: an app that opens
 /// a new tab from its own JS bypasses the click/auxclick listeners, and on a
@@ -6751,9 +6757,18 @@ mod tests {
 
         // The cross-origin branch must call preventDefault and send open_url,
         // not navigate.
+        //
+        // Match `e.preventDefault()` with the receiver and parens, not the bare
+        // word: this block also spans the same-origin branch's COMMENT, which
+        // discusses being "preventDefault-ed". A bare `preventDefault` needle is
+        // satisfied by that prose alone, so deleting the real call here would
+        // leave this river#208 / #3852 pin green while cross-origin
+        // `target="_blank"` went back to opening null-origin sandboxed popups.
+        // Verified by mutation: bare needle survives the deletion, this one does
+        // not.
         let cross_origin_block = &js[cross_origin_idx..target_attr_idx];
         assert!(
-            cross_origin_block.contains("preventDefault"),
+            cross_origin_block.contains("e.preventDefault()"),
             "cross-origin branch must preventDefault before opening popup"
         );
         assert!(
@@ -6849,9 +6864,10 @@ mod tests {
     /// correct — they pin today's behaviour, not a permanent invariant.
     /// Whoever lands it should replace this test, not weaken it. The first
     /// assertion is the load-bearing one; the second is a cheap belt-and-
-    /// braces check that a forward was not added ahead of the `return`
-    /// (anything added after it would be unreachable, so it catches less
-    /// than the first).
+    /// braces check. What it uniquely covers is a forward inserted BETWEEN
+    /// the `return` and the `navigate` postMessage — reachable code, just
+    /// for untargeted same-origin links rather than for this branch. A
+    /// forward ahead of the `return` is already caught by the first.
     #[test]
     fn navigation_interceptor_leaves_same_origin_target_blank_to_the_browser() {
         let js = NAVIGATION_INTERCEPTOR_JS;
@@ -6881,6 +6897,45 @@ mod tests {
              with a loopback fallback like the window.open override's isLoopbackHost \
              check, or after removing the sandbox inheritance — this test is pinning the \
              old behaviour and should be replaced, not deleted piecemeal"
+        );
+
+        // Both assertions above scope to the branch, which leaves an evasion:
+        // a re-route added as a SEPARATE EARLIER branch is outside the block
+        // entirely, so `find()` still lands on the untouched `_self` check and
+        // both pass while the bug is fully present. That is not contrived —
+        // "special-case `_blank`, leave named targets alone" is a plausible
+        // next attempt:
+        //
+        //     if (target.target === '_blank') { e.preventDefault(); /* open_url */ return; }
+        //     if (target.target && target.target !== '_self') return;
+        //
+        // So also pin the whole-handler count. `handleAnchorClick` must forward
+        // open_url from exactly ONE place: the cross-origin branch. Anything
+        // that adds a second forward, anywhere in the handler and under any
+        // condition, trips this.
+        //
+        // This is also what makes the asymmetry with `window.open` DELIBERATE
+        // rather than an accident of two reverts: the override below forwards
+        // same-origin new-window opens (#4645) and this handler does not. The
+        // anchor path pays #4645's dead-end on hosted nodes to avoid the
+        // loopback dead click (#5106); the override avoids both because it has
+        // an isLoopbackHost fallback. Whoever unifies them should make that
+        // choice on purpose, and will land here.
+        let handler_start = js
+            .find("function handleAnchorClick")
+            .expect("anchor click handler present");
+        let handler_end = js
+            .find("document.addEventListener('click'")
+            .expect("anchor click listener registration present");
+        let forwards = js[handler_start..handler_end]
+            .matches("type: 'open_url'")
+            .count();
+        assert_eq!(
+            forwards, 1,
+            "handleAnchorClick must forward open_url from exactly one place — the \
+             cross-origin branch (freenet/river#208). A second forward means a \
+             same-origin new-window re-route slipped in outside the branch this \
+             test's other assertions scope to (#5106)"
         );
     }
 
@@ -7170,7 +7225,12 @@ mod tests {
     /// #4846 is implemented as a rule (`h.startsWith('127.')`) on both sides,
     /// both literal sets shrink together and this test goes green without
     /// having checked the new rule. It catches one-sided literal drift — the
-    /// common case — not a symmetric refactor.
+    /// common case — not a symmetric refactor. Two more divergences it cannot
+    /// see, both of which keep identical literals: flipping `||` to `&&` on
+    /// one side (uncovered anywhere), and dropping the bracket-strip
+    /// normalization so `[::1]` stops matching (covered for the shell by
+    /// `shell_open_url_handler_blocks_ipv6_loopback`, and behaviourally for
+    /// the interceptor by window-open.spec.ts). Do not over-trust the parity.
     #[test]
     fn interceptor_loopback_list_matches_shell_open_url_refusal() {
         // Collect the host literals from each `h === '<host>'` comparison in a
@@ -7203,6 +7263,10 @@ mod tests {
             out
         }
 
+        // The `function ` prefix is load-bearing: the name `isLoopbackHost`
+        // also appears in prose in the same-origin branch's comment ABOVE the
+        // declaration, so anchoring on the bare name would slice from the
+        // comment and miss the helper entirely.
         let interceptor_fn_idx = NAVIGATION_INTERCEPTOR_JS
             .find("function isLoopbackHost")
             .expect("interceptor isLoopbackHost helper present");
@@ -7229,23 +7293,46 @@ mod tests {
             .expect("shell open_url loopback refusal returns");
         let shell_hosts = loopback_hosts(&rest[..refusal_end]);
 
-        // Guard against the comparison going vacuous: if a refactor renames the
-        // local or restructures the chain, both sides would extract nothing and
-        // the equality below would pass while guarding nothing (#5076).
-        assert!(
-            shell_hosts.contains(&"localhost".to_string()),
-            "extracted no loopback hosts from the shell open_url handler — the \
-             `h === '...'` chain moved or was renamed, so this test is no longer \
-             comparing anything. Re-anchor it. Got: {shell_hosts:?}"
-        );
+        // The two lists have OPPOSITE polarity, so a bare equality is not
+        // enough. The shell side is a SECURITY control: host in list ->
+        // refuse, which is what stops a contract forging an `open_url` at the
+        // viewer's own loopback services, the local node's API included (see
+        // `shell_open_url_handler_blocks_ipv6_loopback`, and note the handler
+        // deliberately does NOT block RFC1918 — loopback is the one network
+        // class it guards). The interceptor side blocks nothing at all: it is
+        // only a PREDICTION of the shell's refusal so `window.open` can fall
+        // back to native.
+        //
+        // So equality must never be reachable by SHRINKING the shell list.
+        // Drop `127.0.0.1`/`::1`/`0.0.0.0` from both and a bare assert_eq is
+        // green while `open_url` will happily open `http://127.0.0.1:7509/…`
+        // for any contract that asks. Pin a floor on the security side first,
+        // and make the equality message name the correct repair direction —
+        // someone red on #4846 otherwise has an easier wrong fix available
+        // (delete an arm) than the right one.
+        for host in ["localhost", "127.0.0.1", "::1", "0.0.0.0"] {
+            assert!(
+                shell_hosts.iter().any(|h| h == host),
+                "the shell's open_url refusal no longer covers `{host}` — or the \
+                 extraction above truncated, e.g. because the chain was split into \
+                 per-host `if (h === '…') return;` lines, which the `return;` bound \
+                 would cut short (check shell_bridge.js by eye). This list is a \
+                 security boundary. If you are here because the equality below went \
+                 red, the fix is to WIDEN isLoopbackHost in navigation_interceptor.js \
+                 — never to narrow this one. Got: {shell_hosts:?}"
+            );
+        }
         assert_eq!(
             interceptor_hosts, shell_hosts,
-            "isLoopbackHost and the shell's open_url loopback refusal have \
-             drifted. A host the shell refuses but the interceptor does not \
-             list makes window.open forward an open the shell then drops \
-             silently (#5106); the reverse forwards to a sandbox-inheriting \
-             native popup (#4645). Update both, or #4846 when completing the \
-             allow-list."
+            "isLoopbackHost and the shell's open_url loopback refusal have drifted \
+             (or a region bound truncated one of them — compare the two lists above \
+             before assuming drift). Correct repair direction: make \
+             navigation_interceptor.js's isLoopbackHost match shell_bridge.js, not \
+             the reverse. A host the shell refuses but the interceptor omits makes \
+             window.open forward an open the shell then drops silently (#5106); the \
+             reverse merely falls back to a sandbox-inheriting native popup (#4645). \
+             When completing the allow-list per #4846, widen BOTH, starting with the \
+             shell."
         );
     }
 
