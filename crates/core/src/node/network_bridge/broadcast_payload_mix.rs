@@ -89,9 +89,16 @@
 //! — how many distinct peer-side state transitions one originated update
 //! causes. Against the measured ~17.1 co-host degree, ≈17 says the update
 //! reaches its co-host set once and stops; ≫17 says state keeps genuinely
-//! moving hop after hop. See [`ApplyOrigin`] for why "did a re-broadcast
-//! happen" is NOT the discriminant (one happens either way) and whether its
-//! recipients then change state is.
+//! moving hop after hop.
+//!
+//! Why THAT is the discriminant, and not the more obvious "did a re-broadcast
+//! happen": a re-broadcast happens under BOTH topologies, because the executor
+//! emits on every changed apply. What separates them is whether the second
+//! hop's recipients then change state too. Under one-hop reach the second-hop
+//! payloads land on peers that already hold the state, so their applies are
+//! no-ops — counted in `_total`, not in `_changed`. Under re-fan-out they keep
+//! changing state hop after hop. So the `_changed` / `_total` split is what
+//! carries the signal, and `_changed` on the relay arm is the numerator.
 //!
 //! Always a RATIO OF SUMS over the fleet, never a mean of per-window ratios:
 //! most nodes serve no local clients, so a per-node per-window ratio is `0/0`
@@ -103,7 +110,7 @@
 //! population. An earlier revision called the ratio "sound" on that
 //! same-function argument; it is not.
 //!
-//! #### Upward (the majority, and they inflate toward the expensive remedy)
+//! #### Upward (these inflate toward the expensive remedy)
 //!
 //! Numerator gets relayed `changed` applies with no origination behind them:
 //!
@@ -171,9 +178,11 @@
 //! The two topologies this metric exists to separate are an ORDER OF MAGNITUDE
 //! apart — ~17 for one-hop reach, ~17 + 17² ≈ 300 if every hop re-changes
 //! state. So the question to ask of a measurement is which order of magnitude
-//! it is in, NOT where it sits against 17 exactly. The biases above are worth
-//! roughly a small multiple, not a factor of ten; heal volume alone can
-//! plausibly account for 2-3x.
+//! it is in, NOT where it sits against 17 exactly. The bands below assume the
+//! biases are worth a small multiple rather than a factor of ten. That
+//! assumption is NOT currently checkable — the heal contribution has no
+//! counter (see below) — so treat the band edges as a working prior to be
+//! replaced once `heal_sends` lands, not as measured.
 //!
 //! That gives a usable reading:
 //!
@@ -183,10 +192,12 @@
 //!     not proof of, one-hop reach: R/C well BELOW 17 would mean fan-out is
 //!     not reaching the co-host set at all, which is a third failure with a
 //!     third remedy.
-//!   * **Hundreds** — the re-fan-out topology, which no combination of the
-//!     biases above can manufacture.
-//!   * **In between** — genuinely ambiguous, and the honest answer is that
-//!     this metric cannot currently resolve it. See below.
+//!   * **Hundreds** (order ~300, i.e. an order of magnitude above the co-host
+//!     degree) — the re-fan-out topology, which no combination of the biases
+//!     above can manufacture.
+//!   * **In between** (very roughly 50-200) — genuinely ambiguous, and the
+//!     honest answer is that this metric cannot currently resolve it. See
+//!     below.
 //!
 //! Before trusting a LOW reading, check the broadcast queue: `capacity_evictions`
 //! (the one that licenses the conclusion — it counts the actual drops),
@@ -220,7 +231,8 @@
 //! Land the `heal_sends` split and the PUT-path apply counter first; they are
 //! far cheaper than the rewrite they would be authorising.
 //!
-//! The follow-ups that would make R/C tight rather than bounded are that
+//! The follow-ups that would make R/C tight, rather than merely readable with
+//! the procedure above, are that
 //! `heal_sends` split at `record_delivered`, a PUT-path apply counter, and
 //! #5118.
 //!
@@ -509,12 +521,17 @@ impl PayloadArm {
 ///     PRE-replay state, which receivers already hold, so it no-ops at them and
 ///     moves `total_sends / C` only.
 ///
-///     The three re-emission funnels are deliberately NOT listed here: the
-///     retry loop, the stash-recheck re-emit and the `PendingBroadcastStore`
-///     flush all sit inside the `targets.is_empty()` branch, so they fire only
-///     when nothing was sent. They are re-attempts at a fan-out that has not
-///     happened, not extra copies of one that has — which is why they belong
-///     to the zero-delivery bullet above rather than here.
+///     The three re-emission funnels are deliberately NOT listed here. The
+///     retry loop and the stash-recheck re-emit sit inside the
+///     `targets.is_empty()` branch, so they fire only when nothing was sent.
+///     The `PendingBroadcastStore` flush is driven from interest-registration
+///     sites elsewhere, but the stash it drains is POPULATED only inside that
+///     same branch, so it too can only re-drive a fan-out that previously
+///     found no targets. All three are re-attempts at a fan-out that has not
+///     happened rather than extra copies of one that has, which is why they
+///     belong to the zero-delivery bullet above. (The stash is cleared on the
+///     targets-found path but not by every delivery route, so a small residual
+///     of genuine duplicates is possible.)
 ///   * an UPDATE arriving mid-initialization returns `NoChange` without
 ///     merging, and is replayed at init completion where it does merge and
 ///     does broadcast — so it lands in `_total` once and its real apply is
