@@ -824,14 +824,24 @@ fn percent_decode_ascii(s: &str) -> String {
     let mut out = String::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hex = &s[i + 1..i + 3];
-            if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                out.push(byte as char);
+        // Read the two hex digits as BYTES. Slicing `&s[i + 1..i + 3]` would
+        // panic whenever `%` is followed by a multi-byte character (`%é`), and
+        // a query string is attacker-controlled on every request.
+        if let (Some(b'%'), Some(hi), Some(lo)) = (
+            bytes.get(i).copied(),
+            bytes.get(i + 1).copied(),
+            bytes.get(i + 2).copied(),
+        ) {
+            if let (Some(hi), Some(lo)) = ((hi as char).to_digit(16), (lo as char).to_digit(16)) {
+                out.push((hi as u8 * 16 + lo as u8) as char);
                 i += 3;
                 continue;
             }
         }
+        // Byte-wise passthrough: a non-ASCII byte becomes its Latin-1 char.
+        // That mangles multi-byte text, which is fine and deliberate — the only
+        // consumer prefix-compares the result against two ASCII literals, and a
+        // mangled non-ASCII name cannot equal either.
         out.push(bytes[i] as char);
         i += 1;
     }
@@ -1987,6 +1997,31 @@ mod tests {
         }
         // A malformed escape is not a decode, and must not become one.
         assert!(!is_sensitive_query_param("auth%zzToken=x"));
+        // Multi-byte characters around a `%` must not panic: a query string is
+        // attacker-controlled on every request, and byte-slicing the two hex
+        // digits would land mid-character.
+        for odd in [
+            // 3-byte char after `%`: byte index i+3 lands INSIDE it, so a
+            // `&str` slice of the two hex digits panics. Reachable with one
+            // unauthenticated GET carrying raw non-ASCII in the query — hyper
+            // accepts it, browsers just never send it.
+            "%\u{20ac}=1",
+            "a%\u{20ac}b=1",
+            // 4-byte char.
+            "%\u{1f600}=1",
+            "%é=1",
+            "auth%é=1",
+            "%",
+            "%2",
+            "a%",
+            "%e2%82%ac=1",
+            "authToken%=1",
+            "π=1",
+        ] {
+            let _ = is_sensitive_query_param(odd);
+        }
+        // …and one that must still be caught despite the neighbouring escape.
+        assert!(is_sensitive_query_param("authT%6Fken%é=1"));
     }
 
     /// Regression test for the sub-page loss that removing the `window.open`
