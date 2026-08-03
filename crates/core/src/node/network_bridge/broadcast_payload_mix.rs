@@ -95,38 +95,70 @@
 //!
 //! Always a RATIO OF SUMS over the fleet, never a mean of per-window ratios:
 //! most nodes serve no local clients, so a per-node per-window ratio is `0/0`
-//! far more often than not. Note also that the sum is unbiased only if
-//! telemetry coverage is uniform across relay-heavy and client-serving nodes;
-//! gateways relay much and serve few local clients, so a reporting population
-//! skewed toward them under-samples the denominator.
+//! far more often than not.
 //!
-//! ### `total_sends / applies_client_local_changed` is an UPPER BOUND only
+//! ### R/C IS BIASED UPWARD. Read it as an upper bound.
 //!
-//! Tempting, and the more direct statement of "sends per originated update",
-//! but the two are not drawn from the same population. `total_sends` counts
-//! every delivery `record_delivered` sees, and the broadcast queue carries
-//! traffic that no `applies_*` counter can ever match:
+//! Both halves come out of the same function, but NOT out of the same
+//! population, and the residuals do not cancel — they push the same way. An
+//! earlier revision of this doc called the ratio "sound" on the same-function
+//! argument; that was wrong, and wrong in the direction that costs money,
+//! because every effect below inflates R/C toward the ≫17 reading whose remedy
+//! is the expensive one.
+//!
+//! Numerator gets relayed `changed` applies with no origination behind them:
 //!
 //!   * targeted anti-entropy heals (`NodeEvent::SyncStateToPeer`) enqueue into
-//!     the SAME queue, with no apply behind them at all — and heal volume
-//!     rises with churn, i.e. loudest under the conditions being measured;
-//!   * PUT-, GET-cache-, ResyncResponse-, first-install- and delegate-driven
-//!     applies broadcast without passing through `update_contract`, so they
-//!     add sends with no denominator entry;
-//!   * no-target retries and `PendingBroadcastStore` re-emits re-send an apply
-//!     that was counted once, or never.
+//!     the SAME broadcast queue and arrive as the same `UpdateMsg::BroadcastTo`
+//!     wire shape, so the receiver applies them as `NetworkRelay` and cannot
+//!     tell them from a fan-out leg. Heal volume rises with churn, i.e. it is
+//!     loudest under the conditions being measured;
+//!   * the summary-first PUT reverse-delta merge books a relay entry at the
+//!     ORIGINATOR of a local PUT whose origination is not in the denominator.
 //!
-//! All of those inflate it. Pulling the other way, `record_delivered` is
-//! delivery-gated while `record_apply` is not, and the executor's broadcast
-//! emit is best-effort under channel pressure. So the net direction is not
-//! known, which is why the relay/client ratio above — same function, same drop
-//! semantics on both halves — is the one to read for a spend/don't-spend
-//! decision. Separating heal sends from fan-out sends would make this bound
-//! tight and is the natural follow-up.
+//! Denominator misses originations entirely:
+//!
+//!   * a client PUT never calls `update_contract` — it broadcasts from
+//!     `broadcast_state_change` on the `PutQuery` path — yet its fan-out
+//!     produces relayed `changed` applies fleet-wide. Same for delegate-driven
+//!     PUT/UPDATE, and for ResyncResponse heals, which apply relayed state via
+//!     a raw `UpdateQuery`;
+//!   * a client UPDATE on a node that is not hosting fails its local apply
+//!     while propagation proceeds regardless.
+//!
+//! Pulling the other way, and smaller: the broadcast dedup cache and the
+//! merge-failure backoff gate both short-circuit BEFORE `update_contract`, so
+//! some relayed applies never reach the numerator (the backoff one concentrated
+//! on poison contracts — again the churn being measured); and fair-queue
+//! shedding drops sub-`ClientLocal` work first.
+//!
+//! Practical reading: **R/C ≈ 17 is strong evidence of one-hop reach**, because
+//! the biases can only push it up. **R/C ≫ 17 is suggestive, not conclusive** —
+//! before spending on propagation topology, bound the heal and PUT-origination
+//! contribution. The follow-ups that would make this tight are a `heal_sends`
+//! split at `record_delivered` and a PUT-path apply counter.
+//!
+//! ### `total_sends / applies_client_local_changed` is looser still
+//!
+//! The more direct statement of "sends per originated update", and the one
+//! #5062 asks for, but its numerator additionally carries every heal delivery,
+//! every PUT/GET-cache/Resync/first-install/delegate-driven send, and no-target
+//! retries plus `PendingBroadcastStore` re-emits of already-counted applies.
+//! Against that, `record_delivered` is delivery-gated while `record_apply` is
+//! not, and the executor's emit is best-effort under channel pressure. Prefer
+//! R/C; use this only as a coarse cross-check.
+//!
+//! ### Coverage
+//!
+//! Either ratio is unbiased across the fleet only if telemetry coverage is
+//! uniform across relay-heavy and client-serving nodes. Gateways relay much and
+//! serve few local clients, so a reporting population skewed toward them
+//! under-samples the denominator — pushing both ratios up, same direction as
+//! everything above.
 //!
 //! ### Not the same thing as the receiver-apply counters
 //!
-//! [`ReceiverApplyStats`] above also counts changed-vs-no-op applies, and the
+//! [`ReceiverApplyStats`] below also counts changed-vs-no-op applies, and the
 //! two will never reconcile — by construction, not by bug. Those are
 //! cumulative rather than windowed, and are fed only by the two broadcast-
 //! receive drivers that build a [`ReceiverTerminalGuard`], whereas
@@ -147,8 +179,8 @@
 //! ## Cost
 //!
 //! One short uncontended mutex acquire per **delivered broadcast** (not per
-//! packet), covering a handful of integer adds and at most one bounded
-//! `HashMap` touch, plus one more per completed update APPLY.
+//! packet), covering a handful of integer adds and up to three bounded
+//! `HashMap` touches, plus one more per completed update APPLY.
 //!
 //! That second acquisition is NOT rare: every RECEIVED broadcast runs
 //! `update_contract` too, and by the #5091 figure above only ~1 in 17.5 of
@@ -156,8 +188,8 @@
 //! send rates are comparable and this roughly DOUBLES the acquisition rate on
 //! `window` — worth stating plainly, since "one more, strictly rarer" would
 //! license the next apply-path counter on reasoning that is off by ~17x. It is
-//! still cheap in absolute terms: the apply critical section is two array
-//! writes, against up to three bounded `HashMap` touches for a send.
+//! still cheap in absolute terms: the apply critical section is a single array
+//! write, against up to three bounded `HashMap` touches for a send.
 //!
 //! Everything else happens in the aggregator task, and the hot path only ever
 //! WRITES. The lock is what makes a rollup a consistent snapshot; see
@@ -546,7 +578,7 @@ struct Window {
     /// applies describe the same 60 s of work and the ratio between them is
     /// meaningful rather than smeared across window boundaries.
     ///
-    /// Fixed cardinality (3 x 2 `u64`s), no per-contract map: see the module
+    /// Fixed cardinality (2 x 2 `u64`s), no per-contract map: see the module
     /// docs for why the per-contract refinement is deliberately not here.
     applies: [[u64; 2]; ApplyOrigin::COUNT],
 }
@@ -1332,18 +1364,21 @@ fn payload_mix_json(
         "attribution_dropped_bytes".into(),
         attribution_dropped_bytes.into(),
     );
-    // #5062: the fan-out multiplier's denominator. `total_sends` above is the
-    // numerator, recorded into the same window and drained by the same atomic
-    // take, so the two describe the same 60 s of work.
+    // #5062: update applies split by origin, recorded into the same window as
+    // the send counters above and drained by the same atomic take.
     //
-    // NO ratio is published here, deliberately. The quantity that matters is a
-    // ratio of SUMS over the fleet —
-    //   sum(total_sends) / sum(applies_client_local_changed)
-    // — and most nodes host no local clients, so a per-window per-node ratio is
-    // `0/0` far more often than not. Publishing one would invite exactly the
-    // mean-of-ratios aggregation that `not_efficient_summary_to_state_bytes_ratio`
-    // above is named to steer consumers away from, on data where it is far more
-    // degenerate. Raw counters only; the division belongs in the query.
+    // The quantity to build a dashboard on is the ratio of SUMS over the fleet
+    //   sum(applies_network_relay_changed) / sum(applies_client_local_changed)
+    // — NOT `total_sends / applies_client_local_changed`, which is looser. Read
+    // the module docs before using either: both are biased UPWARD, and by how
+    // much is not published. Do not read them to three significant figures.
+    //
+    // NO ratio is published here, deliberately. Most nodes host no local
+    // clients, so a per-window per-node ratio is `0/0` far more often than not,
+    // and publishing one would invite exactly the mean-of-ratios aggregation
+    // that `not_efficient_summary_to_state_bytes_ratio` above is named to steer
+    // consumers away from, on data where it is far more degenerate. Raw
+    // counters only; the division belongs in the query.
     for (origin, changed, total) in applies {
         obj.insert(
             format!("applies_{}_changed", origin.label()),
@@ -1991,11 +2026,13 @@ mod tests {
         // what it drains.
         let drained_total = Arc::new(Mutex::new(0u64));
         let drained_applies = Arc::new(Mutex::new(0u64));
+        let drained_changed = Arc::new(Mutex::new(0u64));
         let drainer = {
             let mix = Arc::clone(&mix);
             let stop = Arc::clone(&stop);
             let drained_total = Arc::clone(&drained_total);
             let drained_applies = Arc::clone(&drained_applies);
+            let drained_changed = Arc::clone(&drained_changed);
             std::thread::spawn(move || {
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                     let w = mix.take_window();
@@ -2003,8 +2040,17 @@ mod tests {
                     *drained_total.lock() += sum;
                     // Same atomic take must carry the applies, or the two
                     // halves of the ratio drift apart across a rollover.
+                    // `changed` is conserved SEPARATELY from the total: it is
+                    // the slot the ratio actually divides by, and a mutation
+                    // that always wrote the unchanged slot would conserve the
+                    // total perfectly while zeroing the measurement.
                     *drained_applies.lock() +=
                         w.applies().iter().map(|(_, _, total)| total).sum::<u64>();
+                    *drained_changed.lock() += w
+                        .applies()
+                        .iter()
+                        .map(|(_, changed, _)| changed)
+                        .sum::<u64>();
                     // Sleep rather than spin. A hot loop here would burn a
                     // whole core for the duration of the test, and the suite
                     // runs tests in parallel — starving a timing-sensitive
@@ -2057,6 +2103,11 @@ mod tests {
             .iter()
             .map(|(_, _, total)| total)
             .sum();
+        let leftover_changed: u64 = final_window
+            .applies()
+            .iter()
+            .map(|(_, changed, _)| changed)
+            .sum();
         let total = *drained_total.lock() + leftover;
         assert_eq!(
             total,
@@ -2067,6 +2118,15 @@ mod tests {
             *drained_applies.lock() + leftover_applies,
             (THREADS * PER_THREAD) as u64,
             "applies were lost or double-counted across a concurrent rollover"
+        );
+        // Writers pass `changed = i % 3 == 0`, so each thread contributes
+        // ceil(PER_THREAD / 3).
+        assert_eq!(
+            *drained_changed.lock() + leftover_changed,
+            (THREADS * PER_THREAD.div_ceil(3)) as u64,
+            "CHANGED applies were lost, double-counted, or routed to the wrong \
+             slot across a concurrent rollover — that slot is the ratio's \
+             denominator, so conserving only the total would miss it"
         );
     }
 
@@ -2591,21 +2651,36 @@ mod tests {
     /// `record_apply`. This test is what catches that.
     #[test]
     fn apply_origin_variants_are_all_listed_and_densely_indexed() {
+        // The exhaustive match is the load-bearing part, and it must live HERE
+        // rather than iterate `ALL`. Deriving the variant list from `ALL` is
+        // what makes the obvious version of this test vacuous: it would check
+        // `ALL` against itself and stay green in exactly the case that matters
+        // — a variant added to `index()` but missing from `ALL`, whose records
+        // `record_apply`'s bounds check then silently drops. Adding a variant
+        // fails to compile here until it is listed below AND in `ALL`.
+        let every_variant = [ApplyOrigin::ClientLocal, ApplyOrigin::NetworkRelay];
+        for v in every_variant {
+            match v {
+                ApplyOrigin::ClientLocal | ApplyOrigin::NetworkRelay => {}
+            }
+            assert!(
+                ApplyOrigin::ALL.contains(&v),
+                "{v:?} exists but is missing from `ALL`, so `COUNT` under-sizes \
+                 the counter array and every record for it is dropped"
+            );
+        }
+        assert_eq!(
+            ApplyOrigin::COUNT,
+            every_variant.len(),
+            "`ALL` must list every variant"
+        );
+
         let indices: Vec<usize> = ApplyOrigin::ALL.iter().map(|o| o.index()).collect();
         assert_eq!(
             indices,
             (0..ApplyOrigin::COUNT).collect::<Vec<_>>(),
             "indices must be dense, ordered, and cover exactly `ALL`"
         );
-        // Every index reachable from `index()` must be in range for the
-        // counter array — the invariant `record_apply`'s bounds check exists
-        // to survive, and that this test exists to keep unnecessary.
-        for origin in ApplyOrigin::ALL {
-            assert!(
-                origin.index() < ApplyOrigin::COUNT,
-                "{origin:?} indexes outside the counter array"
-            );
-        }
         let mut labels: Vec<&str> = ApplyOrigin::ALL.iter().map(|o| o.label()).collect();
         labels.sort_unstable();
         labels.dedup();
@@ -2616,30 +2691,36 @@ mod tests {
         );
     }
 
-    /// An out-of-range origin index degrades to a dropped record rather than
-    /// panicking inside the held mutex on the apply hot path.
+    /// `record_apply` must index the origin arm FALLIBLY.
+    ///
+    /// No in-range call can demonstrate this, since `index()` cannot currently
+    /// return an out-of-range value — which is exactly why it needs a pin
+    /// rather than a behavioural test. If a variant is ever added to `index()`
+    /// without being added to `ALL`, `COUNT` under-sizes the array and the
+    /// index goes out of range; as `[idx]` that would PANIC inside a held mutex
+    /// on the contract-apply hot path, which the sibling `tracked_missing`
+    /// counters in `record_delivered` already refuse to do for the same reason.
+    ///
+    /// A source scrape is the honest instrument here. The previous version of
+    /// this test asserted `applies.get_mut(COUNT).is_none()`, which is a
+    /// compile-time truth about any fixed-size array and stayed green when the
+    /// guard was replaced with `[idx]`.
     #[test]
-    fn out_of_range_origin_index_drops_the_record_instead_of_panicking() {
-        let mix = PayloadMix::new();
-        {
-            // Simulate the "added a variant, forgot `ALL`" state directly: an
-            // index past the array's width. `record_apply` must survive it.
-            let mut w = mix.window.lock();
-            assert!(
-                w.applies.get_mut(ApplyOrigin::COUNT).is_none(),
-                "test premise: COUNT indexes past the end"
-            );
-        }
-        // The real call cannot produce an out-of-range index today, so assert
-        // the guard's shape rather than reaching through it: every listed
-        // origin records, and the window stays consistent.
-        for origin in ApplyOrigin::ALL {
-            mix.record_apply(origin, true);
-        }
-        let json = emit(&mix);
-        for origin in ApplyOrigin::ALL {
-            assert_eq!(json[format!("applies_{}_changed", origin.label())], 1);
-        }
+    fn record_apply_indexes_the_origin_arm_fallibly_pin() {
+        let src = include_str!("broadcast_payload_mix.rs");
+        let start = src
+            .find("pub(crate) fn record_apply(")
+            .expect("record_apply not found");
+        let body = &src[start..];
+        let end = body.find("\n    }").expect("end of record_apply not found");
+        let body: String = body[..end].split_whitespace().collect();
+
+        assert!(
+            body.contains("w.applies.get_mut(idx)"),
+            "record_apply must index the origin arm fallibly; a bare \
+             `w.applies[idx]` panics inside a held mutex on the apply hot path \
+             the moment a variant is added to `index()` but not to `ALL`"
+        );
     }
 
     /// The published schema splits applies by origin AND by whether the merge
@@ -2769,6 +2850,64 @@ mod tests {
         );
     }
 
+    /// Source-scrape pin: every `update_contract` call site's `ApplyOrigin`.
+    ///
+    /// This is THE production mutation for this feature and no other test sees
+    /// it: flipping `ClientLocal` to `NetworkRelay` at a driver call site
+    /// collapses the denominator and explodes the published multiplier, while
+    /// the whole suite stays green. The behavioural test proves
+    /// `update_contract` honours the origin it is HANDED; only this pins which
+    /// origin each caller hands it.
+    ///
+    /// Counts rather than names the sites, so adding a legitimate one is a
+    /// deliberate update to this test rather than a silent drift. If you are
+    /// here because the count changed: check the new site tags its CONTENT's
+    /// provenance, not its scheduling lane — see `ApplyOrigin`.
+    #[test]
+    fn update_contract_call_sites_tag_their_origin_pin() {
+        // (file, ClientLocal sites, NetworkRelay sites)
+        let files = [
+            (
+                "update/op_ctx_task.rs",
+                include_str!("../../operations/update/op_ctx_task.rs"),
+                2,
+                4,
+            ),
+            (
+                "put/op_ctx_task.rs",
+                include_str!("../../operations/put/op_ctx_task.rs"),
+                0,
+                2,
+            ),
+        ];
+        let (mut client_total, mut relay_total) = (0, 0);
+        for (name, src, want_client, want_relay) in files {
+            let flat: String = src.split_whitespace().collect();
+            let client = flat
+                .matches("crate::node::ApplyOrigin::ClientLocal")
+                .count();
+            let relay = flat
+                .matches("crate::node::ApplyOrigin::NetworkRelay")
+                .count();
+            assert_eq!(
+                (client, relay),
+                (want_client, want_relay),
+                "{name}: update_contract origin tags changed. A wrong tag here \
+                 silently moves the #5062 denominator and nothing else catches it."
+            );
+            client_total += client;
+            relay_total += relay;
+        }
+        assert_eq!(
+            (client_total, relay_total),
+            (2, 6),
+            "8 production update_contract call sites: 2 client-originated, \
+             6 relayed. The put reverse-delta merge is deliberately RELAYED — \
+             it applies content the remote holder sent back, even though its \
+             `Priority` is ClientLocal for scheduling reasons."
+        );
+    }
+
     /// Source-scrape pin: `update_contract` must record BOTH terminal apply
     /// outcomes.
     ///
@@ -2790,12 +2929,15 @@ mod tests {
             .expect("end of update_contract not found");
         let body = &body[..end];
 
-        // Whitespace-collapsed before matching, following the convention of
-        // the sibling pin in this same file
-        // (`update_contract_never_builds_a_summary_from_state_bytes`): needles
-        // that embed rustfmt's line breaks turn a green test red on a pure
-        // reformat, which teaches the next person to delete the pin.
-        let collapsed: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        // ALL whitespace removed before matching, which is the convention of
+        // the sibling pin over this same function
+        // (`update_contract_never_builds_a_summary_from_state_bytes`, in
+        // `operations/update.rs`). Joining on a single space instead — as an
+        // earlier revision of this test did — still embeds rustfmt's choices:
+        // reflowing the call across lines yields `record_apply( origin,` and
+        // every needle below misses. A pin that goes red on a pure reformat
+        // teaches the next person to delete it.
+        let collapsed: String = body.split_whitespace().collect();
 
         assert_eq!(
             collapsed.matches("record_apply(origin,").count(),
@@ -2809,23 +2951,25 @@ mod tests {
         // must pass a literal `false`. Hardcoding `true` in either would count
         // no-op merges as broadcast-emitting applies and inflate the ratio.
         assert!(
-            collapsed.contains("record_apply(origin, state_changed)"),
+            collapsed.contains("record_apply(origin,state_changed)"),
             "the state-changed arm must record the handler's own \
              `state_changed` verdict"
         );
         assert!(
-            collapsed.contains("record_apply(origin, false)"),
+            collapsed.contains("record_apply(origin,false)"),
             "the merged-to-no-change arm must record `changed = false`"
         );
         // Ordering: the no-change record must precede the state-recovery
         // fallback's error exit, or an early failure there silently drops that
-        // arm from the denominator. Same idiom as the offset-comparison pins in
-        // `update/op_ctx_task.rs`.
+        // arm from the denominator. The harness cannot reach that exit (its
+        // stand-in always serves the fallback's GetQuery), so this textual
+        // check is the only thing holding the ordering. Same idiom as the
+        // offset-comparison pins in `update/op_ctx_task.rs`.
         let no_change_pos = collapsed
-            .find("record_apply(origin, false)")
+            .find("record_apply(origin,false)")
             .expect("no-change record not found");
         let fallback_err_pos = collapsed
-            .find("Cannot extract state from delta-only UpdateData")
+            .find("Cannotextractstatefromdelta-onlyUpdateData")
             .expect("state-recovery fallback not found");
         assert!(
             no_change_pos < fallback_err_pos,

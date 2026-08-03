@@ -732,10 +732,12 @@ pub(crate) async fn update_contract(
                 new_val.size() > 0,
                 "update_contract: state must be non-empty after successful UPDATE for contract {key}"
             );
-            // #5062: attribute this apply to where the update came from. See
-            // `ApplyOrigin` for why `priority` is a sound provenance source
-            // and why `state_changed` is a 1:1 correlate of a broadcast
-            // fan-out being emitted.
+            // #5062: attribute this apply to where its CONTENT came from —
+            // `origin`, never the `priority` above. Those are free to diverge
+            // (a scheduling lane is not a provenance claim) and at one call
+            // site they already do; see `ApplyOrigin`. `state_changed` is what
+            // causes the executor to emit a fan-out, modulo the residuals
+            // enumerated there.
             op_manager.payload_mix.record_apply(origin, state_changed);
             // #4923: no summary is computed here — never relabel the state
             // bytes as a summary (the self-poisoning full-state-broadcast
