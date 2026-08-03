@@ -5346,6 +5346,43 @@ shutdown-drain-secs = 42
         }
     }
 
+    /// Both emissions must survive.
+    ///
+    /// The `eprintln!` is the load-bearing one: `read_config` runs inside
+    /// `ConfigArgs::build`, one line before `set_logger`, so no subscriber
+    /// exists yet and the tracing event alone goes nowhere. Deleting it returns
+    /// the operator to silence about a setting the node just ignored — which is
+    /// the #5124 failure itself, arriving through the fix for it. Deleting
+    /// either was otherwise green.
+    ///
+    /// Source-scraped, and honest about being so: capturing stderr in-process
+    /// is awkward, and a scrape that says why beats no guard at all.
+    #[test]
+    fn the_duplicate_spelling_warning_is_still_emitted_both_ways() {
+        let source = include_str!("config.rs");
+        let body = source
+            .split("fn redundant_key_spellings(")
+            .nth(1)
+            .expect("redundant_key_spellings must exist")
+            .split("\nfn ")
+            .next()
+            .expect("its body must be delimited by the next item");
+        // Needles assembled at runtime and matched on the CALL, not the macro
+        // name: written literally they would match this test's own text, and
+        // the bare macro name also matches the prose comment beside the
+        // emissions. Both traps were hit writing this.
+        for emission in [
+            format!("tracing::warn!(\"{{{}}}\")", "message"),
+            format!("eprintln!(\"warning: {{{}}}\")", "message"),
+        ] {
+            assert!(
+                body.contains(&emission),
+                "`redundant_key_spellings` must still emit `{emission}` — see \
+                 this test's rustdoc for why both are needed"
+            );
+        }
+    }
+
     /// ...and the remote-index call site must actually PASS its URL.
     ///
     /// The message-formatting test above pins what `redundant_key_spellings`
