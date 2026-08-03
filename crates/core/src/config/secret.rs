@@ -139,7 +139,11 @@ impl ConfigArgs {
     }
 }
 
+/// CLI/env arguments for the secret paths. Serde names mirror [`Secrets`];
+/// see [`crate::config::NetworkArgs`] for why no back-compat `alias` is needed
+/// on an args struct.
 #[derive(Debug, Default, Clone, clap::Parser, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct SecretArgs {
     /// Path to the X25519 keypair for the transport layer.
     #[clap(long, value_parser, default_value=None, env = "TRANSPORT_KEYPAIR")]
@@ -292,11 +296,19 @@ impl SecretArgs {
 /// an unrelated allocation. `TransportKeypair` carries its own
 /// `ZeroizeOnDrop` on the secret-key half (`x25519_dalek::StaticSecret`),
 /// so this struct does not need to wipe it explicitly.
+/// Flattened into [`crate::config::Config`], so its keys are top-level keys in
+/// `config.toml` and follow the same kebab-case convention (#5124). The
+/// historical `transport_keypair` spelling stays accepted via `alias`.
 #[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct Secrets {
     #[serde(skip)]
     pub transport_keypair: TransportKeypair,
-    #[serde(rename = "transport_keypair", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "transport-keypair",
+        alias = "transport_keypair",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub transport_keypair_path: Option<PathBuf>,
     #[serde(skip)]
     pub nonce: [u8; 24],

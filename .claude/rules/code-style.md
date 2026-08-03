@@ -363,6 +363,25 @@ fails to COMPILE there until you classify it:
   - not config (peer_id, gateways, secret key material, derived/runtime
     fields) → bind it to `_` in the guard with a one-line reason.
 
+**Its TOML key MUST be kebab-case.** Every struct that participates in
+`config.toml` carries `#[serde(rename_all = "kebab-case")]`, so a normal
+`snake_case` Rust field already gets the right key — do NOT add a
+per-field `#[serde(rename = "...")]` that merely spells out the same
+kebab form. Only rename when the key genuinely differs from the field
+name (`min_connections` → `min-number-of-connections`).
+
+The guard test `config::tests::config_toml_keys_are_all_kebab_case`
+serializes a fully-populated `Config` and fails on any key containing an
+underscore. If it fails, fix the key — do not add an exception. If the
+underscored key was already released, keep it working by adding
+`#[serde(alias = "<old_key>")]` plus an entry in
+`config::tests::RENAMED_CONFIG_KEYS`.
+
+WHY: before #5124, keys were kebab-cased one `rename` at a time and some
+were missed, so `total-bandwidth-limit` and `bandwidth_limit` sat
+adjacent in the same file with no way to guess which was which. A user
+on Matrix could not find the bandwidth settings at all.
+
 ### WHEN writing documentation
 
 ```

@@ -1179,7 +1179,23 @@ mod serde_log_level_filter {
     }
 }
 
+/// Node configuration, as persisted to and read back from `config.toml`.
+///
+/// # TOML key convention
+///
+/// Every key in `config.toml` is **kebab-case**, enforced structurally by the
+/// container-level `rename_all` on this struct and on each struct flattened
+/// into it (rather than by remembering a per-field `rename`, which is how the
+/// spelling drifted in the first place — see #5124). The
+/// `config_toml_keys_are_all_kebab_case` test fails if a new field breaks the
+/// convention.
+///
+/// The historical underscored spelling of every key that used to be written
+/// with underscores is still accepted on deserialization via `#[serde(alias)]`,
+/// so a `config.toml` written by any earlier release keeps working unchanged
+/// and indefinitely. Only the *emitted* spelling changed.
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "kebab-case")]
 pub struct Config {
     /// Node operation mode.
     pub mode: OperationMode,
@@ -1189,7 +1205,7 @@ pub struct Config {
     pub ws_api: WebsocketApiConfig,
     #[serde(flatten)]
     pub secrets: Secrets,
-    #[serde(with = "serde_log_level_filter")]
+    #[serde(with = "serde_log_level_filter", alias = "log_level")]
     pub log_level: tracing::log::LevelFilter,
     #[serde(flatten)]
     config_paths: Arc<ConfigPaths>,
@@ -1197,10 +1213,14 @@ pub struct Config {
     pub(crate) peer_id: Option<PeerId>,
     #[serde(skip)]
     pub(crate) gateways: Vec<GatewayConfig>,
+    #[serde(alias = "is_gateway")]
     pub(crate) is_gateway: bool,
     pub(crate) location: Option<f64>,
     /// Maximum number of threads for blocking operations (WASM execution, etc.).
-    #[serde(default = "default_max_blocking_threads")]
+    #[serde(
+        default = "default_max_blocking_threads",
+        alias = "max_blocking_threads"
+    )]
     pub max_blocking_threads: usize,
     /// Budget in bytes for hosted contract *state*. Once exceeded, contracts
     /// are evicted (least-valuable-first) and their on-disk state reclaimed.
@@ -1222,7 +1242,6 @@ pub struct Config {
     /// [`is_default_hosting_budget`].
     #[serde(
         default = "default_max_hosting_storage",
-        rename = "max-hosting-storage",
         skip_serializing_if = "is_default_hosting_budget"
     )]
     pub max_hosting_storage: u64,
@@ -1231,13 +1250,13 @@ pub struct Config {
     /// budget is the second floor on hosting eviction
     /// (`effective = min(ram_budget, disk_budget)`). Default 0.5. Persisted so an
     /// operator override survives a flag-less restart.
-    #[serde(default = "default_hosting_disk_pct", rename = "hosting-disk-pct")]
+    #[serde(default = "default_hosting_disk_pct")]
     pub hosting_disk_pct: f64,
     /// Hard upper clamp in bytes for the aggregate disk budget (#4683), the disk
     /// analogue of `max-hosting-storage`. The disk budget never exceeds this even
     /// on a host with a very large data disk. Default 32 GiB. Persisted so an
     /// operator override survives a flag-less restart.
-    #[serde(default = "default_max_hosting_disk", rename = "max-hosting-disk")]
+    #[serde(default = "default_max_hosting_disk")]
     pub max_hosting_disk: u64,
     /// Per-user secret-storage quota in bytes for hosted mode (#4561, P5 of
     /// #4381). Bounds a single hosted user's TOTAL on-disk footprint (active
@@ -1276,10 +1295,7 @@ pub struct Config {
     /// #4441). When unset, the default scales with system RAM
     /// (`clamp(total_ram / 8, 64 MiB, 4 GiB)`) so a small VPS doesn't OOM and
     /// a big gateway still caches a large working set.
-    #[serde(
-        default = "default_module_cache_budget_bytes",
-        rename = "module-cache-budget-bytes"
-    )]
+    #[serde(default = "default_module_cache_budget_bytes")]
     pub module_cache_budget_bytes: usize,
 
     /// Whether to write the local append-only diagnostic event log
@@ -1300,11 +1316,7 @@ pub struct Config {
     ///
     /// NOT related to the telemetry that feeds telemetry.freenet.org; see the
     /// `ConfigArgs::enable_event_log` docs (#4968).
-    #[serde(
-        default,
-        rename = "enable-event-log",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_event_log: Option<bool>,
 
     /// Telemetry configuration
@@ -1327,10 +1339,7 @@ pub struct Config {
     /// `freenet-git` mirror PUTs on the nova gateway, producing
     /// repeated `Mirror to Freenet` failure alerts to
     /// `#freenet-dev:matrix.org`.
-    #[serde(
-        default = "default_shutdown_drain_secs",
-        rename = "shutdown-drain-secs"
-    )]
+    #[serde(default = "default_shutdown_drain_secs")]
     pub shutdown_drain_secs: u64,
 
     /// Operator opt-out of the automatic self-update check. RUNTIME-ONLY, NOT
@@ -1439,7 +1448,17 @@ impl Config {
     }
 }
 
+/// CLI/env arguments for the `[network]` settings, merged over `config.toml`
+/// in [`ConfigArgs::build`].
+///
+/// Serde names mirror [`NetworkApiConfig`] (the struct that actually defines
+/// the persisted `config.toml` keys) so the two never disagree about what a
+/// setting is called; the kebab-case convention is enforced structurally by
+/// `rename_all` plus the `config_toml_keys_are_all_kebab_case` guard test
+/// (#5124). No back-compat `alias` is needed here: this struct is a clap
+/// parser and is never itself read back from an on-disk file.
 #[derive(clap::Parser, Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct NetworkArgs {
     /// Address to bind to for the network event listener, default is :: (dual-stack)
     #[arg(
@@ -1452,7 +1471,7 @@ pub struct NetworkArgs {
 
     /// Port to bind for the network event listener, default is 31337
     #[arg(long, env = "NETWORK_PORT")]
-    #[serde(rename = "network-port", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub network_port: Option<u16>,
 
     /// Public address for the network. Required for gateways.
@@ -1491,17 +1510,19 @@ pub struct NetworkArgs {
 
     /// Optional list of gateways to connect to in network mode. Used for testing purposes.
     #[arg(long, hide = true)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub gateways: Option<Vec<String>>,
 
     /// Gateway peers to connect to, specified as "ip:port,hex-pubkey".
     /// The hex-pubkey is a 64-character hex-encoded X25519 public key (32 bytes).
     /// Can be repeated: --gateway "1.2.3.4:31337,abcd..." --gateway "5.6.7.8:31337,ef01..."
     #[arg(long)]
-    #[serde(rename = "gateway", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway: Option<Vec<String>>,
 
     /// Optional location of the node, this is to be able to deterministically set locations for gateways for testing purposes.
     #[arg(long, hide = true, env = "LOCATION")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<f64>,
 
     /// Ignores protocol version failures, continuing to run the node if there is a mismatch with the gateway.
@@ -1513,50 +1534,43 @@ pub struct NetworkArgs {
     /// The general packet rate limiter is currently disabled due to reliability issues.
     /// Default: 3 MB/s (3,000,000 bytes/second)
     #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bandwidth_limit: Option<usize>,
 
     /// Total bandwidth limit across ALL connections (in bytes per second).
     /// When set, individual connection rates are computed as: total / active_connections.
     /// This overrides the per-connection bandwidth_limit.
     #[arg(long)]
-    #[serde(
-        rename = "total-bandwidth-limit",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub total_bandwidth_limit: Option<usize>,
 
     /// Minimum bandwidth per connection when using total_bandwidth_limit (bytes/sec).
     /// Prevents connection starvation when many connections are active.
     /// Default: 1 MB/s (1,000,000 bytes/second)
     #[arg(long)]
-    #[serde(
-        rename = "min-bandwidth-per-connection",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub min_bandwidth_per_connection: Option<usize>,
 
     /// List of IP:port addresses to refuse connections to/from.
     #[arg(long, num_args = 0..)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked_addresses: Option<Vec<SocketAddr>>,
 
     /// Capacity for the event loop notification and op execution channels.
     /// Default: 2048. Increase under sustained multi-client load to reduce
     /// channel saturation and associated context-switch spikes.
     #[arg(long, env = "EVENT_LOOP_CHANNEL_CAPACITY")]
-    #[serde(
-        rename = "event-loop-channel-capacity",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub event_loop_channel_capacity: Option<usize>,
 
     /// Maximum number of concurrent transient connections accepted by a gateway.
     #[arg(long, env = "TRANSIENT_BUDGET")]
-    #[serde(rename = "transient-budget", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub transient_budget: Option<usize>,
 
     /// Time (in seconds) before an unpromoted transient connection is dropped.
     #[arg(long, env = "TRANSIENT_TTL_SECS")]
-    #[serde(rename = "transient-ttl-secs", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub transient_ttl_secs: Option<u64>,
 
     /// Minimum desired connections for the ring topology. Defaults to 10.
@@ -1578,10 +1592,7 @@ pub struct NetworkArgs {
     /// Threshold in bytes above which streaming transport is used.
     /// Default: 65536 (64KB)
     #[arg(long, env = "STREAMING_THRESHOLD")]
-    #[serde(
-        rename = "streaming-threshold",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub streaming_threshold: Option<usize>,
 
     /// Minimum ssthresh floor for LEDBAT timeout recovery (bytes).
@@ -1599,10 +1610,7 @@ pub struct NetworkArgs {
     ///
     /// Default: None (uses spec-compliant 2*min_cwnd ≈ 5.7KB floor)
     #[arg(long, env = "LEDBAT_MIN_SSTHRESH")]
-    #[serde(
-        rename = "ledbat-min-ssthresh",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ledbat_min_ssthresh: Option<usize>,
 
     /// Congestion control algorithm for transport connections.
@@ -1614,7 +1622,7 @@ pub struct NetworkArgs {
     ///
     /// Default: `fixedrate` (most stable for production)
     #[arg(long, env = "FREENET_CONGESTION_CONTROL")]
-    #[serde(rename = "congestion-control", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub congestion_control: Option<String>,
 
     /// BBR startup minimum pacing rate (bytes/sec).
@@ -1624,7 +1632,7 @@ pub struct NetworkArgs {
     ///
     /// Default: 25 MB/s (25_000_000 bytes/sec)
     #[arg(long, env = "FREENET_BBR_STARTUP_RATE")]
-    #[serde(rename = "bbr-startup-rate", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bbr_startup_rate: Option<u64>,
 }
 
@@ -1722,6 +1730,7 @@ impl NetworkArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct NetworkApiConfig {
     /// Address to listen to locally
     #[serde(default = "default_listening_address", rename = "network-address")]
@@ -1733,13 +1742,22 @@ pub struct NetworkApiConfig {
 
     /// Public external address for the network, mandatory for gateways.
     #[serde(
-        rename = "public_network_address",
+        rename = "public-network-address",
+        alias = "public_network_address",
         skip_serializing_if = "Option::is_none"
     )]
     pub public_address: Option<IpAddr>,
 
     /// Public external port for the network, mandatory for gateways.
-    #[serde(rename = "public_port", skip_serializing_if = "Option::is_none")]
+    ///
+    /// Named to match the `--public-network-port` flag and its
+    /// `public-network-address` sibling; `public_port` is the historical
+    /// spelling and is still accepted.
+    #[serde(
+        rename = "public-network-port",
+        alias = "public_port",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub public_port: Option<u16>,
 
     /// Whether to ignore protocol version compatibility routine while initiating connections.
@@ -1753,7 +1771,7 @@ pub struct NetworkApiConfig {
     ///
     /// If `total_bandwidth_limit` is set, this field is ignored and per-connection rates
     /// are derived from: `total_bandwidth_limit / active_connections`.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "bandwidth_limit", skip_serializing_if = "Option::is_none")]
     pub bandwidth_limit: Option<usize>,
 
     /// Total bandwidth limit across ALL connections (in bytes per second).
@@ -1762,7 +1780,10 @@ pub struct NetworkApiConfig {
     ///
     /// Example: With 50 MB/s total and 5 connections, each gets 10 MB/s.
     /// Default: None (use per-connection `bandwidth_limit` instead)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        alias = "total_bandwidth_limit",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub total_bandwidth_limit: Option<usize>,
 
     /// Minimum bandwidth per connection when using `total_bandwidth_limit` (bytes/sec).
@@ -1770,25 +1791,31 @@ pub struct NetworkApiConfig {
     ///
     /// If `total / N < min`, each connection gets `min` (exceeding total is possible).
     /// Default: 1 MB/s (1,000,000 bytes/second)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        alias = "min_bandwidth_per_connection",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub min_bandwidth_per_connection: Option<usize>,
 
     /// List of IP:port addresses to refuse connections to/from.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "blocked_addresses", skip_serializing_if = "Option::is_none")]
     pub blocked_addresses: Option<HashSet<SocketAddr>>,
 
     /// Capacity for the event loop notification and op execution channels.
     /// Default: 2048. Increase under sustained multi-client load to reduce
     /// channel saturation and associated context-switch spikes.
-    #[serde(default = "default_event_loop_channel_capacity")]
+    #[serde(
+        default = "default_event_loop_channel_capacity",
+        alias = "event_loop_channel_capacity"
+    )]
     pub event_loop_channel_capacity: usize,
 
     /// Maximum number of concurrent transient connections accepted by a gateway.
-    #[serde(default = "default_transient_budget", rename = "transient-budget")]
+    #[serde(default = "default_transient_budget")]
     pub transient_budget: usize,
 
     /// Time (in seconds) before an unpromoted transient connection is dropped.
-    #[serde(default = "default_transient_ttl_secs", rename = "transient-ttl-secs")]
+    #[serde(default = "default_transient_ttl_secs")]
     pub transient_ttl_secs: u64,
 
     /// Minimum desired connections for the ring topology.
@@ -1807,10 +1834,7 @@ pub struct NetworkApiConfig {
 
     /// Threshold in bytes above which streaming transport is used.
     /// Default: 65536 (64KB)
-    #[serde(
-        default = "default_streaming_threshold",
-        rename = "streaming-threshold"
-    )]
+    #[serde(default = "default_streaming_threshold")]
     pub streaming_threshold: usize,
 
     /// Minimum ssthresh floor for LEDBAT timeout recovery (bytes).
@@ -1823,7 +1847,6 @@ pub struct NetworkApiConfig {
     /// Set to None for LAN-only deployments.
     #[serde(
         default = "default_ledbat_min_ssthresh",
-        rename = "ledbat-min-ssthresh",
         skip_serializing_if = "Option::is_none"
     )]
     pub ledbat_min_ssthresh: Option<usize>,
@@ -1834,7 +1857,7 @@ pub struct NetworkApiConfig {
     /// - `fixedrate` (default): Fixed-rate transmission at 10 Mbps per connection
     /// - `bbr`: BBR (Bottleneck Bandwidth and RTT)
     /// - `ledbat`: LEDBAT++ (Low Extra Delay Background Transport)
-    #[serde(default = "default_congestion_control", rename = "congestion-control")]
+    #[serde(default = "default_congestion_control")]
     pub congestion_control: String,
 
     /// BBR startup minimum pacing rate (bytes/sec).
@@ -1842,7 +1865,6 @@ pub struct NetworkApiConfig {
     /// Only used when congestion_control is "bbr".
     #[serde(
         default = "default_bbr_startup_rate",
-        rename = "bbr-startup-rate",
         skip_serializing_if = "Option::is_none"
     )]
     pub bbr_startup_rate: Option<u64>,
@@ -1855,7 +1877,7 @@ pub struct NetworkApiConfig {
     /// neither, the on-disk gateways.toml is still read — the test-harness
     /// contract preserved for callers like freenet-test-network's Docker NAT
     /// path that pre-populate the file in a custom `--config-dir`.
-    #[serde(default)]
+    #[serde(default, alias = "skip_load_from_network")]
     pub skip_load_from_network: bool,
 }
 
@@ -1941,7 +1963,10 @@ fn default_bbr_startup_rate() -> Option<u64> {
     None
 }
 
+/// CLI/env arguments for the websocket-API settings. Serde names mirror
+/// [`WebsocketApiConfig`]; see [`NetworkArgs`] for why no `alias` is needed.
 #[derive(clap::Parser, Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct WebsocketApiArgs {
     /// Address to bind to for the websocket API, default is :: (dual-stack)
     #[arg(
@@ -1954,20 +1979,17 @@ pub struct WebsocketApiArgs {
 
     /// Port to expose the websocket on, default is 7509
     #[arg(long, env = "WS_API_PORT")]
-    #[serde(rename = "ws-api-port", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ws_api_port: Option<u16>,
 
     /// Token time-to-live in seconds (default is 86400 = 24 hours)
     #[arg(long, env = "TOKEN_TTL_SECONDS")]
-    #[serde(rename = "token-ttl-seconds", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub token_ttl_seconds: Option<u64>,
 
     /// Token cleanup interval in seconds (default is 300 = 5 minutes)
     #[arg(long, env = "TOKEN_CLEANUP_INTERVAL_SECONDS")]
-    #[serde(
-        rename = "token-cleanup-interval-seconds",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub token_cleanup_interval_seconds: Option<u64>,
 
     /// Additional hostname(s) to accept in the Host header for the local
@@ -1978,7 +2000,7 @@ pub struct WebsocketApiArgs {
     /// Can be specified multiple times. If omitted, only the machine's hostname and
     /// bound IP are accepted.
     #[arg(long, env = "ALLOWED_HOST")]
-    #[serde(rename = "allowed-host", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_host: Option<Vec<String>>,
 
     /// Additional source IP ranges (CIDR notation) permitted to reach the
@@ -1998,10 +2020,7 @@ pub struct WebsocketApiArgs {
         env = "ALLOWED_SOURCE_CIDRS",
         value_delimiter = ','
     )]
-    #[serde(
-        rename = "allowed-source-cidrs",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_source_cidrs: Option<Vec<String>>,
 
     /// Opt-in hosted mode (P2 of #4381): honor a per-connection durable user
@@ -2064,7 +2083,7 @@ pub struct WebsocketApiArgs {
         num_args = 0..=1,
         default_missing_value = "true"
     )]
-    #[serde(rename = "hosted-mode", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hosted_mode: Option<bool>,
 
     /// Sustained per-user operation rate limit (requests/second) for HOSTED
@@ -2075,6 +2094,7 @@ pub struct WebsocketApiArgs {
     /// Default: 10 req/sec. `0` disables operation rate limiting. Has NO effect
     /// outside hosted mode — local single-user requests are never rate-limited.
     #[arg(long = "per-user-op-rate-limit", env = "PER_USER_OP_RATE_LIMIT")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub per_user_op_rate_limit: Option<u64>,
 
     /// Per-user operation burst capacity for HOSTED mode (#4561). The maximum
@@ -2083,6 +2103,7 @@ pub struct WebsocketApiArgs {
     /// Default: 100. Paired with the rate limit above; only meaningful when
     /// op rate limiting is enabled.
     #[arg(long = "per-user-op-burst", env = "PER_USER_OP_BURST")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub per_user_op_burst: Option<u64>,
 
     /// Minimum seconds between hosted-export downloads PER USER (#4561). The
@@ -2094,6 +2115,7 @@ pub struct WebsocketApiArgs {
         long = "per-user-export-min-interval-secs",
         env = "PER_USER_EXPORT_MIN_INTERVAL_SECS"
     )]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub per_user_export_min_interval_secs: Option<u64>,
 }
 
@@ -2101,7 +2123,10 @@ pub struct WebsocketApiArgs {
 /// Using domain name for resilience to IP changes.
 pub const DEFAULT_TELEMETRY_ENDPOINT: &str = "http://nova.locut.us:4318";
 
+/// CLI/env arguments for telemetry. Serde names mirror [`TelemetryConfig`];
+/// see [`NetworkArgs`] for why no `alias` is needed.
 #[derive(clap::Parser, Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct TelemetryArgs {
     /// Enable telemetry reporting to help improve Freenet (default: true during alpha).
     /// Telemetry includes operation timing and network topology data, but never contract content.
@@ -2124,10 +2149,7 @@ pub struct TelemetryArgs {
         long = "transport-snapshot-interval-secs",
         env = "FREENET_TRANSPORT_SNAPSHOT_INTERVAL_SECS"
     )]
-    #[serde(
-        rename = "transport-snapshot-interval-secs",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub transport_snapshot_interval_secs: Option<u64>,
 
     /// Enable the Phase 1.5 reference-ping shadow probe (#4074): a 1Hz
@@ -2142,10 +2164,7 @@ pub struct TelemetryArgs {
         env = "FREENET_REFERENCE_PING_ENABLED",
         default_value = "false"
     )]
-    #[serde(
-        rename = "reference-ping-enabled",
-        default = "default_reference_ping_enabled"
-    )]
+    #[serde(default = "default_reference_ping_enabled")]
     pub reference_ping_enabled: bool,
 
     /// Enable the Phase 1.6 OS-interface-tx shadow probe (#4074): a 1Hz
@@ -2160,7 +2179,7 @@ pub struct TelemetryArgs {
         env = "FREENET_IFACE_TX_ENABLED",
         default_value = "false"
     )]
-    #[serde(rename = "iface-tx-enabled", default = "default_iface_tx_enabled")]
+    #[serde(default = "default_iface_tx_enabled")]
     pub iface_tx_enabled: bool,
 }
 
@@ -2181,6 +2200,7 @@ fn default_telemetry_enabled() -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct TelemetryConfig {
     /// Whether telemetry reporting is enabled
     #[serde(default = "default_telemetry_enabled", rename = "telemetry-enabled")]
@@ -2193,10 +2213,7 @@ pub struct TelemetryConfig {
     /// Interval in seconds for emitting transport layer metric snapshots.
     /// Set to 0 to disable transport snapshots.
     /// Default: 30 seconds.
-    #[serde(
-        default = "default_transport_snapshot_interval_secs",
-        rename = "transport-snapshot-interval-secs"
-    )]
+    #[serde(default = "default_transport_snapshot_interval_secs")]
     pub transport_snapshot_interval_secs: u64,
 
     /// Whether this is a test environment (detected via --id flag).
@@ -2207,16 +2224,13 @@ pub struct TelemetryConfig {
     /// Enable the Phase 1.5 reference-ping shadow probe (#4074).
     /// Opt-in: defaults to false; production gateway configs set
     /// this to true. See `TelemetryArgs::reference_ping_enabled`.
-    #[serde(
-        default = "default_reference_ping_enabled",
-        rename = "reference-ping-enabled"
-    )]
+    #[serde(default = "default_reference_ping_enabled")]
     pub reference_ping_enabled: bool,
 
     /// Enable the Phase 1.6 OS-interface-tx shadow probe (#4074).
     /// Opt-in: defaults to false; production gateway configs set this to
     /// true. See `TelemetryArgs::iface_tx_enabled`.
-    #[serde(default = "default_iface_tx_enabled", rename = "iface-tx-enabled")]
+    #[serde(default = "default_iface_tx_enabled")]
     pub iface_tx_enabled: bool,
 }
 
@@ -2250,6 +2264,7 @@ impl Default for TelemetryConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct WebsocketApiConfig {
     /// Address to bind to
     #[serde(default = "default_listening_address", rename = "ws-api-address")]
@@ -2260,14 +2275,11 @@ pub struct WebsocketApiConfig {
     pub port: u16,
 
     /// Token time-to-live in seconds
-    #[serde(default = "default_token_ttl_seconds", rename = "token-ttl-seconds")]
+    #[serde(default = "default_token_ttl_seconds")]
     pub token_ttl_seconds: u64,
 
     /// Token cleanup interval in seconds
-    #[serde(
-        default = "default_token_cleanup_interval_seconds",
-        rename = "token-cleanup-interval-seconds"
-    )]
+    #[serde(default = "default_token_cleanup_interval_seconds")]
     pub token_cleanup_interval_seconds: u64,
 
     /// Additional hostnames allowed in the Host header for WebSocket connections.
@@ -2278,7 +2290,7 @@ pub struct WebsocketApiConfig {
     /// Additional source IP ranges (CIDR) permitted to reach the API.
     /// Stored as parsed `IpNet` so config errors surface at startup.
     /// Empty means only loopback + RFC1918 / IPv6 ULA are accepted.
-    #[serde(default, rename = "allowed-source-cidrs")]
+    #[serde(default)]
     pub allowed_source_cidrs: Vec<ipnet::IpNet>,
 
     /// Opt-in hosted mode (P2 of #4381). When `true`, a WebSocket connection
@@ -2290,32 +2302,26 @@ pub struct WebsocketApiConfig {
     /// This flag ONLY governs whether the WS boundary derives a per-user
     /// context; everything downstream is driven by whether a context was
     /// derived, so with the flag off the entire feature is inert.
-    #[serde(default, rename = "hosted-mode")]
+    #[serde(default)]
     pub hosted_mode: bool,
 
     /// Sustained per-user operation rate limit (requests/second) for hosted
     /// mode (#4561, P5 of #4381). Bounds how fast a single hosted user can
     /// issue contract operations so one visitor cannot flood the node. `0`
     /// disables op rate limiting. No effect outside hosted mode. Default 10.
-    #[serde(
-        default = "default_per_user_op_rate_limit",
-        rename = "per-user-op-rate-limit"
-    )]
+    #[serde(default = "default_per_user_op_rate_limit")]
     pub per_user_op_rate_limit: u64,
 
     /// Per-user operation burst capacity for hosted mode (#4561). Max ops a
     /// previously-idle user may issue back-to-back before being throttled to
     /// the sustained rate. Default 100.
-    #[serde(default = "default_per_user_op_burst", rename = "per-user-op-burst")]
+    #[serde(default = "default_per_user_op_burst")]
     pub per_user_op_burst: u64,
 
     /// Minimum seconds between hosted-export downloads per user (#4561). Export
     /// is expensive, so it gets a separate tighter limit; a request inside this
     /// window returns HTTP 429. `0` disables export rate limiting. Default 10.
-    #[serde(
-        default = "default_per_user_export_min_interval_secs",
-        rename = "per-user-export-min-interval-secs"
-    )]
+    #[serde(default = "default_per_user_export_min_interval_secs")]
     pub per_user_export_min_interval_secs: u64,
 
     /// Resolved secrets directory for this node. RUNTIME-ONLY, NOT persisted
@@ -2523,7 +2529,10 @@ const fn default_ws_api_port() -> u16 {
     7509
 }
 
+/// CLI/env arguments for the on-disk paths. Serde names mirror
+/// [`ConfigPaths`]; see [`NetworkArgs`] for why no `alias` is needed.
 #[derive(clap::Parser, Default, Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct ConfigPathsArgs {
     /// The configuration directory.
     #[arg(long, default_value = None, env = "CONFIG_DIR")]
@@ -2696,21 +2705,29 @@ impl ConfigPathsArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct ConfigPaths {
+    #[serde(alias = "contracts_dir")]
     contracts_dir: PathBuf,
+    #[serde(alias = "delegates_dir")]
     delegates_dir: PathBuf,
+    #[serde(alias = "secrets_dir")]
     secrets_dir: PathBuf,
+    #[serde(alias = "db_dir")]
     db_dir: PathBuf,
+    #[serde(alias = "event_log")]
     event_log: PathBuf,
+    #[serde(alias = "data_dir")]
     data_dir: PathBuf,
+    #[serde(alias = "config_dir")]
     config_dir: PathBuf,
-    #[serde(default = "get_log_dir")]
+    #[serde(default = "get_log_dir", alias = "log_dir")]
     log_dir: Option<PathBuf>,
     /// Relocated wasmtime compile-cache directory (#4683). `#[serde(default)]`
     /// so a `config.toml` persisted before this field existed deserializes with
     /// an empty path; `build()` always re-derives the real one from the data
     /// dir, so the persisted value is never load-bearing.
-    #[serde(default)]
+    #[serde(default, alias = "wasmtime_cache_dir")]
     wasmtime_cache_dir: PathBuf,
 }
 
@@ -4254,6 +4271,400 @@ mod tests {
         let cfg = args.build().await.unwrap();
         let serialized = toml::to_string(&cfg).unwrap();
         let _: Config = toml::from_str(&serialized).unwrap();
+    }
+
+    // ---------------------------------------------------------------------
+    // #5124 — `config.toml` key convention: every key is kebab-case, and the
+    // historical underscored spelling of every renamed key stays accepted.
+    // ---------------------------------------------------------------------
+
+    /// Keys whose *emitted* spelling changed in #5124, as
+    /// `(historical spelling, current spelling)`.
+    ///
+    /// This is the whole back-compat surface of that change: every entry's
+    /// left-hand side is still accepted on deserialization via
+    /// `#[serde(alias = ...)]`, and both spellings must produce an identical
+    /// `Config`. Anything not listed here kept the spelling it always had.
+    const RENAMED_CONFIG_KEYS: &[(&str, &str)] = &[
+        ("public_network_address", "public-network-address"),
+        // The port did not merely lose its underscore: it is now named after
+        // its `--public-network-port` flag and its address sibling.
+        ("public_port", "public-network-port"),
+        ("bandwidth_limit", "bandwidth-limit"),
+        ("total_bandwidth_limit", "total-bandwidth-limit"),
+        (
+            "min_bandwidth_per_connection",
+            "min-bandwidth-per-connection",
+        ),
+        ("blocked_addresses", "blocked-addresses"),
+        ("event_loop_channel_capacity", "event-loop-channel-capacity"),
+        ("skip_load_from_network", "skip-load-from-network"),
+        ("transport_keypair", "transport-keypair"),
+        ("log_level", "log-level"),
+        ("contracts_dir", "contracts-dir"),
+        ("delegates_dir", "delegates-dir"),
+        ("secrets_dir", "secrets-dir"),
+        ("db_dir", "db-dir"),
+        ("event_log", "event-log"),
+        ("data_dir", "data-dir"),
+        ("config_dir", "config-dir"),
+        ("log_dir", "log-dir"),
+        ("wasmtime_cache_dir", "wasmtime-cache-dir"),
+        ("is_gateway", "is-gateway"),
+        ("max_blocking_threads", "max-blocking-threads"),
+    ];
+
+    /// A `config.toml` exactly as a pre-#5124 release wrote it, with every
+    /// optional key set to a non-default value so nothing is silently masked
+    /// by a `default`/`skip_serializing_if` fallback.
+    ///
+    /// Values are deliberately distinct from every default so that a key that
+    /// fails to bind is visible as a wrong value, not as a coincidental match.
+    const LEGACY_CONFIG_TOML: &str = r#"
+mode = "network"
+network-address = "0.0.0.0"
+network-port = 31338
+public_network_address = "203.0.113.7"
+public_port = 31339
+bandwidth_limit = 3000001
+total_bandwidth_limit = 2000002
+min_bandwidth_per_connection = 250003
+blocked_addresses = ["198.51.100.9:1234"]
+event_loop_channel_capacity = 4096
+transient-budget = 1024
+transient-ttl-secs = 45
+min-number-of-connections = 25
+max-number-of-connections = 200
+streaming-threshold = 65537
+ledbat-min-ssthresh = 102401
+congestion-control = "bbr"
+bbr-startup-rate = 12345678
+skip_load_from_network = true
+ws-api-address = "127.0.0.1"
+ws-api-port = 7510
+token-ttl-seconds = 86401
+token-cleanup-interval-seconds = 301
+allowed-host = ["example.invalid"]
+allowed-source-cidrs = ["100.64.0.0/10"]
+hosted-mode = true
+per-user-op-rate-limit = 11
+per-user-op-burst = 101
+per-user-export-min-interval-secs = 12
+transport_keypair = "/tmp/freenet-5124/secrets/transport_keypair"
+nonce = "/tmp/freenet-5124/secrets/nonce"
+cipher = "/tmp/freenet-5124/secrets/delegate_cipher"
+log_level = "debug"
+contracts_dir = "/tmp/freenet-5124/contracts"
+delegates_dir = "/tmp/freenet-5124/delegates"
+secrets_dir = "/tmp/freenet-5124/secrets"
+db_dir = "/tmp/freenet-5124/db"
+event_log = "/tmp/freenet-5124/_EVENT_LOG"
+data_dir = "/tmp/freenet-5124"
+config_dir = "/tmp/freenet-5124/config"
+log_dir = "/tmp/freenet-5124/logs"
+wasmtime_cache_dir = "/tmp/freenet-5124/wasmtime-cache"
+is_gateway = true
+location = 0.25
+max_blocking_threads = 17
+max-hosting-storage = 12345678
+hosting-disk-pct = 0.25
+max-hosting-disk = 23456789
+per-user-secret-quota = 4194305
+per-user-inactive-ttl = 2592001
+inactive-user-sweep-interval = 3601
+module-cache-budget-bytes = 4294967296
+enable-event-log = true
+telemetry-enabled = true
+telemetry-endpoint = "http://127.0.0.1:14318"
+transport-snapshot-interval-secs = 31
+reference-ping-enabled = true
+iface-tx-enabled = true
+shutdown-drain-secs = 42
+"#;
+
+    /// [`LEGACY_CONFIG_TOML`] rewritten into the current all-kebab-case
+    /// spelling, via [`RENAMED_CONFIG_KEYS`]. Asserts each rewrite actually
+    /// fired so a typo in either table can't quietly turn this into a copy of
+    /// the legacy document.
+    fn kebab_config_toml() -> String {
+        let mut doc = LEGACY_CONFIG_TOML.to_string();
+        for (legacy, kebab) in RENAMED_CONFIG_KEYS {
+            let from = format!("\n{legacy} = ");
+            let to = format!("\n{kebab} = ");
+            assert!(
+                doc.contains(&from),
+                "LEGACY_CONFIG_TOML is missing the `{legacy}` key that \
+                 RENAMED_CONFIG_KEYS says was renamed to `{kebab}`"
+            );
+            doc = doc.replace(&from, &to);
+        }
+        doc
+    }
+
+    /// Every value that a renamed key carries, asserted against the parsed
+    /// `Config`. Shared by the legacy and kebab-case tests so both spellings
+    /// are held to the identical, explicit expectation — an equality check
+    /// between the two parses alone would pass vacuously if BOTH spellings
+    /// were ignored and both fell back to defaults.
+    fn assert_renamed_key_values_bound(cfg: &Config) {
+        assert_eq!(
+            cfg.network_api.public_address,
+            Some("203.0.113.7".parse::<IpAddr>().unwrap())
+        );
+        assert_eq!(cfg.network_api.public_port, Some(31339));
+        assert_eq!(cfg.network_api.bandwidth_limit, Some(3_000_001));
+        assert_eq!(cfg.network_api.total_bandwidth_limit, Some(2_000_002));
+        assert_eq!(cfg.network_api.min_bandwidth_per_connection, Some(250_003));
+        assert_eq!(
+            cfg.network_api.blocked_addresses,
+            Some(HashSet::from(["198.51.100.9:1234".parse().unwrap()]))
+        );
+        assert_eq!(cfg.network_api.event_loop_channel_capacity, 4096);
+        assert!(cfg.network_api.skip_load_from_network);
+        assert_eq!(
+            cfg.secrets.transport_keypair_path.as_deref(),
+            Some(Path::new("/tmp/freenet-5124/secrets/transport_keypair"))
+        );
+        assert_eq!(cfg.log_level, tracing::log::LevelFilter::Debug);
+        assert_eq!(
+            cfg.config_paths.contracts_dir,
+            PathBuf::from("/tmp/freenet-5124/contracts")
+        );
+        assert_eq!(
+            cfg.config_paths.delegates_dir,
+            PathBuf::from("/tmp/freenet-5124/delegates")
+        );
+        assert_eq!(
+            cfg.config_paths.secrets_dir,
+            PathBuf::from("/tmp/freenet-5124/secrets")
+        );
+        assert_eq!(
+            cfg.config_paths.db_dir,
+            PathBuf::from("/tmp/freenet-5124/db")
+        );
+        assert_eq!(
+            cfg.config_paths.event_log,
+            PathBuf::from("/tmp/freenet-5124/_EVENT_LOG")
+        );
+        assert_eq!(
+            cfg.config_paths.data_dir,
+            PathBuf::from("/tmp/freenet-5124")
+        );
+        assert_eq!(
+            cfg.config_paths.config_dir,
+            PathBuf::from("/tmp/freenet-5124/config")
+        );
+        assert_eq!(
+            cfg.config_paths.log_dir,
+            Some(PathBuf::from("/tmp/freenet-5124/logs"))
+        );
+        assert_eq!(
+            cfg.config_paths.wasmtime_cache_dir,
+            PathBuf::from("/tmp/freenet-5124/wasmtime-cache")
+        );
+        assert!(cfg.is_gateway);
+        assert_eq!(cfg.max_blocking_threads, 17);
+    }
+
+    /// BACK-COMPAT: a `config.toml` written by any pre-#5124 release still
+    /// parses, and every value still binds to the field it always bound to.
+    /// Renaming the emitted keys must never orphan an operator's existing file.
+    #[test]
+    fn legacy_underscored_config_toml_keys_still_bind() {
+        let cfg: Config = toml::from_str(LEGACY_CONFIG_TOML)
+            .expect("a config.toml written by a pre-#5124 release must still parse");
+        assert_renamed_key_values_bound(&cfg);
+    }
+
+    /// THE BUG (#5124): before the fix, keys like `bandwidth-limit` and
+    /// `log-level` were not accepted — a user who followed the kebab-case
+    /// convention the rest of the file demonstrates got a silently-ignored
+    /// setting (for the `Option`/`default`ed keys) or a hard parse failure
+    /// (for `log_level` / `is_gateway`, which have no default).
+    #[test]
+    fn kebab_case_config_toml_keys_bind() {
+        let cfg: Config = toml::from_str(&kebab_config_toml())
+            .expect("every config.toml key must be accepted in kebab-case");
+        assert_renamed_key_values_bound(&cfg);
+    }
+
+    /// Both spellings must produce byte-identical configuration, not merely
+    /// two configs that each parsed without error.
+    #[test]
+    fn legacy_and_kebab_config_toml_are_equivalent() {
+        let legacy: Config = toml::from_str(LEGACY_CONFIG_TOML).unwrap();
+        let kebab: Config = toml::from_str(&kebab_config_toml()).unwrap();
+        assert_eq!(
+            toml::to_string(&legacy).unwrap(),
+            toml::to_string(&kebab).unwrap(),
+            "the historical and current spellings of a key must deserialize to \
+             the same value"
+        );
+    }
+
+    /// END-TO-END UPGRADE (#5124): a node whose on-disk `config.toml` was
+    /// written by a pre-#5124 release must (a) keep every operator value on the
+    /// first post-upgrade boot, (b) have the file rewritten in the current
+    /// kebab-case spelling, and (c) still see those values on the next boot,
+    /// from the rewritten file.
+    ///
+    /// (c) is the part a parse-only test cannot cover: the rewrite is what
+    /// would silently revert an operator's settings to defaults if the emitted
+    /// keys and the accepted keys ever disagreed.
+    #[tokio::test]
+    async fn legacy_config_toml_survives_upgrade_and_is_rewritten_kebab_case() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+        // Written exactly as a pre-#5124 release would have written it, for a
+        // node whose operator had customized the bandwidth settings — the case
+        // from the issue. Secret paths are omitted because `read_config` loads
+        // them from disk; their aliases are covered by the parse tests above.
+        let legacy = format!(
+            r#"
+mode = "local"
+network-address = "0.0.0.0"
+network-port = 31338
+bandwidth_limit = 3000001
+total_bandwidth_limit = 2000002
+min_bandwidth_per_connection = 250003
+blocked_addresses = ["198.51.100.9:1234"]
+event_loop_channel_capacity = 4096
+skip_load_from_network = true
+ws-api-address = "127.0.0.1"
+ws-api-port = 7510
+log_level = "debug"
+contracts_dir = "{dir}/contracts"
+delegates_dir = "{dir}/delegates"
+secrets_dir = "{dir}/secrets"
+db_dir = "{dir}/db"
+event_log = "{dir}/_EVENT_LOG"
+data_dir = "{dir}"
+config_dir = "{dir}"
+log_dir = "{dir}"
+wasmtime_cache_dir = "{dir}/wasmtime-cache"
+is_gateway = false
+max_blocking_threads = 17
+"#,
+            dir = dir.display()
+        );
+        std::fs::write(dir.join("config.toml"), &legacy).unwrap();
+
+        let assert_operator_values = |cfg: &Config, when: &str| {
+            assert_eq!(
+                cfg.network_api.bandwidth_limit,
+                Some(3_000_001),
+                "bandwidth_limit must survive {when}"
+            );
+            assert_eq!(
+                cfg.network_api.total_bandwidth_limit,
+                Some(2_000_002),
+                "total_bandwidth_limit must survive {when}"
+            );
+            assert_eq!(
+                cfg.network_api.min_bandwidth_per_connection,
+                Some(250_003),
+                "min_bandwidth_per_connection must survive {when}"
+            );
+            assert_eq!(
+                cfg.network_api.blocked_addresses,
+                Some(HashSet::from(["198.51.100.9:1234".parse().unwrap()])),
+                "blocked_addresses must survive {when}"
+            );
+            assert_eq!(
+                cfg.network_api.event_loop_channel_capacity, 4096,
+                "event_loop_channel_capacity must survive {when}"
+            );
+            assert!(
+                cfg.network_api.skip_load_from_network,
+                "skip_load_from_network must survive {when}"
+            );
+            assert_eq!(
+                cfg.log_level,
+                tracing::log::LevelFilter::Debug,
+                "log_level must survive {when}"
+            );
+            assert_eq!(
+                cfg.max_blocking_threads, 17,
+                "max_blocking_threads must survive {when}"
+            );
+        };
+
+        let first_boot = clap_bare_args(dir).build().await.unwrap();
+        assert_operator_values(&first_boot, "the first boot after upgrading");
+
+        let rewritten = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+        let underscored: Vec<&str> = rewritten
+            .lines()
+            .filter_map(|line| line.split('=').next())
+            .map(str::trim)
+            .filter(|key| key.contains('_'))
+            .collect();
+        assert!(
+            underscored.is_empty(),
+            "the rewritten config.toml must use kebab-case keys, found: \
+             {underscored:?}\n{rewritten}"
+        );
+
+        let second_boot = clap_bare_args(dir).build().await.unwrap();
+        assert_operator_values(&second_boot, "a reboot from the rewritten file");
+    }
+
+    /// STRUCTURAL GUARD (#5124): every key freenet writes into `config.toml`
+    /// is kebab-case. A new field that lands with an underscored key — the way
+    /// `bandwidth_limit` and friends did — fails here.
+    ///
+    /// If this test fails, do NOT add the offending key to an exception list:
+    /// give the field's struct `#[serde(rename_all = "kebab-case")]` (or the
+    /// field an explicit kebab-case `rename`). If the key was already released
+    /// with an underscore, add `#[serde(alias = "<old_key>")]` and an entry in
+    /// [`RENAMED_CONFIG_KEYS`] so existing files keep working.
+    #[test]
+    fn config_toml_keys_are_all_kebab_case() {
+        // Parsed from the fully-populated document so that `Option` fields
+        // carrying `skip_serializing_if` are actually emitted and checked.
+        let cfg: Config = toml::from_str(&kebab_config_toml()).unwrap();
+        let doc: toml::Table = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+
+        fn is_kebab_case(key: &str) -> bool {
+            !key.is_empty()
+                && key.split('-').all(|seg| {
+                    !seg.is_empty()
+                        && seg
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                })
+        }
+
+        fn check(table: &toml::Table, path: &str, offenders: &mut Vec<String>) {
+            for (key, value) in table {
+                let full = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                if !is_kebab_case(key) {
+                    offenders.push(full.clone());
+                }
+                if let toml::Value::Table(inner) = value {
+                    check(inner, &full, offenders);
+                }
+            }
+        }
+
+        let mut offenders = Vec::new();
+        check(&doc, "", &mut offenders);
+        assert!(
+            offenders.is_empty(),
+            "config.toml keys must be kebab-case; these are not: {offenders:?}"
+        );
+
+        // Sanity-check the checker itself, so a bug in `is_kebab_case` cannot
+        // make this guard vacuously pass.
+        assert!(is_kebab_case("bandwidth-limit"));
+        assert!(is_kebab_case("mode"));
+        assert!(!is_kebab_case("bandwidth_limit"));
+        assert!(!is_kebab_case("Bandwidth-Limit"));
+        assert!(!is_kebab_case("bandwidth--limit"));
     }
 
     #[tokio::test]
