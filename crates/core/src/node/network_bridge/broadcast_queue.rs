@@ -101,9 +101,14 @@ pub(super) struct SendLanePermit {
     /// `None` only while parked waiting out a congested large lane — see
     /// [`Self::ensure_capacity_for`]. Nothing is on the wire during that
     /// window, so an absent permit never means unmetered bytes. (The one
-    /// exception is a large pool that CLOSES during that wait, which no code
-    /// path does today; the send then proceeds unmetered rather than hanging
-    /// forever. See [`Self::large_pool_closed`].)
+    /// exception is a large pool that CLOSES during that wait — reachable only
+    /// via [`LaneGroup::shutdown`], i.e. after a drain has already stopped; the
+    /// send then proceeds unmetered rather than hanging forever. Every send
+    /// inside `ensure_capacity_for` takes that exit at once, so a shutdown can
+    /// release a one-off burst of up to `MAX_PARKED_LANE_UPGRADES` +
+    /// small-pool-width sends outside the large-payload limit. That is bounded,
+    /// one-off, and only on an already-broken node. See
+    /// [`Self::large_pool_closed`].)
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
     /// Which pool `permit` came from.
     lane: QueuedPayloadClass,
@@ -1477,11 +1482,9 @@ mod queue {
                 // This lane was empty, wait for new entries
                 notified.await;
                 // ...which may have been the sibling drain shutting us down
-                // rather than an enqueue. This exit must ALSO shut down, not
-                // just return: an idle drain can reach it first (its pool
-                // closes while it waits), and returning quietly here would
-                // leave the sibling running — the exact asymmetry this whole
-                // mechanism exists to prevent.
+                // rather than an enqueue. `LaneDrainGuard` would shut the
+                // sibling down on the way out regardless; the explicit call
+                // below is kept so the log names which lane stopped first.
                 if semaphore.is_closed() {
                     tracing::error!(
                         ?lane,
@@ -1598,8 +1601,11 @@ mod queue {
         fn start_worker_spawns_one_drain_per_lane() {
             let src = include_str!("broadcast_queue.rs");
             let start = src.find("pub(crate) fn start_worker(").unwrap();
+            // Bound at the end of `start_worker` itself, NOT at `drain_lane`:
+            // the wider slice would let the wiring literals below be satisfied
+            // by `LaneGroup`/`LaneDrainGuard`, which sit between the two.
             let end = src[start..]
-                .find("    /// Drain loop for ONE lane")
+                .find("    /// The pools and wakeups both lane drains share.")
                 .unwrap()
                 + start;
             let body = &src[start..end];
@@ -1608,6 +1614,19 @@ mod queue {
                 2,
                 "start_worker must spawn exactly one drain per lane"
             );
+            // Naming both lanes is load-bearing, not decoration: a count of two
+            // is equally satisfied by spawning the SAME lane twice, which leaves
+            // the other lane undrained until `evict_oldest` starts dropping its
+            // entries. `start_worker` has no test caller, so nothing else would
+            // notice. (The previous form of this pin carried the lane names
+            // incidentally, inside the argument literals; removing the dead
+            // argument removed them, which two reviewers caught.)
+            for lane in ["Small", "Large"] {
+                assert!(
+                    body.contains(&format!("spawn_lane(QueuedPayloadClass::{lane})")),
+                    "start_worker must spawn a drain for the {lane} lane"
+                );
+            }
             // Pin the lane→pool and lane→notify WIRING, which lives in the
             // `LaneGroup` literal. Transposing either pair here is a one-token
             // slip: swapping the pools caps small broadcasts at 2 concurrent —
@@ -1957,6 +1976,11 @@ mod queue {
             // overflow behaviour is what gets exercised.
             let upgrade_slots = Arc::new(Semaphore::new(2));
             let (tx, mut dispatched) = tokio::sync::mpsc::unbounded_channel();
+            // Lifetime-cumulative process-global; this test is in the serial
+            // group with the only other test that evicts, so a delta is sound.
+            let evictions_before = crate::node::BROADCAST_QUEUE_EFFICIENCY_METRICS
+                .snapshot()
+                .capacity_evictions;
             let group = LaneGroup {
                 small_pool: small_permits.clone(),
                 large_pool: large_permits.clone(),
@@ -2006,7 +2030,11 @@ mod queue {
             }
             for _ in 0..2 {
                 assert_eq!(
-                    lane_of(dispatched.recv().await),
+                    lane_of(
+                        tokio::time::timeout(Duration::from_secs(5), dispatched.recv())
+                            .await
+                            .expect("both large permits must be taken and held")
+                    ),
                     Some(QueuedPayloadClass::Large),
                     "both large permits must be taken and held"
                 );
@@ -2027,7 +2055,11 @@ mod queue {
             }
             for _ in 0..12 {
                 assert_eq!(
-                    lane_of(dispatched.recv().await),
+                    lane_of(
+                        tokio::time::timeout(Duration::from_secs(5), dispatched.recv())
+                            .await
+                            .expect("the small lane dispatches up to its pool width")
+                    ),
                     Some(QueuedPayloadClass::Small),
                     "the small lane dispatches up to its pool width"
                 );
@@ -2092,19 +2124,23 @@ mod queue {
                  evict_oldest and drops whole fan-outs (#5118)"
             );
 
-            let q = queue.queue.lock().await;
-            assert!(
-                q.entries.len() < 256,
-                "and the queue must not have backed up to the depth cap"
+            assert_eq!(
+                crate::node::BROADCAST_QUEUE_EFFICIENCY_METRICS
+                    .snapshot()
+                    .capacity_evictions,
+                evictions_before,
+                "and nothing was evicted — dropping queued entries under a \
+                 misprediction burst is the user-visible half of #5118, since \
+                 eviction walks seq order and a fan-out's per-peer entries form \
+                 a temporal cluster"
             );
-            drop(q);
             release.add_permits(64);
             for worker in workers {
                 worker.abort();
             }
         }
 
-        /// #4961, head-of-line half.        /// #4961, head-of-line half. A small entry queued behind a large entry
+        /// #4961, head-of-line half. A small entry queued behind a large entry
         /// that is waiting for large-lane capacity must still be scheduled.
         ///
         /// Pre-fix, ONE worker drained both lanes and awaited the large
@@ -2689,8 +2725,6 @@ mod queue {
             for phase in [Phase::HoldingSlot, Phase::Parked, Phase::QueuedForParking] {
                 let park_first = !matches!(phase, Phase::HoldingSlot);
                 let small = Arc::new(Semaphore::new(12));
-                // TWO large permits, one left free, so the "took no large
-                // permit" assertion below can actually fail.
                 let large = Arc::new(Semaphore::new(2));
                 let _occupied = large
                     .clone()
@@ -2757,11 +2791,9 @@ mod queue {
                     1,
                     "[{phase:?}] and so must the parking slot"
                 );
-                assert_eq!(
-                    large.available_permits(),
-                    0,
-                    "[{phase:?}] the cancelled send took no large permit"
-                );
+                // No assertion on `large` here: the test holds both of its
+                // permits for the whole run, so any such check is vacuous. The
+                // small and parking pools above are what discriminate.
             }
         }
 

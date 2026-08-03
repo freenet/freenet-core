@@ -202,7 +202,7 @@ pub(crate) struct NetworkEfficiencyV1 {
     ///   * queued-small/actual-large read 0 fleet-wide pre-fix and was close to
     ///     structurally so (the lane came from the state size, which bounds the
     ///     payload from above to within `MIN_FULL_STATE_SAVING_BYTES`); the one
-    ///     ways it could fire were a delta exceeding the state by up to
+    ///     two ways it could fire were a delta exceeding the state by up to
     ///     `MIN_FULL_STATE_SAVING_BYTES`, and the stale-dedup-lane defect fixed
     ///     alongside this in #5108. It is now the payload-misprediction count and is EXPECTED to
     ///     be non-zero. Those sends still take a large-lane permit before
