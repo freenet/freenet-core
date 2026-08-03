@@ -731,6 +731,13 @@ pub(crate) async fn update_contract(
                 new_val.size() > 0,
                 "update_contract: state must be non-empty after successful UPDATE for contract {key}"
             );
+            // #5062: attribute this apply to where the update came from. See
+            // `ApplyOrigin` for why `priority` is a sound provenance source
+            // and why `state_changed` is a 1:1 correlate of a broadcast
+            // fan-out being emitted.
+            op_manager
+                .payload_mix
+                .record_apply_with_priority(priority, state_changed);
             // #4923: no summary is computed here — never relabel the state
             // bytes as a summary (the self-poisoning full-state-broadcast
             // loop), and no per-apply summary fetch on this hot path either
@@ -748,6 +755,16 @@ pub(crate) async fn update_contract(
             Err(err.into())
         }
         Ok(ContractHandlerEvent::UpdateNoChange { .. }) => {
+            // #5062: recorded at the TOP of the arm, before the state-recovery
+            // fallback below. The apply itself is already terminal and already
+            // decided — the handler merged and the state did not move, so no
+            // broadcast was emitted. The fallback's own failure paths are
+            // about reconstructing a value to RETURN, not about whether the
+            // apply happened, so an early error there must not silently drop
+            // this arm from the denominator.
+            op_manager
+                .payload_mix
+                .record_apply_with_priority(priority, false);
             // Helper to extract state from UpdateData variants that contain state
             fn extract_state_from_update_data(
                 update_data: &UpdateData<'static>,

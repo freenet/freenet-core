@@ -67,13 +67,50 @@
 //!
 //! [rt]: crate::topology::meter::ResourceType::BroadcastFanoutCost
 //!
+//! ## The fan-out multiplier (#5062)
+//!
+//! Everything above measures what this node SENT. [`ApplyOrigin`] measures the
+//! other half — what this node APPLIED, and whether it came from a local
+//! client or from a peer — because the send counters alone cannot distinguish
+//! the two topologies that produce the fleet's observed ~17.5 payloads per
+//! state-changing one (#5091):
+//!
+//!   * one node fanning out to its ~17 co-hosts, versus
+//!   * ~17 nodes each RE-fanning-out to their own ~17 co-hosts.
+//!
+//! Those differ by a further ~17x in cost, and by which fix applies: a payload
+//! fix for the first, a propagation-topology fix for the second. The number
+//! that separates them is
+//!
+//! ```text
+//! sum(total_sends) / sum(applies_client_local_changed)
+//! ```
+//!
+//! summed over the fleet as a RATIO OF SUMS, never a mean of per-window
+//! ratios — most nodes serve no local clients, so a per-node ratio is `0/0`
+//! most windows. `applies_network_relay_changed / applies_client_local_changed`
+//! reads the re-broadcast amplification directly.
+//!
+//! ### What is deliberately NOT here
+//!
+//! #5062 also asks for this split PER CONTRACT. That is not in this rollup, on
+//! volume grounds: a top-N array of per-contract origin counts roughly doubles
+//! this event's contribution, on a collector already ingesting ~30 GB/day with
+//! ~3-day retention, to refine a number nobody has read yet. Per-contract SENDS
+//! already ship (`top_contracts_by_total_bytes`, #4979/#5055), so the moment
+//! the node-level ratio says re-broadcast amplification is real, the
+//! per-contract denominator is a small follow-up against a known-useful
+//! measurement rather than a speculative one.
+//!
 //! ## Cost
 //!
 //! One short uncontended mutex acquire per **delivered broadcast** (not per
 //! packet), covering a handful of integer adds and at most one bounded
-//! `HashMap` touch. Everything else happens in the aggregator task, and the
-//! hot path only ever WRITES. The lock is what makes a rollup a consistent
-//! snapshot; see [`PayloadMix`] for why per-field atomics were not enough.
+//! `HashMap` touch, plus one more per completed update APPLY (strictly rarer
+//! than sends, since one apply is what fans out to N peers). Everything else
+//! happens in the aggregator task, and the hot path only ever WRITES. The lock
+//! is what makes a rollup a consistent snapshot; see [`PayloadMix`] for why
+//! per-field atomics were not enough.
 //!
 //! [`broadcast_to_single_peer`]: super::broadcast_queue::broadcast_to_single_peer
 
@@ -213,6 +250,111 @@ impl PayloadArm {
     }
 }
 
+/// Where an update this node APPLIED came from — the denominator half of the
+/// fan-out multiplier (#5062).
+///
+/// ## Why this is the missing measurement
+///
+/// The sender-side arm counters above say how many payloads this node put on
+/// the wire, and #5091's receiver-side counters say how few of them changed
+/// anything (fleet-measured at 17.5 payloads delivered per one that changes
+/// state). Neither can separate the two topologies that produce that number
+/// and have completely different remedies:
+///
+///   * one node fans out to its ~17 co-hosts, and
+///   * ~17 nodes EACH re-fan-out to their own ~17 co-hosts.
+///
+/// They differ by a further ~17x in cost. Splitting applies by origin is what
+/// tells them apart: under the first, essentially every broadcast a node emits
+/// follows a locally-originated apply; under the second, all but a ~1/18th
+/// slice follow a RELAYED apply that this node then re-broadcast.
+///
+/// ## Why the counter can be taken here at all
+///
+/// `Executor::bridged_upsert_contract_state_inner` calls `commit_state_update`
+/// — the only production emitter of `NodeEvent::BroadcastStateChange` on the
+/// UPDATE path — inside the `updated_state != current_state` branch, and
+/// returns `UpsertResult::NoChange` otherwise. So a `changed == true` apply is
+/// a 1:1 correlate of a broadcast fan-out being emitted, and no provenance
+/// plumbing through the `ContractExecutor` trait is needed to attribute it:
+/// `update_contract` already receives the origin as a
+/// [`Priority`](crate::contract::Priority) and already learns `changed` from
+/// the handler's reply.
+///
+/// The one gap in that correspondence is the broken-invariant suppression
+/// (`ring::broken_invariants`), which can swallow a commit that this counter
+/// still counts as changed. It is rare, deliberate, and already separately
+/// observable, so it is left as a documented residual rather than a second
+/// counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApplyOrigin {
+    /// Originated by a WS/HTTP client connected to THIS node — the true
+    /// denominator of "sends per originated update".
+    ClientLocal,
+    /// Applied on behalf of a remote peer's relayed operation. A `changed`
+    /// apply here is a RE-broadcast: the amplification #5062 exists to size.
+    NetworkRelay,
+    /// Node-internal background work. No `update_contract` call site produces
+    /// this today; it is carried so that one appearing later shows up as its
+    /// own number instead of silently inflating the relay arm.
+    Background,
+}
+
+impl ApplyOrigin {
+    /// Every origin, in reporting order.
+    pub(crate) const ALL: [ApplyOrigin; 3] = [
+        ApplyOrigin::ClientLocal,
+        ApplyOrigin::NetworkRelay,
+        ApplyOrigin::Background,
+    ];
+
+    pub(crate) const COUNT: usize = Self::ALL.len();
+
+    const fn index(self) -> usize {
+        match self {
+            ApplyOrigin::ClientLocal => 0,
+            ApplyOrigin::NetworkRelay => 1,
+            ApplyOrigin::Background => 2,
+        }
+    }
+
+    /// Stable wire label. Used as a telemetry field infix, so changing one
+    /// breaks existing dashboard queries.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            ApplyOrigin::ClientLocal => "client_local",
+            ApplyOrigin::NetworkRelay => "network_relay",
+            ApplyOrigin::Background => "background",
+        }
+    }
+
+    /// Read the origin off the scheduling class the apply was queued under.
+    ///
+    /// [`Priority`](crate::contract::Priority) is a scheduling class that
+    /// happens to be defined on exactly this axis, and all eight production
+    /// `update_contract` call sites tag it explicitly and correctly today
+    /// (three `ClientLocal`, five `NetworkRelay`). Reusing it is what makes
+    /// this measurement a one-site change instead of a new parameter threaded
+    /// through the `ContractExecutor` trait and ~160 call sites.
+    ///
+    /// The risk it carries, stated so a future reader does not have to
+    /// rediscover it: `Priority::DEFAULT` is `NetworkRelay`, so a NEW call
+    /// site that forgets to tag itself reads as "relayed" rather than as
+    /// something unclassified. That biases the multiplier's denominator DOWN
+    /// and the amplification numerator UP — i.e. it can only ever make the
+    /// fan-out problem look worse than it is, never better, which is the safe
+    /// direction for a measurement whose purpose is to decide whether to spend
+    /// engineering effort on propagation topology. A new client-originated
+    /// path that lands untagged is the case to watch for.
+    pub(crate) const fn from_priority(priority: crate::contract::Priority) -> Self {
+        match priority {
+            crate::contract::Priority::ClientLocal => ApplyOrigin::ClientLocal,
+            crate::contract::Priority::NetworkRelay => ApplyOrigin::NetworkRelay,
+            crate::contract::Priority::Background => ApplyOrigin::Background,
+        }
+    }
+}
+
 /// One rollup window's counters.
 ///
 /// Every field advances together under a single lock so a rollup takes a
@@ -319,6 +461,22 @@ struct Window {
     /// [`SummaryMissingReason::index`]; sums to the `tracked` arm's totals.
     tracked_missing_sends: [u64; SummaryMissingReason::ALL.len()],
     tracked_missing_bytes: [u64; SummaryMissingReason::ALL.len()],
+
+    /// Update applies this node completed, by [`ApplyOrigin`] — the
+    /// denominator of the fan-out multiplier (#5062).
+    ///
+    /// Indexed `[origin][changed as usize]`, so `[o][1]` counts the applies
+    /// that actually mutated state (and therefore emitted a broadcast) and
+    /// `[o][0] + [o][1]` is every completed apply for that origin.
+    ///
+    /// Deliberately recorded into the SAME window as the `sends` counters
+    /// above and drained by the same atomic take, so a rollup's sends and its
+    /// applies describe the same 60 s of work and the ratio between them is
+    /// meaningful rather than smeared across window boundaries.
+    ///
+    /// Fixed cardinality (3 x 2 `u64`s), no per-contract map: see the module
+    /// docs for why the per-contract refinement is deliberately not here.
+    applies: [[u64; 2]; ApplyOrigin::COUNT],
 }
 
 impl Default for Window {
@@ -339,6 +497,7 @@ impl Default for Window {
             not_efficient_state_bytes_max: 0,
             tracked_missing_sends: [0; SummaryMissingReason::ALL.len()],
             tracked_missing_bytes: [0; SummaryMissingReason::ALL.len()],
+            applies: [[0; 2]; ApplyOrigin::COUNT],
         }
     }
 }
@@ -647,6 +806,45 @@ impl PayloadMix {
         }
     }
 
+    /// Record one COMPLETED update apply and where it came from (#5062).
+    ///
+    /// `changed` must be the contract handler's own verdict on whether the
+    /// merge mutated state, because that is precisely the condition under
+    /// which the executor emits a broadcast fan-out — see [`ApplyOrigin`].
+    ///
+    /// Call this only on a terminal apply outcome (merged, or merged-to-no-
+    /// change). Applies that ERRORED are deliberately excluded: nothing was
+    /// committed and nothing was broadcast, so counting them would pad the
+    /// denominator of a ratio whose whole purpose is to be compared against
+    /// sends. Failures are already published receiver-side by #5091's
+    /// `*_failed` terminal counters.
+    /// [`Self::record_apply`], reading the origin off the scheduling class the
+    /// apply was queued under.
+    ///
+    /// This is the form production calls. It exists so `operations::update`
+    /// never has to name [`ApplyOrigin`] — `node::network_bridge` is private
+    /// outside `node`, and more importantly the apply path has no business
+    /// knowing the telemetry taxonomy. The `Priority` -> origin
+    /// reinterpretation stays in one documented place; see
+    /// [`ApplyOrigin::from_priority`] for the aliasing risk it carries.
+    pub(crate) fn record_apply_with_priority(
+        &self,
+        priority: crate::contract::Priority,
+        changed: bool,
+    ) {
+        self.record_apply(ApplyOrigin::from_priority(priority), changed);
+    }
+
+    pub(crate) fn record_apply(&self, origin: ApplyOrigin, changed: bool) {
+        let idx = origin.index();
+        let changed_idx = usize::from(changed);
+        let mut w = self.window.lock();
+        // Saturating for the same reason as the send counters: a wrapped
+        // denominator would report an absurd multiplier rather than an
+        // obviously-clamped one.
+        w.applies[idx][changed_idx] = w.applies[idx][changed_idx].saturating_add(1);
+    }
+
     /// Atomically take the current window, leaving a fresh empty one.
     ///
     /// One lock acquisition covers every field, so the aggregate counters and
@@ -664,6 +862,20 @@ impl Window {
             .map(|arm| {
                 let idx = arm.index();
                 (*arm, self.sends[idx], self.bytes[idx])
+            })
+            .collect()
+    }
+
+    /// Per-origin `(changed, total)` applies in [`ApplyOrigin::ALL`] order.
+    fn applies(&self) -> Vec<(ApplyOrigin, u64, u64)> {
+        ApplyOrigin::ALL
+            .iter()
+            .map(|origin| {
+                let counts = self.applies[origin.index()];
+                // `total` is emitted rather than `unchanged` so the ratio's
+                // denominator is present as a published field instead of
+                // something a consumer has to reconstruct by addition.
+                (*origin, counts[1], counts[0].saturating_add(counts[1]))
             })
             .collect()
     }
@@ -814,6 +1026,7 @@ fn payload_mix_json(
     attribution_dropped_bytes: u64,
     gate: NotEfficientGateStats,
     tracked_missing: &[(SummaryMissingReason, u64, u64)],
+    applies: &[(ApplyOrigin, u64, u64)],
     window_secs: u64,
 ) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
@@ -1035,6 +1248,26 @@ fn payload_mix_json(
         "attribution_dropped_bytes".into(),
         attribution_dropped_bytes.into(),
     );
+    // #5062: the fan-out multiplier's denominator. `total_sends` above is the
+    // numerator, recorded into the same window and drained by the same atomic
+    // take, so the two describe the same 60 s of work.
+    //
+    // NO ratio is published here, deliberately. The quantity that matters is a
+    // ratio of SUMS over the fleet —
+    //   sum(total_sends) / sum(applies_client_local_changed)
+    // — and most nodes host no local clients, so a per-window per-node ratio is
+    // `0/0` far more often than not. Publishing one would invite exactly the
+    // mean-of-ratios aggregation that `not_efficient_summary_to_state_bytes_ratio`
+    // above is named to steer consumers away from, on data where it is far more
+    // degenerate. Raw counters only; the division belongs in the query.
+    for (origin, changed, total) in applies {
+        obj.insert(
+            format!("applies_{}_changed", origin.label()),
+            (*changed).into(),
+        );
+        obj.insert(format!("applies_{}_total", origin.label()), (*total).into());
+    }
+
     obj.insert("window_secs".into(), window_secs.into());
     serde_json::Value::Object(obj)
 }
@@ -1062,6 +1295,7 @@ pub(crate) fn emit_payload_mix_rollup(
         window.attribution_dropped_bytes,
         window.gate_stats(),
         &window.tracked_missing(),
+        &window.applies(),
         window_secs,
     );
     crate::tracing::telemetry::send_standalone_shadow_event_with_peer_id(
@@ -1413,6 +1647,7 @@ mod tests {
             window.attribution_dropped_bytes,
             window.gate_stats(),
             &[],
+            &[],
             60,
         );
         let top_sum: u64 = json["top_contracts_by_full_state_bytes"]
@@ -1465,6 +1700,7 @@ mod tests {
             window.attribution_dropped_sends,
             window.attribution_dropped_bytes,
             window.gate_stats(),
+            &[],
             &[],
             60,
         );
@@ -1582,6 +1818,7 @@ mod tests {
             window.attribution_dropped_bytes,
             window.gate_stats(),
             &window.tracked_missing(),
+            &window.applies(),
             60,
         );
         assert_eq!(json["total_attribution_dropped_sends"], 3);
@@ -1738,6 +1975,7 @@ mod tests {
             0,
             NotEfficientGateStats::default(),
             &[],
+            &[],
             60,
         );
         assert_eq!(json["total_bytes"], 1000);
@@ -1793,6 +2031,7 @@ mod tests {
             window.attribution_dropped_bytes,
             window.gate_stats(),
             &[],
+            &[],
             60,
         );
 
@@ -1825,6 +2064,7 @@ mod tests {
             window.attribution_dropped_bytes,
             window.gate_stats(),
             &window.tracked_missing(),
+            &window.applies(),
             60,
         )
     }
@@ -1996,6 +2236,7 @@ mod tests {
             window.attribution_dropped_bytes,
             window.gate_stats(),
             &[],
+            &[],
             60,
         );
         assert_eq!(json["not_efficient_summary_bytes_sum"], 2000);
@@ -2025,6 +2266,7 @@ mod tests {
             0,
             window.gate_stats(),
             &[],
+            &[],
             60,
         );
         assert!(json["not_efficient_summary_to_state_bytes_ratio"].is_null());
@@ -2045,6 +2287,7 @@ mod tests {
             0,
             0,
             NotEfficientGateStats::default(),
+            &[],
             &[],
             60,
         );
@@ -2217,5 +2460,217 @@ mod tests {
                 "{arm:?} must attribute its full-state bytes to the contract"
             );
         }
+    }
+
+    // ---- #5062: the fan-out multiplier's denominator ----
+
+    /// Every `Priority` class maps to a distinct origin, and the mapping is
+    /// the one the schema claims.
+    ///
+    /// This is the single point where a scheduling class is reinterpreted as
+    /// provenance, so it is the single point where that reinterpretation can
+    /// silently rot — e.g. a new `Priority` variant folded into an existing
+    /// arm. An exhaustive check here is what makes the reuse safe.
+    #[test]
+    fn apply_origin_maps_each_priority_class_to_its_own_arm() {
+        use crate::contract::Priority;
+
+        assert_eq!(
+            ApplyOrigin::from_priority(Priority::ClientLocal),
+            ApplyOrigin::ClientLocal
+        );
+        assert_eq!(
+            ApplyOrigin::from_priority(Priority::NetworkRelay),
+            ApplyOrigin::NetworkRelay
+        );
+        assert_eq!(
+            ApplyOrigin::from_priority(Priority::Background),
+            ApplyOrigin::Background
+        );
+
+        // Distinct indices and distinct labels: two origins sharing either
+        // would silently merge two arms of the measurement.
+        let indices: Vec<usize> = ApplyOrigin::ALL.iter().map(|o| o.index()).collect();
+        assert_eq!(indices, vec![0, 1, 2], "indices must be dense and ordered");
+        let mut labels: Vec<&str> = ApplyOrigin::ALL.iter().map(|o| o.label()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(
+            labels.len(),
+            ApplyOrigin::COUNT,
+            "every origin needs a unique wire label"
+        );
+    }
+
+    /// The published schema splits applies by origin AND by whether the merge
+    /// changed state — the `changed` arm being the one that corresponds 1:1
+    /// with an emitted broadcast.
+    #[test]
+    fn applies_split_by_origin_and_by_whether_state_changed() {
+        let mix = PayloadMix::new();
+        // Two locally-originated updates, one of which was a no-op merge.
+        mix.record_apply(ApplyOrigin::ClientLocal, true);
+        mix.record_apply(ApplyOrigin::ClientLocal, false);
+        // Three relayed applies, one of which actually moved state and so
+        // triggered a re-broadcast from this node.
+        mix.record_apply(ApplyOrigin::NetworkRelay, true);
+        mix.record_apply(ApplyOrigin::NetworkRelay, false);
+        mix.record_apply(ApplyOrigin::NetworkRelay, false);
+
+        let json = emit(&mix);
+        assert_eq!(json["applies_client_local_changed"], 1);
+        assert_eq!(json["applies_client_local_total"], 2);
+        assert_eq!(json["applies_network_relay_changed"], 1);
+        assert_eq!(json["applies_network_relay_total"], 3);
+        // Untouched origins are published as explicit zeros, not omitted: a
+        // missing field and a zero field read identically to a careless query
+        // but differently to a careful one.
+        assert_eq!(json["applies_background_changed"], 0);
+        assert_eq!(json["applies_background_total"], 0);
+    }
+
+    /// `total` is never less than `changed` for any origin — the invariant a
+    /// consumer divides by.
+    #[test]
+    fn applies_total_covers_changed_for_every_origin() {
+        let mix = PayloadMix::new();
+        for (i, origin) in ApplyOrigin::ALL.iter().enumerate() {
+            for _ in 0..=i {
+                mix.record_apply(*origin, true);
+            }
+            mix.record_apply(*origin, false);
+        }
+        let json = emit(&mix);
+        for (i, origin) in ApplyOrigin::ALL.iter().enumerate() {
+            let changed = json[format!("applies_{}_changed", origin.label())]
+                .as_u64()
+                .expect("changed must be a number");
+            let total = json[format!("applies_{}_total", origin.label())]
+                .as_u64()
+                .expect("total must be a number");
+            assert_eq!(changed, i as u64 + 1, "{origin:?} changed count");
+            assert_eq!(total, i as u64 + 2, "{origin:?} total count");
+            assert!(
+                total >= changed,
+                "{origin:?}: total ({total}) must cover changed ({changed})"
+            );
+        }
+    }
+
+    /// The multiplier's numerator and denominator must come out of the SAME
+    /// window, and the same atomic drain must reset both.
+    ///
+    /// This is the property that makes `total_sends / applies_*_changed`
+    /// meaningful at all. If applies survived a drain that reset sends (or
+    /// vice versa), the ratio would be computed across mismatched intervals —
+    /// the exact defect the single-mutex design exists to prevent for the
+    /// per-contract maps.
+    #[test]
+    fn applies_and_sends_share_one_window_and_one_drain() {
+        let mix = PayloadMix::new();
+        mix.record_apply(ApplyOrigin::ClientLocal, true);
+        mix.record_delivered(PayloadArm::Delta, &contract(1), 100, None, None);
+        mix.record_delivered(PayloadArm::Delta, &contract(1), 100, None, None);
+
+        let first = emit(&mix);
+        assert_eq!(first["applies_client_local_changed"], 1);
+        assert_eq!(first["total_sends"], 2, "one apply fanned out to two peers");
+
+        // Second window: the drain reset BOTH halves, so a quiet window
+        // reports zeros rather than re-reporting the previous window's work.
+        let second = emit(&mix);
+        assert_eq!(second["applies_client_local_changed"], 0);
+        assert_eq!(second["applies_client_local_total"], 0);
+        assert_eq!(second["total_sends"], 0);
+    }
+
+    /// An empty window publishes every apply field as zero.
+    #[test]
+    fn empty_window_publishes_zero_applies_for_every_origin() {
+        let json = emit(&PayloadMix::new());
+        for origin in ApplyOrigin::ALL.iter() {
+            assert_eq!(
+                json[format!("applies_{}_changed", origin.label())],
+                0,
+                "{origin:?} changed must be present and zero"
+            );
+            assert_eq!(
+                json[format!("applies_{}_total", origin.label())],
+                0,
+                "{origin:?} total must be present and zero"
+            );
+        }
+    }
+
+    /// Counters saturate rather than wrap.
+    ///
+    /// A wrapped denominator is worse than a clamped one: it reports a
+    /// plausible-looking small number, which yields an absurd multiplier that
+    /// reads as a real finding. Clamping at `u64::MAX` is obviously broken.
+    #[test]
+    fn apply_counters_saturate_rather_than_wrap() {
+        let mix = PayloadMix::new();
+        {
+            let mut w = mix.window.lock();
+            let idx = ApplyOrigin::NetworkRelay.index();
+            w.applies[idx][1] = u64::MAX;
+            w.applies[idx][0] = u64::MAX;
+        }
+        mix.record_apply(ApplyOrigin::NetworkRelay, true);
+        mix.record_apply(ApplyOrigin::NetworkRelay, false);
+
+        let json = emit(&mix);
+        assert_eq!(
+            json["applies_network_relay_changed"],
+            u64::MAX,
+            "changed count must clamp, not wrap to 0"
+        );
+        // `total` sums two saturated halves, and must itself clamp rather than
+        // overflow the addition in `Window::applies`.
+        assert_eq!(
+            json["applies_network_relay_total"],
+            u64::MAX,
+            "total must clamp, not wrap"
+        );
+    }
+
+    /// Source-scrape pin: `update_contract` must record BOTH terminal apply
+    /// outcomes.
+    ///
+    /// The two arms are ~100 lines apart in `operations/update.rs` and the
+    /// no-change one sits above a block of state-recovery fallback logic, so
+    /// the plausible regression is that a refactor keeps the changed arm and
+    /// drops the other. That would not fail any assertion — it would just make
+    /// every no-op apply vanish from the denominator and shrink the reported
+    /// multiplier, silently and in the flattering direction.
+    #[test]
+    fn update_contract_records_both_terminal_apply_outcomes_pin() {
+        let src = include_str!("../../operations/update.rs");
+        let start = src
+            .find("pub(crate) async fn update_contract(")
+            .expect("update_contract not found");
+        let body = &src[start..];
+        let end = body
+            .find("\n/// Send proactive summary notifications")
+            .expect("end of update_contract not found");
+        let body = &body[..end];
+
+        assert_eq!(
+            body.matches("record_apply_with_priority(priority,").count(),
+            2,
+            "update_contract must record exactly two apply outcomes — the \
+             state-changed merge and the merged-to-no-change arm — and both \
+             must pass this call's OWN `priority` rather than a hardcoded \
+             origin, because `priority` IS the provenance (#5062). Dropping \
+             either arm silently biases the fan-out denominator."
+        );
+        // The changed arm must forward the handler's verdict, not a literal:
+        // hardcoding `true` there would count every no-op merge as a
+        // broadcast-emitting apply.
+        assert!(
+            body.contains("record_apply_with_priority(priority, state_changed)"),
+            "the state-changed arm must record the handler's own \
+             `state_changed` verdict"
+        );
     }
 }
