@@ -608,7 +608,15 @@ jobs:
   windows_unit:
     name: Windows Service Unit
     runs-on: windows-latest
-    timeout-minutes: 30
+    # This job is new (introduced alongside the #5132 fix), so unlike
+    # macos_unit/windows_check it has no warm Swatinem cache from prior
+    # main-branch runs yet — a stone-cold Windows compile of the full
+    # freenet bin + test harness (wasmtime, tao, tray-icon, criterion,
+    # proptest, ...) does not finish in 30 minutes. 60 minutes gives this
+    # one-time cold start headroom; revisit downward once main has run
+    # this job at least once (cache only saves on `github.ref ==
+    # refs/heads/main`, see the cache step below).
+    timeout-minutes: 60
     needs: fmt_check
     # Same skip conditions as test_unit (see test_unit comment for details).
     if: |
