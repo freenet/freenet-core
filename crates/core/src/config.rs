@@ -385,7 +385,20 @@ fn redundant_key_spellings(
             continue;
         };
         for ignored in present {
-            let (kept_value, ignored_value) = (value_of(keep), value_of(ignored));
+            // Escaped and capped. A value reaches this message from the
+            // REMOTE gateway index too, where it is not operator-controlled:
+            // `toml::Value`'s Display renders an embedded newline as a raw
+            // newline, so an unescaped value lets a compromised or MITM'd index
+            // write attacker-chosen lines — including a forged `warning:`
+            // prefix — into the node's stderr and journal.
+            let render = |key| {
+                let value = format!("{:?}", value_of(key));
+                match value.char_indices().nth(200) {
+                    Some((cut, _)) => format!("{}…", &value[..cut]),
+                    None => value,
+                }
+            };
+            let (kept_value, ignored_value) = (render(keep), render(ignored));
             // Name both VALUES, not just both keys. The precedence rule spends
             // the operator's newly-typed setting to buy upgrade safety, and
             // this message is the whole of what they get back for it: without
@@ -515,7 +528,7 @@ impl ConfigArgs {
                             toml::from_str::<toml::Table>(&content).map_err(invalid_data)?;
                         let redundant = redundant_key_spellings(
                             CONFIG_KEY_SPELLINGS,
-                            "config.toml",
+                            &path.display().to_string(),
                             |key| table.contains_key(key),
                             |key| table[key].to_string(),
                         );
@@ -550,7 +563,7 @@ impl ConfigArgs {
                             .map(|map| {
                                 redundant_key_spellings(
                                     CONFIG_KEY_SPELLINGS,
-                                    "config.json",
+                                    &path.display().to_string(),
                                     |key| map.contains_key(key),
                                     |key| map[key].to_string(),
                                 )
@@ -1847,7 +1860,13 @@ pub struct InlineGwConfig {
     pub address: SocketAddr,
 
     /// Path to the public key of the gateway (hex-encoded X25519 key).
-    #[serde(rename = "public_key", alias = "public-key")]
+    ///
+    /// Deliberately NO `public-key` alias, unlike [`GatewayConfig`]: this is
+    /// the hidden `--gateways` JSON flag, emitted only by test harnesses, so a
+    /// second spelling buys nothing — while accepting one would re-create the
+    /// fatal `duplicate field` case in the one place `redundant_key_spellings`
+    /// does not reach.
+    #[serde(rename = "public_key")]
     pub public_key_path: PathBuf,
 
     /// Optional location of the gateway. Necessary for deterministic testing.
@@ -4595,6 +4614,28 @@ shutdown-drain-secs = 42
     /// spellings, both would fall back to the same default and the comparison
     /// would pass while the setting did nothing.
     fn assert_seeded_values_bound(cfg: &Config) {
+        assert_seeded_values_bound_except_secrets(cfg);
+        assert_eq!(
+            cfg.secrets.transport_keypair_path.as_deref(),
+            Some(Path::new("/tmp/freenet-5124/secrets/transport_keypair"))
+        );
+        // Single-word keys, so this change cannot move them — but they are the
+        // operator's key material, and nothing else in these tests asserts they
+        // still bind.
+        assert_eq!(
+            cfg.secrets.nonce_path.as_deref(),
+            Some(Path::new("/tmp/freenet-5124/secrets/nonce"))
+        );
+        assert_eq!(
+            cfg.secrets.cipher_path.as_deref(),
+            Some(Path::new("/tmp/freenet-5124/secrets/delegate_cipher"))
+        );
+    }
+
+    /// The same, minus the three secret paths — for tests that go through
+    /// `read_config`, which resolves those off disk and so cannot name files
+    /// that do not exist.
+    fn assert_seeded_values_bound_except_secrets(cfg: &Config) {
         assert_eq!(
             cfg.network_api.public_address,
             Some("203.0.113.7".parse::<IpAddr>().unwrap())
@@ -4609,10 +4650,6 @@ shutdown-drain-secs = 42
         );
         assert_eq!(cfg.network_api.event_loop_channel_capacity, 4096);
         assert!(cfg.network_api.skip_load_from_network);
-        assert_eq!(
-            cfg.secrets.transport_keypair_path.as_deref(),
-            Some(Path::new("/tmp/freenet-5124/secrets/transport_keypair"))
-        );
         assert_eq!(cfg.log_level, tracing::log::LevelFilter::Debug);
         assert_eq!(
             cfg.config_paths.contracts_dir,
@@ -4652,17 +4689,6 @@ shutdown-drain-secs = 42
         );
         assert!(cfg.is_gateway);
         assert_eq!(cfg.max_blocking_threads, 17);
-        // Single-word keys, so this change cannot move them — but they are the
-        // operator's key material, and nothing else in these tests asserts they
-        // still bind.
-        assert_eq!(
-            cfg.secrets.nonce_path.as_deref(),
-            Some(Path::new("/tmp/freenet-5124/secrets/nonce"))
-        );
-        assert_eq!(
-            cfg.secrets.cipher_path.as_deref(),
-            Some(Path::new("/tmp/freenet-5124/secrets/delegate_cipher"))
-        );
         // Keys that were always kebab-case, spot-checked so the documents are
         // exercised beyond the renamed set.
         assert_eq!(cfg.network_api.congestion_control, "bbr");
@@ -4771,6 +4797,44 @@ shutdown-drain-secs = 42
         );
     }
 
+    /// The exact set of `config.toml` keys #5127 shipped emitting with an
+    /// underscore, written out INDEPENDENTLY of [`CONFIG_KEY_SPELLINGS`].
+    ///
+    /// Independent on purpose: a table cannot guard itself. Review demonstrated
+    /// a green mutation that REORDERED a group so its kebab spelling came first
+    /// and moved the `#[serde(rename)]` to match — self-consistent, no row
+    /// deleted, and it is the edit a #5130 author following the table's own
+    /// "first entry is what the node writes" instruction would naturally make.
+    /// Pinning the count instead of the spellings could not see it.
+    ///
+    /// Removing an entry here means the node now writes that key under a
+    /// spelling shipped releases cannot read. Do it only as part of #5130's
+    /// rollout, having confirmed the release rollback would restore already
+    /// accepts the new spelling.
+    const KEYS_EMITTED_WITH_AN_UNDERSCORE: &[&str] = &[
+        "public_network_address",
+        "public_port",
+        "bandwidth_limit",
+        "total_bandwidth_limit",
+        "min_bandwidth_per_connection",
+        "blocked_addresses",
+        "event_loop_channel_capacity",
+        "skip_load_from_network",
+        "transport_keypair",
+        "log_level",
+        "contracts_dir",
+        "delegates_dir",
+        "secrets_dir",
+        "db_dir",
+        "event_log",
+        "data_dir",
+        "config_dir",
+        "log_dir",
+        "wasmtime_cache_dir",
+        "is_gateway",
+        "max_blocking_threads",
+    ];
+
     /// ROLLBACK SAFETY (#5124 / #5130): the node must keep WRITING the key
     /// spellings older releases can read.
     ///
@@ -4786,23 +4850,6 @@ shutdown-drain-secs = 42
     /// rollback could restore already accepts the new one. This release makes
     /// the hyphenated spellings accepted; #5130 flips what is emitted, one
     /// release later. Until then this guard fails if the emitted format moves.
-    /// The number of keys #5127 shipped emitting with an underscore.
-    ///
-    /// Pinned as a literal ON PURPOSE, and separately from
-    /// [`CONFIG_KEY_SPELLINGS`], because the table alone cannot guard itself:
-    /// deleting a row makes the guard blind to that key, and deleting the row
-    /// *and* moving the key's emitted spelling leaves the table
-    /// self-consistent. Both were demonstrated green against an earlier version
-    /// of this test. #5130 is exactly the change that edits the table — row by
-    /// row, as it flips each key — so the failure mode is one row removed a
-    /// release early.
-    ///
-    /// Lowering this number means the node now writes a key under a spelling
-    /// shipped releases cannot read. Do it only as part of #5130's rollout,
-    /// having confirmed the release rollback would restore already accepts the
-    /// new spelling.
-    const KEYS_EMITTED_WITH_AN_UNDERSCORE: usize = 21;
-
     #[tokio::test]
     async fn emitted_config_toml_keys_keep_their_released_spelling() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -4830,6 +4877,17 @@ shutdown-drain-secs = 42
             .map(|group| group[0])
             .filter(|key| key.contains('_'))
             .collect();
+        let pinned: BTreeSet<&str> = KEYS_EMITTED_WITH_AN_UNDERSCORE.iter().copied().collect();
+
+        // Against the INDEPENDENT list first: this is the assertion that
+        // survives the table being edited self-consistently.
+        assert_eq!(
+            emitted_underscored, pinned,
+            "the keys WRITTEN with an underscore no longer match the set this \
+             release shipped, which breaks crash-loop rollback (#4073) — read \
+             KEYS_EMITTED_WITH_AN_UNDERSCORE's rustdoc and #5130 before \
+             changing it"
+        );
 
         // Set equality, not "every tabled key is emitted": the reverse
         // direction is what catches a NEW field landing with an underscored
@@ -4846,9 +4904,9 @@ shutdown-drain-secs = 42
         );
         assert_eq!(
             CONFIG_KEY_SPELLINGS.len(),
-            KEYS_EMITTED_WITH_AN_UNDERSCORE,
-            "CONFIG_KEY_SPELLINGS changed size; read \
-             KEYS_EMITTED_WITH_AN_UNDERSCORE's rustdoc before touching it"
+            KEYS_EMITTED_WITH_AN_UNDERSCORE.len(),
+            "CONFIG_KEY_SPELLINGS gained or lost a group without the pinned \
+             list moving with it"
         );
     }
 
@@ -4965,6 +5023,11 @@ shutdown-drain-secs = 42
             "the spelling the node emits must win, so an upgrade never silently \
              changes a node's effective configuration"
         );
+        // Every other key must survive the normalized parse too: resolving the
+        // ambiguity routes the whole document through a different deserializer
+        // (`toml::Value::try_into` rather than `from_str`), so assert the lot
+        // rather than the one key the test is named for.
+        assert_seeded_values_bound_except_secrets(&cfg);
     }
 
     /// Same normalization, but between two ALIASES of one key, where neither is
@@ -5123,6 +5186,69 @@ shutdown-drain-secs = 42
             gateways.gateways[0].public_key_path,
             PathBuf::from("/tmp/freenet-5124/vega.pub"),
             "the spelling the node writes must win, as it does for config.toml"
+        );
+    }
+
+    /// Every `#[serde(alias = "...")]` in the config types must appear in
+    /// [`CONFIG_KEY_SPELLINGS`] or [`GATEWAY_KEY_SPELLINGS`].
+    ///
+    /// `key_spelling_groups_match_the_serde_aliases` checks the safe direction
+    /// — that everything listed is accepted. This checks the DANGEROUS one: an
+    /// alias added without a table row means a file naming that key both ways
+    /// is never normalized, so it hard-fails the node with `duplicate field`.
+    /// That is the fatal case this whole change exists to prevent, and it would
+    /// arrive with every other test green.
+    ///
+    /// Scraped from source because serde aliases are not reflectable at
+    /// runtime. #5130 will add and move many of these, which is exactly when a
+    /// row is easiest to forget.
+    #[test]
+    fn every_serde_alias_is_listed_in_a_spelling_table() {
+        let listed: BTreeSet<&str> = CONFIG_KEY_SPELLINGS
+            .iter()
+            .chain(GATEWAY_KEY_SPELLINGS.iter())
+            .flat_map(|group| group.iter().copied())
+            .collect();
+
+        let mut found = 0usize;
+        for (file, source) in [
+            ("config.rs", include_str!("config.rs")),
+            ("config/secret.rs", include_str!("config/secret.rs")),
+        ] {
+            for (line_no, line) in source.lines().enumerate() {
+                // Anywhere in the line: aliases share an attribute with
+                // `default` / `rename` / `skip_serializing_if` as often as not.
+                for occurrence in line.split("alias = \"").skip(1) {
+                    let Some(spelling) = occurrence.split('"').next() else {
+                        continue;
+                    };
+                    // Skip the illustrative `alias = "..."` in prose.
+                    if spelling.is_empty()
+                        || !spelling
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                    {
+                        continue;
+                    }
+                    found += 1;
+                    assert!(
+                        listed.contains(spelling),
+                        "{file}:{} declares `alias = \"{spelling}\"` but no \
+                         spelling table lists it, so a config naming that key \
+                         both ways would refuse to start instead of being \
+                         resolved",
+                        line_no + 1
+                    );
+                }
+            }
+        }
+        // A floor, so a scraper that silently stops matching cannot pass by
+        // finding nothing. Every group contributes at least one alias.
+        let expected = CONFIG_KEY_SPELLINGS.len() + GATEWAY_KEY_SPELLINGS.len();
+        assert!(
+            found >= expected,
+            "scraped only {found} aliases but {expected} spelling groups exist \
+             — the scraper has probably stopped matching the attribute format"
         );
     }
 
