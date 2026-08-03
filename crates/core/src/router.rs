@@ -183,22 +183,36 @@ pub(crate) struct NetworkEfficiencyV1 {
     ///     volume (they never were on the large side).
     ///   * queued-large/actual-small was the pre-fix misclassification signal
     ///     (64.5% of large-lane items); it should collapse toward zero.
-    ///   * queued-small/actual-large was structurally zero (the lane came from
-    ///     the state size, which bounds the payload from above); it is now the
-    ///     payload-prediction miss rate and is EXPECTED to be non-zero. Those
-    ///     sends still take a large-lane permit before hitting the wire.
+    ///   * queued-small/actual-large read 0 fleet-wide pre-fix and was close to
+    ///     structurally so (the lane came from the state size, which bounds the
+    ///     payload from above to within `MIN_FULL_STATE_SAVING_BYTES`); the one
+    ///     way it could fire was the stale-dedup-lane defect this PR also
+    ///     fixes. It is now the payload-misprediction count and is EXPECTED to
+    ///     be non-zero. Those sends still take a large-lane permit before
+    ///     hitting the wire. It is a COUNT, not a rate: nothing counts correct
+    ///     predictions, and `scheduled_small` is not a usable denominator
+    ///     because it includes sends that return before payload selection.
     ///   * small-entry-ms was small entries BLOCKED behind a large-lane permit
     ///     wait; it is now merely small entries queued DURING one, since the
-    ///     small lane drains them concurrently. Its population also widened
-    ///     with the lane definition (large-state delta sends are now small-lane
-    ///     entries), so it moves for two reasons at once. Collapsing toward zero
-    ///     is the fix landing.
+    ///     small lane drains them concurrently. Collapsing toward zero is the
+    ///     fix landing.
     ///   * large-head incidents/ms keep their trigger (the large drain waiting
     ///     on an empty pool with small entries queued), but the pool has a
     ///     second consumer now — a mispredicted small-lane send correcting its
     ///     lane — so an incident no longer implies a large-lane ENTRY caused the
     ///     exhaustion, and the sampled trigger can miss a wait that an upgrader
-    ///     won the race for.
+    ///     won the race for. BOTH these and small-entry-ms are gated on a
+    ///     small-lane entry being queued, and that population widened with the
+    ///     lane definition (large-state delta sends are now small-lane
+    ///     entries), so all three move for a second reason as well.
+    ///   * active-key overflow was structurally unreachable pre-fix (in-flight
+    ///     sends were capped by the 12+2 permits, far under the 256-key cap);
+    ///     it is now reachable only by the lane-correction parking area, so a
+    ///     non-zero value means mispredicted sends piled up.
+    ///   * enqueue-while-pair-active keeps its definition, but the window it
+    ///     samples — how long a pair stays in `active` — now includes any
+    ///     lane-correction wait, so it inflates for a reason unrelated to
+    ///     enqueue behaviour.
     pub queue: [u64; 15],
     /// Successful apply counts by delta/full x changed/no-op x resulting-state
     /// size bucket.
