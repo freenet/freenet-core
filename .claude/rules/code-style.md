@@ -363,6 +363,45 @@ fails to COMPILE there until you classify it:
   - not config (peer_id, gateways, secret key material, derived/runtime
     fields) → bind it to `_` in the guard with a one-line reason.
 
+**Give it a kebab-case TOML key.** A new field has no released spelling to
+be compatible with, so name it `#[serde(rename = "my-new-key")]` from the
+start. Do NOT add a field whose key is the bare `snake_case` field name —
+that is how `bandwidth_limit` ended up next to `total-bandwidth-limit` with
+no way to guess which was which (#5124).
+
+Every `config.toml` key is ALSO accepted hyphenated, via
+`#[serde(alias = "...")]` on the ones a release already shipped underscored,
+listed in `config::CONFIG_KEY_SPELLINGS`. (`gateways.toml` gets the same
+treatment for `public_key`; its guards do not extend there, because
+`Config::gateways` is `#[serde(skip)]`.)
+
+Two tests guard this, and it is worth knowing what each can and cannot see:
+`every_emitted_config_key_is_also_accepted_in_kebab_case` round-trips the
+serialized output, so it catches a missing alias only when the lost value
+differs from the field's fallback; the set-equality check in
+`emitted_config_toml_keys_keep_their_released_spelling` catches a new
+underscored key whatever it was seeded with, as long as the field is always
+emitted. **Seed a new field to a NON-DEFAULT value** in
+`config::tests::config_with_every_field_seeded` — an `Option` left `None`
+emits no key and is invisible to both.
+
+### NEVER change the key an EXISTING field is written under
+
+Not in the same release you start accepting the new one. Crash-loop
+auto-rollback (#4073, `bin/commands/rollback.rs`) reinstalls the
+*immediately-previous* binary when a freshly-updated node crashes during
+probation. `config.toml` is rewritten on the first boot after an update, so
+a rewrite in a spelling the previous release cannot parse makes the
+rolled-back binary exit 1 on `missing field ...` — and rollback does not
+fire twice, so the node stays down until an operator hand-edits the file.
+The brick-safety mechanism becomes the brick.
+
+The emitted spelling may only move once every release rollback could restore
+already accepts the new one, i.e. one full release later. `config::tests::
+emitted_config_toml_keys_keep_their_released_spelling` fails if the emitted
+format moves; read its rustdoc before touching it. Renaming the remaining
+underscored keys this way is #5130.
+
 ### WHEN writing documentation
 
 ```

@@ -296,7 +296,11 @@ impl SecretArgs {
 pub struct Secrets {
     #[serde(skip)]
     pub transport_keypair: TransportKeypair,
-    #[serde(rename = "transport_keypair", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "transport_keypair",
+        alias = "transport-keypair",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub transport_keypair_path: Option<PathBuf>,
     #[serde(skip)]
     pub nonce: [u8; 24],

@@ -298,6 +298,220 @@ impl Default for ConfigArgs {
     }
 }
 
+/// Every `config.toml` key a release has emitted with an underscore, listed
+/// with the kebab-case spelling(s) also accepted for it (#5124).
+///
+/// The FIRST entry of each group is the spelling the node writes; the rest are
+/// aliases accepted on read. Declaration order is load-bearing — it is the
+/// precedence order [`redundant_key_spellings`] applies, and it is what makes
+/// the resolution preserve the value the previous release was using.
+///
+/// When #5130 flips what is emitted, the first entry must move with it, or that
+/// property silently inverts and an upgrade starts changing effective configs.
+///
+/// Kept beside [`ConfigArgs::read_config`], which needs it, and re-used by the
+/// tests so the `#[serde(alias = ...)]` attributes and this list cannot drift
+/// apart. `config::tests::key_spelling_groups_match_the_serde_aliases` pins
+/// that.
+const CONFIG_KEY_SPELLINGS: &[&[&str]] = &[
+    &["public_network_address", "public-network-address"],
+    &["public_port", "public-network-port", "public-port"],
+    &["bandwidth_limit", "bandwidth-limit"],
+    &["total_bandwidth_limit", "total-bandwidth-limit"],
+    &[
+        "min_bandwidth_per_connection",
+        "min-bandwidth-per-connection",
+    ],
+    &["blocked_addresses", "blocked-addresses"],
+    &["event_loop_channel_capacity", "event-loop-channel-capacity"],
+    &["skip_load_from_network", "skip-load-from-network"],
+    &["transport_keypair", "transport-keypair"],
+    &["log_level", "log-level"],
+    &["contracts_dir", "contracts-dir"],
+    &["delegates_dir", "delegates-dir"],
+    &["secrets_dir", "secrets-dir"],
+    &["db_dir", "db-dir"],
+    &["event_log", "event-log"],
+    &["data_dir", "data-dir"],
+    &["config_dir", "config-dir"],
+    &["log_dir", "log-dir"],
+    &["wasmtime_cache_dir", "wasmtime-cache-dir"],
+    &["is_gateway", "is-gateway"],
+    &["max_blocking_threads", "max-blocking-threads"],
+];
+
+/// The same, for the `[[gateways]]` entries of `gateways.toml`.
+///
+/// Separate from [`CONFIG_KEY_SPELLINGS`] because these keys are NESTED — they
+/// live inside an array of tables, not at the document root — so the two are
+/// applied by different walkers and must not be mixed.
+const GATEWAY_KEY_SPELLINGS: &[&[&str]] = &[&["public_key", "public-key"]];
+
+/// The same again, for the nested `[gateways.address]` table.
+///
+/// `host_address` is the legacy single-string form, and it is what the node
+/// EMITS for `Address::HostAddress` — so an operator hyphenating the key their
+/// own `gateways.toml` contains hits the identical hard failure `public_key`
+/// did. Separate table because it is one level deeper still.
+const GATEWAY_ADDRESS_KEY_SPELLINGS: &[&[&str]] = &[&["host_address", "host-address"]];
+
+/// The redundant spellings to drop when a config file gives one setting under
+/// more than one of its accepted names. Empty for the overwhelmingly common
+/// case of a file that spells each key once.
+///
+/// Accepting two spellings for a key (#5124) makes a file carrying BOTH
+/// ambiguous, and serde resolves that by refusing the file outright with
+/// `duplicate field ...`. A config parse failure is fatal, so without this the
+/// node would not start — on a file that worked on every earlier release, where
+/// the not-yet-recognized spelling was simply ignored as an unknown key.
+///
+/// That is not a hypothetical file. The operator most likely to have one is
+/// precisely the one who hit #5124: tried the hyphenated key, saw nothing
+/// happen, added the underscored key, and left the dead line behind. It is
+/// easier still to produce after the fix — add the hyphenated key next to the
+/// underscored one the node itself wrote.
+///
+/// The winner is the FIRST spelling present in [`CONFIG_KEY_SPELLINGS`] order,
+/// i.e. the one the node emits when it is there. So an upgrade never silently
+/// changes a node's effective configuration: the value that wins is the value
+/// the previous release was already using. The loser is dropped with a warning
+/// naming both, and the next write-back removes it from the file for good.
+fn redundant_key_spellings(
+    groups: &[&[&'static str]],
+    source: &str,
+    contains: impl Fn(&str) -> bool,
+    // Separate from `contains` so it runs only on the rare ambiguous path.
+    // Rendering a value goes through `toml::Value`'s `Display`, which carries
+    // an internal `unwrap`, and there is no reason to put that on every boot
+    // over operator-controlled data to build a message almost never shown.
+    value_of: impl Fn(&str) -> String,
+) -> Vec<(&'static str, String)> {
+    let mut redundant = Vec::new();
+    for group in groups {
+        let mut present = group.iter().copied().filter(|key| contains(key));
+        let Some(keep) = present.next() else {
+            continue;
+        };
+        for ignored in present {
+            // Escaped and capped. A value reaches this message from the
+            // REMOTE gateway index too, where it is not operator-controlled:
+            // `toml::Value`'s Display renders an embedded newline as a raw
+            // newline, so an unescaped value lets a compromised or MITM'd index
+            // write attacker-chosen lines — including a forged `warning:`
+            // prefix — into the node's stderr and journal.
+            let render = |key| {
+                let value = value_of(key);
+                // `value_of` already yields the TOML rendering — a string comes
+                // back quoted, a number bare. Escaping unconditionally would
+                // double-quote every path and turn every integer into a quoted
+                // string, making the message harder to read than before. Only a
+                // value that could forge a log line needs it.
+                // `\u{2028}`/`\u{2029}` are belt-and-braces: journald and stderr
+                // split on `\n` only, so they cannot forge a line there, but a
+                // downstream consumer that treats them as breaks is cheap to
+                // rule out. TOML's own Display escapes every other control
+                // character already, and renders only `\n` raw.
+                let value = if value.contains(['\n', '\r', '\u{2028}', '\u{2029}']) {
+                    format!("{value:?}")
+                } else {
+                    value
+                };
+                match value.char_indices().nth(200) {
+                    Some((cut, _)) => format!("{}… (truncated)", &value[..cut]),
+                    None => value,
+                }
+            };
+            let (kept_value, ignored_value) = (render(keep), render(ignored));
+            // Name both VALUES, not just both keys. The precedence rule spends
+            // the operator's newly-typed setting to buy upgrade safety, and
+            // this message is the whole of what they get back for it: without
+            // the values it does not say which line to delete to get the
+            // outcome they were reaching for. Deliberately does NOT promise the
+            // ignored key is removed automatically — that only happens for
+            // `config.toml`, and telling an operator it is handled reads as
+            // "nothing to do here", which is the confusion this all started as.
+            let message = format!(
+                "`{ignored} = {ignored_value}` in {source} is ignored: \
+                 `{keep} = {kept_value}` is also set and wins. They are two \
+                 spellings of one setting (#5124), and the node is using \
+                 {kept_value}. To use {ignored_value} instead, delete the \
+                 `{keep}` line."
+            );
+            // Both, deliberately. `read_config` runs inside `ConfigArgs::build`,
+            // which the node calls one line BEFORE `set_logger`
+            // (`bin/freenet.rs`), so no subscriber is installed yet and the
+            // tracing event alone would be swallowed — leaving the operator with
+            // a silently-ignored setting, which is the failure this whole change
+            // is about. The tracing event is kept for library consumers that do
+            // have a subscriber by then. Same reasoning as the `eprintln!`s in
+            // `node/p2p_impl.rs`.
+            tracing::warn!("{message}");
+            eprintln!("warning: {message}");
+            // Returned as well as emitted, so a test can pin the wording — the
+            // message is the whole compensation for the precedence rule
+            // ignoring the operator's newer line.
+            redundant.push((ignored, message));
+        }
+    }
+    redundant
+}
+
+/// Parse `gateways.toml`, resolving duplicate key spellings the same way
+/// [`ConfigArgs::read_config`] does for `config.toml`.
+///
+/// `public_key` accepts `public-key` (#5124), which makes a file carrying both
+/// ambiguous — and `gateways.toml` is hand-edited (pinned peers, isolated
+/// networks, test harnesses pre-populating a `--config-dir`), so such a file is
+/// exactly as reachable as the `config.toml` case.
+///
+/// Getting this wrong here is worse than in `config.toml`, because the failure
+/// is INTERMITTENT: the local-cache read on the remote-index-success path
+/// swallows parse errors, while the fallback path propagates them. A node would
+/// run happily for months and then refuse to start the first time freenet.org
+/// was unreachable — the exact outage in which the cache is supposed to save
+/// it, and long after the edit that caused it.
+fn parse_gateways_toml(content: &str, source: &str) -> Result<Gateways, toml::de::Error> {
+    let mut table = toml::from_str::<toml::Table>(content)?;
+    let mut normalized = false;
+    if let Some(toml::Value::Array(entries)) = table.get_mut("gateways") {
+        for entry in entries {
+            let Some(map) = entry.as_table_mut() else {
+                continue;
+            };
+            let redundant = redundant_key_spellings(
+                GATEWAY_KEY_SPELLINGS,
+                source,
+                |key| map.contains_key(key),
+                |key| map.get(key).map(|v| v.to_string()).unwrap_or_default(),
+            );
+            for (key, _) in redundant {
+                map.remove(key);
+                normalized = true;
+            }
+            // And one level deeper: `[gateways.address]` has its own key with
+            // the same history.
+            if let Some(address) = map.get_mut("address").and_then(|a| a.as_table_mut()) {
+                let redundant = redundant_key_spellings(
+                    GATEWAY_ADDRESS_KEY_SPELLINGS,
+                    source,
+                    |key| address.contains_key(key),
+                    |key| address.get(key).map(|v| v.to_string()).unwrap_or_default(),
+                );
+                for (key, _) in redundant {
+                    address.remove(key);
+                    normalized = true;
+                }
+            }
+        }
+    }
+    if normalized {
+        toml::Value::Table(table).try_into::<Gateways>()
+    } else {
+        // Unambiguous file: keep the parse whose errors carry line/column.
+        toml::from_str::<Gateways>(content)
+    }
+}
+
 impl ConfigArgs {
     pub fn current_version(&self) -> &str {
         PCK_VERSION
@@ -343,9 +557,31 @@ impl ConfigArgs {
                         let mut file = File::open(&path)?;
                         let mut content = String::new();
                         file.read_to_string(&mut content)?;
-                        let mut config = toml::from_str::<Config>(&content).map_err(|e| {
+                        let invalid_data = |e: toml::de::Error| {
                             std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-                        })?;
+                        };
+                        // Only take the value-level path when the file actually
+                        // carries a key twice; the plain string parse is kept
+                        // for every other file because its errors carry
+                        // line/column spans that a Value-level parse loses.
+                        let mut table =
+                            toml::from_str::<toml::Table>(&content).map_err(invalid_data)?;
+                        let redundant = redundant_key_spellings(
+                            CONFIG_KEY_SPELLINGS,
+                            &path.display().to_string(),
+                            |key| table.contains_key(key),
+                            |key| table.get(key).map(|v| v.to_string()).unwrap_or_default(),
+                        );
+                        let mut config = if redundant.is_empty() {
+                            toml::from_str::<Config>(&content).map_err(invalid_data)?
+                        } else {
+                            for (key, _) in redundant {
+                                table.remove(key);
+                            }
+                            toml::Value::Table(table)
+                                .try_into::<Config>()
+                                .map_err(invalid_data)?
+                        };
                         let secrets = Self::read_secrets(
                             config.secrets.transport_keypair_path.clone(),
                             config.secrets.nonce_path.clone(),
@@ -356,7 +592,55 @@ impl ConfigArgs {
                     }
                     "json" => {
                         let mut file = File::open(&path)?;
-                        let mut config = serde_json::from_reader::<_, Config>(&mut file)?;
+                        let mut content = String::new();
+                        file.read_to_string(&mut content)?;
+                        // Same two-path shape as the TOML branch above, and for
+                        // the same reason: the direct parse reports line/column,
+                        // the value-level one does not.
+                        let mut object = serde_json::from_str::<serde_json::Value>(&content)?;
+                        let mut rewritten = false;
+                        if let Some(map) = object.as_object_mut() {
+                            // A JSON `null` beside another spelling of the same
+                            // key has to be REMOVED, not merely ignored: it is
+                            // still the field appearing twice as far as serde is
+                            // concerned, so leaving it in place fails the parse
+                            // even after the other spelling wins. (TOML has no
+                            // null, so only this path needs any of it.)
+                            //
+                            // Scoped to groups that are ACTUALLY ambiguous. A
+                            // lone null keeps exactly the meaning it always had
+                            // — including staying an error on a key whose type
+                            // rejects it — and a document with no duplicate
+                            // spelling keeps the direct parse, so it keeps its
+                            // line/column spans.
+                            let nulls: Vec<&str> = CONFIG_KEY_SPELLINGS
+                                .iter()
+                                .filter(|group| {
+                                    group.iter().filter(|key| map.contains_key(**key)).count() > 1
+                                })
+                                .flat_map(|group| group.iter().copied())
+                                .filter(|key| map.get(*key).is_some_and(|value| value.is_null()))
+                                .collect();
+                            for key in nulls {
+                                map.remove(key);
+                                rewritten = true;
+                            }
+                            let redundant = redundant_key_spellings(
+                                CONFIG_KEY_SPELLINGS,
+                                &path.display().to_string(),
+                                |key| map.contains_key(key),
+                                |key| map.get(key).map(|v| v.to_string()).unwrap_or_default(),
+                            );
+                            for (key, _) in redundant {
+                                map.remove(key);
+                                rewritten = true;
+                            }
+                        }
+                        let mut config = if rewritten {
+                            serde_json::from_value::<Config>(object)?
+                        } else {
+                            serde_json::from_str::<Config>(&content)?
+                        };
                         let secrets = Self::read_secrets(
                             config.secrets.transport_keypair_path.clone(),
                             config.secrets.nonce_path.clone(),
@@ -710,7 +994,7 @@ impl ConfigArgs {
             // them. The remote index still wins; --skip-load-from-network keeps
             // a custom peer set.
             if let Ok(content) = fs::read_to_string(&gateways_file) {
-                if let Ok(local_cache) = toml::from_str::<Gateways>(&content) {
+                if let Ok(local_cache) = parse_gateways_toml(&content, "gateways.toml") {
                     let dropped = gateways_dropped_by_remote_replace(
                         &local_cache.gateways,
                         &remotely_loaded_gateways.gateways,
@@ -797,7 +1081,7 @@ impl ConfigArgs {
                 Ok(mut file) => {
                     let mut content = String::new();
                     file.read_to_string(&mut content)?;
-                    toml::from_str::<Gateways>(&content).map_err(|e| {
+                    parse_gateways_toml(&content, "gateways.toml").map_err(|e| {
                         std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
                     })?
                 }
@@ -1216,7 +1500,7 @@ pub struct Config {
     pub ws_api: WebsocketApiConfig,
     #[serde(flatten)]
     pub secrets: Secrets,
-    #[serde(with = "serde_log_level_filter")]
+    #[serde(with = "serde_log_level_filter", alias = "log-level")]
     pub log_level: tracing::log::LevelFilter,
     #[serde(flatten)]
     config_paths: Arc<ConfigPaths>,
@@ -1224,10 +1508,14 @@ pub struct Config {
     pub(crate) peer_id: Option<PeerId>,
     #[serde(skip)]
     pub(crate) gateways: Vec<GatewayConfig>,
+    #[serde(alias = "is-gateway")]
     pub(crate) is_gateway: bool,
     pub(crate) location: Option<f64>,
     /// Maximum number of threads for blocking operations (WASM execution, etc.).
-    #[serde(default = "default_max_blocking_threads")]
+    #[serde(
+        default = "default_max_blocking_threads",
+        alias = "max-blocking-threads"
+    )]
     pub max_blocking_threads: usize,
     /// Budget in bytes for hosted contract *state*. Once exceeded, contracts
     /// are evicted (least-valuable-first) and their on-disk state reclaimed.
@@ -1661,6 +1949,12 @@ pub struct InlineGwConfig {
     pub address: SocketAddr,
 
     /// Path to the public key of the gateway (hex-encoded X25519 key).
+    ///
+    /// Deliberately NO `public-key` alias, unlike [`GatewayConfig`]: this is
+    /// the hidden `--gateways` JSON flag, emitted only by test harnesses, so a
+    /// second spelling buys nothing — while accepting one would re-create the
+    /// fatal `duplicate field` case in the one place `redundant_key_spellings`
+    /// does not reach.
     #[serde(rename = "public_key")]
     pub public_key_path: PathBuf,
 
@@ -1761,12 +2055,21 @@ pub struct NetworkApiConfig {
     /// Public external address for the network, mandatory for gateways.
     #[serde(
         rename = "public_network_address",
+        alias = "public-network-address",
         skip_serializing_if = "Option::is_none"
     )]
     pub public_address: Option<IpAddr>,
 
     /// Public external port for the network, mandatory for gateways.
-    #[serde(rename = "public_port", skip_serializing_if = "Option::is_none")]
+    /// Both kebab spellings are accepted: `public-network-port` (which matches
+    /// the `--public-network-port` flag and is the key this will be WRITTEN as
+    /// once #5130 lands) and the direct `public-port`.
+    #[serde(
+        rename = "public_port",
+        alias = "public-network-port",
+        alias = "public-port",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub public_port: Option<u16>,
 
     /// Whether to ignore protocol version compatibility routine while initiating connections.
@@ -1780,7 +2083,7 @@ pub struct NetworkApiConfig {
     ///
     /// If `total_bandwidth_limit` is set, this field is ignored and per-connection rates
     /// are derived from: `total_bandwidth_limit / active_connections`.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "bandwidth-limit", skip_serializing_if = "Option::is_none")]
     pub bandwidth_limit: Option<usize>,
 
     /// Total bandwidth limit across ALL connections (in bytes per second).
@@ -1789,7 +2092,10 @@ pub struct NetworkApiConfig {
     ///
     /// Example: With 50 MB/s total and 5 connections, each gets 10 MB/s.
     /// Default: None (use per-connection `bandwidth_limit` instead)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        alias = "total-bandwidth-limit",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub total_bandwidth_limit: Option<usize>,
 
     /// Minimum bandwidth per connection when using `total_bandwidth_limit` (bytes/sec).
@@ -1797,17 +2103,23 @@ pub struct NetworkApiConfig {
     ///
     /// If `total / N < min`, each connection gets `min` (exceeding total is possible).
     /// Default: 1 MB/s (1,000,000 bytes/second)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        alias = "min-bandwidth-per-connection",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub min_bandwidth_per_connection: Option<usize>,
 
     /// List of IP:port addresses to refuse connections to/from.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "blocked-addresses", skip_serializing_if = "Option::is_none")]
     pub blocked_addresses: Option<HashSet<SocketAddr>>,
 
     /// Capacity for the event loop notification and op execution channels.
     /// Default: 2048. Increase under sustained multi-client load to reduce
     /// channel saturation and associated context-switch spikes.
-    #[serde(default = "default_event_loop_channel_capacity")]
+    #[serde(
+        default = "default_event_loop_channel_capacity",
+        alias = "event-loop-channel-capacity"
+    )]
     pub event_loop_channel_capacity: usize,
 
     /// Maximum number of concurrent transient connections accepted by a gateway.
@@ -1882,7 +2194,7 @@ pub struct NetworkApiConfig {
     /// neither, the on-disk gateways.toml is still read — the test-harness
     /// contract preserved for callers like freenet-test-network's Docker NAT
     /// path that pre-populate the file in a custom `--config-dir`.
-    #[serde(default)]
+    #[serde(default, alias = "skip-load-from-network")]
     pub skip_load_from_network: bool,
 }
 
@@ -2724,20 +3036,27 @@ impl ConfigPathsArgs {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigPaths {
+    #[serde(alias = "contracts-dir")]
     contracts_dir: PathBuf,
+    #[serde(alias = "delegates-dir")]
     delegates_dir: PathBuf,
+    #[serde(alias = "secrets-dir")]
     secrets_dir: PathBuf,
+    #[serde(alias = "db-dir")]
     db_dir: PathBuf,
+    #[serde(alias = "event-log")]
     event_log: PathBuf,
+    #[serde(alias = "data-dir")]
     data_dir: PathBuf,
+    #[serde(alias = "config-dir")]
     config_dir: PathBuf,
-    #[serde(default = "get_log_dir")]
+    #[serde(default = "get_log_dir", alias = "log-dir")]
     log_dir: Option<PathBuf>,
     /// Relocated wasmtime compile-cache directory (#4683). `#[serde(default)]`
     /// so a `config.toml` persisted before this field existed deserializes with
     /// an empty path; `build()` always re-derives the real one from the data
     /// dir, so the persisted value is never load-bearing.
-    #[serde(default)]
+    #[serde(default, alias = "wasmtime-cache-dir")]
     wasmtime_cache_dir: PathBuf,
 }
 
@@ -2979,7 +3298,7 @@ pub struct GatewayConfig {
     pub address: Address,
 
     /// Path to the public key of the gateway (hex-encoded X25519 key).
-    #[serde(rename = "public_key")]
+    #[serde(rename = "public_key", alias = "public-key")]
     pub public_key_path: PathBuf,
 
     /// Optional location of the gateway.
@@ -3093,6 +3412,7 @@ impl<'de> Deserialize<'de> for Address {
             host: Option<String>,
             port: Option<u16>,
             hostname: Option<String>,
+            #[serde(alias = "host-address")]
             host_address: Option<SocketAddr>,
         }
 
@@ -4189,7 +4509,10 @@ async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Res
         .error_for_status()?
         .text()
         .await?;
-    let mut gateways: Gateways = toml::from_str(&response)?;
+    // Name the remote index, not a local file: a duplicate spelling published
+    // there would otherwise have every node on the network tell its operator to
+    // go edit an innocent gateways.toml, on every boot.
+    let mut gateways: Gateways = parse_gateways_toml(&response, url)?;
     let mut base_url = reqwest::Url::parse(url)?;
     base_url.set_path("");
     let mut valid_gateways = Vec::new();
@@ -4260,10 +4583,1208 @@ async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Res
 mod tests {
     use httptest::{Expectation, Server, matchers::*, responders::*};
 
+    use std::collections::BTreeSet;
+
     use crate::node::NodeConfig;
     use crate::transport::TransportKeypair;
 
     use super::*;
+
+    // ---------------------------------------------------------------------
+    // #5124 — `config.toml` key convention.
+    //
+    // Keys in `config.toml` mix hyphens and underscores with no pattern
+    // distinguishing them (`total-bandwidth-limit` and `bandwidth_limit` sit
+    // adjacent in the same file), so a setting nobody can spell is a setting
+    // nobody can use. Step 1 makes every key in `config.toml` accept its
+    // kebab-case spelling, so either guess works — plus the two keys in
+    // `gateways.toml` with the same history, `public_key` and the nested
+    // `host_address`.
+    // Emitting one consistent spelling is step 2 (#5130) — see
+    // `emitted_config_toml_keys_keep_their_released_spelling` for why the two
+    // cannot land together.
+    //
+    // A wholly unknown key is still ignored in silence; that is #5131.
+    // ---------------------------------------------------------------------
+
+    /// A `config.toml` in the exact spelling releases write, with every
+    /// optional key set to a value distinct from its default — so a key that
+    /// fails to bind shows up as a wrong value rather than a coincidental
+    /// match against a default.
+    const RELEASED_CONFIG_TOML: &str = r#"
+mode = "network"
+network-address = "0.0.0.0"
+network-port = 31338
+public_network_address = "203.0.113.7"
+public_port = 31339
+bandwidth_limit = 3000001
+total_bandwidth_limit = 2000002
+min_bandwidth_per_connection = 250003
+blocked_addresses = ["198.51.100.9:1234"]
+event_loop_channel_capacity = 4096
+transient-budget = 1024
+transient-ttl-secs = 45
+min-number-of-connections = 25
+max-number-of-connections = 200
+streaming-threshold = 65537
+ledbat-min-ssthresh = 102401
+congestion-control = "bbr"
+bbr-startup-rate = 12345678
+skip_load_from_network = true
+ws-api-address = "127.0.0.1"
+ws-api-port = 7510
+token-ttl-seconds = 86401
+token-cleanup-interval-seconds = 301
+allowed-host = ["example.invalid"]
+allowed-source-cidrs = ["100.64.0.0/10"]
+hosted-mode = true
+per-user-op-rate-limit = 11
+per-user-op-burst = 101
+per-user-export-min-interval-secs = 12
+transport_keypair = "/tmp/freenet-5124/secrets/transport_keypair"
+nonce = "/tmp/freenet-5124/secrets/nonce"
+cipher = "/tmp/freenet-5124/secrets/delegate_cipher"
+log_level = "debug"
+contracts_dir = "/tmp/freenet-5124/contracts"
+delegates_dir = "/tmp/freenet-5124/delegates"
+secrets_dir = "/tmp/freenet-5124/secrets"
+db_dir = "/tmp/freenet-5124/db"
+event_log = "/tmp/freenet-5124/_EVENT_LOG"
+data_dir = "/tmp/freenet-5124"
+config_dir = "/tmp/freenet-5124/config"
+log_dir = "/tmp/freenet-5124/logs"
+wasmtime_cache_dir = "/tmp/freenet-5124/wasmtime-cache"
+is_gateway = true
+location = 0.25
+max_blocking_threads = 17
+max-hosting-storage = 12345678
+hosting-disk-pct = 0.25
+max-hosting-disk = 23456789
+per-user-secret-quota = 4194305
+per-user-inactive-ttl = 2592001
+inactive-user-sweep-interval = 3601
+module-cache-budget-bytes = 4294967296
+enable-event-log = true
+telemetry-enabled = true
+telemetry-endpoint = "http://127.0.0.1:14318"
+transport-snapshot-interval-secs = 31
+reference-ping-enabled = true
+iface-tx-enabled = true
+shutdown-drain-secs = 42
+"#;
+
+    /// [`RELEASED_CONFIG_TOML`] with every underscored key rewritten to its
+    /// kebab-case spelling, taken from [`CONFIG_KEY_SPELLINGS`].
+    ///
+    /// Derived from the production table rather than a second copy of it: three
+    /// hand-maintained encodings of one fact (the serde attributes, this, and
+    /// the table) is one too many, and review proved a key dropped from the
+    /// test-side copy was caught by nothing. Asserts each rewrite fires, so a
+    /// typo cannot quietly reduce this to a copy of the released document.
+    fn kebab_config_toml() -> String {
+        let mut doc = RELEASED_CONFIG_TOML.to_string();
+        for (underscored, kebab) in CONFIG_KEY_SPELLINGS.iter().map(|g| (g[0], g[1])) {
+            let from = format!("\n{underscored} = ");
+            let to = format!("\n{kebab} = ");
+            assert!(
+                doc.contains(&from),
+                "RELEASED_CONFIG_TOML is missing the `{underscored}` key that \
+                 CONFIG_KEY_SPELLINGS pairs with `{kebab}`"
+            );
+            assert_ne!(from, to, "group `{underscored}` rewrites to itself");
+            doc = doc.replace(&from, &to);
+        }
+        assert_ne!(
+            doc, RELEASED_CONFIG_TOML,
+            "the kebab fixture is a byte copy of the released one, so every \
+             test built on it is vacuous"
+        );
+        doc
+    }
+
+    /// The value every renamed key carries, asserted
+    /// against a parsed `Config`.
+    ///
+    /// Shared by the released-spelling and kebab-spelling tests so both are
+    /// held to the same explicit expectation. Comparing the two parses against
+    /// each OTHER is not enough on its own: if a key were ignored under BOTH
+    /// spellings, both would fall back to the same default and the comparison
+    /// would pass while the setting did nothing.
+    fn assert_seeded_values_bound(cfg: &Config) {
+        assert_seeded_values_bound_except_secrets(cfg);
+        assert_eq!(
+            cfg.secrets.transport_keypair_path.as_deref(),
+            Some(Path::new("/tmp/freenet-5124/secrets/transport_keypair"))
+        );
+        // Single-word keys, so this change cannot move them — but they are the
+        // operator's key material, and nothing else in these tests asserts they
+        // still bind.
+        assert_eq!(
+            cfg.secrets.nonce_path.as_deref(),
+            Some(Path::new("/tmp/freenet-5124/secrets/nonce"))
+        );
+        assert_eq!(
+            cfg.secrets.cipher_path.as_deref(),
+            Some(Path::new("/tmp/freenet-5124/secrets/delegate_cipher"))
+        );
+    }
+
+    /// The same, minus the three secret paths — for tests that go through
+    /// `read_config`, which resolves those off disk and so cannot name files
+    /// that do not exist.
+    fn assert_seeded_values_bound_except_secrets(cfg: &Config) {
+        assert_eq!(
+            cfg.network_api.public_address,
+            Some("203.0.113.7".parse::<IpAddr>().unwrap())
+        );
+        assert_eq!(cfg.network_api.public_port, Some(31339));
+        assert_eq!(cfg.network_api.bandwidth_limit, Some(3_000_001));
+        assert_eq!(cfg.network_api.total_bandwidth_limit, Some(2_000_002));
+        assert_eq!(cfg.network_api.min_bandwidth_per_connection, Some(250_003));
+        assert_eq!(
+            cfg.network_api.blocked_addresses,
+            Some(HashSet::from(["198.51.100.9:1234".parse().unwrap()]))
+        );
+        assert_eq!(cfg.network_api.event_loop_channel_capacity, 4096);
+        assert!(cfg.network_api.skip_load_from_network);
+        assert_eq!(cfg.log_level, tracing::log::LevelFilter::Debug);
+        assert_eq!(
+            cfg.config_paths.contracts_dir,
+            PathBuf::from("/tmp/freenet-5124/contracts")
+        );
+        assert_eq!(
+            cfg.config_paths.delegates_dir,
+            PathBuf::from("/tmp/freenet-5124/delegates")
+        );
+        assert_eq!(
+            cfg.config_paths.secrets_dir,
+            PathBuf::from("/tmp/freenet-5124/secrets")
+        );
+        assert_eq!(
+            cfg.config_paths.db_dir,
+            PathBuf::from("/tmp/freenet-5124/db")
+        );
+        assert_eq!(
+            cfg.config_paths.event_log,
+            PathBuf::from("/tmp/freenet-5124/_EVENT_LOG")
+        );
+        assert_eq!(
+            cfg.config_paths.data_dir,
+            PathBuf::from("/tmp/freenet-5124")
+        );
+        assert_eq!(
+            cfg.config_paths.config_dir,
+            PathBuf::from("/tmp/freenet-5124/config")
+        );
+        assert_eq!(
+            cfg.config_paths.log_dir,
+            Some(PathBuf::from("/tmp/freenet-5124/logs"))
+        );
+        assert_eq!(
+            cfg.config_paths.wasmtime_cache_dir,
+            PathBuf::from("/tmp/freenet-5124/wasmtime-cache")
+        );
+        assert!(cfg.is_gateway);
+        assert_eq!(cfg.max_blocking_threads, 17);
+        // Keys that were always kebab-case, spot-checked so the documents are
+        // exercised beyond the renamed set.
+        assert_eq!(cfg.network_api.congestion_control, "bbr");
+        assert_eq!(cfg.ws_api.per_user_op_burst, 101);
+        assert_eq!(cfg.shutdown_drain_secs, 42);
+    }
+
+    /// THE BUG (#5124): a `config.toml` key could not be spelled the way the
+    /// rest of the file demonstrates. Following the hyphenated convention got
+    /// you a silently-ignored setting (for keys with a default) or a refusal to
+    /// start (for `log_level` / `is_gateway` / the `ConfigPaths` keys, which
+    /// have none). Every key must now accept its kebab-case spelling.
+    #[test]
+    fn kebab_case_config_toml_keys_are_accepted() {
+        let cfg: Config = toml::from_str(&kebab_config_toml())
+            .expect("every config.toml key must be accepted in kebab-case");
+        assert_seeded_values_bound(&cfg);
+    }
+
+    /// BACK-COMPAT: accepting the hyphenated spelling must not cost the
+    /// underscored one. Every `config.toml` any release has ever written keeps
+    /// working, unchanged and indefinitely.
+    #[test]
+    fn released_underscored_config_toml_keys_still_bind() {
+        let cfg: Config = toml::from_str(RELEASED_CONFIG_TOML)
+            .expect("a config.toml written by any release must still parse");
+        assert_seeded_values_bound(&cfg);
+    }
+
+    /// The two spellings must be genuinely interchangeable, not merely both
+    /// parseable. (Read with `assert_seeded_values_bound`, which is what stops
+    /// this from passing on two identically-defaulted configs.)
+    #[test]
+    fn released_and_kebab_config_toml_are_equivalent() {
+        let released: Config = toml::from_str(RELEASED_CONFIG_TOML).unwrap();
+        let kebab: Config = toml::from_str(&kebab_config_toml()).unwrap();
+        assert_eq!(
+            toml::to_string(&released).unwrap(),
+            toml::to_string(&kebab).unwrap(),
+        );
+    }
+
+    /// `public-port` is accepted alongside `public-network-port`: the file's
+    /// released key is `public_port`, so that is the spelling an operator
+    /// hyphenating what they see will reach for, while the flag they read in
+    /// `--help` is `--public-network-port`. Both work.
+    #[test]
+    fn both_kebab_spellings_of_public_port_are_accepted() {
+        for key in ["public-network-port", "public-port"] {
+            let doc = RELEASED_CONFIG_TOML.replace("\npublic_port = ", &format!("\n{key} = "));
+            assert_ne!(
+                doc, RELEASED_CONFIG_TOML,
+                "the substitution did not fire, so `{key}` is not actually \
+                 being exercised"
+            );
+            let cfg: Config =
+                toml::from_str(&doc).unwrap_or_else(|e| panic!("`{key}` must be accepted: {e}"));
+            assert_eq!(cfg.network_api.public_port, Some(31339), "{key}");
+        }
+    }
+
+    /// STRUCTURAL GUARD (#5124): every key the node WRITES is also accepted
+    /// hyphenated. Derived from the serialized output rather than from a
+    /// hand-written fixture, so a field added later is covered without anyone
+    /// remembering to extend a document — which is the exact discipline that
+    /// failed and produced this bug.
+    ///
+    /// Limit worth knowing: this compares re-serialized bytes, so it can only
+    /// see a lost binding whose value DIFFERS from what the field falls back
+    /// to. A field seeded to its own default round-trips identically and slips
+    /// past — see [`config_with_every_field_seeded`]'s seeding contract, and
+    /// the set-equality check in
+    /// `emitted_config_toml_keys_keep_their_released_spelling`, which catches
+    /// that case for any always-emitted key regardless of its value.
+    #[tokio::test]
+    async fn every_emitted_config_key_is_also_accepted_in_kebab_case() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base = clap_bare_args(temp_dir.path()).build().await.unwrap();
+        let seeded = config_with_every_field_seeded(&base);
+
+        let emitted = toml::to_string(&seeded).unwrap();
+        let table: toml::Table = toml::from_str(&emitted).unwrap();
+        let mut kebabbed = toml::Table::new();
+        for (key, value) in &table {
+            // Not `.collect()`: that would silently swallow a future pair of
+            // keys that kebab to the same string, dropping one from the check.
+            assert!(
+                kebabbed
+                    .insert(key.replace('_', "-"), value.clone())
+                    .is_none(),
+                "two emitted keys collide when hyphenated, at `{key}`"
+            );
+        }
+
+        let renamed = table.keys().filter(|k| k.contains('_')).count();
+        assert!(
+            renamed >= CONFIG_KEY_SPELLINGS.len(),
+            "expected at least {} underscored keys to rewrite, saw {renamed} — \
+             if emitted keys became kebab-case, this guard and #5130's rollout \
+             both need revisiting",
+            CONFIG_KEY_SPELLINGS.len()
+        );
+
+        let reparsed: Config = toml::from_str(&toml::to_string(&kebabbed).unwrap())
+            .expect("the kebab-case spelling of every emitted key must be accepted");
+        assert_eq!(
+            toml::to_string(&reparsed).unwrap(),
+            emitted,
+            "a key lost its value when spelled in kebab-case — it is missing a \
+             #[serde(alias = \"...\")] for the hyphenated form"
+        );
+    }
+
+    /// The exact set of `config.toml` keys #5127 shipped emitting with an
+    /// underscore, written out INDEPENDENTLY of [`CONFIG_KEY_SPELLINGS`].
+    ///
+    /// Independent on purpose: a table cannot guard itself. Review demonstrated
+    /// a green mutation that REORDERED a group so its kebab spelling came first
+    /// and moved the `#[serde(rename)]` to match — self-consistent, no row
+    /// deleted, and it is the edit a #5130 author following the table's own
+    /// "first entry is what the node writes" instruction would naturally make.
+    /// Pinning the count instead of the spellings could not see it.
+    ///
+    /// Removing an entry here means the node now writes that key under a
+    /// spelling shipped releases cannot read. Do it only as part of #5130's
+    /// rollout, having confirmed the release rollback would restore already
+    /// accepts the new spelling.
+    const KEYS_EMITTED_WITH_AN_UNDERSCORE: &[&str] = &[
+        "public_network_address",
+        "public_port",
+        "bandwidth_limit",
+        "total_bandwidth_limit",
+        "min_bandwidth_per_connection",
+        "blocked_addresses",
+        "event_loop_channel_capacity",
+        "skip_load_from_network",
+        "transport_keypair",
+        "log_level",
+        "contracts_dir",
+        "delegates_dir",
+        "secrets_dir",
+        "db_dir",
+        "event_log",
+        "data_dir",
+        "config_dir",
+        "log_dir",
+        "wasmtime_cache_dir",
+        "is_gateway",
+        "max_blocking_threads",
+    ];
+
+    /// ROLLBACK SAFETY (#5124 / #5130): the node must keep WRITING the key
+    /// spellings older releases can read.
+    ///
+    /// Crash-loop auto-rollback (#4073, `bin/commands/rollback.rs`) reinstalls
+    /// the immediately-previous binary when a freshly-updated node crashes
+    /// during probation. `config.toml` is rewritten on the first boot after an
+    /// update, so if that rewrite used keys the previous release cannot parse,
+    /// the rolled-back binary exits 1 on `missing field ...` — and rollback
+    /// does not fire twice, so the node stays down until an operator edits the
+    /// file by hand. That turns the brick-safety mechanism into the brick.
+    ///
+    /// So the emitted spelling may only change once EVERY release that
+    /// rollback could restore already accepts the new one. This release makes
+    /// the hyphenated spellings accepted; #5130 flips what is emitted, one
+    /// release later. Until then this guard fails if the emitted format moves.
+    #[tokio::test]
+    async fn emitted_config_toml_keys_keep_their_released_spelling() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base = clap_bare_args(temp_dir.path()).build().await.unwrap();
+        // Everything in the table must actually be emitted for this guard to
+        // see it; `transport_keypair` is the one key sourced from the real
+        // build rather than the seed, so assert the premise instead of
+        // skipping it — a filter would fail open if `build()` ever stopped
+        // setting it.
+        assert!(
+            base.secrets.transport_keypair_path.is_some(),
+            "the seeded config must carry a transport_keypair path, or this \
+             guard silently stops covering that key"
+        );
+        let seeded = config_with_every_field_seeded(&base);
+        let table: toml::Table = toml::from_str(&toml::to_string(&seeded).unwrap()).unwrap();
+
+        let emitted_underscored: BTreeSet<&str> = table
+            .keys()
+            .filter(|key| key.contains('_'))
+            .map(String::as_str)
+            .collect();
+        let tabled: BTreeSet<&str> = CONFIG_KEY_SPELLINGS
+            .iter()
+            .map(|group| group[0])
+            .filter(|key| key.contains('_'))
+            .collect();
+        let pinned: BTreeSet<&str> = KEYS_EMITTED_WITH_AN_UNDERSCORE.iter().copied().collect();
+
+        // Against the INDEPENDENT list first: this is the assertion that
+        // survives the table being edited self-consistently.
+        assert_eq!(
+            emitted_underscored, pinned,
+            "the keys WRITTEN with an underscore no longer match the set this \
+             release shipped, which breaks crash-loop rollback (#4073) — read \
+             KEYS_EMITTED_WITH_AN_UNDERSCORE's rustdoc and #5130 before \
+             changing it"
+        );
+
+        // Set equality, not "every tabled key is emitted": the reverse
+        // direction is what catches a NEW field landing with an underscored
+        // key, and it catches it whatever value it was seeded with — unlike a
+        // round-trip comparison, which cannot see a field whose lost binding
+        // reproduces the same bytes.
+        assert_eq!(
+            emitted_underscored, tabled,
+            "the set of keys WRITTEN with an underscore has changed. A key \
+             here but not in CONFIG_KEY_SPELLINGS is a new field that should \
+             have been named kebab-case from the start; a key there but not \
+             here means the emitted spelling MOVED, which breaks crash-loop \
+             rollback (#4073) — see this test's rustdoc and #5130."
+        );
+        assert_eq!(
+            CONFIG_KEY_SPELLINGS.len(),
+            KEYS_EMITTED_WITH_AN_UNDERSCORE.len(),
+            "CONFIG_KEY_SPELLINGS gained or lost a group without the pinned \
+             list moving with it"
+        );
+    }
+
+    /// ROLLBACK SAFETY, the operator-edit direction: a config hand-written in
+    /// kebab-case is normalized back to the emitted spelling on the first boot.
+    ///
+    /// That is what keeps an operator's edit from creating a file only new
+    /// binaries can read — the same brick #4073 would otherwise hit, arrived at
+    /// from the other side. It is a consequence of writing `Config` back out
+    /// rather than an explicit mechanism, so it is easy to remove by accident;
+    /// pinned so #5130 has to do it deliberately.
+    #[tokio::test]
+    async fn a_kebab_written_config_is_normalized_to_the_emitted_spelling() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+        let kebab = kebab_config_toml()
+            .lines()
+            .filter(|line| {
+                !["transport-keypair = ", "nonce = ", "cipher = "]
+                    .iter()
+                    .any(|key| line.starts_with(key))
+            })
+            // Point the paths at the temp dir so the build does not touch the
+            // developer's real data directories.
+            .map(|line| line.replace("/tmp/freenet-5124", &dir.display().to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.join("config.toml"), kebab).unwrap();
+
+        clap_bare_args(dir).build().await.unwrap();
+
+        let rewritten: toml::Table =
+            toml::from_str(&std::fs::read_to_string(dir.join("config.toml")).unwrap()).unwrap();
+        for group in CONFIG_KEY_SPELLINGS {
+            let emitted = group[0];
+            // Every alias, not just the first: `public_port` has two, and the
+            // second would otherwise never be checked here.
+            for alias in &group[1..] {
+                assert!(
+                    !rewritten.contains_key(*alias) || *alias == emitted,
+                    "`{alias}` survived the write-back; a released binary \
+                     cannot read it, so a rollback onto one would not start"
+                );
+            }
+        }
+        assert!(
+            rewritten.contains_key("log_level"),
+            "the rewritten file must use the emitted spelling"
+        );
+    }
+
+    /// [`RELEASED_CONFIG_TOML`] minus the three secret-path keys.
+    ///
+    /// `read_config` resolves those paths off disk, so a test that goes through
+    /// it (rather than deserializing directly) must not name files that do not
+    /// exist. Their aliases are covered by the direct-deserialization tests.
+    fn released_config_toml_without_secret_paths() -> String {
+        RELEASED_CONFIG_TOML
+            .lines()
+            .filter(|line| {
+                !["transport_keypair = ", "nonce = ", "cipher = "]
+                    .iter()
+                    .any(|key| line.starts_with(key))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Raw serde REFUSES a file that spells one key two ways — `duplicate
+    /// field ...`. Pinned because it is the reason [`redundant_key_spellings`]
+    /// exists: a config parse failure is fatal, so without that normalization
+    /// accepting a second spelling would turn a file that booted on every
+    /// earlier release (where the unrecognized spelling was ignored) into a
+    /// node that will not start.
+    #[test]
+    fn raw_deserialization_rejects_a_key_spelled_two_ways() {
+        let doc = format!("{RELEASED_CONFIG_TOML}bandwidth-limit = 999\n");
+        let err = toml::from_str::<Config>(&doc).expect_err(
+            "raw serde must reject the ambiguous file — read_config normalizes it first",
+        );
+        assert!(
+            err.to_string().contains("duplicate"),
+            "expected a duplicate-field error, got: {err}"
+        );
+    }
+
+    /// REGRESSION (found in review of this PR): a config that spells one key
+    /// both ways must still boot, and must keep the value it had before the
+    /// upgrade.
+    ///
+    /// The operator most likely to have such a file is exactly the one who hit
+    /// #5124 — tried `bandwidth-limit`, saw nothing happen, added
+    /// `bandwidth_limit`, left the dead line. That file works on every shipped
+    /// release. Accepting both spellings without this normalization turns it
+    /// into `Error: TOML parse error at line 1, column 1 / duplicate field`,
+    /// exit 1 — which `bin/commands/rollback.rs` counts as a crash.
+    #[test]
+    fn a_key_spelled_two_ways_keeps_the_value_the_previous_release_used() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        // The hyphenated line is the operator's failed attempt; the underscored
+        // one is what the node wrote and what the previous release honored.
+        let doc = format!(
+            "{}\nbandwidth-limit = 999\n",
+            released_config_toml_without_secret_paths()
+        );
+        std::fs::write(temp_dir.path().join("config.toml"), doc).unwrap();
+
+        let cfg = ConfigArgs::read_config(&temp_dir.path().to_path_buf())
+            .expect("a config spelling one key two ways must still load")
+            .expect("config.toml is present");
+        assert_eq!(
+            cfg.network_api.bandwidth_limit,
+            Some(3_000_001),
+            "the spelling the node emits must win, so an upgrade never silently \
+             changes a node's effective configuration"
+        );
+        // Every other key must survive the normalized parse too: resolving the
+        // ambiguity routes the whole document through a different deserializer
+        // (`toml::Value::try_into` rather than `from_str`), so assert the lot
+        // rather than the one key the test is named for.
+        assert_seeded_values_bound_except_secrets(&cfg);
+    }
+
+    /// Same normalization, but between two ALIASES of one key, where neither is
+    /// the emitted spelling. Declaration order in [`CONFIG_KEY_SPELLINGS`]
+    /// decides, so the outcome is deterministic rather than dependent on the
+    /// order the keys happen to appear in the file.
+    #[test]
+    fn two_aliases_of_one_key_resolve_deterministically() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base = released_config_toml_without_secret_paths();
+        // Assert on the SUBSTITUTION, before appending: `doc != base` would
+        // hold either way because of the appended line, so that check could
+        // never fail. (Which is the defect it was added to prevent — caught in
+        // review of the commit that added it.)
+        let substituted = base.replace("\npublic_port = ", "\npublic-network-port = ");
+        let doc = substituted.clone() + "\npublic-port = 31999\n";
+        assert!(
+            substituted != base,
+            "the substitution did not fire, so this would silently collapse \
+             into a duplicate of the emitted-vs-alias test and stop covering \
+             alias-vs-alias precedence"
+        );
+        std::fs::write(temp_dir.path().join("config.toml"), doc).unwrap();
+
+        let cfg = ConfigArgs::read_config(&temp_dir.path().to_path_buf())
+            .expect("two aliases of one key must not stop the node booting")
+            .expect("config.toml is present");
+        assert_eq!(cfg.network_api.public_port, Some(31339));
+    }
+
+    /// The normalization must not fire on a well-formed file: a file spelling
+    /// each key once takes the plain string-parse path, whose errors carry the
+    /// line/column spans a value-level parse would lose.
+    #[test]
+    fn a_well_formed_config_has_no_redundant_spellings() {
+        for doc in [RELEASED_CONFIG_TOML.to_string(), kebab_config_toml()] {
+            let table: toml::Table = toml::from_str(&doc).unwrap();
+            assert!(
+                redundant_key_spellings(
+                    CONFIG_KEY_SPELLINGS,
+                    "config.toml",
+                    |key| table.contains_key(key),
+                    |key| table.get(key).map(|v| v.to_string()).unwrap_or_default()
+                )
+                .is_empty(),
+                "no key is spelled twice here, so nothing may be dropped"
+            );
+        }
+    }
+
+    /// [`CONFIG_KEY_SPELLINGS`] drives the duplicate-spelling normalization,
+    /// and the `#[serde(alias = ...)]` attributes drive what deserializes.
+    /// They are two hand-maintained lists of the same fact, so pin that every
+    /// spelling in the table is genuinely accepted — a stale entry would
+    /// silently drop a key the file legitimately uses.
+    #[test]
+    fn key_spelling_groups_match_the_serde_aliases() {
+        let baseline =
+            toml::to_string(&toml::from_str::<Config>(RELEASED_CONFIG_TOML).unwrap()).unwrap();
+        for group in CONFIG_KEY_SPELLINGS {
+            let emitted = group[0];
+            for spelling in *group {
+                let doc = RELEASED_CONFIG_TOML
+                    .replace(&format!("\n{emitted} = "), &format!("\n{spelling} = "));
+                assert!(
+                    doc != RELEASED_CONFIG_TOML || *spelling == emitted,
+                    "RELEASED_CONFIG_TOML does not carry `{emitted}`, so this \
+                     group is untested"
+                );
+                let parsed = toml::from_str::<Config>(&doc).unwrap_or_else(|e| {
+                    panic!("`{spelling}` is in CONFIG_KEY_SPELLINGS but is not accepted: {e}")
+                });
+                // `is_ok()` alone would prove nothing: `Config` flattens and
+                // sets no `deny_unknown_fields`, so an unknown key parses
+                // happily and is discarded. Compare against the baseline
+                // instead — that is what proves the spelling bound to THIS
+                // field with the same value, rather than being ignored.
+                assert_eq!(
+                    toml::to_string(&parsed).unwrap(),
+                    baseline,
+                    "`{spelling}` parsed but did not bind to the same field \
+                     and value as `{emitted}` — it is being ignored as an \
+                     unknown key"
+                );
+            }
+        }
+    }
+
+    /// The `config.json` branch of `read_config` got the same two-path rewrite
+    /// as the TOML one and had no coverage at all — every other test here is
+    /// TOML. Covers both halves: the hyphenated spelling is accepted, and an
+    /// ambiguous file resolves to the spelling the node emits.
+    #[tokio::test]
+    async fn config_json_accepts_both_spellings_and_resolves_duplicates() {
+        let as_json = || {
+            let table = toml::from_str::<toml::Table>(&released_config_toml_without_secret_paths())
+                .unwrap();
+            serde_json::to_value(table).unwrap()
+        };
+
+        // (a) hyphenated only — the key must bind.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut doc = as_json();
+        let object = doc.as_object_mut().unwrap();
+        let value = object.remove("bandwidth_limit").unwrap();
+        object.insert("bandwidth-limit".to_string(), value);
+        std::fs::write(
+            temp_dir.path().join("config.json"),
+            serde_json::to_string_pretty(&doc).unwrap(),
+        )
+        .unwrap();
+        let cfg = ConfigArgs::read_config(&temp_dir.path().to_path_buf())
+            .expect("a config.json using the hyphenated key must load")
+            .expect("config.json is present");
+        assert_eq!(cfg.network_api.bandwidth_limit, Some(3_000_001));
+
+        // (b) both spellings — the emitted one wins, and the file still loads.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut doc = as_json();
+        doc.as_object_mut()
+            .unwrap()
+            .insert("bandwidth-limit".to_string(), 999.into());
+        std::fs::write(
+            temp_dir.path().join("config.json"),
+            serde_json::to_string_pretty(&doc).unwrap(),
+        )
+        .unwrap();
+        let cfg = ConfigArgs::read_config(&temp_dir.path().to_path_buf())
+            .expect("a config.json naming one key twice must still load")
+            .expect("config.json is present");
+        assert_eq!(
+            cfg.network_api.bandwidth_limit,
+            Some(3_000_001),
+            "the spelling the node emits must win, as it does for TOML"
+        );
+    }
+
+    /// REGRESSION (introduced and caught within this PR): a JSON `null` under
+    /// one spelling, beside a real value under the other.
+    ///
+    /// Treating the `null` as merely absent left it in the document, so serde
+    /// still saw the field twice and `read_config` failed with `duplicate
+    /// field` — the node would not start, on a file that booted before. The
+    /// null has to be REMOVED for the surviving spelling to bind.
+    #[tokio::test]
+    async fn config_json_null_does_not_shadow_or_break_the_other_spelling() {
+        for (name, null_key, value_key) in [
+            (
+                "null under the emitted spelling",
+                "bandwidth_limit",
+                "bandwidth-limit",
+            ),
+            ("null under the alias", "bandwidth-limit", "bandwidth_limit"),
+        ] {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let table = toml::from_str::<toml::Table>(&released_config_toml_without_secret_paths())
+                .unwrap();
+            let mut doc = serde_json::to_value(table).unwrap();
+            let object = doc.as_object_mut().unwrap();
+            object.insert(null_key.to_string(), serde_json::Value::Null);
+            object.insert(value_key.to_string(), 999.into());
+            std::fs::write(
+                temp_dir.path().join("config.json"),
+                serde_json::to_string(&doc).unwrap(),
+            )
+            .unwrap();
+
+            let cfg = ConfigArgs::read_config(&temp_dir.path().to_path_buf())
+                .unwrap_or_else(|e| panic!("{name}: the node must still start: {e}"))
+                .unwrap_or_else(|| panic!("{name}: config.json is present"));
+            assert_eq!(
+                cfg.network_api.bandwidth_limit,
+                Some(999),
+                "{name}: the real value must win over a null"
+            );
+        }
+    }
+
+    /// A lone `null` still means unset, as it always did.
+    #[tokio::test]
+    async fn config_json_lone_null_leaves_the_setting_unset() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table =
+            toml::from_str::<toml::Table>(&released_config_toml_without_secret_paths()).unwrap();
+        let mut doc = serde_json::to_value(table).unwrap();
+        doc.as_object_mut()
+            .unwrap()
+            .insert("bandwidth_limit".to_string(), serde_json::Value::Null);
+        std::fs::write(
+            temp_dir.path().join("config.json"),
+            serde_json::to_string(&doc).unwrap(),
+        )
+        .unwrap();
+        let cfg = ConfigArgs::read_config(&temp_dir.path().to_path_buf())
+            .expect("a lone null must not be an error")
+            .expect("config.json is present");
+        assert_eq!(cfg.network_api.bandwidth_limit, None);
+    }
+
+    /// The null handling is scoped to groups that are actually ambiguous, so a
+    /// lone null keeps exactly the meaning it had before this change — and a
+    /// document with no duplicate spelling keeps the direct parse, and with it
+    /// its line/column spans.
+    ///
+    /// Sweeping every null unconditionally, as the first version did, silently
+    /// widened two things: a null on a defaulted key started falling back to
+    /// the default instead of erroring, and any document containing one lost
+    /// its spans.
+    #[tokio::test]
+    async fn a_lone_json_null_neither_widens_nor_costs_the_spans() {
+        let write =
+            |dir: &Path, mutate: &dyn Fn(&mut serde_json::Map<String, serde_json::Value>)| {
+                let table =
+                    toml::from_str::<toml::Table>(&released_config_toml_without_secret_paths())
+                        .unwrap();
+                let mut doc = serde_json::to_value(table).unwrap();
+                mutate(doc.as_object_mut().unwrap());
+                std::fs::write(
+                    dir.join("config.json"),
+                    serde_json::to_string(&doc).unwrap(),
+                )
+                .unwrap();
+            };
+
+        // A lone null on a key whose type rejects it is still an error.
+        let temp_dir = tempfile::tempdir().unwrap();
+        write(temp_dir.path(), &|object| {
+            object.insert("max_blocking_threads".to_string(), serde_json::Value::Null);
+        });
+        ConfigArgs::read_config(&temp_dir.path().to_path_buf())
+            .expect_err("a lone null on a non-Option key must stay an error");
+
+        // And an unrelated type error in a document containing a lone null
+        // still reports where it is.
+        let temp_dir = tempfile::tempdir().unwrap();
+        write(temp_dir.path(), &|object| {
+            object.insert("bandwidth_limit".to_string(), serde_json::Value::Null);
+            object.insert("ws-api-port".to_string(), "not a port".into());
+        });
+        let err = ConfigArgs::read_config(&temp_dir.path().to_path_buf())
+            .expect_err("a type error must still be an error")
+            .to_string();
+        assert!(
+            err.contains("line") && err.contains("column"),
+            "a document with no duplicate spelling must keep the \
+             span-preserving parse; got: {err}"
+        );
+    }
+
+    /// REGRESSION (found in review): the same duplicate-spelling case as
+    /// `config.toml`, but nested inside `[[gateways]]` — and nastier, because
+    /// the failure is INTERMITTENT. The local-cache read on the
+    /// remote-index-success path swallows parse errors while the fallback path
+    /// propagates them, so a node with such a file runs for months and then
+    /// refuses to start the first time freenet.org is unreachable.
+    #[test]
+    fn gateways_toml_public_key_spelled_two_ways_still_loads() {
+        let doc = "[[gateways]]\n\
+                   public_key = \"/tmp/freenet-5124/vega.pub\"\n\
+                   public-key = \"/tmp/freenet-5124/stale.pub\"\n\
+                   location = 0.25\n\
+                   \n\
+                   [gateways.address]\n\
+                   host = \"vega.locut.us\"\n\
+                   port = 31337\n";
+        assert!(
+            toml::from_str::<Gateways>(doc).is_err(),
+            "precondition: raw serde rejects the ambiguous file"
+        );
+        let gateways = parse_gateways_toml(doc, "gateways.toml")
+            .expect("a gateways.toml naming one key twice must still load");
+        assert_eq!(
+            gateways.gateways[0].public_key_path,
+            PathBuf::from("/tmp/freenet-5124/vega.pub"),
+            "the spelling the node writes must win, as it does for config.toml"
+        );
+        // The rest of the entry must survive the normalized parse too — it goes
+        // through a different deserializer than the direct path.
+        assert_eq!(gateways.gateways[0].location, Some(0.25));
+    }
+
+    /// The warning must name the source it was given, not a hardcoded file.
+    /// `parse_gateways_toml` also parses the REMOTE index, where a duplicate
+    /// spelling would otherwise send every operator on the network to edit an
+    /// innocent local file — so the label being a parameter is the point, and
+    /// nothing else pins it.
+    #[test]
+    fn the_gateways_warning_names_the_source_it_was_given() {
+        let table: toml::Table =
+            toml::from_str("public_key = \"/tmp/a.pub\"\npublic-key = \"/tmp/b.pub\"\n").unwrap();
+        for source in ["gateways.toml", "https://freenet.org/keys/gateways.toml"] {
+            let reported = redundant_key_spellings(
+                GATEWAY_KEY_SPELLINGS,
+                source,
+                |key| table.contains_key(key),
+                |key| table.get(key).map(|v| v.to_string()).unwrap_or_default(),
+            );
+            let [(_, message)] = reported.as_slice() else {
+                panic!("expected one redundant spelling, got {reported:?}");
+            };
+            assert!(
+                message.contains(source),
+                "the warning must name `{source}`; got: {message}"
+            );
+        }
+    }
+
+    /// Both emissions must survive.
+    ///
+    /// The `eprintln!` is the load-bearing one: `read_config` runs inside
+    /// `ConfigArgs::build`, one line before `set_logger`, so no subscriber
+    /// exists yet and the tracing event alone goes nowhere. Deleting it returns
+    /// the operator to silence about a setting the node just ignored — which is
+    /// the #5124 failure itself, arriving through the fix for it. Deleting
+    /// either was otherwise green.
+    ///
+    /// Source-scraped, and honest about being so: capturing stderr in-process
+    /// is awkward, and a scrape that says why beats no guard at all.
+    #[test]
+    fn the_duplicate_spelling_warning_is_still_emitted_both_ways() {
+        let source = include_str!("config.rs");
+        let body = source
+            .split("fn redundant_key_spellings(")
+            .nth(1)
+            .expect("redundant_key_spellings must exist")
+            .split("\nfn ")
+            .next()
+            .expect("its body must be delimited by the next item");
+        // Needles assembled at runtime and matched on the CALL, not the macro
+        // name: written literally they would match this test's own text, and
+        // the bare macro name also matches the prose comment beside the
+        // emissions. Both traps were hit writing this.
+        for emission in [
+            format!("tracing::warn!(\"{{{}}}\")", "message"),
+            format!("eprintln!(\"warning: {{{}}}\")", "message"),
+        ] {
+            assert!(
+                body.contains(&emission),
+                "`redundant_key_spellings` must still emit `{emission}` — see \
+                 this test's rustdoc for why both are needed"
+            );
+        }
+    }
+
+    /// ...and the remote-index call site must actually PASS its URL.
+    ///
+    /// The message-formatting test above pins what `redundant_key_spellings`
+    /// produces; this pins the one line that decides which source it is told
+    /// about. Reverting that argument to a hardcoded `"gateways.toml"` is
+    /// otherwise invisible — it was, and that is the whole of what the commit
+    /// threading `source` through changed. Source-scraped because exercising it
+    /// for real would mean serving a duplicate-spelling index over HTTP and
+    /// capturing stderr.
+    #[test]
+    fn the_remote_gateway_index_is_parsed_under_its_own_url() {
+        let source = include_str!("config.rs");
+        // Assembled at runtime: spelled out as a literal, the needle would
+        // appear in this test's own text and match itself. (It did.)
+        let needle = format!("parse_gateways_toml(&response, {})", "url");
+        assert!(
+            source.contains(&needle),
+            "load_gateways_from_index must pass the index URL as the source \
+             label, or a duplicate spelling published upstream tells every \
+             operator on the network to edit their own innocent gateways.toml"
+        );
+    }
+
+    /// The gateways two-path parse has the same justification as the config
+    /// one, and the same risk of being read as dead weight later.
+    #[test]
+    fn an_unambiguous_broken_gateways_toml_keeps_its_line_and_column() {
+        let doc = "[[gateways]]\npublic_key = 42\n\n[gateways.address]\nhost = \"a\"\n";
+        let err = parse_gateways_toml(doc, "gateways.toml")
+            .expect_err("a type error must still be an error")
+            .to_string();
+        assert!(
+            err.contains("line") && err.contains("column"),
+            "an unambiguous file must take the span-preserving parse; got: {err}"
+        );
+    }
+
+    /// `host_address` is `gateways.toml`'s OTHER key with this history — the
+    /// legacy single-string address form, and what the node emits for
+    /// `Address::HostAddress`. Hyphenating the key their own file contains gave
+    /// operators `gateway address must specify one of ...` naming the key they
+    /// had just specified.
+    #[test]
+    fn gateways_toml_host_address_is_accepted_in_both_spellings() {
+        for key in ["host_address", "host-address"] {
+            let doc = format!(
+                "[[gateways]]\npublic_key = \"/tmp/freenet-5124/vega.pub\"\n\
+                 \n[gateways.address]\n{key} = \"203.0.113.1:31337\"\n"
+            );
+            let gateways = parse_gateways_toml(&doc, "gateways.toml")
+                .unwrap_or_else(|e| panic!("`{key}` must be accepted: {e}"));
+            assert_eq!(
+                gateways.gateways[0].address,
+                Address::HostAddress("203.0.113.1:31337".parse().unwrap()),
+                "{key}"
+            );
+        }
+    }
+
+    /// ... and naming it both ways must not stop the node booting, the same as
+    /// one level up.
+    #[test]
+    fn gateways_toml_host_address_spelled_two_ways_still_loads() {
+        let doc = "[[gateways]]\n\
+                   public_key = \"/tmp/freenet-5124/vega.pub\"\n\
+                   \n\
+                   [gateways.address]\n\
+                   host_address = \"203.0.113.1:31337\"\n\
+                   host-address = \"198.51.100.9:1234\"\n";
+        assert!(
+            toml::from_str::<Gateways>(doc).is_err(),
+            "precondition: raw serde rejects the ambiguous nested table"
+        );
+        let gateways = parse_gateways_toml(doc, "gateways.toml")
+            .expect("a nested address naming one key twice must still load");
+        assert_eq!(
+            gateways.gateways[0].address,
+            Address::HostAddress("203.0.113.1:31337".parse().unwrap()),
+            "the spelling the node writes must win"
+        );
+    }
+
+    /// The two-path parse exists so an ordinary broken file keeps its
+    /// line/column span, which a value-level parse loses. Pinned, because once
+    /// #5130 makes normalization common someone will read the direct branch as
+    /// dead weight.
+    #[test]
+    fn an_unambiguous_broken_config_keeps_its_line_and_column() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let doc = released_config_toml_without_secret_paths().replace(
+            "max_blocking_threads = 17",
+            "max_blocking_threads = \"not a number\"",
+        );
+        std::fs::write(temp_dir.path().join("config.toml"), doc).unwrap();
+        let err = ConfigArgs::read_config(&temp_dir.path().to_path_buf())
+            .expect_err("a type error must still be an error")
+            .to_string();
+        assert!(
+            err.contains("line") && err.contains("column"),
+            "an unambiguous file must take the span-preserving parse; got: {err}"
+        );
+    }
+
+    /// The warning is the whole compensation for the precedence rule ignoring
+    /// the operator's newer line, so pin what it says: both keys, both values,
+    /// which one is in effect, and which line to delete.
+    #[test]
+    fn the_duplicate_spelling_warning_names_both_values_and_the_remedy() {
+        let table: toml::Table =
+            toml::from_str("bandwidth_limit = 10000000\nbandwidth-limit = 50000000\n").unwrap();
+        let reported = redundant_key_spellings(
+            CONFIG_KEY_SPELLINGS,
+            "config.toml",
+            |key| table.contains_key(key),
+            |key| table.get(key).map(|v| v.to_string()).unwrap_or_default(),
+        );
+        let [(ignored, message)] = reported.as_slice() else {
+            panic!("expected exactly one redundant spelling, got {reported:?}");
+        };
+        assert_eq!(*ignored, "bandwidth-limit");
+        for expected in [
+            "bandwidth-limit",                   // the key being ignored
+            "= 50000000",                        // ... its value, bare not re-quoted
+            "bandwidth_limit",                   // the key that wins
+            "= 10000000",                        // ... and the value now in effect
+            "delete the `bandwidth_limit` line", // the remedy
+            "config.toml",                       // where to do it
+        ] {
+            assert!(
+                message.contains(expected),
+                "the warning must mention `{expected}`; got: {message}"
+            );
+        }
+
+        // A string value keeps exactly ONE level of quoting. Escaping the TOML
+        // rendering a second time turned every path into `"\"/srv\""` and every
+        // integer into a quoted string — making the message worse than it was
+        // before it was made safe.
+        let table: toml::Table =
+            toml::from_str("data_dir = \"/var/lib/freenet\"\ndata-dir = \"/srv/freenet\"\n")
+                .unwrap();
+        let reported = redundant_key_spellings(
+            CONFIG_KEY_SPELLINGS,
+            "config.toml",
+            |key| table.contains_key(key),
+            |key| table.get(key).map(|v| v.to_string()).unwrap_or_default(),
+        );
+        let [(_, message)] = reported.as_slice() else {
+            panic!("expected one redundant spelling");
+        };
+        assert!(
+            message.contains("= \"/srv/freenet\""),
+            "a string value must be quoted once, not escaped twice; got: {message}"
+        );
+
+        // ...but a value that could forge a log line is escaped onto one line.
+        let table: toml::Table = toml::from_str(
+            "data_dir = \"/var/lib/freenet\"\ndata-dir = \"\"\"\nwarning: forged\n/srv\"\"\"\n",
+        )
+        .unwrap();
+        let reported = redundant_key_spellings(
+            CONFIG_KEY_SPELLINGS,
+            "config.toml",
+            |key| table.contains_key(key),
+            |key| table.get(key).map(|v| v.to_string()).unwrap_or_default(),
+        );
+        let [(_, message)] = reported.as_slice() else {
+            panic!("expected one redundant spelling");
+        };
+        assert!(
+            !message.contains('\n'),
+            "a newline-bearing value must not break the message onto a second \
+             line, or a remote index could forge log entries; got: {message}"
+        );
+
+        // The same for the Unicode line separators. They cannot forge a line in
+        // journald or stderr, which split on `\n` — this is for a downstream
+        // consumer that treats them as breaks, and it is here so the belt-and-
+        // braces cannot be dropped silently.
+        let table: toml::Table =
+            toml::from_str("data_dir = \"/var/lib/freenet\"\ndata-dir = \"a\\u2028b\\u2029c\"\n")
+                .unwrap();
+        let reported = redundant_key_spellings(
+            CONFIG_KEY_SPELLINGS,
+            "config.toml",
+            |key| table.contains_key(key),
+            |key| table.get(key).map(|v| v.to_string()).unwrap_or_default(),
+        );
+        let [(_, message)] = reported.as_slice() else {
+            panic!("expected one redundant spelling");
+        };
+        assert!(
+            !message.contains(['\u{2028}', '\u{2029}']),
+            "Unicode line separators must be escaped out of the message; got: \
+             {message}"
+        );
+
+        // ...and a very long one is capped. The third leg of the same
+        // hardening: without it a hostile index can flood the journal with a
+        // single enormous value rather than with extra lines.
+        let long = "x".repeat(400);
+        let table: toml::Table =
+            toml::from_str(&format!("data_dir = \"/var\"\ndata-dir = \"{long}\"\n")).unwrap();
+        let reported = redundant_key_spellings(
+            CONFIG_KEY_SPELLINGS,
+            "config.toml",
+            |key| table.contains_key(key),
+            |key| table.get(key).map(|v| v.to_string()).unwrap_or_default(),
+        );
+        let [(_, message)] = reported.as_slice() else {
+            panic!("expected one redundant spelling");
+        };
+        assert!(
+            message.contains("(truncated)") && !message.contains(&long),
+            "a very long value must be capped; got {} chars",
+            message.len()
+        );
+    }
+
+    /// Every `#[serde(alias = "...")]` in the config types must appear in
+    /// [`CONFIG_KEY_SPELLINGS`] or [`GATEWAY_KEY_SPELLINGS`].
+    ///
+    /// `key_spelling_groups_match_the_serde_aliases` checks the safe direction
+    /// — that everything listed is accepted. This checks the DANGEROUS one: an
+    /// alias added without a table row means a file naming that key both ways
+    /// is never normalized, so it hard-fails the node with `duplicate field`.
+    /// That is the fatal case this whole change exists to prevent, and it would
+    /// arrive with every other test green.
+    ///
+    /// Scraped from source because serde aliases are not reflectable at
+    /// runtime. #5130 will add and move many of these, which is exactly when a
+    /// row is easiest to forget.
+    #[test]
+    fn every_serde_alias_is_listed_in_a_spelling_table() {
+        let listed: BTreeSet<&str> = CONFIG_KEY_SPELLINGS
+            .iter()
+            .chain(GATEWAY_KEY_SPELLINGS.iter())
+            .chain(GATEWAY_ADDRESS_KEY_SPELLINGS.iter())
+            .flat_map(|group| group.iter().copied())
+            .collect();
+
+        let mut found = 0usize;
+        for (file, source) in [
+            ("config.rs", include_str!("config.rs")),
+            ("config/secret.rs", include_str!("config/secret.rs")),
+        ] {
+            for (line_no, line) in source.lines().enumerate() {
+                // Anywhere in the line: aliases share an attribute with
+                // `default` / `rename` / `skip_serializing_if` as often as not.
+                for occurrence in line.split("alias = \"").skip(1) {
+                    let Some(spelling) = occurrence.split('"').next() else {
+                        continue;
+                    };
+                    // Skip the illustrative `alias = "..."` in prose.
+                    // `_` included deliberately: every alias #5130 adds is
+                    // the UNDERSCORED spelling of a key it flips to kebab, so
+                    // excluding them would blind this guard in exactly the
+                    // scenario its rustdoc names. The illustrative
+                    // `alias = "..."` in prose is still skipped, by the `.`.
+                    if spelling.is_empty()
+                        || !spelling.chars().all(|c| {
+                            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_'
+                        })
+                    {
+                        continue;
+                    }
+                    found += 1;
+                    assert!(
+                        listed.contains(spelling),
+                        "{file}:{} declares `alias = \"{spelling}\"` but no \
+                         spelling table lists it, so a config naming that key \
+                         both ways would refuse to start instead of being \
+                         resolved",
+                        line_no + 1
+                    );
+                }
+            }
+        }
+        // A floor, so a scraper that silently stops matching cannot pass by
+        // finding nothing. Every group contributes at least one alias.
+        let expected = CONFIG_KEY_SPELLINGS.len()
+            + GATEWAY_KEY_SPELLINGS.len()
+            + GATEWAY_ADDRESS_KEY_SPELLINGS.len();
+        assert!(
+            found >= expected,
+            "scraped only {found} aliases but {expected} spelling groups exist \
+             — the scraper has probably stopped matching the attribute format"
+        );
+    }
+
+    /// `gateways.toml` is hand-edited by operators too, and its `public_key`
+    /// has no serde default — spelling it hyphenated gave `missing field
+    /// public_key` and a node that would not start. The key is still WRITTEN
+    /// underscored: the same format is served by the remote gateway index, so
+    /// renaming it is a wire change (unlike accepting a second spelling).
+    #[test]
+    fn gateways_toml_public_key_is_accepted_in_both_spellings() {
+        for key in ["public_key", "public-key"] {
+            let doc = format!(
+                "[[gateways]]\naddress = {{ host = \"vega.locut.us\", port = 31337 }}\n\
+                 {key} = \"/tmp/freenet-5124/vega.pub\"\n"
+            );
+            let gateways: Gateways = toml::from_str(&doc)
+                .unwrap_or_else(|e| panic!("`{key}` must be accepted in gateways.toml: {e}"));
+            assert_eq!(
+                gateways.gateways[0].public_key_path,
+                PathBuf::from("/tmp/freenet-5124/vega.pub"),
+                "{key}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_serde_config_args() {
@@ -5305,23 +6826,43 @@ mod tests {
         assert!(set.disable_auto_update, "--disable-auto-update → OFF");
     }
 
-    #[tokio::test]
-    async fn all_persisted_config_fields_round_trip_through_build() {
-        // #4275 guard against the recurring bug class (#3890, #4275): build()'s
-        // field-by-field merge silently drops any persisted field it doesn't
-        // list. Seeds a non-default value for EVERY persisted field, writes it,
-        // rebuilds from a clap-bare ConfigArgs, and asserts each one survives.
-        //
-        // The destructuring below has NO `..`: adding a field to any of these
-        // structs fails to COMPILE until the author classifies it (round-trips
-        // -> merge + assert; skip-by-design -> bind to `_`). Keeps it honest.
-        let temp_dir = tempfile::tempdir().unwrap();
-
-        // Valid base build: creates the on-disk secret files (and gives us real
-        // secrets + resolved paths) that the rebuild will read back.
-        let base = clap_bare_args(temp_dir.path()).build().await.unwrap();
-
-        let seed = Config {
+    /// A [`Config`] with EVERY persisted field seeded to a non-default value,
+    /// on top of a real `build()` result for the fields that must be genuine
+    /// (`secrets`, `config_paths`).
+    ///
+    /// This is a struct literal with NO `..`, so a new field on `Config` or on
+    /// any struct flattened into it fails to COMPILE here until the author
+    /// gives it a value. That compile-time gate is what makes all three callers
+    /// exhaustive rather than dependent on someone remembering to extend a
+    /// hand-written fixture:
+    ///
+    ///  - [`all_persisted_config_fields_round_trip_through_build`] — does the
+    ///    value survive the `config.toml` merge? (#4275)
+    ///  - `every_emitted_config_key_is_also_accepted_in_kebab_case` — is the
+    ///    key it is written under also accepted hyphenated? (#5124)
+    ///  - `emitted_config_toml_keys_keep_their_released_spelling` — is the key
+    ///    it is WRITTEN under still the one older releases can read? (#5124)
+    ///
+    /// # Seed every field to a NON-DEFAULT value, and every `Option` to `Some`
+    ///
+    /// The compile gate forces you to write *a* value; it cannot force a
+    /// *distinct* one, and that is the difference between the guards working
+    /// and passing vacuously:
+    ///
+    ///  - An `Option` carrying `skip_serializing_if` that is seeded `None`
+    ///    emits no key at all, so no guard can inspect it. This is the one
+    ///    residual hole — nothing but this paragraph stops it.
+    ///  - A field seeded to the value it would fall back to anyway round-trips
+    ///    byte-identically, so the round-trip guard cannot see a lost binding.
+    ///    (The set-equality check in
+    ///    `emitted_config_toml_keys_keep_their_released_spelling` does catch
+    ///    this for any field that is always emitted, whatever it was seeded
+    ///    with.)
+    ///
+    /// `secrets` is the known exception: it is taken from the real build rather
+    /// than seeded, so `nonce` is absent whenever the build left it unset.
+    fn config_with_every_field_seeded(base: &Config) -> Config {
+        Config {
             mode: OperationMode::Local,
             network_api: NetworkApiConfig {
                 address: "10.1.2.3".parse().unwrap(),
@@ -5391,7 +6932,26 @@ mod tests {
             },
             shutdown_drain_secs: 77,
             disable_auto_update: true, // #[serde(skip)] — see destructure below
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn all_persisted_config_fields_round_trip_through_build() {
+        // #4275 guard against the recurring bug class (#3890, #4275): build()'s
+        // field-by-field merge silently drops any persisted field it doesn't
+        // list. Seeds a non-default value for EVERY persisted field, writes it,
+        // rebuilds from a clap-bare ConfigArgs, and asserts each one survives.
+        //
+        // The destructuring below has NO `..`: adding a field to any of these
+        // structs fails to COMPILE until the author classifies it (round-trips
+        // -> merge + assert; skip-by-design -> bind to `_`). Keeps it honest.
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Valid base build: creates the on-disk secret files (and gives us real
+        // secrets + resolved paths) that the rebuild will read back.
+        let base = clap_bare_args(temp_dir.path()).build().await.unwrap();
+
+        let seed = config_with_every_field_seeded(&base);
 
         std::fs::write(
             temp_dir.path().join("config.toml"),
