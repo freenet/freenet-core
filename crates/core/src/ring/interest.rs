@@ -6130,15 +6130,25 @@ mod tests {
             manager.retained_summary_count(),
             RETAINED_SUMMARY_CACHE_SIZE
         );
-        assert!(
-            retained_outcome(&manager, RetainedSummaryOutcome::Evicted) >= 64,
+        assert_eq!(
+            retained_outcome(&manager, RetainedSummaryOutcome::Evicted),
+            (overflow - RETAINED_SUMMARY_CACHE_SIZE) as u64,
             "over-cap stores must be visibly evicted, not silently dropped"
         );
-        // The most recently stored pair survives; some earlier one was evicted
-        // and falls back to the pre-fix behaviour.
-        let evicted_contract = make_unique_contract_key(0);
-        manager.register_peer_interest(&evicted_contract, peer.clone(), None, false);
-        assert!(manager.get_peer_summary(&evicted_contract, &peer).is_none());
+
+        // Exactly the cap survives; the remaining pairs fall back to the pre-fix
+        // behaviour (one full-state send each). WHICH pairs are evicted is
+        // deliberately not asserted: `remove_all_peer_interests_for` walks a
+        // `HashSet`, so store order — and therefore LRU order — is unspecified.
+        let restored = (0..overflow as u32)
+            .filter(|seed| {
+                let contract = make_unique_contract_key(*seed);
+                manager.register_peer_interest(&contract, peer.clone(), None, false);
+                manager.get_peer_summary(&contract, &peer).is_some()
+            })
+            .count();
+        assert_eq!(restored, RETAINED_SUMMARY_CACHE_SIZE);
+        assert_eq!(manager.retained_summary_count(), 0);
     }
 
     /// Summary bytes are contract-defined and partly remote-influenced, so an
@@ -6252,6 +6262,12 @@ mod tests {
         assert!(
             manager.get_peer_summary(&contract_b, &peer).is_none(),
             "contract B never had a summary; A's must not leak into it"
+        );
+        // …and B's registration must not have consumed A's retained entry.
+        manager.register_peer_interest(&contract_a, peer.clone(), None, false);
+        assert!(
+            manager.get_peer_summary(&contract_a, &peer).is_some(),
+            "contract A's own retained summary must still be claimable"
         );
     }
 
