@@ -422,6 +422,51 @@ test("a contract cannot reach a node-origin context by escaping the sandbox (#38
   await popup.close();
 });
 
+test("a modifier-click on an untargeted in-contract link opens a real tab", async ({
+  page,
+  context,
+}) => {
+  await page.goto(shellUrl!);
+  await captureShellMessages(page);
+  const frame = await fixtureFrame(page);
+
+  // `#same-origin-link` carries no `target`, so it used to reach the
+  // same-origin branch on EVERY click and become an in-place `navigate` hop —
+  // middle-click and ctrl/cmd-click included, which silently lost their "open
+  // in a new tab" meaning. The modifier skip now runs before origin
+  // classification, so the browser gets the click and gives it real
+  // background-tab placement.
+  const opened = context.waitForEvent("page");
+  await frame.locator("#same-origin-link").click({ button: "middle" });
+  const popup = await opened;
+  // Background tabs commit their navigation late; wait for the URL, not the
+  // initial empty document.
+  await popup.waitForURL(/page2\.html/);
+  // A real top-level tab, not a blank sandbox-inheriting one: it renders its
+  // own shell and app frame.
+  await expect(popup.locator("iframe#app")).toBeAttached();
+  await expect(
+    popup.frameLocator("iframe#app").locator("#page2-title"),
+  ).toBeVisible();
+  await popup.close();
+
+  expect(
+    (await shellMessages(page)).map((m) => m.type),
+    "a modifier-click must not be turned into an in-place navigate hop",
+  ).toEqual([]);
+
+  // Control, in the SAME document: an UNMODIFIED click on the very same link IS
+  // intercepted. Without this the assertion above would also pass if the
+  // interceptor had simply stopped running.
+  await frame.locator("#same-origin-link").click();
+  await expect
+    .poll(async () => (await shellMessages(page)).map((m) => m.type), {
+      message:
+        "the plain click on the same link must still produce the navigate hop",
+    })
+    .toEqual(["navigate"]);
+});
+
 test("same-origin in-contract link performs an in-place navigate hop", async ({
   page,
 }) => {

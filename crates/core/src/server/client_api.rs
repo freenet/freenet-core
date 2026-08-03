@@ -1874,7 +1874,7 @@ mod tests {
     /// `NodeError("Contract not cached yet")`) via a cold cache + dead sender;
     /// no `Sec-Fetch-Dest: document`, so it does NOT take the redirect branch.
     #[tokio::test]
-    async fn serve_sandbox_response_error_carries_cors_header() {
+    async fn serve_sandbox_response_error_carries_cors_and_sandbox_headers() {
         // Unique non-zero key so this cold-cache assertion can't collide with
         // another test on the process-global webapp cache.
         let key = {
@@ -1912,6 +1912,18 @@ mod tests {
             Some("*"),
             "the sandbox-HTML error branch must carry the CORS header too, \
              otherwise the null-origin iframe surfaces it as an opaque CORS error"
+        );
+        // …and the sandbox directive, for the same reason the success branch
+        // carries it: the body reflects the request path, and this response is
+        // reachable from a context we do not control once popups can escape the
+        // sandbox. Cheaper to sandbox every response on the route than to keep
+        // re-deriving whether the current error renderer can emit markup.
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_SECURITY_POLICY)
+                .map(|v| v.to_str().unwrap_or("")),
+            Some(CONTRACT_CONTENT_SANDBOX_CSP),
+            "the sandbox-HTML error branch must also be sandboxed (#3818)"
         );
     }
 
