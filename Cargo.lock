@@ -2125,7 +2125,7 @@ dependencies = [
  "turmoil",
  "ulid",
  "url",
- "wasmparser 0.253.0",
+ "wasmparser 0.255.0",
  "wasmtime",
  "which",
  "winapi",
@@ -5317,7 +5317,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7871,9 +7871,9 @@ dependencies = [
 
 [[package]]
 name = "wasmparser"
-version = "0.253.0"
+version = "0.255.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19db11f87d2486580e1e8b6f494c54df7e0566b87d0b599db843c24019667339"
+checksum = "e8e329ef4b5d46e73b91d3ac6924417cad55a8cbbf869c199283383427c3320b"
 dependencies = [
  "bitflags 2.11.1",
  "hashbrown 0.17.1",
