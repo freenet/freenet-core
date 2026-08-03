@@ -428,13 +428,23 @@ async fn test_priority_select_event_loop_simulation() {
 
     let mut received_events = Vec::new();
 
+    // Hang guard, NOT a latency budget. The property under test is that the
+    // stream keeps its waker registration across `.next().await` calls; a
+    // regression makes iteration 0 hang FOREVER, so any generous bound fails the
+    // same way. The previous 50ms bound read like an assertion but only measured
+    // whether the producer task — which sleeps 10ms of REAL time before its first
+    // send — got scheduled promptly, so it failed on a loaded machine while the
+    // behaviour under test was fine. Wall-clock durations are not a
+    // synchronization primitive (`.claude/rules/flaky-tests.md`).
+    const WAKER_REGISTRATION_HANG_GUARD: Duration = Duration::from_secs(10);
+
     // Simulate event loop: poll stream until we've received all expected messages (3+2+2+1 = 8)
     let expected_count = 8;
     for iteration in 0..expected_count {
         tracing::info!("Event loop iteration {}", iteration);
 
         // Poll the SAME stream on each iteration - waker registration is maintained
-        let result = timeout(Duration::from_millis(50), stream.as_mut().next()).await;
+        let result = timeout(WAKER_REGISTRATION_HANG_GUARD, stream.as_mut().next()).await;
         assert!(result.is_ok(), "Iteration {} should complete", iteration);
 
         let event = result.unwrap().expect("Stream should yield value");
