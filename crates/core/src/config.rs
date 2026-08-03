@@ -4630,8 +4630,14 @@ shutdown-drain-secs = 42
                 "RELEASED_CONFIG_TOML is missing the `{underscored}` key that \
                  CONFIG_KEY_SPELLINGS pairs with `{kebab}`"
             );
+            assert_ne!(from, to, "group `{underscored}` rewrites to itself");
             doc = doc.replace(&from, &to);
         }
+        assert_ne!(
+            doc, RELEASED_CONFIG_TOML,
+            "the kebab fixture is a byte copy of the released one, so every \
+             test built on it is vacuous"
+        );
         doc
     }
 
@@ -5211,6 +5217,7 @@ shutdown-drain-secs = 42
         let doc = "[[gateways]]\n\
                    public_key = \"/tmp/freenet-5124/vega.pub\"\n\
                    public-key = \"/tmp/freenet-5124/stale.pub\"\n\
+                   location = 0.25\n\
                    \n\
                    [gateways.address]\n\
                    host = \"vega.locut.us\"\n\
@@ -5225,6 +5232,72 @@ shutdown-drain-secs = 42
             gateways.gateways[0].public_key_path,
             PathBuf::from("/tmp/freenet-5124/vega.pub"),
             "the spelling the node writes must win, as it does for config.toml"
+        );
+        // The rest of the entry must survive the normalized parse too — it goes
+        // through a different deserializer than the direct path.
+        assert_eq!(gateways.gateways[0].location, Some(0.25));
+    }
+
+    /// The warning must name the source it was given, not a hardcoded file.
+    /// `parse_gateways_toml` also parses the REMOTE index, where a duplicate
+    /// spelling would otherwise send every operator on the network to edit an
+    /// innocent local file — so the label being a parameter is the point, and
+    /// nothing else pins it.
+    #[test]
+    fn the_gateways_warning_names_the_source_it_was_given() {
+        let table: toml::Table =
+            toml::from_str("public_key = \"/tmp/a.pub\"\npublic-key = \"/tmp/b.pub\"\n").unwrap();
+        for source in ["gateways.toml", "https://freenet.org/keys/gateways.toml"] {
+            let reported = redundant_key_spellings(
+                GATEWAY_KEY_SPELLINGS,
+                source,
+                |key| table.contains_key(key),
+                |key| table.get(key).map(|v| v.to_string()).unwrap_or_default(),
+            );
+            let [(_, message)] = reported.as_slice() else {
+                panic!("expected one redundant spelling, got {reported:?}");
+            };
+            assert!(
+                message.contains(source),
+                "the warning must name `{source}`; got: {message}"
+            );
+        }
+    }
+
+    /// ...and the remote-index call site must actually PASS its URL.
+    ///
+    /// The message-formatting test above pins what `redundant_key_spellings`
+    /// produces; this pins the one line that decides which source it is told
+    /// about. Reverting that argument to a hardcoded `"gateways.toml"` is
+    /// otherwise invisible — it was, and that is the whole of what the commit
+    /// threading `source` through changed. Source-scraped because exercising it
+    /// for real would mean serving a duplicate-spelling index over HTTP and
+    /// capturing stderr.
+    #[test]
+    fn the_remote_gateway_index_is_parsed_under_its_own_url() {
+        let source = include_str!("config.rs");
+        // Assembled at runtime: spelled out as a literal, the needle would
+        // appear in this test's own text and match itself. (It did.)
+        let needle = format!("parse_gateways_toml(&response, {})", "url");
+        assert!(
+            source.contains(&needle),
+            "load_gateways_from_index must pass the index URL as the source \
+             label, or a duplicate spelling published upstream tells every \
+             operator on the network to edit their own innocent gateways.toml"
+        );
+    }
+
+    /// The gateways two-path parse has the same justification as the config
+    /// one, and the same risk of being read as dead weight later.
+    #[test]
+    fn an_unambiguous_broken_gateways_toml_keeps_its_line_and_column() {
+        let doc = "[[gateways]]\npublic_key = 42\n\n[gateways.address]\nhost = \"a\"\n";
+        let err = parse_gateways_toml(doc, "gateways.toml")
+            .expect_err("a type error must still be an error")
+            .to_string();
+        assert!(
+            err.contains("line") && err.contains("column"),
+            "an unambiguous file must take the span-preserving parse; got: {err}"
         );
     }
 
