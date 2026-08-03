@@ -1224,8 +1224,22 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             .last_observed
             .is_some_and(|observed| now.saturating_duration_since(observed) > INTEREST_TTL)
         {
+            // Reset the SEND counter only. `recent_removal` must NOT be wiped
+            // here: `last_observed` is stamped exclusively on this untracked
+            // path, so it says nothing about when the pair's interest entry was
+            // removed, and the removal's own freshness is already enforced by
+            // the `removed_at` filter immediately below.
+            //
+            // Wiping it conflated the two clocks and systematically hid
+            // recreation: a pair observed untracked at T0, then tracked, then
+            // removed at T1, then broadcast to again at T2 > T0 + INTEREST_TTL
+            // lost its T1 removal and reported `UntrackedFirstObserved` instead
+            // of `UntrackedFirstRecreated`. That is why the former is the
+            // largest missing-summary class on the fleet (771K sends / 78.2 GB
+            // on 0.2.118) while `UntrackedRepeatSequential` is ~zero: every
+            // churn cycle longer than INTEREST_TTL landed in the "never seen
+            // before" bucket.
             record.send_starts = 0;
-            record.recent_removal = None;
         }
         let first = record.send_starts == 0;
         let recreated = record
@@ -3131,6 +3145,83 @@ mod tests {
 
         // Remove again returns false
         assert!(!manager.remove_peer_interest(&contract, &peer));
+    }
+
+    /// The untracked-path staleness reset must not wipe `recent_removal`.
+    ///
+    /// `last_observed` is stamped only when a pair is broadcast to while
+    /// UNTRACKED, so it measures a different clock from the removal. Wiping the
+    /// removal alongside the send counter made every churn cycle longer than
+    /// `INTEREST_TTL` report as `UntrackedFirstObserved` ("never seen before")
+    /// rather than `UntrackedFirstRecreated` — which is why the former is the
+    /// largest missing-summary class on the fleet while `UntrackedRepeat*` is
+    /// ~zero. Without the fix this test observes `UntrackedFirstObserved`.
+    ///
+    /// The removal's own freshness is still enforced, by the `removed_at`
+    /// filter that survives the reset — pinned by the second half of this test,
+    /// so the fix cannot drift into honouring an arbitrarily old removal.
+    #[test]
+    fn untracked_staleness_reset_preserves_a_recent_removal() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(15);
+        let peer = make_peer_key(15);
+
+        // T0: broadcast to an untracked pair — stamps `last_observed`.
+        let PeerSummaryForBroadcast::Missing {
+            attempt: Some(attempt),
+            ..
+        } = manager.begin_peer_summary_broadcast(&contract, &peer)
+        else {
+            panic!("an untracked pair must start lifecycle accounting");
+        };
+        assert_eq!(attempt.class, MissingSummaryClass::UntrackedFirstObserved);
+        drop(manager.missing_summary_attempt_guard(attempt));
+
+        // T1 = T0 + 21m: the pair becomes tracked and is then torn down. This is
+        // PAST `INTEREST_TTL` from T0, so the next untracked observation trips
+        // the staleness reset.
+        time.advance_time(INTEREST_TTL + Duration::from_secs(60));
+        manager.register_peer_interest(&contract, peer.clone(), None, false);
+        assert!(manager.remove_peer_interest_for(
+            &contract,
+            &peer,
+            InterestRemovalCause::DisconnectGrace
+        ));
+
+        // T2 = T1 + 1m: the removal is RECENT, even though the last untracked
+        // observation is not.
+        time.advance_time(Duration::from_secs(60));
+        let PeerSummaryForBroadcast::Missing {
+            attempt: Some(attempt),
+            ..
+        } = manager.begin_peer_summary_broadcast(&contract, &peer)
+        else {
+            panic!("the pair is untracked again");
+        };
+        assert_eq!(
+            attempt.class,
+            MissingSummaryClass::UntrackedFirstRecreated,
+            "a removal one minute ago must classify as a recreation regardless of \
+             how long ago the pair was last observed untracked"
+        );
+        drop(manager.missing_summary_attempt_guard(attempt));
+
+        // T3 = T2 + 21m: the removal is now STALE. The surviving `removed_at`
+        // filter must still refuse to call this a recreation.
+        time.advance_time(INTEREST_TTL + Duration::from_secs(60));
+        let PeerSummaryForBroadcast::Missing {
+            attempt: Some(attempt),
+            ..
+        } = manager.begin_peer_summary_broadcast(&contract, &peer)
+        else {
+            panic!("the pair is still untracked");
+        };
+        assert_eq!(
+            attempt.class,
+            MissingSummaryClass::UntrackedFirstObserved,
+            "a removal older than INTEREST_TTL must not be honoured just because \
+             the wipe is gone — the removed_at filter is the remaining guard"
+        );
     }
 
     #[test]
