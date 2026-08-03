@@ -524,9 +524,12 @@ impl PayloadArm {
 ///     The three re-emission funnels are deliberately NOT listed here. The
 ///     retry loop and the stash-recheck re-emit sit inside the
 ///     `targets.is_empty()` branch, so they fire only when nothing was sent.
-///     The `PendingBroadcastStore` flush is driven from interest-registration
-///     sites elsewhere, but the stash it drains is POPULATED only inside that
-///     same branch, so it too can only re-drive a fan-out that previously
+///     The `PendingBroadcastStore` flush is driven from elsewhere — the
+///     neighbor-hosting proximity signal, which since #4642 step 9 is the only
+///     source that can actually produce a target, plus interest-registration
+///     sites that are an eager nudge. But the stash it drains is only ever
+///     populated from inside that same branch (the flush re-stashes just what
+///     it drained), so it too can only re-drive a fan-out that previously
 ///     found no targets. All three are re-attempts at a fan-out that has not
 ///     happened rather than extra copies of one that has, which is why they
 ///     belong to the zero-delivery bullet above. (The stash is cleared on the
