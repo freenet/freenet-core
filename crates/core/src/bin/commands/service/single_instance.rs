@@ -111,17 +111,123 @@ pub(super) fn acquire_wrapper_single_instance_lock() -> AcquireWrapperLockOutcom
     }
 }
 
-/// Non-macOS stub so `run_wrapper` compiles without cfg gates around
-/// every mention. On Linux the backend-level port guard is sufficient
-/// (no tray); on Windows the install-time wrapper detection is the
-/// analogous mechanism.
-#[cfg(not(target_os = "macos"))]
+// ── Windows wrapper single-instance lock ──
+//
+// Problem: unlike macOS (launchd RunAtLoad racing an open-launch) or
+// Linux (no tray, so no wrapper-overlap concern), the Windows wrapper had
+// NO single-instance guard at all — every relaunch (double-clicking the
+// downloaded exe, or launching the installed
+// `%localappdata%\Freenet\bin\freenet.exe`, while Freenet was already
+// running from autostart or a prior launch) fell straight through to
+// `kill_stale_freenet_processes`, which unconditionally `taskkill`s every
+// `freenet network` child for the current user — "stale" in name only,
+// it has no way to distinguish an orphan from the process a live wrapper
+// is actively supervising. The result: every relaunch kills the running
+// node and starts a new one, and when the kill races the new wrapper's
+// own startup closely enough, two `freenet network` processes can end up
+// concurrently reading and (pre-#5132-fix) non-atomically rewriting
+// config.toml, which is how a hand-edit could come back as defaults.
+// See #5132.
+//
+// Solution: a named kernel mutex, acquired in `run_wrapper` BEFORE
+// `kill_stale_freenet_processes` and before any user-visible state
+// change — the direct Windows analogue of the macOS flock guard above.
+// `CreateMutexW` on a name already held by another process (even a
+// different handle held by the SAME process) returns a valid handle but
+// sets the last error to `ERROR_ALREADY_EXISTS`; checking that lets a
+// second wrapper detect the first and exit silently instead of killing
+// it. The mutex is released automatically by the kernel when every
+// handle to it closes, including on ungraceful process exit, so there is
+// no stale-lock cleanup to get wrong.
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(super) struct WrapperSingleInstanceLock {
+    // The raw handle keeps the mutex alive; closing it (on Drop) releases
+    // the mutex. Never used for anything else post-acquisition, so the
+    // struct only exists to hold the handle for its lifetime.
+    handle: winapi::um::winnt::HANDLE,
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WrapperSingleInstanceLock {
+    fn drop(&mut self) {
+        // SAFETY: `self.handle` is a valid mutex handle returned by a
+        // prior successful `CreateMutexW`, not yet closed (this is the
+        // only place that closes it, and it runs at most once per value).
+        unsafe {
+            winapi::um::handleapi::CloseHandle(self.handle);
+        }
+    }
+}
+
+/// Name of the wrapper single-instance mutex. The `Global\` prefix is
+/// deliberately omitted: this only needs to be unique per interactive
+/// user session (Freenet installs and runs per-user, never as a system
+/// service on Windows — see `install_service`), and an unprefixed name
+/// is scoped to the caller's session, avoiding any cross-user collision
+/// or the extra privilege `Global\` names can require.
+#[cfg(target_os = "windows")]
+pub(super) const WRAPPER_MUTEX_NAME: &str = "FreenetWrapperSingleInstance";
+
+/// Acquire the wrapper single-instance mutex via `CreateMutexW`.
+#[cfg(target_os = "windows")]
+#[allow(dead_code)]
+pub(super) fn acquire_wrapper_single_instance_lock() -> AcquireWrapperLockOutcome {
+    use std::os::windows::ffi::OsStrExt;
+    // NUL-terminate explicitly: `CreateMutexW` reads `lpName` as a
+    // NUL-terminated wide string, and `encode_wide()` does not append one.
+    let name: Vec<u16> = std::ffi::OsStr::new(WRAPPER_MUTEX_NAME)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `name` is a valid, NUL-terminated UTF-16 buffer that outlives
+    // the call (it's a local `Vec` still in scope). Passing null security
+    // attributes and `FALSE` for `bInitialOwner` requests default security
+    // and does not implicitly acquire the mutex, matching a plain
+    // "does this name already exist" probe.
+    let handle = unsafe {
+        winapi::um::synchapi::CreateMutexW(
+            std::ptr::null_mut(),
+            winapi::shared::minwindef::FALSE,
+            name.as_ptr(),
+        )
+    };
+    if handle.is_null() {
+        tracing::warn!(
+            "Wrapper lock: CreateMutexW failed (error {}); proceeding without lock",
+            unsafe { winapi::um::errhandlingapi::GetLastError() }
+        );
+        return AcquireWrapperLockOutcome::UnavailableSoProceed;
+    }
+    // SAFETY: `handle` was just returned non-null by `CreateMutexW` above;
+    // `GetLastError` reflects that call's outcome (nothing else has run
+    // on this thread since).
+    let already_exists = unsafe { winapi::um::errhandlingapi::GetLastError() }
+        == winapi::shared::winerror::ERROR_ALREADY_EXISTS;
+    if already_exists {
+        // SAFETY: `handle` is the valid handle just returned; we're done
+        // with it immediately since we're not the owner.
+        unsafe {
+            winapi::um::handleapi::CloseHandle(handle);
+        }
+        AcquireWrapperLockOutcome::AnotherWrapperRunning
+    } else {
+        AcquireWrapperLockOutcome::Acquired(WrapperSingleInstanceLock { handle })
+    }
+}
+
+/// Non-macOS, non-Windows stub so `run_wrapper` compiles without cfg
+/// gates around every mention. Linux has no tray and no wrapper-overlap
+/// concern (no autostart mechanism analogous to launchd RunAtLoad or the
+/// Windows Run key double-launches this guards against).
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[allow(dead_code)]
 pub(super) fn acquire_wrapper_single_instance_lock() -> AcquireWrapperLockOutcome {
     AcquireWrapperLockOutcome::UnavailableSoProceed
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(super) struct WrapperSingleInstanceLock;

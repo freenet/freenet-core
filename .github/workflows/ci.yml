@@ -598,6 +598,52 @@ jobs:
       - name: Test service commands
         run: cargo nextest run -p freenet --bin freenet --profile ci -E 'test(commands::service)'
 
+  # Windows unit tests for the wrapper's Windows-only code paths (named-mutex
+  # single-instance guard, process classification, etc). `windows_check` above
+  # only `cargo check`s — compilation is not verification of a `#[cfg(target_os
+  # = "windows")]` path (see .claude/rules/deployment.md) — so without this job
+  # the Windows-specific tests in commands::service would never actually run.
+  # Added alongside the #5132 fix (Windows wrapper had no single-instance
+  # guard at all), mirroring macos_unit above.
+  windows_unit:
+    name: Windows Service Unit
+    runs-on: windows-latest
+    timeout-minutes: 30
+    needs: fmt_check
+    # Same skip conditions as test_unit (see test_unit comment for details).
+    if: |
+      (github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
+      !startsWith(github.head_ref, 'release/v')
+
+    env:
+      RUST_LOG: error
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install nextest
+        run: |
+          $tmp = New-TemporaryFile | Rename-Item -NewName { $_ -replace 'tmp$', 'zip' } -PassThru
+          Invoke-WebRequest -OutFile $tmp https://get.nexte.st/latest/windows
+          $outputDir = if ($Env:CARGO_HOME) { Join-Path $Env:CARGO_HOME "bin" } else { "$Env:USERPROFILE\.cargo\bin" }
+          $tmp | Expand-Archive -DestinationPath $outputDir -Force
+          $tmp | Remove-Item
+
+      - name: Build freenet bin
+        run: cargo build --locked -p freenet --bin freenet
+
+      - name: Test service commands
+        run: cargo nextest run -p freenet --bin freenet --profile ci -E 'test(commands::service)'
+
   test_simulation:
     name: Simulation
     # Run on the heavy runner for PRs (validates the change) and for release

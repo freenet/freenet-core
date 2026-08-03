@@ -1128,8 +1128,21 @@ impl ConfigArgs {
         let current = std::fs::read_to_string(&config_path).ok();
         if current.as_deref() != Some(new_config_toml.as_str()) {
             tracing::info!(path = ?config_path, "Persisting configuration");
-            let mut file = File::create(&config_path)?;
+            // Write to a sibling temp file and rename into place rather than
+            // truncating config.toml directly. `File::create` + `write_all`
+            // leaves a window where a concurrent reader (e.g. another
+            // `freenet` process racing this one) can observe a truncated or
+            // partially-written file; `rename` replaces the destination
+            // atomically, so a reader always sees either the old or the new
+            // complete content. The temp filename's extension ("toml.tmp",
+            // not "toml") keeps `read_config`'s directory scan from ever
+            // picking it up as a candidate config file if a rename is
+            // interrupted before cleanup.
+            let tmp_path = config_path.with_extension("toml.tmp");
+            let mut file = File::create(&tmp_path)?;
             file.write_all(new_config_toml.as_bytes())?;
+            drop(file);
+            std::fs::rename(&tmp_path, &config_path)?;
         }
 
         Ok(this)
@@ -5132,6 +5145,44 @@ mod tests {
         assert_eq!(
             before, after,
             "a no-op restart must not rewrite config.toml"
+        );
+    }
+
+    #[tokio::test]
+    async fn persisting_config_never_truncates_existing_file_on_temp_write_failure() {
+        // The config.toml write path must go through a temp file + rename
+        // rather than truncating config.toml in place, so a reader (e.g. a
+        // second `freenet` process racing this one — see #5132) can never
+        // observe an empty or partially-written file. Force a failure in the
+        // temp-file write step (by pre-occupying its path with a directory)
+        // and verify the destination file survives byte-for-byte untouched.
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // First run creates a real config.toml.
+        clap_bare_args(temp_dir.path()).build().await.unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+        let original = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!original.is_empty());
+
+        // Occupy config.toml.tmp with a directory so the next persist's
+        // `File::create` on the temp path fails instead of succeeding.
+        std::fs::create_dir(config_path.with_extension("toml.tmp")).unwrap();
+
+        // Change a value so the persist path actually attempts a write.
+        let mut args = clap_bare_args(temp_dir.path());
+        args.network_api.total_bandwidth_limit = Some(123_456_789);
+        let result = args.build().await;
+
+        assert!(
+            result.is_err(),
+            "build() must surface the forced temp-file write failure, not silently succeed"
+        );
+
+        let after = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(
+            original, after,
+            "a failed persist must leave the existing config.toml completely untouched, \
+             never truncated or partially overwritten"
         );
     }
 
