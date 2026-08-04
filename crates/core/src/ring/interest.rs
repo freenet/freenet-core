@@ -137,9 +137,17 @@ const RESYNC_THROTTLE_CACHE_SIZE: usize = 4096;
 /// rotation cursor (#5155). Keyed by remote socket address, so it MUST be
 /// bounded — see the per-key-collection rule in `.claude/rules/code-style.md`.
 ///
-/// Eviction fails SAFE: a forgotten cursor restarts that peer's rotation at the
-/// start of the shared set, which re-sends summaries it has already seen. It
-/// can never skip one, which is the failure that would matter.
+/// Eviction costs a peer its place in the cycle, not coverage: a forgotten
+/// cursor restarts that peer's rotation at a random offset, so the contracts
+/// re-sent are ones it may have seen recently rather than ones it is owed.
+///
+/// The random restart is load-bearing here, not decoration. Under a fixed
+/// restart, a single eviction would be harmless, but SUSTAINED eviction — more
+/// concurrently-syncing fallback peers than cache slots — would return every
+/// peer to the head of its set every round and starve the tail permanently. The
+/// cap is well above `max_connections`, so that is not the expected regime; the
+/// randomisation is what makes it a slow cycle rather than a silent hole if it
+/// ever is. See [`InterestManager::fallback_window_start`].
 const SUMMARY_FALLBACK_CURSOR_CACHE_SIZE: usize = 4096;
 
 /// Bounds diagnostic correlation state influenced by remote (contract, peer)
@@ -2526,17 +2534,48 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// the shared-contract set in [`Self::get_matching_contracts`] order
     /// (ascending by contract id).
     ///
-    /// Returns 0 when there is no cursor for this peer — the first fallback
-    /// reply of a connection, or after an LRU eviction — which restarts the
-    /// rotation at the beginning rather than skipping.
+    /// Mid-cycle this resumes immediately after the last contract SENT to that
+    /// peer, which is what makes successive windows contiguous in id space
+    /// (see [`first_index_after`]). At a cycle BOUNDARY — no cursor yet, the
+    /// cursor evicted or lost, or the previous window ending on the highest id
+    /// — the next cycle starts at a RANDOM offset rather than at 0.
     ///
-    /// See [`first_index_after`] for why the resume point is derived from the
-    /// stored id instead of a stored index.
+    /// A fixed restart at 0 is the failure this codebase has already rejected
+    /// twice, for the same reason each time: see the rotations in
+    /// `emit_stale_peer_syncs` and in the `SummaryDigests` arm, both of which
+    /// note that a fixed prefix "would starve the tail on every cycle
+    /// forever". The two ways to land back at a boundary repeatedly are both
+    /// reachable here, and neither needs an attacker:
+    ///
+    /// - The cursor is in-memory and keyed by address, so it is lost on our
+    ///   own restart, on LRU eviction, and whenever a peer reconnects from a
+    ///   new source port. A peer that reconnects more often than one cycle
+    ///   completes would, with a fixed restart, only ever be told about the
+    ///   head of the set.
+    /// - `sorted` is the INTERSECTION with the hash list the peer advertised,
+    ///   so the peer influences where the cursor lands. Advertising a single
+    ///   high-id contract parks the cursor at the end, and the following full
+    ///   round would restart at 0 — repeat, and everything past the first
+    ///   window is never advertised.
+    ///
+    /// Randomising the boundary costs nothing in the ordinary case: a cycle
+    /// beginning at any offset still advances contiguously and still covers
+    /// the whole set in `ceil(len / limit)` rounds, because the window wraps.
+    /// It only removes the guarantee that the SAME contracts are the ones
+    /// covered first every time.
+    ///
+    /// `GlobalRng` keeps this deterministic under simulation and test.
     pub(crate) fn fallback_window_start(&self, peer: SocketAddr, sorted: &[ContractKey]) -> usize {
+        if sorted.is_empty() {
+            return 0;
+        }
         let after = { self.summary_fallback_cursor.lock().peek(&peer).copied() };
-        match after {
-            Some(after) => first_index_after(sorted, &after),
-            None => 0,
+        let resumed = after.map(|after| first_index_after(sorted, &after));
+        match resumed {
+            // Mid-cycle: continue exactly where the last reply stopped.
+            Some(start) if start < sorted.len() => start,
+            // Cycle boundary (cursor absent, or exhausted past the end).
+            _ => crate::config::GlobalRng::random_range(0..sorted.len()),
         }
     }
 
@@ -2586,8 +2625,16 @@ pub(crate) fn first_index_after(sorted: &[ContractKey], after: &ContractInstance
 ///
 /// Wrapping is what makes the coverage argument hold. A window that stopped at
 /// the end of the set would give the tail a shorter turn than the head on every
-/// cycle; wrapping makes each round advance by a full `limit` entries, so a
-/// stable set of `len` contracts is covered in `ceil(len / limit)` rounds.
+/// cycle; wrapping makes each round advance by a full `limit` entries.
+///
+/// That gives `ceil(len / limit)` rounds to cover a stable set — but ONLY when
+/// every selected entry is actually sent. The caller may send fewer than the
+/// window it asked for (the byte budget in `node.rs` cuts a reply once it has
+/// spent its allowance) and then records the cursor against what it SENT, so
+/// the real cycle length is set by bytes rather than by entry count whenever
+/// summaries are large. See `MAX_FALLBACK_SUMMARY_BYTES_PER_REPLY` for the
+/// honest bound; do not quote `ceil(len / limit)` as the cycle time without
+/// checking which of the two limits binds.
 pub(crate) fn rotation_window_indices(len: usize, start: usize, limit: usize) -> Vec<usize> {
     if len == 0 || limit == 0 {
         return Vec::new();
@@ -6653,6 +6700,13 @@ mod tests {
 
     /// One round of the rotation over `sorted`, resuming after `cursor`.
     /// Returns the ids covered and the new cursor.
+    ///
+    /// `cursor: None` starts at index 0 here rather than at the random offset
+    /// production uses at a cycle boundary. That is deliberate: these tests
+    /// pin the WITHIN-cycle contiguity and coverage properties, which must hold
+    /// from any starting offset, so the tests below sweep the starts explicitly
+    /// instead of sampling them. `fallback_window_start_randomises_the_cycle_
+    /// boundary` covers the production entry point.
     fn rotation_round(
         sorted: &[ContractKey],
         cursor: Option<ContractInstanceId>,
@@ -6720,30 +6774,47 @@ mod tests {
     /// only trades detection LATENCY, never detection itself. If this fails,
     /// some contract is never advertised to that peer at all, which is
     /// permanent silent divergence rather than a slower safety net.
+    /// Coverage must hold from ANY starting offset, not just from index 0, and
+    /// for set sizes that do not divide evenly by the limit.
+    ///
+    /// Both conditions matter. Production starts each cycle at a random offset,
+    /// so a coverage property that only holds from 0 would not describe it. And
+    /// a set size divisible by the limit never produces a short final round,
+    /// which is exactly the case where a window that truncated at the end of
+    /// the set instead of wrapping would still look correct.
     #[test]
     fn rotation_covers_every_contract_within_ceil_n_over_limit_rounds() {
         const LIMIT: usize = 64;
-        for n in [1usize, 5, 63, 64, 65, 128, 266, 2448] {
+        for n in [1usize, 5, 63, 64, 65, 100, 128, 266, 2448] {
             let sorted = sorted_keys(0..n as u32);
             let expected: HashSet<ContractInstanceId> =
                 sorted.iter().map(|k| *k.id()).collect::<HashSet<_>>();
             let rounds = n.div_ceil(LIMIT);
 
-            let mut covered: HashSet<ContractInstanceId> = HashSet::new();
-            let mut cursor = None;
-            for _ in 0..rounds {
-                let (sent, next) = rotation_round(&sorted, cursor, LIMIT);
-                assert!(
-                    sent.len() <= LIMIT,
-                    "a round exceeded the entry bound at n={n}"
+            // Sweep the starting offsets a random cycle boundary could pick.
+            for first in [0usize, 1, n / 3, n / 2, n - 1] {
+                let mut covered: HashSet<ContractInstanceId> = HashSet::new();
+                // Seed the cursor so round one begins at `first`.
+                let mut cursor = if first == 0 {
+                    None
+                } else {
+                    Some(*sorted[first - 1].id())
+                };
+                for _ in 0..rounds {
+                    let (sent, next) = rotation_round(&sorted, cursor, LIMIT);
+                    assert!(
+                        sent.len() <= LIMIT,
+                        "a round exceeded the entry bound at n={n}"
+                    );
+                    covered.extend(sent);
+                    cursor = next;
+                }
+                assert_eq!(
+                    covered, expected,
+                    "n={n} starting at {first} was not fully covered in \
+                     {rounds} rounds (ceil({n}/{LIMIT}))"
                 );
-                covered.extend(sent);
-                cursor = next;
             }
-            assert_eq!(
-                covered, expected,
-                "n={n} was not fully covered in {rounds} rounds (ceil({n}/{LIMIT}))"
-            );
         }
     }
 
@@ -6885,27 +6956,105 @@ mod tests {
         assert_eq!(first_index_after(&sorted, &beyond), sorted.len());
     }
 
-    /// The stored cursor round-trips through the manager, and an unknown peer
-    /// starts at the beginning rather than at an arbitrary offset.
+    /// Mid-cycle the stored cursor round-trips and resumes deterministically,
+    /// and cursors do not leak between peers.
     #[test]
-    fn fallback_cursor_round_trips_and_defaults_to_the_start() {
+    fn fallback_cursor_round_trips_and_resumes_mid_cycle() {
         let (mgr, _clock) = make_manager();
         let peer: SocketAddr = "127.0.0.1:9100".parse().unwrap();
         let sorted = sorted_keys(0..8);
 
-        assert_eq!(
-            mgr.fallback_window_start(peer, &sorted),
-            0,
-            "a peer with no cursor must restart the rotation, not skip"
-        );
         assert_eq!(mgr.peek_fallback_cursor(peer), None);
 
         mgr.record_fallback_cursor(peer, *sorted[2].id());
         assert_eq!(mgr.peek_fallback_cursor(peer), Some(*sorted[2].id()));
-        assert_eq!(mgr.fallback_window_start(peer, &sorted), 3);
+        assert_eq!(
+            mgr.fallback_window_start(peer, &sorted),
+            3,
+            "mid-cycle the resume point must be exactly after the last id sent"
+        );
 
         // Cursors are per peer: one peer's progress must not advance another's.
         let other: SocketAddr = "127.0.0.1:9101".parse().unwrap();
-        assert_eq!(mgr.fallback_window_start(other, &sorted), 0);
+        mgr.record_fallback_cursor(other, *sorted[6].id());
+        assert_eq!(mgr.fallback_window_start(peer, &sorted), 3);
+        assert_eq!(mgr.fallback_window_start(other, &sorted), 7);
+
+        // An empty shared set has no valid offset; it must not panic or draw.
+        assert_eq!(mgr.fallback_window_start(peer, &[]), 0);
+    }
+
+    /// At a CYCLE BOUNDARY the start is random, not a fixed 0.
+    ///
+    /// A boundary is reached with no cursor (first reply, our own restart, LRU
+    /// eviction, a peer reconnecting on a new port) or with a cursor already at
+    /// the highest id. Restarting at 0 every time would re-send the head of the
+    /// set and starve the tail for any peer that keeps returning to a boundary,
+    /// which is the failure `emit_stale_peer_syncs` and the `SummaryDigests`
+    /// arm both already rotate to avoid.
+    ///
+    /// The peer influences this: `sorted` is the intersection with the hash
+    /// list it advertised, so advertising one high-id contract parks the cursor
+    /// at the end. With a fixed restart that alternation pins the window to the
+    /// head forever; with a random one it cannot.
+    #[test]
+    fn fallback_window_start_randomises_the_cycle_boundary() {
+        let (mgr, _clock) = make_manager();
+        let sorted = sorted_keys(0..64);
+
+        // No cursor: many draws, all in range, and not all the same value.
+        let mut seen = HashSet::new();
+        for i in 0..40u32 {
+            let peer: SocketAddr = format!("127.0.0.1:{}", 9200 + i).parse().unwrap();
+            let start = mgr.fallback_window_start(peer, &sorted);
+            assert!(start < sorted.len(), "start {start} out of range");
+            seen.insert(start);
+        }
+        assert!(
+            seen.len() > 1,
+            "a missing cursor must not always restart at the same offset — 40 \
+             draws over 64 contracts all landed on {seen:?}"
+        );
+
+        // Cursor at the highest id: also a boundary, also randomised.
+        let peer: SocketAddr = "127.0.0.1:9300".parse().unwrap();
+        let mut seen_wrapped = HashSet::new();
+        for _ in 0..40 {
+            mgr.record_fallback_cursor(peer, *sorted[sorted.len() - 1].id());
+            seen_wrapped.insert(mgr.fallback_window_start(peer, &sorted));
+        }
+        assert!(
+            seen_wrapped.iter().all(|s| *s < sorted.len()),
+            "wrapped start out of range"
+        );
+        assert!(
+            seen_wrapped.len() > 1,
+            "a cursor at the end of the set must restart at a random offset, \
+             not deterministically at 0 — got {seen_wrapped:?}"
+        );
+    }
+
+    /// Source pin: the cycle-boundary offset must come from `GlobalRng`.
+    ///
+    /// Two things ride on this and neither is visible in the behavioural test
+    /// above: a non-random restart re-opens the tail-starvation failure, and an
+    /// offset drawn from anything other than `GlobalRng` is not reproducible
+    /// under the deterministic simulation harness, which would make any
+    /// convergence simulation covering this path silently non-deterministic.
+    #[test]
+    fn fallback_window_start_draws_its_offset_from_global_rng() {
+        let src = include_str!("interest.rs");
+        let at = src
+            .find("pub(crate) fn fallback_window_start(")
+            .expect("fallback_window_start not found");
+        let body_end = at + src[at..].find("\n    }\n").expect("body end not found");
+        let body = &src[at..body_end];
+        assert!(
+            body.contains("GlobalRng::random_range"),
+            "the cycle-boundary offset is no longer drawn from GlobalRng — a \
+             fixed restart starves the tail of the set for any peer that keeps \
+             returning to a boundary, and a non-GlobalRng source breaks \
+             simulation determinism"
+        );
     }
 }

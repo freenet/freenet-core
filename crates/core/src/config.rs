@@ -4347,11 +4347,12 @@ impl GlobalTestMetrics {
     // === Hash-first summary exchange falsifiers (#4965) ===
     //
     // The claim under test is "the common case stops shipping summary bytes".
-    // These counters are fed from the TWO constructor functions that can build
-    // these messages — `node::summaries_reply_for_peer` (which chooses the
-    // encoding) and `node::full_summaries_message` (which every full-bytes
-    // path routes through, including the `operations::update` helpers, which
-    // are CALLERS rather than construction sites). So
+    // These counters are fed from the constructor functions that can build
+    // these messages — `node::summaries_reply_in_form` (which applies the
+    // chosen encoding, and which `node::summaries_reply_for_peer` delegates
+    // to) and `node::full_summaries_message` (which every full-bytes path
+    // routes through, including the `operations::update` helpers, which are
+    // CALLERS rather than construction sites). So
     // `summary_full_bytes() == 0` means no summary byte was put on the wire by
     // any path, not merely by the one a test happened to exercise.
     // `no_uninstrumented_full_summaries_construction` pins that no production
