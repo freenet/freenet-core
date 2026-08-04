@@ -341,10 +341,10 @@ default to the dashboard collector.
 
 The otel pipeline authenticates to the collector per `otel-auth-mode`:
 `freenet` (default) sends a per-request
-`Authorization: Bearer freenet/<pubkey>/<timestamp>/<nonce>/<signature>`
+`Authorization: Bearer freenet/<pubkey>/<timestamp>/<signature>`
 token — an XEdDSA (Signal construction, `xeddsa` crate) signature over
-`freenet/<pubkey>/<timestamp>/<nonce>` (epoch seconds, 16-byte nonce, all
-base58), signed with the x25519 transport secret itself
+`freenet/<pubkey>/<timestamp>` (epoch seconds, all base58), signed with
+the x25519 transport secret itself
 (`TransportKeypair::auth_token_signer`). `<pubkey>` is the FULL base58
 x25519 transport public key — the node's one identity — so the collector
 verifies by converting Montgomery→Edwards (sign bit 0) and running stock
