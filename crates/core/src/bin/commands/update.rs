@@ -22,6 +22,13 @@ use super::service::{generate_system_service_file, generate_user_service_file};
 /// list, which the quota-free redirect cannot provide. The former
 /// `/releases/latest` REST call that ran on every invocation is gone: see
 /// `auto_update::GITHUB_LATEST_REDIRECT_URL`.
+/// Total deadline for the small release assets (`SHA256SUMS.txt`, `.sig`).
+const MANIFEST_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Idle (between-bytes) timeout for the release archive. Bounds a stalled
+/// connection without capping a slow-but-progressing download.
+const STALLED_TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 const GITHUB_API_TAG_URL_PREFIX: &str =
     "https://api.github.com/repos/freenet/freenet-core/releases/tags/";
 
@@ -1389,7 +1396,13 @@ async fn download_bytes(url: &str) -> Result<Vec<u8>> {
     use futures::StreamExt;
 
     let client = reqwest::Client::builder()
-        .user_agent("freenet-updater")
+        .user_agent(super::auto_update::GITHUB_USER_AGENT)
+        // A TOTAL deadline is right here: these assets are a manifest of a few
+        // hundred bytes and a 64-byte signature, so there is no legitimate slow
+        // transfer to protect. Unbounded, a half-open connection would hang until
+        // systemd SIGKILLs the post-stop updater — the exact hazard the sibling
+        // timeout on the asset-list fetch was added to prevent.
+        .timeout(MANIFEST_DOWNLOAD_TIMEOUT)
         .build()?;
 
     let response = client
@@ -1634,7 +1647,14 @@ fn get_archive_extension() -> &'static str {
 
 async fn download_file(url: &str, dest: &Path, quiet: bool) -> Result<()> {
     let client = reqwest::Client::builder()
-        .user_agent("freenet-updater")
+        .user_agent(super::auto_update::GITHUB_USER_AGENT)
+        // A READ timeout, deliberately NOT a total one: this is the release
+        // archive (tens of MB), so a total deadline would abort a legitimately
+        // slow connection. `read_timeout` bounds time between bytes, which is
+        // what actually distinguishes "slow link" from "stalled connection" —
+        // and it is the stall that would otherwise hang until SIGKILL on the
+        // ExecStopPost path.
+        .read_timeout(STALLED_TRANSFER_TIMEOUT)
         .build()?;
 
     let response = client
