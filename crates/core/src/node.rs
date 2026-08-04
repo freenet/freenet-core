@@ -9455,6 +9455,123 @@ mod tests {
             );
         }
 
+        /// Two `Interests` from the same peer handled concurrently cost at
+        /// most one round of rotation progress, and cannot wedge or corrupt it.
+        ///
+        /// The handler reads the cursor, awaits up to 64 summary fetches, then
+        /// writes the cursor back, so two overlapping invocations for one peer
+        /// can both read the same start and build the same window. Inbound
+        /// messages are dispatched one task per message, so this is reachable
+        /// in production and a peer can provoke it deliberately. The comment at
+        /// the cursor-advance site accepts that cost as "one round"; this test
+        /// is that claim's evidence rather than its restatement.
+        ///
+        /// The load-bearing assertion is the progress floor: after `PAIRS`
+        /// concurrent pairs run back to back with no sequential round between
+        /// them, the union of what was advertised must be at least
+        /// `PAIRS * 64` contracts — i.e. every pair advanced the rotation by at
+        /// least one window even in the worst interleaving. Losing MORE than
+        /// one round per pair, or losing the cursor entirely and re-sending the
+        /// same window forever, both fail here. The bound holds for any
+        /// interleaving, so the test does not depend on the scheduler
+        /// reproducing a particular one: a genuinely concurrent run and a
+        /// serialised run both satisfy it, and only a broken rotation does not.
+        ///
+        /// Multi-threaded flavour with `spawn` on purpose: an earlier version
+        /// of this test used `join!` on a current-thread runtime and the two
+        /// futures did NOT overlap — it passed while exercising nothing.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn concurrent_interests_from_one_peer_cost_at_most_one_round() {
+            const PAIRS: usize = 3;
+            let h = build_harness("hf-bound-concurrent", 17170, vec![7u8; 64]).await;
+            let keys = host_many(&h, 400);
+            let hashes = distinct_hashes(&keys);
+            let expected: HashSet<u32> = hashes.iter().copied().collect();
+            let ids: HashSet<ContractInstanceId> = keys.iter().map(|k| *k.id()).collect();
+
+            let mut covered: HashSet<u32> = HashSet::new();
+            for pair in 0..PAIRS {
+                let spawn_one = || {
+                    let op_manager = Arc::clone(&h.op_manager);
+                    let hashes = hashes.clone();
+                    let peer = h.old_peer;
+                    tokio::spawn(async move {
+                        handle_interest_sync_message(
+                            &op_manager,
+                            peer,
+                            InterestMessage::Interests { hashes },
+                        )
+                        .await
+                    })
+                };
+                let (first, second) = tokio::join!(spawn_one(), spawn_one());
+
+                for (which, joined) in [("first", first), ("second", second)] {
+                    match joined.expect("handler task panicked") {
+                        Some(InterestMessage::Summaries { entries, .. }) => {
+                            assert!(
+                                entries.len() <= 64,
+                                "pair {pair} {which} reply carried {} entries; the \
+                                 per-reply bound must hold regardless of overlap",
+                                entries.len()
+                            );
+                            assert!(summary_bytes_of(&entries) <= 9 * 1024 + h.our_summary.len());
+                            covered.extend(entries.iter().map(|e| e.hash));
+                        }
+                        other => panic!("pair {pair} {which} reply was {other:?}"),
+                    }
+                }
+
+                // The cursor must still name a contract that exists, not a
+                // value torn between the two writers.
+                let cursor = h
+                    .op_manager
+                    .interest_manager
+                    .peek_fallback_cursor(h.old_peer)
+                    .expect("a fallback reply must leave a cursor");
+                assert!(
+                    ids.contains(&cursor),
+                    "after pair {pair} the cursor is no longer a member of the \
+                     shared set — concurrent writers corrupted the rotation \
+                     rather than merely duplicating a window"
+                );
+            }
+
+            assert!(
+                covered.len() >= PAIRS * 64,
+                "{PAIRS} concurrent pairs advertised only {} distinct contracts; \
+                 each pair must advance the rotation by at least one 64-entry \
+                 window, so the overlap cost more than the one round the \
+                 cursor-advance comment claims",
+                covered.len()
+            );
+
+            // And the rotation still completes from there.
+            for _ in 0..hashes.len().div_ceil(64) {
+                match handle_interest_sync_message(
+                    &h.op_manager,
+                    h.old_peer,
+                    InterestMessage::Interests {
+                        hashes: hashes.clone(),
+                    },
+                )
+                .await
+                {
+                    Some(InterestMessage::Summaries { entries, .. }) => {
+                        covered.extend(entries.iter().map(|e| e.hash));
+                    }
+                    other => panic!("expected full bytes, got {other:?}"),
+                }
+            }
+            assert_eq!(
+                covered.len(),
+                expected.len(),
+                "{} contracts still unadvertised after the concurrent pairs plus \
+                 a full sequential cycle",
+                expected.difference(&covered).count()
+            );
+        }
+
         /// The rotation bounds what we ADVERTISE, never who we consider a
         /// broadcast target.
         ///
