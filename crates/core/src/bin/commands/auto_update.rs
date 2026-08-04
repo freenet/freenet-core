@@ -628,6 +628,7 @@ pub(crate) async fn fetch_latest_release_tag(bypass_cached_cooldown: bool) -> Re
         // not have to guess whether the Location was malformed, refused for
         // leaving the origin, or never arrived. Previously all three read as
         // "no parseable release tag", which points at the wrong thing.
+        ProbeResult::Aborted { reason } => anyhow::bail!("release probe aborted: {reason}"),
         ProbeResult::Unusable { status, location } => match location.as_deref() {
             None => anyhow::bail!("GitHub returned {status} with no Location header"),
             Some(loc) if parse_tag_from_release_location(loc).is_some() => anyhow::bail!(
@@ -655,6 +656,19 @@ pub(crate) enum ProbeResult {
     Unusable {
         status: u16,
         location: Option<String>,
+    },
+    /// The probe never reached a conclusion — it hit its own limit rather than
+    /// receiving an unusable answer.
+    ///
+    /// Separate from [`ProbeResult::Unusable`] because these causes are not
+    /// HTTP-shaped. Reporting them with a synthetic `status: 0` and the reason
+    /// stuffed into `location` produced operator-facing text like "GitHub
+    /// returned 0 with no parseable release tag in Location (probe exceeded its
+    /// chain deadline)" — a status GitHub never returned, and a cause that is not
+    /// why it failed. That is the conflation the caller's three-way match was
+    /// written to end, reintroduced one function away.
+    Aborted {
+        reason: String,
     },
 }
 
@@ -698,18 +712,14 @@ pub(crate) async fn probe_release_tag_at(url: &str) -> Result<ProbeResult> {
 /// The deadline is a parameter purely so a test can drive it at millisecond
 /// scale: verifying it with the production 10s value would need a test that
 /// actually takes 10s, and a bound nobody has watched fire is not known to work.
-pub(crate) async fn probe_release_tag_within(
-    url: &str,
-    chain_timeout: Duration,
-) -> Result<ProbeResult> {
+async fn probe_release_tag_within(url: &str, chain_timeout: Duration) -> Result<ProbeResult> {
     match tokio::time::timeout(chain_timeout, probe_release_tag_chain(url)).await {
         Ok(result) => result,
-        Err(_elapsed) => Ok(ProbeResult::Unusable {
-            status: 0,
-            location: Some(format!(
+        Err(_elapsed) => Ok(ProbeResult::Aborted {
+            reason: format!(
                 "probe exceeded its {}ms chain deadline",
                 chain_timeout.as_millis()
-            )),
+            ),
         }),
     }
 }
@@ -721,6 +731,12 @@ pub(crate) async fn probe_release_tag_within(
 /// sized against. See [`probe_release_tag_at`].
 const PROBE_CHAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Per-request timeout inside a probe. A named constant so the test asserting
+/// "the chain costs no more than one request" actually READS it — comparing
+/// against a duplicated literal, as an earlier version did, means the invariant
+/// can be falsified without failing the test that names it.
+const PROBE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 async fn probe_release_tag_chain(url: &str) -> Result<ProbeResult> {
     let client = reqwest::Client::builder()
         .user_agent(GITHUB_USER_AGENT)
@@ -729,7 +745,7 @@ async fn probe_release_tag_chain(url: &str) -> Result<ProbeResult> {
         // in the header. Hops are instead followed SELECTIVELY below, only when
         // a redirect does not carry a tag.
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(10))
+        .timeout(PROBE_REQUEST_TIMEOUT)
         .build()?;
 
     let mut current = url.to_string();
@@ -795,9 +811,8 @@ async fn probe_release_tag_chain(url: &str) -> Result<ProbeResult> {
         }
     }
 
-    Ok(ProbeResult::Unusable {
-        status: 0,
-        location: Some(format!("redirect limit ({MAX_PROBE_REDIRECTS}) exceeded")),
+    Ok(ProbeResult::Aborted {
+        reason: format!("redirect limit ({MAX_PROBE_REDIRECTS}) exceeded"),
     })
 }
 
@@ -2349,13 +2364,20 @@ mod tests {
         // mistake this whole helper exists to catch, committed inside the check
         // itself; it stayed hidden until a later PR happened to write that phrase
         // into a doc comment.
-        if let Some(tests_at) = src.find("\n#[cfg(test)]\nmod ").map(|i| i + 1) {
-            assert!(
-                at < tests_at,
-                "`{signature}` matched inside the test module — this pin is \
-                 scraping its own source and would pass vacuously"
-            );
-        }
+        // `.expect`, not `if let`: a pattern that stops matching (a one-line
+        // `#[cfg(test)] mod tests {`, an intervening attribute, `pub mod tests`,
+        // CRLF) would otherwise skip the check entirely and leave every pin
+        // silently unguarded — a fail-OPEN inside the guard whose whole purpose
+        // is to stop things failing open. Refuse rather than verify nothing.
+        let tests_at = src
+            .find("\n#[cfg(test)]\nmod ")
+            .map(|i| i + 1)
+            .expect("test module not located — this guard cannot verify anything");
+        assert!(
+            at < tests_at,
+            "`{signature}` matched inside the test module — this pin is \
+             scraping its own source and would pass vacuously"
+        );
         assert!(
             at == 0 || src.as_bytes()[at - 1] == b'\n',
             "fn_body only supports column-0 free functions; `{signature}` is \
@@ -2370,7 +2392,11 @@ mod tests {
         // the test-module attribute. If it does, the `\n}\n` search ran past the
         // function and this pin is measuring the whole file.
         assert!(
-            !body.contains("#[cfg(test)]"),
+            // Anchored like the check above. A bare `contains` would false-panic
+            // on a doc comment inside the scraped body that merely mentions
+            // `#[cfg(test)]` — the same naive-substring mistake, from the other
+            // direction, and the one that actually bit this file.
+            !body.contains("\n#[cfg(test)]\nmod "),
             "scoped region for `{signature}` escaped into the test module — this \
              pin would pass vacuously"
         );
@@ -3165,6 +3191,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn an_aborted_probe_is_not_reported_as_an_http_failure() {
+        // The review finding this closes was operator-facing text, so the test is
+        // about text. Both non-HTTP aborts used to travel as
+        // `Unusable { status: 0, location: Some(<prose>) }` and rendered as
+        //   "GitHub returned 0 with no parseable release tag in Location
+        //    (probe exceeded its 10000ms chain deadline)"
+        // — a status GitHub never returned, and a cause that is not why it
+        // failed. Someone debugging a detection outage chases the redirect.
+        //
+        // Scoped with fn_body so a future edit that folds these back into
+        // `Unusable` fails here rather than silently restoring the conflation.
+        let this_src = include_str!("auto_update.rs");
+
+        for (func, what) in [
+            (
+                "async fn probe_release_tag_within(",
+                "the chain-deadline exit",
+            ),
+            (
+                "async fn probe_release_tag_chain(",
+                "the redirect-limit exit",
+            ),
+        ] {
+            let body = fn_body(this_src, func);
+            assert!(
+                body.contains("ProbeResult::Aborted"),
+                "{what} must report Aborted, not an HTTP-shaped Unusable"
+            );
+            assert!(
+                !body.contains("status: 0"),
+                "{what} must not invent a status GitHub never returned"
+            );
+        }
+
+        // And the caller must render it as its own thing.
+        let caller = fn_body(this_src, "pub(crate) async fn fetch_latest_release_tag(");
+        assert!(
+            caller.contains("ProbeResult::Aborted { reason }"),
+            "the caller must handle Aborted explicitly"
+        );
+        let (aborted_arm, _) = caller
+            .split_once("ProbeResult::Unusable")
+            .expect("the Unusable arm should follow the Aborted arm");
+        let (_, aborted_arm) = aborted_arm
+            .split_once("ProbeResult::Aborted { reason }")
+            .expect("Aborted arm not found");
+        assert!(
+            !aborted_arm.contains("GitHub returned")
+                && !aborted_arm.contains("no parseable release tag"),
+            "an aborted probe must not borrow the HTTP failure's wording — that \
+             is the conflation this exists to prevent, got: {aborted_arm}"
+        );
+    }
+
     #[tokio::test]
     async fn probe_chain_is_bounded_in_wall_clock_not_just_hops() {
         use httptest::{Expectation, Server, matchers::*, responders::*};
@@ -3198,8 +3279,8 @@ mod tests {
         let elapsed = started.elapsed();
 
         match got {
-            ProbeResult::Unusable { location, .. } => assert!(
-                location.unwrap_or_default().contains("chain deadline"),
+            ProbeResult::Aborted { reason } => assert!(
+                reason.contains("chain deadline"),
                 "hitting the deadline must say so, so an operator can tell it from \
                  a malformed redirect"
             ),
@@ -3222,17 +3303,37 @@ mod tests {
         // inside TimeoutStopSec=45, which the unit already spends on the 30s
         // drain plus teardown headroom; a probe that grew to 4x would push the
         // SIGKILL from mid-probe into mid-install.
-        let per_request = Duration::from_secs(10);
         assert_eq!(
-            PROBE_CHAIN_TIMEOUT, per_request,
+            PROBE_CHAIN_TIMEOUT, PROBE_REQUEST_TIMEOUT,
             "the chain deadline must equal the per-request timeout, so following \
              redirects costs no additional wall clock"
         );
-        // And it must stay far enough inside the stop budget to leave room for
-        // the install that follows it.
-        assert!(
-            PROBE_CHAIN_TIMEOUT.as_secs() * 2 < 45,
-            "probe + asset fetch must both fit well inside TimeoutStopSec=45"
+
+        // The previous version of this test asserted
+        // `PROBE_CHAIN_TIMEOUT * 2 < 45` under the message "probe + asset fetch
+        // must both fit well inside TimeoutStopSec=45". True, but it OVERSTATED
+        // what was guaranteed: the legs AFTER the asset fetch — the manifest, the
+        // signature and the release archive — had no timeout at all, so the
+        // stop-phase footprint was in fact unbounded. A green assertion naming
+        // the whole budget is worse than no assertion, because it terminates the
+        // investigation (the "overstated saving" row in
+        // `.claude/rules/bug-prevention-patterns.md`).
+        //
+        // A large download legitimately cannot carry a total deadline, so no test
+        // can honestly claim a whole-update wall-clock bound. What IS checkable,
+        // and what actually matters, is that every HTTP client on this path is
+        // bounded by SOMETHING — so a stalled connection can never hang until
+        // systemd SIGKILLs the updater mid-install.
+        let update_src = include_str!("update.rs");
+        let clients = update_src.matches("reqwest::Client::builder()").count();
+        let bounded =
+            update_src.matches(".timeout(").count() + update_src.matches(".read_timeout(").count();
+        assert_eq!(
+            clients, bounded,
+            "every reqwest client in the update path must set a timeout or a \
+             read_timeout: found {clients} client(s) and {bounded} bound(s). An \
+             unbounded client on the ExecStopPost path hangs until SIGKILL, and \
+             that SIGKILL lands mid-install."
         );
     }
 
@@ -3252,9 +3353,9 @@ mod tests {
             .await
             .expect("a redirect loop must terminate, not error out")
         {
-            ProbeResult::Unusable { location, .. } => {
+            ProbeResult::Aborted { reason } => {
                 assert!(
-                    location.unwrap_or_default().contains("redirect limit"),
+                    reason.contains("redirect limit"),
                     "giving up on a loop should say so"
                 );
             }
