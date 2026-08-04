@@ -670,6 +670,21 @@ pub(crate) struct RouterSnapshotInfo {
     pub lattice_predecessor_distance: Option<f64>,
     pub lattice_probes_issued: Option<u64>,
     pub lattice_probe_improvements: Option<u64>,
+    /// Version-gate refusal counters (#5156), populated by `Ring` on the
+    /// snapshot cadence from `ConnectionManager::version_gate_refusal_stats`.
+    /// `supports_hash_first_summaries` and `supports_summary_first_put` both
+    /// fail closed to their full-bytes fallback for two causes with opposite
+    /// implications, previously indistinguishable in telemetry:
+    /// `*_declined_unknown_version` (the remote's negotiated version was never
+    /// recorded — documented on joiner->gateway `AckConnection` links, which
+    /// never self-heals as the fleet upgrades) vs `*_declined_pre_floor` (a
+    /// known version below the feature's minimum — self-heals as peers
+    /// upgrade). Monotonic lifetime totals, differenced by the collector.
+    /// `None` until the snapshot task populates them.
+    pub hash_first_summaries_declined_unknown_version: Option<u64>,
+    pub hash_first_summaries_declined_pre_floor: Option<u64>,
+    pub summary_first_put_declined_unknown_version: Option<u64>,
+    pub summary_first_put_declined_pre_floor: Option<u64>,
     /// Streamed-transfer (> 64 KB) abort counters, populated by `Ring` from the
     /// per-node `network_status` singleton on the snapshot cadence. They isolate
     /// the large-contract failure class (~50% of large fetches were failing)
@@ -1628,6 +1643,12 @@ impl Router {
             lattice_predecessor_distance: None,
             lattice_probes_issued: None,
             lattice_probe_improvements: None,
+            // Version-gate refusal counters, populated by Ring on the
+            // snapshot cadence (#5156).
+            hash_first_summaries_declined_unknown_version: None,
+            hash_first_summaries_declined_pre_floor: None,
+            summary_first_put_declined_unknown_version: None,
+            summary_first_put_declined_pre_floor: None,
             // Streamed-transfer abort counters, populated by Ring from the
             // network_status singleton on the snapshot cadence (Group B).
             stream_recv_aborts_inactivity_total: None,
