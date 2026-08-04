@@ -71,14 +71,14 @@ pub(crate) const COVERED_SET_BYTES: usize = 128;
 pub(crate) const COVERED_SET_HASHES: u32 = 6;
 
 /// Bytes this adds to every `BroadcastToWithCoverage` message on the wire:
-/// [`COVERED_SET_BYTES`] of filter plus bincode's 8-byte length prefix for the
-/// byte sequence.
+/// [`COVERED_SET_BYTES`] of filter, plus bincode's 8-byte length prefix for the
+/// byte sequence, plus the 8-byte per-broadcast salt.
 ///
 /// Pinned by a test so the cost of the variant cannot drift unnoticed. For
 /// scale: the median node currently absorbs 505 MB/day of duplicate payload
 /// against ~1,081 MB/day of total received contract bytes, so even at one
 /// broadcast per second this overhead is under 12 MB/day.
-pub(crate) const COVERED_SET_WIRE_BYTES: usize = COVERED_SET_BYTES + 8;
+pub(crate) const COVERED_SET_WIRE_BYTES: usize = COVERED_SET_BYTES + 8 + 8;
 
 /// Fraction of bits set above which the filter is treated as saturated and
 /// [`CoveredSet::contains`] stops claiming coverage.
@@ -105,12 +105,22 @@ const SATURATION_FILL: f32 = 0.6;
 pub(crate) struct CoveredSet {
     #[serde_as(as = "serde_with::Bytes")]
     bits: [u8; COVERED_SET_BYTES],
-}
-
-impl Default for CoveredSet {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Per-broadcast salt, chosen by the originator and inherited by every hop.
+    ///
+    /// **Load-bearing for correctness, not just hygiene.** Without it the bit
+    /// positions for a peer depend only on its public key, so a false positive
+    /// is deterministic AND correlated down the whole tree: every hop unions
+    /// the originator's bits, so a peer that collides against those bits is
+    /// suppressed by *every* relaying node. Since a contract's co-host set
+    /// barely changes between updates, the same peer would then collide on
+    /// update after update — turning a bounded "some forwards are redundant"
+    /// into "this peer never receives this contract", with no self-healing.
+    ///
+    /// With a fresh salt per broadcast, collisions are independent across
+    /// updates. A peer that is skipped once is picked up by the next
+    /// broadcast, whose delta is computed against that peer's still-stale
+    /// cached summary and therefore carries the missed update too.
+    salt: u64,
 }
 
 impl std::fmt::Debug for CoveredSet {
@@ -128,10 +138,22 @@ impl std::fmt::Debug for CoveredSet {
 }
 
 impl CoveredSet {
-    pub(crate) fn new() -> Self {
+    /// Start a fresh covered set for one broadcast.
+    ///
+    /// `salt` must be unique per broadcast and identical across every hop of
+    /// that broadcast — derive it from the originating transaction id or the
+    /// payload hash, never from the contract key (which would be constant and
+    /// reintroduce the persistent-collision failure this salt exists to
+    /// prevent). See [`Self::salt`].
+    pub(crate) fn new(salt: u64) -> Self {
         Self {
             bits: [0u8; COVERED_SET_BYTES],
+            salt,
         }
+    }
+
+    pub(crate) fn salt(&self) -> u64 {
+        self.salt
     }
 
     /// Derive the two 32-bit seeds used for double hashing.
@@ -147,11 +169,12 @@ impl CoveredSet {
     /// peer can do by grinding its public key to collide is cause other peers
     /// to skip forwarding to it, i.e. deny itself timely updates, which it can
     /// do far more cheaply by simply not connecting.
-    fn seeds(pub_key: &crate::transport::TransportPublicKey) -> (u32, u32) {
+    fn seeds(&self, pub_key: &crate::transport::TransportPublicKey) -> (u32, u32) {
         use ahash::AHasher;
         use std::hash::Hasher;
 
         let mut hasher = AHasher::default();
+        hasher.write_u64(self.salt);
         hasher.write(pub_key.as_bytes());
         let h = hasher.finish();
         // h2 forced odd so it is coprime with the (power-of-two) bit count and
@@ -160,10 +183,11 @@ impl CoveredSet {
     }
 
     fn bit_positions(
+        &self,
         pub_key: &crate::transport::TransportPublicKey,
     ) -> impl Iterator<Item = usize> {
         const BITS: u64 = (COVERED_SET_BYTES * 8) as u64;
-        let (h1, h2) = Self::seeds(pub_key);
+        let (h1, h2) = self.seeds(pub_key);
         (0..COVERED_SET_HASHES).map(move |i| {
             (((h1 as u64).wrapping_add((i as u64).wrapping_mul(h2 as u64))) % BITS) as usize
         })
@@ -171,7 +195,7 @@ impl CoveredSet {
 
     /// Record that the broadcast has been sent to `pub_key`.
     pub(crate) fn insert(&mut self, pub_key: &crate::transport::TransportPublicKey) {
-        for pos in Self::bit_positions(pub_key) {
+        for pos in self.bit_positions(pub_key).collect::<Vec<_>>() {
             self.bits[pos / 8] |= 1 << (pos % 8);
         }
     }
@@ -185,14 +209,29 @@ impl CoveredSet {
         if self.is_saturated() {
             return false;
         }
-        Self::bit_positions(pub_key).all(|pos| self.bits[pos / 8] & (1 << (pos % 8)) != 0)
+        self.bit_positions(pub_key)
+            .all(|pos| self.bits[pos / 8] & (1 << (pos % 8)) != 0)
     }
 
-    /// Merge another node's covered set into this one.
-    pub(crate) fn union_with(&mut self, other: &CoveredSet) {
+    /// Merge another hop's covered set for the SAME broadcast into this one.
+    ///
+    /// Returns `false` and merges nothing if the salts differ. Two filters
+    /// built under different salts index the same peer at different bit
+    /// positions, so ORing them together would produce a filter whose set bits
+    /// mean nothing under either salt — every membership test would then be a
+    /// coin flip, and the false-positive rate this type is sized around would
+    /// no longer bound anything. A mismatch means a caller has crossed two
+    /// broadcasts; refusing is strictly safer than silently forwarding to
+    /// everyone or silently suppressing everyone.
+    #[must_use]
+    pub(crate) fn union_with(&mut self, other: &CoveredSet) -> bool {
+        if self.salt != other.salt {
+            return false;
+        }
         for (a, b) in self.bits.iter_mut().zip(other.bits.iter()) {
             *a |= *b;
         }
+        true
     }
 
     pub(crate) fn bits_set(&self) -> u32 {
@@ -225,7 +264,7 @@ mod tests {
     fn inserted_peers_are_always_reported_present() {
         // No false negatives: this is the property that makes suppression
         // safe to act on at all.
-        let mut set = CoveredSet::new();
+        let mut set = CoveredSet::new(0xD1CE_5A17);
         let keys: Vec<_> = (0..17).map(key).collect();
         for k in &keys {
             set.insert(k);
@@ -241,7 +280,7 @@ mod tests {
         // median fan-out of ~17 the false-positive rate should be far below
         // 1%; assert a loose 2% so the test is not itself flaky, while still
         // failing loudly if someone shrinks the filter or drops k.
-        let mut set = CoveredSet::new();
+        let mut set = CoveredSet::new(0xD1CE_5A17);
         for i in 0..17 {
             set.insert(&key(i));
         }
@@ -255,19 +294,63 @@ mod tests {
 
     #[test]
     fn union_preserves_membership_from_both_sides() {
-        let (mut a, mut b) = (CoveredSet::new(), CoveredSet::new());
+        let (mut a, mut b) = (CoveredSet::new(7), CoveredSet::new(7));
         let (ka, kb) = (key(1), key(2));
         a.insert(&ka);
         b.insert(&kb);
-        a.union_with(&b);
+        assert!(a.union_with(&b));
         assert!(a.contains(&ka) && a.contains(&kb));
+    }
+
+    #[test]
+    fn union_refuses_a_different_broadcasts_filter() {
+        // Filters under different salts index the same peer at different bit
+        // positions, so ORing them yields bits that mean nothing under either
+        // salt. Refusing is what keeps the false-positive rate a real bound.
+        let (mut a, mut b) = (CoveredSet::new(1), CoveredSet::new(2));
+        b.insert(&key(1));
+        assert!(!a.union_with(&b), "must refuse a mismatched salt");
+        assert_eq!(a.bits_set(), 0, "must not merge anything on refusal");
+    }
+
+    #[test]
+    fn a_collision_does_not_persist_across_broadcasts() {
+        // THE property the salt exists for. Unsalted, bit positions depend
+        // only on the public key, so a peer that collides against a given
+        // co-host set collides against it on EVERY update — and because each
+        // hop inherits the originator's bits, it is suppressed tree-wide.
+        // That is a permanently invisible peer, not a bounded waste.
+        //
+        // Find a key that false-positives under one salt, then assert it is
+        // not condemned to false-positive under every other salt too.
+        let members: Vec<_> = (0..17).map(key).collect();
+        let build = |salt: u64| {
+            let mut s = CoveredSet::new(salt);
+            for m in &members {
+                s.insert(m);
+            }
+            s
+        };
+
+        let first = build(1);
+        let victim = (1000..60_000)
+            .map(key)
+            .find(|k| first.contains(k))
+            .expect("expected at least one false positive in 59k probes");
+
+        let escapes = (2..200u64).filter(|s| !build(*s).contains(&victim)).count();
+        assert!(
+            escapes > 150,
+            "a peer that collides under one salt must be clear under nearly all \
+             others; only {escapes}/198 salts cleared it — salting is not working"
+        );
     }
 
     #[test]
     fn saturated_filter_reports_nothing_covered() {
         // The delivery-outage guard. A filter this full carries no usable
         // information, and the safe reading is "forward".
-        let mut set = CoveredSet::new();
+        let mut set = CoveredSet::new(0xD1CE_5A17);
         for i in 0..4000 {
             set.insert(&key(i));
         }
@@ -285,8 +368,8 @@ mod tests {
         // explicit peer list. Assert the constant so a future encoding change
         // (e.g. switching to a Vec) trips CI instead of silently reintroducing
         // a degree-proportional cost.
-        let empty = CoveredSet::new();
-        let mut full = CoveredSet::new();
+        let empty = CoveredSet::new(0xD1CE_5A17);
+        let mut full = CoveredSet::new(0xD1CE_5A17);
         for i in 0..138 {
             full.insert(&key(i));
         }
