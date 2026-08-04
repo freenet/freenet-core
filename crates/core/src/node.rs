@@ -406,6 +406,31 @@ pub struct NodeConfig {
     /// `#[serde(skip)]`; never serialized.
     #[serde(skip)]
     pub(crate) hash_first_summaries_floor_override: Option<(u8, u8, u16)>,
+    /// Test-only override for the version-carrying-ack floor
+    /// (`GATEWAY_ACK_VERSION_MIN_VERSION`, #5161). Threaded down into the
+    /// TRANSPORT layer (`create_connection_handler`), unlike the three
+    /// overrides above, which are read at the `ConnectionManager`: the gate it
+    /// controls decides how a handshake ack is ENCODED, and the handshake runs
+    /// below the node layer entirely.
+    ///
+    /// In production this is `None` → the real `(0, 2, 120)` floor (untouched).
+    ///
+    /// **Simulations default this ON**, like `hash_first_summaries_floor_override`
+    /// and unlike the two cascade gates. Same reasoning: it changes only the
+    /// ENCODING of an ack every sim already exchanges, with identical handshake
+    /// semantics, so defaulting it on costs unrelated sims nothing and buys the
+    /// one thing a version-gated wire change otherwise cannot get — the whole
+    /// simulation suite exercising the new path BEFORE the release that lifts
+    /// the crate version over the floor. It also un-breaks the sim topology
+    /// asymmetry that several existing tests document and work around (a
+    /// regular node could not learn its gateway's version, so gateway-directed
+    /// PUTs had to originate from the gateway).
+    ///
+    /// Not cfg-gated for the same reason as `subscribe_hint_floor_override`:
+    /// `node::testing_impl` sets it and is compiled unconditionally.
+    /// `#[serde(skip)]`; never serialized.
+    #[serde(skip)]
+    pub(crate) ack_version_floor_override: Option<(u8, u8, u16)>,
     /// Test-only harness flag: when set, a startup-hosted contract
     /// (`SeedHostedContract`, i.e. `append_contracts` with `subscription =
     /// true`) is registered in the neighbor-hosting advertised set so the
@@ -573,6 +598,7 @@ impl NodeConfig {
             subscribe_hint_floor_override: None,
             summary_first_put_floor_override: None,
             hash_first_summaries_floor_override: None,
+            ack_version_floor_override: None,
             advertise_seeded_hosts: false,
             hosting_time_source_override: None,
         })

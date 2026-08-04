@@ -106,8 +106,13 @@ pub(crate) struct RemoteConnection<S = super::UdpSocket, T: TimeSource = RealTim
     #[allow(dead_code)]
     pub(super) my_address: Option<SocketAddr>,
     /// Remote peer's negotiated protocol version, captured during the handshake.
-    /// `None` on the joiner->gateway path (the gateway's AckConnection payload
-    /// carries no version) — see connection_handler.rs traverse_nat AckConnection arm.
+    ///
+    /// Learned from the remote's intro packet where we parse one, and otherwise
+    /// from the acceptor's `AckConnectionV2` (#5161). `None` means the remote is
+    /// below `GATEWAY_ACK_VERSION_MIN_VERSION`, which is a fact about the peer —
+    /// not a gap in what this path can observe. Before #5161 the joiner->gateway
+    /// path was ALWAYS `None`, because the gateway's `AckConnection` carried no
+    /// version and the joiner never parses an intro packet from it.
     pub(super) remote_protoc_version: Option<(u8, u8, u16)>,
     pub(super) transport_secret_key: TransportSecretKey,
     /// Congestion controller (BBR by default) - adapts to network conditions
@@ -1032,7 +1037,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                 }
                             }
                         }
-                        SymmetricMessagePayload::AckConnection { .. } | SymmetricMessagePayload::ShortMessage { .. } | SymmetricMessagePayload::StreamFragment { .. } => {}
+                        SymmetricMessagePayload::AckConnection { .. } | SymmetricMessagePayload::AckConnectionV2 { .. } | SymmetricMessagePayload::ShortMessage { .. } | SymmetricMessagePayload::StreamFragment { .. } => {}
                     }
 
                     {
@@ -1640,7 +1645,13 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             AckConnection { result: Err(cause) } => {
                 Err(TransportError::ConnectionEstablishmentFailure { cause })
             }
-            AckConnection { result: Ok(_) } => {
+            // A duplicate success ack on an ESTABLISHED connection, in either
+            // encoding (#5161): the remote did not see our completion ack, so
+            // re-send it. The reply is deliberately the legacy `ack_ok` in both
+            // cases — this side is the joiner, the remote already learned our
+            // version from our intro packet, and answering a V2 ack with a V2
+            // ack would tell it nothing it does not have.
+            AckConnection { result: Ok(_) } | AckConnectionV2 { .. } => {
                 let packet = SymmetricMessage::ack_ok(
                     &self.remote_conn.outbound_symmetric_key,
                     self.remote_conn.inbound_symmetric_key_bytes,

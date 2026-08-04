@@ -138,6 +138,7 @@ pub(crate) fn classify(payload: &SymmetricMessagePayload) -> OutboundClass {
         SymmetricMessagePayload::ShortMessage { .. } => OutboundClass::Short,
         SymmetricMessagePayload::NoOp
         | SymmetricMessagePayload::AckConnection { .. }
+        | SymmetricMessagePayload::AckConnectionV2 { .. }
         | SymmetricMessagePayload::Ping { .. }
         | SymmetricMessagePayload::Pong { .. } => OutboundClass::MustFlow,
     }
