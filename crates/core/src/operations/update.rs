@@ -9,6 +9,7 @@
 //! the post-merge propagation helpers survive here because the
 //! drivers consume them.
 
+pub(crate) mod covered_set;
 pub(crate) mod op_ctx_task;
 pub(crate) mod pending_broadcast;
 pub(crate) mod propagation_stats;
