@@ -680,8 +680,21 @@ pub(crate) async fn probe_release_tag_at(url: &str) -> Result<ProbeResult> {
                 .map(str::to_owned)
         };
         let location = header("location");
+        // Resolve (and origin-check) the Location ONCE, and use the result both
+        // as the tag source and as the follow target.
+        //
+        // Doing it before classification is what closes the second half of the
+        // gap: `parse_tag_from_release_location` only looks for a
+        // `/releases/tag/` segment, so an off-origin Location carrying a
+        // plausible-looking tag would otherwise be believed as a version without
+        // any request being made to it. A version we accept drives exit-42, so it
+        // should come from the host we were pointed at, not from wherever a
+        // response says.
+        let resolved = location
+            .as_deref()
+            .and_then(|loc| resolve_redirect_target(&current, loc));
 
-        match classify_probe_response(status, location.as_deref()) {
+        match classify_probe_response(status, resolved.as_deref()) {
             ProbeOutcome::Tag(tag) => return Ok(ProbeResult::Tag(tag)),
             ProbeOutcome::RateLimited => {
                 return Ok(ProbeResult::RateLimited {
@@ -701,10 +714,7 @@ pub(crate) async fn probe_release_tag_at(url: &str) -> Result<ProbeResult> {
                 // because reqwest follows redirects by default; `Policy::none()`
                 // is what took that away, so it has to be given back — bounded,
                 // so a redirect loop cannot hang the probe.
-                match location
-                    .as_deref()
-                    .and_then(|loc| resolve_redirect_target(&current, loc))
-                {
+                match resolved {
                     Some(next) if status.is_redirection() => {
                         tracing::debug!(from = %current, to = %next, "following release redirect");
                         current = next;
@@ -732,14 +742,45 @@ pub(crate) async fn probe_release_tag_at(url: &str) -> Result<ProbeResult> {
 const MAX_PROBE_REDIRECTS: usize = 3;
 
 /// Resolve a `Location` against the URL it came from, so relative headers work.
-/// `None` if the result is not a usable absolute HTTP(S) URL — we never follow a
-/// redirect out of HTTP(S).
+///
+/// Refuses anything that leaves the **origin** — scheme, host and port must all
+/// match the URL the redirect came from. Two things this stops:
+///
+/// * **A downgrade to plaintext.** Permitting `http` would let a redirect move
+///   the probe onto a channel a network attacker can actually rewrite — which is
+///   the difference between "needs to compromise GitHub" and "needs to be on the
+///   path". The initial URL is `https`, so there is never a legitimate reason to
+///   leave it.
+/// * **A redirect off to an arbitrary host.** This runs unattended in a
+///   supervised service, so a `Location` we follow anywhere is a request the
+///   operator never asked for, pointed wherever the response says.
+///
+/// Same-ORIGIN rather than an allow-list of `github.com`: it ties the rule to
+/// wherever the caller was actually pointed, which is what `probe_release_tag_at`
+/// needs (the only reason it follows at all is a repo rename, which GitHub
+/// answers on the same host) — and it keeps the local test server exercising the
+/// real follow path instead of forcing a special case into production code.
+///
+/// Defence in depth, not a fix for a live hole: reaching this requires control of
+/// a TLS-protected GitHub response, and even then a bogus tag only yields a
+/// version string whose assets are fetched from GitHub and checksum/signature
+/// verified. Cheap enough to be worth having anyway.
 fn resolve_redirect_target(current: &str, location: &str) -> Option<String> {
-    let next = reqwest::Url::parse(current).ok()?.join(location).ok()?;
-    match next.scheme() {
-        "http" | "https" => Some(next.into()),
-        _ => None,
+    let base = reqwest::Url::parse(current).ok()?;
+    let next = base.join(location).ok()?;
+    let same_origin = next.scheme() == base.scheme()
+        && next.host_str() == base.host_str()
+        && next.port_or_known_default() == base.port_or_known_default();
+
+    if !matches!(next.scheme(), "http" | "https") || !same_origin {
+        tracing::debug!(
+            from = %current,
+            to = %next,
+            "refusing to follow a release redirect that leaves the origin"
+        );
+        return None;
     }
+    Some(next.into())
 }
 
 /// What a release-probe response means.
@@ -2938,6 +2979,101 @@ mod tests {
             ProbeResult::Tag("v0.2.118".to_string()),
             "a redirect whose Location carries no tag must be followed"
         );
+    }
+
+    #[test]
+    fn redirect_follow_refuses_downgrade_and_off_host() {
+        let base = "https://github.com/freenet/freenet-core/releases/latest";
+
+        // Relative and same-host absolute both resolve.
+        assert_eq!(
+            resolve_redirect_target(base, "/freenet/freenet-core/releases/latest").as_deref(),
+            Some("https://github.com/freenet/freenet-core/releases/latest")
+        );
+        assert_eq!(
+            resolve_redirect_target(base, "https://github.com/other/repo/releases/latest")
+                .as_deref(),
+            Some("https://github.com/other/repo/releases/latest")
+        );
+
+        // A downgrade to plaintext is refused: it would move the probe onto a
+        // channel a network attacker can rewrite.
+        assert_eq!(
+            resolve_redirect_target(
+                base,
+                "http://github.com/freenet/freenet-core/releases/latest"
+            ),
+            None,
+            "must not follow https -> http"
+        );
+
+        // A different port on the same host is a different origin.
+        assert_eq!(
+            resolve_redirect_target(
+                base,
+                "https://github.com:8443/freenet/freenet-core/releases/latest"
+            ),
+            None,
+            "must not follow to a different port"
+        );
+
+        // The rule is same-ORIGIN, not hard-coded https: a probe that began on
+        // plain http (only the local test server does) may follow within it.
+        // This is what lets the follow tests below exercise the real path.
+        assert_eq!(
+            resolve_redirect_target("http://127.0.0.1:9/releases/latest", "/new/releases/latest")
+                .as_deref(),
+            Some("http://127.0.0.1:9/new/releases/latest")
+        );
+
+        // Another host is refused, however plausible it looks. This runs
+        // unattended in a supervised service.
+        for off_host in [
+            "https://evil.example.com/freenet/freenet-core/releases/latest",
+            "https://github.com.evil.example.com/a/b/releases/latest",
+            "https://raw.githubusercontent.com/freenet/freenet-core/releases/latest",
+            "https://127.0.0.1/releases/latest",
+            "https://[::1]:8080/releases/latest",
+        ] {
+            assert_eq!(
+                resolve_redirect_target(base, off_host),
+                None,
+                "must not follow off-host redirect to {off_host}"
+            );
+        }
+
+        // Non-HTTP schemes stay refused.
+        assert_eq!(resolve_redirect_target(base, "file:///etc/passwd"), None);
+        assert_eq!(resolve_redirect_target(base, "ftp://github.com/x"), None);
+    }
+
+    #[tokio::test]
+    async fn probe_does_not_trust_or_follow_an_off_origin_redirect() {
+        use httptest::{Expectation, Server, matchers::*, responders::*};
+        // End-to-end, covering BOTH halves of the off-origin gap. The Location
+        // here deliberately carries a plausible `/releases/tag/v9.9.9`, so:
+        //   * it must not be believed as a version (it would compare as newer
+        //     than anything and drive a pointless exit-42 cycle), and
+        //   * it must not be followed (an unattended supervised service must not
+        //     issue requests aimed wherever a response points it).
+        // `.times(1)` covers the second: a follow would be a second request.
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/releases/latest"))
+                .times(1)
+                .respond_with(status_code(301).append_header(
+                    "location",
+                    "https://evil.example.com/freenet/freenet-core/releases/tag/v9.9.9",
+                )),
+        );
+
+        match probe_release_tag_at(&server.url_str("/releases/latest"))
+            .await
+            .expect("an off-host redirect must resolve to Unusable, not error")
+        {
+            ProbeResult::Unusable { status, .. } => assert_eq!(status, 301),
+            other => panic!("off-host redirect must not be followed, got {other:?}"),
+        }
     }
 
     #[tokio::test]
