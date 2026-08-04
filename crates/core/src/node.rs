@@ -827,7 +827,7 @@ impl NodeConfig {
             // renders as `{pub_key}@{addr}`, which would put this node's socket
             // address on every exported batch and re-identify the node on every
             // address change.
-            crate::tracing::otel::init(&self.config.otel, self.key_pair.public().to_string());
+            crate::tracing::otel::init(&self.config.otel, &self.key_pair);
 
             (DynamicRegister::new(registers), flush_handle)
         };
