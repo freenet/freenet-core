@@ -3191,6 +3191,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn an_aborted_probe_is_not_reported_as_an_http_failure() {
+        // The review finding this closes was operator-facing text, so the test is
+        // about text. Both non-HTTP aborts used to travel as
+        // `Unusable { status: 0, location: Some(<prose>) }` and rendered as
+        //   "GitHub returned 0 with no parseable release tag in Location
+        //    (probe exceeded its 10000ms chain deadline)"
+        // — a status GitHub never returned, and a cause that is not why it
+        // failed. Someone debugging a detection outage chases the redirect.
+        //
+        // Scoped with fn_body so a future edit that folds these back into
+        // `Unusable` fails here rather than silently restoring the conflation.
+        let this_src = include_str!("auto_update.rs");
+
+        for (func, what) in [
+            (
+                "async fn probe_release_tag_within(",
+                "the chain-deadline exit",
+            ),
+            (
+                "async fn probe_release_tag_chain(",
+                "the redirect-limit exit",
+            ),
+        ] {
+            let body = fn_body(this_src, func);
+            assert!(
+                body.contains("ProbeResult::Aborted"),
+                "{what} must report Aborted, not an HTTP-shaped Unusable"
+            );
+            assert!(
+                !body.contains("status: 0"),
+                "{what} must not invent a status GitHub never returned"
+            );
+        }
+
+        // And the caller must render it as its own thing.
+        let caller = fn_body(this_src, "pub(crate) async fn fetch_latest_release_tag(");
+        assert!(
+            caller.contains("ProbeResult::Aborted { reason }"),
+            "the caller must handle Aborted explicitly"
+        );
+        let (aborted_arm, _) = caller
+            .split_once("ProbeResult::Unusable")
+            .expect("the Unusable arm should follow the Aborted arm");
+        let (_, aborted_arm) = aborted_arm
+            .split_once("ProbeResult::Aborted { reason }")
+            .expect("Aborted arm not found");
+        assert!(
+            !aborted_arm.contains("GitHub returned")
+                && !aborted_arm.contains("no parseable release tag"),
+            "an aborted probe must not borrow the HTTP failure's wording — that \
+             is the conflation this exists to prevent, got: {aborted_arm}"
+        );
+    }
+
     #[tokio::test]
     async fn probe_chain_is_bounded_in_wall_clock_not_just_hops() {
         use httptest::{Expectation, Server, matchers::*, responders::*};
