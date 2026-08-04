@@ -996,6 +996,9 @@ impl ConfigArgs {
             if let Some(endpoint) = cfg.otel.endpoint {
                 self.otel.endpoint.get_or_insert(endpoint);
             }
+            // Always emitted (non-Option in OtelConfig), so merge
+            // unconditionally; the CLI value still wins via get_or_insert.
+            self.otel.auth_mode.get_or_insert(cfg.otel.auth_mode);
         }
 
         // Validate the effective config (CLI + values merged from config.toml).
@@ -1508,6 +1511,7 @@ impl ConfigArgs {
             otel: OtelConfig {
                 enabled: self.otel.enabled,
                 endpoint: self.otel.endpoint,
+                auth_mode: self.otel.auth_mode.unwrap_or_default(),
                 // Same --id rule as telemetry: simulated networks and
                 // integration tests must not ship data to a collector.
                 is_test_environment: self.id.is_some(),
@@ -2929,6 +2933,21 @@ fn default_iface_tx_enabled() -> bool {
 /// must always be an explicit operator choice.
 pub const DEFAULT_OTEL_ENDPOINT: &str = "http://localhost:4318";
 
+/// How the OTel exporter authenticates to the collector.
+///
+/// `freenet` (the default) sends a per-request
+/// `Authorization: Bearer freenet/<pubkey>/<timestamp>/<nonce>/<signature>`
+/// token signed with a key derived from the node's transport keypair — see
+/// `tracing::otel::bearer_token`. `disabled` sends no Authorization header.
+/// Future methods get new variants.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum OtelAuthMode {
+    #[default]
+    Freenet,
+    Disabled,
+}
+
 /// CLI/file args for the OpenTelemetry SDK metrics exporter.
 ///
 /// Strictly independent of [`TelemetryArgs`]: no shared field, no shared
@@ -2966,6 +2985,14 @@ pub struct OtelArgs {
     #[arg(id = "otel_endpoint", long = "otel-endpoint")]
     #[serde(rename = "otel-endpoint", skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// Collector authentication method. `Option` so `build()` can tell "not
+    /// given on the CLI" from an explicit choice and merge the config-file
+    /// value; resolves to [`OtelAuthMode::default`] (`freenet`) when neither
+    /// sets it.
+    #[arg(id = "otel_auth_mode", long = "otel-auth-mode", value_enum)]
+    #[serde(rename = "otel-auth-mode", skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<OtelAuthMode>,
 }
 
 /// Resolved configuration for the OpenTelemetry SDK metrics exporter.
@@ -2983,6 +3010,10 @@ pub struct OtelConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub endpoint: Option<String>,
+
+    /// Collector authentication method.
+    #[serde(default, rename = "otel-auth-mode")]
+    pub auth_mode: OtelAuthMode,
 
     /// Whether this is a test environment (detected via `--id`). Mirrors
     /// [`TelemetryConfig::is_test_environment`]; suppresses export so test
@@ -6718,6 +6749,34 @@ shutdown-drain-secs = 42
             "otel-telemetry-enabled must default to false"
         );
         assert_eq!(args.endpoint, None, "no implicit collector");
+        assert_eq!(
+            args.auth_mode.unwrap_or_default(),
+            OtelAuthMode::Freenet,
+            "auth mode must default to the freenet bearer-token format"
+        );
+    }
+
+    #[test]
+    fn otel_auth_mode_parses_from_cli_and_file() {
+        use clap::Parser;
+        let none = ConfigArgs::try_parse_from(["freenet"]).expect("bare parse");
+        assert_eq!(none.otel.auth_mode, None, "unset on the CLI stays None");
+        let off = ConfigArgs::try_parse_from(["freenet", "--otel-auth-mode", "disabled"])
+            .expect("disabled parse");
+        assert_eq!(off.otel.auth_mode, Some(OtelAuthMode::Disabled));
+        let on = ConfigArgs::try_parse_from(["freenet", "--otel-auth-mode", "freenet"])
+            .expect("freenet parse");
+        assert_eq!(on.otel.auth_mode, Some(OtelAuthMode::Freenet));
+
+        // The file spelling is the lowercase variant name.
+        let cfg: OtelConfig = toml::from_str("otel-auth-mode = \"disabled\"").unwrap();
+        assert_eq!(cfg.auth_mode, OtelAuthMode::Disabled);
+        let cfg: OtelConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            cfg.auth_mode,
+            OtelAuthMode::Freenet,
+            "absent key -> default"
+        );
     }
 
     #[test]
@@ -7946,7 +8005,8 @@ shutdown-drain-secs = 42
             otel: OtelConfig {
                 enabled: true,
                 endpoint: Some("http://example.invalid:4319".to_string()),
-                is_test_environment: false, // #[serde(skip)] — derived from --id
+                auth_mode: OtelAuthMode::Disabled, // non-default: default is Freenet
+                is_test_environment: false,        // #[serde(skip)] — derived from --id
             },
             shutdown_drain_secs: 77,
             disable_auto_update: true, // #[serde(skip)] — see destructure below
@@ -8058,6 +8118,11 @@ shutdown-drain-secs = 42
             otel.endpoint, seed.otel.endpoint,
             "otel.endpoint — an operator's collector URL must survive the \
              config.toml merge"
+        );
+        assert_eq!(
+            otel.auth_mode, seed.otel.auth_mode,
+            "otel.auth_mode — an operator's explicit `disabled` must survive \
+             the config.toml merge, or auth silently re-enables on restart"
         );
 
         let NetworkApiConfig {

@@ -76,12 +76,91 @@ pub(crate) fn resolve_metrics_endpoint(
 
 use opentelemetry::metrics::{Counter, Histogram};
 use opentelemetry::{KeyValue, global};
-use opentelemetry_otlp::{ExporterBuildError, MetricExporter, WithExportConfig};
+use opentelemetry_http::{Bytes, HttpClient, HttpError, Request, Response};
+use opentelemetry_otlp::{ExporterBuildError, MetricExporter, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::{
     Resource,
     metrics::{Aggregation, Instrument, InstrumentKind, SdkMeterProvider, Stream},
 };
 use std::sync::OnceLock;
+
+/// Build one `freenet`-mode bearer token:
+/// `freenet/<pubkey>/<timestamp>/<nonce>/<signature>`, where `<signature>` is
+/// the XEdDSA signature over `freenet/<pubkey>/<timestamp>/<nonce>`.
+///
+/// `<pubkey>` is the base58 full x25519 transport public key — the node's one
+/// real identity, the same key peers see and whose truncated fingerprint UIs
+/// display. `<timestamp>` is seconds since the Unix epoch, `<nonce>` is 16
+/// base58 random bytes for replay protection, `<signature>` is base58 too.
+/// Freshly built per export request so the timestamp stays current.
+///
+/// Collector-side verification needs no exotic library: convert the
+/// Montgomery pubkey to Edwards (sign bit 0), then standard Ed25519 verify —
+/// see `node_pubkey_is_verifiable_with_stock_ed25519` below.
+pub(crate) fn bearer_token(signer: &xeddsa::xed25519::PrivateKey, pubkey_b58: &str) -> String {
+    use xeddsa::xeddsa::Sign;
+    // Wall-clock epoch seconds on purpose: the collector checks it against
+    // ITS clock, so simulation time would be meaningless here.
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let mut nonce_bytes = [0u8; 16];
+    crate::config::GlobalRng::fill_bytes(&mut nonce_bytes);
+    let nonce = bs58::encode(nonce_bytes).into_string();
+    let signed_payload = format!("freenet/{pubkey_b58}/{timestamp}/{nonce}");
+    // OS entropy (SysRng), not GlobalRng: XEdDSA's Z randomness hedges the
+    // signature nonce, which is cryptographic material — the same exception
+    // documented in .claude/rules/code-style.md for keys/nonces. UnwrapErr is
+    // required because xeddsa's bound is the infallible rand 0.10 CryptoRng.
+    let signature: [u8; 64] = signer.sign(
+        signed_payload.as_bytes(),
+        rand_core10::UnwrapErr(rand10::rngs::SysRng),
+    );
+    let signature = bs58::encode(signature).into_string();
+    format!("{signed_payload}/{signature}")
+}
+
+/// OTLP HTTP client that injects a fresh `Authorization: Bearer` token
+/// (see [`bearer_token`]) into every export request, delegating the actual
+/// send to the same blocking reqwest client the exporter would use anyway.
+struct FreenetAuthClient {
+    inner: reqwest::blocking::Client,
+    signer: xeddsa::xed25519::PrivateKey,
+    pubkey_b58: String,
+}
+
+// Manual impl: never print the signing key.
+impl std::fmt::Debug for FreenetAuthClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FreenetAuthClient").finish_non_exhaustive()
+    }
+}
+
+#[async_trait::async_trait]
+impl HttpClient for FreenetAuthClient {
+    async fn send_bytes(&self, mut request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
+        let token = bearer_token(&self.signer, &self.pubkey_b58);
+        request.headers_mut().insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_str(&format!("Bearer {token}"))?,
+        );
+        // Hand-rolled send, mirroring opentelemetry-http's blocking impl:
+        // that impl is on reqwest 0.13's client (opentelemetry-http's own
+        // dep), while the workspace is on 0.12, so we can't delegate to it.
+        // Blocking inside async is fine here for the same reason the SDK's
+        // default client is blocking: PeriodicReader exports via block_on on
+        // a dedicated thread. Fold both in when the workspace moves to 0.13.
+        let request: reqwest::blocking::Request = request.map(|body| body.to_vec()).try_into()?;
+        let mut response = self.inner.execute(request)?.error_for_status()?;
+        let headers = std::mem::take(response.headers_mut());
+        let mut http_response = Response::builder()
+            .status(response.status())
+            .body(response.bytes()?)?;
+        *http_response.headers_mut() = headers;
+        Ok(http_response)
+    }
+}
 
 /// Instrumentation scope name for every instrument this crate registers.
 const METER_NAME: &str = "freenet";
@@ -93,9 +172,12 @@ const METER_NAME: &str = "freenet";
 /// otherwise: an exporter that cannot be built logs a warning and the node
 /// starts anyway. Metrics export must never be a startup dependency.
 ///
-/// `instance_id` identifies THIS node and must not contain a network address:
-/// see [`build_provider`].
-pub fn init(config: &OtelConfig, instance_id: String) {
+/// `keypair` is the node's transport keypair: it yields the
+/// `freenet.node.pubkey` / `freenet.node.fingerprint` resource attributes
+/// (see [`build_provider`]) and, when `otel-auth-mode = "freenet"`, its
+/// derived signing key authenticates every export request (see
+/// [`bearer_token`]).
+pub fn init(config: &OtelConfig, keypair: &crate::transport::TransportKeypair) {
     if let Some(reason) = otel_suppression_reason(
         config,
         cfg!(test),
@@ -115,7 +197,19 @@ pub fn init(config: &OtelConfig, instance_id: String) {
             .as_deref(),
     );
 
-    match build_provider(endpoint.as_deref(), instance_id) {
+    // `service.instance.id` IS the auth identity: the same base58 ed25519
+    // verifying key the bearer token carries as `<pubkey>`, so the collector
+    // self-validates the node id against the signing key by string equality
+    // after verifying the signature. Derived from the keypair even when auth
+    // is disabled, so the id is stable across auth-mode changes.
+    let pubkey = bs58::encode(keypair.public_key_bytes()).into_string();
+    let fingerprint = keypair.public().to_string();
+    let auth_signer = match config.auth_mode {
+        crate::config::OtelAuthMode::Freenet => Some(keypair.auth_token_signer()),
+        crate::config::OtelAuthMode::Disabled => None,
+    };
+
+    match build_provider(endpoint.as_deref(), pubkey, fingerprint, auth_signer) {
         Ok(provider) => {
             // ponytail: no shutdown hook. `set_meter_provider` holds a
             // reference for the process lifetime and PeriodicReader exports
@@ -147,18 +241,39 @@ pub fn init(config: &OtelConfig, instance_id: String) {
 /// [`resolve_metrics_endpoint`] for why calling `with_endpoint` at all would
 /// override them.
 ///
-/// `instance_id` MUST be the transport public key fingerprint, never a
-/// `PeerId`: `PeerId`'s `Display` is `{pub_key}@{addr}`, so using it would put
-/// this node's socket address in every exported batch AND make the identity
-/// churn on every address change. The fingerprint is public by construction
-/// (peers learn it on connect) and stable for the life of the keypair.
+/// Two identity resource attributes, both computed by [`init`] from the one
+/// transport keypair:
+///
+/// - `freenet.node.pubkey` — the base58 full x25519 transport public key,
+///   byte-equal to the bearer token's `<pubkey>` field. The collector
+///   verifies the token's XEdDSA signature against this key, so the identity
+///   is self-validating and unforgeable.
+/// - `freenet.node.fingerprint` — base58 of the FIRST 12 BYTES of the same
+///   key (`TransportPublicKey::Display`, what UIs show). A pure public
+///   function of `pubkey`, so the collector recomputes and checks it rather
+///   than trusting it.
+///
+/// Neither may ever be a `PeerId`: its `Display` is `{pub_key}@{addr}`, so
+/// using it would put this node's socket address in every exported batch AND
+/// make the identity churn on every address change.
 pub(crate) fn build_provider(
     endpoint: Option<&str>,
-    instance_id: String,
+    pubkey: String,
+    fingerprint: String,
+    auth_signer: Option<xeddsa::xed25519::PrivateKey>,
 ) -> Result<SdkMeterProvider, ExporterBuildError> {
     let mut builder = MetricExporter::builder().with_http();
     if let Some(endpoint) = endpoint {
         builder = builder.with_endpoint(endpoint);
+    }
+    if let Some(signer) = auth_signer {
+        // Same blocking client the exporter defaults to (PeriodicReader
+        // exports off-runtime — see Cargo.toml), wrapped to sign each request.
+        builder = builder.with_http_client(FreenetAuthClient {
+            inner: reqwest::blocking::Client::new(),
+            signer,
+            pubkey_b58: pubkey.clone(),
+        });
     }
     let exporter = builder.build()?;
 
@@ -171,7 +286,8 @@ pub(crate) fn build_provider(
     // identifying the remote end of a connection.
     let resource = Resource::builder()
         .with_service_name("freenet-node")
-        .with_attribute(KeyValue::new("service.instance.id", instance_id))
+        .with_attribute(KeyValue::new("freenet.node.pubkey", pubkey))
+        .with_attribute(KeyValue::new("freenet.node.fingerprint", fingerprint))
         .with_attribute(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
         .with_attribute(KeyValue::new("os.type", std::env::consts::OS))
         .with_attribute(KeyValue::new("host.arch", std::env::consts::ARCH))
@@ -556,8 +672,116 @@ mod tests {
         OtelConfig {
             enabled: true,
             endpoint: None,
+            auth_mode: Default::default(),
             is_test_environment: false,
         }
+    }
+
+    /// One keypair plus its token, pre-split, for the verification tests.
+    fn token_fixture() -> (crate::transport::TransportKeypair, String) {
+        let keypair = crate::transport::TransportKeypair::new();
+        let pubkey_b58 = bs58::encode(keypair.public_key_bytes()).into_string();
+        let token = bearer_token(&keypair.auth_token_signer(), &pubkey_b58);
+        (keypair, token)
+    }
+
+    #[test]
+    fn bearer_token_has_the_documented_shape_and_verifies() {
+        use xeddsa::xeddsa::Verify;
+
+        let (keypair, token) = token_fixture();
+
+        let parts: Vec<&str> = token.split('/').collect();
+        let [scheme, pubkey, timestamp, nonce, signature] = parts[..] else {
+            panic!("expected 5 /-separated parts, got {token}");
+        };
+        assert_eq!(scheme, "freenet");
+        assert_eq!(
+            pubkey,
+            bs58::encode(keypair.public_key_bytes()).into_string(),
+            "pubkey part must be the full base58 x25519 transport public key"
+        );
+        let ts: u64 = timestamp.parse().expect("timestamp is epoch seconds");
+        assert!(
+            ts > 1_700_000_000,
+            "timestamp must be current epoch seconds"
+        );
+        assert!(!nonce.is_empty());
+
+        // The signature covers everything before its own slash, and verifies
+        // against the token's OWN pubkey — the transport key itself.
+        let signed_payload = format!("freenet/{pubkey}/{timestamp}/{nonce}");
+        let sig_bytes: [u8; 64] = bs58::decode(signature)
+            .into_vec()
+            .unwrap()
+            .try_into()
+            .expect("64-byte signature");
+        xeddsa::xed25519::PublicKey(keypair.public_key_bytes())
+            .verify(signed_payload.as_bytes(), &sig_bytes)
+            .expect("XEdDSA signature must verify against the transport pubkey");
+
+        // A forged payload with the same signature must fail.
+        assert!(
+            xeddsa::xed25519::PublicKey(keypair.public_key_bytes())
+                .verify(b"freenet/forged", &sig_bytes)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn node_pubkey_is_verifiable_with_stock_ed25519() {
+        // The collector-side contract, spelled out: no xeddsa dependency
+        // needed there. Convert the Montgomery (x25519) pubkey to an Edwards
+        // point with sign bit 0, then run ordinary Ed25519 verification.
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+        let (keypair, token) = token_fixture();
+        let (payload, sig_b58) = token.rsplit_once('/').unwrap();
+        let sig_bytes: [u8; 64] = bs58::decode(sig_b58)
+            .into_vec()
+            .unwrap()
+            .try_into()
+            .unwrap();
+
+        let edwards = curve25519_dalek::montgomery::MontgomeryPoint(keypair.public_key_bytes())
+            .to_edwards(0)
+            .expect("transport pubkey must map to Edwards")
+            .compress()
+            .to_bytes();
+        VerifyingKey::from_bytes(&edwards)
+            .unwrap()
+            .verify(payload.as_bytes(), &Signature::from_bytes(&sig_bytes))
+            .expect("stock ed25519 verify after Montgomery->Edwards conversion");
+    }
+
+    #[test]
+    fn fingerprint_attr_is_recomputable_from_the_pubkey_attr() {
+        // Requirement: a node cannot fake the UI-facing fingerprint. The
+        // collector derives it from the verified pubkey instead of trusting
+        // it: b58-decode pubkey, take the first 12 bytes, b58-encode.
+        let keypair = crate::transport::TransportKeypair::new();
+        let pubkey_attr = bs58::encode(keypair.public_key_bytes()).into_string();
+        let fingerprint_attr = keypair.public().to_string();
+
+        let decoded = bs58::decode(&pubkey_attr).into_vec().unwrap();
+        assert_eq!(
+            bs58::encode(&decoded[..12]).into_string(),
+            fingerprint_attr,
+            "fingerprint must be a pure function of pubkey, or the collector \
+             cannot validate the UI-facing id"
+        );
+    }
+
+    #[test]
+    fn bearer_tokens_are_unique_per_request() {
+        // Fresh nonce every call — a replayed token must be detectable.
+        let keypair = crate::transport::TransportKeypair::new();
+        let pubkey = bs58::encode(keypair.public_key_bytes()).into_string();
+        let signer = keypair.auth_token_signer();
+        assert_ne!(
+            bearer_token(&signer, &pubkey),
+            bearer_token(&signer, &pubkey)
+        );
     }
 
     #[test]
@@ -650,19 +874,36 @@ mod tests {
     }
 
     #[test]
-    fn instance_id_carries_no_network_address() {
-        // The exporter identifies this node by its transport public key
-        // fingerprint. `PeerId` renders as `{pub_key}@{addr}`, so using it — as
-        // the exporter originally did — leaks our socket address into every
-        // batch and re-identifies the node whenever the address changes.
-        let keypair = crate::transport::TransportKeypair::new();
-        let instance_id = keypair.public().to_string();
-
-        assert!(!instance_id.is_empty());
-        assert!(
-            !instance_id.contains('@') && !instance_id.contains(':'),
-            "instance id must not embed an address, got {instance_id}"
+    fn node_pubkey_attr_matches_the_bearer_token_pubkey() {
+        // The collector's self-validation contract: after verifying the token
+        // signature, `<pubkey>` must equal `freenet.node.pubkey` exactly.
+        let (keypair, token) = token_fixture();
+        let pubkey_attr = bs58::encode(keypair.public_key_bytes()).into_string();
+        assert_eq!(
+            token.split('/').nth(1),
+            Some(pubkey_attr.as_str()),
+            "token <pubkey> must equal freenet.node.pubkey, or the collector \
+             cannot self-validate the node id against the signing key"
         );
+    }
+
+    #[test]
+    fn instance_id_carries_no_network_address() {
+        // `PeerId` renders as `{pub_key}@{addr}`, so using it — as the
+        // exporter originally did — leaks our socket address into every
+        // batch and re-identifies the node whenever the address changes.
+        // Both identity attributes must stay address-free.
+        let keypair = crate::transport::TransportKeypair::new();
+        for instance_id in [
+            bs58::encode(keypair.public_key_bytes()).into_string(),
+            keypair.public().to_string(),
+        ] {
+            assert!(!instance_id.is_empty());
+            assert!(
+                !instance_id.contains('@') && !instance_id.contains(':'),
+                "identity attribute must not embed an address, got {instance_id}"
+            );
+        }
 
         let peer_id = crate::node::PeerId::new(
             keypair.public().clone(),
@@ -700,7 +941,11 @@ mod tests {
         // startup. Port 1 is chosen because nothing can be listening there.
         let provider = build_provider(
             Some("http://127.0.0.1:1/v1/metrics"),
-            "peer-under-test".to_string(),
+            "pubkey-under-test".to_string(),
+            "fingerprint-under-test".to_string(),
+            // Auth on: the signing client path must not panic in async
+            // context either.
+            Some(crate::transport::TransportKeypair::new().auth_token_signer()),
         )
         .expect("exporter build must succeed against an unreachable collector");
         provider.shutdown().expect("clean shutdown");
