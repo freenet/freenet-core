@@ -85,13 +85,13 @@ use opentelemetry_sdk::{
 use std::sync::OnceLock;
 
 /// Build one `freenet`-mode bearer token:
-/// `freenet/<pubkey>/<timestamp>/<nonce>/<signature>`, where `<signature>` is
-/// the XEdDSA signature over `freenet/<pubkey>/<timestamp>/<nonce>`.
+/// `freenet/<pubkey>/<timestamp>/<signature>`, where `<signature>` is
+/// the XEdDSA signature over `freenet/<pubkey>/<timestamp>`.
 ///
 /// `<pubkey>` is the base58 full x25519 transport public key — the node's one
 /// real identity, the same key peers see and whose truncated fingerprint UIs
-/// display. `<timestamp>` is seconds since the Unix epoch, `<nonce>` is 16
-/// base58 random bytes for replay protection, `<signature>` is base58 too.
+/// display. `<timestamp>` is seconds since the Unix epoch, `<signature>` is
+/// base58 too.
 /// Freshly built per export request so the timestamp stays current.
 ///
 /// Collector-side verification needs no exotic library: convert the
@@ -105,10 +105,7 @@ pub(crate) fn bearer_token(signer: &xeddsa::xed25519::PrivateKey, pubkey_b58: &s
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default();
-    let mut nonce_bytes = [0u8; 16];
-    crate::config::GlobalRng::fill_bytes(&mut nonce_bytes);
-    let nonce = bs58::encode(nonce_bytes).into_string();
-    let signed_payload = format!("freenet/{pubkey_b58}/{timestamp}/{nonce}");
+    let signed_payload = format!("freenet/{pubkey_b58}/{timestamp}");
     // OS entropy (SysRng), not GlobalRng: XEdDSA's Z randomness hedges the
     // signature nonce, which is cryptographic material — the same exception
     // documented in .claude/rules/code-style.md for keys/nonces. UnwrapErr is
@@ -692,8 +689,8 @@ mod tests {
         let (keypair, token) = token_fixture();
 
         let parts: Vec<&str> = token.split('/').collect();
-        let [scheme, pubkey, timestamp, nonce, signature] = parts[..] else {
-            panic!("expected 5 /-separated parts, got {token}");
+        let [scheme, pubkey, timestamp, signature] = parts[..] else {
+            panic!("expected 4 /-separated parts, got {token}");
         };
         assert_eq!(scheme, "freenet");
         assert_eq!(
@@ -706,11 +703,9 @@ mod tests {
             ts > 1_700_000_000,
             "timestamp must be current epoch seconds"
         );
-        assert!(!nonce.is_empty());
-
         // The signature covers everything before its own slash, and verifies
         // against the token's OWN pubkey — the transport key itself.
-        let signed_payload = format!("freenet/{pubkey}/{timestamp}/{nonce}");
+        let signed_payload = format!("freenet/{pubkey}/{timestamp}");
         let sig_bytes: [u8; 64] = bs58::decode(signature)
             .into_vec()
             .unwrap()
@@ -774,7 +769,8 @@ mod tests {
 
     #[test]
     fn bearer_tokens_are_unique_per_request() {
-        // Fresh nonce every call — a replayed token must be detectable.
+        // XEdDSA's random Z makes each signature distinct even over an
+        // identical payload (same pubkey, same second).
         let keypair = crate::transport::TransportKeypair::new();
         let pubkey = bs58::encode(keypair.public_key_bytes()).into_string();
         let signer = keypair.auth_token_signer();
