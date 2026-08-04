@@ -136,10 +136,50 @@ impl SymmetricMessage {
                 }),
             },
         };
+        Self::serialize_ack(&message, outbound_sym_key)
+    }
+
+    /// Version-carrying form of [`Self::ack_ok`] (#5161).
+    ///
+    /// Emits [`SymmetricMessagePayload::AckConnectionV2`], which is
+    /// byte-incompatible with a peer that does not carry that variant index —
+    /// the caller MUST have established that the remote is at or above
+    /// `GATEWAY_ACK_VERSION_MIN_VERSION` first. See
+    /// `connection_handler::version_cmp::version_supports_ack_version`.
+    ///
+    /// `ack_ok` is deliberately left untouched rather than generalised to take
+    /// an `Option<[u8; 8]>`: the pre-floor path must keep producing the exact
+    /// bytes it produces today, and calling the same unmodified function is a
+    /// stronger guarantee of that than any amount of branch review.
+    /// `ack_ok_produces_identical_bytes_to_pre_5161_encoding` pins it anyway.
+    pub fn ack_ok_with_version(
+        outbound_sym_key: &Aes128Gcm,
+        our_inbound_key: [u8; 16],
+        remote_addr: SocketAddr,
+        protoc_version: [u8; 8],
+    ) -> Result<PacketData<SymmetricAES>, bincode::Error> {
+        let message = Self {
+            packet_id: Self::FIRST_PACKET_ID,
+            confirm_receipt: vec![],
+            payload: SymmetricMessagePayload::AckConnectionV2 {
+                connection: OutboundConnectionV2 {
+                    key: our_inbound_key,
+                    remote_addr,
+                    protoc_version,
+                },
+            },
+        };
+        Self::serialize_ack(&message, outbound_sym_key)
+    }
+
+    fn serialize_ack(
+        message: &Self,
+        outbound_sym_key: &Aes128Gcm,
+    ) -> Result<PacketData<SymmetricAES>, bincode::Error> {
         let mut packet = [0u8; MAX_DATA_SIZE];
-        let size = bincode::serialized_size(&message)?;
+        let size = bincode::serialized_size(message)?;
         debug_assert!(size <= MAX_DATA_SIZE as u64);
-        bincode::serialize_into(packet.as_mut_slice(), &message)?;
+        bincode::serialize_into(packet.as_mut_slice(), message)?;
         let bytes = &packet[..size as usize];
 
         let packet = PacketData::from_buf_plain(bytes);
@@ -263,6 +303,28 @@ pub(crate) struct OutboundConnection {
     pub(super) remote_addr: SocketAddr,
 }
 
+/// [`OutboundConnection`] plus the ACCEPTOR's protocol version (#5161).
+///
+/// The version is the same 8-byte `PROTOC_VERSION` wire encoding the intro
+/// packet carries, so the receiver parses it with the identical
+/// `version_cmp::parse_version_bytes` and gets `min_compatible` for free.
+///
+/// Why a parallel struct rather than a field on `OutboundConnection`: the
+/// payload is bincode, whose field layout is not forward-tolerant, so the
+/// version can only be sent to a peer already known to decode it. A plain new
+/// field would have to be omitted conditionally, which bincode cannot express
+/// without a hand-written `Serialize`; an `Option` would still emit its
+/// discriminant byte and change the bytes a pre-floor peer sees. Leaving the
+/// legacy type untouched makes the compatibility guarantee structural.
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, Debug, Clone))]
+pub(crate) struct OutboundConnectionV2 {
+    pub(super) key: [u8; 16],
+    pub(super) remote_addr: SocketAddr,
+    /// Acceptor's `PROTOC_VERSION` bytes, in the intro packet's encoding.
+    pub(super) protoc_version: [u8; 8],
+}
+
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(test, derive(PartialEq, Debug, Clone))]
 pub(crate) enum SymmetricMessagePayload {
@@ -298,6 +360,26 @@ pub(crate) enum SymmetricMessagePayload {
         /// Sequence number from the corresponding Ping
         sequence: u64,
     },
+    /// Successful connection ack that ALSO carries the acceptor's protocol
+    /// version (#5161).
+    ///
+    /// The legacy [`Self::AckConnection`] tells the joiner nothing about who it
+    /// just connected to, so a node permanently treated every gateway — and
+    /// every peer whose hole-punch raced ahead to the ack — as unknown-version,
+    /// and every version-gated wire feature failed closed on exactly those
+    /// links. The acceptor already parsed the joiner's intro packet before it
+    /// builds the ack, so it knows whether the joiner can decode this variant;
+    /// a joiner below `GATEWAY_ACK_VERSION_MIN_VERSION` still receives the
+    /// byte-identical legacy `AckConnection`.
+    ///
+    /// MUST stay last: appending keeps every existing variant's bincode index
+    /// unchanged, which is what makes the legacy encoding provably untouched.
+    /// The failure case has no V2 form — an incompatible peer is rejected with
+    /// the legacy `AckConnection { result: Err(..) }` (`ack_error`), which is
+    /// correct precisely because such a peer may not carry this index.
+    AckConnectionV2 {
+        connection: OutboundConnectionV2,
+    },
 }
 
 #[cfg(test)]
@@ -325,6 +407,9 @@ impl std::fmt::Display for SymmetricMessagePayload {
             SymmetricMessagePayload::NoOp => write!(f, "NoOp"),
             SymmetricMessagePayload::Ping { sequence } => write!(f, "Ping({sequence})"),
             SymmetricMessagePayload::Pong { sequence } => write!(f, "Pong({sequence})"),
+            SymmetricMessagePayload::AckConnectionV2 { .. } => {
+                write!(f, "AckConnectionV2")
+            }
         }
     }
 }
@@ -448,6 +533,167 @@ mod test {
             SymmetricMessagePayload::AckConnection { result: Ok(_) }
         ));
         Ok(())
+    }
+
+    /// **The #5161 backward-compatibility guarantee, asserted on bytes.**
+    ///
+    /// A joiner below `GATEWAY_ACK_VERSION_MIN_VERSION` must receive the exact
+    /// ack it receives today. `ack_ok` is what it receives, so this pins
+    /// `ack_ok`'s plaintext for a fixed input against a golden literal captured
+    /// from the pre-#5161 encoding.
+    ///
+    /// A golden literal rather than a re-serialization of the same struct: the
+    /// latter would compare the encoder against itself and pass even if the
+    /// wire layout moved wholesale. This fails if ANYTHING shifts the legacy
+    /// bytes — a field added to `OutboundConnection`, a reordering of
+    /// `SymmetricMessage`, a bincode config change, or a variant inserted
+    /// before `AckConnection` in `SymmetricMessagePayload`.
+    ///
+    /// **Provenance, because the literal cannot vouch for itself.** It was
+    /// hand-derived from the bincode-fixint layout — 4 (`packet_id`) + 8 (empty
+    /// vec length) + 4 (payload variant) + 4 (`Result::Ok`) + 16 (key) + 4
+    /// (`SocketAddr::V4`) + 4 (octets) + 2 (port) = 46 bytes — and cross-checked
+    /// against the pre-#5161 encoder. If you ever find this failing, do NOT
+    /// re-derive the literal from whatever the current code emits: that turns
+    /// the pin into a no-op. Work out which of the four causes above moved, and
+    /// whether the peers who cannot be upgraded can still decode it.
+    #[test]
+    fn ack_ok_produces_identical_bytes_to_pre_5161_encoding() {
+        // packet_id=0 (u32 LE) | confirm_receipt len=0 (u64 LE)
+        // | payload variant 0 = AckConnection (u32 LE)
+        // | Result variant 0 = Ok (u32 LE)
+        // | key: 16 raw bytes
+        // | remote_addr: SocketAddr variant 0 = V4 (u32 LE), 4 octets, port (u16 LE)
+        const PRE_5161_ACK_OK_PLAINTEXT: &[u8] = &[
+            0, 0, 0, 0, // packet_id
+            0, 0, 0, 0, 0, 0, 0, 0, // confirm_receipt: empty vec
+            0, 0, 0, 0, // SymmetricMessagePayload::AckConnection
+            0, 0, 0, 0, // Result::Ok
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, // key
+            0, 0, 0, 0, // SocketAddr::V4
+            127, 0, 0, 1, // 127.0.0.1
+            210, 4, // port 1234
+        ];
+
+        let key = gen_key();
+        let packet = SymmetricMessage::ack_ok(
+            &key,
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            (Ipv4Addr::LOCALHOST, 1234).into(),
+        )
+        .unwrap();
+        let plaintext = packet.decrypt(&key).unwrap();
+
+        assert_eq!(
+            plaintext.data(),
+            PRE_5161_ACK_OK_PLAINTEXT,
+            "the legacy ack encoding MOVED. A pre-floor joiner would no longer receive \
+             byte-identical traffic, which is the whole compatibility guarantee of #5161."
+        );
+    }
+
+    /// Appending `AckConnectionV2` must not renumber any existing variant.
+    ///
+    /// If it did, the compatibility guarantee above would hold for `ack_ok`
+    /// alone while every OTHER message silently changed meaning on the wire —
+    /// a peer would read a `ShortMessage` as a `StreamFragment`. Reads the
+    /// variant index straight out of the serialized bytes, at the fixed offset
+    /// after `packet_id` (u32) and the empty `confirm_receipt` length (u64).
+    #[test]
+    fn appending_ack_connection_v2_did_not_renumber_existing_variants() {
+        const VARIANT_INDEX_OFFSET: usize = 4 + 8;
+
+        fn variant_index(payload: SymmetricMessagePayload) -> u32 {
+            let bytes = bincode::serialize(&SymmetricMessage {
+                packet_id: 0,
+                confirm_receipt: vec![],
+                payload,
+            })
+            .unwrap();
+            u32::from_le_bytes(
+                bytes[VARIANT_INDEX_OFFSET..VARIANT_INDEX_OFFSET + 4]
+                    .try_into()
+                    .unwrap(),
+            )
+        }
+
+        let expected: [(u32, SymmetricMessagePayload); 7] = [
+            (
+                0,
+                SymmetricMessagePayload::AckConnection {
+                    result: Err(Cow::Borrowed("e")),
+                },
+            ),
+            (
+                1,
+                SymmetricMessagePayload::ShortMessage {
+                    payload: Bytes::new(),
+                },
+            ),
+            (
+                2,
+                SymmetricMessagePayload::StreamFragment {
+                    stream_id: StreamId::next(),
+                    total_length_bytes: 1,
+                    fragment_number: 0,
+                    payload: Bytes::new(),
+                    metadata_bytes: None,
+                },
+            ),
+            (3, SymmetricMessagePayload::NoOp),
+            (4, SymmetricMessagePayload::Ping { sequence: 0 }),
+            (5, SymmetricMessagePayload::Pong { sequence: 0 }),
+            (
+                6,
+                SymmetricMessagePayload::AckConnectionV2 {
+                    connection: OutboundConnectionV2 {
+                        key: [0; 16],
+                        remote_addr: (Ipv4Addr::LOCALHOST, 1).into(),
+                        protoc_version: [0; 8],
+                    },
+                },
+            ),
+        ];
+
+        for (index, payload) in expected {
+            assert_eq!(
+                variant_index(payload),
+                index,
+                "SymmetricMessagePayload variant indices are wire-visible and MUST NOT move; \
+                 AckConnectionV2 has to stay appended at the end"
+            );
+        }
+    }
+
+    /// The version-carrying ack round-trips, and is a DIFFERENT encoding from
+    /// the legacy one for the same connection parameters — i.e. the gate that
+    /// chooses between them is choosing between genuinely different bytes, not
+    /// decorating an unchanged message.
+    #[test]
+    fn ack_ok_with_version_round_trips_and_differs_from_legacy() {
+        let key = gen_key();
+        let sym_key = [9u8; 16];
+        let addr = (Ipv4Addr::LOCALHOST, 4321).into();
+        let version = [0xFF, 0, 2, 0, 120, 0, 80, 1];
+
+        let legacy = SymmetricMessage::ack_ok(&key, sym_key, addr).unwrap();
+        let versioned =
+            SymmetricMessage::ack_ok_with_version(&key, sym_key, addr, version).unwrap();
+
+        let legacy_plain = legacy.decrypt(&key).unwrap();
+        let versioned_plain = versioned.decrypt(&key).unwrap();
+        assert_ne!(legacy_plain.data(), versioned_plain.data());
+
+        let deser = SymmetricMessage::deser(versioned_plain.data()).unwrap();
+        match deser.payload {
+            SymmetricMessagePayload::AckConnectionV2 { connection } => {
+                assert_eq!(connection.key, sym_key);
+                assert_eq!(connection.remote_addr, addr);
+                assert_eq!(connection.protoc_version, version);
+            }
+            other => panic!("expected AckConnectionV2, got {other}"),
+        }
+        assert_eq!(deser.packet_id, SymmetricMessage::FIRST_PACKET_ID);
     }
 
     #[test]

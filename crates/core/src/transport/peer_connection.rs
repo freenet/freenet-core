@@ -106,8 +106,13 @@ pub(crate) struct RemoteConnection<S = super::UdpSocket, T: TimeSource = RealTim
     #[allow(dead_code)]
     pub(super) my_address: Option<SocketAddr>,
     /// Remote peer's negotiated protocol version, captured during the handshake.
-    /// `None` on the joiner->gateway path (the gateway's AckConnection payload
-    /// carries no version) — see connection_handler.rs traverse_nat AckConnection arm.
+    ///
+    /// Learned from the remote's intro packet where we parse one, and otherwise
+    /// from the acceptor's `AckConnectionV2` (#5161). `None` means the remote is
+    /// below `GATEWAY_ACK_VERSION_MIN_VERSION`, which is a fact about the peer —
+    /// not a gap in what this path can observe. Before #5161 the joiner->gateway
+    /// path was ALWAYS `None`, because the gateway's `AckConnection` carried no
+    /// version and the joiner never parses an intro packet from it.
     pub(super) remote_protoc_version: Option<(u8, u8, u16)>,
     pub(super) transport_secret_key: TransportSecretKey,
     /// Congestion controller (BBR by default) - adapts to network conditions
@@ -1032,7 +1037,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                 }
                             }
                         }
-                        SymmetricMessagePayload::AckConnection { .. } | SymmetricMessagePayload::ShortMessage { .. } | SymmetricMessagePayload::StreamFragment { .. } => {}
+                        SymmetricMessagePayload::AckConnection { .. } | SymmetricMessagePayload::AckConnectionV2 { .. } | SymmetricMessagePayload::ShortMessage { .. } | SymmetricMessagePayload::StreamFragment { .. } => {}
                     }
 
                     {
@@ -1640,7 +1645,13 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             AckConnection { result: Err(cause) } => {
                 Err(TransportError::ConnectionEstablishmentFailure { cause })
             }
-            AckConnection { result: Ok(_) } => {
+            // A duplicate success ack on an ESTABLISHED connection, in either
+            // encoding (#5161): the remote did not see our completion ack, so
+            // re-send it. The reply is deliberately the legacy `ack_ok` in both
+            // cases — this side is the joiner, the remote already learned our
+            // version from our intro packet, and answering a V2 ack with a V2
+            // ack would tell it nothing it does not have.
+            AckConnection { result: Ok(_) } | AckConnectionV2 { .. } => {
                 let packet = SymmetricMessage::ack_ok(
                     &self.remote_conn.outbound_symmetric_key,
                     self.remote_conn.inbound_symmetric_key_bytes,
@@ -3485,6 +3496,136 @@ mod tests {
         assert!(
             !cache.contains(&msg_hash(b"msg-1")),
             "msg-1 should be evicted"
+        );
+    }
+
+    /// A duplicate `AckConnectionV2` on an ESTABLISHED connection is answered
+    /// with the LEGACY `ack_ok`, and does not disturb the connection (#5161).
+    ///
+    /// The arm handling it is shared with the legacy duplicate ack, and the
+    /// choice to reply in the old encoding is deliberate rather than an
+    /// oversight: this side is the joiner, so the remote already learned our
+    /// version from our intro packet, and answering V2 with V2 would tell it
+    /// nothing it does not have. That reasoning was load-bearing and unpinned
+    /// until this test — a reviewer flagged that nothing drove `process_inbound`
+    /// with either success ack.
+    ///
+    /// Sends a `ShortMessage` behind the ack so `recv()` has something to
+    /// return: the ack arm yields `Ok(None)` and loops, so a test that sent only
+    /// the ack would hang rather than assert.
+    #[tokio::test]
+    async fn duplicate_v2_ack_on_established_connection_is_answered_with_legacy_ack() {
+        use crate::transport::crypto::TransportKeypair;
+        use crate::transport::packet_data::PacketData;
+        use crate::transport::symmetric_message::SymmetricMessagePayload;
+        use crate::util::time_source::SharedMockTimeSource;
+        use bytes::Bytes;
+
+        let time_source = SharedMockTimeSource::new();
+        let (inbound_tx, inbound_rx) = mpsc::channel(16);
+        let remote_addr = SocketAddr::new(Ipv4Addr::new(10, 99, 99, 2).into(), 50002);
+
+        let mut key = [0u8; 16];
+        crate::config::GlobalRng::fill_bytes(&mut key);
+        let cipher = Aes128Gcm::new(&key.into());
+        let keypair = TransportKeypair::new();
+
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(
+            SentPacketTracker::new_with_time_source(time_source.clone()),
+        ));
+        let congestion_controller =
+            crate::transport::congestion_control::CongestionControlConfig::default()
+                .build_arc_with_time_source(time_source.clone());
+        let token_bucket = Arc::new(TokenBucket::new_with_time_source(
+            10_000,
+            10_000_000,
+            time_source.clone(),
+        ));
+        let (sock_tx, mut sock_rx) = mpsc::channel::<(SocketAddr, Arc<[u8]>)>(16);
+        let socket = Arc::new(TestSocket::new(sock_tx));
+
+        let rolling_rtt_stats = crate::transport::rolling_rtt_stats::RollingRttStatsHandle::new(
+            remote_addr,
+            time_source.clone(),
+        );
+        let remote_conn = RemoteConnection {
+            outbound_symmetric_key: cipher.clone(),
+            remote_addr,
+            sent_tracker,
+            last_packet_id: Arc::new(AtomicU32::new(0)),
+            inbound_packet_recv: inbound_rx,
+            inbound_symmetric_key: cipher.clone(),
+            inbound_symmetric_key_bytes: key,
+            my_address: None,
+            remote_protoc_version: Some((0, 2, 120)),
+            transport_secret_key: keypair.secret,
+            congestion_controller,
+            token_bucket,
+            socket,
+            global_bandwidth: None,
+            rolling_rtt_stats,
+            time_source,
+        };
+
+        // A retransmitted V2 success ack, as an upgraded acceptor would resend
+        // if it never saw our completion ack.
+        let v2 = SymmetricMessage::ack_ok_with_version(
+            &cipher,
+            key,
+            remote_addr,
+            [0xFF, 0, 2, 0, 120, 0, 80, 1],
+        )
+        .expect("encode v2 ack");
+        inbound_tx
+            .send(
+                PacketData::<crate::transport::packet_data::UnknownEncryption>::from_buf(v2.data()),
+            )
+            .await
+            .expect("send v2 ack");
+
+        // Something for `recv()` to actually return.
+        let follow_up = SymmetricMessage::serialize_msg_to_packet_data(
+            7,
+            SymmetricMessagePayload::ShortMessage {
+                payload: Bytes::from_static(b"after-the-ack"),
+            },
+            &cipher,
+            vec![],
+        )
+        .expect("encode short message");
+        inbound_tx
+            .send(
+                PacketData::<crate::transport::packet_data::UnknownEncryption>::from_buf(
+                    follow_up.data(),
+                ),
+            )
+            .await
+            .expect("send short message");
+
+        let mut conn = PeerConnection::new(remote_conn);
+        let msg = conn.recv().await.expect("recv");
+        assert_eq!(
+            msg.as_slice(),
+            b"after-the-ack".as_slice(),
+            "the V2 ack must be consumed and the connection carry on"
+        );
+
+        let (target, sent) = sock_rx.try_recv().expect("a reply must have been sent");
+        assert_eq!(target, remote_addr);
+        let decrypted =
+            PacketData::<crate::transport::packet_data::UnknownEncryption>::from_buf(&sent)
+                .try_decrypt_sym(&cipher)
+                .expect("reply is encrypted under the shared key");
+        let reply = SymmetricMessage::deser(decrypted.data()).expect("reply decodes");
+        assert!(
+            matches!(
+                reply.payload,
+                SymmetricMessagePayload::AckConnection { result: Ok(_) }
+            ),
+            "the reply must be the LEGACY ack — replying V2 here would tell the \
+             acceptor nothing it did not already learn from our intro packet, \
+             and would be an ungated send of the new encoding. Got: {:?}",
+            reply.payload
         );
     }
 

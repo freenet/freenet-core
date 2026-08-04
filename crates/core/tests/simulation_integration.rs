@@ -15100,19 +15100,23 @@ fn test_step9_source2_removal_subscriber_heals_via_anti_entropy() {
 /// without CRDT emulation. See `mock_runtime.rs::get_contract_state_delta`.
 ///
 /// **Role choice is load-bearing, not arbitrary:** the second (probing) PUT
-/// MUST originate from the GATEWAY, not the regular node. `RemoteConnection::
-/// remote_protoc_version` is `None` on the joiner->gateway path ("the
-/// gateway's AckConnection payload carries no version" — see
-/// `transport/peer_connection.rs`), so a regular node's `ConnectionManager`
-/// never records its gateway's negotiated version and `supports_summary_first_put`
-/// fails closed for EVERY PUT a regular node routes through its gateway link —
-/// in production as much as in sim, this is not a simulation-harness gap.
-/// Only the gateway's connection TO the node carries the node's version, so
-/// only a gateway-originated PUT can pass the emission gate in a
-/// gateway/regular-node topology. (Confirmed empirically: with the roles
-/// reversed, the regular node's PUT never even logs a
+/// MUST originate from the GATEWAY, not the regular node. A regular node's
+/// `ConnectionManager` does not record its gateway's negotiated version here,
+/// so `supports_summary_first_put` fails closed for EVERY PUT a regular node
+/// routes through its gateway link. Only the gateway's connection TO the node
+/// carries the node's version, so only a gateway-originated PUT can pass the
+/// emission gate in a gateway/regular-node topology. (Confirmed empirically:
+/// with the roles reversed, the regular node's PUT never even logs a
 /// `PUT summary-first: ...` line — the whole block is skipped, not merely
 /// falling through inside it.)
+///
+/// That asymmetry USED to be production behaviour too — the gateway's
+/// `AckConnection` carried no version, so a joiner could never learn it — but
+/// #5161 fixed that, and it now survives here only because
+/// `ack_version_floor_override` defaults the version-carrying ack OFF in
+/// simulations (see `SimNetwork::enable_gateway_ack_version` for why). If this
+/// test is ever switched to `enable_gateway_ack_version`, node1's own PUT
+/// starts passing the gate too and the counter assertions below change.
 #[test_log::test]
 fn test_summary_first_put_holder_found_ships_delta() {
     use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
@@ -15155,8 +15159,9 @@ fn test_summary_first_put_holder_found_ships_delta() {
         // node1 PUTs + subscribes: becomes a fresh holder
         // (`Ring::is_receiving_updates` true via its own client subscription).
         // Its own PUT never touches the probe counters (see rustdoc above:
-        // its connection to the gateway can't carry the gateway's version),
-        // so this is a clean, counter-neutral way to seed the holder.
+        // with the version-carrying ack off — the sim default, #5161 — its
+        // connection to the gateway carries no gateway version), so this is a
+        // clean, counter-neutral way to seed the holder.
         ScheduledOperation::new(
             node1.clone(),
             SimOperation::Put {
@@ -15204,11 +15209,11 @@ fn test_summary_first_put_holder_found_ships_delta() {
         "summary-first PUT delta test: probe outcome counters"
     );
 
-    // node1's own PUT never touches these counters: its connection to the
-    // gateway never carries the gateway's negotiated version (see rustdoc
-    // above), so `supports_summary_first_put` fails closed and the whole
-    // summary-first block is skipped for node1's PUT — only the gateway's
-    // PUT can move them.
+    // node1's own PUT never touches these counters: with the version-carrying
+    // ack off (the sim default, #5161 — see rustdoc above) its connection to the
+    // gateway carries no gateway version, so `supports_summary_first_put` fails
+    // closed and the whole summary-first block is skipped for node1's PUT —
+    // only the gateway's PUT can move them.
     assert_eq!(
         new_contract_sends, 0,
         "no-holder path must NOT fire: the gateway's PUT found a fresh \
@@ -15279,10 +15284,9 @@ fn test_summary_first_put_holder_found_ships_delta() {
 /// hosting behavior rather than silently doing nothing.
 ///
 /// The PUT originates from the GATEWAY, not a regular node — see the rustdoc
-/// on `test_summary_first_put_holder_found_ships_delta` for why: a regular
-/// node's connection to its gateway never carries the gateway's negotiated
-/// version (`RemoteConnection::remote_protoc_version` is `None` on the
-/// joiner->gateway path in both production and sim), so `supports_summary_first_put`
+/// on `test_summary_first_put_holder_found_ships_delta` for why: with the
+/// version-carrying ack off (the simulation default, #5161) a regular node's
+/// connection to its gateway carries no version, so `supports_summary_first_put`
 /// fails closed and a regular-node-originated PUT here would skip the
 /// summary-first block entirely rather than exercising the no-holder branch.
 #[test_log::test]
@@ -15434,7 +15438,8 @@ fn test_summary_first_put_reverse_delta_converges_originator() {
     let operations = vec![
         // node1 PUTs v2 + subscribes: becomes a fresh holder AHEAD of the
         // originator. (Its own PUT never touches the probe counters — its
-        // link to the gateway carries no gateway version, see Test A.)
+        // link to the gateway carries no gateway version with the ack gate off,
+        // see Test A.)
         ScheduledOperation::new(
             node1.clone(),
             SimOperation::Put {
@@ -17037,4 +17042,268 @@ fn test_every_hop_summarize_calls_flat_vs_fanout() {
          total_summarize={total_summarize} << per_target_broadcasts={update_broadcast_targets} \
          (>= vacuity_floor={vacuity_floor})"
     );
+}
+
+/// **#5161 end to end, through the real handshake, with its own controls.**
+///
+/// A regular node connects to a gateway. Before this fix, its side of that link
+/// carried no version at all: the version rides in the asymmetrically-encrypted
+/// intro packet, only the RECEIVING side of an intro learns it, and a gateway
+/// never sends one back — it replies with an `AckConnection` that has no version
+/// field. So `remote_version` was `None` for every gateway link a node held, and
+/// every `version_supports_*` gate fell back to the legacy wire format on
+/// exactly the highest-degree, highest-traffic links on the network.
+///
+/// Three simulations, run in one test so the claims are measured differences
+/// rather than assertions against a remembered baseline a later edit could
+/// quietly invalidate. They differ only in their two floor overrides (and in
+/// network name, which the harness requires to be unique):
+///
+/// - **control** — gate off. Reproduces the pre-fix behaviour exactly. Without
+///   this arm the enabled arm could pass on a harness that populated versions
+///   by some other route, and would never have failed against the bug.
+/// - **enabled** — gate on. The node records the gateway's *exact* version, and
+///   `supports_hash_first_summaries` is true for that link.
+/// - **enabled, hash-first floor unreachable** — the arm that stops the
+///   hash-first assertion from being a restatement. With the sim's default
+///   hash-first floor of `(0,0,0)`, `supports_hash_first_summaries` reduces
+///   algebraically to `remote_version.is_some()`, so asserting it alongside
+///   `is_some()` carries no independent information (a reviewer caught this).
+///   Pinning that floor out of reach makes the two disagree: the version is
+///   known and the gate is still false, which is what proves the gate composes
+///   version AND floor rather than merely echoing the version.
+///
+/// The ack gate is opt-in per simulation rather than a suite-wide default; see
+/// `SimNetwork::enable_gateway_ack_version` for why, and for what that costs.
+#[test_log::test]
+fn test_joiner_records_gateway_version_through_sim_handshake() {
+    use freenet::dev_tool::NodeLabel;
+
+    const SEED: u64 = 0x5161_ACC0_CAFE;
+
+    struct Arm {
+        version: Option<(u8, u8, u16)>,
+        hash_first: bool,
+    }
+
+    fn run(network_name: &str, enable_ack_version: bool, enable_hash_first: bool) -> Arm {
+        setup_deterministic_state(SEED);
+        let rt = create_runtime();
+
+        let gateway = NodeLabel::gateway(network_name, 0);
+        let node1 = NodeLabel::node(network_name, 1);
+
+        let mut sim =
+            rt.block_on(async { SimNetwork::new(network_name, 1, 1, 7, 3, 10, 2, SEED).await });
+        if enable_ack_version {
+            sim.enable_gateway_ack_version();
+        }
+        if enable_hash_first {
+            sim.enable_hash_first_summaries();
+        } else {
+            sim.disable_hash_first_summaries();
+        }
+
+        let gateway_addr = *sim
+            .all_node_addresses()
+            .get(&gateway)
+            .expect("gateway must have an address");
+
+        let result = sim.run_controlled_simulation(
+            SEED,
+            Vec::new(),
+            Duration::from_secs(60),
+            Duration::from_secs(10),
+        );
+        assert!(
+            result.turmoil_result.is_ok(),
+            "gateway-ack-version sim failed: {:?}",
+            result.turmoil_result.err()
+        );
+
+        Arm {
+            version: result.node_recorded_remote_version(&node1, gateway_addr),
+            hash_first: result.node_supports_hash_first_summaries(&node1, gateway_addr),
+        }
+    }
+
+    let control = run("gateway-ack-version-control", false, true);
+    let enabled = run("gateway-ack-version-enabled", true, true);
+    let enabled_no_hash_first = run("gateway-ack-version-floored", true, false);
+
+    // The version every node in these sims runs. Asserted as an exact value,
+    // not merely `is_some`: a regression that recorded the WRONG version — the
+    // joiner echoing its own `PROTOC_VERSION`, or misreading the field — would
+    // satisfy `is_some`.
+    //
+    // Parsed here from `CARGO_PKG_VERSION` rather than read back out of the
+    // transport's own `parse_version_bytes`, so the expectation does not come
+    // from the encoder under test. This test crate is part of the `freenet`
+    // package, so the env var is freenet's version.
+    let expected = {
+        let mut parts = env!("CARGO_PKG_VERSION")
+            .split(['.', '-'])
+            .filter_map(|p| p.parse::<u16>().ok());
+        (
+            parts.next().expect("major") as u8,
+            parts.next().expect("minor") as u8,
+            parts.next().expect("patch"),
+        )
+    };
+
+    tracing::info!(
+        control_version = ?control.version,
+        control_hash_first = control.hash_first,
+        enabled_version = ?enabled.version,
+        enabled_hash_first = enabled.hash_first,
+        floored_version = ?enabled_no_hash_first.version,
+        floored_hash_first = enabled_no_hash_first.hash_first,
+        "gateway ack version: arm outcomes"
+    );
+
+    // Control: the bug, reproduced. If this ever starts passing, the enabled
+    // arm has stopped proving anything.
+    assert_eq!(
+        control.version, None,
+        "control arm must reproduce the pre-#5161 behaviour — a node learns \
+         NOTHING about its gateway's version when the version-carrying ack is off"
+    );
+    assert!(
+        !control.hash_first,
+        "control arm: an unknown gateway version must fail the hash-first gate closed"
+    );
+
+    // Enabled: the fix.
+    assert_eq!(
+        enabled.version,
+        Some(expected),
+        "the node MUST record its gateway's exact protocol version once the \
+         gateway answers with AckConnectionV2 — this is the whole of #5161"
+    );
+    assert!(
+        enabled.hash_first,
+        "with the gateway's version known, the node->gateway link must pass the \
+         hash-first gate: that is the user-visible consequence, since the \
+         fallback ships one full summary per shared contract"
+    );
+
+    // Enabled but floored out: version known, gate still closed. This is what
+    // makes the two assertions above independent of each other.
+    assert_eq!(
+        enabled_no_hash_first.version,
+        Some(expected),
+        "the ack gate and the hash-first floor are independent — raising the \
+         latter must not stop the node learning the version"
+    );
+    assert!(
+        !enabled_no_hash_first.hash_first,
+        "a KNOWN version below the hash-first floor must still fail closed; \
+         without this arm the hash-first assertions above are algebraically \
+         identical to the version assertions and cannot fail separately"
+    );
+}
+
+/// **The cascade #5161 unlocks, exercised where the suite otherwise cannot see
+/// it.** This is the mirror image of `test_summary_first_put_holder_found_ships_delta`:
+/// there the probing PUT MUST originate from the gateway, because a regular
+/// node could never learn its gateway's version and so failed
+/// `supports_summary_first_put` closed on every PUT it routed through that
+/// link. Here the roles are reversed and the regular node's PUT is the probing
+/// one — which works only because the version-carrying ack is enabled.
+///
+/// It exists because the ack gate is OFF by default in simulations (see
+/// `SimNetwork::enable_gateway_ack_version`). That default is deliberate, but
+/// it means no other sim covers what actually happens in production from
+/// 0.2.120: node->gateway links become eligible for every other
+/// `version_supports_*` feature at once, on the highest-degree nodes on the
+/// network. Without this test that transition would first be exercised by the
+/// fleet.
+///
+/// The discriminating assertion is `delta_sends == 1`. With the ack gate off it
+/// is 0 — the whole summary-first block is skipped, not merely fallen through —
+/// which is precisely what the reversed-roles note on Test A records having
+/// observed.
+#[test_log::test]
+fn test_gateway_ack_version_unlocks_node_originated_summary_first_put() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    const SEED: u64 = 0x5161_CA5C_ADE1;
+    const NETWORK_NAME: &str = "ack-version-cascade";
+
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let gateway = NodeLabel::gateway(NETWORK_NAME, 0);
+    let node1 = NodeLabel::node(NETWORK_NAME, 1);
+
+    let contract = SimOperation::create_test_contract(0x5F);
+    let contract_id = *contract.key().id();
+    register_crdt_contract(contract_id);
+
+    let state_v1 = SimOperation::create_crdt_state(1, 0x11);
+    let state_v2 = SimOperation::create_crdt_state(2, 0x22);
+
+    let mut sim =
+        rt.block_on(async { SimNetwork::new(NETWORK_NAME, 1, 1, 7, 3, 10, 2, SEED).await });
+    sim.enable_summary_first_put();
+    // The point of the test: without this the node's PUT cannot pass the
+    // emission gate, and `delta_sends` below is 0.
+    sim.enable_gateway_ack_version();
+
+    let operations = vec![
+        // The GATEWAY seeds the holder this time (Test A has the node do it).
+        ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: state_v1.clone(),
+                subscribe: true,
+            },
+        ),
+        // The regular NODE probes. Its only known peer is the gateway, so the
+        // probe necessarily travels the node->gateway link — the exact link
+        // that carried no version before #5161.
+        ScheduledOperation::new(
+            node1.clone(),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: state_v2.clone(),
+                subscribe: false,
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(120),
+        Duration::from_secs(30),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "ack-version cascade sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let delta_sends = GlobalTestMetrics::put_probe_existing_mesh_delta_sends();
+    let delta_bytes = GlobalTestMetrics::put_probe_existing_mesh_delta_bytes();
+    tracing::info!(
+        delta_sends,
+        delta_bytes,
+        "ack-version cascade: node-originated summary-first PUT counters"
+    );
+
+    assert_eq!(
+        delta_sends, 1,
+        "the NODE's PUT must reach the holder-found branch through its gateway \
+         link. This is 0 without the version-carrying ack — the emission gate \
+         fails closed on an unknown remote version and the summary-first block \
+         is skipped entirely"
+    );
+    assert!(
+        delta_bytes > 0,
+        "the probe must have shipped a real delta, not an empty one"
+    );
+
+    freenet::dev_tool::clear_crdt_contracts();
 }

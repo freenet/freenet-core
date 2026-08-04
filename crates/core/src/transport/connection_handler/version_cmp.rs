@@ -144,6 +144,67 @@ pub(super) fn is_compatible(local: &[u8; 8], remote: &[u8; 8]) -> Result<Version
     Ok(remote_info)
 }
 
+/// Minimum protocol version a peer must report in its intro packet before we
+/// may answer it with the version-carrying
+/// [`SymmetricMessagePayload::AckConnectionV2`](super::super::symmetric_message::SymmetricMessagePayload)
+/// instead of the legacy `AckConnection` (#5161).
+///
+/// # Why a floor at all
+///
+/// The ack payload is bincode, so a peer that does not carry the `AckConnectionV2`
+/// variant index cannot deserialize it. On this particular path the decode
+/// failure is not a dropped connection but a handshake that never completes:
+/// the joiner would be unable to connect to ANY upgraded gateway. So the new
+/// form may only go to a peer already known to decode it.
+///
+/// # Why the usual bootstrapping problem does not arise
+///
+/// Unlike every other version-gated wire feature here, there is no chicken and
+/// egg. The acceptor has already decrypted and parsed the joiner's intro packet
+/// — which carries the joiner's version — BEFORE it builds the ack. So the gate
+/// reads a version we already hold, and a pre-floor joiner receives byte-identical
+/// traffic to today (`SymmetricMessage::ack_ok`, unmodified).
+///
+/// # Release-time check
+///
+/// Per the wire-gated-floor rule in `docs/RELEASING.md`, this MUST equal the
+/// release that first EMITS `AckConnectionV2`, then be frozen. The crate is at
+/// 0.2.119 and this ships in 0.2.120. A floor BELOW the shipping version sends
+/// an undecodable ack to peers on the release just before, breaking their
+/// handshakes outright during the 0-4h staggered rollout; a floor ABOVE it
+/// silently leaves the bug in place against fully-capable peers.
+/// `ack_version_floor_tracks_the_shipping_release` fails the build if a release
+/// bump lifts `PCK_VERSION` to the floor without this having shipped, so the
+/// release cannot silently outrun it in either direction.
+pub(super) const GATEWAY_ACK_VERSION_MIN_VERSION: (u8, u8, u16) = (0, 2, 120);
+
+/// Has the version-carrying ack actually SHIPPED, and in which release?
+///
+/// `Some(v)` — shipped in `v`, which must EQUAL the floor, frozen thereafter.
+/// `None` — not yet shipped, so the floor is a PREDICTION about the next
+/// release and must stay strictly ABOVE the current crate version.
+///
+/// Read only by `ack_version_floor_tracks_the_shipping_release`; it carries no
+/// runtime behaviour by design, mirroring `HASH_FIRST_SHIPPED_IN`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) const ACK_VERSION_SHIPPED_IN: Option<(u8, u8, u16)> = None;
+
+/// Pure version-gate for [`GATEWAY_ACK_VERSION_MIN_VERSION`], mirroring
+/// `node::version_supports_hash_first_summaries`: `true` iff `remote` is known
+/// (`Some`) AND at least `floor`.
+///
+/// Fail-closed on `None`, which on this path means the intro packet was parsed
+/// but yielded no usable version — send the legacy ack, exactly today's
+/// behaviour. Takes an explicit `floor` so the predicate is unit-testable
+/// independent of the production constant, and so simulations can exercise the
+/// path before the crate version passes the real floor.
+pub(super) fn version_supports_ack_version(
+    remote: Option<(u8, u8, u16)>,
+    floor: (u8, u8, u16),
+) -> bool {
+    remote.is_some_and(|v| v >= floor)
+}
+
 /// Check if a version mismatch from an old peer means WE need to update.
 ///
 /// When an old peer rejects us (they do strict exact-match), parse their
@@ -176,6 +237,55 @@ pub(super) fn old_peer_rejection_means_we_must_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The #5161 gate fails closed on an unknown version and is a plain `>=`
+    /// against the floor. Both halves matter: `None` must NOT emit the new
+    /// encoding (we would be guessing that a peer can decode a variant it may
+    /// not carry), and the release exactly AT the floor must (a floor that
+    /// excluded its own release would silently never activate).
+    #[test]
+    fn ack_version_gate_is_fail_closed_and_inclusive_at_the_floor() {
+        const FLOOR: (u8, u8, u16) = (0, 2, 120);
+        assert!(
+            !version_supports_ack_version(None, FLOOR),
+            "unknown version must not receive the version-carrying ack"
+        );
+        assert!(!version_supports_ack_version(Some((0, 2, 119)), FLOOR));
+        assert!(!version_supports_ack_version(Some((0, 1, 65535)), FLOOR));
+        assert!(version_supports_ack_version(Some(FLOOR), FLOOR));
+        assert!(version_supports_ack_version(Some((0, 2, 121)), FLOOR));
+        assert!(version_supports_ack_version(Some((0, 3, 0)), FLOOR));
+        assert!(version_supports_ack_version(Some((1, 0, 0)), FLOOR));
+    }
+
+    /// Guard that the version-carrying ack ships in exactly the release its
+    /// floor names, mirroring `hash_first_floor_tracks_the_shipping_release`.
+    ///
+    /// The failure this prevents is not cosmetic. If the floor goes stale — a
+    /// slipped or renumbered release — every test here stays green while a peer
+    /// running the real release at the floor reads as at-floor, receives an ack
+    /// whose variant index it does not carry, and cannot complete the
+    /// handshake at all. The moment a release bump lifts `PCK_VERSION` to the
+    /// floor, this fails until someone consciously either confirms we are
+    /// shipping it or raises the floor.
+    #[test]
+    fn ack_version_floor_tracks_the_shipping_release() {
+        let crate_version = parse_semver(PCK_VERSION);
+        match ACK_VERSION_SHIPPED_IN {
+            Some(shipped) => {
+                assert_eq!(
+                    shipped, GATEWAY_ACK_VERSION_MIN_VERSION,
+                    "the release that ships the version-carrying ack must EQUAL its floor"
+                );
+            }
+            None => assert!(
+                crate_version < GATEWAY_ACK_VERSION_MIN_VERSION,
+                "floor {GATEWAY_ACK_VERSION_MIN_VERSION:?} is a PREDICTION about the next \
+                 release, but the crate is already at {crate_version:?} — either flip \
+                 ACK_VERSION_SHIPPED_IN to Some(floor) (we are shipping it) or raise the floor"
+            ),
+        }
+    }
 
     #[test]
     fn test_parse_semver() {

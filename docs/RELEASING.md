@@ -78,10 +78,13 @@ required for the cascade to fire automatically).
 
 ### Wire-gated feature floors (one-time, per feature)
 
-Some features that add a new `NetMessageV1` wire variant are version-gated:
-a node only sends the new variant to peers whose negotiated protocol version
-is at or above a hardcoded floor, so older peers never receive a variant they
-can't deserialize (they'd drop the connection). When you cut the release that
+Some features that add a new wire variant are version-gated: a node only sends
+the new variant to peers whose negotiated protocol version is at or above a
+hardcoded floor, so older peers never receive a variant they can't deserialize
+(they'd drop the connection). Most such variants are added to `NetMessageV1`,
+but **not all** — `GATEWAY_ACK_VERSION_MIN_VERSION` below gates a
+`SymmetricMessagePayload` variant on the transport handshake instead, so do not
+scan for `NetMessageV1` alone when checking which floors apply. When you cut the release that
 **first** ships such a feature, set its floor to **exactly that release
 version**, then leave it frozen — do NOT bump it on later releases (raising it
 above the first-shipping version would silently stop sending to fully-capable
@@ -130,8 +133,9 @@ Current wire-gated floors:
   handlers.
 
   **This one is guarded by a marker, not by a manual check.** Alongside the
-  floor there is `HASH_FIRST_SHIPPED_IN: Option<(u8, u8, u16)>`, currently
-  `None`. The test
+  floor there is `HASH_FIRST_SHIPPED_IN: Option<(u8, u8, u16)>` (now
+  `Some((0, 2, 116))` — the feature shipped; this paragraph previously said
+  "currently `None`" and had gone stale). The test
   `connection_manager.rs::hash_first_floor_tracks_the_shipping_release`
   asserts:
 
@@ -160,6 +164,34 @@ Current wire-gated floors:
   `hash_first_floor_stays_above_every_release_without_the_variants` is kept as
   a companion: it catches the floor being *lowered*, which the marker test does
   not.
+
+- `GATEWAY_ACK_VERSION_MIN_VERSION` in
+  `crates/core/src/transport/connection_handler/version_cmp.rs` — **a different
+  file and a different layer from the three above** (version-carrying connection
+  ack, #5161).
+
+  Set to **`(0, 2, 120)`**, the release intended to first ship the
+  `SymmetricMessagePayload::AckConnectionV2` variant.
+
+  **Its failure mode is more severe than the others', so bias high if in
+  doubt.** The three floors above gate application messages: a peer that cannot
+  decode one drops the connection. This one gates the connection ACK itself, so
+  a peer that cannot decode it never completes the handshake at all — a floor
+  set too low means every pre-floor node fails to connect to any upgraded
+  gateway, and the release cascade upgrades the gateways FIRST.
+
+  Guarded by a marker exactly like `HASH_FIRST_SHIPPED_IN`:
+  `ACK_VERSION_SHIPPED_IN: Option<(u8, u8, u16)>`, currently `None`, checked by
+  `version_cmp.rs::ack_version_floor_tracks_the_shipping_release`. When a
+  release bump raises `CARGO_PKG_VERSION` to `(0, 2, 120)`, that test fails
+  until the releaser consciously either sets
+  `ACK_VERSION_SHIPPED_IN = Some(GATEWAY_ACK_VERSION_MIN_VERSION)` (this release
+  carries it) or raises the floor (it does not).
+
+  Note the emission gate reads the peer's version from the intro packet it just
+  parsed, never from a cached value, so unlike the floors above there is no
+  bootstrapping round-trip and no way for the decision to go stale against a
+  peer that downgraded at a reused address.
 
 When a NEW wire-gated feature first ships (not this one), set its floor to
 **exactly that release version** and freeze it, as described above.

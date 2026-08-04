@@ -712,6 +712,10 @@ pub(in crate::node) struct P2pConnManager {
     ledbat_min_ssthresh: Option<usize>,
     /// Congestion control configuration.
     congestion_config: CongestionControlConfig,
+    /// Test-only override for the #5161 version-carrying-ack floor, threaded
+    /// into the transport handler. `None` in production.
+    /// See `NodeConfig::ack_version_floor_override`.
+    ack_version_floor_override: Option<(u8, u8, u16)>,
     blocked_addresses: Option<HashSet<SocketAddr>>,
     /// Per-contract retry count for broadcasts that found no targets yet.
     broadcast_retries: HashMap<freenet_stdlib::prelude::ContractKey, u8>,
@@ -1195,6 +1199,7 @@ impl P2pConnManager {
             is_gateway: config.is_gateway,
             this_location: config.location,
             check_version: !config.config.network_api.ignore_protocol_version,
+            ack_version_floor_override: config.ack_version_floor_override,
             bandwidth_limit: config.config.network_api.bandwidth_limit,
             global_bandwidth: config
                 .config
@@ -1279,6 +1284,7 @@ impl P2pConnManager {
             global_bandwidth,
             ledbat_min_ssthresh,
             congestion_config,
+            ack_version_floor_override,
             blocked_addresses,
             broadcast_retries,
             broadcast_no_target_streak,
@@ -1296,6 +1302,7 @@ impl P2pConnManager {
                 global_bandwidth,
                 ledbat_min_ssthresh,
                 Some(congestion_config.clone()),
+                ack_version_floor_override,
             )
             .await?;
 
@@ -1365,6 +1372,9 @@ impl P2pConnManager {
             global_bandwidth: None, // Already used for connection handler, not needed in ctx
             ledbat_min_ssthresh,
             congestion_config, // Already used for connection handler, kept for struct completeness
+            // Already consumed by create_connection_handler above; kept for
+            // struct completeness, same as the two fields around it.
+            ack_version_floor_override,
             blocked_addresses,
             broadcast_retries,
             broadcast_no_target_streak,

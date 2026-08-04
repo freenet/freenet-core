@@ -1378,6 +1378,24 @@ impl ConnectionManager {
     /// undecodable wire variant to a downgraded peer; see the
     /// `remote_version` field rustdoc for the full failure.
     ///
+    /// # Why #5161 did NOT relax this to "keep the old value on `None`"
+    ///
+    /// The issue read the clearing as information loss — a reconnect deleting a
+    /// version we already knew. That was the SYMPTOM of the handshake gap, not
+    /// a second bug, and relaxing it would have re-opened the downgrade failure
+    /// above.
+    ///
+    /// What #5161 changed is what `None` MEANS. Enumerate where a `None` can
+    /// now reach this function: the joiner->gateway ack path and the
+    /// peer-to-peer ack race both yield `Some` for any remote at or above
+    /// `GATEWAY_ACK_VERSION_MIN_VERSION`, and the intro-parsing path always
+    /// did. So a remaining `None` is not "we failed to learn it" — it is the
+    /// positive fact that the remote is BELOW the floor. Clearing a stale
+    /// newer entry is then the accurate write, not a lossy one, and every
+    /// `version_supports_*` predicate fails closed on the absence exactly as it
+    /// would on a below-floor value. Pinned by
+    /// `record_remote_version_none_clears_a_stale_entry`.
+    ///
     /// Called from `p2p_protoc::connection_lifecycle` at the same point
     /// `P2pConnManager` records `remote_version` on its own `connections`
     /// entry — keep the two writes together if that call site changes.
@@ -2728,6 +2746,60 @@ mod tests {
         assert_eq!(cm.remote_version(addr), None);
         cm.record_remote_version(addr, Some((0, 2, 94)));
         assert_eq!(cm.remote_version(addr), Some((0, 2, 94)));
+    }
+
+    /// **The address-reuse-with-downgrade case (#5161).** A `None` MUST clear a
+    /// previously recorded version rather than preserve it.
+    ///
+    /// A recorded version is keyed by socket address, and addresses are reused:
+    /// a peer restarts on an older binary, or a NAT reassigns the port. If the
+    /// new connection reports no version and we kept the old one, we would keep
+    /// believing a downgraded peer is current and send it a wire variant it
+    /// cannot deserialize — which closes the connection
+    /// (`ConnectionError::Serialization`) and reads as a transport fault. That
+    /// is the failure the write-through exists to prevent, and #5161 removed
+    /// its most common trigger (the version-less gateway ack) rather than the
+    /// protection itself.
+    ///
+    /// The trailing assertions are the point: a cleared entry must fail closed
+    /// at the gates, so clearing is conservative in the same direction as a
+    /// genuinely below-floor version would be.
+    #[test]
+    fn record_remote_version_none_clears_a_stale_entry() {
+        let cm = make_connection_manager(Some(make_addr(9000)), 1, 10, false);
+        let addr = make_addr(9002);
+
+        cm.record_remote_version(addr, Some((0, 2, 118)));
+        assert_eq!(cm.remote_version(addr), Some((0, 2, 118)));
+
+        // Reconnect at the same address whose handshake yielded no version.
+        cm.record_remote_version(addr, None);
+        assert_eq!(
+            cm.remote_version(addr),
+            None,
+            "a reconnect that reports no version must not leave the previous \
+             version in place — the peer may have restarted on an older build \
+             at this address, and we would then send it an undecodable variant"
+        );
+        assert!(!cm.supports_summary_first_put(addr));
+        assert!(!cm.supports_hash_first_summaries(addr));
+    }
+
+    /// The other half of the same rule: a `Some` at a reused address overwrites
+    /// unconditionally, INCLUDING downwards. A "keep the highest version seen"
+    /// policy would be the same downgrade bug in a different shape.
+    #[test]
+    fn record_remote_version_overwrites_downwards_at_a_reused_address() {
+        let cm = make_connection_manager(Some(make_addr(9000)), 1, 10, false);
+        let addr = make_addr(9003);
+
+        cm.record_remote_version(addr, Some((0, 2, 120)));
+        cm.record_remote_version(addr, Some((0, 2, 100)));
+        assert_eq!(
+            cm.remote_version(addr),
+            Some((0, 2, 100)),
+            "the most recent connection's version wins, even when it is lower"
+        );
     }
 
     /// Emission gate, fail-closed case: a peer with no recorded version
