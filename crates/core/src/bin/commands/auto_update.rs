@@ -3012,6 +3012,45 @@ mod tests {
     }
 
     #[test]
+    fn cooldown_is_consulted_before_a_local_token_is_spent() {
+        // Ordering is the whole point of this fix, on BOTH paths. Spending a
+        // token first and only then discovering the cooldown burns one per 60s
+        // tick — the GithubRateLimitedError arm deliberately records no check
+        // time and grows no backoff, so the loop re-enters every tick, drains the
+        // 8-token bucket in ~8 minutes, and then throttles recovery for a further
+        // ~10 minutes per token AFTER GitHub would already have accepted a free
+        // request. Nothing else would catch a reordering: both orders compile,
+        // both behave identically until an IP is actually rate-limited.
+        let node = fn_body(
+            include_str!("auto_update.rs"),
+            "async fn get_latest_version() -> Result<String> {",
+        );
+        let cooldown_at = node
+            .find("github_cooldown_remaining()")
+            .expect("get_latest_version must consult the cooldown");
+        let token_at = node
+            .find("try_consume_node_poll()")
+            .expect("get_latest_version must consume a node token");
+        assert!(
+            cooldown_at < token_at,
+            "the cooldown must be checked BEFORE a node token is spent, or a \
+             rate-limited node drains its own bucket and delays its recovery"
+        );
+
+        let install = fn_body(include_str!("update.rs"), "async fn probe_latest_tag(");
+        let cooldown_at = install
+            .find("github_cooldown_remaining_public()")
+            .expect("probe_latest_tag must consult the cooldown");
+        let token_at = install
+            .find("try_consume_install_poll()")
+            .expect("probe_latest_tag must consume an install token");
+        assert!(
+            cooldown_at < token_at,
+            "the cooldown must be checked BEFORE an install token is spent"
+        );
+    }
+
+    #[test]
     fn rate_limited_paths_persist_the_cooldown_and_exit_without_failing() {
         // #5102/#5104 split the previously-atomic `note_rate_limited_response`
         // (parse header + persist deadline + build error) into two call sites.
