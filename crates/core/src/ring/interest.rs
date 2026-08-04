@@ -2599,7 +2599,8 @@ impl<T: TimeSource + Sync> InterestManager<T> {
 /// First index in `sorted` (ascending by contract id, as
 /// [`InterestManager::get_matching_contracts`] returns it) whose id is strictly
 /// greater than `after`. Returns `sorted.len()` when `after` is at or past the
-/// end, which the caller wraps to 0.
+/// end, which [`InterestManager::fallback_window_start`] reads as the end of a
+/// cycle and answers with a fresh random offset.
 ///
 /// This is the churn-safe half of the rotation. Because it is a binary search
 /// over ids rather than a stored offset, it behaves correctly when the set
@@ -6951,7 +6952,8 @@ mod tests {
              rather than stepping over it"
         );
 
-        // Cursor past the end: caller wraps to 0.
+        // Cursor at the end: signals a completed cycle to the caller, which
+        // restarts at a random offset rather than at 0.
         let beyond = *sorted[7].id();
         assert_eq!(first_index_after(&sorted, &beyond), sorted.len());
     }
