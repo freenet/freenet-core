@@ -2867,9 +2867,13 @@ const MAX_FALLBACK_SUMMARIES_PER_REPLY: usize = 64;
 /// Everything above is a MODEL, derived from fleet averages. That is how the
 /// entry cap came to be sized off a mean of 143 B/entry when the population it
 /// governs is nothing like the mean — the error survived review of the
-/// arithmetic because no counter contradicted it. **#5169** adds
+/// arithmetic because no counter contradicted it. **#5168** adds
 /// entries-per-reply and bytes-per-reply on this path. Do not move either
 /// constant on the strength of another average; read the distribution.
+///
+/// Those counters are also the cleanest read on #5161: as gateway links learn
+/// peer versions and stop taking this path at all, they should fall toward
+/// zero.
 const MAX_FALLBACK_SUMMARY_BYTES_PER_REPLY: usize = 9 * 1024;
 
 /// Which wire form a multi-entry `Summaries` reply to a peer takes.
