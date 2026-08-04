@@ -2861,6 +2861,15 @@ const MAX_FALLBACK_SUMMARIES_PER_REPLY: usize = 64;
 /// same links is a multi-megabyte message every 5 minutes; there is no setting
 /// of this constant that is both cheap and fast, which is the argument for
 /// repairing the version gate (#5156 / #5161) rather than tuning here.
+///
+/// # Before retuning either constant, get the field reading
+///
+/// Everything above is a MODEL, derived from fleet averages. That is how the
+/// entry cap came to be sized off a mean of 143 B/entry when the population it
+/// governs is nothing like the mean — the error survived review of the
+/// arithmetic because no counter contradicted it. **#5169** adds
+/// entries-per-reply and bytes-per-reply on this path. Do not move either
+/// constant on the strength of another average; read the distribution.
 const MAX_FALLBACK_SUMMARY_BYTES_PER_REPLY: usize = 9 * 1024;
 
 /// Which wire form a multi-entry `Summaries` reply to a peer takes.
