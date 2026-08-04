@@ -76,6 +76,23 @@ Is the test superseded by new semantics?
   → Keep the test as historical documentation
 ```
 
+### WHEN writing a source-scrape pin test
+
+```
+A test that include_str!s its own source and asserts a symbol appears
+inside a function MUST bound the region to that function.
+
+A bare split_once(anchor) does NOT fail when the anchor moves — it
+matches a later occurrence, typically the pin's own assertion string,
+and the assertion then passes vacuously.
+
+Use the fn_body() helper pattern (commands::auto_update tests), and
+mutation-test the pin when you write it: apply the exact regression it
+names and confirm it FAILS.
+
+See .claude/rules/bug-prevention-patterns.md — this has shipped twice.
+```
+
 ### WHEN writing cleanup/GC logic
 
 ```
