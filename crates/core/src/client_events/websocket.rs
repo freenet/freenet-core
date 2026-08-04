@@ -1852,8 +1852,37 @@ async fn process_client_request(
                 backoff_ms = remaining.as_millis(),
                 "Rejecting delegate request due to repeated failures (retry after backoff)"
             );
+            // NOT `DelegateError::Missing`, which this used to send.
+            //
+            // `Missing` is what the executor returns when a delegate genuinely
+            // is not registered on this node. Sending it for a throttled
+            // request overloaded it with a second, incompatible meaning, and a
+            // client had no way to tell them apart:
+            //
+            //   - not registered  -> the app is built against a stale delegate
+            //                        key; the user must update it, and the
+            //                        developer needs to know.
+            //   - rate limited    -> transient; back off and retry.
+            //
+            // Those want opposite responses, and conflating them cost a real
+            // user: an app built against a re-keyed ghostkeys delegate told
+            // someone to go buy a Ghost Key they already owned
+            // (freenet/ghostkeys#21).
+            //
+            // `ExecutionError` carries a message rather than a key, which is
+            // fine here -- the client sent the request, so it knows which
+            // delegate. A dedicated `RateLimited { key, retry_after }` variant
+            // would be better still, but that is a freenet-stdlib change and
+            // this is the fix that does not need one.
             let error: ClientError = ErrorKind::RequestError(RequestError::DelegateError(
-                DelegateError::Missing(delegate_req.key().clone()),
+                DelegateError::ExecutionError(
+                    format!(
+                        "delegate {} is rate limited after repeated failures; retry in {} ms",
+                        delegate_req.key(),
+                        remaining.as_millis()
+                    )
+                    .into(),
+                ),
             ))
             .into();
             let serialized = match conn_state.encoding_protoc {
@@ -3395,6 +3424,62 @@ mod tests {
         limiter.record_success(&key_a);
         assert!(limiter.check_backoff(&key_a).is_none());
         assert!(limiter.check_backoff(&key_b).is_some());
+    }
+
+    /// A throttled delegate request must NOT be reported as a missing
+    /// delegate.
+    ///
+    /// `Missing` means "not registered on this node", which tells a client its
+    /// build references a delegate that no longer exists — an app-update
+    /// problem the developer needs to hear about. Throttling is transient and
+    /// wants a retry. Sending `Missing` for both left clients unable to
+    /// distinguish them, and cost a real user: an app built against a re-keyed
+    /// ghostkeys delegate told someone to buy a Ghost Key they already owned
+    /// (freenet/ghostkeys#21).
+    ///
+    /// Pins the variant rather than the wording, except for a substring that
+    /// makes the cause legible in a log.
+    #[test]
+    fn throttled_request_is_not_reported_as_a_missing_delegate() {
+        let key = DelegateKey::new([7u8; 32], CodeHash::new([7u8; 32]));
+        let remaining = Duration::from_millis(250);
+
+        // Mirrors what the backoff branch constructs.
+        let err = DelegateError::ExecutionError(
+            format!(
+                "delegate {} is rate limited after repeated failures; retry in {} ms",
+                key,
+                remaining.as_millis()
+            )
+            .into(),
+        );
+
+        assert!(
+            !matches!(err, DelegateError::Missing(_)),
+            "throttling must not masquerade as an unregistered delegate"
+        );
+        match &err {
+            DelegateError::ExecutionError(msg) => {
+                assert!(
+                    msg.contains("rate limited"),
+                    "the cause should be legible in the message: {msg}"
+                );
+            }
+            other => panic!("expected ExecutionError, got {other:?}"),
+        }
+
+        // And it carries no key, so it cannot be mistaken for a per-delegate
+        // failure by the tracker.
+        assert!(delegate_error_key(&err).is_none());
+    }
+
+    /// The counterpart: a genuinely unregistered delegate still reports
+    /// `Missing`, and still carries its key for failure tracking.
+    #[test]
+    fn unregistered_delegate_still_reports_missing_with_its_key() {
+        let key = DelegateKey::new([9u8; 32], CodeHash::new([9u8; 32]));
+        let err = DelegateError::Missing(key.clone());
+        assert_eq!(delegate_error_key(&err), Some(key.bytes()));
     }
 
     #[test]
