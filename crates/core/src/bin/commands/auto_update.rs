@@ -624,10 +624,20 @@ pub(crate) async fn fetch_latest_release_tag(bypass_cached_cooldown: bool) -> Re
             record_github_cooldown(retry_after);
             Err(GithubRateLimitedError { retry_after }.into())
         }
-        ProbeResult::Unusable { status, location } => anyhow::bail!(
-            "GitHub returned {status} with no parseable release tag in Location ({})",
-            location.as_deref().unwrap_or("<absent>")
-        ),
+        // Distinguish the causes: an operator debugging a detection outage should
+        // not have to guess whether the Location was malformed, refused for
+        // leaving the origin, or never arrived. Previously all three read as
+        // "no parseable release tag", which points at the wrong thing.
+        ProbeResult::Unusable { status, location } => match location.as_deref() {
+            None => anyhow::bail!("GitHub returned {status} with no Location header"),
+            Some(loc) if parse_tag_from_release_location(loc).is_some() => anyhow::bail!(
+                "GitHub returned {status} with a release tag in a Location that leaves the \
+                 expected origin, so it was refused: {loc}"
+            ),
+            Some(loc) => anyhow::bail!(
+                "GitHub returned {status} with no parseable release tag in Location ({loc})"
+            ),
+        },
     }
 }
 
@@ -657,6 +667,61 @@ pub(crate) enum ProbeResult {
 /// assumption about how we read a redirect is exactly the kind that breaks
 /// silently and takes fleet-wide auto-update with it.
 pub(crate) async fn probe_release_tag_at(url: &str) -> Result<ProbeResult> {
+    // Bound the whole CHAIN, not just each hop.
+    //
+    // `reqwest`'s builder timeout is per REQUEST ("from when the request starts
+    // connecting until the response body has finished"), and `Policy::none()`
+    // makes every followed hop a separate request — so the redirect-follow added
+    // in #5102 silently turned a 10s worst case into 4 x 10s = 40s.
+    //
+    // That matters because of where this runs. `freenet update` is invoked from
+    // systemd's `ExecStopPost` on every non-0/43 exit, inside `TimeoutStopSec=45`
+    // — a budget the unit's own comment already allocates (30s drain + 15s
+    // headroom for teardown). A 40s probe would leave ~5s for the asset fetch,
+    // download, checksum, signature verify and `replace_binary`, moving the
+    // SIGKILL from mid-PROBE (harmless) to mid-INSTALL (the brick-adjacent window
+    // #3934/#4073 exist to protect). The sibling 10s timeout in `update.rs` was
+    // chosen against this same number, back when the probe was one request;
+    // nothing re-derived it at 4x.
+    //
+    // The deadline is therefore the SAME 10s the single request used to get, with
+    // hops sharing it rather than each getting their own. The follow must not
+    // expand this function's stop-phase footprint at all. A rename hop is cheap
+    // (GitHub's 302 is `content-length: 0`), so the realistic case fits easily; a
+    // chain too slow to fit fails to `Unusable`, which backs off and retries, and
+    // is not a brick.
+    probe_release_tag_within(url, PROBE_CHAIN_TIMEOUT).await
+}
+
+/// [`probe_release_tag_at`] with an explicit chain deadline.
+///
+/// The deadline is a parameter purely so a test can drive it at millisecond
+/// scale: verifying it with the production 10s value would need a test that
+/// actually takes 10s, and a bound nobody has watched fire is not known to work.
+pub(crate) async fn probe_release_tag_within(
+    url: &str,
+    chain_timeout: Duration,
+) -> Result<ProbeResult> {
+    match tokio::time::timeout(chain_timeout, probe_release_tag_chain(url)).await {
+        Ok(result) => result,
+        Err(_elapsed) => Ok(ProbeResult::Unusable {
+            status: 0,
+            location: Some(format!(
+                "probe exceeded its {}ms chain deadline",
+                chain_timeout.as_millis()
+            )),
+        }),
+    }
+}
+
+/// Wall-clock bound on an entire probe, including every followed redirect.
+///
+/// Deliberately equal to the per-request timeout below: the redirect-follow must
+/// not widen the worst case that `ExecStopPost`'s `TimeoutStopSec=45` budget was
+/// sized against. See [`probe_release_tag_at`].
+const PROBE_CHAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn probe_release_tag_chain(url: &str) -> Result<ProbeResult> {
     let client = reqwest::Client::builder()
         .user_agent(GITHUB_USER_AGENT)
         // We want the `Location` header, not the page it points at: following
@@ -755,11 +820,22 @@ const MAX_PROBE_REDIRECTS: usize = 3;
 ///   supervised service, so a `Location` we follow anywhere is a request the
 ///   operator never asked for, pointed wherever the response says.
 ///
-/// Same-ORIGIN rather than an allow-list of `github.com`: it ties the rule to
-/// wherever the caller was actually pointed, which is what `probe_release_tag_at`
-/// needs (the only reason it follows at all is a repo rename, which GitHub
-/// answers on the same host) — and it keeps the local test server exercising the
-/// real follow path instead of forcing a special case into production code.
+/// **Same-origin IS an `https` + `github.com` allow-list in production** — that
+/// is the security argument, not merely a convenience. There is exactly one
+/// production caller, and it passes the [`GITHUB_LATEST_REDIRECT_URL`] constant;
+/// every other caller is a test. So the rule delivers precisely the guarantee a
+/// hard-coded allow-list would, while letting the local test server exercise the
+/// real follow path instead of forcing a `#[cfg(test)]` special case into
+/// production code. Do NOT "tighten" this into a literal `github.com` check: it
+/// would gain nothing and would silently stop the follow tests from testing the
+/// follow.
+///
+/// **The path is deliberately NOT constrained.** A redirect to
+/// `https://github.com/other/repo/releases/tag/v1.2.3` resolves, and a unit test
+/// asserts it. That is required by the case this exists for — a repository
+/// rename moves the path — and it adds no exposure under the threat model above:
+/// anyone able to control a GitHub response could serve the tag directly rather
+/// than redirect to it.
 ///
 /// Defence in depth, not a fix for a live hole: reaching this requires control of
 /// a TLS-protected GitHub response, and even then a bogus tag only yields a
@@ -773,7 +849,12 @@ fn resolve_redirect_target(current: &str, location: &str) -> Option<String> {
         && next.port_or_known_default() == base.port_or_known_default();
 
     if !matches!(next.scheme(), "http" | "https") || !same_origin {
-        tracing::debug!(
+        // warn!, not debug!: if this ever fires in production it means either
+        // GitHub changed its redirect topology — in which case detection is dying
+        // fleet-wide — or something is tampering with the response. Neither is
+        // something an operator should have to enable debug logging to discover.
+        // Same reasoning that raised the rate-limit path to warn! above.
+        tracing::warn!(
             from = %current,
             to = %next,
             "refusing to follow a release redirect that leaves the origin"
@@ -2260,7 +2341,15 @@ mod tests {
         // `#[cfg(test)]` check below cannot see that case — by then the region
         // starts *after* the attribute, so it is never inside it. Catch it here
         // instead, by position.
-        if let Some(tests_at) = src.find("#[cfg(test)]") {
+        // Matched at COLUMN 0 and followed by `mod `, i.e. the real test-module
+        // attribute — not any mention of it. Searching for the bare string found
+        // a DOC COMMENT in production code that discusses `#[cfg(test)]`, placing
+        // the "test module" hundreds of lines before the function being scraped
+        // and failing every pin in this file. That is the same naive-substring
+        // mistake this whole helper exists to catch, committed inside the check
+        // itself; it stayed hidden until a later PR happened to write that phrase
+        // into a doc comment.
+        if let Some(tests_at) = src.find("\n#[cfg(test)]\nmod ").map(|i| i + 1) {
             assert!(
                 at < tests_at,
                 "`{signature}` matched inside the test module — this pin is \
@@ -3074,6 +3163,77 @@ mod tests {
             ProbeResult::Unusable { status, .. } => assert_eq!(status, 301),
             other => panic!("off-host redirect must not be followed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn probe_chain_is_bounded_in_wall_clock_not_just_hops() {
+        use httptest::{Expectation, Server, matchers::*, responders::*};
+        // The hop cap alone does not bound TIME: `probe_gives_up_on_a_redirect_loop`
+        // uses a server that answers instantly, so it pins the COUNT only. With a
+        // per-REQUEST timeout, N slow hops cost N x 10s — which is how the
+        // redirect-follow turned a 10s worst case into 40s and began eating the
+        // ExecStopPost budget `TimeoutStopSec=45` allocates.
+        //
+        // Each hop here is individually fast (200ms, far inside the 10s
+        // per-request timeout) but the chain never resolves, so only the SUM
+        // breaks the budget. That is precisely the shape a per-request bound
+        // cannot see. Driven at ms scale via the injectable deadline so the test
+        // is fast and uses real time (httptest's server runs on its own runtime,
+        // so a paused clock would just fire the client timeout immediately).
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/slow"))
+                .times(..)
+                .respond_with(delay_and_then(
+                    Duration::from_millis(200),
+                    status_code(302).append_header("location", "/slow"),
+                )),
+        );
+
+        let deadline = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let got = probe_release_tag_within(&server.url_str("/slow"), deadline)
+            .await
+            .expect("exceeding the deadline is a normal outcome, not an error");
+        let elapsed = started.elapsed();
+
+        match got {
+            ProbeResult::Unusable { location, .. } => assert!(
+                location.unwrap_or_default().contains("chain deadline"),
+                "hitting the deadline must say so, so an operator can tell it from \
+                 a malformed redirect"
+            ),
+            other => panic!("a chain that never resolves must end Unusable, got {other:?}"),
+        }
+        // Generous upper bound: the point is that it stops near the deadline
+        // rather than running all 4 hops (800ms+), not that it is precise.
+        assert!(
+            elapsed < Duration::from_millis(700),
+            "the whole chain must finish near its {deadline:?} deadline, took {elapsed:?} \
+             — a per-hop bound would have let all {} hops run",
+            MAX_PROBE_REDIRECTS + 1
+        );
+    }
+
+    #[test]
+    fn probe_chain_deadline_does_not_widen_the_stop_phase_budget() {
+        // The follow must not make the probe's worst case any longer than the
+        // single request it replaced. `freenet update` runs from ExecStopPost
+        // inside TimeoutStopSec=45, which the unit already spends on the 30s
+        // drain plus teardown headroom; a probe that grew to 4x would push the
+        // SIGKILL from mid-probe into mid-install.
+        let per_request = Duration::from_secs(10);
+        assert_eq!(
+            PROBE_CHAIN_TIMEOUT, per_request,
+            "the chain deadline must equal the per-request timeout, so following \
+             redirects costs no additional wall clock"
+        );
+        // And it must stay far enough inside the stop budget to leave room for
+        // the install that follows it.
+        assert!(
+            PROBE_CHAIN_TIMEOUT.as_secs() * 2 < 45,
+            "probe + asset fetch must both fit well inside TimeoutStopSec=45"
+        );
     }
 
     #[tokio::test]
