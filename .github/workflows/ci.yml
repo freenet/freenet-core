@@ -175,6 +175,16 @@ jobs:
       - name: Self-test release.yml merge-queue auto-merge
         run: bash scripts/release_mergequeue_test.sh
 
+      # Regression gate for #5170: a merge_group-triggered workflow whose
+      # concurrency group does not vary per queue entry makes each new entry
+      # cancel the previous entry's required check, so the older entry goes
+      # UNMERGEABLE and stalls the queue — invisibly, since the PR itself still
+      # reads CLEAN. Pins that the linter still fires on the exact key that
+      # shipped, that this repo satisfies the invariant, and that the linter is
+      # still wired into rule_lint.
+      - name: Self-test merge-queue concurrency guard
+        run: bash scripts/merge_group_concurrency_test.sh
+
       # install.sh now sets up a supervised service by default (issue #4073) so
       # new nodes auto-update. The system-vs-user + lingering decision is the
       # load-bearing new logic; these smoke tests pin it without needing real
@@ -262,6 +272,15 @@ jobs:
       # uses (must NOT flag, including the #4616 moved-test-module case).
       - name: Rules #1/#2/#3 linter self-test
         run: python3 .github/scripts/check_banned_patterns.py --self-test
+
+      # Self-test the merge-queue concurrency linter, then run it. Unlike the
+      # linters above this one is NOT diff-scoped — the invariant is a property
+      # of each workflow file as it stands, and checking all of them is cheap.
+      - name: Merge-queue concurrency linter self-test
+        run: python3 .github/scripts/check_merge_group_concurrency.py --self-test
+
+      - name: Check merge_group workflows vary their concurrency group
+        run: python3 .github/scripts/check_merge_group_concurrency.py .github/workflows
 
       - name: Check for banned patterns in new code
         env:
