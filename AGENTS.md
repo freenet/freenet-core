@@ -336,6 +336,20 @@ config, no endpoint, and no fallback in either direction — enabling or
 disabling one has no effect on the other, and `otel-endpoint` must never
 default to the dashboard collector.
 
+The otel pipeline authenticates to the collector per `otel-auth-mode`:
+`freenet` (default) sends a per-request
+`Authorization: Bearer freenet/<pubkey>/<timestamp>/<nonce>/<signature>`
+token — an XEdDSA (Signal construction, `xeddsa` crate) signature over
+`freenet/<pubkey>/<timestamp>/<nonce>` (epoch seconds, 16-byte nonce, all
+base58), signed with the x25519 transport secret itself
+(`TransportKeypair::auth_token_signer`). `<pubkey>` is the FULL base58
+x25519 transport public key — the node's one identity — so the collector
+verifies by converting Montgomery→Edwards (sign bit 0) and running stock
+Ed25519 verification; no shared secret, no second key, nothing assertable.
+`disabled` sends no header. Tokens are built per request
+(`tracing/otel.rs::bearer_token` via a custom `HttpClient`) so the timestamp
+stays fresh; future auth methods get new enum variants.
+
 The otel pipeline honors the standard variables, which take priority over
 `otel-endpoint` in `config.toml`:
 `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_EXPORTER_OTLP_ENDPOINT`,
@@ -364,9 +378,14 @@ Every histogram is base-2 exponential via a single `with_view` in
 
 No instrument carries an attribute identifying the remote end of a connection.
 Per-datapoint attributes cost per series and multiply by bucket count on
-histograms; identifying THIS node is a resource attribute
-(`service.instance.id`), which rides once per export batch. That id is the
-transport public key fingerprint, NOT a `PeerId` — `PeerId` renders as
+histograms; identifying THIS node is done with two resource attributes,
+riding once per export batch. `freenet.node.pubkey`
+is the base58 ed25519 verifying key derived from the transport keypair —
+byte-equal to the bearer token's `<pubkey>` field, so the collector
+self-validates the node id against the signing key after verifying the
+signature. `freenet.node.fingerprint` is the transport public key fingerprint
+(what UIs and the legacy dashboard show), for cross-referencing only —
+unverifiable by the collector. Neither is ever a `PeerId` — `PeerId` renders as
 `{pub_key}@{addr}` and would export our socket address and re-identify the node
 on every address change. Note also that "peer" means the other end of a
 connection; metrics about ourselves use `freenet.node.*`.

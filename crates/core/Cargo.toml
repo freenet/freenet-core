@@ -104,7 +104,9 @@ wasmtime = { workspace = true, optional = true }
 # PUT time must run regardless of which WASM execution backend is compiled in.
 wasmparser = { workspace = true }
 xz2 = { workspace = true }
-reqwest = { workspace = true }
+# `blocking` named explicitly (not just inherited via feature unification from
+# opentelemetry-http) because tracing::otel constructs reqwest::blocking::Client.
+reqwest = { workspace = true, features = ["blocking"] }
 # Hidden (no-echo) prompt for the `freenet secrets export/import` passphrase, so
 # secrets don't have to be passed on argv (where they leak via `ps`/history).
 rpassword = "7"
@@ -136,6 +138,17 @@ tracing-appender = { workspace = true, optional = true }
 # async reqwest client would have no tokio reactor. reqwest-rustls adds TLS
 # so https:// collector endpoints actually work (otherwise every export to an
 # https endpoint silently fails at connect time).
+# Direct dep so tracing::otel can implement HttpClient (per-request auth
+# headers); the crate is already in the graph via opentelemetry-otlp.
+opentelemetry-http = { workspace = true }
+async-trait = { workspace = true }
+http = { workspace = true }
+# XEdDSA collector auth: sign with the x25519 transport key (see
+# transport::crypto::TransportKeypair::auth_token_signer). rand10/rand_core10
+# exist only because xeddsa's rng bound is rand 0.10 (workspace rand is 0.9).
+xeddsa = { workspace = true }
+rand10 = { workspace = true }
+rand_core10 = { workspace = true }
 opentelemetry-otlp = { workspace = true, features = [
     "http-proto",
     "metrics",
@@ -188,6 +201,9 @@ criterion = { workspace = true }
 freenet-stdlib = { features = ["net", "testing"], workspace = true }
 freenet-macros = { path = "../freenet-macros" }
 httptest = { workspace = true }
+# Test-only: proves the collector can verify XEdDSA tokens with a stock
+# ed25519 library after Montgomery->Edwards conversion (4.1.3 = xeddsa's).
+curve25519-dalek = "4.1.3"
 libc = { workspace = true }  # For sendmmsg syscall batching benchmarks
 parking_lot = { workspace = true, features = ["deadlock_detection"] }
 # Used by tests/in_process_restart.rs to directly probe the redb file lock as a
