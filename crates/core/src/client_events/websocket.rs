@@ -3473,6 +3473,57 @@ mod tests {
         assert!(delegate_error_key(&err).is_none());
     }
 
+    /// Pin the WIRING, not just the shape.
+    ///
+    /// The tests above construct the error by hand, so they prove what a
+    /// throttle rejection should look like but not that the backoff branch
+    /// actually builds one. A future edit could reinstate
+    /// `DelegateError::Missing` there and they would all still pass.
+    ///
+    /// Source-scrape instead (same idiom as `server.rs` and
+    /// `ring/update_rate_limit.rs`): the backoff branch must not name
+    /// `Missing`. Anchored on `check_backoff`, which is the branch's own
+    /// condition, so this survives the surrounding code being reorganised.
+    #[test]
+    fn backoff_branch_does_not_construct_a_missing_delegate_error() {
+        const SRC: &str = include_str!("websocket.rs");
+
+        let (body, _) = SRC
+            .split_once("\nmod tests {")
+            .expect("websocket.rs should have a tests module");
+
+        let idx = body
+            .find("rate_limiter.check_backoff(key_bytes)")
+            .expect("the delegate backoff branch should still exist");
+
+        // The branch is short; take a generous window rather than trying to
+        // brace-match.
+        let window = &body[idx..(idx + 2000).min(body.len())];
+
+        // Strip line comments before asserting. The branch carries a comment
+        // explaining why it does NOT use `Missing`, and a naive scrape cannot
+        // tell that apart from code that does -- which is exactly what this
+        // test caught on its first run.
+        let branch: String = window
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !branch.contains("DelegateError::Missing"),
+            "the backoff branch must not report a throttled request as a \
+             missing delegate -- `Missing` means the delegate is not \
+             registered, and conflating the two leaves clients unable to \
+             tell an app that needs updating from one that should retry \
+             (freenet/ghostkeys#21)"
+        );
+        assert!(
+            branch.contains("DelegateError::ExecutionError"),
+            "the backoff branch should report ExecutionError naming the cause"
+        );
+    }
+
     /// The counterpart: a genuinely unregistered delegate still reports
     /// `Missing`, and still carries its key for failure tracking.
     #[test]
