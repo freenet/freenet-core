@@ -2165,18 +2165,48 @@ mod broadcast_to_telemetry_tests {
     /// from the real sender address (`get_peer_by_addr(sender_addr)`), never
     /// hard-code `this_peer`/self — that self-attribution is exactly what
     /// made the deleted `from_inbound_msg_v1` arm useless.
+    /// Return just the body of `signature_prefix`'s function, bounded by
+    /// brace depth. An unbounded `SOURCE[start..].find(..)` would keep
+    /// scanning past the function's end and match a *later* function's call
+    /// site, so a regression inside this function would pass vacuously —
+    /// exactly the failure AGENTS.md's source-scrape-pin rule describes.
+    fn fn_body<'a>(source: &'a str, signature_prefix: &str) -> &'a str {
+        let start = source
+            .find(signature_prefix)
+            .unwrap_or_else(|| panic!("{signature_prefix} not found in op_ctx_task.rs"));
+        let brace = source[start..]
+            .find('{')
+            .unwrap_or_else(|| panic!("{signature_prefix} must have a body"));
+        let body_start = start + brace + 1;
+        let bytes = source.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = body_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[body_start..i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("unbalanced braces while scanning {signature_prefix}");
+    }
+
     #[test]
     fn driver_broadcast_received_call_sites_resolve_sender_not_self() {
         const SOURCE: &str = include_str!("../operations/update/op_ctx_task.rs");
         let mut checked = 0;
         for anchor in [
-            "fn drive_relay_broadcast_to(",
-            "fn apply_streaming_broadcast(",
+            "async fn drive_relay_broadcast_to(",
+            "async fn apply_streaming_broadcast(",
         ] {
-            let start = SOURCE
-                .find(anchor)
-                .unwrap_or_else(|| panic!("{anchor} not found in op_ctx_task.rs"));
-            let call = SOURCE[start..]
+            let body = fn_body(SOURCE, anchor);
+            let call = body
                 .find("NetEventLog::update_broadcast_received(")
                 .unwrap_or_else(|| {
                     panic!("{anchor} must call NetEventLog::update_broadcast_received")
@@ -2185,7 +2215,11 @@ mod broadcast_to_telemetry_tests {
             // `if let Some(requester_pkl) = ... get_peer_by_addr(sender_addr)`
             // guard; look at the ~400 bytes leading up to the call site.
             let window_start = call.saturating_sub(400);
-            let window = &SOURCE[start..][window_start..call];
+            // `get` rather than direct slicing: a non-ASCII byte in a comment
+            // could put `window_start` mid-character, and panicking on that
+            // would be an unrelated failure. Falling back to the whole prefix
+            // only ever widens the window, never narrows it.
+            let window = body.get(window_start..call).unwrap_or(&body[..call]);
             assert!(
                 window.contains("get_peer_by_addr(sender_addr)"),
                 "{anchor} must resolve the update_broadcast_received requester via \
