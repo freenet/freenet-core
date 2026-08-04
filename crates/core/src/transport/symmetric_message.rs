@@ -548,6 +548,15 @@ mod test {
     /// bytes — a field added to `OutboundConnection`, a reordering of
     /// `SymmetricMessage`, a bincode config change, or a variant inserted
     /// before `AckConnection` in `SymmetricMessagePayload`.
+    ///
+    /// **Provenance, because the literal cannot vouch for itself.** It was
+    /// hand-derived from the bincode-fixint layout — 4 (`packet_id`) + 8 (empty
+    /// vec length) + 4 (payload variant) + 4 (`Result::Ok`) + 16 (key) + 4
+    /// (`SocketAddr::V4`) + 4 (octets) + 2 (port) = 46 bytes — and cross-checked
+    /// against the pre-#5161 encoder. If you ever find this failing, do NOT
+    /// re-derive the literal from whatever the current code emits: that turns
+    /// the pin into a no-op. Work out which of the four causes above moved, and
+    /// whether the peers who cannot be upgraded can still decode it.
     #[test]
     fn ack_ok_produces_identical_bytes_to_pre_5161_encoding() {
         // packet_id=0 (u32 LE) | confirm_receipt len=0 (u64 LE)

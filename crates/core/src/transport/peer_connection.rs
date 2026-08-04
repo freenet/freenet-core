@@ -3499,6 +3499,136 @@ mod tests {
         );
     }
 
+    /// A duplicate `AckConnectionV2` on an ESTABLISHED connection is answered
+    /// with the LEGACY `ack_ok`, and does not disturb the connection (#5161).
+    ///
+    /// The arm handling it is shared with the legacy duplicate ack, and the
+    /// choice to reply in the old encoding is deliberate rather than an
+    /// oversight: this side is the joiner, so the remote already learned our
+    /// version from our intro packet, and answering V2 with V2 would tell it
+    /// nothing it does not have. That reasoning was load-bearing and unpinned
+    /// until this test — a reviewer flagged that nothing drove `process_inbound`
+    /// with either success ack.
+    ///
+    /// Sends a `ShortMessage` behind the ack so `recv()` has something to
+    /// return: the ack arm yields `Ok(None)` and loops, so a test that sent only
+    /// the ack would hang rather than assert.
+    #[tokio::test]
+    async fn duplicate_v2_ack_on_established_connection_is_answered_with_legacy_ack() {
+        use crate::transport::crypto::TransportKeypair;
+        use crate::transport::packet_data::PacketData;
+        use crate::transport::symmetric_message::SymmetricMessagePayload;
+        use crate::util::time_source::SharedMockTimeSource;
+        use bytes::Bytes;
+
+        let time_source = SharedMockTimeSource::new();
+        let (inbound_tx, inbound_rx) = mpsc::channel(16);
+        let remote_addr = SocketAddr::new(Ipv4Addr::new(10, 99, 99, 2).into(), 50002);
+
+        let mut key = [0u8; 16];
+        crate::config::GlobalRng::fill_bytes(&mut key);
+        let cipher = Aes128Gcm::new(&key.into());
+        let keypair = TransportKeypair::new();
+
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(
+            SentPacketTracker::new_with_time_source(time_source.clone()),
+        ));
+        let congestion_controller =
+            crate::transport::congestion_control::CongestionControlConfig::default()
+                .build_arc_with_time_source(time_source.clone());
+        let token_bucket = Arc::new(TokenBucket::new_with_time_source(
+            10_000,
+            10_000_000,
+            time_source.clone(),
+        ));
+        let (sock_tx, mut sock_rx) = mpsc::channel::<(SocketAddr, Arc<[u8]>)>(16);
+        let socket = Arc::new(TestSocket::new(sock_tx));
+
+        let rolling_rtt_stats = crate::transport::rolling_rtt_stats::RollingRttStatsHandle::new(
+            remote_addr,
+            time_source.clone(),
+        );
+        let remote_conn = RemoteConnection {
+            outbound_symmetric_key: cipher.clone(),
+            remote_addr,
+            sent_tracker,
+            last_packet_id: Arc::new(AtomicU32::new(0)),
+            inbound_packet_recv: inbound_rx,
+            inbound_symmetric_key: cipher.clone(),
+            inbound_symmetric_key_bytes: key,
+            my_address: None,
+            remote_protoc_version: Some((0, 2, 120)),
+            transport_secret_key: keypair.secret,
+            congestion_controller,
+            token_bucket,
+            socket,
+            global_bandwidth: None,
+            rolling_rtt_stats,
+            time_source,
+        };
+
+        // A retransmitted V2 success ack, as an upgraded acceptor would resend
+        // if it never saw our completion ack.
+        let v2 = SymmetricMessage::ack_ok_with_version(
+            &cipher,
+            key,
+            remote_addr,
+            [0xFF, 0, 2, 0, 120, 0, 80, 1],
+        )
+        .expect("encode v2 ack");
+        inbound_tx
+            .send(
+                PacketData::<crate::transport::packet_data::UnknownEncryption>::from_buf(v2.data()),
+            )
+            .await
+            .expect("send v2 ack");
+
+        // Something for `recv()` to actually return.
+        let follow_up = SymmetricMessage::serialize_msg_to_packet_data(
+            7,
+            SymmetricMessagePayload::ShortMessage {
+                payload: Bytes::from_static(b"after-the-ack"),
+            },
+            &cipher,
+            vec![],
+        )
+        .expect("encode short message");
+        inbound_tx
+            .send(
+                PacketData::<crate::transport::packet_data::UnknownEncryption>::from_buf(
+                    follow_up.data(),
+                ),
+            )
+            .await
+            .expect("send short message");
+
+        let mut conn = PeerConnection::new(remote_conn);
+        let msg = conn.recv().await.expect("recv");
+        assert_eq!(
+            msg.as_slice(),
+            b"after-the-ack".as_slice(),
+            "the V2 ack must be consumed and the connection carry on"
+        );
+
+        let (target, sent) = sock_rx.try_recv().expect("a reply must have been sent");
+        assert_eq!(target, remote_addr);
+        let decrypted =
+            PacketData::<crate::transport::packet_data::UnknownEncryption>::from_buf(&sent)
+                .try_decrypt_sym(&cipher)
+                .expect("reply is encrypted under the shared key");
+        let reply = SymmetricMessage::deser(decrypted.data()).expect("reply decodes");
+        assert!(
+            matches!(
+                reply.payload,
+                SymmetricMessagePayload::AckConnection { result: Ok(_) }
+            ),
+            "the reply must be the LEGACY ack — replying V2 here would tell the \
+             acceptor nothing it did not already learn from our intro packet, \
+             and would be an ungated send of the new encoding. Got: {:?}",
+            reply.payload
+        );
+    }
+
     /// Regression test for #3369: `last_received_nanos` is a struct field, not a local.
     ///
     /// Before the fix, `last_received_nanos` was a local variable in `recv()`,

@@ -415,16 +415,16 @@ pub struct NodeConfig {
     ///
     /// In production this is `None` → the real `(0, 2, 120)` floor (untouched).
     ///
-    /// **Simulations default this ON**, like `hash_first_summaries_floor_override`
-    /// and unlike the two cascade gates. Same reasoning: it changes only the
-    /// ENCODING of an ack every sim already exchanges, with identical handshake
-    /// semantics, so defaulting it on costs unrelated sims nothing and buys the
-    /// one thing a version-gated wire change otherwise cannot get — the whole
-    /// simulation suite exercising the new path BEFORE the release that lifts
-    /// the crate version over the floor. It also un-breaks the sim topology
-    /// asymmetry that several existing tests document and work around (a
-    /// regular node could not learn its gateway's version, so gateway-directed
-    /// PUTs had to originate from the gateway).
+    /// **Simulations default this OFF**, like the two cascade gates and unlike
+    /// `hash_first_summaries_floor_override`. The gate is encoding-only where it
+    /// fires, but the version it teaches is the INPUT to every other
+    /// `version_supports_*` gate, so enabling it network-wide makes
+    /// node->gateway links newly eligible for those features — a cascade in
+    /// effect. Measured rather than assumed: defaulting it ON changes the
+    /// outcome of the summary-first PUT sims.
+    ///
+    /// A sim that wants it calls `SimNetwork::enable_gateway_ack_version`; see
+    /// that method for the full argument and for what the OFF default costs.
     ///
     /// Not cfg-gated for the same reason as `subscribe_hint_floor_override`:
     /// `node::testing_impl` sets it and is compiled unconditionally.
