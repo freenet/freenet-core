@@ -6477,4 +6477,164 @@ pub(crate) mod tests {
             ),
         }
     }
+
+    /// A REFUSED newcomer's sender must be DROPPED, not parked.
+    ///
+    /// The guard's contract is not only "the incumbent survives" — it is also
+    /// that the refused caller learns it was refused. Dropping the sender makes
+    /// the newcomer's `recv()` yield `None`, which is what drives the ~360ms
+    /// infra-retry in `op_ctx.rs`. A refactor that stashed skipped senders
+    /// anywhere — a retry queue, a side map, even a stray clone held in a local
+    /// — would silently convert every skip into a full-`OPERATION_TTL` hang,
+    /// and every other test in this module would still pass: they all assert
+    /// about the INCUMBENT, and none observes what became of the newcomer.
+    #[tokio::test]
+    async fn install_pending_op_callback_drops_a_refused_newcomer() {
+        use crate::transport::ExpectedInboundTracker;
+
+        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let tx = crate::dev_tool::Transaction::new::<crate::operations::put::PutMsg>();
+
+        // A live incumbent holds the slot.
+        let (incumbent_tx_, _incumbent_rx) = mpsc::channel::<crate::node::WaiterReply>(1);
+        state.pending_op_results.insert(tx, incumbent_tx_);
+
+        // The newcomer is refused. Keep its RECEIVER so we can observe the
+        // sender's fate; the function must not retain the sender anywhere.
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let (newcomer_tx, mut newcomer_rx) = mpsc::channel::<crate::node::WaiterReply>(1);
+        super::dispatch::install_pending_op_callback(&mut state, tx, newcomer_tx);
+
+        assert!(
+            !state
+                .pending_op_results
+                .get(&tx)
+                .expect("incumbent must still hold the slot")
+                .is_closed(),
+            "the live incumbent must survive the refusal"
+        );
+
+        // `None`, not `Empty`: every clone of the sender is gone, so the
+        // newcomer's driver fails fast and retries instead of hanging to TTL.
+        assert!(
+            matches!(newcomer_rx.try_recv(), Err(TryRecvError::Disconnected)),
+            "a refused newcomer's sender must be dropped, not parked — otherwise \
+             its recv() blocks until OPERATION_TTL instead of failing fast"
+        );
+    }
+
+    /// Branch 1 of `install_pending_op_callback`: an incoming callback that is
+    /// ALREADY closed is never inserted.
+    ///
+    /// This is the pre-existing #3100 bound — the driver task can be cancelled
+    /// between `op_execution_sender.send()` and the event loop reaching the
+    /// payload (simulation teardown drops driver futures), and inserting a dead
+    /// sender would hold the slot until the 60s sweep. Guarded end-to-end by
+    /// `test_pending_op_results_bounded`, but only through a full simulation;
+    /// this pins the decision itself.
+    #[tokio::test]
+    async fn install_pending_op_callback_skips_a_closed_incoming_callback() {
+        use crate::transport::ExpectedInboundTracker;
+
+        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let tx = crate::dev_tool::Transaction::new::<crate::operations::put::PutMsg>();
+
+        let (sender, receiver) = mpsc::channel::<crate::node::WaiterReply>(1);
+        drop(receiver); // the driver was cancelled before we got here
+        assert!(
+            sender.is_closed(),
+            "precondition: the callback must be closed"
+        );
+
+        super::dispatch::install_pending_op_callback(&mut state, tx, sender);
+
+        assert!(
+            !state.pending_op_results.contains_key(&tx),
+            "a closed callback must not occupy a pending_op_results slot: it \
+             would be held until the 60s sweep, which is the #3100 unbounded \
+             growth this skip exists to prevent"
+        );
+    }
+
+    /// Branch 3 of `install_pending_op_callback`, the sub-case the live-waiter
+    /// guard puts at risk: a CLOSED incumbent must still be replaced.
+    ///
+    /// The guard refuses to displace a live waiter only. If it were ever
+    /// loosened to `pending_op_results.get(&tx).is_some()` — dropping the
+    /// `!existing.is_closed()` predicate — dead entries would accumulate in the
+    /// map, reintroducing #3100 by the other door. That mutation passes
+    /// `op_execution_payload_must_not_clobber_live_waiter`, whose incumbent is
+    /// live; this test is what fails it.
+    #[tokio::test]
+    async fn install_pending_op_callback_replaces_a_closed_incumbent() {
+        use crate::transport::ExpectedInboundTracker;
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let tx = crate::dev_tool::Transaction::new::<crate::operations::put::PutMsg>();
+
+        // A stale incumbent whose receiver is already gone.
+        let (stale_sender, stale_receiver) = mpsc::channel::<crate::node::WaiterReply>(1);
+        super::dispatch::install_pending_op_callback(&mut state, tx, stale_sender);
+        drop(stale_receiver);
+        assert!(
+            state.pending_op_results[&tx].is_closed(),
+            "precondition: the incumbent must be closed"
+        );
+
+        // A live callback for the same tx must take the slot.
+        let (fresh_sender, mut fresh_rx) = mpsc::channel::<crate::node::WaiterReply>(1);
+        super::dispatch::install_pending_op_callback(&mut state, tx, fresh_sender);
+
+        assert!(
+            !state.pending_op_results[&tx].is_closed(),
+            "a closed incumbent must be replaced, not preserved: keeping it \
+             strands the slot and strands this waiter"
+        );
+
+        // And the slot must be wired to the NEW waiter, not merely non-closed.
+        let reply = crate::message::NetMessage::V1(crate::message::NetMessageV1::Aborted(tx));
+        use crate::message::MessageStats; // for `msg.id()`
+
+        let cb = state.pending_op_results.get(&tx).cloned();
+        crate::node::try_forward_driver_reply(cb.as_ref(), reply, "put");
+        // Assert the reply ARRIVED, not merely that the map had an entry.
+        // `try_forward_driver_reply` returns true for any Some(callback) — a
+        // try_send that fails Closed or Full is swallowed into a debug! — and
+        // `!matches!(.., Err(Empty))` also passes on Err(Disconnected) and on
+        // Ok(PeerDisconnected). A refactor that dropped `fresh_sender` instead
+        // of installing it would satisfy both and still be wrong.
+        match fresh_rx.try_recv() {
+            Ok(crate::node::WaiterReply::Reply(msg)) => {
+                assert_eq!(msg.id(), &tx, "the replacing waiter got the wrong tx");
+            }
+            other => {
+                panic!("the replacing waiter never received the terminal reply (got {other:?})")
+            }
+        }
+    }
+
+    /// Branch 3 of `install_pending_op_callback`, plain case: no existing
+    /// entry and a live callback inserts.
+    ///
+    /// Asserted as a precondition inside
+    /// `op_execution_payload_must_not_clobber_live_waiter`; stated separately
+    /// so the extracted function's branch coverage is legible on its own.
+    #[tokio::test]
+    async fn install_pending_op_callback_inserts_when_the_slot_is_empty() {
+        use crate::transport::ExpectedInboundTracker;
+
+        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let tx = crate::dev_tool::Transaction::new::<crate::operations::put::PutMsg>();
+
+        let (sender, _rx) = mpsc::channel::<crate::node::WaiterReply>(1);
+        super::dispatch::install_pending_op_callback(&mut state, tx, sender);
+
+        assert!(
+            state.pending_op_results.contains_key(&tx),
+            "a live callback must take an empty slot"
+        );
+        assert!(!state.pending_op_results[&tx].is_closed());
+    }
 }
