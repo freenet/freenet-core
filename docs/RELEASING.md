@@ -193,6 +193,39 @@ Current wire-gated floors:
   bootstrapping round-trip and no way for the decision to go stale against a
   peer that downgraded at a reused address.
 
+- `BROADCAST_TARGET_LIST_MIN_VERSION` in
+  `crates/core/src/node/network_bridge/p2p_protoc.rs` — the originator target
+  list on contract broadcasts (#5147).
+
+  Set to **`(0, 2, 120)`**, the release intended to first ship the
+  `UpdateMsg::BroadcastToV2` / `BroadcastToStreamingV2` variants.
+
+  Same failure mode as the three application-message floors above, and it is
+  worth stating concretely because it is easy to read as merely a lost
+  optimisation: a peer at or above the floor that does **not** carry the code
+  receives a variant index it has no arm for, `decode_msg` fails, and the
+  connection is CLOSED rather than degraded. Across the 0-4h staggered rollout
+  that presents as fleet-wide transport churn, not as a feature that quietly
+  did nothing.
+
+  Guarded by a marker exactly like `HASH_FIRST_SHIPPED_IN`:
+  `BROADCAST_TARGET_LIST_SHIPPED_IN: Option<(u8, u8, u16)>`, currently `None`,
+  checked by
+  `connection_manager.rs::broadcast_target_list_floor_tracks_the_shipping_release`.
+  When a release bump raises `CARGO_PKG_VERSION` to `(0, 2, 120)`, that test
+  fails until the releaser consciously either sets
+  `BROADCAST_TARGET_LIST_SHIPPED_IN = Some(BROADCAST_TARGET_LIST_MIN_VERSION)`
+  (this release carries it) or raises the floor (it does not).
+  `broadcast_target_list_floor_stays_above_every_release_without_the_variants`
+  is the companion that catches the floor being *lowered*.
+
+  **Know the one way to resolve that red test wrongly.** The `Some(..)` arm
+  asserts `shipped == floor && floor <= current`. Setting the marker to
+  `Some((0, 2, 120))` when the code did NOT land in 0.2.120 satisfies both
+  clauses and goes green — so the marker records a claim no test can check.
+  If the feature slips to a later release, RAISE THE FLOOR; do not set the
+  marker to make the test pass.
+
 When a NEW wire-gated feature first ships (not this one), set its floor to
 **exactly that release version** and freeze it, as described above.
 
