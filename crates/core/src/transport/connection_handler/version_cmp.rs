@@ -187,7 +187,7 @@ pub(super) const GATEWAY_ACK_VERSION_MIN_VERSION: (u8, u8, u16) = (0, 2, 120);
 /// Read only by `ack_version_floor_tracks_the_shipping_release`; it carries no
 /// runtime behaviour by design, mirroring `HASH_FIRST_SHIPPED_IN`.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(super) const ACK_VERSION_SHIPPED_IN: Option<(u8, u8, u16)> = None;
+pub(super) const ACK_VERSION_SHIPPED_IN: Option<(u8, u8, u16)> = Some((0, 2, 120));
 
 /// Pure version-gate for [`GATEWAY_ACK_VERSION_MIN_VERSION`], mirroring
 /// `node::version_supports_hash_first_summaries`: `true` iff `remote` is known
