@@ -1540,10 +1540,12 @@ async fn process_open_request(
                     // conversation, so neither registers a routing path — the
                     // path is established by an ApplicationMessages request that
                     // carries a notification channel (above), never by
-                    // registration. RegisterDelegateWithPredecessors additionally
-                    // triggers the node-side secret copy-forward (#4117), which
-                    // is likewise not an app-routing event. Both are listed
-                    // EXPLICITLY (not swept) per this match's contract that
+                    // registration. RegisterDelegateWithPredecessors's
+                    // node-side secret copy-forward (#4117) is unconditionally
+                    // disabled as of #5198 (its origin_contract gate is
+                    // forgeable) — it was likewise never an app-routing event
+                    // even when active. Both are listed EXPLICITLY (not swept)
+                    // per this match's contract that
                     // app-facing variants must be handled above the wildcard; the
                     // wildcard remains ONLY to satisfy `#[non_exhaustive]` for
                     // genuinely future variants (see git-workflow.md).
