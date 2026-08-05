@@ -312,11 +312,40 @@ impl P2pConnManager {
                 "BroadcastStateChange: every eligible peer already has this \
                  update; fan-out complete with nothing to send"
             );
-            // Same bookkeeping as the targets-found path: this is a completed
-            // fan-out, so no retry cycle and no stash may survive it.
+            // The retry cycle is correctly cancelled: retrying is actively
+            // harmful here, because the coverage claim is taken once and a
+            // retry would re-resolve without it and re-broadcast the whole
+            // co-host set (the regression this branch exists to fix).
             self.broadcast_retries.remove(&key);
             self.broadcast_no_target_streak.remove(&key);
-            let _ = op_manager.pending_broadcasts.take(key.id());
+
+            // The #4359 stash is a DIFFERENT matter, and the targets-found
+            // path's justification for dropping it — "this fan-out is reaching
+            // targets now, so a previously-abandoned state is superseded" —
+            // does not transfer to a branch that reached nobody. Discarding it
+            // here destroyed an earlier give-up's stash with no replacement, so
+            // a peer that subscribes later lost its only non-heartbeat path to
+            // that contract.
+            //
+            // Refresh rather than either extreme. Leaving the old stash intact
+            // would keep STALE state queued for re-emission (this apply's state
+            // is newer). Stashing unconditionally would add a stash write to
+            // every fully-covered fan-out — the COMMON outcome in the clique
+            // regime this design targets — and re-emit on every new subscriber.
+            // So: only if something was already stashed (meaning an earlier
+            // broadcast genuinely gave up on this contract) do we put the
+            // current state back in its place.
+            if op_manager.pending_broadcasts.take(key.id()).is_some() {
+                op_manager
+                    .pending_broadcasts
+                    .stash(*key.id(), new_state.clone());
+                tracing::debug!(
+                    contract = %key,
+                    phase = "fully_covered_stash_refresh",
+                    "fan-out fully covered; refreshed the deferred broadcast with \
+                     current state rather than discarding it (#4359 + #5147)"
+                );
+            }
             // Recorded through a DEDICATED entry point, not `record_broadcast`
             // with a zero target count: that would land in the `no_targets`
             // bucket, which is the operator-facing propagation-FAILURE counter.

@@ -5190,15 +5190,33 @@ pub(crate) mod tests {
              every fully-suppressed fan-out is retried and re-broadcast"
         );
 
-        // The branch must also clear the stash. A fully-covered fan-out is a
-        // completed one, so a previously-stashed state for this contract is
-        // superseded and must not be re-emitted later as stale — the same
-        // reasoning as the targets-found path.
+        // The branch must REFRESH the #4359 stash, not discard it.
+        //
+        // This originally asserted a bare `take` on the reasoning that a
+        // fully-covered fan-out is a completed one, "exactly as the
+        // targets-found path does". That reasoning does not transfer: the
+        // targets-found path drops the stash because it is reaching targets
+        // right now, and this branch reaches NOBODY. Discarding here destroyed
+        // an earlier give-up's stash with no replacement, so a peer subscribing
+        // later lost its only non-heartbeat path to the contract.
+        //
+        // Leaving the old stash would queue STALE state for re-emission, so the
+        // branch takes it and puts the CURRENT state back — and only when
+        // something was already stashed, so the common clique-regime outcome
+        // does not start writing a stash on every fan-out.
         let branch = &body[covered_pos..retry_pos];
         assert!(
-            branch.contains("pending_broadcasts.take(key.id())"),
-            "the fully-covered branch must drop any deferred re-broadcast \
-             stash, exactly as the targets-found path does"
+            branch.contains("pending_broadcasts.take(key.id()).is_some()"),
+            "the fully-covered branch must act on a deferred re-broadcast stash \
+             only when one EXISTS. An unconditional take discards an earlier \
+             give-up's stash with no replacement; an unconditional stash adds a \
+             write to every fully-covered fan-out."
+        );
+        assert!(
+            branch.contains("pending_broadcasts") && branch.contains(".stash("),
+            "the fully-covered branch must put CURRENT state back into the \
+             stash it took, or the #4359 deferred-broadcast recovery is lost \
+             for this contract"
         );
         assert!(
             branch.contains("self.broadcast_retries.remove(&key)"),
