@@ -3292,7 +3292,9 @@ mod tests {
         // consumed exactly once, by `broadcast_cohost_targets`, and both sides
         // of the partition go through THAT.
         assert_eq!(
-            stripped.matches("self.advertised_cohost_pub_keys(key)").count(),
+            stripped
+                .matches("self.advertised_cohost_pub_keys(key)")
+                .count(),
             1,
             "the raw accessor must be consumed exactly once in this file, by \
              `broadcast_cohost_targets`. A second read is a site that will not \
