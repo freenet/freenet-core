@@ -830,3 +830,25 @@ test("browser tab title re-syncs on a later change and dedupes a repeated identi
       `got: ${JSON.stringify(values)}`,
   ).toEqual(["Retitled After Load"]);
 });
+
+test("navigating to a page with no <title> at all leaves the tab on the previous title (documented tradeoff)", async ({
+  page,
+}) => {
+  // title_sync.js's `if (!title || ...) return;` guard deliberately does NOT
+  // reset the shell's tab when the new page has no <title> element — see the
+  // comment on that guard in path_handlers/assets/title_sync.js. This test
+  // locks that specific, chosen behavior in place: the tab must keep showing
+  // the fixture's real title, not blank out or silently do something else.
+  await page.goto(shellUrl!);
+  const frame = await fixtureFrame(page);
+  await expect(page).toHaveTitle("Freenet shell smoke-test fixture");
+
+  await frame.locator("#no-title-link").click();
+  await expect(
+    page.frameLocator("iframe#app").locator("#no-title-page"),
+  ).toBeVisible();
+
+  // The iframe has genuinely navigated to the titleless page (confirmed
+  // above), but the tab title must be UNCHANGED from before the hop.
+  await expect(page).toHaveTitle("Freenet shell smoke-test fixture");
+});
