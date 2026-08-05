@@ -87,6 +87,7 @@ type ShellMessage = {
   url?: string;
   href?: string;
   shiftKey?: boolean;
+  title?: string;
 };
 
 async function shellMessages(page: Page): Promise<ShellMessage[]> {
@@ -759,4 +760,64 @@ test("browser tab title reflects the contract's own <title>, with no bespoke sen
   await page.goto(shellUrl!);
   await fixtureFrame(page);
   await expect(page).toHaveTitle("Freenet shell smoke-test fixture");
+});
+
+test("browser tab title re-syncs on a later change and dedupes a repeated identical title (MutationObserver + lastSent guard)", async ({
+  page,
+}) => {
+  // The one-shot "reflects the contract's own <title>" test above only
+  // exercises the initial postMessage sent when title_sync.js first runs.
+  // The reason that script installs a MutationObserver on <head> at all —
+  // rather than just posting once — is to also catch a title the app sets
+  // LATER (an SPA route change, an async-loaded page title). This test
+  // exercises that path for real, plus the `lastSent` dedup guard that stops
+  // an unchanged title from posting again.
+  await page.goto(shellUrl!);
+  const frame = await fixtureFrame(page);
+  // Let the INITIAL title postMessage land and settle before we start
+  // capturing: `toHaveTitle` only becomes true once the shell has received
+  // and applied that first message, so installing the message listener AFTER
+  // this point deterministically excludes it — no race against how fast the
+  // sandboxed iframe's own synchronous first post beats our listener attach.
+  await expect(page).toHaveTitle("Freenet shell smoke-test fixture");
+  await captureShellMessages(page);
+
+  // Read the RAW sink directly (not the navigation-tests' shellMessages()
+  // helper, which filters 'title' out) so we can inspect title messages
+  // specifically.
+  const titleMessages = async (): Promise<ShellMessage[]> => {
+    const all = await page.evaluate(
+      () =>
+        (window as unknown as { __freenetMessages: ShellMessage[] })
+          .__freenetMessages,
+    );
+    return all.filter((m) => m.type === "title");
+  };
+
+  // Change the title from inside the sandboxed iframe, simulating an SPA
+  // route change or an async-loaded page title set well after initial load.
+  await frame.locator("html").evaluate(() => {
+    document.title = "Retitled After Load";
+  });
+  await expect(page).toHaveTitle("Retitled After Load");
+
+  // Setting the SAME title again must NOT produce a second postMessage — the
+  // `lastSent` guard in title_sync.js exists specifically to suppress a
+  // redundant identical assignment (e.g. a re-render that re-sets the same
+  // string every tick).
+  await frame.locator("html").evaluate(() => {
+    document.title = "Retitled After Load";
+  });
+  // Give any (incorrect) redundant postMessage a moment to arrive before
+  // asserting its absence.
+  await page.waitForTimeout(300);
+
+  const messages = await titleMessages();
+  const values = messages.map((m) => m.title);
+  expect(
+    values,
+    `expected exactly one post for the change to "Retitled After Load", ` +
+      `with the repeated identical re-assignment deduped away by lastSent; ` +
+      `got: ${JSON.stringify(values)}`,
+  ).toEqual(["Retitled After Load"]);
 });
