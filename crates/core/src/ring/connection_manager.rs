@@ -521,6 +521,13 @@ pub(crate) struct ConnectionManager {
     hash_first_declined_pre_floor: Arc<AtomicU64>,
     summary_first_put_declined_unknown_version: Arc<AtomicU64>,
     summary_first_put_declined_pre_floor: Arc<AtomicU64>,
+    /// Test-only override for the originator-target-list version floor
+    /// (#5147), threaded exactly like `summary_first_put_floor_override`.
+    /// `None` in production (the real `BROADCAST_TARGET_LIST_MIN_VERSION`
+    /// applies). Simulations default it OFF — this gate changes fan-out
+    /// BEHAVIOUR, not just an encoding — so a sim opts in explicitly via
+    /// `SimNetwork::enable_broadcast_target_list`. See `NodeConfig`.
+    broadcast_target_list_floor_override: Option<(u8, u8, u16)>,
     /// Rotating start offset for the per-new-peer migration scan. The scan
     /// examines at most `MIGRATION_SCAN_CAP_PER_NEW_PEER` hosted contracts per
     /// event; advancing this cursor each event makes successive events cover
@@ -662,6 +669,7 @@ impl ConnectionManager {
         cm.subscribe_hint_floor_override = config.subscribe_hint_floor_override;
         cm.summary_first_put_floor_override = config.summary_first_put_floor_override;
         cm.hash_first_summaries_floor_override = config.hash_first_summaries_floor_override;
+        cm.broadcast_target_list_floor_override = config.broadcast_target_list_floor_override;
         cm
     }
 
@@ -703,6 +711,7 @@ impl ConnectionManager {
             hash_first_declined_pre_floor: Arc::new(AtomicU64::new(0)),
             summary_first_put_declined_unknown_version: Arc::new(AtomicU64::new(0)),
             summary_first_put_declined_pre_floor: Arc::new(AtomicU64::new(0)),
+            broadcast_target_list_floor_override: None,
             migration_scan_cursor: Arc::new(AtomicUsize::new(0)),
             transient_connections: Arc::new(DashMap::new()),
             transient_in_use: Arc::new(AtomicUsize::new(0)),
@@ -1564,6 +1573,27 @@ impl ConnectionManager {
                 .summary_first_put_declined_pre_floor
                 .load(Ordering::Relaxed),
         }
+    }
+
+    /// Whether the peer at `addr` reports a version new enough to understand
+    /// the originator target list (`UpdateMsg::BroadcastToV2` /
+    /// `BroadcastToStreamingV2`, #5147).
+    ///
+    /// Same shape and same fail-closed rule as
+    /// [`Self::supports_hash_first_summaries`]. The fallback is the legacy
+    /// `BroadcastTo` / `BroadcastToStreaming`, byte-identical to what every
+    /// peer receives today, so failing closed costs the duplicate bandwidth we
+    /// already spend and never costs convergence.
+    ///
+    /// Honours `NodeConfig::broadcast_target_list_floor_override`, which
+    /// simulations must set explicitly — unlike the hash-first override it
+    /// defaults OFF, because opening this gate changes which peers receive a
+    /// broadcast at all.
+    pub(crate) fn supports_broadcast_target_list(&self, addr: SocketAddr) -> bool {
+        let floor = self
+            .broadcast_target_list_floor_override
+            .unwrap_or(crate::node::BROADCAST_TARGET_LIST_MIN_VERSION);
+        crate::node::version_supports_broadcast_target_list(self.remote_version(addr), floor)
     }
 
     /// Reserve the next `window`-sized slice of the hosting set for a migration
@@ -3272,6 +3302,132 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The send gate for `UpdateMsg::BroadcastToV2` / `BroadcastToStreamingV2`
+    /// (#5147).
+    ///
+    /// Same stakes as the hash-first gate above: a pre-floor peer has no
+    /// variant index for these, cannot bincode-deserialize them, and DROPS THE
+    /// CONNECTION. During a staggered rollout most peers are pre-floor.
+    ///
+    /// Asserts the gate DISCRIMINATES rather than always-rejecting — an
+    /// always-false gate would pass a test that only checked the unknown case,
+    /// and the feature would be silently inert.
+    #[test]
+    fn supports_broadcast_target_list_gate_discriminates_by_version() {
+        let cm = make_connection_manager(Some(make_addr(9200)), 1, 10, false);
+
+        let unknown = make_addr(9201);
+        assert!(
+            !cm.supports_broadcast_target_list(unknown),
+            "an unrecorded peer version must fail CLOSED. Note this is not \
+             hypothetical during rollout: until #5161/#5167 deploys, a node \
+             never learns its GATEWAY's version at all, so every gateway link \
+             takes this branch"
+        );
+
+        // 0.2.119 is the highest already-released version at the time this
+        // shipped and carries neither V2 variant.
+        let pre_floor = make_addr(9202);
+        cm.record_remote_version(pre_floor, Some((0, 2, 119)));
+        assert!(
+            !cm.supports_broadcast_target_list(pre_floor),
+            "a peer one release below the floor must keep receiving the legacy \
+             BroadcastTo, byte-identical to today"
+        );
+
+        let at_floor = make_addr(9203);
+        cm.record_remote_version(
+            at_floor,
+            Some(crate::node::BROADCAST_TARGET_LIST_MIN_VERSION),
+        );
+        assert!(
+            cm.supports_broadcast_target_list(at_floor),
+            "the floor release carries the variants, so it must be accepted — \
+             otherwise the feature never activates at all"
+        );
+
+        let newer = make_addr(9204);
+        cm.record_remote_version(newer, Some((0, 3, 0)));
+        assert!(
+            cm.supports_broadcast_target_list(newer),
+            "the floor is a minimum, never an equality test"
+        );
+    }
+
+    /// #5147's copy of the release-timing guard. See
+    /// `hash_first_floor_tracks_the_shipping_release` for the full rationale;
+    /// the failure it prevents is identical — a floor left behind by a release
+    /// bump means peers on the real 0.2.120 read as at-floor, receive a
+    /// `BroadcastToV2` they have no variant index for, fail to decode, and the
+    /// connection is closed.
+    #[test]
+    fn broadcast_target_list_floor_tracks_the_shipping_release() {
+        fn crate_version() -> (u8, u8, u16) {
+            let v = env!("CARGO_PKG_VERSION");
+            let mut it = v.split('.');
+            let major = it.next().unwrap().parse().expect("major");
+            let minor = it.next().unwrap().parse().expect("minor");
+            let patch = it
+                .next()
+                .unwrap()
+                .split(['-', '+'])
+                .next()
+                .unwrap()
+                .parse()
+                .expect("patch");
+            (major, minor, patch)
+        }
+
+        let floor = crate::node::BROADCAST_TARGET_LIST_MIN_VERSION;
+        let current = crate_version();
+
+        match crate::node::BROADCAST_TARGET_LIST_SHIPPED_IN {
+            None => assert!(
+                floor > current,
+                "BROADCAST_TARGET_LIST_MIN_VERSION is {floor:?} but the crate \
+                 is already at {current:?}, and BROADCAST_TARGET_LIST_SHIPPED_IN \
+                 is None.\n\n\
+                 The release has caught up with the floor. Decide which is true \
+                 and encode it:\n\
+                 - This release DOES carry the target list -> set \
+                 BROADCAST_TARGET_LIST_SHIPPED_IN = Some({floor:?}) and freeze \
+                 both.\n\
+                 - It does NOT -> raise BROADCAST_TARGET_LIST_MIN_VERSION to the \
+                 release that will.\n\n\
+                 Leaving it ships a floor that peers on the real {current:?} \
+                 satisfy without carrying the BroadcastToV2 variant: they cannot \
+                 decode it, and the connection is closed."
+            ),
+            Some(shipped) => {
+                assert_eq!(
+                    shipped, floor,
+                    "BROADCAST_TARGET_LIST_SHIPPED_IN ({shipped:?}) must EQUAL \
+                     BROADCAST_TARGET_LIST_MIN_VERSION ({floor:?})"
+                );
+                assert!(
+                    floor <= current,
+                    "shipped in {shipped:?} but the crate is only at {current:?} \
+                     — a release cannot have shipped in the future"
+                );
+            }
+        }
+    }
+
+    /// Catches the floor being LOWERED, which the marker test above cannot see.
+    #[test]
+    fn broadcast_target_list_floor_stays_above_every_release_without_the_variants() {
+        /// Last release that does NOT carry the V2 broadcast variants.
+        const LAST_RELEASE_WITHOUT_VARIANTS: (u8, u8, u16) = (0, 2, 119);
+        assert!(
+            crate::node::BROADCAST_TARGET_LIST_MIN_VERSION > LAST_RELEASE_WITHOUT_VARIANTS,
+            "BROADCAST_TARGET_LIST_MIN_VERSION ({:?}) dropped to or below \
+             {LAST_RELEASE_WITHOUT_VARIANTS:?}, a release with no BroadcastToV2 \
+             variant index. Emitting to those peers fails to decode and drops \
+             the connection.",
+            crate::node::BROADCAST_TARGET_LIST_MIN_VERSION,
+        );
     }
 
     /// Companion to the marker guard: the floor must never drop to or below a

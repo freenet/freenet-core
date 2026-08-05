@@ -1451,6 +1451,19 @@ pub struct SimNetwork {
     /// production stops having it. `enable_gateway_ack_version` is how a test
     /// that cares opts in.
     ack_version_floor_override: Option<(u8, u8, u16)>,
+    /// Per-node override for the originator-target-list version floor (#5147).
+    ///
+    /// Defaults to `SIM_MIGRATION_DISABLED_FLOOR` — OFF — grouping with
+    /// `subscribe_hint_floor_override` and `summary_first_put_floor_override`
+    /// rather than with `hash_first_summaries_floor_override`. Hash-first is ON
+    /// by default because it changes only the ENCODING of an exchange with
+    /// identical semantics. This one changes fan-out BEHAVIOUR: it removes
+    /// peers from a broadcast. Defaulting it ON would silently alter the
+    /// delivery graph under every sim that asserts on convergence or delivery
+    /// counts, and a failure could not be attributed between that sim's own
+    /// subject and this suppression. Tests that want it call
+    /// [`enable_broadcast_target_list`](Self::enable_broadcast_target_list).
+    broadcast_target_list_floor_override: Option<(u8, u8, u16)>,
     /// Optional controllable hosting clock injected into every node's
     /// `HostingManager` (via `NodeConfig::hosting_time_source_override`). When
     /// set, hosting-cache TTL and subscription-lease eviction advance ONLY when
@@ -1656,6 +1669,9 @@ impl SimNetwork {
             // `version_supports_*` gate, so switching it on network-wide is a
             // cascade in effect. Opt in per sim via `enable_gateway_ack_version`.
             ack_version_floor_override: Some(Self::SIM_MIGRATION_DISABLED_FLOOR),
+            // Fail-CLOSED by default, like the two behavioural gates above and
+            // unlike hash-first (#5147). See the field's rustdoc.
+            broadcast_target_list_floor_override: Some(Self::SIM_MIGRATION_DISABLED_FLOOR),
             hosting_clock: None,
             hosting_budget_override: None,
             shared_rings: HashMap::new(),
@@ -2047,6 +2063,46 @@ impl SimNetwork {
         }
         for (builder, _) in self.nodes.iter_mut() {
             builder.config.ack_version_floor_override = floor;
+        }
+        self
+    }
+
+    /// Turn the originator target list (#5147) ON for this simulation by
+    /// pinning the per-node version floor to the always-passing
+    /// [`Self::SIM_MIGRATION_ENABLED_FLOOR`].
+    ///
+    /// Unlike [`enable_hash_first_summaries`](Self::enable_hash_first_summaries),
+    /// this is NOT the default and the call is load-bearing: without it every
+    /// peer falls back to the legacy `BroadcastTo` and the sim measures
+    /// today's unsuppressed fan-out. That is exactly what the control arm of a
+    /// suppression measurement wants, so the two arms differ by this one call.
+    #[allow(dead_code)]
+    pub fn enable_broadcast_target_list(&mut self) -> &mut Self {
+        let floor = Some(Self::SIM_MIGRATION_ENABLED_FLOOR);
+        self.broadcast_target_list_floor_override = floor;
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.broadcast_target_list_floor_override = floor;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.broadcast_target_list_floor_override = floor;
+        }
+        self
+    }
+
+    /// Force the originator target list OFF for this simulation.
+    ///
+    /// Already the default (see `new_inner`); exists so the CONTROL arm of a
+    /// suppression measurement states its premise at the call site rather than
+    /// depending on a default a future edit could flip.
+    #[allow(dead_code)]
+    pub fn disable_broadcast_target_list(&mut self) -> &mut Self {
+        let floor = Some(Self::SIM_MIGRATION_DISABLED_FLOOR);
+        self.broadcast_target_list_floor_override = floor;
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.broadcast_target_list_floor_override = floor;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.broadcast_target_list_floor_override = floor;
         }
         self
     }
@@ -2734,6 +2790,7 @@ impl SimNetwork {
             config.summary_first_put_floor_override = self.summary_first_put_floor_override;
             config.hash_first_summaries_floor_override = self.hash_first_summaries_floor_override;
             config.ack_version_floor_override = self.ack_version_floor_override;
+            config.broadcast_target_list_floor_override = self.broadcast_target_list_floor_override;
             config.hosting_time_source_override = self
                 .hosting_clock
                 .clone()
@@ -2836,6 +2893,7 @@ impl SimNetwork {
             config.summary_first_put_floor_override = self.summary_first_put_floor_override;
             config.hash_first_summaries_floor_override = self.hash_first_summaries_floor_override;
             config.ack_version_floor_override = self.ack_version_floor_override;
+            config.broadcast_target_list_floor_override = self.broadcast_target_list_floor_override;
             config.hosting_time_source_override = self
                 .hosting_clock
                 .clone()

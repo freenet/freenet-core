@@ -1066,6 +1066,48 @@ pub(crate) fn version_supports_hash_first_summaries(
     remote.is_some_and(|v| v >= floor)
 }
 
+/// Has the originator target list (#5147) actually SHIPPED, and in which
+/// release?
+///
+/// Same contract as [`HASH_FIRST_SHIPPED_IN`], guarded by
+/// `broadcast_target_list_floor_tracks_the_shipping_release`: `None` means
+/// [`BROADCAST_TARGET_LIST_MIN_VERSION`] is a prediction that must stay
+/// strictly ABOVE the crate version; `Some(v)` means it shipped in `v`, which
+/// must equal the floor.
+///
+/// RELEASE-TIME ACTION: when the release carrying this feature is cut, set this
+/// to `Some(BROADCAST_TARGET_LIST_MIN_VERSION)` and freeze both.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const BROADCAST_TARGET_LIST_SHIPPED_IN: Option<(u8, u8, u16)> = None;
+
+/// Version floor for the originator target list on broadcast (#5147).
+///
+/// Below this, a peer has no `BroadcastToV2` / `BroadcastToStreamingV2` variant
+/// index and would fail to bincode-decode one, which closes the connection —
+/// so the gate must fail closed on an unknown version.
+pub(crate) const BROADCAST_TARGET_LIST_MIN_VERSION: (u8, u8, u16) = (0, 2, 120);
+
+/// Pure version-gate for the originator target list, mirroring
+/// [`version_supports_hash_first_summaries`]: `true` iff `remote` is known
+/// (`Some`) AND at least `floor`.
+///
+/// Fail-closed on `None`. The fallback is the legacy `BroadcastTo`, i.e. exactly
+/// what every peer receives today, so a closed gate costs the bandwidth we are
+/// already spending and never costs convergence.
+///
+/// NOTE (#5161 / PR #5167): until that fix deploys, a joiner never learns its
+/// GATEWAY's version — `AckConnection` carries none — so `remote` is `None` on
+/// gateway links and this gate stays closed there regardless of what the
+/// gateway actually runs. Peer-to-peer links are unaffected. That is a
+/// suppression shortfall on gateway legs, not a correctness problem, and it
+/// resolves itself once #5167 ships.
+pub(crate) fn version_supports_broadcast_target_list(
+    remote: Option<(u8, u8, u16)>,
+    floor: (u8, u8, u16),
+) -> bool {
+    remote.is_some_and(|v| v >= floor)
+}
+
 /// Upper bound on the number of hosted contracts examined per new-peer
 /// migration trigger. Each examined contract may emit a best-effort
 /// non-blocking `try_send` (the SubscribeHint nudge), so an unbounded scan
@@ -5017,6 +5059,185 @@ pub(crate) mod tests {
             prod_body[prod_empty..].contains("refresh_peer_interest("),
             "the production empty-delta skip must refresh the interest TTL too \
              — the sim and production bodies must not drift on this"
+        );
+    }
+
+    /// #5147: a fully-suppressed fan-out must be treated as COMPLETE, never as
+    /// the no-subscriber failure case.
+    ///
+    /// This pins the fix for a self-defeating bug the simulation caught (see
+    /// `test_5147_originator_target_list_cuts_duplicate_deliveries`). In the
+    /// clique regime the target list targets, a relayer's co-hosts are
+    /// frequently ALL named by the originator, so the correct fan-out is the
+    /// empty one. The pre-existing empty-target branch reads empty as "nobody
+    /// is subscribed yet": it retries three times with backoff and then stashes
+    /// the state for a later interest flush. Each retry re-resolves targets
+    /// AFTER the coverage claim has been consumed — it is taken once, by design
+    /// — so the retry suppresses nothing and re-broadcasts to the whole co-host
+    /// set one backoff later. The suppressed traffic comes back, delayed and
+    /// with staler summaries, and the measured effect of the feature inverts
+    /// from a 44% send reduction to a 15% increase.
+    ///
+    /// The ordering is the whole fix, so the ordering is what is pinned: the
+    /// fully-covered early return must precede the retry branch. Mutation-check
+    /// when editing this — move the return after the retry branch and confirm
+    /// this test FAILS.
+    #[test]
+    fn fully_covered_fanout_returns_before_the_no_target_retry() {
+        const SOURCE: &str = include_str!("p2p_protoc/broadcast.rs");
+
+        let fn_anchor = "async fn handle_broadcast_state_change(";
+        let fn_start = SOURCE
+            .find(fn_anchor)
+            .expect("handle_broadcast_state_change renamed or removed");
+        let after_header = &SOURCE[fn_start + fn_anchor.len()..];
+        let body_end = [
+            after_header.find("\n    async fn "),
+            after_header.find("\n    pub(super) async fn "),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .map(|p| fn_start + fn_anchor.len() + p)
+        .unwrap_or(SOURCE.len());
+        let body = &SOURCE[fn_start..body_end];
+
+        let covered_pos = body.find("let fully_covered =").expect(
+            "handle_broadcast_state_change lost the #5147 fully-covered branch. \
+             Without it a fully-suppressed fan-out enters the no-target retry \
+             cycle, which re-resolves targets after the coverage claim has been \
+             consumed and re-broadcasts everything one backoff later — the \
+             feature silently defeats itself.",
+        );
+        let retry_pos = body
+            .find("self.broadcast_retries.entry(key)")
+            .expect("the no-target retry branch is missing");
+        assert!(
+            covered_pos < retry_pos,
+            "the #5147 fully-covered return (offset {covered_pos}) must run \
+             BEFORE the no-target retry branch (offset {retry_pos}); otherwise \
+             every fully-suppressed fan-out is retried and re-broadcast"
+        );
+
+        // The branch must REFRESH the #4359 stash, not discard it.
+        //
+        // This originally asserted a bare `take` on the reasoning that a
+        // fully-covered fan-out is a completed one, "exactly as the
+        // targets-found path does". That reasoning does not transfer: the
+        // targets-found path drops the stash because it is reaching targets
+        // right now, and this branch reaches NOBODY. Discarding here destroyed
+        // an earlier give-up's stash with no replacement, so a peer subscribing
+        // later lost its only non-heartbeat path to the contract.
+        //
+        // Leaving the old stash would queue STALE state for re-emission, so the
+        // branch takes it and puts the CURRENT state back — and only when
+        // something was already stashed, so the common clique-regime outcome
+        // does not start writing a stash on every fan-out.
+        let branch = &body[covered_pos..retry_pos];
+        assert!(
+            branch.contains("pending_broadcasts.take(key.id()).is_some()"),
+            "the fully-covered branch must act on a deferred re-broadcast stash \
+             only when one EXISTS. An unconditional take discards an earlier \
+             give-up's stash with no replacement; an unconditional stash adds a \
+             write to every fully-covered fan-out."
+        );
+        assert!(
+            branch.contains("pending_broadcasts") && branch.contains(".stash("),
+            "the fully-covered branch must put CURRENT state back into the \
+             stash it took, or the #4359 deferred-broadcast recovery is lost \
+             for this contract"
+        );
+        assert!(
+            branch.contains("self.broadcast_retries.remove(&key)"),
+            "the fully-covered branch must clear retry bookkeeping, or a \
+             contract that was mid-retry-cycle keeps a stale entry"
+        );
+        // It must not DISCARD the #4359 stash the way the targets-found path
+        // does — see `broadcast_path_feeds_propagation_stats_pin_test`, which
+        // owns that assertion and the reasoning. Noted here so a reader of this
+        // pin does not "restore symmetry" with the targets-found path: the two
+        // are deliberately asymmetric because only one of them sends anything.
+        // The condition must also exclude the case where the target set is
+        // empty merely because co-hosts failed to RESOLVE. Those peers were not
+        // served — they are unreachable — and calling that fan-out complete
+        // swallows a genuine failure the retry exists to heal.
+        assert!(
+            branch.contains("proximity_resolve_failed == 0")
+                || body[..covered_pos].contains("proximity_resolve_failed == 0"),
+            "the fully-covered condition must require \
+             `proximity_resolve_failed == 0`; otherwise a fan-out that is empty \
+             only because every co-host lookup failed is reported as a \
+             completed broadcast"
+        );
+    }
+
+    /// The PRODUCTION fan-out must pass its real target list to the queue.
+    ///
+    /// The #5147 simulation drives `broadcast_state_to_peers`, which is
+    /// `#[cfg(feature = "simulation_tests")]` and never compiled into a
+    /// production binary — the function says so itself: "production splits the
+    /// fan-out across a queue and rebuilds the list per leg, this one holds the
+    /// whole set in scope. A test that only exercises this branch proves
+    /// nothing about production."
+    ///
+    /// So the entire measured effect (44% fewer legs) came from a path that
+    /// does not ship, and the shipping path had no coverage. Two one-token
+    /// mutations made the feature INERT on the fleet while every test,
+    /// including that simulation, stayed green:
+    ///
+    ///   * pass `no_fanout()` instead of the built `fanout` at the enqueue
+    ///     loop — no leg ever carries a list;
+    ///   * drop `existing.fanout = fanout` on dedup replacement — a superseded
+    ///     list is sent for a different fan-out, which is over-suppression.
+    ///
+    /// Every other caller in the tree passes `no_fanout()`, so nothing
+    /// distinguished the two. This pins both anchors on the production side.
+    #[test]
+    fn production_fanout_passes_its_target_list_to_the_queue() {
+        const SOURCE: &str = include_str!("p2p_protoc/broadcast.rs");
+
+        // Bound the region to the production fan-out. `broadcast_state_change`
+        // is the non-simulation path; the sim twin lives in a separate
+        // cfg-gated fn and must not satisfy this pin.
+        let fn_anchor = "async fn handle_broadcast_state_change(";
+        let fn_start = SOURCE
+            .find(fn_anchor)
+            .expect("handle_broadcast_state_change renamed or removed");
+        let after_header = &SOURCE[fn_start + fn_anchor.len()..];
+        let body_end = [
+            after_header.find("\n    async fn "),
+            after_header.find("\n    pub(super) async fn "),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .map(|p| fn_start + fn_anchor.len() + p)
+        .unwrap_or(SOURCE.len());
+        let body = &SOURCE[fn_start..body_end];
+
+        assert!(
+            body.contains("fanout.clone()"),
+            "the production enqueue loop in handle_broadcast_state_change must \
+             pass the target list it just built. If this is `no_fanout()` the \
+             #5147 feature is inert on the fleet while the simulation — which \
+             drives the cfg(simulation_tests) twin — still reports suppression."
+        );
+        assert!(
+            !body.contains("no_fanout()"),
+            "the production fan-out must never hand the queue an empty target \
+             list; that is the shape of the inert-feature regression."
+        );
+
+        // The dedup-replacement refresh, whose own comment calls it the guard
+        // against the one direction this design refuses.
+        const QUEUE_SOURCE: &str = include_str!("broadcast_queue.rs");
+        assert!(
+            QUEUE_SOURCE.contains("existing.fanout = fanout;"),
+            "broadcast_queue must refresh the stored target list when a queued \
+             payload is replaced. Without it a superseded list rides a later \
+             fan-out and names peers that fan-out never touched — \
+             over-suppression. Every queue test passes an empty fanout, so no \
+             behavioural test distinguishes the two."
         );
     }
 

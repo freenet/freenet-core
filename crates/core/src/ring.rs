@@ -80,6 +80,7 @@ const _: () = {
     );
 };
 
+pub(crate) mod broadcast_coverage;
 mod broken_invariants;
 mod connection_backoff;
 mod connection_manager;

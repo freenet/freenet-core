@@ -3954,6 +3954,21 @@ impl SimulationIdleTimeout {
 std::thread_local! {
     static GLOBAL_RESYNC_REQUESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_DELTA_SENDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Fan-out legs skipped because the peer's cached summary already matched
+    /// ours (the pre-existing mechanism, counted for #5147 diagnosis).
+    static GLOBAL_FANOUT_SUMMARY_SKIPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Fan-out targets dropped because the originator named them (#5147).
+    static GLOBAL_BROADCAST_TARGETS_SUPPRESSED: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+    /// Fan-out legs dropped because the target was the delivering peer (#5147).
+    static GLOBAL_BROADCAST_SENDER_SKIPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Inbound broadcast payloads that reached a terminal classification
+    /// (#5147). Denominator for the duplicate-delivery ratio.
+    static GLOBAL_BROADCAST_DELIVERIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The subset of those that carried nothing new — a deduped duplicate, or
+    /// a merge that moved no state (#5147).
+    static GLOBAL_REDUNDANT_BROADCAST_DELIVERIES: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
     static GLOBAL_FULL_STATE_SENDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_INSERTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_REMOVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -4047,6 +4062,11 @@ impl GlobalTestMetrics {
     pub fn reset() {
         GLOBAL_RESYNC_REQUESTS.with(|c| c.set(0));
         GLOBAL_DELTA_SENDS.with(|c| c.set(0));
+        GLOBAL_FANOUT_SUMMARY_SKIPS.with(|c| c.set(0));
+        GLOBAL_BROADCAST_TARGETS_SUPPRESSED.with(|c| c.set(0));
+        GLOBAL_BROADCAST_SENDER_SKIPS.with(|c| c.set(0));
+        GLOBAL_BROADCAST_DELIVERIES.with(|c| c.set(0));
+        GLOBAL_REDUNDANT_BROADCAST_DELIVERIES.with(|c| c.set(0));
         GLOBAL_FULL_STATE_SENDS.with(|c| c.set(0));
         GLOBAL_PENDING_OP_INSERTS.with(|c| c.set(0));
         GLOBAL_PENDING_OP_REMOVES.with(|c| c.set(0));
@@ -4155,6 +4175,87 @@ impl GlobalTestMetrics {
     /// last reset.
     pub fn resync_responses_suppressed() -> u64 {
         Self::resync_responses_suppressed_per_peer() + Self::resync_responses_suppressed_global()
+    }
+
+    /// Records a fan-out leg skipped by the summary-match gate.
+    pub fn record_fanout_summary_skip() {
+        GLOBAL_FANOUT_SUMMARY_SKIPS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Fan-out legs skipped by the summary-match gate since reset.
+    pub fn fanout_summary_skips() -> u64 {
+        GLOBAL_FANOUT_SUMMARY_SKIPS.with(|c| c.get())
+    }
+
+    /// Records one fan-out target dropped because the originator's list named
+    /// it (#5147).
+    ///
+    /// Incremented BY the filter in `get_broadcast_targets_update`, alongside
+    /// its own `skipped_covered` field, never re-derived from the difference
+    /// between the resolved co-host set and the final target set — that
+    /// subtraction also absorbs the sender, self, and resolve-failure filters,
+    /// so it would keep reporting a plausible number after this filter is
+    /// deleted. The simulation's discriminator rests on this counter going to
+    /// exactly 0 when the feature is off, which a derived count would not do.
+    pub fn record_broadcast_target_suppressed() {
+        GLOBAL_BROADCAST_TARGETS_SUPPRESSED.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Records that the peer which delivered this update was dropped from our
+    /// own fan-out (#5147 sender exclusion).
+    ///
+    /// A FOURTH terminal outcome for an offered leg, alongside sent /
+    /// summary-skipped / list-suppressed. It needs its own counter for the same
+    /// reason the others do — it is incremented by the filter that makes the
+    /// decision, not derived at a call site — and because without it the
+    /// simulation's leg-accounting identity is short by exactly the number of
+    /// sender exclusions, which reads as the two arms having done different
+    /// amounts of work when they did not.
+    pub fn record_broadcast_sender_skipped() {
+        GLOBAL_BROADCAST_SENDER_SKIPS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Fan-out legs dropped because the target was the delivering peer.
+    pub fn broadcast_sender_skips() -> u64 {
+        GLOBAL_BROADCAST_SENDER_SKIPS.with(|c| c.get())
+    }
+
+    /// Fan-out targets suppressed by the originator target list since reset.
+    pub fn broadcast_targets_suppressed() -> u64 {
+        GLOBAL_BROADCAST_TARGETS_SUPPRESSED.with(|c| c.get())
+    }
+
+    /// Records one inbound broadcast payload reaching a terminal outcome, and
+    /// whether it carried anything new (#5147).
+    ///
+    /// Called from `PayloadMix::record_receiver_terminal` — the ONE place that
+    /// classifies an inbound broadcast — so the redundancy count is produced by
+    /// the code making the decision rather than re-derived from set sizes
+    /// elsewhere. See `.claude/rules/bug-prevention-patterns.md`, "Metric
+    /// describing a filtering decision, re-derived at the call site": a
+    /// subtraction across two collections silently absorbs every other filter
+    /// between them and keeps reporting a plausible number after the filter it
+    /// claims to measure is gone.
+    ///
+    /// A `Failed` outcome is counted as a delivery but NOT as redundant: the
+    /// payload may well have carried something new and the merge simply broke.
+    /// Calling a failure redundant would flatter any change that increased
+    /// merge failures.
+    pub fn record_broadcast_delivery(redundant: bool) {
+        GLOBAL_BROADCAST_DELIVERIES.with(|c| c.set(c.get() + 1));
+        if redundant {
+            GLOBAL_REDUNDANT_BROADCAST_DELIVERIES.with(|c| c.set(c.get() + 1));
+        }
+    }
+
+    /// Inbound broadcast payloads that reached a terminal outcome since reset.
+    pub fn broadcast_deliveries() -> u64 {
+        GLOBAL_BROADCAST_DELIVERIES.with(|c| c.get())
+    }
+
+    /// Those of [`Self::broadcast_deliveries`] that changed nothing.
+    pub fn redundant_broadcast_deliveries() -> u64 {
+        GLOBAL_REDUNDANT_BROADCAST_DELIVERIES.with(|c| c.get())
     }
 
     /// Records that a delta was sent in a state change broadcast.

@@ -259,13 +259,118 @@ impl P2pConnManager {
             return;
         };
 
-        let target_result = op_manager.get_broadcast_targets_update(&key, &self_addr);
+        // #5147. Take the provenance of the apply that caused this fan-out:
+        // who delivered it to us, and who they say they already delivered it
+        // to. `BroadcastStateChange` carries none of that — the executor emits
+        // it on any committed write and has no idea whether the write came from
+        // a local client or an inbound broadcast — so it is parked on
+        // `broadcast_coverage` by `update_contract` and collected here. Absent
+        // or expired yields `BroadcastOrigin::local()`, which suppresses
+        // nothing and is exactly today's behaviour.
+        //
+        // Taken ONCE and reused by the stash recheck below: taking it again
+        // there would find it already consumed and silently drop the
+        // suppression on the re-emitted path.
+        let origin = op_manager.broadcast_coverage.take(key.id());
+
+        let target_result = op_manager.get_broadcast_targets_update(&key, &origin);
         tracing::debug!(
             contract = %key,
             target_count = target_result.targets.len(),
+            skipped_covered = target_result.skipped_covered,
+            skipped_sender = target_result.skipped_sender,
+            covered_named = origin.covered_len(),
             self_addr = %self_addr,
             "BroadcastStateChange: found targets"
         );
+
+        // #5147: an empty target set is not always a failure any more.
+        //
+        // The branch below exists for the case where a state change has NOBODY
+        // to propagate to — a race between an update and subscription
+        // establishment — and it responds by retrying three times with backoff
+        // and then stashing the state for a later interest flush. That is
+        // exactly wrong when the set is empty because every eligible peer was
+        // already served: in the clique regime this design targets, a relayer's
+        // co-hosts are frequently ALL on the originator's list, so the correct
+        // fan-out is the empty one and it is COMPLETE.
+        //
+        // Without this the mechanism defeats itself, and does so invisibly.
+        // Each retry re-resolves targets, by which time the coverage entry has
+        // been consumed (it is taken once, by design), so the retry sees no
+        // claim, suppresses nothing, and re-broadcasts to the whole co-host set
+        // one backoff later — the suppressed traffic comes back, delayed, with
+        // staler summaries than if it had been sent immediately.
+        //
+        // Two conditions beyond "empty and something was skipped", both from
+        // review:
+        //
+        // * `proximity_resolve_failed == 0`. A co-host whose `get_peer_by_pub_key`
+        //   lookup FAILED was not served — it is gone. Counting a fan-out as
+        //   complete when the only reason it is empty is that we could not
+        //   resolve anyone would swallow a genuine unreachability and skip the
+        //   retry that heals it.
+        // * The stash is only dropped when we actually sent something. See the
+        //   drop site below.
+        let fully_covered = target_result.targets.is_empty()
+            && target_result.proximity_resolve_failed == 0
+            && (target_result.skipped_covered > 0 || target_result.skipped_sender > 0);
+        if fully_covered {
+            tracing::debug!(
+                contract = %key,
+                skipped_covered = target_result.skipped_covered,
+                skipped_sender = target_result.skipped_sender,
+                phase = "broadcast_fully_covered",
+                "BroadcastStateChange: every eligible peer already has this \
+                 update; fan-out complete with nothing to send"
+            );
+            // The retry cycle is correctly cancelled: retrying is actively
+            // harmful here, because the coverage claim is taken once and a
+            // retry would re-resolve without it and re-broadcast the whole
+            // co-host set (the regression this branch exists to fix).
+            self.broadcast_retries.remove(&key);
+            self.broadcast_no_target_streak.remove(&key);
+
+            // The #4359 stash is a DIFFERENT matter, and the targets-found
+            // path's justification for dropping it — "this fan-out is reaching
+            // targets now, so a previously-abandoned state is superseded" —
+            // does not transfer to a branch that reached nobody. Discarding it
+            // here destroyed an earlier give-up's stash with no replacement, so
+            // a peer that subscribes later lost its only non-heartbeat path to
+            // that contract.
+            //
+            // Refresh rather than either extreme. Leaving the old stash intact
+            // would keep STALE state queued for re-emission (this apply's state
+            // is newer). Stashing unconditionally would add a stash write to
+            // every fully-covered fan-out — the COMMON outcome in the clique
+            // regime this design targets — and re-emit on every new subscriber.
+            // So: only if something was already stashed (meaning an earlier
+            // broadcast genuinely gave up on this contract) do we put the
+            // current state back in its place.
+            if op_manager.pending_broadcasts.take(key.id()).is_some() {
+                op_manager
+                    .pending_broadcasts
+                    .stash(*key.id(), new_state.clone());
+                tracing::debug!(
+                    contract = %key,
+                    phase = "fully_covered_stash_refresh",
+                    "fan-out fully covered; refreshed the deferred broadcast with \
+                     current state rather than discarding it (#4359 + #5147)"
+                );
+            }
+            // Recorded through a DEDICATED entry point, not `record_broadcast`
+            // with a zero target count: that would land in the `no_targets`
+            // bucket, which is the operator-facing propagation-FAILURE counter.
+            // A fully-covered fan-out is a success, and in the clique regime
+            // this design targets it is the EXPECTED outcome — so counting it
+            // as a failure would report one in direct proportion to how well
+            // the feature works. The #4281 summary still sees one broadcast per
+            // apply. Pinned by `a_fully_covered_fanout_is_not_counted_as_a_propagation_failure`.
+            op_manager
+                .update_propagation_stats
+                .record_fully_covered_broadcast(*key.id(), target_result.interest_resolve_failed);
+            return;
+        }
 
         if target_result.targets.is_empty() {
             // Record the NO_TARGETS outcome once per *fresh* no-target broadcast
@@ -373,7 +478,25 @@ impl P2pConnManager {
                 // the TTL. Re-resolve targets now that the stash is in place: if a
                 // target has appeared, take the stash back and re-emit
                 // immediately rather than waiting on a future flush.
-                let recheck = op_manager.get_broadcast_targets_update(&key, &self_addr);
+                // Probe with a LOCAL origin, not the claim this fan-out already
+                // consumed. Two reasons, and the second is the one that bites:
+                //
+                //  * this is a "did a target appear while we were giving up"
+                //    question, not a fan-out decision, so the unfiltered set is
+                //    the right one to ask about — and it is the safe direction
+                //    for the #4359 recovery, since finding a target re-emits
+                //    rather than abandoning state;
+                //  * re-passing `origin` re-runs the suppression filters over
+                //    the same offered legs, so `record_broadcast_target_suppressed`
+                //    and `record_broadcast_sender_skipped` fire twice for one
+                //    fan-out while `sends` counts once. That inflates only the
+                //    treatment arm (both counters are 0 in control), which
+                //    would put a one-sided bias into the very leg-accounting
+                //    comparison that exists to detect arm asymmetry.
+                let recheck = op_manager.get_broadcast_targets_update(
+                    &key,
+                    &crate::ring::broadcast_coverage::BroadcastOrigin::local(),
+                );
                 if !recheck.targets.is_empty() {
                     if let Some(stashed) = op_manager.pending_broadcasts.take(key.id()) {
                         tracing::debug!(
@@ -516,9 +639,27 @@ impl P2pConnManager {
         // delivery order and breaks convergence.
         #[cfg(not(feature = "simulation_tests"))]
         {
+            // #5147: the originator target list, computed ONCE for the whole
+            // fan-out and shared by `Arc` across its legs. It has to be built
+            // here because this loop is where the full target set stops
+            // existing — each iteration becomes an independent queue entry, and
+            // the send site downstream sees only its own peer.
+            let fanout: super::super::broadcast_queue::FanoutTargets = std::sync::Arc::new(
+                target_result
+                    .targets
+                    .iter()
+                    .map(|target| target.pub_key().clone())
+                    .collect(),
+            );
             for target in &target_result.targets {
                 self.broadcast_queue
-                    .enqueue(op_manager, key, target.clone(), new_state.clone())
+                    .enqueue(
+                        op_manager,
+                        key,
+                        target.clone(),
+                        new_state.clone(),
+                        fanout.clone(),
+                    )
                     .await;
             }
             // Emit broadcast emitted telemetry (issue #3622)
@@ -625,8 +766,16 @@ impl P2pConnManager {
 
         #[cfg(not(feature = "simulation_tests"))]
         {
+            // A targeted single-peer sync, not a mesh fan-out: there are no
+            // sibling recipients to name, so the list is empty.
             self.broadcast_queue
-                .enqueue(op_manager, key, target, new_state)
+                .enqueue(
+                    op_manager,
+                    key,
+                    target,
+                    new_state,
+                    super::super::broadcast_queue::no_fanout(),
+                )
                 .await;
         }
         #[cfg(feature = "simulation_tests")]
@@ -638,6 +787,7 @@ impl P2pConnManager {
                 new_state,
                 target,
                 None,
+                super::super::broadcast_queue::no_fanout(),
             )
             .await;
         }
@@ -682,6 +832,19 @@ impl P2pConnManager {
             contract = %key,
             target_count = target_result.targets.len(),
             "Broadcasting state change to network peers"
+        );
+
+        // #5147: the originator target list for this fan-out. Built here for
+        // the same reason as the production path, but note the two paths differ —
+        // production splits the fan-out across a queue and rebuilds the list
+        // per leg, this one holds the whole set in scope. A test that only
+        // exercises this branch proves nothing about production.
+        let fanout: super::super::broadcast_queue::FanoutTargets = std::sync::Arc::new(
+            target_result
+                .targets
+                .iter()
+                .map(|target| target.pub_key().clone())
+                .collect(),
         );
 
         let mut skipped_summary_match: usize = 0;
@@ -842,11 +1005,22 @@ impl P2pConnManager {
                     payload_size,
                     "Using streaming for BroadcastTo"
                 );
-                let msg = crate::operations::update::UpdateMsg::BroadcastToStreaming {
-                    id: update_tx,
-                    stream_id: sid,
-                    key,
-                    total_size: payload_bytes.len() as u64,
+                let msg = match super::super::broadcast_queue::target_list_for(
+                    op_manager, &update_tx, peer_addr, &peer_key, &fanout,
+                ) {
+                    Some(covered) => crate::operations::update::UpdateMsg::BroadcastToStreamingV2 {
+                        id: update_tx,
+                        stream_id: sid,
+                        key,
+                        total_size: payload_bytes.len() as u64,
+                        covered,
+                    },
+                    None => crate::operations::update::UpdateMsg::BroadcastToStreaming {
+                        id: update_tx,
+                        stream_id: sid,
+                        key,
+                        total_size: payload_bytes.len() as u64,
+                    },
                 };
                 let net_msg: NetMessage = msg.into();
                 // Serialize metadata for embedding in fragment #1 (fix #2757)
@@ -901,15 +1075,29 @@ impl P2pConnManager {
                     Err(err) => Err(err),
                 }
             } else {
-                let msg = crate::operations::update::UpdateMsg::BroadcastTo {
-                    id: update_tx,
-                    key,
-                    payload,
-                    // Include our summary so peer doesn't echo back
-                    sender_summary_bytes: our_summary
-                        .as_ref()
-                        .map(|s| s.as_ref().to_vec())
-                        .unwrap_or_default(),
+                let msg = match super::super::broadcast_queue::target_list_for(
+                    op_manager, &update_tx, peer_addr, &peer_key, &fanout,
+                ) {
+                    Some(covered) => crate::operations::update::UpdateMsg::BroadcastToV2 {
+                        id: update_tx,
+                        key,
+                        payload,
+                        sender_summary_bytes: our_summary
+                            .as_ref()
+                            .map(|s| s.as_ref().to_vec())
+                            .unwrap_or_default(),
+                        covered,
+                    },
+                    None => crate::operations::update::UpdateMsg::BroadcastTo {
+                        id: update_tx,
+                        key,
+                        payload,
+                        // Include our summary so peer doesn't echo back
+                        sender_summary_bytes: our_summary
+                            .as_ref()
+                            .map(|s| s.as_ref().to_vec())
+                            .unwrap_or_default(),
+                    },
                 };
                 // channel-safety: ok — sim-only path (see the
                 // `#[cfg(feature = "simulation_tests")]` gate on this fn); never

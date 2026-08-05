@@ -17307,3 +17307,682 @@ fn test_gateway_ack_version_unlocks_node_originated_summary_first_put() {
 
     freenet::dev_tool::clear_crdt_contracts();
 }
+
+/// One arm of the #5147 suppression measurement: run an update workload over a
+/// co-host mesh and report what the fleet received.
+#[cfg(test)]
+struct SuppressionArm {
+    /// Inbound broadcast payloads that reached a terminal outcome.
+    deliveries: u64,
+    /// Those that changed nothing — the waste #5147 removes.
+    redundant: u64,
+    /// Outbound broadcast legs actually put on the wire.
+    sends: u64,
+    delta_sends: u64,
+    full_state_sends: u64,
+    resync_suppressed: u64,
+    summary_skips: u64,
+    /// Contracts that converged, and how many there were.
+    converged: (usize, usize),
+    /// Peers that actually agreed on the converged state.
+    ///
+    /// `converged` counts CONTRACTS, and this simulation has one, so on its own
+    /// it reduces to `1 >= 1`. `check_convergence_from_logs` also skips any
+    /// contract with fewer than two reporting peers and counts only peers that
+    /// logged a state hash — so a peer that stops RECEIVING stops logging and
+    /// leaves the denominator rather than being counted as diverged. The
+    /// replica count is what notices that.
+    replicas: usize,
+    /// Contracts whose replicas disagreed outright.
+    diverged: usize,
+    /// Peers that were suppressed because the originator named them.
+    suppressed: u64,
+    /// Legs dropped because the target was the peer that delivered the update.
+    ///
+    /// The FOURTH terminal outcome. It is gated with the feature, so it is
+    /// zero in the control arm and non-zero in the treatment arm — which means
+    /// leaving it out of the accounting identity below made the arms look
+    /// unequal by exactly this count.
+    sender_skips: u64,
+    /// Hosting advertisements exchanged. The premise check: without these no
+    /// peer has an advertised co-host, so there is no mesh and nothing to
+    /// suppress.
+    hosting_updates: u64,
+}
+
+#[cfg(test)]
+fn run_5147_suppression_arm(network_name: &str, target_list_enabled: bool) -> SuppressionArm {
+    run_5147_arm_inner(network_name, target_list_enabled, false)
+}
+
+/// Same arm, but every update originates from a DIFFERENT peer in turn.
+///
+/// This is the workload that exercises the design's sharpest open question.
+/// The target list attests DELIVERY of the originator's payload — "A sent this
+/// to C" — but a relayer re-broadcasts its own POST-MERGE state, which under
+/// concurrent writers can be strictly newer than the payload it received. If B
+/// suppresses C on A's say-so while holding state C lacks, C does not learn it
+/// until the ~5-minute anti-entropy heartbeat.
+///
+/// The single-writer arm cannot see this: with one writer every peer merges the
+/// same payload into the same prior state, so the relayer's state and the
+/// originator's payload agree and suppression is exactly right. Rotating the
+/// writer is what makes relayer-ahead-of-recipient reachable.
+fn run_5147_multi_writer_arm(network_name: &str, target_list_enabled: bool) -> SuppressionArm {
+    run_5147_arm_inner(network_name, target_list_enabled, true)
+}
+
+fn run_5147_arm_inner(
+    network_name: &str,
+    target_list_enabled: bool,
+    multi_writer: bool,
+) -> SuppressionArm {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    const SEED: u64 = 0x5147_0001_0001;
+    // Enough peers that each has SEVERAL non-sender co-hosts. With two, a
+    // peer's only other co-host is the sender, the originator's list is empty
+    // after excluding the recipient, and the measurement is vacuous.
+    const PEERS: usize = 6;
+    const SUSTAINED_UPDATES: usize = 20;
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let (sim, logs_handle) = rt.block_on(async {
+        let mut sim = SimNetwork::new(
+            network_name,
+            1, // 1 gateway (the update source)
+            PEERS,
+            7, // max_htl
+            3, // rnd_if_htl_above
+            // Wide enough that the peers connect to EACH OTHER. At a narrower
+            // cap a star forms, every peer's only co-host is the sender, and
+            // the target list has nobody to name — the same blind spot the
+            // #4965 co-host test documents.
+            12, // max_connections
+            4,  // min_connections
+            SEED,
+        )
+        .await;
+        // The ONLY difference between the two arms. Stated explicitly on both
+        // sides rather than relying on the default, so a future edit that flips
+        // the default cannot silently turn the control arm into a second
+        // treatment arm and make the comparison read as "no effect".
+        if target_list_enabled {
+            sim.enable_broadcast_target_list();
+        } else {
+            sim.disable_broadcast_target_list();
+        }
+        // Space the updates across the ~5-minute InterestSync heartbeat
+        // (`INTEREST_HEARTBEAT_INTERVAL`, 300s). At the 3s default the whole
+        // update burst finishes inside one heartbeat window, so the ONLY thing
+        // keeping peer-summary caches fresh is the `sender_summary_bytes`
+        // riding on the broadcasts themselves — precisely what this feature
+        // removes. That regime makes the measurement a study of the sim's
+        // pacing rather than of production, where a River-style update cadence
+        // is minutes apart with heartbeats in between.
+        sim.with_controlled_op_interval(Duration::from_secs(3));
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    // CRDT contract so post-bootstrap broadcasts compute real version-aware
+    // deltas; a hash contract's "delta" is full state.
+    let contract = SimOperation::create_test_contract(0x51);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    let mut operations = vec![ScheduledOperation::new(
+        NodeLabel::gateway(network_name, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: SimOperation::create_crdt_state(1, 0x10),
+            subscribe: true,
+        },
+    )];
+    for node_idx in 1..=PEERS {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(network_name, node_idx),
+            SimOperation::Subscribe { contract_id },
+        ));
+    }
+    for v in 0..SUSTAINED_UPDATES {
+        // Single-writer: always the gateway, so every peer merges the same
+        // payload into the same prior state. Multi-writer: rotate across the
+        // subscribing peers, so a relayer can hold state its recipient lacks.
+        let writer = if multi_writer {
+            NodeLabel::node(network_name, (v % PEERS) + 1)
+        } else {
+            NodeLabel::gateway(network_name, 0)
+        };
+        operations.push(ScheduledOperation::new(
+            writer,
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state((v as u64) + 2, 0x20 + v as u8),
+            },
+        ));
+    }
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(240),
+        Duration::from_secs(90),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "{network_name}: simulation should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let convergence =
+        rt.block_on(async { freenet::dev_tool::check_convergence_from_logs(&logs_handle).await });
+
+    SuppressionArm {
+        deliveries: GlobalTestMetrics::broadcast_deliveries(),
+        redundant: GlobalTestMetrics::redundant_broadcast_deliveries(),
+        sends: GlobalTestMetrics::delta_sends() + GlobalTestMetrics::full_state_sends(),
+        delta_sends: GlobalTestMetrics::delta_sends(),
+        full_state_sends: GlobalTestMetrics::full_state_sends(),
+        resync_suppressed: GlobalTestMetrics::resync_requests_suppressed(),
+        summary_skips: GlobalTestMetrics::fanout_summary_skips(),
+        converged: (convergence.converged.len(), convergence.total_contracts()),
+        replicas: convergence
+            .converged
+            .iter()
+            .map(|c| c.replica_count)
+            .sum::<usize>(),
+        diverged: convergence.diverged.len(),
+        suppressed: GlobalTestMetrics::broadcast_targets_suppressed(),
+        sender_skips: GlobalTestMetrics::broadcast_sender_skips(),
+        hosting_updates: GlobalTestMetrics::neighbor_hosting_updates(),
+    }
+}
+
+/// End-to-end measurement of #5147 on a co-host mesh, with a control arm.
+///
+/// ## Measured (7 nodes, 20 CRDT updates, identical seed and topology)
+///
+/// ```text
+/// control:   sends=460 summary_skips=417 suppressed=0   redundant=321 replicas=7 diverged=0
+/// treatment: sends=288 summary_skips=146 suppressed=428 redundant=160 replicas=7 diverged=0
+/// ```
+///
+/// 37% fewer broadcast legs on the wire and 50% fewer redundant deliveries,
+/// with convergence unchanged and every replica retained.
+///
+/// These numbers superseded an earlier `460 -> 256` reading, and the reason is
+/// worth keeping: back then the sender exclusion shipped UNGATED, so it was
+/// live in BOTH arms and the control arm was not main's behaviour. Gating it
+/// made the comparison apples-to-apples and moved the measured saving down.
+///
+/// An earlier version of this doc also claimed
+/// `sends + summary_skips + suppressed` was **identical in both arms** and
+/// called that a conservation law. It is not one, and the assertion below is a
+/// 5% bound rather than an equality — see the comment at that assertion for the
+/// buckets an offered leg can exit through uncounted.
+///
+/// The overlap with the pre-existing summary-match gate is large here — many of
+/// the suppressions are legs that gate would have skipped for free — which is
+/// why the send reduction is smaller than the suppression count suggests. On
+/// the fleet that overlap is much smaller: the measured
+/// dedup ratio there is 18.6 against this simulation's 3.7, i.e. the
+/// summary-match gate is suppressing far less in production than it does here,
+/// so the target list's marginal value is larger, not smaller.
+///
+/// ## This test earned its keep once already
+///
+/// Written before the code was believed correct, it FAILED on the first run —
+/// treatment sends 528 vs control 460, redundant 400 vs 321 — i.e. the feature
+/// made traffic worse. A control-vs-control run (byte-identical numbers)
+/// cleared the rig, so the regression was real. Cause: a fully-suppressed
+/// fan-out has an empty target set, and `handle_broadcast_state_change` treated
+/// empty as the no-subscriber FAILURE case — three retries with backoff, then a
+/// stash. Each retry re-resolved targets after the coverage claim had already
+/// been consumed, so it suppressed nothing and re-broadcast the whole co-host
+/// set one backoff later. The mechanism defeated itself and would have shipped
+/// looking plausible: every unit test passed, and the only visible symptom was
+/// a bandwidth number nobody had a baseline for. The `fully_covered` branch in
+/// `broadcast.rs` is the fix, and this test is its regression test.
+///
+/// ## Why a control arm and not a threshold
+///
+/// A single-arm test asserting "redundant deliveries are below N" pins the
+/// simulation's own convergence behaviour as much as the feature: change the
+/// topology, the update count, or the CONNECT timing and N moves for reasons
+/// that have nothing to do with the target list. Two arms differing by exactly
+/// one `enable_broadcast_target_list()` call measure the FEATURE, and the
+/// control arm doubles as the "this is what today looks like" baseline.
+///
+/// ## What is asserted, and what deliberately is not
+///
+/// The discriminator is that the treatment arm suppresses fan-out targets AND
+/// receives strictly fewer redundant deliveries than the control. Both halves
+/// are needed: the suppression counter alone would pass if the mechanism fired
+/// but the duplicates arrived by some other route, and the delivery drop alone
+/// could come from a topology difference between the two runs.
+///
+/// A specific suppression FRACTION is NOT asserted. The measured fleet figures
+/// (0.647 at degree 5, rising to 0.924 at 17) are degree-dependent, and this
+/// simulation's achieved degree is far below the fleet's — the topology it
+/// builds is the regime with the LEAST overlap to exploit, so a fleet-derived
+/// threshold here would be measuring the wrong graph. The achieved numbers are
+/// logged so a reader can see the regime rather than infer it.
+///
+/// ## Safety half
+///
+/// Convergence must be no worse in the treatment arm. This is the assertion
+/// that fails if suppression over-reaches: a peer wrongly excluded from a
+/// fan-out does not converge, and no bandwidth saving justifies that.
+#[test_log::test]
+fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
+    let control = run_5147_suppression_arm("i5147-control", false);
+    let treatment = run_5147_suppression_arm("i5147-treatment", true);
+
+    tracing::info!(
+        "#5147 control:   deliveries={} redundant={} sends={} (delta={} full={}) \
+         suppressed={} summary_skips={} resync_suppressed={} converged={:?} replicas={} diverged={}",
+        control.deliveries,
+        control.redundant,
+        control.sends,
+        control.delta_sends,
+        control.full_state_sends,
+        control.suppressed,
+        control.summary_skips,
+        control.resync_suppressed,
+        control.converged,
+        control.replicas,
+        control.diverged,
+    );
+    tracing::info!(
+        "#5147 treatment: deliveries={} redundant={} sends={} (delta={} full={}) \
+         suppressed={} summary_skips={} resync_suppressed={} converged={:?} replicas={} diverged={}",
+        treatment.deliveries,
+        treatment.redundant,
+        treatment.sends,
+        treatment.delta_sends,
+        treatment.full_state_sends,
+        treatment.suppressed,
+        treatment.summary_skips,
+        treatment.resync_suppressed,
+        treatment.converged,
+        treatment.replicas,
+        treatment.diverged,
+    );
+
+    // PREMISE 1: the peers really became each other's advertised co-hosts. If
+    // they did not, no peer has a co-host to name, the list is empty
+    // everywhere, and every assertion below is vacuous.
+    assert!(
+        control.hosting_updates > 0 && treatment.hosting_updates > 0,
+        "premise: no hosting advertisements were exchanged, so there is no \
+         co-host mesh and #5147 has nothing to suppress. control={} \
+         treatment={}",
+        control.hosting_updates,
+        treatment.hosting_updates,
+    );
+
+    // PREMISE 2: the control arm actually exhibits the waste being removed.
+    assert!(
+        control.redundant > 0,
+        "premise: the control arm received ZERO redundant deliveries, so this \
+         topology does not reproduce the duplicate fan-out at all and the \
+         comparison below measures nothing"
+    );
+
+    // PREMISE 2-bis: the sender exclusion is gated WITH the feature, so it must
+    // be absent from the control arm and present in the treatment arm.
+    //
+    // The field's own doc asserts exactly this, and nothing checked it. That
+    // matters because `sender_skips` was added to explain a gap in the leg
+    // accounting: if it were zero in BOTH arms, adding the bucket changed
+    // nothing, the gap has some other cause, and the stated explanation would
+    // be unverified while looking settled.
+    assert_eq!(
+        control.sender_skips, 0,
+        "premise: the control arm excluded the sender {} times, so the sender \
+         exclusion is not gated with the feature and the arms differ by more \
+         than one flag",
+        control.sender_skips,
+    );
+    assert!(
+        treatment.sender_skips > 0,
+        "premise: the treatment arm never excluded a delivering sender, so \
+         `sender_skips` explains none of the leg-accounting gap it was added \
+         to explain"
+    );
+
+    // PREMISE 3: the control arm is genuinely unsuppressed. Without this a
+    // default flip would make both arms treatment arms and the test would read
+    // "no effect" as success.
+    assert_eq!(
+        control.suppressed, 0,
+        "the control arm must be running today's behaviour; a non-zero \
+         suppression count means the version gate opened when it should have \
+         stayed shut, and the comparison has no baseline"
+    );
+
+    // DISCRIMINATOR A: the mechanism fired.
+    assert!(
+        treatment.suppressed > 0,
+        "#5147 suppressed nothing on a topology built to exercise it: \
+         {} hosting advertisements were exchanged, so peers ARE advertised \
+         co-hosts of each other, yet no fan-out target was ever dropped. \
+         Either the version gate never opened, or the coverage never reached \
+         the fan-out decision.",
+        treatment.hosting_updates,
+    );
+
+    // The two arms must have done comparable amounts of fan-out WORK, so the
+    // reduction below cannot be a topology difference between the runs.
+    //
+    // This was originally an exact equality on sends + summary_skips +
+    // suppressed, justified as a conservation law: "every offered leg ends in
+    // exactly one of three places". It is not one, and a reviewer said so
+    // before the numbers did. Two independent leaks showed up:
+    //
+    //  * the sender exclusion is a FOURTH terminal outcome, counted nowhere
+    //    (now `sender_skips`, recorded at the decision site);
+    //  * legs still exit through paths no counter observes — a failed send
+    //    (`sends` counts only successful ones), the `compute_delta` empty-delta
+    //    return, `should_broadcast_contract`, and queue eviction.
+    //
+    // With all four buckets the arms land at 877 vs 869: under 1%. So the
+    // assertion is a bound, not an identity. It is still a real discriminator —
+    // a genuine topology difference between the arms moves this by far more
+    // than a few unbucketed legs — while no longer being a tripwire that fires
+    // on a single extra send failure, which under this repo's
+    // flaky-tests-are-blockers rule would make it a merge blocker of its own.
+    let control_legs =
+        control.sends + control.summary_skips + control.suppressed + control.sender_skips;
+    let treatment_legs =
+        treatment.sends + treatment.summary_skips + treatment.suppressed + treatment.sender_skips;
+    assert!(
+        control_legs > 0,
+        "premise: the control arm accounted for ZERO fan-out legs, so the \
+         tolerance below is 0 and the comparison passes vacuously"
+    );
+    let leg_gap = control_legs.abs_diff(treatment_legs);
+    let leg_tolerance = control_legs / 20; // 5%
+    assert!(
+        leg_gap <= leg_tolerance,
+        "the arms accounted for very different amounts of fan-out work \
+         ({control_legs} vs {treatment_legs}, gap {leg_gap} > tolerance \
+         {leg_tolerance}). A few unbucketed legs are expected — a failed send, \
+         an empty-delta skip, a should_broadcast_contract early return, a queue \
+         eviction — but a gap this size means the two runs did genuinely \
+         different work, so the reduction below is not attributable to #5147."
+    );
+
+    // DISCRIMINATOR B: it removed real traffic, not just incremented a counter.
+    assert!(
+        treatment.redundant < control.redundant,
+        "#5147 suppressed {} fan-out targets yet the fleet still received as \
+         many redundant deliveries ({} vs control {}). A suppression that does \
+         not show up as fewer received duplicates is suppressing the wrong \
+         thing.",
+        treatment.suppressed,
+        treatment.redundant,
+        control.redundant,
+    );
+
+    // DISCRIMINATOR C: fewer legs actually on the wire. Distinct from B —
+    // B says the fleet RECEIVES fewer duplicates, this says the fleet SENDS
+    // less. The retry bug in this test's history passed neither, but a future
+    // regression that merely delays the suppressed traffic would pass B while
+    // failing here.
+    assert!(
+        treatment.sends < control.sends,
+        "#5147 suppressed {} targets yet the fleet sent as many broadcast legs \
+         ({} vs control {}). Suppressed traffic that reappears later — via the \
+         no-target retry, an anti-entropy heal, or a stash re-emission — is not \
+         suppressed, it is deferred.",
+        treatment.suppressed,
+        treatment.sends,
+        control.sends,
+    );
+
+    // DISCRIMINATOR D: the duplicate FRACTION fell, not just the numerator.
+    //
+    // B alone is satisfiable the wrong way: an arm that halves total deliveries
+    // halves redundant deliveries with it and passes, having suppressed real
+    // traffic rather than duplicate traffic. `deliveries` exists as the
+    // denominator for exactly this ratio (see its rustdoc) and was previously
+    // gathered and never used. Cross-multiplied to stay in integers:
+    //   treatment.redundant / treatment.deliveries < control.redundant / control.deliveries
+    // Measured after the gating fix: control 321/440 = 73.0%, treatment
+    // 160/260 = 61.5%.
+    assert!(
+        treatment.redundant * control.deliveries < control.redundant * treatment.deliveries,
+        "#5147 reduced redundant deliveries ({} vs control {}) only in step with \
+         total deliveries ({} vs control {}), so the duplicate FRACTION did not \
+         improve. That is what suppressing genuine traffic looks like, and \
+         discriminator B alone cannot tell the two apart.",
+        treatment.redundant,
+        control.redundant,
+        treatment.deliveries,
+        control.deliveries,
+    );
+
+    // DISCRIMINATOR E: the saving is in BYTES, not merely in message count.
+    //
+    // Every assertion above counts legs. This design has a specific, known way
+    // to cut legs while RAISING bytes: suppressing a leg also suppresses the
+    // `sender_summary_bytes` piggyback that keeps peer-summary caches warm, and
+    // a peer whose cached summary we lack receives FULL STATE
+    // (`FullNoTheirSummaryTracked`) instead of a delta — 26.9% of broadcast
+    // bytes at a 357 KB mean in the 0.2.109 fleet profile, against a few KB for
+    // a delta. Roughly a dozen extra full states would erase the entire
+    // measured saving while `sends`, `redundant` and `suppressed` all still
+    // moved the right way.
+    //
+    // `full_state_sends` was captured and logged but never asserted, which left
+    // the one number that reveals the inversion outside the test's reach.
+    //
+    // Measured after the gating fix: **16 in both arms**, saving entirely in
+    // deltas (444 -> 272). State that honestly: under a `<=` comparison, equal
+    // counts pass by exactly one step, not "with margin" as an earlier version
+    // of this comment claimed. And the direction of risk is real — every extra
+    // suppressed leg also suppresses the `sender_summary_bytes` piggyback named
+    // above, which is what would push the treatment arm's full-state count up.
+    // So if this ever reddens, the first hypothesis is that suppression grew,
+    // not that the test is brittle.
+    assert!(
+        treatment.full_state_sends <= control.full_state_sends,
+        "#5147 cut broadcast legs ({} vs control {}) but pushed peers onto the \
+         FULL-STATE path ({} vs control {}). A full state is ~357 KB against a \
+         few-KB delta, so this is a bandwidth INCREASE wearing the costume of a \
+         bandwidth saving — the second-order failure this design's summary-seeding \
+         interaction makes possible.",
+        treatment.sends,
+        control.sends,
+        treatment.full_state_sends,
+        control.full_state_sends,
+    );
+
+    // SAFETY: no bandwidth saving justifies a peer not converging. This is the
+    // assertion that fails on over-suppression.
+    // PREMISE 4: the control arm converged at all. Without this the assertion
+    // below is satisfied by `0 >= 0` if a future change breaks BOTH arms.
+    assert!(
+        control.converged.0 > 0 && control.diverged == 0,
+        "premise: the control arm did not converge ({} converged, {} diverged), \
+         so the treatment-vs-control safety comparison below means nothing",
+        control.converged.0,
+        control.diverged,
+    );
+
+    // SAFETY (a): nobody diverged outright.
+    assert_eq!(
+        treatment.diverged, 0,
+        "#5147 left {} contract(s) with replicas holding different state; a \
+         peer wrongly excluded from a fan-out does not learn of the update \
+         until the ~5-minute interest heartbeat",
+        treatment.diverged,
+    );
+
+    // SAFETY (b): no peer silently dropped OUT of the comparison.
+    //
+    // Divergence alone cannot see the failure this design is most likely to
+    // cause. Over-suppression does not give a peer WRONG state, it gives it NO
+    // state — and a peer that never receives never logs a state hash, so it
+    // leaves the denominator instead of being counted as diverged. Comparing
+    // replica counts across arms is what catches that.
+    assert!(
+        treatment.replicas >= control.replicas,
+        "#5147 cut the number of peers holding the converged state ({} vs \
+         control {}). Suppressing a peer that needed the update does not show \
+         up as divergence — the peer simply stops reporting — so this is the \
+         assertion that sees it.",
+        treatment.replicas,
+        control.replicas,
+    );
+
+    assert!(
+        treatment.converged.0 >= control.converged.0,
+        "#5147 cost convergence: control converged {:?}, treatment {:?}. A \
+         peer wrongly excluded from a fan-out does not learn of the update \
+         until the ~5-minute interest heartbeat, which is exactly the failure \
+         this design refuses.",
+        control.converged,
+        treatment.converged,
+    );
+}
+
+/// **What suppression does under CONCURRENT WRITERS.**
+///
+/// Renamed and rescoped after a reviewer showed the safety claim it originally
+/// made was one it could not support. Read the limits before quoting it.
+///
+/// ## What this DOES establish
+///
+/// The feature engages under a rotating-writer workload, and its benefit is
+/// strongly regime-dependent:
+///
+/// ```text
+/// control:   sends=459 redundant=319 suppressed=0
+/// treatment: sends=420 redundant=288 suppressed=229
+/// ```
+///
+/// About -8.5% sends here against -37% in the single-writer test on the same
+/// topology. That gap is the point: every update in the headline measurement
+/// originates at the GATEWAY, and quoting its number as the expected fleet
+/// saving would overstate it, since real River traffic is multi-writer.
+///
+/// ## What this does NOT establish, despite an earlier version claiming it
+///
+/// It does **not** show that suppression is safe against the design's sharpest
+/// hazard — that a relayer's post-merge state can be newer than the payload it
+/// received, so suppressing on DELIVERY can skip a leg carrying state the
+/// recipient lacks.
+///
+/// Demonstrated, not suspected: making suppression UNCONDITIONAL (drop every
+/// advertised co-host on any relayed fan-out — 480 suppressions, sends
+/// 459 -> 317) leaves this test GREEN, `diverged=0` and `replicas=7`. So its
+/// convergence assertions cannot detect over-suppression here, and three
+/// independent properties of the setup explain why:
+///
+/// * **Topology.** 7 peers at `max_connections: 12` is near-clique, so no peer
+///   depends on a relayer for any update; over-suppressing relay legs costs
+///   nobody state.
+/// * **Merge semantics.** The CRDT fixture is an LWW register with strictly
+///   increasing versions, so missing an OLDER update is harmless by
+///   construction — and `apply_crdt_full_state` returning `CurrentWon`
+///   re-broadcasts, which actively heals the case being probed.
+/// * **Settle window.** Convergence is checked after 90 simulated seconds of
+///   quiet, long enough for that healing to finish.
+///
+/// Closing it needs a workload where a recipient's ONLY path to newer state
+/// runs through the suppressing relayer — a sparser graph, equal-version
+/// writes that fork, or a settle window shorter than the heal — plus a counter
+/// asserting the relayer-ahead condition actually occurred rather than merely
+/// being reachable. Tracked rather than bodged in at the end of a long session.
+///
+/// The convergence assertions are kept because they are cheap and would catch a
+/// gross regression, but they are NOT evidence on the hazard above and must not
+/// be cited as such.
+#[test_log::test]
+fn test_5147_multi_writer_suppression_is_regime_dependent() {
+    let control = run_5147_multi_writer_arm("5147-mw-control", false);
+    let treatment = run_5147_multi_writer_arm("5147-mw-treatment", true);
+
+    tracing::info!(
+        "#5147 multi-writer control:   deliveries={} redundant={} sends={} \
+         (delta={} full={}) suppressed={} summary_skips={} resync_suppressed={} \
+         converged={:?} replicas={} diverged={}",
+        control.deliveries,
+        control.redundant,
+        control.sends,
+        control.delta_sends,
+        control.full_state_sends,
+        control.suppressed,
+        control.summary_skips,
+        control.resync_suppressed,
+        control.converged,
+        control.replicas,
+        control.diverged,
+    );
+    tracing::info!(
+        "#5147 multi-writer treatment: deliveries={} redundant={} sends={} \
+         (delta={} full={}) suppressed={} summary_skips={} resync_suppressed={} \
+         converged={:?} replicas={} diverged={}",
+        treatment.deliveries,
+        treatment.redundant,
+        treatment.sends,
+        treatment.delta_sends,
+        treatment.full_state_sends,
+        treatment.suppressed,
+        treatment.summary_skips,
+        treatment.resync_suppressed,
+        treatment.converged,
+        treatment.replicas,
+        treatment.diverged,
+    );
+
+    // PREMISE 1: the control arm converged, so the comparison means something.
+    assert!(
+        control.converged.0 > 0 && control.diverged == 0,
+        "premise: the multi-writer control arm did not converge ({} converged, \
+         {} diverged), so nothing below is a statement about #5147",
+        control.converged.0,
+        control.diverged,
+    );
+
+    // PREMISE 2: the feature actually engaged on this workload. Without this the
+    // safety assertions pass trivially against a treatment arm that suppressed
+    // nothing, which is exactly what a broken gate would produce.
+    assert!(
+        treatment.suppressed > 0,
+        "premise: the treatment arm suppressed nothing under the multi-writer \
+         workload, so this test is not exercising the mechanism it exists for"
+    );
+    assert_eq!(
+        control.suppressed, 0,
+        "premise: the control arm suppressed {} targets, so the arms do not \
+         differ by the feature alone",
+        control.suppressed,
+    );
+
+    // SAFETY: concurrent writers must not diverge under suppression.
+    assert_eq!(
+        treatment.diverged, 0,
+        "#5147 left {} contract(s) diverged under concurrent writers. A gross \
+         regression check only — see this test's rustdoc for why it cannot \
+         detect targeted over-suppression in this topology.",
+        treatment.diverged,
+    );
+
+    assert!(
+        treatment.replicas >= control.replicas,
+        "#5147 cut the number of peers holding the converged state under \
+         concurrent writers ({} vs control {}). A peer suppressed while the \
+         relayer held state it lacked stops reporting rather than reporting a \
+         conflict, so this — not divergence — is what that failure looks like.",
+        treatment.replicas,
+        control.replicas,
+    );
+}

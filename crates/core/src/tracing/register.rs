@@ -2145,14 +2145,28 @@ mod broadcast_to_telemetry_tests {
     #[test]
     fn from_inbound_msg_v1_has_no_broadcast_to_arm() {
         let body = from_inbound_msg_v1_body();
-        assert!(
-            !body.contains("UpdateMsg::BroadcastTo {"),
-            "from_inbound_msg_v1 must not match UpdateMsg::BroadcastTo directly — \
-             doing so reintroduces the #5149 duplicate/self-attributed \
-             update_broadcast_received event. The driver-side emitters in \
-             operations/update/op_ctx_task.rs (drive_relay_broadcast_to, \
-             apply_streaming_broadcast) already cover this event correctly."
-        );
+        // Every payload-bearing broadcast variant, not just the original.
+        // #5147 added V2 forms of both; an arm for either would reintroduce the
+        // #5149 duplicate exactly as an arm for `BroadcastTo` would, and would
+        // additionally make the two encodings produce DIFFERENT event counts
+        // for the same logical delivery — which would move the very metric the
+        // #5147 rollout is judged on, in the direction that flatters it.
+        for variant in [
+            "UpdateMsg::BroadcastTo {",
+            "UpdateMsg::BroadcastToStreaming {",
+            "UpdateMsg::BroadcastToV2 {",
+            "UpdateMsg::BroadcastToStreamingV2 {",
+        ] {
+            assert!(
+                !body.contains(variant),
+                "from_inbound_msg_v1 must not match `{variant}` directly — \
+                 doing so reintroduces the #5149 duplicate/self-attributed \
+                 update_broadcast_received event. The driver-side emitters in \
+                 operations/update/op_ctx_task.rs (drive_relay_broadcast_to, \
+                 apply_streaming_broadcast) already cover this event correctly \
+                 for every variant."
+            );
+        }
         assert!(
             body.contains("NetMessageV1::Update(_)"),
             "the generic Update wildcard arm must still exist so BroadcastTo \

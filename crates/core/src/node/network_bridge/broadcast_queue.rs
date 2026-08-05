@@ -48,6 +48,19 @@ use crate::transport::BroadcastDeliveryOutcome;
 use super::broadcast_payload_mix::PayloadArm;
 use super::p2p_protoc::P2pBridge;
 
+/// The public keys of every peer one fan-out is going to (#5147).
+///
+/// Shared by `Arc` because `handle_broadcast_state_change` splits a single
+/// fan-out into one queue entry per target, and each entry needs the whole set
+/// to build the list it attaches. At the p90 fan-out of 58 (max 138 observed)
+/// cloning the `Vec` per leg would be O(targets^2) key clones per broadcast.
+pub(super) type FanoutTargets = Arc<Vec<crate::transport::TransportPublicKey>>;
+
+/// The list attached to a send with no fan-out context.
+pub(super) fn no_fanout() -> FanoutTargets {
+    Arc::new(Vec::new())
+}
+
 /// Timeout for awaiting stream completion signal before releasing the permit
 /// anyway. Prevents permanent permit leak if a stream task panics or hangs.
 /// Used by `broadcast_to_single_peer` under both `simulation_tests` and
@@ -598,7 +611,16 @@ pub(super) async fn fanout_send_needed(
 ) -> bool {
     match plan_fanout_send(&op_manager.interest_manager, key, summaries, *probes_used) {
         FanoutSendPlan::Send => true,
-        FanoutSendPlan::Skip => false,
+        FanoutSendPlan::Skip => {
+            // #5147 diagnostic: the pre-existing summary-match skip is the
+            // OTHER mechanism suppressing fan-out legs, and it is fed by the
+            // `sender_summary_bytes` that rides on the very sends the target
+            // list removes. Counting it is what makes an interaction between
+            // the two visible instead of showing up as an unexplained rise in
+            // total sends.
+            crate::config::GlobalTestMetrics::record_fanout_summary_skip();
+            false
+        }
         FanoutSendPlan::Probe => {
             *probes_used += 1;
             let SummaryPair { ours, theirs } = summaries;
@@ -635,6 +657,7 @@ mod queue {
     use crate::ring::{PeerKey, PeerKeyLocation};
 
     use super::super::p2p_protoc::P2pBridge;
+    use super::FanoutTargets;
     use super::{QueueScheduling, QueuedPayloadClass, SendLanePermit, broadcast_to_single_peer};
 
     /// Maximum concurrent outbound broadcast streams for small payloads (< 64KB).
@@ -737,6 +760,15 @@ mod queue {
         key: ContractKey,
         target: PeerKeyLocation,
         new_state: WrappedState,
+        /// The whole fan-out this entry is one leg of (#5147), shared by `Arc`
+        /// across every leg so a 138-target broadcast clones a pointer rather
+        /// than 138 public keys per leg.
+        ///
+        /// Carried through the queue because the full target set does not
+        /// otherwise survive to the send site: `handle_broadcast_state_change`
+        /// resolves it, then immediately splits it into independent per-peer
+        /// entries, and `broadcast_to_single_peer` sees only its own target.
+        fanout: FanoutTargets,
         /// Contract STATE size in bytes. Feeds the `scheduled_*_state_bytes`
         /// counters only — it is deliberately NOT what picks the lane (see
         /// [`classify_payload_lane`]).
@@ -1113,6 +1145,7 @@ mod queue {
             key: ContractKey,
             target: PeerKeyLocation,
             new_state: WrappedState,
+            fanout: FanoutTargets,
         ) {
             let lane = lane_for(
                 &op_manager.interest_manager,
@@ -1121,7 +1154,8 @@ mod queue {
                 &target,
                 new_state.size(),
             );
-            self.enqueue_in_lane(lane, key, target, new_state).await;
+            self.enqueue_in_lane(lane, key, target, new_state, fanout)
+                .await;
         }
 
         /// The lane-agnostic half of [`Self::enqueue`], split out so tests can
@@ -1132,6 +1166,7 @@ mod queue {
             key: ContractKey,
             target: PeerKeyLocation,
             new_state: WrappedState,
+            fanout: FanoutTargets,
         ) {
             let dedup_key = (key, target.clone());
             let state_size = new_state.size();
@@ -1152,6 +1187,14 @@ mod queue {
                     // go stale the moment a state crossed the threshold.
                     existing.state_size = state_size;
                     existing.lane = lane;
+                    // #5147: the target list belongs to the state it was
+                    // computed for. A replacement is a DIFFERENT fan-out with a
+                    // different (possibly smaller) target set, so keeping the
+                    // superseded list would tell the recipient we delivered to
+                    // peers this broadcast never touched — over-suppression, the
+                    // one direction this design refuses. Refresh it in lockstep
+                    // with `new_state`.
+                    existing.fanout = fanout;
                 }
                 if previous_lane != lane {
                     let small_queued = match lane {
@@ -1194,6 +1237,7 @@ mod queue {
                         key,
                         target,
                         new_state,
+                        fanout,
                         state_size,
                         lane,
                         seq,
@@ -1270,6 +1314,7 @@ mod queue {
                                 entry.new_state,
                                 entry.target,
                                 Some(scheduling),
+                                entry.fanout,
                             )
                             .await;
                         }
@@ -1786,6 +1831,168 @@ mod queue {
             }
         }
 
+        /// #5147: the PRODUCTION send site must decide the wire variant through
+        /// the version gate, and must build the legacy arm unchanged.
+        ///
+        /// `broadcast_to_single_peer` is the production message-construction
+        /// site and is exercised by no behavioural test — it needs a live
+        /// `P2pBridge` and `OpManager`, and the end-to-end simulation runs a
+        /// SEPARATE inline copy in `p2p_protoc/broadcast.rs`. A reviewer forced
+        /// both `match target_list_for(..)` expressions to their `None` arm —
+        /// making the feature entirely inert in production — and every lib test
+        /// still passed. This pin is what closes that hole.
+        #[test]
+        fn production_send_site_gates_both_v2_variants_on_the_version_check() {
+            const SOURCE: &str = include_str!("broadcast_queue.rs");
+
+            // Assembled with `concat!` rather than written whole, and NOT
+            // spelled out in any comment here either.
+            //
+            // This test module sits BEFORE the function in the file, and the
+            // pre-existing pins further down slice the function's body by
+            // searching for its signature from the top of the file. Any earlier
+            // occurrence — in a literal OR in a comment — makes those pins slice
+            // from here instead and assert against this test's text. Writing it
+            // out once broke two of them; writing it out in the comment
+            // explaining that fix broke them again.
+            let fn_anchor = concat!("pub(super) async fn ", "broadcast_to_single_", "peer(");
+            let start = SOURCE
+                .find(fn_anchor)
+                .expect("broadcast_to_single_peer renamed or removed");
+            let after = &SOURCE[start + fn_anchor.len()..];
+            let end = after
+                .find("\n#[cfg(test)]")
+                .or_else(|| after.find("\nmod "))
+                .map(|p| start + fn_anchor.len() + p)
+                .unwrap_or(SOURCE.len());
+            let body = &SOURCE[start..end];
+
+            for (variant, legacy) in [
+                ("UpdateMsg::BroadcastToV2 {", "UpdateMsg::BroadcastTo {"),
+                (
+                    "UpdateMsg::BroadcastToStreamingV2 {",
+                    "UpdateMsg::BroadcastToStreaming {",
+                ),
+            ] {
+                assert!(
+                    body.contains(variant),
+                    "the production send site must be able to emit `{variant}`. \
+                     Without it the whole feature is inert in production while \
+                     the simulation — which runs a SEPARATE inline copy of this \
+                     logic — still reports it working."
+                );
+                assert!(
+                    body.contains(legacy),
+                    "the production send site must keep emitting `{legacy}` for \
+                     pre-floor peers, byte-identically to today"
+                );
+            }
+
+            let gate = body
+                .find("target_list_for(")
+                .expect("the production send site must consult the version gate");
+            let first_v2 = body
+                .find("UpdateMsg::BroadcastToStreamingV2 {")
+                .expect("checked above");
+            assert!(
+                gate < first_v2,
+                "the version gate (offset {gate}) must be consulted BEFORE any \
+                 V2 variant is constructed (offset {first_v2}); a pre-floor \
+                 peer that receives one cannot decode it and the connection is \
+                 CLOSED"
+            );
+        }
+
+        /// #5147: the target list must survive the queue, and a dedup
+        /// replacement must REFRESH it.
+        ///
+        /// The full fan-out set exists only at `handle_broadcast_state_change`;
+        /// it is immediately split into one queue entry per target, and the
+        /// send site sees only its own peer. So the list rides on
+        /// `BroadcastEntry`, and the replace-on-dedup path has to update it in
+        /// lockstep with `new_state` — a superseded entry's list names peers a
+        /// DIFFERENT fan-out targeted, which is over-suppression, the one
+        /// direction this design refuses.
+        ///
+        /// This is also the only test that drives the PRODUCTION queue path:
+        /// the end-to-end simulation runs the `simulation_tests` inline branch,
+        /// a separate copy, so nothing else would notice if the queue dropped
+        /// the list entirely. Mutation-verified — replacing the refresh with a
+        /// no-op fails this test.
+        #[tokio::test(start_paused = true)]
+        #[serial_test::serial(broadcast_queue_depth_gauge)]
+        async fn the_queue_carries_the_target_list_and_refreshes_it_on_replacement() {
+            use crate::transport::TransportKeypair;
+
+            let queue = BroadcastQueue::new();
+            let group = LaneGroup {
+                small_pool: Arc::new(Semaphore::new(4)),
+                large_pool: Arc::new(Semaphore::new(4)),
+                upgrade_slots: Arc::new(Semaphore::new(super::super::MAX_PARKED_LANE_UPGRADES)),
+                small_notify: queue.small_notify.clone(),
+                large_notify: queue.large_notify.clone(),
+            };
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let worker = tokio::spawn(drain_lane(
+                QueuedPayloadClass::Small,
+                queue.queue.clone(),
+                group,
+                move |entry: BroadcastEntry, scheduling: QueueScheduling| {
+                    let tx = tx.clone();
+                    async move {
+                        let _scheduling = scheduling;
+                        let _ = tx.send(entry.fanout);
+                    }
+                },
+            ));
+
+            let key = contract(77);
+            let target = PeerKeyLocation::random();
+            let superseded: FanoutTargets =
+                Arc::new(vec![TransportKeypair::new().public().clone()]);
+            let current: FanoutTargets = Arc::new(vec![
+                TransportKeypair::new().public().clone(),
+                TransportKeypair::new().public().clone(),
+            ]);
+
+            // Two enqueues for the same (contract, peer): the second dedups
+            // onto the first and must win on BOTH state and target list.
+            queue
+                .enqueue_in_lane(
+                    QueuedPayloadClass::Small,
+                    key,
+                    target.clone(),
+                    state(16),
+                    superseded.clone(),
+                )
+                .await;
+            queue
+                .enqueue_in_lane(
+                    QueuedPayloadClass::Small,
+                    key,
+                    target,
+                    state(32),
+                    current.clone(),
+                )
+                .await;
+
+            let dispatched = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the drain must dispatch")
+                .expect("the drain must send the entry's fanout");
+
+            assert_eq!(
+                *dispatched, *current,
+                "the replacement's target list must reach the send site; a \
+                 superseded list names peers a different fan-out targeted, so \
+                 the recipient would suppress peers this broadcast never \
+                 delivered to"
+            );
+            assert_ne!(*dispatched, *superseded);
+
+            worker.abort();
+        }
+
         /// A lane drain can only exit on a closed pool, which nothing does in
         /// production. But there are TWO of them now, and the pre-#4961 failure
         /// — one worker exiting, so all broadcast draining stops — was at least
@@ -1816,6 +2023,7 @@ mod queue {
                                 contract(seed),
                                 PeerKeyLocation::random(),
                                 state(BIG),
+                                crate::node::network_bridge::broadcast_queue::no_fanout(),
                             )
                             .await;
                     }
@@ -1840,6 +2048,7 @@ mod queue {
                             contract(21),
                             PeerKeyLocation::random(),
                             state(BIG),
+                            crate::node::network_bridge::broadcast_queue::no_fanout(),
                         )
                         .await;
                 }
@@ -1917,6 +2126,7 @@ mod queue {
                     contract(40),
                     PeerKeyLocation::random(),
                     state(BIG),
+                    crate::node::network_bridge::broadcast_queue::no_fanout(),
                 )
                 .await;
             assert_eq!(
@@ -2025,6 +2235,7 @@ mod queue {
                         contract(seed),
                         PeerKeyLocation::random(),
                         state(BIG),
+                        crate::node::network_bridge::broadcast_queue::no_fanout(),
                     )
                     .await;
             }
@@ -2050,6 +2261,7 @@ mod queue {
                         contract(seed),
                         PeerKeyLocation::random(),
                         state(BIG),
+                        crate::node::network_bridge::broadcast_queue::no_fanout(),
                     )
                     .await;
             }
@@ -2104,6 +2316,7 @@ mod queue {
                     key,
                     PeerKeyLocation::random(),
                     state(BIG),
+                    crate::node::network_bridge::broadcast_queue::no_fanout(),
                 )
                 .await;
             let mut saw_large = false;
@@ -2165,6 +2378,7 @@ mod queue {
                         contract(seed),
                         PeerKeyLocation::random(),
                         state(BIG),
+                        crate::node::network_bridge::broadcast_queue::no_fanout(),
                     )
                     .await;
             }
@@ -2188,6 +2402,7 @@ mod queue {
                     contract(2),
                     PeerKeyLocation::random(),
                     state(BIG),
+                    crate::node::network_bridge::broadcast_queue::no_fanout(),
                 )
                 .await;
             // ...and a small entry arrives behind it. Every one of the small
@@ -2201,6 +2416,7 @@ mod queue {
                     small,
                     PeerKeyLocation::random(),
                     state(16),
+                    crate::node::network_bridge::broadcast_queue::no_fanout(),
                 )
                 .await;
 
@@ -2260,6 +2476,7 @@ mod queue {
                     key,
                     PeerKeyLocation::random(),
                     state(BIG),
+                    crate::node::network_bridge::broadcast_queue::no_fanout(),
                 )
                 .await;
 
@@ -2295,10 +2512,22 @@ mod queue {
             let target = PeerKeyLocation::random();
 
             queue
-                .enqueue_in_lane(QueuedPayloadClass::Small, key, target.clone(), state(16))
+                .enqueue_in_lane(
+                    QueuedPayloadClass::Small,
+                    key,
+                    target.clone(),
+                    state(16),
+                    crate::node::network_bridge::broadcast_queue::no_fanout(),
+                )
                 .await;
             queue
-                .enqueue_in_lane(QueuedPayloadClass::Large, key, target.clone(), state(BIG))
+                .enqueue_in_lane(
+                    QueuedPayloadClass::Large,
+                    key,
+                    target.clone(),
+                    state(BIG),
+                    crate::node::network_bridge::broadcast_queue::no_fanout(),
+                )
                 .await;
 
             {
@@ -2324,7 +2553,13 @@ mod queue {
 
             // ...and symmetrically back again.
             queue
-                .enqueue_in_lane(QueuedPayloadClass::Small, key, target, state(16))
+                .enqueue_in_lane(
+                    QueuedPayloadClass::Small,
+                    key,
+                    target,
+                    state(16),
+                    crate::node::network_bridge::broadcast_queue::no_fanout(),
+                )
                 .await;
             let q = queue.queue.lock().await;
             let entry = q.entries.values().next().expect("the replaced entry");
@@ -2354,6 +2589,7 @@ mod queue {
                     oldest,
                     PeerKeyLocation::random(),
                     state(BIG),
+                    crate::node::network_bridge::broadcast_queue::no_fanout(),
                 )
                 .await;
             for seed in 2..4u8 {
@@ -2363,6 +2599,7 @@ mod queue {
                         contract(seed),
                         PeerKeyLocation::random(),
                         state(16),
+                        crate::node::network_bridge::broadcast_queue::no_fanout(),
                     )
                     .await;
             }
@@ -2392,6 +2629,7 @@ mod queue {
                     oldest,
                     PeerKeyLocation::random(),
                     state(16),
+                    crate::node::network_bridge::broadcast_queue::no_fanout(),
                 )
                 .await;
             for seed in 6..8u8 {
@@ -2401,6 +2639,7 @@ mod queue {
                         contract(seed),
                         PeerKeyLocation::random(),
                         state(BIG),
+                        crate::node::network_bridge::broadcast_queue::no_fanout(),
                     )
                     .await;
             }
@@ -2437,6 +2676,7 @@ mod queue {
                     key,
                     PeerKeyLocation::random(),
                     state(BIG),
+                    crate::node::network_bridge::broadcast_queue::no_fanout(),
                 )
                 .await;
             assert_eq!(
@@ -3127,6 +3367,64 @@ fn record_delivery_to_interest<T: crate::util::time_source::TimeSource + Sync>(
     }
 }
 
+/// Build the originator target list to attach to one leg of a fan-out (#5147),
+/// or `None` when the recipient is on a pre-floor release.
+///
+/// `None` is the fail-closed answer, and it is what an unknown peer version
+/// yields: a pre-floor peer has no `BroadcastToV2` variant index, would fail to
+/// bincode-decode one, and the connection would be CLOSED. The caller's
+/// fallback is the legacy message, byte-identical to what every peer receives
+/// today, so failing closed costs the duplicate bandwidth we already spend and
+/// never costs convergence.
+///
+/// The recipient is excluded from its own list. It obviously has what we are
+/// sending it, and it excludes itself from its own fan-out anyway, so naming it
+/// would spend 8 bytes to say nothing.
+///
+/// The list describes who we ENQUEUED to, which is not identical to who
+/// receives bytes. Some of the gap is benign: the empty-delta return skips a
+/// peer precisely BECAUSE it already holds this state, so naming it is correct.
+///
+/// The rest is NOT benign, and the full list matters because every entry on it
+/// converts a transient one-hop loss into a network-visible divergence that
+/// heals only on the ~5-minute interest heartbeat:
+///
+/// * **Queue eviction at capacity** (`max_queue_depth`) — an evicted leg never
+///   sends, yet stays named, under exactly the load that causes eviction.
+/// * **Send failure** — `bridge.send` returning `Err`, a stream dropped or
+///   timed out before `Delivered`, or a payload that fails to serialize. These
+///   also cluster under congestion.
+/// * **`should_broadcast_contract` returning false**, and a target whose
+///   `socket_addr()` is `None`.
+/// * **`fanout_send_needed` skipping on a cached summary.** The skip means the
+///   peer already holds this state *according to our cache*, which is a belief,
+///   not an ack — see the wrongly-cached-summary caveat in this module. Before
+///   #5147 a wrong belief cost one leg and was corrected by the next
+///   comparison; now it is exported one hop and the relayer suppresses too.
+///
+/// None of these are corrected for here. Closing them means finalising the list
+/// only AFTER dispatch, i.e. a second pass over the fan-out, which the message
+/// cannot wait for. The bound on all of them is the interest heartbeat.
+pub(crate) fn target_list_for(
+    op_manager: &Arc<OpManager>,
+    tx: &crate::message::Transaction,
+    peer_addr: std::net::SocketAddr,
+    recipient: &crate::ring::PeerKey,
+    fanout: &FanoutTargets,
+) -> Option<crate::ring::broadcast_coverage::CoveredPeers> {
+    if !op_manager
+        .ring
+        .connection_manager
+        .supports_broadcast_target_list(peer_addr)
+    {
+        return None;
+    }
+    Some(crate::ring::broadcast_coverage::CoveredPeers::from_targets(
+        tx,
+        fanout.iter().filter(|pub_key| *pub_key != &recipient.0),
+    ))
+}
+
 /// Send a state change broadcast to a single peer.
 ///
 /// This is the per-target body extracted from `broadcast_state_to_peers`.
@@ -3140,6 +3438,7 @@ fn record_delivery_to_interest<T: crate::util::time_source::TimeSource + Sync>(
 /// `scheduling` is `Some` exactly when the production queue dispatched this
 /// send, and carries both the lane it was classified into and that lane's
 /// permit. The sim fan-out calls in-line with `None` (no queue, no permits).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn broadcast_to_single_peer(
     bridge: &P2pBridge,
     op_manager: &Arc<OpManager>,
@@ -3147,6 +3446,9 @@ pub(super) async fn broadcast_to_single_peer(
     new_state: WrappedState,
     target: PeerKeyLocation,
     scheduling: Option<QueueScheduling>,
+    // The whole fan-out this send is one leg of (#5147). Used to build the
+    // originator target list attached to this leg, minus the recipient itself.
+    fanout: FanoutTargets,
 ) {
     use crate::message::{DeltaOrFullState, NetMessage};
     use crate::node::network_bridge::NetworkBridge;
@@ -3583,11 +3885,25 @@ pub(super) async fn broadcast_to_single_peer(
             payload_size,
             "Using streaming for BroadcastTo (via queue)"
         );
-        let msg = UpdateMsg::BroadcastToStreaming {
-            id: update_tx,
-            stream_id: sid,
-            key,
-            total_size: payload_bytes.len() as u64,
+        let msg = match target_list_for(op_manager, &update_tx, peer_addr, &peer_key, &fanout) {
+            Some(covered) => UpdateMsg::BroadcastToStreamingV2 {
+                id: update_tx,
+                stream_id: sid,
+                key,
+                total_size: payload_bytes.len() as u64,
+                covered,
+            },
+            // Pre-floor peer: build the message through the SAME unchanged
+            // expression it has always been built with, rather than a shared
+            // constructor parameterised on an `Option`. Calling identical code
+            // is a stronger guarantee that a pre-floor peer's bytes are
+            // untouched than any amount of branch review (#5167's rationale).
+            None => UpdateMsg::BroadcastToStreaming {
+                id: update_tx,
+                stream_id: sid,
+                key,
+                total_size: payload_bytes.len() as u64,
+            },
         };
         let net_msg: NetMessage = msg.into();
         // Serialize metadata for embedding in fragment #1 (fix #2757)
@@ -3714,14 +4030,28 @@ pub(super) async fn broadcast_to_single_peer(
         }
         send_res
     } else {
-        let msg = UpdateMsg::BroadcastTo {
-            id: update_tx,
-            key,
-            payload,
-            sender_summary_bytes: our_summary
-                .as_ref()
-                .map(|s| s.as_ref().to_vec())
-                .unwrap_or_default(),
+        let msg = match target_list_for(op_manager, &update_tx, peer_addr, &peer_key, &fanout) {
+            Some(covered) => UpdateMsg::BroadcastToV2 {
+                id: update_tx,
+                key,
+                payload,
+                sender_summary_bytes: our_summary
+                    .as_ref()
+                    .map(|s| s.as_ref().to_vec())
+                    .unwrap_or_default(),
+                covered,
+            },
+            // See the streaming twin: the legacy arm is the untouched original
+            // expression, deliberately duplicated rather than factored.
+            None => UpdateMsg::BroadcastTo {
+                id: update_tx,
+                key,
+                payload,
+                sender_summary_bytes: our_summary
+                    .as_ref()
+                    .map(|s| s.as_ref().to_vec())
+                    .unwrap_or_default(),
+            },
         };
         let res = bridge.send(peer_addr, msg.into()).await;
         // Non-streaming inline broadcasts have no separate transfer phase: a
