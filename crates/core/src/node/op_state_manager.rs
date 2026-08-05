@@ -3421,7 +3421,7 @@ mod tests {
     /// pins the encoding itself against a literal; this one pins that the
     /// routing decision actually reaches it.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_pre_floor_peer_receives_byte_identical_broadcast_traffic() {
+    async fn a_pre_floor_peer_receives_the_legacy_variant_index() {
         use crate::message::DeltaOrFullState;
         use crate::node::network_bridge::broadcast_queue::target_list_for;
         use crate::operations::update::UpdateMsg;

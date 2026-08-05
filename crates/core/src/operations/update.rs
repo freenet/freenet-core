@@ -1801,7 +1801,7 @@ mod tests {
     /// risk #5147 introduces, which is this enum. This is the byte-level form
     /// of the "a pre-floor peer receives byte-identical traffic" requirement;
     /// the routing-level form is
-    /// `a_pre_floor_peer_receives_byte_identical_broadcast_traffic` in
+    /// `a_pre_floor_peer_receives_the_legacy_variant_index` in
     /// `node/op_state_manager.rs`.
     #[test]
     fn legacy_broadcast_to_encoding_is_unchanged_by_the_v2_variants() {

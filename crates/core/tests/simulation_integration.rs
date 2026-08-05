@@ -17701,6 +17701,11 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
         control.sends + control.summary_skips + control.suppressed + control.sender_skips;
     let treatment_legs =
         treatment.sends + treatment.summary_skips + treatment.suppressed + treatment.sender_skips;
+    assert!(
+        control_legs > 0,
+        "premise: the control arm accounted for ZERO fan-out legs, so the \
+         tolerance below is 0 and the comparison passes vacuously"
+    );
     let leg_gap = control_legs.abs_diff(treatment_legs);
     let leg_tolerance = control_legs / 20; // 5%
     assert!(
@@ -17749,7 +17754,8 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
     // denominator for exactly this ratio (see its rustdoc) and was previously
     // gathered and never used. Cross-multiplied to stay in integers:
     //   treatment.redundant / treatment.deliveries < control.redundant / control.deliveries
-    // Measured: control 321/440 = 73.0%, treatment 136/236 = 57.6%.
+    // Measured after the gating fix: control 321/440 = 73.0%, treatment
+    // 160/260 = 61.5%.
     assert!(
         treatment.redundant * control.deliveries < control.redundant * treatment.deliveries,
         "#5147 reduced redundant deliveries ({} vs control {}) only in step with \
@@ -17776,8 +17782,15 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
     //
     // `full_state_sends` was captured and logged but never asserted, which left
     // the one number that reveals the inversion outside the test's reach.
-    // Measured: 16 in BOTH arms — the saving here is entirely in deltas
-    // (444 -> 240), so this holds with margin rather than by a hair.
+    //
+    // Measured after the gating fix: **16 in both arms**, saving entirely in
+    // deltas (444 -> 272). State that honestly: under a `<=` comparison, equal
+    // counts pass by exactly one step, not "with margin" as an earlier version
+    // of this comment claimed. And the direction of risk is real — every extra
+    // suppressed leg also suppresses the `sender_summary_bytes` piggyback named
+    // above, which is what would push the treatment arm's full-state count up.
+    // So if this ever reddens, the first hypothesis is that suppression grew,
+    // not that the test is brittle.
     assert!(
         treatment.full_state_sends <= control.full_state_sends,
         "#5147 cut broadcast legs ({} vs control {}) but pushed peers onto the \
@@ -17840,38 +17853,60 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
     );
 }
 
-/// **The multi-writer safety case for #5147.**
+/// **What suppression does under CONCURRENT WRITERS.**
 ///
-/// The target list attests DELIVERY, not state equality: it says "A sent this
-/// payload to C". But a relayer re-broadcasts its own POST-MERGE state, and
-/// under concurrent writers that state can be strictly newer than the payload
-/// it received. Suppressing C on A's say-so can therefore skip a leg that
-/// carried something C genuinely did not have.
+/// Renamed and rescoped after a reviewer showed the safety claim it originally
+/// made was one it could not support. Read the limits before quoting it.
 ///
-/// The headline measurement cannot see this. Every one of its updates
-/// originates from the gateway, so all peers merge the same payload into the
-/// same prior state, the relayer's state and the originator's payload agree,
-/// and suppression is correct by construction. That is the regime most
-/// favourable to the feature, and asserting safety only there would be
-/// assuming the answer.
+/// ## What this DOES establish
 ///
-/// Here the writer rotates across peers, so relayer-ahead-of-recipient is
-/// reachable on every round. What is asserted is SAFETY, not bandwidth:
+/// The feature engages under a rotating-writer workload, and its benefit is
+/// strongly regime-dependent:
 ///
-/// * nobody diverges, and
-/// * suppression does not cost the converged state any replicas.
+/// ```text
+/// control:   sends=459 redundant=319 suppressed=0
+/// treatment: sends=420 redundant=288 suppressed=229
+/// ```
 ///
-/// The second is the load-bearing one. Over-suppression does not hand a peer
-/// WRONG state — it hands it none — and a peer that stops receiving stops
-/// logging a state hash, so it silently leaves the denominator instead of being
-/// counted as diverged. Comparing replica counts across arms is what sees it.
+/// About -8.5% sends here against -37% in the single-writer test on the same
+/// topology. That gap is the point: every update in the headline measurement
+/// originates at the GATEWAY, and quoting its number as the expected fleet
+/// saving would overstate it, since real River traffic is multi-writer.
 ///
-/// Deliberately NOT asserted: any bandwidth reduction. The single-writer test
-/// owns that claim; duplicating it here would just be a second sample of the
-/// same mechanism, and a suppression fraction measured on this graph would not
-/// transfer to the fleet's anyway.
+/// ## What this does NOT establish, despite an earlier version claiming it
+///
+/// It does **not** show that suppression is safe against the design's sharpest
+/// hazard — that a relayer's post-merge state can be newer than the payload it
+/// received, so suppressing on DELIVERY can skip a leg carrying state the
+/// recipient lacks.
+///
+/// Demonstrated, not suspected: making suppression UNCONDITIONAL (drop every
+/// advertised co-host on any relayed fan-out — 480 suppressions, sends
+/// 459 -> 317) leaves this test GREEN, `diverged=0` and `replicas=7`. So its
+/// convergence assertions cannot detect over-suppression here, and three
+/// independent properties of the setup explain why:
+///
+/// * **Topology.** 7 peers at `max_connections: 12` is near-clique, so no peer
+///   depends on a relayer for any update; over-suppressing relay legs costs
+///   nobody state.
+/// * **Merge semantics.** The CRDT fixture is an LWW register with strictly
+///   increasing versions, so missing an OLDER update is harmless by
+///   construction — and `apply_crdt_full_state` returning `CurrentWon`
+///   re-broadcasts, which actively heals the case being probed.
+/// * **Settle window.** Convergence is checked after 90 simulated seconds of
+///   quiet, long enough for that healing to finish.
+///
+/// Closing it needs a workload where a recipient's ONLY path to newer state
+/// runs through the suppressing relayer — a sparser graph, equal-version
+/// writes that fork, or a settle window shorter than the heal — plus a counter
+/// asserting the relayer-ahead condition actually occurred rather than merely
+/// being reachable. Tracked rather than bodged in at the end of a long session.
+///
+/// The convergence assertions are kept because they are cheap and would catch a
+/// gross regression, but they are NOT evidence on the hazard above and must not
+/// be cited as such.
 #[test_log::test]
-fn test_5147_multi_writer_suppression_preserves_convergence() {
+fn test_5147_multi_writer_suppression_is_regime_dependent() {
     let control = run_5147_multi_writer_arm("5147-mw-control", false);
     let treatment = run_5147_multi_writer_arm("5147-mw-treatment", true);
 
@@ -17935,10 +17970,9 @@ fn test_5147_multi_writer_suppression_preserves_convergence() {
     // SAFETY: concurrent writers must not diverge under suppression.
     assert_eq!(
         treatment.diverged, 0,
-        "#5147 left {} contract(s) diverged under concurrent writers. This is \
-         the case the single-writer measurement cannot reach: a relayer whose \
-         post-merge state is newer than the payload it received suppressed a \
-         peer that needed the difference.",
+        "#5147 left {} contract(s) diverged under concurrent writers. A gross \
+         regression check only — see this test's rustdoc for why it cannot \
+         detect targeted over-suppression in this topology.",
         treatment.diverged,
     );
 

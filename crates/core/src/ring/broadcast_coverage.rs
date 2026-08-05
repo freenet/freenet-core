@@ -853,6 +853,47 @@ mod tests {
         assert!(covered.resolve(&tx(), [&peer]).is_empty());
     }
 
+    /// The receive-side cap must bound a list built OUTSIDE `from_targets`.
+    ///
+    /// `MAX_COVERED_PEERS` was enforced only in `from_targets`, which is sender
+    /// self-discipline — a remote peer's list arrives with whatever length it
+    /// chose. Every existing test constructs `CoveredPeers` through
+    /// `from_targets`, so it was already truncated before `resolve` saw it and
+    /// deleting the receive-side `.take()` made nothing red.
+    ///
+    /// This builds the struct directly, which is the actual threat model (an
+    /// oversized list off the wire), so the cap is tested as a property of the
+    /// TYPE rather than of one construction path.
+    ///
+    /// Mutation that must make this red: delete `.take(MAX_COVERED_PEERS)` in
+    /// `resolve`.
+    #[test]
+    fn resolve_bounds_an_oversized_inbound_list() {
+        let tx = tx();
+        let peers: Vec<TransportPublicKey> =
+            (0..(MAX_COVERED_PEERS + 12)).map(|_| pub_key()).collect();
+
+        // Every peer named, bypassing `from_targets`' truncation entirely.
+        let mut hashes: Vec<PeerHash> = peers.iter().map(|pk| peer_hash(&tx, pk)).collect();
+        hashes.sort_unstable();
+        hashes.dedup();
+        let oversized = CoveredPeers { hashes };
+        assert!(
+            oversized.len() > MAX_COVERED_PEERS,
+            "premise: the fixture must actually exceed the cap, or this test \
+             passes against any implementation"
+        );
+
+        let resolved = oversized.resolve(&tx, peers.iter());
+        assert!(
+            resolved.len() <= MAX_COVERED_PEERS,
+            "an inbound list of {} names resolved {} peers; the cap must hold \
+             for a list we did not build",
+            oversized.len(),
+            resolved.len()
+        );
+    }
+
     #[test]
     fn covered_peers_over_cap_truncates_rather_than_omitting() {
         let tx = tx();

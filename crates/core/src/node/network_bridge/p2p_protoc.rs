@@ -5081,77 +5081,6 @@ pub(crate) mod tests {
     /// The ordering is the whole fix, so the ordering is what is pinned: the
     /// fully-covered early return must precede the retry branch. Mutation-check
     /// when editing this — move the return after the retry branch and confirm
-
-    /// The PRODUCTION fan-out must pass its real target list to the queue.
-    ///
-    /// The #5147 simulation drives `broadcast_state_to_peers`, which is
-    /// `#[cfg(feature = "simulation_tests")]` and never compiled into a
-    /// production binary — the function says so itself: "production splits the
-    /// fan-out across a queue and rebuilds the list per leg, this one holds the
-    /// whole set in scope. A test that only exercises this branch proves
-    /// nothing about production."
-    ///
-    /// So the entire measured effect (44% fewer legs) came from a path that
-    /// does not ship, and the shipping path had no coverage. Two one-token
-    /// mutations made the feature INERT on the fleet while every test,
-    /// including that simulation, stayed green:
-    ///
-    ///   * pass `no_fanout()` instead of the built `fanout` at the enqueue
-    ///     loop — no leg ever carries a list;
-    ///   * drop `existing.fanout = fanout` on dedup replacement — a superseded
-    ///     list is sent for a different fan-out, which is over-suppression.
-    ///
-    /// Every other caller in the tree passes `no_fanout()`, so nothing
-    /// distinguished the two. This pins both anchors on the production side.
-    #[test]
-    fn production_fanout_passes_its_target_list_to_the_queue() {
-        const SOURCE: &str = include_str!("p2p_protoc/broadcast.rs");
-
-        // Bound the region to the production fan-out. `broadcast_state_change`
-        // is the non-simulation path; the sim twin lives in a separate
-        // cfg-gated fn and must not satisfy this pin.
-        let fn_anchor = "async fn handle_broadcast_state_change(";
-        let fn_start = SOURCE
-            .find(fn_anchor)
-            .expect("handle_broadcast_state_change renamed or removed");
-        let after_header = &SOURCE[fn_start + fn_anchor.len()..];
-        let body_end = [
-            after_header.find("\n    async fn "),
-            after_header.find("\n    pub(super) async fn "),
-        ]
-        .into_iter()
-        .flatten()
-        .min()
-        .map(|p| fn_start + fn_anchor.len() + p)
-        .unwrap_or(SOURCE.len());
-        let body = &SOURCE[fn_start..body_end];
-
-        assert!(
-            body.contains("fanout.clone()"),
-            "the production enqueue loop in handle_broadcast_state_change must \
-             pass the target list it just built. If this is `no_fanout()` the \
-             #5147 feature is inert on the fleet while the simulation — which \
-             drives the cfg(simulation_tests) twin — still reports suppression."
-        );
-        assert!(
-            !body.contains("no_fanout()"),
-            "the production fan-out must never hand the queue an empty target \
-             list; that is the shape of the inert-feature regression."
-        );
-
-        // The dedup-replacement refresh, whose own comment calls it the guard
-        // against the one direction this design refuses.
-        const QUEUE_SOURCE: &str = include_str!("broadcast_queue.rs");
-        assert!(
-            QUEUE_SOURCE.contains("existing.fanout = fanout;"),
-            "broadcast_queue must refresh the stored target list when a queued \
-             payload is replaced. Without it a superseded list rides a later \
-             fan-out and names peers that fan-out never touched — \
-             over-suppression. Every queue test passes an empty fanout, so no \
-             behavioural test distinguishes the two."
-        );
-    }
-
     /// this test FAILS.
     #[test]
     fn fully_covered_fanout_returns_before_the_no_target_retry() {
@@ -5228,13 +5157,6 @@ pub(crate) mod tests {
         // owns that assertion and the reasoning. Noted here so a reader of this
         // pin does not "restore symmetry" with the targets-found path: the two
         // are deliberately asymmetric because only one of them sends anything.
-        assert!(
-            branch.contains("pending_broadcasts") && branch.contains(".stash("),
-            "the fully-covered branch must REFRESH the #4359 stash, not discard \
-             it. Taking it without putting the current state back destroys an \
-             earlier give-up's only non-heartbeat recovery route; leaving a \
-             stale one queues superseded state for re-emission."
-        );
         // The condition must also exclude the case where the target set is
         // empty merely because co-hosts failed to RESOLVE. Those peers were not
         // served — they are unreachable — and calling that fan-out complete
@@ -5246,6 +5168,76 @@ pub(crate) mod tests {
              `proximity_resolve_failed == 0`; otherwise a fan-out that is empty \
              only because every co-host lookup failed is reported as a \
              completed broadcast"
+        );
+    }
+
+    /// The PRODUCTION fan-out must pass its real target list to the queue.
+    ///
+    /// The #5147 simulation drives `broadcast_state_to_peers`, which is
+    /// `#[cfg(feature = "simulation_tests")]` and never compiled into a
+    /// production binary — the function says so itself: "production splits the
+    /// fan-out across a queue and rebuilds the list per leg, this one holds the
+    /// whole set in scope. A test that only exercises this branch proves
+    /// nothing about production."
+    ///
+    /// So the entire measured effect (44% fewer legs) came from a path that
+    /// does not ship, and the shipping path had no coverage. Two one-token
+    /// mutations made the feature INERT on the fleet while every test,
+    /// including that simulation, stayed green:
+    ///
+    ///   * pass `no_fanout()` instead of the built `fanout` at the enqueue
+    ///     loop — no leg ever carries a list;
+    ///   * drop `existing.fanout = fanout` on dedup replacement — a superseded
+    ///     list is sent for a different fan-out, which is over-suppression.
+    ///
+    /// Every other caller in the tree passes `no_fanout()`, so nothing
+    /// distinguished the two. This pins both anchors on the production side.
+    #[test]
+    fn production_fanout_passes_its_target_list_to_the_queue() {
+        const SOURCE: &str = include_str!("p2p_protoc/broadcast.rs");
+
+        // Bound the region to the production fan-out. `broadcast_state_change`
+        // is the non-simulation path; the sim twin lives in a separate
+        // cfg-gated fn and must not satisfy this pin.
+        let fn_anchor = "async fn handle_broadcast_state_change(";
+        let fn_start = SOURCE
+            .find(fn_anchor)
+            .expect("handle_broadcast_state_change renamed or removed");
+        let after_header = &SOURCE[fn_start + fn_anchor.len()..];
+        let body_end = [
+            after_header.find("\n    async fn "),
+            after_header.find("\n    pub(super) async fn "),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .map(|p| fn_start + fn_anchor.len() + p)
+        .unwrap_or(SOURCE.len());
+        let body = &SOURCE[fn_start..body_end];
+
+        assert!(
+            body.contains("fanout.clone()"),
+            "the production enqueue loop in handle_broadcast_state_change must \
+             pass the target list it just built. If this is `no_fanout()` the \
+             #5147 feature is inert on the fleet while the simulation — which \
+             drives the cfg(simulation_tests) twin — still reports suppression."
+        );
+        assert!(
+            !body.contains("no_fanout()"),
+            "the production fan-out must never hand the queue an empty target \
+             list; that is the shape of the inert-feature regression."
+        );
+
+        // The dedup-replacement refresh, whose own comment calls it the guard
+        // against the one direction this design refuses.
+        const QUEUE_SOURCE: &str = include_str!("broadcast_queue.rs");
+        assert!(
+            QUEUE_SOURCE.contains("existing.fanout = fanout;"),
+            "broadcast_queue must refresh the stored target list when a queued \
+             payload is replaced. Without it a superseded list rides a later \
+             fan-out and names peers that fan-out never touched — \
+             over-suppression. Every queue test passes an empty fanout, so no \
+             behavioural test distinguishes the two."
         );
     }
 
