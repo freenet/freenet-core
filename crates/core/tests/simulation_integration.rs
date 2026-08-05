@@ -17272,6 +17272,42 @@ fn test_gateway_ack_version_unlocks_node_originated_summary_first_put() {
             },
         ),
     ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(120),
+        Duration::from_secs(30),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "ack-version cascade sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let delta_sends = GlobalTestMetrics::put_probe_existing_mesh_delta_sends();
+    let delta_bytes = GlobalTestMetrics::put_probe_existing_mesh_delta_bytes();
+    tracing::info!(
+        delta_sends,
+        delta_bytes,
+        "ack-version cascade: node-originated summary-first PUT counters"
+    );
+
+    assert_eq!(
+        delta_sends, 1,
+        "the NODE's PUT must reach the holder-found branch through its gateway \
+         link. This is 0 without the version-carrying ack — the emission gate \
+         fails closed on an unknown remote version and the summary-first block \
+         is skipped entirely"
+    );
+    assert!(
+        delta_bytes > 0,
+        "the probe must have shipped a real delta, not an empty one"
+    );
+
+    freenet::dev_tool::clear_crdt_contracts();
+}
+
 /// One arm of the #5147 suppression measurement: run an update workload over a
 /// co-host mesh and report what the fleet received.
 #[cfg(test)]
@@ -17383,36 +17419,6 @@ fn run_5147_suppression_arm(network_name: &str, target_list_enabled: bool) -> Su
     let result = sim.run_controlled_simulation(
         SEED,
         operations,
-        Duration::from_secs(120),
-        Duration::from_secs(30),
-    );
-    assert!(
-        result.turmoil_result.is_ok(),
-        "ack-version cascade sim failed: {:?}",
-        result.turmoil_result.err()
-    );
-
-    let delta_sends = GlobalTestMetrics::put_probe_existing_mesh_delta_sends();
-    let delta_bytes = GlobalTestMetrics::put_probe_existing_mesh_delta_bytes();
-    tracing::info!(
-        delta_sends,
-        delta_bytes,
-        "ack-version cascade: node-originated summary-first PUT counters"
-    );
-
-    assert_eq!(
-        delta_sends, 1,
-        "the NODE's PUT must reach the holder-found branch through its gateway \
-         link. This is 0 without the version-carrying ack — the emission gate \
-         fails closed on an unknown remote version and the summary-first block \
-         is skipped entirely"
-    );
-    assert!(
-        delta_bytes > 0,
-        "the probe must have shipped a real delta, not an empty one"
-    );
-
-    freenet::dev_tool::clear_crdt_contracts();
         Duration::from_secs(240),
         Duration::from_secs(90),
     );
