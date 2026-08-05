@@ -3326,16 +3326,23 @@ mod tests {
             payload: payload.clone(),
             sender_summary_bytes: summary.clone(),
         };
+        // What a pre-floor peer receives must still decode as the LEGACY
+        // variant, i.e. carry bincode variant index 1.
+        //
+        // This replaces an assertion that serialized the identical expression
+        // twice and compared it to itself — it carried this test's name and no
+        // input could make it red. The full field-order byte pin lives in
+        // `update.rs::legacy_broadcast_to_encoding_is_unchanged_by_the_v2_variants`,
+        // which compares against a hand-built literal; what is worth asserting
+        // HERE, next to the gate decision, is that the branch the gate selects
+        // is the one an old peer can parse at all.
+        let legacy_bytes = bincode::serialize(&legacy).expect("serialize legacy");
         assert_eq!(
-            bincode::serialize(&legacy).expect("serialize legacy"),
-            bincode::serialize(&UpdateMsg::BroadcastTo {
-                id: tx,
-                key,
-                payload: payload.clone(),
-                sender_summary_bytes: summary.clone(),
-            })
-            .expect("serialize reference"),
-            "a pre-floor peer's bytes must be exactly today's BroadcastTo"
+            u32::from_le_bytes(legacy_bytes[..4].try_into().expect("variant prefix")),
+            1,
+            "a pre-floor peer must receive bincode variant index 1 \
+             (`BroadcastTo`). Any other index is a message it cannot decode, \
+             and a failed decode CLOSES the connection rather than degrading."
         );
 
         // Now record an at-floor version and confirm the gate genuinely flips —
