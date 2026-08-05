@@ -5,6 +5,17 @@
 //! `DEFAULT_TELEMETRY_ENDPOINT`. The two features are independent by design —
 //! see `docs/design/otel-metrics-exporter.md`.
 
+use std::sync::OnceLock;
+
+use opentelemetry::metrics::{Counter, Histogram};
+use opentelemetry::{KeyValue, global};
+use opentelemetry_http::{Bytes, HttpClient, HttpError, Request, Response};
+use opentelemetry_otlp::{ExporterBuildError, MetricExporter, WithExportConfig, WithHttpConfig};
+use opentelemetry_sdk::{
+    Resource,
+    metrics::{Aggregation, Instrument, InstrumentKind, SdkMeterProvider, Stream},
+};
+
 use crate::config::OtelConfig;
 
 /// Why the OTel metrics exporter was not started.
@@ -73,16 +84,6 @@ pub(crate) fn resolve_metrics_endpoint(
     let base = cfg_endpoint.map(str::trim).filter(|s| !s.is_empty())?;
     Some(format!("{}/v1/metrics", base.trim_end_matches('/')))
 }
-
-use opentelemetry::metrics::{Counter, Histogram};
-use opentelemetry::{KeyValue, global};
-use opentelemetry_http::{Bytes, HttpClient, HttpError, Request, Response};
-use opentelemetry_otlp::{ExporterBuildError, MetricExporter, WithExportConfig, WithHttpConfig};
-use opentelemetry_sdk::{
-    Resource,
-    metrics::{Aggregation, Instrument, InstrumentKind, SdkMeterProvider, Stream},
-};
-use std::sync::OnceLock;
 
 /// Build one `freenet`-mode bearer token:
 /// `freenet/<pubkey>/<timestamp>/<signature>`, where `<signature>` is
@@ -269,7 +270,19 @@ pub(crate) fn build_provider(
         scope
             .spawn(move || build_provider_blocking(endpoint, pubkey, fingerprint, auth_signer))
             .join()
-            .expect("otel provider build thread panicked")
+            // A panic in the builder must surface as a build error, not
+            // propagate: `init` runs on node startup and metrics export must
+            // never be a startup dependency.
+            .unwrap_or_else(|panic| {
+                let msg = panic
+                    .downcast_ref::<&str>()
+                    .map(ToString::to_string)
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_owned());
+                Err(ExporterBuildError::InternalFailure(format!(
+                    "otel provider build thread panicked: {msg}"
+                )))
+            })
     })
 }
 
@@ -767,6 +780,92 @@ mod tests {
             .unwrap()
             .verify(payload.as_bytes(), &Signature::from_bytes(&sig_bytes))
             .expect("stock ed25519 verify after Montgomery->Edwards conversion");
+    }
+
+    #[test]
+    fn send_bytes_puts_a_verifiable_bearer_header_on_the_wire() {
+        use std::io::{Read, Write};
+
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+        // The full auth transport path: header injection plus the
+        // http::Request -> reqwest::blocking::Request conversion, observed
+        // from the collector's side of a real socket. Plain #[test], not
+        // tokio: the blocking client must stay out of async contexts.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 1024];
+            // Read until the body payload arrives; the client writes the
+            // whole request before waiting on the response.
+            while !raw.windows(14).any(|w| w == b"export-payload") {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .unwrap();
+            String::from_utf8_lossy(&raw).into_owned()
+        });
+
+        let keypair = crate::transport::TransportKeypair::new();
+        let pubkey_b58 = bs58::encode(keypair.public_key_bytes()).into_string();
+        let client = FreenetAuthClient {
+            inner: reqwest::blocking::Client::new(),
+            signer: keypair.auth_token_signer(),
+            pubkey_b58: pubkey_b58.clone(),
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("http://{addr}/v1/metrics"))
+            .body(Bytes::from_static(b"export-payload"))
+            .unwrap();
+        // futures' executor, not tokio: send_bytes blocks internally.
+        let response = futures::executor::block_on(client.send_bytes(request)).unwrap();
+        assert!(response.status().is_success());
+
+        let raw = server.join().unwrap();
+        let auth = raw
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+            .expect("Authorization header must reach the wire");
+        let token = auth
+            .split_once(':')
+            .unwrap()
+            .1
+            .trim()
+            .strip_prefix("Bearer ")
+            .expect("Bearer scheme");
+        let (payload, sig_b58) = token.rsplit_once('/').unwrap();
+        assert!(
+            payload.starts_with(&format!("freenet/{pubkey_b58}/")),
+            "wire token must carry this node's pubkey: {token}"
+        );
+        // Verify exactly like a collector would — see
+        // node_pubkey_is_verifiable_with_stock_ed25519.
+        let sig_bytes: [u8; 64] = bs58::decode(sig_b58)
+            .into_vec()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let edwards = curve25519_dalek::montgomery::MontgomeryPoint(keypair.public_key_bytes())
+            .to_edwards(0)
+            .unwrap()
+            .compress()
+            .to_bytes();
+        VerifyingKey::from_bytes(&edwards)
+            .unwrap()
+            .verify(payload.as_bytes(), &Signature::from_bytes(&sig_bytes))
+            .expect("wire bearer token must verify with stock ed25519");
+        assert!(
+            raw.contains("export-payload"),
+            "body must survive the http -> reqwest conversion"
+        );
     }
 
     #[test]
