@@ -1482,16 +1482,15 @@ mod tests {
         // Verify exit code 43 prevents restart (another instance already running)
         assert!(service_content.contains("RestartPreventExitStatus=43"));
 
-        // Regression for #3967: stale-orphan self-heal pre-flight. Because
+        // Regression for #3967: orphan self-heal pre-flight. Because
         // RestartPreventExitStatus=43 blocks restart on exit 43, the
-        // version-compare-and-kill must run as an ExecStartPre before the main
-        // ExecStart so a stale orphan can't hold the port forever.
+        // orphan-reap must run as an ExecStartPre before the main
+        // ExecStart so an init-adopted orphan can't hold the port forever.
         assert!(
             service_content.contains("ExecStartPre=")
-                && service_content.contains("Freenet version:")
                 && service_content.contains("kill -TERM")
                 && service_content.contains("kill -KILL"),
-            "systemd unit must run a stale-orphan version-compare-and-kill pre-flight (#3967)"
+            "systemd unit must run an orphan-reap pre-flight (#3967)"
         );
 
         // Verify graceful shutdown timeout is set. 45s = 30s drain
@@ -1583,13 +1582,12 @@ mod tests {
         // Verify exit code 43 prevents restart (another instance already running)
         assert!(service_content.contains("RestartPreventExitStatus=43"));
 
-        // Regression for #3967: stale-orphan self-heal pre-flight (system unit).
+        // Regression for #3967: orphan self-heal pre-flight (system unit).
         assert!(
             service_content.contains("ExecStartPre=")
-                && service_content.contains("Freenet version:")
                 && service_content.contains("kill -TERM")
                 && service_content.contains("kill -KILL"),
-            "system systemd unit must run a stale-orphan version-compare-and-kill pre-flight (#3967)"
+            "system systemd unit must run an orphan-reap pre-flight (#3967)"
         );
 
         // Logging routes to journal (same reasoning as the user-unit test).
@@ -1902,7 +1900,7 @@ mod tests {
 
             // Post-render the file on disk MUST carry the systemd-level `$$`
             // form for the shell identifiers the pre-flight relies on.
-            for needle in ["$$pid", "$$exe", "$$ondisk", "$$self", "$$(id -u)"] {
+            for needle in ["$$pid", "$$ppid", "$$self", "$$(id -u)"] {
                 assert!(
                     pre.contains(needle),
                     "{which} ExecStartPre must double shell dollars (missing `{needle}`); \
@@ -1917,13 +1915,7 @@ mod tests {
             // NB: we cannot blanket-assert absence of `$(id -u)` because the
             // VALID doubled form `$$(id -u)` contains it as a substring; the
             // `$$(id -u)` presence check above covers that identifier instead.
-            for bad in [
-                "/proc/$pid/",
-                "\"$pid\"",
-                "\"$exe\"",
-                "\"$ondisk\"",
-                "\"$self\"",
-            ] {
+            for bad in ["/proc/$pid/", "\"$pid\"", "\"$ppid\"", "\"$self\""] {
                 assert!(
                     !pre.contains(bad),
                     "{which} ExecStartPre contains bare single-`$` `{bad}` that systemd \
@@ -1967,11 +1959,18 @@ mod tests {
                  (#3967 round-2 RE-REVIEW)"
             );
 
-            // MUST-FIX #3/#4: kill is gated on PPID==1 AND (readable-version
-            // mismatch OR unreadable holder version). Render-level check.
+            // MUST-FIX #3: kill is gated on PPID==1 (init-adopted orphan).
+            // The former version-compare gate is deliberately GONE: sparing a
+            // current-version orphan wedges the unit into success-but-dead
+            // with the node unsupervised. Render-level check.
             assert!(
-                pre.contains("[ \"$$ppid\" = \"1\" ] &&"),
+                pre.contains("if [ \"$$ppid\" = \"1\" ]; then"),
                 "{which} ExecStartPre must require PPID==1 before killing (#3967 MUST-FIX 3)"
+            );
+            assert!(
+                !pre.contains("$$ondisk") && !pre.contains("$$hv"),
+                "{which} ExecStartPre must not version-gate the orphan kill — a \
+                 same-version orphan wedges the unit into unsupervised mode"
             );
 
             // Now emulate systemd's `$$` -> `$` collapse and confirm the body
