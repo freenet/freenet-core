@@ -1285,13 +1285,23 @@ pub(crate) async fn send_proactive_summary_notification(
             SummariesEmitter::Notification,
         );
 
-        if let Err(e) = op_manager
-            .notify_node_event(NodeEvent::SendInterestMessage {
-                target: *peer_addr,
-                message,
-            })
-            .await
-        {
+        // NON-blocking, deliberately. `notify_node_event` is a 30 s
+        // timeout-bounded blocking send on the bounded event-loop channel; this
+        // loop runs it once per recipient, and #5190 roughly 10x's the
+        // recipient count on a high-degree peer (at the measured 0.924
+        // suppression fraction at degree 17, nearly every co-host is covered
+        // and therefore newly notified). A blocking send per recipient is the
+        // #4145/#4231 back-pressure shape.
+        //
+        // This site meets `try_notify_node_event`'s criterion (2) exactly: a
+        // dropped summary notification is recovered by the ~5-minute
+        // InterestSync heartbeat, which is already this mechanism's stated
+        // backstop. The four best-effort Broadcast emitters were converted in
+        // #4231 for the same reason; this loop was missed.
+        if let Err(e) = op_manager.try_notify_node_event(NodeEvent::SendInterestMessage {
+            target: *peer_addr,
+            message,
+        }) {
             tracing::debug!(
                 contract = %key,
                 peer = %peer_addr,

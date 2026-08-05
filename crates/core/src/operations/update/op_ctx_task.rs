@@ -3369,18 +3369,32 @@ mod tests {
 
     /// Body of one relay-broadcast driver, whitespace-stripped.
     ///
-    /// Bounded at the next top-level `async fn` (or the test module) so a pin
-    /// cannot match a sibling driver or its own assertion strings.
+    /// Bounded at the next top-level fn (or the test module) so a pin cannot
+    /// match a sibling driver or its own assertion strings.
+    ///
+    /// All four visibility spellings are candidates, not just bare `async fn`:
+    /// matching only the bare form let the `drive_relay_broadcast_to` slice run
+    /// ~190 lines past its own end, swallowing two `pub(crate) async fn`
+    /// siblings. Harmless today (neither contains the needles) but the helper
+    /// would have been claiming a bound it did not enforce, which is the class
+    /// of defect these pins exist to catch.
     fn broadcast_driver_body(signature: &str) -> String {
         let src = include_str!("op_ctx_task.rs");
         let start = src
             .find(signature)
             .unwrap_or_else(|| panic!("{signature} not found"));
         let after = &src[start + 1..];
-        let end = after
-            .find("\nasync fn ")
-            .or_else(|| after.find("\n#[cfg(test)]"))
-            .unwrap_or(after.len());
+        let end = [
+            "\nasync fn ",
+            "\npub(crate) async fn ",
+            "\npub(super) async fn ",
+            "\npub async fn ",
+            "\n#[cfg(test)]",
+        ]
+        .iter()
+        .filter_map(|marker| after.find(marker))
+        .min()
+        .unwrap_or(after.len());
         src[start..start + 1 + end]
             .chars()
             .filter(|c| !c.is_whitespace())

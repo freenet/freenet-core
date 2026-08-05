@@ -4190,8 +4190,14 @@ impl GlobalTestMetrics {
     /// Records one fan-out target dropped because the originator's list named
     /// it (#5147).
     ///
-    /// Incremented BY the filter in `get_broadcast_targets_update`, alongside
-    /// its own `skipped_covered` field, never re-derived from the difference
+    /// The count is PRODUCED by the filter — `OpManager::broadcast_cohost_targets`,
+    /// which returns it as `covered_skipped` — and incremented by its
+    /// broadcast-side caller `get_broadcast_targets_update`, alongside that
+    /// function's own `skipped_covered` field. The increment sits at the caller
+    /// rather than in the filter because #5190 gave the filter a SECOND caller
+    /// (the proactive summary notification), and only one of the two represents
+    /// a suppressed send; incrementing inside would double-count. The count is
+    /// still never re-derived from the difference
     /// between the resolved co-host set and the final target set — that
     /// subtraction also absorbs the sender, self, and resolve-failure filters,
     /// so it would keep reporting a plausible number after this filter is
