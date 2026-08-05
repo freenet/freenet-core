@@ -90,11 +90,19 @@ type ShellMessage = {
 };
 
 async function shellMessages(page: Page): Promise<ShellMessage[]> {
-  return page.evaluate(
+  const all = await page.evaluate(
     () =>
       (window as unknown as { __freenetMessages: ShellMessage[] })
         .__freenetMessages,
   );
+  // The injected title-sync script posts a `title` message on every
+  // sandboxed-page load (and re-fires on each in-place navigate hop), fully
+  // independent of user interaction. Every call site of this helper asserts
+  // the exact sequence of CLICK-classification messages (navigate/open_url),
+  // so a `title` landing anywhere in that sequence is page-lifecycle noise,
+  // not a signal any of them are testing for — filter it out here rather
+  // than at each call site.
+  return all.filter((m) => m.type !== "title");
 }
 
 // Serve the RFC 2606 documentation domain from the test itself, so the tabs
@@ -737,4 +745,18 @@ test("browser Back restores the previous subpage via the popstate handler (#3839
   await expect(
     page.frameLocator("iframe#app").locator("#page2-title"),
   ).toHaveCount(0);
+});
+
+test("browser tab title reflects the contract's own <title>, with no bespoke sender required", async ({
+  page,
+}) => {
+  // The shell page's <title> is hardcoded ("Freenet") because the sandboxed
+  // iframe has no allow-same-origin and cannot touch document.title on the
+  // parent directly. fixture-webapp/index.html sets its own <title> and
+  // deliberately implements NO shell postMessage sender (see the comment at
+  // the top of that file) — the injected title-sync script
+  // (path_handlers.rs TITLE_SYNC_JS) must be what carries it to the tab.
+  await page.goto(shellUrl!);
+  await fixtureFrame(page);
+  await expect(page).toHaveTitle("Freenet shell smoke-test fixture");
 });
