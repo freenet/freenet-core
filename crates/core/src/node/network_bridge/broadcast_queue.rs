@@ -1831,6 +1831,168 @@ mod queue {
             }
         }
 
+        /// #5147: the PRODUCTION send site must decide the wire variant through
+        /// the version gate, and must build the legacy arm unchanged.
+        ///
+        /// `broadcast_to_single_peer` is the production message-construction
+        /// site and is exercised by no behavioural test — it needs a live
+        /// `P2pBridge` and `OpManager`, and the end-to-end simulation runs a
+        /// SEPARATE inline copy in `p2p_protoc/broadcast.rs`. A reviewer forced
+        /// both `match target_list_for(..)` expressions to their `None` arm —
+        /// making the feature entirely inert in production — and every lib test
+        /// still passed. This pin is what closes that hole.
+        #[test]
+        fn production_send_site_gates_both_v2_variants_on_the_version_check() {
+            const SOURCE: &str = include_str!("broadcast_queue.rs");
+
+            // Assembled with `concat!` rather than written whole, and NOT
+            // spelled out in any comment here either.
+            //
+            // This test module sits BEFORE the function in the file, and the
+            // pre-existing pins further down slice the function's body by
+            // searching for its signature from the top of the file. Any earlier
+            // occurrence — in a literal OR in a comment — makes those pins slice
+            // from here instead and assert against this test's text. Writing it
+            // out once broke two of them; writing it out in the comment
+            // explaining that fix broke them again.
+            let fn_anchor = concat!("pub(super) async fn ", "broadcast_to_single_", "peer(");
+            let start = SOURCE
+                .find(fn_anchor)
+                .expect("broadcast_to_single_peer renamed or removed");
+            let after = &SOURCE[start + fn_anchor.len()..];
+            let end = after
+                .find("\n#[cfg(test)]")
+                .or_else(|| after.find("\nmod "))
+                .map(|p| start + fn_anchor.len() + p)
+                .unwrap_or(SOURCE.len());
+            let body = &SOURCE[start..end];
+
+            for (variant, legacy) in [
+                ("UpdateMsg::BroadcastToV2 {", "UpdateMsg::BroadcastTo {"),
+                (
+                    "UpdateMsg::BroadcastToStreamingV2 {",
+                    "UpdateMsg::BroadcastToStreaming {",
+                ),
+            ] {
+                assert!(
+                    body.contains(variant),
+                    "the production send site must be able to emit `{variant}`. \
+                     Without it the whole feature is inert in production while \
+                     the simulation — which runs a SEPARATE inline copy of this \
+                     logic — still reports it working."
+                );
+                assert!(
+                    body.contains(legacy),
+                    "the production send site must keep emitting `{legacy}` for \
+                     pre-floor peers, byte-identically to today"
+                );
+            }
+
+            let gate = body
+                .find("target_list_for(")
+                .expect("the production send site must consult the version gate");
+            let first_v2 = body
+                .find("UpdateMsg::BroadcastToStreamingV2 {")
+                .expect("checked above");
+            assert!(
+                gate < first_v2,
+                "the version gate (offset {gate}) must be consulted BEFORE any \
+                 V2 variant is constructed (offset {first_v2}); a pre-floor \
+                 peer that receives one cannot decode it and the connection is \
+                 CLOSED"
+            );
+        }
+
+        /// #5147: the target list must survive the queue, and a dedup
+        /// replacement must REFRESH it.
+        ///
+        /// The full fan-out set exists only at `handle_broadcast_state_change`;
+        /// it is immediately split into one queue entry per target, and the
+        /// send site sees only its own peer. So the list rides on
+        /// `BroadcastEntry`, and the replace-on-dedup path has to update it in
+        /// lockstep with `new_state` — a superseded entry's list names peers a
+        /// DIFFERENT fan-out targeted, which is over-suppression, the one
+        /// direction this design refuses.
+        ///
+        /// This is also the only test that drives the PRODUCTION queue path:
+        /// the end-to-end simulation runs the `simulation_tests` inline branch,
+        /// a separate copy, so nothing else would notice if the queue dropped
+        /// the list entirely. Mutation-verified — replacing the refresh with a
+        /// no-op fails this test.
+        #[tokio::test(start_paused = true)]
+        #[serial_test::serial(broadcast_queue_depth_gauge)]
+        async fn the_queue_carries_the_target_list_and_refreshes_it_on_replacement() {
+            use crate::transport::TransportKeypair;
+
+            let queue = BroadcastQueue::new();
+            let group = LaneGroup {
+                small_pool: Arc::new(Semaphore::new(4)),
+                large_pool: Arc::new(Semaphore::new(4)),
+                upgrade_slots: Arc::new(Semaphore::new(super::super::MAX_PARKED_LANE_UPGRADES)),
+                small_notify: queue.small_notify.clone(),
+                large_notify: queue.large_notify.clone(),
+            };
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let worker = tokio::spawn(drain_lane(
+                QueuedPayloadClass::Small,
+                queue.queue.clone(),
+                group,
+                move |entry: BroadcastEntry, scheduling: QueueScheduling| {
+                    let tx = tx.clone();
+                    async move {
+                        let _scheduling = scheduling;
+                        let _ = tx.send(entry.fanout);
+                    }
+                },
+            ));
+
+            let key = contract(77);
+            let target = PeerKeyLocation::random();
+            let superseded: FanoutTargets =
+                Arc::new(vec![TransportKeypair::new().public().clone()]);
+            let current: FanoutTargets = Arc::new(vec![
+                TransportKeypair::new().public().clone(),
+                TransportKeypair::new().public().clone(),
+            ]);
+
+            // Two enqueues for the same (contract, peer): the second dedups
+            // onto the first and must win on BOTH state and target list.
+            queue
+                .enqueue_in_lane(
+                    QueuedPayloadClass::Small,
+                    key,
+                    target.clone(),
+                    state(16),
+                    superseded.clone(),
+                )
+                .await;
+            queue
+                .enqueue_in_lane(
+                    QueuedPayloadClass::Small,
+                    key,
+                    target,
+                    state(32),
+                    current.clone(),
+                )
+                .await;
+
+            let dispatched = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the drain must dispatch")
+                .expect("the drain must send the entry's fanout");
+
+            assert_eq!(
+                *dispatched, *current,
+                "the replacement's target list must reach the send site; a \
+                 superseded list names peers a different fan-out targeted, so \
+                 the recipient would suppress peers this broadcast never \
+                 delivered to"
+            );
+            assert_ne!(*dispatched, *superseded);
+
+            worker.abort();
+        }
+
         /// A lane drain can only exit on a closed pool, which nothing does in
         /// production. But there are TWO of them now, and the pre-#4961 failure
         /// — one worker exiting, so all broadcast draining stops — was at least
@@ -3205,19 +3367,6 @@ fn record_delivery_to_interest<T: crate::util::time_source::TimeSource + Sync>(
     }
 }
 
-/// Send a state change broadcast to a single peer.
-///
-/// This is the per-target body extracted from `broadcast_state_to_peers`.
-/// It handles delta computation, streaming vs inline decision, and telemetry.
-///
-/// For streaming sends, a completion oneshot is created internally and threaded
-/// through the stream send path. The function awaits it (with timeout) so the
-/// semaphore permit — owned by `scheduling`, dropped when this function returns
-/// — is held until the actual stream transfer finishes.
-///
-/// `scheduling` is `Some` exactly when the production queue dispatched this
-/// send, and carries both the lane it was classified into and that lane's
-/// permit. The sim fan-out calls in-line with `None` (no queue, no permits).
 /// Build the originator target list to attach to one leg of a fan-out (#5147),
 /// or `None` when the recipient is on a pre-floor release.
 ///
@@ -3233,14 +3382,29 @@ fn record_delivery_to_interest<T: crate::util::time_source::TimeSource + Sync>(
 /// would spend 8 bytes to say nothing.
 ///
 /// The list describes who we ENQUEUED to, which is not identical to who
-/// receives bytes. Most of the gap is benign and deliberately not corrected
-/// for: `fanout_send_needed` and the empty-delta return skip a peer precisely
-/// BECAUSE it already holds this state, so naming it is correct. The one gap
-/// that is not benign is queue eviction at capacity (`max_queue_depth`) — an
-/// evicted leg never sends, yet stays named — which over-suppresses under
-/// exactly the load that causes eviction. It is bounded by the queue depth and
-/// healed by the interest heartbeat; closing it would mean finalising the list
-/// only after dispatch, i.e. a second pass over the fan-out.
+/// receives bytes. Some of the gap is benign: the empty-delta return skips a
+/// peer precisely BECAUSE it already holds this state, so naming it is correct.
+///
+/// The rest is NOT benign, and the full list matters because every entry on it
+/// converts a transient one-hop loss into a network-visible divergence that
+/// heals only on the ~5-minute interest heartbeat:
+///
+/// * **Queue eviction at capacity** (`max_queue_depth`) — an evicted leg never
+///   sends, yet stays named, under exactly the load that causes eviction.
+/// * **Send failure** — `bridge.send` returning `Err`, a stream dropped or
+///   timed out before `Delivered`, or a payload that fails to serialize. These
+///   also cluster under congestion.
+/// * **`should_broadcast_contract` returning false**, and a target whose
+///   `socket_addr()` is `None`.
+/// * **`fanout_send_needed` skipping on a cached summary.** The skip means the
+///   peer already holds this state *according to our cache*, which is a belief,
+///   not an ack — see the wrongly-cached-summary caveat in this module. Before
+///   #5147 a wrong belief cost one leg and was corrected by the next
+///   comparison; now it is exported one hop and the relayer suppresses too.
+///
+/// None of these are corrected for here. Closing them means finalising the list
+/// only AFTER dispatch, i.e. a second pass over the fan-out, which the message
+/// cannot wait for. The bound on all of them is the interest heartbeat.
 pub(crate) fn target_list_for(
     op_manager: &Arc<OpManager>,
     tx: &crate::message::Transaction,
@@ -3261,6 +3425,19 @@ pub(crate) fn target_list_for(
     ))
 }
 
+/// Send a state change broadcast to a single peer.
+///
+/// This is the per-target body extracted from `broadcast_state_to_peers`.
+/// It handles delta computation, streaming vs inline decision, and telemetry.
+///
+/// For streaming sends, a completion oneshot is created internally and threaded
+/// through the stream send path. The function awaits it (with timeout) so the
+/// semaphore permit — owned by `scheduling`, dropped when this function returns
+/// — is held until the actual stream transfer finishes.
+///
+/// `scheduling` is `Some` exactly when the production queue dispatched this
+/// send, and carries both the lane it was classified into and that lane's
+/// permit. The sim fan-out calls in-line with `None` (no queue, no permits).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn broadcast_to_single_peer(
     bridge: &P2pBridge,

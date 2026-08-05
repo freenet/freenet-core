@@ -226,6 +226,19 @@ Current wire-gated floors:
   If the feature slips to a later release, RAISE THE FLOOR; do not set the
   marker to make the test pass.
 
+  **This floor DEPENDS on `GATEWAY_ACK_VERSION_MIN_VERSION` above and shares
+  its target release.** Until the version-carrying ack ships, a node never
+  learns its gateway's version, so this gate fails closed on every gateway link
+  no matter what the gateway actually runs. If the two are ever separated, this
+  one must not ship BEFORE that one, or it is inert on exactly the links that
+  carry the most fan-out.
+
+  Note also that a mis-set floor here is not symmetric with the others. Too low
+  closes connections, as above. Too high does not merely lose an optimisation
+  either — it is the *suppression* side that carries the risk, because a
+  wrongly-suppressed peer waits for the ~5-minute interest heartbeat. Bias
+  high, but understand that neither direction is free.
+
 When a NEW wire-gated feature first ships (not this one), set its floor to
 **exactly that release version** and freeze it, as described above.
 

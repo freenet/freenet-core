@@ -918,6 +918,29 @@ mod tests {
              propagation failure."
         );
 
+        // The fully-covered branch must NOT drop the #4359 stash: it sends
+        // nothing, so a stashed state that reached nobody is not superseded by
+        // it. Only the targets-found path, which does send, may drop it.
+        let covered_pos = source
+            .find("let fully_covered =")
+            .expect("the #5147 fully-covered branch is missing");
+        let retry_pos = source
+            .find("self.broadcast_retries.entry(key)")
+            .expect("the no-target retry branch is missing");
+        let covered_branch = &source[covered_pos..retry_pos];
+        assert!(
+            !covered_branch.contains("pending_broadcasts.take(")
+                || covered_branch.contains(".stash("),
+            "the fully-covered branch must not DISCARD the #4359 \
+             pending-broadcast stash. It sends zero bytes, so the stashed state \
+             — which by definition reached nobody — is not superseded by it, \
+             and the peers it suppressed hold the ORIGINATOR's payload, which \
+             does not contain that state. Taking the stash without putting the \
+             current state back deletes the only non-heartbeat recovery path \
+             for content that has never propagated. Refreshing it is correct; \
+             discarding it is not."
+        );
+
         // The no-target record must be gated on `!is_retry && !is_reemit` so
         // neither retry re-emissions (Codex P2) nor #4359 deferred-broadcast
         // re-emissions get counted as fresh misses (re-review SHOULD-FIX 5:

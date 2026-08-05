@@ -3045,29 +3045,6 @@ mod tests {
         op_manager.neighbor_hosting.contracts_for_peer(hub)
     }
 
-    /// Safety proof for #4642 step 9 (remove the Source-2 interest fan-out arm
-    /// from live UPDATE propagation). At the `get_broadcast_targets_update`
-    /// boundary this asserts the properties the removal must preserve:
-    ///
-    /// 1. An interest-only peer — registered in the interest manager but NOT
-    ///    advertising via the advertisement layer — is EXCLUDED from broadcast
-    ///    targets. This is the interest-but-not-yet-advertised (lagged
-    ///    advertisement) case; under the old two-source model it WOULD be a
-    ///    target via Source 2, and after step 9 it must not be.
-    /// 2. An advertised co-host (Source 1) is still INCLUDED.
-    /// 3. The advertisement-reconciliation heal restores the lagged peer: once
-    ///    our view of it includes the contract it becomes a broadcast target. The
-    ///    periodic interest heartbeat sends each neighbor a `HostingStateRequest`;
-    ///    the neighbor replies with a `HostingStateResponse` snapshot of its
-    ///    hosted set, which we full-replace into our Source-1 view
-    ///    (`ring.rs::interest_heartbeat`, #4722).
-    ///
-    /// This is the unit-level counterpart of the lagged-advertisement
-    /// convergence simulation: removing Source-2 is safe precisely because a
-    /// peer that is interested-but-not-yet-advertised is reached once its
-    /// advertisement lands in Source-1, live or via anti-entropy. See
-    /// `.claude/rules/hosting-invariants.md` invariant 1 and
-    /// `docs/design/demand-driven-hosting.md`.
     /// Shared fixture for the #5147 target-list tests: an op-manager whose
     /// advertised co-host set for one contract is `count` connected peers.
     ///
@@ -3450,6 +3427,29 @@ mod tests {
         assert_eq!(result.skipped_covered, 0);
     }
 
+    /// Safety proof for #4642 step 9 (remove the Source-2 interest fan-out arm
+    /// from live UPDATE propagation). At the `get_broadcast_targets_update`
+    /// boundary this asserts the properties the removal must preserve:
+    ///
+    /// 1. An interest-only peer — registered in the interest manager but NOT
+    ///    advertising via the advertisement layer — is EXCLUDED from broadcast
+    ///    targets. This is the interest-but-not-yet-advertised (lagged
+    ///    advertisement) case; under the old two-source model it WOULD be a
+    ///    target via Source 2, and after step 9 it must not be.
+    /// 2. An advertised co-host (Source 1) is still INCLUDED.
+    /// 3. The advertisement-reconciliation heal restores the lagged peer: once
+    ///    our view of it includes the contract it becomes a broadcast target. The
+    ///    periodic interest heartbeat sends each neighbor a `HostingStateRequest`;
+    ///    the neighbor replies with a `HostingStateResponse` snapshot of its
+    ///    hosted set, which we full-replace into our Source-1 view
+    ///    (`ring.rs::interest_heartbeat`, #4722).
+    ///
+    /// This is the unit-level counterpart of the lagged-advertisement
+    /// convergence simulation: removing Source-2 is safe precisely because a
+    /// peer that is interested-but-not-yet-advertised is reached once its
+    /// advertisement lands in Source-1, live or via anti-entropy. See
+    /// `.claude/rules/hosting-invariants.md` invariant 1 and
+    /// `docs/design/demand-driven-hosting.md`.
     #[tokio::test(flavor = "current_thread")]
     async fn broadcast_targets_are_advertised_cohosts_only_and_heal_via_advertisement() {
         use crate::ring::interest::PeerKey;

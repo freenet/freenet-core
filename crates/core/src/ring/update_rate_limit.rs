@@ -707,13 +707,16 @@ mod tests {
              messages don't pay the spawn cost"
         );
 
-        // (c) all four wire variants are matched in the dispatch, and
-        //     each spawn site is also present.
+        // (c) EVERY wire variant is matched in the dispatch, and each spawn
+        //     site is also present. Kept in step with the variant list in
+        //     `contract_ban_list.rs`; see the note there about #5147.
         for variant in [
             "UpdateMsg::RequestUpdate {",
             "UpdateMsg::BroadcastTo {",
             "UpdateMsg::RequestUpdateStreaming {",
             "UpdateMsg::BroadcastToStreaming {",
+            "UpdateMsg::BroadcastToV2 {",
+            "UpdateMsg::BroadcastToStreamingV2 {",
         ] {
             assert!(
                 block.contains(variant),

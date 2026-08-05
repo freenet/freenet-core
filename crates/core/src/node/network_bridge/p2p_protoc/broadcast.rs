@@ -301,7 +301,19 @@ impl P2pConnManager {
         // claim, suppresses nothing, and re-broadcasts to the whole co-host set
         // one backoff later — the suppressed traffic comes back, delayed, with
         // staler summaries than if it had been sent immediately.
+        //
+        // Two conditions beyond "empty and something was skipped", both from
+        // review:
+        //
+        // * `proximity_resolve_failed == 0`. A co-host whose `get_peer_by_pub_key`
+        //   lookup FAILED was not served — it is gone. Counting a fan-out as
+        //   complete when the only reason it is empty is that we could not
+        //   resolve anyone would swallow a genuine unreachability and skip the
+        //   retry that heals it.
+        // * The stash is only dropped when we actually sent something. See the
+        //   drop site below.
         let fully_covered = target_result.targets.is_empty()
+            && target_result.proximity_resolve_failed == 0
             && (target_result.skipped_covered > 0 || target_result.skipped_sender > 0);
         if fully_covered {
             tracing::debug!(

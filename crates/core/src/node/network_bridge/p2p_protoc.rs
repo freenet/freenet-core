@@ -5223,6 +5223,30 @@ pub(crate) mod tests {
             "the fully-covered branch must clear retry bookkeeping, or a \
              contract that was mid-retry-cycle keeps a stale entry"
         );
+        // It must not DISCARD the #4359 stash the way the targets-found path
+        // does — see `broadcast_path_feeds_propagation_stats_pin_test`, which
+        // owns that assertion and the reasoning. Noted here so a reader of this
+        // pin does not "restore symmetry" with the targets-found path: the two
+        // are deliberately asymmetric because only one of them sends anything.
+        assert!(
+            branch.contains("pending_broadcasts") && branch.contains(".stash("),
+            "the fully-covered branch must REFRESH the #4359 stash, not discard \
+             it. Taking it without putting the current state back destroys an \
+             earlier give-up's only non-heartbeat recovery route; leaving a \
+             stale one queues superseded state for re-emission."
+        );
+        // The condition must also exclude the case where the target set is
+        // empty merely because co-hosts failed to RESOLVE. Those peers were not
+        // served — they are unreachable — and calling that fan-out complete
+        // swallows a genuine failure the retry exists to heal.
+        assert!(
+            branch.contains("proximity_resolve_failed == 0")
+                || body[..covered_pos].contains("proximity_resolve_failed == 0"),
+            "the fully-covered condition must require \
+             `proximity_resolve_failed == 0`; otherwise a fan-out that is empty \
+             only because every co-host lookup failed is reported as a \
+             completed broadcast"
+        );
     }
 
     /// Phase 7 egress self-block pin (#4300). `handle_broadcast_state_change`

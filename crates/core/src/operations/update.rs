@@ -1761,12 +1761,21 @@ mod tests {
     /// The other half: a legacy `BroadcastTo` must serialize to EXACTLY the
     /// bytes it did before #5147, for a pre-floor peer.
     ///
-    /// Pinned against a hand-written literal rather than a re-serialization of
-    /// the same struct — the latter compares the encoder against itself and
-    /// would pass even if the whole layout moved. This is the byte-level form
+    /// The variant index and the `Vec<u8>` length prefix are hand-written
+    /// literals rather than re-serializations, so a change to THIS enum's
+    /// layout — a reordered field, a renumbered variant, a changed length
+    /// encoding — is caught. Field reordering is verified to fail it.
+    ///
+    /// Its limit, stated so nobody over-trusts it: `id`, `key`, and `payload`
+    /// are still produced by `bincode::serialize` of the same values, so a
+    /// layout change INSIDE `Transaction`, `ContractKey`, or `DeltaOrFullState`
+    /// moves both sides together and passes. Those types are shared with every
+    /// other message, so they have their own guards; this test is scoped to the
+    /// risk #5147 introduces, which is this enum. This is the byte-level form
     /// of the "a pre-floor peer receives byte-identical traffic" requirement;
     /// the routing-level form is
-    /// `a_pre_floor_peer_gets_the_legacy_variant` in `broadcast_queue.rs`.
+    /// `a_pre_floor_peer_receives_byte_identical_broadcast_traffic` in
+    /// `node/op_state_manager.rs`.
     #[test]
     fn legacy_broadcast_to_encoding_is_unchanged_by_the_v2_variants() {
         use crate::message::DeltaOrFullState;

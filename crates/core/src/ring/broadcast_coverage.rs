@@ -107,8 +107,9 @@ pub(crate) type PeerHash = [u8; 8];
 /// Maximum number of peers an originator will name in one broadcast.
 ///
 /// At the fleet median fan-out of 16-17 this never binds; it bounds the tail
-/// (`broadcasted_to` p90 is 58, max 138 on 0.2.119) so a single broadcast
-/// cannot attach a half-kilobyte list to every leg of a large fan-out.
+/// (`broadcasted_to` p90 is 58, max 138 on 0.2.119). 64 entries is 520 bytes
+/// on the wire, so the cap does not make the list small — it stops the max-138
+/// case from attaching nearly 1.1 KB to every one of 138 legs.
 ///
 /// **Over-cap behaviour is truncation, never omission.** A truncated list names
 /// fewer peers, so the relayer suppresses fewer of them and the result degrades
@@ -268,15 +269,32 @@ fn peer_hash(tx: &Transaction, pub_key: &TransportPublicKey) -> PeerHash {
 ///
 /// # Residual, stated rather than hidden
 ///
-/// Commit paths that emit `BroadcastStateChange` WITHOUT going through
-/// `update_contract` — the executor-internal replay, and the second emitter at
-/// `executor_impl.rs`'s `broadcast_state_change` — do not register, so they can
-/// take an entry belonging to a concurrent relay apply of the same contract.
-/// That one IS over-suppression. It needs a same-contract PUT-or-replay
-/// concurrent with a relayed update, inside one contract-handler round trip;
-/// it is bounded by [`COVERAGE_TTL`] and healed by the interest heartbeat.
-/// Closing it means threading provenance through the WASM/contract-handler
-/// layer, which is the tradeoff #5147 chose against.
+/// Every path that emits `BroadcastStateChange` WITHOUT registering can take an
+/// entry belonging to a concurrent relay apply of the same contract. That IS
+/// over-suppression. The complete list, which must be kept complete — a partial
+/// one is worse than none, because it reads as an audit:
+///
+/// * `contract_ops.rs`'s two PUT commit sites and the executor-internal replay
+///   at `executor_impl.rs`, none of which route through `update_contract`.
+/// * `executor_impl.rs`'s standalone `broadcast_state_change`.
+/// * The no-target retry re-emission (`p2p_protoc/broadcast.rs`, `is_retry`).
+///   Its own claim was consumed by the attempt that scheduled it, so it takes
+///   whatever a concurrent apply has since registered.
+/// * The #4359 stash flush (`op_state_manager.rs`'s
+///   `emit_pending_broadcast_reemit_on`). This is the worst victim of the set:
+///   the state it re-drives is by definition one that reached NOBODY, so
+///   suppressing its fan-out against someone else's claim withholds content
+///   that has never propagated at all.
+///
+/// Each needs a same-contract emission concurrent with a relayed update inside
+/// one contract-handler round trip. All are bounded by [`COVERAGE_TTL`] and
+/// healed by the interest heartbeat. Closing them means either threading
+/// provenance through the WASM/contract-handler layer — the tradeoff #5147
+/// chose against — or having each of these paths register
+/// [`BroadcastOrigin::local`], which is cheap and would collapse the whole
+/// class; the latter is the better fix and is not done here only because it
+/// touches five call sites in three modules that this change otherwise leaves
+/// alone.
 pub(crate) struct BroadcastCoverageStore {
     entries: DashMap<ContractInstanceId, CoverageEntry>,
 }
@@ -476,6 +494,22 @@ impl BroadcastCoverageStore {
     /// `BroadcastStateChange` will ever come for it.
     pub(crate) fn discard(&self, key: &ContractInstanceId) {
         self.entries.remove(key);
+    }
+
+    /// Age every entry past [`COVERAGE_TTL`].
+    ///
+    /// The store reads `Instant::now()` directly rather than going through
+    /// `TimeSource`, so expiry is otherwise only reachable by sleeping for the
+    /// TTL. That would make the expiry branches untestable in practice, which
+    /// is how the `min(stale_deadline, now + TTL)` bug in `register` survived
+    /// review — it kept the PAST deadline and left every replacement of an
+    /// orphaned entry dead on arrival, in the one branch no test could reach.
+    #[cfg(test)]
+    pub(crate) fn expire_all_for_test(&self) {
+        let past = Instant::now() - COVERAGE_TTL - Duration::from_secs(1);
+        for mut entry in self.entries.iter_mut() {
+            entry.expires_at = past;
+        }
     }
 
     #[cfg(test)]
@@ -877,6 +911,116 @@ mod tests {
         }
 
         assert_eq!(store.take(&key), relayed(HashSet::from([peer])));
+    }
+
+    /// Regression test for the `min(past_deadline, now + TTL)` bug.
+    ///
+    /// When `register` finds an EXPIRED entry it replaces the claim — but it
+    /// used to keep the earlier of the two deadlines, which for an expired
+    /// entry is the past one. The fresh claim was therefore expired the instant
+    /// it was written, and the branch whose comment says it must not discard
+    /// this apply's coverage discarded exactly that. Direction was safe
+    /// (under-suppression), which is why nothing else caught it.
+    #[test]
+    fn replacing_an_expired_entry_leaves_the_new_claim_usable() {
+        let store = BroadcastCoverageStore::new();
+        let key = instance_id();
+        let orphaned = PeerKey::from(pub_key());
+        let live = PeerKey::from(pub_key());
+
+        store.register(&key, relayed(HashSet::from([orphaned.clone()])));
+        store.expire_all_for_test();
+        store.register(&key, relayed(HashSet::from([live.clone()])));
+
+        let taken = store.take(&key);
+        assert!(
+            taken.covers(&live.0),
+            "the replacement claim must be usable; it was written after the \
+             stale one expired and belongs to a live apply"
+        );
+        assert!(
+            !taken.covers(&orphaned.0),
+            "the orphaned claim must not survive its replacement"
+        );
+    }
+
+    /// Two concurrent applies delivered by DIFFERENT senders must not leave
+    /// either sender excluded.
+    ///
+    /// The covered sets narrow by intersection, but the sender is a single
+    /// value with no meaningful intersection: keeping either one would exclude
+    /// a peer that did not send the update this fan-out belongs to, which is
+    /// over-suppression. `narrow` therefore drops it.
+    #[test]
+    fn narrow_drops_a_disagreeing_sender() {
+        let store = BroadcastCoverageStore::new();
+        let key = instance_id();
+        let shared = PeerKey::from(pub_key());
+        let first: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let second: SocketAddr = "127.0.0.1:2".parse().unwrap();
+
+        store.register(
+            &key,
+            BroadcastOrigin::relayed(first, HashSet::from([shared.clone()])),
+        );
+        store.register(
+            &key,
+            BroadcastOrigin::relayed(second, HashSet::from([shared.clone()])),
+        );
+
+        let taken = store.take(&key);
+        assert_eq!(
+            taken.sender(),
+            None,
+            "with two candidate senders we cannot tell which delivery this \
+             fan-out belongs to, so neither may be excluded"
+        );
+        assert!(
+            taken.covers(&shared.0),
+            "the agreed coverage survives; only the sender is dropped"
+        );
+    }
+
+    /// The same sender registering twice keeps its exclusion — otherwise the
+    /// test above would pass against a `narrow` that unconditionally cleared
+    /// the sender, and the exclusion would be silently inert under any
+    /// concurrency at all.
+    #[test]
+    fn narrow_keeps_an_agreeing_sender() {
+        let store = BroadcastCoverageStore::new();
+        let key = instance_id();
+        let sender: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+        store.register(&key, BroadcastOrigin::relayed(sender, HashSet::new()));
+        store.register(&key, BroadcastOrigin::relayed(sender, HashSet::new()));
+
+        assert_eq!(store.take(&key).sender(), Some(&sender));
+    }
+
+    /// The wire type must survive a bincode round trip with real content — the
+    /// unit tests otherwise only ever construct it in-process, and the wire
+    /// pin in `update.rs` only ever embeds an EMPTY list.
+    #[test]
+    fn covered_peers_round_trips_over_the_wire_with_content() {
+        let tx = tx();
+        let peers: Vec<TransportPublicKey> = (0..17).map(|_| pub_key()).collect();
+        let covered = CoveredPeers::from_targets(&tx, peers.iter());
+
+        let bytes = bincode::serialize(&covered).expect("serialize");
+        let decoded: CoveredPeers = bincode::deserialize(&bytes).expect("deserialize");
+        assert_eq!(decoded, covered);
+        assert_eq!(decoded.resolve(&tx, peers.iter()).len(), peers.len());
+
+        // The size claim that the whole exact-list-beats-Bloom argument rests
+        // on: at the fleet median fan-out of 17 the encoding must stay in the
+        // ~144-byte range the design compared against the Bloom's 144.
+        assert_eq!(
+            bytes.len(),
+            8 + 17 * 8,
+            "17 eight-byte hashes plus bincode's u64 length prefix; if this \
+             grows, the cost argument against the retired Bloom design moves \
+             with it"
+        );
     }
 
     #[test]
