@@ -313,56 +313,36 @@ impl Executor<Runtime> {
                     )));
                 }
 
-                // Register exactly as `RegisterDelegate` does, THEN run the
-                // one-shot, Local-scope copy-forward of the predecessors' secrets.
-                // The copy is best-effort and never fails registration: a
-                // refused/absent/partly-unreadable predecessor is recorded in the
-                // report and logged, but the successor still registers. See
-                // `SecretsStore::migrate_secrets` for the full contract.
-                match self.register_delegate_and_record_origin(
-                    delegate,
-                    cipher,
-                    nonce,
-                    origin_contract,
-                ) {
-                    Ok(key) => {
-                        // Record the originating web-app contract (when present).
-                        // `ContractInstanceId::as_bytes` is the 32-byte id;
-                        // `try_into` never fails but is used to stay panic-free.
-                        let origin_bytes: Option<[u8; 32]> =
-                            origin_contract.and_then(|c| c.as_bytes().try_into().ok());
-                        let report =
-                            self.runtime
-                                .migrate_delegate_secrets(&deduped, &key, origin_bytes);
-                        if report.total_errors() > 0 {
-                            tracing::warn!(
-                                delegate_key = %key,
-                                predecessors = deduped.len(),
-                                copied = report.total_copied(),
-                                skipped_existing = report.total_skipped_existing(),
-                                user_scope_skipped = report.total_user_scope_skipped(),
-                                errors = report.total_errors(),
-                                phase = "secret_copy_forward",
-                                "delegate secret copy-forward completed with errors"
-                            );
-                        } else {
-                            tracing::info!(
-                                delegate_key = %key,
-                                predecessors = deduped.len(),
-                                copied = report.total_copied(),
-                                skipped_existing = report.total_skipped_existing(),
-                                user_scope_skipped = report.total_user_scope_skipped(),
-                                phase = "secret_copy_forward",
-                                "delegate secret copy-forward completed"
-                            );
-                        }
-                        Ok(DelegateResponse {
-                            key,
-                            values: Vec::new(),
-                        })
-                    }
-                    Err(err) => Err(err),
+                // SECURITY (freenet/freenet-core#5198): the predecessor secret
+                // copy-forward below `self.runtime.migrate_delegate_secrets(...)`
+                // is INTENTIONALLY NEVER CALLED. `SecretsStore::migrate_secrets`
+                // gates the copy on `origin_contract` matching the predecessor's
+                // recorded first-registration origin, but `origin_contract` is
+                // forgeable by any HTTP client through the webapp-shell token
+                // issuance path (see #5198 for the full exploit chain) — so the
+                // gate does not actually authorize anything. Do NOT re-enable
+                // this call without first hardening how `origin_contract` is
+                // attested; the gate itself remains sound given a trustworthy
+                // origin. The feature has zero known callers (every app in this
+                // ecosystem has its own client-driven secret-continuity
+                // mechanism instead), so disabling it changes no observed
+                // behavior. Registration proceeds exactly as `RegisterDelegate`.
+                if !deduped.is_empty() {
+                    tracing::warn!(
+                        delegate_key = %delegate.key(),
+                        predecessors = deduped.len(),
+                        "RegisterDelegateWithPredecessors: predecessor secret \
+                         copy-forward is disabled pending a security fix (see \
+                         freenet/freenet-core#5198); registering the delegate \
+                         without migrating any secrets"
+                    );
                 }
+
+                self.register_delegate_and_record_origin(delegate, cipher, nonce, origin_contract)
+                    .map(|key| DelegateResponse {
+                        key,
+                        values: Vec::new(),
+                    })
             }
             DelegateRequest::UnregisterDelegate(key) => {
                 self.delegate_origin_ids.remove(&key);

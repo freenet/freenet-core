@@ -100,37 +100,38 @@ async fn delegate_app_msg(
     }
 }
 
-/// E2E test for the delegate secret copy-forward feature's H1 same-origin gate
-/// (#4117), exercised end-to-end over token-less raw WebSocket connections.
+/// E2E test for `RegisterDelegateWithPredecessors`'s secret copy-forward,
+/// exercised end-to-end over token-less raw WebSocket connections.
 ///
 /// A delegate's on-disk key is BLAKE3(code_hash || params), so any WASM
 /// rebuild (or, as here, a param change simulating one) mints a new key and
 /// a new, empty secret namespace. `DelegateRequest::RegisterDelegateWithPredecessors`
-/// carries Local-scope secrets forward from a list of predecessor keys into
-/// the newly-registered successor's namespace so `get_secret` can resolve
-/// under the new key — but ONLY when the registering request's web-app origin
-/// equals the predecessor's FIRST-registration origin (the H1 same-origin
-/// gate; see `SecretsStore::migrate_secrets`). A raw WS connection like the
-/// one this test harness opens carries no web-app origin attestation, so both
-/// registrations below run with `origin_contract = None`; `None` is NEVER
-/// privileged by the gate (not even against a predecessor with no recorded
-/// origin), so the copy-forward is REFUSED.
+/// was designed to carry Local-scope secrets forward from a list of
+/// predecessor keys into the newly-registered successor's namespace, gated by
+/// an H1 same-origin check in `SecretsStore::migrate_secrets` — but as of
+/// freenet/freenet-core#5198, the copy-forward call is UNCONDITIONALLY
+/// DISABLED at the handler level (`crates/core/src/contract/executor/runtime/delegates.rs`):
+/// `origin_contract` is forgeable by any HTTP client, so the H1 gate cannot
+/// actually authorize anything, and re-enabling the copy needs that fixed
+/// first. This test's raw WS connection carries no origin attestation at all
+/// (`origin_contract = None`), which was already unprivileged even before
+/// #5198 — so this test exercises the same observable outcome (copy refused)
+/// both before and after the fix, but for a different reason now (disabled
+/// entirely, not merely None-unprivileged).
 ///
 /// This test registers a "predecessor" delegate (test-delegate-2), stores a
 /// Local-scope secret in it via `set_secret` (exercised through the
 /// `StoreSecret` app message), then registers a "successor" delegate — same
 /// WASM, different params, so a DIFFERENT `DelegateKey` — via
 /// `RegisterDelegateWithPredecessors` naming the predecessor. It asserts that
-/// registration itself still succeeds (the gate never fails registration,
-/// only the copy), that the successor genuinely has NO migrated secret (the
-/// refusal took effect), and that the predecessor's own copy is untouched
-/// (no-delete invariant, independent of the gate outcome). The
-/// successful-copy path — where the registering origin matches the
-/// predecessor's recorded origin — is covered end-to-end by the store-level
-/// `migrate_secrets` tests and the handler-level
-/// `register_delegate_with_predecessors_copies_secrets_forward` test in
-/// `crates/core/src`, both of which can inject an origin directly; this raw-WS
-/// harness has no way to attach a web-app origin to a connection.
+/// registration itself still succeeds (disabling the copy never fails
+/// registration), that the successor genuinely has NO migrated secret, and
+/// that the predecessor's own copy is untouched (no-delete invariant). The
+/// handler-level `register_delegate_with_predecessors_never_copies_secrets`
+/// test in `crates/core/src` covers the stronger claim directly (copy refused
+/// even when `origin_contract` DOES match the predecessor's recorded origin);
+/// this raw-WS harness has no way to attach any origin to a connection, so it
+/// only ever exercises the `None` case.
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn test_delegate_secret_copy_forward_e2e_refuses_token_less_origin() -> anyhow::Result<()> {
     // Same WASM, different params => different DelegateKeys
@@ -288,14 +289,13 @@ async fn test_delegate_secret_copy_forward_e2e_refuses_token_less_origin() -> an
             }
         }
 
-        // Step 5: The successor must NOT resolve the migrated SecretsId. Both
-        // registrations above ran over a token-less connection
-        // (`origin_contract = None`), and the H1 same-origin gate never
-        // privileges `None` — so `migrate_secrets` refused the copy
-        // (`origin_refused`, and `no_provenance` too since this predecessor was
-        // never given a recorded origin). Registration itself still succeeded
-        // (Step 4), demonstrating the gate never fails registration, only the
-        // copy.
+        // Step 5: The successor must NOT resolve the migrated SecretsId.
+        // Copy-forward is unconditionally disabled (#5198), so this holds
+        // regardless of origin — this token-less connection additionally
+        // carries `origin_contract = None`, which was already unprivileged
+        // under the underlying H1 gate even before #5198. Registration
+        // itself still succeeded (Step 4): disabling the copy never fails
+        // registration.
         match delegate_app_msg(
             &mut client,
             &succ_key,
@@ -306,15 +306,13 @@ async fn test_delegate_secret_copy_forward_e2e_refuses_token_less_origin() -> an
         {
             OutboundAppMessage::SecretResult(None) => {
                 tracing::info!(
-                    "Successor correctly has NO migrated secret — the H1 same-origin gate \
-                     refused the token-less (None-origin) copy-forward, as expected"
+                    "Successor correctly has NO migrated secret — copy-forward is disabled (#5198)"
                 );
             }
             OutboundAppMessage::SecretResult(Some(value)) => {
                 return Err(anyhow!(
-                    "successor unexpectedly read a migrated secret ({} bytes) via a \
-                     token-less registration — the H1 same-origin gate should have refused \
-                     this copy (None is never privileged)",
+                    "successor unexpectedly read a migrated secret ({} bytes) — copy-forward \
+                     must be unconditionally disabled (#5198)",
                     value.len()
                 ));
             }
@@ -347,8 +345,8 @@ async fn test_delegate_secret_copy_forward_e2e_refuses_token_less_origin() -> an
         }
 
         tracing::info!(
-            "Delegate secret copy-forward E2E checks passed: token-less registration \
-             succeeded, and the H1 same-origin gate correctly refused the copy!"
+            "Delegate secret copy-forward E2E checks passed: registration succeeded, \
+             and the copy-forward (disabled, #5198) correctly copied nothing"
         );
         Ok::<_, anyhow::Error>(())
     });

@@ -1506,21 +1506,18 @@ mod remove_contract_tests {
             .with_extension("wasm")
     }
 
-    /// Handler-level (#4117): a `RegisterDelegateWithPredecessors` request
-    /// registers the successor AND copies a predecessor's Local secret into the
-    /// successor's namespace end-to-end — the request→register→migrate→disk
-    /// wiring that the store-level `migrate_secrets` tests do not cover. Verified
-    /// on disk (the successor's secret file materializes), so no successor
-    /// secret-store handle is needed. Also asserts the one-shot marker prevents
-    /// resurrection when the delegate re-registers after the user deletes a copy.
-    ///
-    /// Exercises the H1 same-origin gate (#4117): the predecessor's
-    /// FIRST-registration origin is recorded as `Some(ORIGIN)` before the
-    /// migrating registration, and the registration itself supplies
-    /// `origin_contract = Some(&contract_instance_id)` whose bytes equal
-    /// `ORIGIN` — otherwise the copy would be refused as `no_provenance`.
+    /// Handler-level (freenet/freenet-core#5198): `RegisterDelegateWithPredecessors`
+    /// NEVER copies a predecessor's secrets, even when the registering request's
+    /// `origin_contract` exactly matches the predecessor's recorded
+    /// first-registration origin (the one case the H1 same-origin gate in
+    /// `SecretsStore::migrate_secrets` would otherwise allow). The copy-forward
+    /// call is disabled at the handler level because `origin_contract` itself is
+    /// forgeable by any HTTP client (see #5198) — so even a "matching" origin
+    /// proves nothing. Registration still succeeds, exactly as plain
+    /// `RegisterDelegate` would. This replaces the pre-#5198 test asserting the
+    /// copy DID happen on a matching origin.
     #[tokio::test(flavor = "multi_thread")]
-    async fn register_delegate_with_predecessors_copies_secrets_forward() {
+    async fn register_delegate_with_predecessors_never_copies_secrets() {
         use crate::wasm_runtime::SecretScope;
         use freenet_stdlib::client_api::{DelegateRequest, HostResponse};
         use freenet_stdlib::prelude::{
@@ -1605,29 +1602,24 @@ mod remove_contract_tests {
             other => panic!("expected DelegateResponse, got {other:?}"),
         }
 
-        // The predecessor's Local secret was copied into the successor namespace.
-        assert!(
-            successor_secret_path.exists(),
-            "successor secret file must exist after copy-forward"
-        );
-
-        // One-shot / anti-resurrection at the handler level: delete the copy and
-        // re-register — the marker must make the re-run a no-op (the marker gate
-        // short-circuits before the origin gate, so the same origin is supplied
-        // here purely for realism, not because it's load-bearing for this part).
-        std::fs::remove_file(&successor_secret_path).expect("remove copied secret");
-        let req2 = DelegateRequest::RegisterDelegateWithPredecessors {
-            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ.clone())),
-            cipher: [7u8; 32],
-            nonce: [9u8; 24],
-            predecessors: vec![pred.key().clone()],
-        };
-        executor
-            .delegate_request(req2, Some(&origin_contract), None, None)
-            .expect("re-registration must succeed");
+        // The predecessor's Local secret must NOT be copied — the copy-forward
+        // is unconditionally disabled (#5198), even though the supplied
+        // `origin_contract` matches the predecessor's recorded origin exactly
+        // (the one case the underlying H1 gate would otherwise have allowed).
         assert!(
             !successor_secret_path.exists(),
-            "one-shot marker must prevent resurrection on re-registration"
+            "successor secret file must NOT exist: copy-forward is disabled (#5198) \
+             regardless of origin_contract"
+        );
+
+        // The predecessor's own secret is untouched (registration never mutates
+        // or deletes a predecessor's data, disabled copy-forward or not).
+        let predecessor_secret_path = secrets_dir
+            .join(pred.key().encode())
+            .join(secret_id.encode());
+        assert!(
+            predecessor_secret_path.exists(),
+            "predecessor secret must remain untouched"
         );
     }
 
@@ -1638,8 +1630,10 @@ mod remove_contract_tests {
     /// registered (no `.reg` file) and no predecessor secret is copied, so a
     /// registered-but-recordless delegate (a claimable first-writer slot an
     /// attacker could later name as its own) can never exist. Once the disk
-    /// recovers, the app's retry registers, records, and copies normally. Uses
-    /// the fault-injecting redb backend to fail the origin-record write on demand.
+    /// recovers, the app's retry registers and records normally (copy-forward
+    /// itself is unconditionally disabled, #5198, so it never copies — see
+    /// the final assertion). Uses the fault-injecting redb backend to fail the
+    /// origin-record write on demand.
     #[cfg(feature = "redb")]
     #[tokio::test(flavor = "multi_thread")]
     async fn register_aborts_when_origin_record_fails_then_recovers() {
@@ -1806,9 +1800,12 @@ mod remove_contract_tests {
             succ_reg_path.exists(),
             "after recovery the successor IS registered (.reg present)"
         );
+        // Copy-forward is unconditionally disabled (#5198): the retry succeeds
+        // (registration itself was only ever blocked by the origin-record
+        // write failure, now healed), but no secret is ever copied.
         assert!(
-            succ_secret_path.exists(),
-            "after recovery the predecessor secret IS copied forward"
+            !succ_secret_path.exists(),
+            "the predecessor secret must NOT be copied forward: copy-forward is disabled (#5198)"
         );
     }
 
