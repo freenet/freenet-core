@@ -15,6 +15,15 @@
   var lastSent = null;
   function sendTitle() {
     var title = document.title;
+    // A page with no <title> at all (document.title === '') is left alone
+    // rather than resetting the tab: on a multi-page contract site reached
+    // via an in-place navigate hop, this means the tab keeps showing the
+    // PREVIOUS page's real title rather than reverting to "Freenet". That's
+    // a deliberate choice, not an oversight — a stale-but-real title is a
+    // narrower, already-strictly-better-than-baseline edge case (before this
+    // script existed the tab showed "Freenet" unconditionally, always), and
+    // "what should an untitled page show instead" is a separate product
+    // decision this fix doesn't make unilaterally.
     if (!title || title === lastSent) return;
     lastSent = title;
     window.parent.postMessage(
