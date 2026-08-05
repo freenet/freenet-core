@@ -1497,15 +1497,6 @@ impl P2pConnManager {
                     );
                 }
 
-                // Periodic ReadyState re-broadcast: if we are ready and have readiness
-                // gating enabled, re-broadcast our ReadyState to all peers every 30s.
-                // This ensures lost ReadyState messages are recovered within one tick.
-                if op_manager.ring.connection_manager.min_ready_connections > 0
-                    && op_manager.ring.connection_manager.is_self_ready()
-                {
-                    ctx.handle_broadcast_ready_state(true).await;
-                }
-
                 #[cfg(all(unix, feature = "jemalloc-prof"))]
                 {
                     use tikv_jemalloc_ctl::{epoch, stats};
@@ -5933,6 +5924,54 @@ pub(crate) mod tests {
             !branch.contains("record_failure"),
             "#4145 SITE 6: the connect-command-drop branch must NOT record peer backoff \
              (local channel contention is not a remote connection failure)."
+        );
+    }
+
+    /// Source-scrape regression guard for #5154: the periodic 30s
+    /// `STATS_LOG_INTERVAL` tick must NEVER re-broadcast `ReadyState`.
+    ///
+    /// `ConnectionManager::is_peer_ready` returns `true` for any connection
+    /// older than `OPTIMISTIC_READY_TIMEOUT` (60s) BEFORE consulting
+    /// `ready_peers` (the only reader of what this broadcast wrote), so a
+    /// `ready: true` re-broadcast to already-ready-by-timeout peers changes
+    /// no receiver's decision. Measured fleet-wide, this tick alone was 3.0%
+    /// of every packet the network transmits (9-byte payload, 90 bytes on
+    /// the wire per message after framing/AEAD/UDP overhead) for zero
+    /// behavioral effect. The on-connect immediate send
+    /// (`op_state_manager.rs`) and the transition-driven sends in
+    /// `connection_lifecycle.rs` fully cover the semantics that remain.
+    ///
+    /// Bound the window to the periodic-stats-logging block specifically
+    /// (not the whole event loop) so an unrelated future addition of
+    /// `handle_broadcast_ready_state` elsewhere in the loop does not
+    /// falsely trip this pin.
+    #[test]
+    fn periodic_stats_tick_does_not_rebroadcast_ready_state() {
+        let src = include_str!("p2p_protoc.rs");
+
+        let anchor = "// Periodic stats logging";
+        let start = src
+            .find(anchor)
+            .expect("periodic stats logging block must exist in the event loop");
+        // Tight window: bound at the point the tick resets its own counters,
+        // the unambiguous tail of this block.
+        let end_needle = "loop_iteration_count = 0;";
+        let end_rel = src[start..]
+            .find(end_needle)
+            .expect("periodic stats logging block must reset loop_iteration_count");
+        let body = &src[start..start + end_rel];
+
+        assert!(
+            !body.contains("handle_broadcast_ready_state"),
+            "#5154: the periodic STATS_LOG_INTERVAL tick must not re-broadcast \
+             ReadyState — it is provably inert past the 60s optimistic-ready \
+             timeout and costs 3% of all network packets. Block:\n{body}"
+        );
+        assert!(
+            !body.contains("min_ready_connections"),
+            "#5154: the periodic tick must not reference readiness gating at \
+             all — the re-broadcast conditional should be fully removed, not \
+             just its call site. Block:\n{body}"
         );
     }
 }
