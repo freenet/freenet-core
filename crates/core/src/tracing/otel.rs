@@ -259,6 +259,26 @@ pub(crate) fn build_provider(
     fingerprint: String,
     auth_signer: Option<xeddsa::xed25519::PrivateKey>,
 ) -> Result<SdkMeterProvider, ExporterBuildError> {
+    // The blocking reqwest clients below (ours and the exporter's default)
+    // each own a private tokio runtime. Creating one — or dropping one on the
+    // error path — inside an async context panics with "Cannot drop a runtime
+    // in a context where blocking is not allowed", and `init` runs inside the
+    // node's async build path. Hop to a plain thread so the whole build is
+    // async-context-free regardless of the caller.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || build_provider_blocking(endpoint, pubkey, fingerprint, auth_signer))
+            .join()
+            .expect("otel provider build thread panicked")
+    })
+}
+
+fn build_provider_blocking(
+    endpoint: Option<&str>,
+    pubkey: String,
+    fingerprint: String,
+    auth_signer: Option<xeddsa::xed25519::PrivateKey>,
+) -> Result<SdkMeterProvider, ExporterBuildError> {
     let mut builder = MetricExporter::builder().with_http();
     if let Some(endpoint) = endpoint {
         builder = builder.with_endpoint(endpoint);
@@ -930,11 +950,14 @@ mod tests {
     #[tokio::test]
     async fn provider_builds_inside_a_tokio_runtime() {
         // Two things under test. First, exporter construction must not panic
-        // when it happens inside an async context — the OTLP HTTP exporter uses
-        // reqwest's BLOCKING client because PeriodicReader exports from its own
-        // thread. Second, an unreachable collector must not surface as a build
-        // error: export failures are asynchronous and must never fail node
-        // startup. Port 1 is chosen because nothing can be listening there.
+        // when invoked from an async context — the blocking reqwest client
+        // owns a private tokio runtime, so `build_provider` hops to a plain
+        // thread internally; this asserts that hop works (on Linux, building
+        // inline panics with "Cannot drop a runtime in a context where
+        // blocking is not allowed"). Second, an unreachable collector must not
+        // surface as a build error: export failures are asynchronous and must
+        // never fail node startup. Port 1 is chosen because nothing can be
+        // listening there.
         let provider = build_provider(
             Some("http://127.0.0.1:1/v1/metrics"),
             "pubkey-under-test".to_string(),
@@ -944,6 +967,11 @@ mod tests {
             Some(crate::transport::TransportKeypair::new().auth_token_signer()),
         )
         .expect("exporter build must succeed against an unreachable collector");
-        provider.shutdown().expect("clean shutdown");
+        // Shutdown drops the exporter's blocking client and with it that
+        // private runtime — same hazard as construction, so it must happen
+        // where blocking is allowed, not on this async test thread.
+        tokio::task::spawn_blocking(move || provider.shutdown().expect("clean shutdown"))
+            .await
+            .expect("shutdown thread panicked");
     }
 }
