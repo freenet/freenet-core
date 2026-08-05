@@ -729,12 +729,26 @@ mod tests {
     /// `.claude/rules/bug-prevention-patterns.md`).
     ///
     /// The handler records each fresh logical broadcast's outcome exactly
-    /// once: a NO_TARGETS record on the fresh-broadcast path (gated on
-    /// `!is_retry && !is_reemit`, so neither retry re-emissions nor #4359
-    /// deferred-broadcast re-emissions record a miss), and a success record on
-    /// the targets-found path. That's two call sites; this pins both so neither
-    /// outcome arm is dropped, and pins the gate so a refactor can't start
-    /// counting retry / deferred re-emissions as fresh misses.
+    /// once, and there are now THREE terminal outcomes:
+    ///
+    /// 1. NO_TARGETS on the fresh-broadcast path (gated on `!is_retry &&
+    ///    !is_reemit`, so neither retry re-emissions nor #4359
+    ///    deferred-broadcast re-emissions record a miss);
+    /// 2. success on the targets-found path;
+    /// 3. success with a ZERO target count on the #5147 fully-covered path —
+    ///    every eligible peer was already named by the originator (or is the
+    ///    sender), so the fan-out is complete with nothing to send.
+    ///
+    /// The third was added with #5147 and is deliberately NOT folded into
+    /// arm 1 despite also having zero targets: a fully-covered fan-out is a
+    /// SUCCESS, and counting it as `no_targets` would make the operator-facing
+    /// propagation summary report a propagation failure every time the feature
+    /// works perfectly — the loudest possible false alarm, on the path the
+    /// design expects to be common in the clique regime.
+    ///
+    /// This pins all three so no outcome arm is dropped, and pins the gate so a
+    /// refactor can't start counting retry / deferred re-emissions as fresh
+    /// misses.
     #[test]
     fn broadcast_path_feeds_propagation_stats_pin_test() {
         // `handle_broadcast_state_change` lives in the `broadcast` submodule
@@ -748,12 +762,13 @@ mod tests {
             .matches("update_propagation_stats.record_broadcast(")
             .count();
         assert_eq!(
-            call_count, 2,
+            call_count, 3,
             "handle_broadcast_state_change must call \
-             `update_propagation_stats.record_broadcast(...)` exactly twice — once \
-             on the fresh no-target path and once on the targets-found success \
-             path. Found {call_count}. A different count means an outcome arm was \
-             dropped (silent telemetry rot) or recording leaked elsewhere."
+             `update_propagation_stats.record_broadcast(...)` exactly three times \
+             — the fresh no-target path, the targets-found success path, and the \
+             #5147 fully-covered success path. Found {call_count}. A different \
+             count means an outcome arm was dropped (silent telemetry rot) or \
+             recording leaked elsewhere."
         );
 
         // The no-target record must be gated on `!is_retry && !is_reemit` so

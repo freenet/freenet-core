@@ -17272,6 +17272,113 @@ fn test_gateway_ack_version_unlocks_node_originated_summary_first_put() {
             },
         ),
     ];
+/// One arm of the #5147 suppression measurement: run an update workload over a
+/// co-host mesh and report what the fleet received.
+#[cfg(test)]
+struct SuppressionArm {
+    /// Inbound broadcast payloads that reached a terminal outcome.
+    deliveries: u64,
+    /// Those that changed nothing — the waste #5147 removes.
+    redundant: u64,
+    /// Outbound broadcast legs actually put on the wire.
+    sends: u64,
+    delta_sends: u64,
+    full_state_sends: u64,
+    resync_suppressed: u64,
+    summary_skips: u64,
+    /// Contracts that converged, and how many there were.
+    converged: (usize, usize),
+    /// Peers that were suppressed because the originator named them.
+    suppressed: u64,
+    /// Hosting advertisements exchanged. The premise check: without these no
+    /// peer has an advertised co-host, so there is no mesh and nothing to
+    /// suppress.
+    hosting_updates: u64,
+}
+
+#[cfg(test)]
+fn run_5147_suppression_arm(network_name: &str, target_list_enabled: bool) -> SuppressionArm {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    const SEED: u64 = 0x5147_0001_0001;
+    // Enough peers that each has SEVERAL non-sender co-hosts. With two, a
+    // peer's only other co-host is the sender, the originator's list is empty
+    // after excluding the recipient, and the measurement is vacuous.
+    const PEERS: usize = 6;
+    const SUSTAINED_UPDATES: usize = 20;
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let (sim, logs_handle) = rt.block_on(async {
+        let mut sim = SimNetwork::new(
+            network_name,
+            1, // 1 gateway (the update source)
+            PEERS,
+            7, // max_htl
+            3, // rnd_if_htl_above
+            // Wide enough that the peers connect to EACH OTHER. At a narrower
+            // cap a star forms, every peer's only co-host is the sender, and
+            // the target list has nobody to name — the same blind spot the
+            // #4965 co-host test documents.
+            12, // max_connections
+            4,  // min_connections
+            SEED,
+        )
+        .await;
+        // The ONLY difference between the two arms. Stated explicitly on both
+        // sides rather than relying on the default, so a future edit that flips
+        // the default cannot silently turn the control arm into a second
+        // treatment arm and make the comparison read as "no effect".
+        if target_list_enabled {
+            sim.enable_broadcast_target_list();
+        } else {
+            sim.disable_broadcast_target_list();
+        }
+        // Space the updates across the ~5-minute InterestSync heartbeat
+        // (`INTEREST_HEARTBEAT_INTERVAL`, 300s). At the 3s default the whole
+        // update burst finishes inside one heartbeat window, so the ONLY thing
+        // keeping peer-summary caches fresh is the `sender_summary_bytes`
+        // riding on the broadcasts themselves — precisely what this feature
+        // removes. That regime makes the measurement a study of the sim's
+        // pacing rather than of production, where a River-style update cadence
+        // is minutes apart with heartbeats in between.
+        sim.with_controlled_op_interval(Duration::from_secs(3));
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    // CRDT contract so post-bootstrap broadcasts compute real version-aware
+    // deltas; a hash contract's "delta" is full state.
+    let contract = SimOperation::create_test_contract(0x51);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    let mut operations = vec![ScheduledOperation::new(
+        NodeLabel::gateway(network_name, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: SimOperation::create_crdt_state(1, 0x10),
+            subscribe: true,
+        },
+    )];
+    for node_idx in 1..=PEERS {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(network_name, node_idx),
+            SimOperation::Subscribe { contract_id },
+        ));
+    }
+    for v in 0..SUSTAINED_UPDATES {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::gateway(network_name, 0),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state((v as u64) + 2, 0x20 + v as u8),
+            },
+        ));
+    }
 
     let result = sim.run_controlled_simulation(
         SEED,
@@ -17306,4 +17413,224 @@ fn test_gateway_ack_version_unlocks_node_originated_summary_first_put() {
     );
 
     freenet::dev_tool::clear_crdt_contracts();
+        Duration::from_secs(240),
+        Duration::from_secs(90),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "{network_name}: simulation should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let convergence =
+        rt.block_on(async { freenet::dev_tool::check_convergence_from_logs(&logs_handle).await });
+
+    SuppressionArm {
+        deliveries: GlobalTestMetrics::broadcast_deliveries(),
+        redundant: GlobalTestMetrics::redundant_broadcast_deliveries(),
+        sends: GlobalTestMetrics::delta_sends() + GlobalTestMetrics::full_state_sends(),
+        delta_sends: GlobalTestMetrics::delta_sends(),
+        full_state_sends: GlobalTestMetrics::full_state_sends(),
+        resync_suppressed: GlobalTestMetrics::resync_requests_suppressed(),
+        summary_skips: GlobalTestMetrics::fanout_summary_skips(),
+        converged: (convergence.converged.len(), convergence.total_contracts()),
+        suppressed: GlobalTestMetrics::broadcast_targets_suppressed(),
+        hosting_updates: GlobalTestMetrics::neighbor_hosting_updates(),
+    }
+}
+
+/// End-to-end measurement of #5147 on a co-host mesh, with a control arm.
+///
+/// ## Measured (7 nodes, 20 CRDT updates, identical seed and topology)
+///
+/// ```text
+/// control:   sends=460 summary_skips=317 suppressed=0   redundant=321 converged=1/1
+/// treatment: sends=256 summary_skips=21  suppressed=500 redundant=136 converged=1/1
+/// ```
+///
+/// 44% fewer broadcast legs on the wire and 58% fewer redundant deliveries,
+/// with convergence unchanged. Note `sends + summary_skips + suppressed` is
+/// **777 in both arms**: the two runs did the identical amount of fan-out work
+/// and the treatment merely reclassified 500 legs, which is what rules out a
+/// topology difference between the arms as the explanation. That identity is
+/// asserted below.
+///
+/// The overlap with the pre-existing summary-match gate is large here — of the
+/// 500 suppressions, roughly 300 were legs that gate would have skipped for
+/// free — which is why the send reduction (44%) is smaller than the suppression
+/// count suggests. On the fleet that overlap is much smaller: the measured
+/// dedup ratio there is 18.6 against this simulation's 3.7, i.e. the
+/// summary-match gate is suppressing far less in production than it does here,
+/// so the target list's marginal value is larger, not smaller.
+///
+/// ## This test earned its keep once already
+///
+/// Written before the code was believed correct, it FAILED on the first run —
+/// treatment sends 528 vs control 460, redundant 400 vs 321 — i.e. the feature
+/// made traffic worse. A control-vs-control run (byte-identical numbers)
+/// cleared the rig, so the regression was real. Cause: a fully-suppressed
+/// fan-out has an empty target set, and `handle_broadcast_state_change` treated
+/// empty as the no-subscriber FAILURE case — three retries with backoff, then a
+/// stash. Each retry re-resolved targets after the coverage claim had already
+/// been consumed, so it suppressed nothing and re-broadcast the whole co-host
+/// set one backoff later. The mechanism defeated itself and would have shipped
+/// looking plausible: every unit test passed, and the only visible symptom was
+/// a bandwidth number nobody had a baseline for. The `fully_covered` branch in
+/// `broadcast.rs` is the fix, and this test is its regression test.
+///
+/// ## Why a control arm and not a threshold
+///
+/// A single-arm test asserting "redundant deliveries are below N" pins the
+/// simulation's own convergence behaviour as much as the feature: change the
+/// topology, the update count, or the CONNECT timing and N moves for reasons
+/// that have nothing to do with the target list. Two arms differing by exactly
+/// one `enable_broadcast_target_list()` call measure the FEATURE, and the
+/// control arm doubles as the "this is what today looks like" baseline.
+///
+/// ## What is asserted, and what deliberately is not
+///
+/// The discriminator is that the treatment arm suppresses fan-out targets AND
+/// receives strictly fewer redundant deliveries than the control. Both halves
+/// are needed: the suppression counter alone would pass if the mechanism fired
+/// but the duplicates arrived by some other route, and the delivery drop alone
+/// could come from a topology difference between the two runs.
+///
+/// A specific suppression FRACTION is NOT asserted. The measured fleet figures
+/// (0.647 at degree 5, rising to 0.924 at 17) are degree-dependent, and this
+/// simulation's achieved degree is far below the fleet's — the topology it
+/// builds is the regime with the LEAST overlap to exploit, so a fleet-derived
+/// threshold here would be measuring the wrong graph. The achieved numbers are
+/// logged so a reader can see the regime rather than infer it.
+///
+/// ## Safety half
+///
+/// Convergence must be no worse in the treatment arm. This is the assertion
+/// that fails if suppression over-reaches: a peer wrongly excluded from a
+/// fan-out does not converge, and no bandwidth saving justifies that.
+#[test_log::test]
+fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
+    let control = run_5147_suppression_arm("i5147-control", false);
+    let treatment = run_5147_suppression_arm("i5147-treatment", true);
+
+    tracing::info!(
+        "#5147 control:   deliveries={} redundant={} sends={} (delta={} full={}) \
+         suppressed={} summary_skips={} resync_suppressed={} converged={:?}",
+        control.deliveries,
+        control.redundant,
+        control.sends,
+        control.delta_sends,
+        control.full_state_sends,
+        control.suppressed,
+        control.summary_skips,
+        control.resync_suppressed,
+        control.converged,
+    );
+    tracing::info!(
+        "#5147 treatment: deliveries={} redundant={} sends={} (delta={} full={}) \
+         suppressed={} summary_skips={} resync_suppressed={} converged={:?}",
+        treatment.deliveries,
+        treatment.redundant,
+        treatment.sends,
+        treatment.delta_sends,
+        treatment.full_state_sends,
+        treatment.suppressed,
+        treatment.summary_skips,
+        treatment.resync_suppressed,
+        treatment.converged,
+    );
+
+    // PREMISE 1: the peers really became each other's advertised co-hosts. If
+    // they did not, no peer has a co-host to name, the list is empty
+    // everywhere, and every assertion below is vacuous.
+    assert!(
+        control.hosting_updates > 0 && treatment.hosting_updates > 0,
+        "premise: no hosting advertisements were exchanged, so there is no \
+         co-host mesh and #5147 has nothing to suppress. control={} \
+         treatment={}",
+        control.hosting_updates,
+        treatment.hosting_updates,
+    );
+
+    // PREMISE 2: the control arm actually exhibits the waste being removed.
+    assert!(
+        control.redundant > 0,
+        "premise: the control arm received ZERO redundant deliveries, so this \
+         topology does not reproduce the duplicate fan-out at all and the \
+         comparison below measures nothing"
+    );
+
+    // PREMISE 3: the control arm is genuinely unsuppressed. Without this a
+    // default flip would make both arms treatment arms and the test would read
+    // "no effect" as success.
+    assert_eq!(
+        control.suppressed, 0,
+        "the control arm must be running today's behaviour; a non-zero \
+         suppression count means the version gate opened when it should have \
+         stayed shut, and the comparison has no baseline"
+    );
+
+    // DISCRIMINATOR A: the mechanism fired.
+    assert!(
+        treatment.suppressed > 0,
+        "#5147 suppressed nothing on a topology built to exercise it: \
+         {} hosting advertisements were exchanged, so peers ARE advertised \
+         co-hosts of each other, yet no fan-out target was ever dropped. \
+         Either the version gate never opened, or the coverage never reached \
+         the fan-out decision.",
+        treatment.hosting_updates,
+    );
+
+    // The two arms must have done the SAME amount of fan-out work. Every
+    // offered leg ends in exactly one of three places — sent, skipped by the
+    // summary gate, or suppressed by the target list — so the sum is the
+    // fan-out volume. If it differs, the arms are not comparable and the
+    // reduction below could be a topology difference rather than the feature.
+    let control_legs = control.sends + control.summary_skips + control.suppressed;
+    let treatment_legs = treatment.sends + treatment.summary_skips + treatment.suppressed;
+    assert_eq!(
+        control_legs, treatment_legs,
+        "the arms offered different numbers of fan-out legs ({control_legs} vs \
+         {treatment_legs}), so they are not comparable and any reduction \
+         measured between them is not attributable to #5147"
+    );
+
+    // DISCRIMINATOR B: it removed real traffic, not just incremented a counter.
+    assert!(
+        treatment.redundant < control.redundant,
+        "#5147 suppressed {} fan-out targets yet the fleet still received as \
+         many redundant deliveries ({} vs control {}). A suppression that does \
+         not show up as fewer received duplicates is suppressing the wrong \
+         thing.",
+        treatment.suppressed,
+        treatment.redundant,
+        control.redundant,
+    );
+
+    // DISCRIMINATOR C: fewer legs actually on the wire. Distinct from B —
+    // B says the fleet RECEIVES fewer duplicates, this says the fleet SENDS
+    // less. The retry bug in this test's history passed neither, but a future
+    // regression that merely delays the suppressed traffic would pass B while
+    // failing here.
+    assert!(
+        treatment.sends < control.sends,
+        "#5147 suppressed {} targets yet the fleet sent as many broadcast legs \
+         ({} vs control {}). Suppressed traffic that reappears later — via the \
+         no-target retry, an anti-entropy heal, or a stash re-emission — is not \
+         suppressed, it is deferred.",
+        treatment.suppressed,
+        treatment.sends,
+        control.sends,
+    );
+
+    // SAFETY: no bandwidth saving justifies a peer not converging. This is the
+    // assertion that fails on over-suppression.
+    assert!(
+        treatment.converged.0 >= control.converged.0,
+        "#5147 cost convergence: control converged {:?}, treatment {:?}. A \
+         peer wrongly excluded from a fan-out does not learn of the update \
+         until the ~5-minute interest heartbeat, which is exactly the failure \
+         this design refuses.",
+        control.converged,
+        treatment.converged,
+    );
 }

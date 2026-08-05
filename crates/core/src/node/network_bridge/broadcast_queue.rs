@@ -611,7 +611,16 @@ pub(super) async fn fanout_send_needed(
 ) -> bool {
     match plan_fanout_send(&op_manager.interest_manager, key, summaries, *probes_used) {
         FanoutSendPlan::Send => true,
-        FanoutSendPlan::Skip => false,
+        FanoutSendPlan::Skip => {
+            // #5147 diagnostic: the pre-existing summary-match skip is the
+            // OTHER mechanism suppressing fan-out legs, and it is fed by the
+            // `sender_summary_bytes` that rides on the very sends the target
+            // list removes. Counting it is what makes an interaction between
+            // the two visible instead of showing up as an unexplained rise in
+            // total sends.
+            crate::config::GlobalTestMetrics::record_fanout_summary_skip();
+            false
+        }
         FanoutSendPlan::Probe => {
             *probes_used += 1;
             let SummaryPair { ours, theirs } = summaries;

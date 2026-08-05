@@ -410,6 +410,7 @@ impl OpManager {
             // exclude both).
             if origin.covers(&pub_key) {
                 skipped_covered += 1;
+                crate::config::GlobalTestMetrics::record_broadcast_target_suppressed();
                 continue;
             }
             if let Some(pkl) = self.ring.connection_manager.get_peer_by_pub_key(&pub_key) {

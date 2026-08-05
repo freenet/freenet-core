@@ -284,6 +284,51 @@ impl P2pConnManager {
             "BroadcastStateChange: found targets"
         );
 
+        // #5147: an empty target set is not always a failure any more.
+        //
+        // The branch below exists for the case where a state change has NOBODY
+        // to propagate to — a race between an update and subscription
+        // establishment — and it responds by retrying three times with backoff
+        // and then stashing the state for a later interest flush. That is
+        // exactly wrong when the set is empty because every eligible peer was
+        // already served: in the clique regime this design targets, a relayer's
+        // co-hosts are frequently ALL on the originator's list, so the correct
+        // fan-out is the empty one and it is COMPLETE.
+        //
+        // Without this the mechanism defeats itself, and does so invisibly.
+        // Each retry re-resolves targets, by which time the coverage entry has
+        // been consumed (it is taken once, by design), so the retry sees no
+        // claim, suppresses nothing, and re-broadcasts to the whole co-host set
+        // one backoff later — the suppressed traffic comes back, delayed, with
+        // staler summaries than if it had been sent immediately.
+        let fully_covered = target_result.targets.is_empty()
+            && (target_result.skipped_covered > 0 || target_result.skipped_sender > 0);
+        if fully_covered {
+            tracing::debug!(
+                contract = %key,
+                skipped_covered = target_result.skipped_covered,
+                skipped_sender = target_result.skipped_sender,
+                phase = "broadcast_fully_covered",
+                "BroadcastStateChange: every eligible peer already has this \
+                 update; fan-out complete with nothing to send"
+            );
+            // Same bookkeeping as the targets-found path: this is a completed
+            // fan-out, so no retry cycle and no stash may survive it.
+            self.broadcast_retries.remove(&key);
+            self.broadcast_no_target_streak.remove(&key);
+            let _ = op_manager.pending_broadcasts.take(key.id());
+            // Recorded with a zero target count so the #4281 propagation
+            // summary still sees one broadcast per apply, but NOT through the
+            // `no_targets` counter below — a fully-covered fan-out is a success
+            // and must not read as a propagation failure to an operator.
+            op_manager.update_propagation_stats.record_broadcast(
+                *key.id(),
+                0,
+                target_result.interest_resolve_failed,
+            );
+            return;
+        }
+
         if target_result.targets.is_empty() {
             // Record the NO_TARGETS outcome once per *fresh* no-target broadcast
             // for the #4281 summary, but NOT for retry re-emissions. Gating on

@@ -926,6 +926,12 @@ impl PayloadMix {
         outcome: ReceiverTerminalOutcome,
         payload_bytes: usize,
     ) {
+        // #5147 measurement, emitted from the classification itself so the
+        // redundancy count cannot drift from the decision it describes.
+        crate::config::GlobalTestMetrics::record_broadcast_delivery(matches!(
+            outcome,
+            ReceiverTerminalOutcome::Dedup | ReceiverTerminalOutcome::NoOp
+        ));
         let outcome_index = outcome.index();
         let kind_index = usize::from(!is_delta) * 5 + outcome_index;
         let bucket = state_size_bucket(payload_bytes as u64);
