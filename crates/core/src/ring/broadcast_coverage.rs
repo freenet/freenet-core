@@ -294,8 +294,13 @@ pub(crate) struct BroadcastCoverageStore {
 ///   for one with broken invariants, both BEFORE it takes the coverage — so
 ///   every applying broadcast on such a contract leaks an entry, precisely
 ///   during the storm conditions that set those flags (#4861 / #4903 shape);
-/// * `try_notify_node_event(BroadcastStateChange)` is best-effort by design
-///   (#4145), so a dropped event leaves a kept entry with no consumer.
+/// * the `BroadcastStateChange` notification is best-effort by design (#4145),
+///   so a dropped event leaves a kept entry with no consumer.
+///
+/// (Phrased without naming the emitting helper as a call: the shared
+/// `EMISSION_SITES` allowlist walker in `op_state_manager.rs` scrapes for that
+/// token textually and does not skip comments, so writing it here would demand
+/// an allowlist entry for a file that emits nothing.)
 ///
 /// Each leaked entry holds up to [`MAX_COVERED_PEERS`] public keys, so the
 /// growth is monotonic in distinct contract ids touched. Sweeping only when
