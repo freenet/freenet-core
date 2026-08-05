@@ -549,9 +549,13 @@ impl OutboundMix {
     /// Lives on the outbound rollup despite being a RECEIVE-side observation,
     /// for two reasons: it belongs in the same node-minute record as the
     /// `interest_sync_summaries_bytes` it explains (joinable without
-    /// interpolation), and the telemetry budget has room for exactly one more
-    /// aligned rollup stream (`telemetry.rs`, `MAX_SHADOW_EVENTS_PER_SECOND`),
-    /// which this measurement does not deserve to consume.
+    /// interpolation), and adding a rollup stream is not free: whether one
+    /// fits is decided by the emit SCHEDULE, not by a spare slot in
+    /// `MAX_SHADOW_EVENTS_PER_SECOND` (see
+    /// `telemetry::tests::shadow_rollup_emit_schedule_fits_the_shadow_sub_budget`),
+    /// and on a busy node a new stream mostly competes for the aggregate cap
+    /// that already discards ~31 % of shadow telemetry (#5197). This
+    /// measurement does not deserve to consume that.
     pub(crate) fn record_summary_comparison(
         &self,
         contract: &ContractInstanceId,
@@ -1711,6 +1715,43 @@ mod tests {
     /// ASSIGNMENT form instead, because `classify` is where `SummaryRequest`
     /// gets its arm — that message carries no emitter field, having exactly
     /// one possible origin.
+    /// Sibling of `payload_mix_aggregator_applies_the_phase_offset_pin`.
+    ///
+    /// This aggregator must carry the SAME offset as the payload-mix one, not
+    /// merely some offset: the two rollups are joined per node-minute without
+    /// interpolation, so a phase difference between them silently breaks the
+    /// join. Both constants are aliased from `broadcast_payload_mix` so they
+    /// cannot drift in value; this pins that the ticker actually applies them.
+    ///
+    /// Bounded to the function body (AGENTS.md): an unbounded `find` would
+    /// match this test's own assertion strings and pass vacuously.
+    #[test]
+    fn outbound_mix_aggregator_applies_the_phase_offset_pin() {
+        let src = include_str!("outbound_message_mix.rs");
+        let start = src
+            .find("pub(crate) fn spawn_outbound_mix_aggregator(")
+            .expect("spawn_outbound_mix_aggregator not found");
+        let body = &src[start..];
+        let end = body
+            .find("\n}")
+            .expect("end of spawn_outbound_mix_aggregator not found");
+        let body: String = body[..end].split_whitespace().collect();
+
+        assert!(
+            body.contains("tokio::time::interval_at("),
+            "spawn_outbound_mix_aggregator must start its ticker with \
+             interval_at so the first emit is phase-offset; a plain \
+             `interval(ROLLUP_WINDOW)` puts it back on the 30 s shadow-stat \
+             boundary"
+        );
+        assert!(
+            body.contains("ROLLUP_WINDOW+ROLLUP_PHASE_OFFSET"),
+            "spawn_outbound_mix_aggregator must offset its first tick by the \
+             SAME ROLLUP_PHASE_OFFSET as the payload-mix aggregator, or the \
+             per-node-minute join between the two rollups breaks"
+        );
+    }
+
     #[test]
     fn summaries_emitter_sites_are_pinned() {
         use crate::node::network_bridge::p2p_protoc::tests::{
