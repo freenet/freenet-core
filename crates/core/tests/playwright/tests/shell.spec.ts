@@ -87,14 +87,23 @@ type ShellMessage = {
   url?: string;
   href?: string;
   shiftKey?: boolean;
+  title?: string;
 };
 
 async function shellMessages(page: Page): Promise<ShellMessage[]> {
-  return page.evaluate(
+  const all = await page.evaluate(
     () =>
       (window as unknown as { __freenetMessages: ShellMessage[] })
         .__freenetMessages,
   );
+  // The injected title-sync script posts a `title` message on every
+  // sandboxed-page load (and re-fires on each in-place navigate hop), fully
+  // independent of user interaction. Every call site of this helper asserts
+  // the exact sequence of CLICK-classification messages (navigate/open_url),
+  // so a `title` landing anywhere in that sequence is page-lifecycle noise,
+  // not a signal any of them are testing for — filter it out here rather
+  // than at each call site.
+  return all.filter((m) => m.type !== "title");
 }
 
 // Serve the RFC 2606 documentation domain from the test itself, so the tabs
@@ -592,6 +601,15 @@ test("same-origin in-contract link performs an in-place navigate hop", async ({
   ).toBeVisible();
   await expect(page).toHaveURL(/page2\.html/);
   await expect(page).not.toHaveURL(/__sandbox/);
+
+  // A real navigate hop reloads the iframe with a fresh document — including
+  // a fresh title_sync.js instance — so the tab must pick up page 2's own
+  // <title> ("Freenet shell fixture - page 2", set in fixture-webapp/page2.html),
+  // not keep index.html's. Unlike the "re-syncs on a later change" test
+  // (which mutates document.title within the SAME document via JS), this
+  // exercises a genuine iframe reload — the path a real multi-page contract
+  // site actually takes.
+  await expect(page).toHaveTitle("Freenet shell fixture - page 2");
 });
 
 test("a link carrying a download attribute is NOT intercepted", async ({
@@ -737,4 +755,100 @@ test("browser Back restores the previous subpage via the popstate handler (#3839
   await expect(
     page.frameLocator("iframe#app").locator("#page2-title"),
   ).toHaveCount(0);
+});
+
+test("browser tab title reflects the contract's own <title>, with no bespoke sender required", async ({
+  page,
+}) => {
+  // The shell page's <title> is hardcoded ("Freenet") because the sandboxed
+  // iframe has no allow-same-origin and cannot touch document.title on the
+  // parent directly. fixture-webapp/index.html sets its own <title> and
+  // deliberately implements NO shell postMessage sender (see the comment at
+  // the top of that file) — the injected title-sync script
+  // (path_handlers.rs TITLE_SYNC_JS) must be what carries it to the tab.
+  await page.goto(shellUrl!);
+  await fixtureFrame(page);
+  await expect(page).toHaveTitle("Freenet shell smoke-test fixture");
+});
+
+test("browser tab title re-syncs on a later change and dedupes a repeated identical title (MutationObserver + lastSent guard)", async ({
+  page,
+}) => {
+  // The one-shot "reflects the contract's own <title>" test above only
+  // exercises the initial postMessage sent when title_sync.js first runs.
+  // The reason that script installs a MutationObserver on <head> at all —
+  // rather than just posting once — is to also catch a title the app sets
+  // LATER (an SPA route change, an async-loaded page title). This test
+  // exercises that path for real, plus the `lastSent` dedup guard that stops
+  // an unchanged title from posting again.
+  await page.goto(shellUrl!);
+  const frame = await fixtureFrame(page);
+  // Let the INITIAL title postMessage land and settle before we start
+  // capturing: `toHaveTitle` only becomes true once the shell has received
+  // and applied that first message, so installing the message listener AFTER
+  // this point deterministically excludes it — no race against how fast the
+  // sandboxed iframe's own synchronous first post beats our listener attach.
+  await expect(page).toHaveTitle("Freenet shell smoke-test fixture");
+  await captureShellMessages(page);
+
+  // Read the RAW sink directly (not the navigation-tests' shellMessages()
+  // helper, which filters 'title' out) so we can inspect title messages
+  // specifically.
+  const titleMessages = async (): Promise<ShellMessage[]> => {
+    const all = await page.evaluate(
+      () =>
+        (window as unknown as { __freenetMessages: ShellMessage[] })
+          .__freenetMessages,
+    );
+    return all.filter((m) => m.type === "title");
+  };
+
+  // Change the title from inside the sandboxed iframe, simulating an SPA
+  // route change or an async-loaded page title set well after initial load.
+  await frame.locator("html").evaluate(() => {
+    document.title = "Retitled After Load";
+  });
+  await expect(page).toHaveTitle("Retitled After Load");
+
+  // Setting the SAME title again must NOT produce a second postMessage — the
+  // `lastSent` guard in title_sync.js exists specifically to suppress a
+  // redundant identical assignment (e.g. a re-render that re-sets the same
+  // string every tick).
+  await frame.locator("html").evaluate(() => {
+    document.title = "Retitled After Load";
+  });
+  // Give any (incorrect) redundant postMessage a moment to arrive before
+  // asserting its absence.
+  await page.waitForTimeout(300);
+
+  const messages = await titleMessages();
+  const values = messages.map((m) => m.title);
+  expect(
+    values,
+    `expected exactly one post for the change to "Retitled After Load", ` +
+      `with the repeated identical re-assignment deduped away by lastSent; ` +
+      `got: ${JSON.stringify(values)}`,
+  ).toEqual(["Retitled After Load"]);
+});
+
+test("navigating to a page with no <title> at all leaves the tab on the previous title (documented tradeoff)", async ({
+  page,
+}) => {
+  // title_sync.js's `if (!title || ...) return;` guard deliberately does NOT
+  // reset the shell's tab when the new page has no <title> element — see the
+  // comment on that guard in path_handlers/assets/title_sync.js. This test
+  // locks that specific, chosen behavior in place: the tab must keep showing
+  // the fixture's real title, not blank out or silently do something else.
+  await page.goto(shellUrl!);
+  const frame = await fixtureFrame(page);
+  await expect(page).toHaveTitle("Freenet shell smoke-test fixture");
+
+  await frame.locator("#no-title-link").click();
+  await expect(
+    page.frameLocator("iframe#app").locator("#no-title-page"),
+  ).toBeVisible();
+
+  // The iframe has genuinely navigated to the titleless page (confirmed
+  // above), but the tab title must be UNCHANGED from before the hop.
+  await expect(page).toHaveTitle("Freenet shell smoke-test fixture");
 });

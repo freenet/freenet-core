@@ -1765,13 +1765,16 @@ async fn sandbox_content_body(
     body = body.replace("\"/./", &format!("\"{prefix}"));
     body = body.replace("'/./", &format!("'{prefix}"));
 
-    // Inject the WebSocket shim and navigation interceptor before any other scripts.
-    // The shim overrides window.WebSocket so that wasm-bindgen routes connections
-    // through the shell page's bridge. The interceptor catches <a> clicks AND
-    // overrides programmatic window.open, routing both through postMessage for
-    // multi-page navigation without a sandbox-inheriting popup (#4645).
-    let injected_scripts =
-        format!("<script>{WEBSOCKET_SHIM_JS}</script><script>{NAVIGATION_INTERCEPTOR_JS}</script>");
+    // Inject the WebSocket shim, navigation interceptor, and title sync before
+    // any other scripts. The shim overrides window.WebSocket so that
+    // wasm-bindgen routes connections through the shell page's bridge. The
+    // interceptor catches <a> clicks AND overrides programmatic window.open,
+    // routing both through postMessage for multi-page navigation without a
+    // sandbox-inheriting popup (#4645). The title sync forwards this page's
+    // <title> to the shell so the browser tab reflects it.
+    let injected_scripts = format!(
+        "<script>{WEBSOCKET_SHIM_JS}</script><script>{NAVIGATION_INTERCEPTOR_JS}</script><script>{TITLE_SYNC_JS}</script>"
+    );
     if let Some(pos) = body.find("</head>") {
         body.insert_str(pos, &injected_scripts);
     } else if let Some(pos) = body.find("<body") {
@@ -1883,6 +1886,20 @@ const WEBSOCKET_SHIM_JS: &str = include_str!("path_handlers/assets/websocket_shi
 /// inside the click handler, where the gesture is live.
 const NAVIGATION_INTERCEPTOR_JS: &str =
     include_str!("path_handlers/assets/navigation_interceptor.js");
+
+/// JavaScript that forwards the sandboxed iframe's `document.title` to the
+/// shell via the `__freenet_shell__` / `type: 'title'` postMessage
+/// `SHELL_BRIDGE_JS` already handles.
+///
+/// The shell page's own `<title>` is hardcoded (`shell.html`) because this
+/// iframe has no `allow-same-origin` and cannot touch the parent's
+/// `document.title` directly. Before this script existed, the shell's title
+/// only ever changed for the handful of apps that hand-rolled this exact
+/// postMessage themselves (River, Atlas, Delta); every other app — including
+/// a static, JS-free contract website — left the browser tab reading
+/// "Freenet" forever. Injected into every sandboxed page unconditionally so
+/// the tab title is correct with zero per-app opt-in.
+const TITLE_SYNC_JS: &str = include_str!("path_handlers/assets/title_sync.js");
 
 /// Strips the version + contract + key prefix from a request path and returns
 /// the remaining relative asset path (e.g. `assets/app.js`, or `my image.png`).
@@ -5304,6 +5321,45 @@ mod tests {
         assert!(
             !result.contains("__FREENET_AUTH_TOKEN__"),
             "auth token leaked into sandbox content"
+        );
+    }
+
+    /// Regression test: the shell page's `<title>` is hardcoded (`shell.html`)
+    /// and the sandboxed iframe cannot touch `document.title` on the parent
+    /// directly (no `allow-same-origin`), so before `TITLE_SYNC_JS` existed
+    /// the browser tab showed "Freenet" forever for any contract that did not
+    /// hand-roll its own postMessage sender — which was every contract except
+    /// River, Atlas, and Delta. This asserts the sync script is injected
+    /// alongside the WS shim and interceptor for EVERY sandboxed page,
+    /// including one with no app JS at all.
+    #[tokio::test]
+    async fn sandbox_content_injects_title_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "testkey123";
+        let html =
+            r#"<!DOCTYPE html><html><head><title>My App</title></head><body>Hello</body></html>"#;
+        std::fs::write(dir.path().join("index.html"), html).unwrap();
+
+        let result = response_body(
+            sandbox_content_body(dir.path(), key, ApiVersion::V1, "index.html")
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        assert!(
+            result.contains("type: 'title'"),
+            "title sync script not injected"
+        );
+        assert!(
+            result.contains("__freenet_shell__: true"),
+            "title sync script must use the shell postMessage bridge protocol"
+        );
+        // Must forward document.title, not a hardcoded string — this is what
+        // makes it work for every app rather than needing per-app wiring.
+        assert!(
+            TITLE_SYNC_JS.contains("document.title"),
+            "title sync script must read document.title, not a fixed string"
         );
     }
 
