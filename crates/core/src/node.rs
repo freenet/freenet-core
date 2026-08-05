@@ -9506,6 +9506,21 @@ mod tests {
         /// Multi-threaded flavour with `spawn` on purpose: an earlier version
         /// of this test used `join!` on a current-thread runtime and the two
         /// futures did NOT overlap — it passed while exercising nothing.
+        ///
+        /// # How that was caught, since the same trap is easy to re-enter
+        ///
+        /// A concurrency test that passes first time deserves suspicion,
+        /// because the cheapest way to pass one is not to be concurrent. The
+        /// check that separated "passes" from "is evidence" was to probe for
+        /// the race's own signature rather than for the assertions: both
+        /// handlers reading the same cursor must produce the SAME window, so
+        /// **identical windows prove the overlap happened and different ones
+        /// prove it did not**. The `join!` version produced different windows,
+        /// which is what exposed it as vacuous.
+        ///
+        /// If you rewrite this test, re-run that probe rather than trusting a
+        /// green result — and do not "simplify" it back to `join!` on the
+        /// default runtime, which is where it started.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn concurrent_interests_from_one_peer_cost_at_most_one_round() {
             const PAIRS: usize = 3;
