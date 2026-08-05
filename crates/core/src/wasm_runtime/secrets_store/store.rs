@@ -2552,6 +2552,15 @@ impl SecretsStore {
     /// `RegisterDelegateWithPredecessors` handler), mirroring the on-loop write
     /// discipline of `store_secret` / the live bundle import. The work is bounded
     /// by the predecessors' own on-disk secret count.
+    ///
+    /// UNREACHABLE FROM PRODUCTION as of freenet/freenet-core#5198: the H1 gate
+    /// above is sound only if `origin_contract` is trustworthy, and it isn't —
+    /// any HTTP client can forge an `origin_contract` value for an arbitrary
+    /// public contract key (see #5198). The one caller
+    /// (`RegisterDelegateWithPredecessors`'s handler) no longer invokes this
+    /// method; it is kept, with its test suite, for potential reactivation once
+    /// `origin_contract` attestation is hardened. Do not re-wire a caller to
+    /// this method without first fixing that.
     pub fn migrate_secrets(
         &mut self,
         predecessors: &[DelegateKey],

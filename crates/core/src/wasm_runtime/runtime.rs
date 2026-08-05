@@ -632,6 +632,16 @@ impl Runtime {
     ///
     /// Runs ON the contract loop (serialized with delegate `store_secret`),
     /// mirroring the on-loop write discipline of `import_secret_bundle`.
+    ///
+    /// UNREACHABLE as of freenet/freenet-core#5198: the sole caller (the
+    /// `RegisterDelegateWithPredecessors` handler in
+    /// `crates/core/src/contract/executor/runtime/delegates.rs`) no longer
+    /// calls this, because the `origin_contract` this method's H1 gate relies
+    /// on is forgeable by any HTTP client — see #5198 for the exploit chain.
+    /// Kept (not deleted) so the underlying `SecretsStore::migrate_secrets`
+    /// mechanism, which is otherwise sound, is easy to re-wire once
+    /// `origin_contract` attestation is hardened.
+    #[allow(dead_code)]
     pub(crate) fn migrate_delegate_secrets(
         &mut self,
         predecessors: &[DelegateKey],

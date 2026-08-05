@@ -174,9 +174,18 @@ pub(crate) const MIGRATION_MARKER_TABLE: TableDefinition<&[u8], &[u8]> =
 /// `RegisterDelegateWithPredecessors`). Copy-forward consults it: a predecessor's
 /// Local secrets are copied into a successor ONLY when the registering request's
 /// origin is among the predecessor's recorded origins (or both are the Admin/None
-/// class), so a malicious web-app cannot register a delegate that names an
-/// unrelated victim delegate as a predecessor to exfiltrate its secrets
-/// (predecessor keys are public-derivable). See `SecretsStore::delegate_origins`.
+/// class).
+///
+/// **This gate alone is NOT sufficient protection (freenet/freenet-core#5198).**
+/// The registering request's `origin_contract` is itself forgeable by any HTTP
+/// client (see #5198 for the exploit chain), so a malicious web-app CAN obtain
+/// a value that matches an unrelated victim delegate's recorded origin. The
+/// actual protection today is that the copy-forward's sole caller
+/// (`RegisterDelegateWithPredecessors`'s handler) is unconditionally disabled —
+/// this gate is not currently invoked in production at all. Do not treat this
+/// table as a sufficient authorization control if the copy-forward is ever
+/// re-wired; `origin_contract` attestation needs hardening first. See
+/// `SecretsStore::delegate_origins` and `SecretsStore::migrate_secrets`.
 ///
 /// Key: DelegateKey (64 bytes)
 /// Value: `[has_admin_none: 1][N × ContractInstanceId(32)]` — `has_admin_none`
