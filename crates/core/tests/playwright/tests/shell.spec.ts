@@ -601,6 +601,15 @@ test("same-origin in-contract link performs an in-place navigate hop", async ({
   ).toBeVisible();
   await expect(page).toHaveURL(/page2\.html/);
   await expect(page).not.toHaveURL(/__sandbox/);
+
+  // A real navigate hop reloads the iframe with a fresh document — including
+  // a fresh title_sync.js instance — so the tab must pick up page 2's own
+  // <title> ("Freenet shell fixture - page 2", set in fixture-webapp/page2.html),
+  // not keep index.html's. Unlike the "re-syncs on a later change" test
+  // (which mutates document.title within the SAME document via JS), this
+  // exercises a genuine iframe reload — the path a real multi-page contract
+  // site actually takes.
+  await expect(page).toHaveTitle("Freenet shell fixture - page 2");
 });
 
 test("a link carrying a download attribute is NOT intercepted", async ({
