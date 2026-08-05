@@ -1076,9 +1076,14 @@ pub(crate) fn version_supports_hash_first_summaries(
 /// must equal the floor.
 ///
 /// RELEASE-TIME ACTION: when the release carrying this feature is cut, set this
-/// to `Some(BROADCAST_TARGET_LIST_MIN_VERSION)` and freeze both.
+/// to a LITERAL `Some((major, minor, patch))` of that release and freeze both.
+///
+/// Write the literal, NOT `Some(BROADCAST_TARGET_LIST_MIN_VERSION)`. Naming the
+/// constant compiles, passes, and reads as tidier, but it makes the guard's
+/// `shipped == floor` assertion compare the floor against itself, so that arm
+/// can never fail again, which is the entire point of the guard.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const BROADCAST_TARGET_LIST_SHIPPED_IN: Option<(u8, u8, u16)> = None;
+pub(crate) const BROADCAST_TARGET_LIST_SHIPPED_IN: Option<(u8, u8, u16)> = Some((0, 2, 120));
 
 /// Version floor for the originator target list on broadcast (#5147).
 ///
