@@ -428,6 +428,7 @@ impl OpManager {
                     // 100%-wasted send on every single relayed broadcast.
                     if Some(&pkl_addr) == sender {
                         skipped_sender += 1;
+                        crate::config::GlobalTestMetrics::record_broadcast_sender_skipped();
                         continue;
                     }
                     // Self-exclusion is now UNCONDITIONAL. Broadcasting to

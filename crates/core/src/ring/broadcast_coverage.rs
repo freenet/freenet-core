@@ -409,6 +409,33 @@ impl BroadcastOrigin {
         }
     }
 
+    /// The update arrived over the network and named `covered`, but the SENDER
+    /// itself must not be excluded from our fan-out.
+    ///
+    /// Exists because the two halves of a relayed claim are gated differently,
+    /// and conflating them made the whole feature inert:
+    ///
+    /// * The covered LIST is self-gating. It rides only on `BroadcastToV2` /
+    ///   `BroadcastToStreamingV2`, so a pre-floor sender produces no list and
+    ///   suppresses nothing whatever we do. Receiving one IS the proof that the
+    ///   sender supports the feature — a stronger signal than any version
+    ///   lookup, because it is the sender's own act rather than our record of it.
+    /// * The sender EXCLUSION has no wire signal of its own, so it is gated on
+    ///   the sender's recorded version.
+    ///
+    /// Gating the list on the version table too looks equivalent and is not: a
+    /// node does not learn its gateway's version until #5167 propagates, so the
+    /// lookup fails closed on exactly the highest-degree links, and the list is
+    /// discarded even though the V2 message in hand proves it is honourable.
+    /// In simulation, where that ack gate defaults OFF, it zeroed suppression
+    /// outright.
+    pub(crate) fn relayed_list_only(covered: HashSet<PeerKey>) -> Self {
+        Self {
+            sender: None,
+            covered,
+        }
+    }
+
     /// The peer that delivered this update, if it came from the network.
     pub(crate) fn sender(&self) -> Option<&SocketAddr> {
         self.sender.as_ref()

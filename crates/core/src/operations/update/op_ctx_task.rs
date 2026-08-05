@@ -809,22 +809,37 @@ pub(crate) fn resolve_covered_peers(
     sender_addr: SocketAddr,
     covered: &crate::ring::broadcast_coverage::CoveredPeers,
 ) -> crate::ring::broadcast_coverage::BroadcastOrigin {
-    if !op_manager
-        .ring
-        .connection_manager
-        .supports_broadcast_target_list(sender_addr)
-    {
-        // Pre-floor or unknown sender: no suppression of any kind, so this
-        // node's fan-out is byte-for-byte what it is today.
-        return crate::ring::broadcast_coverage::BroadcastOrigin::local();
-    }
+    // The two halves are gated SEPARATELY, and conflating them is what made the
+    // whole feature inert. See `BroadcastOrigin::relayed_list_only`.
+    //
+    // The covered LIST is self-gating: it rides only on the V2 variants, so a
+    // pre-floor sender hands us an empty one and suppresses nothing no matter
+    // what we do here. Holding a populated list IS proof the sender supports the
+    // feature — its own act, rather than our record of it.
+    //
+    // The sender EXCLUSION has no wire signal, so it keeps the version gate.
     let resolved = if covered.is_empty() {
         std::collections::HashSet::new()
     } else {
         let candidates = op_manager.advertised_cohost_pub_keys(key);
         covered.resolve(tx, candidates.iter())
     };
-    crate::ring::broadcast_coverage::BroadcastOrigin::relayed(sender_addr, resolved)
+
+    if op_manager
+        .ring
+        .connection_manager
+        .supports_broadcast_target_list(sender_addr)
+    {
+        crate::ring::broadcast_coverage::BroadcastOrigin::relayed(sender_addr, resolved)
+    } else {
+        // Pre-floor or UNKNOWN sender version. Unknown is the common case, not a
+        // corner: a node does not learn its gateway's version until #5167
+        // propagates, and simulations default that ack gate OFF. Gating the list
+        // on this lookup too discarded a claim the message in hand had already
+        // proven honourable, which zeroed suppression on the highest-degree
+        // links in production and entirely in simulation.
+        crate::ring::broadcast_coverage::BroadcastOrigin::relayed_list_only(resolved)
+    }
 }
 
 /// Spawn a relay driver for a fresh inbound `UpdateMsg::BroadcastTo`.
