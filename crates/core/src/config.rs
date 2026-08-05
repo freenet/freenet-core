@@ -2933,8 +2933,9 @@ pub const DEFAULT_OTEL_ENDPOINT: &str = "http://localhost:4318";
 /// How the OTel exporter authenticates to the collector.
 ///
 /// `freenet` (the default) sends a per-request
-/// `Authorization: Bearer freenet/<pubkey>/<timestamp>/<nonce>/<signature>`
-/// token signed with a key derived from the node's transport keypair — see
+/// `Authorization: Bearer freenet/<pubkey>/<timestamp>/<signature>`
+/// token — an XEdDSA signature over `freenet/<pubkey>/<timestamp>`, signed
+/// with the node's x25519 transport secret — see
 /// `tracing::otel::bearer_token`. `disabled` sends no Authorization header.
 /// Future methods get new variants.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
