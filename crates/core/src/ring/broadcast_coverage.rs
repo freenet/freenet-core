@@ -49,16 +49,33 @@
 //! targets into it. Measured hop-2 suppression is already 0.99, so multi-hop
 //! buys nothing.
 //!
-//! It also closes an attack. The list is an attestation of the sender's own
-//! actions: a malicious ORIGINATOR "suppressing" its own update is a non-attack
-//! (it could simply not send). A malicious RELAYER attaching a fabricated
-//! "everyone is covered" list to a genuine update could suppress third-party
-//! re-fan-out for a cycle. The rule that closes it: **honor a list only from
-//! the message that delivered the payload.** One-hop makes that free, and it is
-//! enforced structurally — [`CoveredPeers`] is only ever read out of the
-//! payload-bearing `BroadcastToV2` / `BroadcastToStreamingV2` variants, and the
-//! re-fan-out builds a fresh list from its own targets rather than propagating
-//! the one it received.
+//! It also narrows an attack, and it is worth being exact about which one,
+//! because an earlier version of this comment claimed more than the design
+//! delivers.
+//!
+//! The rule is: **honor a list only from the message that delivered the
+//! payload.** That is enforced structurally — [`CoveredPeers`] is only ever
+//! read out of the payload-bearing `BroadcastToV2` / `BroadcastToStreamingV2`
+//! variants, and the re-fan-out builds a fresh list from its own targets rather
+//! than propagating the one it received.
+//!
+//! What that CLOSES: a peer which delivers nothing cannot assert coverage. It
+//! must actually carry the payload to be listened to, so a bystander cannot
+//! silence a fan-out it is not part of.
+//!
+//! What it does NOT close, stated plainly: a relayer that genuinely delivers
+//! the payload can still fabricate the list. It mints the `update_tx` that
+//! seeds the hashes, and `resolve` verifies nothing about the claim. So a
+//! malicious co-host M can forward a real update to B naming all of B's
+//! co-hosts, and B suppresses its entire re-fan-out for one cycle; where B is a
+//! cut vertex, propagation past B stops until the ~5-minute heartbeat heals it.
+//!
+//! Note this is an AMPLIFICATION rather than a new capability, which is the
+//! honest framing — "a malicious originator could simply not send" is true but
+//! does not bound it. Withholding costs M its own links; lying costs M's links
+//! PLUS B's entire fan-out. The residual is bounded (one hop, one cycle,
+//! anti-entropy heals it, and the attacker must already be an advertised
+//! co-host in the delivery path) and is accepted, not closed.
 //!
 //! # Transaction-seeded hashing
 //!
@@ -69,9 +86,17 @@
 //! co-host sets across transactions to infer topology. The receiver
 //! reconstructs the seed from the transaction id carried on the same message.
 //!
+//! What tx-seeding does NOT prevent, since the seed travels in the clear on the
+//! same message: the RECIPIENT can test membership for this one broadcast. It
+//! computes `blake3(tx || pk)[..8]` for any public key it holds and learns
+//! whether that peer was served — including peers that advertised co-hosting to
+//! the SENDER but never to it. Marginal over the existing neighbor-hosting
+//! gossip, but not nothing. Against an off-path observer there is no leak: the
+//! list only ever rides an established, point-to-point encrypted peer link.
+//!
 //! Note that in production each fan-out leg mints its OWN transaction
 //! (`broadcast_queue.rs`), so the list is built per-recipient. That is a
-//! handful of 48-byte hashes per send and is not measurable next to the WASM
+//! handful of 8-byte hashes per send and is not measurable next to the WASM
 //! merge it precedes.
 //!
 //! # Provenance: how the list reaches the fan-out decision
@@ -201,7 +226,22 @@ impl CoveredPeers {
         if self.hashes.is_empty() {
             return HashSet::new();
         }
-        let named: HashSet<PeerHash> = self.hashes.iter().copied().collect();
+        // Receive-side bound. [`MAX_COVERED_PEERS`] is enforced in
+        // `from_targets`, which is sender self-discipline: a remote peer's list
+        // arrives with whatever length it chose. The wire already bounds it in
+        // practice (a short message caps around 170 hashes) and the cost here is
+        // O(candidates) rather than O(named), so this is not closing an
+        // amplification — it is making the documented cap an invariant of the
+        // type rather than a property of one construction path. Truncating
+        // (rather than rejecting) keeps the over-cap direction the same as the
+        // sender's: name fewer peers, suppress fewer, degrade toward today's
+        // unsuppressed behaviour.
+        let named: HashSet<PeerHash> = self
+            .hashes
+            .iter()
+            .take(MAX_COVERED_PEERS)
+            .copied()
+            .collect();
         candidates
             .into_iter()
             .filter(|pub_key| named.contains(&peer_hash(tx, pub_key)))
@@ -806,9 +846,27 @@ mod tests {
 
         // Every retained entry must still be a genuine member: truncation may
         // only lose suppression, never invent it.
+        //
+        // The obvious spelling of that — `resolved.iter().all(|p| peers.contains(p))`
+        // — cannot fail: `resolve` maps over the candidates it is handed, and
+        // the candidates here ARE `peers`, so it is asking whether a subset of a
+        // set is in that set. It was there and it proved nothing.
+        //
+        // What can fail: resolving against candidates the list never named must
+        // suppress NOBODY. That is the property "truncation cannot invent
+        // suppression" actually rests on, and it goes red if `resolve` ever
+        // matched on anything but the tx-seeded hash.
         let resolved = covered.resolve(&tx, peers.iter());
         assert_eq!(resolved.len(), MAX_COVERED_PEERS);
-        assert!(resolved.iter().all(|peer| peers.contains(&peer.0)));
+
+        let strangers: Vec<TransportPublicKey> = (0..8).map(|_| pub_key()).collect();
+        let resolved_strangers = covered.resolve(&tx, strangers.iter());
+        assert!(
+            resolved_strangers.is_empty(),
+            "a truncated list resolved against peers it never named suppressed \
+             {} of them; truncation may only LOSE suppression, never invent it",
+            resolved_strangers.len()
+        );
     }
 
     /// Encoding is canonical: the same peer set produces the same bytes

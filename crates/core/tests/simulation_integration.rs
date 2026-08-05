@@ -17324,6 +17324,17 @@ struct SuppressionArm {
     summary_skips: u64,
     /// Contracts that converged, and how many there were.
     converged: (usize, usize),
+    /// Peers that actually agreed on the converged state.
+    ///
+    /// `converged` counts CONTRACTS, and this simulation has one, so on its own
+    /// it reduces to `1 >= 1`. `check_convergence_from_logs` also skips any
+    /// contract with fewer than two reporting peers and counts only peers that
+    /// logged a state hash — so a peer that stops RECEIVING stops logging and
+    /// leaves the denominator rather than being counted as diverged. The
+    /// replica count is what notices that.
+    replicas: usize,
+    /// Contracts whose replicas disagreed outright.
+    diverged: usize,
     /// Peers that were suppressed because the originator named them.
     suppressed: u64,
     /// Hosting advertisements exchanged. The premise check: without these no
@@ -17440,6 +17451,12 @@ fn run_5147_suppression_arm(network_name: &str, target_list_enabled: bool) -> Su
         resync_suppressed: GlobalTestMetrics::resync_requests_suppressed(),
         summary_skips: GlobalTestMetrics::fanout_summary_skips(),
         converged: (convergence.converged.len(), convergence.total_contracts()),
+        replicas: convergence
+            .converged
+            .iter()
+            .map(|c| c.replica_count)
+            .sum::<usize>(),
+        diverged: convergence.diverged.len(),
         suppressed: GlobalTestMetrics::broadcast_targets_suppressed(),
         hosting_updates: GlobalTestMetrics::neighbor_hosting_updates(),
     }
@@ -17520,7 +17537,7 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
 
     tracing::info!(
         "#5147 control:   deliveries={} redundant={} sends={} (delta={} full={}) \
-         suppressed={} summary_skips={} resync_suppressed={} converged={:?}",
+         suppressed={} summary_skips={} resync_suppressed={} converged={:?} replicas={} diverged={}",
         control.deliveries,
         control.redundant,
         control.sends,
@@ -17530,10 +17547,12 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
         control.summary_skips,
         control.resync_suppressed,
         control.converged,
+        control.replicas,
+        control.diverged,
     );
     tracing::info!(
         "#5147 treatment: deliveries={} redundant={} sends={} (delta={} full={}) \
-         suppressed={} summary_skips={} resync_suppressed={} converged={:?}",
+         suppressed={} summary_skips={} resync_suppressed={} converged={:?} replicas={} diverged={}",
         treatment.deliveries,
         treatment.redundant,
         treatment.sends,
@@ -17543,6 +17562,8 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
         treatment.summary_skips,
         treatment.resync_suppressed,
         treatment.converged,
+        treatment.replicas,
+        treatment.diverged,
     );
 
     // PREMISE 1: the peers really became each other's advertised co-hosts. If
@@ -17591,13 +17612,32 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
     // summary gate, or suppressed by the target list — so the sum is the
     // fan-out volume. If it differs, the arms are not comparable and the
     // reduction below could be a topology difference rather than the feature.
+    // Exact equality is deliberate and is NOT a flake risk here, but the reason
+    // is worth stating because it does not generalise: this simulation is
+    // turmoil-scheduled from a fixed seed with peer identity derived from the
+    // label rather than the network name, so each arm is individually
+    // deterministic and re-running either reproduces its counts exactly. The
+    // equality is therefore a real claim about the two arms, not a sample.
+    //
+    // What it is NOT is a conservation law. The three buckets do not partition
+    // every offered leg: `sends` counts only SUCCESSFUL sends, the `compute_delta`
+    // empty-delta return skips without incrementing `summary_skips`, and the
+    // `should_broadcast_contract` early return and queue eviction leave no trace
+    // in any of them. So if this fires, the honest reading is "the arms did
+    // different amounts of work OR a leg took an unbucketed exit" — the failure
+    // message must not send the next reader hunting a topology difference that
+    // did not happen.
     let control_legs = control.sends + control.summary_skips + control.suppressed;
     let treatment_legs = treatment.sends + treatment.summary_skips + treatment.suppressed;
     assert_eq!(
         control_legs, treatment_legs,
-        "the arms offered different numbers of fan-out legs ({control_legs} vs \
-         {treatment_legs}), so they are not comparable and any reduction \
-         measured between them is not attributable to #5147"
+        "the arms accounted for different numbers of fan-out legs \
+         ({control_legs} vs {treatment_legs}). Either they genuinely did \
+         different amounts of work — in which case the reduction below is not \
+         attributable to #5147 — or a leg exited through a path none of the \
+         three counters observe (a failed send, an empty-delta skip, a \
+         should_broadcast_contract early return, or a queue eviction). Check \
+         which before treating this as a topology difference."
     );
 
     // DISCRIMINATOR B: it removed real traffic, not just incremented a counter.
@@ -17680,6 +17720,42 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
 
     // SAFETY: no bandwidth saving justifies a peer not converging. This is the
     // assertion that fails on over-suppression.
+    // PREMISE 4: the control arm converged at all. Without this the assertion
+    // below is satisfied by `0 >= 0` if a future change breaks BOTH arms.
+    assert!(
+        control.converged.0 > 0 && control.diverged == 0,
+        "premise: the control arm did not converge ({} converged, {} diverged), \
+         so the treatment-vs-control safety comparison below means nothing",
+        control.converged.0,
+        control.diverged,
+    );
+
+    // SAFETY (a): nobody diverged outright.
+    assert_eq!(
+        treatment.diverged, 0,
+        "#5147 left {} contract(s) with replicas holding different state; a \
+         peer wrongly excluded from a fan-out does not learn of the update \
+         until the ~5-minute interest heartbeat",
+        treatment.diverged,
+    );
+
+    // SAFETY (b): no peer silently dropped OUT of the comparison.
+    //
+    // Divergence alone cannot see the failure this design is most likely to
+    // cause. Over-suppression does not give a peer WRONG state, it gives it NO
+    // state — and a peer that never receives never logs a state hash, so it
+    // leaves the denominator instead of being counted as diverged. Comparing
+    // replica counts across arms is what catches that.
+    assert!(
+        treatment.replicas >= control.replicas,
+        "#5147 cut the number of peers holding the converged state ({} vs \
+         control {}). Suppressing a peer that needed the update does not show \
+         up as divergence — the peer simply stops reporting — so this is the \
+         assertion that sees it.",
+        treatment.replicas,
+        control.replicas,
+    );
+
     assert!(
         treatment.converged.0 >= control.converged.0,
         "#5147 cost convergence: control converged {:?}, treatment {:?}. A \

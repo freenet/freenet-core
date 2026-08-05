@@ -715,6 +715,12 @@ mod tests {
             "UpdateMsg::BroadcastTo {",
             "UpdateMsg::RequestUpdateStreaming {",
             "UpdateMsg::BroadcastToStreaming {",
+            // #5147 appended these two. The list was NOT extended when they
+            // landed, so this guard — whose entire job is to fail when a new
+            // UPDATE wire variant appears ungated — silently passed on the very
+            // change that added two. No live bypass resulted (the key is
+            // extracted from all six variants at node.rs before both gates run),
+            // but the guard had stopped guarding.
             "UpdateMsg::BroadcastToV2 {",
             "UpdateMsg::BroadcastToStreamingV2 {",
         ] {

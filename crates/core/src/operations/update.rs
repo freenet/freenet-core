@@ -326,13 +326,16 @@ impl OpManager {
     pub(crate) fn advertised_cohost_pub_keys(&self, key: &ContractKey) -> Vec<TransportPublicKey> {
         self.neighbor_hosting.neighbors_with_contract(key)
     }
+
     /// Resolve the set of peers to broadcast a state update to.
     ///
     /// Targets are the advertised co-hosts from the proximity neighbor cache
     /// (peers who announced, via the advertisement layer, that they host this
-    /// contract). Skips the sender (to avoid echo) and this node (unless we are
-    /// the local originator). Returns skip-reason counters alongside the
-    /// resolved targets for broadcast delivery diagnostics (issue #3046).
+    /// contract). Skips the sender (to avoid echo) and, unconditionally, this
+    /// node — #5147 removed the `is_local_update_initiator` condition on the
+    /// latter, since broadcasting to ourselves is never correct. Returns
+    /// skip-reason counters alongside the resolved targets for broadcast
+    /// delivery diagnostics (issue #3046).
     ///
     /// ## Source-1-only live fan-out (#4642 step 9)
     ///
@@ -1674,10 +1677,33 @@ mod tests {
     /// payload. That is not a decode error; it is a plausible-looking wrong
     /// message.
     ///
-    /// The table is a FIXED-LENGTH array, so adding a variant without extending
-    /// it is a compile error rather than a silently-passing test.
+    /// Adding a variant without extending this test is a compile error, via the
+    /// wildcard-free match in `variant_index_anchor` below.
+    ///
+    /// It did NOT used to be. The rustdoc claimed the fixed-length
+    /// `[(u32, UpdateMsg); 6]` array delivered that guarantee, and it does not:
+    /// an array literal has no exhaustiveness relationship to the enum, so a
+    /// 7th variant compiled and this test passed unchanged. The claim was
+    /// convincing enough that two of five independent reviewers repeated it
+    /// back rather than testing it. The anchor makes it true.
     #[test]
     fn update_msg_wire_variant_indices_are_frozen() {
+        // Exhaustiveness anchor. Its ONLY job is to fail compilation when a
+        // variant is added: a wildcard-free match over every variant cannot be
+        // extended without the author coming here, seeing the frozen indices,
+        // and appending to `expected` too. Never add a `_ =>` arm.
+        #[allow(dead_code)]
+        fn variant_index_anchor(msg: &UpdateMsg) -> u32 {
+            match msg {
+                UpdateMsg::RequestUpdate { .. } => 0,
+                UpdateMsg::BroadcastTo { .. } => 1,
+                UpdateMsg::RequestUpdateStreaming { .. } => 2,
+                UpdateMsg::BroadcastToStreaming { .. } => 3,
+                UpdateMsg::BroadcastToV2 { .. } => 4,
+                UpdateMsg::BroadcastToStreamingV2 { .. } => 5,
+            }
+        }
+
         use crate::message::DeltaOrFullState;
         use crate::ring::broadcast_coverage::CoveredPeers;
         use crate::transport::peer_connection::StreamId;
