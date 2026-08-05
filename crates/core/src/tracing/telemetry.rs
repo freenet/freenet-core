@@ -2808,6 +2808,30 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "lattice_probe_improvements".to_string(),
                     serde_json::json!(snapshot.lattice_probe_improvements),
                 );
+                // Version-gate refusal counters (#5156): same hand-mirror
+                // footgun as the gauges above — a new `RouterSnapshotInfo`
+                // field is invisible to the collector unless added here.
+                // These split the hash-first-summaries / summary-first-PUT
+                // fail-closed fallback into its two causes (unknown remote
+                // version vs known-but-pre-floor), which have opposite
+                // self-healing implications. Pinned by
+                // `router_snapshot_json_includes_version_gate_refusal_counters`.
+                obj.insert(
+                    "hash_first_summaries_declined_unknown_version".to_string(),
+                    serde_json::json!(snapshot.hash_first_summaries_declined_unknown_version),
+                );
+                obj.insert(
+                    "hash_first_summaries_declined_pre_floor".to_string(),
+                    serde_json::json!(snapshot.hash_first_summaries_declined_pre_floor),
+                );
+                obj.insert(
+                    "summary_first_put_declined_unknown_version".to_string(),
+                    serde_json::json!(snapshot.summary_first_put_declined_unknown_version),
+                );
+                obj.insert(
+                    "summary_first_put_declined_pre_floor".to_string(),
+                    serde_json::json!(snapshot.summary_first_put_declined_pre_floor),
+                );
                 // Interest-weighted (two-tier) module-cache SHADOW gauges
                 // (#4441/#4534). Inserted here (not as inline `json!` keys) to
                 // keep the macro under its recursion limit, same as the
@@ -3696,6 +3720,34 @@ mod tests {
             json["phantom_in_use_contracts"], 7,
             "phantom_in_use_contracts must reach the OTLP body"
         );
+    }
+
+    /// Pin: the version-gate refusal counters (#5156) must reach the
+    /// hand-mirrored OTLP body — same footgun as the gauges above. These
+    /// split why `supports_hash_first_summaries` / `supports_summary_first_put`
+    /// fell back to the full-bytes path into its two causes (unknown remote
+    /// version, which never self-heals, vs known-but-pre-floor, which
+    /// self-heals as the fleet upgrades). A silent drop would re-blind
+    /// central telemetry to which cause actually dominates the fallback.
+    #[test]
+    fn router_snapshot_json_includes_version_gate_refusal_counters() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.hash_first_summaries_declined_unknown_version = Some(41);
+        info.hash_first_summaries_declined_pre_floor = Some(43);
+        info.summary_first_put_declined_unknown_version = Some(47);
+        info.summary_first_put_declined_pre_floor = Some(53);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("hash_first_summaries_declined_unknown_version", 41),
+            ("hash_first_summaries_declined_pre_floor", 43),
+            ("summary_first_put_declined_unknown_version", 47),
+            ("summary_first_put_declined_pre_floor", 53),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
     }
 
     /// Pin: the terminal advertisement-consult counters (hosting redesign piece

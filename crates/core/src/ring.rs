@@ -1701,6 +1701,23 @@ impl Ring {
             snapshot.lattice_probes_issued = Some(lattice_probes_issued);
             snapshot.lattice_probe_improvements = Some(lattice_probe_improvements);
 
+            // Version-gate refusal counters (#5156): why
+            // `supports_hash_first_summaries` / `supports_summary_first_put`
+            // fell back to the full-bytes path, split into the two causes
+            // with opposite implications (unknown remote version, which never
+            // self-heals, vs a known pre-floor version, which self-heals as
+            // the fleet upgrades). Read directly from the gate's own counters
+            // — see `ConnectionManager::version_gate_refusal_stats`.
+            let version_gate_refusals = cm.version_gate_refusal_stats();
+            snapshot.hash_first_summaries_declined_unknown_version =
+                Some(version_gate_refusals.hash_first_declined_unknown_version);
+            snapshot.hash_first_summaries_declined_pre_floor =
+                Some(version_gate_refusals.hash_first_declined_pre_floor);
+            snapshot.summary_first_put_declined_unknown_version =
+                Some(version_gate_refusals.summary_first_put_declined_unknown_version);
+            snapshot.summary_first_put_declined_pre_floor =
+                Some(version_gate_refusals.summary_first_put_declined_pre_floor);
+
             // Compiled-WASM module-cache occupancy + eviction gauges (#4440),
             // read from the per-node `Arc` the caches publish into (they live
             // behind the contract-handler channel, unreachable from here; the

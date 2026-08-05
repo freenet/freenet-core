@@ -504,6 +504,23 @@ pub(crate) struct ConnectionManager {
     /// exercises the hash-first path before the crate version reaches the
     /// production floor. See `NodeConfig`.
     hash_first_summaries_floor_override: Option<(u8, u8, u16)>,
+    /// Version-gate refusal counters (#5156). Both `supports_hash_first_summaries`
+    /// and `supports_summary_first_put` fail closed to the full-bytes fallback
+    /// for two causes with opposite implications — a pre-floor peer self-heals
+    /// as the fleet upgrades, an unknown remote version never does (it is
+    /// documented on joiner->gateway `AckConnection` links, `peer_connection.rs`)
+    /// — and until now nothing told the two apart. Each gate increments its own
+    /// pair directly, at the point it decides, so the count can never drift from
+    /// the decision it describes (see the "Metric describing a filtering
+    /// decision" row in `.claude/rules/bug-prevention-patterns.md`: a count
+    /// re-derived at the call site, e.g. by subtracting set sizes, silently
+    /// keeps reporting a plausible number after the filter it claims to measure
+    /// is deleted). Cheap `Relaxed` atomics, read once per `router_snapshot`
+    /// cadence via `version_gate_refusal_stats`; never blocks.
+    hash_first_declined_unknown_version: Arc<AtomicU64>,
+    hash_first_declined_pre_floor: Arc<AtomicU64>,
+    summary_first_put_declined_unknown_version: Arc<AtomicU64>,
+    summary_first_put_declined_pre_floor: Arc<AtomicU64>,
     /// Rotating start offset for the per-new-peer migration scan. The scan
     /// examines at most `MIGRATION_SCAN_CAP_PER_NEW_PEER` hosted contracts per
     /// event; advancing this cursor each event makes successive events cover
@@ -562,6 +579,16 @@ pub(crate) struct ConnectionManager {
     /// surfaced via the dashboard ring-stats provider.
     lattice_probes_issued: Arc<AtomicU64>,
     lattice_probe_improvements: Arc<AtomicU64>,
+}
+
+/// A point-in-time read of the version-gate refusal counters (#5156). See
+/// [`ConnectionManager::version_gate_refusal_stats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct VersionGateRefusalStats {
+    pub hash_first_declined_unknown_version: u64,
+    pub hash_first_declined_pre_floor: u64,
+    pub summary_first_put_declined_unknown_version: u64,
+    pub summary_first_put_declined_pre_floor: u64,
 }
 
 impl ConnectionManager {
@@ -672,6 +699,10 @@ impl ConnectionManager {
             // Default off; `new(config)` overrides from config after init.
             summary_first_put_floor_override: None,
             hash_first_summaries_floor_override: None,
+            hash_first_declined_unknown_version: Arc::new(AtomicU64::new(0)),
+            hash_first_declined_pre_floor: Arc::new(AtomicU64::new(0)),
+            summary_first_put_declined_unknown_version: Arc::new(AtomicU64::new(0)),
+            summary_first_put_declined_pre_floor: Arc::new(AtomicU64::new(0)),
             migration_scan_cursor: Arc::new(AtomicUsize::new(0)),
             transient_connections: Arc::new(DashMap::new()),
             transient_in_use: Arc::new(AtomicUsize::new(0)),
@@ -1435,12 +1466,30 @@ impl ConnectionManager {
     /// treated as unsupported (fail-closed): an older peer that cannot
     /// deserialize the appended `ProbeRequest` wire tag would drop the
     /// connection, so when in doubt the caller must not emit it.
+    ///
+    /// Refusals are attributed (#5156): a `None` remote version increments
+    /// `summary_first_put_declined_unknown_version` (never self-heals — see
+    /// [`Self::version_gate_refusal_stats`]), a known-but-below-floor version
+    /// increments `summary_first_put_declined_pre_floor` (self-heals as the
+    /// fleet upgrades). Recorded HERE, at the point the gate decides, not
+    /// re-derived by a caller from set sizes.
     pub(crate) fn supports_summary_first_put(&self, addr: SocketAddr) -> bool {
         let remote = self.remote_version(addr);
         let floor = self
             .summary_first_put_floor_override()
             .unwrap_or(crate::node::SUMMARY_FIRST_PUT_MIN_VERSION);
-        crate::node::version_supports_summary_first_put(remote, floor)
+        let supported = crate::node::version_supports_summary_first_put(remote, floor);
+        if !supported {
+            match remote {
+                None => self
+                    .summary_first_put_declined_unknown_version
+                    .fetch_add(1, Ordering::Relaxed),
+                Some(_) => self
+                    .summary_first_put_declined_pre_floor
+                    .fetch_add(1, Ordering::Relaxed),
+            };
+        }
+        supported
     }
 
     /// Whether the peer at `addr` reports a version new enough to understand
@@ -1467,11 +1516,54 @@ impl ConnectionManager {
     /// DIRECTION of a sim peer pair may have a known version. A test that
     /// picks the wrong direction gets `None`, fails closed, and silently
     /// exercises the fallback instead of the feature.
+    ///
+    /// Refusals are attributed (#5156) the same way as
+    /// [`Self::supports_summary_first_put`]: a `None` remote version
+    /// increments `hash_first_declined_unknown_version`, a known-but-below-
+    /// floor version increments `hash_first_declined_pre_floor`. See
+    /// [`Self::version_gate_refusal_stats`].
     pub(crate) fn supports_hash_first_summaries(&self, addr: SocketAddr) -> bool {
         let floor = self
             .hash_first_summaries_floor_override
             .unwrap_or(crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION);
-        crate::node::version_supports_hash_first_summaries(self.remote_version(addr), floor)
+        let remote = self.remote_version(addr);
+        let supported = crate::node::version_supports_hash_first_summaries(remote, floor);
+        if !supported {
+            match remote {
+                None => self
+                    .hash_first_declined_unknown_version
+                    .fetch_add(1, Ordering::Relaxed),
+                Some(_) => self
+                    .hash_first_declined_pre_floor
+                    .fetch_add(1, Ordering::Relaxed),
+            };
+        }
+        supported
+    }
+
+    /// Read the version-gate refusal counters (#5156): why
+    /// [`Self::supports_hash_first_summaries`] and
+    /// [`Self::supports_summary_first_put`] fell back to the full-bytes /
+    /// full-state path, split by cause. `*_declined_unknown_version` never
+    /// self-heals (documented on joiner->gateway `AckConnection` links, which
+    /// carry no negotiated version); `*_declined_pre_floor` self-heals as the
+    /// fleet upgrades past the floor. Monotonic lifetime totals; the collector
+    /// differences them across the `router_snapshot` cadence.
+    pub(crate) fn version_gate_refusal_stats(&self) -> VersionGateRefusalStats {
+        VersionGateRefusalStats {
+            hash_first_declined_unknown_version: self
+                .hash_first_declined_unknown_version
+                .load(Ordering::Relaxed),
+            hash_first_declined_pre_floor: self
+                .hash_first_declined_pre_floor
+                .load(Ordering::Relaxed),
+            summary_first_put_declined_unknown_version: self
+                .summary_first_put_declined_unknown_version
+                .load(Ordering::Relaxed),
+            summary_first_put_declined_pre_floor: self
+                .summary_first_put_declined_pre_floor
+                .load(Ordering::Relaxed),
+        }
     }
 
     /// Reserve the next `window`-sized slice of the hosting set for a migration
@@ -2909,6 +3001,146 @@ mod tests {
             "a peer above the floor must stay supported (the floor is a \
              minimum, never an equality test)"
         );
+    }
+
+    // ============ version-gate refusal counters (#5156) ============
+
+    /// Each refusal counter increments ONLY for its own cause: an unknown
+    /// remote version bumps `*_declined_unknown_version`, a known-but-
+    /// below-floor version bumps `*_declined_pre_floor` — never both at once,
+    /// and a call to one gate never touches the other gate's counters.
+    /// Exercises both `supports_hash_first_summaries` and
+    /// `supports_summary_first_put` since they share the same shape.
+    #[test]
+    fn version_gate_refusal_counters_increment_for_their_own_cause_only() {
+        let cm = make_connection_manager(Some(make_addr(9200)), 1, 10, false);
+        assert_eq!(
+            cm.version_gate_refusal_stats(),
+            VersionGateRefusalStats::default(),
+            "counters must start at zero"
+        );
+
+        // Hash-first: unknown version.
+        let unknown_hf = make_addr(9201);
+        assert!(!cm.supports_hash_first_summaries(unknown_hf));
+        let s = cm.version_gate_refusal_stats();
+        assert_eq!(
+            s.hash_first_declined_unknown_version, 1,
+            "unknown-version cause"
+        );
+        assert_eq!(
+            s.hash_first_declined_pre_floor, 0,
+            "must not also count as pre-floor"
+        );
+        assert_eq!(
+            s.summary_first_put_declined_unknown_version, 0,
+            "must not leak into the PUT gate's counters"
+        );
+        assert_eq!(s.summary_first_put_declined_pre_floor, 0);
+
+        // Hash-first: known but below the floor.
+        let pre_floor_hf = make_addr(9202);
+        cm.record_remote_version(pre_floor_hf, Some((0, 2, 115)));
+        assert!(!cm.supports_hash_first_summaries(pre_floor_hf));
+        let s = cm.version_gate_refusal_stats();
+        assert_eq!(
+            s.hash_first_declined_unknown_version, 1,
+            "must not also double-count as unknown-version"
+        );
+        assert_eq!(s.hash_first_declined_pre_floor, 1, "pre-floor cause");
+
+        // Hash-first: at/above the floor never refuses; counters unchanged.
+        let at_floor_hf = make_addr(9203);
+        cm.record_remote_version(
+            at_floor_hf,
+            Some(crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION),
+        );
+        assert!(cm.supports_hash_first_summaries(at_floor_hf));
+        let s = cm.version_gate_refusal_stats();
+        assert_eq!(s.hash_first_declined_unknown_version, 1);
+        assert_eq!(s.hash_first_declined_pre_floor, 1);
+
+        // Summary-first PUT: unknown version.
+        let unknown_sf = make_addr(9204);
+        assert!(!cm.supports_summary_first_put(unknown_sf));
+        let s = cm.version_gate_refusal_stats();
+        assert_eq!(
+            s.summary_first_put_declined_unknown_version, 1,
+            "unknown-version cause"
+        );
+        assert_eq!(
+            s.summary_first_put_declined_pre_floor, 0,
+            "must not also count as pre-floor"
+        );
+        // The hash-first counters from above must be untouched by the PUT gate.
+        assert_eq!(s.hash_first_declined_unknown_version, 1);
+        assert_eq!(s.hash_first_declined_pre_floor, 1);
+
+        // Summary-first PUT: known but below the floor.
+        let pre_floor_sf = make_addr(9205);
+        cm.record_remote_version(pre_floor_sf, Some((0, 2, 80)));
+        assert!(!cm.supports_summary_first_put(pre_floor_sf));
+        let s = cm.version_gate_refusal_stats();
+        assert_eq!(s.summary_first_put_declined_unknown_version, 1);
+        assert_eq!(s.summary_first_put_declined_pre_floor, 1, "pre-floor cause");
+    }
+
+    /// Mutation check prescribed by `.claude/rules/bug-prevention-patterns.md`
+    /// ("Metric describing a filtering decision, re-derived at the call
+    /// site"): a refusal counter must be driven by the ACTUAL gate decision,
+    /// not by a fact independent of it. This simulates deleting the floor
+    /// filter by overriding it to the lowest possible version `(0, 0, 0)` —
+    /// every known remote version then satisfies it, so the pre-floor cause
+    /// can never fire — using the EXACT same remote versions that
+    /// `supports_hash_first_summaries_gate_discriminates_by_version` and
+    /// `supports_summary_first_put_respects_recorded_version_against_production_floor`
+    /// prove get refused under the real production floor. If the counter were
+    /// re-derived (e.g. from total refusals minus some other tally) rather
+    /// than incremented by the gate's own floor comparison, it could stay
+    /// non-zero here even though this specific cause can no longer occur.
+    #[test]
+    fn pre_floor_counters_go_to_zero_when_the_floor_filter_is_disabled() {
+        let mut cm = make_connection_manager(Some(make_addr(9300)), 1, 10, false);
+        cm.hash_first_summaries_floor_override = Some((0, 0, 0));
+        cm.summary_first_put_floor_override = Some((0, 0, 0));
+
+        let hf_addr = make_addr(9301);
+        cm.record_remote_version(hf_addr, Some((0, 2, 115)));
+        assert!(
+            cm.supports_hash_first_summaries(hf_addr),
+            "with the floor overridden to (0,0,0) every known version must pass"
+        );
+
+        let sf_addr = make_addr(9302);
+        cm.record_remote_version(sf_addr, Some((0, 2, 80)));
+        assert!(
+            cm.supports_summary_first_put(sf_addr),
+            "with the floor overridden to (0,0,0) every known version must pass"
+        );
+
+        let s = cm.version_gate_refusal_stats();
+        assert_eq!(
+            s.hash_first_declined_pre_floor, 0,
+            "the pre-floor cause can never fire once the floor filter is disabled"
+        );
+        assert_eq!(
+            s.summary_first_put_declined_pre_floor, 0,
+            "the pre-floor cause can never fire once the floor filter is disabled"
+        );
+
+        // The unknown-version cause is a SEPARATE filter (`remote.is_some_and`)
+        // that the floor override does not touch, so it must still fire
+        // normally — proving the zero above reflects "this cause is
+        // unreachable", not "the counters are wired to do nothing".
+        let unknown_hf = make_addr(9303);
+        assert!(!cm.supports_hash_first_summaries(unknown_hf));
+        let unknown_sf = make_addr(9304);
+        assert!(!cm.supports_summary_first_put(unknown_sf));
+        let s = cm.version_gate_refusal_stats();
+        assert_eq!(s.hash_first_declined_unknown_version, 1);
+        assert_eq!(s.summary_first_put_declined_unknown_version, 1);
+        assert_eq!(s.hash_first_declined_pre_floor, 0);
+        assert_eq!(s.summary_first_put_declined_pre_floor, 0);
     }
 
     /// A reconnection whose version is UNKNOWN must CLEAR the mirror, not
