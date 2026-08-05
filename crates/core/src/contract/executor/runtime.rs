@@ -1623,6 +1623,103 @@ mod remove_contract_tests {
         );
     }
 
+    /// Regression test for freenet/freenet-core#5198, directory-level: a
+    /// predecessor holding MULTIPLE Local secrets, named in a
+    /// `RegisterDelegateWithPredecessors` request with a matching
+    /// `origin_contract`, must leave the successor's on-disk secrets
+    /// directory completely absent (or empty) — not merely missing one
+    /// known secret ID. This is stronger than
+    /// `register_delegate_with_predecessors_never_copies_secrets`, which
+    /// only checks a single secret path; a copy-forward bug that mis-copies
+    /// a DIFFERENT secret ID than the one under test would slip past a
+    /// single-path check but not a whole-directory scan.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn register_delegate_with_predecessors_successor_dir_stays_empty() {
+        use crate::wasm_runtime::SecretScope;
+        use freenet_stdlib::client_api::{DelegateRequest, HostResponse};
+        use freenet_stdlib::prelude::{
+            ContractInstanceId, Delegate, DelegateContainer, DelegateWasmAPIVersion, SecretsId,
+        };
+        use zeroize::Zeroizing;
+
+        const ORIGIN: [u8; 32] = [0x22u8; 32];
+
+        let temp_dir = crate::util::tests::get_temp_dir();
+        let db = Storage::new(temp_dir.path()).await.expect("create db");
+        let contract_store =
+            ContractStore::new(temp_dir.path().join("contracts"), 10_000, db.clone())
+                .expect("create contract store");
+        let delegate_store =
+            DelegateStore::new(temp_dir.path().join("delegate"), 10_000, db.clone())
+                .expect("create delegate store");
+        let secrets_dir = temp_dir.path().join("secrets");
+        let mut secrets_store =
+            SecretsStore::new(secrets_dir.clone(), Default::default(), db.clone())
+                .expect("create secrets store");
+
+        let pred = Delegate::from((&vec![9u8].into(), &vec![1u8].into()));
+        let succ = Delegate::from((&vec![9u8].into(), &vec![2u8].into()));
+
+        // Seed THREE Local secrets under the predecessor.
+        for i in 0u8..3 {
+            secrets_store
+                .store_secret(
+                    pred.key(),
+                    &SecretsId::new(format!("secret-{i}").into_bytes()),
+                    SecretScope::Local,
+                    Zeroizing::new(format!("value-{i}").into_bytes()),
+                )
+                .expect("seed predecessor secret");
+        }
+        secrets_store
+            .record_delegate_registration_origin(pred.key(), Some(ORIGIN))
+            .unwrap();
+
+        let successor_secrets_dir = secrets_dir.join(succ.key().encode());
+        assert!(
+            !successor_secrets_dir.exists(),
+            "successor secrets directory must not exist before registration"
+        );
+
+        let state_store = StateStore::new(db, 10_000_000).expect("create state store");
+        let runtime = Runtime::build(contract_store, delegate_store, secrets_store, false)
+            .expect("build runtime");
+        let mut executor = Executor::new(
+            state_store,
+            || Ok(()),
+            crate::contract::executor::OperationMode::Local,
+            runtime,
+            None,
+        )
+        .await
+        .expect("create executor");
+
+        let origin_contract = ContractInstanceId::new(ORIGIN);
+        let req = DelegateRequest::RegisterDelegateWithPredecessors {
+            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ.clone())),
+            cipher: [7u8; 32],
+            nonce: [9u8; 24],
+            predecessors: vec![pred.key().clone()],
+        };
+        let resp = executor
+            .delegate_request(req, Some(&origin_contract), None, None)
+            .expect("register-with-predecessors must succeed");
+        assert!(matches!(resp, HostResponse::DelegateResponse { .. }));
+
+        // Whole-directory check: NOTHING was copied into the successor's
+        // namespace, whether the directory was never created or was created
+        // empty.
+        let successor_has_any_secret = successor_secrets_dir
+            .read_dir()
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false);
+        assert!(
+            !successor_has_any_secret,
+            "successor secrets directory must be absent or empty: copy-forward is \
+             disabled (#5198) regardless of origin_contract or predecessor secret count"
+        );
+    }
+
     /// Handler-level (#4117 H1, persistence-succeeds-before-usable): if the
     /// first-writer origin record cannot be DURABLY persisted, the WHOLE
     /// registration is aborted — for BOTH the plain `RegisterDelegate` and the
