@@ -3158,6 +3158,19 @@ mod tests {
         }
         assert_eq!(result.skipped_covered, 2, "the filter counts its own drops");
         assert_eq!(got.len(), 3);
+        // `proximity_found` is the population BEFORE any narrowing, and it
+        // feeds a telemetry denominator (`tracing/register.rs`). #5190 moved
+        // the covered-peer filter into `broadcast_cohost_targets`, so the
+        // count is now `targets.len() + covered_skipped` rather than the raw
+        // list length. Asserted here — with a NON-EMPTY covered set, which the
+        // other two `proximity_found` assertions lack — because dropping the
+        // `+ covered_skipped` term silently halves that denominator with the
+        // whole suite green.
+        assert_eq!(
+            result.proximity_found, 5,
+            "proximity_found must still count every advertised co-host, \
+             including the ones the #5147 list suppressed"
+        );
     }
 
     /// A local apply carries no claim, so nothing is suppressed: byte-for-byte

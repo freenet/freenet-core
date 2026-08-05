@@ -3352,15 +3352,70 @@ mod tests {
     /// it causes peers to repeatedly broadcast stale data.
     #[test]
     fn broadcast_to_spawns_proactive_summary() {
-        let src = include_str!("op_ctx_task.rs");
-        let driver_start = src
-            .find("async fn drive_relay_broadcast_to(")
-            .expect("drive_relay_broadcast_to not found");
-        let driver_src = &src[driver_start..];
+        // Bounded to the driver body. It previously sliced to END OF FILE,
+        // which swallowed this test module — including this assertion's own
+        // message, which contains the needle verbatim. Deleting the spawn
+        // entirely left it green, and it could not tell this driver from
+        // `apply_streaming_broadcast`'s call either. See AGENTS.md, "WHEN
+        // writing a source-scrape pin test".
+        let body = broadcast_driver_body("async fn drive_relay_broadcast_to(");
         assert!(
-            driver_src.contains("send_proactive_summary_notification"),
+            body.contains("send_proactive_summary_notification"),
             "drive_relay_broadcast_to must spawn send_proactive_summary_notification \
              after a successful state change (mirrors legacy update.rs:806-819)."
+        );
+        assert_origin_is_threaded_to_the_notification(&body, "drive_relay_broadcast_to");
+    }
+
+    /// Body of one relay-broadcast driver, whitespace-stripped.
+    ///
+    /// Bounded at the next top-level `async fn` (or the test module) so a pin
+    /// cannot match a sibling driver or its own assertion strings.
+    fn broadcast_driver_body(signature: &str) -> String {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} not found"));
+        let after = &src[start + 1..];
+        let end = after
+            .find("\nasync fn ")
+            .or_else(|| after.find("\n#[cfg(test)]"))
+            .unwrap_or(after.len());
+        src[start..start + 1 + end]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    /// #5190: the notification's exclusion set is "peers the broadcast really
+    /// reached", which is only true if it is handed the SAME
+    /// `BroadcastOrigin` the fan-out used.
+    ///
+    /// Passing `BroadcastOrigin::local()` — an empty covered set — makes
+    /// `covers()` always false, so `broadcast_cohost_targets` returns the RAW
+    /// co-host set and the exclusion widens back to every advertised co-host.
+    /// That is #5190 restored, in one line, and before this pin existed the
+    /// entire suite stayed green through it: the behavioural test calls the
+    /// emitter directly and never exercises either driver.
+    fn assert_origin_is_threaded_to_the_notification(body: &str, driver: &str) {
+        assert!(
+            body.contains(
+                "send_proactive_summary_notification(&op_mgr,&key,sender_addr,&broadcast_origin,)"
+            ) || body.contains(
+                "send_proactive_summary_notification(&op_mgr,&key,sender_addr,&broadcast_origin)"
+            ),
+            "{driver} must hand the notification the fan-out's OWN origin \
+             (`&broadcast_origin`). A fresh `BroadcastOrigin::local()` or a \
+             re-resolved origin restores #5190: the covered peer is suppressed \
+             from the broadcast AND excluded from the summary, receiving neither"
+        );
+        assert_eq!(
+            body.matches("resolve_covered_peers(").count(),
+            1,
+            "{driver} must resolve the origin EXACTLY once and share it. A \
+             second resolution re-reads the co-host population at a later \
+             instant, so the notification could exclude a peer the fan-out \
+             never targeted"
         );
     }
 
@@ -6362,21 +6417,15 @@ mod tests {
     /// A invariant at `broadcast_to_spawns_proactive_summary`).
     #[test]
     fn broadcast_to_streaming_spawns_proactive_summary() {
-        let src = include_str!("op_ctx_task.rs");
-        let start = src
-            .find("async fn apply_streaming_broadcast(")
-            .expect("apply_streaming_broadcast not found");
-        let after = &src[start + 1..];
-        let end = after
-            .find("\nasync fn ")
-            .or_else(|| after.find("\n#[cfg(test)]"))
-            .unwrap_or(after.len());
-        let driver_src = &src[start..start + 1 + end];
+        let body = broadcast_driver_body("async fn apply_streaming_broadcast(");
         assert!(
-            driver_src.contains("send_proactive_summary_notification"),
+            body.contains("send_proactive_summary_notification"),
             "apply_streaming_broadcast must spawn \
              send_proactive_summary_notification on successful state change"
         );
+        // Parity with the non-streaming driver: the two were changed
+        // identically for #5190 and nothing else would notice them diverging.
+        assert_origin_is_threaded_to_the_notification(&body, "apply_streaming_broadcast");
     }
 
     /// Pin: the streaming RAII guard must remove from

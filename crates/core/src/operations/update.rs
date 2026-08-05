@@ -339,8 +339,8 @@ impl OpManager {
         self.neighbor_hosting.neighbors_with_contract(key)
     }
 
-    /// The advertised co-hosts this fan-out will actually broadcast to, after
-    /// the #5147 target-list narrowing.
+    /// The advertised co-hosts remaining after the #5147 target-list
+    /// narrowing.
     ///
     /// This is the population the broadcast/notification partition is defined
     /// over, and the ONLY thing either side of it may read. The broadcast
@@ -348,6 +348,21 @@ impl OpManager {
     /// still notifies the peers this narrowing dropped, which is the whole
     /// point — they did not get the summary in a broadcast, because they did
     /// not get a broadcast.
+    ///
+    /// Deliberately NOT "the peers the fan-out will really reach". Two
+    /// pre-existing filters sit downstream of this and are not modelled here,
+    /// so `targets` is an over-approximation:
+    ///
+    /// - the broadcast site then drops co-hosts with no resolvable
+    ///   connection, and the notification's own `resolved` step drops the
+    ///   same peers, so the two still agree — but by coincidence rather than
+    ///   by construction;
+    /// - a co-host that is ALSO the sender is dropped by both sites for
+    ///   different reasons.
+    ///
+    /// Neither is widened by #5190 and both predate it. They are the reason
+    /// the subset property is "by construction" only with respect to the
+    /// #5147 narrowing, which is the one that broke it.
     ///
     /// `covered_skipped` is returned rather than recorded here because two
     /// callers make this same call and only one of them is performing a
@@ -3291,13 +3306,18 @@ mod tests {
         // So pin the narrowing itself: within this file the raw accessor is
         // consumed exactly once, by `broadcast_cohost_targets`, and both sides
         // of the partition go through THAT.
+        // Count CALLS, not one spelling of one receiver. Needling
+        // `self.advertised_cohost_pub_keys(key)` would let a re-read written
+        // as `op_manager.advertised_cohost_pub_keys(key)` slip past — and that
+        // is precisely the form `send_proactive_summary_notification` used
+        // before this fix. The definition line strips to
+        // `fnadvertised_cohost_pub_keys(&self,...`, so requiring a leading `.`
+        // excludes it from the count.
         assert_eq!(
-            stripped
-                .matches("self.advertised_cohost_pub_keys(key)")
-                .count(),
+            stripped.matches(".advertised_cohost_pub_keys(").count(),
             1,
-            "the raw accessor must be consumed exactly once in this file, by \
-             `broadcast_cohost_targets`. A second read is a site that will not \
+            "the raw accessor must be CALLED exactly once in this file, by \
+             `broadcast_cohost_targets`. A second call is a site that will not \
              follow the #5147 narrowing — which is exactly how #5190 happened"
         );
         // Both consumers go through the NARROWED accessor, with an origin.
