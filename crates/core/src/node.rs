@@ -1087,6 +1087,14 @@ fn try_forward_driver_reply(
     op_label: &'static str,
 ) -> bool {
     let Some(callback) = pending_op_result else {
+        // Was silent at every level. Finding the clobber bug required patching
+        // a node to see this branch at all, because "no waiter is registered"
+        // is exactly the symptom a displaced waiter produces.
+        tracing::debug!(
+            tx_id = %reply.id(),
+            %op_label,
+            "try_forward_driver_reply: no waiter registered for this tx; dropping the reply"
+        );
         return false;
     };
     let tx_id = *reply.id();

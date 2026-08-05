@@ -6387,4 +6387,94 @@ pub(crate) mod tests {
              just its call site. Block:\n{body}"
         );
     }
+    /// Deterministic reproduction of the "failed notifying, channel closed"
+    /// leak on originator-loopback PUT (the #4111 forbidden marker,
+    /// v0.2.118 field reports).
+    ///
+    /// Sequence modelled (no timing, no threads):
+    ///   1. The originator's `send_and_await` registers a LIVE waiter under
+    ///      `tx` (`install_pending_op_callback` observes a live callback and
+    ///      inserts it).
+    ///   2. The relay driver — running on the SAME node (originator
+    ///      loopback) — emits a payload for the SAME `tx` through the
+    ///      op-execution channel (`send_fire_and_forget` forward, or
+    ///      `send_local_loopback` Response). Its dummy callback is designed
+    ///      to be observed closed, but the receiver half only drops when the
+    ///      producer's poll finishes; the event loop runs on a different OS
+    ///      thread and can dequeue the payload inside the enqueue→drop
+    ///      window (observed in the field on a starved 1-CPU gateway:
+    ///      `is_closed()` returned false). That state is modelled here by
+    ///      holding the dummy receiver alive across the install call.
+    ///   3. The producer's poll finishes: the dummy receiver drops.
+    ///   4. The terminal Response arrives; the bypass looks up
+    ///      `pending_op_results[tx]` and forwards via
+    ///      `try_forward_driver_reply`.
+    ///
+    /// Pre-fix behaviour: step 2's insert CLOBBERS the live waiter, dropping
+    /// the originator's sender — the driver's `recv()` yields `None`
+    /// (surfaced as `OpError::NotificationError`, i.e. "failed notifying,
+    /// channel closed"), and step 4's `try_send` hits the closed dummy
+    /// (`err=channel closed` with a callback still registered). The PUT
+    /// itself succeeded — an infrastructure leak misreported as a failure.
+    ///
+    /// Contract pinned: an op-execution payload must NEVER displace a LIVE
+    /// `pending_op_results` waiter.
+    #[tokio::test]
+    async fn op_execution_payload_must_not_clobber_live_waiter() {
+        use crate::message::MessageStats; // for `msg.id()`
+        use crate::transport::ExpectedInboundTracker;
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let tx = crate::dev_tool::Transaction::new::<crate::operations::put::PutMsg>();
+
+        // Step 1: the originator's live waiter (send_and_await's callback).
+        let (originator_sender, mut originator_rx) = mpsc::channel::<crate::node::WaiterReply>(1);
+        super::dispatch::install_pending_op_callback(&mut state, tx, originator_sender);
+        assert!(
+            state.pending_op_results.contains_key(&tx),
+            "precondition: the originator's live waiter must be installed"
+        );
+
+        // Step 2: the relay's dummy callback for the SAME tx, observed while
+        // its receiver is still alive.
+        let (dummy_sender, dummy_receiver) = mpsc::channel::<crate::node::WaiterReply>(1);
+        super::dispatch::install_pending_op_callback(&mut state, tx, dummy_sender);
+
+        // Step 3: the producer's poll finishes — the dummy receiver drops.
+        drop(dummy_receiver);
+
+        // The originator's driver must still be wired: its `recv()` must NOT
+        // resolve to `None` (that is `OpError::NotificationError` — the
+        // forbidden "failed notifying, channel closed" leak).
+        match originator_rx.try_recv() {
+            Err(TryRecvError::Empty) => {} // still connected, still waiting — correct
+            Err(TryRecvError::Disconnected) => panic!(
+                "originator's waiter channel was closed by the dummy-callback \
+                 install: the driver's recv() yields None -> NotificationError \
+                 -> the client sees 'failed notifying, channel closed' for a \
+                 PUT that succeeded (the #4111 forbidden marker)"
+            ),
+            Ok(other) => panic!("no reply was sent yet, got {other:?}"),
+        }
+
+        // Step 4: the Response arrives and the bypass forwards it to the
+        // registered callback (mirrors `process_message`'s clone-then-forward).
+        let reply = crate::message::NetMessage::V1(crate::message::NetMessageV1::Aborted(tx));
+        let cb = state.pending_op_results.get(&tx).cloned();
+        let handled = crate::node::try_forward_driver_reply(cb.as_ref(), reply, "put");
+        assert!(handled, "a callback must be registered for the tx");
+
+        // The originator must actually RECEIVE the terminal reply.
+        match originator_rx.try_recv() {
+            Ok(crate::node::WaiterReply::Reply(msg)) => {
+                assert_eq!(msg.id(), &tx, "forwarded reply must carry the tx");
+            }
+            other => panic!(
+                "originator never received the terminal reply (got {other:?}): \
+                 the reply was forwarded into the clobbering dummy callback \
+                 whose receiver is gone (try_send err=channel closed)"
+            ),
+        }
+    }
 }
