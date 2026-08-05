@@ -17508,21 +17508,28 @@ fn run_5147_arm_inner(
 /// ## Measured (7 nodes, 20 CRDT updates, identical seed and topology)
 ///
 /// ```text
-/// control:   sends=460 summary_skips=317 suppressed=0   redundant=321 converged=1/1
-/// treatment: sends=256 summary_skips=21  suppressed=500 redundant=136 converged=1/1
+/// control:   sends=460 summary_skips=417 suppressed=0   redundant=321 replicas=7 diverged=0
+/// treatment: sends=288 summary_skips=146 suppressed=428 redundant=160 replicas=7 diverged=0
 /// ```
 ///
-/// 44% fewer broadcast legs on the wire and 58% fewer redundant deliveries,
-/// with convergence unchanged. Note `sends + summary_skips + suppressed` is
-/// **777 in both arms**: the two runs did the identical amount of fan-out work
-/// and the treatment merely reclassified 500 legs, which is what rules out a
-/// topology difference between the arms as the explanation. That identity is
-/// asserted below.
+/// 37% fewer broadcast legs on the wire and 50% fewer redundant deliveries,
+/// with convergence unchanged and every replica retained.
 ///
-/// The overlap with the pre-existing summary-match gate is large here — of the
-/// 500 suppressions, roughly 300 were legs that gate would have skipped for
-/// free — which is why the send reduction (44%) is smaller than the suppression
-/// count suggests. On the fleet that overlap is much smaller: the measured
+/// These numbers superseded an earlier `460 -> 256` reading, and the reason is
+/// worth keeping: back then the sender exclusion shipped UNGATED, so it was
+/// live in BOTH arms and the control arm was not main's behaviour. Gating it
+/// made the comparison apples-to-apples and moved the measured saving down.
+///
+/// An earlier version of this doc also claimed
+/// `sends + summary_skips + suppressed` was **identical in both arms** and
+/// called that a conservation law. It is not one, and the assertion below is a
+/// 5% bound rather than an equality — see the comment at that assertion for the
+/// buckets an offered leg can exit through uncounted.
+///
+/// The overlap with the pre-existing summary-match gate is large here — many of
+/// the suppressions are legs that gate would have skipped for free — which is
+/// why the send reduction is smaller than the suppression count suggests. On
+/// the fleet that overlap is much smaller: the measured
 /// dedup ratio there is 18.6 against this simulation's 3.7, i.e. the
 /// summary-match gate is suppressing far less in production than it does here,
 /// so the target list's marginal value is larger, not smaller.
@@ -17569,119 +17576,6 @@ fn run_5147_arm_inner(
 /// ## Safety half
 ///
 /// Convergence must be no worse in the treatment arm. This is the assertion
-/// **The multi-writer safety case for #5147.**
-///
-/// The target list attests DELIVERY, not state equality: it says "A sent this
-/// payload to C". But a relayer re-broadcasts its own POST-MERGE state, and
-/// under concurrent writers that state can be strictly newer than the payload
-/// it received. Suppressing C on A's say-so can therefore skip a leg that
-/// carried something C genuinely did not have.
-///
-/// The headline measurement cannot see this. Every one of its updates
-/// originates from the gateway, so all peers merge the same payload into the
-/// same prior state, the relayer's state and the originator's payload agree,
-/// and suppression is correct by construction. That is the regime most
-/// favourable to the feature, and asserting safety only there would be
-/// assuming the answer.
-///
-/// Here the writer rotates across peers, so relayer-ahead-of-recipient is
-/// reachable on every round. What is asserted is SAFETY, not bandwidth:
-///
-/// * nobody diverges, and
-/// * suppression does not cost the converged state any replicas.
-///
-/// The second is the load-bearing one. Over-suppression does not hand a peer
-/// WRONG state — it hands it none — and a peer that stops receiving stops
-/// logging a state hash, so it silently leaves the denominator instead of being
-/// counted as diverged. Comparing replica counts across arms is what sees it.
-///
-/// Deliberately NOT asserted: any bandwidth reduction. The single-writer test
-/// owns that claim; duplicating it here would just be a second sample of the
-/// same mechanism, and a suppression fraction measured on this graph would not
-/// transfer to the fleet's anyway.
-#[test_log::test]
-fn test_5147_multi_writer_suppression_preserves_convergence() {
-    let control = run_5147_multi_writer_arm("5147-mw-control", false);
-    let treatment = run_5147_multi_writer_arm("5147-mw-treatment", true);
-
-    tracing::info!(
-        "#5147 multi-writer control:   deliveries={} redundant={} sends={} \
-         (delta={} full={}) suppressed={} summary_skips={} resync_suppressed={} \
-         converged={:?} replicas={} diverged={}",
-        control.deliveries,
-        control.redundant,
-        control.sends,
-        control.delta_sends,
-        control.full_state_sends,
-        control.suppressed,
-        control.summary_skips,
-        control.resync_suppressed,
-        control.converged,
-        control.replicas,
-        control.diverged,
-    );
-    tracing::info!(
-        "#5147 multi-writer treatment: deliveries={} redundant={} sends={} \
-         (delta={} full={}) suppressed={} summary_skips={} resync_suppressed={} \
-         converged={:?} replicas={} diverged={}",
-        treatment.deliveries,
-        treatment.redundant,
-        treatment.sends,
-        treatment.delta_sends,
-        treatment.full_state_sends,
-        treatment.suppressed,
-        treatment.summary_skips,
-        treatment.resync_suppressed,
-        treatment.converged,
-        treatment.replicas,
-        treatment.diverged,
-    );
-
-    // PREMISE 1: the control arm converged, so the comparison means something.
-    assert!(
-        control.converged.0 > 0 && control.diverged == 0,
-        "premise: the multi-writer control arm did not converge ({} converged, \
-         {} diverged), so nothing below is a statement about #5147",
-        control.converged.0,
-        control.diverged,
-    );
-
-    // PREMISE 2: the feature actually engaged on this workload. Without this the
-    // safety assertions pass trivially against a treatment arm that suppressed
-    // nothing, which is exactly what a broken gate would produce.
-    assert!(
-        treatment.suppressed > 0,
-        "premise: the treatment arm suppressed nothing under the multi-writer \
-         workload, so this test is not exercising the mechanism it exists for"
-    );
-    assert_eq!(
-        control.suppressed, 0,
-        "premise: the control arm suppressed {} targets, so the arms do not \
-         differ by the feature alone",
-        control.suppressed,
-    );
-
-    // SAFETY: concurrent writers must not diverge under suppression.
-    assert_eq!(
-        treatment.diverged, 0,
-        "#5147 left {} contract(s) diverged under concurrent writers. This is \
-         the case the single-writer measurement cannot reach: a relayer whose \
-         post-merge state is newer than the payload it received suppressed a \
-         peer that needed the difference.",
-        treatment.diverged,
-    );
-
-    assert!(
-        treatment.replicas >= control.replicas,
-        "#5147 cut the number of peers holding the converged state under \
-         concurrent writers ({} vs control {}). A peer suppressed while the \
-         relayer held state it lacked stops reporting rather than reporting a \
-         conflict, so this — not divergence — is what that failure looks like.",
-        treatment.replicas,
-        control.replicas,
-    );
-}
-
 /// that fails if suppression over-reaches: a peer wrongly excluded from a
 /// fan-out does not converge, and no bandwidth saving justifies that.
 #[test_log::test]
@@ -17740,6 +17634,28 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
          comparison below measures nothing"
     );
 
+    // PREMISE 2-bis: the sender exclusion is gated WITH the feature, so it must
+    // be absent from the control arm and present in the treatment arm.
+    //
+    // The field's own doc asserts exactly this, and nothing checked it. That
+    // matters because `sender_skips` was added to explain a gap in the leg
+    // accounting: if it were zero in BOTH arms, adding the bucket changed
+    // nothing, the gap has some other cause, and the stated explanation would
+    // be unverified while looking settled.
+    assert_eq!(
+        control.sender_skips, 0,
+        "premise: the control arm excluded the sender {} times, so the sender \
+         exclusion is not gated with the feature and the arms differ by more \
+         than one flag",
+        control.sender_skips,
+    );
+    assert!(
+        treatment.sender_skips > 0,
+        "premise: the treatment arm never excluded a delivering sender, so \
+         `sender_skips` explains none of the leg-accounting gap it was added \
+         to explain"
+    );
+
     // PREMISE 3: the control arm is genuinely unsuppressed. Without this a
     // default flip would make both arms treatment arms and the test would read
     // "no effect" as success.
@@ -17761,11 +17677,6 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
         treatment.hosting_updates,
     );
 
-    // The two arms must have done the SAME amount of fan-out work. Every
-    // offered leg ends in exactly one of three places — sent, skipped by the
-    // summary gate, or suppressed by the target list — so the sum is the
-    // fan-out volume. If it differs, the arms are not comparable and the
-    // reduction below could be a topology difference rather than the feature.
     // The two arms must have done comparable amounts of fan-out WORK, so the
     // reduction below cannot be a topology difference between the runs.
     //
@@ -17926,5 +17837,118 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
          this design refuses.",
         control.converged,
         treatment.converged,
+    );
+}
+
+/// **The multi-writer safety case for #5147.**
+///
+/// The target list attests DELIVERY, not state equality: it says "A sent this
+/// payload to C". But a relayer re-broadcasts its own POST-MERGE state, and
+/// under concurrent writers that state can be strictly newer than the payload
+/// it received. Suppressing C on A's say-so can therefore skip a leg that
+/// carried something C genuinely did not have.
+///
+/// The headline measurement cannot see this. Every one of its updates
+/// originates from the gateway, so all peers merge the same payload into the
+/// same prior state, the relayer's state and the originator's payload agree,
+/// and suppression is correct by construction. That is the regime most
+/// favourable to the feature, and asserting safety only there would be
+/// assuming the answer.
+///
+/// Here the writer rotates across peers, so relayer-ahead-of-recipient is
+/// reachable on every round. What is asserted is SAFETY, not bandwidth:
+///
+/// * nobody diverges, and
+/// * suppression does not cost the converged state any replicas.
+///
+/// The second is the load-bearing one. Over-suppression does not hand a peer
+/// WRONG state — it hands it none — and a peer that stops receiving stops
+/// logging a state hash, so it silently leaves the denominator instead of being
+/// counted as diverged. Comparing replica counts across arms is what sees it.
+///
+/// Deliberately NOT asserted: any bandwidth reduction. The single-writer test
+/// owns that claim; duplicating it here would just be a second sample of the
+/// same mechanism, and a suppression fraction measured on this graph would not
+/// transfer to the fleet's anyway.
+#[test_log::test]
+fn test_5147_multi_writer_suppression_preserves_convergence() {
+    let control = run_5147_multi_writer_arm("5147-mw-control", false);
+    let treatment = run_5147_multi_writer_arm("5147-mw-treatment", true);
+
+    tracing::info!(
+        "#5147 multi-writer control:   deliveries={} redundant={} sends={} \
+         (delta={} full={}) suppressed={} summary_skips={} resync_suppressed={} \
+         converged={:?} replicas={} diverged={}",
+        control.deliveries,
+        control.redundant,
+        control.sends,
+        control.delta_sends,
+        control.full_state_sends,
+        control.suppressed,
+        control.summary_skips,
+        control.resync_suppressed,
+        control.converged,
+        control.replicas,
+        control.diverged,
+    );
+    tracing::info!(
+        "#5147 multi-writer treatment: deliveries={} redundant={} sends={} \
+         (delta={} full={}) suppressed={} summary_skips={} resync_suppressed={} \
+         converged={:?} replicas={} diverged={}",
+        treatment.deliveries,
+        treatment.redundant,
+        treatment.sends,
+        treatment.delta_sends,
+        treatment.full_state_sends,
+        treatment.suppressed,
+        treatment.summary_skips,
+        treatment.resync_suppressed,
+        treatment.converged,
+        treatment.replicas,
+        treatment.diverged,
+    );
+
+    // PREMISE 1: the control arm converged, so the comparison means something.
+    assert!(
+        control.converged.0 > 0 && control.diverged == 0,
+        "premise: the multi-writer control arm did not converge ({} converged, \
+         {} diverged), so nothing below is a statement about #5147",
+        control.converged.0,
+        control.diverged,
+    );
+
+    // PREMISE 2: the feature actually engaged on this workload. Without this the
+    // safety assertions pass trivially against a treatment arm that suppressed
+    // nothing, which is exactly what a broken gate would produce.
+    assert!(
+        treatment.suppressed > 0,
+        "premise: the treatment arm suppressed nothing under the multi-writer \
+         workload, so this test is not exercising the mechanism it exists for"
+    );
+    assert_eq!(
+        control.suppressed, 0,
+        "premise: the control arm suppressed {} targets, so the arms do not \
+         differ by the feature alone",
+        control.suppressed,
+    );
+
+    // SAFETY: concurrent writers must not diverge under suppression.
+    assert_eq!(
+        treatment.diverged, 0,
+        "#5147 left {} contract(s) diverged under concurrent writers. This is \
+         the case the single-writer measurement cannot reach: a relayer whose \
+         post-merge state is newer than the payload it received suppressed a \
+         peer that needed the difference.",
+        treatment.diverged,
+    );
+
+    assert!(
+        treatment.replicas >= control.replicas,
+        "#5147 cut the number of peers holding the converged state under \
+         concurrent writers ({} vs control {}). A peer suppressed while the \
+         relayer held state it lacked stops reporting rather than reporting a \
+         conflict, so this — not divergence — is what that failure looks like.",
+        treatment.replicas,
+        control.replicas,
     );
 }

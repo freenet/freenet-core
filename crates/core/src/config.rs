@@ -3958,9 +3958,10 @@ std::thread_local! {
     /// ours (the pre-existing mechanism, counted for #5147 diagnosis).
     static GLOBAL_FANOUT_SUMMARY_SKIPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Fan-out targets dropped because the originator named them (#5147).
-    static GLOBAL_BROADCAST_SENDER_SKIPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_BROADCAST_TARGETS_SUPPRESSED: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
+    /// Fan-out legs dropped because the target was the delivering peer (#5147).
+    static GLOBAL_BROADCAST_SENDER_SKIPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Inbound broadcast payloads that reached a terminal classification
     /// (#5147). Denominator for the duplicate-delivery ratio.
     static GLOBAL_BROADCAST_DELIVERIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };

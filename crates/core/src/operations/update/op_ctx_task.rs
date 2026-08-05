@@ -817,7 +817,23 @@ pub(crate) fn resolve_covered_peers(
     // what we do here. Holding a populated list IS proof the sender supports the
     // feature — its own act, rather than our record of it.
     //
-    // The sender EXCLUSION has no wire signal, so it keeps the version gate.
+    // The sender EXCLUSION keeps the version gate — but as a ROLLOUT SWITCH,
+    // not as wire or semantic safety, and it is worth being exact because the
+    // obvious reading is wrong. Not sending a peer a message cannot break its
+    // decoding, so there is no wire-compat exposure to fail closed against; and
+    // the semantic worry (our post-merge state can be newer than what the
+    // sender gave us) is version-INDEPENDENT — a post-floor sender has exactly
+    // the same property, and that is the risk the list half accepts and the
+    // multi-writer simulation validates. What the gate buys is a staged rollout
+    // and a sim toggle, both of which are worth having on a change with this
+    // blast radius.
+    //
+    // Consequence to keep in view: on an unknown-version link we honour the
+    // sender's list while still echoing back to the sender itself — suppressing
+    // legs that are only probably redundant, while keeping the one that is
+    // certainly redundant. At the fleet median fan-out of 16-17 that is roughly
+    // 6% of legs left on the table, on the gateway links that matter most,
+    // until #5167 propagates.
     let resolved = if covered.is_empty() {
         std::collections::HashSet::new()
     } else {

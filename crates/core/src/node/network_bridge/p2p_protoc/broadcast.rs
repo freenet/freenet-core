@@ -478,7 +478,25 @@ impl P2pConnManager {
                 // the TTL. Re-resolve targets now that the stash is in place: if a
                 // target has appeared, take the stash back and re-emit
                 // immediately rather than waiting on a future flush.
-                let recheck = op_manager.get_broadcast_targets_update(&key, &origin);
+                // Probe with a LOCAL origin, not the claim this fan-out already
+                // consumed. Two reasons, and the second is the one that bites:
+                //
+                //  * this is a "did a target appear while we were giving up"
+                //    question, not a fan-out decision, so the unfiltered set is
+                //    the right one to ask about — and it is the safe direction
+                //    for the #4359 recovery, since finding a target re-emits
+                //    rather than abandoning state;
+                //  * re-passing `origin` re-runs the suppression filters over
+                //    the same offered legs, so `record_broadcast_target_suppressed`
+                //    and `record_broadcast_sender_skipped` fire twice for one
+                //    fan-out while `sends` counts once. That inflates only the
+                //    treatment arm (both counters are 0 in control), which
+                //    would put a one-sided bias into the very leg-accounting
+                //    comparison that exists to detect arm asymmetry.
+                let recheck = op_manager.get_broadcast_targets_update(
+                    &key,
+                    &crate::ring::broadcast_coverage::BroadcastOrigin::local(),
+                );
                 if !recheck.targets.is_empty() {
                     if let Some(stashed) = op_manager.pending_broadcasts.take(key.id()) {
                         tracing::debug!(

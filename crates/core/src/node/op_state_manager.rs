@@ -3258,8 +3258,15 @@ mod tests {
         }
     }
 
-    /// The sender exclusion is behind the same version gate as the target
-    /// list, and fails closed on an unknown sender.
+    /// The sender exclusion keeps the version gate; the target LIST does not.
+    ///
+    /// They are deliberately NOT the same gate, and this docstring used to say
+    /// they were. Conflating them is what made the whole feature inert once
+    /// already: routing the list through the version table too meant a node
+    /// that had never learned its gateway's version discarded every list it
+    /// received, so the send side opened while the receive side failed closed.
+    /// See `a_covered_list_is_honored_even_when_the_sender_version_is_unknown`,
+    /// which is the cheap guard against that regression returning.
     ///
     /// The exclusion needs no wire change of its own, so it would ship
     /// unconditionally if nobody gated it — and it has the same unsafe shape as
@@ -3267,6 +3274,85 @@ mod tests {
     /// holds what we are about to send. This asserts the gate DISCRIMINATES:
     /// pre-floor sender suppresses nothing, at-floor sender excludes the
     /// sender. Without the second half an always-closed gate would pass.
+    /// A covered LIST must be honored from a sender whose version we do not know.
+    ///
+    /// This is the cheap guard for a regression that shipped once and was
+    /// caught only by a full 7-node simulation. `31729f41a` gated BOTH halves
+    /// of a relayed claim on `supports_broadcast_target_list(sender_addr)` and
+    /// returned `local()` when it failed. That reads as symmetric caution, but
+    /// a node does not learn its GATEWAY's version until #5167 propagates, so
+    /// the lookup fails closed on exactly the highest-degree links — every list
+    /// was discarded and suppression went to zero while the send path still
+    /// looked healthy.
+    ///
+    /// The list needs no version lookup because it is self-gating: it can only
+    /// arrive on `BroadcastToV2` / `BroadcastToStreamingV2`, so holding a
+    /// populated one IS proof the sender supports the feature — the sender's
+    /// own act, which is stronger evidence than our record of its version.
+    ///
+    /// Mutation that must make this red: re-hoist the
+    /// `supports_broadcast_target_list` check above the resolve in
+    /// `resolve_covered_peers`, or `&&` it into the list half.
+    ///
+    /// Note the fixture records NO version for the sender, which is what makes
+    /// this the unknown-version case rather than a pre-floor one. Both take the
+    /// same branch, and both must still honor the list.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_covered_list_is_honored_even_when_the_sender_version_is_unknown() {
+        use crate::operations::update::UpdateMsg;
+
+        let (op_manager, _guards, key, _self_addr, kps) =
+            cohost_fixture("5147-list-unknown-version", 3).await;
+        let sender_kp = &kps[1];
+        let sender_addr = addr_of(&op_manager, sender_kp);
+        let tx = crate::message::Transaction::new::<UpdateMsg>();
+
+        // The originator names two of our co-hosts. No version is recorded for
+        // it, so `supports_broadcast_target_list(sender_addr)` is false.
+        let named: Vec<_> = kps.iter().take(2).map(|kp| kp.public().clone()).collect();
+        let covered = crate::ring::broadcast_coverage::CoveredPeers::from_targets(
+            &tx,
+            named.iter().collect::<Vec<_>>().into_iter(),
+        );
+        assert!(
+            !covered.is_empty(),
+            "premise: the fixture must actually name someone, or this test \
+             passes against a gate that discards everything"
+        );
+
+        let origin = crate::operations::update::op_ctx_task::resolve_covered_peers(
+            &op_manager,
+            &key,
+            &tx,
+            sender_addr,
+            &covered,
+        );
+
+        assert_eq!(
+            origin.sender(),
+            None,
+            "the sender exclusion keeps its version gate, so an unknown sender \
+             must NOT be excluded"
+        );
+
+        let result = op_manager.get_broadcast_targets_update(&key, &origin);
+        assert_eq!(
+            result.skipped_covered,
+            named.len(),
+            "the covered list must still suppress the peers it named even \
+             though the sender's version is unknown. Zero here is the inert-\
+             feature regression: the list was discarded because a version \
+             lookup failed, on precisely the links where that lookup cannot \
+             succeed until #5167 propagates."
+        );
+        for pk in &named {
+            assert!(
+                !result.targets.iter().any(|t| t.pub_key() == pk),
+                "a named peer survived into the fan-out"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn the_sender_exclusion_is_version_gated_and_fails_closed() {
         use crate::operations::update::UpdateMsg;
