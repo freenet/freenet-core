@@ -17628,6 +17628,56 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
         control.sends,
     );
 
+    // DISCRIMINATOR D: the duplicate FRACTION fell, not just the numerator.
+    //
+    // B alone is satisfiable the wrong way: an arm that halves total deliveries
+    // halves redundant deliveries with it and passes, having suppressed real
+    // traffic rather than duplicate traffic. `deliveries` exists as the
+    // denominator for exactly this ratio (see its rustdoc) and was previously
+    // gathered and never used. Cross-multiplied to stay in integers:
+    //   treatment.redundant / treatment.deliveries < control.redundant / control.deliveries
+    // Measured: control 321/440 = 73.0%, treatment 136/236 = 57.6%.
+    assert!(
+        treatment.redundant * control.deliveries < control.redundant * treatment.deliveries,
+        "#5147 reduced redundant deliveries ({} vs control {}) only in step with \
+         total deliveries ({} vs control {}), so the duplicate FRACTION did not \
+         improve. That is what suppressing genuine traffic looks like, and \
+         discriminator B alone cannot tell the two apart.",
+        treatment.redundant,
+        control.redundant,
+        treatment.deliveries,
+        control.deliveries,
+    );
+
+    // DISCRIMINATOR E: the saving is in BYTES, not merely in message count.
+    //
+    // Every assertion above counts legs. This design has a specific, known way
+    // to cut legs while RAISING bytes: suppressing a leg also suppresses the
+    // `sender_summary_bytes` piggyback that keeps peer-summary caches warm, and
+    // a peer whose cached summary we lack receives FULL STATE
+    // (`FullNoTheirSummaryTracked`) instead of a delta — 26.9% of broadcast
+    // bytes at a 357 KB mean in the 0.2.109 fleet profile, against a few KB for
+    // a delta. Roughly a dozen extra full states would erase the entire
+    // measured saving while `sends`, `redundant` and `suppressed` all still
+    // moved the right way.
+    //
+    // `full_state_sends` was captured and logged but never asserted, which left
+    // the one number that reveals the inversion outside the test's reach.
+    // Measured: 16 in BOTH arms — the saving here is entirely in deltas
+    // (444 -> 240), so this holds with margin rather than by a hair.
+    assert!(
+        treatment.full_state_sends <= control.full_state_sends,
+        "#5147 cut broadcast legs ({} vs control {}) but pushed peers onto the \
+         FULL-STATE path ({} vs control {}). A full state is ~357 KB against a \
+         few-KB delta, so this is a bandwidth INCREASE wearing the costume of a \
+         bandwidth saving — the second-order failure this design's summary-seeding \
+         interaction makes possible.",
+        treatment.sends,
+        control.sends,
+        treatment.full_state_sends,
+        control.full_state_sends,
+    );
+
     // SAFETY: no bandwidth saving justifies a peer not converging. This is the
     // assertion that fails on over-suppression.
     assert!(

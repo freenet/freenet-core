@@ -281,6 +281,29 @@ pub(crate) struct BroadcastCoverageStore {
     entries: DashMap<ContractInstanceId, CoverageEntry>,
 }
 
+/// Entry count above which [`BroadcastCoverageStore::register`] sweeps expired
+/// entries before inserting a new contract.
+///
+/// `expires_at` governs an entry's VALIDITY on read, but nothing governed its
+/// RESIDENCY: the only removals are `take`, `discard`, and same-key
+/// replacement, so an entry that is registered, `keep()`-ed, and then never
+/// consumed stays forever. Two paths produce exactly that, and both fire
+/// hardest under load:
+///
+/// * `handle_broadcast_state_change` returns early for a BANNED contract and
+///   for one with broken invariants, both BEFORE it takes the coverage — so
+///   every applying broadcast on such a contract leaks an entry, precisely
+///   during the storm conditions that set those flags (#4861 / #4903 shape);
+/// * `try_notify_node_event(BroadcastStateChange)` is best-effort by design
+///   (#4145), so a dropped event leaves a kept entry with no consumer.
+///
+/// Each leaked entry holds up to [`MAX_COVERED_PEERS`] public keys, so the
+/// growth is monotonic in distinct contract ids touched. Sweeping only when
+/// the map is already large keeps the hot path (a live contract re-registering
+/// under its own key) free of the O(n) scan — that path hits the Occupied arm
+/// and never reaches this check.
+const SWEEP_THRESHOLD: usize = 512;
+
 struct CoverageEntry {
     origin: BroadcastOrigin,
     expires_at: Instant,
@@ -374,6 +397,7 @@ impl BroadcastCoverageStore {
     pub(crate) fn register(&self, key: &ContractInstanceId, origin: BroadcastOrigin) {
         let now = Instant::now();
         let expires_at = now + COVERAGE_TTL;
+        let mut inserted_new_contract = false;
         match self.entries.entry(*key) {
             dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
                 let existing = occupied.get_mut();
@@ -382,18 +406,51 @@ impl BroadcastCoverageStore {
                     // rather than narrow — narrowing against a claim that no
                     // live apply stands behind would discard this apply's
                     // coverage for no reason.
+                    //
+                    // The deadline must be REPLACED too, not `min`-ed. The
+                    // existing one is by definition in the past here, so
+                    // keeping the earlier of the two would leave the fresh
+                    // entry born already expired: `take` checks
+                    // `expires_at > now`, fails, and hands back
+                    // `BroadcastOrigin::local()`. That silently made this whole
+                    // branch dead — safe in direction (under-suppression) but
+                    // the exact opposite of what it says it does. Pinned by
+                    // `replacing_a_stale_entry_yields_a_live_claim`.
                     existing.origin = origin;
+                    existing.expires_at = expires_at;
                 } else {
                     existing.origin.narrow(&origin);
+                    // Keep the EARLIER deadline. The merged claim is only valid
+                    // for as long as its shortest-lived contributor.
+                    existing.expires_at = existing.expires_at.min(expires_at);
                 }
-                // Keep the EARLIER deadline. The merged claim is only valid for
-                // as long as its shortest-lived contributor.
-                existing.expires_at = existing.expires_at.min(expires_at);
             }
             dashmap::mapref::entry::Entry::Vacant(vacant) => {
                 vacant.insert(CoverageEntry { origin, expires_at });
+                inserted_new_contract = true;
             }
         }
+
+        // Deliberately AFTER the match: `entry()` holds the shard guard for the
+        // duration of that block, and `retain` wants every shard's guard. Doing
+        // this inside the Vacant arm is the DashMap re-entrancy deadlock this
+        // codebase has hit before.
+        if inserted_new_contract {
+            self.sweep_expired(now);
+        }
+    }
+
+    /// Drop entries whose deadline has passed, but only once the map has grown
+    /// past [`SWEEP_THRESHOLD`].
+    ///
+    /// See that constant for why residency needs its own mechanism at all.
+    /// Bounded work: `retain` visits each shard once, and it runs only on the
+    /// insertion of a contract not already tracked.
+    fn sweep_expired(&self, now: Instant) {
+        if self.entries.len() <= SWEEP_THRESHOLD {
+            return;
+        }
+        self.entries.retain(|_, entry| entry.expires_at > now);
     }
 
     /// Take the coverage for a contract's fan-out, if any is live.
@@ -423,6 +480,34 @@ impl BroadcastCoverageStore {
             .iter()
             .filter(|entry| entry.expires_at > now)
             .count()
+    }
+
+    /// Total entries RESIDENT, live or expired.
+    ///
+    /// Distinct from [`Self::live_entries`] on purpose: the gap between the two
+    /// is what [`SWEEP_THRESHOLD`] exists to bound, and a test that only ever
+    /// asked for the live count could not see an expired-entry leak at all.
+    #[cfg(test)]
+    pub(crate) fn resident_entries(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Insert an entry with an explicit deadline.
+    ///
+    /// `Instant` is not injectable here (no `TimeSource` on this path), so
+    /// without a seam there is no way to construct an EXPIRED entry, and the
+    /// TTL — the whole orphan backstop — goes untested. It did: the stale-entry
+    /// branch in `register` shipped inert because the deadline was `min`-ed
+    /// against a past value, and no test could observe it.
+    #[cfg(test)]
+    pub(crate) fn insert_with_deadline(
+        &self,
+        key: &ContractInstanceId,
+        origin: BroadcastOrigin,
+        expires_at: Instant,
+    ) {
+        self.entries
+            .insert(*key, CoverageEntry { origin, expires_at });
     }
 }
 
@@ -499,6 +584,132 @@ mod tests {
 
     fn instance_id() -> ContractInstanceId {
         *crate::operations::test_utils::make_contract_key(1).id()
+    }
+
+    /// Replacing an EXPIRED entry must produce a claim the fan-out can use.
+    ///
+    /// The stale branch of `register` says it "replaces rather than narrows",
+    /// but it originally then ran
+    /// `existing.expires_at = existing.expires_at.min(expires_at)`. In that
+    /// branch `existing.expires_at` is by definition already in the past, so
+    /// `min` kept it: the fresh entry was born expired, `take` rejected it, and
+    /// the branch was dead. Direction was safe (under-suppression), which is
+    /// why nothing noticed — and no test existed that could, since `Instant`
+    /// has no seam here.
+    ///
+    /// Mutation that must make this red: restore the `.min()` in the stale arm.
+    #[test]
+    fn replacing_a_stale_entry_yields_a_live_claim() {
+        let store = BroadcastCoverageStore::new();
+        let key = instance_id();
+        let stale_peer = pub_key();
+        let fresh_peer = pub_key();
+
+        // An orphaned entry: registered by an apply whose fan-out never came.
+        store.insert_with_deadline(
+            &key,
+            relayed(HashSet::from([PeerKey::from(stale_peer.clone())])),
+            Instant::now() - Duration::from_secs(1),
+        );
+
+        store.register(
+            &key,
+            relayed(HashSet::from([PeerKey::from(fresh_peer.clone())])),
+        );
+
+        let taken = store.take(&key);
+        assert!(
+            taken.covers(&fresh_peer),
+            "the replacing apply's coverage must survive — if this is empty the \
+             entry was born expired and `take` handed back a local() claim, so \
+             the stale-replacement branch is inert"
+        );
+        assert!(
+            !taken.covers(&stale_peer),
+            "the orphaned claim must be REPLACED, not merged: no live apply \
+             stands behind it"
+        );
+    }
+
+    /// An entry past its TTL must not suppress anything.
+    ///
+    /// The other half of the seam above: `take` is what enforces validity, and
+    /// deleting its deadline check would make orphaned claims suppress peers
+    /// indefinitely — the one way this design can withhold an update from a
+    /// peer that needs it.
+    #[test]
+    fn an_expired_entry_suppresses_nothing() {
+        let store = BroadcastCoverageStore::new();
+        let key = instance_id();
+        let peer = pub_key();
+
+        store.insert_with_deadline(
+            &key,
+            relayed(HashSet::from([PeerKey::from(peer.clone())])),
+            Instant::now() - Duration::from_millis(1),
+        );
+
+        let taken = store.take(&key);
+        assert!(
+            !taken.covers(&peer),
+            "a claim past COVERAGE_TTL must be ignored; mutation: delete the \
+             `expires_at > Instant::now()` guard in `take`"
+        );
+    }
+
+    /// Orphaned entries must not accumulate without bound.
+    ///
+    /// `expires_at` governs validity on READ, but until the sweeper existed
+    /// nothing governed RESIDENCY: `take`, `discard` and same-key replacement
+    /// were the only removals, so a contract that registered coverage and then
+    /// never fanned out (banned contract, broken invariants, dropped
+    /// best-effort event) left an entry holding up to MAX_COVERED_PEERS keys
+    /// forever — worst exactly under the storm conditions that cause it.
+    ///
+    /// Mutation that must make this red: make `sweep_expired` a no-op.
+    #[test]
+    fn expired_entries_are_reclaimed_once_the_map_grows() {
+        let store = BroadcastCoverageStore::new();
+        let past = Instant::now() - Duration::from_secs(1);
+
+        // Orphan one entry per distinct contract, past the sweep threshold.
+        for i in 0..(SWEEP_THRESHOLD + 2) {
+            let mut bytes = [0u8; 32];
+            bytes[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+            store.insert_with_deadline(
+                &ContractInstanceId::new(bytes),
+                relayed(HashSet::from([PeerKey::from(pub_key())])),
+                past,
+            );
+        }
+        assert!(
+            store.resident_entries() > SWEEP_THRESHOLD,
+            "premise: the map must actually be over the sweep threshold"
+        );
+        assert_eq!(
+            store.live_entries(),
+            0,
+            "premise: every seeded entry is expired"
+        );
+
+        // A new contract's registration is what triggers the sweep.
+        let fresh_key = instance_id();
+        store.register(
+            &fresh_key,
+            relayed(HashSet::from([PeerKey::from(pub_key())])),
+        );
+
+        assert_eq!(
+            store.resident_entries(),
+            1,
+            "expired entries must be reclaimed, leaving only the live one; \
+             found {} resident",
+            store.resident_entries()
+        );
+        assert!(
+            store.take(&fresh_key).covered_len() > 0,
+            "the sweep must not evict the live entry it ran alongside"
+        );
     }
 
     #[test]

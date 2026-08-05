@@ -317,15 +317,17 @@ impl P2pConnManager {
             self.broadcast_retries.remove(&key);
             self.broadcast_no_target_streak.remove(&key);
             let _ = op_manager.pending_broadcasts.take(key.id());
-            // Recorded with a zero target count so the #4281 propagation
-            // summary still sees one broadcast per apply, but NOT through the
-            // `no_targets` counter below — a fully-covered fan-out is a success
-            // and must not read as a propagation failure to an operator.
-            op_manager.update_propagation_stats.record_broadcast(
-                *key.id(),
-                0,
-                target_result.interest_resolve_failed,
-            );
+            // Recorded through a DEDICATED entry point, not `record_broadcast`
+            // with a zero target count: that would land in the `no_targets`
+            // bucket, which is the operator-facing propagation-FAILURE counter.
+            // A fully-covered fan-out is a success, and in the clique regime
+            // this design targets it is the EXPECTED outcome — so counting it
+            // as a failure would report one in direct proportion to how well
+            // the feature works. The #4281 summary still sees one broadcast per
+            // apply. Pinned by `a_fully_covered_fanout_is_not_counted_as_a_propagation_failure`.
+            op_manager
+                .update_propagation_stats
+                .record_fully_covered_broadcast(*key.id(), target_result.interest_resolve_failed);
             return;
         }
 
