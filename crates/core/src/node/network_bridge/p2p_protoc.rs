@@ -969,8 +969,12 @@ pub(crate) fn version_supports_summary_first_put(
 /// Consulted by `ConnectionManager::supports_hash_first_summaries`, which the
 /// digest-capable send sites check before choosing the digest form: the
 /// `Interests` and `ChangeInterests` replies in
-/// `node.rs::handle_interest_sync_message`, both via
-/// `node::summaries_reply_for_peer`.
+/// `node.rs::handle_interest_sync_message`. `ChangeInterests` reads it via
+/// `node::summaries_reply_for_peer`; `Interests` reads it via
+/// `node::summary_reply_form` and threads the answer through
+/// `node::summaries_reply_in_form`, because #5155 must know the form before it
+/// builds entries in order to bound the full-bytes fallback. Both are the same
+/// single reading of this gate.
 ///
 /// Two send sites deliberately do NOT consult it:
 ///
