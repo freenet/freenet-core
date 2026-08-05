@@ -129,7 +129,24 @@ pub(crate) struct BroadcastTargetResult {
     pub interest_resolve_failed: usize,
     pub skipped_self: usize,
     pub skipped_sender: usize,
+    /// Targets dropped because the originator's list said it already
+    /// delivered to them (#5147).
+    ///
+    /// Counted BY the filter that drops them, never re-derived as
+    /// `resolved.len() - targets.len()` at a call site: that subtraction
+    /// silently absorbs the sender, self, and resolve-failure filters too, and
+    /// keeps reporting a plausible number after this filter is deleted. See
+    /// `.claude/rules/bug-prevention-patterns.md`, "Metric describing a
+    /// filtering decision, re-derived at the call site" — the row exists
+    /// because that exact mistake was made three times in a row on this very
+    /// function's sibling filter.
+    pub skipped_covered: usize,
 }
+
+/// Re-exported so `p2p_protoc::broadcast` and the relay drivers name one type
+/// for "who already has this". Defined next to the store that produces it; see
+/// [`crate::ring::broadcast_coverage`].
+pub(crate) use crate::ring::broadcast_coverage::BroadcastOrigin;
 
 /// Result of [`update_contract`]: the merged state and whether it changed.
 ///
@@ -309,7 +326,6 @@ impl OpManager {
     pub(crate) fn advertised_cohost_pub_keys(&self, key: &ContractKey) -> Vec<TransportPublicKey> {
         self.neighbor_hosting.neighbors_with_contract(key)
     }
-
     /// Resolve the set of peers to broadcast a state update to.
     ///
     /// Targets are the advertised co-hosts from the proximity neighbor cache
@@ -359,17 +375,18 @@ impl OpManager {
     pub(crate) fn get_broadcast_targets_update(
         &self,
         key: &ContractKey,
-        sender: &SocketAddr,
+        origin: &BroadcastOrigin,
     ) -> BroadcastTargetResult {
         use std::collections::HashSet;
 
         let self_addr = self.ring.connection_manager.get_own_addr();
-        let is_local_update_initiator = self_addr.as_ref().map(|me| me == sender).unwrap_or(false);
+        let sender = origin.sender();
 
         let mut targets: HashSet<PeerKeyLocation> = HashSet::new();
         let mut proximity_resolve_failed: usize = 0;
         let mut skipped_self: usize = 0;
         let mut skipped_sender: usize = 0;
+        let mut skipped_covered: usize = 0;
 
         // Source 1 (the ONLY live fan-out source): the proximity cache of
         // advertised co-hosts — peers who announced they host this contract via
@@ -384,13 +401,37 @@ impl OpManager {
         let proximity_found = proximity_pub_keys.len();
 
         for pub_key in proximity_pub_keys {
+            // #5147: the originator told us it already delivered to this peer,
+            // so re-sending is a byte-identical duplicate. Checked BEFORE the
+            // address filters purely so the counter attributes the drop to the
+            // reason a reader would expect; the three are disjoint in practice
+            // (the sender is never on its own list, and we are never on it
+            // either — a peer builds the list from its fan-out targets, which
+            // exclude both).
+            if origin.covers(&pub_key) {
+                skipped_covered += 1;
+                continue;
+            }
             if let Some(pkl) = self.ring.connection_manager.get_peer_by_pub_key(&pub_key) {
                 if let Some(pkl_addr) = pkl.socket_addr() {
-                    if &pkl_addr == sender && !is_local_update_initiator {
+                    // Both of these were dead before #5147: the re-fan-out call
+                    // site passed its own address as `sender`, so
+                    // `is_local_update_initiator` was always true and both arms
+                    // were unreachable exactly where they were needed. With a
+                    // real `BroadcastOrigin` the sender exclusion does what its
+                    // author intended — a relayer no longer echoes the update
+                    // straight back to the peer that just sent it, which is a
+                    // 100%-wasted send on every single relayed broadcast.
+                    if Some(&pkl_addr) == sender {
                         skipped_sender += 1;
                         continue;
                     }
-                    if !is_local_update_initiator && self_addr.as_ref() == Some(&pkl_addr) {
+                    // Self-exclusion is now UNCONDITIONAL. Broadcasting to
+                    // ourselves is never correct, and the old
+                    // `!is_local_update_initiator` guard only ever meant "we
+                    // could not tell who the sender was", which is not a reason
+                    // to send ourselves a network message.
+                    if self_addr.as_ref() == Some(&pkl_addr) {
                         skipped_self += 1;
                         continue;
                     }
@@ -415,7 +456,7 @@ impl OpManager {
                 tracing::debug!(
                     contract = %format!("{:.8}", key),
                     proximity_neighbor = %pub_key,
-                    is_local = is_local_update_initiator,
+                    is_local = sender.is_none(),
                     phase = "target_lookup_failed",
                     "Proximity cache neighbor not found in connection manager; reaped stale entry"
                 );
@@ -436,7 +477,8 @@ impl OpManager {
         if !result.is_empty() {
             tracing::debug!(
                 contract = %format!("{:.8}", key),
-                peer_addr = %sender,
+                peer_addr = ?sender,
+                skipped_covered,
                 targets = %result
                     .iter()
                     .filter_map(|s| s.socket_addr())
@@ -459,7 +501,8 @@ impl OpManager {
             // (proximity_resolve_failed). Issue #4251 re-review M2.
             tracing::debug!(
                 contract = %format!("{:.8}", key),
-                peer_addr = %sender,
+                peer_addr = ?sender,
+                skipped_covered,
                 self_addr = ?self_addr.map(|a| format!("{:.8}", a)),
                 proximity_sources = proximity_found,
                 proximity_resolve_failed,
@@ -478,6 +521,7 @@ impl OpManager {
             interest_resolve_failed: 0,
             skipped_self,
             skipped_sender,
+            skipped_covered,
         }
     }
 }
@@ -679,6 +723,21 @@ async fn contract_summary_or_empty(
 /// The `update_data` parameter can be:
 /// - `UpdateData::Delta(delta)` - A delta from the client, merged with current state
 /// - `UpdateData::State(state)` - A full state from PUT or executor
+///
+/// `covered` is the #5147 originator target list, already resolved against this
+/// node's view of the contract's co-hosts. It is registered on
+/// [`crate::ring::broadcast_coverage::BroadcastCoverageStore`] for the duration
+/// of the apply, so the fan-out the executor emits on a committed write can
+/// find it — nothing on the path between here and
+/// `handle_broadcast_state_change` carries networking context, and threading
+/// one through the WASM/contract-handler layer is the cost #5147 chose against.
+///
+/// Registration lives HERE rather than in the two relay drivers that have a
+/// list, so that every apply registers: a client-local apply passes an EMPTY
+/// set, which intersects any concurrent relayed coverage down to nothing rather
+/// than letting a local update inherit someone else's list. See the store's
+/// rustdoc for the full race argument.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn update_contract(
     op_manager: &OpManager,
     key: ContractKey,
@@ -686,7 +745,18 @@ pub(crate) async fn update_contract(
     related_contracts: RelatedContracts<'static>,
     priority: crate::contract::Priority,
     origin: crate::node::ApplyOrigin,
+    covered: BroadcastOrigin,
 ) -> Result<UpdateExecution, OpError> {
+    // Registered BEFORE the UpdateQuery enters the contract handler, which is
+    // what makes the ordering sound: the fan-out can only run after that query
+    // commits, so the entry is always present when its own fan-out reads it.
+    // The guard discards it again unless the apply actually changed state.
+    let coverage = crate::ring::broadcast_coverage::CoverageRegistration::new(
+        &op_manager.broadcast_coverage,
+        *key.id(),
+        covered,
+    );
+
     let previous_state = match op_manager
         .notify_contract_handler_prioritized(
             ContractHandlerEvent::GetQuery {
@@ -739,6 +809,15 @@ pub(crate) async fn update_contract(
             // causes the executor to emit a fan-out, modulo the residuals
             // enumerated there.
             op_manager.payload_mix.record_apply(origin, state_changed);
+            if state_changed {
+                // A `BroadcastStateChange` was emitted for this write, so hand
+                // the coverage to it. Otherwise the guard's drop clears it —
+                // no fan-out is coming, and a no-change apply is the COMMON
+                // case (97% of received contract bytes change nothing), so
+                // leaving those entries to expire would fill the store with
+                // coverage that intersects away every real entry.
+                coverage.keep();
+            }
             // #4923: no summary is computed here — never relabel the state
             // bytes as a summary (the self-poisoning full-state-broadcast
             // loop), and no per-apply summary fetch on this hot path either
@@ -1464,6 +1543,63 @@ mod messages {
             /// Total size of the streamed payload in bytes
             total_size: u64,
         },
+
+        // ---- APPEND ONLY BELOW THIS LINE ----
+        //
+        // Variant order IS the bincode wire encoding: the index is written as a
+        // u32 and nothing else identifies the variant. Inserting or reordering
+        // renumbers every later variant, so a peer would decode a `BroadcastTo`
+        // as something else entirely. Pinned by
+        // `update_msg_wire_variant_indices_are_frozen`.
+        /// [`Self::BroadcastTo`] plus the originator's target list (#5147).
+        ///
+        /// Why a parallel variant rather than a field on `BroadcastTo`: the
+        /// payload is bincode, whose layout is not forward-tolerant, so the
+        /// list can only be sent to a peer already known to decode it. A plain
+        /// new field would have to be omitted conditionally, which bincode
+        /// cannot express; an `Option` would still emit its discriminant byte
+        /// and change the bytes a pre-floor peer sees. Leaving the legacy
+        /// variant untouched makes the compatibility guarantee structural
+        /// rather than a matter of branch review — and it is why
+        /// `broadcast_to_single_peer` builds the legacy message through the
+        /// same unchanged code path it always did.
+        ///
+        /// Gated per-recipient by
+        /// `ConnectionManager::supports_broadcast_target_list`.
+        BroadcastToV2 {
+            id: Transaction,
+            key: ContractKey,
+            payload: crate::message::DeltaOrFullState,
+            sender_summary_bytes: Vec<u8>,
+            /// Peers the SENDER of this message delivered this same broadcast
+            /// to, so the receiver can leave them out of its own re-fan-out.
+            ///
+            /// One hop only. A relayer does not forward this onward and does
+            /// not union its own targets into it: the value is an attestation
+            /// of the immediate sender's own actions, and honoring it only from
+            /// the message that carried the payload is what stops a malicious
+            /// relayer from fabricating an "everyone is covered" list to
+            /// suppress third-party fan-out. See
+            /// [`crate::ring::broadcast_coverage`].
+            covered: crate::ring::broadcast_coverage::CoveredPeers,
+        },
+
+        /// [`Self::BroadcastToStreaming`] plus the originator's target list
+        /// (#5147). Same rationale as [`Self::BroadcastToV2`].
+        ///
+        /// The list rides on the header rather than inside
+        /// [`BroadcastStreamingPayload`] because that struct is bincode too and
+        /// adding a field to it would break the same compatibility the parallel
+        /// variant exists to preserve. The header is still the message that
+        /// delivers the payload — it is what opens the stream — so the
+        /// honor-only-from-the-payload-bearing-message rule holds.
+        BroadcastToStreamingV2 {
+            id: Transaction,
+            stream_id: StreamId,
+            key: ContractKey,
+            total_size: u64,
+            covered: crate::ring::broadcast_coverage::CoveredPeers,
+        },
     }
 
     impl InnerMessage for UpdateMsg {
@@ -1472,7 +1608,9 @@ mod messages {
                 UpdateMsg::RequestUpdate { id, .. }
                 | UpdateMsg::BroadcastTo { id, .. }
                 | UpdateMsg::RequestUpdateStreaming { id, .. }
-                | UpdateMsg::BroadcastToStreaming { id, .. } => id,
+                | UpdateMsg::BroadcastToStreaming { id, .. }
+                | UpdateMsg::BroadcastToV2 { id, .. }
+                | UpdateMsg::BroadcastToStreamingV2 { id, .. } => id,
             }
         }
 
@@ -1481,7 +1619,9 @@ mod messages {
                 UpdateMsg::RequestUpdate { key, .. }
                 | UpdateMsg::BroadcastTo { key, .. }
                 | UpdateMsg::RequestUpdateStreaming { key, .. }
-                | UpdateMsg::BroadcastToStreaming { key, .. } => Some(Location::from(key.id())),
+                | UpdateMsg::BroadcastToStreaming { key, .. }
+                | UpdateMsg::BroadcastToV2 { key, .. }
+                | UpdateMsg::BroadcastToStreamingV2 { key, .. } => Some(Location::from(key.id())),
             }
         }
     }
@@ -1497,6 +1637,21 @@ mod messages {
                 UpdateMsg::BroadcastToStreaming { id, stream_id, .. } => {
                     write!(f, "BroadcastToStreaming(id: {id}, stream: {stream_id})")
                 }
+                UpdateMsg::BroadcastToV2 { id, covered, .. } => {
+                    write!(f, "BroadcastToV2(id: {id}, covered: {})", covered.len())
+                }
+                UpdateMsg::BroadcastToStreamingV2 {
+                    id,
+                    stream_id,
+                    covered,
+                    ..
+                } => {
+                    write!(
+                        f,
+                        "BroadcastToStreamingV2(id: {id}, stream: {stream_id}, covered: {})",
+                        covered.len()
+                    )
+                }
             }
         }
     }
@@ -1507,6 +1662,210 @@ mod messages {
 mod tests {
     use super::*;
     use crate::operations::test_utils::make_contract_key;
+
+    /// Wire-compatibility guard for #5147, in two independent halves.
+    ///
+    /// Appending `BroadcastToV2` / `BroadcastToStreamingV2` must not renumber
+    /// any existing variant. If it did, the compatibility argument would hold
+    /// for the new variants alone while every OTHER message silently changed
+    /// meaning on the wire — a peer would decode a `BroadcastTo` as a
+    /// `RequestUpdateStreaming`, whose `stream_id`/`total_size` bytes are its
+    /// payload. That is not a decode error; it is a plausible-looking wrong
+    /// message.
+    ///
+    /// The table is a FIXED-LENGTH array, so adding a variant without extending
+    /// it is a compile error rather than a silently-passing test.
+    #[test]
+    fn update_msg_wire_variant_indices_are_frozen() {
+        use crate::message::DeltaOrFullState;
+        use crate::ring::broadcast_coverage::CoveredPeers;
+        use crate::transport::peer_connection::StreamId;
+
+        fn variant_index(msg: &UpdateMsg) -> u32 {
+            let bytes = bincode::serialize(msg).expect("serialize UpdateMsg");
+            u32::from_le_bytes(bytes[..4].try_into().expect("variant index prefix"))
+        }
+
+        let id = Transaction::new::<UpdateMsg>();
+        let key = make_contract_key(1);
+        let expected: [(u32, UpdateMsg); 6] = [
+            (
+                0,
+                UpdateMsg::RequestUpdate {
+                    id,
+                    key,
+                    related_contracts: RelatedContracts::default(),
+                    value: WrappedState::new(vec![1]),
+                },
+            ),
+            (
+                1,
+                UpdateMsg::BroadcastTo {
+                    id,
+                    key,
+                    payload: DeltaOrFullState::Delta(vec![1]),
+                    sender_summary_bytes: vec![],
+                },
+            ),
+            (
+                2,
+                UpdateMsg::RequestUpdateStreaming {
+                    id,
+                    stream_id: StreamId::next(),
+                    key,
+                    total_size: 1,
+                },
+            ),
+            (
+                3,
+                UpdateMsg::BroadcastToStreaming {
+                    id,
+                    stream_id: StreamId::next(),
+                    key,
+                    total_size: 1,
+                },
+            ),
+            (
+                4,
+                UpdateMsg::BroadcastToV2 {
+                    id,
+                    key,
+                    payload: DeltaOrFullState::Delta(vec![1]),
+                    sender_summary_bytes: vec![],
+                    covered: CoveredPeers::empty(),
+                },
+            ),
+            (
+                5,
+                UpdateMsg::BroadcastToStreamingV2 {
+                    id,
+                    stream_id: StreamId::next(),
+                    key,
+                    total_size: 1,
+                    covered: CoveredPeers::empty(),
+                },
+            ),
+        ];
+
+        for (index, msg) in &expected {
+            assert_eq!(
+                variant_index(msg),
+                *index,
+                "UpdateMsg variant indices are wire-visible and MUST NOT move; \
+                 the V2 variants have to stay appended at the end"
+            );
+        }
+    }
+
+    /// The other half: a legacy `BroadcastTo` must serialize to EXACTLY the
+    /// bytes it did before #5147, for a pre-floor peer.
+    ///
+    /// Pinned against a hand-written literal rather than a re-serialization of
+    /// the same struct — the latter compares the encoder against itself and
+    /// would pass even if the whole layout moved. This is the byte-level form
+    /// of the "a pre-floor peer receives byte-identical traffic" requirement;
+    /// the routing-level form is
+    /// `a_pre_floor_peer_gets_the_legacy_variant` in `broadcast_queue.rs`.
+    #[test]
+    fn legacy_broadcast_to_encoding_is_unchanged_by_the_v2_variants() {
+        use crate::message::DeltaOrFullState;
+
+        let id = Transaction::new::<UpdateMsg>();
+        let key = make_contract_key(7);
+        let msg = UpdateMsg::BroadcastTo {
+            id,
+            key,
+            payload: DeltaOrFullState::Delta(vec![0xAA, 0xBB]),
+            sender_summary_bytes: vec![0xCC],
+        };
+        let actual = bincode::serialize(&msg).expect("serialize");
+
+        let mut expected = Vec::new();
+        // variant index: BroadcastTo == 1
+        expected.extend_from_slice(&1u32.to_le_bytes());
+        // id
+        expected.extend_from_slice(&bincode::serialize(&id).expect("id"));
+        // key
+        expected.extend_from_slice(&bincode::serialize(&key).expect("key"));
+        // payload: DeltaOrFullState::Delta(vec![0xAA, 0xBB])
+        expected.extend_from_slice(
+            &bincode::serialize(&DeltaOrFullState::Delta(vec![0xAA, 0xBB])).expect("payload"),
+        );
+        // sender_summary_bytes: Vec<u8> = len(u64 LE) + bytes
+        expected.extend_from_slice(&1u64.to_le_bytes());
+        expected.push(0xCC);
+
+        assert_eq!(
+            actual, expected,
+            "the legacy BroadcastTo encoding is what every pre-0.2.120 peer \
+             decodes; a change here closes their connections on the first \
+             broadcast after upgrade"
+        );
+
+        // And the V2 form must be genuinely DIFFERENT bytes, so the version
+        // gate is provably choosing between two encodings rather than two
+        // spellings of one.
+        let v2 = UpdateMsg::BroadcastToV2 {
+            id,
+            key,
+            payload: DeltaOrFullState::Delta(vec![0xAA, 0xBB]),
+            sender_summary_bytes: vec![0xCC],
+            covered: crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        };
+        assert_ne!(bincode::serialize(&v2).expect("serialize v2"), actual);
+    }
+
+    /// The #5147 security rule, enforced structurally: a target list may only
+    /// ride on a variant that also carries the payload.
+    ///
+    /// A relayer is trusted with a list solely because it is attesting to sends
+    /// it actually made while delivering this payload. If a list could arrive
+    /// on a control message, any peer could assert "everyone is covered" and
+    /// silence third-party re-fan-out for a cycle. There is no runtime check
+    /// for this — the guarantee is that no other variant HAS the field — so
+    /// this test is what keeps a future variant from quietly acquiring one.
+    #[test]
+    fn only_payload_bearing_variants_carry_a_target_list() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/operations/update.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("must read own source at {}: {e}", path.display()));
+        let start = source
+            .find("pub(crate) enum UpdateMsg {")
+            .expect("UpdateMsg enum must exist");
+        let body = &source[start..];
+        let end = body
+            .find("\n    }\n")
+            .expect("UpdateMsg enum must terminate");
+        let body = &body[..end];
+
+        // The nearest `Name {` above each `covered:` is the variant carrying it.
+        let carriers: Vec<&str> = body
+            .match_indices("covered:")
+            .map(|(idx, _)| {
+                body[..idx]
+                    .rmatch_indices(" {")
+                    .filter_map(|(brace, _)| {
+                        let line_start = body[..brace].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                        let name = body[line_start..brace].trim();
+                        (name.chars().next().is_some_and(char::is_uppercase)).then_some(name)
+                    })
+                    .next()
+                    .expect("a `covered:` field must sit inside a named variant")
+            })
+            .collect();
+
+        assert_eq!(
+            carriers,
+            vec!["BroadcastToV2", "BroadcastToStreamingV2"],
+            "ONLY the payload-bearing broadcast variants may carry a `covered:` \
+             target list (#5147). A list on a control message would let any \
+             relayer fabricate an everyone-is-covered claim and suppress \
+             third-party re-fan-out; the one-hop design has no runtime defence \
+             against that, because the defence IS that no other variant has \
+             the field."
+        );
+    }
 
     /// Source-level pin for the UPDATE_PROPAGATION NO_TARGETS log site.
     /// Originally INFO; briefly promoted to WARN in PR #4252 commit 2;
@@ -2270,6 +2629,7 @@ mod tests {
             RelatedContracts::default(),
             crate::contract::Priority::ClientLocal,
             crate::node::ApplyOrigin::ClientLocal,
+            BroadcastOrigin::local(),
         )
         .await
         .expect("update must succeed");
@@ -2345,6 +2705,7 @@ mod tests {
                 // test would fail.
                 crate::contract::Priority::ClientLocal,
                 origin,
+                BroadcastOrigin::local(),
             )
             .await
             .expect("update must succeed");
@@ -2379,6 +2740,7 @@ mod tests {
             RelatedContracts::default(),
             crate::contract::Priority::NetworkRelay,
             ApplyOrigin::NetworkRelay,
+            BroadcastOrigin::local(),
         )
         .await
         .expect("a no-change merge is still a successful apply");
@@ -3022,7 +3384,10 @@ mod tests {
         }
 
         let broadcast_targets: HashSet<SocketAddr> = op_manager
-            .get_broadcast_targets_update(&key, &sender_addr)
+            .get_broadcast_targets_update(
+                &key,
+                &BroadcastOrigin::relayed(sender_addr, Default::default()),
+            )
             .targets
             .iter()
             .filter_map(|pkl| pkl.socket_addr())

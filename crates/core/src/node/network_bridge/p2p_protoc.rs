@@ -1066,6 +1066,48 @@ pub(crate) fn version_supports_hash_first_summaries(
     remote.is_some_and(|v| v >= floor)
 }
 
+/// Has the originator target list (#5147) actually SHIPPED, and in which
+/// release?
+///
+/// Same contract as [`HASH_FIRST_SHIPPED_IN`], guarded by
+/// `broadcast_target_list_floor_tracks_the_shipping_release`: `None` means
+/// [`BROADCAST_TARGET_LIST_MIN_VERSION`] is a prediction that must stay
+/// strictly ABOVE the crate version; `Some(v)` means it shipped in `v`, which
+/// must equal the floor.
+///
+/// RELEASE-TIME ACTION: when the release carrying this feature is cut, set this
+/// to `Some(BROADCAST_TARGET_LIST_MIN_VERSION)` and freeze both.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const BROADCAST_TARGET_LIST_SHIPPED_IN: Option<(u8, u8, u16)> = None;
+
+/// Version floor for the originator target list on broadcast (#5147).
+///
+/// Below this, a peer has no `BroadcastToV2` / `BroadcastToStreamingV2` variant
+/// index and would fail to bincode-decode one, which closes the connection —
+/// so the gate must fail closed on an unknown version.
+pub(crate) const BROADCAST_TARGET_LIST_MIN_VERSION: (u8, u8, u16) = (0, 2, 120);
+
+/// Pure version-gate for the originator target list, mirroring
+/// [`version_supports_hash_first_summaries`]: `true` iff `remote` is known
+/// (`Some`) AND at least `floor`.
+///
+/// Fail-closed on `None`. The fallback is the legacy `BroadcastTo`, i.e. exactly
+/// what every peer receives today, so a closed gate costs the bandwidth we are
+/// already spending and never costs convergence.
+///
+/// NOTE (#5161 / PR #5167): until that fix deploys, a joiner never learns its
+/// GATEWAY's version — `AckConnection` carries none — so `remote` is `None` on
+/// gateway links and this gate stays closed there regardless of what the
+/// gateway actually runs. Peer-to-peer links are unaffected. That is a
+/// suppression shortfall on gateway legs, not a correctness problem, and it
+/// resolves itself once #5167 ships.
+pub(crate) fn version_supports_broadcast_target_list(
+    remote: Option<(u8, u8, u16)>,
+    floor: (u8, u8, u16),
+) -> bool {
+    remote.is_some_and(|v| v >= floor)
+}
+
 /// Upper bound on the number of hosted contracts examined per new-peer
 /// migration trigger. Each examined contract may emit a best-effort
 /// non-blocking `try_send` (the SubscribeHint nudge), so an unbounded scan

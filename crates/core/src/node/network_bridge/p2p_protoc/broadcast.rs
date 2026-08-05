@@ -259,10 +259,27 @@ impl P2pConnManager {
             return;
         };
 
-        let target_result = op_manager.get_broadcast_targets_update(&key, &self_addr);
+        // #5147. Take the provenance of the apply that caused this fan-out:
+        // who delivered it to us, and who they say they already delivered it
+        // to. `BroadcastStateChange` carries none of that — the executor emits
+        // it on any committed write and has no idea whether the write came from
+        // a local client or an inbound broadcast — so it is parked on
+        // `broadcast_coverage` by `update_contract` and collected here. Absent
+        // or expired yields `BroadcastOrigin::local()`, which suppresses
+        // nothing and is exactly today's behaviour.
+        //
+        // Taken ONCE and reused by the stash recheck below: taking it again
+        // there would find it already consumed and silently drop the
+        // suppression on the re-emitted path.
+        let origin = op_manager.broadcast_coverage.take(key.id());
+
+        let target_result = op_manager.get_broadcast_targets_update(&key, &origin);
         tracing::debug!(
             contract = %key,
             target_count = target_result.targets.len(),
+            skipped_covered = target_result.skipped_covered,
+            skipped_sender = target_result.skipped_sender,
+            covered_named = origin.covered_len(),
             self_addr = %self_addr,
             "BroadcastStateChange: found targets"
         );
@@ -373,7 +390,7 @@ impl P2pConnManager {
                 // the TTL. Re-resolve targets now that the stash is in place: if a
                 // target has appeared, take the stash back and re-emit
                 // immediately rather than waiting on a future flush.
-                let recheck = op_manager.get_broadcast_targets_update(&key, &self_addr);
+                let recheck = op_manager.get_broadcast_targets_update(&key, &origin);
                 if !recheck.targets.is_empty() {
                     if let Some(stashed) = op_manager.pending_broadcasts.take(key.id()) {
                         tracing::debug!(
@@ -516,9 +533,27 @@ impl P2pConnManager {
         // delivery order and breaks convergence.
         #[cfg(not(feature = "simulation_tests"))]
         {
+            // #5147: the originator target list, computed ONCE for the whole
+            // fan-out and shared by `Arc` across its legs. It has to be built
+            // here because this loop is where the full target set stops
+            // existing — each iteration becomes an independent queue entry, and
+            // the send site downstream sees only its own peer.
+            let fanout: super::super::broadcast_queue::FanoutTargets = std::sync::Arc::new(
+                target_result
+                    .targets
+                    .iter()
+                    .map(|target| target.pub_key().clone())
+                    .collect(),
+            );
             for target in &target_result.targets {
                 self.broadcast_queue
-                    .enqueue(op_manager, key, target.clone(), new_state.clone())
+                    .enqueue(
+                        op_manager,
+                        key,
+                        target.clone(),
+                        new_state.clone(),
+                        fanout.clone(),
+                    )
                     .await;
             }
             // Emit broadcast emitted telemetry (issue #3622)
@@ -625,8 +660,16 @@ impl P2pConnManager {
 
         #[cfg(not(feature = "simulation_tests"))]
         {
+            // A targeted single-peer sync, not a mesh fan-out: there are no
+            // sibling recipients to name, so the list is empty.
             self.broadcast_queue
-                .enqueue(op_manager, key, target, new_state)
+                .enqueue(
+                    op_manager,
+                    key,
+                    target,
+                    new_state,
+                    super::super::broadcast_queue::no_fanout(),
+                )
                 .await;
         }
         #[cfg(feature = "simulation_tests")]
@@ -638,6 +681,7 @@ impl P2pConnManager {
                 new_state,
                 target,
                 None,
+                super::super::broadcast_queue::no_fanout(),
             )
             .await;
         }
@@ -682,6 +726,19 @@ impl P2pConnManager {
             contract = %key,
             target_count = target_result.targets.len(),
             "Broadcasting state change to network peers"
+        );
+
+        // #5147: the originator target list for this fan-out. Built here for
+        // the same reason as the production path, but note the two paths differ —
+        // production splits the fan-out across a queue and rebuilds the list
+        // per leg, this one holds the whole set in scope. A test that only
+        // exercises this branch proves nothing about production.
+        let fanout: super::super::broadcast_queue::FanoutTargets = std::sync::Arc::new(
+            target_result
+                .targets
+                .iter()
+                .map(|target| target.pub_key().clone())
+                .collect(),
         );
 
         let mut skipped_summary_match: usize = 0;
@@ -842,11 +899,22 @@ impl P2pConnManager {
                     payload_size,
                     "Using streaming for BroadcastTo"
                 );
-                let msg = crate::operations::update::UpdateMsg::BroadcastToStreaming {
-                    id: update_tx,
-                    stream_id: sid,
-                    key,
-                    total_size: payload_bytes.len() as u64,
+                let msg = match super::super::broadcast_queue::target_list_for(
+                    op_manager, &update_tx, peer_addr, &peer_key, &fanout,
+                ) {
+                    Some(covered) => crate::operations::update::UpdateMsg::BroadcastToStreamingV2 {
+                        id: update_tx,
+                        stream_id: sid,
+                        key,
+                        total_size: payload_bytes.len() as u64,
+                        covered,
+                    },
+                    None => crate::operations::update::UpdateMsg::BroadcastToStreaming {
+                        id: update_tx,
+                        stream_id: sid,
+                        key,
+                        total_size: payload_bytes.len() as u64,
+                    },
                 };
                 let net_msg: NetMessage = msg.into();
                 // Serialize metadata for embedding in fragment #1 (fix #2757)
@@ -901,15 +969,29 @@ impl P2pConnManager {
                     Err(err) => Err(err),
                 }
             } else {
-                let msg = crate::operations::update::UpdateMsg::BroadcastTo {
-                    id: update_tx,
-                    key,
-                    payload,
-                    // Include our summary so peer doesn't echo back
-                    sender_summary_bytes: our_summary
-                        .as_ref()
-                        .map(|s| s.as_ref().to_vec())
-                        .unwrap_or_default(),
+                let msg = match super::super::broadcast_queue::target_list_for(
+                    op_manager, &update_tx, peer_addr, &peer_key, &fanout,
+                ) {
+                    Some(covered) => crate::operations::update::UpdateMsg::BroadcastToV2 {
+                        id: update_tx,
+                        key,
+                        payload,
+                        sender_summary_bytes: our_summary
+                            .as_ref()
+                            .map(|s| s.as_ref().to_vec())
+                            .unwrap_or_default(),
+                        covered,
+                    },
+                    None => crate::operations::update::UpdateMsg::BroadcastTo {
+                        id: update_tx,
+                        key,
+                        payload,
+                        // Include our summary so peer doesn't echo back
+                        sender_summary_bytes: our_summary
+                            .as_ref()
+                            .map(|s| s.as_ref().to_vec())
+                            .unwrap_or_default(),
+                    },
                 };
                 // channel-safety: ok — sim-only path (see the
                 // `#[cfg(feature = "simulation_tests")]` gate on this fn); never

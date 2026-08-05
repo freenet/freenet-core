@@ -48,6 +48,19 @@ use crate::transport::BroadcastDeliveryOutcome;
 use super::broadcast_payload_mix::PayloadArm;
 use super::p2p_protoc::P2pBridge;
 
+/// The public keys of every peer one fan-out is going to (#5147).
+///
+/// Shared by `Arc` because `handle_broadcast_state_change` splits a single
+/// fan-out into one queue entry per target, and each entry needs the whole set
+/// to build the list it attaches. At the p90 fan-out of 58 (max 138 observed)
+/// cloning the `Vec` per leg would be O(targets^2) key clones per broadcast.
+pub(super) type FanoutTargets = Arc<Vec<crate::transport::TransportPublicKey>>;
+
+/// The list attached to a send with no fan-out context.
+pub(super) fn no_fanout() -> FanoutTargets {
+    Arc::new(Vec::new())
+}
+
 /// Timeout for awaiting stream completion signal before releasing the permit
 /// anyway. Prevents permanent permit leak if a stream task panics or hangs.
 /// Used by `broadcast_to_single_peer` under both `simulation_tests` and
@@ -635,6 +648,7 @@ mod queue {
     use crate::ring::{PeerKey, PeerKeyLocation};
 
     use super::super::p2p_protoc::P2pBridge;
+    use super::FanoutTargets;
     use super::{QueueScheduling, QueuedPayloadClass, SendLanePermit, broadcast_to_single_peer};
 
     /// Maximum concurrent outbound broadcast streams for small payloads (< 64KB).
@@ -737,6 +751,15 @@ mod queue {
         key: ContractKey,
         target: PeerKeyLocation,
         new_state: WrappedState,
+        /// The whole fan-out this entry is one leg of (#5147), shared by `Arc`
+        /// across every leg so a 138-target broadcast clones a pointer rather
+        /// than 138 public keys per leg.
+        ///
+        /// Carried through the queue because the full target set does not
+        /// otherwise survive to the send site: `handle_broadcast_state_change`
+        /// resolves it, then immediately splits it into independent per-peer
+        /// entries, and `broadcast_to_single_peer` sees only its own target.
+        fanout: FanoutTargets,
         /// Contract STATE size in bytes. Feeds the `scheduled_*_state_bytes`
         /// counters only — it is deliberately NOT what picks the lane (see
         /// [`classify_payload_lane`]).
@@ -1113,6 +1136,7 @@ mod queue {
             key: ContractKey,
             target: PeerKeyLocation,
             new_state: WrappedState,
+            fanout: FanoutTargets,
         ) {
             let lane = lane_for(
                 &op_manager.interest_manager,
@@ -1121,7 +1145,8 @@ mod queue {
                 &target,
                 new_state.size(),
             );
-            self.enqueue_in_lane(lane, key, target, new_state).await;
+            self.enqueue_in_lane(lane, key, target, new_state, fanout)
+                .await;
         }
 
         /// The lane-agnostic half of [`Self::enqueue`], split out so tests can
@@ -1132,6 +1157,7 @@ mod queue {
             key: ContractKey,
             target: PeerKeyLocation,
             new_state: WrappedState,
+            fanout: FanoutTargets,
         ) {
             let dedup_key = (key, target.clone());
             let state_size = new_state.size();
@@ -1152,6 +1178,14 @@ mod queue {
                     // go stale the moment a state crossed the threshold.
                     existing.state_size = state_size;
                     existing.lane = lane;
+                    // #5147: the target list belongs to the state it was
+                    // computed for. A replacement is a DIFFERENT fan-out with a
+                    // different (possibly smaller) target set, so keeping the
+                    // superseded list would tell the recipient we delivered to
+                    // peers this broadcast never touched — over-suppression, the
+                    // one direction this design refuses. Refresh it in lockstep
+                    // with `new_state`.
+                    existing.fanout = fanout;
                 }
                 if previous_lane != lane {
                     let small_queued = match lane {
@@ -1194,6 +1228,7 @@ mod queue {
                         key,
                         target,
                         new_state,
+                        fanout,
                         state_size,
                         lane,
                         seq,
@@ -1270,6 +1305,7 @@ mod queue {
                                 entry.new_state,
                                 entry.target,
                                 Some(scheduling),
+                                entry.fanout,
                             )
                             .await;
                         }
@@ -1816,6 +1852,7 @@ mod queue {
                                 contract(seed),
                                 PeerKeyLocation::random(),
                                 state(BIG),
+                                crate::node::network_bridge::broadcast_queue::no_fanout(),
                             )
                             .await;
                     }
@@ -1840,6 +1877,7 @@ mod queue {
                             contract(21),
                             PeerKeyLocation::random(),
                             state(BIG),
+                            crate::node::network_bridge::broadcast_queue::no_fanout(),
                         )
                         .await;
                 }
@@ -1917,6 +1955,7 @@ mod queue {
                     contract(40),
                     PeerKeyLocation::random(),
                     state(BIG),
+                    crate::node::network_bridge::broadcast_queue::no_fanout(),
                 )
                 .await;
             assert_eq!(
@@ -2025,6 +2064,7 @@ mod queue {
                         contract(seed),
                         PeerKeyLocation::random(),
                         state(BIG),
+                        crate::node::network_bridge::broadcast_queue::no_fanout(),
                     )
                     .await;
             }
@@ -2050,6 +2090,7 @@ mod queue {
                         contract(seed),
                         PeerKeyLocation::random(),
                         state(BIG),
+                        crate::node::network_bridge::broadcast_queue::no_fanout(),
                     )
                     .await;
             }
@@ -2104,6 +2145,7 @@ mod queue {
                     key,
                     PeerKeyLocation::random(),
                     state(BIG),
+                    crate::node::network_bridge::broadcast_queue::no_fanout(),
                 )
                 .await;
             let mut saw_large = false;
@@ -2165,6 +2207,7 @@ mod queue {
                         contract(seed),
                         PeerKeyLocation::random(),
                         state(BIG),
+                        crate::node::network_bridge::broadcast_queue::no_fanout(),
                     )
                     .await;
             }
@@ -2188,6 +2231,7 @@ mod queue {
                     contract(2),
                     PeerKeyLocation::random(),
                     state(BIG),
+                    crate::node::network_bridge::broadcast_queue::no_fanout(),
                 )
                 .await;
             // ...and a small entry arrives behind it. Every one of the small
@@ -2201,6 +2245,7 @@ mod queue {
                     small,
                     PeerKeyLocation::random(),
                     state(16),
+                    crate::node::network_bridge::broadcast_queue::no_fanout(),
                 )
                 .await;
 
@@ -2260,6 +2305,7 @@ mod queue {
                     key,
                     PeerKeyLocation::random(),
                     state(BIG),
+                    crate::node::network_bridge::broadcast_queue::no_fanout(),
                 )
                 .await;
 
@@ -2295,10 +2341,22 @@ mod queue {
             let target = PeerKeyLocation::random();
 
             queue
-                .enqueue_in_lane(QueuedPayloadClass::Small, key, target.clone(), state(16))
+                .enqueue_in_lane(
+                    QueuedPayloadClass::Small,
+                    key,
+                    target.clone(),
+                    state(16),
+                    crate::node::network_bridge::broadcast_queue::no_fanout(),
+                )
                 .await;
             queue
-                .enqueue_in_lane(QueuedPayloadClass::Large, key, target.clone(), state(BIG))
+                .enqueue_in_lane(
+                    QueuedPayloadClass::Large,
+                    key,
+                    target.clone(),
+                    state(BIG),
+                    crate::node::network_bridge::broadcast_queue::no_fanout(),
+                )
                 .await;
 
             {
@@ -2324,7 +2382,13 @@ mod queue {
 
             // ...and symmetrically back again.
             queue
-                .enqueue_in_lane(QueuedPayloadClass::Small, key, target, state(16))
+                .enqueue_in_lane(
+                    QueuedPayloadClass::Small,
+                    key,
+                    target,
+                    state(16),
+                    crate::node::network_bridge::broadcast_queue::no_fanout(),
+                )
                 .await;
             let q = queue.queue.lock().await;
             let entry = q.entries.values().next().expect("the replaced entry");
@@ -2354,6 +2418,7 @@ mod queue {
                     oldest,
                     PeerKeyLocation::random(),
                     state(BIG),
+                    crate::node::network_bridge::broadcast_queue::no_fanout(),
                 )
                 .await;
             for seed in 2..4u8 {
@@ -2363,6 +2428,7 @@ mod queue {
                         contract(seed),
                         PeerKeyLocation::random(),
                         state(16),
+                        crate::node::network_bridge::broadcast_queue::no_fanout(),
                     )
                     .await;
             }
@@ -2392,6 +2458,7 @@ mod queue {
                     oldest,
                     PeerKeyLocation::random(),
                     state(16),
+                    crate::node::network_bridge::broadcast_queue::no_fanout(),
                 )
                 .await;
             for seed in 6..8u8 {
@@ -2401,6 +2468,7 @@ mod queue {
                         contract(seed),
                         PeerKeyLocation::random(),
                         state(BIG),
+                        crate::node::network_bridge::broadcast_queue::no_fanout(),
                     )
                     .await;
             }
@@ -2437,6 +2505,7 @@ mod queue {
                     key,
                     PeerKeyLocation::random(),
                     state(BIG),
+                    crate::node::network_bridge::broadcast_queue::no_fanout(),
                 )
                 .await;
             assert_eq!(
@@ -3140,6 +3209,50 @@ fn record_delivery_to_interest<T: crate::util::time_source::TimeSource + Sync>(
 /// `scheduling` is `Some` exactly when the production queue dispatched this
 /// send, and carries both the lane it was classified into and that lane's
 /// permit. The sim fan-out calls in-line with `None` (no queue, no permits).
+/// Build the originator target list to attach to one leg of a fan-out (#5147),
+/// or `None` when the recipient is on a pre-floor release.
+///
+/// `None` is the fail-closed answer, and it is what an unknown peer version
+/// yields: a pre-floor peer has no `BroadcastToV2` variant index, would fail to
+/// bincode-decode one, and the connection would be CLOSED. The caller's
+/// fallback is the legacy message, byte-identical to what every peer receives
+/// today, so failing closed costs the duplicate bandwidth we already spend and
+/// never costs convergence.
+///
+/// The recipient is excluded from its own list. It obviously has what we are
+/// sending it, and it excludes itself from its own fan-out anyway, so naming it
+/// would spend 8 bytes to say nothing.
+///
+/// The list describes who we ENQUEUED to, which is not identical to who
+/// receives bytes. Most of the gap is benign and deliberately not corrected
+/// for: `fanout_send_needed` and the empty-delta return skip a peer precisely
+/// BECAUSE it already holds this state, so naming it is correct. The one gap
+/// that is not benign is queue eviction at capacity (`max_queue_depth`) — an
+/// evicted leg never sends, yet stays named — which over-suppresses under
+/// exactly the load that causes eviction. It is bounded by the queue depth and
+/// healed by the interest heartbeat; closing it would mean finalising the list
+/// only after dispatch, i.e. a second pass over the fan-out.
+pub(crate) fn target_list_for(
+    op_manager: &Arc<OpManager>,
+    tx: &crate::message::Transaction,
+    peer_addr: std::net::SocketAddr,
+    recipient: &crate::ring::PeerKey,
+    fanout: &FanoutTargets,
+) -> Option<crate::ring::broadcast_coverage::CoveredPeers> {
+    if !op_manager
+        .ring
+        .connection_manager
+        .supports_broadcast_target_list(peer_addr)
+    {
+        return None;
+    }
+    Some(crate::ring::broadcast_coverage::CoveredPeers::from_targets(
+        tx,
+        fanout.iter().filter(|pub_key| *pub_key != &recipient.0),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn broadcast_to_single_peer(
     bridge: &P2pBridge,
     op_manager: &Arc<OpManager>,
@@ -3147,6 +3260,9 @@ pub(super) async fn broadcast_to_single_peer(
     new_state: WrappedState,
     target: PeerKeyLocation,
     scheduling: Option<QueueScheduling>,
+    // The whole fan-out this send is one leg of (#5147). Used to build the
+    // originator target list attached to this leg, minus the recipient itself.
+    fanout: FanoutTargets,
 ) {
     use crate::message::{DeltaOrFullState, NetMessage};
     use crate::node::network_bridge::NetworkBridge;
@@ -3583,11 +3699,25 @@ pub(super) async fn broadcast_to_single_peer(
             payload_size,
             "Using streaming for BroadcastTo (via queue)"
         );
-        let msg = UpdateMsg::BroadcastToStreaming {
-            id: update_tx,
-            stream_id: sid,
-            key,
-            total_size: payload_bytes.len() as u64,
+        let msg = match target_list_for(op_manager, &update_tx, peer_addr, &peer_key, &fanout) {
+            Some(covered) => UpdateMsg::BroadcastToStreamingV2 {
+                id: update_tx,
+                stream_id: sid,
+                key,
+                total_size: payload_bytes.len() as u64,
+                covered,
+            },
+            // Pre-floor peer: build the message through the SAME unchanged
+            // expression it has always been built with, rather than a shared
+            // constructor parameterised on an `Option`. Calling identical code
+            // is a stronger guarantee that a pre-floor peer's bytes are
+            // untouched than any amount of branch review (#5167's rationale).
+            None => UpdateMsg::BroadcastToStreaming {
+                id: update_tx,
+                stream_id: sid,
+                key,
+                total_size: payload_bytes.len() as u64,
+            },
         };
         let net_msg: NetMessage = msg.into();
         // Serialize metadata for embedding in fragment #1 (fix #2757)
@@ -3714,14 +3844,28 @@ pub(super) async fn broadcast_to_single_peer(
         }
         send_res
     } else {
-        let msg = UpdateMsg::BroadcastTo {
-            id: update_tx,
-            key,
-            payload,
-            sender_summary_bytes: our_summary
-                .as_ref()
-                .map(|s| s.as_ref().to_vec())
-                .unwrap_or_default(),
+        let msg = match target_list_for(op_manager, &update_tx, peer_addr, &peer_key, &fanout) {
+            Some(covered) => UpdateMsg::BroadcastToV2 {
+                id: update_tx,
+                key,
+                payload,
+                sender_summary_bytes: our_summary
+                    .as_ref()
+                    .map(|s| s.as_ref().to_vec())
+                    .unwrap_or_default(),
+                covered,
+            },
+            // See the streaming twin: the legacy arm is the untouched original
+            // expression, deliberately duplicated rather than factored.
+            None => UpdateMsg::BroadcastTo {
+                id: update_tx,
+                key,
+                payload,
+                sender_summary_bytes: our_summary
+                    .as_ref()
+                    .map(|s| s.as_ref().to_vec())
+                    .unwrap_or_default(),
+            },
         };
         let res = bridge.send(peer_addr, msg.into()).await;
         // Non-streaming inline broadcasts have no separate transfer phase: a

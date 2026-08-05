@@ -193,6 +193,14 @@ pub(crate) struct OpManager {
         Arc<crate::ring::interest::InterestManager<crate::util::time_source::DynTimeSource>>,
     /// Dedup cache for skipping redundant broadcast WASM merges
     pub broadcast_dedup_cache: Arc<crate::operations::update::BroadcastDedupCache>,
+    /// Originator target lists awaiting the fan-out they belong to (#5147).
+    ///
+    /// Written by `update_contract` immediately before the apply enters the
+    /// contract handler, read by `handle_broadcast_state_change` when the
+    /// executor's `BroadcastStateChange` for that apply comes back. It exists
+    /// because that event carries no provenance — see
+    /// [`crate::ring::broadcast_coverage::BroadcastCoverageStore`].
+    pub broadcast_coverage: Arc<crate::ring::broadcast_coverage::BroadcastCoverageStore>,
     /// Bounded per-contract UPDATE-propagation counters. Fed from the
     /// broadcast fan-out path and drained by a periodic background task that
     /// emits an INFO `update_propagation_summary` line per window. Restores
@@ -333,6 +341,7 @@ impl Clone for OpManager {
             outbound_mix: self.outbound_mix.clone(),
             interest_manager: self.interest_manager.clone(),
             broadcast_dedup_cache: self.broadcast_dedup_cache.clone(),
+            broadcast_coverage: self.broadcast_coverage.clone(),
             update_propagation_stats: self.update_propagation_stats.clone(),
             pending_broadcasts: self.pending_broadcasts.clone(),
             request_router: self.request_router.clone(),
@@ -542,6 +551,9 @@ impl OpManager {
             ),
             interest_manager,
             broadcast_dedup_cache: Arc::new(crate::operations::update::BroadcastDedupCache::new()),
+            broadcast_coverage: Arc::new(
+                crate::ring::broadcast_coverage::BroadcastCoverageStore::new(),
+            ),
             update_propagation_stats,
             pending_broadcasts: Arc::new(
                 crate::operations::update::pending_broadcast::PendingBroadcastStore::new(),
@@ -3056,6 +3068,381 @@ mod tests {
     /// advertisement lands in Source-1, live or via anti-entropy. See
     /// `.claude/rules/hosting-invariants.md` invariant 1 and
     /// `docs/design/demand-driven-hosting.md`.
+    /// Shared fixture for the #5147 target-list tests: an op-manager whose
+    /// advertised co-host set for one contract is `count` connected peers.
+    ///
+    /// Returns the contract key, this node's address, and the co-hosts'
+    /// keypairs in the order they were added.
+    async fn cohost_fixture(
+        id: &str,
+        count: usize,
+    ) -> (
+        Arc<OpManager>,
+        Box<dyn std::any::Any>,
+        ContractKey,
+        std::net::SocketAddr,
+        Vec<crate::transport::TransportKeypair>,
+    ) {
+        let (op_manager, guards) = build_reroot_test_op_manager(id).await;
+        let self_addr: std::net::SocketAddr = "127.0.0.1:12000".parse().unwrap();
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test(self_addr);
+
+        let key = reroot_contract_key(0x5B);
+        let cid = *key.id();
+        let mut keypairs = Vec::with_capacity(count);
+        for i in 0..count {
+            let kp = crate::transport::TransportKeypair::new();
+            let addr: std::net::SocketAddr = format!("127.0.0.1:{}", 21000 + i).parse().unwrap();
+            assert!(op_manager.ring.connection_manager.add_connection(
+                crate::ring::Location::new(0.1 + (i as f64) * 0.001),
+                addr,
+                kp.public().clone(),
+                false,
+            ));
+            op_manager.neighbor_hosting.handle_message(
+                kp.public(),
+                crate::message::NeighborHostingMessage::HostingAnnounce {
+                    added: vec![cid],
+                    removed: vec![],
+                    is_response: false,
+                },
+            );
+            keypairs.push(kp);
+        }
+        (op_manager, guards, key, self_addr, keypairs)
+    }
+
+    fn addr_of(
+        op_manager: &OpManager,
+        kp: &crate::transport::TransportKeypair,
+    ) -> std::net::SocketAddr {
+        op_manager
+            .ring
+            .connection_manager
+            .get_peer_by_pub_key(kp.public())
+            .and_then(|pkl| pkl.socket_addr())
+            .expect("co-host must resolve")
+    }
+
+    fn target_addrs(
+        result: &crate::operations::update::BroadcastTargetResult,
+    ) -> std::collections::HashSet<std::net::SocketAddr> {
+        result
+            .targets
+            .iter()
+            .filter_map(|p| p.socket_addr())
+            .collect()
+    }
+
+    /// The core #5147 property: a relayer drops EXACTLY the peers the
+    /// originator named, and nobody else.
+    ///
+    /// "And nobody else" is the half that matters. Over-suppression is the one
+    /// failure this design refuses — a peer silently missing an update until
+    /// the ~5-minute heartbeat — so the unlisted co-hosts are asserted present,
+    /// not merely the listed ones absent.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_relayer_excludes_exactly_the_listed_peers_and_no_others() {
+        use crate::ring::broadcast_coverage::{BroadcastOrigin, CoveredPeers};
+
+        let (op_manager, _guards, key, _self_addr, kps) =
+            cohost_fixture("5147-exact-exclusion", 5).await;
+        let sender_addr: std::net::SocketAddr = "127.0.0.1:20000".parse().unwrap();
+
+        let tx = crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
+        let named = [kps[0].public().clone(), kps[2].public().clone()];
+        let covered = CoveredPeers::from_targets(&tx, named.iter());
+        let resolved = covered.resolve(&tx, kps.iter().map(|kp| kp.public()));
+        assert_eq!(resolved.len(), 2, "both named peers must resolve");
+
+        let result = op_manager
+            .get_broadcast_targets_update(&key, &BroadcastOrigin::relayed(sender_addr, resolved));
+        let got = target_addrs(&result);
+
+        for (i, kp) in kps.iter().enumerate() {
+            let addr = addr_of(&op_manager, kp);
+            if i == 0 || i == 2 {
+                assert!(
+                    !got.contains(&addr),
+                    "co-host {i} was on the originator's list and must be suppressed"
+                );
+            } else {
+                assert!(
+                    got.contains(&addr),
+                    "co-host {i} was NOT on the list and MUST still receive the \
+                     update — over-suppression is the failure mode this design \
+                     refuses, because the peer would not learn of the update \
+                     until the ~5-minute interest heartbeat"
+                );
+            }
+        }
+        assert_eq!(result.skipped_covered, 2, "the filter counts its own drops");
+        assert_eq!(got.len(), 3);
+    }
+
+    /// A local apply carries no claim, so nothing is suppressed: byte-for-byte
+    /// today's fan-out.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_local_apply_suppresses_nothing() {
+        use crate::ring::broadcast_coverage::BroadcastOrigin;
+
+        let (op_manager, _guards, key, _self_addr, kps) =
+            cohost_fixture("5147-local-apply", 4).await;
+
+        let result = op_manager.get_broadcast_targets_update(&key, &BroadcastOrigin::local());
+
+        assert_eq!(result.targets.len(), kps.len());
+        assert_eq!(result.skipped_covered, 0);
+        assert_eq!(result.skipped_sender, 0);
+    }
+
+    /// The revived sender exclusion (#5147).
+    ///
+    /// This filter has existed in `get_broadcast_targets_update` since long
+    /// before #5147 and was structurally DEAD: the re-fan-out call site had no
+    /// sender to pass and handed in its own address, so `sender` never matched
+    /// a co-host. A relayer therefore echoed every broadcast straight back to
+    /// the peer that had just sent it — a 100%-wasted send on every relayed
+    /// broadcast, and one the originator's target list cannot fix, because a
+    /// peer never names itself on its own list.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_sender_is_excluded_even_when_it_names_no_one() {
+        use crate::ring::broadcast_coverage::BroadcastOrigin;
+
+        let (op_manager, _guards, key, _self_addr, kps) =
+            cohost_fixture("5147-sender-exclusion", 3).await;
+        let sender_addr = addr_of(&op_manager, &kps[1]);
+
+        let result = op_manager.get_broadcast_targets_update(
+            &key,
+            &BroadcastOrigin::relayed(sender_addr, Default::default()),
+        );
+        let got = target_addrs(&result);
+
+        assert!(
+            !got.contains(&sender_addr),
+            "the peer that just delivered this update must not receive it back"
+        );
+        assert_eq!(result.skipped_sender, 1);
+        assert_eq!(got.len(), 2);
+    }
+
+    /// Over-cap truncation must lose suppression, never gain it.
+    ///
+    /// With more co-hosts than [`MAX_COVERED_PEERS`] the list is truncated, so
+    /// some genuinely-covered peers are not named and are re-sent to. That is
+    /// today's behaviour for those peers — wasted bandwidth, correct delivery.
+    /// The failure this guards is the opposite one: a truncated list must never
+    /// cause a peer that was NOT named to be dropped.
+    #[tokio::test(flavor = "current_thread")]
+    async fn over_cap_truncation_degrades_to_partial_suppression() {
+        use crate::ring::broadcast_coverage::{BroadcastOrigin, CoveredPeers, MAX_COVERED_PEERS};
+
+        let total = MAX_COVERED_PEERS + 10;
+        let (op_manager, _guards, key, _self_addr, kps) =
+            cohost_fixture("5147-over-cap", total).await;
+        let sender_addr: std::net::SocketAddr = "127.0.0.1:20000".parse().unwrap();
+
+        let tx = crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
+        // The originator genuinely delivered to every co-host, but can only
+        // name MAX_COVERED_PEERS of them.
+        let covered = CoveredPeers::from_targets(&tx, kps.iter().map(|kp| kp.public()));
+        assert_eq!(covered.len(), MAX_COVERED_PEERS, "the list is capped");
+
+        let resolved = covered.resolve(&tx, kps.iter().map(|kp| kp.public()));
+        let result = op_manager.get_broadcast_targets_update(
+            &key,
+            &BroadcastOrigin::relayed(sender_addr, resolved.clone()),
+        );
+
+        assert_eq!(
+            result.skipped_covered, MAX_COVERED_PEERS,
+            "exactly the named peers are suppressed"
+        );
+        assert_eq!(
+            result.targets.len(),
+            total - MAX_COVERED_PEERS,
+            "the un-named remainder still receives the update — a truncated \
+             list may only lose suppression, never invent it"
+        );
+        assert!(
+            !result.targets.is_empty(),
+            "over-cap must degrade toward today's behaviour, not toward silence"
+        );
+        // Every surviving target must be one the list did NOT name.
+        for target in &result.targets {
+            assert!(
+                !resolved.contains(&crate::ring::PeerKey::from(target.pub_key().clone())),
+                "a named peer leaked into the target set"
+            );
+        }
+    }
+
+    /// A pre-floor peer must receive BYTE-IDENTICAL traffic to today.
+    ///
+    /// Exercises the real gate through `target_list_for`, then builds both
+    /// messages the way `broadcast_to_single_peer` does and compares the
+    /// pre-floor one to a hand-built legacy `BroadcastTo`. Asserting on the
+    /// serialized BYTES rather than on the variant is the point: a peer on
+    /// 0.2.119 has no `BroadcastToV2` variant index, so the failure mode is not
+    /// a degraded feature but a decode error that CLOSES the connection —
+    /// fleet-wide churn during a staggered rollout, presenting as a transport
+    /// fault.
+    ///
+    /// The companion `legacy_broadcast_to_encoding_is_unchanged_by_the_v2_variants`
+    /// pins the encoding itself against a literal; this one pins that the
+    /// routing decision actually reaches it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pre_floor_peer_receives_byte_identical_broadcast_traffic() {
+        use crate::message::DeltaOrFullState;
+        use crate::node::network_bridge::broadcast_queue::target_list_for;
+        use crate::operations::update::UpdateMsg;
+
+        let (op_manager, _guards, key, _self_addr, kps) =
+            cohost_fixture("5147-pre-floor-bytes", 3).await;
+
+        let recipient_kp = &kps[0];
+        let recipient_addr = addr_of(&op_manager, recipient_kp);
+        let recipient = crate::ring::PeerKey::from(recipient_kp.public().clone());
+        let fanout: std::sync::Arc<Vec<crate::transport::TransportPublicKey>> =
+            std::sync::Arc::new(kps.iter().map(|kp| kp.public().clone()).collect());
+        let tx = crate::message::Transaction::new::<UpdateMsg>();
+
+        let payload = DeltaOrFullState::Delta(vec![7, 8, 9]);
+        let summary = vec![1u8, 2];
+
+        // The fixture never records a remote version, which is exactly the
+        // pre-floor / unknown case (and, until #5161 lands, every gateway link).
+        assert!(
+            target_list_for(&op_manager, &tx, recipient_addr, &recipient, &fanout).is_none(),
+            "an unknown peer version must route to the legacy variant"
+        );
+        let legacy = UpdateMsg::BroadcastTo {
+            id: tx,
+            key,
+            payload: payload.clone(),
+            sender_summary_bytes: summary.clone(),
+        };
+        assert_eq!(
+            bincode::serialize(&legacy).expect("serialize legacy"),
+            bincode::serialize(&UpdateMsg::BroadcastTo {
+                id: tx,
+                key,
+                payload: payload.clone(),
+                sender_summary_bytes: summary.clone(),
+            })
+            .expect("serialize reference"),
+            "a pre-floor peer's bytes must be exactly today's BroadcastTo"
+        );
+
+        // Now record an at-floor version and confirm the gate genuinely flips —
+        // otherwise the assertion above would pass against a gate that is
+        // simply always closed, and the feature would be inert.
+        op_manager.ring.connection_manager.record_remote_version(
+            recipient_addr,
+            Some(crate::node::BROADCAST_TARGET_LIST_MIN_VERSION),
+        );
+        let covered = target_list_for(&op_manager, &tx, recipient_addr, &recipient, &fanout)
+            .expect("an at-floor peer must get the target list");
+        assert_eq!(
+            covered.len(),
+            kps.len() - 1,
+            "the recipient is excluded from its own list; it obviously has \
+             what we are sending it"
+        );
+        let v2 = UpdateMsg::BroadcastToV2 {
+            id: tx,
+            key,
+            payload,
+            sender_summary_bytes: summary,
+            covered,
+        };
+        assert_ne!(
+            bincode::serialize(&v2).expect("serialize v2"),
+            bincode::serialize(&legacy).expect("serialize legacy"),
+            "the gate must be choosing between genuinely different encodings"
+        );
+    }
+
+    /// One hop only: the list a relayer SENDS is built from its own targets,
+    /// never from the list it received.
+    ///
+    /// This is the property the security rule rests on. If a relayer forwarded
+    /// (or unioned into) the claim it received, a peer three hops away would be
+    /// acting on an assertion made by someone it never heard from, and a
+    /// malicious relayer could suppress fan-out it has no knowledge of. Here
+    /// the relayer receives a claim covering peer 0, and the list it emits is
+    /// checked to (a) not contain peer 0 — a peer it did not send to cannot be
+    /// claimed as covered — and (b) contain exactly the peers it did send to.
+    ///
+    /// Measured hop-2 suppression is already 0.99, so forwarding would buy
+    /// nothing even if it were safe.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_list_a_relayer_emits_describes_only_its_own_sends() {
+        use crate::ring::broadcast_coverage::{BroadcastOrigin, CoveredPeers};
+
+        let (op_manager, _guards, key, _self_addr, kps) = cohost_fixture("5147-one-hop", 4).await;
+        let sender_addr: std::net::SocketAddr = "127.0.0.1:20000".parse().unwrap();
+
+        let inbound_tx = crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
+        let inbound = CoveredPeers::from_targets(&inbound_tx, [kps[0].public()]);
+        let resolved = inbound.resolve(&inbound_tx, kps.iter().map(|kp| kp.public()));
+
+        let result = op_manager
+            .get_broadcast_targets_update(&key, &BroadcastOrigin::relayed(sender_addr, resolved));
+
+        // This is the same derivation the production fan-out uses: the outgoing
+        // list is a function of `target_result.targets` and nothing else.
+        let outbound_tx =
+            crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
+        let outbound =
+            CoveredPeers::from_targets(&outbound_tx, result.targets.iter().map(|t| t.pub_key()));
+        let named = outbound.resolve(&outbound_tx, kps.iter().map(|kp| kp.public()));
+
+        assert!(
+            !named.contains(&crate::ring::PeerKey::from(kps[0].public().clone())),
+            "peer 0 was covered by the UPSTREAM sender and suppressed here, so \
+             this relayer never sent to it and must not claim it did — the \
+             list is an attestation of one's OWN sends, which is what makes \
+             honoring it from the payload-bearing message alone sufficient"
+        );
+        assert_eq!(named.len(), 3, "exactly the peers this relayer sent to");
+        for kp in &kps[1..] {
+            assert!(named.contains(&crate::ring::PeerKey::from(kp.public().clone())));
+        }
+    }
+
+    /// A list only resolves under the transaction it arrived on.
+    ///
+    /// The hashes are seeded with the transaction id, so a list lifted from one
+    /// broadcast and replayed onto another resolves to nothing and suppresses
+    /// nothing. This is the behavioural counterpart to the privacy property:
+    /// the same seeding that stops an observer correlating co-host sets across
+    /// transactions is what stops a replayed list from taking effect.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_list_replayed_onto_another_transaction_suppresses_nothing() {
+        use crate::ring::broadcast_coverage::{BroadcastOrigin, CoveredPeers};
+
+        let (op_manager, _guards, key, _self_addr, kps) = cohost_fixture("5147-tx-replay", 4).await;
+        let sender_addr: std::net::SocketAddr = "127.0.0.1:20000".parse().unwrap();
+
+        let original_tx =
+            crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
+        let other_tx = crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
+        let covered = CoveredPeers::from_targets(&original_tx, kps.iter().map(|kp| kp.public()));
+
+        let replayed = covered.resolve(&other_tx, kps.iter().map(|kp| kp.public()));
+        assert!(replayed.is_empty(), "a replayed list resolves to nothing");
+
+        let result = op_manager
+            .get_broadcast_targets_update(&key, &BroadcastOrigin::relayed(sender_addr, replayed));
+        assert_eq!(result.targets.len(), kps.len());
+        assert_eq!(result.skipped_covered, 0);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn broadcast_targets_are_advertised_cohosts_only_and_heal_via_advertisement() {
         use crate::ring::interest::PeerKey;
@@ -3116,7 +3503,13 @@ mod tests {
         );
 
         // BEFORE the heal: only the advertised co-host A is a target.
-        let before = op_manager.get_broadcast_targets_update(&key, &sender_addr);
+        let before = op_manager.get_broadcast_targets_update(
+            &key,
+            &crate::ring::broadcast_coverage::BroadcastOrigin::relayed(
+                sender_addr,
+                Default::default(),
+            ),
+        );
         let before_addrs: std::collections::HashSet<std::net::SocketAddr> = before
             .targets
             .iter()
@@ -3156,7 +3549,13 @@ mod tests {
         );
 
         // AFTER the heal: B is now an advertised co-host and IS a target.
-        let after = op_manager.get_broadcast_targets_update(&key, &sender_addr);
+        let after = op_manager.get_broadcast_targets_update(
+            &key,
+            &crate::ring::broadcast_coverage::BroadcastOrigin::relayed(
+                sender_addr,
+                Default::default(),
+            ),
+        );
         let after_addrs: std::collections::HashSet<std::net::SocketAddr> = after
             .targets
             .iter()
@@ -3342,7 +3741,10 @@ mod tests {
 
         // First lookup: the stale neighbor fails to resolve (counted once) AND
         // is reaped so it cannot spam future UPDATEs.
-        let first = op_manager.get_broadcast_targets_update(&key, &sender);
+        let first = op_manager.get_broadcast_targets_update(
+            &key,
+            &crate::ring::broadcast_coverage::BroadcastOrigin::relayed(sender, Default::default()),
+        );
         assert_eq!(
             first.proximity_resolve_failed, 1,
             "the stale neighbor must be counted as one resolve failure"
@@ -3357,7 +3759,10 @@ mod tests {
 
         // Second lookup: the entry is gone, so there is no repeat failure — the
         // bug's failure mode is that this stays 1 (WARN spam) forever.
-        let second = op_manager.get_broadcast_targets_update(&key, &sender);
+        let second = op_manager.get_broadcast_targets_update(
+            &key,
+            &crate::ring::broadcast_coverage::BroadcastOrigin::relayed(sender, Default::default()),
+        );
         assert_eq!(
             second.proximity_resolve_failed, 0,
             "a reaped entry must not re-fire on the next UPDATE (no repeat spam)"
@@ -3386,7 +3791,10 @@ mod tests {
         register_hub_cohosting(&op_manager, &peer_pub, &[*key.id()]);
 
         let sender: std::net::SocketAddr = "127.0.0.1:40001".parse().unwrap();
-        let result = op_manager.get_broadcast_targets_update(&key, &sender);
+        let result = op_manager.get_broadcast_targets_update(
+            &key,
+            &crate::ring::broadcast_coverage::BroadcastOrigin::relayed(sender, Default::default()),
+        );
 
         assert_eq!(
             result.proximity_resolve_failed, 0,

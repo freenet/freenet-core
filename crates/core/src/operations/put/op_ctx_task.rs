@@ -786,6 +786,12 @@ async fn try_summary_first_put(
             // tag is a scheduling-lane choice (see the comment above), and
             // the two are free to disagree.
             crate::node::ApplyOrigin::NetworkRelay,
+            // #5147: a PUT-path apply names no broadcast delivery targets, so
+            // it attests to no coverage. Registering an EMPTY set rather than
+            // skipping registration is deliberate: it collapses any concurrent
+            // relayed coverage for this contract, so a PUT's fan-out is never
+            // suppressed against a list belonging to someone else's broadcast.
+            crate::ring::broadcast_coverage::BroadcastOrigin::local(),
         )
         .await
         {
@@ -4207,6 +4213,12 @@ async fn drive_relay_probe_reconcile(
             RelatedContracts::default(),
             crate::contract::Priority::NetworkRelay,
             crate::node::ApplyOrigin::NetworkRelay,
+            // #5147: a PUT-path apply names no broadcast delivery targets, so
+            // it attests to no coverage. Registering an EMPTY set rather than
+            // skipping registration is deliberate: it collapses any concurrent
+            // relayed coverage for this contract, so a PUT's fan-out is never
+            // suppressed against a list belonging to someone else's broadcast.
+            crate::ring::broadcast_coverage::BroadcastOrigin::local(),
         )
         .await
         {

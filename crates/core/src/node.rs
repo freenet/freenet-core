@@ -65,12 +65,16 @@ pub(crate) use network_bridge::broadcast_queue_metrics::BROADCAST_QUEUE_EFFICIEN
 // re-export rather than a path through `network_bridge` directly. Mirrors
 // `BROADCAST_STREAM_METRICS` above.
 pub(crate) use network_bridge::p2p_protoc::{
-    HASH_FIRST_SUMMARIES_MIN_VERSION, SUMMARY_FIRST_PUT_MIN_VERSION,
+    BROADCAST_TARGET_LIST_MIN_VERSION, HASH_FIRST_SUMMARIES_MIN_VERSION,
+    SUMMARY_FIRST_PUT_MIN_VERSION, version_supports_broadcast_target_list,
     version_supports_hash_first_summaries, version_supports_summary_first_put,
 };
 // Test-only: the release-timing marker has no runtime reader by design (see
 // its rustdoc), so re-exporting it unconditionally is an unused import in the
 // non-test build.
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use network_bridge::p2p_protoc::BROADCAST_TARGET_LIST_SHIPPED_IN;
 #[cfg(test)]
 pub(crate) use network_bridge::p2p_protoc::HASH_FIRST_SHIPPED_IN;
 #[cfg(test)]
@@ -431,6 +435,30 @@ pub struct NodeConfig {
     /// `#[serde(skip)]`; never serialized.
     #[serde(skip)]
     pub(crate) ack_version_floor_override: Option<(u8, u8, u16)>,
+    /// Test-only override for the originator-target-list version floor
+    /// ([`BROADCAST_TARGET_LIST_MIN_VERSION`], #5147). Threaded exactly like
+    /// the three overrides above and consulted as
+    /// `broadcast_target_list_floor_override.unwrap_or(BROADCAST_TARGET_LIST_MIN_VERSION)`
+    /// by `ConnectionManager::supports_broadcast_target_list`.
+    ///
+    /// In production this is `None` → the real `(0, 2, 120)` floor.
+    ///
+    /// **Simulations default this to `SIM_MIGRATION_DISABLED_FLOOR` — OFF —
+    /// like `subscribe_hint_floor_override` and `summary_first_put_floor_override`,
+    /// and unlike `hash_first_summaries_floor_override`.** The rule stated at
+    /// that field applies: hash-first defaults ON because it changes only the
+    /// ENCODING of an exchange with identical semantics, whereas this gate
+    /// changes BEHAVIOUR — it removes peers from a fan-out. Every sim that
+    /// asserts on delivery or convergence would silently be exercising a
+    /// different delivery graph, and a failure could not be attributed between
+    /// the sim's own subject and this suppression. Tests that want it opt in
+    /// via `SimNetwork::enable_broadcast_target_list`.
+    ///
+    /// Not cfg-gated, for the same reason as the others: `node::testing_impl`
+    /// sets it and is compiled unconditionally. `#[serde(skip)]`; never
+    /// serialized.
+    #[serde(skip)]
+    pub(crate) broadcast_target_list_floor_override: Option<(u8, u8, u16)>,
     /// Test-only harness flag: when set, a startup-hosted contract
     /// (`SeedHostedContract`, i.e. `append_contracts` with `subscription =
     /// true`) is registered in the neighbor-hosting advertised set so the
@@ -599,6 +627,7 @@ impl NodeConfig {
             summary_first_put_floor_override: None,
             hash_first_summaries_floor_override: None,
             ack_version_floor_override: None,
+            broadcast_target_list_floor_override: None,
             advertise_seeded_hosts: false,
             hosting_time_source_override: None,
         })
@@ -1535,7 +1564,9 @@ where
                     update::UpdateMsg::RequestUpdate { key, .. }
                     | update::UpdateMsg::BroadcastTo { key, .. }
                     | update::UpdateMsg::RequestUpdateStreaming { key, .. }
-                    | update::UpdateMsg::BroadcastToStreaming { key, .. } => *key,
+                    | update::UpdateMsg::BroadcastToStreaming { key, .. }
+                    | update::UpdateMsg::BroadcastToV2 { key, .. }
+                    | update::UpdateMsg::BroadcastToStreamingV2 { key, .. } => *key,
                 };
 
                 // Phase 7 ban-list gate. Runs BEFORE the rate limiter
@@ -1596,6 +1627,10 @@ where
                         }
                         return Ok(());
                     }
+                    // The legacy variant carries no target list, so the
+                    // relayer suppresses nothing and behaves exactly as it does
+                    // today. `CoveredPeers::empty()` is that "nobody is
+                    // covered" statement, not a missing value.
                     update::UpdateMsg::BroadcastTo {
                         id,
                         key,
@@ -1609,6 +1644,7 @@ where
                             payload.clone(),
                             sender_summary_bytes.clone(),
                             sender_addr,
+                            crate::ring::broadcast_coverage::CoveredPeers::empty(),
                         )
                         .await
                         {
@@ -1661,6 +1697,7 @@ where
                             *stream_id,
                             *total_size,
                             sender_addr,
+                            crate::ring::broadcast_coverage::CoveredPeers::empty(),
                         )
                         .await
                         {
@@ -1669,6 +1706,69 @@ where
                                 %key,
                                 error = %err,
                                 "UPDATE relay dispatch: start_relay_broadcast_to_streaming failed"
+                            );
+                        }
+                        return Ok(());
+                    }
+                    // #5147. These two arms are the ONLY places a target list
+                    // is honored, and that is the security rule rather than an
+                    // implementation detail: the list is trusted solely because
+                    // it arrived on the message that delivered the payload, so
+                    // its author is attesting to sends it actually made. A
+                    // relayer therefore cannot fabricate an "everyone is
+                    // covered" list to suppress third-party fan-out, because
+                    // there is no other message type that carries one. Do NOT
+                    // add a `covered` field to a non-payload-bearing variant.
+                    update::UpdateMsg::BroadcastToV2 {
+                        id,
+                        key,
+                        payload,
+                        sender_summary_bytes,
+                        covered,
+                    } => {
+                        if let Err(err) = update::op_ctx_task::start_relay_broadcast_to(
+                            op_manager.clone(),
+                            *id,
+                            *key,
+                            payload.clone(),
+                            sender_summary_bytes.clone(),
+                            sender_addr,
+                            covered.clone(),
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                tx = %id,
+                                %key,
+                                error = %err,
+                                "UPDATE relay dispatch: start_relay_broadcast_to (v2) failed"
+                            );
+                        }
+                        return Ok(());
+                    }
+                    update::UpdateMsg::BroadcastToStreamingV2 {
+                        id,
+                        key,
+                        stream_id,
+                        total_size,
+                        covered,
+                    } => {
+                        if let Err(err) = update::op_ctx_task::start_relay_broadcast_to_streaming(
+                            op_manager.clone(),
+                            *id,
+                            *key,
+                            *stream_id,
+                            *total_size,
+                            sender_addr,
+                            covered.clone(),
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                tx = %id,
+                                %key,
+                                error = %err,
+                                "UPDATE relay dispatch: start_relay_broadcast_to_streaming (v2) failed"
                             );
                         }
                         return Ok(());
