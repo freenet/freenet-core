@@ -769,13 +769,55 @@ pub(crate) async fn start_relay_request_update(
 /// `tx` is the transaction the list arrived on. The hashes are seeded with it,
 /// so resolving under any other transaction yields nothing; that is what stops
 /// a list from being replayed onto a different broadcast.
-fn resolve_covered_peers(
+///
+/// # Both halves are behind the #5147 version gate, including the sender
+///
+/// The sender exclusion needs no wire change of its own — it is a decision
+/// about our OWN fan-out — so it would ship unconditionally if left ungated.
+/// It is gated anyway, and deliberately:
+///
+/// * It has the same unsafe shape as the target list. Excluding the peer that
+///   delivered a payload assumes it holds what we are about to send, and on a
+///   merge path our post-merge state can be strictly newer than what it sent
+///   us. That is the same assumption the target list makes, so it deserves the
+///   same caution rather than inheriting the list's without its gate.
+/// * Ungated, it would reach every peer on the floor release with none of the
+///   machinery that makes the rest of this reviewable — no sim override, so no
+///   simulation could turn it off to get a baseline, and no version floor, so
+///   no staged rollout.
+///
+/// Gating on the SENDER's version is the coherent choice: if the peer that
+/// delivered this payload predates the feature, we are in the legacy world
+/// with it and behave toward it exactly as today. An unknown version fails
+/// closed, which on a gateway link is the common case until #5161 deploys.
+/// NOTE: `pub(crate)` rather than private, and deliberately NOT reached through
+/// a test-only shim, so a unit test in `node::op_state_manager` drives the real
+/// gate.
+///
+/// A test-gated item must not be introduced above this point in the file. The
+/// source-scrape pins below slice production code with `production_source`,
+/// which truncates the file at the first test-gate attribute, so an earlier one
+/// silently hides every function after it from those pins — they then fail with
+/// "could not find ...", or worse, pass vacuously. Note the attribute must not
+/// be spelled out in prose here either: `production_source` matches the literal
+/// text, so even a comment mentioning it truncates the slice. That is not
+/// hypothetical; writing this warning the obvious way broke four pins.
+pub(crate) fn resolve_covered_peers(
     op_manager: &OpManager,
     key: &ContractKey,
     tx: &Transaction,
     sender_addr: SocketAddr,
     covered: &crate::ring::broadcast_coverage::CoveredPeers,
 ) -> crate::ring::broadcast_coverage::BroadcastOrigin {
+    if !op_manager
+        .ring
+        .connection_manager
+        .supports_broadcast_target_list(sender_addr)
+    {
+        // Pre-floor or unknown sender: no suppression of any kind, so this
+        // node's fan-out is byte-for-byte what it is today.
+        return crate::ring::broadcast_coverage::BroadcastOrigin::local();
+    }
     let resolved = if covered.is_empty() {
         std::collections::HashSet::new()
     } else {

@@ -3258,6 +3258,68 @@ mod tests {
         }
     }
 
+    /// The sender exclusion is behind the same version gate as the target
+    /// list, and fails closed on an unknown sender.
+    ///
+    /// The exclusion needs no wire change of its own, so it would ship
+    /// unconditionally if nobody gated it — and it has the same unsafe shape as
+    /// the list, since excluding the peer that delivered a payload assumes it
+    /// holds what we are about to send. This asserts the gate DISCRIMINATES:
+    /// pre-floor sender suppresses nothing, at-floor sender excludes the
+    /// sender. Without the second half an always-closed gate would pass.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_sender_exclusion_is_version_gated_and_fails_closed() {
+        use crate::operations::update::UpdateMsg;
+
+        let (op_manager, _guards, key, _self_addr, kps) =
+            cohost_fixture("5147-sender-gate", 3).await;
+        let sender_kp = &kps[1];
+        let sender_addr = addr_of(&op_manager, sender_kp);
+        let tx = crate::message::Transaction::new::<UpdateMsg>();
+        let empty = crate::ring::broadcast_coverage::CoveredPeers::empty();
+
+        // No version recorded — the pre-#5161 gateway-link case.
+        let origin = crate::operations::update::op_ctx_task::resolve_covered_peers(
+            &op_manager,
+            &key,
+            &tx,
+            sender_addr,
+            &empty,
+        );
+        assert_eq!(
+            origin.sender(),
+            None,
+            "a pre-floor or unknown sender must not be excluded — this node's \
+             fan-out has to stay byte-for-byte what it is today toward peers \
+             that predate the feature"
+        );
+        let before = op_manager.get_broadcast_targets_update(&key, &origin);
+        assert_eq!(before.skipped_sender, 0);
+        assert_eq!(before.targets.len(), kps.len());
+
+        // At-floor sender: the exclusion activates.
+        op_manager.ring.connection_manager.record_remote_version(
+            sender_addr,
+            Some(crate::node::BROADCAST_TARGET_LIST_MIN_VERSION),
+        );
+        let origin = crate::operations::update::op_ctx_task::resolve_covered_peers(
+            &op_manager,
+            &key,
+            &tx,
+            sender_addr,
+            &empty,
+        );
+        assert_eq!(
+            origin.sender(),
+            Some(&sender_addr),
+            "the gate must genuinely flip; an always-closed gate would pass the \
+             assertion above while the feature was inert"
+        );
+        let after = op_manager.get_broadcast_targets_update(&key, &origin);
+        assert_eq!(after.skipped_sender, 1);
+        assert_eq!(after.targets.len(), kps.len() - 1);
+    }
+
     /// A pre-floor peer must receive BYTE-IDENTICAL traffic to today.
     ///
     /// Exercises the real gate through `target_list_for`, then builds both
