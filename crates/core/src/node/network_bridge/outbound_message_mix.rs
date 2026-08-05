@@ -93,7 +93,16 @@ const TOP_DIFFERING_CONTRACTS_REPORTED: usize = 10;
 
 /// Rollup cadence, matching [`super::broadcast_payload_mix`] so the two
 /// rollups can be joined per node-minute without interpolation.
-const ROLLUP_WINDOW: Duration = Duration::from_secs(60);
+///
+/// Aliased to that module's constant rather than restated, so the cadence the
+/// join depends on cannot drift between the two files.
+const ROLLUP_WINDOW: Duration = super::broadcast_payload_mix::ROLLUP_WINDOW;
+
+/// Shared with [`super::broadcast_payload_mix`] for the same reason the
+/// cadence is: both minute rollups must sit off the 30 s shadow-stat boundary,
+/// and must stay on the same phase as each other. Rationale for the value is
+/// on `broadcast_payload_mix::ROLLUP_PHASE_OFFSET`.
+const ROLLUP_PHASE_OFFSET: Duration = super::broadcast_payload_mix::ROLLUP_PHASE_OFFSET;
 
 /// Which kind of message put these bytes on the wire.
 ///
@@ -816,10 +825,15 @@ pub(crate) fn spawn_outbound_mix_aggregator(
     monitor: &BackgroundTaskMonitor,
 ) {
     let handle = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(ROLLUP_WINDOW);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        ticker.tick().await; // skip the immediate first tick
         let mut last_rollup = tokio::time::Instant::now();
+        // Phase-offset off the 30 s shadow-stat boundary; see
+        // `ROLLUP_PHASE_OFFSET`. Same shape as the payload-mix aggregator, and
+        // the same offset, so the two stay joinable per node-minute.
+        let mut ticker = tokio::time::interval_at(
+            last_rollup + ROLLUP_WINDOW + ROLLUP_PHASE_OFFSET,
+            ROLLUP_WINDOW,
+        );
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
             let now = tokio::time::Instant::now();

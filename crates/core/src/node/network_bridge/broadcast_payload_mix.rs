@@ -313,7 +313,36 @@ use crate::tracing::event_kind::{STATE_SIZE_BUCKET_COUNT, state_size_bucket};
 /// a minute rather than the 1 Hz sampling the `shadow_demand` aggregators use;
 /// one event per minute per node is a negligible addition to the telemetry
 /// volume this is meant to explain.
-const ROLLUP_WINDOW: Duration = Duration::from_secs(60);
+pub(crate) const ROLLUP_WINDOW: Duration = Duration::from_secs(60);
+
+/// Phase offset applied to the two minute-cadence mix rollups so they never
+/// share an emit second with the 30 s shadow-stat rollups.
+///
+/// Every shadow emitter is spawned from the same block in
+/// [`crate::node::p2p_impl`], so their tickers start within microseconds of
+/// each other. The five shadow-stat streams close a
+/// [`crate::transport::shadow_stats::SHADOW_ROLLUP_WINDOW_SECS`] (30 s) window
+/// and the two mix streams a 60 s one, so without an offset all seven emit in
+/// the SAME second every 60 s. The telemetry worker admits at most
+/// `MAX_SHADOW_EVENTS_PER_SECOND` (6) shadow events per second, so on a
+/// gateway — the only place all seven run, since `shadow_reference_ping` and
+/// `shadow_iface_tx` are gateway opt-ins — exactly one rollup was dropped
+/// every minute, and WHICH one depended on task-wakeup order. Gateways are
+/// precisely where these rollups get read.
+///
+/// Offsetting is preferred over raising the shadow sub-budget to 7: it adds
+/// no telemetry volume, whereas a cap of 7 would leave only 3 of the 10
+/// aggregate slots per second for operational telemetry.
+///
+/// 15 s is half the shadow window, which maximises the distance to the
+/// nearest 30 s boundary and so is the most tolerant of spawn-time skew.
+/// Applied to BOTH mix rollups equally, preserving the shared cadence that
+/// lets them be joined per node-minute without interpolation.
+///
+/// `telemetry::tests::shadow_rollup_emit_schedule_fits_the_shadow_sub_budget`
+/// derives the collision schedule from these constants and fails if this is
+/// set back to zero or an eighth stream lands on an occupied second.
+pub(crate) const ROLLUP_PHASE_OFFSET: Duration = Duration::from_secs(15);
 
 /// Per-contract attribution cap for one window.
 ///
@@ -1598,13 +1627,21 @@ pub(crate) fn spawn_payload_mix_aggregator(
     monitor: &BackgroundTaskMonitor,
 ) {
     let handle = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(ROLLUP_WINDOW);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        ticker.tick().await; // skip the immediate first tick
         // `tokio::time::Instant` (not `std::time::Instant`) so this reads the
         // same clock the ticker uses and stays controllable under a paused
         // test runtime.
         let mut last_rollup = tokio::time::Instant::now();
+        // First emit at one window PLUS `ROLLUP_PHASE_OFFSET`, so this rollup
+        // never lands on the same second as the 30 s shadow-stat rollups (see
+        // `ROLLUP_PHASE_OFFSET`). Starting the interval at the first real emit
+        // replaces the previous skip-the-immediate-tick dance, and makes the
+        // reported window of that first rollup match the period it actually
+        // accumulated over.
+        let mut ticker = tokio::time::interval_at(
+            last_rollup + ROLLUP_WINDOW + ROLLUP_PHASE_OFFSET,
+            ROLLUP_WINDOW,
+        );
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
             let now = tokio::time::Instant::now();
