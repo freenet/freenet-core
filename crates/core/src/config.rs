@@ -1271,8 +1271,13 @@ impl ConfigArgs {
         // reports it after the subscriber exists. See `WsApiExposure`.
         let ws_api_exposure = WsApiExposure {
             source: ws_api_address_source,
+            // Report the discard ONLY when the bind actually got narrower.
+            // A node whose persisted `::1` is dropped and then auto-widened to
+            // `::` is getting MORE exposed, so "clients on other machines can
+            // no longer reach this node" would be flatly untrue — and would
+            // print directly above the auto-widen line saying the opposite.
             dropped_persisted_address: dropped_persisted_wildcard
-                .filter(|persisted| *persisted != ws_api_address),
+                .filter(|persisted| !persisted.is_loopback() && ws_api_address.is_loopback()),
         };
         let this = Config {
             mode,
@@ -9679,6 +9684,24 @@ shutdown-drain-secs = 42
         assert_eq!(
             migrated.ws_api.exposure.source,
             WsApiAddressSource::DefaultLoopback
+        );
+
+        // Boot 3 in the same dir: the operator adds a CIDR grant, so the
+        // persisted `::1` is dropped and immediately auto-widened back to `::`.
+        // The bind got WIDER, so the "clients on other machines can no longer
+        // reach this node" notice must NOT fire — it would print directly above
+        // the auto-widen line and say the opposite of it.
+        let mut widened_later = ws_api_test_args(OperationMode::Network, upgrade_dir.path());
+        widened_later.ws_api.allowed_source_cidrs = Some(vec!["100.64.0.0/10".to_string()]);
+        let cfg = widened_later
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("third build should succeed");
+        assert_eq!(cfg.ws_api.address, default_listening_address());
+        assert_eq!(cfg.ws_api.exposure.source, WsApiAddressSource::AutoWidened);
+        assert_eq!(
+            cfg.ws_api.exposure.dropped_persisted_address, None,
+            "a widening re-derivation must not report itself as a loss of access"
         );
     }
 
