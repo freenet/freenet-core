@@ -127,13 +127,37 @@ Authorization: Bearer freenet/<pubkey>/<audience>/<timestamp>/<signature>
 on every export. `<signature>` is an XEdDSA (Signal construction, `xeddsa`
 crate) signature over everything preceding it, made with the x25519 transport
 secret itself (`TransportKeypair::auth_token_signer`) — the node's one
-identity, no second key to cross-certify. All fields are base58 except
-`<audience>` (the target collector's `host[:port]`, taken from the request URI)
-and `<timestamp>` (epoch seconds). A collector verifies with a stock Ed25519
-library after converting the Montgomery public key to Edwards with sign bit 0,
-then checks `<audience>` against its own hostname and `<timestamp>` against its
-own clock. The audience binding is what stops a collector we export to from
-replaying our token at a different collector.
+identity, no second key to cross-certify. `<pubkey>` and `<signature>` are
+base58, `<timestamp>` is epoch seconds.
+
+`<audience>` binds the token to the collector it was minted for: without it,
+any collector we export to could replay our token at any other collector
+accepting this scheme and impersonate the node. It is
+**base58 of the first 16 bytes of `SHA-256(canonical target URL)`**, hashed
+rather than sent literally because a URL contains `/`, the token's field
+separator. The canonical form both sides must agree on:
+
+- `{scheme}://{host}:{port}{path}`, e.g. `http://collector.example:4318/v1/metrics`
+- scheme and host lowercased
+- port always explicit, defaulting to 80 for `http` and 443 for `https`
+- path verbatim, no normalization
+- userinfo stripped, query and fragment dropped
+
+Stripping userinfo is load-bearing twice over: it keeps operator credentials
+out of a signed, wire-visible field, and a collector that does not know the
+password could not otherwise reproduce the hash.
+
+Hashing the full URL rather than just the authority means two collectors
+behind one hostname on different paths (`/tenant-a` vs `/tenant-b`) get
+distinct audiences. The cost is diagnosability — a rejected token tells the
+collector nothing about where the sender thought it was pointing — so the node
+logs its resolved endpoint at startup and `docs/otel-metrics.md` documents the
+computation for hand-checking a mismatch.
+
+A collector verifies with a stock Ed25519 library after converting the
+Montgomery public key to Edwards with sign bit 0, then checks `<audience>`
+against the hash of each URL it answers at and `<timestamp>` against its own
+clock.
 
 The default is `disabled` — no `Authorization` header. Pointing the exporter at
 your own collector must not ship a signed assertion of this node's identity

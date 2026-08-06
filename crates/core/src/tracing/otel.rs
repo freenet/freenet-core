@@ -91,20 +91,18 @@ pub(crate) fn resolve_metrics_endpoint(
 ///
 /// `<pubkey>` is the base58 full x25519 transport public key — the node's one
 /// real identity, the same key peers see and whose truncated fingerprint UIs
-/// display. `<audience>` is the authority (`host[:port]`) of the collector the
-/// request is going to, so a token is only valid at the collector it was
-/// minted for: without it, any collector we export to could replay the token
-/// to any other collector accepting this scheme and impersonate this node.
-/// Authority rather than the full URL because it carries no `/`, which is the
-/// token's field separator. `<timestamp>` is seconds since the Unix epoch,
-/// `<signature>` is base58 too.
+/// display. `<audience>` names the collector the request is going to (see
+/// [`audience_of`]), so a token is only valid there: without it, any collector
+/// we export to could replay the token to any other collector accepting this
+/// scheme and impersonate this node. `<timestamp>` is seconds since the Unix
+/// epoch, `<signature>` is base58 too.
 /// Freshly built per export request so the timestamp stays current.
 ///
 /// Collector-side verification needs no exotic library: convert the
 /// Montgomery pubkey to Edwards (sign bit 0), then standard Ed25519 verify —
 /// see `node_pubkey_is_verifiable_with_stock_ed25519` below. The collector
-/// must additionally check `<audience>` against its own hostname and
-/// `<timestamp>` against its own clock.
+/// must additionally check `<audience>` against the hash of each URL it
+/// answers at (see [`audience_of`]) and `<timestamp>` against its own clock.
 pub(crate) fn bearer_token(
     signer: &xeddsa::xed25519::PrivateKey,
     pubkey_b58: &str,
@@ -128,6 +126,54 @@ pub(crate) fn bearer_token(
     );
     let signature = bs58::encode(signature).into_string();
     format!("{signed_payload}/{signature}")
+}
+
+/// The `<audience>` field of a bearer token: base58 of the first 16 bytes of
+/// `SHA-256(canonical target URL)`.
+///
+/// A hash rather than the URL itself for two reasons: a URL contains `/`,
+/// which is the token's field separator, and the full URL is longer than the
+/// binding needs to be. 16 bytes is 128 bits — an attacker looking to reuse a
+/// token elsewhere needs a *second meaningful collector URL* colliding with
+/// the first, which this is far past sufficient for.
+///
+/// The collector recomputes this from the URL(s) it expects to be reached at
+/// and compares, so both sides must canonicalize identically. The rules,
+/// exactly:
+///
+/// - `{scheme}://{host}:{port}{path}`, e.g.
+///   `http://collector.example:4318/v1/metrics`.
+/// - scheme and host lowercased (both are case-insensitive).
+/// - port always explicit, defaulting to 80 for `http` and 443 for `https`,
+///   so `https://c.example/x` and `https://c.example:443/x` agree.
+/// - path verbatim — no trailing-slash or dot-segment normalization.
+/// - **userinfo stripped**, and query/fragment dropped (an OTLP export URL has
+///   neither). Stripping userinfo is not cosmetic: hashing an endpoint of
+///   `https://user:secret@collector/` would make the value unreproducible for
+///   a collector that does not know the password, and it keeps credentials out
+///   of the signed input entirely.
+///
+/// Cost of hashing: a rejected token tells the collector nothing about what
+/// the sender aimed at. The node logs its resolved endpoint at startup, and
+/// `docs/otel-metrics.md` documents this computation so a mismatch can be
+/// worked out by hand.
+fn audience_of(uri: &http::Uri) -> String {
+    use sha2::{Digest, Sha256};
+
+    let Some(host) = uri.host() else {
+        return String::new();
+    };
+    let scheme = uri.scheme_str().unwrap_or("http").to_ascii_lowercase();
+    let port = uri.port_u16().unwrap_or(match scheme.as_str() {
+        "https" => 443,
+        _ => 80,
+    });
+    let canonical = format!(
+        "{scheme}://{}:{port}{}",
+        host.to_ascii_lowercase(),
+        uri.path()
+    );
+    bs58::encode(&Sha256::digest(canonical.as_bytes())[..16]).into_string()
 }
 
 /// The exporter's only HTTP transport, in every auth mode.
@@ -163,8 +209,7 @@ impl HttpClient for OtlpHttpClient {
         // bearer token is one auth scheme among several, not the only one.
         if let Some(signer) = self.signer.as_ref() {
             if !request.headers().contains_key(http::header::AUTHORIZATION) {
-                let audience = request.uri().authority().map(|a| a.as_str()).unwrap_or("");
-                let token = bearer_token(signer, &self.pubkey_b58, audience);
+                let token = bearer_token(signer, &self.pubkey_b58, &audience_of(request.uri()));
                 request.headers_mut().insert(
                     http::header::AUTHORIZATION,
                     http::HeaderValue::from_str(&format!("Bearer {token}"))?,
@@ -820,8 +865,15 @@ mod tests {
     use super::*;
     use crate::config::OtelConfig;
 
-    /// The collector this module's tests mint tokens for.
-    const TEST_AUDIENCE: &str = "collector.example:4318";
+    /// The collector this module's tests mint tokens for, as the audience
+    /// hash of `http://collector.example:4318/v1/metrics`.
+    fn test_audience() -> String {
+        audience_of(
+            &"http://collector.example:4318/v1/metrics"
+                .parse::<http::Uri>()
+                .unwrap(),
+        )
+    }
 
     fn enabled_config() -> OtelConfig {
         OtelConfig {
@@ -836,7 +888,7 @@ mod tests {
     fn token_fixture() -> (crate::transport::TransportKeypair, String) {
         let keypair = crate::transport::TransportKeypair::new();
         let pubkey_b58 = bs58::encode(keypair.public_key_bytes()).into_string();
-        let token = bearer_token(&keypair.auth_token_signer(), &pubkey_b58, TEST_AUDIENCE);
+        let token = bearer_token(&keypair.auth_token_signer(), &pubkey_b58, &test_audience());
         (keypair, token)
     }
 
@@ -857,7 +909,8 @@ mod tests {
             "pubkey part must be the full base58 x25519 transport public key"
         );
         assert_eq!(
-            audience, TEST_AUDIENCE,
+            audience,
+            test_audience(),
             "the token must name the collector it was minted for, or it can be \
              replayed to any other collector accepting this scheme"
         );
@@ -988,11 +1041,16 @@ mod tests {
             .expect("Bearer scheme")
             .to_owned();
         let (payload, sig_b58) = token.rsplit_once('/').unwrap();
-        let audience = addr.to_string();
+        // What the collector computes from the URL it answers at.
+        let audience = audience_of(
+            &format!("http://{addr}/v1/metrics")
+                .parse::<http::Uri>()
+                .unwrap(),
+        );
         assert!(
             payload.starts_with(&format!("freenet/{pubkey_b58}/{audience}/")),
-            "wire token must carry this node's pubkey and the collector's own \
-             authority as the audience: {token}"
+            "wire token must carry this node's pubkey and the audience hash of \
+             the URL it was actually sent to: {token}"
         );
         // Verify exactly like a collector would — see
         // node_pubkey_is_verifiable_with_stock_ed25519.
@@ -1077,8 +1135,8 @@ mod tests {
         let pubkey = bs58::encode(keypair.public_key_bytes()).into_string();
         let signer = keypair.auth_token_signer();
         assert_ne!(
-            bearer_token(&signer, &pubkey, TEST_AUDIENCE),
-            bearer_token(&signer, &pubkey, TEST_AUDIENCE)
+            bearer_token(&signer, &pubkey, &test_audience()),
+            bearer_token(&signer, &pubkey, &test_audience())
         );
     }
 
@@ -1090,20 +1148,93 @@ mod tests {
 
         let keypair = crate::transport::TransportKeypair::new();
         let (pubkey, _) = identity_attributes(&keypair);
-        let token = bearer_token(&keypair.auth_token_signer(), &pubkey, TEST_AUDIENCE);
+        let token = bearer_token(&keypair.auth_token_signer(), &pubkey, &test_audience());
         let (payload, sig_b58) = token.rsplit_once('/').unwrap();
         let sig_bytes: [u8; 64] = bs58::decode(sig_b58)
             .into_vec()
             .unwrap()
             .try_into()
             .unwrap();
-        let replayed = payload.replace(TEST_AUDIENCE, "other-collector:4318");
+        let other = audience_of(
+            &"http://other-collector:4318/v1/metrics"
+                .parse::<http::Uri>()
+                .unwrap(),
+        );
+        let replayed = payload.replace(&test_audience(), &other);
         assert_ne!(replayed, payload, "audience must appear in the payload");
         assert!(
             xeddsa::xed25519::PublicKey(keypair.public_key_bytes())
                 .verify(replayed.as_bytes(), &sig_bytes)
                 .is_err(),
             "a token re-aimed at another collector must fail verification"
+        );
+    }
+
+    #[test]
+    fn the_audience_hash_is_reproducible_from_the_documented_canonical_url() {
+        // The collector recomputes this from the URL it expects, so the
+        // canonicalization is a wire contract. Recompute it here the way the
+        // doc comment (and docs/otel-metrics.md) describe, independently of
+        // audience_of's own string building.
+        use sha2::{Digest, Sha256};
+        let expect = |canonical: &str| {
+            bs58::encode(&Sha256::digest(canonical.as_bytes())[..16]).into_string()
+        };
+
+        for (uri, canonical) in [
+            (
+                "http://collector.example:4318/v1/metrics",
+                "http://collector.example:4318/v1/metrics",
+            ),
+            // Default port filled in, scheme and host lowercased.
+            (
+                "https://Collector.Example/v1/metrics",
+                "https://collector.example:443/v1/metrics",
+            ),
+            (
+                "http://collector.example/v1/metrics",
+                "http://collector.example:80/v1/metrics",
+            ),
+            // Credentials stripped: a collector that does not know the
+            // password must still be able to reproduce the hash.
+            (
+                "https://user:secret@collector.example:4318/v1/metrics",
+                "https://collector.example:4318/v1/metrics",
+            ),
+            (
+                "http://[::1]:4318/v1/metrics",
+                "http://[::1]:4318/v1/metrics",
+            ),
+            // Everything at once: credentials, port, multi-segment path.
+            (
+                "http://user:pass@host:1234/path/here",
+                "http://host:1234/path/here",
+            ),
+        ] {
+            let audience = audience_of(&uri.parse::<http::Uri>().unwrap());
+            assert_eq!(audience, expect(canonical), "audience of {uri}");
+            assert!(
+                !audience.contains('/'),
+                "audience must not contain the token's field separator"
+            );
+        }
+
+        // The binding has to be sensitive to the parts it claims to cover.
+        let of = |u: &str| audience_of(&u.parse::<http::Uri>().unwrap());
+        assert_ne!(
+            of("https://c.example:4318/v1/metrics"),
+            of("http://c.example:4318/v1/metrics"),
+            "scheme is bound"
+        );
+        assert_ne!(
+            of("http://c.example:4318/v1/metrics"),
+            of("http://c.example:4319/v1/metrics"),
+            "port is bound"
+        );
+        assert_ne!(
+            of("http://c.example:4318/tenant-a/v1/metrics"),
+            of("http://c.example:4318/tenant-b/v1/metrics"),
+            "path is bound — two collectors behind one host must differ"
         );
     }
 
