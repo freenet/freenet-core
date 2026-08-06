@@ -1523,9 +1523,7 @@ async fn process_open_request(
                 // read the SAME `request.connection_scope`, so they agree on
                 // whether the caller is attestable.
                 let app_identity = if request.connection_scope.is_local() {
-                    crate::contract::delegate_app_registry::AppIdentity::Local {
-                        attested: request.origin_contract,
-                    }
+                    crate::contract::delegate_app_registry::AppIdentity::Local
                 } else {
                     crate::contract::delegate_app_registry::AppIdentity::Remote
                 };
@@ -2026,7 +2024,7 @@ mod serve_during_gate_tests {
     /// GHSA-824h-7x5x-wfmf: the app-routing registration must record WHO
     /// registered, derived from the connection scope.
     ///
-    /// The type system alone does not protect this: `AppIdentity::Local { .. }`
+    /// The type system alone does not protect this: `AppIdentity::Local`
     /// is constructible unconditionally, so a version that classified every
     /// registration as `Local` would compile and would re-open the hole for
     /// every off-host caller. This pins that the identity handed to

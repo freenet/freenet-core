@@ -3447,7 +3447,7 @@ async fn test_notification_application_message_routed_to_registered_app()
         delegate_app_registry::register_app(
             &delegate_key,
             app_client,
-            delegate_app_registry::AppIdentity::Local { attested: None },
+            delegate_app_registry::AppIdentity::Local,
             app_tx,
         ),
         "app registration must succeed"

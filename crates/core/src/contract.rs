@@ -516,11 +516,28 @@ async fn fetch_related_off_loop(
 /// 5. Repeats until no more contract request messages
 ///
 /// Returns the final response with contract request messages filtered out.
+/// Whether a delegate run may deliver delegate-to-delegate messages.
+///
+/// This exists because the two callers of
+/// [`handle_delegate_with_contract_requests`] differ in a security-relevant way:
+/// one descends from a client connection whose scope is known, the other does
+/// not descend from a connection at all (GHSA-824h-7x5x-wfmf).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterDelegateDispatch {
+    /// Client-driven run. The hop carries the ORIGINATING connection scope, so a
+    /// non-local caller cannot obtain an attested `MessageOrigin::Delegate`.
+    Allowed,
+    /// Contract-notification-driven run. Suppressed — see the rationale at the
+    /// dispatch site.
+    Suppressed,
+}
+
 async fn handle_delegate_with_contract_requests<CH, P>(
     contract_handler: &mut CH,
     initial_req: DelegateRequest<'static>,
     origin_contract: Option<&ContractInstanceId>,
     connection_scope: crate::client_events::ConnectionScope,
+    inter_delegate: InterDelegateDispatch,
     user_context: Option<&UserSecretContext>,
     delegate_key: &DelegateKey,
     prompter: &P,
@@ -951,10 +968,14 @@ where
         //   sees `MessageOrigin::Delegate(caller_key)` and can authorize on it
         //   (issue #3860). The runtime attests this identity — the calling delegate
         //   cannot forge it.
-        // - Inter-delegate messaging only works via ApplicationMessages path; messages
-        //   from handle_delegate_notification (contract state change callbacks) do not
-        //   trigger delegate-to-delegate delivery.
-        if !delegate_messages.is_empty() {
+        // - Inter-delegate delivery runs ONLY for a client-driven run
+        //   (`InterDelegateDispatch::Allowed`). It is SUPPRESSED for a
+        //   contract-notification-driven run — see the guard below. An earlier
+        //   version of this comment asserted that notification-driven runs did
+        //   not reach this code; that was false, because
+        //   `handle_delegate_notification` calls THIS function, and the guard is
+        //   what finally makes the statement true.
+        if !delegate_messages.is_empty() && inter_delegate == InterDelegateDispatch::Allowed {
             tracing::debug!(
                 delegate_key = %delegate_key,
                 count = delegate_messages.len(),
@@ -979,12 +1000,22 @@ where
                     // keeps the per-user namespace bound to the connection
                     // boundary, not propagated transitively through delegate
                     // messages (part of the #4381 unforgeability invariant).
-                    // The originating connection's scope rides along: a hop
-                    // driven by an off-host caller must not manufacture an
-                    // attested `MessageOrigin::Delegate` that the caller could
-                    // not have obtained directly (GHSA-824h-7x5x-wfmf). Paired
-                    // with the executor's refusal to dispatch from a delegate
-                    // that has no registration origin at all.
+                    // The ORIGINATING connection's scope rides along, never a
+                    // literal `Local`: a hop driven by an off-host caller must
+                    // not manufacture an attested `MessageOrigin::Delegate` that
+                    // the caller could not have obtained directly
+                    // (GHSA-824h-7x5x-wfmf). This forwarding is the control that
+                    // REPLACED the deleted registration-record refusal, so it is
+                    // source-pinned by
+                    // `inter_delegate_hop_forwards_the_originating_scope`.
+                    //
+                    // Scope nulls the `origin` ARGUMENT only. `msg.sender` still
+                    // rides through unchanged on every path, so the target can
+                    // always see which delegate sent it — that field is
+                    // runtime-attested (`execution.rs` overwrites it with the key
+                    // of the delegate that actually ran) and is a hash of that
+                    // delegate's own code, so it is self-authenticating rather
+                    // than borrowed authority.
                     .execute_delegate_request(
                         target_req,
                         None,
@@ -1016,6 +1047,40 @@ where
                     }
                 }
             }
+        } else if !delegate_messages.is_empty() {
+            // SCOPE-LAUNDERING GUARD (GHSA-824h-7x5x-wfmf).
+            //
+            // `handle_delegate_notification` invokes this function for a run that
+            // descends from a contract state change rather than from any client
+            // connection, so it has no connection scope to pass and hardcodes
+            // `Local`. That made the notification path a laundry: a non-local
+            // caller drives its own delegate (correctly resolving to NO attested
+            // origin), the delegate emits `SubscribeContractRequest`, and on the
+            // next state change of that contract the SAME delegate re-executes
+            // under `Local` — at which point its `SendDelegateMessage` would
+            // reach a victim carrying a fully attested
+            // `MessageOrigin::Delegate(caller)`. The scope the caller was
+            // refused would have been handed back to it one hop later.
+            //
+            // Suppressing the hop on this path removes the laundering route
+            // outright, which is stronger than propagating a scope and is what
+            // the function's own design notes always claimed happened. If
+            // notification-driven inter-delegate messaging is ever wanted, it
+            // must come back with the originating scope RECORDED ON THE
+            // SUBSCRIPTION (both `DELEGATE_SUBSCRIPTIONS` registration paths) and
+            // propagated here — never with a hardcoded `Local`.
+            //
+            // `info!`, not `debug!`: the crate sets `release_max_level_info`, so
+            // a `debug!` would compile out of shipped binaries and a delegate
+            // author would have no way to see why their message vanished.
+            tracing::info!(
+                delegate_key = %delegate_key,
+                count = delegate_messages.len(),
+                "Suppressed delegate-to-delegate messages from a \
+                 notification-driven run (GHSA-824h-7x5x-wfmf): this path carries \
+                 no client connection scope, so it must not confer an attested \
+                 caller identity"
+            );
         }
 
         // Process UserInput requests: prompt the user and send responses back
@@ -2025,10 +2090,17 @@ async fn handle_delegate_notification<CH, P>(
         req,
         None,
         // Node-internal invocation: this descends from a contract state change,
-        // not from any client connection, so there is no connection to classify
-        // and nothing an off-host caller could have steered. `Local` keeps the
-        // delegate's own inherited attestation intact exactly as before.
+        // not from any client connection, so there is NO scope to classify and
+        // this hardcodes `Local` to keep the delegate's own inherited
+        // attestation intact exactly as before.
+        //
+        // That hardcoded `Local` is precisely why the inter-delegate hop must be
+        // SUPPRESSED below: a non-local caller can steer WHICH delegate runs here
+        // (drive it once, have it subscribe, then trigger a state change), so a
+        // hop under this scope would hand back the attestation the caller was
+        // refused. See the guard in `handle_delegate_with_contract_requests`.
         crate::client_events::ConnectionScope::Local,
+        InterDelegateDispatch::Suppressed,
         // Contract-state-change notification: not driven by a client
         // connection, so there is no user token and no per-user secret
         // namespace. Secrets stay `SecretScope::Local`.
@@ -2088,11 +2160,18 @@ async fn handle_delegate_notification<CH, P>(
             });
         let delivered = delegate_app_registry::route_to_apps(&delegate_key, response);
         if delivered == 0 {
-            // `info!`, not `debug!`: the crate sets `release_max_level_info`, so
-            // a `debug!` would compile out of shipped binaries and an operator
-            // whose app stopped receiving notifications would see nothing. This
-            // is the line that says "the delegate spoke and nobody heard it".
-            tracing::info!(
+            // `debug!` on purpose. This fires once per notification, so at
+            // `release_max_level_info` it would ship one line per contract-state
+            // change on any node where nobody happens to be registered — a
+            // headless node, or simply a closed browser tab. That is the same
+            // per-room-update amplification removed from the executor's audit
+            // line, and "nobody is listening" is a normal state rather than a
+            // security event.
+            //
+            // The case that IS a security event — a registration that exists but
+            // is withheld from delivery — is reported at INFO by
+            // `route_to_apps`, once per registration.
+            tracing::debug!(
                 delegate = %delegate_key,
                 "Delegate notification produced an ApplicationMessage but no \
                  local app is registered with this delegate — nothing to route to"
@@ -2451,6 +2530,10 @@ where
                 req,
                 origin_contract.as_ref(),
                 connection_scope,
+                // Client-driven: the hop forwards THIS connection's scope, so a
+                // non-local caller cannot obtain an attested caller identity
+                // through it.
+                InterDelegateDispatch::Allowed,
                 user_context.as_ref(),
                 &delegate_key,
                 prompter,
@@ -2951,6 +3034,69 @@ mod tests {
         let code = ContractCode::from(vec![42u8; 32]);
         let params = Parameters::from(vec![7u8; 8]);
         ContractKey::from_params_and_code(&params, &code)
+    }
+
+    /// H2 — the control that REPLACED the deleted registration-record gate.
+    ///
+    /// Removing a control is only safe if the thing standing in for it is
+    /// itself pinned. The inter-delegate hop is safe because it forwards the
+    /// ORIGINATING connection scope, so a non-local caller cannot launder its
+    /// lack of attestation through a delegate. Nothing enforced that: passing a
+    /// literal `ConnectionScope::Local` at the hop compiled and broke nothing.
+    ///
+    /// Two properties, because the hop has two callers with different scope
+    /// provenance:
+    ///  1. the hop forwards the `connection_scope` VARIABLE, never a literal; and
+    ///  2. the notification path — which has no connection and therefore
+    ///     hardcodes `Local` — is `InterDelegateDispatch::Suppressed`, so that
+    ///     hardcoded value can never reach the hop.
+    #[test]
+    fn inter_delegate_hop_forwards_the_originating_scope() {
+        let src = include_str!("contract.rs");
+        let body = src
+            .split("async fn handle_delegate_with_contract_requests")
+            .nth(1)
+            .expect("handle_delegate_with_contract_requests must exist");
+        let body = body
+            .split("\nasync fn ")
+            .next()
+            .expect("bounded by the next free function");
+
+        // Isolate the hop's own executor call.
+        let hop = body
+            .split(".execute_delegate_request(")
+            .nth(2)
+            .expect("the inter-delegate hop is the SECOND execute_delegate_request call");
+        // Bound on `.await`, not on the first `)` — the argument list itself
+        // contains parentheses (`Some(delegate_key)`).
+        let hop_args = hop
+            .split(".await")
+            .next()
+            .expect("the call is bounded by its .await");
+        assert!(
+            hop_args.contains("connection_scope"),
+            "the hop must forward the originating connection scope; got args: {hop_args}"
+        );
+        assert!(
+            !hop_args.contains("ConnectionScope::Local"),
+            "the hop must NOT hardcode a scope — that is the laundering bug this \
+             replaced the removed registration-record gate to avoid; got args: {hop_args}"
+        );
+
+        // And the scopeless caller must not be able to reach it at all.
+        let notification = src
+            .split("async fn handle_delegate_notification")
+            .nth(1)
+            .expect("handle_delegate_notification must exist");
+        let notification = notification
+            .split("\nasync fn ")
+            .next()
+            .expect("bounded by the next free function");
+        assert!(
+            notification.contains("InterDelegateDispatch::Suppressed"),
+            "the notification path hardcodes ConnectionScope::Local, so it MUST \
+             suppress inter-delegate dispatch or that literal reaches the hop"
+        );
     }
 
     /// GHSA-824h-7x5x-wfmf: the identity rendered to the HUMAN in a consent
