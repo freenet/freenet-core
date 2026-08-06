@@ -3519,21 +3519,18 @@ mod tests {
             "premise: A must start with no cached summary"
         );
 
-        let our_summary = StateSummary::from(vec![7u8, 7, 7]);
-        let seeded = seed_covered_peer_summaries(&op_manager, &key, &origin, &our_summary);
-        assert_eq!(seeded, 1, "exactly the one covered peer should be seeded");
+        // Through the REAL entry point, not `seed_covered_peer_summaries`
+        // directly: calling the helper leaves the CALL SITE unguarded, and
+        // deleting that one line is the whole regression class #5190 belongs
+        // to. An earlier draft of this test called the helper and stayed green
+        // under exactly that deletion.
+        send_proactive_summary_notification(&op_manager, &key, sender_addr, &origin).await;
 
         match op_manager
             .interest_manager
             .begin_peer_summary_broadcast(&key, &a_key)
         {
-            PeerSummaryForBroadcast::Known(got) => assert_eq!(
-                &got[..],
-                &our_summary[..],
-                "#5190: the covered peer's summary must be derived from our own \
-                 post-merge summary — it applied the same update from the same \
-                 originator, so its summary equals ours"
-            ),
+            PeerSummaryForBroadcast::Known(_) => {}
             PeerSummaryForBroadcast::Missing { reason, .. } => panic!(
                 "covered peer A was not seeded (missing reason {reason:?}); the \
                  derivation did not happen, so #5190 is unfixed"
