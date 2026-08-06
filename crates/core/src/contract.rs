@@ -1988,26 +1988,6 @@ async fn handle_delegate_notification<CH, P>(
         inbound,
     };
 
-    // The delegate's own attested app identity, read from its durable
-    // first-registration origin record. This is what decides who may receive the
-    // output below (GHSA-824h-7x5x-wfmf), and it is read BEFORE the delegate
-    // runs so a delegate cannot influence its own routing.
-    //
-    // Skipped when nobody is registered for this delegate: on the pooled
-    // executor the lookup checks an executor out of the pool, and this path runs
-    // on the contract loop for every contract notification. Nothing to route to
-    // means nothing to decide. The check is on the registry (which the delegate
-    // cannot write) and still happens before the delegate runs, so it does not
-    // weaken the "read before it runs" property.
-    let attested_origin = if delegate_app_registry::has_registrations(&delegate_key) {
-        contract_handler
-            .executor()
-            .delegate_attested_origin(&delegate_key)
-            .await
-    } else {
-        None
-    };
-
     let outbound = handle_delegate_with_contract_requests(
         contract_handler,
         req,
@@ -2064,6 +2044,29 @@ async fn handle_delegate_notification<CH, P>(
     if app_messages.is_empty() {
         return;
     }
+
+    // The delegate's own attested app identity, read from its durable
+    // first-registration origin record. This is what decides who may receive the
+    // output (GHSA-824h-7x5x-wfmf).
+    //
+    // Read HERE rather than before the run, and only when there is both output
+    // and somebody registered to receive it: on the pooled executor the lookup
+    // checks an executor out of the pool, and this path runs on the contract loop
+    // for every contract notification, so doing it unconditionally would add a
+    // checkout per notification. Reading it after the run is safe because the
+    // record is first-writer-wins and immutable for the delegate's lifetime
+    // (`register_delegate_and_record_origin`), and a delegate cannot register
+    // delegates — so nothing the run just did can have changed the answer.
+    let attested_origin = if delegate_app_registry::has_registrations(&delegate_key) {
+        contract_handler
+            .executor()
+            .delegate_attested_origin(&delegate_key)
+            .await
+    } else {
+        // Nobody registered: `route_to_apps` will deliver to nobody regardless,
+        // so skip the lookup entirely.
+        None
+    };
 
     // One HostResponse per ApplicationMessage so an app sees each reply as a
     // distinct DelegateResponse, exactly as it would for a client-initiated
