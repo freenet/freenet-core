@@ -464,6 +464,7 @@ async fn web_home(
 /// freenet/freenet-core#3841). Both must issue the SAME credentials and
 /// headers; factoring it here keeps the deep-link path from drifting out
 /// of sync with the root path (e.g. forgetting the cookie or the CSP).
+#[allow(clippy::too_many_arguments)]
 async fn render_shell_response(
     key: String,
     config: &Config,
@@ -575,7 +576,6 @@ fn hosted_mode_or_default(ext: Option<Extension<crate::server::HostedMode>>) -> 
     ext.map(|Extension(hm)| hm.0).unwrap_or(false)
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 async fn web_subpages(
     key: String,
