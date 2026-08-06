@@ -1236,6 +1236,11 @@ pub(crate) async fn send_proactive_summary_notification(
     // in `delta_sends`/`full_state_sends` — see
     // `GlobalTestMetrics::record_notification_cohosts_skipped`.
     crate::config::GlobalTestMetrics::record_notification_cohosts_skipped(cohosts_skipped as u64);
+    // The cost twin. Recorded next to the saving so the two cannot drift apart:
+    // the #5147 A/B could see this mechanism get cheaper and was blind to it
+    // getting more expensive, which is how #5190's fix reached a green unit
+    // suite while adding ~429 messages to buy 13 fewer sends.
+    crate::config::GlobalTestMetrics::record_notification_targets(targets.len() as u64);
 
     tracing::debug!(
         contract = %key,

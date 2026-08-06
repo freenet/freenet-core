@@ -17348,6 +17348,14 @@ struct SuppressionArm {
     /// peer has an advertised co-host, so there is no mesh and nothing to
     /// suppress.
     hosting_updates: u64,
+    /// Standalone `Summaries` notifications SENT.
+    ///
+    /// The cost axis. Every other counter here measures traffic this feature
+    /// REMOVES; without this one the rig can only ever report good news. #5190's
+    /// fix restores a notification to each suppressed peer, so its cost lands
+    /// entirely here and nowhere else: it is invisible in `sends`,
+    /// `delta_sends`, `full_state_sends` and `summary_skips`.
+    notification_targets: u64,
 }
 
 #[cfg(test)]
@@ -17500,6 +17508,7 @@ fn run_5147_arm_inner(
         suppressed: GlobalTestMetrics::broadcast_targets_suppressed(),
         sender_skips: GlobalTestMetrics::broadcast_sender_skips(),
         hosting_updates: GlobalTestMetrics::neighbor_hosting_updates(),
+        notification_targets: GlobalTestMetrics::notification_targets(),
     }
 }
 
@@ -17585,7 +17594,7 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
 
     tracing::info!(
         "#5147 control:   deliveries={} redundant={} sends={} (delta={} full={}) \
-         suppressed={} summary_skips={} resync_suppressed={} converged={:?} replicas={} diverged={}",
+         suppressed={} summary_skips={} notif_sent={} resync_suppressed={} converged={:?} replicas={} diverged={}",
         control.deliveries,
         control.redundant,
         control.sends,
@@ -17593,6 +17602,7 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
         control.full_state_sends,
         control.suppressed,
         control.summary_skips,
+        control.notification_targets,
         control.resync_suppressed,
         control.converged,
         control.replicas,
@@ -17600,7 +17610,7 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
     );
     tracing::info!(
         "#5147 treatment: deliveries={} redundant={} sends={} (delta={} full={}) \
-         suppressed={} summary_skips={} resync_suppressed={} converged={:?} replicas={} diverged={}",
+         suppressed={} summary_skips={} notif_sent={} resync_suppressed={} converged={:?} replicas={} diverged={}",
         treatment.deliveries,
         treatment.redundant,
         treatment.sends,
@@ -17608,6 +17618,7 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
         treatment.full_state_sends,
         treatment.suppressed,
         treatment.summary_skips,
+        treatment.notification_targets,
         treatment.resync_suppressed,
         treatment.converged,
         treatment.replicas,
@@ -17912,7 +17923,7 @@ fn test_5147_multi_writer_suppression_is_regime_dependent() {
 
     tracing::info!(
         "#5147 multi-writer control:   deliveries={} redundant={} sends={} \
-         (delta={} full={}) suppressed={} summary_skips={} resync_suppressed={} \
+         (delta={} full={}) suppressed={} summary_skips={} notif_sent={} resync_suppressed={} \
          converged={:?} replicas={} diverged={}",
         control.deliveries,
         control.redundant,
@@ -17921,6 +17932,7 @@ fn test_5147_multi_writer_suppression_is_regime_dependent() {
         control.full_state_sends,
         control.suppressed,
         control.summary_skips,
+        control.notification_targets,
         control.resync_suppressed,
         control.converged,
         control.replicas,
@@ -17928,7 +17940,7 @@ fn test_5147_multi_writer_suppression_is_regime_dependent() {
     );
     tracing::info!(
         "#5147 multi-writer treatment: deliveries={} redundant={} sends={} \
-         (delta={} full={}) suppressed={} summary_skips={} resync_suppressed={} \
+         (delta={} full={}) suppressed={} summary_skips={} notif_sent={} resync_suppressed={} \
          converged={:?} replicas={} diverged={}",
         treatment.deliveries,
         treatment.redundant,
@@ -17937,6 +17949,7 @@ fn test_5147_multi_writer_suppression_is_regime_dependent() {
         treatment.full_state_sends,
         treatment.suppressed,
         treatment.summary_skips,
+        treatment.notification_targets,
         treatment.resync_suppressed,
         treatment.converged,
         treatment.replicas,
