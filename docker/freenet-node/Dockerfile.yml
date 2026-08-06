@@ -41,6 +41,11 @@ COPY freenet-node-startup.sh /usr/local/bin/freenet-node-startup.sh
 RUN chmod +x /usr/local/bin/freenet-node-startup.sh
 
 # Expose default WebSocket API port
+# NOTE: the client API binds LOOPBACK by default as of GHSA-824h-7x5x-wfmf, so
+# publishing this port (`-p 7509:7509`) forwards into a container whose API is
+# listening only on the container's own loopback and connections are refused.
+# Set WS_API_ADDRESS=:: to make it reachable — and put an authenticating proxy
+# in front of it, because that API can read and modify contract state and keys.
 EXPOSE 7509
 
 # Use the startup script as the entrypoint

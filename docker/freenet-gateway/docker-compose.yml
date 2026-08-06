@@ -5,6 +5,11 @@ services:
       dockerfile: Dockerfile
     image: freenet-gateway:latest
     environment:
+      # The client API binds LOOPBACK by default (GHSA-824h-7x5x-wfmf), so it is
+      # reachable only from inside this container. That is the right posture for
+      # a gateway, whose job is the P2P port below, not the control API. Set
+      # WS_API_ADDRESS=:: only if you deliberately need to drive this gateway's
+      # API from elsewhere, and put an authenticating proxy in front of it.
       TRANSPORT_KEYPAIR: /root/.cache/freenet/keys/transport-keypair.pem
       PUBLIC_NETWORK_ADDRESS: 0.0.0.0
       PUBLIC_NETWORK_PORT: 31337

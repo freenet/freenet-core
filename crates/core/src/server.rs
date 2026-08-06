@@ -563,7 +563,17 @@ fn build_allowed_hosts(
     hosts.add_machine_hostname();
 
     if !bind_addr.is_unspecified() {
-        hosts.add(&bind_addr.to_string());
+        // Bracket IPv6 literals. A `Host` header carries `[::1]:7509`, never
+        // `::1:7509`, so the unbracketed forms `add` would otherwise insert are
+        // one dead entry plus one malformed one. Harmless (add_localhost has
+        // already inserted the bracketed `[::1]`), but this branch became the
+        // DEFAULT path when the client API moved to a loopback bind
+        // (GHSA-824h-7x5x-wfmf), so the junk now shows up in the
+        // `allowed_hosts` startup log on every node.
+        match bind_addr {
+            IpAddr::V6(v6) => hosts.add(&format!("[{v6}]")),
+            IpAddr::V4(v4) => hosts.add(&v4.to_string()),
+        }
     }
 
     for host in extra_allowed_hosts {
