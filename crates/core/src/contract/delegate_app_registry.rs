@@ -54,6 +54,24 @@ use crate::client_events::{ClientId, HostResult};
 /// single delegate. Caps notification fan-out cost per delegate.
 pub(crate) const MAX_APPS_PER_DELEGATE: usize = 128;
 
+/// Slots within [`MAX_APPS_PER_DELEGATE`] that only LOCAL registrations may
+/// occupy.
+///
+/// Without this, a pre-existing denial of service is reachable purely off-host
+/// and needs no unclean disconnect: an off-host caller simply HOLDS
+/// `MAX_APPS_PER_DELEGATE` connections open, sends one `ApplicationMessages` on
+/// each, and every slot is filled by live `Remote` registrations that
+/// [`route_to_apps`] will never deliver to. The legitimate LOCAL app is then
+/// refused at the cap indefinitely. The dead-channel prune does not help,
+/// because nothing here is dead.
+///
+/// Capping `Remote` occupancy below the total leaves this many slots that only a
+/// local client can take, so the local app can always register. 32 is far above
+/// the real local count (usually one app, occasionally a few) while still
+/// leaving 96 for off-host clients, which register successfully and simply
+/// receive no pushed output.
+pub(crate) const LOCAL_RESERVED_SLOTS: usize = 32;
+
 /// Maximum number of distinct delegates a single client may register with.
 /// Prevents a resource-spreading attack where one client registers with many
 /// delegates to hold many channels.
@@ -69,8 +87,6 @@ pub(crate) const MAX_DELEGATES_PER_CLIENT: usize = 256;
 /// process lifetime.
 pub(crate) const REGISTRATION_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
-/// One app's registration with a delegate: where to push messages, plus when it
-/// was last confirmed (for TTL eviction).
 /// Who made a registration, from the perspective that decides whether it may
 /// receive a delegate's notification output.
 ///
@@ -97,7 +113,7 @@ pub(crate) enum AppIdentity {
 
 impl AppIdentity {
     fn may_receive(self) -> bool {
-        matches!(self, Self::Local { .. })
+        matches!(self, Self::Local)
     }
 }
 
@@ -107,14 +123,36 @@ struct AppRegistration {
     client_id: ClientId,
     identity: AppIdentity,
     /// Whether this registration has already reported being withheld from
-    /// delivery, so the report is once-per-registration rather than
-    /// once-per-notification. See [`route_to_apps`].
+    /// delivery. Read and set ONLY through
+    /// [`AppRegistration::latch_withhold_report`], so the report stays
+    /// once-per-registration rather than once-per-notification. See
+    /// [`route_to_apps`].
     withhold_logged: bool,
     sender: mpsc::Sender<HostResult>,
     /// `tokio::time::Instant` (not `std::time::Instant`) so tests using
     /// `tokio::time::pause` / `advance` can drive TTL eviction deterministically,
     /// matching the convention used by `DelegateContextEntry` and `RealTime`.
     last_seen: tokio::time::Instant,
+}
+
+impl AppRegistration {
+    /// Claim the right to emit this registration's withheld-from-delivery
+    /// report: `true` exactly once, `false` on every later call.
+    ///
+    /// A method rather than an inline `if` on purpose. The guard and the flag
+    /// write belong together — inlined, deleting the `if` while keeping the
+    /// assignment still sets the flag, so a test that inspects the flag passes
+    /// while the line has silently become once-per-notification. Bundled here,
+    /// that edit instead leaves this method uncalled, which is a `dead_code`
+    /// error under the crate's `-D warnings` build, and the returned sequence is
+    /// directly testable.
+    fn latch_withhold_report(&mut self) -> bool {
+        if self.withhold_logged {
+            return false;
+        }
+        self.withhold_logged = true;
+        true
+    }
 }
 
 /// `delegate -> [app registrations]`.
@@ -147,9 +185,6 @@ pub(crate) fn register_app(
     let mut apps = DELEGATE_APPS.entry(delegate_key.clone()).or_default();
 
     // Refresh path: already registered → update sender + TTL, no cap change.
-    // The origin is refreshed too: a client id is per-connection, so this is the
-    // same connection and therefore the same (immutable) attested identity — but
-    // re-storing it keeps the field from going stale if that ever changes.
     if let Some(existing) = apps.iter_mut().find(|a| a.client_id == client_id) {
         existing.sender = sender;
         existing.identity = identity;
@@ -169,6 +204,26 @@ pub(crate) fn register_app(
             "Rejecting app registration: delegate at max apps"
         );
         return false;
+    }
+
+    // LOCAL SLOT RESERVATION (see `LOCAL_RESERVED_SLOTS`). Off-host
+    // registrations are capped BELOW the total, so holding connections open can
+    // never crowd the local app out of the registry. Counted over `Remote`
+    // entries only, so a delegate legitimately used by many local clients is
+    // unaffected. O(n) over a list bounded by `MAX_APPS_PER_DELEGATE`, on a path
+    // that already scans it for the refresh check above.
+    if !identity.may_receive() {
+        let remote_occupancy = apps.iter().filter(|a| !a.identity.may_receive()).count();
+        if remote_occupancy >= MAX_APPS_PER_DELEGATE - LOCAL_RESERVED_SLOTS {
+            tracing::warn!(
+                delegate = %delegate_key,
+                %client_id,
+                cap = MAX_APPS_PER_DELEGATE - LOCAL_RESERVED_SLOTS,
+                "Rejecting non-local app registration: at the off-host cap, which \
+                 exists so a local app can always register (GHSA-824h-7x5x-wfmf)"
+            );
+            return false;
+        }
     }
 
     // Enforce per-client cap.
@@ -242,20 +297,18 @@ pub(crate) fn route_to_apps(delegate_key: &DelegateKey, message: HostResult) -> 
         if !app.identity.may_receive() {
             // PRUNE BEFORE SKIP (GHSA-824h-7x5x-wfmf).
             //
-            // Returning `true` here unconditionally would re-introduce exactly
-            // the remotely-triggerable denial of service that made the
-            // record-matching design unacceptable. Before this fix the
-            // `try_send` below was what reaped registrations whose client had
-            // vanished without a clean disconnect. Skipping ahead of it means a
-            // non-local registration is never reaped: an off-host caller opens
-            // `MAX_APPS_PER_DELEGATE` connections to a derivable delegate key,
-            // sends one `ApplicationMessages` on each, drops them uncleanly, and
-            // the dead slots survive the full `REGISTRATION_TTL` — during which
-            // the legitimate LOCAL app's `register_app` is refused at the cap and
-            // it receives nothing. Renewable indefinitely.
+            // Before this fix the `try_send` below was what reaped
+            // registrations whose client had vanished without a clean
+            // disconnect. Skipping ahead of it would mean a non-local
+            // registration is never reaped, so dead slots would survive the full
+            // `REGISTRATION_TTL`. `is_closed()` gives the same liveness signal
+            // `try_send` gave, without delivering anything.
             //
-            // `is_closed()` gives the same liveness signal `try_send` gave,
-            // without delivering anything.
+            // SCOPE OF THIS PRUNE, precisely: it reaps CLOSED senders only. It
+            // does NOT close the slot-exhaustion DoS, because the cheaper attack
+            // holds its connections OPEN and nothing here is dead.
+            // `LOCAL_RESERVED_SLOTS` is what makes that attack a non-problem; the
+            // two are complementary and neither substitutes for the other.
             if app.sender.is_closed() {
                 closed_clients.push(app.client_id);
                 return false;
@@ -266,8 +319,7 @@ pub(crate) fn route_to_apps(delegate_key: &DelegateKey, message: HostResult) -> 
             // turn every room update into one line per parked connection. The
             // flag lives on the registration, so `MAX_APPS_PER_DELEGATE` bounds
             // the total.
-            if !app.withhold_logged {
-                app.withhold_logged = true;
+            if app.latch_withhold_report() {
                 tracing::info!(
                     delegate = %delegate_key,
                     client_id = %app.client_id,
@@ -665,6 +717,55 @@ mod tests {
         );
     }
 
+    /// K1 regression: off-host registrations must never crowd a local app out of
+    /// the registry.
+    ///
+    /// The dead-channel prune reaps only CLOSED senders, so it does nothing
+    /// against the cheaper attack: hold the connections OPEN. Without a
+    /// reservation an off-host caller fills all `MAX_APPS_PER_DELEGATE` slots
+    /// with live registrations that are never delivery targets, and the
+    /// legitimate local app is refused at the cap for as long as the attacker
+    /// keeps its sockets open.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn open_remote_connections_cannot_crowd_out_a_local_app() {
+        let ns = Namespace::new();
+        let dk = ns.key(0);
+
+        // Hold the channels alive: nothing here is closed, so the prune cannot
+        // help and only the reservation can.
+        let mut keepalive = Vec::new();
+        let mut accepted = 0usize;
+        for i in 0..MAX_APPS_PER_DELEGATE {
+            let (tx, rx) = mpsc::channel::<HostResult>(1);
+            keepalive.push(rx);
+            if register_app(&dk, ns.client(i), AppIdentity::Remote, tx) {
+                accepted += 1;
+            }
+        }
+        assert_eq!(
+            accepted,
+            MAX_APPS_PER_DELEGATE - LOCAL_RESERVED_SLOTS,
+            "off-host registrations must stop at the reserved boundary"
+        );
+
+        // The local app must still get in, and must actually receive output.
+        let (local_tx, mut local_rx) = mpsc::channel::<HostResult>(4);
+        assert!(
+            register_app(
+                &dk,
+                ns.client(MAX_APPS_PER_DELEGATE + 1),
+                AppIdentity::Local,
+                local_tx
+            ),
+            "a local app must always be able to register, however many off-host \
+             clients are parked on this delegate"
+        );
+        assert_eq!(route_to_apps(&dk, host_msg()), 1);
+        assert!(local_rx.try_recv().is_ok());
+        drop(keepalive);
+    }
+
     /// The withheld report is once per REGISTRATION, not once per notification:
     /// this line ships at `release_max_level_info`, and the fan-out runs per
     /// contract-state change.
@@ -684,14 +785,20 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(route_to_apps(&dk, host_msg()), 0);
         }
-        let logged_once = DELEGATE_APPS
-            .get(&dk)
-            .map(|apps| apps.iter().all(|a| a.withhold_logged))
+
+        // Assert the LATCH, not the flag. After five withheld notifications the
+        // right to report must already be spent, so a further claim returns
+        // false — i.e. exactly one line was emitted, not five. Inspecting
+        // `withhold_logged` instead would pass even if the guard were deleted
+        // and the assignment kept.
+        let spent = DELEGATE_APPS
+            .get_mut(&dk)
+            .map(|mut apps| apps.iter_mut().all(|a| !a.latch_withhold_report()))
             .unwrap_or(false);
         assert!(
-            logged_once,
-            "the flag must latch on the first withheld notification so later ones \
-             do not each emit a shipped log line"
+            spent,
+            "the report must be claimable only once per registration, or every \
+             contract-state change emits a shipped log line per parked connection"
         );
     }
 

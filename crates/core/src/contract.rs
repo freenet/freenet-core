@@ -504,18 +504,6 @@ async fn fetch_related_off_loop(
     }
 }
 
-/// Handle a delegate request, including any contract request messages in the response.
-///
-/// When a delegate emits contract request messages, this function:
-/// 1. For GET: Fetches the contract state and sends GetContractResponse back
-/// 2. For PUT: Upserts the contract state via `upsert_contract_state` (which automatically
-///    propagates to the network via `BroadcastStateChange`), sends PutContractResponse back
-/// 3. For UPDATE: Applies a state update via `upsert_contract_state` (same propagation),
-///    sends UpdateContractResponse back
-/// 4. For SUBSCRIBE: Registers in subscription registry, sends SubscribeContractResponse back
-/// 5. Repeats until no more contract request messages
-///
-/// Returns the final response with contract request messages filtered out.
 /// Whether a delegate run may deliver delegate-to-delegate messages.
 ///
 /// This exists because the two callers of
@@ -532,6 +520,18 @@ enum InterDelegateDispatch {
     Suppressed,
 }
 
+/// Handle a delegate request, including any contract request messages in the response.
+///
+/// When a delegate emits contract request messages, this function:
+/// 1. For GET: Fetches the contract state and sends GetContractResponse back
+/// 2. For PUT: Upserts the contract state via `upsert_contract_state` (which automatically
+///    propagates to the network via `BroadcastStateChange`), sends PutContractResponse back
+/// 3. For UPDATE: Applies a state update via `upsert_contract_state` (same propagation),
+///    sends UpdateContractResponse back
+/// 4. For SUBSCRIBE: Registers in subscription registry, sends SubscribeContractResponse back
+/// 5. Repeats until no more contract request messages
+///
+/// Returns the final response with contract request messages filtered out.
 #[allow(clippy::too_many_arguments)]
 async fn handle_delegate_with_contract_requests<CH, P>(
     contract_handler: &mut CH,
@@ -1065,7 +1065,31 @@ where
             //
             // Suppressing the hop on this path removes the laundering route
             // outright, which is stronger than propagating a scope and is what
-            // the function's own design notes always claimed happened. If
+            // the function's own design notes always claimed happened.
+            //
+            // TEST COVERAGE, precisely: this suppression has NO behavioural
+            // test. It is covered only by the source scrape
+            // `inter_delegate_hop_forwards_the_originating_scope`, which asserts
+            // that this call site passes `InterDelegateDispatch::Suppressed` and
+            // that the hop forwards a scope variable rather than a literal.
+            // Both halves were checked non-vacuous by mutation. What that does
+            // NOT cover is the runtime behaviour — that a delegate emitting
+            // `SendDelegateMessage` from a notification run really is not
+            // delivered to. Exercising that needs a delegate that subscribes,
+            // then messages, under a notification-driven run; if you add one,
+            // this comment should shrink.
+            //
+            // Safe to suppress because nothing first-party emits here, verified
+            // by reading the delegates rather than by observing tests: River's
+            // chat delegate returns only empty or `UpdateContractRequest` from
+            // `ContractNotification` and never constructs a `DelegateMessage`,
+            // ghostkeys rejects notifications in its catch-all, and the only
+            // in-tree emitter of `SendDelegateMessage` sits in the
+            // `ApplicationMessage` arm and errors on notifications. "No test
+            // relied on it" is deliberately NOT the grounds here — that is the
+            // same reasoning that let the tokenless-CLI break through.
+            //
+            // If
             // notification-driven inter-delegate messaging is ever wanted, it
             // must come back with the originating scope RECORDED ON THE
             // SUBSCRIPTION (both `DELEGATE_SUBSCRIPTIONS` registration paths) and

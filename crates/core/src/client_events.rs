@@ -1510,10 +1510,10 @@ async fn process_open_request(
 
                 // Who this connection is, from the perspective of delegate
                 // notification routing (GHSA-824h-7x5x-wfmf). Only a connection
-                // the node proved is local may receive a delegate's output; the
-                // attested contract id rides along for diagnostics but does NOT
-                // decide delivery (see `route_to_apps` for why matching on it is
-                // unsafe).
+                // the node proved is local may receive a delegate's output.
+                // Locality is the WHOLE of the identity here — no contract id is
+                // carried, because keying delivery on one is unsafe (see
+                // `route_to_apps`).
                 //
                 // The executor dispatch further down is NOT handed this value —
                 // it receives the raw `origin_contract` alongside
