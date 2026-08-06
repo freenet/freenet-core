@@ -147,6 +147,89 @@ impl From<String> for AuthToken {
     }
 }
 
+/// Where the client connection that issued a request reached the node from.
+///
+/// This is the trust boundary for **attested application identity**: the node
+/// hands a delegate a [`freenet_stdlib::prelude::MessageOrigin`] naming the web
+/// app on whose behalf a request runs, and delegates authorize on that name. The
+/// client API has no authentication, so the only non-forgeable signal available
+/// at the connection boundary is the peer address the kernel recorded for the
+/// accepted socket (`ConnectInfo<SocketAddr>`) — the same anchor
+/// `decide_user_token` (`client_events::websocket`) already uses to gate the durable
+/// per-user token.
+///
+/// `Local` therefore means "this HOST", not "this user" — see the security
+/// notes on [`Self::from_source_ip`].
+///
+/// **Fail closed:** anything that cannot be *proven* loopback is [`Self::Remote`],
+/// including a missing `ConnectInfo`. [`Default`] is `Remote` for the same
+/// reason: a construction site that forgets to set the scope loses attestation
+/// (a visible functional failure) rather than granting it (a silent
+/// vulnerability).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConnectionScope {
+    /// The kernel observed the peer address of this connection as loopback.
+    Local,
+    /// Off-host, or not provably loopback.
+    #[default]
+    Remote,
+}
+
+impl ConnectionScope {
+    pub fn is_local(self) -> bool {
+        matches!(self, Self::Local)
+    }
+
+    /// Classify a connection from the peer address the kernel recorded.
+    ///
+    /// # Security scope — read before relying on this
+    ///
+    /// A loopback peer address proves the connection was accepted over the
+    /// loopback interface of THIS HOST. It does **not** prove:
+    ///
+    /// - **the same user.** A different local user account, or an app confined
+    ///   from `$HOME` (Flatpak/Snap/container) but able to open a localhost
+    ///   socket, is loopback and passes this check. (A same-user *unconfined*
+    ///   process is out of scope entirely: it can read `secrets_dir/node_kek`
+    ///   and decrypt directly, so no client-API gate could help it.)
+    /// - **the same machine as the human.** Behind a colocated reverse proxy
+    ///   every client presents the proxy's loopback address, so this classifies
+    ///   every request as `Local` and the gate is a no-op for that deployment.
+    ///
+    /// `None` (no `ConnectInfo` on the request — only reachable from unit tests
+    /// that omit it) is `Remote`: we cannot prove loopback, so we must not
+    /// attest.
+    pub fn from_source_ip(source_ip: Option<std::net::IpAddr>) -> Self {
+        match source_ip {
+            Some(ip) if is_loopback_source(ip) => Self::Local,
+            _ => Self::Remote,
+        }
+    }
+}
+
+/// Whether a source IP is loopback (`127.0.0.0/8`, `::1`), after normalizing an
+/// IPv4-mapped IPv6 source (`::ffff:127.0.0.1`) from a dual-stack socket.
+///
+/// Loopback is the trust anchor for two distinct per-connection decisions —
+/// honoring a durable per-user token (`decide_user_token` (`client_events::websocket`))
+/// and attesting an application identity ([`ConnectionScope::from_source_ip`]).
+/// Both live on this ONE definition on purpose: two copies of "is this local"
+/// would be free to drift, and a normalization fixed in one (the IPv4-mapped
+/// case) would silently not reach the other.
+///
+/// Anything off-host cannot forge a loopback source — the kernel sets it from
+/// the accepted socket (`ConnectInfo<SocketAddr>`) — so it is a sound,
+/// non-spoofable signal that the connection did not cross the network.
+pub(crate) fn is_loopback_source(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.is_loopback(),
+            None => v6.is_loopback(),
+        },
+    }
+}
+
 #[non_exhaustive]
 pub struct OpenRequest<'a> {
     pub client_id: ClientId,
@@ -155,6 +238,11 @@ pub struct OpenRequest<'a> {
     pub notification_channel: Option<mpsc::Sender<HostResult>>,
     pub token: Option<AuthToken>,
     pub origin_contract: Option<ContractInstanceId>,
+    /// Whether the issuing connection is entitled to an *attested* application
+    /// identity (see [`ConnectionScope`]). Like `user_context` this rides
+    /// alongside the request and is never read from the request body, so a
+    /// client cannot forge it.
+    pub connection_scope: ConnectionScope,
     /// Per-connection per-user secret namespace (hosted mode, P2 of #4381),
     /// derived once at the WS connection boundary from the connection's user
     /// token. `None` outside hosted mode or when no token was presented. This
@@ -189,6 +277,7 @@ impl<'a> OpenRequest<'a> {
             notification_channel: None,
             token: None,
             origin_contract: None,
+            connection_scope: ConnectionScope::default(),
             user_context: None,
         }
     }
@@ -208,8 +297,91 @@ impl<'a> OpenRequest<'a> {
         self
     }
 
+    pub fn with_connection_scope(mut self, scope: ConnectionScope) -> Self {
+        self.connection_scope = scope;
+        self
+    }
+
     pub fn with_user_context(mut self, user_context: Option<UserSecretContext>) -> Self {
         self.user_context = user_context;
         self
+    }
+}
+
+#[cfg(test)]
+mod connection_scope_tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    /// GHSA-824h-7x5x-wfmf: the whole gate rests on this classification, so it
+    /// must fail CLOSED. A missing `ConnectInfo` cannot prove loopback and must
+    /// not be read as local — the same fail-closed rule `decide_user_token`
+    /// applies to the durable per-user token.
+    #[test]
+    fn missing_source_ip_is_remote() {
+        assert_eq!(
+            ConnectionScope::from_source_ip(None),
+            ConnectionScope::Remote
+        );
+        assert!(!ConnectionScope::from_source_ip(None).is_local());
+    }
+
+    #[test]
+    fn loopback_sources_are_local_including_ipv4_mapped() {
+        for ip in [
+            "127.0.0.1",
+            // Anywhere in 127.0.0.0/8, not just .1.
+            "127.4.5.6",
+            "::1",
+            // A dual-stack socket reports an IPv4 loopback peer in this form;
+            // failing to normalize it would misclassify every local browser on
+            // a dual-stack bind as Remote and break the shell outright.
+            "::ffff:127.0.0.1",
+        ] {
+            let parsed: IpAddr = ip.parse().expect("test address must parse");
+            assert_eq!(
+                ConnectionScope::from_source_ip(Some(parsed)),
+                ConnectionScope::Local,
+                "{ip} must classify as Local"
+            );
+        }
+    }
+
+    #[test]
+    fn off_host_sources_are_remote() {
+        for ip in [
+            // LAN — the case this fix deliberately breaks (see the PR's
+            // limitations): a browser on another machine no longer gets an
+            // attested identity.
+            "192.168.1.50",
+            "10.0.0.7",
+            "5.9.111.215",
+            "2001:db8::1",
+            // An IPv4-mapped NON-loopback address must not be waved through by
+            // the normalization above.
+            "::ffff:192.168.1.50",
+        ] {
+            let parsed: IpAddr = ip.parse().expect("test address must parse");
+            assert_eq!(
+                ConnectionScope::from_source_ip(Some(parsed)),
+                ConnectionScope::Remote,
+                "{ip} must classify as Remote"
+            );
+        }
+    }
+
+    /// A construction site that forgets to set the scope must lose attestation
+    /// (a visible functional failure), never grant it (a silent hole).
+    #[test]
+    fn default_scope_is_remote() {
+        assert_eq!(ConnectionScope::default(), ConnectionScope::Remote);
+        assert!(
+            !OpenRequest::new(
+                ClientId::FIRST,
+                Box::new(freenet_stdlib::client_api::ClientRequest::Close),
+            )
+            .connection_scope
+            .is_local()
+        );
     }
 }

@@ -400,6 +400,7 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
         _req: DelegateRequest<'_>,
         _origin_contract: Option<&ContractInstanceId>,
         _caller_delegate: Option<&DelegateKey>,
+        _connection_scope: crate::client_events::ConnectionScope,
         _user_context: Option<&UserSecretContext>,
     ) -> Response {
         Err(ExecutorError::other(anyhow::anyhow!(

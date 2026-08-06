@@ -2700,8 +2700,11 @@ pub struct WebsocketApiConfig {
     /// themselves, because both are real user-facing modes rather than test
     /// scaffolding:
     ///
-    /// - `HttpClientApi::as_router`, which `server::local_node::run_local_node`
-    ///   serves through. Its signature is public API and takes no cache root.
+    /// - `HttpClientApi::as_router`, the direct router-composition entry point.
+    ///   Its signature is public API and takes no cache root. (It used to be
+    ///   described as what `server::local_node::run_local_node` serves through;
+    ///   that serve loop was unreachable and has been deleted — see the note
+    ///   where it stood in `server.rs`.)
     /// - `WebsocketApiConfig::default()` / `From<SocketAddr>`, the fallback for
     ///   any serving config not produced by `build()`.
     ///
@@ -8778,9 +8781,8 @@ shutdown-drain-secs = 42
     ///    precedent, not its safety.
     /// 2. It would not close the door it is aimed at. `HttpClientApi::as_router`
     ///    is the direct router-composition entry a test would reach for, and it
-    ///    resolves `default_webapp_cache_dir()` itself because
-    ///    `local_node::run_local_node` (a real user-facing mode) serves through
-    ///    it. Its signature is public API and carries no cache root.
+    ///    resolves `default_webapp_cache_dir()` itself. Its signature is public
+    ///    API and carries no cache root.
     /// 3. These constructors are the fallback for any future serving path that
     ///    is not `ConfigArgs::build()`, where an unbounded cache under an
     ///    arbitrary working directory would be strictly worse than a shared but

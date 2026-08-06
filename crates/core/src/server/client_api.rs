@@ -409,6 +409,7 @@ async fn notify_service_worker() -> impl IntoResponse {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn web_home(
     Path(key): Path<String>,
     Extension(rs): Extension<HttpClientApiRequest>,
@@ -417,6 +418,7 @@ async fn web_home(
     api_version: ApiVersion,
     query_string: Option<String>,
     hosted_mode: bool,
+    source_addr: Option<std::net::SocketAddr>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     // Check if this is the sandboxed iframe requesting its content
     let is_sandbox = query_string
@@ -446,6 +448,7 @@ async fn web_home(
         None,
         rs,
         hosted_mode,
+        source_addr,
     )
     .await
 }
@@ -469,11 +472,32 @@ async fn render_shell_response(
     sub_path: Option<&str>,
     rs: HttpClientApiRequest,
     hosted_mode: bool,
+    // Peer address of the requesting connection, for the issuance audit log.
+    // `None` only where no `ConnectInfo` is installed (standalone test routers).
+    source_addr: Option<std::net::SocketAddr>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     use headers::{Header, HeaderMapExt};
 
     // Shell page: generate auth token, serve iframe wrapper with CSP
     let token = AuthToken::generate();
+
+    // AUDIT (GHSA-824h-7x5x-wfmf): this is THE issuance point for an
+    // app-identity auth token — the node mints one on request for ANY contract
+    // id, and whoever holds it is thereafter attested as that app. Record every
+    // issuance so the trail exists after the fact.
+    //
+    // `info!` deliberately, not `debug!`: the crate builds with
+    // `release_max_level_info`, so a `debug!` here would be compiled out of
+    // every shipped binary and the audit log would exist only in development.
+    //
+    // Ids and addresses ONLY. The token itself is never logged — it IS the
+    // credential — and neither is any key material.
+    tracing::info!(
+        contract_id = %key,
+        peer_addr = ?source_addr,
+        api_version = %api_version.prefix(),
+        "Issued app-identity auth token for a contract shell page"
+    );
 
     let auth_header = headers::Authorization::<headers::authorization::Bearer>::name().to_string();
     let version_prefix = api_version.prefix();
@@ -552,6 +576,7 @@ fn hosted_mode_or_default(ext: Option<Extension<crate::server::HostedMode>>) -> 
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn web_subpages(
     key: String,
     last_path: String,
@@ -561,6 +586,7 @@ async fn web_subpages(
     config: &Config,
     request_sender: HttpClientApiRequest,
     hosted_mode: bool,
+    source_addr: Option<std::net::SocketAddr>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     let is_sandbox = query_string
         .as_ref()
@@ -616,6 +642,7 @@ async fn web_subpages(
             Some(&last_path),
             request_sender,
             hosted_mode,
+            source_addr,
         )
         .await;
     }
@@ -1722,6 +1749,7 @@ mod tests {
                     &localhost_config(),
                     sender,
                     false,
+                    None,
                 )
                 .await
                 .map(|_| ())
@@ -1756,6 +1784,7 @@ mod tests {
             &localhost_config(),
             dead_request_sender(),
             false,
+            None,
         )
         .await
         .expect("sandbox document load must redirect, not error");
@@ -1776,6 +1805,7 @@ mod tests {
             &localhost_config(),
             dead_request_sender(),
             false,
+            None,
         )
         .await;
         match res {
@@ -1826,6 +1856,7 @@ mod tests {
             &localhost_config(),
             dead_request_sender(),
             false,
+            None,
         )
         .await
         .expect("web_subpages must convert the inner error into a response, not propagate it");
@@ -1905,6 +1936,7 @@ mod tests {
                     &localhost_config(),
                     dead_request_sender(),
                     false,
+                    None,
                 )
                 .await
                 .expect("web_subpages must respond, not propagate")

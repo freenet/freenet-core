@@ -3444,7 +3444,7 @@ async fn test_notification_application_message_routed_to_registered_app()
     let app_client = ClientId::FIRST;
     let (app_tx, mut app_rx) = tokio::sync::mpsc::channel::<HostResult>(8);
     assert!(
-        delegate_app_registry::register_app(&delegate_key, app_client, app_tx),
+        delegate_app_registry::register_app(&delegate_key, app_client, None, app_tx),
         "app registration must succeed"
     );
 
@@ -3475,7 +3475,7 @@ async fn test_notification_application_message_routed_to_registered_app()
         key: delegate_key.clone(),
         values: vec![OutboundDelegateMsg::ApplicationMessage(app_msg)],
     });
-    let delivered = delegate_app_registry::route_to_apps(&delegate_key, response);
+    let delivered = delegate_app_registry::route_to_apps(&delegate_key, None, response);
     assert_eq!(delivered, 1, "message must reach the one registered app");
 
     // The registered app receives the delegate's notification-driven reply.
@@ -3511,6 +3511,7 @@ async fn test_notification_application_message_routed_to_registered_app()
     assert_eq!(
         delegate_app_registry::route_to_apps(
             &delegate_key,
+            None,
             Ok(HostResponse::DelegateResponse {
                 key: delegate_key.clone(),
                 values: vec![],

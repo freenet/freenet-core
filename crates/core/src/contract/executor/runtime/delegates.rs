@@ -218,11 +218,25 @@ impl Executor<Runtime> {
         }
     }
 
+    /// The contract id `delegate` was FIRST registered under, read from the
+    /// durable first-writer origin record (`register_delegate_and_record_origin`).
+    /// `None` when it was registered by a caller with no attested identity, is
+    /// unknown here, or the record could not be read (fail closed).
+    pub(crate) fn registered_delegate_origin(
+        &self,
+        delegate: &DelegateKey,
+    ) -> Option<ContractInstanceId> {
+        self.runtime
+            .delegate_registration_origin(delegate)
+            .map(ContractInstanceId::new)
+    }
+
     pub fn delegate_request(
         &mut self,
         req: DelegateRequest<'_>,
         origin_contract: Option<&ContractInstanceId>,
         caller_delegate: Option<&DelegateKey>,
+        connection_scope: crate::client_events::ConnectionScope,
         user_context: Option<&UserSecretContext>,
     ) -> Response {
         // Mutual exclusion invariant: a single inbound delegate request is
@@ -242,8 +256,38 @@ impl Executor<Runtime> {
         tracing::debug!(
             origin_contract = ?origin_contract,
             caller_delegate = ?caller_delegate.map(|k| k.to_string()),
+            connection_scope = ?connection_scope,
             "received delegate request"
         );
+
+        // INTER-DELEGATE DISPATCH GATE (GHSA-824h-7x5x-wfmf).
+        //
+        // `caller_delegate` is a runtime-attested identity that wins over every
+        // other origin (see `resolve_message_origin`), so it is a way to hand a
+        // victim delegate an attested caller. A delegate registered WITHOUT an
+        // origin record is one anybody could install — messaging it makes its
+        // own WASM emit `SendDelegateMessage`, and the victim would then
+        // authorize on `MessageOrigin::Delegate(attacker)`. Refuse to dispatch
+        // from such a delegate at all: an unattested delegate cannot lend its
+        // identity to anyone.
+        //
+        // The record is durable and written BEFORE the delegate is registered
+        // (`register_delegate_and_record_origin`), so "no contract id recorded"
+        // is a definite answer, not a race. A read failure yields `None` and is
+        // likewise refused (fail closed).
+        if let Some(caller) = caller_delegate {
+            if self.registered_delegate_origin(caller).is_none() {
+                tracing::warn!(
+                    caller_delegate = %caller,
+                    target_delegate = %req.key(),
+                    "refusing inter-delegate dispatch: caller has no attested registration origin"
+                );
+                return Err(ExecutorError::other(anyhow::anyhow!(
+                    "inter-delegate dispatch refused: calling delegate has no attested registration origin"
+                )));
+            }
+        }
+
         match req {
             DelegateRequest::RegisterDelegate {
                 delegate,
@@ -313,13 +357,13 @@ impl Executor<Runtime> {
                     )));
                 }
 
-                // SECURITY (freenet/freenet-core#5198): the predecessor secret
+                // SECURITY (GHSA-824h-7x5x-wfmf): the predecessor secret
                 // copy-forward below `self.runtime.migrate_delegate_secrets(...)`
                 // is INTENTIONALLY NEVER CALLED. `SecretsStore::migrate_secrets`
                 // gates the copy on `origin_contract` matching the predecessor's
                 // recorded first-registration origin, but `origin_contract` is
                 // forgeable by any HTTP client through the webapp-shell token
-                // issuance path (see #5198 for the full exploit chain) — so the
+                // issuance path (see GHSA-824h-7x5x-wfmf for the full exploit chain) — so the
                 // gate does not actually authorize anything. Do NOT re-enable
                 // this call without first hardening how `origin_contract` is
                 // attested; the gate itself remains sound given a trustworthy
@@ -333,7 +377,7 @@ impl Executor<Runtime> {
                         predecessors = deduped.len(),
                         "RegisterDelegateWithPredecessors: predecessor secret \
                          copy-forward is disabled pending a security fix (see \
-                         freenet/freenet-core#5198); registering the delegate \
+                         GHSA-824h-7x5x-wfmf); registering the delegate \
                          without migrating any secrets"
                     );
                 }
@@ -386,6 +430,27 @@ impl Executor<Runtime> {
                     caller_delegate,
                     origin_contract,
                     &key,
+                    connection_scope,
+                );
+                // AUDIT (info!, not debug! — the crate builds with
+                // `release_max_level_info`, so a `debug!` here would compile out
+                // of every shipped binary and the audit trail would exist only
+                // in development). Ids only: no token values, no key material.
+                tracing::info!(
+                    delegate_key = %key,
+                    origin_kind = match origin.as_ref() {
+                        None => "none",
+                        Some(MessageOrigin::WebApp(_)) => "web_app",
+                        Some(MessageOrigin::Delegate(_)) => "delegate",
+                        Some(_) => "other",
+                    },
+                    origin_id = ?origin.as_ref().map(|o| match o {
+                        MessageOrigin::WebApp(c) => c.to_string(),
+                        MessageOrigin::Delegate(d) => d.to_string(),
+                        other => format!("{other:?}"),
+                    }),
+                    loopback = connection_scope.is_local(),
+                    "delegate ApplicationMessages: resolved message origin"
                 );
                 match self.runtime.inbound_app_message(
                     &key,
@@ -453,7 +518,26 @@ fn resolve_message_origin(
     caller_delegate: Option<&DelegateKey>,
     origin_contract: Option<&ContractInstanceId>,
     delegate_key: &DelegateKey,
+    connection_scope: crate::client_events::ConnectionScope,
 ) -> Option<MessageOrigin> {
+    // GATE THE RESOLVED ORIGIN, NOT ONE OF ITS INPUTS (GHSA-824h-7x5x-wfmf).
+    //
+    // The obvious-looking fix — refuse to look up `origin_contract` for an
+    // off-host caller — closes only branch 2. Branch 3 is keyed on the TARGET
+    // delegate, not on anything the caller supplied, so it would keep handing a
+    // tokenless off-host caller a fully-attested WebApp origin for any delegate
+    // that happens to carry an inherited attestation. Branch 1 is likewise
+    // caller-independent once a delegate has been induced to emit
+    // `SendDelegateMessage`. Returning early HERE is the only placement that
+    // covers all three by construction, and it stays correct if a fourth branch
+    // is ever added below.
+    //
+    // Withholding attestation is not an error: the caller sees exactly what a
+    // tokenless local caller has always seen (`None`), so nothing on the wire
+    // changes and no new response variant is needed.
+    if !connection_scope.is_local() {
+        return None;
+    }
     if let Some(caller) = caller_delegate {
         Some(MessageOrigin::Delegate(caller.clone()))
     } else if let Some(contract_id) = origin_contract {
@@ -472,6 +556,7 @@ fn resolve_message_origin(
 #[cfg(test)]
 mod resolve_message_origin_tests {
     use super::*;
+    use crate::client_events::ConnectionScope;
     use freenet_stdlib::prelude::CodeHash;
 
     fn dkey(seed: u8) -> DelegateKey {
@@ -518,8 +603,13 @@ mod resolve_message_origin_tests {
         let recipient = dkey(0xB2);
         let app_contract = ContractInstanceId::new([0xC3; 32]);
 
-        let origin =
-            resolve_message_origin(&origins(), Some(&caller), Some(&app_contract), &recipient);
+        let origin = resolve_message_origin(
+            &origins(),
+            Some(&caller),
+            Some(&app_contract),
+            &recipient,
+            ConnectionScope::Local,
+        );
 
         match origin {
             Some(MessageOrigin::Delegate(k)) => assert_eq!(k, caller),
@@ -534,7 +624,13 @@ mod resolve_message_origin_tests {
         let recipient = dkey(0xB2);
         let app_contract = ContractInstanceId::new([0xC3; 32]);
 
-        let origin = resolve_message_origin(&origins(), None, Some(&app_contract), &recipient);
+        let origin = resolve_message_origin(
+            &origins(),
+            None,
+            Some(&app_contract),
+            &recipient,
+            ConnectionScope::Local,
+        );
 
         match origin {
             Some(MessageOrigin::WebApp(id)) => assert_eq!(id, app_contract),
@@ -549,7 +645,8 @@ mod resolve_message_origin_tests {
     fn no_arguments_and_no_inherited_yields_none() {
         let recipient = dkey(0xEE);
 
-        let origin = resolve_message_origin(&origins(), None, None, &recipient);
+        let origin =
+            resolve_message_origin(&origins(), None, None, &recipient, ConnectionScope::Local);
         assert!(origin.is_none(), "Expected None, got {origin:?}");
     }
 
@@ -570,7 +667,13 @@ mod resolve_message_origin_tests {
             crate::wasm_runtime::InheritedOriginsEntry::new(vec![inherited_contract]),
         );
 
-        let origin = resolve_message_origin(&origins, Some(&caller), None, &recipient);
+        let origin = resolve_message_origin(
+            &origins,
+            Some(&caller),
+            None,
+            &recipient,
+            ConnectionScope::Local,
+        );
 
         match origin {
             Some(MessageOrigin::Delegate(k)) => assert_eq!(k, caller),
@@ -594,7 +697,8 @@ mod resolve_message_origin_tests {
             InheritedOriginsEntry::new(vec![contract]),
         );
 
-        let origin = resolve_message_origin(&origins, None, None, &recipient);
+        let origin =
+            resolve_message_origin(&origins, None, None, &recipient, ConnectionScope::Local);
 
         assert!(
             matches!(origin, Some(MessageOrigin::WebApp(c)) if c == contract),
@@ -626,14 +730,139 @@ mod resolve_message_origin_tests {
 
         assert!(
             matches!(
-                resolve_message_origin(&node_a, None, None, &recipient),
+                resolve_message_origin(&node_a, None, None, &recipient, ConnectionScope::Local),
                 Some(MessageOrigin::WebApp(c)) if c == contract
             ),
             "node A resolves its own inherited origin"
         );
         assert!(
-            resolve_message_origin(&node_b, None, None, &recipient).is_none(),
+            resolve_message_origin(&node_b, None, None, &recipient, ConnectionScope::Local)
+                .is_none(),
             "node B must NOT resolve node A's inherited origin for the same key"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // GHSA-824h-7x5x-wfmf: a connection the node cannot prove is local gets NO
+    // attested origin — through EVERY branch of `resolve_message_origin`.
+    //
+    // These three are the load-bearing ones. The advisory's near-miss is a fix
+    // that gates only branch 2 (`origin_contract`, the input the caller's token
+    // produced) and leaves branches 1 and 3 open: branch 3 is keyed on the
+    // TARGET delegate, so it would keep attesting a WebApp origin for a caller
+    // that supplied nothing at all. Revert the `!connection_scope.is_local()`
+    // early return and `remote_connection_gets_no_inherited_origin` fails while
+    // a branch-2-only fix would leave it passing.
+    // ---------------------------------------------------------------------
+
+    /// Branch 2: a remote caller holding a valid auth token still gets nothing.
+    #[test]
+    fn remote_connection_gets_no_webapp_origin_from_token() {
+        let recipient = dkey(0xB2);
+        let app_contract = ContractInstanceId::new([0xC3; 32]);
+
+        let origin = resolve_message_origin(
+            &origins(),
+            None,
+            Some(&app_contract),
+            &recipient,
+            ConnectionScope::Remote,
+        );
+        assert!(
+            origin.is_none(),
+            "a non-loopback connection must receive NO attested origin, got {origin:?}"
+        );
+    }
+
+    /// Branch 3: the branch a token-input-only gate misses. The caller supplies
+    /// NOTHING — the origin comes from the node's own attestation map, keyed on
+    /// the delegate being messaged — so gating the caller's input cannot help.
+    #[test]
+    fn remote_connection_gets_no_inherited_origin() {
+        use crate::wasm_runtime::InheritedOriginsEntry;
+
+        let recipient = dkey(0xC5);
+        let contract = ContractInstanceId::new([0xC6; 32]);
+        let origins = origins();
+        origins.insert(
+            recipient.clone(),
+            InheritedOriginsEntry::new(vec![contract]),
+        );
+
+        // Sanity: the same call from a local connection DOES attest, so this
+        // test is asserting on the scope gate and not on an empty map.
+        assert!(
+            resolve_message_origin(&origins, None, None, &recipient, ConnectionScope::Local)
+                .is_some(),
+            "fixture must attest for a local connection, or the assertion below is vacuous"
+        );
+
+        let origin =
+            resolve_message_origin(&origins, None, None, &recipient, ConnectionScope::Remote);
+        assert!(
+            origin.is_none(),
+            "a non-loopback connection must not inherit the target delegate's \
+             WebApp attestation, got {origin:?}"
+        );
+    }
+
+    /// Branch 1: the highest-precedence branch, which wins unconditionally over
+    /// the other two, is gated as well.
+    #[test]
+    fn remote_connection_gets_no_caller_delegate_origin() {
+        let caller = dkey(0xA1);
+        let recipient = dkey(0xB3);
+
+        assert!(
+            resolve_message_origin(
+                &origins(),
+                Some(&caller),
+                None,
+                &recipient,
+                ConnectionScope::Local
+            )
+            .is_some(),
+            "fixture must attest for a local connection, or the assertion below is vacuous"
+        );
+
+        let origin = resolve_message_origin(
+            &origins(),
+            Some(&caller),
+            None,
+            &recipient,
+            ConnectionScope::Remote,
+        );
+        assert!(
+            origin.is_none(),
+            "a non-loopback connection must not receive an attested caller \
+             delegate identity, got {origin:?}"
+        );
+    }
+
+    /// The gate must be on the RESOLVED value, not bolted onto one branch. A
+    /// future fourth branch added below the early return is covered for free;
+    /// one added above it is not. Pin the early return's position so a
+    /// refactor that moves the branch dispatch above it fails here.
+    #[test]
+    fn scope_gate_precedes_every_branch_in_source() {
+        let src = include_str!("delegates.rs");
+        let body = src
+            .split("fn resolve_message_origin(")
+            .nth(1)
+            .expect("resolve_message_origin must exist")
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("function body is bounded by the test module");
+        let gate = body
+            .find("if !connection_scope.is_local() {")
+            .expect("resolve_message_origin must early-return for a non-local connection");
+        let first_branch = body
+            .find("if let Some(caller) = caller_delegate {")
+            .expect("branch 1 must exist");
+        assert!(
+            gate < first_branch,
+            "the connection-scope gate must run BEFORE any origin branch, so a \
+             branch added later is covered by construction"
         );
     }
 }

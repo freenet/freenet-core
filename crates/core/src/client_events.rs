@@ -25,7 +25,7 @@ pub(crate) use error::{Error, ensure_peer_ready};
 pub(crate) use proxy::BoxedClient;
 pub use proxy::ClientEventsProxy;
 pub(crate) use types::HostIncomingMsg;
-pub use types::{AuthToken, ClientId, HostResult, OpenRequest, RequestId};
+pub use types::{AuthToken, ClientId, ConnectionScope, HostResult, OpenRequest, RequestId};
 
 use either::Either;
 use freenet_stdlib::{
@@ -1508,6 +1508,17 @@ async fn process_open_request(
                 );
                 let delegate_key = req.key().clone();
 
+                // The attested app identity of THIS connection, after the
+                // loopback gate: `None` for any caller the node will not attest
+                // (GHSA-824h-7x5x-wfmf). Computed once here and used for both the
+                // routing registration below and the executor dispatch further
+                // down, so the two can never disagree about who the caller is.
+                let attested_origin = if request.connection_scope.is_local() {
+                    request.origin_contract
+                } else {
+                    None
+                };
+
                 // Register (or refresh) this app's routing path so the delegate
                 // can push notification-driven ApplicationMessages back to it
                 // (#3275). An app "registers with a delegate" by talking to it
@@ -1516,12 +1527,19 @@ async fn process_open_request(
                 // the path. UnregisterDelegate tears it down. RegisterDelegate
                 // (installing the delegate binary) does NOT register an app —
                 // it's an admin op, not an app conversation.
+                //
+                // The registration is BOUND to `attested_origin`: registering is
+                // still open to anyone (it is how a client asks to be pushed to),
+                // but the delegate's output is only routed to a registration
+                // whose identity matches the delegate's own — see
+                // `delegate_app_registry::route_to_apps`.
                 match &req {
                     freenet_stdlib::client_api::DelegateRequest::ApplicationMessages { .. } => {
                         if let Some(sender) = &subscription_listener {
                             if !crate::contract::delegate_app_registry::register_app(
                                 &delegate_key,
                                 client_id,
+                                attested_origin,
                                 sender.clone(),
                             ) {
                                 tracing::warn!(
@@ -1627,6 +1645,7 @@ async fn process_open_request(
                     );
                 }
                 let origin_contract = request.origin_contract;
+                let connection_scope = request.connection_scope;
                 // Per-connection user secret namespace (hosted mode). Taken from
                 // the OpenRequest, which received it from the connection layer —
                 // NOT from anything inside `req`. Moving it into the event keeps
@@ -1638,6 +1657,7 @@ async fn process_open_request(
                         ContractHandlerEvent::DelegateRequest {
                             req,
                             origin_contract,
+                            connection_scope,
                             user_context,
                         },
                         crate::contract::Priority::ClientLocal,
@@ -1990,6 +2010,64 @@ mod serve_during_gate_tests {
              blocking_subscribe — that silently downgrades an explicit \
              blocking_subscribe=true GET to fire-and-forget (#4524 regression). \
              Call args: {args_only:?}"
+        );
+    }
+
+    /// GHSA-824h-7x5x-wfmf: the app-routing registration must be bound to the
+    /// ATTESTED origin, and "attested" must be gated on the connection scope.
+    ///
+    /// A compile-time signature change already forces SOMETHING to be passed as
+    /// the origin, so the type system alone does not protect this: passing
+    /// `request.origin_contract` directly would compile and would re-open the
+    /// hole for every off-host caller holding a token. This pins that the value
+    /// handed to `register_app` is derived through `connection_scope.is_local()`
+    /// and that the SAME derived value is what reaches the executor, so the two
+    /// cannot disagree about who the caller is.
+    #[test]
+    fn delegate_registration_binds_to_the_gated_attested_origin() {
+        let src = include_str!("client_events.rs");
+        // Bound the scrape to the DelegateOp arm. An unbounded `split_once`
+        // would happily match this test's own assertion strings further down
+        // the file and pass vacuously.
+        let arm = src
+            .split("ClientRequest::DelegateOp(req) => {")
+            .nth(1)
+            .expect("the DelegateOp arm must exist");
+        let arm = arm
+            .split("\n            ClientRequest::")
+            .next()
+            .expect("the arm is bounded by the next ClientRequest arm");
+
+        let derivation = arm
+            .find("let attested_origin = if request.connection_scope.is_local()")
+            .expect(
+                "the attested origin must be derived by gating `origin_contract` on \
+                 `connection_scope.is_local()`",
+            );
+        let registration = arm
+            .find("register_app(")
+            .expect("the DelegateOp arm must register the app routing path");
+        assert!(
+            derivation < registration,
+            "the scope gate must be applied BEFORE the value reaches register_app"
+        );
+
+        let register_call = &arm[registration..];
+        let register_call = register_call
+            .split(") {")
+            .next()
+            .expect("register_app call must be bounded");
+        assert!(
+            register_call.contains("attested_origin"),
+            "register_app must receive the GATED origin, not `request.origin_contract`; \
+             got: {register_call}"
+        );
+
+        assert!(
+            arm.contains("let connection_scope = request.connection_scope;")
+                && arm.contains("connection_scope,\n                            user_context,"),
+            "the same connection scope must also reach the executor via \
+             ContractHandlerEvent::DelegateRequest"
         );
     }
 }

@@ -1287,6 +1287,7 @@ mod tests {
                         inbound: vec![],
                     },
                     origin_contract: None,
+                    connection_scope: crate::client_events::ConnectionScope::Local,
                     user_context: None,
                 },
             ),

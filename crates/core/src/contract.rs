@@ -520,6 +520,7 @@ async fn handle_delegate_with_contract_requests<CH, P>(
     contract_handler: &mut CH,
     initial_req: DelegateRequest<'static>,
     origin_contract: Option<&ContractInstanceId>,
+    connection_scope: crate::client_events::ConnectionScope,
     user_context: Option<&UserSecretContext>,
     delegate_key: &DelegateKey,
     prompter: &P,
@@ -563,7 +564,13 @@ where
         // Execute the delegate request
         let values = match contract_handler
             .executor()
-            .execute_delegate_request(current_req, origin_contract, None, user_context)
+            .execute_delegate_request(
+                current_req,
+                origin_contract,
+                None,
+                connection_scope,
+                user_context,
+            )
             .await
         {
             Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse { key: _, values }) => {
@@ -952,7 +959,19 @@ where
                     // keeps the per-user namespace bound to the connection
                     // boundary, not propagated transitively through delegate
                     // messages (part of the #4381 unforgeability invariant).
-                    .execute_delegate_request(target_req, None, Some(delegate_key), None)
+                    // The originating connection's scope rides along: a hop
+                    // driven by an off-host caller must not manufacture an
+                    // attested `MessageOrigin::Delegate` that the caller could
+                    // not have obtained directly (GHSA-824h-7x5x-wfmf). Paired
+                    // with the executor's refusal to dispatch from a delegate
+                    // that has no registration origin at all.
+                    .execute_delegate_request(
+                        target_req,
+                        None,
+                        Some(delegate_key),
+                        connection_scope,
+                        None,
+                    )
                     .await
                 {
                     Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse {
@@ -1969,10 +1988,24 @@ async fn handle_delegate_notification<CH, P>(
         inbound,
     };
 
+    // The delegate's own attested app identity, read from its durable
+    // first-registration origin record. This is what decides who may receive the
+    // output below (GHSA-824h-7x5x-wfmf), and it is read BEFORE the delegate
+    // runs so a delegate cannot influence its own routing.
+    let attested_origin = contract_handler
+        .executor()
+        .delegate_attested_origin(&delegate_key)
+        .await;
+
     let outbound = handle_delegate_with_contract_requests(
         contract_handler,
         req,
         None,
+        // Node-internal invocation: this descends from a contract state change,
+        // not from any client connection, so there is no connection to classify
+        // and nothing an off-host caller could have steered. `Local` keeps the
+        // delegate's own inherited attestation intact exactly as before.
+        crate::client_events::ConnectionScope::Local,
         // Contract-state-change notification: not driven by a client
         // connection, so there is no user token and no per-user secret
         // namespace. Secrets stay `SecretScope::Local`.
@@ -2030,12 +2063,15 @@ async fn handle_delegate_notification<CH, P>(
                 key: delegate_key.clone(),
                 values: vec![app_msg],
             });
-        let delivered = delegate_app_registry::route_to_apps(&delegate_key, response);
+        let delivered =
+            delegate_app_registry::route_to_apps(&delegate_key, attested_origin, response);
         if delivered == 0 {
             tracing::debug!(
                 delegate = %delegate_key,
-                "Delegate notification produced an ApplicationMessage but no apps \
-                 are registered with this delegate — nothing to route to"
+                ?attested_origin,
+                "Delegate notification produced an ApplicationMessage but no app \
+                 holding this delegate's attested identity is registered — \
+                 nothing to route to"
             );
         }
     }
@@ -2371,6 +2407,7 @@ where
         ContractHandlerEvent::DelegateRequest {
             req,
             origin_contract,
+            connection_scope,
             user_context,
         } => {
             let delegate_key = req.key().clone();
@@ -2389,6 +2426,7 @@ where
                 contract_handler,
                 req,
                 origin_contract.as_ref(),
+                connection_scope,
                 user_context.as_ref(),
                 &delegate_key,
                 prompter,

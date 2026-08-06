@@ -45,7 +45,7 @@
 use std::sync::LazyLock;
 
 use dashmap::DashMap;
-use freenet_stdlib::prelude::DelegateKey;
+use freenet_stdlib::prelude::{ContractInstanceId, DelegateKey};
 use tokio::sync::mpsc;
 
 use crate::client_events::{ClientId, HostResult};
@@ -73,6 +73,17 @@ pub(crate) const REGISTRATION_TTL: std::time::Duration = std::time::Duration::fr
 /// was last confirmed (for TTL eviction).
 struct AppRegistration {
     client_id: ClientId,
+    /// The ATTESTED app identity this registration was made under — the
+    /// `origin_contract` of the registering connection AFTER the loopback gate,
+    /// so it is `None` for any caller the node would not attest.
+    ///
+    /// Registrations are a push channel for a delegate's output, and that output
+    /// is the delegate's app's data. Before GHSA-824h-7x5x-wfmf this field did
+    /// not exist and [`route_to_apps`] fanned every notification to EVERY
+    /// registration, so any client that sent one `ApplicationMessages` request
+    /// to a delegate received its subsequent output. Routing now requires this
+    /// to equal the delegate's own attested origin.
+    origin: Option<ContractInstanceId>,
     sender: mpsc::Sender<HostResult>,
     /// `tokio::time::Instant` (not `std::time::Instant`) so tests using
     /// `tokio::time::pause` / `advance` can drive TTL eviction deterministically,
@@ -103,14 +114,19 @@ static CLIENT_REGISTRATION_COUNTS: LazyLock<DashMap<ClientId, usize>> =
 pub(crate) fn register_app(
     delegate_key: &DelegateKey,
     client_id: ClientId,
+    origin: Option<ContractInstanceId>,
     sender: mpsc::Sender<HostResult>,
 ) -> bool {
     let now = tokio::time::Instant::now();
     let mut apps = DELEGATE_APPS.entry(delegate_key.clone()).or_default();
 
     // Refresh path: already registered → update sender + TTL, no cap change.
+    // The origin is refreshed too: a client id is per-connection, so this is the
+    // same connection and therefore the same (immutable) attested identity — but
+    // re-storing it keeps the field from going stale if that ever changes.
     if let Some(existing) = apps.iter_mut().find(|a| a.client_id == client_id) {
         existing.sender = sender;
+        existing.origin = origin;
         existing.last_seen = now;
         return true;
     }
@@ -140,6 +156,7 @@ pub(crate) fn register_app(
 
     apps.push(AppRegistration {
         client_id,
+        origin,
         sender,
         last_seen: now,
     });
@@ -148,14 +165,27 @@ pub(crate) fn register_app(
 }
 
 /// Route a notification-driven `ApplicationMessage` (already wrapped in a
-/// [`HostResult`]) to every app registered with `delegate_key`.
+/// [`HostResult`]) to every registered app that holds `attested_origin` — the
+/// delegate's OWN attested app identity, read from its durable registration
+/// record by the caller.
+///
+/// A registration whose origin differs is skipped: a delegate's output belongs
+/// to the app that installed it, and merely having talked to a delegate is not
+/// a claim on its data (GHSA-824h-7x5x-wfmf). `attested_origin == None` (a
+/// delegate registered by an unattested caller) matches only registrations that
+/// are likewise unattested, which preserves today's behavior for tokenless
+/// local CLI clients.
 ///
 /// Uses `try_send` (never `.await`) so it is safe to call from the
 /// single-threaded contract-handling loop — a full or closed client channel is
 /// dropped/logged, never blocks the loop (see `.claude/rules/channel-safety.md`).
 /// Returns the number of apps the message was delivered to. Closed channels are
 /// pruned as a side effect (the client is gone).
-pub(crate) fn route_to_apps(delegate_key: &DelegateKey, message: HostResult) -> usize {
+pub(crate) fn route_to_apps(
+    delegate_key: &DelegateKey,
+    attested_origin: Option<ContractInstanceId>,
+    message: HostResult,
+) -> usize {
     let Some(mut apps) = DELEGATE_APPS.get_mut(delegate_key) else {
         return 0;
     };
@@ -163,23 +193,37 @@ pub(crate) fn route_to_apps(delegate_key: &DelegateKey, message: HostResult) -> 
     let mut delivered = 0usize;
     let mut closed_clients: Vec<ClientId> = Vec::new();
 
-    apps.retain(|app| match app.sender.try_send(message.clone()) {
-        Ok(()) => {
-            delivered += 1;
-            true
-        }
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            tracing::warn!(
+    apps.retain(|app| {
+        // Identity mismatch: not a delivery target. Keep the registration (it is
+        // still a live client, just not one entitled to THIS delegate's output);
+        // only closed channels are pruned.
+        if app.origin != attested_origin {
+            tracing::debug!(
                 delegate = %delegate_key,
                 client_id = %app.client_id,
-                "App notification channel full — delegate ApplicationMessage dropped"
+                "Skipping delegate notification for an app that does not hold \
+                 the delegate's attested identity"
             );
-            true
+            return true;
         }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
-            // Client disconnected without a clean event; drop the registration.
-            closed_clients.push(app.client_id);
-            false
+        match app.sender.try_send(message.clone()) {
+            Ok(()) => {
+                delivered += 1;
+                true
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    delegate = %delegate_key,
+                    client_id = %app.client_id,
+                    "App notification channel full — delegate ApplicationMessage dropped"
+                );
+                true
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                // Client disconnected without a clean event; drop the registration.
+                closed_clients.push(app.client_id);
+                false
+            }
         }
     });
 
@@ -299,9 +343,9 @@ mod tests {
         let ns = Namespace::new();
         let dk = ns.key(0);
         let (tx, mut rx) = mpsc::channel::<HostResult>(4);
-        assert!(register_app(&dk, ns.client(0), tx));
+        assert!(register_app(&dk, ns.client(0), None, tx));
 
-        let delivered = route_to_apps(&dk, host_msg());
+        let delivered = route_to_apps(&dk, None, host_msg());
         assert_eq!(delivered, 1);
         assert!(rx.try_recv().is_ok(), "app must receive the message");
     }
@@ -310,7 +354,7 @@ mod tests {
     #[serial_test::serial]
     async fn route_to_unknown_delegate_delivers_nothing() {
         let ns = Namespace::new();
-        let delivered = route_to_apps(&ns.key(0), host_msg());
+        let delivered = route_to_apps(&ns.key(0), None, host_msg());
         assert_eq!(delivered, 0);
     }
 
@@ -321,11 +365,11 @@ mod tests {
         let dk = ns.key(0);
         for i in 0..MAX_APPS_PER_DELEGATE {
             let (tx, _rx) = mpsc::channel::<HostResult>(1);
-            assert!(register_app(&dk, ns.client(i), tx));
+            assert!(register_app(&dk, ns.client(i), None, tx));
         }
         let (tx, _rx) = mpsc::channel::<HostResult>(1);
         assert!(
-            !register_app(&dk, ns.client(MAX_APPS_PER_DELEGATE), tx),
+            !register_app(&dk, ns.client(MAX_APPS_PER_DELEGATE), None, tx),
             "registration past per-delegate cap must be rejected"
         );
     }
@@ -337,11 +381,11 @@ mod tests {
         let client = ns.client(0);
         for i in 0..MAX_DELEGATES_PER_CLIENT {
             let (tx, _rx) = mpsc::channel::<HostResult>(1);
-            assert!(register_app(&ns.key(i), client, tx));
+            assert!(register_app(&ns.key(i), client, None, tx));
         }
         let (tx, _rx) = mpsc::channel::<HostResult>(1);
         assert!(
-            !register_app(&ns.key(MAX_DELEGATES_PER_CLIENT), client, tx),
+            !register_app(&ns.key(MAX_DELEGATES_PER_CLIENT), client, None, tx),
             "registration past per-client cap must be rejected"
         );
     }
@@ -353,13 +397,13 @@ mod tests {
         let dk = ns.key(0);
         let client = ns.client(0);
         let (tx, _rx) = mpsc::channel::<HostResult>(1);
-        assert!(register_app(&dk, client, tx));
+        assert!(register_app(&dk, client, None, tx));
         remove_client(client);
-        assert_eq!(route_to_apps(&dk, host_msg()), 0);
+        assert_eq!(route_to_apps(&dk, None, host_msg()), 0);
         // Count freed, so client can register up to the cap again.
         for i in 0..MAX_DELEGATES_PER_CLIENT {
             let (tx, _rx) = mpsc::channel::<HostResult>(1);
-            assert!(register_app(&ns.key(i + 1), client, tx));
+            assert!(register_app(&ns.key(i + 1), client, None, tx));
         }
     }
 
@@ -370,13 +414,13 @@ mod tests {
         let dk = ns.key(0);
         let client = ns.client(0);
         let (tx, rx) = mpsc::channel::<HostResult>(1);
-        assert!(register_app(&dk, client, tx));
+        assert!(register_app(&dk, client, None, tx));
         drop(rx); // client gone
-        assert_eq!(route_to_apps(&dk, host_msg()), 0);
+        assert_eq!(route_to_apps(&dk, None, host_msg()), 0);
         // Registration pruned and client count freed: can fill cap again.
         for i in 0..MAX_DELEGATES_PER_CLIENT {
             let (t, _r) = mpsc::channel::<HostResult>(1);
-            assert!(register_app(&ns.key(i + 1), client, t));
+            assert!(register_app(&ns.key(i + 1), client, None, t));
         }
     }
 
@@ -386,12 +430,12 @@ mod tests {
         let ns = Namespace::new();
         let dk = ns.key(0);
         let (tx, _rx) = mpsc::channel::<HostResult>(1);
-        assert!(register_app(&dk, ns.client(0), tx));
+        assert!(register_app(&dk, ns.client(0), None, tx));
 
         tokio::time::advance(REGISTRATION_TTL + std::time::Duration::from_secs(1)).await;
         sweep_expired();
         assert_eq!(
-            route_to_apps(&dk, host_msg()),
+            route_to_apps(&dk, None, host_msg()),
             0,
             "stale registration must be swept after TTL"
         );
@@ -404,19 +448,109 @@ mod tests {
         let dk = ns.key(0);
         let client = ns.client(0);
         let (tx, mut rx) = mpsc::channel::<HostResult>(4);
-        assert!(register_app(&dk, client, tx.clone()));
+        assert!(register_app(&dk, client, None, tx.clone()));
 
         // Advance nearly to TTL, then refresh.
         tokio::time::advance(REGISTRATION_TTL - std::time::Duration::from_secs(10)).await;
-        assert!(register_app(&dk, client, tx));
+        assert!(register_app(&dk, client, None, tx));
         // Advance past the ORIGINAL expiry but within the refreshed window.
         tokio::time::advance(std::time::Duration::from_secs(20)).await;
         sweep_expired();
         assert_eq!(
-            route_to_apps(&dk, host_msg()),
+            route_to_apps(&dk, None, host_msg()),
             1,
             "refreshed registration must survive"
         );
+        assert!(rx.try_recv().is_ok());
+    }
+
+    fn contract(seed: u8) -> ContractInstanceId {
+        ContractInstanceId::new([seed; 32])
+    }
+
+    // -----------------------------------------------------------------------
+    // GHSA-824h-7x5x-wfmf, gap 2 (delegate app registry).
+    //
+    // Registration is open to anyone — it is how a client asks to be pushed to
+    // — and it happens BEFORE the request is dispatched, so it cannot be gated
+    // on the delegate accepting the caller. The gate has to be on DELIVERY:
+    // a delegate's notification output goes only to a client that proved the
+    // delegate's own attested app identity.
+    // -----------------------------------------------------------------------
+
+    /// The core regression: a client that talked to the delegate but holds a
+    /// DIFFERENT (or no) attested identity receives nothing, while the app that
+    /// owns the delegate still does. Before the fix both were delivered to.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn route_skips_apps_that_do_not_hold_the_delegates_identity() {
+        let ns = Namespace::new();
+        let dk = ns.key(0);
+        let owner = contract(0x11);
+
+        let (owner_tx, mut owner_rx) = mpsc::channel::<HostResult>(4);
+        let (other_app_tx, mut other_app_rx) = mpsc::channel::<HostResult>(4);
+        let (tokenless_tx, mut tokenless_rx) = mpsc::channel::<HostResult>(4);
+
+        assert!(register_app(&dk, ns.client(0), Some(owner), owner_tx));
+        assert!(register_app(
+            &dk,
+            ns.client(1),
+            Some(contract(0x22)),
+            other_app_tx
+        ));
+        assert!(register_app(&dk, ns.client(2), None, tokenless_tx));
+
+        let delivered = route_to_apps(&dk, Some(owner), host_msg());
+
+        assert_eq!(delivered, 1, "only the owning app may receive the output");
+        assert!(
+            owner_rx.try_recv().is_ok(),
+            "the owning app must receive it"
+        );
+        assert!(
+            other_app_rx.try_recv().is_err(),
+            "an app attested as a DIFFERENT contract must not receive it"
+        );
+        assert!(
+            tokenless_rx.try_recv().is_err(),
+            "an unattested client must not receive an attested delegate's output"
+        );
+    }
+
+    /// A non-matching registration is SKIPPED, not evicted: the client is still
+    /// live and may legitimately hold registrations with other delegates. If
+    /// skipping silently dropped it, a later matching delivery would fail.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn skipped_registration_is_retained_not_evicted() {
+        let ns = Namespace::new();
+        let dk = ns.key(0);
+        let owner = contract(0x33);
+        let (tx, mut rx) = mpsc::channel::<HostResult>(4);
+        assert!(register_app(&dk, ns.client(0), Some(owner), tx));
+
+        assert_eq!(route_to_apps(&dk, Some(contract(0x44)), host_msg()), 0);
+        assert_eq!(
+            route_to_apps(&dk, Some(owner), host_msg()),
+            1,
+            "the registration must survive a skipped delivery"
+        );
+        assert!(rx.try_recv().is_ok());
+    }
+
+    /// The tokenless local CLI shape (riverctl, atlasctl, fdev): a delegate with
+    /// NO recorded origin routes to registrations that likewise hold none. This
+    /// is today's behavior for those clients and must not regress.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn unattested_delegate_routes_to_unattested_apps() {
+        let ns = Namespace::new();
+        let dk = ns.key(0);
+        let (tx, mut rx) = mpsc::channel::<HostResult>(4);
+        assert!(register_app(&dk, ns.client(0), None, tx));
+
+        assert_eq!(route_to_apps(&dk, None, host_msg()), 1);
         assert!(rx.try_recv().is_ok());
     }
 }

@@ -660,6 +660,28 @@ impl Runtime {
     ///
     /// Propagates the store's error: a persistence failure MUST fail the whole
     /// registration (see `SecretsStore::record_delegate_registration_origin`).
+    /// Read back the contract id `delegate` was FIRST registered under, or
+    /// `None` if it was registered without an attested origin, is unknown to
+    /// this node, or the record could not be read (fail closed).
+    ///
+    /// The counterpart of [`Self::record_delegate_registration_origin`]; it is
+    /// the delegate's own attested app identity, used to decide who may drive
+    /// it and who may receive its notification output (GHSA-824h-7x5x-wfmf).
+    pub(crate) fn delegate_registration_origin(&self, delegate: &DelegateKey) -> Option<[u8; 32]> {
+        match self.secret_store.delegate_registration_origins(delegate) {
+            Ok(Some((_has_admin_none, origins))) => origins.first().copied(),
+            Ok(None) => None,
+            Err(err) => {
+                tracing::warn!(
+                    delegate = %delegate.encode(),
+                    error = %err,
+                    "could not read delegate first-registration origin; treating as unattested (fail closed)"
+                );
+                None
+            }
+        }
+    }
+
     pub(crate) fn record_delegate_registration_origin(
         &self,
         delegate: &DelegateKey,

@@ -812,6 +812,12 @@ pub(crate) enum ContractHandlerEvent {
     DelegateRequest {
         req: DelegateRequest<'static>,
         origin_contract: Option<ContractInstanceId>,
+        /// Whether the issuing connection may receive an ATTESTED application
+        /// identity (GHSA-824h-7x5x-wfmf). Carried on the same forge-proof
+        /// channel as `user_context`; the executor withholds every attested
+        /// [`freenet_stdlib::prelude::MessageOrigin`] when this is
+        /// [`ConnectionScope::Remote`].
+        connection_scope: crate::client_events::ConnectionScope,
         /// Per-connection per-user secret namespace (hosted mode, P2 of #4381),
         /// derived once at the WS connection boundary from the connection's
         /// user token. `None` outside hosted mode or when no token was

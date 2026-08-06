@@ -3003,6 +3003,27 @@ impl SecretsStore {
     /// this gate exists to prevent. `Ok(())` covers both a freshly-written record
     /// AND an already-present one (an idempotent re-registration); neither is an
     /// error.
+    /// Read back the FIRST-registration origin recorded by
+    /// [`Self::record_delegate_registration_origin`], as
+    /// `(has_admin_none, contract_ids)`. `Ok(None)` means the delegate has
+    /// never been registered on this node.
+    ///
+    /// # Errors
+    /// Returns `Err` if the record could not be read. Callers gating an
+    /// authorization decision MUST treat `Err` as "no attested origin"
+    /// (fail closed), never as "any origin".
+    #[allow(clippy::type_complexity)]
+    pub fn delegate_registration_origins(
+        &self,
+        delegate: &DelegateKey,
+    ) -> Result<Option<(bool, Vec<[u8; 32]>)>, SecretStoreError> {
+        self.db.get_delegate_origins(delegate).map_err(|e| {
+            SecretStoreError::IO(std::io::Error::other(format!(
+                "could not read delegate first-registration origin: {e}"
+            )))
+        })
+    }
+
     pub fn record_delegate_registration_origin(
         &self,
         delegate: &DelegateKey,

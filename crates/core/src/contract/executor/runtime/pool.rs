@@ -1170,11 +1170,29 @@ impl ContractExecutor for RuntimePool {
         req: DelegateRequest<'_>,
         origin_contract: Option<&ContractInstanceId>,
         caller_delegate: Option<&DelegateKey>,
+        connection_scope: crate::client_events::ConnectionScope,
         user_context: Option<&UserSecretContext>,
     ) -> Response {
         let mut executor = self.pop_executor().await;
-        let result = executor.delegate_request(req, origin_contract, caller_delegate, user_context);
+        let result = executor.delegate_request(
+            req,
+            origin_contract,
+            caller_delegate,
+            connection_scope,
+            user_context,
+        );
         self.return_checked(executor, "execute_delegate_request")
+            .await;
+        result
+    }
+
+    async fn delegate_attested_origin(
+        &mut self,
+        delegate: &DelegateKey,
+    ) -> Option<ContractInstanceId> {
+        let executor = self.pop_executor().await;
+        let result = executor.registered_delegate_origin(delegate);
+        self.return_checked(executor, "delegate_attested_origin")
             .await;
         result
     }
