@@ -1922,6 +1922,11 @@ async fn drive_relay_broadcast_to(
     }
 
     // ── Step 4: apply broadcast via WASM merge ────────────────────────────
+    // Hoisted: step 6 needs the SAME origin this fan-out registered, to derive
+    // the covered peers' summaries (#5190). Re-resolving there would re-read
+    // the co-host population at a later instant.
+    let broadcast_origin =
+        resolve_covered_peers(op_manager, &key, &incoming_tx, sender_addr, &covered);
     let update_result = super::update_contract(
         op_manager,
         key,
@@ -1929,7 +1934,7 @@ async fn drive_relay_broadcast_to(
         RelatedContracts::default(),
         crate::contract::Priority::NetworkRelay,
         crate::node::ApplyOrigin::NetworkRelay,
-        resolve_covered_peers(op_manager, &key, &incoming_tx, sender_addr, &covered),
+        broadcast_origin.clone(),
     )
     .await;
 
@@ -2217,7 +2222,8 @@ async fn drive_relay_broadcast_to(
     // contract's REAL summary itself (#4923) — no caller-supplied value.
     let op_mgr = op_manager.clone();
     GlobalExecutor::spawn(async move {
-        super::send_proactive_summary_notification(&op_mgr, &key, sender_addr).await;
+        super::send_proactive_summary_notification(&op_mgr, &key, sender_addr, &broadcast_origin)
+            .await;
     });
 
     Ok(())
@@ -2851,6 +2857,9 @@ async fn apply_streaming_broadcast(
     }
 
     // Step 7: WASM merge.
+    // Same hoist as the non-streaming driver, same reason (#5190).
+    let broadcast_origin =
+        resolve_covered_peers(op_manager, &key, &incoming_tx, sender_addr, &covered);
     let update_result = super::update_contract(
         op_manager,
         key,
@@ -2858,7 +2867,7 @@ async fn apply_streaming_broadcast(
         RelatedContracts::default(),
         crate::contract::Priority::NetworkRelay,
         crate::node::ApplyOrigin::NetworkRelay,
-        resolve_covered_peers(op_manager, &key, &incoming_tx, sender_addr, &covered),
+        broadcast_origin.clone(),
     )
     .await;
 
@@ -2993,7 +3002,8 @@ async fn apply_streaming_broadcast(
     // caller-supplied value.
     let op_mgr = op_manager.clone();
     GlobalExecutor::spawn(async move {
-        super::send_proactive_summary_notification(&op_mgr, &key, sender_addr).await;
+        super::send_proactive_summary_notification(&op_mgr, &key, sender_addr, &broadcast_origin)
+            .await;
     });
 
     Ok(())
