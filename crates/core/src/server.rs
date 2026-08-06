@@ -1299,8 +1299,11 @@ mod tests {
 
     #[test]
     fn test_build_allowed_hosts_excludes_ipv6_unspecified() {
-        // :: is the new default bind address; verify it's excluded from allowlist
-        // but localhost variants are still included
+        // `::` is a wildcard bind (an explicit --ws-api-address, or the compat
+        // auto-widen; it stopped being the network-mode default in
+        // GHSA-824h-7x5x-wfmf). It must still be excluded from the Host
+        // allowlist — a wildcard names no host — while the localhost variants
+        // stay included.
         let hosts = build_allowed_hosts(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 7509, &[]);
         assert!(!hosts.contains("::"));
         assert!(!hosts.contains("[::]:7509"));
