@@ -77,14 +77,14 @@ collector that does not check these tokens — it ships a signed assertion of
 your node's identity to whatever it is pointed at.
 
 `<audience>` is base58 of the first 16 bytes of `SHA-256` over the canonical
-target URL, which is `{scheme}://{host}:{port}{path}` with scheme and host
-lowercased, the port always explicit (80 for `http`, 443 for `https` when the
-URL omits it), the path verbatim, and any `user:password@` stripped. So an
-endpoint of `http://collector.example:4318` produces the audience for
-`http://collector.example:4318/v1/metrics`, which you can reproduce with:
+target, which is `{host}:{port}{path}` — host lowercased, port always explicit
+(filled in from the scheme as 80 or 443 when the URL omits it), path verbatim,
+any `user:password@` stripped, and no scheme. So an endpoint of
+`http://collector.example:4318` produces the audience for
+`collector.example:4318/v1/metrics`, which you can reproduce with:
 
 ```bash
-printf 'http://collector.example:4318/v1/metrics' \
+printf 'collector.example:4318/v1/metrics' \
   | openssl dgst -sha256 -binary | head -c 16 | base58
 ```
 

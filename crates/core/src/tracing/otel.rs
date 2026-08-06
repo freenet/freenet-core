@@ -141,17 +141,23 @@ pub(crate) fn bearer_token(
 /// and compares, so both sides must canonicalize identically. The rules,
 /// exactly:
 ///
-/// - `{scheme}://{host}:{port}{path}`, e.g.
-///   `http://collector.example:4318/v1/metrics`.
-/// - scheme and host lowercased (both are case-insensitive).
-/// - port always explicit, defaulting to 80 for `http` and 443 for `https`,
-///   so `https://c.example/x` and `https://c.example:443/x` agree.
+/// - `{host}:{port}{path}`, e.g. `collector.example:4318/v1/metrics`.
+/// - host lowercased (case-insensitive).
+/// - port always explicit, defaulting to 80 for an `http` URL and 443 for an
+///   `https` one, so `https://c.example/x` and `https://c.example:443/x` agree.
 /// - path verbatim — no trailing-slash or dot-segment normalization.
 /// - **userinfo stripped**, and query/fragment dropped (an OTLP export URL has
 ///   neither). Stripping userinfo is not cosmetic: hashing an endpoint of
 ///   `https://user:secret@collector/` would make the value unreproducible for
 ///   a collector that does not know the password, and it keeps credentials out
 ///   of the signed input entirely.
+///
+/// The scheme is deliberately NOT part of the hashed string. It identifies a
+/// transport, not a party, so binding it would not narrow "which collector may
+/// use this token" at all — while forcing every collector reachable over both
+/// http and https to configure the same URL twice. Note it still leaks in
+/// indirectly through the default-port rule above, which is why
+/// `http://c.example/x` and `https://c.example/x` do not collide.
 ///
 /// Cost of hashing: a rejected token tells the collector nothing about what
 /// the sender aimed at. The node logs its resolved endpoint at startup, and
@@ -163,16 +169,11 @@ fn audience_of(uri: &http::Uri) -> String {
     let Some(host) = uri.host() else {
         return String::new();
     };
-    let scheme = uri.scheme_str().unwrap_or("http").to_ascii_lowercase();
-    let port = uri.port_u16().unwrap_or(match scheme.as_str() {
-        "https" => 443,
+    let port = uri.port_u16().unwrap_or(match uri.scheme_str() {
+        Some("https") => 443,
         _ => 80,
     });
-    let canonical = format!(
-        "{scheme}://{}:{port}{}",
-        host.to_ascii_lowercase(),
-        uri.path()
-    );
+    let canonical = format!("{}:{port}{}", host.to_ascii_lowercase(), uri.path());
     bs58::encode(&Sha256::digest(canonical.as_bytes())[..16]).into_string()
 }
 
@@ -1184,31 +1185,28 @@ mod tests {
         for (uri, canonical) in [
             (
                 "http://collector.example:4318/v1/metrics",
-                "http://collector.example:4318/v1/metrics",
+                "collector.example:4318/v1/metrics",
             ),
-            // Default port filled in, scheme and host lowercased.
+            // Default port filled in from the scheme, host lowercased.
             (
                 "https://Collector.Example/v1/metrics",
-                "https://collector.example:443/v1/metrics",
+                "collector.example:443/v1/metrics",
             ),
             (
                 "http://collector.example/v1/metrics",
-                "http://collector.example:80/v1/metrics",
+                "collector.example:80/v1/metrics",
             ),
             // Credentials stripped: a collector that does not know the
             // password must still be able to reproduce the hash.
             (
                 "https://user:secret@collector.example:4318/v1/metrics",
-                "https://collector.example:4318/v1/metrics",
+                "collector.example:4318/v1/metrics",
             ),
-            (
-                "http://[::1]:4318/v1/metrics",
-                "http://[::1]:4318/v1/metrics",
-            ),
+            ("http://[::1]:4318/v1/metrics", "[::1]:4318/v1/metrics"),
             // Everything at once: credentials, port, multi-segment path.
             (
                 "http://user:pass@host:1234/path/here",
-                "http://host:1234/path/here",
+                "host:1234/path/here",
             ),
         ] {
             let audience = audience_of(&uri.parse::<http::Uri>().unwrap());
@@ -1222,11 +1220,6 @@ mod tests {
         // The binding has to be sensitive to the parts it claims to cover.
         let of = |u: &str| audience_of(&u.parse::<http::Uri>().unwrap());
         assert_ne!(
-            of("https://c.example:4318/v1/metrics"),
-            of("http://c.example:4318/v1/metrics"),
-            "scheme is bound"
-        );
-        assert_ne!(
             of("http://c.example:4318/v1/metrics"),
             of("http://c.example:4319/v1/metrics"),
             "port is bound"
@@ -1235,6 +1228,22 @@ mod tests {
             of("http://c.example:4318/tenant-a/v1/metrics"),
             of("http://c.example:4318/tenant-b/v1/metrics"),
             "path is bound — two collectors behind one host must differ"
+        );
+        // ...and NOT to the scheme, which names a transport rather than a
+        // party: one collector reachable both ways must not need two
+        // audience entries. Deliberate, so pin it rather than leave it to
+        // be "fixed" later.
+        assert_eq!(
+            of("https://c.example:4318/v1/metrics"),
+            of("http://c.example:4318/v1/metrics"),
+            "scheme is deliberately not bound"
+        );
+        // It does still reach the hash through the default-port rule, so
+        // these two do not collide.
+        assert_ne!(
+            of("https://c.example/v1/metrics"),
+            of("http://c.example/v1/metrics"),
+            "an omitted port defaults per scheme: 443 vs 80"
         );
     }
 
