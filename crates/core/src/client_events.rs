@@ -1510,9 +1510,16 @@ async fn process_open_request(
 
                 // The attested app identity of THIS connection, after the
                 // loopback gate: `None` for any caller the node will not attest
-                // (GHSA-824h-7x5x-wfmf). Computed once here and used for both the
-                // routing registration below and the executor dispatch further
-                // down, so the two can never disagree about who the caller is.
+                // (GHSA-824h-7x5x-wfmf). Used for the routing registration below.
+                //
+                // The executor dispatch further down is NOT handed this value —
+                // it receives the raw `origin_contract` alongside
+                // `connection_scope` and applies the gate itself, because it must
+                // also gate the two origin sources this layer cannot see
+                // (`caller_delegate` and the node's inherited-origins map). Both
+                // gates read the SAME `request.connection_scope`, so they agree
+                // on whether the caller is attestable; `resolve_message_origin`
+                // is the single place that decides what that attestation is.
                 let attested_origin = if request.connection_scope.is_local() {
                     request.origin_contract
                 } else {
