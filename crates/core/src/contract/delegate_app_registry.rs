@@ -164,6 +164,17 @@ pub(crate) fn register_app(
     true
 }
 
+/// Whether any app is currently registered for `delegate_key`.
+///
+/// A cheap pre-check so the notification path can skip the (executor-checkout)
+/// attested-origin lookup entirely when there is nobody to route to — the common
+/// case for a delegate driven only by contract notifications.
+pub(crate) fn has_registrations(delegate_key: &DelegateKey) -> bool {
+    DELEGATE_APPS
+        .get(delegate_key)
+        .is_some_and(|apps| !apps.is_empty())
+}
+
 /// Route a notification-driven `ApplicationMessage` (already wrapped in a
 /// [`HostResult`]) to every registered app that holds `attested_origin` — the
 /// delegate's OWN attested app identity, read from its durable registration

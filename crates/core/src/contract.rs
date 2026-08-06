@@ -1992,10 +1992,21 @@ async fn handle_delegate_notification<CH, P>(
     // first-registration origin record. This is what decides who may receive the
     // output below (GHSA-824h-7x5x-wfmf), and it is read BEFORE the delegate
     // runs so a delegate cannot influence its own routing.
-    let attested_origin = contract_handler
-        .executor()
-        .delegate_attested_origin(&delegate_key)
-        .await;
+    //
+    // Skipped when nobody is registered for this delegate: on the pooled
+    // executor the lookup checks an executor out of the pool, and this path runs
+    // on the contract loop for every contract notification. Nothing to route to
+    // means nothing to decide. The check is on the registry (which the delegate
+    // cannot write) and still happens before the delegate runs, so it does not
+    // weaken the "read before it runs" property.
+    let attested_origin = if delegate_app_registry::has_registrations(&delegate_key) {
+        contract_handler
+            .executor()
+            .delegate_attested_origin(&delegate_key)
+            .await
+    } else {
+        None
+    };
 
     let outbound = handle_delegate_with_contract_requests(
         contract_handler,

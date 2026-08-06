@@ -436,22 +436,31 @@ impl Executor<Runtime> {
                 // `release_max_level_info`, so a `debug!` here would compile out
                 // of every shipped binary and the audit trail would exist only
                 // in development). Ids only: no token values, no key material.
-                tracing::info!(
-                    delegate_key = %key,
-                    origin_kind = match origin.as_ref() {
-                        None => "none",
-                        Some(MessageOrigin::WebApp(_)) => "web_app",
-                        Some(MessageOrigin::Delegate(_)) => "delegate",
-                        Some(_) => "other",
-                    },
-                    origin_id = ?origin.as_ref().map(|o| match o {
-                        MessageOrigin::WebApp(c) => c.to_string(),
-                        MessageOrigin::Delegate(d) => d.to_string(),
-                        other => format!("{other:?}"),
-                    }),
-                    loopback = connection_scope.is_local(),
-                    "delegate ApplicationMessages: resolved message origin"
-                );
+                //
+                // Two events are worth recording: an operation that RECEIVED an
+                // attested identity, and one that was REFUSED one. The remaining
+                // case — a local caller with no identity to begin with, the
+                // tokenless CLI shape — is neither, and it is also the highest
+                // volume, so it is not logged. Without that exclusion this line
+                // fires once per delegate message on a chatty app.
+                if origin.is_some() || !connection_scope.is_local() {
+                    tracing::info!(
+                        delegate_key = %key,
+                        origin_kind = match origin.as_ref() {
+                            None => "none",
+                            Some(MessageOrigin::WebApp(_)) => "web_app",
+                            Some(MessageOrigin::Delegate(_)) => "delegate",
+                            Some(_) => "other",
+                        },
+                        origin_id = ?origin.as_ref().map(|o| match o {
+                            MessageOrigin::WebApp(c) => c.to_string(),
+                            MessageOrigin::Delegate(d) => d.to_string(),
+                            other => format!("{other:?}"),
+                        }),
+                        loopback = connection_scope.is_local(),
+                        "delegate ApplicationMessages: resolved message origin"
+                    );
+                }
                 match self.runtime.inbound_app_message(
                     &key,
                     &params,
