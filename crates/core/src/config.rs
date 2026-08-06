@@ -1875,6 +1875,25 @@ impl Config {
                 );
             }
         }
+        // These two branches report the SAME event — a persisted address was
+        // dropped and re-derived — in the two directions it can go. They are
+        // deliberately separate messages rather than one message plus a filter,
+        // and the history is worth keeping.
+        //
+        // An earlier cut emitted only the narrowing text and fired it whenever
+        // anything was dropped, so a node that dropped a loopback value and then
+        // auto-widened printed "clients on other machines can no longer reach
+        // this node" directly above "bound to all interfaces". The fix applied to
+        // that contradiction was to SUPPRESS the first line for the widening
+        // case — which silenced the only notice that a node someone had pinned
+        // to loopback was now listening on every interface, and that widening
+        // then went unnoticed through two further rounds of review.
+        //
+        // The lesson, because the next person to hit a noisy contradiction will
+        // reach for the same fix: a contradictory pair of log lines is evidence
+        // that the code does two DIFFERENT things on one path. Make each message
+        // say which one happened. Never silence one of them — the branch you
+        // suppress is the one nobody will hear about again.
         if let Some(persisted) = self.ws_api.exposure.dropped_persisted_address {
             if address.is_loopback() {
                 // warn!, not info!: this fires on ONE boot and never again (from
