@@ -1282,13 +1282,14 @@ impl ConfigArgs {
         // reports it after the subscriber exists. See `WsApiExposure`.
         let ws_api_exposure = WsApiExposure {
             source: ws_api_address_source,
-            // Report the discard ONLY when the bind actually got narrower.
-            // A node whose persisted `::1` is dropped and then auto-widened to
-            // `::` is getting MORE exposed, so "clients on other machines can
-            // no longer reach this node" would be flatly untrue — and would
-            // print directly above the auto-widen line saying the opposite.
+            // Recorded when the re-derivation actually MOVED the bind, in
+            // either direction; `log_client_api_exposure` picks the message
+            // from which way it went. A value that re-derives to itself (the
+            // steady state from boot 2 onward) is not reported at all, because
+            // re-announcing an unchanged bind every boot is how a log line gets
+            // tuned out.
             dropped_persisted_address: dropped_persisted_wildcard
-                .filter(|persisted| !persisted.is_loopback() && ws_api_address.is_loopback()),
+                .filter(|persisted| *persisted != ws_api_address),
         };
         let this = Config {
             mode,
@@ -1849,15 +1850,18 @@ impl Config {
     pub fn log_client_api_exposure(&self) {
         let address = self.ws_api.address;
 
-        // The two allow-list env vars were UNNAMESPACED (`ALLOWED_HOST`,
+        // These three were UNNAMESPACED (`WS_API_ADDRESS`, `ALLOWED_HOST`,
         // `ALLOWED_SOURCE_CIDRS`) until GHSA-824h-7x5x-wfmf. That was survivable
-        // while they only added a Host-header entry to a socket that was wide
-        // anyway; now `--allowed-source-cidrs` DECIDES whether the socket is
-        // wide, so a stray value in a shared container, CI runner or systemd
-        // environment could open the API. They are namespaced, and a leftover
-        // old-style variable is reported rather than ignored — otherwise a
-        // working overlay deployment goes loopback-only with no explanation.
+        // while a network-mode node bound `::` anyway and they only shaped which
+        // Host headers it accepted; it is not now that `--ws-api-address`
+        // decides the socket directly, at the highest precedence, and
+        // `--allowed-source-cidrs` decides whether it is wide. A stray value in
+        // a shared container, CI runner or systemd environment could open the
+        // API. They are namespaced, and a leftover old-style variable is
+        // REPORTED rather than ignored — otherwise a working deployment goes
+        // loopback-only with no explanation.
         for (legacy, replacement) in [
+            ("WS_API_ADDRESS", "FREENET_WS_API_ADDRESS"),
             ("ALLOWED_HOST", "FREENET_ALLOWED_HOST"),
             ("ALLOWED_SOURCE_CIDRS", "FREENET_ALLOWED_SOURCE_CIDRS"),
         ] {
@@ -1872,25 +1876,43 @@ impl Config {
             }
         }
         if let Some(persisted) = self.ws_api.exposure.dropped_persisted_address {
-            // warn!, not info!: this fires on ONE boot and never again (the
-            // filter keys on a non-loopback persisted value, and boot 2 onward
-            // sees loopback). For a remote gateway whose operator finds out
-            // days later when a client fails, this line is the whole
-            // explanation, so it must not be ranked below the exposure warning
-            // that fires for the comparatively safe case.
-            tracing::warn!(
-                %persisted,
-                resolved = %address,
-                "The client API now defaults to loopback, so the `ws-api-address` \
-                 previously auto-written to config.toml has been re-derived. Clients \
-                 on OTHER machines can no longer reach this node's API. If they \
-                 should, add --ws-api-address :: to the node's invocation and KEEP it \
-                 there — a value only persisted in config.toml is not enough, because \
-                 this code cannot tell its own past output from your choice. On a \
-                 systemd install add it with `systemctl edit` as a drop-in; do not \
-                 hand-edit the generated unit, which marks it user-modified and opts \
-                 this node out of future unit updates."
-            );
+            if address.is_loopback() {
+                // warn!, not info!: this fires on ONE boot and never again (from
+                // boot 2 the persisted value re-derives to itself and is not
+                // reported). For a remote gateway whose operator finds out days
+                // later when a client fails, this line is the whole
+                // explanation, so it must not rank below the exposure warning
+                // that fires for the comparatively safe case.
+                tracing::warn!(
+                    %persisted,
+                    resolved = %address,
+                    "The client API now defaults to loopback, so the `ws-api-address` \
+                     previously auto-written to config.toml has been re-derived. Clients \
+                     on OTHER machines can no longer reach this node's API. If they \
+                     should, add --ws-api-address :: to the node's invocation and KEEP it \
+                     there — a value only persisted in config.toml is not enough, because \
+                     this code cannot tell its own past output from your choice. On a \
+                     systemd install add it with `systemctl edit` as a drop-in; do not \
+                     hand-edit the generated unit, which marks it user-modified and opts \
+                     this node out of future unit updates."
+                );
+            } else {
+                // The opposite direction, and the one a hardening change owes an
+                // operator loudly: their config named a LOOPBACK address, and we
+                // dropped it (this code writes that value itself, so it cannot be
+                // told from an operator's choice) and then widened on the CIDR
+                // grant. The socket is more exposed than the config it replaced.
+                tracing::warn!(
+                    %persisted,
+                    resolved = %address,
+                    "The loopback `ws-api-address` in config.toml was re-derived — this \
+                     code writes that value itself, so it cannot be distinguished from a \
+                     deliberate pin — and --allowed-source-cidrs then widened the bind. \
+                     The client API is now reachable from OTHER machines, which the \
+                     config file alone said it should not be. Pass --ws-api-address \
+                     explicitly to pin it either way."
+                );
+            }
         }
         if self.ws_api.exposure.source == WsApiAddressSource::AutoWidened {
             tracing::info!(
@@ -1907,7 +1929,6 @@ impl Config {
             self.ws_api.hosted_mode,
             address,
             &self.ws_api.allowed_hosts,
-            shared_delegate_namespace_is_occupied(&self.ws_api.secrets_dir),
         ) {
             tracing::warn!(
                 %address,
@@ -2456,16 +2477,22 @@ pub struct WebsocketApiArgs {
     /// operation modes: running as a network peer says nothing about wanting
     /// this node's fully-privileged control API driveable from other machines.
     /// Pass `::` (or a specific interface address) to serve clients on other
-    /// hosts. Setting `--allowed-source-cidrs` or `--allowed-host` without this
-    /// flag widens the bind to `::` automatically, since neither flag does
-    /// anything on a loopback listener.
+    /// hosts, and keep the flag in the node's invocation — a value left only in
+    /// config.toml is re-derived on the next boot.
+    ///
+    /// One flag widens the bind on its own, in network mode:
+    /// `--allowed-source-cidrs`, which is inert on a loopback socket and so can
+    /// only have been set by someone expecting non-local clients.
+    /// `--allowed-host` does NOT: it is a Host-header allowlist that works
+    /// perfectly on loopback, where a same-host reverse proxy lives. Running
+    /// the proxy on a DIFFERENT host needs this flag as well.
     ///
     /// SECURITY: anything that can reach this address and port can read and
     /// modify your contract state, identities and keys.
     #[arg(
         name = "ws_api_address",
         long = "ws-api-address",
-        env = "WS_API_ADDRESS"
+        env = "FREENET_WS_API_ADDRESS"
     )]
     #[serde(rename = "ws-api-address", skip_serializing_if = "Option::is_none")]
     pub address: Option<IpAddr>,
@@ -3230,68 +3257,6 @@ fn resolve_ws_api_address(
     }
 }
 
-/// Whether the node's SHARED (non-per-user) delegate-secret namespace holds
-/// anything, checked by looking for a single file.
-///
-/// Layout is `<secrets_dir>/<delegate_key>/…`, with hosted mode's per-user
-/// namespaces under a `users/` component. So a file inside a delegate directory
-/// but NOT under `users/` is a secret that EVERY untokened connection shares.
-/// Node key material (`transport_keypair`, `delegate_cipher`, …) sits directly
-/// in `secrets_dir` at depth 1 and is deliberately not counted: it is not
-/// reachable through the delegate API this warning is about.
-///
-/// Returns `true` if it cannot tell (an unreadable secrets tree): "I could not
-/// check" must not read as "nothing to protect".
-///
-/// Stops at the first hit and bounds its own depth, so the common case is a
-/// couple of `read_dir` calls at startup.
-fn shared_delegate_namespace_is_occupied(secrets_dir: &Path) -> bool {
-    fn walk(dir: &Path, depth: u32) -> bool {
-        // Deep enough for `<delegate>/<subdir>/<file>`; a legitimate shared
-        // secret is never buried deeper than this, and the cap keeps a
-        // symlinked or pathological tree from stalling startup.
-        const MAX_DEPTH: u32 = 4;
-        if depth > MAX_DEPTH {
-            return false;
-        }
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            // Unreadable: fail loud rather than silently claiming "empty".
-            return true;
-        };
-        for entry in entries.flatten() {
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_dir() {
-                // Per-user namespaces are exactly what hosted mode isolates,
-                // so they are not the shared namespace.
-                if entry.file_name() == "users" {
-                    continue;
-                }
-                if walk(&entry.path(), depth + 1) {
-                    return true;
-                }
-            } else if file_type.is_file() {
-                return true;
-            }
-        }
-        false
-    }
-
-    if secrets_dir.as_os_str().is_empty() {
-        // The standalone/test composition carries no secrets tree.
-        return false;
-    }
-    let Ok(entries) = std::fs::read_dir(secrets_dir) else {
-        return false; // No secrets tree yet: nothing is shared.
-    };
-    // Depth 1 is node key material, not delegate secrets — descend past it.
-    entries
-        .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .any(|e| walk(&e.path(), 2))
-}
-
 /// Whether startup should warn that the client API is reachable beyond this
 /// machine while connections can land in ONE shared secret namespace, and if
 /// so, why. `None` means stay quiet.
@@ -3299,32 +3264,33 @@ fn shared_delegate_namespace_is_occupied(secrets_dir: &Path) -> bool {
 /// The shared namespace is the danger. `decide_user_token` hands a connection
 /// the node's single-user context whenever hosted mode is off **or the
 /// connection simply omits `userToken`** — so hosted mode ADDS a per-user
-/// namespace for well-behaved clients, it does not remove the shared one. A
-/// remote client that presents no token still drives the same delegate secrets,
-/// identities and contract state as the operator's own browser.
+/// namespace for well-behaved clients, it does not remove the shared one.
 ///
-/// Three cases:
+/// Two triggers:
 /// - a **non-loopback bind** warns regardless of hosted mode, because any host
 ///   that can route to the address can omit a token and land in the shared
 ///   namespace;
-/// - **`--allowed-host` on a loopback bind with hosted mode OFF** warns
-///   unconditionally. That flag names a reverse proxy, and a proxy terminates
-///   the connection itself, so every visitor arrives wearing the proxy's source
-///   address and the node's own source-IP filters cannot tell them apart. It is
-///   not gated on occupancy because with hosted mode off there is no isolation
-///   at all: the namespace becomes occupied the moment anyone uses it.
-/// - **loopback + hosted mode** — try.freenet.org's shape — warns ONLY if the
-///   shared namespace already holds secrets. Hosted mode routes tokened
-///   connections to per-user namespaces, so the shared one stays empty in the
-///   intended deployment, and containment is real if unglamorous: there is
-///   nothing there to take. Warning on every boot of the flagship deployment
-///   would train operators to ignore the one signal we have, so this warning is
-///   made ACCURATE rather than loud.
+/// - **`--allowed-host` on a loopback bind with hosted mode OFF** warns. That
+///   flag names a reverse proxy, and a proxy terminates the connection itself,
+///   so every visitor arrives wearing the proxy's source address and the node's
+///   own source-IP filters cannot tell them apart.
+///
+/// **Loopback + hosted mode stays quiet, and that is a known gap, not an
+/// assertion of safety.** A connection that omits `userToken` reads the shared
+/// namespace there too, and behind a public proxy that is any visitor;
+/// containment on the flagship deployment today is that the shared namespace is
+/// empty (measured: zero files outside `*/users/*`), which is a fact about
+/// current state rather than a structural guarantee. Making this branch fire
+/// only when the shared namespace actually holds something needs a probe of the
+/// secrets tree, which is a separate change with its own failure modes — it is
+/// tracked separately rather than bolted onto a default-hardening PR, because a
+/// probe that is wrong in either direction is worse than no warning: too eager
+/// and it fires on every boot of the flagship and trains operators to ignore the
+/// one signal there is.
 fn ws_api_shares_one_namespace_with_remote_clients(
     hosted_mode: bool,
     address: IpAddr,
     allowed_hosts: &[String],
-    shared_namespace_occupied: bool,
 ) -> Option<&'static str> {
     if !address.is_loopback() {
         return Some(if hosted_mode {
@@ -3337,11 +3303,7 @@ fn ws_api_shares_one_namespace_with_remote_clients(
         });
     }
     if hosted_mode {
-        return shared_namespace_occupied.then_some(
-            "this node is in hosted mode but its SHARED delegate-secret namespace is \
-             not empty, and a connection that omits `userToken` reads that namespace \
-             rather than a per-user one — behind a proxy, any visitor can",
-        );
+        return None;
     }
     if !allowed_hosts.is_empty() {
         return Some(
@@ -9616,104 +9578,39 @@ shutdown-drain-secs = 42
         let loopback = default_local_address();
         let wildcard = default_listening_address();
         let proxy = vec!["try.freenet.org".to_string()];
-        // (hosted_mode, address, allowed_hosts, shared namespace occupied)
-        let quiet =
-            |h, a, l: &[String], occ| ws_api_shares_one_namespace_with_remote_clients(h, a, l, occ);
 
         // Quiet: the default single-user desktop node.
-        assert_eq!(quiet(false, loopback, &[], false), None);
-        // Quiet: try.freenet.org's shape. Hosted mode routes tokened
-        // connections to per-user namespaces, and the shared one is empty, so
-        // there is nothing behind the proxy to take. Warning on every boot of
-        // the flagship deployment would train operators to ignore this signal.
-        assert_eq!(quiet(true, loopback, &proxy, false), None);
-
-        // Fires: SAME shape, but the shared namespace now holds secrets, which
-        // is the real containment boundary rather than any structural
-        // guarantee — a connection omitting `userToken` reads it.
-        let occupied = quiet(true, loopback, &proxy, true)
-            .expect("a hosted node with a non-empty shared namespace must warn");
-        assert!(occupied.contains("SHARED"), "{occupied}");
+        assert_eq!(
+            ws_api_shares_one_namespace_with_remote_clients(false, loopback, &[]),
+            None
+        );
+        // Quiet: try.freenet.org's shape. A KNOWN GAP rather than a safety
+        // claim — an untokened connection reads the shared namespace here too.
+        // Containment today is that the namespace is empty; making the warning
+        // conditional on that needs a probe of the secrets tree, tracked
+        // separately so a probe that is wrong in either direction cannot ride
+        // in on a default-hardening change.
+        assert_eq!(
+            ws_api_shares_one_namespace_with_remote_clients(true, loopback, &proxy),
+            None
+        );
 
         // Fires: reachable from other machines, one shared namespace. The
         // reason names the bind, which is the thing to change.
-        let bind_reason = quiet(false, wildcard, &[], false)
+        let bind_reason = ws_api_shares_one_namespace_with_remote_clients(false, wildcard, &[])
             .expect("a wildcard bind with hosted mode off must warn");
         assert!(bind_reason.contains("non-loopback"), "{bind_reason}");
 
-        // Fires: hosted mode does NOT make a wide bind safe, occupied or not.
-        // `decide_user_token` returns the shared context whenever a connection
-        // omits `userToken`, so a remote client presenting nothing still drives
-        // the same delegate secrets.
-        for occ in [false, true] {
-            let hosted_wide = quiet(true, wildcard, &proxy, occ)
-                .expect("a wildcard bind must warn even in hosted mode");
-            assert!(hosted_wide.contains("hosted mode does"), "{hosted_wide}");
-        }
+        // Fires: hosted mode does NOT make a wide bind safe. `decide_user_token`
+        // returns the shared context whenever a connection omits `userToken`.
+        let hosted_wide = ws_api_shares_one_namespace_with_remote_clients(true, wildcard, &proxy)
+            .expect("a wildcard bind must warn even in hosted mode");
+        assert!(hosted_wide.contains("hosted mode does"), "{hosted_wide}");
 
-        // Fires: proxied with hosted mode off. NOT gated on occupancy — with no
-        // isolation at all the namespace fills the moment anyone uses it.
-        let proxy_reason = quiet(false, loopback, &proxy, false)
+        // Fires: proxied with hosted mode off, the shape with no isolation.
+        let proxy_reason = ws_api_shares_one_namespace_with_remote_clients(false, loopback, &proxy)
             .expect("a proxied node with hosted mode off must warn");
         assert!(proxy_reason.contains("--allowed-host"), "{proxy_reason}");
-    }
-
-    /// The occupancy probe must distinguish hosted mode's per-user namespaces
-    /// (which are the isolation, not a leak) from a genuinely shared secret,
-    /// and must not count the node's own key material at the tree root.
-    #[test]
-    fn shared_namespace_probe_ignores_per_user_dirs_and_node_keys() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-
-        // Empty tree.
-        assert!(!shared_delegate_namespace_is_occupied(root));
-
-        // Node key material lives at depth 1 and is not delegate-reachable.
-        std::fs::write(root.join("transport_keypair"), b"k").unwrap();
-        assert!(!shared_delegate_namespace_is_occupied(root));
-
-        // try.freenet.org's measured shape: every secret under `users/`.
-        let delegate = root.join("2hwN7pycUxLzzaEeCLNsi3XQ9zA1EpPTrWdWxcUozb9j");
-        std::fs::create_dir_all(delegate.join("users").join("alice")).unwrap();
-        std::fs::write(delegate.join("users").join("alice").join("s"), b"x").unwrap();
-        assert!(
-            !shared_delegate_namespace_is_occupied(root),
-            "per-user namespaces are the isolation, not the shared namespace"
-        );
-
-        // A secret in the delegate dir itself IS shared.
-        std::fs::write(delegate.join("shared_secret"), b"x").unwrap();
-        assert!(shared_delegate_namespace_is_occupied(root));
-    }
-
-    /// An unreadable secrets tree must read as "cannot tell", not as "empty":
-    /// silence here would be a warning suppressed by a permissions bug.
-    #[test]
-    #[cfg(unix)]
-    fn shared_namespace_probe_fails_loud_when_it_cannot_read() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let delegate = dir.path().join("delegate");
-        std::fs::create_dir_all(&delegate).unwrap();
-        std::fs::set_permissions(&delegate, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let unreadable = shared_delegate_namespace_is_occupied(dir.path());
-        // Restore before the assert so the tempdir can always clean up.
-        std::fs::set_permissions(&delegate, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // Running as root defeats the permission bit; skip rather than lie.
-        if !nix_running_as_root() {
-            assert!(
-                unreadable,
-                "an unreadable secrets tree must not read as empty"
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    fn nix_running_as_root() -> bool {
-        // SAFETY: `geteuid` takes no arguments, touches no memory and cannot
-        // fail; it is unsafe only because it is an extern "C" call.
-        unsafe { libc::geteuid() == 0 }
     }
 
     /// `build()` persists the RESOLVED config, so every node that has already
@@ -9823,16 +9720,21 @@ shutdown-drain-secs = 42
         assert_eq!(cfg.ws_api.address, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
     }
 
-    /// The migration keys on "wildcard" and nothing else: a specific interface
-    /// address was never auto-written, so it is an operator choice and must
-    /// survive an upgrade untouched. Same for an explicit loopback literal —
-    /// `127.0.0.1` must not be silently rewritten to `::1`, since a node bound
-    /// to exactly one family is a deliberate posture (see `in_process_restart`).
+    /// The migration keys on "a value this code could have written" and nothing
+    /// else: a specific interface address is never auto-written, so it is an
+    /// operator choice and must survive an upgrade untouched.
+    ///
+    /// Note `127.0.0.1` is deliberately NOT in this test any more. It became
+    /// auto-derivable when re-derivation started preserving the address family
+    /// — it is what an IPv4 node re-derives TO — so it round-trips to itself
+    /// rather than being preserved. Same observable value, different mechanism;
+    /// asserting it here would pass for the wrong reason. Its real coverage is
+    /// `auto_derivable_addresses_are_exactly_the_ones_this_code_writes`.
     #[tokio::test]
     async fn persisted_explicit_address_survives_the_migration() {
         for chosen in [
             IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 5)),
         ] {
             let temp_dir = tempfile::tempdir().unwrap();
             let (_server, index_url) = empty_gateways_index_server();
@@ -9955,11 +9857,13 @@ shutdown-drain-secs = 42
             WsApiAddressSource::DefaultLoopback
         );
 
-        // Boot 3 in the same dir: the operator adds a CIDR grant, so the
-        // persisted `::1` is dropped and immediately auto-widened back to `::`.
-        // The bind got WIDER, so the "clients on other machines can no longer
-        // reach this node" notice must NOT fire — it would print directly above
-        // the auto-widen line and say the opposite of it.
+        // Boot 3 in the same dir: the operator applies the documented remedy on
+        // an ALREADY-MIGRATED node — config.toml holds the post-migration
+        // loopback, and the CIDR grant arrives now. This is the sequence the
+        // startup message actually points operators at, and it only works
+        // because the sentinel treats loopback as auto-derivable: read back as
+        // an operator choice it would take the Explicit short-circuit and the
+        // remedy would silently do nothing.
         let mut widened_later = ws_api_test_args(OperationMode::Network, upgrade_dir.path());
         widened_later.ws_api.allowed_source_cidrs = Some(vec!["100.64.0.0/10".to_string()]);
         let cfg = widened_later
@@ -9968,9 +9872,58 @@ shutdown-drain-secs = 42
             .expect("third build should succeed");
         assert_eq!(cfg.ws_api.address, default_listening_address());
         assert_eq!(cfg.ws_api.exposure.source, WsApiAddressSource::AutoWidened);
+        // Recorded, because the bind MOVED — and moved toward exposure. A
+        // hardening change that widens a node whose config named loopback owes
+        // the operator a loud line about it, which is why the notice is
+        // directional rather than suppressed here.
         assert_eq!(
-            cfg.ws_api.exposure.dropped_persisted_address, None,
-            "a widening re-derivation must not report itself as a loss of access"
+            cfg.ws_api.exposure.dropped_persisted_address,
+            Some(default_local_address()),
+            "widening past a persisted loopback address must be reported, not silent"
+        );
+    }
+
+    /// D4 regression: the same remedy sequence, asserted on the BIND rather
+    /// than on the exposure record, and starting from a node that is already
+    /// migrated. `auto_widen_preserves_the_address_family` starts from a
+    /// persisted wildcard, which is the migration boot, not the remedy.
+    #[tokio::test]
+    async fn remedy_still_works_after_the_upgrade_persisted_loopback() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_server, index_url) = empty_gateways_index_server();
+
+        // Boot 1: pre-upgrade node with the old wildcard auto-default.
+        let mut first = ws_api_test_args(OperationMode::Network, temp_dir.path());
+        first.ws_api.address = Some(default_listening_address());
+        first
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("first build should succeed");
+
+        // Boot 2: upgraded, flag-less. Re-derived to loopback and persisted.
+        let migrated = ws_api_test_args(OperationMode::Network, temp_dir.path())
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("second build should succeed");
+        assert_eq!(migrated.ws_api.address, default_local_address());
+        let persisted =
+            std::fs::read_to_string(temp_dir.path().join("config.toml")).expect("config persisted");
+        assert!(
+            persisted.contains(r#"ws-api-address = "::1""#),
+            "test premise: the loopback address must be persisted, got:\n{persisted}"
+        );
+
+        // Boot 3: the operator applies the documented remedy.
+        let mut remedied = ws_api_test_args(OperationMode::Network, temp_dir.path());
+        remedied.ws_api.allowed_source_cidrs = Some(vec!["100.64.0.0/10".to_string()]);
+        let cfg = remedied
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("third build should succeed");
+        assert_eq!(
+            cfg.ws_api.address,
+            default_listening_address(),
+            "the auto-widen remedy must still work once the migration has run"
         );
     }
 

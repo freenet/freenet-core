@@ -13,7 +13,7 @@ services:
       # opt-in. Uncomment to serve clients on other machines, and put an
       # authenticating reverse proxy in front of it if the network is not
       # fully trusted.
-      # - WS_API_ADDRESS=::
+      # - FREENET_WS_API_ADDRESS=::
     network_mode: host
     volumes:
       - freenet-data:/root/.cache/freenet
