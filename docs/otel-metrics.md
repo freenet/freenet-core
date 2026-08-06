@@ -70,11 +70,28 @@ Authorization: Bearer freenet/<pubkey>/<audience>/<timestamp>/<signature>
 
 to each export, where `<signature>` is an XEdDSA signature over the preceding
 fields made with the node's transport key, `<pubkey>` is that key in base58,
-and `<audience>` is the collector's `host:port`. It proves the metrics came
-from the node they claim to, and the audience field means a token sent to one
-collector cannot be replayed at another. Do not enable it for a collector that
-does not check these tokens — it ships a signed assertion of your node's
-identity to whatever it is pointed at.
+and `<audience>` identifies the exact URL the export was sent to. It proves the
+metrics came from the node they claim to, and the audience field means a token
+sent to one collector cannot be replayed at another. Do not enable it for a
+collector that does not check these tokens — it ships a signed assertion of
+your node's identity to whatever it is pointed at.
+
+`<audience>` is base58 of the first 16 bytes of `SHA-256` over the canonical
+target URL, which is `{scheme}://{host}:{port}{path}` with scheme and host
+lowercased, the port always explicit (80 for `http`, 443 for `https` when the
+URL omits it), the path verbatim, and any `user:password@` stripped. So an
+endpoint of `http://collector.example:4318` produces the audience for
+`http://collector.example:4318/v1/metrics`, which you can reproduce with:
+
+```bash
+printf 'http://collector.example:4318/v1/metrics' \
+  | openssl dgst -sha256 -binary | head -c 16 | base58
+```
+
+If your collector rejects tokens with an audience mismatch, compare that value
+against the endpoint in the node's "OTel metrics exporter started" log line —
+the two must name the same URL, including the path your ingress finally
+delivers to.
 
 ## Identifying a node
 
