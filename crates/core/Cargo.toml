@@ -133,11 +133,16 @@ tracing-appender = { workspace = true, optional = true }
 # is a goal here (see docs/design/otel-metrics-exporter.md, non-goals). It does
 # NOT drop trace: `http-proto` mandates `trace`, `prost` and
 # opentelemetry-proto, so those stay in the graph regardless.
-# reqwest-blocking-client is load-bearing, not incidental: PeriodicReader
-# exports from a dedicated thread via futures_executor::block_on, where an
-# async reqwest client would have no tokio reactor. reqwest-rustls adds TLS
-# so https:// collector endpoints actually work (otherwise every export to an
-# https endpoint silently fails at connect time).
+# NO reqwest-*-client / reqwest-rustls feature on purpose: tracing::otel always
+# supplies its own HttpClient, so the exporter never builds one (it only does
+# when none was given — opentelemetry-otlp src/exporter/http/mod.rs). Enabling
+# them would pull opentelemetry-http's reqwest 0.13, whose `rustls` feature is
+# hardwired to aws-lc-rs + rustls-platform-verifier: a second reqwest major, a
+# second TLS root store, a C/asm build (aws-lc-sys via cc+cmake) on every
+# release target, and two crypto providers in one rustls, which makes
+# `CryptoProvider::get_default_or_install_from_crate_features` panic.
+# Our client rides the workspace reqwest 0.12, which already has rustls-tls, so
+# https:// collector endpoints work with nothing new in the graph.
 # Direct dep so tracing::otel can implement HttpClient (per-request auth
 # headers); the crate is already in the graph via opentelemetry-otlp.
 opentelemetry-http = { workspace = true }
@@ -152,8 +157,6 @@ rand_core10 = { workspace = true }
 opentelemetry-otlp = { workspace = true, features = [
     "http-proto",
     "metrics",
-    "reqwest-blocking-client",
-    "reqwest-rustls",
     "internal-logs",
 ] }
 opentelemetry_sdk = { workspace = true }

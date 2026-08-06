@@ -365,75 +365,35 @@ Operator-facing documentation (encryption model, migration matrix,
 
 ## Two independent telemetry pipelines
 
-`telemetry-enabled` / `telemetry-endpoint` feed the project's central
-dashboard through a hand-rolled OTLP-JSON log POST (`tracing/telemetry.rs`).
+`telemetry-enabled` / `telemetry-endpoint` feed the project's central dashboard
+(`tracing/telemetry.rs`). `otel-telemetry-enabled` / `otel-endpoint` are a
+**separate, unrelated** OpenTelemetry SDK metrics pipeline (`tracing/otel.rs`):
+no shared config, no shared endpoint, no fallback in either direction, and
+`otel-endpoint` must never default to the dashboard collector.
 
-`otel-telemetry-enabled` / `otel-endpoint` are a **separate, unrelated**
-OpenTelemetry SDK metrics pipeline (`tracing/otel.rs`). The two share no
-config, no endpoint, and no fallback in either direction — enabling or
-disabling one has no effect on the other, and `otel-endpoint` must never
-default to the dashboard collector.
+Rules when touching `tracing/otel.rs`:
 
-The otel pipeline authenticates to the collector per `otel-auth-mode`:
-`freenet` (default) sends a per-request
-`Authorization: Bearer freenet/<pubkey>/<timestamp>/<signature>`
-token — an XEdDSA (Signal construction, `xeddsa` crate) signature over
-`freenet/<pubkey>/<timestamp>` (epoch seconds, all base58), signed with
-the x25519 transport secret itself
-(`TransportKeypair::auth_token_signer`). `<pubkey>` is the FULL base58
-x25519 transport public key — the node's one identity — so the collector
-verifies by converting Montgomery→Edwards (sign bit 0) and running stock
-Ed25519 verification; no shared secret, no second key, nothing assertable.
-`disabled` sends no header. Tokens are built per request
-(`tracing/otel.rs::bearer_token` via a custom `HttpClient`) so the timestamp
-stays fresh; future auth methods get new enum variants.
+- Observable instruments must read **cumulative, never-reset** values.
+  `TransportSnapshot` fields are period accumulators that `take_snapshot`
+  zeroes for the legacy telemetry worker, so observing one as a counter yields
+  a non-monotonic series whenever `telemetry-enabled` is also on.
+- Never export a `PeerId`, socket address, or any attribute identifying the
+  remote end of a connection. `PeerId` renders as `{pub_key}@{addr}`, which
+  leaks our address and re-identifies the node whenever it changes. This node's
+  identity is two resource attributes (`freenet.node.*`, one per export batch),
+  not a per-datapoint attribute. "Peer" means the *other* end of a connection.
+- Histograms get their base-2 exponential aggregation from one `with_view` in
+  `build_provider`. Do not add explicit bucket boundaries per instrument.
+- The exporter always installs its own `HttpClient`, so `opentelemetry-otlp`
+  needs none of its `reqwest-*`/TLS features — enabling one pulls a second
+  reqwest major, a second TLS stack, and a C/asm aws-lc build into every
+  release target.
 
-The otel pipeline honors the standard variables, which take priority over
-`otel-endpoint` in `config.toml`:
-`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_EXPORTER_OTLP_ENDPOINT`,
-`OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_SERVICE_NAME`,
-`OTEL_RESOURCE_ATTRIBUTES`, `OTEL_METRIC_EXPORT_INTERVAL`. Without any of
-them it exports to `http://localhost:4318`.
-
-All instruments are registered in `tracing/otel.rs::register_metrics`. Two
-kinds, and the choice is not stylistic:
-
-- **Observable** (gauges / `observable_counter`) own a callback that reads
-  existing state at collection time — the transport's cumulative counters, or
-  `network_status::otel_metrics_snapshot()`. Nothing is added to the hot path.
-  Read cumulative, never-reset values only: the `TransportSnapshot` fields are
-  period accumulators that `take_snapshot` zeroes for the legacy telemetry
-  worker, so observing one as a counter yields a non-monotonic series whenever
-  `telemetry-enabled` is also on.
-- **Synchronous** (`Histogram` / `Counter`) are held in the `INSTRUMENTS`
-  `OnceLock` and recorded via the `record_*` helpers. They need a stored handle
-  because an instrument built before `global::set_meter_provider` binds to the
-  no-op provider forever; when the exporter is off the helpers are one atomic
-  load and a branch.
-
-Every histogram is base-2 exponential via a single `with_view` in
-`build_provider` — do not add explicit bucket boundaries per instrument.
-
-No instrument carries an attribute identifying the remote end of a connection.
-Per-datapoint attributes cost per series and multiply by bucket count on
-histograms; identifying THIS node is done with two resource attributes,
-riding once per export batch. `freenet.node.pubkey`
-is the base58 ed25519 verifying key derived from the transport keypair —
-byte-equal to the bearer token's `<pubkey>` field, so the collector
-self-validates the node id against the signing key after verifying the
-signature. `freenet.node.fingerprint` is the transport public key fingerprint
-(what UIs and the legacy dashboard show), for cross-referencing only —
-unverifiable by the collector. Neither is ever a `PeerId` — `PeerId` renders as
-`{pub_key}@{addr}` and would export our socket address and re-identify the node
-on every address change. Note also that "peer" means the other end of a
-connection; metrics about ourselves use `freenet.node.*`.
-
-The proof-of-life gauge `freenet.process.memory.rss` is sourced from
-`node::resource_metrics::rss_bytes()`, which is implemented for Linux only.
-On macOS and Windows the gauge registers but reports no datapoints — an
-empty series there is expected, not a broken pipeline.
-
-Design: [`docs/design/otel-metrics-exporter.md`](docs/design/otel-metrics-exporter.md).
+Everything else — the bearer-token format, endpoint precedence, the
+`OTEL_*` variables honored, and per-instrument notes — is in
+[`docs/design/otel-metrics-exporter.md`](docs/design/otel-metrics-exporter.md),
+and operator-facing configuration is in
+[`docs/otel-metrics.md`](docs/otel-metrics.md).
 
 ## External Resources
 

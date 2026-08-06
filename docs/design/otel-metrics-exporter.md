@@ -1,7 +1,7 @@
 # Design: OpenTelemetry metrics exporter (isolated from existing telemetry)
 
-Status: proposed. Implementation plan:
-[`docs/superpowers/plans/2026-08-01-otel-metrics-exporter.md`](../superpowers/plans/2026-08-01-otel-metrics-exporter.md).
+Status: implemented (`crates/core/src/tracing/otel.rs`).
+Operator-facing configuration: [`docs/otel-metrics.md`](../otel-metrics.md).
 
 ## Problem
 
@@ -66,9 +66,18 @@ Registered in `tracing/otel.rs::register_metrics`.
 Everything but the histograms and the four synchronous counters is an
 observable callback over state that already existed for the local dashboard.
 
-Resource attributes: `service.instance.id` (transport public key fingerprint —
-never a `PeerId`, which embeds our socket address), `service.version`,
-`os.type`, `host.arch`, plus whatever `OTEL_RESOURCE_ATTRIBUTES` adds.
+Resource attributes: `freenet.node.pubkey` (the full base58 **x25519** transport
+public key — byte-equal to the bearer token's `<pubkey>` field, so a collector
+that verified the signature has also verified the node id),
+`freenet.node.fingerprint` (the truncated form UIs show, recomputable from
+`freenet.node.pubkey`, so the collector derives rather than trusts it),
+`service.name`, `service.version`, `os.type`, `host.arch`. Never a `PeerId`,
+which renders as `{pub_key}@{addr}` and would export our socket address.
+
+The literals are applied only for keys the operator did **not** declare through
+`OTEL_SERVICE_NAME` / `OTEL_RESOURCE_ATTRIBUTES`: `ResourceBuilder` seeds from
+the environment and then merges `with_attribute` over that seed, so setting one
+unconditionally would silently discard the operator's value.
 
 Not instrumented: `TransportMetrics::slowdowns_triggered` is read and reset but
 never incremented anywhere in the tree, so it is dead and was left out rather
@@ -96,9 +105,41 @@ New `OtelArgs` (clap + serde) and `OtelConfig` (resolved), beside
 |---|---|---|---|
 | `otel-telemetry-enabled` | `FREENET_OTEL_TELEMETRY_ENABLED` | `false` | Enable the SDK metrics exporter |
 | `otel-endpoint` | (see below) | none | OTLP/HTTP collector base URL |
+| `otel-auth-mode` | — | `disabled` | `freenet` (bearer token) or `disabled` (no header) |
 
 Default is `false`: nothing is exported yet, so off is the no-behavior-change
 default. Operators opt in.
+
+`otel-telemetry-enabled` is `Option<bool>` in `OtelArgs` and has no clap
+`default_value`, unlike its `telemetry-*` siblings. With a default, "unset" and
+"explicitly false" are indistinguishable after parsing, so
+`--otel-telemetry-enabled=false` could not override a `config.toml` that says
+`true` — the off switch would not work.
+
+### Collector authentication
+
+`otel-auth-mode = "freenet"` puts a per-request
+
+```
+Authorization: Bearer freenet/<pubkey>/<audience>/<timestamp>/<signature>
+```
+
+on every export. `<signature>` is an XEdDSA (Signal construction, `xeddsa`
+crate) signature over everything preceding it, made with the x25519 transport
+secret itself (`TransportKeypair::auth_token_signer`) — the node's one
+identity, no second key to cross-certify. All fields are base58 except
+`<audience>` (the target collector's `host[:port]`, taken from the request URI)
+and `<timestamp>` (epoch seconds). A collector verifies with a stock Ed25519
+library after converting the Montgomery public key to Edwards with sign bit 0,
+then checks `<audience>` against its own hostname and `<timestamp>` against its
+own clock. The audience binding is what stops a collector we export to from
+replaying our token at a different collector.
+
+The default is `disabled` — no `Authorization` header. Pointing the exporter at
+your own collector must not ship a signed assertion of this node's identity
+somewhere that never asked for one; `freenet` mode is for collectors that
+actually verify these tokens. Either way, an `Authorization` header supplied
+through `OTEL_EXPORTER_OTLP_HEADERS` is never overwritten.
 
 ### Endpoint precedence
 
@@ -127,20 +168,33 @@ No code for them.
 ## Dependencies
 
 `opentelemetry` is already non-optional in `crates/core/Cargo.toml`.
-`opentelemetry_sdk` and `opentelemetry-otlp` are optional and reachable only
-through the `trace-ot` feature; both are already in `Cargo.lock`. Making them
-non-optional is the whole dependency change — their default features already
-cover what is needed:
+`opentelemetry_sdk` and `opentelemetry-otlp` were optional and reachable only
+through the `trace-ot` feature; both were already in `Cargo.lock`. Making them
+non-optional, with `opentelemetry-otlp` trimmed to `http-proto` + `metrics` +
+`internal-logs`, is the dependency change. Net new packages in `Cargo.lock`:
+`xeddsa` and its `convert_case`.
 
-- `opentelemetry-otlp` defaults: `http-proto`, `reqwest-blocking-client`,
-  `metrics`, `trace`, `logs`, `internal-logs`.
-- `opentelemetry_sdk` defaults: `metrics`, `trace`, `logs` (workspace decl adds
-  `rt-tokio`).
+**No `reqwest-*-client` and no `reqwest-rustls` feature.** `tracing::otel`
+always supplies its own `HttpClient`, and `opentelemetry-otlp` builds a client
+only when none was given, so those features would be dead weight with a real
+cost: they pull `opentelemetry-http`'s reqwest **0.13**, whose `rustls` feature
+is hardwired to `aws-lc-rs` + `rustls-platform-verifier`. That is a second
+reqwest major, a second TLS root store, a C/assembly `aws-lc-sys` build (via
+`cc`+`cmake`, on musl and Windows release targets that install neither), and
+two crypto providers inside one rustls — which makes
+`CryptoProvider::get_default_or_install_from_crate_features` return `None` and
+panic for any caller that does not pass a provider explicitly. Note that
+switching to `reqwest-rustls-webpki-roots` does **not** avoid this: it still
+enables `reqwest/default-tls`, i.e. the same aws-lc stack, and merely adds
+webpki roots on top.
 
-`reqwest-blocking-client` is load-bearing, not incidental: `PeriodicReader` runs
-exports on a dedicated thread through `futures_executor::block_on`
-(`periodic_reader.rs:419`). An async reqwest client on that thread has no tokio
-reactor and would fail at export time.
+Our client is blocking on purpose: `PeriodicReader` runs exports on a dedicated
+thread through `futures_executor::block_on` (`periodic_reader.rs:419`), where
+an async reqwest client has no tokio reactor. It rides the workspace reqwest
+0.12, which already carries `rustls-tls`, so `https://` endpoints work with
+nothing new in the graph. It also applies the export timeout
+(`OTEL_EXPORTER_OTLP_METRICS_TIMEOUT` > `OTEL_EXPORTER_OTLP_TIMEOUT` > 10s)
+itself, because the SDK only resolves that for a client it built.
 
 Because a feature array may not name a non-optional dependency, `trace-ot` drops
 `"opentelemetry-otlp"` from its list.
@@ -168,19 +222,28 @@ inside a test process, which by construction trips signals 3 and 4.
 `crates/core/src/tracing/otel.rs`:
 
 ```
-MetricExporter::builder().with_http()[.with_endpoint(resolved)].build()
+MetricExporter::builder().with_http()[.with_endpoint(resolved)]
+    .with_http_client(OtlpHttpClient { .. })     // always ours; signs when auth is on
+    .build()
   → SdkMeterProvider::builder()
         .with_periodic_exporter(exporter)
         .with_resource(Resource::builder()
-            .with_service_name("freenet-peer")
-            .with_attribute(KeyValue::new("peer.id", local_peer_id))
+            .with_service_name("freenet-node")   // only if OTEL_* did not set it
+            .with_attribute(KeyValue::new("freenet.node.pubkey", pubkey))
+            .with_attribute(KeyValue::new("freenet.node.fingerprint", fingerprint))
             .build())
+        .with_view(/* base-2 exponential for every histogram */)
         .build()
-  → opentelemetry::global::set_meter_provider(provider.clone())
+  → opentelemetry::global::set_meter_provider(provider)
 ```
 
-Exporter build failure logs a WARN and returns `None`. Metrics export must never
-fail node startup.
+Exporter build failure logs a WARN and the node starts anyway. Metrics export
+must never fail node startup.
+
+The whole build runs on a plain `std::thread`: `reqwest::blocking::Client` owns
+a private tokio runtime, and creating or dropping one inside an async context
+panics with "Cannot drop a runtime in a context where blocking is not allowed".
+`init` is called from the node's async build path.
 
 No wrapper type, no registry, no facade. Future instrumentation is
 `opentelemetry::global::meter("freenet").u64_counter(…)` at the call site.
@@ -197,7 +260,7 @@ at in a collector to confirm the pipeline works.
 Not wired. `global::set_meter_provider` holds a reference for the process
 lifetime, and `PeriodicReader` exports every 60s, so at most one partial interval
 is lost at exit. Flushing on the signal path is plumbing this does not need yet;
-the code carries a `ponytail:` comment naming the ceiling and the upgrade path.
+the code carries a `NOTE:` comment naming the ceiling and the upgrade path.
 
 ## Wire-up
 
@@ -205,10 +268,15 @@ the code carries a `ponytail:` comment naming the ceiling and the upgrade path.
 `TelemetryReporter::new` call (`node.rs:754`):
 
 ```rust
-otel::init(&self.config.otel, self.local_peer_id_string());
+crate::tracing::otel::init(&self.config.otel, &self.key_pair);
 ```
 
-The provider is registered globally; nothing is stored on `Node`.
+The transport keypair, not a `PeerId`: it yields both identity resource
+attributes and, in `freenet` auth mode, the token signing key. The provider is
+registered globally; nothing is stored on `Node`. `init` returns the
+suppression reason (or `None` when it started) so a test can prove it consults
+that check before building anything — `init` is otherwise unreachable under
+`cfg(test)`.
 
 ## Testing
 
@@ -223,7 +291,17 @@ The provider is registered globally; nothing is stored on `Node`.
   widening of the harness detector).
 - CLI/env parsing: `--otel-telemetry-enabled=false` parses as false. A bare
   clap flag with an `env` binding treats any value of the variable as true,
-  which would turn the exporter on for an operator trying to turn it off.
+  which would turn the exporter on for an operator trying to turn it off. It
+  also overrides a `config.toml` that says `true`, asserted through
+  `ConfigArgs::build()` rather than at parse level.
+- Auth: token shape and stock-Ed25519 verification; a token re-aimed at another
+  collector fails to verify; the header reaches a real socket in `freenet`
+  mode, is absent in `disabled` mode, and never replaces an operator-supplied
+  `Authorization`.
+- Pins that would otherwise be vacuous: `init` returns a suppression reason
+  under `cfg(test)` (deleting the check makes it build a pipeline instead), and
+  a cross-file scrape asserts every hot-path `record_*` mirror still exists in
+  `transport/metrics.rs` / `node/network_status.rs`.
 - Provider construction succeeds inside a tokio runtime against an unreachable
   endpoint (guards the reqwest-blocking-in-async-context concern; export failure
   is asynchronous and must not surface at build time).
@@ -232,26 +310,14 @@ The provider is registered globally; nothing is stored on `Node`.
 
 ## Risks
 
-- Making the two crates non-optional grows the default build. They do NOT
-  share reqwest with the existing HTTP client: `opentelemetry-otlp` pulls
-  reqwest 0.13, a separate major version from the workspace's reqwest 0.12.
-  `opentelemetry-otlp` is trimmed to `default-features = false` plus exactly
-  the metrics/http-proto/reqwest-blocking-client/reqwest-rustls/internal-logs
-  features. That drops the logs exporter only: `http-proto` mandates `trace`,
-  `prost` and `opentelemetry-proto`, so those remain in the default build and
-  the trim is narrower than "metrics-only". The remaining cost is a second
-  reqwest major version plus the trace+metrics OTLP exporter — confirm
-  cross-compile targets still build
-  (`.github/workflows/cross-compile.yml`,
-  `crates/core/tests/cross_compile_feature_split.rs`).
-- `reqwest-rustls` pulls `aws-lc-rs`/`aws-lc-sys`, which builds C sources via
-  CMake, and rustls 0.23 unification turns it on workspace-wide. Prebuilt musl
-  bindings ship for both release targets and the musl jobs are native-arch, so
-  this is expected to work — but `cross-compile.yml` never runs on PRs and does
-  not install `cmake`, so a failure would land after merge on the release path.
-  Verify with a `workflow_dispatch` run on the branch before merging.
+- Making the two crates non-optional grows the default build: the trim drops
+  the logs exporter only, since `http-proto` mandates `trace`, `prost` and
+  `opentelemetry-proto`. No new native toolchain requirement — see
+  Dependencies — so the musl/Windows release targets in
+  `.github/workflows/cross-compile.yml` (which never runs on PRs) build the
+  same way they did before.
 - `global::set_meter_provider` is process-global. A `trace-ot` build also sets
-  OTel globals (tracer provider, not meter provider) — confirm no conflict.
+  OTel globals (tracer provider, not meter provider).
 - `reqwest/blocking` gets enabled workspace-wide by feature unification, which
   pulls in a background runtime thread for blocking clients.
 
@@ -259,4 +325,4 @@ The provider is registered globally; nothing is stored on `Node`.
 
 This is a feature, not a bug fix. Per
 [CONTRIBUTING.md](../../CONTRIBUTING.md) it needs a maintainer-approved issue
-before implementation starts.
+before implementation starts — see #5046.
