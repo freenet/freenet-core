@@ -58,7 +58,7 @@ rather than trusted, and the flag has to stay in whatever launches the node:
   drop-in overriding `ExecStart`. Do **not** hand-edit the generated unit file:
   that trips the installer's checksum, permanently marks the unit as
   user-modified, and opts the node out of every future unit-template change.
-- **Docker** — `WS_API_ADDRESS` in the compose `environment:` block.
+- **Docker** — `FREENET_WS_API_ADDRESS` in the compose `environment:` block.
 - **By hand** — the flag on the command line, every time.
 
 A **specific** address (`192.0.2.10`, `127.0.0.5`) is not a value this code ever
@@ -109,3 +109,9 @@ delegate-secret namespace. It adds isolation for well-behaved clients; it does
 not remove the shared namespace. A connection that simply omits the token still
 lands in the node's single-user context. So hosted mode does not make a
 non-loopback bind safe, and the exposure warning fires for one regardless.
+
+**Known gap:** on a loopback bind with hosted mode on, **no warning fires** —
+including when a reverse proxy is in front of the node. Treat that silence as
+"not yet reported", not as "checked and safe". If you run a hosted node behind a
+public proxy, keep an eye on the shared namespace yourself; making the warning
+conditional on what is actually in it is tracked separately.

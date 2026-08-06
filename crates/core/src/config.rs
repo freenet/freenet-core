@@ -3119,7 +3119,7 @@ const fn default_local_address() -> IpAddr {
 /// See [`WsApiExposure`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WsApiAddressSource {
-    /// The operator named an address (`--ws-api-address`, `WS_API_ADDRESS`, or
+    /// The operator named an address (`--ws-api-address`, `FREENET_WS_API_ADDRESS`, or
     /// a `ws-api-address` key in `config.toml` that this code could not itself
     /// have written). Used verbatim.
     ///
@@ -3151,8 +3151,14 @@ pub struct WsApiExposure {
     /// How the bind address was chosen.
     pub source: WsApiAddressSource,
     /// A `ws-api-address` this code could itself have auto-written, discarded
-    /// from `config.toml` during the merge so it could be re-derived. `Some`
-    /// only when the operator supplied no address by flag or env.
+    /// from `config.toml` during the merge so it could be re-derived.
+    ///
+    /// `Some` only when the operator supplied no address by flag or env AND the
+    /// re-derivation actually MOVED the bind. A value that re-derives to itself
+    /// — the steady state from the second boot onward — is not recorded, because
+    /// re-announcing an unchanged bind every boot is how a log line gets tuned
+    /// out. Which direction it moved selects the message; see
+    /// `Config::log_client_api_exposure`.
     pub dropped_persisted_address: Option<IpAddr>,
 }
 
@@ -3302,7 +3308,8 @@ fn resolve_ws_api_address(
 /// current state rather than a structural guarantee. Making this branch fire
 /// only when the shared namespace actually holds something needs a probe of the
 /// secrets tree, which is a separate change with its own failure modes — it is
-/// tracked separately rather than bolted onto a default-hardening PR, because a
+/// tracked in advisory GHSA-824h-7x5x-wfmf §8, with the measured tree shape and
+/// the requirements, rather than bolted onto a default-hardening PR, because a
 /// probe that is wrong in either direction is worse than no warning: too eager
 /// and it fires on every boot of the flagship and trains operators to ignore the
 /// one signal there is.
@@ -9495,7 +9502,7 @@ shutdown-drain-secs = 42
         }
     }
 
-    /// `ALLOWED_HOST=` declared with no value — routine in a docker-compose
+    /// `FREENET_ALLOWED_HOST=` declared with no value — routine in a docker-compose
     /// `.env`, a k8s ConfigMap, or a systemd `Environment=` line — parses as
     /// `Some(vec![""])`. Reading that as intent would widen the bind on a node
     /// whose operator granted nothing.
@@ -9588,7 +9595,9 @@ shutdown-drain-secs = 42
         }
     }
 
-    /// The exposure warning fires on hosted-mode-off AND (non-loopback bind OR
+    /// The exposure warning fires on a non-loopback bind REGARDLESS of hosted
+    /// mode (an untokened connection reaches the shared namespace either way),
+    /// and additionally on (non-loopback bind OR
     /// an `--allowed-host` reverse-proxy grant). Both triggers matter: a proxy
     /// terminates the connection itself, so every visitor looks local to the
     /// node's own source-IP filters even when the bind is `127.0.0.1`.
@@ -10030,6 +10039,38 @@ shutdown-drain-secs = 42
             report.contains("tracing::warn!"),
             "log_client_api_exposure no longer warns about a shared-namespace exposure"
         );
+
+        // A re-derivation that MOVED the bind is reported in whichever direction
+        // it moved, and both branches must survive. The record-site filter is
+        // pinned above, so re-applying the old "suppress the contradiction" fix
+        // there fails — but deleting the widening `else` here achieves the same
+        // silence and is invisible to every behavioural test, because nothing
+        // asserts on emitted logs. That is the cannot-fail shape this function's
+        // own comment block warns about, so pin the selection by its message
+        // stems.
+        for (stem, direction) in [
+            ("can no longer reach this node's API", "narrowing"),
+            ("widened the bind", "widening"),
+        ] {
+            assert!(
+                report.contains(stem),
+                "log_client_api_exposure no longer reports the {direction} \
+                 re-derivation. Both directions must speak: silencing one is how \
+                 a node that got MORE exposed stopped saying so."
+            );
+        }
+
+        // Each renamed environment variable must keep its deprecation notice.
+        // Dropping a pair from the array is silent: the operator's old-style
+        // variable is then ignored with no explanation, which is exactly the
+        // failure the loop exists to prevent.
+        for legacy in ["WS_API_ADDRESS", "ALLOWED_HOST", "ALLOWED_SOURCE_CIDRS"] {
+            assert!(
+                report.contains(&format!("(\"{legacy}\", \"FREENET_{legacy}\")")),
+                "log_client_api_exposure no longer reports a leftover `{legacy}`; a \
+                 deployment relying on it goes loopback-only with no explanation"
+            );
+        }
 
         // The mode-keyed DEFAULT must not come back. Pin it on the resolver's
         // signature rather than on a text search of `build()`: `mode` is a
