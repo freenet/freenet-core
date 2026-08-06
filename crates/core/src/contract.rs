@@ -2953,6 +2953,50 @@ mod tests {
         ContractKey::from_params_and_code(&params, &code)
     }
 
+    /// GHSA-824h-7x5x-wfmf: the identity rendered to the HUMAN in a consent
+    /// prompt must come from the GATED origin.
+    ///
+    /// `caller_identity_from_origin` feeds `CallerIdentity` to
+    /// `DashboardPrompter`, which names the requesting app to the user deciding
+    /// whether to approve. Fed the raw `origin_contract`, a caller the node
+    /// cannot prove is local could mint a token for a well-known contract id,
+    /// drive a delegate that emits `RequestUserInput` with attacker-chosen text,
+    /// and have the prompt attribute the request to that app.
+    ///
+    /// This is a source pin rather than a behavioural test because reaching the
+    /// prompt needs a full delegate + prompter harness; what it must catch is
+    /// the gate being deleted or moved below its consumer, which it does. The
+    /// region is bounded to the function so the pin cannot match its own
+    /// assertion strings further down the file.
+    #[test]
+    fn consent_prompt_identity_comes_from_the_gated_origin() {
+        let src = include_str!("contract.rs");
+        let body = src
+            .split("async fn handle_delegate_with_contract_requests")
+            .nth(1)
+            .expect("handle_delegate_with_contract_requests must exist");
+        let body = body
+            .split("\nasync fn ")
+            .next()
+            .expect("bounded by the next free function");
+
+        let gate = body
+            .find("let origin_contract = if connection_scope.is_local()")
+            .expect(
+                "handle_delegate_with_contract_requests must gate `origin_contract` on \
+                 the connection scope before using it",
+            );
+        let prompt_use = body
+            .find("caller_identity_from_origin(origin_contract)")
+            .expect("the prompter's caller identity must be built from origin_contract");
+        assert!(
+            gate < prompt_use,
+            "the connection-scope gate must run BEFORE the origin reaches the \
+             consent prompt, or a non-local caller's forged app identity is \
+             rendered to the user"
+        );
+    }
+
     // Regression test for issue #3857: the executor's origin context must be
     // mapped onto the prompter's CallerIdentity correctly. Without this test,
     // accidentally swapping the Some/None arms — or wiring the wrong
