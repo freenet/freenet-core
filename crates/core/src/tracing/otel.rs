@@ -86,19 +86,30 @@ pub(crate) fn resolve_metrics_endpoint(
 }
 
 /// Build one `freenet`-mode bearer token:
-/// `freenet/<pubkey>/<timestamp>/<signature>`, where `<signature>` is
-/// the XEdDSA signature over `freenet/<pubkey>/<timestamp>`.
+/// `freenet/<pubkey>/<audience>/<timestamp>/<signature>`, where `<signature>`
+/// is the XEdDSA signature over everything preceding it.
 ///
 /// `<pubkey>` is the base58 full x25519 transport public key — the node's one
 /// real identity, the same key peers see and whose truncated fingerprint UIs
-/// display. `<timestamp>` is seconds since the Unix epoch, `<signature>` is
-/// base58 too.
+/// display. `<audience>` is the authority (`host[:port]`) of the collector the
+/// request is going to, so a token is only valid at the collector it was
+/// minted for: without it, any collector we export to could replay the token
+/// to any other collector accepting this scheme and impersonate this node.
+/// Authority rather than the full URL because it carries no `/`, which is the
+/// token's field separator. `<timestamp>` is seconds since the Unix epoch,
+/// `<signature>` is base58 too.
 /// Freshly built per export request so the timestamp stays current.
 ///
 /// Collector-side verification needs no exotic library: convert the
 /// Montgomery pubkey to Edwards (sign bit 0), then standard Ed25519 verify —
-/// see `node_pubkey_is_verifiable_with_stock_ed25519` below.
-pub(crate) fn bearer_token(signer: &xeddsa::xed25519::PrivateKey, pubkey_b58: &str) -> String {
+/// see `node_pubkey_is_verifiable_with_stock_ed25519` below. The collector
+/// must additionally check `<audience>` against its own hostname and
+/// `<timestamp>` against its own clock.
+pub(crate) fn bearer_token(
+    signer: &xeddsa::xed25519::PrivateKey,
+    pubkey_b58: &str,
+    audience: &str,
+) -> String {
     use xeddsa::xeddsa::Sign;
     // Wall-clock epoch seconds on purpose: the collector checks it against
     // ITS clock, so simulation time would be meaningless here.
@@ -106,7 +117,7 @@ pub(crate) fn bearer_token(signer: &xeddsa::xed25519::PrivateKey, pubkey_b58: &s
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default();
-    let signed_payload = format!("freenet/{pubkey_b58}/{timestamp}");
+    let signed_payload = format!("freenet/{pubkey_b58}/{audience}/{timestamp}");
     // OS entropy (SysRng), not GlobalRng: XEdDSA's Z randomness hedges the
     // signature nonce, which is cryptographic material — the same exception
     // documented in .claude/rules/code-style.md for keys/nonces. UnwrapErr is
@@ -119,30 +130,47 @@ pub(crate) fn bearer_token(signer: &xeddsa::xed25519::PrivateKey, pubkey_b58: &s
     format!("{signed_payload}/{signature}")
 }
 
-/// OTLP HTTP client that injects a fresh `Authorization: Bearer` token
-/// (see [`bearer_token`]) into every export request, delegating the actual
-/// send to the same blocking reqwest client the exporter would use anyway.
-struct FreenetAuthClient {
+/// The exporter's only HTTP transport, in every auth mode.
+///
+/// Always installed, so `opentelemetry-otlp` never builds a client of its own
+/// and none of its `reqwest-*` features have to be enabled — see the comment
+/// on the dependency in `crates/core/Cargo.toml` for the dependency-graph
+/// reason that matters.
+///
+/// With `signer` set (`otel-auth-mode = "freenet"`) it adds a fresh
+/// `Authorization: Bearer` token (see [`bearer_token`]) to each request;
+/// with it unset it is a plain sender.
+struct OtlpHttpClient {
     inner: reqwest::blocking::Client,
-    signer: xeddsa::xed25519::PrivateKey,
+    /// `None` in `disabled` auth mode.
+    signer: Option<xeddsa::xed25519::PrivateKey>,
     pubkey_b58: String,
 }
 
 // Manual impl: never print the signing key.
-impl std::fmt::Debug for FreenetAuthClient {
+impl std::fmt::Debug for OtlpHttpClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FreenetAuthClient").finish_non_exhaustive()
+        f.debug_struct("OtlpHttpClient").finish_non_exhaustive()
     }
 }
 
 #[async_trait::async_trait]
-impl HttpClient for FreenetAuthClient {
+impl HttpClient for OtlpHttpClient {
     async fn send_bytes(&self, mut request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
-        let token = bearer_token(&self.signer, &self.pubkey_b58);
-        request.headers_mut().insert(
-            http::header::AUTHORIZATION,
-            http::HeaderValue::from_str(&format!("Bearer {token}"))?,
-        );
+        // Never clobber an operator-supplied header: the exporter applies
+        // OTEL_EXPORTER_OTLP_HEADERS before calling us, so a hosted collector
+        // configured with `Authorization: Basic ...` there must win. Our
+        // bearer token is one auth scheme among several, not the only one.
+        if let Some(signer) = self.signer.as_ref() {
+            if !request.headers().contains_key(http::header::AUTHORIZATION) {
+                let audience = request.uri().authority().map(|a| a.as_str()).unwrap_or("");
+                let token = bearer_token(signer, &self.pubkey_b58, audience);
+                request.headers_mut().insert(
+                    http::header::AUTHORIZATION,
+                    http::HeaderValue::from_str(&format!("Bearer {token}"))?,
+                );
+            }
+        }
         // Hand-rolled send, mirroring opentelemetry-http's blocking impl:
         // that impl is on reqwest 0.13's client (opentelemetry-http's own
         // dep), while the workspace is on 0.12, so we can't delegate to it.
@@ -150,11 +178,14 @@ impl HttpClient for FreenetAuthClient {
         // default client is blocking: PeriodicReader exports via block_on on
         // a dedicated thread. Fold both in when the workspace moves to 0.13.
         let request: reqwest::blocking::Request = request.map(|body| body.to_vec()).try_into()?;
-        let mut response = self.inner.execute(request)?.error_for_status()?;
+        // Deliberately no `error_for_status()`: it discards the body, which is
+        // where OTLP puts rejection detail. Hand the whole response back and
+        // the SDK turns a non-2xx into an export error itself, logging the
+        // status, the URL and the body (`HttpClient.StatusError`).
+        let mut response = self.inner.execute(request)?;
+        let status = response.status();
         let headers = std::mem::take(response.headers_mut());
-        let mut http_response = Response::builder()
-            .status(response.status())
-            .body(response.bytes()?)?;
+        let mut http_response = Response::builder().status(status).body(response.bytes()?)?;
         *http_response.headers_mut() = headers;
         Ok(http_response)
     }
@@ -175,14 +206,23 @@ const METER_NAME: &str = "freenet";
 /// (see [`build_provider`]) and, when `otel-auth-mode = "freenet"`, its
 /// derived signing key authenticates every export request (see
 /// [`bearer_token`]).
-pub fn init(config: &OtelConfig, keypair: &crate::transport::TransportKeypair) {
+///
+/// Returns the reason it did NOT start, or `None` when the pipeline is
+/// installed. Callers ignore it; it exists so a test can assert that `init`
+/// consults [`otel_suppression_reason`] and returns before building anything —
+/// deleting the check would make an enabled config return `None` under
+/// `cfg(test)`, i.e. ship a test network's metrics to a collector.
+pub(crate) fn init(
+    config: &OtelConfig,
+    keypair: &crate::transport::TransportKeypair,
+) -> Option<OtelSuppression> {
     if let Some(reason) = otel_suppression_reason(
         config,
         cfg!(test),
         super::telemetry::running_under_cargo_test(),
     ) {
         tracing::debug!(?reason, "OTel metrics exporter not started");
-        return;
+        return Some(reason);
     }
 
     let endpoint = resolve_metrics_endpoint(
@@ -195,13 +235,7 @@ pub fn init(config: &OtelConfig, keypair: &crate::transport::TransportKeypair) {
             .as_deref(),
     );
 
-    // `service.instance.id` IS the auth identity: the same base58 ed25519
-    // verifying key the bearer token carries as `<pubkey>`, so the collector
-    // self-validates the node id against the signing key by string equality
-    // after verifying the signature. Derived from the keypair even when auth
-    // is disabled, so the id is stable across auth-mode changes.
-    let pubkey = bs58::encode(keypair.public_key_bytes()).into_string();
-    let fingerprint = keypair.public().to_string();
+    let (pubkey, fingerprint) = identity_attributes(keypair);
     let auth_signer = match config.auth_mode {
         crate::config::OtelAuthMode::Freenet => Some(keypair.auth_token_signer()),
         crate::config::OtelAuthMode::Disabled => None,
@@ -209,7 +243,7 @@ pub fn init(config: &OtelConfig, keypair: &crate::transport::TransportKeypair) {
 
     match build_provider(endpoint.as_deref(), pubkey, fingerprint, auth_signer) {
         Ok(provider) => {
-            // ponytail: no shutdown hook. `set_meter_provider` holds a
+            // NOTE: no shutdown hook. `set_meter_provider` holds a
             // reference for the process lifetime and PeriodicReader exports
             // every 60s (OTEL_METRIC_EXPORT_INTERVAL), so at most one partial
             // interval is lost at exit. If that tail ever matters, keep the
@@ -217,10 +251,29 @@ pub fn init(config: &OtelConfig, keypair: &crate::transport::TransportKeypair) {
             // shutdown path in `bin/freenet.rs`.
             global::set_meter_provider(provider);
             register_metrics();
+            // Log where this node's signed identity is actually going,
+            // including when an inherited OTEL_* variable overrode the
+            // configured endpoint — an operator who cannot see that from the
+            // logs cannot tell their collector was bypassed.
+            let env_endpoint =
+                std::env::var(opentelemetry_otlp::OTEL_EXPORTER_OTLP_METRICS_ENDPOINT)
+                    .or_else(|_| std::env::var(opentelemetry_otlp::OTEL_EXPORTER_OTLP_ENDPOINT))
+                    .ok();
+            if let (Some(env_endpoint), Some(cfg_endpoint)) =
+                (env_endpoint.as_deref(), config.endpoint.as_deref())
+            {
+                tracing::warn!(
+                    %env_endpoint,
+                    %cfg_endpoint,
+                    "OTEL_EXPORTER_OTLP_* overrides the configured otel-endpoint"
+                );
+            }
             tracing::info!(
                 endpoint = endpoint
                     .as_deref()
-                    .unwrap_or("<resolved by OTEL_* env or SDK default>"),
+                    .or(env_endpoint.as_deref())
+                    .unwrap_or("http://localhost:4318 (SDK default)"),
+                auth_mode = ?config.auth_mode,
                 "OTel metrics exporter started"
             );
         }
@@ -231,6 +284,25 @@ pub fn init(config: &OtelConfig, keypair: &crate::transport::TransportKeypair) {
             );
         }
     }
+    None
+}
+
+/// The two resource attributes that identify THIS node, both derived from the
+/// one transport keypair: `(freenet.node.pubkey, freenet.node.fingerprint)`.
+///
+/// A function rather than two inline expressions in [`init`] so the guards in
+/// this module's tests assert on what production actually attaches — building
+/// the same strings in a test body would pass no matter what `init` does.
+fn identity_attributes(keypair: &crate::transport::TransportKeypair) -> (String, String) {
+    // The full base58 x25519 transport public key. Byte-equal to the bearer
+    // token's `<pubkey>` field, so the collector self-validates the node id
+    // against the signing key after verifying the signature. Derived from the
+    // keypair even when auth is disabled, so the id is stable across auth-mode
+    // changes. NEVER a `PeerId`: its Display is `{pub_key}@{addr}`.
+    (
+        bs58::encode(keypair.public_key_bytes()).into_string(),
+        keypair.public().to_string(),
+    )
 }
 
 /// Build the OTLP/HTTP exporter and meter provider.
@@ -286,6 +358,38 @@ pub(crate) fn build_provider(
     })
 }
 
+/// Per-export HTTP timeout, resolved exactly like `opentelemetry-otlp` would
+/// (`OTEL_EXPORTER_OTLP_METRICS_TIMEOUT` > `OTEL_EXPORTER_OTLP_TIMEOUT` >
+/// 10s, in milliseconds). The SDK applies its own resolution only to a client
+/// it builds itself, and we always supply one, so it has to happen here.
+fn export_timeout() -> std::time::Duration {
+    [
+        opentelemetry_otlp::OTEL_EXPORTER_OTLP_METRICS_TIMEOUT,
+        opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT,
+    ]
+    .iter()
+    .find_map(|var| std::env::var(var).ok()?.trim().parse::<u64>().ok())
+    .map(std::time::Duration::from_millis)
+    .unwrap_or(opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT)
+}
+
+/// Resource attribute keys the operator declared through the environment,
+/// which must not be overwritten — see the merge note in
+/// [`build_provider_blocking`].
+fn env_declared_resource_keys() -> Vec<String> {
+    let mut keys = Vec::new();
+    if std::env::var("OTEL_SERVICE_NAME").is_ok_and(|v| !v.trim().is_empty()) {
+        keys.push("service.name".to_owned());
+    }
+    if let Ok(attrs) = std::env::var("OTEL_RESOURCE_ATTRIBUTES") {
+        keys.extend(attrs.split(',').filter_map(|pair| {
+            let key = pair.split('=').next()?.trim();
+            (!key.is_empty()).then(|| key.to_owned())
+        }));
+    }
+    keys
+}
+
 fn build_provider_blocking(
     endpoint: Option<&str>,
     pubkey: String,
@@ -296,32 +400,48 @@ fn build_provider_blocking(
     if let Some(endpoint) = endpoint {
         builder = builder.with_endpoint(endpoint);
     }
-    if let Some(signer) = auth_signer {
-        // Same blocking client the exporter defaults to (PeriodicReader
-        // exports off-runtime — see Cargo.toml), wrapped to sign each request.
-        builder = builder.with_http_client(FreenetAuthClient {
-            inner: reqwest::blocking::Client::new(),
-            signer,
-            pubkey_b58: pubkey.clone(),
-        });
-    }
+    // Always ours, in every auth mode — see `OtlpHttpClient`. Blocking on
+    // purpose: PeriodicReader exports off-runtime (see Cargo.toml). The
+    // timeout is the one the SDK would have applied to its own client, which
+    // it does not apply to a supplied one.
+    builder = builder.with_http_client(OtlpHttpClient {
+        inner: reqwest::blocking::Client::builder()
+            .timeout(export_timeout())
+            .build()
+            .unwrap_or_else(|_| reqwest::blocking::Client::new()),
+        signer: auth_signer,
+        pubkey_b58: pubkey.clone(),
+    });
     let exporter = builder.build()?;
 
-    // `service.name` is overridden by OTEL_SERVICE_NAME / OTEL_RESOURCE_ATTRIBUTES
-    // when the operator sets them; the SDK reads those itself.
-    //
     // Resource attributes ride once per export batch, not per datapoint, so
     // identifying THIS node here costs nothing per series — unlike a
     // per-datapoint attribute, which is why no instrument below carries one
     // identifying the remote end of a connection.
-    let resource = Resource::builder()
-        .with_service_name("freenet-node")
-        .with_attribute(KeyValue::new("freenet.node.pubkey", pubkey))
-        .with_attribute(KeyValue::new("freenet.node.fingerprint", fingerprint))
-        .with_attribute(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
-        .with_attribute(KeyValue::new("os.type", std::env::consts::OS))
-        .with_attribute(KeyValue::new("host.arch", std::env::consts::ARCH))
-        .build();
+    //
+    // `Resource::builder` seeds from OTEL_SERVICE_NAME / OTEL_RESOURCE_ATTRIBUTES
+    // and then `with_attribute`/`with_service_name` MERGE OVER that seed, so
+    // setting a literal unconditionally silently discards the operator's
+    // value: two nodes on one host with distinct OTEL_SERVICE_NAMEs would both
+    // export `service.name=freenet-node`. Only fill in what the environment
+    // did not declare.
+    let declared = env_declared_resource_keys();
+    let mut resource = Resource::builder();
+    if !declared.iter().any(|k| k == "service.name") {
+        resource = resource.with_service_name("freenet-node");
+    }
+    for (key, value) in [
+        ("freenet.node.pubkey", pubkey),
+        ("freenet.node.fingerprint", fingerprint),
+        ("service.version", env!("CARGO_PKG_VERSION").to_owned()),
+        ("os.type", std::env::consts::OS.to_owned()),
+        ("host.arch", std::env::consts::ARCH.to_owned()),
+    ] {
+        if !declared.iter().any(|k| k == key) {
+            resource = resource.with_attribute(KeyValue::new(key, value));
+        }
+    }
+    let resource = resource.build();
 
     Ok(SdkMeterProvider::builder()
         .with_periodic_exporter(exporter)
@@ -397,7 +517,7 @@ pub(crate) fn record_nat_traversal(result: &'static str) {
 
 /// Record an operation outcome. `op` is one of get/put/update/subscribe.
 ///
-/// ponytail: outcome only, no duration histogram — no driver measures its own
+/// NOTE: outcome only, no duration histogram — no driver measures its own
 /// elapsed time today, and adding one means threading `TimeSource` through
 /// every `op_ctx_task` (raw `Instant::now()` is banned in this crate). Add the
 /// histogram when someone needs operation latency percentiles.
@@ -632,12 +752,14 @@ fn register_queue_metrics(meter: &opentelemetry::metrics::Meter) {
 
     let _depth = meter
         .u64_observable_gauge("freenet.contract.queue.depth")
-        .with_description("Current fair-queue occupancy")
+        .with_description(
+            "Current fair-queue occupancy, per tier. No `total` series: it would \
+             double-count under `sum by (queue)` — sum the tiers instead.",
+        )
         .with_callback(|observer| {
             if let Some(s) = snapshot() {
                 let q = &s.fair_queue;
                 for (tier, depth) in [
-                    ("total", q.depth_total),
                     ("client_local", q.depth_client_local),
                     ("network_relay", q.depth_network_relay),
                     ("background", q.depth_background),
@@ -698,6 +820,9 @@ mod tests {
     use super::*;
     use crate::config::OtelConfig;
 
+    /// The collector this module's tests mint tokens for.
+    const TEST_AUDIENCE: &str = "collector.example:4318";
+
     fn enabled_config() -> OtelConfig {
         OtelConfig {
             enabled: true,
@@ -711,7 +836,7 @@ mod tests {
     fn token_fixture() -> (crate::transport::TransportKeypair, String) {
         let keypair = crate::transport::TransportKeypair::new();
         let pubkey_b58 = bs58::encode(keypair.public_key_bytes()).into_string();
-        let token = bearer_token(&keypair.auth_token_signer(), &pubkey_b58);
+        let token = bearer_token(&keypair.auth_token_signer(), &pubkey_b58, TEST_AUDIENCE);
         (keypair, token)
     }
 
@@ -722,14 +847,19 @@ mod tests {
         let (keypair, token) = token_fixture();
 
         let parts: Vec<&str> = token.split('/').collect();
-        let [scheme, pubkey, timestamp, signature] = parts[..] else {
-            panic!("expected 4 /-separated parts, got {token}");
+        let [scheme, pubkey, audience, timestamp, signature] = parts[..] else {
+            panic!("expected 5 /-separated parts, got {token}");
         };
         assert_eq!(scheme, "freenet");
         assert_eq!(
             pubkey,
             bs58::encode(keypair.public_key_bytes()).into_string(),
             "pubkey part must be the full base58 x25519 transport public key"
+        );
+        assert_eq!(
+            audience, TEST_AUDIENCE,
+            "the token must name the collector it was minted for, or it can be \
+             replayed to any other collector accepting this scheme"
         );
         let ts: u64 = timestamp.parse().expect("timestamp is epoch seconds");
         assert!(
@@ -738,7 +868,7 @@ mod tests {
         );
         // The signature covers everything before its own slash, and verifies
         // against the token's OWN pubkey — the transport key itself.
-        let signed_payload = format!("freenet/{pubkey}/{timestamp}");
+        let signed_payload = format!("freenet/{pubkey}/{audience}/{timestamp}");
         let sig_bytes: [u8; 64] = bs58::decode(signature)
             .into_vec()
             .unwrap()
@@ -782,16 +912,11 @@ mod tests {
             .expect("stock ed25519 verify after Montgomery->Edwards conversion");
     }
 
-    #[test]
-    fn send_bytes_puts_a_verifiable_bearer_header_on_the_wire() {
+    /// One-shot collector on a real socket: returns its address and a handle
+    /// yielding the raw request text it received.
+    fn oneshot_collector() -> (std::net::SocketAddr, std::thread::JoinHandle<String>) {
         use std::io::{Read, Write};
 
-        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-
-        // The full auth transport path: header injection plus the
-        // http::Request -> reqwest::blocking::Request conversion, observed
-        // from the collector's side of a real socket. Plain #[test], not
-        // tokio: the blocking client must stay out of async contexts.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
@@ -812,39 +937,62 @@ mod tests {
                 .unwrap();
             String::from_utf8_lossy(&raw).into_owned()
         });
+        (addr, server)
+    }
 
-        let keypair = crate::transport::TransportKeypair::new();
-        let pubkey_b58 = bs58::encode(keypair.public_key_bytes()).into_string();
-        let client = FreenetAuthClient {
-            inner: reqwest::blocking::Client::new(),
-            signer: keypair.auth_token_signer(),
-            pubkey_b58: pubkey_b58.clone(),
-        };
-        let request = Request::builder()
+    /// The `Authorization` header value as the collector saw it, if any.
+    fn wire_auth_header(raw: &str) -> Option<String> {
+        raw.lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+            .map(|l| l.split_once(':').unwrap().1.trim().to_owned())
+    }
+
+    fn post_export(client: &OtlpHttpClient, addr: std::net::SocketAddr, auth: Option<&str>) {
+        let mut request = Request::builder()
             .method("POST")
-            .uri(format!("http://{addr}/v1/metrics"))
-            .body(Bytes::from_static(b"export-payload"))
-            .unwrap();
+            .uri(format!("http://{addr}/v1/metrics"));
+        if let Some(auth) = auth {
+            request = request.header(http::header::AUTHORIZATION, auth);
+        }
+        let request = request.body(Bytes::from_static(b"export-payload")).unwrap();
         // futures' executor, not tokio: send_bytes blocks internally.
         let response = futures::executor::block_on(client.send_bytes(request)).unwrap();
         assert!(response.status().is_success());
+    }
+
+    fn test_client(keypair: &crate::transport::TransportKeypair, signed: bool) -> OtlpHttpClient {
+        OtlpHttpClient {
+            inner: reqwest::blocking::Client::new(),
+            signer: signed.then(|| keypair.auth_token_signer()),
+            pubkey_b58: bs58::encode(keypair.public_key_bytes()).into_string(),
+        }
+    }
+
+    #[test]
+    fn send_bytes_puts_a_verifiable_bearer_header_on_the_wire() {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+        // The full auth transport path: header injection plus the
+        // http::Request -> reqwest::blocking::Request conversion, observed
+        // from the collector's side of a real socket. Plain #[test], not
+        // tokio: the blocking client must stay out of async contexts.
+        let (addr, server) = oneshot_collector();
+        let keypair = crate::transport::TransportKeypair::new();
+        let pubkey_b58 = bs58::encode(keypair.public_key_bytes()).into_string();
+        post_export(&test_client(&keypair, true), addr, None);
 
         let raw = server.join().unwrap();
-        let auth = raw
-            .lines()
-            .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
-            .expect("Authorization header must reach the wire");
-        let token = auth
-            .split_once(':')
-            .unwrap()
-            .1
-            .trim()
+        let token = wire_auth_header(&raw)
+            .expect("Authorization header must reach the wire")
             .strip_prefix("Bearer ")
-            .expect("Bearer scheme");
+            .expect("Bearer scheme")
+            .to_owned();
         let (payload, sig_b58) = token.rsplit_once('/').unwrap();
+        let audience = addr.to_string();
         assert!(
-            payload.starts_with(&format!("freenet/{pubkey_b58}/")),
-            "wire token must carry this node's pubkey: {token}"
+            payload.starts_with(&format!("freenet/{pubkey_b58}/{audience}/")),
+            "wire token must carry this node's pubkey and the collector's own \
+             authority as the audience: {token}"
         );
         // Verify exactly like a collector would — see
         // node_pubkey_is_verifiable_with_stock_ed25519.
@@ -869,13 +1017,48 @@ mod tests {
     }
 
     #[test]
+    fn an_operator_supplied_authorization_header_is_never_overwritten() {
+        // OTEL_EXPORTER_OTLP_HEADERS is applied by the exporter before it
+        // calls us. An operator pointing at a hosted collector that wants
+        // `Authorization: Basic ...` would otherwise get a 401 on every
+        // export with no way to turn our token off but `otel-auth-mode`.
+        let (addr, server) = oneshot_collector();
+        let keypair = crate::transport::TransportKeypair::new();
+        post_export(
+            &test_client(&keypair, true),
+            addr,
+            Some("Basic b3BlcmF0b3I="),
+        );
+        assert_eq!(
+            wire_auth_header(&server.join().unwrap()).as_deref(),
+            Some("Basic b3BlcmF0b3I="),
+            "the operator's own credentials must reach the collector"
+        );
+    }
+
+    #[test]
+    fn disabled_auth_mode_sends_no_authorization_header() {
+        // The default mode: exporting to your own collector must not ship a
+        // signed assertion of this node's identity there.
+        let (addr, server) = oneshot_collector();
+        let keypair = crate::transport::TransportKeypair::new();
+        post_export(&test_client(&keypair, false), addr, None);
+        assert_eq!(
+            wire_auth_header(&server.join().unwrap()),
+            None,
+            "auth-mode disabled must put no Authorization header on the wire"
+        );
+    }
+
+    #[test]
     fn fingerprint_attr_is_recomputable_from_the_pubkey_attr() {
         // Requirement: a node cannot fake the UI-facing fingerprint. The
         // collector derives it from the verified pubkey instead of trusting
         // it: b58-decode pubkey, take the first 12 bytes, b58-encode.
+        // Asserts on `identity_attributes` — the function production uses —
+        // not on strings rebuilt here, which would pass whatever init does.
         let keypair = crate::transport::TransportKeypair::new();
-        let pubkey_attr = bs58::encode(keypair.public_key_bytes()).into_string();
-        let fingerprint_attr = keypair.public().to_string();
+        let (pubkey_attr, fingerprint_attr) = identity_attributes(&keypair);
 
         let decoded = bs58::decode(&pubkey_attr).into_vec().unwrap();
         assert_eq!(
@@ -894,9 +1077,111 @@ mod tests {
         let pubkey = bs58::encode(keypair.public_key_bytes()).into_string();
         let signer = keypair.auth_token_signer();
         assert_ne!(
-            bearer_token(&signer, &pubkey),
-            bearer_token(&signer, &pubkey)
+            bearer_token(&signer, &pubkey, TEST_AUDIENCE),
+            bearer_token(&signer, &pubkey, TEST_AUDIENCE)
         );
+    }
+
+    #[test]
+    fn a_token_for_one_collector_does_not_verify_at_another() {
+        // The replay bound: a collector we export to must not be able to
+        // present our token at a different collector and impersonate us.
+        use xeddsa::xeddsa::Verify;
+
+        let keypair = crate::transport::TransportKeypair::new();
+        let (pubkey, _) = identity_attributes(&keypair);
+        let token = bearer_token(&keypair.auth_token_signer(), &pubkey, TEST_AUDIENCE);
+        let (payload, sig_b58) = token.rsplit_once('/').unwrap();
+        let sig_bytes: [u8; 64] = bs58::decode(sig_b58)
+            .into_vec()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let replayed = payload.replace(TEST_AUDIENCE, "other-collector:4318");
+        assert_ne!(replayed, payload, "audience must appear in the payload");
+        assert!(
+            xeddsa::xed25519::PublicKey(keypair.public_key_bytes())
+                .verify(replayed.as_bytes(), &sig_bytes)
+                .is_err(),
+            "a token re-aimed at another collector must fail verification"
+        );
+    }
+
+    #[test]
+    fn init_refuses_to_start_from_a_test_process() {
+        // The suppression check lives in `init`, and `init` is unreachable
+        // under cfg(test) — so without this, deleting the whole block leaves
+        // every test green and a `--id` test network ships to a collector.
+        // Under cfg(test) an ENABLED config must still come back suppressed;
+        // if the check were gone, init would build a pipeline and return None.
+        assert_eq!(
+            init(
+                &enabled_config(),
+                &crate::transport::TransportKeypair::new()
+            ),
+            Some(OtelSuppression::TestHarness),
+            "init must consult otel_suppression_reason and return before \
+             building anything"
+        );
+        assert!(
+            INSTRUMENTS.get().is_none(),
+            "a suppressed init must not have registered instruments"
+        );
+    }
+
+    /// Cross-file pin (a same-file scrape can be satisfied by its own literal
+    /// — see .claude/rules/bug-prevention-patterns.md): every hot-path mirror
+    /// that feeds a synchronous instrument must still exist. Delete one and
+    /// its counter reports zero forever with nothing else failing.
+    ///
+    /// Ceiling: presence in the file, not in the right function. A mirror
+    /// moved to the wrong call site still passes; a deleted one does not.
+    #[test]
+    fn every_sync_instrument_still_has_its_hot_path_mirror() {
+        for (source, call) in [
+            (
+                include_str!("../transport/metrics.rs"),
+                "crate::tracing::otel::record_rtt_ms(",
+            ),
+            (
+                include_str!("../transport/metrics.rs"),
+                "crate::tracing::otel::record_cwnd(",
+            ),
+            (
+                include_str!("../transport/metrics.rs"),
+                "crate::tracing::otel::record_transfer(\"completed\")",
+            ),
+            (
+                include_str!("../transport/metrics.rs"),
+                "crate::tracing::otel::record_transfer(\"failed\")",
+            ),
+            (
+                include_str!("../transport/metrics.rs"),
+                "crate::tracing::otel::record_nat_traversal(\"attempt\")",
+            ),
+            (
+                include_str!("../transport/metrics.rs"),
+                "crate::tracing::otel::record_nat_traversal(\"established\")",
+            ),
+            (
+                include_str!("../transport/metrics.rs"),
+                "crate::tracing::otel::record_nat_traversal(\"failed_error\")",
+            ),
+            (
+                include_str!("../transport/metrics.rs"),
+                "crate::tracing::otel::record_nat_traversal(\"failed_version\")",
+            ),
+            (
+                include_str!("../node/network_status.rs"),
+                "crate::tracing::otel::record_op_result(",
+            ),
+        ] {
+            assert!(
+                source.contains(call),
+                "missing hot-path mirror `{call}`: the instrument it feeds \
+                 would report zero forever"
+            );
+        }
     }
 
     #[test]
@@ -1044,6 +1329,23 @@ mod tests {
             INSTRUMENTS.get().is_none(),
             "recording must not lazily bind instruments to the no-op provider"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_builds_with_auth_disabled() {
+        // The default auth mode, and the only path where no signer is
+        // installed. It still gets our HttpClient — the exporter has no
+        // reqwest feature enabled and would fail with NoHttpClient otherwise.
+        let provider = build_provider(
+            Some("http://127.0.0.1:1/v1/metrics"),
+            "pubkey-under-test".to_string(),
+            "fingerprint-under-test".to_string(),
+            None,
+        )
+        .expect("exporter build must succeed with auth disabled");
+        tokio::task::spawn_blocking(move || provider.shutdown().expect("clean shutdown"))
+            .await
+            .expect("shutdown thread panicked");
     }
 
     #[tokio::test]

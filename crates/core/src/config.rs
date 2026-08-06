@@ -971,13 +971,11 @@ impl ConfigArgs {
             if cfg.telemetry.iface_tx_enabled {
                 self.telemetry.iface_tx_enabled = true;
             }
-            // otel-telemetry-enabled defaults to false via clap, so only the
-            // file-says-true direction needs handling — same one-directional
-            // override as reference-ping/iface-tx above. Kept separate from the
-            // telemetry merge on purpose: the two features are independent.
-            if cfg.otel.enabled {
-                self.otel.enabled = true;
-            }
+            // Kept separate from the telemetry merge above on purpose: the two
+            // features are independent. Unlike reference-ping/iface-tx this
+            // merge is bidirectional — `--otel-telemetry-enabled=false` parses
+            // to `Some(false)` and must override a config.toml that says true.
+            self.otel.enabled.get_or_insert(cfg.otel.enabled);
             if let Some(endpoint) = cfg.otel.endpoint {
                 self.otel.endpoint.get_or_insert(endpoint);
             }
@@ -1491,7 +1489,7 @@ impl ConfigArgs {
                 iface_tx_enabled: self.telemetry.iface_tx_enabled,
             },
             otel: OtelConfig {
-                enabled: self.otel.enabled,
+                enabled: self.otel.enabled.unwrap_or(false),
                 endpoint: self.otel.endpoint,
                 auth_mode: self.otel.auth_mode.unwrap_or_default(),
                 // Same --id rule as telemetry: simulated networks and
@@ -2840,28 +2838,25 @@ fn default_iface_tx_enabled() -> bool {
     false
 }
 
-/// Default OTLP/HTTP endpoint for the SDK metrics pipeline, used when neither
-/// the standard `OTEL_EXPORTER_OTLP_*` env vars nor `otel-endpoint` are set.
-///
-/// Deliberately NOT `DEFAULT_TELEMETRY_ENDPOINT`: `otel-telemetry-enabled` and
-/// `telemetry-enabled` are strictly isolated features that are not expected to
-/// share a backend. Pointing this pipeline at the central dashboard collector
-/// must always be an explicit operator choice.
-pub const DEFAULT_OTEL_ENDPOINT: &str = "http://localhost:4318";
-
 /// How the OTel exporter authenticates to the collector.
 ///
-/// `freenet` (the default) sends a per-request
-/// `Authorization: Bearer freenet/<pubkey>/<timestamp>/<signature>`
-/// token — an XEdDSA signature over `freenet/<pubkey>/<timestamp>`, signed
-/// with the node's x25519 transport secret — see
-/// `tracing::otel::bearer_token`. `disabled` sends no Authorization header.
-/// Future methods get new variants.
+/// `freenet` sends a per-request `Authorization: Bearer
+/// freenet/<pubkey>/<audience>/<timestamp>/<signature>` token — an XEdDSA
+/// signature over the preceding fields, signed with the node's x25519
+/// transport secret — see `tracing::otel::bearer_token`. Future methods get
+/// new variants.
+///
+/// `disabled` is the DEFAULT and sends no `Authorization` header: pointing the
+/// exporter at your own collector must not ship a signed assertion of this
+/// node's identity somewhere it was never asked to. Operators exporting to a
+/// collector that verifies freenet tokens opt in explicitly; anyone else
+/// carries their own auth in `OTEL_EXPORTER_OTLP_HEADERS`, which the exporter
+/// never overwrites.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum OtelAuthMode {
-    #[default]
     Freenet,
+    #[default]
     Disabled,
 }
 
@@ -2880,17 +2875,25 @@ pub struct OtelArgs {
     /// as true, so `FREENET_OTEL_TELEMETRY_ENABLED=false` would silently turn
     /// the exporter ON. This form accepts `--otel-telemetry-enabled`,
     /// `--otel-telemetry-enabled=false`, and a properly parsed env value.
+    ///
+    /// `Option` and NO `default_value`, unlike the sibling telemetry flags:
+    /// with a default, "unset" and "explicitly false" are indistinguishable
+    /// after parsing, so `build()` cannot let `--otel-telemetry-enabled=false`
+    /// override a `config.toml` that says true — i.e. the off switch would not
+    /// work. `None` means "not given"; `build()` resolves it to `false`.
     #[arg(
         id = "otel_telemetry_enabled",
         long = "otel-telemetry-enabled",
         env = "FREENET_OTEL_TELEMETRY_ENABLED",
         num_args = 0..=1,
-        default_value = "false",
         default_missing_value = "true",
         action = clap::ArgAction::Set
     )]
-    #[serde(rename = "otel-telemetry-enabled", default)]
-    pub enabled: bool,
+    #[serde(
+        rename = "otel-telemetry-enabled",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub enabled: Option<bool>,
 
     /// OTLP/HTTP collector base URL (e.g. `http://collector:4318`).
     ///
@@ -6539,15 +6542,17 @@ shutdown-drain-secs = 42
         // The new pipeline exports nothing yet, so shipping it on would be a
         // behavior change. Operators opt in explicitly.
         let args = OtelArgs::default();
-        assert!(
-            !args.enabled,
-            "otel-telemetry-enabled must default to false"
+        assert_eq!(
+            args.enabled, None,
+            "otel-telemetry-enabled unset must stay None so an explicit \
+             --otel-telemetry-enabled=false can override config.toml"
         );
         assert_eq!(args.endpoint, None, "no implicit collector");
         assert_eq!(
             args.auth_mode.unwrap_or_default(),
-            OtelAuthMode::Freenet,
-            "auth mode must default to the freenet bearer-token format"
+            OtelAuthMode::Disabled,
+            "auth must default off: pointing the exporter at a collector must \
+             not ship a signed assertion of this node's identity unasked"
         );
     }
 
@@ -6569,7 +6574,7 @@ shutdown-drain-secs = 42
         let cfg: OtelConfig = toml::from_str("").unwrap();
         assert_eq!(
             cfg.auth_mode,
-            OtelAuthMode::Freenet,
+            OtelAuthMode::Disabled,
             "absent key -> default"
         );
     }
@@ -6578,16 +6583,24 @@ shutdown-drain-secs = 42
     fn otel_flag_parses_from_cli() {
         use clap::Parser;
         let none = ConfigArgs::try_parse_from(["freenet"]).expect("bare parse");
-        assert!(!none.otel.enabled, "no flag -> off");
+        assert_eq!(none.otel.enabled, None, "no flag -> unset, not false");
         let set = ConfigArgs::try_parse_from(["freenet", "--otel-telemetry-enabled"])
             .expect("flag parse");
-        assert!(set.otel.enabled, "--otel-telemetry-enabled -> on");
+        assert_eq!(
+            set.otel.enabled,
+            Some(true),
+            "--otel-telemetry-enabled -> on"
+        );
         // Explicit `=false` must parse and mean false. Without this form the flag
         // would be a bare ArgAction::SetTrue, and clap turns ANY value of the bound
         // env var — including "false" — into true.
         let off = ConfigArgs::try_parse_from(["freenet", "--otel-telemetry-enabled=false"])
             .expect("explicit false parse");
-        assert!(!off.otel.enabled, "--otel-telemetry-enabled=false -> off");
+        assert_eq!(
+            off.otel.enabled,
+            Some(false),
+            "--otel-telemetry-enabled=false -> off"
+        );
         let with_ep = ConfigArgs::try_parse_from([
             "freenet",
             "--otel-endpoint",
@@ -6649,14 +6662,37 @@ shutdown-drain-secs = 42
         );
     }
 
-    #[test]
-    fn otel_endpoint_never_defaults_to_the_dashboard_collector() {
-        // Hard isolation requirement: the two pipelines share no backend.
-        assert_ne!(
-            DEFAULT_OTEL_ENDPOINT, DEFAULT_TELEMETRY_ENDPOINT,
-            "otel must not default to the central dashboard collector"
+    #[tokio::test]
+    async fn otel_cli_false_overrides_a_config_file_that_says_true() {
+        // The off switch has to work: an operator who exports to a collector
+        // and then needs it stopped must be able to do it from the command
+        // line without editing config.toml. `Some(false)` from the CLI beats
+        // the file; `None` (flag absent) lets the file's `true` through.
+        let temp_dir = tempfile::tempdir().unwrap();
+        clap_bare_args(temp_dir.path()).build().await.unwrap();
+        let path = temp_dir.path().join("config.toml");
+        let base = tokio::fs::read_to_string(&path).await.unwrap();
+        let base: String = base
+            .lines()
+            .filter(|line| !line.starts_with("otel-telemetry-enabled"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        std::fs::write(&path, format!("{base}otel-telemetry-enabled = true\n")).unwrap();
+
+        // Flag absent first: build() rewrites config.toml, so the negative
+        // case has to run last or it would overwrite the seed.
+        let inherited = clap_bare_args(temp_dir.path()).build().await.unwrap();
+        assert!(
+            inherited.otel.enabled,
+            "with the flag absent, config.toml's `true` must still win"
         );
-        assert_eq!(DEFAULT_OTEL_ENDPOINT, "http://localhost:4318");
+
+        let mut args = clap_bare_args(temp_dir.path());
+        args.otel.enabled = Some(false);
+        assert!(
+            !args.build().await.unwrap().otel.enabled,
+            "--otel-telemetry-enabled=false must override config.toml"
+        );
     }
 
     #[tokio::test]
@@ -7821,8 +7857,8 @@ shutdown-drain-secs = 42
             otel: OtelConfig {
                 enabled: true,
                 endpoint: Some("http://example.invalid:4319".to_string()),
-                auth_mode: OtelAuthMode::Disabled, // non-default: default is Freenet
-                is_test_environment: false,        // #[serde(skip)] — derived from --id
+                auth_mode: OtelAuthMode::Freenet, // non-default: default is Disabled
+                is_test_environment: false,       // #[serde(skip)] — derived from --id
             },
             shutdown_drain_secs: 77,
             disable_auto_update: true, // #[serde(skip)] — see destructure below
@@ -7924,16 +7960,22 @@ shutdown-drain-secs = 42
             shutdown_drain_secs, seed.shutdown_drain_secs,
             "shutdown_drain_secs"
         );
-        assert_eq!(otel.enabled, seed.otel.enabled, "otel.enabled");
+        let OtelConfig {
+            enabled: otel_enabled,
+            endpoint: otel_endpoint,
+            auth_mode: otel_auth_mode,
+            is_test_environment: _, // serde-skip, derived from --id
+        } = otel;
+        assert_eq!(otel_enabled, seed.otel.enabled, "otel.enabled");
         assert_eq!(
-            otel.endpoint, seed.otel.endpoint,
+            otel_endpoint, seed.otel.endpoint,
             "otel.endpoint — an operator's collector URL must survive the \
              config.toml merge"
         );
         assert_eq!(
-            otel.auth_mode, seed.otel.auth_mode,
-            "otel.auth_mode — an operator's explicit `disabled` must survive \
-             the config.toml merge, or auth silently re-enables on restart"
+            otel_auth_mode, seed.otel.auth_mode,
+            "otel.auth_mode — an operator's explicit choice must survive the \
+             config.toml merge, or auth silently reverts on restart"
         );
 
         let NetworkApiConfig {
