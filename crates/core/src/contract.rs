@@ -532,6 +532,7 @@ enum InterDelegateDispatch {
     Suppressed,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_delegate_with_contract_requests<CH, P>(
     contract_handler: &mut CH,
     initial_req: DelegateRequest<'static>,

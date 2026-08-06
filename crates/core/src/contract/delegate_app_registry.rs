@@ -45,7 +45,7 @@
 use std::sync::LazyLock;
 
 use dashmap::DashMap;
-use freenet_stdlib::prelude::{ContractInstanceId, DelegateKey};
+use freenet_stdlib::prelude::DelegateKey;
 use tokio::sync::mpsc;
 
 use crate::client_events::{ClientId, HostResult};
@@ -546,10 +546,6 @@ mod tests {
         assert!(rx.try_recv().is_ok());
     }
 
-    fn contract(seed: u8) -> ContractInstanceId {
-        ContractInstanceId::new([seed; 32])
-    }
-
     // -----------------------------------------------------------------------
     // GHSA-824h-7x5x-wfmf, gap 2 (delegate app registry).
     //
@@ -699,13 +695,15 @@ mod tests {
         );
     }
 
-    /// Delivery must NOT depend on the attested contract id. Two local apps with
-    /// different attested identities both receive the output — the deliberate
-    /// scope limit (locality, not per-app separation), and the reason the
-    /// immutable-record matching was reverted.
+    /// Delivery keys ONLY on locality: two distinct local clients both receive
+    /// the output. This is the deliberate scope limit (locality, not per-app
+    /// separation) and the reason the immutable-record matching was reverted —
+    /// see `route_to_apps`. It is also the cross-app harvesting the PR's
+    /// limitations call out, pinned so the retreat is explicit rather than
+    /// accidental.
     #[tokio::test(start_paused = true)]
     #[serial_test::serial]
-    async fn delivery_does_not_key_on_the_attested_contract_id() {
+    async fn delivery_keys_only_on_locality_not_on_app_identity() {
         let ns = Namespace::new();
         let dk = ns.key(0);
         let (a_tx, mut a_rx) = mpsc::channel::<HostResult>(4);
