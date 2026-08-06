@@ -3465,6 +3465,99 @@ mod tests {
     /// the weakest statement that still rules out vacuity. The strict form
     /// ("A specifically is a target") would fire first under a narrowing
     /// mutation and hide the fact that the subset property is what detects it.
+    /// #5190: a covered peer's summary is DERIVED, not requested.
+    ///
+    /// #5147 suppresses the fan-out leg to a covered peer, and that leg is how
+    /// the peer would have learned our summary; #4965 separately excludes
+    /// advertised co-hosts from the standalone notification. So it received
+    /// neither and stayed stale until the ~5-minute heartbeat.
+    ///
+    /// What this test must prove is BOTH halves: the model is populated, AND
+    /// no message was sent to populate it. Asserting only the first would pass
+    /// equally for the transmit-based fix that was measured at 429 extra
+    /// messages to save 13 sends.
+    ///
+    /// The read-back goes through `begin_peer_summary_broadcast`, the same
+    /// accessor the broadcast path uses, so this asserts the value is visible
+    /// to the code that actually consumes it rather than to a test-only peek.
+    #[tokio::test]
+    async fn covered_peer_summary_is_derived_without_sending_anything() {
+        use crate::ring::interest::PeerSummaryForBroadcast;
+
+        let (op_manager, mut rx, _guard) =
+            build_notification_test_node("notif-covered-inference-5190").await;
+        let key = crate::operations::test_utils::make_contract_key(12);
+        op_manager
+            .ring
+            .host_contract(key, 1024, crate::ring::AccessType::Put);
+
+        // A: advertised co-host the originator says it already delivered to.
+        // B: advertised co-host NOT on the list. B is the control — it stops
+        //    this passing under a mutation that seeds every peer regardless.
+        let (a_pk, _a_addr) = connect_peer(&op_manager, 19301, 0.31);
+        let (b_pk, _b_addr) = connect_peer(&op_manager, 19302, 0.32);
+        let (_d_pk, sender_addr) = connect_peer(&op_manager, 19304, 0.34);
+        advertise_cohost(&op_manager, &a_pk, &key);
+        advertise_cohost(&op_manager, &b_pk, &key);
+
+        let a_key = crate::ring::PeerKey::from(a_pk.clone());
+        let b_key = crate::ring::PeerKey::from(b_pk.clone());
+        let origin = BroadcastOrigin::relayed(
+            sender_addr,
+            [a_key.clone()].into_iter().collect::<HashSet<_>>(),
+        );
+
+        // Premise: A has no cached summary yet, so a Known result below is
+        // attributable to this call rather than to prior state.
+        assert!(
+            matches!(
+                op_manager
+                    .interest_manager
+                    .begin_peer_summary_broadcast(&key, &a_key),
+                PeerSummaryForBroadcast::Missing { .. }
+            ),
+            "premise: A must start with no cached summary"
+        );
+
+        let our_summary = StateSummary::from(vec![7u8, 7, 7]);
+        let seeded = seed_covered_peer_summaries(&op_manager, &key, &origin, &our_summary);
+        assert_eq!(seeded, 1, "exactly the one covered peer should be seeded");
+
+        match op_manager
+            .interest_manager
+            .begin_peer_summary_broadcast(&key, &a_key)
+        {
+            PeerSummaryForBroadcast::Known(got) => assert_eq!(
+                &got[..],
+                &our_summary[..],
+                "#5190: the covered peer's summary must be derived from our own \
+                 post-merge summary — it applied the same update from the same \
+                 originator, so its summary equals ours"
+            ),
+            PeerSummaryForBroadcast::Missing { reason, .. } => panic!(
+                "covered peer A was not seeded (missing reason {reason:?}); the \
+                 derivation did not happen, so #5190 is unfixed"
+            ),
+        }
+
+        assert!(
+            matches!(
+                op_manager
+                    .interest_manager
+                    .begin_peer_summary_broadcast(&key, &b_key),
+                PeerSummaryForBroadcast::Missing { .. }
+            ),
+            "B was NOT on the originator's list, so nothing is known about what \
+             it holds and nothing may be assumed"
+        );
+
+        // The whole point: none of that cost a message.
+        assert!(
+            drain_interest_targets(&mut rx).is_empty(),
+            "deriving the summary must cost ZERO messages"
+        );
+    }
+
     #[tokio::test]
     async fn notification_exclusion_is_a_subset_of_broadcast_targets() {
         let (op_manager, mut rx, _guard) =
