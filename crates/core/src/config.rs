@@ -266,7 +266,15 @@ impl Default for ConfigArgs {
                 bbr_startup_rate: None,    // Uses default from BBR config
             },
             ws_api: WebsocketApiArgs {
-                address: Some(default_listening_address()),
+                // `None`, NOT an explicit address: this is the "operator said
+                // nothing" state, so it must fall through to
+                // `resolve_ws_api_address` and land on loopback. Pinning
+                // `Some(default_listening_address())` here took the Explicit
+                // branch and silently reinstated the wildcard bind for every
+                // programmatic composition (GHSA-824h-7x5x-wfmf). Contrast
+                // `network_api.address` above, which SHOULD stay `::`: that is
+                // the overlay transport, which does have to accept peers.
+                address: None,
                 ws_api_port: Some(default_ws_api_port()),
                 token_ttl_seconds: None,
                 token_cleanup_interval_seconds: None,
@@ -708,11 +716,50 @@ impl ConfigArgs {
             }
         };
 
+        // Set when the config.toml merge below discards a persisted wildcard
+        // `ws-api-address` as the old auto-default; reported after resolution,
+        // and only if the bind actually moved. See the merge site.
+        let mut dropped_persisted_wildcard: Option<IpAddr> = None;
+
         // merge the configuration from the file with the command line arguments
         if let Some(cfg) = cfg {
             self.secrets.merge(cfg.secrets);
             self.mode.get_or_insert(cfg.mode);
-            self.ws_api.address.get_or_insert(cfg.ws_api.address);
+            // GHSA-824h-7x5x-wfmf upgrade migration. `build()` persists the
+            // RESOLVED config, so every node that has ever booted in network
+            // mode already has the old auto-default written into its
+            // config.toml as a literal `ws-api-address`. A plain get_or_insert
+            // would merge that back and pin the whole existing fleet to the
+            // wildcard bind forever — the hardening would reach fresh installs
+            // only, which is no hardening at all.
+            //
+            // The sentinel is "wildcard", not one literal: the auto-default was
+            // `0.0.0.0` before #3648 and `::` after, and both are exactly the
+            // "any interface" bind this change exists to stop defaulting to. So
+            // an unspecified persisted address is treated as auto-written: skip
+            // the merge and let the resolution below re-derive — loopback, or
+            // the wildcard again if --allowed-source-cidrs / --allowed-host
+            // says the operator wants non-local clients. Any OTHER persisted
+            // value (a specific interface IP, `127.0.0.1`, `::1`) was never
+            // auto-written, so it is an explicit choice and is preserved
+            // unchanged.
+            //
+            // CLI/env values are parsed into `self` BEFORE this merge, so
+            // `--ws-api-address ::` still wins on every boot. Accepted,
+            // release-note-worthy edge: an operator who hand-edited a wildcard
+            // into config.toml with no CLI flag and no allow-list is
+            // indistinguishable from the old auto-default and gets re-derived
+            // to loopback. The remedy is one flag.
+            if !cfg.ws_api.address.is_unspecified() {
+                self.ws_api.address.get_or_insert(cfg.ws_api.address);
+            } else if self.ws_api.address.is_none() {
+                // Only note it if the re-derivation actually CHANGES the bind.
+                // A node with an overlay/proxy grant drops the persisted
+                // wildcard here and auto-widens straight back to it, and
+                // announcing "ignoring your address" on every boot of a node
+                // whose bind never moved is how a log line gets tuned out.
+                dropped_persisted_wildcard = Some(cfg.ws_api.address);
+            }
             self.ws_api.ws_api_port.get_or_insert(cfg.ws_api.port);
             self.ws_api
                 .token_ttl_seconds
@@ -1207,6 +1254,57 @@ impl ConfigArgs {
             gateways = cli_gateways;
         }
 
+        // --- client (HTTP/WebSocket) API exposure ---------------------------
+        // Resolved before the `Config` literal so the bind address, the host
+        // allowlist and the hosted-mode flag are all in scope together: the
+        // exposure warning below needs all three, and the auto-widen decision
+        // needs to be logged, which a struct-literal field initializer cannot
+        // do cleanly.
+        let ws_api_allowed_hosts = self.ws_api.allowed_host.clone().unwrap_or_default();
+        let ws_api_hosted_mode = self.ws_api.hosted_mode.unwrap_or(false);
+        let (ws_api_address, ws_api_address_source) = resolve_ws_api_address(
+            self.ws_api.address,
+            self.ws_api.allowed_source_cidrs.as_deref(),
+            self.ws_api.allowed_host.as_deref(),
+        );
+        if let Some(persisted) = dropped_persisted_wildcard {
+            if ws_api_address != persisted {
+                tracing::info!(
+                    %persisted,
+                    resolved = %ws_api_address,
+                    "The client API now defaults to loopback, so the wildcard \
+                     `ws-api-address` previously auto-written to config.toml is being \
+                     re-derived. Clients on OTHER machines will no longer be able to \
+                     reach this node's API. Pass --ws-api-address :: (or set \
+                     --allowed-source-cidrs / --allowed-host) if they should."
+                );
+            }
+        }
+        if ws_api_address_source == WsApiAddressSource::AutoWidened {
+            tracing::info!(
+                address = %ws_api_address,
+                "Client API bound to all interfaces because --allowed-source-cidrs \
+                 and/or --allowed-host was set (those flags are no-ops on a loopback \
+                 listener). The default is loopback only; pass --ws-api-address \
+                 explicitly to override this."
+            );
+        }
+        if let Some(reason) = ws_api_shares_one_namespace_with_remote_clients(
+            ws_api_hosted_mode,
+            ws_api_address,
+            &ws_api_allowed_hosts,
+        ) {
+            tracing::warn!(
+                address = %ws_api_address,
+                allowed_hosts = ?ws_api_allowed_hosts,
+                "Client API is reachable from outside this machine while hosted mode is \
+                 OFF, so every connection shares ONE delegate-secret namespace and can \
+                 read and modify this node's contract state, identities and keys: \
+                 {reason}. Bind loopback (--ws-api-address ::1) unless you intend this, \
+                 or enable --hosted-mode for per-user isolation."
+            );
+        }
+
         let this = Config {
             mode,
             peer_id,
@@ -1266,12 +1364,7 @@ impl ConfigArgs {
                 skip_load_from_network: self.network_api.skip_load_from_network,
             },
             ws_api: WebsocketApiConfig {
-                address: {
-                    self.ws_api.address.unwrap_or_else(|| match mode {
-                        OperationMode::Local => default_local_address(),
-                        OperationMode::Network => default_listening_address(),
-                    })
-                },
+                address: ws_api_address,
                 port: self.ws_api.ws_api_port.unwrap_or(default_ws_api_port()),
                 token_ttl_seconds: self
                     .ws_api
@@ -1281,7 +1374,7 @@ impl ConfigArgs {
                     .ws_api
                     .token_cleanup_interval_seconds
                     .unwrap_or(default_token_cleanup_interval_seconds()),
-                allowed_hosts: self.ws_api.allowed_host.unwrap_or_default(),
+                allowed_hosts: ws_api_allowed_hosts,
                 allowed_source_cidrs: self
                     .ws_api
                     .allowed_source_cidrs
@@ -1304,7 +1397,7 @@ impl ConfigArgs {
                     })
                     .transpose()?
                     .unwrap_or_default(),
-                hosted_mode: self.ws_api.hosted_mode.unwrap_or(false),
+                hosted_mode: ws_api_hosted_mode,
                 per_user_op_rate_limit: self
                     .ws_api
                     .per_user_op_rate_limit
@@ -2282,7 +2375,18 @@ fn default_bbr_startup_rate() -> Option<u64> {
 
 #[derive(clap::Parser, Debug, Default, Clone, Serialize, Deserialize)]
 pub struct WebsocketApiArgs {
-    /// Address to bind to for the websocket API, default is :: (dual-stack)
+    /// Address to bind to for the local HTTP/WebSocket client API.
+    ///
+    /// Defaults to loopback (`::1`, with a `127.0.0.1` companion bind) in BOTH
+    /// operation modes: running as a network peer says nothing about wanting
+    /// this node's fully-privileged control API driveable from other machines.
+    /// Pass `::` (or a specific interface address) to serve clients on other
+    /// hosts. Setting `--allowed-source-cidrs` or `--allowed-host` without this
+    /// flag widens the bind to `::` automatically, since neither flag does
+    /// anything on a loopback listener.
+    ///
+    /// SECURITY: anything that can reach this address and port can read and
+    /// modify your contract state, identities and keys.
     #[arg(
         name = "ws_api_address",
         long = "ws-api-address",
@@ -2830,7 +2934,11 @@ impl Default for WebsocketApiConfig {
     #[inline]
     fn default() -> Self {
         Self {
-            address: default_listening_address(),
+            // Loopback, matching `resolve_ws_api_address`'s default: a caller
+            // that composes this config without going through
+            // `ConfigArgs::build()` gets the safe bind rather than silently
+            // inheriting a wildcard listener (GHSA-824h-7x5x-wfmf).
+            address: default_local_address(),
             port: default_ws_api_port(),
             token_ttl_seconds: default_token_ttl_seconds(),
             token_cleanup_interval_seconds: default_token_cleanup_interval_seconds(),
@@ -2855,6 +2963,105 @@ const fn default_listening_address() -> IpAddr {
 #[inline]
 const fn default_local_address() -> IpAddr {
     IpAddr::V6(Ipv6Addr::LOCALHOST)
+}
+
+/// How [`resolve_ws_api_address`] arrived at the client-API bind address.
+///
+/// Carried out of the pure resolver so `build()` can log the auto-widen at
+/// INFO without the resolver itself needing a tracing dependency (and so the
+/// unit tests can assert on the decision rather than only its byte value).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WsApiAddressSource {
+    /// The operator named an address (`--ws-api-address`, `WS_API_ADDRESS`, or
+    /// a `ws-api-address` key in `config.toml`). Used verbatim.
+    Explicit,
+    /// No address given, and no LAN/overlay access was configured either:
+    /// loopback (`::1`, plus its `127.0.0.1` companion bind).
+    DefaultLoopback,
+    /// No address given, but `--allowed-source-cidrs` and/or `--allowed-host`
+    /// was — flags that only mean anything for a non-loopback listener. Widened
+    /// to the wildcard `::` so those invocations keep working unchanged.
+    AutoWidened,
+}
+
+/// Resolve the address the client (HTTP/WebSocket) API binds to.
+///
+/// The default is **loopback in both operation modes**. `OperationMode` still
+/// governs ring participation and `secrets_dir(mode)`; it deliberately does NOT
+/// govern who may drive the client API. Running as a network peer is a
+/// statement about the overlay, not consent to expose a fully-privileged
+/// control API (contract state, delegate secrets, key material) to every host
+/// on the LAN. Anyone who wants that exposure asks for it — see the two
+/// non-default branches below.
+///
+/// Auto-widening exists so the pre-existing, working invocations keep working
+/// with zero operator action: `--allowed-source-cidrs` (the Tailscale/WireGuard
+/// overlay grant) and `--allowed-host` (the reverse-proxy hostname grant) are
+/// both no-ops on a loopback listener, so setting either is an unambiguous
+/// statement of intent to serve non-local clients. Setting `--ws-api-address`
+/// explicitly always wins; auto-widening never overrides an operator's choice.
+fn resolve_ws_api_address(
+    explicit: Option<IpAddr>,
+    allowed_source_cidrs: Option<&[String]>,
+    allowed_hosts: Option<&[String]>,
+) -> (IpAddr, WsApiAddressSource) {
+    if let Some(addr) = explicit {
+        return (addr, WsApiAddressSource::Explicit);
+    }
+    // `Some(vec![])` is treated as unset: an empty list grants nothing, and the
+    // config-file merge can hand us an empty vec from a persisted `[]`.
+    let widening_intent = allowed_source_cidrs.is_some_and(|c| !c.is_empty())
+        || allowed_hosts.is_some_and(|h| !h.is_empty());
+    if widening_intent {
+        (default_listening_address(), WsApiAddressSource::AutoWidened)
+    } else {
+        (default_local_address(), WsApiAddressSource::DefaultLoopback)
+    }
+}
+
+/// Whether startup should warn that the client API is reachable beyond this
+/// machine while every connection shares ONE secret namespace.
+///
+/// Hosted mode (`--hosted-mode`) is what gives each connection its own
+/// delegate-secret namespace keyed by `userToken`. With it OFF, every
+/// connection — local or not — drives the same single-user node: the same
+/// delegate secrets, the same identities, the same contract state. That is
+/// correct and safe for a loopback-only listener, and is the silent-exposure
+/// case the moment the listener is reachable from elsewhere.
+///
+/// Two independently-sufficient triggers:
+/// - a **non-loopback bind**: any host that can route to the address can drive
+///   the API;
+/// - **`--allowed-host` set**: the reverse-proxy grant. A proxy terminates the
+///   connection itself, so every visitor arrives wearing the proxy's source
+///   address and looks local to the node's own filters — the LAN/CIDR checks
+///   cannot distinguish them. This fires even on a loopback bind, because a
+///   proxy in front of `127.0.0.1:7509` is precisely how a node gets exposed
+///   to the internet without ever binding a non-loopback address.
+///
+/// Returns the reason to warn about, or `None` to stay quiet. Naming the
+/// reason keeps the log actionable: "bound to 0.0.0.0" and "sits behind a
+/// reverse proxy" call for different fixes, and a warning that guesses wrong
+/// is a warning operators learn to ignore.
+fn ws_api_shares_one_namespace_with_remote_clients(
+    hosted_mode: bool,
+    address: IpAddr,
+    allowed_hosts: &[String],
+) -> Option<&'static str> {
+    if hosted_mode {
+        return None;
+    }
+    if !address.is_loopback() {
+        Some(
+            "the client API is bound to a non-loopback address, so any host that can route to it can drive this node",
+        )
+    } else if !allowed_hosts.is_empty() {
+        Some(
+            "--allowed-host names a reverse proxy in front of this node; a proxy terminates the connection itself, so every visitor arrives looking local and the source-IP filters cannot tell them apart",
+        )
+    } else {
+        None
+    }
 }
 
 #[inline]
@@ -4718,6 +4925,7 @@ mod tests {
     use httptest::{Expectation, Server, matchers::*, responders::*};
 
     use std::collections::BTreeSet;
+    use std::net::Ipv4Addr;
 
     use crate::node::NodeConfig;
     use crate::transport::TransportKeypair;
@@ -8843,5 +9051,364 @@ shutdown-drain-secs = 42
             i += 1;
         }
         panic!("unterminated body for {signature_prefix}");
+    }
+
+    // ------------------------------------------------------------------
+    // GHSA-824h-7x5x-wfmf — the client API defaults to loopback in BOTH
+    // operation modes.
+    //
+    // Before this change `OperationMode::Network` defaulted the client API to
+    // the wildcard `::`, so every host on the LAN could drive a fully
+    // privileged control API (contract state, delegate secrets, key material)
+    // on any node whose operator had done nothing but run `freenet network`.
+    // `OperationMode` still governs ring participation and `secrets_dir(mode)`;
+    // it no longer governs who may drive the client API.
+    // ------------------------------------------------------------------
+
+    /// Build a `ConfigArgs` in `mode` with everything unrelated to the client
+    /// API pinned to something inert, so a test can vary only the ws-api knobs.
+    fn ws_api_test_args(mode: OperationMode, config_dir: &std::path::Path) -> ConfigArgs {
+        ConfigArgs {
+            mode: Some(mode),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(config_dir.to_path_buf()),
+                data_dir: Some(config_dir.to_path_buf()),
+                log_dir: Some(config_dir.to_path_buf()),
+            },
+            network_api: NetworkArgs {
+                // A public identity means the peer may bootstrap disjoint, so
+                // an empty gateway index is not a build error and the test
+                // stays focused on the ws-api resolution.
+                public_address: Some("198.51.100.7".parse().unwrap()),
+                public_port: Some(31337),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn ws_api_defaults_to_loopback_in_network_mode() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_server, index_url) = empty_gateways_index_server();
+
+        let cfg = ws_api_test_args(OperationMode::Network, temp_dir.path())
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("build should succeed");
+
+        assert_eq!(
+            cfg.ws_api.address,
+            default_local_address(),
+            "a plain `freenet network` node must NOT expose its client API to the LAN"
+        );
+        assert!(cfg.ws_api.address.is_loopback());
+    }
+
+    #[tokio::test]
+    async fn ws_api_defaults_to_loopback_in_local_mode() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_server, index_url) = empty_gateways_index_server();
+
+        let cfg = ws_api_test_args(OperationMode::Local, temp_dir.path())
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("build should succeed");
+
+        assert_eq!(cfg.ws_api.address, default_local_address());
+    }
+
+    #[tokio::test]
+    async fn ws_api_auto_widens_when_allowed_source_cidrs_is_set() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_server, index_url) = empty_gateways_index_server();
+
+        let mut args = ws_api_test_args(OperationMode::Network, temp_dir.path());
+        // The canonical Tailscale invocation, which worked before this change
+        // only because the default happened to be `::`.
+        args.ws_api.allowed_source_cidrs = Some(vec!["100.64.0.0/10".to_string()]);
+
+        let cfg = args
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("build should succeed");
+
+        assert_eq!(
+            cfg.ws_api.address,
+            default_listening_address(),
+            "--allowed-source-cidrs is a no-op on a loopback listener, so it must widen the bind"
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_api_auto_widens_when_allowed_host_is_set() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_server, index_url) = empty_gateways_index_server();
+
+        let mut args = ws_api_test_args(OperationMode::Network, temp_dir.path());
+        args.ws_api.allowed_host = Some(vec!["node.example.org".to_string()]);
+
+        let cfg = args
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("build should succeed");
+
+        assert_eq!(cfg.ws_api.address, default_listening_address());
+    }
+
+    #[tokio::test]
+    async fn explicit_ws_api_address_is_never_auto_widened() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_server, index_url) = empty_gateways_index_server();
+
+        // This is try.freenet.org's exact shape: an explicit loopback bind
+        // behind a reverse proxy that is named with --allowed-host. The
+        // explicit flag must win, or the hardening would silently un-harden
+        // the one deployment that already did the right thing.
+        let mut args = ws_api_test_args(OperationMode::Network, temp_dir.path());
+        args.ws_api.address = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        args.ws_api.allowed_host = Some(vec!["try.freenet.org".to_string()]);
+        args.ws_api.allowed_source_cidrs = Some(vec!["100.64.0.0/10".to_string()]);
+
+        let cfg = args
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("build should succeed");
+
+        assert_eq!(cfg.ws_api.address, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    /// An empty allow-list grants nothing, so it must not be read as intent to
+    /// widen. This is not hypothetical: the config-file merge hands `build()`
+    /// the persisted `allowed-host = []` / `allowed-source-cidrs = []` that
+    /// every already-booted node has in its `config.toml`.
+    #[test]
+    fn empty_allow_lists_do_not_widen() {
+        assert_eq!(
+            resolve_ws_api_address(None, Some(&[]), Some(&[])),
+            (default_local_address(), WsApiAddressSource::DefaultLoopback)
+        );
+        assert_eq!(
+            resolve_ws_api_address(None, None, None),
+            (default_local_address(), WsApiAddressSource::DefaultLoopback)
+        );
+    }
+
+    #[test]
+    fn resolve_ws_api_address_reports_how_it_decided() {
+        let explicit = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
+        assert_eq!(
+            resolve_ws_api_address(Some(explicit), None, None),
+            (explicit, WsApiAddressSource::Explicit)
+        );
+        assert_eq!(
+            resolve_ws_api_address(None, Some(&["10.0.0.0/8".to_string()]), None),
+            (default_listening_address(), WsApiAddressSource::AutoWidened)
+        );
+        assert_eq!(
+            resolve_ws_api_address(None, None, Some(&["h.example".to_string()])),
+            (default_listening_address(), WsApiAddressSource::AutoWidened)
+        );
+    }
+
+    /// The exposure warning fires on hosted-mode-off AND (non-loopback bind OR
+    /// an `--allowed-host` reverse-proxy grant). Both triggers matter: a proxy
+    /// terminates the connection itself, so every visitor looks local to the
+    /// node's own source-IP filters even when the bind is `127.0.0.1`.
+    #[test]
+    fn exposure_warning_fires_only_when_one_namespace_is_reachable_remotely() {
+        let loopback = default_local_address();
+        let wildcard = default_listening_address();
+        let proxy = vec!["try.freenet.org".to_string()];
+
+        // Quiet: the default single-user desktop node.
+        assert_eq!(
+            ws_api_shares_one_namespace_with_remote_clients(false, loopback, &[]),
+            None
+        );
+        // Quiet: hosted mode gives each connection its own secret namespace,
+        // which is exactly what makes a proxied deployment safe. try.freenet.org
+        // is this row — it must not emit a scary warning on every restart.
+        assert_eq!(
+            ws_api_shares_one_namespace_with_remote_clients(true, loopback, &proxy),
+            None
+        );
+        assert_eq!(
+            ws_api_shares_one_namespace_with_remote_clients(true, wildcard, &proxy),
+            None
+        );
+
+        // Fires: reachable from other machines, one shared namespace. The
+        // reason names the bind, which is the thing to change.
+        let bind_reason = ws_api_shares_one_namespace_with_remote_clients(false, wildcard, &[])
+            .expect("a wildcard bind with hosted mode off must warn");
+        assert!(bind_reason.contains("non-loopback"), "{bind_reason}");
+
+        // Fires: the genuinely dangerous shape — proxied with hosted mode off.
+        // Different reason, because the remedy is different.
+        let proxy_reason = ws_api_shares_one_namespace_with_remote_clients(false, loopback, &proxy)
+            .expect("a proxied node with hosted mode off must warn");
+        assert!(proxy_reason.contains("--allowed-host"), "{proxy_reason}");
+    }
+
+    /// `build()` persists the RESOLVED config, so every node that has already
+    /// booted in network mode carries the old auto-default
+    /// `ws-api-address = "::"` in its `config.toml`. Merging that back would
+    /// pin the entire existing fleet to the wildcard bind and leave the
+    /// hardening reaching fresh installs only.
+    #[tokio::test]
+    async fn persisted_legacy_wildcard_address_is_re_derived_to_loopback() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_server, index_url) = empty_gateways_index_server();
+
+        // First boot on the OLD code: resolve to `::` and persist it.
+        let mut first = ws_api_test_args(OperationMode::Network, temp_dir.path());
+        first.ws_api.address = Some(default_listening_address());
+        let first_cfg = first
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("first build should succeed");
+        assert_eq!(first_cfg.ws_api.address, default_listening_address());
+        let persisted =
+            std::fs::read_to_string(temp_dir.path().join("config.toml")).expect("config persisted");
+        assert!(
+            persisted.contains(r#"ws-api-address = "::""#),
+            "test premise: the wildcard must actually be written to config.toml, got:\n{persisted}"
+        );
+
+        // Second boot on the NEW code, flag-less: the persisted `::` is
+        // recognised as the old auto-default and re-derived.
+        let cfg = ws_api_test_args(OperationMode::Network, temp_dir.path())
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("second build should succeed");
+        assert_eq!(
+            cfg.ws_api.address,
+            default_local_address(),
+            "an upgrading node must stop exposing its client API to the LAN"
+        );
+    }
+
+    /// `default_listening_address()` was `0.0.0.0` before #3648 and `::` after,
+    /// so a node old enough to have persisted the IPv4 wildcard must be
+    /// migrated too — keying the sentinel on today's literal only would leave
+    /// the oldest installs (the ones most likely to be forgotten) exposed.
+    #[tokio::test]
+    async fn persisted_legacy_ipv4_wildcard_is_also_re_derived_to_loopback() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_server, index_url) = empty_gateways_index_server();
+
+        let mut first = ws_api_test_args(OperationMode::Network, temp_dir.path());
+        first.ws_api.address = Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        first
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("first build should succeed");
+
+        let cfg = ws_api_test_args(OperationMode::Network, temp_dir.path())
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("second build should succeed");
+        assert_eq!(cfg.ws_api.address, default_local_address());
+    }
+
+    /// The migration keys on "wildcard" and nothing else: a specific interface
+    /// address was never auto-written, so it is an operator choice and must
+    /// survive an upgrade untouched. Same for an explicit loopback literal —
+    /// `127.0.0.1` must not be silently rewritten to `::1`, since a node bound
+    /// to exactly one family is a deliberate posture (see `in_process_restart`).
+    #[tokio::test]
+    async fn persisted_explicit_address_survives_the_migration() {
+        for chosen in [
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        ] {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let (_server, index_url) = empty_gateways_index_server();
+
+            let mut first = ws_api_test_args(OperationMode::Network, temp_dir.path());
+            first.ws_api.address = Some(chosen);
+            first
+                .build_with_gateways_index(&index_url)
+                .await
+                .expect("first build should succeed");
+
+            let cfg = ws_api_test_args(OperationMode::Network, temp_dir.path())
+                .build_with_gateways_index(&index_url)
+                .await
+                .expect("second build should succeed");
+            assert_eq!(cfg.ws_api.address, chosen);
+        }
+    }
+
+    /// The upgrade path for a Tailscale-style node: it persisted `::` (the old
+    /// auto-default) alongside its CIDR grant, so the migration drops the
+    /// address and auto-widening must put it straight back. Zero operator
+    /// action, same bind as before the upgrade.
+    #[tokio::test]
+    async fn upgrading_node_with_cidr_grant_keeps_its_wildcard_bind() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_server, index_url) = empty_gateways_index_server();
+
+        let mut first = ws_api_test_args(OperationMode::Network, temp_dir.path());
+        first.ws_api.address = Some(default_listening_address());
+        first.ws_api.allowed_source_cidrs = Some(vec!["100.64.0.0/10".to_string()]);
+        first
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("first build should succeed");
+
+        // Flag-less restart: the CIDR grant comes back from config.toml.
+        let cfg = ws_api_test_args(OperationMode::Network, temp_dir.path())
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("second build should succeed");
+        assert_eq!(cfg.ws_api.address, default_listening_address());
+        assert_eq!(cfg.ws_api.allowed_source_cidrs.len(), 1);
+    }
+
+    /// Source pin: `build()` must actually consult the resolver and the warning
+    /// predicate. A unit-tested pure function that nothing calls is a
+    /// verification that cannot fail.
+    #[test]
+    fn build_resolves_the_ws_api_address_through_the_shared_helpers() {
+        let body = extract_fn_body(
+            production_source(),
+            "async fn build_with_gateways_index(mut self, gateways_index: &str)",
+        );
+        for needle in [
+            "resolve_ws_api_address(",
+            "ws_api_shares_one_namespace_with_remote_clients(",
+        ] {
+            assert!(
+                body.contains(needle),
+                "build_with_gateways_index no longer calls `{needle}` — the client-API \
+                 exposure default/warning has been bypassed"
+            );
+        }
+        // Bound the "no mode-keyed default" check to the `ws_api` literal.
+        // A bare `body.contains(..)` would match `network_api`'s own
+        // `OperationMode::Network => default_listening_address()` a few lines
+        // above and pass vacuously — the network transport SHOULD keep binding
+        // all interfaces; only the client API moves.
+        let ws_api_literal = {
+            let start = body
+                .find("ws_api: WebsocketApiConfig {")
+                .expect("build() must still construct the ws_api config inline");
+            let rest = &body[start..];
+            let end = rest
+                .find("port: self")
+                .expect("the ws_api literal must still set `port` right after `address`");
+            &rest[..end]
+        };
+        assert!(
+            ws_api_literal.contains("address: ws_api_address"),
+            "the ws_api bind address no longer comes from resolve_ws_api_address: \n{ws_api_literal}"
+        );
+        assert!(
+            !ws_api_literal.contains("OperationMode::"),
+            "the mode-keyed ws-api default is back: OperationMode must not govern \
+             who may drive the client API (GHSA-824h-7x5x-wfmf)"
+        );
     }
 }
