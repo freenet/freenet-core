@@ -3977,6 +3977,9 @@ std::thread_local! {
     /// Recipients dropped from a proactive summary notification because they
     /// are advertised co-hosts the broadcast already covered (#4965).
     static GLOBAL_NOTIFICATION_COHOSTS_SKIPPED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Recipients a proactive summary notification actually SENT to — the cost
+    /// side of the pair above, which only ever counted the saving.
+    static GLOBAL_NOTIFICATION_TARGETS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     // Hosting advertisement retractions emitted on stop-hosting (eviction).
     // Advertisement-layer reliability + retraction, #4642 spec step 1.
     static GLOBAL_NEIGHBOR_HOSTING_RETRACTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -4073,6 +4076,7 @@ impl GlobalTestMetrics {
         GLOBAL_PENDING_OP_HWM.with(|c| c.set(0));
         GLOBAL_NEIGHBOR_HOSTING_UPDATES.with(|c| c.set(0));
         GLOBAL_NOTIFICATION_COHOSTS_SKIPPED.with(|c| c.set(0));
+        GLOBAL_NOTIFICATION_TARGETS.with(|c| c.set(0));
         GLOBAL_NEIGHBOR_HOSTING_RETRACTIONS.with(|c| c.set(0));
         GLOBAL_ANTI_STARVATION_TRIGGERS.with(|c| c.set(0));
         GLOBAL_TERMINAL_CONSULT_ATTEMPTS.with(|c| c.set(0));
@@ -4331,6 +4335,34 @@ impl GlobalTestMetrics {
 
     pub fn notification_cohosts_skipped() -> u64 {
         GLOBAL_NOTIFICATION_COHOSTS_SKIPPED.with(|c| c.get())
+    }
+
+    /// A proactive summary notification ATTEMPTED to `n` recipients.
+    ///
+    /// Attempted, not delivered: `n` is the resolved recipient set, counted
+    /// once per notification round, before the per-peer enqueue can fail. That
+    /// matches what the cost question asks (how many messages this mechanism
+    /// puts on the wire) and matches its sibling `notification_cohosts_skipped`,
+    /// which is likewise an intent count. Do not read it as an ack.
+    ///
+    /// The cost half of the pair. `notification_cohosts_skipped` counts only
+    /// what the #4965 exclusion SAVED, so for as long as it stood alone the
+    /// simulation could see this mechanism getting cheaper and could not see it
+    /// getting more expensive.
+    ///
+    /// That asymmetry is not academic: #5190's fix restores notifications to
+    /// every peer the #5147 target list suppresses, and the A/B rig that exists
+    /// specifically to judge #5147 measured the 13 sends it saved while being
+    /// structurally blind to the ~429 messages it added. The trade could only
+    /// be argued, not measured. **A counter for a mechanism's saving needs its
+    /// twin for the mechanism's cost, or the rig can only ever return good
+    /// news.**
+    pub fn record_notification_targets(n: u64) {
+        GLOBAL_NOTIFICATION_TARGETS.with(|c| c.set(c.get() + n));
+    }
+
+    pub fn notification_targets() -> u64 {
+        GLOBAL_NOTIFICATION_TARGETS.with(|c| c.get())
     }
 
     /// A hosting advertisement retraction was emitted because this node stopped

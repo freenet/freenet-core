@@ -17348,6 +17348,19 @@ struct SuppressionArm {
     /// peer has an advertised co-host, so there is no mesh and nothing to
     /// suppress.
     hosting_updates: u64,
+    /// Standalone `Summaries` notifications ATTEMPTED (resolved recipients,
+    /// counted before the per-peer enqueue can fail).
+    ///
+    /// The cost axis. Every other counter here measures traffic this feature
+    /// REMOVES; without this one the rig can only ever report good news.
+    ///
+    /// A candidate #5190 fix (since withdrawn) restored a notification to each
+    /// suppressed peer. Its cost was invisible in `sends`, `delta_sends`,
+    /// `full_state_sends` and `summary_skips` — it lands here and nowhere else.
+    /// Zero in both arms today; the assertions below pin that, so the day a
+    /// change starts sending notifications the test fails and someone has to
+    /// look at the number rather than inferring it costs nothing.
+    notification_targets: u64,
 }
 
 #[cfg(test)]
@@ -17500,6 +17513,7 @@ fn run_5147_arm_inner(
         suppressed: GlobalTestMetrics::broadcast_targets_suppressed(),
         sender_skips: GlobalTestMetrics::broadcast_sender_skips(),
         hosting_updates: GlobalTestMetrics::neighbor_hosting_updates(),
+        notification_targets: GlobalTestMetrics::notification_targets(),
     }
 }
 
@@ -17585,7 +17599,7 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
 
     tracing::info!(
         "#5147 control:   deliveries={} redundant={} sends={} (delta={} full={}) \
-         suppressed={} summary_skips={} resync_suppressed={} converged={:?} replicas={} diverged={}",
+         suppressed={} summary_skips={} notif_sent={} resync_suppressed={} converged={:?} replicas={} diverged={}",
         control.deliveries,
         control.redundant,
         control.sends,
@@ -17593,6 +17607,7 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
         control.full_state_sends,
         control.suppressed,
         control.summary_skips,
+        control.notification_targets,
         control.resync_suppressed,
         control.converged,
         control.replicas,
@@ -17600,7 +17615,7 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
     );
     tracing::info!(
         "#5147 treatment: deliveries={} redundant={} sends={} (delta={} full={}) \
-         suppressed={} summary_skips={} resync_suppressed={} converged={:?} replicas={} diverged={}",
+         suppressed={} summary_skips={} notif_sent={} resync_suppressed={} converged={:?} replicas={} diverged={}",
         treatment.deliveries,
         treatment.redundant,
         treatment.sends,
@@ -17608,10 +17623,30 @@ fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
         treatment.full_state_sends,
         treatment.suppressed,
         treatment.summary_skips,
+        treatment.notification_targets,
         treatment.resync_suppressed,
         treatment.converged,
         treatment.replicas,
         treatment.diverged,
+    );
+
+    // BEFORE-READING: the standalone-notification path currently sends nothing
+    // in this scenario, in either arm. Pinned rather than merely logged.
+    //
+    // A counter that is only printed is an unfailable check: delete the
+    // recorder and the suite stays green while `notif_sent=0` is printed
+    // forever, which reads as "this mechanism costs nothing" — the exact
+    // false-good-news failure this counter was added to prevent. Asserting the
+    // zero means the day a change starts sending notifications, this fails and
+    // someone has to look at the number. If you are that person: the number is
+    // the cost of your change on the messages/s axis. Update the assertion with
+    // it, and state it in your PR.
+    assert_eq!(
+        (control.notification_targets, treatment.notification_targets),
+        (0, 0),
+        "proactive summary notifications were sent where the before-reading is \
+         zero. That is not necessarily wrong, but it is a message-axis cost \
+         that no other counter in this struct can see — measure it and say so"
     );
 
     // PREMISE 1: the peers really became each other's advertised co-hosts. If
@@ -17912,7 +17947,7 @@ fn test_5147_multi_writer_suppression_is_regime_dependent() {
 
     tracing::info!(
         "#5147 multi-writer control:   deliveries={} redundant={} sends={} \
-         (delta={} full={}) suppressed={} summary_skips={} resync_suppressed={} \
+         (delta={} full={}) suppressed={} summary_skips={} notif_sent={} resync_suppressed={} \
          converged={:?} replicas={} diverged={}",
         control.deliveries,
         control.redundant,
@@ -17921,6 +17956,7 @@ fn test_5147_multi_writer_suppression_is_regime_dependent() {
         control.full_state_sends,
         control.suppressed,
         control.summary_skips,
+        control.notification_targets,
         control.resync_suppressed,
         control.converged,
         control.replicas,
@@ -17928,7 +17964,7 @@ fn test_5147_multi_writer_suppression_is_regime_dependent() {
     );
     tracing::info!(
         "#5147 multi-writer treatment: deliveries={} redundant={} sends={} \
-         (delta={} full={}) suppressed={} summary_skips={} resync_suppressed={} \
+         (delta={} full={}) suppressed={} summary_skips={} notif_sent={} resync_suppressed={} \
          converged={:?} replicas={} diverged={}",
         treatment.deliveries,
         treatment.redundant,
@@ -17937,6 +17973,7 @@ fn test_5147_multi_writer_suppression_is_regime_dependent() {
         treatment.full_state_sends,
         treatment.suppressed,
         treatment.summary_skips,
+        treatment.notification_targets,
         treatment.resync_suppressed,
         treatment.converged,
         treatment.replicas,

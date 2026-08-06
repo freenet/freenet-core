@@ -1236,6 +1236,14 @@ pub(crate) async fn send_proactive_summary_notification(
     // in `delta_sends`/`full_state_sends` — see
     // `GlobalTestMetrics::record_notification_cohosts_skipped`.
     crate::config::GlobalTestMetrics::record_notification_cohosts_skipped(cohosts_skipped as u64);
+    // The cost twin. Recorded next to the saving so the two cannot drift apart:
+    // the #5147 A/B could see this mechanism get cheaper and was blind to it
+    // getting more expensive. A CANDIDATE #5190 fix (since withdrawn) restored a
+    // notification to each suppressed peer; the rig showed a green suite while
+    // it added ~429 messages to buy 13 fewer sends, because nothing counted the
+    // messages. Zero on every path today — that is the before-reading, pinned by
+    // `notification_cost_counter_is_wired` and by the A/B's own assertion.
+    crate::config::GlobalTestMetrics::record_notification_targets(targets.len() as u64);
 
     tracing::debug!(
         contract = %key,
@@ -3096,6 +3104,41 @@ mod tests {
             "with the exclusion inactive the co-host skip count MUST be 0 — \
              a non-zero value here means the metric is measuring the sender/\
              self drops and cannot detect the exclusion being removed"
+        );
+    }
+
+    /// The cost counter must stay WIRED to the emitter.
+    ///
+    /// The A/B's before-reading assertion pins the VALUE at zero, but a zero is
+    /// also what you get if the recorder is deleted — so on its own it cannot
+    /// tell "this mechanism is free" from "nobody is counting". This pins the
+    /// call itself, bounded to the emitter body so it cannot match its own
+    /// assertion string.
+    #[test]
+    fn notification_cost_counter_is_wired() {
+        let src = include_str!("update.rs");
+        let prod = &src[..src.find("\nmod tests {").expect("tests module not found")];
+        let start = prod
+            .find("pub(crate) async fn send_proactive_summary_notification(")
+            .expect("emitter not found");
+        let rest = &prod[start..];
+        let end = 1 + rest[1..]
+            .find("\npub(crate) fn ")
+            .expect("expected a following item to bound the emitter body");
+        let body: String = rest[..end].chars().filter(|c| !c.is_whitespace()).collect();
+
+        assert!(
+            body.contains("record_notification_targets(targets.len()"),
+            "send_proactive_summary_notification must record the number of \
+             notifications it sends. Without it the A/B rig reports \
+             `notif_sent=0` forever, which reads as this mechanism being free \
+             — the false-good-news failure the counter exists to prevent"
+        );
+        assert!(
+            body.contains("record_notification_cohosts_skipped("),
+            "the SAVING counter must stay recorded alongside the COST counter; \
+             a rig that keeps only one of the pair can only move in one \
+             direction"
         );
     }
 
