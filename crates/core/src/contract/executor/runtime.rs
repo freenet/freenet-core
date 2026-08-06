@@ -304,13 +304,6 @@ impl ContractExecutor for Executor<Runtime> {
         )
     }
 
-    async fn delegate_attested_origin(
-        &mut self,
-        delegate: &DelegateKey,
-    ) -> Option<ContractInstanceId> {
-        self.registered_delegate_origin(delegate)
-    }
-
     // NOTE: `ContractExecutor::try_begin_export` / `finish_export` are NOT
     // overridden for a bare `Executor<Runtime>` — only the pooled `RuntimePool`
     // can admit a deferred export (it owns the executor pool + the export
@@ -1529,45 +1522,144 @@ mod remove_contract_tests {
             .with_extension("wasm")
     }
 
-    /// Handler-level (GHSA-824h-7x5x-wfmf): `RegisterDelegateWithPredecessors`
-    /// GHSA-824h-7x5x-wfmf, gap 1 (inter-delegate dispatch).
+    /// GHSA-824h-7x5x-wfmf regression: a NON-LOCAL registration must not be able
+    /// to write the durable first-registration origin record.
     ///
-    /// `caller_delegate` is an identity the RUNTIME attests, and it wins over
-    /// every other origin. Before this gate, a delegate could be registered by
-    /// anyone with `origin_contract: None` (no attested identity of its own);
-    /// messaging that delegate makes its own WASM emit `SendDelegateMessage`,
-    /// and the victim then authorizes on `MessageOrigin::Delegate(attacker)`.
-    /// That routes around the connection-scope gate entirely, because the
-    /// attacker never has to hold an attested identity itself.
+    /// The gate on `resolve_message_origin` only controls what a delegate is
+    /// TOLD about its caller. `origin_contract` has a second, far more damaging
+    /// consumer: `register_delegate_and_record_origin` writes it into a record
+    /// that is FIRST-WRITER-WINS and IMMUTABLE. An off-host caller could mint a
+    /// token for any contract id (the node issues one on request, for any id,
+    /// existing or not) and permanently freeze a delegate's recorded provenance
+    /// to a value of their choosing — unrepairable short of wiping the database.
     ///
-    /// A delegate with no recorded registration origin therefore cannot lend
-    /// its identity to anyone. The control half matters as much as the refusal:
-    /// it proves the gate keys on the ORIGIN RECORD and not on "any
-    /// `caller_delegate` is refused", which would break legitimate
-    /// inter-delegate messaging outright.
+    /// Delegate WASM and params are public, so the key is derivable and the
+    /// record can be poisoned BEFORE the legitimate app ever registers.
     #[tokio::test(flavor = "multi_thread")]
-    async fn inter_delegate_dispatch_requires_an_attested_caller_origin() {
+    async fn remote_registration_cannot_write_the_durable_origin_record() {
+        use crate::contract::storages::Storage;
         use freenet_stdlib::client_api::DelegateRequest;
         use freenet_stdlib::prelude::{
-            ContractInstanceId, Delegate, DelegateContainer, DelegateWasmAPIVersion, Parameters,
+            ContractInstanceId, Delegate, DelegateContainer, DelegateWasmAPIVersion,
+        };
+
+        let temp_dir = crate::util::tests::get_temp_dir();
+        let db = Storage::new(temp_dir.path()).await.expect("create db");
+        let contract_store =
+            ContractStore::new(temp_dir.path().join("contracts"), 10_000, db.clone())
+                .expect("contract store");
+        let delegate_store =
+            DelegateStore::new(temp_dir.path().join("delegate"), 10_000, db.clone())
+                .expect("delegate store");
+        let secrets_store = SecretsStore::new(
+            temp_dir.path().join("secrets"),
+            Default::default(),
+            db.clone(),
+        )
+        .expect("secrets store");
+        let state_store = StateStore::new(db.clone(), 10_000_000).expect("state store");
+        let runtime = Runtime::build(contract_store, delegate_store, secrets_store, false)
+            .expect("build runtime");
+        let mut executor = Executor::new(
+            state_store,
+            || Ok(()),
+            crate::contract::executor::OperationMode::Local,
+            runtime,
+            None,
+        )
+        .await
+        .expect("create executor");
+
+        let victim = Delegate::from((&vec![0u8].into(), &vec![0xD4u8].into()));
+        let attacker_claim = ContractInstanceId::new([0x99u8; 32]);
+
+        // An off-host caller registers the delegate, presenting a token bound to
+        // a contract id it does not own.
+        executor
+            .delegate_request(
+                DelegateRequest::RegisterDelegate {
+                    delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(victim.clone())),
+                    cipher: [7u8; 32],
+                    nonce: [9u8; 24],
+                },
+                Some(&attacker_claim),
+                None,
+                crate::client_events::ConnectionScope::Remote,
+                None,
+            )
+            .expect("registration itself still succeeds; only the attestation is withheld");
+
+        let (_has_admin_none, origins) = db
+            .get_delegate_origins(victim.key())
+            .expect("record must be readable")
+            .expect("registration must have written a record");
+        assert!(
+            origins.is_empty(),
+            "a non-local registration must record NO contract id (the record is \
+             immutable, so a poisoned value can never be corrected); got {origins:?}"
+        );
+
+        // Control: the SAME request from a local connection DOES record the id,
+        // so the assertion above is about the scope gate and not about the
+        // record being write-only.
+        let legit = Delegate::from((&vec![0u8].into(), &vec![0xD5u8].into()));
+        let app = ContractInstanceId::new([0x11u8; 32]);
+        executor
+            .delegate_request(
+                DelegateRequest::RegisterDelegate {
+                    delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(legit.clone())),
+                    cipher: [7u8; 32],
+                    nonce: [9u8; 24],
+                },
+                Some(&app),
+                None,
+                crate::client_events::ConnectionScope::Local,
+                None,
+            )
+            .expect("local registration must succeed");
+
+        let (_, origins) = db
+            .get_delegate_origins(legit.key())
+            .expect("record must be readable")
+            .expect("registration must have written a record");
+        assert_eq!(
+            origins.len(),
+            1,
+            "a local registration must still record its attested contract id"
+        );
+        assert_eq!(origins[0], *app.as_bytes(), "wrong contract id recorded");
+    }
+
+    /// GHSA-824h-7x5x-wfmf regression: an UNATTESTED delegate must still be
+    /// able to send delegate-to-delegate messages.
+    ///
+    /// A revision of that fix refused to dispatch from any delegate whose
+    /// first-registration record held no contract id. That record is `None` both
+    /// for "never registered here" AND for the tokenless local CLI shape, so it
+    /// silently broke every delegate installed by riverctl / atlasctl / fdev —
+    /// silently because the caller swallows the error into a warning and the
+    /// client still receives `Ok` with the second delegate's reply simply
+    /// missing. Re-adding any such gate must fail here.
+    ///
+    /// The escalation that gate was aimed at is closed by connection scope
+    /// instead (`resolve_message_origin` returns `None` for a non-local
+    /// connection, and the scope is propagated into the hop), which the
+    /// `remote_connection_gets_no_caller_delegate_origin` unit test pins.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unattested_delegate_can_still_dispatch_to_another_delegate() {
+        use freenet_stdlib::client_api::DelegateRequest;
+        use freenet_stdlib::prelude::{
+            Delegate, DelegateContainer, DelegateWasmAPIVersion, Parameters,
         };
 
         let (mut executor, _contracts_dir, _temp) =
-            build_disk_executor("inter-delegate-origin").await;
+            build_disk_executor("unattested-inter-delegate").await;
 
-        // Registered by a caller holding NO attested identity — the "anyone can
-        // install this" case.
-        let unattested = Delegate::from((&vec![0u8].into(), &vec![0xA1u8].into()));
-        // Registered by a real web app, so it HAS a recorded origin.
-        let attested = Delegate::from((&vec![0u8].into(), &vec![0xB2u8].into()));
+        // Registered with NO attested origin — the tokenless CLI shape.
+        let cli_delegate = Delegate::from((&vec![0u8].into(), &vec![0xA1u8].into()));
         let victim = Delegate::from((&vec![0u8].into(), &vec![0xC3u8].into()));
-        let app = ContractInstanceId::new([0x5Au8; 32]);
 
-        for (delegate, origin) in [
-            (&unattested, None),
-            (&attested, Some(&app)),
-            (&victim, Some(&app)),
-        ] {
+        for delegate in [&cli_delegate, &victim] {
             executor
                 .delegate_request(
                     DelegateRequest::RegisterDelegate {
@@ -1577,7 +1669,7 @@ mod remove_contract_tests {
                         cipher: [7u8; 32],
                         nonce: [9u8; 24],
                     },
-                    origin,
+                    None,
                     None,
                     crate::client_events::ConnectionScope::Local,
                     None,
@@ -1585,47 +1677,32 @@ mod remove_contract_tests {
                 .expect("registration must succeed");
         }
 
-        let dispatch_to_victim = |executor: &mut Executor<Runtime>, caller: &Delegate| {
-            executor.delegate_request(
-                DelegateRequest::ApplicationMessages {
-                    key: victim.key().clone(),
-                    params: Parameters::from(Vec::new()),
-                    inbound: vec![],
-                },
-                None,
-                Some(caller.key()),
-                crate::client_events::ConnectionScope::Local,
-                None,
-            )
-        };
-
-        // REFUSED: the caller has an origin RECORD (registration writes one
-        // unconditionally) but no contract id in it, so it holds no attested
-        // identity to lend.
-        let err = dispatch_to_victim(&mut executor, &unattested)
-            .expect_err("dispatch from an unattested delegate must be refused");
-        assert!(
-            err.to_string().contains("no attested registration origin"),
-            "refusal must name the cause, got: {err}"
+        let result = executor.delegate_request(
+            DelegateRequest::ApplicationMessages {
+                key: victim.key().clone(),
+                params: Parameters::from(Vec::new()),
+                inbound: vec![],
+            },
+            None,
+            Some(cli_delegate.key()),
+            crate::client_events::ConnectionScope::Local,
+            None,
         );
 
-        // CONTROL: an attested caller is NOT refused by this gate. The call
-        // still fails — the fixture delegates are not real WASM — but it must
-        // fail for a DIFFERENT reason, or the gate is refusing everything and
-        // the assertion above proves nothing.
-        let control = dispatch_to_victim(&mut executor, &attested);
-        let control_err = match control {
-            Ok(_) => None,
-            Err(e) => Some(e.to_string()),
-        };
-        assert!(
-            !control_err
-                .as_deref()
-                .is_some_and(|e| e.contains("no attested registration origin")),
-            "an attested caller must pass the dispatch gate, got: {control_err:?}"
-        );
+        // The fixture delegates are not real WASM, so the call still fails — but
+        // it must fail on EXECUTION, never on a provenance/attestation refusal.
+        // Asserting on the absence of that refusal is the whole point: a
+        // re-introduced gate would short-circuit before execution.
+        if let Err(e) = result {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("attested registration origin") && !msg.contains("dispatch refused"),
+                "an unattested delegate must not be refused dispatch; got: {msg}"
+            );
+        }
     }
 
+    /// Handler-level (GHSA-824h-7x5x-wfmf): `RegisterDelegateWithPredecessors`
     /// NEVER copies a predecessor's secrets, even when the registering request's
     /// `origin_contract` exactly matches the predecessor's recorded
     /// first-registration origin (the one case the H1 same-origin gate in

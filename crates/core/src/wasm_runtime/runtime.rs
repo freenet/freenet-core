@@ -633,11 +633,11 @@ impl Runtime {
     /// Runs ON the contract loop (serialized with delegate `store_secret`),
     /// mirroring the on-loop write discipline of `import_secret_bundle`.
     ///
-    /// UNREACHABLE as of freenet/freenet-core#5198: the sole caller (the
+    /// UNREACHABLE as of GHSA-824h-7x5x-wfmf: the sole caller (the
     /// `RegisterDelegateWithPredecessors` handler in
     /// `crates/core/src/contract/executor/runtime/delegates.rs`) no longer
     /// calls this, because the `origin_contract` this method's H1 gate relies
-    /// on is forgeable by any HTTP client — see #5198 for the exploit chain.
+    /// on is forgeable by any HTTP client — see GHSA-824h-7x5x-wfmf for the exploit chain.
     /// Kept (not deleted) so the underlying `SecretsStore::migrate_secrets`
     /// mechanism, which is otherwise sound, is easy to re-wire once
     /// `origin_contract` attestation is hardened.
@@ -660,28 +660,6 @@ impl Runtime {
     ///
     /// Propagates the store's error: a persistence failure MUST fail the whole
     /// registration (see `SecretsStore::record_delegate_registration_origin`).
-    /// Read back the contract id `delegate` was FIRST registered under, or
-    /// `None` if it was registered without an attested origin, is unknown to
-    /// this node, or the record could not be read (fail closed).
-    ///
-    /// The counterpart of [`Self::record_delegate_registration_origin`]; it is
-    /// the delegate's own attested app identity, used to decide who may drive
-    /// it and who may receive its notification output (GHSA-824h-7x5x-wfmf).
-    pub(crate) fn delegate_registration_origin(&self, delegate: &DelegateKey) -> Option<[u8; 32]> {
-        match self.secret_store.delegate_registration_origins(delegate) {
-            Ok(Some((_has_admin_none, origins))) => origins.first().copied(),
-            Ok(None) => None,
-            Err(err) => {
-                tracing::warn!(
-                    delegate = %delegate.encode(),
-                    error = %err,
-                    "could not read delegate first-registration origin; treating as unattested (fail closed)"
-                );
-                None
-            }
-        }
-    }
-
     pub(crate) fn record_delegate_registration_origin(
         &self,
         delegate: &DelegateKey,

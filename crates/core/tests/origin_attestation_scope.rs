@@ -58,6 +58,23 @@ use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
 use tracing::info;
 
+/// The WebSocket handshake itself failed, so the node never saw a request.
+///
+/// Distinguished from every other error on purpose: "the connection was refused"
+/// says nothing about the attestation gate, while "the connection was accepted
+/// and then something went wrong" is a real failure the off-host leg must not
+/// swallow. See that leg's `Err` arm.
+#[derive(Debug)]
+struct ConnectFailed(tokio_tungstenite::tungstenite::Error);
+
+impl std::fmt::Display for ConnectFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "websocket connect failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for ConnectFailed {}
+
 const TEST_DELEGATE: &str = "test-delegate-attested";
 const CIPHER: [u8; 32] = [7u8; 32];
 const NONCE: [u8; 24] = [9u8; 24];
@@ -198,7 +215,9 @@ async fn attested_origin_via(
         "Authorization",
         format!("Bearer {}", token.as_str()).parse()?,
     );
-    let (stream, _) = connect_async(request).await?;
+    let (stream, _) = connect_async(request)
+        .await
+        .map_err(|e| anyhow::Error::new(ConnectFailed(e)))?;
     let mut client = WebApi::start(stream);
     let delegate_key = delegate.key().clone();
 
@@ -365,22 +384,49 @@ async fn attested_origin_survives_loopback_and_proxy_but_not_off_host() -> TestR
                     );
                     info!(%ip, "shape 3 (direct off-host): connection accepted, NOT attested — the gate held");
                 }
-                Err(e) => {
+                Err(e) if e.downcast_ref::<ConnectFailed>().is_some() => {
+                    // The handshake was refused (the pre-existing private-network
+                    // filter, or a host firewall), so the node never processed a
+                    // request and the gate was not exercised. Safe, but not
+                    // evidence — and deliberately NOT reported as a pass.
                     tracing::warn!(
                         %ip, error = %e,
-                        "shape 3 INCONCLUSIVE: the off-host connection never established (the \
-                         pre-existing private-network filter or the host firewall refused it), \
-                         so the attestation gate itself was not exercised on this host. Safe, \
-                         but not evidence about the gate."
+                        "shape 3 INCONCLUSIVE: the off-host connection never established, \
+                         so the attestation gate itself was not exercised on this host"
+                    );
+                }
+                Err(e) => {
+                    // The connection WAS established and then something went
+                    // wrong. Never treat this as inconclusive: a regression where
+                    // an off-host request errors instead of resolving to no
+                    // attestation would otherwise log a warning and pass.
+                    panic!(
+                        "shape 3 (direct off-host) connected but then failed: {e}. \
+                         The gate must resolve a non-local caller to NO attested \
+                         origin, not error."
                     );
                 }
             }
         }
         None => {
-            // Loud, and never mistakable for a pass.
+            // In CI this is a HARD FAILURE. These two legs are the most valuable
+            // assertions in the PR, and a silent environment-dependent skip is
+            // exactly the "verification that cannot fail" shape: the suite would
+            // stay green while the thing it exists to check never ran.
+            //
+            // Locally it stays a warning, so a developer on a loopback-only
+            // machine is not blocked. Set `FREENET_TEST_OFFHOST_IPV4` to any
+            // private address of the host to run them.
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "shapes 2 and 3 could not run: no non-loopback PRIVATE IPv4 address was \
+                 found on this CI host. These legs are the point of this test, so a skip \
+                 here is a failure, not a pass. Set FREENET_TEST_OFFHOST_IPV4 in the \
+                 workflow to a private address of the runner."
+            );
             tracing::warn!(
-                "SKIPPED shapes 2 and 3: no non-loopback IPv4 address on this host, so the \
-                 proxy and off-host topologies cannot be exercised here. The Remote \
+                "SKIPPED shapes 2 and 3: no non-loopback private IPv4 address on this host, \
+                 so the proxy and off-host topologies cannot be exercised here. The Remote \
                  classification itself is pinned by client_events::types unit tests."
             );
         }

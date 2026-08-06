@@ -493,12 +493,23 @@ async fn render_shell_response(
     //
     // Ids and addresses ONLY. The token itself is never logged — it IS the
     // credential — and neither is any key material.
-    tracing::info!(
-        contract_id = %key,
-        peer_addr = ?source_addr,
-        api_version = %api_version.prefix(),
-        "Issued app-identity auth token for a contract shell page"
-    );
+    //
+    // LOG THE PARSED ID, NEVER THE RAW PATH. `key` is an unvalidated
+    // `Path<String>` that axum has already percent-DECODED, and this route is
+    // exposed publicly through the hosted proxy, so logging it raw would let any
+    // internet user inject newlines (`%0A`) and forge entries inside the very
+    // audit trail this line exists to produce. Parsing first bounds the value to
+    // 32 base58-encoded bytes with no control characters. An unparseable key is
+    // not logged here at all — it cannot yield a token, and the request fails
+    // below.
+    if let Ok(instance_id) = ContractInstanceId::from_base58(&key) {
+        tracing::info!(
+            contract_id = %instance_id,
+            peer_addr = ?source_addr,
+            api_version = %api_version.prefix(),
+            "Issued app-identity auth token for a contract shell page"
+        );
+    }
 
     let auth_header = headers::Authorization::<headers::authorization::Bearer>::name().to_string();
     let version_prefix = api_version.prefix();
@@ -1037,12 +1048,20 @@ impl ClientEventsProxy for HttpClientApi {
                         req,
                         auth_token,
                         origin_contract,
+                        // Forwarded explicitly rather than swallowed by `..`.
+                        // Every request on THIS proxy is node-internal today
+                        // (webapp-cache fetches, which carry no origin), so
+                        // dropping it would be inert — but the producers set it
+                        // deliberately, and a future client-facing request here
+                        // would otherwise lose its attestation silently.
+                        connection_scope,
                         user_context,
                         ..
                     } => {
                         return Ok(OpenRequest::new(client_id, req)
                             .with_token(auth_token)
                             .with_origin_contract(origin_contract)
+                            .with_connection_scope(connection_scope)
                             .with_user_context(user_context));
                     }
                 }

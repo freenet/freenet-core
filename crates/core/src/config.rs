@@ -2701,10 +2701,7 @@ pub struct WebsocketApiConfig {
     /// scaffolding:
     ///
     /// - `HttpClientApi::as_router`, the direct router-composition entry point.
-    ///   Its signature is public API and takes no cache root. (It used to be
-    ///   described as what `server::local_node::run_local_node` serves through;
-    ///   that serve loop was unreachable and has been deleted — see the note
-    ///   where it stood in `server.rs`.)
+    ///   Its signature is public API and takes no cache root.
     /// - `WebsocketApiConfig::default()` / `From<SocketAddr>`, the fallback for
     ///   any serving config not produced by `build()`.
     ///

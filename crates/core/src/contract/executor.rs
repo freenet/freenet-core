@@ -942,28 +942,6 @@ pub(crate) trait ContractExecutor: Send + 'static {
         user_context: Option<&UserSecretContext>,
     ) -> impl Future<Output = Response> + Send;
 
-    /// The contract id `delegate` was FIRST registered under, as durably
-    /// recorded at registration time (`delegates.rs`'s first-writer origin
-    /// record). `None` when the delegate was registered by a caller holding no
-    /// attested identity, when it is unknown to this node, or when the record
-    /// cannot be read.
-    ///
-    /// This is the delegate's own app identity, and it is what notification
-    /// output is routed by: only a client that proved the SAME identity may
-    /// receive it (GHSA-824h-7x5x-wfmf). Fail closed — anything other than a
-    /// positively-read contract id is `None`, which routes only to
-    /// registrations that likewise hold no attested identity.
-    ///
-    /// The default returns `None`, which is the fail-closed answer for
-    /// executors with no delegate store (the mocks).
-    fn delegate_attested_origin(
-        &mut self,
-        delegate: &DelegateKey,
-    ) -> impl Future<Output = Option<ContractInstanceId>> + Send {
-        let _ = delegate;
-        async { None }
-    }
-
     /// Export the per-user delegate secrets named by `user_context` into an
     /// encrypted bundle, sealed under the user's `token` (hosted-mode export,
     /// P3-live of #4381). The bundle round-trips through

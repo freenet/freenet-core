@@ -1508,22 +1508,26 @@ async fn process_open_request(
                 );
                 let delegate_key = req.key().clone();
 
-                // The attested app identity of THIS connection, after the
-                // loopback gate: `None` for any caller the node will not attest
-                // (GHSA-824h-7x5x-wfmf). Used for the routing registration below.
+                // Who this connection is, from the perspective of delegate
+                // notification routing (GHSA-824h-7x5x-wfmf). Only a connection
+                // the node proved is local may receive a delegate's output; the
+                // attested contract id rides along for diagnostics but does NOT
+                // decide delivery (see `route_to_apps` for why matching on it is
+                // unsafe).
                 //
                 // The executor dispatch further down is NOT handed this value —
                 // it receives the raw `origin_contract` alongside
                 // `connection_scope` and applies the gate itself, because it must
                 // also gate the two origin sources this layer cannot see
                 // (`caller_delegate` and the node's inherited-origins map). Both
-                // gates read the SAME `request.connection_scope`, so they agree
-                // on whether the caller is attestable; `resolve_message_origin`
-                // is the single place that decides what that attestation is.
-                let attested_origin = if request.connection_scope.is_local() {
-                    request.origin_contract
+                // read the SAME `request.connection_scope`, so they agree on
+                // whether the caller is attestable.
+                let app_identity = if request.connection_scope.is_local() {
+                    crate::contract::delegate_app_registry::AppIdentity::Local {
+                        attested: request.origin_contract,
+                    }
                 } else {
-                    None
+                    crate::contract::delegate_app_registry::AppIdentity::Remote
                 };
 
                 // Register (or refresh) this app's routing path so the delegate
@@ -1535,10 +1539,9 @@ async fn process_open_request(
                 // (installing the delegate binary) does NOT register an app —
                 // it's an admin op, not an app conversation.
                 //
-                // The registration is BOUND to `attested_origin`: registering is
-                // still open to anyone (it is how a client asks to be pushed to),
-                // but the delegate's output is only routed to a registration
-                // whose identity matches the delegate's own — see
+                // The registration records `app_identity`: registering stays open
+                // to anyone (it is how a client asks to be pushed to), but only a
+                // LOCAL registration is ever a delivery target — see
                 // `delegate_app_registry::route_to_apps`.
                 match &req {
                     freenet_stdlib::client_api::DelegateRequest::ApplicationMessages { .. } => {
@@ -1546,7 +1549,7 @@ async fn process_open_request(
                             if !crate::contract::delegate_app_registry::register_app(
                                 &delegate_key,
                                 client_id,
-                                attested_origin,
+                                app_identity,
                                 sender.clone(),
                             ) {
                                 tracing::warn!(
@@ -1567,7 +1570,7 @@ async fn process_open_request(
                     // carries a notification channel (above), never by
                     // registration. RegisterDelegateWithPredecessors's
                     // node-side secret copy-forward (#4117) is unconditionally
-                    // disabled as of #5198 (its origin_contract gate is
+                    // disabled as of GHSA-824h-7x5x-wfmf (its origin_contract gate is
                     // forgeable) — it was likewise never an app-routing event
                     // even when active. Both are listed EXPLICITLY (not swept)
                     // per this match's contract that
@@ -2020,18 +2023,17 @@ mod serve_during_gate_tests {
         );
     }
 
-    /// GHSA-824h-7x5x-wfmf: the app-routing registration must be bound to the
-    /// ATTESTED origin, and "attested" must be gated on the connection scope.
+    /// GHSA-824h-7x5x-wfmf: the app-routing registration must record WHO
+    /// registered, derived from the connection scope.
     ///
-    /// A compile-time signature change already forces SOMETHING to be passed as
-    /// the origin, so the type system alone does not protect this: passing
-    /// `request.origin_contract` directly would compile and would re-open the
-    /// hole for every off-host caller holding a token. This pins that the value
-    /// handed to `register_app` is derived through `connection_scope.is_local()`
-    /// and that the SAME derived value is what reaches the executor, so the two
-    /// cannot disagree about who the caller is.
+    /// The type system alone does not protect this: `AppIdentity::Local { .. }`
+    /// is constructible unconditionally, so a version that classified every
+    /// registration as `Local` would compile and would re-open the hole for
+    /// every off-host caller. This pins that the identity handed to
+    /// `register_app` is derived through `connection_scope.is_local()`, and that
+    /// the connection scope also reaches the executor.
     #[test]
-    fn delegate_registration_binds_to_the_gated_attested_origin() {
+    fn delegate_registration_binds_to_the_connection_scope() {
         let src = include_str!("client_events.rs");
         // Bound the scrape to the DelegateOp arm. An unbounded `split_once`
         // would happily match this test's own assertion strings further down
@@ -2046,9 +2048,9 @@ mod serve_during_gate_tests {
             .expect("the arm is bounded by the next ClientRequest arm");
 
         let derivation = arm
-            .find("let attested_origin = if request.connection_scope.is_local()")
+            .find("let app_identity = if request.connection_scope.is_local()")
             .expect(
-                "the attested origin must be derived by gating `origin_contract` on \
+                "the registration identity must be derived from \
                  `connection_scope.is_local()`",
             );
         let registration = arm
@@ -2065,9 +2067,9 @@ mod serve_during_gate_tests {
             .next()
             .expect("register_app call must be bounded");
         assert!(
-            register_call.contains("attested_origin"),
-            "register_app must receive the GATED origin, not `request.origin_contract`; \
-             got: {register_call}"
+            register_call.contains("app_identity"),
+            "register_app must receive the scope-derived identity, not a value \
+             built from `request.origin_contract` alone; got: {register_call}"
         );
 
         assert!(

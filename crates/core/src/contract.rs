@@ -535,6 +535,26 @@ where
     // the loop before params are read — but the new variant is listed EXPLICITLY
     // for local consistency with this match's style; the wildcard remains only to
     // satisfy `#[non_exhaustive]`.
+    // GATE THE ORIGIN BEFORE ANY CONSUMER IN THIS FUNCTION
+    // (GHSA-824h-7x5x-wfmf).
+    //
+    // Two consumers below read `origin_contract`: the executor call (which
+    // gates again internally, so it is safe either way) and
+    // `caller_identity_from_origin`, which names the calling app to the HUMAN in
+    // the consent prompt. The prompt was the one that mattered: a remote caller
+    // could mint a token for a well-known contract id, drive a delegate that
+    // emits `RequestUserInput` with attacker-chosen text, and have the prompt
+    // render that contract's identity as the requester to a local user who then
+    // approves it.
+    //
+    // Gating here rather than at the prompt call site keeps the two consumers on
+    // one value, so a future third consumer cannot be added ungated by accident.
+    let origin_contract = if connection_scope.is_local() {
+        origin_contract
+    } else {
+        None
+    };
+
     let initial_params = match &initial_req {
         DelegateRequest::ApplicationMessages { params, .. } => params.clone(),
         DelegateRequest::RegisterDelegate { .. }
@@ -1008,9 +1028,21 @@ where
 
             // The caller identity passed to the prompter is built from the
             // executor's runtime context, NOT from anything the delegate could
-            // influence — so a malicious delegate cannot spoof another app's
-            // or delegate's identity in the structured fields the prompt UI
-            // renders. Today the only attested non-None caller is a web app
+            // influence — so a malicious DELEGATE cannot spoof another app's
+            // identity in the structured fields the prompt UI renders.
+            //
+            // That was never the whole story, and the missing half was a real
+            // hole (GHSA-824h-7x5x-wfmf): the identity came from
+            // `origin_contract`, which the CLIENT chooses by presenting a token
+            // the node mints on request for any contract id. A caller the node
+            // cannot prove is local now resolves to `None` (gated at the top of
+            // this function), so it is rendered as an unattested caller rather
+            // than as the app whose id it named. This bounds the spoof to
+            // callers that are already on this host — see the PR's limitations:
+            // "local" means this HOST, not this USER, and it is not a defence
+            // behind a colocated reverse proxy.
+            //
+            // Today the only attested non-None caller is a web app
             // (via `MessageOrigin::WebApp`); delegate-to-delegate attestation
             // is tracked by #3860 and will appear here as a new variant.
             //
@@ -2045,29 +2077,6 @@ async fn handle_delegate_notification<CH, P>(
         return;
     }
 
-    // The delegate's own attested app identity, read from its durable
-    // first-registration origin record. This is what decides who may receive the
-    // output (GHSA-824h-7x5x-wfmf).
-    //
-    // Read HERE rather than before the run, and only when there is both output
-    // and somebody registered to receive it: on the pooled executor the lookup
-    // checks an executor out of the pool, and this path runs on the contract loop
-    // for every contract notification, so doing it unconditionally would add a
-    // checkout per notification. Reading it after the run is safe because the
-    // record is first-writer-wins and immutable for the delegate's lifetime
-    // (`register_delegate_and_record_origin`), and a delegate cannot register
-    // delegates — so nothing the run just did can have changed the answer.
-    let attested_origin = if delegate_app_registry::has_registrations(&delegate_key) {
-        contract_handler
-            .executor()
-            .delegate_attested_origin(&delegate_key)
-            .await
-    } else {
-        // Nobody registered: `route_to_apps` will deliver to nobody regardless,
-        // so skip the lookup entirely.
-        None
-    };
-
     // One HostResponse per ApplicationMessage so an app sees each reply as a
     // distinct DelegateResponse, exactly as it would for a client-initiated
     // ApplicationMessages request.
@@ -2077,15 +2086,16 @@ async fn handle_delegate_notification<CH, P>(
                 key: delegate_key.clone(),
                 values: vec![app_msg],
             });
-        let delivered =
-            delegate_app_registry::route_to_apps(&delegate_key, attested_origin, response);
+        let delivered = delegate_app_registry::route_to_apps(&delegate_key, response);
         if delivered == 0 {
-            tracing::debug!(
+            // `info!`, not `debug!`: the crate sets `release_max_level_info`, so
+            // a `debug!` would compile out of shipped binaries and an operator
+            // whose app stopped receiving notifications would see nothing. This
+            // is the line that says "the delegate spoke and nobody heard it".
+            tracing::info!(
                 delegate = %delegate_key,
-                ?attested_origin,
-                "Delegate notification produced an ApplicationMessage but no app \
-                 holding this delegate's attested identity is registered — \
-                 nothing to route to"
+                "Delegate notification produced an ApplicationMessage but no \
+                 local app is registered with this delegate — nothing to route to"
             );
         }
     }

@@ -2553,10 +2553,10 @@ impl SecretsStore {
     /// discipline of `store_secret` / the live bundle import. The work is bounded
     /// by the predecessors' own on-disk secret count.
     ///
-    /// UNREACHABLE FROM PRODUCTION as of freenet/freenet-core#5198: the H1 gate
+    /// UNREACHABLE FROM PRODUCTION as of GHSA-824h-7x5x-wfmf: the H1 gate
     /// above is sound only if `origin_contract` is trustworthy, and it isn't —
     /// any HTTP client can forge an `origin_contract` value for an arbitrary
-    /// public contract key (see #5198). The one caller
+    /// public contract key (see GHSA-824h-7x5x-wfmf). The one caller
     /// (`RegisterDelegateWithPredecessors`'s handler) no longer invokes this
     /// method; it is kept, with its test suite, for potential reactivation once
     /// `origin_contract` attestation is hardened. Do not re-wire a caller to
@@ -2992,6 +2992,16 @@ impl SecretsStore {
     /// the H1 same-origin copy-forward gate (#4117). FIRST-WRITER-WINS: a record
     /// is written only if none exists, and is NEVER modified afterward — an
     /// attacker who re-registers a victim's public WASM later cannot add itself.
+    ///
+    /// FIRST-WRITER-WINS ALSO MEANS UNREPAIRABLE. A value written here can never
+    /// be corrected, so a wrong one is permanent for the life of the node's
+    /// database. Two consequences for anything tempted to read it: `origin`
+    /// MUST already be gated on the connection scope before it reaches here
+    /// (`Executor::delegate_request` does this — an ungated write let a remote
+    /// caller mint a token for any contract id and freeze a delegate's
+    /// provenance to a value of their choosing), and it is NOT a safe key for
+    /// any live authorization decision, because an app that re-keys can never
+    /// match the frozen value. It is provenance, not policy.
     /// Called on EVERY registration, BEFORE the delegate is registered.
     ///
     /// # Errors
@@ -3003,27 +3013,6 @@ impl SecretsStore {
     /// this gate exists to prevent. `Ok(())` covers both a freshly-written record
     /// AND an already-present one (an idempotent re-registration); neither is an
     /// error.
-    /// Read back the FIRST-registration origin recorded by
-    /// [`Self::record_delegate_registration_origin`], as
-    /// `(has_admin_none, contract_ids)`. `Ok(None)` means the delegate has
-    /// never been registered on this node.
-    ///
-    /// # Errors
-    /// Returns `Err` if the record could not be read. Callers gating an
-    /// authorization decision MUST treat `Err` as "no attested origin"
-    /// (fail closed), never as "any origin".
-    #[allow(clippy::type_complexity)]
-    pub fn delegate_registration_origins(
-        &self,
-        delegate: &DelegateKey,
-    ) -> Result<Option<(bool, Vec<[u8; 32]>)>, SecretStoreError> {
-        self.db.get_delegate_origins(delegate).map_err(|e| {
-            SecretStoreError::IO(std::io::Error::other(format!(
-                "could not read delegate first-registration origin: {e}"
-            )))
-        })
-    }
-
     pub fn record_delegate_registration_origin(
         &self,
         delegate: &DelegateKey,

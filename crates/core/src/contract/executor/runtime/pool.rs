@@ -1186,17 +1186,6 @@ impl ContractExecutor for RuntimePool {
         result
     }
 
-    async fn delegate_attested_origin(
-        &mut self,
-        delegate: &DelegateKey,
-    ) -> Option<ContractInstanceId> {
-        let executor = self.pop_executor().await;
-        let result = executor.registered_delegate_origin(delegate);
-        self.return_checked(executor, "delegate_attested_origin")
-            .await;
-        result
-    }
-
     fn try_begin_export(
         &mut self,
         user_context: &UserSecretContext,

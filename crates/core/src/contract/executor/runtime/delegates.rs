@@ -218,19 +218,6 @@ impl Executor<Runtime> {
         }
     }
 
-    /// The contract id `delegate` was FIRST registered under, read from the
-    /// durable first-writer origin record (`register_delegate_and_record_origin`).
-    /// `None` when it was registered by a caller with no attested identity, is
-    /// unknown here, or the record could not be read (fail closed).
-    pub(crate) fn registered_delegate_origin(
-        &self,
-        delegate: &DelegateKey,
-    ) -> Option<ContractInstanceId> {
-        self.runtime
-            .delegate_registration_origin(delegate)
-            .map(ContractInstanceId::new)
-    }
-
     pub fn delegate_request(
         &mut self,
         req: DelegateRequest<'_>,
@@ -253,6 +240,36 @@ impl Executor<Runtime> {
             "execute_delegate_request: at most one of origin_contract and \
              caller_delegate may be Some (got both)"
         );
+        // GATE THE ORIGIN FOR *EVERY* CONSUMER, NOT JUST MESSAGE RESOLUTION
+        // (GHSA-824h-7x5x-wfmf).
+        //
+        // `resolve_message_origin` gates what a delegate is TOLD about its
+        // caller, but `origin_contract` has a second, more durable consumer:
+        // `register_delegate_and_record_origin` writes it into the immutable
+        // first-writer origin record. Leaving THAT ungated let a remote caller
+        // mint a token for any contract id and register a delegate whose record
+        // then claims that identity — which:
+        //
+        //   1. defeats the inter-delegate dispatch gate below, since the
+        //      attacker's own delegate now has "an attested registration
+        //      origin" and can lend it to a victim delegate; and
+        //   2. enables durable denial by first-writer-poisoning a delegate key
+        //      that is not yet registered locally (WASM and params are public,
+        //      so the key is derivable), permanently fixing its attested origin
+        //      to an attacker value so `route_to_apps` drops every notification
+        //      to the legitimate app.
+        //
+        // The rustdoc on `register_delegate_and_record_origin` names "stealing
+        // the victim's provenance" as the threat the record exists to resist, so
+        // an ungated write is exactly the hole it was built to close. Shadow the
+        // parameter here so no arm below can reach the raw value.
+
+        let origin_contract = if connection_scope.is_local() {
+            origin_contract
+        } else {
+            None
+        };
+
         tracing::debug!(
             origin_contract = ?origin_contract,
             caller_delegate = ?caller_delegate.map(|k| k.to_string()),
@@ -260,33 +277,33 @@ impl Executor<Runtime> {
             "received delegate request"
         );
 
-        // INTER-DELEGATE DISPATCH GATE (GHSA-824h-7x5x-wfmf).
+        // WHY THERE IS NO REGISTRATION-RECORD GATE ON `caller_delegate`
+        // (GHSA-824h-7x5x-wfmf). An earlier revision of this fix refused to
+        // dispatch from any delegate whose first-registration record held no
+        // contract id. It was removed, for two independent reasons:
         //
-        // `caller_delegate` is a runtime-attested identity that wins over every
-        // other origin (see `resolve_message_origin`), so it is a way to hand a
-        // victim delegate an attested caller. A delegate registered WITHOUT an
-        // origin record is one anybody could install — messaging it makes its
-        // own WASM emit `SendDelegateMessage`, and the victim would then
-        // authorize on `MessageOrigin::Delegate(attacker)`. Refuse to dispatch
-        // from such a delegate at all: an unattested delegate cannot lend its
-        // identity to anyone.
+        //  1. It BROKE legitimate use. That record is `None` both for "never
+        //     registered here" and for the tokenless local CLI shape, so every
+        //     delegate installed by riverctl / atlasctl / fdev lost the ability
+        //     to emit `SendDelegateMessage` — silently, because the caller
+        //     swallows the error into a warning and the client still sees `Ok`
+        //     with the reply simply missing.
+        //  2. It was not protecting anything. `caller_delegate` is set by the
+        //     runtime from the key of the delegate that actually ran, and a
+        //     `DelegateKey` is a hash of that delegate's own code and params. So
+        //     `MessageOrigin::Delegate(K)` is SELF-AUTHENTICATING: a caller can
+        //     only ever speak as code it actually got registered, never as some
+        //     other delegate. There is no identity to forge here.
         //
-        // The record is durable and written BEFORE the delegate is registered
-        // (`register_delegate_and_record_origin`), so "no contract id recorded"
-        // is a definite answer, not a race. A read failure yields `None` and is
-        // likewise refused (fail closed).
-        if let Some(caller) = caller_delegate {
-            if self.registered_delegate_origin(caller).is_none() {
-                tracing::warn!(
-                    caller_delegate = %caller,
-                    target_delegate = %req.key(),
-                    "refusing inter-delegate dispatch: caller has no attested registration origin"
-                );
-                return Err(ExecutorError::other(anyhow::anyhow!(
-                    "inter-delegate dispatch refused: calling delegate has no attested registration origin"
-                )));
-            }
-        }
+        // The escalation this gate was aimed at — an off-host caller laundering
+        // its lack of attestation through a delegate hop — is closed where it
+        // should be, by `resolve_message_origin` returning `None` for a non-local
+        // connection: `contract.rs` propagates the ORIGINATING connection scope
+        // into the hop, so the target sees no attestation either. What remains is
+        // that a delegate may present its own key to another delegate. A delegate
+        // that authorizes arbitrary peer delegate keys is making its own trust
+        // decision; the runtime's job is only to make that key unforgeable, which
+        // it does.
 
         match req {
             DelegateRequest::RegisterDelegate {
@@ -437,28 +454,29 @@ impl Executor<Runtime> {
                 // of every shipped binary and the audit trail would exist only
                 // in development). Ids only: no token values, no key material.
                 //
-                // Two events are worth recording: an operation that RECEIVED an
-                // attested identity, and one that was REFUSED one. The remaining
-                // case — a local caller with no identity to begin with, the
-                // tokenless CLI shape — is neither, and it is also the highest
-                // volume, so it is not logged. Without that exclusion this line
-                // fires once per delegate message on a chatty app.
-                if origin.is_some() || !connection_scope.is_local() {
+                // REFUSALS ONLY. An earlier revision also logged every
+                // successfully-attested operation, on the reasoning that the
+                // unattested local case was the high-volume one. That was exactly
+                // backwards: the high-volume case is a web app WITH a token,
+                // which resolves `Some` on every single `ApplicationMessages` —
+                // and, because branch 3 resolves an inherited origin, on every
+                // contract-notification invocation too. A River node in a busy
+                // room would have emitted one shipped INFO per room update.
+                //
+                // Dropping the success case loses nothing: the GRANT of an
+                // attested identity is already recorded once, with the peer
+                // address, at the issuance point in
+                // `server::client_api::render_shell_response`. Re-logging it per
+                // message adds volume, not information. What is NOT recorded
+                // anywhere else, and is genuinely rare, is a connection being
+                // REFUSED attestation — so that is what this line reports.
+                if !connection_scope.is_local() {
                     tracing::info!(
                         delegate_key = %key,
-                        origin_kind = match origin.as_ref() {
-                            None => "none",
-                            Some(MessageOrigin::WebApp(_)) => "web_app",
-                            Some(MessageOrigin::Delegate(_)) => "delegate",
-                            Some(_) => "other",
-                        },
-                        origin_id = ?origin.as_ref().map(|o| match o {
-                            MessageOrigin::WebApp(c) => c.to_string(),
-                            MessageOrigin::Delegate(d) => d.to_string(),
-                            other => format!("{other:?}"),
-                        }),
-                        loopback = connection_scope.is_local(),
-                        "delegate ApplicationMessages: resolved message origin"
+                        from_delegate = ?caller_delegate.map(|k| k.to_string()),
+                        loopback = false,
+                        "delegate ApplicationMessages: withheld attested origin \
+                         from a non-local connection (GHSA-824h-7x5x-wfmf)"
                     );
                 }
                 match self.runtime.inbound_app_message(
