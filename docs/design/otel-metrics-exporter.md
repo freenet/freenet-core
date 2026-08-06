@@ -137,11 +137,16 @@ accepting this scheme and impersonate the node. It is
 rather than sent literally because a URL contains `/`, the token's field
 separator. The canonical form both sides must agree on:
 
-- `{scheme}://{host}:{port}{path}`, e.g. `http://collector.example:4318/v1/metrics`
-- scheme and host lowercased
-- port always explicit, defaulting to 80 for `http` and 443 for `https`
+- `{host}:{port}{path}`, e.g. `collector.example:4318/v1/metrics`
+- host lowercased
+- port always explicit, defaulting to 80 for an `http` URL and 443 for an `https` one
 - path verbatim, no normalization
 - userinfo stripped, query and fragment dropped
+- **scheme not included**: it names a transport, not a party, so binding it
+  would not narrow which collector may use the token, while forcing every
+  collector reachable over both http and https to be configured twice. It does
+  still reach the hash through the default-port rule, so `http://c/x` and
+  `https://c/x` differ.
 
 Stripping userinfo is load-bearing twice over: it keeps operator credentials
 out of a signed, wire-visible field, and a collector that does not know the
