@@ -4337,7 +4337,13 @@ impl GlobalTestMetrics {
         GLOBAL_NOTIFICATION_COHOSTS_SKIPPED.with(|c| c.get())
     }
 
-    /// A proactive summary notification SENT to `n` recipients.
+    /// A proactive summary notification ATTEMPTED to `n` recipients.
+    ///
+    /// Attempted, not delivered: `n` is the resolved recipient set, counted
+    /// once per notification round, before the per-peer enqueue can fail. That
+    /// matches what the cost question asks (how many messages this mechanism
+    /// puts on the wire) and matches its sibling `notification_cohosts_skipped`,
+    /// which is likewise an intent count. Do not read it as an ack.
     ///
     /// The cost half of the pair. `notification_cohosts_skipped` counts only
     /// what the #4965 exclusion SAVED, so for as long as it stood alone the

@@ -17348,7 +17348,8 @@ struct SuppressionArm {
     /// peer has an advertised co-host, so there is no mesh and nothing to
     /// suppress.
     hosting_updates: u64,
-    /// Standalone `Summaries` notifications SENT.
+    /// Standalone `Summaries` notifications ATTEMPTED (resolved recipients,
+    /// counted before the per-peer enqueue can fail).
     ///
     /// The cost axis. Every other counter here measures traffic this feature
     /// REMOVES; without this one the rig can only ever report good news. #5190's
