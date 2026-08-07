@@ -39,12 +39,35 @@ export, regardless of configuration.
 | `otel-auth-mode` | `disabled` | `disabled` sends no `Authorization` header; `freenet` sends a signed bearer token (below) |
 
 The standard OpenTelemetry environment variables take priority over
-`otel-endpoint` and are handled by the SDK:
-`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_EXPORTER_OTLP_ENDPOINT`,
-`OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TIMEOUT`,
+`otel-endpoint`: `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`,
+`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`,
+`OTEL_EXPORTER_OTLP_TIMEOUT`, `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT`,
 `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_METRIC_EXPORT_INTERVAL`
 (default 60s). With none of them and no `otel-endpoint`, the exporter uses
 `http://localhost:4318`.
+
+**The two endpoint variables are not interchangeable.** The signal-specific
+`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` is used exactly as written, so it must
+include the full path:
+
+```bash
+OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://collector:4318/v1/metrics   # full path
+OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318                      # base URL only
+```
+
+Getting this backwards produces a 404 on every export — and, in `freenet` auth
+mode, an audience hash over the wrong path. Include the scheme in either form:
+a bare `collector:4318` is accepted as a URL but cannot be sent, and the node
+warns about it at startup.
+
+The timeout variables are in **milliseconds** (`OTEL_EXPORTER_OTLP_TIMEOUT=10`
+is 10ms, not 10 seconds, and every export will time out). The node warns on a
+suspiciously small value.
+
+`OTEL_EXPORTER_OTLP_COMPRESSION` is **not supported** — the compression
+features are deliberately not compiled in, and setting the variable makes the
+exporter fail to start, leaving the node with no metrics at all. The startup
+warning names the cause.
 
 When an environment variable overrides a configured `otel-endpoint`, the node
 logs a warning at startup naming both, and the "OTel metrics exporter started"
@@ -84,8 +107,12 @@ any `user:password@` stripped, and no scheme. So an endpoint of
 `collector.example:4318/v1/metrics`, which you can reproduce with:
 
 ```bash
+# base58 has no standard CLI; this uses Python, which is universally available.
 printf 'collector.example:4318/v1/metrics' \
-  | openssl dgst -sha256 -binary | head -c 16 | base58
+  | openssl dgst -sha256 -binary | head -c 16 \
+  | python3 -c 'import sys;d=sys.stdin.buffer.read();n=int.from_bytes(d,"big");a="123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";s=""
+while n: n,r = divmod(n,58); s = a[r]+s
+print("1"*(len(d)-len(d.lstrip(b"\0")))+s)'
 ```
 
 If your collector rejects tokens with an audience mismatch, compare that value
@@ -110,4 +137,6 @@ changes.
 - `freenet.process.memory.rss` is Linux-only. On macOS and Windows the series
   is empty; that is expected, not a broken pipeline.
 - Export failures never affect the node: a collector that is down or rejecting
-  batches produces a log line and nothing else.
+  batches produces a `WARN` naming the endpoint and the reason, and nothing
+  else. The warning is logged once per failing streak, with an `INFO` when
+  exports recover — not once per 60s interval.

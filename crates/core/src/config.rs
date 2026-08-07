@@ -2989,7 +2989,7 @@ pub struct OtelArgs {
 
     /// Collector authentication method. `Option` so `build()` can tell "not
     /// given on the CLI" from an explicit choice and merge the config-file
-    /// value; resolves to [`OtelAuthMode::default`] (`freenet`) when neither
+    /// value; resolves to [`OtelAuthMode::default`] (`disabled`) when neither
     /// sets it.
     #[arg(id = "otel_auth_mode", long = "otel-auth-mode", value_enum)]
     #[serde(rename = "otel-auth-mode", skip_serializing_if = "Option::is_none")]
