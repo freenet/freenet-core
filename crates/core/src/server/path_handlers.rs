@@ -5758,12 +5758,34 @@ mod tests {
             SHELL_BRIDGE_JS.contains(r"/\/v[12]\/contract\/web\/([^/?#]+)/"),
             "notification consent key must derive from the /v[12]/contract/web/<key> path"
         );
-        // Every notification is gated on BOTH the browser permission AND this
-        // contract's own consent, so one contract's gateway-wide browser grant
-        // can't notify the user on behalf of a different contract.
+        // The markers bracket showAppNotification so shell_bridge_notifications
+        // .test.mjs can extract and drive it. Pin them here: without this,
+        // deleting the markers AND the .mjs cases together leaves CI green with
+        // the #5043 status coverage silently gone.
+        let show_start = SHELL_BRIDGE_JS
+            .find("notify-show:BEGIN")
+            .expect("notify-show:BEGIN marker must bracket showAppNotification");
+        let show_end = SHELL_BRIDGE_JS[show_start..]
+            .find("notify-show:END")
+            .expect("notify-show:END marker must bracket showAppNotification");
+        let show_slice = &SHELL_BRIDGE_JS[show_start..show_start + show_end];
+        // Same for the enable-prompt ladder (#5043 item 3).
+        let offer_start = SHELL_BRIDGE_JS
+            .find("notify-offer:BEGIN")
+            .expect("notify-offer:BEGIN marker must bracket maybeOfferNotifications");
         assert!(
-            SHELL_BRIDGE_JS
-                .contains("Notification.permission !== 'granted' || !contractHasConsent()"),
+            SHELL_BRIDGE_JS[offer_start..].contains("notify-offer:END"),
+            "notify-offer:END marker must bracket maybeOfferNotifications"
+        );
+        // Every notification is gated on BOTH the browser permission AND this
+        // contract's own consent. Asserted against the marker-bounded slice, so
+        // the gates must live INSIDE showAppNotification — two file-wide
+        // `contains` calls would stay green if a refactor moved them out.
+        // (Two separate gates since #5043, so each drop can report its own
+        // `notification_status` back to the app instead of returning silently.)
+        assert!(
+            show_slice.contains("Notification.permission !== 'granted'")
+                && show_slice.contains("!contractHasConsent()"),
             "showAppNotification must gate on browser permission AND per-contract consent"
         );
         // "Not now" must be durable so a contract that re-sends the enable prompt
@@ -5828,6 +5850,80 @@ mod tests {
         assert!(
             !SHELL_BRIDGE_JS.contains("'serviceWorker' in navigator"),
             "feature-detect by attempting the read (serviceWorkerOrNull), not via `in`"
+        );
+    }
+
+    /// #5043: a framed app can't read `Notification.permission` (opaque origin),
+    /// so the shell reporting a status is its ONLY way to learn a notification
+    /// was dropped. Regression pins for the two paths that were silent and were
+    /// re-broken during review of the first fix — the rate-limiter drop, and the
+    /// async service-worker chain, whose only rejection handler covered
+    /// `showNotification` and left a rejected registration lookup (or a
+    /// synchronous throw) with no reply at all.
+    ///
+    /// The exactly-one-status-per-message behavior is verified by driving the
+    /// real extracted functions in `shell_bridge_notifications.test.mjs` (cases
+    /// 9 and 10, run by the lint-assets CI job). These are source pins for the
+    /// two specific silent-return shapes, in the same discipline as the
+    /// `SHELL_BRIDGE_JS.contains` guards above, so a refactor that reintroduces
+    /// either shape fails here too.
+    #[test]
+    fn bridge_js_notification_drops_are_never_silent() {
+        let start = SHELL_BRIDGE_JS
+            .find("notify-show:BEGIN")
+            .expect("notify-show:BEGIN marker must bracket showAppNotification");
+        let end = SHELL_BRIDGE_JS[start..]
+            .find("notify-show:END")
+            .expect("notify-show:END marker must bracket showAppNotification");
+        let show = &SHELL_BRIDGE_JS[start..start + end];
+
+        // The rate-limiter drop is the most frequent one (a busy room hits the
+        // 3s per-tag throttle constantly). `if (...) return;` on one line is the
+        // exact shape it had while it was silent.
+        assert!(
+            !show.contains("if (!notifyLimiter.ok(opts.tag, Date.now())) return;"),
+            "the rate-limited drop must post a status, not return silently (#5043)"
+        );
+        assert!(
+            show.contains("notifyLimiter.ok(") && show.contains("notifyStatusToIframe('granted')"),
+            "the rate-limited drop must report 'granted' — permission and consent \
+             are intact and the shell merely coalesced the message"
+        );
+
+        // The service-worker chain needs a terminal .catch: without it a rejected
+        // notifyRegistrationReady, a synchronous throw from showNotification, or
+        // a non-thenable return all leave the app with no reply.
+        let sw_start = show
+            .find("notifyRegistrationReady(")
+            .expect("the mobile fallback must go through notifyRegistrationReady");
+        let sw_chain = &show[sw_start..];
+        assert!(
+            sw_chain.contains(".catch("),
+            "the service-worker delivery chain must end in a .catch so a rejected \
+             registration lookup or a throwing showNotification still replies (#5043)"
+        );
+        // ...and that backstop must not turn one reply into two: every post from
+        // the chain goes through the post-at-most-once helper, never through
+        // notifyStatusToIframe directly.
+        assert!(
+            show.contains("var swReplied = false;") && sw_chain.contains("swReply("),
+            "the service-worker chain's .catch backstop must be guarded so a throw \
+             from the success-path status post can't produce a second reply"
+        );
+        assert!(
+            !sw_chain.contains("notifyStatusToIframe("),
+            "the service-worker chain must post via swReply(), which is what bounds \
+             it to one reply — a direct notifyStatusToIframe call bypasses that"
+        );
+
+        // The constructor path's status post must sit OUTSIDE the try: inside, a
+        // throw from it reads as "constructor unsupported" and the worker path
+        // displays the SAME notification a second time.
+        assert!(
+            show.contains("shownByConstructor = true;")
+                && show.contains("if (shownByConstructor) {"),
+            "the constructor path must record delivery in a flag and report \
+             outside the try, so a throwing status post can't double-deliver"
         );
     }
 
