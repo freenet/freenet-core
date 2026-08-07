@@ -1152,8 +1152,9 @@ mod tests {
     // specific bind is used as-is, with IPv6 literals bracketed.
     #[test]
     fn dashboard_authority_maps_bind_address_to_reachable_url_host() {
-        // IPv6 wildcard (the default ws-api-address): primary is IPv6, so use
-        // the IPv6 loopback rather than the best-effort IPv4 companion.
+        // IPv6 wildcard (`--ws-api-address ::`, or the auto-widened bind):
+        // primary is IPv6, so use the IPv6 loopback rather than the
+        // best-effort IPv4 companion.
         assert_eq!(
             dashboard_authority(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 7509)),
             "[::1]:7509"
