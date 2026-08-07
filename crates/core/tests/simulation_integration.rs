@@ -17769,6 +17769,10 @@ fn explore_5147_ttl_horizon() {
 // asserts nothing, and each run costs ~6 min of CI for no signal.
 // Kept because it is the evidence that the #5147 rig is blind to
 // full-state composition; see #5153.
+//
+// Replicated on clean main (no #5190 partition in tree): full-state count
+// identical again at 9/9, 9/9, 14/14, so the null is not an artifact of
+// other in-flight fixes.
 #[ignore]
 #[test_log::test]
 fn explore_5147_sparse_full_state_sensitivity() {
