@@ -126,7 +126,7 @@ wasmparser = "0.255"
 # Testing/simulation
 arbitrary = { version = "1", features = ["derive"] }
 criterion = { version = "0.8", features = ["async_tokio"] }
-freenet-test-network = "0.1.22"
+freenet-test-network = "0.1.24"
 httptest = "0.16"
 proptest = "1"
 regex = "1"
