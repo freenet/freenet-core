@@ -5,6 +5,14 @@ services:
       dockerfile: Dockerfile
     image: freenet-gateway:latest
     environment:
+      # The client API binds LOOPBACK by default (GHSA-824h-7x5x-wfmf). This
+      # service uses `network_mode: host`, so that is the HOST's loopback:
+      # reachable from anything on the host (including other containers sharing
+      # its namespace), not from the LAN. That is the right posture for a
+      # gateway, whose job is the P2P port below, not the control API. Set
+      # FREENET_WS_API_ADDRESS=:: only if you deliberately need to drive this
+      # gateway's API from another machine, and put an authenticating proxy in
+      # front of it.
       TRANSPORT_KEYPAIR: /root/.cache/freenet/keys/transport-keypair.pem
       PUBLIC_NETWORK_ADDRESS: 0.0.0.0
       PUBLIC_NETWORK_PORT: 31337

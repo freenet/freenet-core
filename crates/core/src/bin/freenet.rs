@@ -1058,6 +1058,12 @@ fn run_node(config_args: ConfigArgs) -> anyhow::Result<()> {
     rt.block_on(async move {
         let config = config_args.build().await?;
         freenet::config::set_logger(None, None, config.paths().log_dir());
+        // Same reason as the info! below: `ConfigArgs::build()` resolves the
+        // client API's bind address, but it runs with no subscriber installed,
+        // so it records the decision instead of logging it. Replay it here —
+        // this is the only place an operator learns that their node stopped
+        // answering clients on other machines, and why.
+        config.log_client_api_exposure();
         // The logger is needed before this info which is why it's here instead of above
         tracing::info!(
             max_blocking_threads,
@@ -1070,6 +1076,34 @@ fn run_node(config_args: ConfigArgs) -> anyhow::Result<()> {
     })?;
 
     Ok(())
+}
+
+/// Carry the client-API exposure flags across the subcommand boundary.
+///
+/// `--ws-api-address` / `--allowed-host` / `--allowed-source-cidrs` placed
+/// BEFORE the subcommand (`freenet --ws-api-address :: network`) land in the
+/// top-level `ConfigArgs`, which the `Network`/`Local` arms otherwise discard —
+/// the same trap `--disable-auto-update` hit in #4690.
+///
+/// This matters more since the client API started defaulting to loopback
+/// (GHSA-824h-7x5x-wfmf): these three flags are exactly how an operator asks
+/// for a wider bind, so silently dropping one leaves the node loopback-only
+/// while the operator believes they opted out. Previously the same typo was
+/// harmless, because network mode bound `::` either way.
+///
+/// The subcommand's own value wins; the top-level one only fills a gap.
+fn merge_pre_subcommand_ws_api_args(config: &mut ConfigArgs, top_level: &ConfigArgs) {
+    config.ws_api.address = config.ws_api.address.or(top_level.ws_api.address);
+    config.ws_api.allowed_host = config
+        .ws_api
+        .allowed_host
+        .take()
+        .or_else(|| top_level.ws_api.allowed_host.clone());
+    config.ws_api.allowed_source_cidrs = config
+        .ws_api
+        .allowed_source_cidrs
+        .take()
+        .or_else(|| top_level.ws_api.allowed_source_cidrs.clone());
 }
 
 fn freenet_main() -> anyhow::Result<()> {
@@ -1111,11 +1145,13 @@ fn freenet_main() -> anyhow::Result<()> {
             // opt-out leaves the from-source node auto-updating (the exact loop
             // we are preventing).
             config.disable_auto_update |= cli.config.disable_auto_update;
+            merge_pre_subcommand_ws_api_args(&mut config, &cli.config);
             run_node(config)
         }
         Some(Command::Local { mut config }) => {
             config.mode = Some(OperationMode::Local);
             config.disable_auto_update |= cli.config.disable_auto_update;
+            merge_pre_subcommand_ws_api_args(&mut config, &cli.config);
             run_node(config)
         }
         None => {
@@ -1340,6 +1376,82 @@ mod tests {
                 "flag must be honored in either position: {argv:?}"
             );
         }
+    }
+
+    /// Same trap, for the flags that now decide the client API's bind: placed
+    /// before the subcommand they land in the top-level `ConfigArgs`, which the
+    /// `Network`/`Local` arms discard. Dropping one leaves the node
+    /// loopback-only while the operator believes they widened it.
+    #[test]
+    fn ws_api_exposure_flags_are_honored_before_the_subcommand() {
+        use super::{Cli, Command, merge_pre_subcommand_ws_api_args};
+        use clap::Parser;
+        for argv in [
+            vec![
+                "freenet",
+                "--ws-api-address",
+                "::",
+                "--allowed-host",
+                "node.example",
+                "--allowed-source-cidrs",
+                "100.64.0.0/10",
+                "network",
+            ],
+            vec![
+                "freenet",
+                "network",
+                "--ws-api-address",
+                "::",
+                "--allowed-host",
+                "node.example",
+                "--allowed-source-cidrs",
+                "100.64.0.0/10",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(&argv).expect("parse");
+            let mut config = match cli.command {
+                Some(Command::Network { config }) => config,
+                _ => panic!("expected network subcommand"),
+            };
+            merge_pre_subcommand_ws_api_args(&mut config, &cli.config);
+            assert_eq!(
+                config.ws_api.address,
+                Some("::".parse().unwrap()),
+                "--ws-api-address must survive in either position: {argv:?}"
+            );
+            assert_eq!(
+                config.ws_api.allowed_host.as_deref(),
+                Some(&["node.example".to_string()][..]),
+                "--allowed-host must survive in either position: {argv:?}"
+            );
+            assert_eq!(
+                config.ws_api.allowed_source_cidrs.as_deref(),
+                Some(&["100.64.0.0/10".to_string()][..]),
+                "--allowed-source-cidrs must survive in either position: {argv:?}"
+            );
+        }
+    }
+
+    /// The subcommand's own value wins; the top-level one only fills a gap.
+    #[test]
+    fn subcommand_ws_api_address_beats_the_pre_subcommand_one() {
+        use super::{Cli, Command, merge_pre_subcommand_ws_api_args};
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "freenet",
+            "--ws-api-address",
+            "::",
+            "network",
+            "--ws-api-address",
+            "127.0.0.1",
+        ])
+        .expect("parse");
+        let mut config = match cli.command {
+            Some(Command::Network { config }) => config,
+            _ => panic!("expected network subcommand"),
+        };
+        merge_pre_subcommand_ws_api_args(&mut config, &cli.config);
+        assert_eq!(config.ws_api.address, Some("127.0.0.1".parse().unwrap()));
     }
 
     #[test]

@@ -121,7 +121,7 @@ wasmtime = { version = "47", default-features = false, features = [
 # PUT time (see crates/core/src/client_events.rs::contains_debug_sections).
 # Pinned to the same minor wasmtime 45 already resolves transitively so cargo
 # reuses one copy rather than locking a second wasmparser build.
-wasmparser = "0.253"
+wasmparser = "0.255"
 
 # Testing/simulation
 arbitrary = { version = "1", features = ["derive"] }
@@ -151,8 +151,8 @@ libc = "0.2"
 tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"] }
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 winapi = "0.3"
-tao = { version = "0.35", default-features = false, features = ["rwh_06"] }
-wry = { version = "0.55", default-features = false, features = ["os-webview"] }
+tao = { version = "0.36", default-features = false, features = ["rwh_06"] }
+wry = { version = "0.56", default-features = false, features = ["os-webview"] }
 winreg = "0.56"
 tray-icon = "0.24"
 muda = "0.19"

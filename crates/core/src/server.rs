@@ -427,7 +427,17 @@ fn build_allowed_hosts(
     hosts.add_machine_hostname();
 
     if !bind_addr.is_unspecified() {
-        hosts.add(&bind_addr.to_string());
+        // Bracket IPv6 literals. A `Host` header carries `[::1]:7509`, never
+        // `::1:7509`, so the unbracketed forms `add` would otherwise insert are
+        // one dead entry plus one malformed one. Harmless (add_localhost has
+        // already inserted the bracketed `[::1]`), but this branch became the
+        // DEFAULT path when the client API moved to a loopback bind
+        // (GHSA-824h-7x5x-wfmf), so the junk now shows up in the
+        // `allowed_hosts` startup log on every node.
+        match bind_addr {
+            IpAddr::V6(v6) => hosts.add(&format!("[{v6}]")),
+            IpAddr::V4(v4) => hosts.add(&v4.to_string()),
+        }
     }
 
     for host in extra_allowed_hosts {
@@ -1163,8 +1173,11 @@ mod tests {
 
     #[test]
     fn test_build_allowed_hosts_excludes_ipv6_unspecified() {
-        // :: is the new default bind address; verify it's excluded from allowlist
-        // but localhost variants are still included
+        // `::` is a wildcard bind (an explicit --ws-api-address, or the compat
+        // auto-widen; it stopped being the network-mode default in
+        // GHSA-824h-7x5x-wfmf). It must still be excluded from the Host
+        // allowlist — a wildcard names no host — while the localhost variants
+        // stay included.
         let hosts = build_allowed_hosts(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 7509, &[]);
         assert!(!hosts.contains("::"));
         assert!(!hosts.contains("[::]:7509"));
