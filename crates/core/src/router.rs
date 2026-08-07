@@ -160,8 +160,8 @@ pub(crate) struct NetworkEfficiencyV1 {
     pub ms_b: [u64; MissingSummaryClass::COUNT],
     /// First-send entry-age buckets: <1s, 1-9s, 10-59s, 1-4m59s, >=5m.
     pub ms_age: [u64; 5],
-    /// SIZE histogram of delivered missing-summary payloads, log-4 from <1 KiB
-    /// to >=1 MiB. Rows are `interest::SIZE_HIST_CLASSES` in order:
+    /// SIZE histogram of delivered missing-summary payloads, log-4: <4 KiB,
+    /// <16 KiB, <64 KiB, <256 KiB, <1 MiB, >=1 MiB. Rows are `interest::SIZE_HIST_CLASSES` in order:
     /// tracked_first_new, tracked_first_recreated, untracked_first_observed,
     /// untracked_first_recreated. Not all ten classes — see that constant.
     ///
@@ -169,7 +169,8 @@ pub(crate) struct NetworkEfficiencyV1 {
     /// while full-state SEND COUNT rose only ~12% (#5153): every counter that
     /// existed measured counts, so the axis that actually moved was invisible.
     pub ms_size: [[u64; 6]; 4],
-    /// UNTRACKED sends bucketed by how long ago the pair's entry was removed:
+    /// DELIVERED untracked sends bucketed by how long ago the pair's entry was
+    /// removed:
     /// <10s, <1m, <5m, <20m, older, and finally "no record of a removal".
     ///
     /// `ms_age` cannot cover this population — `first_age_bucket` is computed

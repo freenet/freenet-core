@@ -530,6 +530,16 @@ pub(crate) const MISSING_SUMMARY_SIZE_BUCKETS: usize = 6;
 /// Buckets for `untracked_prior_removal_age`.
 pub(crate) const UNTRACKED_PRIOR_REMOVAL_BUCKETS: usize = 6;
 
+// Both bucket functions below HARDCODE their match arms while these constants
+// size the arrays those arms index. Nothing in the type system couples them, so
+// trimming a constant to save telemetry bytes — exactly the edit this module's
+// own budget pressure invites — would compile clean and then panic with
+// index-out-of-bounds inside the broadcast task on the first oversized payload.
+// `SIZE_HIST_ROWS` is immune because it derives from `.len()`; these only LOOK
+// as safe.
+const _: () = assert!(MISSING_SUMMARY_SIZE_BUCKETS == 6);
+const _: () = assert!(UNTRACKED_PRIOR_REMOVAL_BUCKETS == 6);
+
 /// Classes carrying a size histogram, in row order.
 ///
 /// Deliberately NOT all ten classes. A 10x8 matrix pushed the busy-fleet
@@ -1485,8 +1495,21 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// An untracked pair has no interest entry, so it has no entry age to
     /// report. What it does have is the history record's `recent_removal`, and
     /// the distinction that matters is whether we are broadcasting to a peer
-    /// that RECENTLY lost its entry (a churn/removal problem) or one we have no
-    /// record of at all (genuine first contact). Bucket 5 is the latter.
+    /// that RECENTLY lost its entry (a churn/removal problem) or one we hold no
+    /// removal record for. Bucket 5 is the latter.
+    ///
+    /// Bucket 5 is NOT "genuine first contact", for two reasons, and both bias
+    /// it the same way — toward concluding that churn is not the cause:
+    ///
+    /// 1. It also counts REPEAT untracked sends (`UntrackedRepeat*`), which are
+    ///    by definition not first contact.
+    /// 2. It absorbs LRU evictions. `recent_removal` lives in
+    ///    `missing_summary_history` (bounded, LRU), and `history.get` PROMOTES
+    ///    on every untracked send — so the entries most likely to be evicted are
+    ///    the oldest un-rebroadcast removals, which is precisely the bucket-4
+    ///    tail. Bucket 4 is therefore systematically undercounted INTO bucket 5.
+    ///    Cross-check against `corr_ovf[0]` before reading bucket 5 as evidence
+    ///    of anything; `recreated` carries the same caveat for the same reason.
     fn untracked_prior_removal_bucket(age: Option<Duration>) -> usize {
         match age {
             Some(d) if d < Duration::from_secs(10) => 0,
@@ -3478,12 +3501,27 @@ mod tests {
         }
 
         let snap = manager.interest_lifecycle_snapshot();
-        let row = TestInterestManager::size_hist_row(MissingSummaryClass::UntrackedFirstObserved)
-            .expect("untracked_first_observed must carry a size row");
+        // Literal, NOT `size_hist_row(..)`. Deriving the expected row from the
+        // function under test makes the assertion self-referential: permuting
+        // SIZE_HIST_CLASSES would keep this green while silently mislabelling
+        // every ms_size row against the order router.rs promises the dashboard.
+        let row = 2;
+        assert_eq!(
+            SIZE_HIST_CLASSES,
+            [
+                MissingSummaryClass::TrackedFirstNew,
+                MissingSummaryClass::TrackedFirstRecreated,
+                MissingSummaryClass::UntrackedFirstObserved,
+                MissingSummaryClass::UntrackedFirstRecreated,
+            ],
+            "ms_size row order is a WIRE contract with the dashboard \
+             (router.rs documents it); reordering silently reattributes every \
+             row to the wrong class"
+        );
         // 512 B -> bucket 0; 200 KB -> bucket 3 (65536..=262_143).
         assert_eq!(
             snap.delivered_size_hist[row][0], 1,
-            "the sub-1KiB send must be counted in bucket 0"
+            "the 512-byte send must be counted in bucket 0 (<4 KiB)"
         );
         assert_eq!(
             snap.delivered_size_hist[row][3], 1,
@@ -3498,6 +3536,122 @@ mod tests {
                 .is_none(),
             "repeat classes are a measured zero fleet-wide and are excluded to \
              stay inside the network_efficiency_v1 byte budget"
+        );
+    }
+
+    /// Every bucket boundary of both classifiers, including the exact edges.
+    ///
+    /// The arms are hardcoded literals, so an off-by-one at an edge is invisible
+    /// to any test that only samples interior values — which is all the others
+    /// did.
+    #[test]
+    fn bucket_classifiers_are_exact_at_every_boundary() {
+        type M = TestInterestManager;
+
+        // Size: contiguous, no gap, no overlap, exhaustive over u64.
+        for (bytes, want) in [
+            (0u64, 0usize),
+            (4095, 0),
+            (4096, 1),
+            (16_383, 1),
+            (16_384, 2),
+            (65_535, 2),
+            (65_536, 3),
+            (262_143, 3),
+            (262_144, 4),
+            (1_048_575, 4),
+            (1_048_576, 5),
+            (u64::MAX, 5),
+        ] {
+            assert_eq!(
+                M::delivered_size_bucket(bytes),
+                want,
+                "size bucket for {bytes} bytes"
+            );
+        }
+
+        // Age: strict `<`, so each stated edge belongs to the NEXT bucket up.
+        // The 1200s edge is INTEREST_TTL, which is what makes bucket 4 mean
+        // "older than the adjacent `recreated` filter would have kept".
+        for (secs, want) in [
+            (0u64, 0usize),
+            (9, 0),
+            (10, 1),
+            (59, 1),
+            (60, 2),
+            (299, 2),
+            (300, 3),
+            (1199, 3),
+            (1200, 4),
+            (86_400, 4),
+        ] {
+            assert_eq!(
+                M::untracked_prior_removal_bucket(Some(Duration::from_secs(secs))),
+                want,
+                "age bucket for {secs}s"
+            );
+        }
+        assert_eq!(
+            M::untracked_prior_removal_bucket(None),
+            5,
+            "no removal record is its own bucket, never folded into the tail"
+        );
+        assert_eq!(
+            Duration::from_secs(1200),
+            INTEREST_TTL,
+            "the 1200s edge is INTEREST_TTL by intent, not coincidence; if the \
+             TTL moves, bucket 4 stops meaning 'beyond what `recreated` keeps'"
+        );
+    }
+
+    /// The age read must NOT be clamped by `INTEREST_TTL`.
+    ///
+    /// This is the one novel decision in the change: `recreated` (three lines
+    /// above the read) filters by `INTEREST_TTL`, and this deliberately does
+    /// not, because the whole question is how the age is DISTRIBUTED and
+    /// clamping would discard the tail that separates "recently lost its entry"
+    /// from "no record at all".
+    ///
+    /// Without this test the decision is unpinned: adding the filter back moves
+    /// bucket 4's contents into bucket 5 and every other test stays green.
+    #[test]
+    fn untracked_age_keeps_the_tail_beyond_interest_ttl() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(46);
+        let peer = make_peer_key(46);
+
+        manager.register_peer_interest(&contract, peer.clone(), None, false);
+        assert!(manager.remove_peer_interest_for(
+            &contract,
+            &peer,
+            InterestRemovalCause::DisconnectGrace
+        ));
+
+        // Well past INTEREST_TTL, so a TTL-filtered read would report None.
+        time.advance_time(INTEREST_TTL + Duration::from_secs(600));
+
+        let PeerSummaryForBroadcast::Missing {
+            attempt: Some(attempt),
+            ..
+        } = manager.begin_peer_summary_broadcast(&contract, &peer)
+        else {
+            panic!("untracked pair");
+        };
+        let mut guard = manager.missing_summary_attempt_guard(attempt);
+        guard.mark_delivered(1024);
+        drop(guard);
+
+        let snap = manager.interest_lifecycle_snapshot();
+        assert_eq!(
+            snap.untracked_prior_removal_age[4], 1,
+            "a removal older than INTEREST_TTL must stay in the older-than-20m \
+             bucket. If this lands in bucket 5 the read has been clamped by the \
+             TTL and the counter can no longer tell a churned pair from one it \
+             has no record of"
+        );
+        assert_eq!(
+            snap.untracked_prior_removal_age[5], 0,
+            "and must NOT be folded into the no-record bucket"
         );
     }
 
