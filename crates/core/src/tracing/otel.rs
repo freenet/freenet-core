@@ -6,6 +6,7 @@
 //! see `docs/design/otel-metrics-exporter.md`.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use opentelemetry::metrics::{Counter, Histogram};
 use opentelemetry::{KeyValue, global};
@@ -83,6 +84,46 @@ pub(crate) fn resolve_metrics_endpoint(
     }
     let base = cfg_endpoint.map(str::trim).filter(|s| !s.is_empty())?;
     Some(format!("{}/v1/metrics", base.trim_end_matches('/')))
+}
+
+/// The endpoint the standard environment declares, in SDK precedence order,
+/// or `None` when neither variable is set to a non-blank value.
+///
+/// Blank-filtered on purpose: `env::var` returns `Ok("")` for a variable set
+/// to the empty string, which [`resolve_metrics_endpoint`] correctly treats as
+/// unset — so reading it raw would report an override that is not happening.
+fn env_endpoint() -> Option<String> {
+    [
+        opentelemetry_otlp::OTEL_EXPORTER_OTLP_METRICS_ENDPOINT,
+        opentelemetry_otlp::OTEL_EXPORTER_OTLP_ENDPOINT,
+    ]
+    .iter()
+    .find_map(|var| {
+        let value = std::env::var(var).ok()?;
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    })
+}
+
+/// Why an OTLP endpoint will not work, or `None` when it is usable.
+///
+/// Both failure modes are otherwise near-invisible. `http::Uri` accepts
+/// `collector:4318` as an authority with no scheme, so the exporter builds and
+/// then every export dies converting to a `reqwest::Request` ("relative URL");
+/// and an endpoint the SDK cannot parse at all is swallowed with `.ok()`,
+/// falling back to `http://localhost:4318` while the startup log still names
+/// the operator's URL.
+fn endpoint_problem(endpoint: &str) -> Option<&'static str> {
+    match endpoint.parse::<http::Uri>() {
+        Err(_) => Some(
+            "not a valid URL; the SDK will silently fall back to http://localhost:4318. \
+             Include the scheme, e.g. http://collector:4318",
+        ),
+        Ok(uri) if !matches!(uri.scheme_str(), Some("http" | "https")) => {
+            Some("missing an http:// or https:// scheme; every export will fail to build a request")
+        }
+        Ok(_) => None,
+    }
 }
 
 /// Build one `freenet`-mode bearer token:
@@ -201,6 +242,46 @@ impl std::fmt::Debug for OtlpHttpClient {
     }
 }
 
+/// Whether the last export attempt failed, so failures log on the first
+/// occurrence and on each failing<->recovering transition rather than every
+/// 60s forever.
+static EXPORT_FAILING: AtomicBool = AtomicBool::new(false);
+
+/// Report a failed export at WARN, once per failing streak.
+///
+/// The SDK will not do this for us, despite `opentelemetry-otlp` logging both
+/// network errors and non-2xx responses at DEBUG on the stated grounds that
+/// "PeriodicReader already logs the returned error via `otel_error!`". That is
+/// true for the batch log/span processors and FALSE for metrics: the metrics
+/// `PeriodicReader` logs its export result via `otel_debug!`
+/// ("PeriodReaderInvokedExport"), and the only `otel_error!` in that file is
+/// thread-creation failure. Without this, a collector that is down, rejecting
+/// our token, or 413-ing our batches produces NO output at the default log
+/// level while startup still says "OTel metrics exporter started".
+fn report_export_failure(uri: &http::Uri, detail: &str) {
+    if !EXPORT_FAILING.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            %uri,
+            detail,
+            "OTel metrics export is failing; metrics are not reaching the collector"
+        );
+    }
+}
+
+/// Report a successful export, logging only the failing -> recovered edge.
+fn report_export_success() {
+    if EXPORT_FAILING.swap(false, Ordering::Relaxed) {
+        tracing::info!("OTel metrics export recovered");
+    }
+}
+
+/// First 256 bytes of an error body — OTLP puts rejection detail there, but a
+/// collector may echo back headers (including our bearer token), so it is
+/// truncated rather than logged whole.
+fn truncated_body(body: &[u8]) -> String {
+    String::from_utf8_lossy(&body[..body.len().min(256)]).into_owned()
+}
+
 #[async_trait::async_trait]
 impl HttpClient for OtlpHttpClient {
     async fn send_bytes(&self, mut request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
@@ -217,21 +298,44 @@ impl HttpClient for OtlpHttpClient {
                 );
             }
         }
+        let uri = request.uri().clone();
         // Hand-rolled send, mirroring opentelemetry-http's blocking impl:
         // that impl is on reqwest 0.13's client (opentelemetry-http's own
         // dep), while the workspace is on 0.12, so we can't delegate to it.
         // Blocking inside async is fine here for the same reason the SDK's
         // default client is blocking: PeriodicReader exports via block_on on
         // a dedicated thread. Fold both in when the workspace moves to 0.13.
-        let request: reqwest::blocking::Request = request.map(|body| body.to_vec()).try_into()?;
+        //
+        // Every outcome is reported through `report_export_*`: the SDK logs
+        // them at DEBUG only, so this is the only place a failing export
+        // becomes visible to an operator.
+        let request: reqwest::blocking::Request = request
+            .map(|body| body.to_vec())
+            .try_into()
+            .inspect_err(|error| {
+                // Reached when the endpoint has no scheme: reqwest requires an
+                // absolute URL, while `http::Uri` accepts `host:port` as an
+                // authority. `init` warns about that at startup too.
+                report_export_failure(&uri, &format!("invalid request URL: {error}"))
+            })?;
         // Deliberately no `error_for_status()`: it discards the body, which is
         // where OTLP puts rejection detail. Hand the whole response back and
-        // the SDK turns a non-2xx into an export error itself, logging the
-        // status, the URL and the body (`HttpClient.StatusError`).
-        let mut response = self.inner.execute(request)?;
+        // the SDK turns a non-2xx into an export error itself.
+        let mut response = self
+            .inner
+            .execute(request)
+            .inspect_err(|error| report_export_failure(&uri, &format!("{error}")))?;
         let status = response.status();
         let headers = std::mem::take(response.headers_mut());
-        let mut http_response = Response::builder().status(status).body(response.bytes()?)?;
+        let body = response
+            .bytes()
+            .inspect_err(|error| report_export_failure(&uri, &format!("{error}")))?;
+        if status.is_success() {
+            report_export_success();
+        } else {
+            report_export_failure(&uri, &format!("HTTP {status}: {}", truncated_body(&body)));
+        }
+        let mut http_response = Response::builder().status(status).body(body)?;
         *http_response.headers_mut() = headers;
         Ok(http_response)
     }
@@ -253,11 +357,12 @@ const METER_NAME: &str = "freenet";
 /// derived signing key authenticates every export request (see
 /// [`bearer_token`]).
 ///
-/// Returns the reason it did NOT start, or `None` when the pipeline is
-/// installed. Callers ignore it; it exists so a test can assert that `init`
-/// consults [`otel_suppression_reason`] and returns before building anything —
-/// deleting the check would make an enabled config return `None` under
-/// `cfg(test)`, i.e. ship a test network's metrics to a collector.
+/// Returns `Some(reason)` when the exporter was SUPPRESSED and `None`
+/// otherwise — including when the pipeline failed to build, which is logged
+/// but is not a suppression. Callers ignore the value; it exists so a test can
+/// assert that `init` consults [`otel_suppression_reason`] and returns before
+/// building anything — deleting the check would make an enabled config return
+/// `None` under `cfg(test)`, i.e. ship a test network's metrics to a collector.
 pub(crate) fn init(
     config: &OtelConfig,
     keypair: &crate::transport::TransportKeypair,
@@ -267,10 +372,21 @@ pub(crate) fn init(
         cfg!(test),
         super::telemetry::running_under_cargo_test(),
     ) {
-        tracing::debug!(?reason, "OTel metrics exporter not started");
+        // Being off by default is unremarkable; being switched ON and then
+        // suppressed anyway is something the operator has to be told about,
+        // or the exporter looks enabled and silently ships nothing.
+        if config.enabled && reason != OtelSuppression::Disabled {
+            tracing::warn!(
+                ?reason,
+                "otel-telemetry-enabled is set but the OTel metrics exporter was suppressed"
+            );
+        } else {
+            tracing::debug!(?reason, "OTel metrics exporter not started");
+        }
         return Some(reason);
     }
 
+    let env_endpoint = env_endpoint();
     let endpoint = resolve_metrics_endpoint(
         config.endpoint.as_deref(),
         std::env::var(opentelemetry_otlp::OTEL_EXPORTER_OTLP_METRICS_ENDPOINT)
@@ -280,6 +396,29 @@ pub(crate) fn init(
             .ok()
             .as_deref(),
     );
+
+    // Log where this node's signed identity is actually going, including when
+    // an inherited OTEL_* variable overrode the configured endpoint — an
+    // operator who cannot see that from the logs cannot tell their collector
+    // was bypassed.
+    if let (Some(env_endpoint), Some(cfg_endpoint)) =
+        (env_endpoint.as_deref(), config.endpoint.as_deref())
+    {
+        tracing::warn!(
+            %env_endpoint,
+            %cfg_endpoint,
+            "OTEL_EXPORTER_OTLP_* overrides the configured otel-endpoint"
+        );
+    }
+    // Validate before building: an endpoint the SDK accepts but reqwest does
+    // not produces a per-export failure rather than a build error, and an
+    // unparseable env value is swallowed by the SDK, which then silently
+    // exports to localhost while the log line below names the operator's URL.
+    if let Some(effective) = endpoint.as_deref().or(env_endpoint.as_deref()) {
+        if let Some(problem) = endpoint_problem(effective) {
+            tracing::warn!(endpoint = effective, problem, "OTLP endpoint is unusable");
+        }
+    }
 
     let (pubkey, fingerprint) = identity_attributes(keypair);
     let auth_signer = match config.auth_mode {
@@ -297,23 +436,6 @@ pub(crate) fn init(
             // shutdown path in `bin/freenet.rs`.
             global::set_meter_provider(provider);
             register_metrics();
-            // Log where this node's signed identity is actually going,
-            // including when an inherited OTEL_* variable overrode the
-            // configured endpoint — an operator who cannot see that from the
-            // logs cannot tell their collector was bypassed.
-            let env_endpoint =
-                std::env::var(opentelemetry_otlp::OTEL_EXPORTER_OTLP_METRICS_ENDPOINT)
-                    .or_else(|_| std::env::var(opentelemetry_otlp::OTEL_EXPORTER_OTLP_ENDPOINT))
-                    .ok();
-            if let (Some(env_endpoint), Some(cfg_endpoint)) =
-                (env_endpoint.as_deref(), config.endpoint.as_deref())
-            {
-                tracing::warn!(
-                    %env_endpoint,
-                    %cfg_endpoint,
-                    "OTEL_EXPORTER_OTLP_* overrides the configured otel-endpoint"
-                );
-            }
             tracing::info!(
                 endpoint = endpoint
                     .as_deref()
@@ -409,19 +531,46 @@ pub(crate) fn build_provider(
 /// 10s, in milliseconds). The SDK applies its own resolution only to a client
 /// it builds itself, and we always supply one, so it has to happen here.
 fn export_timeout() -> std::time::Duration {
-    [
+    for var in [
         opentelemetry_otlp::OTEL_EXPORTER_OTLP_METRICS_TIMEOUT,
         opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT,
-    ]
-    .iter()
-    .find_map(|var| std::env::var(var).ok()?.trim().parse::<u64>().ok())
-    .map(std::time::Duration::from_millis)
-    .unwrap_or(opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT)
+    ] {
+        let Ok(raw) = std::env::var(var) else {
+            continue;
+        };
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        match raw.parse::<u64>() {
+            Ok(ms) => {
+                // The spec unit is MILLISECONDS, so `=10` meaning "10 seconds"
+                // yields a 10ms timeout and every export times out instead.
+                if ms < 100 {
+                    tracing::warn!(
+                        var,
+                        ms,
+                        "OTLP export timeout is in MILLISECONDS and this value is very small; \
+                         a seconds value was probably intended"
+                    );
+                }
+                return std::time::Duration::from_millis(ms);
+            }
+            // Fall through to the next variable, as the SDK's own `.ok()`
+            // resolution would — but say so rather than ignoring it silently.
+            Err(error) => tracing::warn!(
+                var,
+                raw,
+                %error,
+                "ignoring unparseable OTLP export timeout (expected whole milliseconds)"
+            ),
+        }
+    }
+    opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT
 }
 
-/// Resource attribute keys the operator declared through the environment,
-/// which must not be overwritten — see the merge note in
-/// [`build_provider_blocking`].
+/// Resource attribute keys the operator declared through the environment —
+/// see [`resource_attributes`] for which of them win.
 fn env_declared_resource_keys() -> Vec<String> {
     let mut keys = Vec::new();
     if std::env::var("OTEL_SERVICE_NAME").is_ok_and(|v| !v.trim().is_empty()) {
@@ -434,6 +583,53 @@ fn env_declared_resource_keys() -> Vec<String> {
         }));
     }
     keys
+}
+
+/// The resource attributes to attach, given the keys the operator declared
+/// through `OTEL_SERVICE_NAME` / `OTEL_RESOURCE_ATTRIBUTES`.
+///
+/// Descriptive attributes defer to the environment: `Resource::builder` seeds
+/// from those variables and `with_attribute` merges OVER that seed, so setting
+/// a literal unconditionally would silently discard the operator's value — two
+/// nodes on one host with distinct `OTEL_SERVICE_NAME`s would both export
+/// `service.name=freenet-node`.
+///
+/// The two `freenet.node.*` identity attributes are the exception and are
+/// ALWAYS emitted. They are not description, they are the collector's proof of
+/// which node sent the batch: `freenet.node.pubkey` must equal the bearer
+/// token's `<pubkey>` field, which is verified against the signature. Letting
+/// `OTEL_RESOURCE_ATTRIBUTES=freenet.node.pubkey=...` shadow them would export
+/// an identity that does not match the key everything was signed with, and
+/// break that self-validation silently on both sides.
+fn resource_attributes(
+    pubkey: String,
+    fingerprint: String,
+    declared: &[String],
+) -> Vec<(&'static str, String)> {
+    let mut attributes = vec![
+        ("freenet.node.pubkey", pubkey),
+        ("freenet.node.fingerprint", fingerprint),
+    ];
+    for (key, _) in &attributes {
+        if declared.iter().any(|declared| declared == key) {
+            tracing::warn!(
+                key,
+                "the node identity resource attribute cannot be overridden by \
+                 OTEL_RESOURCE_ATTRIBUTES; the signed value is exported instead"
+            );
+        }
+    }
+    attributes.extend(
+        [
+            ("service.name", "freenet-node".to_owned()),
+            ("service.version", env!("CARGO_PKG_VERSION").to_owned()),
+            ("os.type", std::env::consts::OS.to_owned()),
+            ("host.arch", std::env::consts::ARCH.to_owned()),
+        ]
+        .into_iter()
+        .filter(|(key, _)| !declared.iter().any(|declared| declared == key)),
+    );
+    attributes
 }
 
 fn build_provider_blocking(
@@ -450,11 +646,19 @@ fn build_provider_blocking(
     // purpose: PeriodicReader exports off-runtime (see Cargo.toml). The
     // timeout is the one the SDK would have applied to its own client, which
     // it does not apply to a supplied one.
+    //
+    // A build failure is propagated rather than falling back to
+    // `Client::new()`: that fallback has NO timeout, so a collector that
+    // accepts the connection and never answers would block the PeriodicReader
+    // thread indefinitely and stop all metric collection.
+    let http_client = reqwest::blocking::Client::builder()
+        .timeout(export_timeout())
+        .build()
+        .map_err(|error| {
+            ExporterBuildError::InternalFailure(format!("otel http client build failed: {error}"))
+        })?;
     builder = builder.with_http_client(OtlpHttpClient {
-        inner: reqwest::blocking::Client::builder()
-            .timeout(export_timeout())
-            .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new()),
+        inner: http_client,
         signer: auth_signer,
         pubkey_b58: pubkey.clone(),
     });
@@ -464,28 +668,11 @@ fn build_provider_blocking(
     // identifying THIS node here costs nothing per series — unlike a
     // per-datapoint attribute, which is why no instrument below carries one
     // identifying the remote end of a connection.
-    //
-    // `Resource::builder` seeds from OTEL_SERVICE_NAME / OTEL_RESOURCE_ATTRIBUTES
-    // and then `with_attribute`/`with_service_name` MERGE OVER that seed, so
-    // setting a literal unconditionally silently discards the operator's
-    // value: two nodes on one host with distinct OTEL_SERVICE_NAMEs would both
-    // export `service.name=freenet-node`. Only fill in what the environment
-    // did not declare.
-    let declared = env_declared_resource_keys();
+    // Which of these defer to the environment and which do not is
+    // [`resource_attributes`]'s decision.
     let mut resource = Resource::builder();
-    if !declared.iter().any(|k| k == "service.name") {
-        resource = resource.with_service_name("freenet-node");
-    }
-    for (key, value) in [
-        ("freenet.node.pubkey", pubkey),
-        ("freenet.node.fingerprint", fingerprint),
-        ("service.version", env!("CARGO_PKG_VERSION").to_owned()),
-        ("os.type", std::env::consts::OS.to_owned()),
-        ("host.arch", std::env::consts::ARCH.to_owned()),
-    ] {
-        if !declared.iter().any(|k| k == key) {
-            resource = resource.with_attribute(KeyValue::new(key, value));
-        }
+    for (key, value) in resource_attributes(pubkey, fingerprint, &env_declared_resource_keys()) {
+        resource = resource.with_attribute(KeyValue::new(key, value));
     }
     let resource = resource.build();
 
@@ -1432,12 +1619,13 @@ mod tests {
         // `PeerId` renders as `{pub_key}@{addr}`, so using it — as the
         // exporter originally did — leaks our socket address into every
         // batch and re-identifies the node whenever the address changes.
-        // Both identity attributes must stay address-free.
+        // Both identity attributes must stay address-free. Asserts on
+        // `identity_attributes` — the function production uses — because
+        // rebuilding the strings here would pass whatever `init` actually
+        // attaches, including a `PeerId`.
         let keypair = crate::transport::TransportKeypair::new();
-        for instance_id in [
-            bs58::encode(keypair.public_key_bytes()).into_string(),
-            keypair.public().to_string(),
-        ] {
+        let (pubkey_attr, fingerprint_attr) = identity_attributes(&keypair);
+        for instance_id in [pubkey_attr, fingerprint_attr] {
             assert!(!instance_id.is_empty());
             assert!(
                 !instance_id.contains('@') && !instance_id.contains(':'),
@@ -1468,6 +1656,71 @@ mod tests {
         assert!(
             INSTRUMENTS.get().is_none(),
             "recording must not lazily bind instruments to the no-op provider"
+        );
+    }
+
+    #[test]
+    fn env_declared_attributes_cannot_shadow_the_node_identity() {
+        // The collector verifies the bearer token's signature and then trusts
+        // `freenet.node.pubkey` as the sender's identity. If
+        // OTEL_RESOURCE_ATTRIBUTES could override that attribute, a node would
+        // export an identity that does not match the key it signed with, and
+        // neither side would notice.
+        let declared = [
+            "freenet.node.pubkey".to_owned(),
+            "freenet.node.fingerprint".to_owned(),
+            "service.name".to_owned(),
+        ];
+        let attributes = resource_attributes("REAL-PK".into(), "REAL-FP".into(), &declared);
+        let value = |key: &str| {
+            attributes
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.as_str())
+        };
+
+        assert_eq!(
+            value("freenet.node.pubkey"),
+            Some("REAL-PK"),
+            "the signed pubkey must be exported even when the environment declares it"
+        );
+        assert_eq!(value("freenet.node.fingerprint"), Some("REAL-FP"));
+        // Descriptive attributes still defer: the operator's own service.name
+        // has to survive, or two nodes on one host collapse into one series.
+        assert_eq!(
+            value("service.name"),
+            None,
+            "a declared service.name must be left to the environment"
+        );
+        assert!(
+            value("service.version").is_some(),
+            "undeclared descriptive attributes are still filled in"
+        );
+    }
+
+    #[test]
+    fn unusable_endpoints_are_diagnosed() {
+        // `http::Uri` accepts `host:port` as an authority with no scheme, so
+        // the exporter builds and every export then dies converting to a
+        // reqwest request — the failure is per-export, not at startup.
+        assert!(
+            endpoint_problem("collector.example:4318").is_some(),
+            "a schemeless authority must be reported"
+        );
+        // Not parseable at all: the SDK swallows this and falls back to
+        // localhost while the startup log names the operator's URL.
+        assert!(endpoint_problem("collector.example:4318/v1/metrics").is_some());
+        assert!(endpoint_problem("not a url").is_some());
+        // A non-HTTP scheme parses fine but reqwest cannot send it.
+        assert!(endpoint_problem("ftp://collector.example:4318/v1/metrics").is_some());
+
+        assert_eq!(
+            endpoint_problem("http://collector.example:4318/v1/metrics"),
+            None
+        );
+        assert_eq!(
+            endpoint_problem("https://collector.example/v1/metrics"),
+            None
         );
     }
 

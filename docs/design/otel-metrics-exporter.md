@@ -63,7 +63,7 @@ Registered in `tracing/otel.rs::register_metrics`.
 | `freenet.contract.queue.rejected` | counter | `reason` | `FairQueueStats` |
 | `freenet.contract.queue.background_shed` | counter | — | `FairQueueStats` |
 
-Everything but the histograms and the four synchronous counters is an
+Everything but the two histograms and the three synchronous counters is an
 observable callback over state that already existed for the local dashboard.
 
 Resource attributes: `freenet.node.pubkey` (the full base58 **x25519** transport
@@ -77,11 +77,18 @@ which renders as `{pub_key}@{addr}` and would export our socket address.
 The literals are applied only for keys the operator did **not** declare through
 `OTEL_SERVICE_NAME` / `OTEL_RESOURCE_ATTRIBUTES`: `ResourceBuilder` seeds from
 the environment and then merges `with_attribute` over that seed, so setting one
-unconditionally would silently discard the operator's value.
+unconditionally would silently discard the operator's value. This deference
+applies to the descriptive attributes only — the two `freenet.node.*` identity
+attributes are always emitted, because they are what the collector checks the
+bearer-token signature against, and an operator-supplied override would export
+an identity that does not match the signing key.
 
-Not instrumented: `TransportMetrics::slowdowns_triggered` is read and reset but
-never incremented anywhere in the tree, so it is dead and was left out rather
-than exported as a permanent zero.
+Not instrumented: `TransportMetrics::slowdowns_triggered` is a period
+accumulator that `take_snapshot` zeroes for the legacy telemetry worker, so
+observing it as a counter would report a non-monotonic series whenever
+`telemetry-enabled` is also on — the same hazard as the transport byte and
+packet counters, which is why those are read from the cumulative totals
+instead.
 
 ## Isolation requirement (hard)
 
@@ -177,7 +184,7 @@ through `OTEL_EXPORTER_OTLP_HEADERS` is never overwritten.
 
 This is deliberately *not* what the SDK does by itself. In
 `opentelemetry-otlp` 0.32, `resolve_http_endpoint`
-(`src/exporter/http/mod.rs:719-749`) gives a programmatic `with_endpoint` value
+(`src/exporter/http/mod.rs:720-750`) gives a programmatic `with_endpoint` value
 **priority over both env vars**, and uses it **verbatim** — `build_endpoint_uri`
 appends `/v1/metrics` only on the env-var path. So to get env-wins precedence the
 code must:
@@ -188,11 +195,26 @@ code must:
 `otel-endpoint` therefore has no clap `env =` binding — binding it would merge the
 standard variable into the config layer and invert the precedence.
 
-Every other standard variable — `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`,
-`OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TIMEOUT`,
-`OTEL_EXPORTER_OTLP_COMPRESSION`, `OTEL_METRIC_EXPORT_INTERVAL` (default 60s,
-`opentelemetry_sdk/src/metrics/periodic_reader.rs:24-43`) — is read by the SDK.
-No code for them.
+Note the two endpoint variables are NOT interchangeable. `resolve_http_endpoint`
+uses the signal-specific `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` **verbatim**
+(`// per signal env var is not modified`); only the generic
+`OTEL_EXPORTER_OTLP_ENDPOINT` and the built-in default go through
+`build_endpoint_uri`. So the signal-specific variable must carry the full
+`/v1/metrics` path and the generic one must not.
+
+Most other standard variables — `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`,
+`OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_METRIC_EXPORT_INTERVAL` (default 60s,
+`opentelemetry_sdk/src/metrics/periodic_reader.rs:24-43`) — are read by the SDK.
+No code for them. Two exceptions:
+
+- `OTEL_EXPORTER_OTLP_TIMEOUT` / `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT` are
+  resolved by `otel::export_timeout`, not the SDK: the SDK applies its resolved
+  timeout only to a client it builds itself, and we always supply one.
+- `OTEL_EXPORTER_OTLP_COMPRESSION` is **not supported**. The exporter validates
+  it at build time and hard-errors unless the `gzip-http` / `zstd-http` feature
+  is enabled, which we deliberately do not enable. Setting it therefore fails
+  the exporter build and the node runs with no metrics (with a WARN naming the
+  cause). Enable the matching feature if compression is ever wanted.
 
 ## Dependencies
 
@@ -230,8 +252,8 @@ Because a feature array may not name a non-optional dependency, `trace-ot` drops
 
 ## Suppression
 
-`otel::init` returns `None` — no provider, no exporter, no global registration —
-when any of these hold, mirroring `telemetry_suppression_reason`
+`otel::init` returns `Some(reason)` — no provider, no exporter, no global
+registration — when any of these hold, mirroring `telemetry_suppression_reason`
 (`telemetry.rs:660-679`):
 
 1. `!cfg.enabled`
@@ -294,7 +316,7 @@ the code carries a `NOTE:` comment naming the ceiling and the upgrade path.
 ## Wire-up
 
 `crates/core/src/node.rs`, in `build_with_flush_handle` beside the
-`TelemetryReporter::new` call (`node.rs:754`):
+`TelemetryReporter::new` call (`node.rs:815`):
 
 ```rust
 crate::tracing::otel::init(&self.config.otel, &self.key_pair);

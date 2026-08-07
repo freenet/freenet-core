@@ -148,15 +148,21 @@ pub(crate) struct OtelMetricsSnapshot {
 
 /// Read the scalars the OTel exporter observes, or `None` before the node has
 /// registered its status (metrics simply report nothing until then).
+///
+/// Every unavailable source yields `None` for the whole snapshot rather than a
+/// default: an observable instrument that skips a collection cycle exports
+/// nothing, which reads as "not known yet", while a zero is a real datapoint —
+/// `freenet.ring.connections = 0` before the ring provider registers is
+/// indistinguishable from a node that has lost every connection.
 pub(crate) fn otel_metrics_snapshot() -> Option<OtelMetricsSnapshot> {
     let connection_attempts = NETWORK_STATUS.get()?.read().ok()?.connection_attempts;
+    let ring = RING_STATS_PROVIDER
+        .read()
+        .as_ref()
+        .map(|provider| provider())?;
     Some(OtelMetricsSnapshot {
         connection_attempts,
-        ring: RING_STATS_PROVIDER
-            .read()
-            .as_ref()
-            .map(|provider| provider())
-            .unwrap_or_default(),
+        ring,
         fair_queue: crate::contract::fair_queue_stats(),
     })
 }

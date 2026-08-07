@@ -383,7 +383,17 @@ Rules when touching `tracing/otel.rs`:
   identity is two resource attributes (`freenet.node.*`, one per export batch),
   not a per-datapoint attribute. "Peer" means the *other* end of a connection.
 - Histograms get their base-2 exponential aggregation from one `with_view` in
-  `build_provider`. Do not add explicit bucket boundaries per instrument.
+  `build_provider_blocking`. Do not add explicit bucket boundaries per
+  instrument.
+- Export outcomes must be logged by `OtlpHttpClient::send_bytes`. The SDK will
+  not do it: `opentelemetry-otlp` logs network errors and non-2xx at DEBUG on
+  the stated grounds that `PeriodicReader` re-logs them at error level, which
+  is true for the batch log/span processors and false for metrics. Deleting
+  that logging makes a dead collector produce no output at all.
+- The `freenet.node.*` resource attributes are always emitted and must never
+  be made deferrable to `OTEL_RESOURCE_ATTRIBUTES`. They are what the
+  collector checks the bearer-token signature against; an override would
+  export an identity that does not match the signing key.
 - The exporter always installs its own `HttpClient`, so `opentelemetry-otlp`
   needs none of its `reqwest-*`/TLS features — enabling one pulls a second
   reqwest major, a second TLS stack, and a C/asm aws-lc build into every
