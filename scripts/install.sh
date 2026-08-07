@@ -331,14 +331,31 @@ should_refresh_system_unit() {
 }
 
 # Decide whether a fresh supervised Linux install should be a system service
-# or a user service. Pure function of two booleans so it is unit-testable.
-#   $1 = am_root     ("1"/"0")
-#   $2 = can_elevate ("1"/"0" - root, or sudo available)
-# Echoes "system" or "user". A system service is preferred whenever we can
-# elevate (it runs at boot, survives logout, and is the most reliable choice
-# on headless servers); otherwise we fall back to a user service (which the
-# binary sets up with lingering enabled).
+# or a user service. Pure function so it is unit-testable.
+#   $1 = am_root       ("1"/"0")
+#   $2 = can_elevate   ("1"/"0" - root, or sudo available)
+#   $3 = install_dir   (path to the install directory, to detect user-local dirs)
+# Echoes "system" or "user". A system service is preferred when we can elevate
+# AND the binary is NOT in a user-local directory (e.g. ~/.local/bin). A binary
+# under $HOME should use a user service: the binary's SELinux context is
+# correct for user execution, and a system service running it would inherit
+# init_t and trigger SELinux denials (#4924).
 decide_linux_service_mode() {
+    # A binary in a user-local directory (e.g. ~/.local/bin, ~/projects)
+    # should use a user service: the binary's SELinux context is correct for
+    # user execution, and a system service running it would inherit init_t
+    # and trigger SELinux denials (#4924).
+    case "$3" in
+        */.local/*) echo "user"; return ;;
+    esac
+    # The `case` in the && condition is deliberate: "${HOME}/"* requires a
+    # path separator after $HOME. A plain "$HOME"* prefix match would also
+    # match siblings like /home/aliceproject when HOME=/home/alice (see the
+    # prefix-match regression tests in scripts/test-install-sh.sh).
+    if [ -n "${HOME:-}" ] && case "$3" in "${HOME}/"*) true;; *) false;; esac; then
+        echo "user"
+        return
+    fi
     if [ "$1" = "1" ] || [ "$2" = "1" ]; then
         echo "system"
     else
@@ -346,12 +363,24 @@ decide_linux_service_mode() {
     fi
 }
 
+# Restore SELinux context on installed binaries (no-op on non-SELinux systems).
+# Without this, binaries moved from /tmp may inherit an incorrect label
+# (e.g. gconf_home_t) that blocks execution by systemd.
+#   $1 = install_dir
+restore_install_context() {
+    if has_cmd restorecon; then
+        restorecon -v "$1/freenet" "$1/fdev" 2>/dev/null || true
+    fi
+}
+
 # Resolve the effective Linux service action, honoring any existing install so
 # a re-run refreshes it instead of creating a duplicate of the other type.
 #   $1 = interactive ("1"/"0")
+#   $2 = install_dir (path to the install directory)
 # Echoes "system" or "user".
 resolve_service_action() {
     interactive=$1
+    install_dir=${2:-"$HOME/.local/bin"}
 
     # Existing install wins: refresh the same kind we already have.
     if has_system_unit; then
@@ -378,7 +407,7 @@ resolve_service_action() {
         can_elevate=1
     fi
 
-    decide_linux_service_mode "$am_root" "$can_elevate"
+    decide_linux_service_mode "$am_root" "$can_elevate" "$install_dir"
 }
 
 # Loud warning printed whenever a node is left unsupervised.
@@ -416,7 +445,7 @@ setup_service() {
     fi
 
     # Linux.
-    action=$(resolve_service_action "$interactive")
+    action=$(resolve_service_action "$interactive" "$(dirname "$bin")")
     case "$action" in
         system)
             # Refresh guard: an existing system unit is re-templated using the
@@ -715,6 +744,8 @@ main() {
     mv -- "$tmp_dir/freenet" "$install_dir/freenet"
     mv -- "$tmp_dir/fdev" "$install_dir/fdev"
     chmod +x "$install_dir/freenet" "$install_dir/fdev"
+
+    restore_install_context "$install_dir"
 
     # Verify the installed binary works
     if ! "$install_dir/freenet" --version >/dev/null 2>&1; then
