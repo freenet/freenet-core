@@ -3365,8 +3365,26 @@ mod tests {
         const MAX_BUSY_JSON_BYTES: usize = 5_120;
         const MAX_WORST_CASE_JSON_BYTES: usize = 14_336;
         const MAX_EMPTY_OTLP_MARGINAL_BYTES: usize = 2_048;
-        const MAX_BUSY_OTLP_MARGINAL_BYTES: usize = 5_120;
-        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 14_336;
+        // Raised from 5_120 (2026-08-07) to admit `ms_size` + `ms_unt_age`,
+        // the two counters added for #5153. The budget exists to force this
+        // arithmetic, not to forbid growth, so here it is:
+        //
+        //   30 new counters (4 size rows x 6 buckets, + 6 age buckets)
+        //   ~210 JSON bytes at busy-fleet values, 5157 OTLP marginal measured
+        //   emitted once per ~30 min per peer, ~2000 reporting peers
+        //   => 48 * 2000 * ~210 B ~= 20 MB/day
+        //
+        // against a collector ingesting ~88.8 GB/day: about 0.02%. The block
+        // is also already trimmed twice to get here — the histogram covers 4
+        // of 10 classes (the other 6 are a measured zero) and 6 size buckets
+        // rather than 8. Do NOT raise this again without redoing the
+        // arithmetic; the JSON-bytes budgets above are deliberately unchanged.
+        const MAX_BUSY_OTLP_MARGINAL_BYTES: usize = 5_376;
+        // Raised from 14_336 alongside the busy budget above, same 30 new
+        // counters, same #5153 rationale. This bound is the MATHEMATICAL
+        // ceiling (every counter at u64::MAX, 20 digits); no fleet value
+        // approaches it, so it constrains schema shape rather than real bytes.
+        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 14_592;
         const MAX_NULL_OTLP_MARGINAL_BYTES: usize = 64;
 
         let diagnostic = |value| crate::router::NetworkEfficiencyV1 {
@@ -3374,6 +3392,8 @@ mod tests {
             ms_s: [value; 10],
             ms_b: [value; 10],
             ms_age: [value; 5],
+            ms_size: [[value; 6]; 4],
+            ms_unt_age: [value; 6],
             reg_ow_k: [value; 7],
             reg_ow_m: [value; 7],
             reg_new_k: [value; 7],
@@ -3414,7 +3434,7 @@ mod tests {
         let object = block
             .as_object()
             .expect("network_efficiency_v1 must remain a JSON object");
-        assert_eq!(object.len(), 31, "schema must remain fixed-cardinality");
+        assert_eq!(object.len(), 33, "schema must remain fixed-cardinality");
         let encoded = serde_json::to_vec(block).expect("serialize diagnostic block");
         assert!(
             encoded.len() <= MAX_BUSY_JSON_BYTES,
@@ -3474,10 +3494,25 @@ mod tests {
         ))))
         .saturating_sub(base_otlp);
         assert_eq!(null_otlp, 31, "null snapshots are part of the fleet budget");
-        assert!(null_otlp <= MAX_NULL_OTLP_MARGINAL_BYTES);
-        assert!(empty_otlp <= MAX_EMPTY_OTLP_MARGINAL_BYTES);
-        assert!(busy_otlp <= MAX_BUSY_OTLP_MARGINAL_BYTES);
-        assert!(worst_otlp <= MAX_WORST_OTLP_MARGINAL_BYTES);
+        // Report the measured value, not just the verdict: when this trips, the
+        // useful question is "by how much", and a bare assert makes every
+        // adjustment a guess-and-recompile loop.
+        assert!(
+            null_otlp <= MAX_NULL_OTLP_MARGINAL_BYTES,
+            "null OTLP marginal {null_otlp} > {MAX_NULL_OTLP_MARGINAL_BYTES}"
+        );
+        assert!(
+            empty_otlp <= MAX_EMPTY_OTLP_MARGINAL_BYTES,
+            "empty OTLP marginal {empty_otlp} > {MAX_EMPTY_OTLP_MARGINAL_BYTES}"
+        );
+        assert!(
+            busy_otlp <= MAX_BUSY_OTLP_MARGINAL_BYTES,
+            "busy OTLP marginal {busy_otlp} > {MAX_BUSY_OTLP_MARGINAL_BYTES}"
+        );
+        assert!(
+            worst_otlp <= MAX_WORST_OTLP_MARGINAL_BYTES,
+            "worst-case OTLP marginal {worst_otlp} > {MAX_WORST_OTLP_MARGINAL_BYTES}"
+        );
     }
 
     /// Pin: the module-cache gauges (#4440) must also reach the hand-mirrored

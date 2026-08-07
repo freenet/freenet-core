@@ -516,6 +516,53 @@ enum NeverPopulatedOrigin {
     OverwriteMissing,
 }
 
+/// Size buckets for `delivered_size_hist`.
+///
+/// Log-4 scale with the tails merged: <4 KiB, <16 KiB, <64 KiB, <256 KiB,
+/// <1 MiB, >=1 MiB. The measured mean full-state payload sits around 60-95
+/// KiB, so resolution is kept on both sides of ~64 KiB while the extremes,
+/// which a full-state broadcast rarely occupies, share a bucket. Six rather
+/// than eight because eight put the busy-fleet `network_efficiency_v1` block
+/// 31 bytes over its explicit 5120-byte budget, and the two merged tails cost
+/// far less information than raising that budget would cost in trust.
+pub(crate) const MISSING_SUMMARY_SIZE_BUCKETS: usize = 6;
+
+/// Buckets for `untracked_prior_removal_age`.
+pub(crate) const UNTRACKED_PRIOR_REMOVAL_BUCKETS: usize = 6;
+
+// Both bucket functions below HARDCODE their match arms while these constants
+// size the arrays those arms index. Nothing in the type system couples them, so
+// trimming a constant to save telemetry bytes — exactly the edit this module's
+// own budget pressure invites — would compile clean and then panic with
+// index-out-of-bounds inside the broadcast task on the first oversized payload.
+// `SIZE_HIST_ROWS` is immune because it derives from `.len()`; these only LOOK
+// as safe.
+const _: () = assert!(MISSING_SUMMARY_SIZE_BUCKETS == 6);
+const _: () = assert!(UNTRACKED_PRIOR_REMOVAL_BUCKETS == 6);
+
+/// Classes carrying a size histogram, in row order.
+///
+/// Deliberately NOT all ten classes. A 10x8 matrix pushed the busy-fleet
+/// `network_efficiency_v1` block to 5499 bytes against its explicit 5120-byte
+/// budget, and most of that spend was on classes that do not fire: both
+/// `*_overwrite_*` classes are a measured ZERO fleet-wide, and all four
+/// `*_repeat_*` classes round to zero. These four carry ~99% of observed
+/// missing-summary bytes.
+///
+/// The trade-off, stated so it is not rediscovered: a repeat/overwrite class
+/// that later becomes significant would have no SIZE distribution here. Its
+/// COUNT and BYTES remain fully visible in `ms_s`/`ms_b`, which keep all ten
+/// classes, so the growth itself could not hide — only its shape.
+pub(crate) const SIZE_HIST_CLASSES: [MissingSummaryClass; 4] = [
+    MissingSummaryClass::TrackedFirstNew,
+    MissingSummaryClass::TrackedFirstRecreated,
+    MissingSummaryClass::UntrackedFirstObserved,
+    MissingSummaryClass::UntrackedFirstRecreated,
+];
+
+/// Rows in `delivered_size_hist`.
+pub(crate) const SIZE_HIST_ROWS: usize = SIZE_HIST_CLASSES.len();
+
 #[derive(Clone, Copy, Debug, Default)]
 struct MissingPairHistory {
     send_starts: u32,
@@ -529,6 +576,8 @@ pub(crate) struct InterestLifecycleSnapshot {
     pub(crate) delivered_sends: [u64; MissingSummaryClass::COUNT],
     pub(crate) delivered_bytes: [u64; MissingSummaryClass::COUNT],
     pub(crate) first_send_age: [u64; 5],
+    pub(crate) delivered_size_hist: [[u64; MISSING_SUMMARY_SIZE_BUCKETS]; SIZE_HIST_ROWS],
+    pub(crate) untracked_prior_removal_age: [u64; UNTRACKED_PRIOR_REMOVAL_BUCKETS],
     pub(crate) registration_overwrite_known: [u64; InterestRegistrationSource::COUNT],
     pub(crate) registration_overwrite_missing: [u64; InterestRegistrationSource::COUNT],
     pub(crate) registration_new_known: [u64; InterestRegistrationSource::COUNT],
@@ -547,6 +596,10 @@ struct InterestLifecycleMetrics {
     delivered_sends: [AtomicU64; MissingSummaryClass::COUNT],
     delivered_bytes: [AtomicU64; MissingSummaryClass::COUNT],
     first_send_age: [AtomicU64; 5],
+    /// Per-class size histogram of delivered missing-summary payloads.
+    delivered_size_hist: [[AtomicU64; MISSING_SUMMARY_SIZE_BUCKETS]; SIZE_HIST_ROWS],
+    /// Untracked sends bucketed by how long ago the pair's entry was removed.
+    untracked_prior_removal_age: [AtomicU64; UNTRACKED_PRIOR_REMOVAL_BUCKETS],
     registration_overwrite_known: [AtomicU64; InterestRegistrationSource::COUNT],
     registration_overwrite_missing: [AtomicU64; InterestRegistrationSource::COUNT],
     registration_new_known: [AtomicU64; InterestRegistrationSource::COUNT],
@@ -563,6 +616,9 @@ pub(crate) struct MissingSummaryAttempt {
     key: (ContractKey, PeerKey),
     class: MissingSummaryClass,
     first_age_bucket: Option<usize>,
+    /// Set only on the UNTRACKED path: how long ago this pair's interest entry
+    /// was removed, or bucket 5 when there is no record of one.
+    untracked_prior_removal_bucket: Option<usize>,
     active_tracked: bool,
 }
 
@@ -581,6 +637,10 @@ impl InterestLifecycleMetrics {
             delivered_sends: std::array::from_fn(|_| AtomicU64::new(0)),
             delivered_bytes: std::array::from_fn(|_| AtomicU64::new(0)),
             first_send_age: std::array::from_fn(|_| AtomicU64::new(0)),
+            delivered_size_hist: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicU64::new(0))
+            }),
+            untracked_prior_removal_age: std::array::from_fn(|_| AtomicU64::new(0)),
             registration_overwrite_known: std::array::from_fn(|_| AtomicU64::new(0)),
             registration_overwrite_missing: std::array::from_fn(|_| AtomicU64::new(0)),
             registration_new_known: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -1262,6 +1322,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                     key,
                     class,
                     first_age_bucket,
+                    untracked_prior_removal_bucket: None,
                     active_tracked,
                 }),
             };
@@ -1309,6 +1370,13 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             .recent_removal
             .filter(|(_, removed_at)| now.saturating_duration_since(*removed_at) <= INTEREST_TTL)
             .is_some();
+        // Deliberately NOT filtered by INTEREST_TTL, unlike `recreated` above:
+        // the whole question this counter answers is how the age is
+        // distributed, so clamping it to the TTL first would discard the tail
+        // that distinguishes "recently lost its entry" from "no record at all".
+        let prior_removal_age = record
+            .recent_removal
+            .map(|(_, removed_at)| now.saturating_duration_since(removed_at));
         let (inflight, active_tracked) = self.begin_active_attempt(&key);
         let class = if inflight {
             MissingSummaryClass::UntrackedRepeatInflight
@@ -1333,6 +1401,9 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 key,
                 class,
                 first_age_bucket: None,
+                untracked_prior_removal_bucket: Some(Self::untracked_prior_removal_bucket(
+                    prior_removal_age,
+                )),
                 active_tracked,
             }),
         }
@@ -1390,6 +1461,66 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         }
     }
 
+    /// Row for `class` in `delivered_size_hist`, if it carries one.
+    fn size_hist_row(class: MissingSummaryClass) -> Option<usize> {
+        SIZE_HIST_CLASSES.iter().position(|c| *c == class)
+    }
+
+    /// Bucket a delivered missing-summary payload by size.
+    ///
+    /// Exists because the 0.2.120 investigation found that full-state BYTES
+    /// rose ~63% while full-state SEND COUNT rose only ~12% (#5153). Every
+    /// counter available at the time measured counts, so the axis that actually
+    /// moved could not be observed at all. A mean would not have settled it
+    /// either: a mean cannot distinguish "every payload grew" from "the mix
+    /// shifted toward a few large contracts", and those want different fixes.
+    fn delivered_size_bucket(bytes: u64) -> usize {
+        match bytes {
+            0..=4095 => 0,
+            4096..=16383 => 1,
+            16384..=65535 => 2,
+            65536..=262_143 => 3,
+            262_144..=1_048_575 => 4,
+            _ => 5,
+        }
+    }
+
+    /// Bucket an untracked send by how long ago the pair's entry was removed.
+    ///
+    /// `ms_age` cannot answer this: `first_age_bucket` is computed only on the
+    /// tracked path and is hardcoded `None` on the untracked one, so the class
+    /// that grew (`untracked_first_observed`, ~4x the population `ms_age`
+    /// covers) had no age signal at all.
+    ///
+    /// An untracked pair has no interest entry, so it has no entry age to
+    /// report. What it does have is the history record's `recent_removal`, and
+    /// the distinction that matters is whether we are broadcasting to a peer
+    /// that RECENTLY lost its entry (a churn/removal problem) or one we hold no
+    /// removal record for. Bucket 5 is the latter.
+    ///
+    /// Bucket 5 is NOT "genuine first contact", for two reasons, and both bias
+    /// it the same way — toward concluding that churn is not the cause:
+    ///
+    /// 1. It also counts REPEAT untracked sends (`UntrackedRepeat*`), which are
+    ///    by definition not first contact.
+    /// 2. It absorbs LRU evictions. `recent_removal` lives in
+    ///    `missing_summary_history` (bounded, LRU), and `history.get` PROMOTES
+    ///    on every untracked send — so the entries most likely to be evicted are
+    ///    the oldest un-rebroadcast removals, which is precisely the bucket-4
+    ///    tail. Bucket 4 is therefore systematically undercounted INTO bucket 5.
+    ///    Cross-check against `corr_ovf[0]` before reading bucket 5 as evidence
+    ///    of anything; `recreated` carries the same caveat for the same reason.
+    fn untracked_prior_removal_bucket(age: Option<Duration>) -> usize {
+        match age {
+            Some(d) if d < Duration::from_secs(10) => 0,
+            Some(d) if d < Duration::from_secs(60) => 1,
+            Some(d) if d < Duration::from_secs(300) => 2,
+            Some(d) if d < Duration::from_secs(1200) => 3,
+            Some(_) => 4,
+            None => 5,
+        }
+    }
+
     fn finish_missing_summary_attempt(
         &self,
         attempt: MissingSummaryAttempt,
@@ -1419,6 +1550,15 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 self.interest_lifecycle_metrics.first_send_age[bucket]
                     .fetch_add(1, Ordering::Relaxed);
             }
+            if let Some(row) = Self::size_hist_row(attempt.class) {
+                self.interest_lifecycle_metrics.delivered_size_hist[row]
+                    [Self::delivered_size_bucket(bytes)]
+                .fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(bucket) = attempt.untracked_prior_removal_bucket {
+                self.interest_lifecycle_metrics.untracked_prior_removal_age[bucket]
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -1442,6 +1582,14 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             }),
             first_send_age: std::array::from_fn(|i| {
                 load(&self.interest_lifecycle_metrics.first_send_age[i])
+            }),
+            delivered_size_hist: std::array::from_fn(|class| {
+                std::array::from_fn(|bucket| {
+                    load(&self.interest_lifecycle_metrics.delivered_size_hist[class][bucket])
+                })
+            }),
+            untracked_prior_removal_age: std::array::from_fn(|i| {
+                load(&self.interest_lifecycle_metrics.untracked_prior_removal_age[i])
             }),
             registration_overwrite_known: std::array::from_fn(|i| {
                 load(&self.interest_lifecycle_metrics.registration_overwrite_known[i])
@@ -3323,6 +3471,281 @@ mod tests {
 
         // Remove again returns false
         assert!(!manager.remove_peer_interest(&contract, &peer));
+    }
+
+    /// The SIZE histogram must bucket by the delivered payload, per class.
+    ///
+    /// The 0.2.120 investigation could not tell "every payload grew" from "the
+    /// mix shifted toward large contracts", because every counter measured
+    /// COUNTS. A histogram answers both; a mean would answer neither.
+    #[test]
+    fn delivered_size_histogram_buckets_by_payload_and_class() {
+        let (manager, _time) = make_manager();
+
+        // Two DIFFERENT untracked pairs, so both sends are first-observed, with
+        // payloads that must land in different buckets of the same row.
+        for (seed, bytes) in [(41u8, 512usize), (45u8, 200_000usize)] {
+            let contract = make_contract_key(seed);
+            let peer = make_peer_key(seed);
+            let PeerSummaryForBroadcast::Missing {
+                attempt: Some(attempt),
+                ..
+            } = manager.begin_peer_summary_broadcast(&contract, &peer)
+            else {
+                panic!("an untracked pair must start lifecycle accounting");
+            };
+            assert_eq!(attempt.class, MissingSummaryClass::UntrackedFirstObserved);
+            let mut guard = manager.missing_summary_attempt_guard(attempt);
+            guard.mark_delivered(bytes);
+            drop(guard);
+        }
+
+        let snap = manager.interest_lifecycle_snapshot();
+        // Literal, NOT `size_hist_row(..)`. Deriving the expected row from the
+        // function under test makes the assertion self-referential: permuting
+        // SIZE_HIST_CLASSES would keep this green while silently mislabelling
+        // every ms_size row against the order router.rs promises the dashboard.
+        let row = 2;
+        assert_eq!(
+            SIZE_HIST_CLASSES,
+            [
+                MissingSummaryClass::TrackedFirstNew,
+                MissingSummaryClass::TrackedFirstRecreated,
+                MissingSummaryClass::UntrackedFirstObserved,
+                MissingSummaryClass::UntrackedFirstRecreated,
+            ],
+            "ms_size row order is a WIRE contract with the dashboard \
+             (router.rs documents it); reordering silently reattributes every \
+             row to the wrong class"
+        );
+        // 512 B -> bucket 0; 200 KB -> bucket 3 (65536..=262_143).
+        assert_eq!(
+            snap.delivered_size_hist[row][0], 1,
+            "the 512-byte send must be counted in bucket 0 (<4 KiB)"
+        );
+        assert_eq!(
+            snap.delivered_size_hist[row][3], 1,
+            "the 200KiB send must land in bucket 3 — separating these two is \
+             the whole point, since a mean cannot tell 'everything grew' from \
+             'the mix shifted toward large contracts'"
+        );
+
+        // The narrowing is deliberate: a REPEAT send carries no size row.
+        assert!(
+            TestInterestManager::size_hist_row(MissingSummaryClass::UntrackedRepeatSequential)
+                .is_none(),
+            "repeat classes are a measured zero fleet-wide and are excluded to \
+             stay inside the network_efficiency_v1 byte budget"
+        );
+    }
+
+    /// Every bucket boundary of both classifiers, including the exact edges.
+    ///
+    /// The arms are hardcoded literals, so an off-by-one at an edge is invisible
+    /// to any test that only samples interior values — which is all the others
+    /// did.
+    #[test]
+    fn bucket_classifiers_are_exact_at_every_boundary() {
+        type M = TestInterestManager;
+
+        // Size: contiguous, no gap, no overlap, exhaustive over u64.
+        for (bytes, want) in [
+            (0u64, 0usize),
+            (4095, 0),
+            (4096, 1),
+            (16_383, 1),
+            (16_384, 2),
+            (65_535, 2),
+            (65_536, 3),
+            (262_143, 3),
+            (262_144, 4),
+            (1_048_575, 4),
+            (1_048_576, 5),
+            (u64::MAX, 5),
+        ] {
+            assert_eq!(
+                M::delivered_size_bucket(bytes),
+                want,
+                "size bucket for {bytes} bytes"
+            );
+        }
+
+        // Age: strict `<`, so each stated edge belongs to the NEXT bucket up.
+        // The 1200s edge is INTEREST_TTL, which is what makes bucket 4 mean
+        // "older than the adjacent `recreated` filter would have kept".
+        for (secs, want) in [
+            (0u64, 0usize),
+            (9, 0),
+            (10, 1),
+            (59, 1),
+            (60, 2),
+            (299, 2),
+            (300, 3),
+            (1199, 3),
+            (1200, 4),
+            (86_400, 4),
+        ] {
+            assert_eq!(
+                M::untracked_prior_removal_bucket(Some(Duration::from_secs(secs))),
+                want,
+                "age bucket for {secs}s"
+            );
+        }
+        assert_eq!(
+            M::untracked_prior_removal_bucket(None),
+            5,
+            "no removal record is its own bucket, never folded into the tail"
+        );
+        assert_eq!(
+            Duration::from_secs(1200),
+            INTEREST_TTL,
+            "the 1200s edge is INTEREST_TTL by intent, not coincidence; if the \
+             TTL moves, bucket 4 stops meaning 'beyond what `recreated` keeps'"
+        );
+    }
+
+    /// The age read must NOT be clamped by `INTEREST_TTL`.
+    ///
+    /// This is the one novel decision in the change: `recreated` (three lines
+    /// above the read) filters by `INTEREST_TTL`, and this deliberately does
+    /// not, because the whole question is how the age is DISTRIBUTED and
+    /// clamping would discard the tail that separates "recently lost its entry"
+    /// from "no record at all".
+    ///
+    /// Without this test the decision is unpinned: adding the filter back moves
+    /// bucket 4's contents into bucket 5 and every other test stays green.
+    #[test]
+    fn untracked_age_keeps_the_tail_beyond_interest_ttl() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(46);
+        let peer = make_peer_key(46);
+
+        manager.register_peer_interest(&contract, peer.clone(), None, false);
+        assert!(manager.remove_peer_interest_for(
+            &contract,
+            &peer,
+            InterestRemovalCause::DisconnectGrace
+        ));
+
+        // Well past INTEREST_TTL, so a TTL-filtered read would report None.
+        time.advance_time(INTEREST_TTL + Duration::from_secs(600));
+
+        let PeerSummaryForBroadcast::Missing {
+            attempt: Some(attempt),
+            ..
+        } = manager.begin_peer_summary_broadcast(&contract, &peer)
+        else {
+            panic!("untracked pair");
+        };
+        let mut guard = manager.missing_summary_attempt_guard(attempt);
+        guard.mark_delivered(1024);
+        drop(guard);
+
+        let snap = manager.interest_lifecycle_snapshot();
+        assert_eq!(
+            snap.untracked_prior_removal_age[4], 1,
+            "a removal older than INTEREST_TTL must stay in the older-than-20m \
+             bucket. If this lands in bucket 5 the read has been clamped by the \
+             TTL and the counter can no longer tell a churned pair from one it \
+             has no record of"
+        );
+        assert_eq!(
+            snap.untracked_prior_removal_age[5], 0,
+            "and must NOT be folded into the no-record bucket"
+        );
+    }
+
+    /// A send that is never delivered must not be counted in the histogram.
+    ///
+    /// `delivered_bytes` gates the existing counters, and the new histogram has
+    /// to sit inside the same gate or it would over-count exactly the sends the
+    /// byte counters deliberately exclude.
+    #[test]
+    fn undelivered_send_is_absent_from_the_size_histogram() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(42);
+        let peer = make_peer_key(42);
+
+        let PeerSummaryForBroadcast::Missing {
+            attempt: Some(attempt),
+            ..
+        } = manager.begin_peer_summary_broadcast(&contract, &peer)
+        else {
+            panic!("an untracked pair must start lifecycle accounting");
+        };
+        // Dropped WITHOUT mark_delivered.
+        drop(manager.missing_summary_attempt_guard(attempt));
+
+        let snap = manager.interest_lifecycle_snapshot();
+        assert_eq!(
+            snap.delivered_size_hist.iter().flatten().sum::<u64>(),
+            0,
+            "an undelivered send must not appear in the size histogram"
+        );
+        assert_eq!(
+            snap.untracked_prior_removal_age.iter().sum::<u64>(),
+            0,
+            "nor in the untracked-age histogram"
+        );
+    }
+
+    /// The untracked-age histogram must separate "recently lost its entry" from
+    /// "no record of one at all".
+    ///
+    /// This is the population `ms_age` structurally cannot see: `first_age_bucket`
+    /// is computed only on the tracked path, so `untracked_first_observed` — the
+    /// class that grew under 0.2.120, and ~4x the population `ms_age` covers —
+    /// had no age signal whatsoever.
+    #[test]
+    fn untracked_age_histogram_separates_recent_removal_from_no_record() {
+        let (manager, time) = make_manager();
+
+        // Pair A: never seen before -> the "no record" bucket (5).
+        let contract_a = make_contract_key(43);
+        let peer_a = make_peer_key(43);
+        let PeerSummaryForBroadcast::Missing {
+            attempt: Some(attempt),
+            ..
+        } = manager.begin_peer_summary_broadcast(&contract_a, &peer_a)
+        else {
+            panic!("untracked pair");
+        };
+        let mut guard = manager.missing_summary_attempt_guard(attempt);
+        guard.mark_delivered(1024);
+        drop(guard);
+
+        // Pair B: tracked, removed, then broadcast to 30s later -> bucket 1
+        // (<1m), NOT the no-record bucket.
+        let contract_b = make_contract_key(44);
+        let peer_b = make_peer_key(44);
+        manager.register_peer_interest(&contract_b, peer_b.clone(), None, false);
+        assert!(manager.remove_peer_interest_for(
+            &contract_b,
+            &peer_b,
+            InterestRemovalCause::DisconnectGrace
+        ));
+        time.advance_time(Duration::from_secs(30));
+        let PeerSummaryForBroadcast::Missing {
+            attempt: Some(attempt),
+            ..
+        } = manager.begin_peer_summary_broadcast(&contract_b, &peer_b)
+        else {
+            panic!("untracked pair");
+        };
+        let mut guard = manager.missing_summary_attempt_guard(attempt);
+        guard.mark_delivered(1024);
+        drop(guard);
+
+        let snap = manager.interest_lifecycle_snapshot();
+        assert_eq!(
+            snap.untracked_prior_removal_age[5], 1,
+            "a pair with no removal record must land in the no-record bucket"
+        );
+        assert_eq!(
+            snap.untracked_prior_removal_age[1], 1,
+            "a pair whose entry was removed 30s ago must land in the <1m \
+             bucket, which is the whole distinction this counter exists to draw"
+        );
     }
 
     /// The untracked-path staleness reset must not wipe `recent_removal`.

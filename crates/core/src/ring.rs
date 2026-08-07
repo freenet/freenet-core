@@ -2167,6 +2167,8 @@ impl Ring {
                     ms_s: lifecycle.delivered_sends,
                     ms_b: lifecycle.delivered_bytes,
                     ms_age: lifecycle.first_send_age,
+                    ms_size: lifecycle.delivered_size_hist,
+                    ms_unt_age: lifecycle.untracked_prior_removal_age,
                     reg_ow_k: lifecycle.registration_overwrite_known,
                     reg_ow_m: lifecycle.registration_overwrite_missing,
                     reg_new_k: lifecycle.registration_new_known,
