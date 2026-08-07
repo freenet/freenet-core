@@ -866,6 +866,10 @@ async fn is_locally_known(
             })),
             auth_token: None,
             origin_contract: None,
+            // Node-internal fetch issued by the HTTP layer itself (webapp cache
+            // reconcile), not a client connection. It carries no
+            // `origin_contract`, so the scope attests nothing either way.
+            connection_scope: crate::client_events::ConnectionScope::Local,
             // Internal node-query request: no delegate secrets, no user context.
             user_context: None,
             api_version: Default::default(),
@@ -897,6 +901,10 @@ async fn is_locally_known(
             req: Box::new(ClientRequest::Disconnect { cause: None }),
             auth_token: None,
             origin_contract: None,
+            // Node-internal fetch issued by the HTTP layer itself (webapp cache
+            // reconcile), not a client connection. It carries no
+            // `origin_contract`, so the scope attests nothing either way.
+            connection_scope: crate::client_events::ConnectionScope::Local,
             // Internal node-query request: no delegate secrets, no user context.
             user_context: None,
             api_version: Default::default(),
@@ -1145,6 +1153,10 @@ async fn ensure_contract_cached(
             ),
             auth_token: None,
             origin_contract: None,
+            // Node-internal fetch issued by the HTTP layer itself (webapp cache
+            // reconcile), not a client connection. It carries no
+            // `origin_contract`, so the scope attests nothing either way.
+            connection_scope: crate::client_events::ConnectionScope::Local,
             // Internal node-query request: no delegate secrets, no user context.
             user_context: None,
             api_version: Default::default(),
@@ -1169,6 +1181,10 @@ async fn ensure_contract_cached(
             req: Box::new(ClientRequest::Disconnect { cause: None }),
             auth_token: None,
             origin_contract: None,
+            // Node-internal fetch issued by the HTTP layer itself (webapp cache
+            // reconcile), not a client connection. It carries no
+            // `origin_contract`, so the scope attests nothing either way.
+            connection_scope: crate::client_events::ConnectionScope::Local,
             // Internal node-query request: no delegate secrets, no user context.
             user_context: None,
             api_version: Default::default(),

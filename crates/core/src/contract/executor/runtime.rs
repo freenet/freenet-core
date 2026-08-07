@@ -292,9 +292,16 @@ impl ContractExecutor for Executor<Runtime> {
         req: DelegateRequest<'_>,
         origin_contract: Option<&ContractInstanceId>,
         caller_delegate: Option<&DelegateKey>,
+        connection_scope: crate::client_events::ConnectionScope,
         user_context: Option<&UserSecretContext>,
     ) -> Response {
-        self.delegate_request(req, origin_contract, caller_delegate, user_context)
+        self.delegate_request(
+            req,
+            origin_contract,
+            caller_delegate,
+            connection_scope,
+            user_context,
+        )
     }
 
     // NOTE: `ContractExecutor::try_begin_export` / `finish_export` are NOT
@@ -573,7 +580,16 @@ impl Executor<Runtime> {
             ClientRequest::ContractOp(op) => self.contract_requests(op, id, updates).await,
             // Local-node path (no hosted-mode connection): always single-user
             // (`user_context = None`), so secrets stay `SecretScope::Local`.
-            ClientRequest::DelegateOp(op) => self.delegate_request(op, None, None, None),
+            // `origin_contract` is `None` here, so the connection scope changes
+            // nothing about what this path can attest — pass `Local` so the
+            // behavior is byte-for-byte what it was.
+            ClientRequest::DelegateOp(op) => self.delegate_request(
+                op,
+                None,
+                None,
+                crate::client_events::ConnectionScope::Local,
+                None,
+            ),
             ClientRequest::Disconnect { cause } => {
                 if let Some(cause) = cause {
                     tracing::info!("disconnecting cause: {cause}");
@@ -1506,15 +1522,195 @@ mod remove_contract_tests {
             .with_extension("wasm")
     }
 
-    /// Handler-level (freenet/freenet-core#5198): `RegisterDelegateWithPredecessors`
+    /// GHSA-824h-7x5x-wfmf regression: a NON-LOCAL registration must not be able
+    /// to write the durable first-registration origin record.
+    ///
+    /// The gate on `resolve_message_origin` only controls what a delegate is
+    /// TOLD about its caller. `origin_contract` has a second, far more damaging
+    /// consumer: `register_delegate_and_record_origin` writes it into a record
+    /// that is FIRST-WRITER-WINS and IMMUTABLE. An off-host caller could mint a
+    /// token for any contract id (the node issues one on request, for any id,
+    /// existing or not) and permanently freeze a delegate's recorded provenance
+    /// to a value of their choosing — unrepairable short of wiping the database.
+    ///
+    /// Delegate WASM and params are public, so the key is derivable and the
+    /// record can be poisoned BEFORE the legitimate app ever registers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_registration_cannot_write_the_durable_origin_record() {
+        use crate::contract::storages::Storage;
+        use freenet_stdlib::client_api::DelegateRequest;
+        use freenet_stdlib::prelude::{
+            ContractInstanceId, Delegate, DelegateContainer, DelegateWasmAPIVersion,
+        };
+
+        let temp_dir = crate::util::tests::get_temp_dir();
+        let db = Storage::new(temp_dir.path()).await.expect("create db");
+        let contract_store =
+            ContractStore::new(temp_dir.path().join("contracts"), 10_000, db.clone())
+                .expect("contract store");
+        let delegate_store =
+            DelegateStore::new(temp_dir.path().join("delegate"), 10_000, db.clone())
+                .expect("delegate store");
+        let secrets_store = SecretsStore::new(
+            temp_dir.path().join("secrets"),
+            Default::default(),
+            db.clone(),
+        )
+        .expect("secrets store");
+        let state_store = StateStore::new(db.clone(), 10_000_000).expect("state store");
+        let runtime = Runtime::build(contract_store, delegate_store, secrets_store, false)
+            .expect("build runtime");
+        let mut executor = Executor::new(
+            state_store,
+            || Ok(()),
+            crate::contract::executor::OperationMode::Local,
+            runtime,
+            None,
+        )
+        .await
+        .expect("create executor");
+
+        let victim = Delegate::from((&vec![0u8].into(), &vec![0xD4u8].into()));
+        let attacker_claim = ContractInstanceId::new([0x99u8; 32]);
+
+        // An off-host caller registers the delegate, presenting a token bound to
+        // a contract id it does not own.
+        executor
+            .delegate_request(
+                DelegateRequest::RegisterDelegate {
+                    delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(victim.clone())),
+                    cipher: [7u8; 32],
+                    nonce: [9u8; 24],
+                },
+                Some(&attacker_claim),
+                None,
+                crate::client_events::ConnectionScope::Remote,
+                None,
+            )
+            .expect("registration itself still succeeds; only the attestation is withheld");
+
+        let (_has_admin_none, origins) = db
+            .get_delegate_origins(victim.key())
+            .expect("record must be readable")
+            .expect("registration must have written a record");
+        assert!(
+            origins.is_empty(),
+            "a non-local registration must record NO contract id (the record is \
+             immutable, so a poisoned value can never be corrected); got {origins:?}"
+        );
+
+        // Control: the SAME request from a local connection DOES record the id,
+        // so the assertion above is about the scope gate and not about the
+        // record being write-only.
+        let legit = Delegate::from((&vec![0u8].into(), &vec![0xD5u8].into()));
+        let app = ContractInstanceId::new([0x11u8; 32]);
+        executor
+            .delegate_request(
+                DelegateRequest::RegisterDelegate {
+                    delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(legit.clone())),
+                    cipher: [7u8; 32],
+                    nonce: [9u8; 24],
+                },
+                Some(&app),
+                None,
+                crate::client_events::ConnectionScope::Local,
+                None,
+            )
+            .expect("local registration must succeed");
+
+        let (_, origins) = db
+            .get_delegate_origins(legit.key())
+            .expect("record must be readable")
+            .expect("registration must have written a record");
+        assert_eq!(
+            origins.len(),
+            1,
+            "a local registration must still record its attested contract id"
+        );
+        assert_eq!(origins[0], *app.as_bytes(), "wrong contract id recorded");
+    }
+
+    /// GHSA-824h-7x5x-wfmf regression: an UNATTESTED delegate must still be
+    /// able to send delegate-to-delegate messages.
+    ///
+    /// A revision of that fix refused to dispatch from any delegate whose
+    /// first-registration record held no contract id. That record is `None` both
+    /// for "never registered here" AND for the tokenless local CLI shape, so it
+    /// silently broke every delegate installed by riverctl / atlasctl / fdev —
+    /// silently because the caller swallows the error into a warning and the
+    /// client still receives `Ok` with the second delegate's reply simply
+    /// missing. Re-adding any such gate must fail here.
+    ///
+    /// The escalation that gate was aimed at is closed by connection scope
+    /// instead (`resolve_message_origin` returns `None` for a non-local
+    /// connection, and the scope is propagated into the hop), which the
+    /// `remote_connection_gets_no_caller_delegate_origin` unit test pins.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unattested_delegate_can_still_dispatch_to_another_delegate() {
+        use freenet_stdlib::client_api::DelegateRequest;
+        use freenet_stdlib::prelude::{
+            Delegate, DelegateContainer, DelegateWasmAPIVersion, Parameters,
+        };
+
+        let (mut executor, _contracts_dir, _temp) =
+            build_disk_executor("unattested-inter-delegate").await;
+
+        // Registered with NO attested origin — the tokenless CLI shape.
+        let cli_delegate = Delegate::from((&vec![0u8].into(), &vec![0xA1u8].into()));
+        let victim = Delegate::from((&vec![0u8].into(), &vec![0xC3u8].into()));
+
+        for delegate in [&cli_delegate, &victim] {
+            executor
+                .delegate_request(
+                    DelegateRequest::RegisterDelegate {
+                        delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(
+                            delegate.clone(),
+                        )),
+                        cipher: [7u8; 32],
+                        nonce: [9u8; 24],
+                    },
+                    None,
+                    None,
+                    crate::client_events::ConnectionScope::Local,
+                    None,
+                )
+                .expect("registration must succeed");
+        }
+
+        let result = executor.delegate_request(
+            DelegateRequest::ApplicationMessages {
+                key: victim.key().clone(),
+                params: Parameters::from(Vec::new()),
+                inbound: vec![],
+            },
+            None,
+            Some(cli_delegate.key()),
+            crate::client_events::ConnectionScope::Local,
+            None,
+        );
+
+        // The fixture delegates are not real WASM, so the call still fails — but
+        // it must fail on EXECUTION, never on a provenance/attestation refusal.
+        // Asserting on the absence of that refusal is the whole point: a
+        // re-introduced gate would short-circuit before execution.
+        if let Err(e) = result {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("attested registration origin") && !msg.contains("dispatch refused"),
+                "an unattested delegate must not be refused dispatch; got: {msg}"
+            );
+        }
+    }
+
+    /// Handler-level (GHSA-824h-7x5x-wfmf): `RegisterDelegateWithPredecessors`
     /// NEVER copies a predecessor's secrets, even when the registering request's
     /// `origin_contract` exactly matches the predecessor's recorded
     /// first-registration origin (the one case the H1 same-origin gate in
     /// `SecretsStore::migrate_secrets` would otherwise allow). The copy-forward
     /// call is disabled at the handler level because `origin_contract` itself is
-    /// forgeable by any HTTP client (see #5198) — so even a "matching" origin
+    /// forgeable by any HTTP client (see GHSA-824h-7x5x-wfmf) — so even a "matching" origin
     /// proves nothing. Registration still succeeds, exactly as plain
-    /// `RegisterDelegate` would. This replaces the pre-#5198 test asserting the
+    /// `RegisterDelegate` would. This replaces the pre-advisory test asserting the
     /// copy DID happen on a matching origin.
     #[tokio::test(flavor = "multi_thread")]
     async fn register_delegate_with_predecessors_never_copies_secrets() {
@@ -1593,7 +1789,13 @@ mod remove_contract_tests {
             predecessors: vec![pred.key().clone()],
         };
         let resp = executor
-            .delegate_request(req, Some(&origin_contract), None, None)
+            .delegate_request(
+                req,
+                Some(&origin_contract),
+                None,
+                crate::client_events::ConnectionScope::Local,
+                None,
+            )
             .expect("register-with-predecessors must succeed");
         match resp {
             HostResponse::DelegateResponse { key, .. } => {
@@ -1603,12 +1805,12 @@ mod remove_contract_tests {
         }
 
         // The predecessor's Local secret must NOT be copied — the copy-forward
-        // is unconditionally disabled (#5198), even though the supplied
+        // is unconditionally disabled (GHSA-824h-7x5x-wfmf), even though the supplied
         // `origin_contract` matches the predecessor's recorded origin exactly
         // (the one case the underlying H1 gate would otherwise have allowed).
         assert!(
             !successor_secret_path.exists(),
-            "successor secret file must NOT exist: copy-forward is disabled (#5198) \
+            "successor secret file must NOT exist: copy-forward is disabled (GHSA-824h-7x5x-wfmf) \
              regardless of origin_contract"
         );
 
@@ -1623,7 +1825,7 @@ mod remove_contract_tests {
         );
     }
 
-    /// Regression test for freenet/freenet-core#5198, directory-level: a
+    /// Regression test for GHSA-824h-7x5x-wfmf, directory-level: a
     /// predecessor holding MULTIPLE Local secrets, named in a
     /// `RegisterDelegateWithPredecessors` request with a matching
     /// `origin_contract`, must leave the successor's on-disk secrets
@@ -1702,7 +1904,13 @@ mod remove_contract_tests {
             predecessors: vec![pred.key().clone()],
         };
         let resp = executor
-            .delegate_request(req, Some(&origin_contract), None, None)
+            .delegate_request(
+                req,
+                Some(&origin_contract),
+                None,
+                crate::client_events::ConnectionScope::Local,
+                None,
+            )
             .expect("register-with-predecessors must succeed");
         assert!(matches!(resp, HostResponse::DelegateResponse { .. }));
 
@@ -1716,7 +1924,7 @@ mod remove_contract_tests {
         assert!(
             !successor_has_any_secret,
             "successor secrets directory must be absent or empty: copy-forward is \
-             disabled (#5198) regardless of origin_contract or predecessor secret count"
+             disabled (GHSA-824h-7x5x-wfmf) regardless of origin_contract or predecessor secret count"
         );
     }
 
@@ -1728,7 +1936,7 @@ mod remove_contract_tests {
     /// registered-but-recordless delegate (a claimable first-writer slot an
     /// attacker could later name as its own) can never exist. Once the disk
     /// recovers, the app's retry registers and records normally (copy-forward
-    /// itself is unconditionally disabled, #5198, so it never copies — see
+    /// itself is unconditionally disabled, GHSA-824h-7x5x-wfmf, so it never copies — see
     /// the final assertion). Uses the fault-injecting redb backend to fail the
     /// origin-record write on demand.
     #[cfg(feature = "redb")]
@@ -1813,7 +2021,13 @@ mod remove_contract_tests {
         };
         assert!(
             executor
-                .delegate_request(req, Some(&origin_contract), None, None)
+                .delegate_request(
+                    req,
+                    Some(&origin_contract),
+                    None,
+                    crate::client_events::ConnectionScope::Local,
+                    None
+                )
                 .is_err(),
             "registration must FAIL when the first-writer origin record cannot persist"
         );
@@ -1838,7 +2052,13 @@ mod remove_contract_tests {
         };
         assert!(
             executor
-                .delegate_request(req_plain, Some(&origin_contract), None, None)
+                .delegate_request(
+                    req_plain,
+                    Some(&origin_contract),
+                    None,
+                    crate::client_events::ConnectionScope::Local,
+                    None
+                )
                 .is_err(),
             "plain RegisterDelegate must ALSO fail when the origin record cannot persist"
         );
@@ -1891,18 +2111,24 @@ mod remove_contract_tests {
             predecessors: vec![pred.key().clone()],
         };
         executor2
-            .delegate_request(req2, Some(&origin_contract), None, None)
+            .delegate_request(
+                req2,
+                Some(&origin_contract),
+                None,
+                crate::client_events::ConnectionScope::Local,
+                None,
+            )
             .expect("retry after recovery must succeed");
         assert!(
             succ_reg_path.exists(),
             "after recovery the successor IS registered (.reg present)"
         );
-        // Copy-forward is unconditionally disabled (#5198): the retry succeeds
+        // Copy-forward is unconditionally disabled (GHSA-824h-7x5x-wfmf): the retry succeeds
         // (registration itself was only ever blocked by the origin-record
         // write failure, now healed), but no secret is ever copied.
         assert!(
             !succ_secret_path.exists(),
-            "the predecessor secret must NOT be copied forward: copy-forward is disabled (#5198)"
+            "the predecessor secret must NOT be copied forward: copy-forward is disabled (GHSA-824h-7x5x-wfmf)"
         );
     }
 
@@ -1944,7 +2170,13 @@ mod remove_contract_tests {
         };
         assert!(
             executor
-                .delegate_request(req_over, None, None, None)
+                .delegate_request(
+                    req_over,
+                    None,
+                    None,
+                    crate::client_events::ConnectionScope::Local,
+                    None
+                )
                 .is_err(),
             "an over-cap UNIQUE predecessor list must be rejected"
         );
@@ -1975,7 +2207,13 @@ mod remove_contract_tests {
             predecessors: dupes,
         };
         executor
-            .delegate_request(req_ok, None, None, None)
+            .delegate_request(
+                req_ok,
+                None,
+                None,
+                crate::client_events::ConnectionScope::Local,
+                None,
+            )
             .expect("a duplicate-heavy but under-cap-UNIQUE list must be accepted");
         assert!(
             reg_path(&succ_ok).exists(),
@@ -1994,7 +2232,13 @@ mod remove_contract_tests {
         };
         assert!(
             executor
-                .delegate_request(req_raw, None, None, None)
+                .delegate_request(
+                    req_raw,
+                    None,
+                    None,
+                    crate::client_events::ConnectionScope::Local,
+                    None
+                )
                 .is_err(),
             "a raw list past the DoS sanity bound must be rejected even when unique count is small"
         );
@@ -2014,7 +2258,13 @@ mod remove_contract_tests {
             predecessors: at_cap,
         };
         executor
-            .delegate_request(req_at_cap, None, None, None)
+            .delegate_request(
+                req_at_cap,
+                None,
+                None,
+                crate::client_events::ConnectionScope::Local,
+                None,
+            )
             .expect("an exactly-at-cap UNIQUE count (64) must be accepted");
         assert!(
             reg_path(&succ_at_cap).exists(),
@@ -2032,7 +2282,13 @@ mod remove_contract_tests {
             predecessors: Vec::new(),
         };
         executor
-            .delegate_request(req_empty, None, None, None)
+            .delegate_request(
+                req_empty,
+                None,
+                None,
+                crate::client_events::ConnectionScope::Local,
+                None,
+            )
             .expect("an empty predecessor list must be accepted (plain-register equivalent)");
         assert!(
             reg_path(&succ_empty).exists(),
@@ -2059,7 +2315,13 @@ mod remove_contract_tests {
             predecessors: raw_at_bound,
         };
         executor
-            .delegate_request(req_raw_boundary, None, None, None)
+            .delegate_request(
+                req_raw_boundary,
+                None,
+                None,
+                crate::client_events::ConnectionScope::Local,
+                None,
+            )
             .expect("a raw list at exactly the sanity bound (unique within cap) must be accepted");
         assert!(
             reg_path(&succ_raw_boundary).exists(),

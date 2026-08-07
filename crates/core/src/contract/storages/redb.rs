@@ -176,9 +176,9 @@ pub(crate) const MIGRATION_MARKER_TABLE: TableDefinition<&[u8], &[u8]> =
 /// origin is among the predecessor's recorded origins (or both are the Admin/None
 /// class).
 ///
-/// **This gate alone is NOT sufficient protection (freenet/freenet-core#5198).**
+/// **This gate alone is NOT sufficient protection (GHSA-824h-7x5x-wfmf).**
 /// The registering request's `origin_contract` is itself forgeable by any HTTP
-/// client (see #5198 for the exploit chain), so a malicious web-app CAN obtain
+/// client (see GHSA-824h-7x5x-wfmf for the exploit chain), so a malicious web-app CAN obtain
 /// a value that matches an unrelated victim delegate's recorded origin. The
 /// actual protection today is that the copy-forward's sole caller
 /// (`RegisterDelegateWithPredecessors`'s handler) is unconditionally disabled —

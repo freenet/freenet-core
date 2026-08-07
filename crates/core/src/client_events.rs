@@ -25,7 +25,7 @@ pub(crate) use error::{Error, ensure_peer_ready};
 pub(crate) use proxy::BoxedClient;
 pub use proxy::ClientEventsProxy;
 pub(crate) use types::HostIncomingMsg;
-pub use types::{AuthToken, ClientId, HostResult, OpenRequest, RequestId};
+pub use types::{AuthToken, ClientId, ConnectionScope, HostResult, OpenRequest, RequestId};
 
 use either::Either;
 use freenet_stdlib::{
@@ -1508,6 +1508,26 @@ async fn process_open_request(
                 );
                 let delegate_key = req.key().clone();
 
+                // Who this connection is, from the perspective of delegate
+                // notification routing (GHSA-824h-7x5x-wfmf). Only a connection
+                // the node proved is local may receive a delegate's output.
+                // Locality is the WHOLE of the identity here — no contract id is
+                // carried, because keying delivery on one is unsafe (see
+                // `route_to_apps`).
+                //
+                // The executor dispatch further down is NOT handed this value —
+                // it receives the raw `origin_contract` alongside
+                // `connection_scope` and applies the gate itself, because it must
+                // also gate the two origin sources this layer cannot see
+                // (`caller_delegate` and the node's inherited-origins map). Both
+                // read the SAME `request.connection_scope`, so they agree on
+                // whether the caller is attestable.
+                let app_identity = if request.connection_scope.is_local() {
+                    crate::contract::delegate_app_registry::AppIdentity::Local
+                } else {
+                    crate::contract::delegate_app_registry::AppIdentity::Remote
+                };
+
                 // Register (or refresh) this app's routing path so the delegate
                 // can push notification-driven ApplicationMessages back to it
                 // (#3275). An app "registers with a delegate" by talking to it
@@ -1516,12 +1536,18 @@ async fn process_open_request(
                 // the path. UnregisterDelegate tears it down. RegisterDelegate
                 // (installing the delegate binary) does NOT register an app —
                 // it's an admin op, not an app conversation.
+                //
+                // The registration records `app_identity`: registering stays open
+                // to anyone (it is how a client asks to be pushed to), but only a
+                // LOCAL registration is ever a delivery target — see
+                // `delegate_app_registry::route_to_apps`.
                 match &req {
                     freenet_stdlib::client_api::DelegateRequest::ApplicationMessages { .. } => {
                         if let Some(sender) = &subscription_listener {
                             if !crate::contract::delegate_app_registry::register_app(
                                 &delegate_key,
                                 client_id,
+                                app_identity,
                                 sender.clone(),
                             ) {
                                 tracing::warn!(
@@ -1542,7 +1568,7 @@ async fn process_open_request(
                     // carries a notification channel (above), never by
                     // registration. RegisterDelegateWithPredecessors's
                     // node-side secret copy-forward (#4117) is unconditionally
-                    // disabled as of #5198 (its origin_contract gate is
+                    // disabled as of GHSA-824h-7x5x-wfmf (its origin_contract gate is
                     // forgeable) — it was likewise never an app-routing event
                     // even when active. Both are listed EXPLICITLY (not swept)
                     // per this match's contract that
@@ -1627,6 +1653,7 @@ async fn process_open_request(
                     );
                 }
                 let origin_contract = request.origin_contract;
+                let connection_scope = request.connection_scope;
                 // Per-connection user secret namespace (hosted mode). Taken from
                 // the OpenRequest, which received it from the connection layer —
                 // NOT from anything inside `req`. Moving it into the event keeps
@@ -1638,6 +1665,7 @@ async fn process_open_request(
                         ContractHandlerEvent::DelegateRequest {
                             req,
                             origin_contract,
+                            connection_scope,
                             user_context,
                         },
                         crate::contract::Priority::ClientLocal,
@@ -1990,6 +2018,63 @@ mod serve_during_gate_tests {
              blocking_subscribe — that silently downgrades an explicit \
              blocking_subscribe=true GET to fire-and-forget (#4524 regression). \
              Call args: {args_only:?}"
+        );
+    }
+
+    /// GHSA-824h-7x5x-wfmf: the app-routing registration must record WHO
+    /// registered, derived from the connection scope.
+    ///
+    /// The type system alone does not protect this: `AppIdentity::Local`
+    /// is constructible unconditionally, so a version that classified every
+    /// registration as `Local` would compile and would re-open the hole for
+    /// every off-host caller. This pins that the identity handed to
+    /// `register_app` is derived through `connection_scope.is_local()`, and that
+    /// the connection scope also reaches the executor.
+    #[test]
+    fn delegate_registration_binds_to_the_connection_scope() {
+        let src = include_str!("client_events.rs");
+        // Bound the scrape to the DelegateOp arm. An unbounded `split_once`
+        // would happily match this test's own assertion strings further down
+        // the file and pass vacuously.
+        let arm = src
+            .split("ClientRequest::DelegateOp(req) => {")
+            .nth(1)
+            .expect("the DelegateOp arm must exist");
+        let arm = arm
+            .split("\n            ClientRequest::")
+            .next()
+            .expect("the arm is bounded by the next ClientRequest arm");
+
+        let derivation = arm
+            .find("let app_identity = if request.connection_scope.is_local()")
+            .expect(
+                "the registration identity must be derived from \
+                 `connection_scope.is_local()`",
+            );
+        let registration = arm
+            .find("register_app(")
+            .expect("the DelegateOp arm must register the app routing path");
+        assert!(
+            derivation < registration,
+            "the scope gate must be applied BEFORE the value reaches register_app"
+        );
+
+        let register_call = &arm[registration..];
+        let register_call = register_call
+            .split(") {")
+            .next()
+            .expect("register_app call must be bounded");
+        assert!(
+            register_call.contains("app_identity"),
+            "register_app must receive the scope-derived identity, not a value \
+             built from `request.origin_contract` alone; got: {register_call}"
+        );
+
+        assert!(
+            arm.contains("let connection_scope = request.connection_scope;")
+                && arm.contains("connection_scope,\n                            user_context,"),
+            "the same connection scope must also reach the executor via \
+             ContractHandlerEvent::DelegateRequest"
         );
     }
 }

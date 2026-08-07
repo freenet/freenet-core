@@ -34,6 +34,7 @@ mod tests {
             notification_channel: None,
             token: None,
             origin_contract: None,
+            connection_scope: crate::client_events::ConnectionScope::Local,
             user_context: None,
         };
 

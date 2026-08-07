@@ -81,6 +81,11 @@ pub(crate) enum ClientConnection {
         req: Box<ClientRequest<'static>>,
         auth_token: Option<AuthToken>,
         origin_contract: Option<ContractInstanceId>,
+        /// Whether the issuing connection may receive an ATTESTED application
+        /// identity (GHSA-824h-7x5x-wfmf). Classified once at the HTTP layer
+        /// from the kernel-observed peer address, carried on the connection
+        /// like `user_context` so nothing in the request body can forge it.
+        connection_scope: crate::client_events::ConnectionScope,
         /// Per-connection per-user secret namespace (hosted mode, P2 of #4381),
         /// derived once at WS upgrade from the connection's user token. `None`
         /// outside hosted mode. Carried on the connection, never from the
@@ -251,158 +256,17 @@ fn is_ipv6_ula(addr: &std::net::Ipv6Addr) -> bool {
     (addr.segments()[0] & 0xfe00) == 0xfc00
 }
 
-pub mod local_node {
-    use freenet_stdlib::client_api::{ClientRequest, ErrorKind};
-    use std::net::SocketAddr;
-    use tower_http::trace::TraceLayer;
-
-    use crate::{
-        client_events::{ClientEventsProxy, OpenRequest, websocket::WebSocketProxy},
-        contract::{Executor, ExecutorError},
-    };
-
-    use super::{client_api::HttpClientApi, serve_dual_stack};
-
-    pub async fn run_local_node(mut executor: Executor, socket: SocketAddr) -> anyhow::Result<()> {
-        if !super::is_private_ip(&socket.ip()) {
-            anyhow::bail!(
-                "invalid ip: {}, only loopback and private network addresses are allowed",
-                socket.ip()
-            )
-        }
-        let (mut gw, gw_router) = HttpClientApi::as_router(&socket);
-        let (mut ws_proxy, ws_router) = WebSocketProxy::create_router(gw_router);
-
-        // Route through serve_dual_stack (not the bare single-socket bind) so
-        // this path also binds an IPv4+IPv6 companion pair for loopback/wildcard
-        // addresses — keeping every client-API serve path reachable over both
-        // families (#4330).
-        //
-        // `run_local_node` owns the server for the lifetime of the process (it
-        // loops forever below), so the abort guard is leaked deliberately: there
-        // is no graceful-shutdown hook on this path to hand it to.
-        let mut aborts = crate::util::AbortOnDrop::new();
-        serve_dual_stack(
-            socket,
-            ws_router.layer(TraceLayer::new_for_http()),
-            None,
-            &mut aborts,
-        )
-        .await?;
-        std::mem::forget(aborts);
-
-        // TODO: use combinator instead
-        // let mut all_clients =
-        //    ClientEventsCombinator::new([Box::new(ws_handle), Box::new(http_handle)]);
-        enum Receiver {
-            Ws,
-            Gw,
-        }
-        let mut receiver;
-        loop {
-            let req = crate::deterministic_select! {
-                req = ws_proxy.recv() => {
-                    receiver = Receiver::Ws;
-                    req?
-                },
-                req = gw.recv() => {
-                    receiver = Receiver::Gw;
-                    req?
-                },
-            };
-            let OpenRequest {
-                client_id: id,
-                request,
-                notification_channel,
-                token,
-                user_context,
-                ..
-            } = req;
-            tracing::trace!(cli_id = %id, "got request -> {request}");
-
-            let res = match *request {
-                ClientRequest::ContractOp(op) => {
-                    executor
-                        .contract_requests(op, id, notification_channel)
-                        .await
-                }
-                ClientRequest::DelegateOp(op) => {
-                    let origin_contract = token.and_then(|token| {
-                        gw.origin_contracts
-                            .get(&token)
-                            .map(|entry| entry.contract_id)
-                    });
-                    // `user_context` is `Some` only in hosted mode with a user
-                    // token; otherwise `None` keeps secrets `SecretScope::Local`.
-                    executor.delegate_request(
-                        op,
-                        origin_contract.as_ref(),
-                        None,
-                        user_context.as_ref(),
-                    )
-                }
-                ClientRequest::Disconnect { cause } => {
-                    if let Some(cause) = cause {
-                        tracing::info!("disconnecting cause: {cause}");
-                    }
-                    // fixme: token must live for a bit to allow reconnections
-                    // Drop the iter() guard before remove() to avoid holding a
-                    // DashMap shard guard across a mutating call on the same map
-                    // (clippy: `significant_drop_in_scrutinee`).
-                    // Safe: the outer caller serialises by `id`, so no concurrent
-                    // iter+remove on this shard is possible.
-                    let rm_token = gw.origin_contracts.iter().find_map(|entry| {
-                        let (k, origin) = entry.pair();
-                        (origin.client_id == id).then(|| k.clone())
-                    });
-                    if let Some(rm_token) = rm_token {
-                        gw.origin_contracts.remove(&rm_token);
-                    }
-                    continue;
-                }
-                ClientRequest::Authenticate { .. }
-                | ClientRequest::NodeQueries(_)
-                | ClientRequest::Close
-                | _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
-            };
-
-            match res {
-                Ok(res) => {
-                    match receiver {
-                        Receiver::Ws => ws_proxy.send(id, Ok(res)).await?,
-                        Receiver::Gw => gw.send(id, Ok(res)).await?,
-                    };
-                }
-                Err(err) if err.is_request() => {
-                    let err = ErrorKind::RequestError(err.unwrap_request());
-                    match receiver {
-                        Receiver::Ws => {
-                            ws_proxy.send(id, Err(err.into())).await?;
-                        }
-                        Receiver::Gw => {
-                            gw.send(id, Err(err.into())).await?;
-                        }
-                    };
-                }
-                Err(err) => {
-                    tracing::error!("{err}");
-                    let err = Err(ErrorKind::Unhandled {
-                        cause: format!("{err}").into(),
-                    }
-                    .into());
-                    match receiver {
-                        Receiver::Ws => {
-                            ws_proxy.send(id, err).await?;
-                        }
-                        Receiver::Gw => {
-                            gw.send(id, err).await?;
-                        }
-                    };
-                }
-            }
-        }
-    }
-}
+// `local_node::run_local_node` (a second, standalone client-API serve loop
+// that predated `node::run_local_node`) was DELETED with the
+// GHSA-824h-7x5x-wfmf fix. It was unreachable — `bin/freenet.rs` runs
+// `node::run_local_node` — and it carried a duplicate origin-resolution path
+// that re-derived a request's `origin_contract` by looking the connection's
+// auth token up in `HttpClientApi::origin_contracts`. That re-derivation read
+// the token and NOTHING about the connection it arrived on, so it could not
+// have honored the connection-scope gate; leaving it in place would have left
+// a second, silently-ungated way to obtain an attested identity for whoever
+// revived the entry point. `node::run_local_node` passes `OpenRequest`'s
+// `origin_contract` (and now its `connection_scope`) straight through instead.
 
 pub async fn serve_client_api(config: WebsocketApiConfig) -> std::io::Result<[BoxedClient; 2]> {
     let (gw, ws_proxy) = serve_client_api_in_impl(config, None).await?;
@@ -1424,7 +1288,7 @@ mod tests {
     /// `tests/playwright_shell.rs`, which boots a real node and fetches a shell
     /// page on a plain `cargo test`. A ready-made template for exactly that
     /// substitution sits in `client_api.rs::as_router`, where the same call is
-    /// legitimate (standalone composition, `local_node::run_local_node`).
+    /// legitimate (standalone router composition).
     ///
     /// The threading is a compile-time guarantee against OMISSION only: the
     /// parameter is required and has no default anywhere in the chain, so a

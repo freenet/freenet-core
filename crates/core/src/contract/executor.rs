@@ -923,11 +923,22 @@ pub(crate) trait ContractExecutor: Send + 'static {
     /// the delegate or client can put in a message can set or forge it. The
     /// inter-delegate dispatch path passes `None` (a delegate-to-delegate hop
     /// does not inherit the originating connection's user namespace).
+    /// `connection_scope` says whether the client connection this request
+    /// descends from is entitled to an ATTESTED application identity
+    /// (GHSA-824h-7x5x-wfmf). When it is
+    /// [`crate::client_events::ConnectionScope::Remote`] the executor resolves
+    /// NO `MessageOrigin` at all — not from `origin_contract`, not from
+    /// `caller_delegate`, not from the node's inherited-origins map — so an
+    /// off-host caller sees exactly what a tokenless local caller has always
+    /// seen. Like `user_context` it travels beside the request, never inside
+    /// it. Node-internal invocations (contract-notification callbacks) pass
+    /// `Local`: they descend from no client connection at all.
     fn execute_delegate_request(
         &mut self,
         req: DelegateRequest<'_>,
         origin_contract: Option<&ContractInstanceId>,
         caller_delegate: Option<&DelegateKey>,
+        connection_scope: crate::client_events::ConnectionScope,
         user_context: Option<&UserSecretContext>,
     ) -> impl Future<Output = Response> + Send;
 

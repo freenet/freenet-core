@@ -3444,7 +3444,12 @@ async fn test_notification_application_message_routed_to_registered_app()
     let app_client = ClientId::FIRST;
     let (app_tx, mut app_rx) = tokio::sync::mpsc::channel::<HostResult>(8);
     assert!(
-        delegate_app_registry::register_app(&delegate_key, app_client, app_tx),
+        delegate_app_registry::register_app(
+            &delegate_key,
+            app_client,
+            delegate_app_registry::AppIdentity::Local,
+            app_tx,
+        ),
         "app registration must succeed"
     );
 

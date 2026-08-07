@@ -4881,6 +4881,7 @@ pub async fn run_local_node(
             notification_channel,
             token,
             origin_contract,
+            connection_scope,
             user_context,
             ..
         } = req;
@@ -4912,7 +4913,17 @@ pub async fn run_local_node(
                 );
                 // `user_context` is `Some` only in hosted mode with a user token;
                 // `None` keeps secrets on the single-user `SecretScope::Local`.
-                executor.delegate_request(op, origin_contract.as_ref(), None, user_context.as_ref())
+                // `connection_scope` decides whether this request may receive an
+                // ATTESTED application identity (GHSA-824h-7x5x-wfmf). It comes
+                // from the connection layer on the same forge-proof channel as
+                // `origin_contract` and `user_context`.
+                executor.delegate_request(
+                    op,
+                    origin_contract.as_ref(),
+                    None,
+                    connection_scope,
+                    user_context.as_ref(),
+                )
             }
             ClientRequest::Disconnect { cause } => {
                 if let Some(cause) = cause {
