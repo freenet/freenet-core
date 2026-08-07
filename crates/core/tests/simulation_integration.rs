@@ -17385,19 +17385,122 @@ fn run_5147_multi_writer_arm(network_name: &str, target_list_enabled: bool) -> S
     run_5147_arm_inner(network_name, target_list_enabled, true)
 }
 
+/// Topology and workload knobs for one #5147 arm.
+///
+/// These were `const`s inside the arm, which fixed the measurement to ONE
+/// regime: a full clique (`max_connections` 12 across 7 nodes) short enough
+/// (240s) to finish inside a single 300s InterestSync heartbeat. That regime
+/// cannot express the case where originators have DIFFERENT neighbourhoods, so
+/// every reading it produced had `full_state_sends=16` whether the feature was
+/// on or off. A knob per dimension is what lets a second arm probe the regime
+/// the first one is blind to.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct ArmTopology {
+    peers: usize,
+    max_connections: usize,
+    min_connections: usize,
+    sustained_updates: usize,
+    /// Wall of simulated time the workload is given.
+    sim_duration: Duration,
+    /// Gap between scheduled operations.
+    op_interval: Duration,
+    /// How many peers subscribe only AFTER the update workload has begun.
+    ///
+    /// With every peer subscribed at bootstrap, the PUT and the first updates
+    /// deliver to every pair, so every pair is tracked before the measurement
+    /// starts and NOTHING can later need a summary it lacks. That is why the
+    /// dense and sparse arms both report a `full_state_sends` count that is
+    /// simply the bootstrap seeding, identical in both arms.
+    ///
+    /// A peer that subscribes late becomes an advertised co-host of relayers
+    /// that have never delivered to it — which is the population the fleet
+    /// counter `untracked_first_observed` measures, and the one that grew by
+    /// 11.2 GB / 3.2h under 0.2.120.
+    late_subscribers: usize,
+}
+
+#[cfg(test)]
+impl ArmTopology {
+    /// The regime the original #5147 measurement ran in. Every field is stated
+    /// so a future default change cannot silently move the baseline.
+    fn dense() -> Self {
+        Self {
+            // Enough peers that each has SEVERAL non-sender co-hosts. With two,
+            // a peer's only other co-host is the sender, the originator's list
+            // is empty after excluding the recipient, and the measurement is
+            // vacuous.
+            peers: 6,
+            // Wide enough that the peers connect to EACH OTHER. At a narrower
+            // cap a star forms, every peer's only co-host is the sender, and
+            // the target list has nobody to name — the same blind spot the
+            // #4965 co-host test documents.
+            max_connections: 12,
+            min_connections: 4,
+            sustained_updates: 20,
+            sim_duration: Duration::from_secs(240),
+            op_interval: Duration::from_secs(3),
+            late_subscribers: 0,
+        }
+    }
+
+    /// The regime `dense()` cannot express: peers with DIFFERENT co-host sets.
+    ///
+    /// In a clique every originator covers every peer, so a relayer either
+    /// suppresses its whole fan-out or has nothing left to send, and no pair is
+    /// ever left untracked-but-needed. Production is not a clique: coverage
+    /// varies per originator, so a pair suppressed under originator A is one a
+    /// relayer must still serve under originator B — with no cached summary,
+    /// hence full state.
+    fn sparse(
+        peers: usize,
+        max_connections: usize,
+        min_connections: usize,
+        late_subscribers: usize,
+    ) -> Self {
+        Self {
+            peers,
+            max_connections,
+            min_connections,
+            sustained_updates: 30,
+            sim_duration: Duration::from_secs(480),
+            op_interval: Duration::from_secs(3),
+            late_subscribers,
+        }
+    }
+}
+
 fn run_5147_arm_inner(
     network_name: &str,
     target_list_enabled: bool,
     multi_writer: bool,
 ) -> SuppressionArm {
+    run_5147_arm_with(
+        network_name,
+        target_list_enabled,
+        multi_writer,
+        ArmTopology::dense(),
+    )
+}
+
+fn run_5147_arm_with(
+    network_name: &str,
+    target_list_enabled: bool,
+    multi_writer: bool,
+    topology: ArmTopology,
+) -> SuppressionArm {
     use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
 
     const SEED: u64 = 0x5147_0001_0001;
-    // Enough peers that each has SEVERAL non-sender co-hosts. With two, a
-    // peer's only other co-host is the sender, the originator's list is empty
-    // after excluding the recipient, and the measurement is vacuous.
-    const PEERS: usize = 6;
-    const SUSTAINED_UPDATES: usize = 20;
+    let ArmTopology {
+        peers,
+        max_connections,
+        min_connections,
+        sustained_updates,
+        sim_duration,
+        op_interval,
+        late_subscribers,
+    } = topology;
 
     GlobalTestMetrics::reset();
     setup_deterministic_state(SEED);
@@ -17407,15 +17510,11 @@ fn run_5147_arm_inner(
         let mut sim = SimNetwork::new(
             network_name,
             1, // 1 gateway (the update source)
-            PEERS,
+            peers,
             7, // max_htl
             3, // rnd_if_htl_above
-            // Wide enough that the peers connect to EACH OTHER. At a narrower
-            // cap a star forms, every peer's only co-host is the sender, and
-            // the target list has nobody to name — the same blind spot the
-            // #4965 co-host test documents.
-            12, // max_connections
-            4,  // min_connections
+            max_connections,
+            min_connections,
             SEED,
         )
         .await;
@@ -17436,7 +17535,7 @@ fn run_5147_arm_inner(
         // removes. That regime makes the measurement a study of the sim's
         // pacing rather than of production, where a River-style update cadence
         // is minutes apart with heartbeats in between.
-        sim.with_controlled_op_interval(Duration::from_secs(3));
+        sim.with_controlled_op_interval(op_interval);
         let logs_handle = sim.event_logs_handle();
         (sim, logs_handle)
     });
@@ -17456,18 +17555,36 @@ fn run_5147_arm_inner(
             subscribe: true,
         },
     )];
-    for node_idx in 1..=PEERS {
+    // The last `late_subscribers` peers are held back and injected partway
+    // through the update stream (below), so relayers acquire co-hosts they have
+    // never delivered to.
+    let early_subscribers = peers.saturating_sub(late_subscribers);
+    for node_idx in 1..=early_subscribers {
         operations.push(ScheduledOperation::new(
             NodeLabel::node(network_name, node_idx),
             SimOperation::Subscribe { contract_id },
         ));
     }
-    for v in 0..SUSTAINED_UPDATES {
+    // Inject the held-back subscribers a third of the way in, so there is a
+    // populated mesh before they arrive and a long tail of updates after.
+    let late_join_at = sustained_updates / 3;
+    for v in 0..sustained_updates {
+        if v == late_join_at {
+            for node_idx in early_subscribers + 1..=peers {
+                operations.push(ScheduledOperation::new(
+                    NodeLabel::node(network_name, node_idx),
+                    SimOperation::Subscribe { contract_id },
+                ));
+            }
+        }
         // Single-writer: always the gateway, so every peer merges the same
         // payload into the same prior state. Multi-writer: rotate across the
         // subscribing peers, so a relayer can hold state its recipient lacks.
+        // Rotation covers only the EARLY subscribers: a late peer that wrote
+        // before subscribing would be originating updates for a contract it
+        // does not yet host.
         let writer = if multi_writer {
-            NodeLabel::node(network_name, (v % PEERS) + 1)
+            NodeLabel::node(network_name, (v % early_subscribers.max(1)) + 1)
         } else {
             NodeLabel::gateway(network_name, 0)
         };
@@ -17480,12 +17597,8 @@ fn run_5147_arm_inner(
         ));
     }
 
-    let result = sim.run_controlled_simulation(
-        SEED,
-        operations,
-        Duration::from_secs(240),
-        Duration::from_secs(90),
-    );
+    let result =
+        sim.run_controlled_simulation(SEED, operations, sim_duration, Duration::from_secs(90));
     assert!(
         result.turmoil_result.is_ok(),
         "{network_name}: simulation should complete: {:?}",
@@ -17592,6 +17705,113 @@ fn run_5147_arm_inner(
 /// Convergence must be no worse in the treatment arm. This is the assertion
 /// that fails if suppression over-reaches: a peer wrongly excluded from a
 /// fan-out does not converge, and no bandwidth saving justifies that.
+/// EXPLORATORY: does crossing `INTEREST_TTL` make `full_state_sends` sensitive
+/// to the #5147 flag?
+///
+/// `record_delivery_to_interest` is the only caller of `refresh_peer_interest`,
+/// and #5147 suppresses the delivery, so a suppressed pair stops being
+/// refreshed and should be reaped at `INTEREST_TTL` (20 min = 4x the 300s
+/// heartbeat, ring/interest.rs:75). Every other arm runs 240-480s of virtual
+/// time, far inside one TTL, so this decay path is unreachable there.
+///
+/// Updates are spaced a minute apart so the workload SPANS the TTL rather than
+/// finishing inside it.
+// Ignored: a manual PROBE, not an assertion — it prints a regime and
+// asserts nothing, and each run costs ~6 min of CI for no signal.
+// Kept because it is the evidence that the #5147 rig is blind to
+// full-state composition; see #5153.
+#[ignore]
+#[test_log::test]
+fn explore_5147_ttl_horizon() {
+    let topo = ArmTopology {
+        peers: 12,
+        max_connections: 6,
+        min_connections: 4,
+        sustained_updates: 30,
+        sim_duration: Duration::from_secs(2400),
+        op_interval: Duration::from_secs(60),
+        late_subscribers: 0,
+    };
+    let control = run_5147_arm_with("i5147-ttl-c", false, true, topo);
+    let treatment = run_5147_arm_with("i5147-ttl-t", true, true, topo);
+
+    for (label, arm) in [("control", &control), ("treatment", &treatment)] {
+        tracing::info!(
+            "TTL-HORIZON {label}: sends={} (delta={} full={}) deliveries={} redundant={} \
+             suppressed={} sender_skips={} summary_skips={} hosting_updates={} \
+             converged={:?} replicas={} diverged={}",
+            arm.sends,
+            arm.delta_sends,
+            arm.full_state_sends,
+            arm.deliveries,
+            arm.redundant,
+            arm.suppressed,
+            arm.sender_skips,
+            arm.summary_skips,
+            arm.hosting_updates,
+            arm.converged,
+            arm.replicas,
+            arm.diverged,
+        );
+    }
+}
+
+/// EXPLORATORY: does a sparse graph make `full_state_sends` sensitive to the
+/// #5147 flag at all?
+///
+/// The dense arms report `full=16` in every reading regardless of the flag,
+/// which is the axis the 0.2.120 fleet regression moved (full-state share of
+/// broadcast bytes 22-24% -> 29%). A rig that cannot move the number cannot
+/// validate a fix for it. This prints rather than asserts: its job is to find
+/// out whether the regime is reachable in simulation before anything is
+/// asserted about it.
+// Ignored: a manual PROBE, not an assertion — it prints a regime and
+// asserts nothing, and each run costs ~6 min of CI for no signal.
+// Kept because it is the evidence that the #5147 rig is blind to
+// full-state composition; see #5153.
+#[ignore]
+#[test_log::test]
+fn explore_5147_sparse_full_state_sensitivity() {
+    // Probe a BAND of topologies. A single point cannot distinguish "the regime
+    // is unreachable" from "this one config was degenerate": the first probe
+    // (10 peers, max 3) produced 3 replicas and suppressed=0, i.e. the mesh
+    // never formed and the feature never fired, which says nothing about the
+    // feature.
+    let mut arms = Vec::new();
+    for (peers, max_conn, min_conn, late) in [(12, 6, 4, 0), (12, 6, 4, 5), (12, 8, 4, 5)] {
+        let topo = ArmTopology::sparse(peers, max_conn, min_conn, late);
+        let tag = format!("p{peers}-max{max_conn}-late{late}");
+        arms.push((
+            format!("{tag} control"),
+            run_5147_arm_with(&format!("i5147-{tag}-c"), false, true, topo),
+        ));
+        arms.push((
+            format!("{tag} treatment"),
+            run_5147_arm_with(&format!("i5147-{tag}-t"), true, true, topo),
+        ));
+    }
+
+    for (label, arm) in arms.iter().map(|(l, a)| (l.as_str(), a)) {
+        tracing::info!(
+            "SPARSE {label}: sends={} (delta={} full={}) deliveries={} redundant={} \
+             suppressed={} sender_skips={} summary_skips={} hosting_updates={} \
+             converged={:?} replicas={} diverged={}",
+            arm.sends,
+            arm.delta_sends,
+            arm.full_state_sends,
+            arm.deliveries,
+            arm.redundant,
+            arm.suppressed,
+            arm.sender_skips,
+            arm.summary_skips,
+            arm.hosting_updates,
+            arm.converged,
+            arm.replicas,
+            arm.diverged,
+        );
+    }
+}
+
 #[test_log::test]
 fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
     let control = run_5147_suppression_arm("i5147-control", false);
