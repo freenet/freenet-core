@@ -4306,11 +4306,16 @@ async fn handle_interest_sync_message(
             // This is the mixed-version-rollout guard: a not-yet-upgraded peer
             // that still emits unlimited ResyncRequests must not be able to make
             // this (upgraded) node full-state-reply in a loop. When suppressed,
-            // simply don't respond — the requester will retry later.
-            if !op_manager
-                .ring
-                .resync_response_limiter
-                .check_and_record((source, *key.id()))
+            // simply don't respond — the requester will retry later. A full map
+            // (Untracked) is a sizing accident, not evidence about this key, so
+            // fail open (#5000).
+            if matches!(
+                op_manager
+                    .ring
+                    .resync_response_limiter
+                    .check_and_record_detailed((source, *key.id())),
+                crate::ring::resync_rate_limit::BucketOutcome::RateLimited
+            )
             {
                 crate::config::GlobalTestMetrics::record_resync_response_suppressed_per_peer();
                 tracing::debug!(
@@ -4327,10 +4332,14 @@ async fn handle_interest_sync_message(
             // distinct requester IPs drive ~9,733 full-state responses/day for
             // one forked contract. This bounds a single contract's total
             // resync-response cost (~12/min) regardless of requester count.
-            if !op_manager
-                .ring
-                .resync_response_global_limiter
-                .check_and_record(*key.id())
+            // A full map (Untracked) is a sizing accident, so fail open (#5000).
+            if matches!(
+                op_manager
+                    .ring
+                    .resync_response_global_limiter
+                    .check_and_record_detailed(*key.id()),
+                crate::ring::resync_rate_limit::BucketOutcome::RateLimited
+            )
             {
                 crate::config::GlobalTestMetrics::record_resync_response_suppressed_global();
                 tracing::debug!(

@@ -1304,11 +1304,15 @@ async fn send_queue_full_resync_request(
     // global-cap-only, with no per-sender throttle. The global suppression records
     // the same `record_resync_request_suppressed` metric node.rs does.) On
     // suppression, CANCEL the reservation so the per-sender window is released and
-    // the sender retries as soon as global tokens refill.
-    if !op_manager
-        .ring
-        .resync_emit_limiter
-        .check_and_record(*key.id())
+    // the sender retries as soon as global tokens refill. A full map (Untracked)
+    // is a sizing accident, so fail open (#5000).
+    if matches!(
+        op_manager
+            .ring
+            .resync_emit_limiter
+            .check_and_record_detailed(*key.id()),
+        crate::ring::resync_rate_limit::BucketOutcome::RateLimited
+    )
     {
         op_manager
             .interest_manager
@@ -2067,11 +2071,15 @@ async fn drive_relay_broadcast_to(
                 // full-state resync storm. When the emit is suppressed, skip the
                 // sender summary-clear too — it is part of the resync handshake,
                 // so clearing it without emitting would just force the sender to
-                // full-state us on the next interest cycle.
-                if op_manager
-                    .ring
-                    .resync_emit_limiter
-                    .check_and_record(*key.id())
+                // full-state us on the next interest cycle. A full map
+                // (Untracked) is a sizing accident, so fail open (#5000).
+                if !matches!(
+                    op_manager
+                        .ring
+                        .resync_emit_limiter
+                        .check_and_record_detailed(*key.id()),
+                    crate::ring::resync_rate_limit::BucketOutcome::RateLimited
+                )
                 {
                     tracing::warn!(
                         tx = %incoming_tx,
