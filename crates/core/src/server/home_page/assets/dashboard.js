@@ -499,6 +499,533 @@ function runImport() {
     });
 }
 
+/* ── Browser-local bandwidth chart (extracted for Node unit tests) ──
+   The server exposes cumulative byte counters but does not mutate history when
+   a page is read. This controller keeps one bounded history per browser page,
+   so other tabs, peer-detail requests, and crawlers cannot change the graph.
+   All clock/DOM dependencies are injected for deterministic Node tests. */
+/* bandwidth-chart-factory:BEGIN */
+function createBandwidthChart(deps) {
+  var WINDOW_MS = 60 * 1000;
+  var MIN_SAMPLE_MS = 1000;
+  /* At most one accepted sample per second plus the inclusive window edge. */
+  var MAX_SAMPLES = 61;
+  var SVG_NS = 'http://www.w3.org/2000/svg';
+  var baseline = null;
+  var samples = [];
+  var lastUptime = null;
+  var lastObservedAt = null;
+  var tooltip = null;
+  var lastSvg = null;
+  var restoreDataOpen = false;
+  var restoreDataFocus = false;
+
+  function asCounter(value) {
+    if (
+      value === null ||
+      value === undefined ||
+      (typeof value === 'string' && value.trim() === '')
+    ) {
+      return null;
+    }
+    try {
+      var parsed = typeof value === 'bigint' ? value : BigInt(value);
+      return parsed >= 0n ? parsed : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function clearHistory() {
+    baseline = null;
+    samples = [];
+  }
+
+  function resetSamples(up, down, at) {
+    baseline = { up: up, down: down, at: at };
+    samples = [];
+  }
+
+  function observeTotals(upTotal, downTotal, now) {
+    var up = asCounter(upTotal);
+    var down = asCounter(downTotal);
+    if (up === null || down === null || !Number.isFinite(now)) {
+      clearHistory();
+      return false;
+    }
+
+    if (baseline === null) {
+      resetSamples(up, down, now);
+      return false;
+    }
+
+    var elapsedMs = now - baseline.at;
+    if (elapsedMs < 0) {
+      resetSamples(up, down, now);
+      return false;
+    }
+    if (elapsedMs === 0) return false;
+
+    /* A process restart resets cumulative counters. Start a fresh series
+       instead of turning the reset into a giant or negative rate. */
+    if (up < baseline.up || down < baseline.down) {
+      resetSamples(up, down, now);
+      return false;
+    }
+
+    /* A point represents only its preceding interval. After a suspended or
+       closed page, traffic from beyond the visible minute must not be stamped
+       as current, so discard both the old series and the stale interval. */
+    if (elapsedMs > WINDOW_MS) {
+      resetSamples(up, down, now);
+      return false;
+    }
+
+    /* Coalesce bursts of refreshes. Do not advance the baseline here: the next
+       accepted sample must include these bytes and the full elapsed interval. */
+    if (elapsedMs < MIN_SAMPLE_MS) return false;
+
+    var upBps = (Number(up - baseline.up) * 1000) / elapsedMs;
+    var downBps = (Number(down - baseline.down) * 1000) / elapsedMs;
+    if (!Number.isFinite(upBps) || !Number.isFinite(downBps)) {
+      resetSamples(up, down, now);
+      return false;
+    }
+
+    baseline = { up: up, down: down, at: now };
+    samples.push({ at: now, upBps: upBps, downBps: downBps });
+
+    var cutoff = now - WINDOW_MS;
+    while (samples.length && samples[0].at < cutoff) samples.shift();
+    while (samples.length > MAX_SAMPLES) samples.shift();
+    return true;
+  }
+
+  function observeSnapshot(up, down, uptimeTotal, now) {
+    var uptime = asCounter(uptimeTotal);
+    if (uptime === null || !Number.isFinite(now)) {
+      clearHistory();
+      lastUptime = null;
+      lastObservedAt = null;
+      return false;
+    }
+
+    if (lastUptime !== null && lastObservedAt !== null) {
+      var elapsedSeconds = Math.max(
+        0,
+        Math.floor((now - lastObservedAt) / 1000),
+      );
+      var elapsedWhole = BigInt(elapsedSeconds);
+      var uptimeAdvance = uptime >= lastUptime ? uptime - lastUptime : 0n;
+      var uptimeTooSlow =
+        elapsedSeconds > 1 && uptimeAdvance + 1n < elapsedWhole;
+      var uptimeTooFast = uptimeAdvance > elapsedWhole + 1n;
+      /* A node restart or a browser clock paused during system sleep makes
+         node uptime diverge from the local monotonic interval. Neither case
+         may bridge byte counters into a misleading current rate. */
+      if (uptime < lastUptime || uptimeTooSlow || uptimeTooFast) clearHistory();
+    }
+
+    lastUptime = uptime;
+    lastObservedAt = now;
+    return observeTotals(up, down, now);
+  }
+
+  function formatRate(value) {
+    var n = Math.max(0, Number(value) || 0);
+    var units = ['B/s', 'KB/s', 'MB/s', 'GB/s', 'TB/s'];
+    var unit = 0;
+    while (n >= 1024 && unit < units.length - 1) {
+      n /= 1024;
+      unit += 1;
+    }
+    var number;
+    if (unit === 0 && Number.isInteger(n)) number = String(n);
+    else number = n.toFixed(1);
+    return number + ' ' + units[unit];
+  }
+
+  function formatAge(ageMs) {
+    var seconds = Math.max(0, Math.round(ageMs / 1000));
+    if (seconds === 0) return 'now';
+    if (seconds < 60) return '-' + seconds + 's';
+    if (seconds < 3600) return '-' + Math.floor(seconds / 60) + 'm';
+    return '-' + Math.floor(seconds / 3600) + 'h';
+  }
+
+  function renderMarkup(history, dataOpen) {
+    if (history.length < 2) {
+      return '<p class="empty bw-collecting">Collecting bandwidth samples…</p>';
+    }
+
+    var width = 560;
+    var height = 150;
+    var padRight = 12;
+    var padTop = 12;
+    var padBottom = 24;
+    var plotHeight = height - padTop - padBottom;
+    var newestAt = history[history.length - 1].at;
+    var windowStart = newestAt - WINDOW_MS;
+    var yMax = 1;
+    for (var i = 0; i < history.length; i++) {
+      yMax = Math.max(yMax, history[i].upBps, history[i].downBps);
+    }
+
+    var yValues = [0, yMax / 2, yMax];
+    var yLabels = yValues.map(formatRate);
+    var longestLabel = Math.max.apply(
+      null,
+      yLabels.map(function (label) {
+        return label.length;
+      }),
+    );
+    var padLeft = Math.max(70, longestLabel * 6 + 10);
+    var plotWidth = width - padLeft - padRight;
+    var baselineY = padTop + plotHeight;
+    var plotRight = padLeft + plotWidth;
+
+    function toX(sample) {
+      return padLeft + ((sample.at - windowStart) / WINDOW_MS) * plotWidth;
+    }
+
+    function toY(value) {
+      return padTop + plotHeight - (value / yMax) * plotHeight;
+    }
+
+    var html =
+      '<svg viewBox="0 0 ' +
+      width +
+      ' ' +
+      height +
+      '" class="chart-svg bw-chart" role="img" aria-labelledby="bandwidth-chart-title bandwidth-chart-desc" data-plot-top="' +
+      padTop +
+      '" data-plot-bottom="' +
+      baselineY +
+      '">' +
+      '<title id="bandwidth-chart-title">Recent Freenet payload transfer rates</title>' +
+      '<desc id="bandwidth-chart-desc">Upload is a solid line and download is a dashed line, measured in bytes per second over the last minute.</desc>' +
+      '<line x1="' +
+      padLeft +
+      '" y1="' +
+      padTop +
+      '" x2="' +
+      padLeft +
+      '" y2="' +
+      baselineY +
+      '" class="bw-axis"/>' +
+      '<line x1="' +
+      padLeft +
+      '" y1="' +
+      baselineY +
+      '" x2="' +
+      plotRight +
+      '" y2="' +
+      baselineY +
+      '" class="bw-axis"/>';
+
+    for (i = 0; i < yValues.length; i++) {
+      var y = toY(yValues[i]);
+      html +=
+        '<line x1="' +
+        padLeft +
+        '" y1="' +
+        y.toFixed(1) +
+        '" x2="' +
+        plotRight +
+        '" y2="' +
+        y.toFixed(1) +
+        '" class="bw-grid"/>' +
+        '<text x="' +
+        (padLeft - 4) +
+        '" y="' +
+        (y + 4).toFixed(1) +
+        '" text-anchor="end" class="axis-label">' +
+        yLabels[i] +
+        '</text>';
+    }
+
+    var tickCount = 5;
+    for (i = 0; i < tickCount; i++) {
+      var fraction = i / (tickCount - 1);
+      var anchor = i === 0 ? 'start' : i === tickCount - 1 ? 'end' : 'middle';
+      html +=
+        '<text x="' +
+        (padLeft + fraction * plotWidth).toFixed(1) +
+        '" y="' +
+        (baselineY + 16) +
+        '" text-anchor="' +
+        anchor +
+        '" class="axis-label">' +
+        formatAge(WINDOW_MS * (1 - fraction)) +
+        '</text>';
+    }
+
+    function points(field) {
+      return history
+        .map(function (sample) {
+          return toX(sample).toFixed(1) + ',' + toY(sample[field]).toFixed(1);
+        })
+        .join(' ');
+    }
+
+    html +=
+      '<polyline class="bw-series bw-series-up" points="' +
+      points('upBps') +
+      '"/>' +
+      '<polyline class="bw-series bw-series-down" points="' +
+      points('downBps') +
+      '"/>';
+
+    for (i = 0; i < history.length; i++) {
+      var sample = history[i];
+      html +=
+        '<circle class="bw-hit" cx="' +
+        toX(sample).toFixed(1) +
+        '" cy="' +
+        baselineY +
+        '" r="8" data-up-y="' +
+        toY(sample.upBps).toFixed(1) +
+        '" data-down-y="' +
+        toY(sample.downBps).toFixed(1) +
+        '" data-age-label="' +
+        formatAge(newestAt - sample.at) +
+        '" data-up-label="' +
+        formatRate(sample.upBps) +
+        '" data-down-label="' +
+        formatRate(sample.downBps) +
+        '" aria-hidden="true"/>';
+    }
+
+    html +=
+      '</svg>' +
+      '<div class="bw-legend" aria-hidden="true">' +
+      '<span class="bw-key"><span class="bw-line bw-line-up"></span> Upload</span>' +
+      '<span class="bw-key"><span class="bw-line bw-line-down"></span> Download</span>' +
+      '</div>' +
+      '<details class="bw-data"' +
+      (dataOpen ? ' open' : '') +
+      '><summary class="bw-data-summary">View sample data</summary>' +
+      '<table><thead><tr><th>Time</th><th>Upload</th><th>Download</th></tr></thead><tbody>';
+    for (i = 0; i < history.length; i++) {
+      sample = history[i];
+      html +=
+        '<tr><td>' +
+        formatAge(newestAt - sample.at) +
+        '</td><td>' +
+        formatRate(sample.upBps) +
+        '</td><td>' +
+        formatRate(sample.downBps) +
+        '</td></tr>';
+    }
+    return html + '</tbody></table></details>';
+  }
+
+  function clearOverlay() {
+    if (lastSvg) {
+      var overlay = lastSvg.querySelector('.bw-overlay');
+      if (overlay && overlay.parentNode === lastSvg)
+        lastSvg.removeChild(overlay);
+      lastSvg = null;
+    }
+    if (tooltip) tooltip.style.display = 'none';
+  }
+
+  function render(host) {
+    clearOverlay();
+    var content = host && host.querySelector('.bw-chart-content');
+    if (!content) {
+      restoreDataOpen = false;
+      restoreDataFocus = false;
+      return false;
+    }
+    content.innerHTML = renderMarkup(samples, restoreDataOpen);
+    if (restoreDataFocus) {
+      var summary = content.querySelector('.bw-data-summary');
+      if (summary) summary.focus();
+    }
+    restoreDataOpen = false;
+    restoreDataFocus = false;
+    return true;
+  }
+
+  function beforeRefresh(root) {
+    clearOverlay();
+    var data = root && root.querySelector('.bw-data');
+    restoreDataOpen = Boolean(data && data.open);
+    var active = deps.activeElement();
+    restoreDataFocus = Boolean(data && active && data.contains(active));
+  }
+
+  function sampleAndRender(root) {
+    var host = root && root.querySelector('[data-bandwidth-chart]');
+    if (!host) {
+      clearOverlay();
+      clearHistory();
+      lastUptime = null;
+      lastObservedAt = null;
+      restoreDataOpen = false;
+      restoreDataFocus = false;
+      return false;
+    }
+    observeSnapshot(
+      host.getAttribute('data-bytes-uploaded'),
+      host.getAttribute('data-bytes-downloaded'),
+      host.getAttribute('data-node-uptime-secs'),
+      deps.now(),
+    );
+    return render(host);
+  }
+
+  function viewBoxX(rect, viewBox, clientX) {
+    var parts = viewBox.trim().split(/\s+/);
+    var vbX = parseFloat(parts[0]) || 0;
+    var vbWidth = parseFloat(parts[2]) || 0;
+    if (!rect.width || !vbWidth) return vbX;
+    return vbX + ((clientX - rect.left) / rect.width) * vbWidth;
+  }
+
+  function nearestHit(hits, x) {
+    var best = null;
+    var bestDistance = Infinity;
+    for (var i = 0; i < hits.length; i++) {
+      var distance = Math.abs(parseFloat(hits[i].getAttribute('cx')) - x);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = hits[i];
+      }
+    }
+    return best;
+  }
+
+  function overlayHtml(hit, plotTop, plotBottom) {
+    var x = parseFloat(hit.getAttribute('cx'));
+    return (
+      '<line class="bw-guide" x1="' +
+      x +
+      '" y1="' +
+      plotTop +
+      '" x2="' +
+      x +
+      '" y2="' +
+      plotBottom +
+      '"/>' +
+      '<circle class="bw-dot bw-dot-up" cx="' +
+      x +
+      '" cy="' +
+      hit.getAttribute('data-up-y') +
+      '" r="3.5"/>' +
+      '<circle class="bw-dot bw-dot-down" cx="' +
+      x +
+      '" cy="' +
+      hit.getAttribute('data-down-y') +
+      '" r="3.5"/>'
+    );
+  }
+
+  function tooltipHtml(hit) {
+    return (
+      '<div class="bw-tooltip-time">' +
+      hit.getAttribute('data-age-label') +
+      '</div>' +
+      '<div class="bw-tooltip-row"><span class="bw-line bw-line-up"></span><span>Up ' +
+      hit.getAttribute('data-up-label') +
+      '</span></div>' +
+      '<div class="bw-tooltip-row"><span class="bw-line bw-line-down"></span><span>Down ' +
+      hit.getAttribute('data-down-label') +
+      '</span></div>'
+    );
+  }
+
+  function positionTooltip(element, clientX, clientY) {
+    var viewportWidth = deps.innerWidth();
+    var viewportHeight = deps.innerHeight();
+    var tooltipWidth = Math.min(190, Math.max(0, viewportWidth - 8));
+    var tooltipHeight = 68;
+    var left = clientX + 14;
+    var top = clientY + 14;
+    if (left + tooltipWidth > viewportWidth - 4)
+      left = clientX - tooltipWidth - 8;
+    if (top + tooltipHeight > viewportHeight - 4)
+      top = clientY - tooltipHeight - 8;
+    left = Math.max(4, Math.min(left, viewportWidth - tooltipWidth - 4));
+    top = Math.max(4, Math.min(top, viewportHeight - tooltipHeight - 4));
+    element.style.left = left + 'px';
+    element.style.top = top + 'px';
+    element.style.maxWidth = tooltipWidth + 'px';
+  }
+
+  function ensureTooltip() {
+    if (tooltip) return tooltip;
+    tooltip = deps.createEl('div');
+    tooltip.setAttribute('class', 'bw-tooltip');
+    tooltip.style.display = 'none';
+    deps.appendToBody(tooltip);
+    return tooltip;
+  }
+
+  function renderOverlay(svg, hit) {
+    var plotTop = parseFloat(svg.getAttribute('data-plot-top'));
+    var plotBottom = parseFloat(svg.getAttribute('data-plot-bottom'));
+    var overlay = svg.querySelector('.bw-overlay');
+    if (!overlay) {
+      overlay = deps.createElNS(SVG_NS, 'g');
+      overlay.setAttribute('class', 'bw-overlay');
+      svg.appendChild(overlay);
+    }
+    overlay.innerHTML = overlayHtml(hit, plotTop, plotBottom);
+  }
+
+  function showHit(svg, hit, clientX, clientY) {
+    if (!hit) {
+      clearOverlay();
+      return;
+    }
+    if (lastSvg && lastSvg !== svg) clearOverlay();
+    lastSvg = svg;
+    renderOverlay(svg, hit);
+    var tip = ensureTooltip();
+    tip.innerHTML = tooltipHtml(hit);
+    tip.style.display = 'block';
+    positionTooltip(tip, clientX, clientY);
+  }
+
+  function onPointer(ev) {
+    var target = ev.target;
+    var svg = target && target.closest ? target.closest('svg.bw-chart') : null;
+    if (!svg) {
+      clearOverlay();
+      return;
+    }
+    var hits = svg.querySelectorAll('.bw-hit');
+    if (!hits.length) {
+      clearOverlay();
+      return;
+    }
+    var x = viewBoxX(
+      deps.getRect(svg),
+      svg.getAttribute('viewBox'),
+      ev.clientX,
+    );
+    showHit(svg, nearestHit(hits, x), ev.clientX, ev.clientY);
+  }
+
+  return {
+    observeTotals: observeTotals,
+    renderMarkup: renderMarkup,
+    sampleAndRender: sampleAndRender,
+    beforeRefresh: beforeRefresh,
+    onPointer: onPointer,
+    clear: clearOverlay,
+    viewBoxX: viewBoxX,
+    nearestHit: nearestHit,
+    positionTooltip: positionTooltip,
+    getSamples: function () {
+      return samples.slice();
+    },
+  };
+}
+/* bandwidth-chart-factory:END */
+
 /* ── Auto-refresh scheduler (extracted for Node unit tests) ──
    The scheduling state machine is deliberately self-contained: every browser
    dependency (timers, the actual fetch/DOM-swap refresh, visibility state) is
@@ -692,7 +1219,13 @@ document.addEventListener('DOMContentLoaded', function () {
         var doc = parser.parseFromString(html, 'text/html');
         var newMain = doc.querySelector('main');
         var oldMain = document.querySelector('main');
-        if (newMain && oldMain) oldMain.innerHTML = newMain.innerHTML;
+        if (newMain && oldMain) {
+          /* bandwidth-chart-refresh:BEGIN */
+          bandwidthChart.beforeRefresh(document);
+          oldMain.innerHTML = newMain.innerHTML;
+          bandwidthChart.sampleAndRender(document);
+          /* bandwidth-chart-refresh:END */
+        }
         /* Update the tab title (connection state + count, #3509) so a
            backgrounded tab still surfaces the current status at a glance. */
         if (doc.title) document.title = doc.title;
@@ -738,6 +1271,47 @@ document.addEventListener('DOMContentLoaded', function () {
       return document.hidden;
     },
   });
+
+  /* bandwidth-chart-wiring:BEGIN */
+  var bandwidthChart = createBandwidthChart({
+    now: function () {
+      return window.performance.now();
+    },
+    getRect: function (el) {
+      return el.getBoundingClientRect();
+    },
+    createEl: function (tag) {
+      return document.createElement(tag);
+    },
+    /* SVG overlay elements need the SVG namespace or the browser won't
+       paint them (see renderOverlay). */
+    createElNS: function (ns, tag) {
+      return document.createElementNS(ns, tag);
+    },
+    appendToBody: function (el) {
+      document.body.appendChild(el);
+    },
+    innerWidth: function () {
+      return window.innerWidth;
+    },
+    innerHeight: function () {
+      return window.innerHeight;
+    },
+    activeElement: function () {
+      return document.activeElement;
+    },
+  });
+  bandwidthChart.sampleAndRender(document);
+  document.addEventListener('pointermove', function (ev) {
+    bandwidthChart.onPointer(ev);
+  });
+  document.addEventListener('pointerdown', function (ev) {
+    bandwidthChart.onPointer(ev);
+  });
+  document.addEventListener('mouseleave', function () {
+    bandwidthChart.clear();
+  });
+  /* bandwidth-chart-wiring:END */
 
   document.addEventListener(
     'visibilitychange',

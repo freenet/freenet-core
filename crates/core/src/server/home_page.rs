@@ -852,6 +852,31 @@ mod tests {
         );
     }
 
+    /// The browser owns bandwidth history so HTTP snapshot reads remain
+    /// side-effect free. The transfer card must expose exact cumulative byte
+    /// counters; formatted totals are not precise enough to calculate deltas.
+    #[test]
+    fn transfer_card_exposes_raw_counters_for_bandwidth_sampler() {
+        let mut snap = base_snapshot();
+        snap.bytes_uploaded = 12_345;
+        snap.bytes_downloaded = 67_890;
+        snap.elapsed_secs = 123;
+
+        let html = build_transfer_card(&Some(snap));
+
+        assert!(html.contains("data-bandwidth-chart"));
+        assert!(html.contains("data-bytes-uploaded=\"12345\""));
+        assert!(html.contains("data-bytes-downloaded=\"67890\""));
+        assert!(html.contains("data-node-uptime-secs=\"123\""));
+        assert!(html.contains("class=\"bw-chart-content\""));
+        assert!(html.contains("Freenet payload rate"));
+        assert!(html.contains("Collecting bandwidth samples"));
+        assert!(
+            html.contains("download counts authenticated UDP payload bytes"),
+            "the UI must describe the asymmetric counter boundary"
+        );
+    }
+
     #[test]
     fn format_bytes_units() {
         assert_eq!(format_bytes(0), "0 B");
