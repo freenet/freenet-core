@@ -303,6 +303,14 @@ check "publish_crates job body was located" \
 check "create_release job body was located" \
   "$([ -n "$CREATE_RELEASE_JOB" ] && echo present || echo missing)" "present"
 
+# A sed range whose closing anchor is renamed silently runs to EOF, so the
+# job-scoped pins below would start matching neighbouring jobs and pass
+# vacuously. Assert each range actually terminated on its anchor.
+check "publish_crates range is bounded by the next job" \
+  "$([ "$(tail -n1 <<< "$PUBLISH_JOB")" = "  create_release:" ] && echo bounded || echo ran-to-eof)" "bounded"
+check "create_release range is bounded by the next job" \
+  "$([ "$(tail -n1 <<< "$CREATE_RELEASE_JOB")" = "  summary:" ] && echo bounded || echo ran-to-eof)" "bounded"
+
 # The bug itself: no job may resolve a moving reference.
 check "release.yml never checks out 'ref: main'" \
   "$(grep -qE '^[[:space:]]*ref:[[:space:]]*main[[:space:]]*$' "$RELEASE_YML" && echo moving-ref || echo pinned)" "pinned"
@@ -331,6 +339,11 @@ for job_name in publish_crates create_release; do
     # shellcheck disable=SC2016
     check "$job_name exports RELEASE_SHA for the verifier" \
       "$(grep -qF 'RELEASE_SHA: ${{ needs.wait_for_pr.outputs.release_sha' <<< "$JOB_BODY" && echo present || echo missing)" "present"
+    # Without this the verifier degenerates to comparing the checkout ref
+    # against itself, which cannot fail.
+    # shellcheck disable=SC2016
+    check "$job_name gives the verifier an independent version oracle" \
+      "$(grep -qF 'EXPECTED_VERSION: ${{ needs.validate.outputs.version }}' <<< "$JOB_BODY" && echo present || echo missing)" "present"
 done
 
 # create_release can only read the output if wait_for_pr is in its needs.
@@ -345,19 +358,23 @@ check "release notes are generated for the pinned commit, not main" \
 
 # --- behavioural: scripts/verify_release_checkout.sh -------------------------
 
+RELEASE_VERSION="0.2.123"
 VERIFY_REPO="$TEST_TMP/verify-repo"
-mkdir -p "$VERIFY_REPO"
+mkdir -p "$VERIFY_REPO/crates/core"
+printf '[package]\nname = "freenet"\nversion = "%s"\n' "$RELEASE_VERSION" \
+  > "$VERIFY_REPO/crates/core/Cargo.toml"
 (
   cd "$VERIFY_REPO"
   git init -q .
-  git -c user.email=t@example.invalid -c user.name=t commit -q --allow-empty -m "release commit"
+  git add crates/core/Cargo.toml
+  git -c user.email=t@example.invalid -c user.name=t commit -q -m "build: release $RELEASE_VERSION"
 ) >/dev/null 2>&1
 VERIFY_HEAD=$(cd "$VERIFY_REPO" && git rev-parse HEAD)
 
 run_verify() {
-    local expected_sha="$1" output_file="$2" status
+    local expected_sha="$1" expected_version="$2" output_file="$3" status
     set +e
-    ( cd "$VERIFY_REPO" && RELEASE_SHA="$expected_sha" \
+    ( cd "$VERIFY_REPO" && RELEASE_SHA="$expected_sha" EXPECTED_VERSION="$expected_version" \
         bash --noprofile --norc "$VERIFY_SCRIPT" ) > "$output_file" 2>&1
     status=$?
     set -e
@@ -365,34 +382,77 @@ run_verify() {
 }
 
 VERIFY_OK_OUTPUT="$TEST_TMP/verify-ok.txt"
-check "verifier accepts a checkout at the pinned commit" \
-  "$(run_verify "$VERIFY_HEAD" "$VERIFY_OK_OUTPUT")" "0"
+check "verifier accepts the pinned commit carrying the release version" \
+  "$(run_verify "$VERIFY_HEAD" "$RELEASE_VERSION" "$VERIFY_OK_OUTPUT")" "0"
 
 VERIFY_DRIFT_OUTPUT="$TEST_TMP/verify-drift.txt"
 DRIFT_SHA="0123456789012345678901234567890123456789"
 check "verifier rejects a checkout that drifted off the pinned commit" \
-  "$([ "$(run_verify "$DRIFT_SHA" "$VERIFY_DRIFT_OUTPUT")" -ne 0 ] && echo failed || echo passed)" "failed"
+  "$([ "$(run_verify "$DRIFT_SHA" "$RELEASE_VERSION" "$VERIFY_DRIFT_OUTPUT")" -ne 0 ] && echo failed || echo passed)" "failed"
 check "verifier names both SHAs when it rejects" \
   "$(grep -qF "$DRIFT_SHA" "$VERIFY_DRIFT_OUTPUT" && grep -qF "$VERIFY_HEAD" "$VERIFY_DRIFT_OUTPUT" && echo present || echo missing)" "present"
 
-VERIFY_UNSET_OUTPUT="$TEST_TMP/verify-unset.txt"
+# The oracle that is NOT a restatement of the checkout ref: the `|| github.sha`
+# fallback would put us on the launch commit, whose manifest still carries the
+# PREVIOUS version. HEAD would match RELEASE_SHA and only this check fires.
+VERIFY_WRONG_TREE_OUTPUT="$TEST_TMP/verify-wrong-tree.txt"
+check "verifier rejects the right SHA carrying the wrong version" \
+  "$([ "$(run_verify "$VERIFY_HEAD" "0.2.122" "$VERIFY_WRONG_TREE_OUTPUT")" -ne 0 ] && echo failed || echo passed)" "failed"
+check "verifier explains which version it found versus expected" \
+  "$(grep -qF "declares version '$RELEASE_VERSION'" "$VERIFY_WRONG_TREE_OUTPUT" && grep -qF 'this release is 0.2.122' "$VERIFY_WRONG_TREE_OUTPUT" && echo present || echo missing)" "present"
+
+VERIFY_NO_MANIFEST_OUTPUT="$TEST_TMP/verify-no-manifest.txt"
 set +e
-( cd "$VERIFY_REPO" && env -u RELEASE_SHA bash --noprofile --norc "$VERIFY_SCRIPT" ) \
-  > "$VERIFY_UNSET_OUTPUT" 2>&1
-VERIFY_UNSET_STATUS=$?
+( cd "$VERIFY_REPO" && RELEASE_SHA="$VERIFY_HEAD" EXPECTED_VERSION="$RELEASE_VERSION" \
+    MANIFEST="crates/core/Absent.toml" bash --noprofile --norc "$VERIFY_SCRIPT" ) \
+  > "$VERIFY_NO_MANIFEST_OUTPUT" 2>&1
+VERIFY_NO_MANIFEST_STATUS=$?
 set -e
-check "verifier fails closed when no pinned SHA was passed" \
-  "$([ "$VERIFY_UNSET_STATUS" -ne 0 ] && echo failed || echo passed)" "failed"
+check "verifier rejects a checkout with no freenet manifest" \
+  "$([ "$VERIFY_NO_MANIFEST_STATUS" -ne 0 ] && echo failed || echo passed)" "failed"
+
+for missing_var in RELEASE_SHA EXPECTED_VERSION; do
+    VERIFY_UNSET_OUTPUT="$TEST_TMP/verify-unset-$missing_var.txt"
+    set +e
+    ( cd "$VERIFY_REPO" && RELEASE_SHA="$VERIFY_HEAD" EXPECTED_VERSION="$RELEASE_VERSION" \
+        env -u "$missing_var" bash --noprofile --norc "$VERIFY_SCRIPT" ) \
+      > "$VERIFY_UNSET_OUTPUT" 2>&1
+    VERIFY_UNSET_STATUS=$?
+    set -e
+    check "verifier fails closed when $missing_var is unset" \
+      "$([ "$VERIFY_UNSET_STATUS" -ne 0 ] && echo failed || echo passed)" "failed"
+done
 
 # --- behavioural: scripts/resolve_release_sha.sh -----------------------------
 
 RESOLVE_BIN="$TEST_TMP/resolve-bin"
 mkdir -p "$RESOLVE_BIN"
+# The mock asserts the REAL invocation shape. Without this a typo in
+# `--json mergeCommit` or in the jq filter would never turn the suite red — it
+# would only fail closed in production, mid-release.
 cat > "$RESOLVE_BIN/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 case "$*" in
   *"pr view"*)
+    for expected in \
+      '--repo freenet/freenet-core' \
+      '--json mergeCommit' \
+      '--jq .mergeCommit.oid // empty'; do
+      if [[ "$*" != *"$expected"* ]]; then
+        echo "missing expected gh pr view argument: $expected" >&2
+        exit 3
+      fi
+    done
+    # Fail the first N calls to exercise the retry path.
+    calls=0
+    if [ -s "$MOCK_RESOLVE_CALLS" ]; then calls=$(< "$MOCK_RESOLVE_CALLS"); fi
+    calls=$((calls + 1))
+    printf '%s\n' "$calls" > "$MOCK_RESOLVE_CALLS"
+    if [ "$calls" -le "${MOCK_FAIL_FIRST:-0}" ]; then
+      echo "simulated transient API failure" >&2
+      exit 1
+    fi
     [ -n "${MOCK_MERGE_SHA:-}" ] || exit 2
     printf '%s\n' "$MOCK_MERGE_SHA"
     ;;
@@ -412,8 +472,11 @@ LAUNCHED_SHA="2222222222222222222222222222222222222222"
 
 run_resolve() {
     # run_resolve <merge_sha> <compare_body> <output_file> <github_output_file>
-    local merge_sha="$1" compare="$2" output_file="$3" gh_output="$4" status
+    #             [fail_first] [attempts]
+    local merge_sha="$1" compare="$2" output_file="$3" gh_output="$4"
+    local fail_first="${5:-0}" attempts="${6:-1}" status
     : > "$gh_output"
+    : > "${gh_output}.calls"
     set +e
     PATH="$RESOLVE_BIN:$PATH" \
       GITHUB_REPOSITORY="freenet/freenet-core" \
@@ -422,6 +485,10 @@ run_resolve() {
       GITHUB_OUTPUT="$gh_output" \
       MOCK_MERGE_SHA="$merge_sha" \
       MOCK_COMPARE="$compare" \
+      MOCK_FAIL_FIRST="$fail_first" \
+      MOCK_RESOLVE_CALLS="${gh_output}.calls" \
+      RESOLVE_ATTEMPTS="$attempts" \
+      RESOLVE_RETRY_INTERVAL="0" \
       bash --noprofile --norc "$RESOLVE_SCRIPT" > "$output_file" 2>&1
     status=$?
     set -e
@@ -464,6 +531,29 @@ RESOLVE_JUNK_OUTPUT="$TEST_TMP/resolve-junk.txt"
 RESOLVE_JUNK_GH_OUTPUT="$TEST_TMP/resolve-junk.env"
 check "resolver rejects a non-SHA merge commit rather than checking it out" \
   "$([ "$(run_resolve "main" "$BUMP_ONLY" "$RESOLVE_JUNK_OUTPUT" "$RESOLVE_JUNK_GH_OUTPUT")" -ne 0 ] && echo failed || echo passed)" "failed"
+
+# This step runs after the bump PR has already merged, so a single transient
+# API failure must not strand the release half-done.
+RESOLVE_RETRY_OUTPUT="$TEST_TMP/resolve-retry.txt"
+RESOLVE_RETRY_GH_OUTPUT="$TEST_TMP/resolve-retry.env"
+check "resolver survives transient API failures and still resolves" \
+  "$(run_resolve "$MERGED_SHA" "$BUMP_ONLY" "$RESOLVE_RETRY_OUTPUT" "$RESOLVE_RETRY_GH_OUTPUT" 2 4)" "0"
+check "resolver exports the SHA it eventually resolved" \
+  "$(grep -qF "sha=$MERGED_SHA" "$RESOLVE_RETRY_GH_OUTPUT" && echo present || echo missing)" "present"
+check "resolver reports each retry attempt" \
+  "$(grep -qF 'attempt 1/4' "$RESOLVE_RETRY_OUTPUT" && echo present || echo missing)" "present"
+check "resolver actually retried rather than succeeding first try" \
+  "$(cat "${RESOLVE_RETRY_GH_OUTPUT}.calls")" "3"
+
+# Exhausting the budget must blame the API, not the pull request.
+RESOLVE_EXHAUST_OUTPUT="$TEST_TMP/resolve-exhaust.txt"
+RESOLVE_EXHAUST_GH_OUTPUT="$TEST_TMP/resolve-exhaust.env"
+check "resolver fails when every attempt hits an API failure" \
+  "$([ "$(run_resolve "$MERGED_SHA" "$BUMP_ONLY" "$RESOLVE_EXHAUST_OUTPUT" "$RESOLVE_EXHAUST_GH_OUTPUT" 3 3)" -ne 0 ] && echo failed || echo passed)" "failed"
+check "resolver blames the API, not the PR, when the API was unreachable" \
+  "$(grep -qF 'GitHub API could not be queried after 3 attempts' "$RESOLVE_EXHAUST_OUTPUT" && echo correct || echo misattributed)" "correct"
+check "resolver tells the operator the bump already merged and to re-run" \
+  "$(grep -qF 'gh run rerun --failed' "$RESOLVE_EXHAUST_OUTPUT" && echo present || echo missing)" "present"
 
 if [ "$FAILURES" -eq 0 ]; then
     echo "PASS: release.yml is merge-queue-compatible, reports failed merge-group CI, and is pinned to one validated commit."

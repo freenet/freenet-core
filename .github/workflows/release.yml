@@ -263,6 +263,9 @@ jobs:
       # NEVER `ref: main` here — see #5233. The fallback is only reachable on
       # the dry-run-with-failed-wait path, and `github.sha` is still immutable.
       RELEASE_SHA: ${{ needs.wait_for_pr.outputs.release_sha || github.sha }}
+      # Resolved independently of RELEASE_SHA, so the verifier has an oracle
+      # that does not just restate the value that drove the checkout.
+      EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
 
     steps:
       - name: Checkout the validated release commit
@@ -325,6 +328,9 @@ jobs:
       # `ref: main` here meant the tag could point at a tree nobody validated
       # and that no published artifact was built from (#5233).
       RELEASE_SHA: ${{ needs.wait_for_pr.outputs.release_sha || github.sha }}
+      # Resolved independently of RELEASE_SHA, so the verifier has an oracle
+      # that does not just restate the value that drove the checkout.
+      EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
 
     steps:
       - name: Checkout the validated release commit

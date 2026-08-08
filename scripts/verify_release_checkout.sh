@@ -1,22 +1,34 @@
 #!/usr/bin/env bash
-# Defence in depth for #5233: prove the working tree is the commit the release
-# was pinned to before anything irreversible happens to it.
+# Prove the working tree is the commit the release was pinned to, before
+# anything irreversible (a crates.io publish, a tag push) happens to it.
 #
-# The pin itself (`ref: $RELEASE_SHA` on actions/checkout) is what fixes the
-# bug. This guard exists because the failure it catches is otherwise SILENT:
-# the release simply ships a different tree and nothing in the run log says so.
-# Keep it even though the pin makes it redundant today — a future edit that
-# reintroduces a moving reference, or a `git pull` slipped back in, then turns
-# into a red job instead of a silently wrong artifact.
+# Two checks, deliberately of different kinds:
 #
-# Must run AFTER checkout and BEFORE publishing or tagging.
+#   1. HEAD == $RELEASE_SHA. Cheap, but note it is NEARLY a tautology: the
+#      same expression feeds `ref:` on actions/checkout, which guarantees the
+#      match. It earns its place only against an edit that changes one and not
+#      the other, or that reintroduces a `git pull` after checkout.
 #
-# Run manually with: RELEASE_SHA=<sha> bash scripts/verify_release_checkout.sh
+#   2. The checked-out manifest carries $EXPECTED_VERSION. This is the real
+#      oracle. It is derived independently of the SHA — from `validate`'s
+#      resolved version rather than from `wait_for_pr`'s output — so it fails
+#      on ANY wrong tree, including the one case check 1 cannot see: the
+#      `|| github.sha` fallback silently engaging and putting us on the LAUNCH
+#      commit, which does not contain the version bump. Publishing or tagging
+#      that tree would ship a crate whose version disagrees with the tag.
+#
+# Must run AFTER checkout and BEFORE publishing or tagging. See #5233.
+#
+# Run manually with:
+#   RELEASE_SHA=<sha> EXPECTED_VERSION=<x.y.z> bash scripts/verify_release_checkout.sh
 # Tests: scripts/release_mergequeue_test.sh
 
 set -euo pipefail
 
 RELEASE_SHA="${RELEASE_SHA:?RELEASE_SHA is required}"
+EXPECTED_VERSION="${EXPECTED_VERSION:?EXPECTED_VERSION is required}"
+# Overridable so the tests can point at a fixture manifest.
+MANIFEST="${MANIFEST:-crates/core/Cargo.toml}"
 
 ACTUAL_SHA=$(git rev-parse HEAD)
 
@@ -25,4 +37,16 @@ if [ "$ACTUAL_SHA" != "$RELEASE_SHA" ]; then
     exit 1
 fi
 
-echo "✅ Release checkout verified at $ACTUAL_SHA"
+if [ ! -f "$MANIFEST" ]; then
+    echo "::error title=Release checkout is not a freenet tree::Expected $MANIFEST in the checkout at $ACTUAL_SHA, but it is missing."
+    exit 1
+fi
+
+ACTUAL_VERSION=$(grep -m1 -E '^version = "' "$MANIFEST" | cut -d'"' -f2)
+
+if [ "$ACTUAL_VERSION" != "$EXPECTED_VERSION" ]; then
+    echo "::error title=Release checkout is the wrong tree::Commit $ACTUAL_SHA declares version '$ACTUAL_VERSION' in $MANIFEST, but this release is $EXPECTED_VERSION. The checkout is not the version-bump commit — publishing or tagging it would ship a crate whose version disagrees with the tag (#5233)."
+    exit 1
+fi
+
+echo "✅ Release checkout verified: $ACTUAL_SHA declares version $ACTUAL_VERSION"
