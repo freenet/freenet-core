@@ -790,9 +790,11 @@ impl WasmEngine for WasmtimeEngine {
     fn create_instance(
         &mut self,
         module: &Module,
-        id: i64,
         req_bytes: usize,
     ) -> Result<InstanceHandle, WasmError> {
+        // Ids come from the one process-global allocator, never from the
+        // caller. See `native_api::NEXT_INSTANCE_ID` for why (#4213 / #5023).
+        let id = native_api::next_instance_id();
         {
             let store = self
                 .store
@@ -2273,7 +2275,7 @@ mod tests {
         let module = engine
             .compile(SIMPLE_WASM)
             .expect("offloaded compile should succeed");
-        let handle = engine.create_instance(&module, 0, 1024).unwrap();
+        let handle = engine.create_instance(&module, 1024).unwrap();
         engine.drop_instance(&handle);
         assert!(engine.module_compiled_size(&module) > 0);
     }
@@ -2292,7 +2294,7 @@ mod tests {
         let module = engine
             .compile(SIMPLE_WASM)
             .expect("inline compile should succeed");
-        let handle = engine.create_instance(&module, 0, 1024).unwrap();
+        let handle = engine.create_instance(&module, 1024).unwrap();
         engine.drop_instance(&handle);
         assert!(engine.module_compiled_size(&module) > 0);
     }
@@ -2509,7 +2511,7 @@ mod tests {
         let start = std::time::Instant::now();
         // create_instance runs the start function via instantiate_async; the
         // global epoch ticker preempts it once the armed 3-tick deadline elapses.
-        let result = engine.create_instance(&module, 1, 0);
+        let result = engine.create_instance(&module, 0);
         let elapsed = start.elapsed();
 
         // `InstanceHandle` is not Debug, so match rather than `{result:?}`.
@@ -2754,7 +2756,7 @@ mod tests {
             .compile(SIMPLE_WASM)
             .expect("compile under current_thread+offload must succeed (no panic)");
         let handle = engine
-            .create_instance(&module, 0, 1024)
+            .create_instance(&module, 1024)
             .expect("module must be instantiable");
         engine.drop_instance(&handle);
         assert!(engine.module_compiled_size(&module) > 0);
@@ -2804,7 +2806,7 @@ mod tests {
             .compile(SIMPLE_WASM)
             .expect("compile with no runtime + offload must succeed inline");
         let handle = engine
-            .create_instance(&module, 0, 1024)
+            .create_instance(&module, 1024)
             .expect("module must be instantiable");
         engine.drop_instance(&handle);
         assert!(engine.module_compiled_size(&module) > 0);
@@ -2974,7 +2976,7 @@ mod tests {
         // default 10,000 limit. Without our ResourceLimiter override this would fail.
         for i in 0..10_001 {
             let handle = engine
-                .create_instance(&module, i, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
             engine.drop_instance(&handle);
         }
@@ -3325,7 +3327,7 @@ mod tests {
         );
 
         let handle = engine
-            .create_instance(&module, 999, 1024)
+            .create_instance(&module, 1024)
             .expect("create instance");
 
         let result = engine.call_3i64_async_imports(&handle, "process", 0, 0, 0);
@@ -3336,6 +3338,78 @@ mod tests {
         );
 
         engine.drop_instance(&handle);
+    }
+
+    /// Regression test for #4213 / #5023: instance ids are a PROCESS-GLOBAL
+    /// namespace, so one engine's instance churn must never disturb another
+    /// engine's LIVE instance.
+    ///
+    /// `MEM_ADDR` (and `DELEGATE_ENV`, `CONTRACT_IO`) are process-global maps
+    /// keyed by instance id, and `drop_instance` removes the entry for the id
+    /// it is handed. While `create_instance` took a caller-supplied id, the
+    /// engine tests in this module passed hand-picked ones: `0..10_001` in
+    /// `test_instance_limit_override_allows_many_instances`, and
+    /// `0..STORE_REFRESH_THRESHOLD` in the store-refresh tests. Their
+    /// `drop_instance` calls removed the `MEM_ADDR` entry of whatever LIVE
+    /// delegate or contract instance in a concurrently-running test had been
+    /// issued the same id. Every host function on the victim then returned
+    /// `ERR_NOT_IN_PROCESS`, which the stdlib collapses into "not found":
+    /// `SecretResult(None)` from `test_large_secret_data` and
+    /// `test_store_and_retrieve_secret`, `error_code: -1` from
+    /// `test_v2_delegate_update_existing_state`.
+    ///
+    /// Ids now come from `native_api::next_instance_id`, so a collision is
+    /// unrepresentable. This test pins the property that makes it so: two live
+    /// engines are never issued the same id, and B's churn leaves A's entry
+    /// intact.
+    #[test]
+    fn instance_ids_are_globally_unique_across_engines() {
+        use crate::wasm_runtime::runtime::{InstanceInfo, Key};
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let config = RuntimeConfig::default();
+
+        let mut engine_a = WasmtimeEngine::new(&config, false).unwrap();
+        let module_a = engine_a.compile(SIMPLE_WASM).unwrap();
+        let live = engine_a
+            .create_instance(&module_a, 1024)
+            .expect("engine A instance");
+        // `RunningInstance::new` is what records the MEM_ADDR entry in
+        // production; stand in for it so an eviction would be observable.
+        let (ptr, size) = engine_a.memory_info(&live).unwrap();
+        MEM_ADDR.insert(
+            live.id,
+            InstanceInfo::new(
+                ptr as i64,
+                size,
+                Key::Contract(ContractInstanceId::new([0u8; 32])),
+            ),
+        );
+
+        // A second engine churns instances the way the store-refresh and
+        // instance-limit tests do, while A's instance stays live.
+        let mut engine_b = WasmtimeEngine::new(&config, false).unwrap();
+        let module_b = engine_b.compile(SIMPLE_WASM).unwrap();
+        for _ in 0..64 {
+            let churn = engine_b
+                .create_instance(&module_b, 1024)
+                .expect("engine B instance");
+            assert_ne!(
+                churn.id, live.id,
+                "engine B was issued engine A's LIVE instance id; instance ids \
+                 must come from the one process-global allocator"
+            );
+            engine_b.drop_instance(&churn);
+        }
+
+        assert!(
+            MEM_ADDR.get(&live.id).is_some(),
+            "another engine's instance churn evicted a LIVE instance's MEM_ADDR \
+             entry; every host function on that instance would now return \
+             ERR_NOT_IN_PROCESS"
+        );
+
+        engine_a.drop_instance(&live);
     }
 
     /// Deterministic regression test for #3248: stale memory base pointer.
@@ -3374,10 +3448,12 @@ mod tests {
         "#;
 
         let module = engine.compile(wat.as_bytes()).unwrap();
-        let instance_id: i64 = 42_000;
         let handle = engine
-            .create_instance(&module, instance_id, 1024)
+            .create_instance(&module, 1024)
             .expect("create instance");
+        // The engine issues the id; `RunningInstance::new` is what normally
+        // records the MEM_ADDR entry, so stand in for it here.
+        let instance_id = handle.id;
 
         let (init_ptr, init_size) = engine.memory_info(&handle).unwrap();
         MEM_ADDR.insert(
@@ -3444,7 +3520,7 @@ mod tests {
         // The last drop_instance should trigger a store refresh.
         for i in 0..STORE_REFRESH_THRESHOLD {
             let handle = engine
-                .create_instance(&module, i as i64, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
             engine.drop_instance(&handle);
         }
@@ -3461,7 +3537,7 @@ mod tests {
             "engine should be healthy after refresh"
         );
         let handle = engine
-            .create_instance(&module, 999_999, 1024)
+            .create_instance(&module, 1024)
             .expect("should create instance after refresh");
         engine.drop_instance(&handle);
     }
@@ -3479,7 +3555,7 @@ mod tests {
         let burn = STORE_REFRESH_THRESHOLD - 3;
         for i in 0..burn {
             let handle = engine
-                .create_instance(&module, i as i64, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
             engine.drop_instance(&handle);
         }
@@ -3489,7 +3565,7 @@ mod tests {
         let mut handles = Vec::new();
         for i in burn..STORE_REFRESH_THRESHOLD {
             let handle = engine
-                .create_instance(&module, i as i64, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
             handles.push(handle);
         }
@@ -3521,9 +3597,9 @@ mod tests {
         let module = engine.compile(SIMPLE_WASM).unwrap();
 
         // Create some instances to bump the counter
-        for i in 0..10 {
+        for _ in 0..10 {
             let handle = engine
-                .create_instance(&module, i, 1024)
+                .create_instance(&module, 1024)
                 .expect("should succeed");
             engine.drop_instance(&handle);
         }
@@ -3538,7 +3614,7 @@ mod tests {
 
         // Engine should still work after recovery
         let handle = engine
-            .create_instance(&module, 999, 1024)
+            .create_instance(&module, 1024)
             .expect("should create instance after recovery");
         engine.drop_instance(&handle);
     }
@@ -3557,7 +3633,7 @@ mod tests {
         // Create and drop enough instances to trigger refresh
         for i in 0..STORE_REFRESH_THRESHOLD {
             let handle = engine
-                .create_instance(&module, i as i64, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
             engine.drop_instance(&handle);
         }
@@ -3567,7 +3643,7 @@ mod tests {
         // Verify that instance creation and WASM execution still work after
         // refresh — the replacement store must have fuel set correctly.
         let handle = engine
-            .create_instance(&module, 999_999, 1024)
+            .create_instance(&module, 1024)
             .expect("should create instance after metered refresh");
         engine.drop_instance(&handle);
     }
@@ -3631,7 +3707,7 @@ mod tests {
         // Create and drop instances just below the threshold (no refresh yet).
         for i in 0..STORE_REFRESH_THRESHOLD - 1 {
             let handle = engine
-                .create_instance(&module, i as i64, 1024)
+                .create_instance(&module, 1024)
                 .unwrap_or_else(|e| panic!("instance {i} should succeed: {e}"));
             engine.drop_instance(&handle);
         }
@@ -3646,7 +3722,7 @@ mod tests {
 
         // One more instance hits the threshold and triggers refresh.
         let handle = engine
-            .create_instance(&module, STORE_REFRESH_THRESHOLD as i64, 1024)
+            .create_instance(&module, 1024)
             .expect("final instance should succeed");
         engine.drop_instance(&handle);
 
@@ -3741,7 +3817,7 @@ mod tests {
         "#;
         let module = engine.compile(wat.as_bytes()).unwrap();
 
-        let result = engine.create_instance(&module, 0, 1024);
+        let result = engine.create_instance(&module, 1024);
         assert!(
             result.is_err(),
             "Module declaring 5000 initial pages (>cap of 4096) must be \
@@ -3822,7 +3898,7 @@ mod tests {
         // taking the baseline so they don't get charged to the per-instance
         // measurement.
         {
-            let h = engine.create_instance(&module, -1, 1024).unwrap();
+            let h = engine.create_instance(&module, 1024).unwrap();
             engine.drop_instance(&h);
         }
         let baseline = read_vm_size_bytes();
@@ -3832,15 +3908,13 @@ mod tests {
         const N_INSTANCES: i64 = 4;
         let mut handles = Vec::with_capacity(N_INSTANCES as usize);
         for i in 0..N_INSTANCES {
-            let h = engine
-                .create_instance(&module, i, 1024)
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "instance {i} should succeed (regression: wasmtime memory \
+            let h = engine.create_instance(&module, 1024).unwrap_or_else(|e| {
+                panic!(
+                    "instance {i} should succeed (regression: wasmtime memory \
                      reservation may be too large for the host's overcommit \
                      limit, see #3986): {e}"
-                    )
-                });
+                )
+            });
             handles.push(h);
         }
         let after = read_vm_size_bytes();
