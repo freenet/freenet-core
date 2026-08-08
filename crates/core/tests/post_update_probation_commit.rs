@@ -27,16 +27,23 @@
 //! 2. A subsequent clean stop of that node records NO crash: the post-stop
 //!    `freenet update` must not report "during post-update probation".
 //!
-//! ## Why assertion 1 checks the log line and not just the file
+//! ## Why assertion 1 checks the announcement and not just the file
 //!
 //! `commit_probation_at` removes the marker down BOTH of its branches: a
 //! version-matched `Committed`, and a `ClearedStale` for a marker belonging to
 //! some other version. So "the file is gone" alone would still pass if the
 //! version comparison regressed and every marker were dropped as stale — which
 //! would disable rollback entirely, a worse bug than the one this guards. The
-//! INFO line is the only artifact that distinguishes the two paths, so it is
-//! asserted too. (`ClearedStale` logs at DEBUG, which release builds compile
-//! out — that is precisely why this whole class was invisible in the field.)
+//! commit announcement is the only artifact that distinguishes the two paths.
+//!
+//! It is asserted on the node's **stderr**, not on its log files, and that is
+//! the point of the fix this test accompanies. `tracing` output goes to the
+//! rolling log files under the log dir; systemd captures only stdout/stderr. So
+//! the crash-count and rollback lines (printed by the installer on stderr) were
+//! in the journal while the commit that disarms them was not, and #5232 was
+//! filed reading a journal that showed three strikes accumulating and no commit
+//! ever happening. Asserting the log file instead would pass on a build where
+//! the journal is silent again — i.e. it would not hold the fix.
 //!
 //! ## Runtime
 //!
@@ -69,9 +76,10 @@ const COMMIT_HEALTHY_UPTIME_SECS: u64 = 60;
 /// Generous slack over the commit window for a cold-started debug-build node.
 const COMMIT_POLL_DEADLINE: Duration = Duration::from_secs(COMMIT_HEALTHY_UPTIME_SECS + 90);
 
-/// Substring of the INFO line `commit_probation` emits on the `Committed`
-/// branch only.
-const COMMITTED_LOG_NEEDLE: &str = "Auto-update probation passed";
+/// Substring of the line `commit_probation` announces on the `Committed`
+/// branch only. Matched against the node's stderr, which is what a supervisor
+/// records — see the module docs.
+const COMMITTED_STDERR_NEEDLE: &str = "post-update probation passed";
 
 /// Substring of the stderr line `freenet update` prints when it counts a crash
 /// against an armed probation marker.
@@ -172,7 +180,12 @@ impl NodeProcess {
     /// Spawn a self-contained, isolated gateway node rooted at `dir`, with
     /// `HOME` pointed at `dir` so the auto-updater state directory (and hence
     /// the probation marker) is the test's own.
+    ///
+    /// stderr is captured to a file rather than a pipe: the assertions read it
+    /// while the node is still running, and a pipe nobody drains would block
+    /// the node once its buffer filled.
     fn spawn(dir: &Path, ws_port: u16, network_port: u16, log_dir: &Path) -> Self {
+        let stderr = std::fs::File::create(stderr_path(dir)).expect("create node stderr file");
         let child = Command::new(freenet_bin())
             .arg("network")
             // Same #4366 contamination guard as persistence_roundtrip.rs: this
@@ -202,7 +215,7 @@ impl NodeProcess {
             .args(["--data-dir", &dir.to_string_lossy()])
             .args(["--log-dir", &log_dir.to_string_lossy()])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr))
             .spawn()
             .expect("spawn freenet network");
         Self { child }
@@ -238,6 +251,16 @@ impl Drop for NodeProcess {
 fn reserve_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     listener.local_addr().expect("local addr").port()
+}
+
+/// Where the node's stderr is captured. This stands in for the journal: it is
+/// the channel a service supervisor records.
+fn stderr_path(dir: &Path) -> PathBuf {
+    dir.join("node.stderr")
+}
+
+fn read_node_stderr(dir: &Path) -> String {
+    std::fs::read_to_string(stderr_path(dir)).unwrap_or_default()
 }
 
 /// Concatenate every rolling log file the node wrote under `log_dir`.
@@ -306,12 +329,17 @@ fn probation_is_committed_after_a_healthy_uptime_window() {
         read_node_logs(&log_dir)
     );
 
-    let logs = read_node_logs(&log_dir);
+    let stderr = read_node_stderr(home);
     assert!(
-        logs.contains(COMMITTED_LOG_NEEDLE),
-        "the probation marker was removed, but the node never logged {COMMITTED_LOG_NEEDLE:?} — \
-         so it was dropped down the ClearedStale branch (a marker for a DIFFERENT version) \
-         rather than committed. That disables rollback protection entirely. Node logs:\n{logs}"
+        stderr.contains(COMMITTED_STDERR_NEEDLE),
+        "#5232: the probation marker was removed, but the node never announced \
+         {COMMITTED_STDERR_NEEDLE:?} on stderr. Either it was dropped down the ClearedStale \
+         branch (a marker for a DIFFERENT version) rather than committed — which disables \
+         rollback protection entirely — or the commit happened silently, leaving an operator \
+         reading `journalctl -u freenet` unable to tell a committed node from one still \
+         accumulating strikes. That is the misreading #5232 was filed on. Node stderr:\n{stderr}\
+         \n\nNode logs:\n{}",
+        read_node_logs(&log_dir)
     );
 
     // ---- Assertion 2: the clean stop that follows is not scored as a crash ----
