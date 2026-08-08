@@ -7604,6 +7604,60 @@ mod k_closest_source_tests {
         }
         assert_eq!(checked, 24, "expected exactly 24 export assignments");
     }
+
+    /// Same mirror seam, for the contract-exec WASM counters. The export block
+    /// hand-copies each `ContractExecSnapshot` field into its `RouterSnapshotInfo`
+    /// twin, so a swap — feeding `..._wasm_calls_total` from `fast_hits`, say —
+    /// compiles cleanly and emits a plausible number that is measuring the
+    /// opposite thing.
+    ///
+    /// That failure mode is not hypothetical here: mistaking cache hits for WASM
+    /// work is the exact blindness these counters exist to remove, and an
+    /// overstated saving is worse than a missing one because it terminates the
+    /// investigation. Assert every assignment reads its own field.
+    /// Whitespace-normalized so rustfmt line-wrapping is irrelevant.
+    #[test]
+    fn contract_exec_export_maps_each_field_to_its_own_counter() {
+        let src = production_source();
+        let block = extract_fn_body(src, "async fn emit_router_snapshot_telemetry(");
+        let norm = block.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let fields = [
+            "summarize_fast_hits",
+            "summarize_reload_hits",
+            "summarize_wasm_calls",
+            "summarize_wasm_uncached",
+            "delta_fast_hits",
+            "delta_reload_hits",
+            "delta_wasm_calls",
+            "delta_wasm_uncached",
+        ];
+        for field in fields {
+            let expected = format!("snapshot.contract_exec_{field}_total = Some(ce.{field});");
+            assert!(
+                norm.contains(&expected),
+                "mirror-seam: export must contain `{expected}` — a field swap here \
+                 silently reports one arm's count under another arm's name"
+            );
+        }
+
+        // The four per-window deltas must each difference their OWN total
+        // against their OWN previous value. Crossing these would emit a delta
+        // that is the difference of two different counters, i.e. noise.
+        for field in [
+            "summarize_fast_hits",
+            "summarize_wasm_calls",
+            "delta_fast_hits",
+            "delta_wasm_calls",
+        ] {
+            let expected = format!("window_delta(ce.{field}, &mut prev_exec.{field});");
+            assert!(
+                norm.contains(&expected),
+                "mirror-seam: the per-window delta must contain `{expected}` — \
+                 differencing one arm against another's previous value emits noise"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
