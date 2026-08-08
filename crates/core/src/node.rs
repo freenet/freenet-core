@@ -1589,14 +1589,56 @@ where
                     .update_rate_limiter
                     .check_and_record(sender_addr, *key.id());
                 if !rate_decision.is_allowed() {
-                    tracing::debug!(
-                        tx = %op.id(),
-                        %key,
-                        %sender_addr,
-                        ?rate_decision,
-                        phase = "update_dispatch_rate_limited",
-                        "UPDATE dispatch: rejected by per-(sender, contract) rate limit"
-                    );
+                    use crate::ring::update_rate_limit::RateLimitDecision;
+                    // Matched exhaustively on purpose: a new drop reason
+                    // that fell into a catch-all would be logged at
+                    // `debug!` and therefore be invisible in release
+                    // builds, which is exactly how #4981 stayed hidden.
+                    match rate_decision {
+                        RateLimitDecision::CapacityExceeded => {
+                            // `info!` because `debug!` is compiled out of release
+                            // builds by `release_max_level_info`, which is how this
+                            // path came to drop legitimate relayed UPDATEs with no
+                            // greppable evidence on a production node (#4981).
+                            // Since that fix the limiter evicts instead of refusing,
+                            // so reaching here means the map was full AND every
+                            // admission attempt lost its freed slot to a concurrent
+                            // caller — rare, and worth seeing when it happens.
+                            tracing::info!(
+                                tx = %op.id(),
+                                %key,
+                                %sender_addr,
+                                phase = "update_dispatch_capacity_dropped",
+                                "UPDATE dispatch: dropped, rate-limiter map at capacity and \
+                                 contended (see ring::update_rate_limit)"
+                            );
+                        }
+                        RateLimitDecision::SenderNewPairBudget => {
+                            // Deliberately NOT logged per drop: a sender
+                            // over this budget is over it on every
+                            // message, so a line here would be a steady
+                            // stream. The limiter logs it once a minute
+                            // with the sender, and the drop is counted in
+                            // `new_pair_budget_rejected_total`.
+                            tracing::debug!(
+                                tx = %op.id(),
+                                %key,
+                                %sender_addr,
+                                phase = "update_dispatch_fresh_id_dropped",
+                                "UPDATE dispatch: dropped, sender over its new-pair budget"
+                            );
+                        }
+                        RateLimitDecision::Rejected { .. } | RateLimitDecision::Allowed => {
+                            tracing::debug!(
+                                tx = %op.id(),
+                                %key,
+                                %sender_addr,
+                                ?rate_decision,
+                                phase = "update_dispatch_rate_limited",
+                                "UPDATE dispatch: rejected by per-(sender, contract) rate limit"
+                            );
+                        }
+                    }
                     return Ok(());
                 }
 
