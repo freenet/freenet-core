@@ -26,7 +26,10 @@
 //!   window ⇒ marker gone, commit announced, and a following post-stop
 //!   `freenet update` records NO crash.
 //! * `probation_survives_a_stop_inside_the_commit_window` — stopped INSIDE the
-//!   window ⇒ marker retained and the stop IS counted, `1/3`.
+//!   window ⇒ the marker is retained, and a crash of that still-uncommitted
+//!   version counts `1/3`. Two separable claims, and the test asserts both: the
+//!   retention is from a real graceful stop, the counting from a forwarded crash
+//!   status (see `post_stop_update`).
 //!
 //! The second is not decoration. It is the positive control for the first: it
 //! proves the fixture actually parses as a `ProbationState`, that
@@ -34,9 +37,13 @@
 //! the state dir, and that the crash line is producible in this harness at all.
 //! Without it, the first test's "no crash was recorded" would also hold if the
 //! post-stop command failed for some entirely unrelated reason — an assertion
-//! that cannot fail. It is also the half that produced the user-visible rollback
-//! in #5232 (three fast restarts), and it costs ~15s rather than ~65s because it
-//! never waits out the window.
+//! that cannot fail. It is also the half the user-visible rollback ran through:
+//! three stops landing inside the window, before anything could commit. (What
+//! made those stops COUNT was #5227 — a graceful shutdown exited 1, which
+//! classifies as a crash. Since #5230 it exits 0, so ordinary restarts no longer
+//! accumulate strikes; the retention behaviour this test pins is what still
+//! decides the outcome for a genuinely crashing release.) It costs ~15s rather
+//! than ~65s because it never waits out the window.
 //!
 //! ## Why the commit assertion reads stderr, not the log files
 //!
@@ -367,11 +374,13 @@ fn reserve_port() -> u16 {
 /// they are testing; the probation/crash-counting branch runs BEFORE the
 /// check/install split, so it is exercised identically either way.
 ///
-/// The forwarded status is always `"1"`, not the node's observed status: 1 is
-/// what a graceful shutdown exits with today (#5227) and classifies as a crash,
-/// so it is the strictest input. If #5227's fix lands and clean stops exit 0,
-/// these assertions keep testing the probation gate rather than silently
-/// becoming a test of the exit-code classifier.
+/// The forwarded status is always `"1"`, never the node's observed status.
+/// Since #5230 a graceful shutdown exits 0, and `classify_stop` short-circuits
+/// `"0"` to `NotCrash` BEFORE `handle_post_stop_at` ever reads the marker — so
+/// forwarding the real status would mean neither test touched the probation
+/// logic at all, and the in-window test would lose its ability to fail. `"1"`
+/// classifies as a crash, which keeps both tests aimed at the probation gate
+/// rather than at the exit-code classifier that #5230 already owns.
 fn post_stop_update(home: &Path) -> String {
     let out = Command::new(freenet_bin())
         .arg("update")
@@ -460,9 +469,10 @@ fn probation_is_committed_after_a_healthy_uptime_window() {
     let post_stop_stderr = post_stop_update(home);
     assert!(
         !post_stop_stderr.contains(CRASH_RECORDED_NEEDLE),
-        "#5232: a clean stop of a node that had already committed its probation was still \
-         counted as a probation crash. Three of these roll the node back. Node stop status was \
-         {status:?}; post-stop `freenet update` said:\n{post_stop_stderr}"
+        "#5232: once probation is committed, NOTHING may be counted against it — this forwards \
+         a crash status (the strictest input) and it still must not register, because the marker \
+         is gone. Three that do register roll the node back. Node stop status was {status:?}; \
+         post-stop `freenet update` said:\n{post_stop_stderr}"
     );
     assert_eq!(
         probation_crash_count(home),
@@ -471,9 +481,14 @@ fn probation_is_committed_after_a_healthy_uptime_window() {
     );
 }
 
-/// The other half of the contract, and the positive control for the test above:
-/// a node stopped INSIDE the commit window keeps its marker, and the stop IS
-/// counted against it.
+/// The other half of the contract, and the positive control for the test above.
+///
+/// Two claims, both asserted here. First, a node stopped INSIDE the commit
+/// window keeps its marker — that is what leaves a genuinely crash-looping
+/// release rollback-eligible, and it is asserted against a REAL graceful stop.
+/// Second, a crash of that still-uncommitted version is counted `1/3` and
+/// persisted — asserted against a forwarded crash status, because since #5230 a
+/// graceful stop is deliberately not a crash (see `post_stop_update`).
 ///
 /// This is what makes the committed test's "no crash was recorded" meaningful.
 /// That assertion is a negative on a subprocess's stderr, so on its own it would
@@ -508,7 +523,9 @@ fn probation_survives_a_stop_inside_the_commit_window() {
         probation_crash_count(home),
         Some(0),
         "a node stopped inside the commit window must keep its armed marker: that is what lets \
-         a genuinely crash-looping release be rolled back. Node stop status: {status:?}"
+         a genuinely crash-looping release still be rolled back. This was a real graceful stop, \
+         so it is the retention that is under test here, not the classification. Node stop \
+         status: {status:?}"
     );
 
     let post_stop_stderr = post_stop_update(home);
