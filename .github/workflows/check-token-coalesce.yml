@@ -70,29 +70,57 @@ jobs:
             grep -E '^\+' | grep -vE '^\+\+\+' | grep -vE 'coalesce-exempt' || true
           }
 
-          # Self-test: a known-bad line MUST be flagged. Runs the same
-          # function the real check uses, so the two cannot drift.
-          #
-          # The fixture is assembled from a variable holding a bare `$` on
+          # The two detectors, defined ONCE and used by both the self-test and
+          # the real check below. Sharing only `added_lines` was not enough:
+          # while the regexes were duplicated, breaking the real one left the
+          # self-test green — the same "the check cannot fail" bug this guard
+          # exists to catch, one layer up.
+          flags_bare_gh_token() {
+            grep -qE 'GH_TOKEN:\s*\$\{\{\s*secrets\.GITHUB_TOKEN'
+          }
+          flags_bare_checkout_token() {
+            grep -qE 'token:\s*\$\{\{\s*github\.token'
+          }
+
+          # Fixtures are assembled from a variable holding a bare `$` on
           # purpose. Writing the two-brace expression literally here does NOT
           # produce a literal: Actions evaluates expressions inside `run:`
-          # blocks before the shell sees them, so the fixture would become the
+          # blocks before the shell sees them, so a fixture would become the
           # real token value and the self-test would fail — it did exactly
           # that on the first CI run of this change, which is the self-test
           # doing its job. Splitting the `$` from the braces keeps the raw
           # text free of the expression marker.
           D='$'
-          SELF_TEST_BAD="+          GH_TOKEN: ${D}{{ secrets.GITHUB_TOKEN }}"
-          SELF_TEST_OUT=$(printf '%s\n+++ b/.github/workflows/x.yml\n' "$SELF_TEST_BAD" | added_lines)
-          if ! echo "$SELF_TEST_OUT" | grep -qE 'GH_TOKEN:\s*\$\{\{\s*secrets\.GITHUB_TOKEN'; then
-            echo "::error::Self-test failed: this guard cannot detect a bare GITHUB_TOKEN line, so its result is meaningless. Fix added_lines() before trusting this job."
+          BAD_GH="+          GH_TOKEN: ${D}{{ secrets.GITHUB_TOKEN }}"
+          BAD_CHECKOUT="+          token: ${D}{{ github.token }}"
+          GOOD_GH="+          GH_TOKEN: ${D}{{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}"
+          EXEMPT_GH="${BAD_GH} # coalesce-exempt: self-test fixture"
+
+          self_test_diff() { printf '%s\n+++ b/.github/workflows/x.yml\n' "$1"; }
+          fail_self_test() {
+            echo "::error::Self-test failed: $1 This job's result would be meaningless — fix it before trusting a pass."
             exit 1
+          }
+
+          # Must FIRE on the bad forms...
+          if ! self_test_diff "$BAD_GH" | added_lines | flags_bare_gh_token; then
+            fail_self_test "a bare secrets.GITHUB_TOKEN line is not detected."
+          fi
+          if ! self_test_diff "$BAD_CHECKOUT" | added_lines | flags_bare_checkout_token; then
+            fail_self_test "a bare github.token checkout line is not detected."
+          fi
+          # ...and stay QUIET on the good and the exempted ones, or every PR
+          # that touches a workflow fails for no reason.
+          if self_test_diff "$GOOD_GH" | added_lines | flags_bare_gh_token; then
+            fail_self_test "a correctly coalesced RELEASE_PAT line is reported as bad."
+          fi
+          if self_test_diff "$EXEMPT_GH" | added_lines | flags_bare_gh_token; then
+            fail_self_test "the '# coalesce-exempt:' marker is not honoured."
           fi
           if printf '+++ b/.github/workflows/x.yml\n' | added_lines | grep -q .; then
-            echo "::error::Self-test failed: this guard is not stripping the '+++' diff header."
-            exit 1
+            fail_self_test "the '+++' diff header is not being stripped."
           fi
-          echo "Self-test passed: the guard detects a bare GITHUB_TOKEN line."
+          echo "Self-test passed: both detectors fire on bare tokens and stay quiet on coalesced and exempted lines."
 
           ERRORS=()
           for f in $CHANGED; do
@@ -105,10 +133,10 @@ jobs:
             # workflow file is flagged for review. Suppress via inline comment
             # `# coalesce-exempt: <reason>` on the same line.
             ADDED=$(git diff "$BASE_SHA"..."$HEAD_SHA" -- "$f" | added_lines)
-            if echo "$ADDED" | grep -qE 'GH_TOKEN:\s*\$\{\{\s*secrets\.GITHUB_TOKEN'; then
+            if echo "$ADDED" | flags_bare_gh_token; then
               ERRORS+=("$f: new step uses bare \`secrets.GITHUB_TOKEN\` — should coalesce on \`RELEASE_PAT\` (see AGENTS.md → Release Workflow). Add `# coalesce-exempt: <reason>` on the line if intentionally read-only and event-quiet.")
             fi
-            if echo "$ADDED" | grep -qE 'token:\s*\$\{\{\s*github\.token'; then
+            if echo "$ADDED" | flags_bare_checkout_token; then
               ERRORS+=("$f: new actions/checkout uses bare \`github.token\` — same coalesce rule applies for any subsequent \`git push\`.")
             fi
           done
