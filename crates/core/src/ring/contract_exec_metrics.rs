@@ -34,10 +34,24 @@
 //! total WASM get_state_delta invocations = delta_wasm_calls     + delta_wasm_uncached
 //! ```
 //!
-//! (Both partitions hold only for a call that RETURNS; an error return — state
-//! missing, params missing, WASM trap — exits without recording a terminal arm.
-//! Those are already loud in their own right, and a silent counter drift would
-//! be worse than a small under-count.)
+//! Four exceptions to the partition, all deliberate:
+//!
+//! 1. **A call that never returns records nothing.** An early error — state
+//!    missing, params missing — exits before any terminal arm. So does a
+//!    cancelled future: both cached functions `await` a state load before the
+//!    slow-path arms are reached.
+//! 2. **A WASM trap still counts as a WASM call.** The `*_wasm_calls` arms are
+//!    recorded immediately BEFORE the invocation they describe, so a trapping
+//!    or timing-out `summarize_state` increments the arm and then returns
+//!    `Err`. That is the intended sign: these arms answer "how much WASM work
+//!    is this peer attempting", and a trap costs the same CPU up to the trap.
+//!    It does mean the arms count ATTEMPTS, so during a trap storm
+//!    `*_wasm_calls` exceeds the successful returns. The hit arms have no
+//!    fallible step after them and so count only successes.
+//! 3. **An executor with no `OpManager` records nothing at all** (unit-test and
+//!    local-only executors have no `Ring` to attribute the work to). Every
+//!    production executor is built by `RuntimePool` with an `OpManager`.
+//! 4. **A snapshot can land mid-call.** See [`ContractExecSnapshot`].
 //!
 //! # What each counter answers
 //!
@@ -58,11 +72,20 @@
 //!
 //! # Cost
 //!
-//! One `Relaxed` `fetch_add` on a `u64` per contract-handler call — a few ns,
-//! uncontended (the contract-handling loop has concurrency exactly 1, enforced
-//! by `&mut self`). The fast path takes exactly one increment; the slow paths
-//! take one more, alongside a state load and a WASM invocation that dwarf it.
-//! Nothing allocates and nothing locks.
+//! One `Relaxed` `fetch_add` on a `u64` per contract-handler call — a few ns.
+//! The fast path takes exactly one increment; the slow paths take one more,
+//! alongside a state load and a WASM invocation that dwarf it. Nothing
+//! allocates and nothing locks.
+//!
+//! The two CACHED entry points are reached only through `RuntimePool`'s
+//! `&mut self` methods, so they are serialized on the contract-handling loop and
+//! the atomics are uncontended there. The `*_uncached` sites are NOT all on that
+//! loop — the `contract_ops` PUT/UPDATE sites are reachable from
+//! `run_local_node`, and `executor_impl.rs` documents that off-loop work can
+//! hold an executor — so treat "uncontended" as the common case, not a
+//! guarantee. `fetch_add` is correct under any contention; `Relaxed` is
+//! sufficient because each counter is read on its own and publishes no other
+//! memory alongside it.
 //!
 //! # How this is read
 //!
@@ -70,10 +93,14 @@
 //! a process global, so unit tests stay isolated — the #4488 rationale that
 //! `ModuleCacheMetrics` was moved off a global for). The executor increments it
 //! through `op_manager.ring`; `emit_router_snapshot_telemetry` reads it on the
-//! existing 5-minute `router_snapshot` cadence and emits both the monotonic
-//! lifetime totals (collector-side differencing) and the per-window deltas for
-//! the four headline arms, so a single snapshot answers "was this peer's
-//! summarize load cache hits or real WASM work" without a stateful reader.
+//! existing 5-minute `router_snapshot` cadence and emits, for EVERY arm, both
+//! the monotonic lifetime total (collector-side differencing) and the per-window
+//! delta, so a single snapshot answers "was this peer's summarize load cache
+//! hits or real WASM work" without a stateful reader. All eight, not a headline
+//! subset: mixing 5-minute deltas with lifetime totals under parallel names on
+//! one log line invites reading them as comparable magnitudes, and the arm that
+//! would be understated that way is `delta_wasm_uncached` — the fan-out delta
+//! with no cache in front of it, which can dominate on a client-facing node.
 //!
 //! Note the deliberate choice of an EXISTING telemetry stream: `router_snapshot`
 //! already carries this class of per-node monotonic counter
@@ -118,6 +145,12 @@ pub(crate) struct ContractExecMetrics {
 }
 
 /// A point-in-time read of [`ContractExecMetrics`] for telemetry emission.
+///
+/// The eight loads are independent and `Relaxed`, so a snapshot taken while the
+/// contract loop is running can land between two arms of one call and violate
+/// the module-level partition identity by one. That is fine for a rate and for
+/// the collector's differencing; do NOT build an alert that asserts the identity
+/// holds exactly on a single snapshot, it would flap.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ContractExecSnapshot {
     pub summarize_fast_hits: u64,
@@ -128,6 +161,51 @@ pub(crate) struct ContractExecSnapshot {
     pub delta_reload_hits: u64,
     pub delta_wasm_calls: u64,
     pub delta_wasm_uncached: u64,
+}
+
+impl ContractExecSnapshot {
+    /// Difference this snapshot against `prev` field-by-field, advancing `prev`
+    /// to this snapshot. Returns the per-window deltas.
+    ///
+    /// This exists as ONE function rather than eight hand-written
+    /// `window_delta(ce.x, &mut prev.x)` calls at the emit site, because a
+    /// hand-written set is exactly where a cross-wiring — differencing one arm
+    /// against another arm's previous value — hides. Such a slip emits a
+    /// plausible number that is pure noise, and the whole point of these
+    /// counters is that a plausible-but-wrong number is worse than none. Here
+    /// the correspondence is structural and `each_field_differences_its_own_twin`
+    /// pins it with distinct per-field values.
+    ///
+    /// `saturating_sub` can only mask a decrease, and these counters are
+    /// monotonic for a process lifetime (nothing resets them — see
+    /// `snapshot_is_non_destructive`), so a non-zero mask means the caller
+    /// passed a `prev` from a different source.
+    pub(crate) fn window_deltas(&self, prev: &mut ContractExecSnapshot) -> ContractExecSnapshot {
+        let deltas = ContractExecSnapshot {
+            summarize_fast_hits: self
+                .summarize_fast_hits
+                .saturating_sub(prev.summarize_fast_hits),
+            summarize_reload_hits: self
+                .summarize_reload_hits
+                .saturating_sub(prev.summarize_reload_hits),
+            summarize_wasm_calls: self
+                .summarize_wasm_calls
+                .saturating_sub(prev.summarize_wasm_calls),
+            summarize_wasm_uncached: self
+                .summarize_wasm_uncached
+                .saturating_sub(prev.summarize_wasm_uncached),
+            delta_fast_hits: self.delta_fast_hits.saturating_sub(prev.delta_fast_hits),
+            delta_reload_hits: self
+                .delta_reload_hits
+                .saturating_sub(prev.delta_reload_hits),
+            delta_wasm_calls: self.delta_wasm_calls.saturating_sub(prev.delta_wasm_calls),
+            delta_wasm_uncached: self
+                .delta_wasm_uncached
+                .saturating_sub(prev.delta_wasm_uncached),
+        };
+        *prev = *self;
+        deltas
+    }
 }
 
 impl ContractExecMetrics {
@@ -238,6 +316,52 @@ mod tests {
         assert_eq!(s.delta_reload_hits, 6);
         assert_eq!(s.delta_wasm_calls, 7);
         assert_eq!(s.delta_wasm_uncached, 8);
+    }
+
+    /// Every per-window delta must difference its OWN twin. A cross-wiring here
+    /// emits the difference of two unrelated arms — a plausible number that is
+    /// pure noise — which is the failure these counters exist to prevent, not
+    /// to commit. Distinct per-field values, so a swap cannot pass.
+    #[test]
+    fn each_field_differences_its_own_twin() {
+        let mut prev = ContractExecSnapshot {
+            summarize_fast_hits: 10,
+            summarize_reload_hits: 20,
+            summarize_wasm_calls: 30,
+            summarize_wasm_uncached: 40,
+            delta_fast_hits: 50,
+            delta_reload_hits: 60,
+            delta_wasm_calls: 70,
+            delta_wasm_uncached: 80,
+        };
+        let now = ContractExecSnapshot {
+            summarize_fast_hits: 11,
+            summarize_reload_hits: 22,
+            summarize_wasm_calls: 33,
+            summarize_wasm_uncached: 44,
+            delta_fast_hits: 55,
+            delta_reload_hits: 66,
+            delta_wasm_calls: 77,
+            delta_wasm_uncached: 88,
+        };
+
+        let d = now.window_deltas(&mut prev);
+        assert_eq!(d.summarize_fast_hits, 1);
+        assert_eq!(d.summarize_reload_hits, 2);
+        assert_eq!(d.summarize_wasm_calls, 3);
+        assert_eq!(d.summarize_wasm_uncached, 4);
+        assert_eq!(d.delta_fast_hits, 5);
+        assert_eq!(d.delta_reload_hits, 6);
+        assert_eq!(d.delta_wasm_calls, 7);
+        assert_eq!(d.delta_wasm_uncached, 8);
+
+        // `prev` advanced to `now`, so an immediately repeated window is all
+        // zeroes rather than re-reporting the same work.
+        assert_eq!(prev, now);
+        assert_eq!(
+            now.window_deltas(&mut prev),
+            ContractExecSnapshot::default()
+        );
     }
 
     #[test]

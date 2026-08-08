@@ -736,6 +736,10 @@ pub(crate) struct RouterSnapshotInfo {
     /// them across the cadence); `*_last_snapshot` are the per-window deltas
     /// `Ring` samples directly, so ONE snapshot answers "was this peer's
     /// summarize load cache hits or real WASM work" without a stateful reader.
+    /// EVERY arm gets both, deliberately: emitting some arms as a delta and
+    /// others as a lifetime total, under parallel names, invites reading them as
+    /// comparable magnitudes and would understate exactly the uncached fan-out
+    /// arm most likely to dominate on a client-facing node.
     /// `None` until the node has a `Ring`-backed executor.
     pub contract_exec_summarize_fast_hits_total: Option<u64>,
     pub contract_exec_summarize_reload_hits_total: Option<u64>,
@@ -746,9 +750,13 @@ pub(crate) struct RouterSnapshotInfo {
     pub contract_exec_delta_wasm_calls_total: Option<u64>,
     pub contract_exec_delta_wasm_uncached_total: Option<u64>,
     pub contract_exec_summarize_fast_hits_last_snapshot: Option<u64>,
+    pub contract_exec_summarize_reload_hits_last_snapshot: Option<u64>,
     pub contract_exec_summarize_wasm_calls_last_snapshot: Option<u64>,
+    pub contract_exec_summarize_wasm_uncached_last_snapshot: Option<u64>,
     pub contract_exec_delta_fast_hits_last_snapshot: Option<u64>,
+    pub contract_exec_delta_reload_hits_last_snapshot: Option<u64>,
     pub contract_exec_delta_wasm_calls_last_snapshot: Option<u64>,
+    pub contract_exec_delta_wasm_uncached_last_snapshot: Option<u64>,
     /// Placement-quality gauges (#4404 follow-up), populated by `Ring` on the
     /// snapshot cadence from the contracts this node hosts. They make the
     /// effect of the SubscribeHint placement migration observable: the migration
@@ -1773,9 +1781,13 @@ impl Router {
             contract_exec_delta_wasm_calls_total: None,
             contract_exec_delta_wasm_uncached_total: None,
             contract_exec_summarize_fast_hits_last_snapshot: None,
+            contract_exec_summarize_reload_hits_last_snapshot: None,
             contract_exec_summarize_wasm_calls_last_snapshot: None,
+            contract_exec_summarize_wasm_uncached_last_snapshot: None,
             contract_exec_delta_fast_hits_last_snapshot: None,
+            contract_exec_delta_reload_hits_last_snapshot: None,
             contract_exec_delta_wasm_calls_last_snapshot: None,
+            contract_exec_delta_wasm_uncached_last_snapshot: None,
             broadcast_stream_failures_last_snapshot: None,
             // Placement-quality + placement-migration gauges populated by Ring on
             // the snapshot cadence (#4404 follow-up).

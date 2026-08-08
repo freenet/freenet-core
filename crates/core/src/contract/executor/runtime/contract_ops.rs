@@ -863,3 +863,77 @@ impl Executor<Runtime> {
         Ok(retry_result)
     }
 }
+
+/// Source-scrape pin for the UNCACHED WASM `summarize_state` counters.
+///
+/// These three sites live in `impl Executor<Runtime>` — a real compiled WASM
+/// runtime — so the `MockWasmRuntime` harness that covers every other arm in
+/// `pool_tests::summarize_delta_cache_tests` cannot reach them, and a runtime
+/// test would need the full `wasm_conformance_tests` fixture. Pinned from
+/// source instead, which is the cheaper guard against the failure that actually
+/// threatens them: a copy-paste slip recording `record_summarize_wasm_call`
+/// here would inflate the CACHED path's miss count with work that never had a
+/// cache in front of it, making a healthy cache look like it was thrashing.
+#[cfg(test)]
+mod uncached_summarize_counter_pins {
+    /// The file's production source, with comment lines removed so a needle
+    /// cannot match the prose that describes the code (the same guard as in
+    /// `executor_impl::contract_exec_counter_pins`, where that trap was
+    /// actually hit), and truncated before this test module so a needle cannot
+    /// match its own assertion strings.
+    fn production_source() -> String {
+        let src = include_str!("contract_ops.rs");
+        let cutoff = src
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("contract_ops.rs must have a top-level #[cfg(test)] mod section");
+        src[..cutoff]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn every_uncached_summarize_site_is_counted_as_uncached() {
+        let src = production_source();
+        let norm = src.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert_eq!(
+            norm.matches(".summarize_state(").count(),
+            3,
+            "expected exactly 3 WASM summarize_state sites in contract_ops; a new one \
+             needs its own record_summarize_wasm_uncached() call, or the WASM total \
+             silently under-reports"
+        );
+        assert_eq!(
+            norm.matches("m.record_summarize_wasm_uncached();").count(),
+            3,
+            "each of the 3 uncached summarize_state sites must record the UNCACHED arm"
+        );
+        assert_eq!(
+            norm.matches("record_summarize_wasm_call()").count(),
+            0,
+            "no site here may record the CACHED-path arm — these calls have no cache \
+             in front of them, and counting them there would make a healthy cache \
+             look like it was thrashing"
+        );
+
+        // Each recorder must PRECEDE its own call, not trail the previous one.
+        let mut cursor = 0usize;
+        for i in 0..3 {
+            let rec = norm[cursor..]
+                .find("m.record_summarize_wasm_uncached();")
+                .unwrap_or_else(|| panic!("uncached recorder #{i} not found"))
+                + cursor;
+            let call = norm[rec..]
+                .find(".summarize_state(")
+                .unwrap_or_else(|| panic!("summarize_state call #{i} not found after recorder"))
+                + rec;
+            assert!(
+                !norm[rec + 1..call].contains("m.record_summarize_wasm_uncached();"),
+                "recorder #{i} is not the one guarding its own summarize_state call"
+            );
+            cursor = call;
+        }
+    }
+}

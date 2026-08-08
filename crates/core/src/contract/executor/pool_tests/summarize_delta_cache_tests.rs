@@ -810,6 +810,132 @@ async fn repeated_delta_counts_a_fast_hit_and_no_wasm_call() {
     );
 }
 
+/// Delta twin of `cold_detector_over_unchanged_state_counts_a_reload_hit`.
+/// The delta cache is keyed on (state-hash, peer-summary-hash), so a cold
+/// detector re-derives the state hash and finds the SAME key — a reload hit,
+/// not a WASM call.
+#[tokio::test(flavor = "current_thread")]
+async fn delta_cold_detector_over_unchanged_state_counts_a_reload_hit() {
+    let storage = MockStateStorage::new();
+    let (op_manager, _guards) = build_op_manager("exec_counts_delta_reload").await;
+    let mut exec = Executor::new_mock_wasm_uncached_with_op_manager(
+        "exec_counts_delta_reload",
+        storage.clone(),
+        op_manager.clone(),
+    )
+    .await
+    .expect("create uncached executor with op_manager");
+
+    let contract = test_contract(b"exec_counts_delta_reload");
+    let key = contract.key();
+    let peer_summary = StateSummary::from(vec![3u8; 4]);
+    exec.upsert_contract_state(
+        key,
+        Either::Left(WrappedState::new(vec![8, 8, 8, 1])),
+        RelatedContracts::default(),
+        Some(contract.clone()),
+    )
+    .await
+    .expect("PUT");
+    let _ = exec
+        .get_contract_state_delta(key, peer_summary.clone())
+        .await
+        .expect("warm the delta cache");
+
+    exec.state_store.cache_invalidator().invalidate(&key);
+
+    let before = exec_counts(&op_manager);
+    let _ = exec
+        .get_contract_state_delta(key, peer_summary)
+        .await
+        .expect("delta with cold detector");
+    let after = exec_counts(&op_manager);
+    assert_eq!(
+        after.delta_reload_hits - before.delta_reload_hits,
+        1,
+        "a cold detector over unchanged state must be counted as a delta reload hit"
+    );
+    assert_eq!(
+        after.delta_wasm_calls, before.delta_wasm_calls,
+        "the cached delta still matched, so no WASM ran and none may be counted"
+    );
+    assert_eq!(
+        after.delta_fast_hits, before.delta_fast_hits,
+        "the detector was cold, so this is not a FAST hit"
+    );
+}
+
+/// The client-notification fan-out computes a per-subscriber delta with NO
+/// cache in front of it. That work must land on the `uncached` arm — not on
+/// `delta_wasm_calls`, which would inflate the cached path's miss count and
+/// make a healthy cache look like it was thrashing.
+///
+/// This arm is the one most likely to dominate `get_state_delta` volume on a
+/// client-facing node, so it gets its own coverage rather than riding on the
+/// cached-path tests.
+#[tokio::test(flavor = "current_thread")]
+async fn client_notification_fanout_delta_counts_as_uncached() {
+    use crate::contract::executor::ClientId;
+
+    let storage = MockStateStorage::new();
+    let (op_manager, _guards) = build_op_manager("exec_counts_fanout").await;
+    let mut exec = Executor::new_mock_wasm_uncached_with_op_manager(
+        "exec_counts_fanout",
+        storage.clone(),
+        op_manager.clone(),
+    )
+    .await
+    .expect("create uncached executor with op_manager");
+
+    let contract = test_contract(b"exec_counts_fanout");
+    let key = contract.key();
+    exec.upsert_contract_state(
+        key,
+        Either::Left(WrappedState::new(vec![1, 1, 1, 1])),
+        RelatedContracts::default(),
+        Some(contract.clone()),
+    )
+    .await
+    .expect("PUT");
+
+    // A subscriber WITH a cached summary is what makes the fan-out take the
+    // delta arm rather than shipping full state.
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    exec.register_contract_notifier(
+        *key.id(),
+        ClientId::FIRST,
+        tx,
+        Some(StateSummary::from(vec![2u8; 4])),
+    )
+    .expect("register subscriber");
+
+    let before = exec_counts(&op_manager);
+    exec.upsert_contract_state(
+        key,
+        Either::Left(WrappedState::new(vec![5, 5, 5, 5, 5])),
+        RelatedContracts::default(),
+        None,
+    )
+    .await
+    .expect("UPDATE drives the fan-out");
+    let after = exec_counts(&op_manager);
+
+    assert_eq!(
+        after.delta_wasm_uncached - before.delta_wasm_uncached,
+        1,
+        "the per-subscriber fan-out delta must be counted on the UNCACHED arm"
+    );
+    assert_eq!(
+        after.delta_wasm_calls, before.delta_wasm_calls,
+        "the fan-out delta has no cache in front of it, so it must NOT inflate \
+         the cached path's miss count"
+    );
+    assert_eq!(
+        after.delta_fast_hits, before.delta_fast_hits,
+        "the fan-out delta is not a cache hit"
+    );
+}
+
 /// The cached path's three arms must PARTITION its calls exactly: every call to
 /// `summarize_contract_state` lands on exactly one of fast hit / reload hit /
 /// WASM call, so no consumer ever has to subtract one counter from another to
@@ -840,20 +966,48 @@ async fn summarize_arms_partition_every_call_exactly_once() {
     .await
     .expect("PUT");
 
-    let before = exec_counts(&op_manager);
+    // Accumulate the measured window in SEGMENTS, so that nothing but a
+    // `summarize_contract_state` call ever falls inside one. Putting the UPDATE
+    // inside the window would make this test fail if a future change routed
+    // upsert through the cached summarize path — pointing the next debugger at
+    // the counter instead of at their own change.
+    let mut recorded = 0u64;
     let mut calls = 0u64;
+    let mut fast = 0u64;
+    let mut reload = 0u64;
+    let mut wasm = 0u64;
 
-    // Mix all three outcomes: cold cache, warm cache, cold detector, and a
-    // post-write recompute.
+    // Segment 1: cold cache, then four warm repeats.
+    let before = exec_counts(&op_manager);
     let _ = exec.summarize_contract_state(key).await.expect("cold");
-    calls += 1;
     for _ in 0..4 {
         let _ = exec.summarize_contract_state(key).await.expect("warm");
-        calls += 1;
     }
+    let after = exec_counts(&op_manager);
+    recorded += (after.summarize_fast_hits - before.summarize_fast_hits)
+        + (after.summarize_reload_hits - before.summarize_reload_hits)
+        + (after.summarize_wasm_calls - before.summarize_wasm_calls);
+    calls += 5;
+    fast += after.summarize_fast_hits - before.summarize_fast_hits;
+    reload += after.summarize_reload_hits - before.summarize_reload_hits;
+    wasm += after.summarize_wasm_calls - before.summarize_wasm_calls;
+
+    // Segment 2: cold detector over unchanged state (the invalidate is outside
+    // the measured window and records nothing by construction).
     exec.state_store.cache_invalidator().invalidate(&key);
+    let before = exec_counts(&op_manager);
     let _ = exec.summarize_contract_state(key).await.expect("reload");
+    let after = exec_counts(&op_manager);
+    recorded += (after.summarize_fast_hits - before.summarize_fast_hits)
+        + (after.summarize_reload_hits - before.summarize_reload_hits)
+        + (after.summarize_wasm_calls - before.summarize_wasm_calls);
     calls += 1;
+    fast += after.summarize_fast_hits - before.summarize_fast_hits;
+    reload += after.summarize_reload_hits - before.summarize_reload_hits;
+    wasm += after.summarize_wasm_calls - before.summarize_wasm_calls;
+
+    // Segment 3: post-write recompute. The UPDATE is deliberately outside the
+    // measured window.
     exec.upsert_contract_state(
         key,
         Either::Left(WrappedState::new(vec![2, 2, 4, 6, 8])),
@@ -862,13 +1016,17 @@ async fn summarize_arms_partition_every_call_exactly_once() {
     )
     .await
     .expect("UPDATE");
+    let before = exec_counts(&op_manager);
     let _ = exec.summarize_contract_state(key).await.expect("recompute");
-    calls += 1;
-
     let after = exec_counts(&op_manager);
-    let recorded = (after.summarize_fast_hits - before.summarize_fast_hits)
+    recorded += (after.summarize_fast_hits - before.summarize_fast_hits)
         + (after.summarize_reload_hits - before.summarize_reload_hits)
         + (after.summarize_wasm_calls - before.summarize_wasm_calls);
+    calls += 1;
+    fast += after.summarize_fast_hits - before.summarize_fast_hits;
+    reload += after.summarize_reload_hits - before.summarize_reload_hits;
+    wasm += after.summarize_wasm_calls - before.summarize_wasm_calls;
+
     assert_eq!(
         recorded, calls,
         "the three cached-path arms must partition every summarize call exactly \
@@ -876,7 +1034,13 @@ async fn summarize_arms_partition_every_call_exactly_once() {
     );
     // Non-vacuity: all three arms must actually have fired, or the partition
     // would hold trivially for a counter that only ever records one of them.
-    assert!(after.summarize_fast_hits > before.summarize_fast_hits);
-    assert!(after.summarize_reload_hits > before.summarize_reload_hits);
-    assert!(after.summarize_wasm_calls > before.summarize_wasm_calls);
+    assert!(fast > 0, "no fast hit fired: the partition holds vacuously");
+    assert!(
+        reload > 0,
+        "no reload hit fired: the partition holds vacuously"
+    );
+    assert!(
+        wasm > 0,
+        "no WASM call fired: the partition holds vacuously"
+    );
 }

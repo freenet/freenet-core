@@ -2696,17 +2696,27 @@ where
         // through `Arc<DashMap>`, not `&mut self`), and leaves this false.
         let mut local_entry_became_empty = false;
 
-        // Owned handle, resolved before either fan-out arm takes its `&mut`
-        // borrows: both arms hold two executor maps mutably for the whole loop,
-        // so the borrowing accessor is unusable inside them. One `Arc` clone per
-        // fan-out (not per subscriber). Neither delta below has a cache in front
-        // of it, so they land on the `uncached` arm — see
-        // `ring::contract_exec_metrics` for why the cached and uncached WASM
-        // totals are kept as separate counters rather than one.
+        // Resolved before either fan-out arm takes its `&mut` borrows: both arms
+        // hold two executor maps mutably for the whole loop, so the
+        // `self.contract_exec_metrics()` accessor (which borrows ALL of `self`)
+        // is unusable inside them.
+        //
+        // Deliberately the FIELD, not that accessor and not an `Arc` clone: this
+        // borrows only `self.op_manager`, which is disjoint from
+        // `self.update_notifications`, `self.subscriber_summaries` and
+        // `self.runtime`, so the borrow checker allows it and the cost is a
+        // pointer. An `Arc` clone here would instead charge two atomic RMWs to
+        // every committed update on the zero-local-subscriber path — the
+        // overwhelmingly common one for a contract this node hosts for the
+        // network, which returns below without recording anything.
+        //
+        // Neither delta below has a cache in front of it, so they land on the
+        // `uncached` arm — see `ring::contract_exec_metrics` for why the cached
+        // and uncached WASM totals are separate counters.
         let exec_metrics = self
             .op_manager
             .as_ref()
-            .map(|om| om.ring.contract_exec_metrics_arc());
+            .map(|om| om.ring.contract_exec_metrics());
 
         if let (Some(shared_notifications), Some(shared_summaries)) = (
             self.shared_notifications.as_ref(),
@@ -2860,7 +2870,7 @@ where
                         if delta_computations < super::MAX_DELTA_COMPUTATIONS_PER_FANOUT =>
                     {
                         delta_computations += 1;
-                        if let Some(m) = exec_metrics.as_deref() {
+                        if let Some(m) = exec_metrics {
                             m.record_delta_wasm_uncached();
                         }
                         self.runtime
@@ -3042,7 +3052,7 @@ where
                         if delta_computations < super::MAX_DELTA_COMPUTATIONS_PER_FANOUT =>
                     {
                         delta_computations += 1;
-                        if let Some(m) = exec_metrics.as_deref() {
+                        if let Some(m) = exec_metrics {
                             m.record_delta_wasm_uncached();
                         }
                         self.runtime

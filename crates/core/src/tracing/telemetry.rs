@@ -2770,16 +2770,32 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         snapshot.contract_exec_summarize_fast_hits_last_snapshot,
                     ),
                     (
+                        "contract_exec_summarize_reload_hits_last_snapshot",
+                        snapshot.contract_exec_summarize_reload_hits_last_snapshot,
+                    ),
+                    (
                         "contract_exec_summarize_wasm_calls_last_snapshot",
                         snapshot.contract_exec_summarize_wasm_calls_last_snapshot,
+                    ),
+                    (
+                        "contract_exec_summarize_wasm_uncached_last_snapshot",
+                        snapshot.contract_exec_summarize_wasm_uncached_last_snapshot,
                     ),
                     (
                         "contract_exec_delta_fast_hits_last_snapshot",
                         snapshot.contract_exec_delta_fast_hits_last_snapshot,
                     ),
                     (
+                        "contract_exec_delta_reload_hits_last_snapshot",
+                        snapshot.contract_exec_delta_reload_hits_last_snapshot,
+                    ),
+                    (
                         "contract_exec_delta_wasm_calls_last_snapshot",
                         snapshot.contract_exec_delta_wasm_calls_last_snapshot,
+                    ),
+                    (
+                        "contract_exec_delta_wasm_uncached_last_snapshot",
+                        snapshot.contract_exec_delta_wasm_uncached_last_snapshot,
                     ),
                 ] {
                     obj.insert(name.to_string(), serde_json::json!(value));
@@ -4269,9 +4285,13 @@ mod tests {
         info.contract_exec_delta_wasm_calls_total = Some(107);
         info.contract_exec_delta_wasm_uncached_total = Some(108);
         info.contract_exec_summarize_fast_hits_last_snapshot = Some(109);
-        info.contract_exec_summarize_wasm_calls_last_snapshot = Some(110);
-        info.contract_exec_delta_fast_hits_last_snapshot = Some(111);
-        info.contract_exec_delta_wasm_calls_last_snapshot = Some(112);
+        info.contract_exec_summarize_reload_hits_last_snapshot = Some(110);
+        info.contract_exec_summarize_wasm_calls_last_snapshot = Some(111);
+        info.contract_exec_summarize_wasm_uncached_last_snapshot = Some(112);
+        info.contract_exec_delta_fast_hits_last_snapshot = Some(113);
+        info.contract_exec_delta_reload_hits_last_snapshot = Some(114);
+        info.contract_exec_delta_wasm_calls_last_snapshot = Some(115);
+        info.contract_exec_delta_wasm_uncached_last_snapshot = Some(116);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
             ("contract_exec_summarize_fast_hits_total", 101),
@@ -4283,9 +4303,13 @@ mod tests {
             ("contract_exec_delta_wasm_calls_total", 107),
             ("contract_exec_delta_wasm_uncached_total", 108),
             ("contract_exec_summarize_fast_hits_last_snapshot", 109),
-            ("contract_exec_summarize_wasm_calls_last_snapshot", 110),
-            ("contract_exec_delta_fast_hits_last_snapshot", 111),
-            ("contract_exec_delta_wasm_calls_last_snapshot", 112),
+            ("contract_exec_summarize_reload_hits_last_snapshot", 110),
+            ("contract_exec_summarize_wasm_calls_last_snapshot", 111),
+            ("contract_exec_summarize_wasm_uncached_last_snapshot", 112),
+            ("contract_exec_delta_fast_hits_last_snapshot", 113),
+            ("contract_exec_delta_reload_hits_last_snapshot", 114),
+            ("contract_exec_delta_wasm_calls_last_snapshot", 115),
+            ("contract_exec_delta_wasm_uncached_last_snapshot", 116),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
