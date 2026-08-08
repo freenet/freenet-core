@@ -281,8 +281,192 @@ check "pre-run requeue gap reaches the bounded timeout" \
 check "queued timeout reports queue position and enqueue time" \
   "$(grep -qF 'queue=state=AWAITING_CHECKS, position=2, enqueuedAt=2026-07-31T14:05:00Z' "$PRE_RUN_OUTPUT" && echo present || echo missing)" "present"
 
+# ---------------------------------------------------------------------------
+# #5233: the release must be cut from ONE immutable commit.
+#
+# `publish_crates` and `create_release` used to check out `ref: main` and then
+# `git pull origin main`. Both run AFTER `wait_for_pr`, which blocks ~20 minutes
+# on the merge queue, so any commit that landed on main during that window was
+# silently published and tagged. v0.2.122 shipped an unrelated commit this way.
+# ---------------------------------------------------------------------------
+
+RESOLVE_SCRIPT="$SCRIPT_DIR/resolve_release_sha.sh"
+VERIFY_SCRIPT="$SCRIPT_DIR/verify_release_checkout.sh"
+
+# Job bodies, bounded to the job. An unbounded grep over the whole file would
+# match a neighbouring job and pass vacuously.
+PUBLISH_JOB=$(sed -n '/^  publish_crates:/,/^  create_release:/p' "$RELEASE_YML")
+CREATE_RELEASE_JOB=$(sed -n '/^  create_release:/,/^  summary:/p' "$RELEASE_YML")
+
+check "publish_crates job body was located" \
+  "$([ -n "$PUBLISH_JOB" ] && echo present || echo missing)" "present"
+check "create_release job body was located" \
+  "$([ -n "$CREATE_RELEASE_JOB" ] && echo present || echo missing)" "present"
+
+# The bug itself: no job may resolve a moving reference.
+check "release.yml never checks out 'ref: main'" \
+  "$(grep -qE '^[[:space:]]*ref:[[:space:]]*main[[:space:]]*$' "$RELEASE_YML" && echo moving-ref || echo pinned)" "pinned"
+check "release.yml never re-widens the window with 'git pull origin main'" \
+  "$(grep -qE '^[^#]*git pull origin main' "$RELEASE_YML" && echo pulls || echo no-pull)" "no-pull"
+
+# The pin has to come from somewhere: wait_for_pr resolves it once and exports it.
+# The GitHub expressions below are intentionally matched literally.
+# shellcheck disable=SC2016
+check "wait_for_pr exports the resolved release SHA" \
+  "$(grep -qF 'release_sha: ${{ steps.release_sha.outputs.sha }}' <<< "$WAIT_JOB" && echo present || echo missing)" "present"
+check "wait_for_pr invokes the tested resolver script" \
+  "$(grep -qF 'run: scripts/resolve_release_sha.sh' <<< "$WAIT_JOB" && echo present || echo missing)" "present"
+
+# Both downstream jobs must consume that SHA and re-check it after checkout.
+for job_name in publish_crates create_release; do
+    case "$job_name" in
+      publish_crates) JOB_BODY="$PUBLISH_JOB" ;;
+      create_release) JOB_BODY="$CREATE_RELEASE_JOB" ;;
+    esac
+    # shellcheck disable=SC2016
+    check "$job_name checks out needs.wait_for_pr.outputs.release_sha" \
+      "$(grep -qF 'ref: ${{ needs.wait_for_pr.outputs.release_sha' <<< "$JOB_BODY" && echo pinned || echo missing)" "pinned"
+    check "$job_name verifies the checkout before acting on it" \
+      "$(grep -qF 'scripts/verify_release_checkout.sh' <<< "$JOB_BODY" && echo present || echo missing)" "present"
+    # shellcheck disable=SC2016
+    check "$job_name exports RELEASE_SHA for the verifier" \
+      "$(grep -qF 'RELEASE_SHA: ${{ needs.wait_for_pr.outputs.release_sha' <<< "$JOB_BODY" && echo present || echo missing)" "present"
+done
+
+# create_release can only read the output if wait_for_pr is in its needs.
+check "create_release depends on wait_for_pr so the SHA is in scope" \
+  "$(grep -qE '^    needs: \[validate, wait_for_pr, publish_crates\]$' <<< "$CREATE_RELEASE_JOB" && echo present || echo missing)" "present"
+
+# The notes must describe the commit being released, not whatever main is now.
+# The shell variable reference is intentionally matched literally.
+# shellcheck disable=SC2016
+check "release notes are generated for the pinned commit, not main" \
+  "$(grep -qF 'target_commitish="$RELEASE_SHA"' <<< "$CREATE_RELEASE_JOB" && echo pinned || echo missing)" "pinned"
+
+# --- behavioural: scripts/verify_release_checkout.sh -------------------------
+
+VERIFY_REPO="$TEST_TMP/verify-repo"
+mkdir -p "$VERIFY_REPO"
+(
+  cd "$VERIFY_REPO"
+  git init -q .
+  git -c user.email=t@example.invalid -c user.name=t commit -q --allow-empty -m "release commit"
+) >/dev/null 2>&1
+VERIFY_HEAD=$(cd "$VERIFY_REPO" && git rev-parse HEAD)
+
+run_verify() {
+    local expected_sha="$1" output_file="$2" status
+    set +e
+    ( cd "$VERIFY_REPO" && RELEASE_SHA="$expected_sha" \
+        bash --noprofile --norc "$VERIFY_SCRIPT" ) > "$output_file" 2>&1
+    status=$?
+    set -e
+    echo "$status"
+}
+
+VERIFY_OK_OUTPUT="$TEST_TMP/verify-ok.txt"
+check "verifier accepts a checkout at the pinned commit" \
+  "$(run_verify "$VERIFY_HEAD" "$VERIFY_OK_OUTPUT")" "0"
+
+VERIFY_DRIFT_OUTPUT="$TEST_TMP/verify-drift.txt"
+DRIFT_SHA="0123456789012345678901234567890123456789"
+check "verifier rejects a checkout that drifted off the pinned commit" \
+  "$([ "$(run_verify "$DRIFT_SHA" "$VERIFY_DRIFT_OUTPUT")" -ne 0 ] && echo failed || echo passed)" "failed"
+check "verifier names both SHAs when it rejects" \
+  "$(grep -qF "$DRIFT_SHA" "$VERIFY_DRIFT_OUTPUT" && grep -qF "$VERIFY_HEAD" "$VERIFY_DRIFT_OUTPUT" && echo present || echo missing)" "present"
+
+VERIFY_UNSET_OUTPUT="$TEST_TMP/verify-unset.txt"
+set +e
+( cd "$VERIFY_REPO" && env -u RELEASE_SHA bash --noprofile --norc "$VERIFY_SCRIPT" ) \
+  > "$VERIFY_UNSET_OUTPUT" 2>&1
+VERIFY_UNSET_STATUS=$?
+set -e
+check "verifier fails closed when no pinned SHA was passed" \
+  "$([ "$VERIFY_UNSET_STATUS" -ne 0 ] && echo failed || echo passed)" "failed"
+
+# --- behavioural: scripts/resolve_release_sha.sh -----------------------------
+
+RESOLVE_BIN="$TEST_TMP/resolve-bin"
+mkdir -p "$RESOLVE_BIN"
+cat > "$RESOLVE_BIN/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  *"pr view"*)
+    [ -n "${MOCK_MERGE_SHA:-}" ] || exit 2
+    printf '%s\n' "$MOCK_MERGE_SHA"
+    ;;
+  *compare*)
+    printf '%s' "${MOCK_COMPARE:-}"
+    ;;
+  *)
+    echo "unexpected gh invocation: $*" >&2
+    exit 2
+    ;;
+esac
+EOF
+chmod +x "$RESOLVE_BIN/gh"
+
+MERGED_SHA="1111111111111111111111111111111111111111"
+LAUNCHED_SHA="2222222222222222222222222222222222222222"
+
+run_resolve() {
+    # run_resolve <merge_sha> <compare_body> <output_file> <github_output_file>
+    local merge_sha="$1" compare="$2" output_file="$3" gh_output="$4" status
+    : > "$gh_output"
+    set +e
+    PATH="$RESOLVE_BIN:$PATH" \
+      GITHUB_REPOSITORY="freenet/freenet-core" \
+      PR_NUMBER="5231" \
+      LAUNCH_SHA="$LAUNCHED_SHA" \
+      GITHUB_OUTPUT="$gh_output" \
+      MOCK_MERGE_SHA="$merge_sha" \
+      MOCK_COMPARE="$compare" \
+      bash --noprofile --norc "$RESOLVE_SCRIPT" > "$output_file" 2>&1
+    status=$?
+    set -e
+    echo "$status"
+}
+
+BUMP_ONLY=$'  aaaaaaaaa build: release 0.2.123\n'
+RACED=$'  aaaaaaaaa build: release 0.2.123\n  bbbbbbbbb fix(diagnostics): unrelated change\n  ccccccccc feat: another unrelated change\n'
+
+RESOLVE_OK_OUTPUT="$TEST_TMP/resolve-ok.txt"
+RESOLVE_OK_GH_OUTPUT="$TEST_TMP/resolve-ok.env"
+check "resolver exits zero when the bump PR has a merge commit" \
+  "$(run_resolve "$MERGED_SHA" "$BUMP_ONLY" "$RESOLVE_OK_OUTPUT" "$RESOLVE_OK_GH_OUTPUT")" "0"
+check "resolver exports the merge commit as the release SHA" \
+  "$(grep -qF "sha=$MERGED_SHA" "$RESOLVE_OK_GH_OUTPUT" && echo present || echo missing)" "present"
+check "resolver stays quiet when only the version bump landed" \
+  "$(grep -qF 'main moved during this release' "$RESOLVE_OK_OUTPUT" && echo warned || echo quiet)" "quiet"
+
+RESOLVE_RACE_OUTPUT="$TEST_TMP/resolve-race.txt"
+RESOLVE_RACE_GH_OUTPUT="$TEST_TMP/resolve-race.env"
+check "resolver still succeeds when main moved" \
+  "$(run_resolve "$MERGED_SHA" "$RACED" "$RESOLVE_RACE_OUTPUT" "$RESOLVE_RACE_GH_OUTPUT")" "0"
+check "resolver warns loudly when main moved during the release" \
+  "$(grep -qF '::warning title=main moved during this release' "$RESOLVE_RACE_OUTPUT" && echo warned || echo silent)" "warned"
+check "resolver lists the commits that raced in" \
+  "$(grep -qF 'fix(diagnostics): unrelated change' "$RESOLVE_RACE_OUTPUT" && echo listed || echo hidden)" "listed"
+check "resolver still pins a single SHA when main moved" \
+  "$(grep -qF "sha=$MERGED_SHA" "$RESOLVE_RACE_GH_OUTPUT" && echo present || echo missing)" "present"
+
+# Failing closed is the whole point: a release must never silently fall back to
+# a moving reference because the merge commit could not be read.
+RESOLVE_FAIL_OUTPUT="$TEST_TMP/resolve-fail.txt"
+RESOLVE_FAIL_GH_OUTPUT="$TEST_TMP/resolve-fail.env"
+check "resolver fails when the merge commit cannot be resolved" \
+  "$([ "$(run_resolve "" "$BUMP_ONLY" "$RESOLVE_FAIL_OUTPUT" "$RESOLVE_FAIL_GH_OUTPUT")" -ne 0 ] && echo failed || echo passed)" "failed"
+check "resolver exports no SHA when it cannot resolve one" \
+  "$(grep -qF 'sha=' "$RESOLVE_FAIL_GH_OUTPUT" && echo leaked || echo empty)" "empty"
+
+RESOLVE_JUNK_OUTPUT="$TEST_TMP/resolve-junk.txt"
+RESOLVE_JUNK_GH_OUTPUT="$TEST_TMP/resolve-junk.env"
+check "resolver rejects a non-SHA merge commit rather than checking it out" \
+  "$([ "$(run_resolve "main" "$BUMP_ONLY" "$RESOLVE_JUNK_OUTPUT" "$RESOLVE_JUNK_GH_OUTPUT")" -ne 0 ] && echo failed || echo passed)" "failed"
+
 if [ "$FAILURES" -eq 0 ]; then
-    echo "PASS: release.yml is merge-queue-compatible and reports failed merge-group CI."
+    echo "PASS: release.yml is merge-queue-compatible, reports failed merge-group CI, and is pinned to one validated commit."
 else
     echo "$FAILURES check(s) failed" >&2
     exit 1
