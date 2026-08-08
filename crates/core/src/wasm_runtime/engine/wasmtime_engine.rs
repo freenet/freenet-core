@@ -2872,6 +2872,34 @@ mod tests {
         }
     }
 
+    /// Source pin (#4213 / #5023): `create_instance` MUST allocate its instance
+    /// id from the one process-global allocator.
+    ///
+    /// The type system stops a CALLER passing an id, but nothing stops this
+    /// method itself from reverting to a per-engine counter, which is exactly
+    /// the shape that made ids collide across engines in one process. The
+    /// bounded-region scrape follows the `fn_body` convention used by
+    /// `create_instance_recovers_store_on_guest_entry_failure` below.
+    #[test]
+    fn create_instance_allocates_its_own_instance_id() {
+        let src = include_str!("wasmtime_engine.rs");
+        let start = src
+            .find("    fn create_instance(")
+            .expect("create_instance not found");
+        let body = &src[start..];
+        let end = body[1..]
+            .find("\n    fn ")
+            .expect("create_instance body must end at the next method");
+        let body = &body[..end];
+        assert!(
+            body.contains("native_api::next_instance_id()"),
+            "create_instance must draw its instance id from \
+             native_api::next_instance_id(); a per-engine counter lets two \
+             engines in one process issue the same id, and drop_instance then \
+             evicts the other engine's live MEM_ADDR entry (#4213 / #5023)"
+        );
+    }
+
     /// #4864 round-9 item 2 pin: `create_instance` MUST recover the store on a
     /// guest-entry (instantiate / `__frnt_set_id`) failure. Without it, a timeout
     /// that returns before `instances.insert` / `lifetime_instances += 1` leaves
@@ -3631,10 +3659,12 @@ mod tests {
     /// `test_store_and_retrieve_secret`, `error_code: -1` from
     /// `test_v2_delegate_update_existing_state`.
     ///
-    /// Ids now come from `native_api::next_instance_id`, so a collision is
-    /// unrepresentable. This test pins the property that makes it so: two live
-    /// engines are never issued the same id, and B's churn leaves A's entry
-    /// intact.
+    /// Ids now come from `native_api::next_instance_id`, which makes a
+    /// caller-supplied id a compile error rather than something a test can
+    /// catch. What this test pins is the one property still expressible at
+    /// runtime, and the one a future change could quietly break: the allocator
+    /// is process-global, not per-engine. Two live engines are never issued the
+    /// same id, so B's churn leaves A's entry intact.
     #[test]
     fn instance_ids_are_globally_unique_across_engines() {
         use crate::wasm_runtime::runtime::{InstanceInfo, Key};
