@@ -870,10 +870,45 @@ async fn run_network_node_with_signals(
                         }
                     }
                 } else {
-                    tracing::debug!(
-                        "Periodic re-poll: skipped — auto-update locked out after repeated \
+                    // Once per process, not once per 6h tick: the lockout
+                    // persists until an operator acts, so this is a state to
+                    // announce on each boot rather than a recurring alarm.
+                    // Mirrors the existing `LOCKOUT_WARNED` pattern in
+                    // `check_if_update_available`.
+                    static LOCKOUT_REPORTED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !LOCKOUT_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        // The second state where the update machinery is silently
+                        // OFF (#5244). This was `debug!`, which release builds
+                        // compile out entirely (`release_max_level_info`), and the
+                        // loud once-per-process warning in `check_if_update_available`
+                        // is only reachable from the PEER-signal triggers — so on a
+                        // node whose peers all share its version, nothing said this
+                        // node would never update again.
+                        //
+                        // Once per process, mirroring that existing `LOCKOUT_WARNED`
+                        // pattern: the condition is permanent until an operator
+                        // acts, so repeating it every 6h forever is noise, and one
+                        // line per restart is enough to find it.
+                        // Names the file as well as the command: the lockout can
+                        // also be reached with the counter UNREADABLE, and in that
+                        // state `freenet update` cannot clear it (the removal is
+                        // best-effort and fails the same way the read did), so
+                        // "run freenet update" alone would be advice that does not
+                        // work. `--force` bypasses the gate for a one-off recovery.
+                        eprintln!(
+                            "Freenet: auto-update is LOCKED OUT on this node (repeated failed \
+                         installs, #3934, or an unreadable failure counter). It will not detect \
+                         or apply any further release until this is cleared: run `freenet \
+                         update` manually, or delete `update_failures` in the Freenet state \
+                         directory (~/.local/state/freenet on Linux). `freenet update --force` \
+                         bypasses the gate for a single run."
+                        );
+                        tracing::warn!(
+                            "Periodic re-poll: skipped — auto-update locked out after repeated \
                          failed installs (#3934); run `freenet update` to recover"
-                    );
+                        );
+                    }
                 }
             }
         }
@@ -1188,7 +1223,17 @@ fn freenet_main() -> anyhow::Result<()> {
                 config_paths,
             )
         }
-        Some(Command::Update(cmd)) => cmd.run(build_info::VERSION),
+        Some(Command::Update(cmd)) => {
+            // #5244: this process previously ran with NO subscriber installed —
+            // `set_logger` is called only on the node path — so every
+            // `tracing::warn!`/`error!` in the installer was a no-op. That is
+            // the process the supervisor runs from `ExecStopPost` to drive
+            // crash-loop rollback, so its warnings are exactly the ones an
+            // operator needs. WARN (not INFO) because this runs on every
+            // non-clean stop of a crash-looping node.
+            freenet::config::set_cli_logger(tracing::level_filters::LevelFilter::WARN);
+            cmd.run(build_info::VERSION)
+        }
         Some(Command::Uninstall(cmd)) => cmd.run(),
         Some(Command::Secrets(cfg)) => {
             // CLI utility; uses simple current-thread runtime (no
