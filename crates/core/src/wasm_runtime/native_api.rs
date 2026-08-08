@@ -297,8 +297,15 @@ pub(super) type InstanceId = i64;
 /// alive at the same time (two simulated nodes, two pooled executors, or two
 /// tests running in parallel in one test binary) must never be issued the same
 /// id. Every id therefore comes from this one counter, handed out by
-/// [`next_instance_id`] inside `WasmEngine::create_instance` and returned to
-/// the caller in the `InstanceHandle`; no caller can supply an id of its own.
+/// [`next_instance_id`] inside `WasmEngine::create_instance` and returned in
+/// the `InstanceHandle`, so no CALLER of `create_instance` can pick an id.
+///
+/// Scope, stated precisely: this closes the `create_instance` surface only. The
+/// WASM ABI is a separate id surface that this does NOT validate: four host
+/// functions (`__frnt__logger__info`, `__frnt__rand__rand_bytes`,
+/// `__frnt__time__utc_now`, `__frnt__fill_buffer`) take an instance id as a
+/// guest-supplied parameter and look it up in these same maps. Do not read the
+/// paragraph above as "every id reaching these maps was issued here".
 ///
 /// Regression this shape prevents (#4213 / #5023): `create_instance` used to
 /// take a caller-supplied id, and the engine unit tests passed hand-picked ones
@@ -308,6 +315,11 @@ pub(super) type InstanceId = i64;
 /// same id here, and every host function on the victim instance began returning
 /// `ERR_NOT_IN_PROCESS`, surfacing as `SecretResult(None)` from a delegate
 /// secret read, or `error_code: -1` from a delegate contract call.
+///
+/// That needs the two tests to share a process, so it bites `cargo test`
+/// (one process per test binary), which is what AGENTS.md tells contributors
+/// to run and what both issues reported. CI runs `cargo nextest`, which gives
+/// each test its own process, so CI was never affected.
 static NEXT_INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
 
 /// Issue the next process-globally unique [`InstanceId`].
