@@ -111,6 +111,40 @@ pub struct RingStatsSnapshot {
     pub lattice_probe_improvements: u64,
 }
 
+/// Scalar-only view for the OTel metrics callbacks.
+///
+/// Deliberately NOT [`get_snapshot`]: that builds per-peer and per-contract
+/// vectors and formats failure HTML, and the SDK has no batch-callback API in
+/// 0.32 — every observable instrument gets its own callback, so the exporter
+/// would pay that cost once per instrument per collection cycle.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OtelMetricsSnapshot {
+    pub connection_attempts: u32,
+    pub ring: RingStatsSnapshot,
+    pub fair_queue: crate::contract::FairQueueStats,
+}
+
+/// Read the scalars the OTel exporter observes, or `None` before the node has
+/// registered its status (metrics simply report nothing until then).
+///
+/// Every unavailable source yields `None` for the whole snapshot rather than a
+/// default: an observable instrument that skips a collection cycle exports
+/// nothing, which reads as "not known yet", while a zero is a real datapoint —
+/// `freenet.ring.connections = 0` before the ring provider registers is
+/// indistinguishable from a node that has lost every connection.
+pub(crate) fn otel_metrics_snapshot() -> Option<OtelMetricsSnapshot> {
+    let connection_attempts = NETWORK_STATUS.get()?.read().ok()?.connection_attempts;
+    let ring = RING_STATS_PROVIDER
+        .read()
+        .as_ref()
+        .map(|provider| provider())?;
+    Some(OtelMetricsSnapshot {
+        connection_attempts,
+        ring,
+        fair_queue: crate::contract::fair_queue_stats(),
+    })
+}
+
 static GOVERNANCE_PROVIDER: parking_lot::RwLock<Option<GovernanceProvider>> =
     parking_lot::RwLock::new(None);
 
@@ -826,6 +860,15 @@ pub fn record_peer_disconnected(addr: SocketAddr) {
 /// Audit: `grep -rn "record_op_result" crates/core/src/operations/`
 /// must show coverage for every op type with a driver.
 pub fn record_op_result(op_type: OpType, success: bool) {
+    crate::tracing::otel::record_op_result(
+        match op_type {
+            OpType::Get => "get",
+            OpType::Put => "put",
+            OpType::Update => "update",
+            OpType::Subscribe => "subscribe",
+        },
+        success,
+    );
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
             let counter = match op_type {
