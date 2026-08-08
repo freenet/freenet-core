@@ -90,10 +90,15 @@ const COMMIT_POLL_DEADLINE: Duration = Duration::from_secs(COMMIT_HEALTHY_UPTIME
 const NODE_READY_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Substring of the line `commit_probation` announces on the `Committed` branch
-/// only. Pinned against a reword by
-/// `rollback.rs::tests::both_marker_clearing_outcomes_are_announced`, which
-/// fails in microseconds rather than after this test's 60s window.
-const COMMITTED_STDERR_NEEDLE: &str = "post-update probation passed";
+/// ONLY.
+///
+/// Deliberately not the leading "post-update probation passed" phrase: the
+/// ClearFailed branch — marker could not be removed, so rollback is still armed
+/// — needs to say the version ran healthily too, and a needle both lines shared
+/// would let this test report a commit while rollback was live.
+/// `rollback.rs::tests::a_failed_clear_is_never_announced_as_a_pass` pins the
+/// two apart in microseconds, rather than after this test's 60s window.
+const COMMITTED_STDERR_NEEDLE: &str = "committed, auto-rollback disarmed";
 
 /// Substring of the line `freenet update` prints when it counts a crash against
 /// an armed probation marker. Asserted PRESENT by the in-window test and ABSENT
