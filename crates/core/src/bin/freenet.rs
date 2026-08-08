@@ -1472,9 +1472,22 @@ mod tests {
     /// region would widen to the whole file and the pin would pass vacuously.
     /// Refuse instead. (Same fail-closed reasoning as `commands::auto_update`'s
     /// `fn_body`; see `.claude/rules/bug-prevention-patterns.md`.)
+    ///
+    /// Uniqueness is asserted rather than taking the first match: a second
+    /// `#[cfg(test)] mod` added ABOVE this one would truncate the region early
+    /// and hide any production code below it — fail-OPEN in exactly the
+    /// direction a bounded region exists to protect.
     fn production_region(src: &str) -> &str {
+        let anchor = "\n#[cfg(test)]\nmod ";
+        assert_eq!(
+            src.matches(anchor).count(),
+            1,
+            "expected exactly one `#[cfg(test)] mod` in this file — the region this \
+             pin counts over is bounded by it, and an earlier one would truncate \
+             the region and hide production code"
+        );
         let tests_at = src
-            .find("\n#[cfg(test)]\nmod ")
+            .find(anchor)
             .expect("test module not located — this pin cannot bound anything");
         &src[..tests_at]
     }
@@ -1528,32 +1541,37 @@ mod tests {
     /// `run_network_node_with_signals`, which also calls `shutdown_handle
     /// .shutdown()` but is NOT an operator stop (it must keep exiting 42).
     ///
-    /// So: exactly one store in production code, inside the signal-handler task.
+    /// So: exactly one way to raise the flag, in the signal-handler task, only
+    /// after a signal has actually arrived — and `finish_run` must be fed the
+    /// flag rather than a constant.
     #[test]
     fn shutdown_requested_is_stored_only_by_the_signal_handler() {
         let src = strip_line_comments(include_str!("freenet.rs"));
         let prod = production_region(&src);
-        let signal_task = braced_block(prod, "let signal_task = {");
+        let flat = squeeze(prod);
+        let signal_task = squeeze(braced_block(prod, "let signal_task = {"));
 
         // Anti-vacuity: if brace matching ran past the block, these markers from
         // later in `run_network_node_with_signals` would be inside it, and the
         // containment assertion below would prove nothing.
         for escaped in ["run_network_node(", "UpdateNeededError", "finish_run("] {
             assert!(
-                !signal_task.contains(escaped),
+                !signal_task.contains(&squeeze(escaped)),
                 "the scoped signal-task block escaped its braces (found `{escaped}`) — \
                  this pin would pass vacuously"
             );
         }
-        // Anti-vacuity, other direction: confirm we scoped the right block.
-        assert!(
-            squeeze(signal_task).contains(&squeeze("shutdown_handle.shutdown().await")),
-            "scoped block is not the signal-handler task"
-        );
+        // Anti-vacuity, other direction: confirm we scoped the right block. The
+        // marker must be one the TEMPTING block does not share — awaiting a
+        // signal is unique to this task, whereas `shutdown_handle.shutdown()`
+        // appears in the auto-update arm too and so would not discriminate.
+        let awaits_a_signal = signal_task
+            .rfind(&squeeze("ctrl_c()"))
+            .expect("scoped block is not the signal-handler task: it awaits no signal");
 
         let needle = squeeze("shutdown_requested.store(");
         assert_eq!(
-            squeeze(prod).matches(&needle).count(),
+            flat.matches(&needle).count(),
             1,
             "production code must set `shutdown_requested` in exactly ONE place. A \
              second store — most temptingly in the auto-update arm, which also calls \
@@ -1561,11 +1579,56 @@ mod tests {
              clean exit 0, so the service manager skips its self-heal and the node \
              stays dead (#5230)"
         );
+        let store_at = signal_task.find(&needle).unwrap_or_else(|| {
+            panic!(
+                "the one store must live in the signal-handler task, which is the \
+                 only place that knows an operator (SIGTERM/SIGINT) asked us to \
+                 stop (#5230)"
+            )
+        });
+        // Location alone is not the invariant: a store hoisted ABOVE the signal
+        // await would still sit inside this block, yet would raise the flag
+        // unconditionally at startup and launder EVERY fault into a clean exit 0.
+        assert!(
+            store_at > awaits_a_signal,
+            "the store must come AFTER the signal await, not before it — a hoisted \
+             store raises the flag at startup, so every fault exits 0 (#5230)"
+        );
+
+        // The needle above pins one spelling. These are the other ways to raise an
+        // `AtomicBool`, or to obtain a second handle to raise it through, each of
+        // which reopens the same hole while leaving the count at 1.
+        for alias in [
+            "shutdown_requested.swap(",
+            "shutdown_requested.fetch_or(",
+            "shutdown_requested.fetch_and(",
+            "shutdown_requested.compare_exchange",
+            "shutdown_requested.clone()",
+            "AtomicBool::store(",
+        ] {
+            assert!(
+                !flat.contains(&squeeze(alias)),
+                "`{alias}` is another way to raise `shutdown_requested` that the \
+                 single-store count above cannot see — route every request through \
+                 the one signal-handler store instead (#5230)"
+            );
+        }
         assert_eq!(
-            squeeze(signal_task).matches(&needle).count(),
+            flat.matches(&squeeze("Arc::clone(&shutdown_requested)"))
+                .count(),
             1,
-            "the one store must live in the signal-handler task, which is the only \
-             place that knows an operator (SIGTERM/SIGINT) asked us to stop (#5230)"
+            "only the signal-handler task may hold a second handle to the flag; \
+             another clone is a store site the count above cannot attribute (#5230)"
+        );
+
+        // The write site is only half of it. `finish_run` must be fed the FLAG: a
+        // constant `true` reopens the identical hole, and every other test in the
+        // repo either takes the bool as a parameter or drives it with a real
+        // signal, so none of them would notice.
+        assert!(
+            flat.contains(&squeeze("finish_run(result, shutdown_requested.load(")),
+            "`finish_run` must receive the live `shutdown_requested` flag — a \
+             constant would make every fault exit 0 (#5230)"
         );
     }
 
