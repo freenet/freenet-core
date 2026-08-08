@@ -468,6 +468,11 @@ pub fn build_transfer_card(snap: &Option<network_status::NetworkStatusSnapshot>)
     format!(
         r#"<div class="card">
             <h2>Data Transfer</h2>
+            <section class="chart-section bw-section" data-bandwidth-chart data-bytes-uploaded="{uploaded_raw}" data-bytes-downloaded="{downloaded_raw}" data-node-uptime-secs="{uptime_secs}">
+                <h3>Freenet payload rate</h3>
+                <p class="bw-note">Upload counts UDP payload bytes; download counts authenticated UDP payload bytes. Network headers are excluded.</p>
+                <div class="bw-chart-content"><p class="empty bw-collecting">Collecting bandwidth samples…</p></div>
+            </section>
             <div class="transfer-stat">
                 <span class="transfer-label">Uploaded</span>
                 <span class="transfer-value">{uploaded}{peak_tput}</span>
@@ -481,6 +486,9 @@ pub fn build_transfer_card(snap: &Option<network_status::NetworkStatusSnapshot>)
             {cwnd_str}
             {slowdown_str}
         </div>"#,
+        uploaded_raw = snap.bytes_uploaded,
+        downloaded_raw = snap.bytes_downloaded,
+        uptime_secs = snap.elapsed_secs,
         uploaded = format_bytes(snap.bytes_uploaded),
         peak_tput = peak_tput,
         downloaded = format_bytes(snap.bytes_downloaded),
