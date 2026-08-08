@@ -89,7 +89,7 @@ jobs:
             # Skip if file was deleted.
             [[ -f "$f" ]] || continue
 
-            # Look for the bad pattern: `GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}`
+            # Look for the bad pattern: `GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}` # coalesce-exempt: prose describing the pattern, not a real usage
             # or `token: ${{ github.token }}` near an event-emitting verb.
             # We're permissive: any new occurrence of bare GITHUB_TOKEN in a
             # workflow file is flagged for review. Suppress via inline comment

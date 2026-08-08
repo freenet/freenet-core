@@ -37,6 +37,12 @@ LAUNCH_SHA="${LAUNCH_SHA:-}"
 # after a merge-queue merge.
 ATTEMPTS="${RESOLVE_ATTEMPTS:-6}"
 RETRY_INTERVAL="${RESOLVE_RETRY_INTERVAL:-10}"
+# A zero or non-numeric budget would run the loop zero times and then blame the
+# PR for what is really a configuration error.
+if [[ ! "$ATTEMPTS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "::error title=Bad resolver configuration::RESOLVE_ATTEMPTS must be a positive integer, got '$ATTEMPTS'."
+    exit 1
+fi
 
 MERGE_SHA=""
 GH_UNREACHABLE=false
@@ -80,16 +86,26 @@ if [ -z "$LAUNCH_SHA" ] || [ "$LAUNCH_SHA" = "$MERGE_SHA" ]; then
     exit 0
 fi
 
-RANGE=$(gh api "repos/$REPOSITORY/compare/$LAUNCH_SHA...$MERGE_SHA" \
-  --jq '.commits[] | "  \(.sha[0:9]) \(.commit.message | split("\n")[0])"' 2>/dev/null || true)
+if ! RANGE=$(gh api "repos/$REPOSITORY/compare/$LAUNCH_SHA...$MERGE_SHA" \
+    --jq '.commits[] | "  \(.sha[0:9]) \(.commit.message | split("\n")[0])"' 2>/dev/null); then
+    # Never claim "main did not move" on the strength of a call that failed.
+    # #5233's complaint was that the divergence was silent; a FALSE all-clear is
+    # worse, because it terminates the investigation.
+    echo "::warning title=Could not check whether main moved::The compare API call failed, so it is unknown whether commits other than the version bump are in this release. The release is still pinned to $MERGE_SHA."
+    exit 0
+fi
 
-# The version-bump commit itself is expected; anything beyond it is a commit
-# that won the race with the merge queue during `wait_for_pr`.
-EXTRA_COUNT=$(printf '%s' "$RANGE" | grep -c . || true)
-if [ "${EXTRA_COUNT:-0}" -le 1 ]; then
+# The version-bump commit itself is expected; anything beyond it won the race
+# with the merge queue while `wait_for_pr` was blocked.
+COMMIT_COUNT=$(printf '%s' "$RANGE" | grep -c . || true)
+COMMIT_COUNT=${COMMIT_COUNT:-0}
+if [ "$COMMIT_COUNT" -le 1 ]; then
     echo "✅ main did not move during this release: the version bump is the only new commit."
     exit 0
 fi
 
-echo "::warning title=main moved during this release::${EXTRA_COUNT} commits landed between the launch commit ($LAUNCH_SHA) and the release commit ($MERGE_SHA), so this release contains more than the version bump. The release is still cut from ONE validated commit; this is a scope notice, not a correctness failure."
+# Report the number of UNINTENDED commits, not the total. The bump is not an
+# extra, and an operator reading "3 commits" would count three surprises.
+EXTRA_COUNT=$((COMMIT_COUNT - 1))
+echo "::warning title=main moved during this release::${EXTRA_COUNT} commit(s) landed on main between the launch commit ($LAUNCH_SHA) and the release commit ($MERGE_SHA) in ADDITION to the version bump, so this release contains more than was intended. The release is still cut from ONE validated commit; this is a scope notice, not a correctness failure. Full range:"
 printf '%s\n' "$RANGE"

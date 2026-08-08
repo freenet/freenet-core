@@ -27,8 +27,18 @@ set -euo pipefail
 
 RELEASE_SHA="${RELEASE_SHA:?RELEASE_SHA is required}"
 EXPECTED_VERSION="${EXPECTED_VERSION:?EXPECTED_VERSION is required}"
+# Empty exactly when `wait_for_pr` produced no SHA and the job fell back to the
+# launch commit. Reported separately so the failure names the real cause
+# instead of blaming the tree for a version mismatch it was always going to
+# have. Unset (rather than empty) means "not wired up", which is not an error.
+RELEASE_SHA_RESOLVED="${RELEASE_SHA_RESOLVED-unset}"
 # Overridable so the tests can point at a fixture manifest.
 MANIFEST="${MANIFEST:-crates/core/Cargo.toml}"
+
+if [ -z "$RELEASE_SHA_RESOLVED" ]; then
+    echo "::error title=No validated release commit::wait_for_pr did not resolve a release commit, so this job fell back to the launch commit $RELEASE_SHA. That commit predates the version bump, so it is not the release. Fix whatever made wait_for_pr fail and re-run (#5233)."
+    exit 1
+fi
 
 ACTUAL_SHA=$(git rev-parse HEAD)
 
@@ -42,7 +52,11 @@ if [ ! -f "$MANIFEST" ]; then
     exit 1
 fi
 
-ACTUAL_VERSION=$(grep -m1 -E '^version = "' "$MANIFEST" | cut -d'"' -f2)
+# Split the grep from the cut: under `pipefail` a no-match grep would abort
+# the script HERE, killing it before the message below that explains what is
+# wrong — turning a legible failure into a blank step.
+VERSION_LINE=$(grep -m1 -E '^version = "' "$MANIFEST" || true)
+ACTUAL_VERSION=$(printf '%s' "$VERSION_LINE" | cut -d'"' -f2)
 
 if [ "$ACTUAL_VERSION" != "$EXPECTED_VERSION" ]; then
     echo "::error title=Release checkout is the wrong tree::Commit $ACTUAL_SHA declares version '$ACTUAL_VERSION' in $MANIFEST, but this release is $EXPECTED_VERSION. The checkout is not the version-bump commit — publishing or tagging it would ship a crate whose version disagrees with the tag (#5233)."

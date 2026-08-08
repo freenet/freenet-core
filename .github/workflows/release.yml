@@ -266,6 +266,9 @@ jobs:
       # Resolved independently of RELEASE_SHA, so the verifier has an oracle
       # that does not just restate the value that drove the checkout.
       EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
+      # Empty exactly when the `|| github.sha` fallback above engaged, so the
+      # verifier can name that cause instead of reporting a version mismatch.
+      RELEASE_SHA_RESOLVED: ${{ needs.wait_for_pr.outputs.release_sha }}
 
     steps:
       - name: Checkout the validated release commit
@@ -331,6 +334,9 @@ jobs:
       # Resolved independently of RELEASE_SHA, so the verifier has an oracle
       # that does not just restate the value that drove the checkout.
       EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
+      # Empty exactly when the `|| github.sha` fallback above engaged, so the
+      # verifier can name that cause instead of reporting a version mismatch.
+      RELEASE_SHA_RESOLVED: ${{ needs.wait_for_pr.outputs.release_sha }}
 
     steps:
       - name: Checkout the validated release commit

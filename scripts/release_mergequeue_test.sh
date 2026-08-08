@@ -310,40 +310,79 @@ check "publish_crates range is bounded by the next job" \
   "$([ "$(tail -n1 <<< "$PUBLISH_JOB")" = "  create_release:" ] && echo bounded || echo ran-to-eof)" "bounded"
 check "create_release range is bounded by the next job" \
   "$([ "$(tail -n1 <<< "$CREATE_RELEASE_JOB")" = "  summary:" ] && echo bounded || echo ran-to-eof)" "bounded"
+# WAIT_JOB is extracted by the pre-existing merge-queue checks above and needs
+# the same guard: renaming publish_crates silently widens it to EOF, after
+# which every wait_for_pr pin starts matching text from other jobs.
+check "wait_for_pr range is bounded by the next job" \
+  "$([ "$(tail -n1 <<< "$WAIT_JOB")" = "  publish_crates:" ] && echo bounded || echo ran-to-eof)" "bounded"
 
 # The bug itself: no job may resolve a moving reference.
-check "release.yml never checks out 'ref: main'" \
-  "$(grep -qE '^[[:space:]]*ref:[[:space:]]*main[[:space:]]*$' "$RELEASE_YML" && echo moving-ref || echo pinned)" "pinned"
-check "release.yml never re-widens the window with 'git pull origin main'" \
-  "$(grep -qE '^[^#]*git pull origin main' "$RELEASE_YML" && echo pulls || echo no-pull)" "no-pull"
+#
+# Every needle below is matched against EXECUTABLE lines (`^[^#]*`) or in a
+# whole-line anchored form. A bare `grep -qF` substring would be satisfied by
+# `# TODO: re-enable <the thing>`, so commenting a guard out would keep this
+# suite green — which is exactly the regression these pins exist to catch.
+check "release.yml never checks out a moving 'main' reference" \
+  "$(grep -qE "^[[:space:]]*ref:[[:space:]]*['\"]?(main|refs/heads/main)['\"]?[[:space:]]*(#.*)?$" "$RELEASE_YML" && echo moving-ref || echo pinned)" "pinned"
+
+# `git pull origin main` was the original second half of the bug, but ANY
+# shell-level re-pointing of the checkout reopens the same window — and does so
+# where the runtime verifier, which has already run, cannot see it.
+for moving_cmd in \
+    'git pull[[:space:]]' \
+    'git checkout[[:space:]]+(-[^[:space:]]+[[:space:]]+)*main' \
+    'git reset[[:space:]]+--hard' \
+    'git merge[[:space:]]+origin/main'; do
+    check "release.yml never re-points the checkout with '$moving_cmd'" \
+      "$(grep -qE "^[^#]*${moving_cmd}" "$RELEASE_YML" && echo moves || echo pinned)" "pinned"
+done
 
 # The pin has to come from somewhere: wait_for_pr resolves it once and exports it.
 # The GitHub expressions below are intentionally matched literally.
 # shellcheck disable=SC2016
 check "wait_for_pr exports the resolved release SHA" \
-  "$(grep -qF 'release_sha: ${{ steps.release_sha.outputs.sha }}' <<< "$WAIT_JOB" && echo present || echo missing)" "present"
+  "$(grep -qE '^[[:space:]]*release_sha: \$\{\{ steps\.release_sha\.outputs\.sha \}\}[[:space:]]*$' <<< "$WAIT_JOB" && echo present || echo missing)" "present"
 check "wait_for_pr invokes the tested resolver script" \
-  "$(grep -qF 'run: scripts/resolve_release_sha.sh' <<< "$WAIT_JOB" && echo present || echo missing)" "present"
+  "$(grep -qE '^[[:space:]]*run: (bash )?scripts/resolve_release_sha\.sh[[:space:]]*$' <<< "$WAIT_JOB" && echo present || echo missing)" "present"
 
 # Both downstream jobs must consume that SHA and re-check it after checkout.
+# The irreversible act each job must never reach unverified. The regex needles
+# below are intentionally literal shell text, not expansions.
+# shellcheck disable=SC2016
 for job_name in publish_crates create_release; do
     case "$job_name" in
-      publish_crates) JOB_BODY="$PUBLISH_JOB" ;;
-      create_release) JOB_BODY="$CREATE_RELEASE_JOB" ;;
+      publish_crates) JOB_BODY="$PUBLISH_JOB"; IRREVERSIBLE='cargo publish' ;;
+      create_release) JOB_BODY="$CREATE_RELEASE_JOB"; IRREVERSIBLE='git push origin "v\$VERSION"' ;;
     esac
-    # shellcheck disable=SC2016
+
     check "$job_name checks out needs.wait_for_pr.outputs.release_sha" \
-      "$(grep -qF 'ref: ${{ needs.wait_for_pr.outputs.release_sha' <<< "$JOB_BODY" && echo pinned || echo missing)" "pinned"
-    check "$job_name verifies the checkout before acting on it" \
-      "$(grep -qF 'scripts/verify_release_checkout.sh' <<< "$JOB_BODY" && echo present || echo missing)" "present"
-    # shellcheck disable=SC2016
+      "$(grep -qE '^[[:space:]]*ref: \$\{\{ needs\.wait_for_pr\.outputs\.release_sha' <<< "$JOB_BODY" && echo pinned || echo missing)" "pinned"
+    check "$job_name verifies the checkout" \
+      "$(grep -qE '^[[:space:]]*run: (bash )?scripts/verify_release_checkout\.sh[[:space:]]*$' <<< "$JOB_BODY" && echo present || echo missing)" "present"
     check "$job_name exports RELEASE_SHA for the verifier" \
-      "$(grep -qF 'RELEASE_SHA: ${{ needs.wait_for_pr.outputs.release_sha' <<< "$JOB_BODY" && echo present || echo missing)" "present"
+      "$(grep -qE '^[[:space:]]*RELEASE_SHA: \$\{\{ needs\.wait_for_pr\.outputs\.release_sha' <<< "$JOB_BODY" && echo present || echo missing)" "present"
     # Without this the verifier degenerates to comparing the checkout ref
     # against itself, which cannot fail.
-    # shellcheck disable=SC2016
     check "$job_name gives the verifier an independent version oracle" \
-      "$(grep -qF 'EXPECTED_VERSION: ${{ needs.validate.outputs.version }}' <<< "$JOB_BODY" && echo present || echo missing)" "present"
+      "$(grep -qE '^[[:space:]]*EXPECTED_VERSION: \$\{\{ needs\.validate\.outputs\.version \}\}[[:space:]]*$' <<< "$JOB_BODY" && echo present || echo missing)" "present"
+    # Lets the verifier distinguish the `|| github.sha` fallback from a
+    # genuinely wrong tree.
+    check "$job_name tells the verifier whether a SHA was actually resolved" \
+      "$(grep -qE '^[[:space:]]*RELEASE_SHA_RESOLVED: \$\{\{ needs\.wait_for_pr\.outputs\.release_sha \}\}[[:space:]]*$' <<< "$JOB_BODY" && echo present || echo missing)" "present"
+
+    # Presence is not enough. A guard placed AFTER the publish or the tag push
+    # verifies nothing — the irreversible act has already happened — so assert
+    # ORDER. Line numbers are relative to the extracted job body.
+    VERIFY_LINE=$(grep -nE '^[[:space:]]*run: (bash )?scripts/verify_release_checkout\.sh[[:space:]]*$' <<< "$JOB_BODY" | head -1 | cut -d: -f1)
+    CHECKOUT_LINE=$(grep -nE '^[[:space:]]*ref: \$\{\{ needs\.wait_for_pr\.outputs\.release_sha' <<< "$JOB_BODY" | head -1 | cut -d: -f1)
+    IRREVERSIBLE_LINE=$(grep -nE "^[^#]*${IRREVERSIBLE}" <<< "$JOB_BODY" | head -1 | cut -d: -f1)
+
+    check "$job_name's irreversible step was located" \
+      "$([ -n "$IRREVERSIBLE_LINE" ] && echo found || echo missing)" "found"
+    check "$job_name verifies BEFORE its irreversible step, not after" \
+      "$([ -n "$VERIFY_LINE" ] && [ -n "$IRREVERSIBLE_LINE" ] && [ "$VERIFY_LINE" -lt "$IRREVERSIBLE_LINE" ] && echo before || echo after)" "before"
+    check "$job_name verifies AFTER the checkout, not before" \
+      "$([ -n "$VERIFY_LINE" ] && [ -n "$CHECKOUT_LINE" ] && [ "$VERIFY_LINE" -gt "$CHECKOUT_LINE" ] && echo after || echo before)" "after"
 done
 
 # create_release can only read the output if wait_for_pr is in its needs.
@@ -353,8 +392,10 @@ check "create_release depends on wait_for_pr so the SHA is in scope" \
 # The notes must describe the commit being released, not whatever main is now.
 # The shell variable reference is intentionally matched literally.
 # shellcheck disable=SC2016
-check "release notes are generated for the pinned commit, not main" \
-  "$(grep -qF 'target_commitish="$RELEASE_SHA"' <<< "$CREATE_RELEASE_JOB" && echo pinned || echo missing)" "pinned"
+check "release notes are generated for the pinned commit" \
+  "$(grep -qE '^[^#]*-f target_commitish="\$RELEASE_SHA"' <<< "$CREATE_RELEASE_JOB" && echo pinned || echo missing)" "pinned"
+check "release notes never fall back to target_commitish=main" \
+  "$(grep -qE '^[^#]*-f target_commitish=main' <<< "$CREATE_RELEASE_JOB" && echo moving || echo pinned)" "pinned"
 
 # --- behavioural: scripts/verify_release_checkout.sh -------------------------
 
@@ -375,6 +416,7 @@ run_verify() {
     local expected_sha="$1" expected_version="$2" output_file="$3" status
     set +e
     ( cd "$VERIFY_REPO" && RELEASE_SHA="$expected_sha" EXPECTED_VERSION="$expected_version" \
+        RELEASE_SHA_RESOLVED="$expected_sha" \
         bash --noprofile --norc "$VERIFY_SCRIPT" ) > "$output_file" 2>&1
     status=$?
     set -e
@@ -401,9 +443,50 @@ check "verifier rejects the right SHA carrying the wrong version" \
 check "verifier explains which version it found versus expected" \
   "$(grep -qF "declares version '$RELEASE_VERSION'" "$VERIFY_WRONG_TREE_OUTPUT" && grep -qF 'this release is 0.2.122' "$VERIFY_WRONG_TREE_OUTPUT" && echo present || echo missing)" "present"
 
+# The `|| github.sha` fallback path: wait_for_pr resolved nothing, so the job
+# is sitting on the launch commit. The failure must name THAT, not report a
+# version mismatch and send the operator to inspect the tree.
+VERIFY_FALLBACK_OUTPUT="$TEST_TMP/verify-fallback.txt"
+set +e
+( cd "$VERIFY_REPO" && RELEASE_SHA="$VERIFY_HEAD" EXPECTED_VERSION="$RELEASE_VERSION" \
+    RELEASE_SHA_RESOLVED="" bash --noprofile --norc "$VERIFY_SCRIPT" ) \
+  > "$VERIFY_FALLBACK_OUTPUT" 2>&1
+VERIFY_FALLBACK_STATUS=$?
+set -e
+check "verifier refuses to act when no release commit was resolved" \
+  "$([ "$VERIFY_FALLBACK_STATUS" -ne 0 ] && echo failed || echo passed)" "failed"
+check "verifier names wait_for_pr as the cause, not the tree" \
+  "$(grep -qF 'wait_for_pr did not resolve a release commit' "$VERIFY_FALLBACK_OUTPUT" && echo correct || echo misattributed)" "correct"
+
+# A manifest with no `^version = "` line must produce the explanatory error,
+# not die silently inside the pipeline that reads it.
+VERIFY_NOVER_REPO="$TEST_TMP/verify-noversion-repo"
+mkdir -p "$VERIFY_NOVER_REPO/crates/core"
+printf '[package]\nname = "freenet"\nversion.workspace = true\n' \
+  > "$VERIFY_NOVER_REPO/crates/core/Cargo.toml"
+(
+  cd "$VERIFY_NOVER_REPO"
+  git init -q .
+  git add crates/core/Cargo.toml
+  git -c user.email=t@example.invalid -c user.name=t commit -q -m "workspace-inherited version"
+) >/dev/null 2>&1
+VERIFY_NOVER_HEAD=$(cd "$VERIFY_NOVER_REPO" && git rev-parse HEAD)
+VERIFY_NOVER_OUTPUT="$TEST_TMP/verify-noversion.txt"
+set +e
+( cd "$VERIFY_NOVER_REPO" && RELEASE_SHA="$VERIFY_NOVER_HEAD" EXPECTED_VERSION="$RELEASE_VERSION" \
+    RELEASE_SHA_RESOLVED="$VERIFY_NOVER_HEAD" bash --noprofile --norc "$VERIFY_SCRIPT" ) \
+  > "$VERIFY_NOVER_OUTPUT" 2>&1
+VERIFY_NOVER_STATUS=$?
+set -e
+check "verifier fails when the manifest has no readable version" \
+  "$([ "$VERIFY_NOVER_STATUS" -ne 0 ] && echo failed || echo passed)" "failed"
+check "verifier explains itself rather than dying silently in a pipeline" \
+  "$(grep -qF '::error' "$VERIFY_NOVER_OUTPUT" && echo explained || echo silent)" "explained"
+
 VERIFY_NO_MANIFEST_OUTPUT="$TEST_TMP/verify-no-manifest.txt"
 set +e
 ( cd "$VERIFY_REPO" && RELEASE_SHA="$VERIFY_HEAD" EXPECTED_VERSION="$RELEASE_VERSION" \
+    RELEASE_SHA_RESOLVED="$VERIFY_HEAD" \
     MANIFEST="crates/core/Absent.toml" bash --noprofile --norc "$VERIFY_SCRIPT" ) \
   > "$VERIFY_NO_MANIFEST_OUTPUT" 2>&1
 VERIFY_NO_MANIFEST_STATUS=$?
@@ -415,6 +498,7 @@ for missing_var in RELEASE_SHA EXPECTED_VERSION; do
     VERIFY_UNSET_OUTPUT="$TEST_TMP/verify-unset-$missing_var.txt"
     set +e
     ( cd "$VERIFY_REPO" && RELEASE_SHA="$VERIFY_HEAD" EXPECTED_VERSION="$RELEASE_VERSION" \
+        RELEASE_SHA_RESOLVED="$VERIFY_HEAD" \
         env -u "$missing_var" bash --noprofile --norc "$VERIFY_SCRIPT" ) \
       > "$VERIFY_UNSET_OUTPUT" 2>&1
     VERIFY_UNSET_STATUS=$?
@@ -453,10 +537,21 @@ case "$*" in
       echo "simulated transient API failure" >&2
       exit 1
     fi
+    # Real `gh pr view --json mergeCommit --jq '.mergeCommit.oid // empty'` on
+    # an UNMERGED PR exits 0 and prints nothing. Modelling that as a non-zero
+    # exit would route the test down the API-failure branch and leave the
+    # PR-has-no-merge-commit branch with no coverage at all.
+    if [ "${MOCK_EMPTY_OID:-0}" = "1" ]; then
+      exit 0
+    fi
     [ -n "${MOCK_MERGE_SHA:-}" ] || exit 2
     printf '%s\n' "$MOCK_MERGE_SHA"
     ;;
   *compare*)
+    if [ "${MOCK_COMPARE_FAILS:-0}" = "1" ]; then
+      echo "simulated compare API failure" >&2
+      exit 1
+    fi
     printf '%s' "${MOCK_COMPARE:-}"
     ;;
   *)
@@ -472,9 +567,10 @@ LAUNCHED_SHA="2222222222222222222222222222222222222222"
 
 run_resolve() {
     # run_resolve <merge_sha> <compare_body> <output_file> <github_output_file>
-    #             [fail_first] [attempts]
+    #             [fail_first] [attempts] [empty_oid] [compare_fails]
     local merge_sha="$1" compare="$2" output_file="$3" gh_output="$4"
-    local fail_first="${5:-0}" attempts="${6:-1}" status
+    local fail_first="${5:-0}" attempts="${6:-1}"
+    local empty_oid="${7:-0}" compare_fails="${8:-0}" status
     : > "$gh_output"
     : > "${gh_output}.calls"
     set +e
@@ -486,6 +582,8 @@ run_resolve() {
       MOCK_MERGE_SHA="$merge_sha" \
       MOCK_COMPARE="$compare" \
       MOCK_FAIL_FIRST="$fail_first" \
+      MOCK_EMPTY_OID="$empty_oid" \
+      MOCK_COMPARE_FAILS="$compare_fails" \
       MOCK_RESOLVE_CALLS="${gh_output}.calls" \
       RESOLVE_ATTEMPTS="$attempts" \
       RESOLVE_RETRY_INTERVAL="0" \
@@ -554,6 +652,58 @@ check "resolver blames the API, not the PR, when the API was unreachable" \
   "$(grep -qF 'GitHub API could not be queried after 3 attempts' "$RESOLVE_EXHAUST_OUTPUT" && echo correct || echo misattributed)" "correct"
 check "resolver tells the operator the bump already merged and to re-run" \
   "$(grep -qF 'gh run rerun --failed' "$RESOLVE_EXHAUST_OUTPUT" && echo present || echo missing)" "present"
+
+# The branch the retry loop exists FOR: gh works fine, the PR simply has no
+# merge commit yet. Real gh exits 0 printing nothing, so this must not be
+# reported as an API failure.
+RESOLVE_EMPTY_OUTPUT="$TEST_TMP/resolve-empty-oid.txt"
+RESOLVE_EMPTY_GH_OUTPUT="$TEST_TMP/resolve-empty-oid.env"
+check "resolver fails when the PR reports no merge commit at all" \
+  "$([ "$(run_resolve "$MERGED_SHA" "$BUMP_ONLY" "$RESOLVE_EMPTY_OUTPUT" "$RESOLVE_EMPTY_GH_OUTPUT" 0 2 1)" -ne 0 ] && echo failed || echo passed)" "failed"
+check "resolver blames the PR, not the API, when the API answered cleanly" \
+  "$(grep -qF "reported merge commit ''" "$RESOLVE_EMPTY_OUTPUT" && echo correct || echo misattributed)" "correct"
+check "resolver does not claim the API was unreachable when it was not" \
+  "$(grep -qF 'GitHub API could not be queried' "$RESOLVE_EMPTY_OUTPUT" && echo misattributed || echo correct)" "correct"
+check "resolver exports no SHA when the PR has no merge commit" \
+  "$(grep -qF 'sha=' "$RESOLVE_EMPTY_GH_OUTPUT" && echo leaked || echo empty)" "empty"
+
+# A failed compare must not be reported as "main did not move". #5233's
+# complaint was a silent divergence; a FALSE all-clear is worse, because it
+# ends the investigation.
+RESOLVE_CMPFAIL_OUTPUT="$TEST_TMP/resolve-compare-fail.txt"
+RESOLVE_CMPFAIL_GH_OUTPUT="$TEST_TMP/resolve-compare-fail.env"
+check "resolver still pins the SHA when the compare call fails" \
+  "$(run_resolve "$MERGED_SHA" "$RACED" "$RESOLVE_CMPFAIL_OUTPUT" "$RESOLVE_CMPFAIL_GH_OUTPUT" 0 1 0 1)" "0"
+check "resolver never claims 'main did not move' on a failed compare" \
+  "$(grep -qF 'main did not move' "$RESOLVE_CMPFAIL_OUTPUT" && echo false-allclear || echo honest)" "honest"
+check "resolver says the divergence check was inconclusive" \
+  "$(grep -qF 'Could not check whether main moved' "$RESOLVE_CMPFAIL_OUTPUT" && echo present || echo missing)" "present"
+
+# The number an operator reads must be the count of SURPRISES, not the total:
+# the version bump is expected and is not an extra.
+check "resolver counts extra commits, excluding the version bump" \
+  "$(grep -oE 'this release::[0-9]+ commit' "$RESOLVE_RACE_OUTPUT" | grep -oE '[0-9]+')" "2"
+
+# A misconfigured budget must not be reported as a PR problem.
+RESOLVE_BADCFG_OUTPUT="$TEST_TMP/resolve-badcfg.txt"
+RESOLVE_BADCFG_GH_OUTPUT="$TEST_TMP/resolve-badcfg.env"
+check "resolver rejects a non-positive retry budget" \
+  "$([ "$(run_resolve "$MERGED_SHA" "$BUMP_ONLY" "$RESOLVE_BADCFG_OUTPUT" "$RESOLVE_BADCFG_GH_OUTPUT" 0 0)" -ne 0 ] && echo failed || echo passed)" "failed"
+check "resolver blames its own configuration, not the PR" \
+  "$(grep -qF 'RESOLVE_ATTEMPTS must be a positive integer' "$RESOLVE_BADCFG_OUTPUT" && echo correct || echo misattributed)" "correct"
+
+# --- the REAL manifest must satisfy the verifier's version grep -------------
+#
+# The verifier's fixture is synthetic, so nothing else pins that `^version = "`
+# picks the PACKAGE version out of the real manifest. A move to
+# `version.workspace = true`, or a sub-table whose `version = "..."` sorts
+# first, would break every release at the guard with no other warning.
+REAL_MANIFEST="$SCRIPT_DIR/../crates/core/Cargo.toml"
+REAL_VERSION=$(grep -m1 -E '^version = "' "$REAL_MANIFEST" | cut -d'"' -f2 || true)
+check "the verifier's grep finds a version in the real core manifest" \
+  "$([[ "$REAL_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] && echo found || echo "missing($REAL_VERSION)")" "found"
+check "the real core manifest's first '^version =' is the package version" \
+  "$(awk '/^\[/{sec=$0} /^version = "/{print sec; exit}' "$REAL_MANIFEST")" "[package]"
 
 if [ "$FAILURES" -eq 0 ]; then
     echo "PASS: release.yml is merge-queue-compatible, reports failed merge-group CI, and is pinned to one validated commit."
