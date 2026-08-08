@@ -435,6 +435,87 @@ when invoked directly, the agent doesn't.
 Set both if you ever need to run `release.sh` while the workflow is also in
 play.
 
+## Auto-update canary (#5222)
+
+Auto-update was broken fleet-wide for **two consecutive releases** (v0.2.120
+and v0.2.121) without anything noticing. #5104 made the node's release-tag
+fetch return the tag verbatim (`v0.2.121`) and normalised it at only one of its
+two consumers; the detection path kept the raw tag, `semver` parsing failed,
+and every update was dropped with a `warn!`. ~1,100 nodes had to be told to run
+`freenet update` by hand, because a broken updater cannot deliver its own fix.
+
+Every signal we had was one-sided — the release built, published, installed and
+ran. Two gates now close that, both driven by `scripts/auto-update-canary.sh`:
+
+**Gate A — pre-flight, BLOCKING** (`attach-to-release` job in
+`cross-compile.yml`, between asset upload and un-draft). Boots the binary that
+is about to ship and requires its updater to read GitHub's current release tag.
+Runs while the release is still a draft, so a failure costs a stuck draft
+rather than a stranded fleet. Adds about a minute.
+
+**Gate B — self-update, post-publish** (`auto-update-selfupdate-canary` job).
+Takes the *previous* release and requires it to detect this one, exit 42, and
+self-replace via `freenet update`. This is the transition the fleet actually
+makes. It cannot run earlier: the detection path is hardwired to GitHub's
+`/releases/latest`, and a draft release does not appear there. A failure is
+loud (red job plus a River dev-room message) but does not block, since the
+release is already public by then.
+
+Both assertions are deliberately **two-sided**: the `Startup update check
+against GitHub` line must be PRESENT *and* there must be no
+`failed to parse latest version` warning. Absence of the error on its own
+proves nothing — it is equally consistent with the check never running, which
+is exactly what `--disable-auto-update` or a dirty build produces. The canary
+also fails if the node under test has auto-update disabled at all, so
+"the canary was silently turned off" is a red build rather than something
+someone has to remember. (It had been forgotten: `framework`, the designated
+real-NAT pre-release smoke peer, ran with `--disable-auto-update` for nine days
+after a #5040 measurement window, which is why it never caught this.)
+
+### If Gate A fails
+
+The release stays an **unpublished draft** with all assets attached. That is
+the correct state — do not un-draft it by hand to unblock the release. The
+updater in that binary cannot read GitHub's release tags, so publishing it
+strands every node on the previous version and the fix cannot be delivered
+automatically. (`scripts/release.sh` will also refuse to publish while the
+cross-compile run is unfinished or failed, for the same reason.)
+
+**Know the state you are in first.** `release.yml` publishes to crates.io
+*before* it pushes the tag, so at this point `freenet`/`fdev` vX.Y.Z are
+already live on crates.io with no published GitHub release. That is a real
+split state: `cargo binstall freenet` will 404 until it is resolved, and the
+nightly `binstall-smoke-test` will go red. crates.io versions cannot be
+un-published, so **do not delete the tag** — a yanked-looking crate pointing at
+a tag that no longer exists is worse than the draft.
+
+1. Read the job log; it names the offending line and distinguishes a genuine
+   parse failure from `UNVERIFIED` (GitHub was unreachable).
+2. **If the failure was `UNVERIFIED` or a job timeout**, it is infrastructure,
+   not a bug: use **Re-run failed jobs** on the cross-compile run. The build
+   artifacts persist, so `attach-to-release` re-runs on its own and publishes
+   if the canary passes.
+3. **If the updater is genuinely broken**, fix the detection path
+   (`crates/core/src/bin/commands/auto_update.rs`) and cut the next patch
+   release. Leave vX.Y.Z's tag and draft in place; publish the draft only if
+   you have decided the broken updater is acceptable, knowing the fleet will
+   not auto-update off it.
+4. To reproduce locally, run the canary against a **clean release build**:
+
+   ```bash
+   bash scripts/auto-update-canary.sh preflight ./target/release/freenet
+   ```
+
+   Note that a build from a dirty working tree disables auto-update entirely
+   (`build_info::GIT_DIRTY`), so the canary will report *auto-update is
+   DISABLED* rather than reproducing the parse failure. Commit or stash first.
+
+### If Gate B fails
+
+The release is already public and the fleet will **not** converge onto it on
+its own. Ship a fix release, and expect to roll existing nodes by hand
+(`freenet update`) as v0.2.120/v0.2.121 required.
+
 ## Post-release verification
 
 After the cascade completes, do these checks (or use the `freenet-release`
@@ -449,6 +530,9 @@ verification skill if you have it):
 4. Matrix room shows the announcement.
 5. `sudo journalctl -u freenet-gateway --since "30 min ago"` on each
    gateway shows no errors.
+6. The `Auto-update self-update canary` job in the tag's `cross-compile` run
+   is green — a node on the previous release reached this one on its own. If
+   it is red, the fleet is stranded; see "Auto-update canary" above.
 
 [PR #4135]: https://github.com/freenet/freenet-core/pull/4135
 [river#241]: https://github.com/freenet/river/issues/241
