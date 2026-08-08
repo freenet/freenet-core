@@ -556,6 +556,12 @@ async fn run_network_node_with_signals(
             Some((major, minor, patch))
         }
 
+        // Once-per-process guard for the lockout report below. The lockout
+        // persists until an operator clears it, so this is a state to announce
+        // on each boot, not a 6-hourly repeat.
+        static LOCKOUT_REPORTED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+
         const HARD_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
         // Stagger timer: random delay 0-4 hours before updating on decentralized discovery.
         const MAX_STAGGER_SECS: u64 = 4 * 3600;
@@ -869,8 +875,25 @@ async fn run_network_node_with_signals(
                             return;
                         }
                     }
-                } else {
-                    tracing::debug!(
+                } else if !LOCKOUT_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    // The second state where the update machinery is silently
+                    // OFF (#5244). This was `debug!`, which release builds
+                    // compile out entirely (`release_max_level_info`), and the
+                    // loud once-per-process warning in `check_if_update_available`
+                    // is only reachable from the PEER-signal triggers — so on a
+                    // node whose peers all share its version, nothing said this
+                    // node would never update again.
+                    //
+                    // Once per process, mirroring that existing `LOCKOUT_WARNED`
+                    // pattern: the condition is permanent until an operator
+                    // acts, so repeating it every 6h forever is noise, and one
+                    // line per restart is enough to find it.
+                    eprintln!(
+                        "Freenet: auto-update is LOCKED OUT on this node after repeated failed \
+                         installs (#3934). It will not detect or apply any further release until \
+                         you run `freenet update` manually to clear the counter."
+                    );
+                    tracing::warn!(
                         "Periodic re-poll: skipped — auto-update locked out after repeated \
                          failed installs (#3934); run `freenet update` to recover"
                     );
@@ -1188,7 +1211,17 @@ fn freenet_main() -> anyhow::Result<()> {
                 config_paths,
             )
         }
-        Some(Command::Update(cmd)) => cmd.run(build_info::VERSION),
+        Some(Command::Update(cmd)) => {
+            // #5244: this process previously ran with NO subscriber installed —
+            // `set_logger` is called only on the node path — so every
+            // `tracing::warn!`/`error!` in the installer was a no-op. That is
+            // the process the supervisor runs from `ExecStopPost` to drive
+            // crash-loop rollback, so its warnings are exactly the ones an
+            // operator needs. WARN (not INFO) because this runs on every
+            // non-clean stop of a crash-looping node.
+            freenet::config::set_cli_logger(tracing::level_filters::LevelFilter::WARN);
+            cmd.run(build_info::VERSION)
+        }
         Some(Command::Uninstall(cmd)) => cmd.run(),
         Some(Command::Secrets(cfg)) => {
             // CLI utility; uses simple current-thread runtime (no
