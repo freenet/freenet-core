@@ -109,6 +109,7 @@ pub(crate) mod testing_impl;
 pub(crate) use p2p_impl::abort_process_on_redb_poison;
 pub use p2p_impl::{
     enable_abort_on_fatal_listener_exit, enable_abort_on_redb_poison, enable_fast_crash_exit_code,
+    listener_exit_is_graceful,
 };
 pub use request_router::{DeduplicatedRequest, RequestRouter};
 

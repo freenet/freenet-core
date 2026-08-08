@@ -366,9 +366,18 @@ async fn run_network_node_with_signals(
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
         .context("failed to install SIGTERM handler")?;
 
+    // Set when THIS process asks the node to stop because an operator signalled
+    // it (SIGTERM from `systemctl stop`, SIGINT from Ctrl+C). Load-bearing for
+    // the exit code: see `finish_run` — an "operator asked us to stop" exit is a
+    // SUCCESS, but the same `EventLoopExitReason::GracefulShutdown` value is
+    // ALSO produced by a fault (a critical internal channel dying, see
+    // `p2p_protoc::ChannelCloseReason`), which must keep failing loudly.
+    let shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // Spawn a task to listen for shutdown signals and trigger graceful shutdown
     let signal_task = {
         let shutdown_handle = shutdown_handle.clone();
+        let shutdown_requested = Arc::clone(&shutdown_requested);
         GlobalExecutor::spawn(async move {
             #[cfg(unix)]
             let shutdown_reason = tokio::select! {
@@ -383,6 +392,9 @@ async fn run_network_node_with_signals(
             };
 
             tracing::info!(reason = shutdown_reason, "Initiating graceful shutdown");
+            // Record the request BEFORE making it, so the flag is always visible
+            // by the time the event loop can observe the shutdown and return.
+            shutdown_requested.store(true, std::sync::atomic::Ordering::SeqCst);
             shutdown_handle.shutdown().await;
         })
     };
@@ -899,11 +911,62 @@ async fn run_network_node_with_signals(
     // and complete their cleanup without being forcefully killed by SIGKILL.
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
+    let result = finish_run(
+        result,
+        shutdown_requested.load(std::sync::atomic::Ordering::SeqCst),
+    );
+
     if result.is_ok() {
         tracing::info!("Graceful shutdown complete");
     }
 
     result
+}
+
+/// Decide what a finished node run means for the PROCESS EXIT CODE (#5227).
+///
+/// `run_network_node` reports a clean SIGTERM/SIGINT stop as
+/// `Err(EventLoopExitReason::GracefulShutdown)` — a typed sentinel, not a real
+/// error. `main` used to hand that straight to its `eprintln!("Error: …")` +
+/// `std::process::exit(1)` fallback, so a deliberate `systemctl stop` was logged
+/// as `status=1/FAILURE`; and because `rollback::classify_stop` treats any
+/// status outside {0, 2, 42, 43, 44} as a crash, three clean stops of a freshly
+/// updated node inside its post-update probation window were enough to trigger
+/// an auto-rollback of a perfectly healthy release (#4073).
+///
+/// Two conditions are required to map that to a success exit, and the second is
+/// the load-bearing one:
+///
+/// 1. `listener_exit_is_graceful(&err)` — the SAME predicate the #4549
+///    fatal-listener force-exit path uses, so the two cannot disagree about
+///    which errors are candidates.
+/// 2. `shutdown_requested` — THIS process asked the node to stop, because an
+///    operator signalled it.
+///
+/// (1) alone is NOT sufficient, and this is the whole reason the flag exists.
+/// `p2p_protoc` raises the very same `GracefulShutdown` when a critical internal
+/// channel dies (`ChannelCloseReason::{Bridge, Controller, Notification,
+/// OpExecution}`) — a node-fatal fault that logs `CRITICAL: Channel closed …`.
+/// `client_events.rs` likewise sends the identical `NodeEvent::Disconnect` when
+/// every client transport has died, a degraded state its own comments call
+/// "restart recommended". Neither is distinguishable from an operator stop at the
+/// p2p layer, so this flag is the sole discriminator. Both must keep a non-zero
+/// exit: on Linux that is what still fires the unit's `ExecStopPost` self-heal
+/// and counts the crash toward probation, and on the macOS/Windows wrappers an
+/// exit 0 is read as "normal shutdown" and would leave the node DOWN rather than
+/// relaunching it.
+///
+/// The auto-update exit is untouched: it surfaces as `UpdateNeededError`, not an
+/// `EventLoopExitReason`, so it still exits 42 and still fires the supervisor's
+/// `freenet update` hook. In the rare race where an update is detected in the
+/// same instant as a SIGTERM, the unbiased `select!` above may resolve the node
+/// arm and the exit is a clean 0 — the operator asked us to stop, so stopping
+/// wins, and the update is picked up by `startup_update_check` on the next boot.
+fn finish_run(result: anyhow::Result<()>, shutdown_requested: bool) -> anyhow::Result<()> {
+    match result {
+        Err(e) if shutdown_requested && freenet::listener_exit_is_graceful(&e) => Ok(()),
+        other => other,
+    }
 }
 
 /// Exit code when another freenet instance is already running.
@@ -1331,6 +1394,63 @@ fn main() {
 mod tests {
     #[cfg(target_os = "linux")]
     use super::parse_listening_inode;
+
+    /// #5227 truth table for the process exit code. The end-to-end proof is
+    /// `tests/graceful_shutdown_exit_code.rs` (it asserts the real process's
+    /// status); this pins the decision itself, including the case that test
+    /// cannot drive a live node into — an UNREQUESTED `GracefulShutdown`, raised
+    /// when a critical internal channel dies (`p2p_protoc::ChannelCloseReason`)
+    /// or every client transport is lost (`client_events.rs`).
+    ///
+    /// Restoring the bug (`finish_run` returning `result`), broadening the guard
+    /// to `Err(_) => Ok(())`, or dropping either conjunct fails this test.
+    #[test]
+    fn finish_run_maps_only_a_requested_graceful_stop_to_success() {
+        use super::commands::auto_update::UpdateNeededError;
+        use super::finish_run;
+        use freenet::EventLoopExitReason;
+
+        // The bug: an operator-requested stop is a SUCCESS.
+        assert!(
+            finish_run(Err(EventLoopExitReason::GracefulShutdown.into()), true).is_ok(),
+            "a SIGTERM/SIGINT stop must exit 0, or systemd logs status=1/FAILURE for a \
+             clean `systemctl stop` and the post-update probation counts it as a crash"
+        );
+
+        // The trap: the SAME sentinel is raised by a critical-channel death that
+        // nobody asked for. It must keep failing, or the macOS/Windows wrappers
+        // read "normal shutdown" and leave the node DOWN, and systemd skips the
+        // ExecStopPost self-heal and the probation crash count.
+        assert!(
+            finish_run(Err(EventLoopExitReason::GracefulShutdown.into()), false).is_err(),
+            "an UNREQUESTED graceful-shutdown exit is a fault and must stay non-zero"
+        );
+
+        // Ordinary fatal listener exits are untouched, requested or not.
+        assert!(finish_run(Err(EventLoopExitReason::UnexpectedStreamEnd.into()), true).is_err());
+        assert!(finish_run(Err(anyhow::anyhow!("boom")), true).is_err());
+
+        // Auto-update must still exit 42, or `ExecStopPost` (which skips `0|43`)
+        // never runs `freenet update`.
+        let update = finish_run(
+            Err(UpdateNeededError {
+                new_version: "9.9.9".to_string(),
+            }
+            .into()),
+            true,
+        )
+        .expect_err("update exit must not become a success");
+        assert_eq!(
+            update
+                .downcast_ref::<UpdateNeededError>()
+                .map(|u| u.new_version.as_str()),
+            Some("9.9.9"),
+            "the UpdateNeededError must survive so `main` exits 42"
+        );
+
+        // A run that somehow returned Ok stays Ok.
+        assert!(finish_run(Ok(()), false).is_ok());
+    }
 
     #[test]
     fn auto_update_default_stays_enabled_flag_and_dirty_disable() {
