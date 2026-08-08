@@ -72,7 +72,17 @@ jobs:
 
           # Self-test: a known-bad line MUST be flagged. Runs the same
           # function the real check uses, so the two cannot drift.
-          SELF_TEST_BAD='+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}' # coalesce-exempt: this is the fixture the self-test feeds in, not a real token usage
+          #
+          # The fixture is assembled from a variable holding a bare `$` on
+          # purpose. Writing the two-brace expression literally here does NOT
+          # produce a literal: Actions evaluates expressions inside `run:`
+          # blocks before the shell sees them, so the fixture would become the
+          # real token value and the self-test would fail — it did exactly
+          # that on the first CI run of this change, which is the self-test
+          # doing its job. Splitting the `$` from the braces keeps the raw
+          # text free of the expression marker.
+          D='$'
+          SELF_TEST_BAD="+          GH_TOKEN: ${D}{{ secrets.GITHUB_TOKEN }}"
           SELF_TEST_OUT=$(printf '%s\n+++ b/.github/workflows/x.yml\n' "$SELF_TEST_BAD" | added_lines)
           if ! echo "$SELF_TEST_OUT" | grep -qE 'GH_TOKEN:\s*\$\{\{\s*secrets\.GITHUB_TOKEN'; then
             echo "::error::Self-test failed: this guard cannot detect a bare GITHUB_TOKEN line, so its result is meaningless. Fix added_lines() before trusting this job."
