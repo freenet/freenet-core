@@ -52,7 +52,8 @@ Registered in `tracing/otel.rs::register_metrics`.
 | `freenet.transport.cwnd` | histogram | — | `record_cwnd_sample` |
 | `freenet.operation.results` | counter | `op`, `result` | `network_status::record_op_result` |
 | `freenet.ring.connections` | gauge | — | `RingStatsSnapshot` |
-| `freenet.node.contracts.hosted` | gauge | — | `RingStatsSnapshot` |
+| `freenet.node.contracts.hosted` | gauge | `reason` | `HostingReasonStats` |
+| `freenet.node.contracts.hosted.bytes` | gauge | `reason` | `HostingReasonStats` |
 | `freenet.connect.attempts` | counter | — | `NetworkStatus` |
 | `freenet.ring.lattice.neighbor` | gauge | `position` | `RingStatsSnapshot` |
 | `freenet.ring.lattice.neighbor.distance` | gauge | `position` | `RingStatsSnapshot` |
@@ -65,6 +66,35 @@ Registered in `tracing/otel.rs::register_metrics`.
 
 Everything but the two histograms and the three synchronous counters is an
 observable callback over state that already existed for the local dashboard.
+
+### `reason` on the hosted-contract gauges
+
+`freenet.node.contracts.hosted` and `.hosted.bytes` answer "how much are we
+holding, and *why*". The `reason` values come from `ring::HostingReason` and
+are a **partition**: the classifier assigns each hosted contract to the first
+matching bucket in priority order, so `sum by (reason)` is the hosted-contract
+count and the byte gauge sums to the hosting cache's used bytes. Neither gauge
+emits an un-attributed total — that would double-count under `sum`.
+
+| `reason` | held because |
+|---|---|
+| `local_client` | a local client (WebSocket/HTTP) holds a subscription |
+| `downstream` | a downstream peer subscribes to us — we relay its updates |
+| `subscribed` | unexpired network subscription, no local or downstream reader |
+| `local_access` | no subscription, but a local client GET/PUT touched it |
+| `abandoned` | was in use and no longer is — the eviction-candidate pool |
+| `routed` | residual: arrived via a routed GET/PUT, no demand signal |
+
+The strings are a metrics contract — collector-side dashboards filter on them,
+so add variants rather than repurpose existing values.
+
+The breakdown has its own provider (`set_hosting_reason_provider`) rather than
+riding `RingStatsSnapshot`: that provider runs on every dashboard HTTP request,
+and this is an O(hosted) walk under the hosting-cache read lock. Its own
+provider confines the cost to the OTel collection cadence. The bytes gauge
+counts contract **state** only — no WASM blobs, no database overhead — matching
+what the hosting cache's byte budget measures, so it is comparable against the
+budget but not against on-disk usage.
 
 Resource attributes: `freenet.node.pubkey` (the full base58 **x25519** transport
 public key — byte-equal to the bearer token's `<pubkey>` field, so a collector

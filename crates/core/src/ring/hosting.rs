@@ -224,6 +224,93 @@ pub(crate) enum PhantomRepair {
     Drop(ContractKey),
 }
 
+/// Why this node is holding a contract it hosts.
+///
+/// This is a PARTITION, not a set of flags: the classifier in
+/// [`HostingManager::hosted_by_reason`] evaluates the variants in declaration
+/// order and assigns each hosted contract to the FIRST one that matches, so
+/// the per-reason counts sum to the hosting-cache size and the per-reason
+/// bytes sum to its used bytes. That is the whole point — the underlying
+/// signals overlap (a contract can be locally accessed AND have downstream
+/// subscribers), and an overlapping breakdown makes `sum by (reason)` lie.
+///
+/// Ordering is strongest-claim-first: a reason further down the list only
+/// applies when every reason above it is absent. `LocalClient` outranks
+/// `Downstream` for the same reason eviction does (`local_and_downstream_counts`
+/// — this node's own user beats forwarded demand), and everything outranks
+/// `Routed`, which is the residual "no demand signal at all" bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostingReason {
+    /// A local client (WebSocket/HTTP) holds a subscription. This node's own
+    /// user wants the contract.
+    LocalClient,
+    /// A downstream peer subscribes to us for this contract — we are a relay
+    /// in someone else's update mesh.
+    Downstream,
+    /// We hold an unexpired network subscription but nothing local or
+    /// downstream reads it: hosted on the network's behalf.
+    Subscribed,
+    /// No subscription of any kind, but a local client GET/PUT touched it
+    /// (`local_client_access`). The read-only / PUT-only local-demand class
+    /// (River UI containers and friends).
+    LocalAccess,
+    /// Was in use and no longer is (`abandoned_at`) — the eviction candidate
+    /// pool. Distinguished from `Routed` because a rising `abandoned` count is
+    /// churn, while a rising `routed` count is ordinary transit caching.
+    Abandoned,
+    /// Residual: arrived through a routed GET/PUT and never acquired any
+    /// demand signal.
+    Routed,
+}
+
+impl HostingReason {
+    /// Every variant, in classifier (and export) order.
+    pub const ALL: [HostingReason; 6] = [
+        HostingReason::LocalClient,
+        HostingReason::Downstream,
+        HostingReason::Subscribed,
+        HostingReason::LocalAccess,
+        HostingReason::Abandoned,
+        HostingReason::Routed,
+    ];
+
+    /// Stable attribute value. These strings are a metrics contract — a
+    /// collector-side dashboard filters on them, so renaming one silently
+    /// empties a panel. Add variants rather than repurposing these.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HostingReason::LocalClient => "local_client",
+            HostingReason::Downstream => "downstream",
+            HostingReason::Subscribed => "subscribed",
+            HostingReason::LocalAccess => "local_access",
+            HostingReason::Abandoned => "abandoned",
+            HostingReason::Routed => "routed",
+        }
+    }
+}
+
+/// Hosted-contract count and state bytes per [`HostingReason`], indexed by
+/// `reason as usize`. Both arrays partition the hosting cache (see
+/// [`HostingReason`]), so `counts.iter().sum()` is the hosted-contract count
+/// and `bytes.iter().sum()` is the cache's used bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HostingReasonStats {
+    counts: [u64; HostingReason::ALL.len()],
+    bytes: [u64; HostingReason::ALL.len()],
+}
+
+impl HostingReasonStats {
+    /// Contracts held for `reason`.
+    pub fn count(&self, reason: HostingReason) -> u64 {
+        self.counts[reason as usize]
+    }
+
+    /// Contract state bytes held for `reason`.
+    pub fn bytes(&self, reason: HostingReason) -> u64 {
+        self.bytes[reason as usize]
+    }
+}
+
 /// Result of adding a client subscription.
 #[derive(Debug)]
 pub struct AddClientSubscriptionResult {
@@ -998,6 +1085,40 @@ impl HostingManager {
             return None;
         }
         Some(tracker.stats())
+    }
+
+    /// Count and state bytes of hosted contracts, partitioned by WHY each one
+    /// is held (see [`HostingReason`]). Fixed cardinality — six buckets, no
+    /// contract identity survives the walk — so it is safe to export as
+    /// metric attributes.
+    ///
+    /// One O(hosted) pass under the hosting-cache read lock. The subscription
+    /// lookups inside the closure read only the `client_subscriptions` /
+    /// `downstream_subscribers` / `active_subscriptions` DashMaps, never the
+    /// hosting cache, so there is no re-lock — the same discipline
+    /// [`Self::cost_eligibility_stats`] relies on.
+    pub(crate) fn hosted_by_reason(&self) -> HostingReasonStats {
+        let mut stats = HostingReasonStats::default();
+        self.hosting_cache.read().for_each_reason_row(|key, entry| {
+            let (local, downstream) = self.local_and_downstream_counts(key);
+            let reason = if local > 0 {
+                HostingReason::LocalClient
+            } else if downstream > 0 {
+                HostingReason::Downstream
+            } else if self.is_subscribed(key) {
+                HostingReason::Subscribed
+            } else if entry.local_client_access {
+                HostingReason::LocalAccess
+            } else if entry.abandoned_at.is_some() {
+                HostingReason::Abandoned
+            } else {
+                HostingReason::Routed
+            };
+            let bucket = reason as usize;
+            stats.counts[bucket] = stats.counts[bucket].saturating_add(1);
+            stats.bytes[bucket] = stats.bytes[bucket].saturating_add(entry.size_bytes);
+        });
+        stats
     }
 
     pub(crate) fn cost_eligibility_stats(
@@ -4449,6 +4570,83 @@ mod tests {
             .expect("in-use subscription present");
         assert!(used.is_receiving_updates);
         assert!(used.in_use, "a client subscription is real demand → in_use");
+    }
+
+    /// `hosted_by_reason` must PARTITION the hosting cache: one bucket per
+    /// contract, counts summing to the cache size and bytes to its used bytes.
+    /// The classification is priority-ordered, so each case below is set up
+    /// with every HIGHER-priority signal deliberately absent — a contract with
+    /// both a local client subscription and downstream subscribers must land in
+    /// `local_client` only, never be counted twice.
+    #[test]
+    fn hosted_by_reason_partitions_the_hosting_cache() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+
+        // Empty cache: every bucket zero (a real datapoint, not absence).
+        let empty = manager.hosted_by_reason();
+        for reason in HostingReason::ALL {
+            assert_eq!(empty.count(reason), 0, "{reason:?} on an empty cache");
+            assert_eq!(empty.bytes(reason), 0, "{reason:?} on an empty cache");
+        }
+
+        // One contract per reason, distinct sizes so a mis-bucketed contract
+        // shows up in the bytes assertions too.
+        let local_client = make_contract_key(1);
+        let downstream = make_contract_key(2);
+        let subscribed = make_contract_key(3);
+        let local_access = make_contract_key(4);
+        let abandoned = make_contract_key(5);
+        let routed = make_contract_key(6);
+        for (key, size) in [
+            (local_client, 100),
+            (downstream, 200),
+            (subscribed, 400),
+            (local_access, 800),
+            (abandoned, 1_600),
+            (routed, 3_200),
+        ] {
+            manager.record_contract_access(key, size, AccessType::Get);
+        }
+
+        // `local_client` ALSO gets a downstream subscriber and a network
+        // subscription: priority must keep it in exactly one bucket.
+        manager.add_client_subscription(local_client.id(), crate::client_events::ClientId::next());
+        manager.add_downstream_subscriber(&local_client, make_peer_key(10));
+        manager.subscribe(local_client);
+
+        // `downstream` also holds a network subscription — downstream wins.
+        manager.add_downstream_subscriber(&downstream, make_peer_key(11));
+        manager.subscribe(downstream);
+
+        manager.subscribe(subscribed);
+        manager.mark_local_client_access(&local_access);
+
+        // Abandonment is a transition, not a flag: subscribe a downstream peer
+        // and take it away again.
+        manager.add_downstream_subscriber(&abandoned, make_peer_key(12));
+        manager.remove_downstream_subscriber(&abandoned, &make_peer_key(12));
+
+        // `routed` gets nothing beyond the GET that seeded it.
+
+        let stats = manager.hosted_by_reason();
+        for (reason, size) in [
+            (HostingReason::LocalClient, 100),
+            (HostingReason::Downstream, 200),
+            (HostingReason::Subscribed, 400),
+            (HostingReason::LocalAccess, 800),
+            (HostingReason::Abandoned, 1_600),
+            (HostingReason::Routed, 3_200),
+        ] {
+            assert_eq!(stats.count(reason), 1, "{reason:?} count");
+            assert_eq!(stats.bytes(reason), size, "{reason:?} bytes");
+        }
+
+        // The partition property itself — what makes `sum by (reason)` valid.
+        let total_count: u64 = HostingReason::ALL.iter().map(|r| stats.count(*r)).sum();
+        let total_bytes: u64 = HostingReason::ALL.iter().map(|r| stats.bytes(*r)).sum();
+        let cache = manager.hosting_cache_stats();
+        assert_eq!(total_count, cache.contract_count, "counts must partition");
+        assert_eq!(total_bytes, cache.current_bytes, "bytes must partition");
     }
 
     /// `is_eviction_eligible` gates the dashboard's "next to evict" badge on the

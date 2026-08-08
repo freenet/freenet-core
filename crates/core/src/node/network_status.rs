@@ -122,6 +122,11 @@ pub(crate) struct OtelMetricsSnapshot {
     pub connection_attempts: u32,
     pub ring: RingStatsSnapshot,
     pub fair_queue: crate::contract::FairQueueStats,
+    /// Hosted contracts partitioned by why they are held. Deliberately NOT a
+    /// `RingStatsSnapshot` field: that provider runs on every dashboard HTTP
+    /// request, and this is an O(hosted) walk under the hosting-cache read
+    /// lock. Its own provider keeps the cost on the OTel collection cadence.
+    pub hosting_reasons: crate::ring::HostingReasonStats,
 }
 
 /// Read the scalars the OTel exporter observes, or `None` before the node has
@@ -138,11 +143,30 @@ pub(crate) fn otel_metrics_snapshot() -> Option<OtelMetricsSnapshot> {
         .read()
         .as_ref()
         .map(|provider| provider())?;
+    let hosting_reasons = HOSTING_REASON_PROVIDER
+        .read()
+        .as_ref()
+        .map(|provider| provider())?;
     Some(OtelMetricsSnapshot {
         connection_attempts,
         ring,
         fair_queue: crate::contract::fair_queue_stats(),
+        hosting_reasons,
     })
+}
+
+/// Source of the per-reason hosted-contract breakdown
+/// (`Ring::hosted_by_reason`). OTel-only; see [`OtelMetricsSnapshot`].
+pub type HostingReasonProvider =
+    Arc<dyn Fn() -> crate::ring::HostingReasonStats + Send + Sync + 'static>;
+
+static HOSTING_REASON_PROVIDER: parking_lot::RwLock<Option<HostingReasonProvider>> =
+    parking_lot::RwLock::new(None);
+
+/// Register the hosting-reason data source. Replaces any previously-registered
+/// provider.
+pub fn set_hosting_reason_provider(provider: HostingReasonProvider) {
+    *HOSTING_REASON_PROVIDER.write() = Some(provider);
 }
 
 static GOVERNANCE_PROVIDER: parking_lot::RwLock<Option<GovernanceProvider>> =
