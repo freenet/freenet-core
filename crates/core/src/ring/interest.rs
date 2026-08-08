@@ -133,9 +133,10 @@ pub(crate) const RESYNC_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(30)
 /// which is safe.
 const RESYNC_THROTTLE_CACHE_SIZE: usize = 4096;
 
-/// Bound on the number of peers tracked by the full-bytes summary fallback
-/// rotation cursor (#5155). Keyed by remote socket address, so it MUST be
-/// bounded — see the per-key-collection rule in `.claude/rules/code-style.md`.
+/// Bound on the number of peers tracked by the periodic summary rotation
+/// cursor (#5155; every peer since #5238, not just the full-bytes minority).
+/// Keyed by remote socket address, so it MUST be bounded — see the
+/// per-key-collection rule in `.claude/rules/code-style.md`.
 ///
 /// Eviction costs a peer its place in the cycle, not coverage: a forgotten
 /// cursor restarts that peer's rotation at a random offset, so the contracts
@@ -143,12 +144,19 @@ const RESYNC_THROTTLE_CACHE_SIZE: usize = 4096;
 ///
 /// The random restart is load-bearing here, not decoration. Under a fixed
 /// restart, a single eviction would be harmless, but SUSTAINED eviction — more
-/// concurrently-syncing fallback peers than cache slots — would return every
-/// peer to the head of its set every round and starve the tail permanently. The
-/// cap is well above `max_connections`, so that is not the expected regime; the
+/// concurrently-syncing peers than cache slots — would return every peer to the
+/// head of its set every round and starve the tail permanently. The cap is well
+/// above `max_connections`, so that is not the expected regime; the
 /// randomisation is what makes it a slow cycle rather than a silent hole if it
 /// ever is. See [`InterestManager::summary_window_start`].
-const SUMMARY_FALLBACK_CURSOR_CACHE_SIZE: usize = 4096;
+///
+/// #5238 widened the tracked population from the full-bytes minority to every
+/// connected peer. That does not change the conclusion — 4096 still clears
+/// `max_connections` by an order of magnitude — but it does mean the headroom
+/// is no longer as large as the original margin suggested, so re-check it
+/// against `max_connections` rather than against this paragraph if either
+/// moves.
+const SUMMARY_WINDOW_CURSOR_CACHE_SIZE: usize = 4096;
 
 /// Bounds diagnostic correlation state influenced by remote (contract, peer)
 /// pairs. Eviction only loses classification detail; it never changes routing.
@@ -1095,11 +1103,11 @@ pub struct InterestManager<T: TimeSource> {
     /// issue #4857.
     resync_request_throttle: Mutex<LruCache<(ContractKey, SocketAddr), Instant>>,
 
-    /// Rotation cursor for the bounded full-bytes summary fallback (#5155),
-    /// keyed by the peer's socket address.
+    /// Rotation cursor for the bounded periodic summary reply (#5155, extended
+    /// to the digest form by #5238), keyed by the peer's socket address.
     ///
     /// Holds the contract id of the LAST entry included in that peer's previous
-    /// fallback reply — a KEY, not an index. That distinction is what preserves
+    /// reply — a KEY, not an index. That distinction is what preserves
     /// the coverage BOUND when the shared set changes between rounds.
     ///
     /// A stored index names a position, and a removal below it shifts every
@@ -1121,8 +1129,11 @@ pub struct InterestManager<T: TimeSource> {
     /// runs both designs over the same removal schedule and shows the index
     /// one missing contracts the key one covers.
     ///
-    /// Only the full-bytes fallback consults this. Digest-capable peers keep
-    /// receiving the complete set every round and never touch it.
+    /// BOTH wire forms consult this. It served only the full-bytes fallback
+    /// under #5155 — digest-capable peers received the complete set every round
+    /// and never touched it — and #5238 ended that, because the cost the window
+    /// really bounds is the per-entry summarize call, which the digest form
+    /// pays in full.
     summary_window_cursor: Mutex<LruCache<SocketAddr, ContractInstanceId>>,
 
     /// Count of concurrently-outstanding queue-full-resync retry tasks (#4862 P1).
@@ -1195,8 +1206,8 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                     .expect("RESYNC_THROTTLE_CACHE_SIZE must be > 0"),
             )),
             summary_window_cursor: Mutex::new(LruCache::new(
-                NonZeroUsize::new(SUMMARY_FALLBACK_CURSOR_CACHE_SIZE)
-                    .expect("SUMMARY_FALLBACK_CURSOR_CACHE_SIZE must be > 0"),
+                NonZeroUsize::new(SUMMARY_WINDOW_CURSOR_CACHE_SIZE)
+                    .expect("SUMMARY_WINDOW_CURSOR_CACHE_SIZE must be > 0"),
             )),
             missing_summary_history: Mutex::new(LruCache::new(
                 NonZeroUsize::new(MISSING_SUMMARY_HISTORY_SIZE)
