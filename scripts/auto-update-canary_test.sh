@@ -38,7 +38,10 @@ source "$CANARY_SH"
 
 FAILURES=0
 TMPROOT="$(mktemp -d)"
-trap 'rm -rf "$TMPROOT"' EXIT
+# Chain, do not replace: sourcing auto-update-canary.sh installed its own
+# `trap cleanup EXIT`, and overwriting it leaks that script's workdir on every
+# CI run.
+trap 'rm -rf "$TMPROOT"; cleanup' EXIT
 
 # check <description> <expected-exit> <log-content> [expected-message-substring]
 #
@@ -121,30 +124,69 @@ check "disabled: dirty build silently skips the check -> fail" 1 "$DIRTY" \
 # a retry that also swallows a real parse failure.
 check "indeterminate: GitHub unreachable -> retry, not fail" 2 "$FETCH_FAIL"
 
-# --- MARKER_TRIGGERED must not match the REFUSAL line ------------------------
-# Found in review. `crates/core/src/bin/freenet.rs` logs
-# "...not triggering auto-update (#4073)" when a newer version is locally
-# blocked (crash-loop pin / repeated install failures). The obvious short
-# marker 'triggering auto-update' is a substring of that, so a node that
-# deliberately REFUSED an update would be read as one that requested it --
-# Gate B would then wait for an exit 42 that is never coming and misreport the
-# cause. Both directions are pinned so neither can regress.
-NOT_TRIGGERED='2026-08-08T02:00:00.000000Z  WARN freenet: Startup check: newer version is locally blocked (crash-loop known-bad pin or repeated install failures); not triggering auto-update (#4073)'
-REALLY_TRIGGERED='2026-08-08T02:02:59.538127Z  INFO freenet: Startup check: newer version on GitHub, triggering auto-update new_version=0.2.122'
+# --- the update-trigger detector --------------------------------------------
+# `node_decided_to_update` must fire for ALL FOUR "triggering auto-update"
+# sites in freenet.rs and must NOT fire for the #4073 refusal, which shares the
+# phrase ("...not triggering auto-update"). Two ways to get this wrong, both
+# found in review: the bare substring counts the refusal as a trigger, and
+# anchoring on one site's full phrase misses the other three -- reporting "did
+# not decide to update" for a node that did.
+trigger_case() {
+    # trigger_case <description> <expect: yes|no> <log-line>
+    local desc="$1" expect="$2" line="$3"
+    local dir
+    dir="$(mktemp -d "$TMPROOT/trig.XXXXXX")"
+    printf '%s\n' "$line" > "$dir/freenet.2026-08-08-02.log"
+    if node_decided_to_update "$dir"; then local got=yes; else local got=no; fi
+    if [[ "$got" == "$expect" ]]; then
+        echo "ok   - $desc"
+    else
+        echo "FAIL - $desc (detector said '$got', expected '$expect')" >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+}
 
-if printf '%s' "$NOT_TRIGGERED" | grep -qF "$MARKER_TRIGGERED"; then
-    echo "FAIL - MARKER_TRIGGERED matches the '#4073 not triggering' refusal line" >&2
-    FAILURES=$((FAILURES + 1))
-else
-    echo "ok   - MARKER_TRIGGERED does not match the #4073 refusal line"
-fi
+trigger_case "trigger: startup check" yes \
+    '2026-08-08T02:02:59Z  INFO freenet: Startup check: newer version on GitHub, triggering auto-update new_version=0.2.122'
+trigger_case "trigger: post-stagger confirm" yes \
+    '2026-08-08T02:02:59Z  INFO freenet: Update confirmed on GitHub after stagger, triggering auto-update new_version=0.2.122'
+trigger_case "trigger: peer-signal confirm" yes \
+    '2026-08-08T02:02:59Z  INFO freenet: Newer version confirmed on GitHub, triggering auto-update new_version=0.2.122'
+trigger_case "trigger: periodic re-poll" yes \
+    '2026-08-08T02:02:59Z  INFO freenet: Periodic re-poll: newer version on GitHub, triggering auto-update new_version=0.2.122'
+trigger_case "NOT a trigger: #4073 locally-blocked refusal" no \
+    '2026-08-08T02:02:59Z  WARN freenet: Startup check: newer version is locally blocked (crash-loop known-bad pin or repeated install failures); not triggering auto-update (#4073)'
 
-if printf '%s' "$REALLY_TRIGGERED" | grep -qF "$MARKER_TRIGGERED"; then
-    echo "ok   - MARKER_TRIGGERED matches a real update trigger"
-else
-    echo "FAIL - MARKER_TRIGGERED no longer matches the real trigger line" >&2
-    FAILURES=$((FAILURES + 1))
-fi
+# --- markers must still exist in the Rust source ----------------------------
+# Without this the fixtures above are a self-consistent copy of strings that
+# may no longer be emitted: the canary would go quietly blind while its own
+# test stayed green. Pin against the source of truth instead.
+SRC="$SCRIPT_DIR/../crates/core/src/bin/freenet.rs"
+AU_SRC="$SCRIPT_DIR/../crates/core/src/bin/commands/auto_update.rs"
+pin_marker() {
+    # pin_marker <description> <file> <needle>
+    local desc="$1" file="$2" needle="$3"
+    if [[ ! -f "$file" ]]; then
+        echo "FAIL - $desc (source file not found: $file)" >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    # Rust string literals wrap across lines, so compare against the source
+    # with newlines and run-together indentation squeezed out.
+    if tr '\n' ' ' < "$file" | tr -s ' ' | grep -qF "$needle"; then
+        echo "ok   - $desc"
+    else
+        echo "FAIL - $desc: '$needle' no longer appears in $(basename "$file")" >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
+pin_marker "source pin: startup-check marker"   "$SRC"    "$MARKER_CHECK_RAN"
+pin_marker "source pin: trigger phrase"         "$SRC"    "$MARKER_TRIGGERED"
+pin_marker "source pin: #4073 refusal phrase"   "$SRC"    "$MARKER_NOT_TRIGGERED"
+pin_marker "source pin: disabled marker"        "$SRC"    "$MARKER_DISABLED"
+pin_marker "source pin: parse-failure marker"   "$AU_SRC" "$MARKER_PARSE_FAIL"
+pin_marker "source pin: fetch-failure marker"   "$AU_SRC" "$MARKER_FETCH_FAIL"
 
 echo
 if [[ "$FAILURES" -eq 0 ]]; then

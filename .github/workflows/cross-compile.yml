@@ -728,7 +728,7 @@ jobs:
   # unpublished draft with nobody told. That is precisely the
   # silent-fail-closed shape this whole change exists to remove.
   notify-auto-update-canary-failure:
-    name: Notify dev room if the auto-update canary failed
+    name: Notify dev room if the release pre-flight failed
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: [attach-to-release, auto-update-selfupdate-canary]
@@ -747,7 +747,7 @@ jobs:
           # red because the updater is broken OR because GitHub was unreachable,
           # and a message that overstates ("the fleet is stranded") on a network
           # blip trains people to ignore the channel.
-          message: "\U0001F6A8 AUTO-UPDATE CANARY did not pass for ${{ github.ref_name }} (publish-blocking pre-flight: ${{ needs.attach-to-release.result }}, self-update: ${{ needs.auto-update-selfupdate-canary.result }}). Either a node on the previous release cannot auto-update to this one (#5221 failure mode — the fleet would need `freenet update` by hand), or the canary could not verify it. If the pre-flight gate is the one that failed, the release is STUCK AS A DRAFT and needs a decision. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          message: "\U0001F6A8 RELEASE PRE-FLIGHT did not pass for ${{ github.ref_name }} (publish job: ${{ needs.attach-to-release.result }}, auto-update self-update canary: ${{ needs.auto-update-selfupdate-canary.result }}). Check WHICH step failed before concluding anything: the publish job also does artifact download, checksumming and signing, so a red result here is not by itself an auto-update fault. If the publish job failed, the release is STUCK AS A DRAFT and needs a decision. If the self-update canary failed, a node on the previous release may not be able to auto-update to this one (#5221 failure mode — the fleet would need `freenet update` by hand). ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
           room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
           gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}

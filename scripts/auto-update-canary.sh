@@ -63,12 +63,19 @@ MARKER_PARSE_FAIL='failed to parse latest version'
 MARKER_FETCH_FAIL='failed to fetch latest version'
 # freenet.rs      -- either --disable-auto-update or a dirty build
 MARKER_DISABLED='Auto-update is DISABLED'
-# freenet.rs      -- detection succeeded and an update was requested.
-# Anchored on the full positive phrase, NOT on "triggering auto-update": the
-# #4073 rollback path logs "...not triggering auto-update", and a substring
-# match on the short form treats a node that deliberately REFUSED an update as
-# one that requested it.
-MARKER_TRIGGERED='newer version on GitHub, triggering auto-update'
+# freenet.rs -- detection succeeded and an update was requested. There are
+# FOUR such sites (startup check, post-stagger confirm, peer-signal confirm,
+# periodic re-poll) and one REFUSAL that shares the phrase:
+#   :524 "Startup check: newer version on GitHub, triggering auto-update"
+#   :650 "Update confirmed on GitHub after stagger, triggering auto-update"
+#   :731 "Newer version confirmed on GitHub, triggering auto-update"
+#   :853 "Periodic re-poll: newer version on GitHub, triggering auto-update"
+#   :519 "...repeated install failures); NOT triggering auto-update (#4073)"
+# Matching the bare substring counts the refusal as a trigger; anchoring on any
+# ONE site's full phrase misses the other three, reporting "did not decide to
+# update" for a node that did. So: match the phrase, subtract the refusal.
+MARKER_TRIGGERED='triggering auto-update'
+MARKER_NOT_TRIGGERED='not triggering auto-update'
 
 MUSL_ASSET='freenet-x86_64-unknown-linux-musl.tar.gz'
 RELEASE_BASE='https://github.com/freenet/freenet-core/releases/download'
@@ -82,7 +89,7 @@ CANARY_WS_PORT="${CANARY_WS_PORT:-39509}"
 # check fires after a 0-60s anti-thundering-herd jitter, so this must clear
 # 60s by a healthy margin; it is a ceiling, not a wait (both gates return as
 # soon as they have their answer, typically ~40s).
-CANARY_TIMEOUT_SECS="${CANARY_TIMEOUT_SECS:-180}"
+CANARY_TIMEOUT_SECS="${CANARY_TIMEOUT_SECS:-240}"
 
 # Retry budget for the INDETERMINATE (GitHub unreachable) case only. Kept
 # small on purpose: this sits on the release critical path inside a job with a
@@ -90,10 +97,25 @@ CANARY_TIMEOUT_SECS="${CANARY_TIMEOUT_SECS:-180}"
 # cancelled job and a permanently stuck draft -- worse than the failure it was
 # trying to ride out.
 CANARY_ATTEMPTS="${CANARY_ATTEMPTS:-2}"
+# A non-numeric or zero override would make the retry loop body never execute
+# and the script report "could not reach GitHub in 0 attempts" -- a blocking
+# failure backed by no attempt at all.
+case "$CANARY_ATTEMPTS" in
+  ''|*[!0-9]*|0) CANARY_ATTEMPTS=2 ;;
+esac
 CANARY_RETRY_SLEEP="${CANARY_RETRY_SLEEP:-20}"
 
 log()  { printf '%s\n' "$*"; }
 fail() { printf '::error::%s\n' "$*" >&2; }
+
+# True when the logs show the node DECIDED to update. See the marker comments
+# above for why this is a subtraction rather than a single grep.
+node_decided_to_update() {
+  local logdir="$1"
+  grep -ahF "$MARKER_TRIGGERED" "$logdir"/freenet.*.log 2>/dev/null \
+    | grep -vF "$MARKER_NOT_TRIGGERED" | grep -q .
+}
+
 
 # One workdir for the whole run, cleaned by a single EXIT trap.
 #
@@ -103,6 +125,14 @@ fail() { printf '::error::%s\n' "$*" >&2; }
 # success is worse than no canary: the first person to hit it learns to
 # override it, and then it never catches anything real.
 CANARY_WORKDIR="$(mktemp -d)"
+if [ -z "$CANARY_WORKDIR" ] || [ ! -d "$CANARY_WORKDIR" ]; then
+  # Without this, a failed mktemp leaves CANARY_WORKDIR empty and the later
+  # `rm -rf "${work:?}"` operates on "/preflight" -- non-empty, so `:?` does
+  # not catch it. The guard only protects against unset/empty, not against a
+  # wrong-but-non-empty path.
+  printf '::error::%s\n' "could not create a temp workdir for the canary" >&2
+  exit 1
+fi
 cleanup() { rm -rf "$CANARY_WORKDIR"; }
 trap cleanup EXIT
 
@@ -186,6 +216,19 @@ run_node_until_check() {
   # An isolated HOME matters for more than tidiness: the node keeps its GitHub
   # poll token-bucket under $HOME/.local/state/freenet, so a shared HOME would
   # let one gate's budget throttle the other's check.
+  # Job control, so this background job gets its own process group, AND the
+  # `exec` below, which is the half that actually makes the kill work.
+  #
+  # `kill $node_pid` alone reaps only the subshell and leaves the
+  # `timeout`/`freenet` grandchild alive (verified), still holding the UDP and
+  # WS ports and burning CPU while the next attempt tries to boot. But `set -m`
+  # by itself is NOT enough either: job control is inherited, so the `timeout`
+  # inside the subshell starts a process group of its OWN and a group kill on
+  # the subshell misses it (also verified -- the pgids differ). `exec` collapses
+  # the two: the subshell BECOMES timeout, so the job pid is timeout's pid and
+  # its child shares the group. The exports still apply, since they run before
+  # the exec replaces the shell.
+  set -m
   (
     # shellcheck disable=SC2030  # scoping HOME to this subshell is the point:
     # the node keeps its GitHub poll bucket under $HOME, and the caller's HOME
@@ -195,7 +238,7 @@ run_node_until_check() {
     # so it takes the real exit-42 path rather than logging a "no supervisor"
     # error and staying put.
     export FREENET_SUPERVISED=1
-    timeout "$CANARY_TIMEOUT_SECS" "$binary" network \
+    exec timeout "$CANARY_TIMEOUT_SECS" "$binary" network \
       --config-dir "$work/cfg" \
       --data-dir "$work/data" \
       --log-dir "$work/logs" \
@@ -204,12 +247,19 @@ run_node_until_check() {
       >"$work/node.out" 2>&1
   ) &
   local node_pid=$!
+  set +m
 
   # Poll for a verdict rather than sleeping the full timeout: the check fires
   # after a 0-60s jitter, so this normally returns in well under a minute and
   # adds no meaningful time to a release.
-  local waited=0
-  while [ "$waited" -lt "$CANARY_TIMEOUT_SECS" ]; do
+  #
+  # Measured against the CLOCK, not by counting `sleep 3` iterations. The
+  # counting version charged 3s per pass while each pass also paid for a grep
+  # and a process check, so the budget ran out well before the nominal window
+  # and a slow-booting node on a loaded machine was reported as "the startup
+  # update check never ran" -- a false blocking failure on a healthy binary.
+  local deadline=$(( $(date +%s) + CANARY_TIMEOUT_SECS ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
     if ! kill -0 "$node_pid" 2>/dev/null; then
       break   # node exited on its own (exit 42 on the selfupdate path)
     fi
@@ -221,7 +271,7 @@ run_node_until_check() {
       # would replace that with 143 and silently defeat Gate B's exit-42
       # assertion -- the canary would report "no update requested" for a node
       # that requested one. Let it finish.
-      if grep -aqF "$MARKER_TRIGGERED" "$work/logs"/freenet.*.log 2>/dev/null; then
+      if node_decided_to_update "$work/logs"; then
         local settle=0
         while kill -0 "$node_pid" 2>/dev/null && [ "$settle" -lt 60 ]; do
           sleep 2
@@ -231,11 +281,11 @@ run_node_until_check() {
       break
     fi
     sleep 3
-    waited=$((waited + 3))
   done
 
-  # Stop the node if it is still up, then reap it for its exit code.
-  kill "$node_pid" 2>/dev/null
+  # Stop the node if it is still up, then reap it for its exit code. Kill the
+  # whole process GROUP (see `set -m` above) so no node outlives this call.
+  kill -- "-$node_pid" 2>/dev/null || kill "$node_pid" 2>/dev/null
   wait "$node_pid"
   NODE_EXIT=$?
   log "node exited with code $NODE_EXIT"
@@ -269,6 +319,11 @@ cmd_preflight() {
     # A retry that cannot produce a different answer is not a retry.
     rm -rf "${work:?}"
     mkdir -p "$work"
+    # Distinct ports per attempt. The process-group kill above should already
+    # guarantee the previous node is gone; this makes a retry survive even if
+    # some future refactor reintroduces a lingering child.
+    CANARY_NETWORK_PORT=$((CANARY_NETWORK_PORT + 1))
+    CANARY_WS_PORT=$((CANARY_WS_PORT + 1))
     run_node_until_check "$binary" "$work"
     assert_detection_healthy "$work/logs"
     rc=$?
@@ -330,7 +385,7 @@ cmd_selfupdate() {
   fi
   [ "$rc" -eq 0 ] || return 1
 
-  if ! grep -ahqF "$MARKER_TRIGGERED" "$work/logs"/freenet.*.log 2>/dev/null; then
+  if ! node_decided_to_update "$work/logs"; then
     fail "v$prev_version parsed GitHub's response but did NOT decide to update to v$expected_version. The release is published and visible, so a node on the previous version is choosing to stay put -- the fleet will not converge."
     return 1
   fi

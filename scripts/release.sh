@@ -1213,30 +1213,37 @@ publish_draft_release() {
     # binaries already available"), so without this guard the local driver
     # would race in and publish a release whose updater the gate was in the
     # middle of rejecting -- silently turning a blocking gate into no gate.
+    local is_draft
+    is_draft=$(gh release view "v$VERSION" --repo freenet/freenet-core --json isDraft --jq '.isDraft' 2>/dev/null || echo "false")
+    if [[ "$is_draft" != "true" ]]; then
+        return 0   # already published (or unknown) -- nothing to gate
+    fi
+
+    # It IS still a draft, so the gate's verdict decides. Anything other than a
+    # successfully-concluded run means "we do not know that the canary passed",
+    # and publishing on an unknown gate state is the fail-open this guard
+    # exists to prevent. Note an EMPTY run list yields the literal "null:null"
+    # (jq interpolates .[0] == null), and a `gh` failure yields "" -- both are
+    # "we do not know", and both must refuse.
     local run_state
     run_state=$(gh run list --repo freenet/freenet-core \
         --workflow=cross-compile.yml --branch "v$VERSION" \
         --json status,conclusion --jq '.[0] | "\(.status):\(.conclusion)"' 2>/dev/null || echo "")
-    case "$run_state" in
-        completed:success|"")
-            # Concluded successfully, or no run found at all (older tags /
-            # manual flows) -- safe to fall through and publish.
-            ;;
-        *)
-            echo "  ⏸  Not publishing: cross-compile for v$VERSION is '$run_state'."
-            echo "     The auto-update pre-flight canary gates publication (#5222);"
-            echo "     let the workflow publish, or fix the gate. Do not un-draft by hand."
-            return 0
-            ;;
-    esac
-
-    local is_draft
-    is_draft=$(gh release view "v$VERSION" --repo freenet/freenet-core --json isDraft --jq '.isDraft' 2>/dev/null || echo "false")
-    if [[ "$is_draft" == "true" ]]; then
-        echo -n "  Publishing draft release... "
-        gh release edit "v$VERSION" --repo freenet/freenet-core --draft=false > /dev/null
-        echo "✓"
+    if [[ "$run_state" != "completed:success" ]]; then
+        echo "  ⏸  NOT publishing v$VERSION: cross-compile is '${run_state:-unknown}'." >&2
+        echo "     Publication is gated on the auto-update pre-flight canary (#5222)," >&2
+        echo "     which runs between asset upload and un-draft. Let the workflow" >&2
+        echo "     publish, or fix the gate. Do NOT un-draft by hand -- a release" >&2
+        echo "     whose updater is broken cannot deliver its own fix." >&2
+        # MUST be non-zero. Returning 0 here made the caller report success, so
+        # the driver went on to update the gateways and announce to Matrix and
+        # River a release that was still an unpublished draft.
+        return 1
     fi
+
+    echo -n "  Publishing draft release... "
+    gh release edit "v$VERSION" --repo freenet/freenet-core --draft=false > /dev/null
+    echo "✓"
 }
 
 verify_required_binaries() {
