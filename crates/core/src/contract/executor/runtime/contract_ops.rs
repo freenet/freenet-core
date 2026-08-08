@@ -53,6 +53,14 @@ impl Executor<Runtime> {
                     WrappedState::new(s.into_bytes())
                 }
                 _ => {
+                    // Uncached WASM `summarize_state`: this PUT/UPSERT response
+                    // site has no summary cache in front of it, so it is counted
+                    // on the `uncached` arm — keeping the cached path's
+                    // hit/miss partition exact while the WASM TOTAL stays
+                    // honest. See `ring::contract_exec_metrics`.
+                    if let Some(m) = self.contract_exec_metrics() {
+                        m.record_summarize_wasm_uncached();
+                    }
                     let summary = self
                         .runtime
                         .summarize_state(&key, &params, &current_state)
@@ -125,6 +133,10 @@ impl Executor<Runtime> {
 
             self.broadcast_state_change(key, new_state.clone()).await;
 
+            // Uncached WASM `summarize_state` (PUT response summary).
+            if let Some(m) = self.contract_exec_metrics() {
+                m.record_summarize_wasm_uncached();
+            }
             let summary = self
                 .runtime
                 .summarize_state(&key, &params, &new_state)
@@ -183,6 +195,10 @@ impl Executor<Runtime> {
             let new_state = self
                 .get_updated_state(&parameters, current_state, key, updates)
                 .await?;
+            // Uncached WASM `summarize_state` (local-mode UPDATE response).
+            if let Some(m) = self.contract_exec_metrics() {
+                m.record_summarize_wasm_uncached();
+            }
             let summary = self
                 .runtime
                 .summarize_state(&key, &parameters, &new_state)

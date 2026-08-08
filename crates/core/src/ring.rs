@@ -85,6 +85,7 @@ mod broken_invariants;
 mod connection_backoff;
 mod connection_manager;
 pub(crate) mod contract_ban_list;
+pub(crate) mod contract_exec_metrics;
 pub(crate) mod delta_incompat;
 /// Shadow-mode detector for repairs that never converge (see the module docs).
 pub(crate) mod futile_repair;
@@ -318,6 +319,15 @@ pub(crate) struct Ring {
     /// task *reads* it. Threading the `Arc` (rather than a process-global)
     /// keeps the gauges per-node so unit tests stay isolated (#4488).
     module_cache_metrics: Arc<crate::wasm_runtime::ModuleCacheMetrics>,
+    /// Per-node contract-exec WASM counters: how many `summarize_state` /
+    /// `get_state_delta` invocations this node actually ran, split from the
+    /// cache hits that elided them. Constructed once here and shared via `Arc`:
+    /// the executor increments it through `op_manager.ring`, while
+    /// `emit_router_snapshot_telemetry` reads it. Threading the `Arc` (rather
+    /// than a process-global) keeps the counters per-node so unit tests stay
+    /// isolated (#4488). See [`contract_exec_metrics`] for why an
+    /// undifferentiated span count could not answer the storm question.
+    contract_exec_metrics: Arc<contract_exec_metrics::ContractExecMetrics>,
     /// Per-node placement-migration activity counters (#4404 follow-up).
     /// Constructed once here and shared via `Arc`: the migration SEND site
     /// (`p2p_protoc::migration`) and the two RECEIVE sites (`node::process_message`)
@@ -704,6 +714,7 @@ impl Ring {
             // (the `RuntimePool` reaches it through `op_manager.ring`). See
             // the field docs and #4488.
             module_cache_metrics: Arc::new(crate::wasm_runtime::ModuleCacheMetrics::new()),
+            contract_exec_metrics: Arc::new(contract_exec_metrics::ContractExecMetrics::default()),
             // One placement-migration counter sink per node, shared with the
             // migration send/receive sites via the `Arc` (reached through
             // `op_manager.ring`). See the field docs.
@@ -873,6 +884,28 @@ impl Ring {
     /// this `Arc` is what replaced the old `MODULE_CACHE_METRICS` process-global.
     pub(crate) fn module_cache_metrics(&self) -> Arc<crate::wasm_runtime::ModuleCacheMetrics> {
         self.module_cache_metrics.clone()
+    }
+
+    /// Shared per-node contract-exec WASM counters. Returns a BORROW, not an
+    /// `Arc` clone: the increment sites sit on the contract-handling loop's hot
+    /// path (tens of calls/sec per node), where an `Arc` refcount bump would be
+    /// a needless atomic RMW on top of the counter's own. The snapshot reader
+    /// borrows the same way on its 5-minute cadence.
+    #[inline]
+    pub(crate) fn contract_exec_metrics(&self) -> &contract_exec_metrics::ContractExecMetrics {
+        &self.contract_exec_metrics
+    }
+
+    /// Owned handle on the same counters, for call sites that must hold the
+    /// sink across an outstanding `&mut self` borrow of the executor (the
+    /// client-notification fan-out borrows two executor maps mutably for the
+    /// whole loop, so the borrowing accessor above is unusable there). Cloned
+    /// ONCE per fan-out, not once per subscriber.
+    #[inline]
+    pub(crate) fn contract_exec_metrics_arc(
+        &self,
+    ) -> Arc<contract_exec_metrics::ContractExecMetrics> {
+        self.contract_exec_metrics.clone()
     }
 
     /// Shared per-node placement-migration counter sink (#4404 follow-up). The
@@ -1697,6 +1730,13 @@ impl Ring {
         let mut prev_broadcast_stream_failures_total: u64 = crate::node::BROADCAST_STREAM_METRICS
             .snapshot()
             .streaming_failures_total;
+        // Same shape for the contract-exec WASM counters: the monotonic totals
+        // are emitted for collector-side differencing, and these loop-local
+        // previous values turn the four headline arms into per-window deltas so
+        // a SINGLE snapshot says whether this node's summarize/delta load was
+        // cache hits or real WASM work. Seeded from the current values so the
+        // first emitted window covers only elapsed-since-start work.
+        let mut prev_exec = ring.contract_exec_metrics.snapshot();
         // The diagnostic block is substantially wider than the ordinary
         // snapshot gauges. Its counters are lifetime-monotonic, so collecting
         // locally on every event but exporting one in six snapshots preserves
@@ -2072,6 +2112,35 @@ impl Ring {
             snapshot.broadcast_stream_failures_last_snapshot =
                 Some(broadcast_stream_failures_delta);
 
+            // Contract-exec WASM counters: the split that makes a summarize rate
+            // interpretable. A high `fast_hits` rate with a low `wasm_calls` rate
+            // is a warm cache doing cheap work; the two converging means the
+            // change-detector has stopped covering the load and the storm class
+            // (#4473 / #4610 / #5040 / #5238) has re-armed.
+            let ce = ring.contract_exec_metrics.snapshot();
+            let ce_summarize_fast_hits_delta =
+                window_delta(ce.summarize_fast_hits, &mut prev_exec.summarize_fast_hits);
+            let ce_summarize_wasm_calls_delta =
+                window_delta(ce.summarize_wasm_calls, &mut prev_exec.summarize_wasm_calls);
+            let ce_delta_fast_hits_delta =
+                window_delta(ce.delta_fast_hits, &mut prev_exec.delta_fast_hits);
+            let ce_delta_wasm_calls_delta =
+                window_delta(ce.delta_wasm_calls, &mut prev_exec.delta_wasm_calls);
+            snapshot.contract_exec_summarize_fast_hits_total = Some(ce.summarize_fast_hits);
+            snapshot.contract_exec_summarize_reload_hits_total = Some(ce.summarize_reload_hits);
+            snapshot.contract_exec_summarize_wasm_calls_total = Some(ce.summarize_wasm_calls);
+            snapshot.contract_exec_summarize_wasm_uncached_total = Some(ce.summarize_wasm_uncached);
+            snapshot.contract_exec_delta_fast_hits_total = Some(ce.delta_fast_hits);
+            snapshot.contract_exec_delta_reload_hits_total = Some(ce.delta_reload_hits);
+            snapshot.contract_exec_delta_wasm_calls_total = Some(ce.delta_wasm_calls);
+            snapshot.contract_exec_delta_wasm_uncached_total = Some(ce.delta_wasm_uncached);
+            snapshot.contract_exec_summarize_fast_hits_last_snapshot =
+                Some(ce_summarize_fast_hits_delta);
+            snapshot.contract_exec_summarize_wasm_calls_last_snapshot =
+                Some(ce_summarize_wasm_calls_delta);
+            snapshot.contract_exec_delta_fast_hits_last_snapshot = Some(ce_delta_fast_hits_delta);
+            snapshot.contract_exec_delta_wasm_calls_last_snapshot = Some(ce_delta_wasm_calls_delta);
+
             // Placement-quality gauge (#4404 follow-up): host-to-hosted-key
             // ring-distance distribution. If the SubscribeHint placement
             // migration is working, hosting drifts toward each contract's key,
@@ -2307,6 +2376,18 @@ impl Ring {
                 broadcast_stream_attempts_total = bs.streaming_attempts_total,
                 broadcast_stream_failures_total = bs.streaming_failures_total,
                 broadcast_stream_failures_last_snapshot = broadcast_stream_failures_delta,
+                // The per-window arms are logged (not just the lifetime totals)
+                // so a local operator reading `journalctl` gets the answer from
+                // ONE line. `info!` survives `release_max_level_info`; `debug!`
+                // would not.
+                contract_exec_summarize_fast_hits_last_snapshot = ce_summarize_fast_hits_delta,
+                contract_exec_summarize_wasm_calls_last_snapshot = ce_summarize_wasm_calls_delta,
+                contract_exec_summarize_reload_hits_total = ce.summarize_reload_hits,
+                contract_exec_summarize_wasm_uncached_total = ce.summarize_wasm_uncached,
+                contract_exec_delta_fast_hits_last_snapshot = ce_delta_fast_hits_delta,
+                contract_exec_delta_wasm_calls_last_snapshot = ce_delta_wasm_calls_delta,
+                contract_exec_delta_reload_hits_total = ce.delta_reload_hits,
+                contract_exec_delta_wasm_uncached_total = ce.delta_wasm_uncached,
                 hosted_contracts_count = ?snapshot.hosted_contracts_count,
                 hosted_key_distance_median = ?snapshot.hosted_key_distance_median,
                 hosted_key_distance_p90 = ?snapshot.hosted_key_distance_p90,
