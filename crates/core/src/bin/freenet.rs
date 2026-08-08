@@ -1452,6 +1452,123 @@ mod tests {
         assert!(finish_run(Ok(()), false).is_ok());
     }
 
+    /// Whitespace-stripped view of source text, so a source-scrape pin survives
+    /// `rustfmt` re-wrapping a call across lines (`shutdown_requested\n
+    /// .store(..)` would otherwise stop matching a contiguous needle).
+    fn squeeze(src: &str) -> String {
+        src.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// The part of this file BEFORE its `#[cfg(test)] mod tests`, i.e. production
+    /// code only.
+    ///
+    /// A pin that counts occurrences across the whole file counts its own
+    /// assertion literals too (`include_str!` pulls in the test module), so it
+    /// can never assert "exactly once". Cutting the region here is a structural
+    /// fix rather than the `concat!("a", "b")` needle-splitting used elsewhere in
+    /// this module, which only holds until someone writes the contiguous string.
+    ///
+    /// `.expect`, not a silent fallback: if the attribute stops matching, the
+    /// region would widen to the whole file and the pin would pass vacuously.
+    /// Refuse instead. (Same fail-closed reasoning as `commands::auto_update`'s
+    /// `fn_body`; see `.claude/rules/bug-prevention-patterns.md`.)
+    fn production_region(src: &str) -> &str {
+        let tests_at = src
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("test module not located — this pin cannot bound anything");
+        &src[..tests_at]
+    }
+
+    /// Slice `src` from `opener` (which must end at the block's `{`) to its
+    /// brace-matched close.
+    ///
+    /// Panics when the anchor is missing or the braces never balance, so a moved
+    /// anchor fails LOUDLY rather than silently widening the scoped region —
+    /// the #5102 failure mode that shipped twice.
+    fn braced_block<'a>(src: &'a str, opener: &str) -> &'a str {
+        assert!(
+            opener.ends_with('{'),
+            "opener must end at the block's opening brace: {opener}"
+        );
+        let at = src
+            .find(opener)
+            .unwrap_or_else(|| panic!("block anchor not found: {opener}"));
+        let body_start = at + opener.len();
+        let mut depth = 1usize;
+        for (i, c) in src[body_start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[body_start..body_start + i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("braces never balanced after: {opener}");
+    }
+
+    /// #5230 rests entirely on `shutdown_requested` meaning EXACTLY "an operator
+    /// asked THIS process to stop". `finish_run` maps
+    /// `EventLoopExitReason::GracefulShutdown` to a success exit only when that
+    /// flag is set, because the identical sentinel is ALSO raised by faults — a
+    /// dead critical `p2p_protoc` channel, or `client_events` losing every client
+    /// transport. Those must keep exiting non-zero, or systemd skips the unit's
+    /// `ExecStopPost` self-heal and the macOS/Windows wrappers read "normal
+    /// shutdown" and leave the node DOWN.
+    ///
+    /// The whole discrimination therefore depends on there being exactly ONE
+    /// place that sets the flag. `finish_run_maps_only_a_requested_graceful_stop_to_success`
+    /// above takes it as a parameter, so it cannot see WHERE it is set: a second
+    /// store elsewhere would launder a fault into a success exit — the node exits
+    /// 0, looks healthy, and stays dead — with the entire suite green. The
+    /// tempting site is the auto-update arm of the `select!` in
+    /// `run_network_node_with_signals`, which also calls `shutdown_handle
+    /// .shutdown()` but is NOT an operator stop (it must keep exiting 42).
+    ///
+    /// So: exactly one store in production code, inside the signal-handler task.
+    #[test]
+    fn shutdown_requested_is_stored_only_by_the_signal_handler() {
+        let src = strip_line_comments(include_str!("freenet.rs"));
+        let prod = production_region(&src);
+        let signal_task = braced_block(prod, "let signal_task = {");
+
+        // Anti-vacuity: if brace matching ran past the block, these markers from
+        // later in `run_network_node_with_signals` would be inside it, and the
+        // containment assertion below would prove nothing.
+        for escaped in ["run_network_node(", "UpdateNeededError", "finish_run("] {
+            assert!(
+                !signal_task.contains(escaped),
+                "the scoped signal-task block escaped its braces (found `{escaped}`) — \
+                 this pin would pass vacuously"
+            );
+        }
+        // Anti-vacuity, other direction: confirm we scoped the right block.
+        assert!(
+            squeeze(signal_task).contains(&squeeze("shutdown_handle.shutdown().await")),
+            "scoped block is not the signal-handler task"
+        );
+
+        let needle = squeeze("shutdown_requested.store(");
+        assert_eq!(
+            squeeze(prod).matches(&needle).count(),
+            1,
+            "production code must set `shutdown_requested` in exactly ONE place. A \
+             second store — most temptingly in the auto-update arm, which also calls \
+             `shutdown_handle.shutdown()` — makes `finish_run` report a FAULT as a \
+             clean exit 0, so the service manager skips its self-heal and the node \
+             stays dead (#5230)"
+        );
+        assert_eq!(
+            squeeze(signal_task).matches(&needle).count(),
+            1,
+            "the one store must live in the signal-handler task, which is the only \
+             place that knows an operator (SIGTERM/SIGINT) asked us to stop (#5230)"
+        );
+    }
+
     #[test]
     fn auto_update_default_stays_enabled_flag_and_dirty_disable() {
         use super::auto_update_is_disabled;
