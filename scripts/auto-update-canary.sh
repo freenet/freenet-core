@@ -63,8 +63,12 @@ MARKER_PARSE_FAIL='failed to parse latest version'
 MARKER_FETCH_FAIL='failed to fetch latest version'
 # freenet.rs      -- either --disable-auto-update or a dirty build
 MARKER_DISABLED='Auto-update is DISABLED'
-# freenet.rs      -- detection succeeded and an update was requested
-MARKER_TRIGGERED='triggering auto-update'
+# freenet.rs      -- detection succeeded and an update was requested.
+# Anchored on the full positive phrase, NOT on "triggering auto-update": the
+# #4073 rollback path logs "...not triggering auto-update", and a substring
+# match on the short form treats a node that deliberately REFUSED an update as
+# one that requested it.
+MARKER_TRIGGERED='newer version on GitHub, triggering auto-update'
 
 MUSL_ASSET='freenet-x86_64-unknown-linux-musl.tar.gz'
 RELEASE_BASE='https://github.com/freenet/freenet-core/releases/download'
@@ -78,7 +82,15 @@ CANARY_WS_PORT="${CANARY_WS_PORT:-39509}"
 # check fires after a 0-60s anti-thundering-herd jitter, so this must clear
 # 60s by a healthy margin; it is a ceiling, not a wait (both gates return as
 # soon as they have their answer, typically ~40s).
-CANARY_TIMEOUT_SECS="${CANARY_TIMEOUT_SECS:-240}"
+CANARY_TIMEOUT_SECS="${CANARY_TIMEOUT_SECS:-180}"
+
+# Retry budget for the INDETERMINATE (GitHub unreachable) case only. Kept
+# small on purpose: this sits on the release critical path inside a job with a
+# fixed timeout, and an over-generous retry budget turns a network blip into a
+# cancelled job and a permanently stuck draft -- worse than the failure it was
+# trying to ride out.
+CANARY_ATTEMPTS="${CANARY_ATTEMPTS:-2}"
+CANARY_RETRY_SLEEP="${CANARY_RETRY_SLEEP:-20}"
 
 log()  { printf '%s\n' "$*"; }
 fail() { printf '::error::%s\n' "$*" >&2; }
@@ -114,7 +126,12 @@ assert_detection_healthy() {
   logs="$(cat "$logdir"/freenet.*.log 2>/dev/null)"
 
   if [ -z "$logs" ]; then
-    fail "canary produced no node logs at all in $logdir -- the node never started."
+    # Distinct wording on purpose: this is NOT evidence that the updater is
+    # broken. The update task is spawned well inside network-node startup, so
+    # anything that stops the node booting (port bind, config, gateway list)
+    # lands here. Saying "auto-update is broken" would point whoever is on
+    # call at the wrong subsystem.
+    fail "canary produced no node logs at all in $logdir -- the node never started, so the updater was never reached. Investigate node startup, not the update path."
     return 1
   fi
 
@@ -243,18 +260,26 @@ cmd_preflight() {
   # retrying it just burns release time; a GitHub blip is worth a second look
   # before we stall a release on it.
   local attempt rc
-  for attempt in 1 2 3; do
-    log "--- attempt $attempt/3 ---"
-    rm -rf "${work:?}/logs"
+  for attempt in $(seq 1 "$CANARY_ATTEMPTS"); do
+    log "--- attempt $attempt/$CANARY_ATTEMPTS ---"
+    # Wipe the WHOLE tree, not just the logs. The node persists its GitHub
+    # poll token-bucket and rate-limit cooldown under $work/home; reusing them
+    # means a retry after a 429 re-reads the same persisted cooldown and
+    # reports the identical INDETERMINATE without ever asking GitHub again.
+    # A retry that cannot produce a different answer is not a retry.
+    rm -rf "${work:?}"
+    mkdir -p "$work"
     run_node_until_check "$binary" "$work"
     assert_detection_healthy "$work/logs"
     rc=$?
     [ "$rc" -eq 2 ] || return "$rc"
-    log "indeterminate (GitHub unreachable); retrying in 30s"
-    sleep 30
+    if [ "$attempt" -lt "$CANARY_ATTEMPTS" ]; then
+      log "indeterminate (GitHub unreachable); retrying in ${CANARY_RETRY_SLEEP}s"
+      sleep "$CANARY_RETRY_SLEEP"
+    fi
   done
 
-  fail "could not reach GitHub in 3 attempts -- cannot confirm the shipping binary's updater works. Refusing to publish on an unverified updater; re-run this job once GitHub is reachable."
+  fail "could not reach GitHub in $CANARY_ATTEMPTS attempts -- cannot confirm the shipping binary's updater works. This is an UNVERIFIED result, not a detected bug: re-run this job once GitHub is reachable. Do NOT un-draft the release by hand to work around it."
   return 1
 }
 
@@ -273,12 +298,15 @@ cmd_selfupdate() {
 
   log "=== Gate B: does v$prev_version self-update to v$expected_version? ==="
   mkdir -p "$work/bin"
-  if ! curl -fsSL -o "$work/prev.tar.gz" \
+  if ! curl -fsSL --max-time 300 -o "$work/prev.tar.gz" \
        "$RELEASE_BASE/v${prev_version}/${MUSL_ASSET}"; then
     fail "could not download the previous release (v$prev_version) -- cannot run the canary."
     return 1
   fi
-  tar xzf "$work/prev.tar.gz" -C "$work/bin"
+  if ! tar xzf "$work/prev.tar.gz" -C "$work/bin" || [ ! -s "$work/bin/freenet" ]; then
+    fail "the previous release archive (v$prev_version) did not extract to a usable binary -- cannot run the canary. This is a download/packaging problem, not an updater problem."
+    return 1
+  fi
   chmod +x "$work/bin/freenet"
 
   local starting
@@ -293,7 +321,11 @@ cmd_selfupdate() {
   assert_detection_healthy "$work/logs"
   local rc=$?
   if [ "$rc" -eq 2 ]; then
-    fail "GitHub was unreachable during the self-update canary; cannot confirm that v$prev_version can reach v$expected_version. Treat as UNVERIFIED, not as pass."
+    # Infrastructure, not a stranded fleet. Still a failure -- reporting green
+    # on an unverified run is the vacuous-pass this canary exists to prevent --
+    # but worded so nobody reads it as "the fleet is broken" and learns to
+    # ignore the alarm.
+    fail "UNVERIFIED: GitHub was unreachable, so the canary could not determine whether v$prev_version reaches v$expected_version. This is NOT evidence that auto-update is broken, and NOT evidence that it works. Re-run the job."
     return 1
   fi
   [ "$rc" -eq 0 ] || return 1
@@ -325,7 +357,8 @@ cmd_selfupdate() {
   final="$("$work/bin/freenet" --version | head -1)"
   log "ended at: $final"
 
-  if ! printf '%s' "$final" | grep -qF "$expected_version"; then
+  # Field-exact, not a substring: `grep -F 0.2.12` also matches "0.2.121".
+  if [ "$(printf '%s' "$final" | awk '{print $3}')" != "$expected_version" ]; then
     fail "self-update did NOT land on v$expected_version. Started at '$starting', ended at '$final'. A node on the previous release will not reach this one on its own."
     return 1
   fi

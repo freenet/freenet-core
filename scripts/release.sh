@@ -1202,8 +1202,34 @@ trigger_gateway_updates() {
 
 publish_draft_release() {
     # Publish the draft release (idempotent -- no-op if already published).
-    # The cross-compile workflow also publishes via gh release edit --draft=false
-    # as a belt-and-suspenders measure (see cross-compile.yml).
+    #
+    # The cross-compile workflow publishes via `gh release edit --draft=false`
+    # as its final step, AFTER the blocking auto-update pre-flight canary
+    # (#5222). This belt-and-suspenders copy must therefore never fire while
+    # that workflow is still deciding: between asset upload and the canary's
+    # verdict there is now a multi-minute window in which every asset is
+    # present but the release has deliberately NOT been published. The caller
+    # below reaches this function on exactly that condition ("all required
+    # binaries already available"), so without this guard the local driver
+    # would race in and publish a release whose updater the gate was in the
+    # middle of rejecting -- silently turning a blocking gate into no gate.
+    local run_state
+    run_state=$(gh run list --repo freenet/freenet-core \
+        --workflow=cross-compile.yml --branch "v$VERSION" \
+        --json status,conclusion --jq '.[0] | "\(.status):\(.conclusion)"' 2>/dev/null || echo "")
+    case "$run_state" in
+        completed:success|"")
+            # Concluded successfully, or no run found at all (older tags /
+            # manual flows) -- safe to fall through and publish.
+            ;;
+        *)
+            echo "  ⏸  Not publishing: cross-compile for v$VERSION is '$run_state'."
+            echo "     The auto-update pre-flight canary gates publication (#5222);"
+            echo "     let the workflow publish, or fix the gate. Do not un-draft by hand."
+            return 0
+            ;;
+    esac
+
     local is_draft
     is_draft=$(gh release view "v$VERSION" --repo freenet/freenet-core --json isDraft --jq '.isDraft' 2>/dev/null || echo "false")
     if [[ "$is_draft" == "true" ]]; then

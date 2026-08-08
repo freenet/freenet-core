@@ -361,7 +361,12 @@ jobs:
   attach-to-release:
     name: Attach binaries to GitHub release
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Raised from 10 for the auto-update pre-flight canary (#5222). The job
+    # itself takes ~40s; the canary adds ~70s on the happy path but up to ~8
+    # min if it has to retry an unreachable GitHub. At the old budget a retry
+    # got the job CANCELLED before the `Publish release` step ran, leaving a
+    # permanently stuck draft — the exact failure the retry existed to avoid.
+    timeout-minutes: 25
     needs: [build-x86_64-linux, build-arm64-linux, build-arm64-macos, build-x86_64-macos, build-x86_64-windows, build-macos-dmg]
     if: startsWith(github.ref, 'refs/tags/v')
 
@@ -625,6 +630,9 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - name: Auto-update pre-flight canary (blocks publish)
+        # Step-level bound so a hung canary is reported as the canary timing
+        # out, not as the whole publish job dying for unclear reasons.
+        timeout-minutes: 12
         run: |
           tar xzf freenet-x86_64-unknown-linux-musl.tar.gz -C /tmp
           chmod +x /tmp/freenet
@@ -684,7 +692,7 @@ jobs:
       - name: Resolve the previous published release
         id: prev
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # coalesce-exempt: read-only `gh api` release listing; emits no downstream event
         run: |
           set -euo pipefail
           TAG_NAME="${GITHUB_REF#refs/tags/}"
@@ -713,18 +721,33 @@ jobs:
   # A red job in a release run is the primary signal, but nobody is guaranteed
   # to be watching Actions at release time — and a silent fail-closed is
   # indistinguishable from working. Mirror it into the dev room.
+  # Covers BOTH gates. An earlier revision hung this off Gate B alone, which
+  # left the BLOCKING gate silent: a Gate A failure fails `attach-to-release`,
+  # which SKIPS Gate B, so `needs.auto-update-selfupdate-canary.result` is
+  # 'skipped' and no message went out — leaving a release stuck as an
+  # unpublished draft with nobody told. That is precisely the
+  # silent-fail-closed shape this whole change exists to remove.
   notify-auto-update-canary-failure:
     name: Notify dev room if the auto-update canary failed
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: auto-update-selfupdate-canary
-    if: failure() && needs.auto-update-selfupdate-canary.result == 'failure'
+    needs: [attach-to-release, auto-update-selfupdate-canary]
+    if: |
+      always() && startsWith(github.ref, 'refs/tags/v') &&
+      (needs.attach-to-release.result == 'failure' ||
+       needs.attach-to-release.result == 'cancelled' ||
+       needs.auto-update-selfupdate-canary.result == 'failure' ||
+       needs.auto-update-selfupdate-canary.result == 'cancelled')
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/river-dev-notify
         with:
-          message: "\U0001F6A8 AUTO-UPDATE CANARY FAILED for ${{ github.ref_name }} — a node on the PREVIOUS release did not self-update to this one. The fleet will not converge on its own and may need `freenet update` by hand (this is the #5221 failure mode). ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # Deliberately does NOT assert which failure happened. The job can be
+          # red because the updater is broken OR because GitHub was unreachable,
+          # and a message that overstates ("the fleet is stranded") on a network
+          # blip trains people to ignore the channel.
+          message: "\U0001F6A8 AUTO-UPDATE CANARY did not pass for ${{ github.ref_name }} (publish-blocking pre-flight: ${{ needs.attach-to-release.result }}, self-update: ${{ needs.auto-update-selfupdate-canary.result }}). Either a node on the previous release cannot auto-update to this one (#5221 failure mode — the fleet would need `freenet update` by hand), or the canary could not verify it. If the pre-flight gate is the one that failed, the release is STUCK AS A DRAFT and needs a decision. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
           room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
           gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}

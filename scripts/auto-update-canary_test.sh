@@ -121,6 +121,31 @@ check "disabled: dirty build silently skips the check -> fail" 1 "$DIRTY" \
 # a retry that also swallows a real parse failure.
 check "indeterminate: GitHub unreachable -> retry, not fail" 2 "$FETCH_FAIL"
 
+# --- MARKER_TRIGGERED must not match the REFUSAL line ------------------------
+# Found in review. `crates/core/src/bin/freenet.rs` logs
+# "...not triggering auto-update (#4073)" when a newer version is locally
+# blocked (crash-loop pin / repeated install failures). The obvious short
+# marker 'triggering auto-update' is a substring of that, so a node that
+# deliberately REFUSED an update would be read as one that requested it --
+# Gate B would then wait for an exit 42 that is never coming and misreport the
+# cause. Both directions are pinned so neither can regress.
+NOT_TRIGGERED='2026-08-08T02:00:00.000000Z  WARN freenet: Startup check: newer version is locally blocked (crash-loop known-bad pin or repeated install failures); not triggering auto-update (#4073)'
+REALLY_TRIGGERED='2026-08-08T02:02:59.538127Z  INFO freenet: Startup check: newer version on GitHub, triggering auto-update new_version=0.2.122'
+
+if printf '%s' "$NOT_TRIGGERED" | grep -qF "$MARKER_TRIGGERED"; then
+    echo "FAIL - MARKER_TRIGGERED matches the '#4073 not triggering' refusal line" >&2
+    FAILURES=$((FAILURES + 1))
+else
+    echo "ok   - MARKER_TRIGGERED does not match the #4073 refusal line"
+fi
+
+if printf '%s' "$REALLY_TRIGGERED" | grep -qF "$MARKER_TRIGGERED"; then
+    echo "ok   - MARKER_TRIGGERED matches a real update trigger"
+else
+    echo "FAIL - MARKER_TRIGGERED no longer matches the real trigger line" >&2
+    FAILURES=$((FAILURES + 1))
+fi
+
 echo
 if [[ "$FAILURES" -eq 0 ]]; then
     echo "All auto-update-canary assertions passed."

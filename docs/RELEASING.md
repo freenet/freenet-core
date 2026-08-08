@@ -474,17 +474,41 @@ after a #5040 measurement window, which is why it never caught this.)
 
 ### If Gate A fails
 
-The release stays an **unpublished draft**. That is the correct state — do not
-un-draft it by hand to unblock the release. The updater in that binary cannot
-read GitHub's release tags, so publishing it strands every node on the previous
-version and the fix cannot be delivered automatically.
+The release stays an **unpublished draft** with all assets attached. That is
+the correct state — do not un-draft it by hand to unblock the release. The
+updater in that binary cannot read GitHub's release tags, so publishing it
+strands every node on the previous version and the fix cannot be delivered
+automatically. (`scripts/release.sh` will also refuse to publish while the
+cross-compile run is unfinished or failed, for the same reason.)
 
-1. Read the job log; it names the offending line.
-2. Fix the detection path (`crates/core/src/bin/commands/auto_update.rs`), land
-   it, and cut a new patch release. The stuck draft and its tag can be deleted:
-   `gh release delete vX.Y.Z --yes && git push --delete origin vX.Y.Z`.
-3. Reproduce locally with:
-   `bash scripts/auto-update-canary.sh preflight ./target/release/freenet`
+**Know the state you are in first.** `release.yml` publishes to crates.io
+*before* it pushes the tag, so at this point `freenet`/`fdev` vX.Y.Z are
+already live on crates.io with no published GitHub release. That is a real
+split state: `cargo binstall freenet` will 404 until it is resolved, and the
+nightly `binstall-smoke-test` will go red. crates.io versions cannot be
+un-published, so **do not delete the tag** — a yanked-looking crate pointing at
+a tag that no longer exists is worse than the draft.
+
+1. Read the job log; it names the offending line and distinguishes a genuine
+   parse failure from `UNVERIFIED` (GitHub was unreachable).
+2. **If the failure was `UNVERIFIED` or a job timeout**, it is infrastructure,
+   not a bug: use **Re-run failed jobs** on the cross-compile run. The build
+   artifacts persist, so `attach-to-release` re-runs on its own and publishes
+   if the canary passes.
+3. **If the updater is genuinely broken**, fix the detection path
+   (`crates/core/src/bin/commands/auto_update.rs`) and cut the next patch
+   release. Leave vX.Y.Z's tag and draft in place; publish the draft only if
+   you have decided the broken updater is acceptable, knowing the fleet will
+   not auto-update off it.
+4. To reproduce locally, run the canary against a **clean release build**:
+
+   ```bash
+   bash scripts/auto-update-canary.sh preflight ./target/release/freenet
+   ```
+
+   Note that a build from a dirty working tree disables auto-update entirely
+   (`build_info::GIT_DIRTY`), so the canary will report *auto-update is
+   DISABLED* rather than reproducing the parse failure. Commit or stash first.
 
 ### If Gate B fails
 
