@@ -253,11 +253,15 @@ run_node_until_check() {
   # after a 0-60s jitter, so this normally returns in well under a minute and
   # adds no meaningful time to a release.
   #
-  # Measured against the CLOCK, not by counting `sleep 3` iterations. The
-  # counting version charged 3s per pass while each pass also paid for a grep
-  # and a process check, so the budget ran out well before the nominal window
-  # and a slow-booting node on a loaded machine was reported as "the startup
-  # update check never ran" -- a false blocking failure on a healthy binary.
+  # Measured against the CLOCK rather than by counting `sleep 3` iterations,
+  # so the budget means what it says regardless of how long a pass takes.
+  #
+  # Not a bug fix, and deliberately not described as one: the counting version
+  # charged 3s per pass while each pass cost slightly more, which makes the
+  # loop run marginally LONGER than nominal, not shorter. The false "the
+  # startup update check never ran" verdict that prompted this was caused by
+  # leaked nodes from earlier runs stealing CPU (see the `exec` note above),
+  # not by this loop.
   local deadline=$(( $(date +%s) + CANARY_TIMEOUT_SECS ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     if ! kill -0 "$node_pid" 2>/dev/null; then

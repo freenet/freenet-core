@@ -197,6 +197,15 @@ jobs:
       - name: Self-test auto-update release canary
         run: bash scripts/auto-update-canary_test.sh
 
+      # Lifecycle half of the same canary: drives the real `run_node_until_check`
+      # and `cmd_preflight` against a FAKE node binary. The pure test above
+      # cannot see process management, and that is where the two real bugs were
+      # — a gate that failed even a healthy binary, and a node left running
+      # after the gate returned (holding its ports, starving the next attempt).
+      # Case 4 is the load-bearing one: reintroduce the leak and it fails.
+      - name: Self-test auto-update canary lifecycle
+        run: bash scripts/auto-update-canary_lifecycle_test.sh
+
       # install.sh now sets up a supervised service by default (issue #4073) so
       # new nodes auto-update. The system-vs-user + lingering decision is the
       # load-bearing new logic; these smoke tests pin it without needing real
