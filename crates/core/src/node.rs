@@ -93,6 +93,15 @@ mod network_bridge;
 /// `network_bridge` is private outside this module.
 pub(crate) use network_bridge::broadcast_payload_mix::ApplyOrigin;
 
+/// Re-exported for `tracing::telemetry`'s shadow sub-budget guard, which has
+/// to name the minute rollups' cadence and phase to derive the worst-case
+/// number of shadow events in one second. Test-only, and `network_bridge` is
+/// private outside this module.
+#[cfg(test)]
+pub(crate) use network_bridge::broadcast_payload_mix::{
+    ROLLUP_PHASE_OFFSET as MIX_ROLLUP_PHASE_OFFSET, ROLLUP_WINDOW as MIX_ROLLUP_WINDOW,
+};
+
 // Re-export fault injection types for test infrastructure.
 // No cfg gate: underlying items are unconditionally compiled and integration
 // tests compile the lib without cfg(test).

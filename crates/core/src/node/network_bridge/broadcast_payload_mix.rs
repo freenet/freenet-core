@@ -313,7 +313,57 @@ use crate::tracing::event_kind::{STATE_SIZE_BUCKET_COUNT, state_size_bucket};
 /// a minute rather than the 1 Hz sampling the `shadow_demand` aggregators use;
 /// one event per minute per node is a negligible addition to the telemetry
 /// volume this is meant to explain.
-const ROLLUP_WINDOW: Duration = Duration::from_secs(60);
+pub(crate) const ROLLUP_WINDOW: Duration = Duration::from_secs(60);
+
+/// Phase offset applied to the two minute-cadence mix rollups so they never
+/// share an emit second with the 30 s shadow-stat rollups.
+///
+/// Every shadow emitter is spawned from the same block in
+/// [`crate::node::p2p_impl`], so their tickers start within microseconds of
+/// each other. The five shadow-stat streams close a
+/// [`crate::transport::shadow_stats::SHADOW_ROLLUP_WINDOW_SECS`] (30 s) window
+/// and the two mix streams a 60 s one, so without an offset all seven emit in
+/// the SAME second every 60 s, against a `MAX_SHADOW_EVENTS_PER_SECOND` of 6.
+///
+/// This is a LATENT defect, not a measured production loss. Do not restate it
+/// as one: an earlier version of this comment claimed gateways lost a rollup
+/// every minute, and production telemetry says otherwise on both counts.
+/// Measured over 1382 nodes, the shadow sub-budget has dropped 54 events
+/// fleet-wide in total, because `admit_event` tests the aggregate 10/s cap
+/// FIRST and returns early — that cap discards ~31 % of shadow and ~77 % of
+/// operational telemetry, and is the real bottleneck (see #5197). And the two
+/// opt-in streams are not in fact co-enabled on the production gateways, which
+/// run six streams against a cap of six and so cannot drop at all; only 2 of
+/// 1382 nodes run all seven.
+///
+/// The offset is kept anyway because the invariant is worth holding
+/// independently of today's numbers: nothing else ties the sub-budget to the
+/// emit schedule. The cap was chosen against a hand-counted five streams, two
+/// were added without revisiting it, and whoever changes the aggregate cap
+/// makes the sub-budget binding for the first time. The guard is the schedule
+/// test named below, not this constant.
+///
+/// Offsetting is preferred over raising the sub-budget to 7: it adds no
+/// telemetry volume, whereas a cap of 7 would leave only 3 of the 10 aggregate
+/// slots per second for operational telemetry that is already losing 77 %.
+///
+/// 15 s is half the shadow window, which maximises the distance to the
+/// nearest 30 s boundary and so is the most tolerant of spawn-time skew.
+/// Applied to BOTH mix rollups equally, preserving the shared cadence that
+/// lets them be joined per node-minute without interpolation.
+///
+/// Known limit: the separation is probabilistic, not structural. Both cadences
+/// use `MissedTickBehavior::Delay`, so relative phase drifts on a node whose
+/// runtime stalls, and 15 s of margin is eventually consumable. Accumulated
+/// drift, not spawn-time skew, is the mode to watch. Relatedly, production
+/// shows sub-budget drops on nodes running only FIVE streams, which this
+/// schedule model says is impossible — so some source of emission bunching
+/// remains unidentified (see #5195 discussion).
+///
+/// `telemetry::tests::shadow_rollup_emit_schedule_fits_the_shadow_sub_budget`
+/// derives the collision schedule from these constants and fails if this is
+/// set back to zero or an eighth stream lands on an occupied second.
+pub(crate) const ROLLUP_PHASE_OFFSET: Duration = Duration::from_secs(15);
 
 /// Per-contract attribution cap for one window.
 ///
@@ -1598,13 +1648,28 @@ pub(crate) fn spawn_payload_mix_aggregator(
     monitor: &BackgroundTaskMonitor,
 ) {
     let handle = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(ROLLUP_WINDOW);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        ticker.tick().await; // skip the immediate first tick
         // `tokio::time::Instant` (not `std::time::Instant`) so this reads the
         // same clock the ticker uses and stays controllable under a paused
         // test runtime.
         let mut last_rollup = tokio::time::Instant::now();
+        // First emit at one window PLUS `ROLLUP_PHASE_OFFSET`, so this rollup
+        // never lands on the same second as the 30 s shadow-stat rollups (see
+        // `ROLLUP_PHASE_OFFSET`). Starting the interval at the first real emit
+        // replaces the previous skip-the-immediate-tick dance, and makes the
+        // reported window of that first rollup match the period it actually
+        // accumulated over.
+        //
+        // Consequence worth knowing downstream: the FIRST window after every
+        // node start is 75 s, not 60 s. `rollup_window_secs` derives
+        // `window_secs` from real elapsed time, so the emitted record is
+        // self-describing and correct — but an analysis that hardcodes 60
+        // under-reports that one record by 20 %. Gateways restart on every
+        // auto-update, so this is not rare. Normalise by `window_secs`.
+        let mut ticker = tokio::time::interval_at(
+            last_rollup + ROLLUP_WINDOW + ROLLUP_PHASE_OFFSET,
+            ROLLUP_WINDOW,
+        );
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
             let now = tokio::time::Instant::now();
@@ -2866,6 +2931,44 @@ mod tests {
             "record_apply must index the origin arm fallibly; a bare \
              `w.applies[idx]` panics inside a held mutex on the apply hot path \
              the moment a variant is added to `index()` but not to `ALL`"
+        );
+    }
+
+    /// The phase offset is only real if the SPAWN SITE applies it.
+    ///
+    /// `ROLLUP_PHASE_OFFSET` carries a long rationale, so it is well guarded
+    /// against being deleted or zeroed. The ticker line that consumes it is the
+    /// unguarded half: `spawn_payload_mix_aggregator` has exactly two callers,
+    /// both in `p2p_impl`, and no test drives it, so reverting it to a plain
+    /// `tokio::time::interval(ROLLUP_WINDOW)` restores the pre-fix alignment
+    /// with the whole suite still green. It reads like boilerplate a refactor
+    /// would happily normalise.
+    ///
+    /// Bounded to the function body (AGENTS.md): an unbounded `find` would
+    /// match this test's own assertion strings and pass vacuously.
+    #[test]
+    fn payload_mix_aggregator_applies_the_phase_offset_pin() {
+        let src = include_str!("broadcast_payload_mix.rs");
+        let start = src
+            .find("pub(crate) fn spawn_payload_mix_aggregator(")
+            .expect("spawn_payload_mix_aggregator not found");
+        let body = &src[start..];
+        let end = body
+            .find("\n}")
+            .expect("end of spawn_payload_mix_aggregator not found");
+        let body: String = body[..end].split_whitespace().collect();
+
+        assert!(
+            body.contains("tokio::time::interval_at("),
+            "spawn_payload_mix_aggregator must start its ticker with \
+             interval_at so the first emit is phase-offset; a plain \
+             `interval(ROLLUP_WINDOW)` puts it back on the 30 s shadow-stat \
+             boundary"
+        );
+        assert!(
+            body.contains("ROLLUP_WINDOW+ROLLUP_PHASE_OFFSET"),
+            "spawn_payload_mix_aggregator must offset its first tick by \
+             ROLLUP_PHASE_OFFSET; without it the constant is inert"
         );
     }
 
