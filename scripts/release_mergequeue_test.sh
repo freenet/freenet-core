@@ -322,8 +322,10 @@ check "wait_for_pr range is bounded by the next job" \
 # whole-line anchored form. A bare `grep -qF` substring would be satisfied by
 # `# TODO: re-enable <the thing>`, so commenting a guard out would keep this
 # suite green — which is exactly the regression these pins exist to catch.
+# `github.ref` is included because on `workflow_dispatch` it IS `refs/heads/main`,
+# so `ref: ${{ github.ref }}` is the same bug wearing an expression.
 check "release.yml never checks out a moving 'main' reference" \
-  "$(grep -qE "^[[:space:]]*ref:[[:space:]]*['\"]?(main|refs/heads/main)['\"]?[[:space:]]*(#.*)?$" "$RELEASE_YML" && echo moving-ref || echo pinned)" "pinned"
+  "$(grep -qE "^[[:space:]]*ref:[[:space:]]*(['\"]?(main|refs/heads/main)['\"]?|\\\$\\{\\{[[:space:]]*github\\.ref[[:space:]]*\\}\\})[[:space:]]*(#.*)?$" "$RELEASE_YML" && echo moving-ref || echo pinned)" "pinned"
 
 # `git pull origin main` was the original second half of the bug, but ANY
 # shell-level re-pointing of the checkout reopens the same window — and does so

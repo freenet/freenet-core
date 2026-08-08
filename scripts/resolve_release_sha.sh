@@ -46,10 +46,15 @@ fi
 
 MERGE_SHA=""
 GH_UNREACHABLE=false
+# Keep the last stderr rather than discarding it: when this fails it fails
+# mid-release, and "could not be queried" without the 403/404/rate-limit body
+# is the least useful message possible at that moment.
+GH_STDERR=$(mktemp)
+trap 'rm -f "$GH_STDERR"' EXIT
 
 for attempt in $(seq 1 "$ATTEMPTS"); do
     if MERGE_SHA=$(gh pr view "$PR_NUMBER" --repo "$REPOSITORY" \
-        --json mergeCommit --jq '.mergeCommit.oid // empty' 2>/dev/null); then
+        --json mergeCommit --jq '.mergeCommit.oid // empty' 2>"$GH_STDERR"); then
         GH_UNREACHABLE=false
     else
         # Distinguish "the API call failed" from "the PR has no merge commit";
@@ -75,6 +80,10 @@ if [[ ! "$MERGE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
         REASON="PR #$PR_NUMBER reported merge commit '${MERGE_SHA}', which is not a commit SHA"
     fi
     echo "::error title=Could not resolve the release commit::${REASON}. Refusing to fall back to a moving 'main' reference — that is the #5233 bug. The version bump has already merged, so re-run this job (\`gh run rerun --failed\`) once the PR's merge commit is visible."
+    if [ "$GH_UNREACHABLE" = true ] && [ -s "$GH_STDERR" ]; then
+        echo "Last error from gh:"
+        sed 's/^/  /' "$GH_STDERR"
+    fi
     exit 1
 fi
 
@@ -86,6 +95,10 @@ if [ -z "$LAUNCH_SHA" ] || [ "$LAUNCH_SHA" = "$MERGE_SHA" ]; then
     exit 0
 fi
 
+# `.commits` is capped at 250 by the compare API. That is unreachable inside a
+# ~20-minute merge-queue window, and this whole section is advisory anyway, so
+# counting the listed commits is fine; if it ever saturates, the count would
+# understate and `.total_commits` would be the authoritative field.
 if ! RANGE=$(gh api "repos/$REPOSITORY/compare/$LAUNCH_SHA...$MERGE_SHA" \
     --jq '.commits[] | "  \(.sha[0:9]) \(.commit.message | split("\n")[0])"' 2>/dev/null); then
     # Never claim "main did not move" on the strength of a call that failed.
