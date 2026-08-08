@@ -11,24 +11,43 @@
       flake-utils,
       ...
     }:
+    let
+      inherit (nixpkgs) lib;
+    in
     {
       overlays.default = _: pkgs: {
-        freenet = pkgs.callPackage (import ./package.nix) { };
-        freenet-autoupdate = pkgs.writeShellScriptBin "freenet-autoupdate" ''
-          trap "" INT
+        freenet = pkgs.callPackage (import ./package.nix) {
+          gitDirty = !(self ? rev);
+          gitCommitHash =
+            if self ? rev then
+              lib.substring 0 12 self.rev
+            else
+              lib.substring 0 12 (lib.removeSuffix "-dirty" self.dirtyRev);
+        };
+        freenet-autoupdate = pkgs.writeShellApplication {
+          name = "freenet-autoupdate";
+          runtimeInputs = [
+            pkgs.gh
+            pkgs.nix
+          ];
+          text = ''
+            while true; do
+                vsn="$(gh release view --repo freenet/freenet-core \
+                  --json tagName --jq .tagName)"
+                echo "Running freenet $vsn"
+                exit_code=0
+                nix --option experimental-features 'nix-command flakes' \
+                  run "github:freenet/freenet-core/$vsn#freenet" || exit_code=$?
 
-          while true; do
-              nix run github:freenet/freenet-core#freenet
-              exit_code=$?
-
-              if [ $exit_code -eq 42 ]; then
-                  echo "Autoupdate triggered. Restarting..."
-              else
-                  echo "Non-autoupdate exit code: $exit_code. Stopping."
-                  break
-              fi
-          done
-        '';
+                if [ $exit_code -eq 42 ]; then
+                    echo "Autoupdate triggered. Restarting..."
+                else
+                    echo "Non-autoupdate exit code: $exit_code. Stopping."
+                    exit $exit_code
+                fi
+            done
+          '';
+        };
       };
     }
     // flake-utils.lib.eachDefaultSystem (
@@ -43,6 +62,19 @@
         packages = rec {
           inherit (pkgs) freenet freenet-autoupdate;
           default = freenet-autoupdate;
+        };
+        devShells.default = pkgs.mkShell {
+          inputsFrom = [ self.packages.${system}.freenet ];
+          packages = [
+            pkgs.cargo-nextest
+            pkgs.clippy
+            pkgs.jq
+            pkgs.nixfmt
+            pkgs.pre-commit
+            pkgs.python3
+            pkgs.rustfmt
+            pkgs.shellcheck
+          ];
         };
       }
     );
