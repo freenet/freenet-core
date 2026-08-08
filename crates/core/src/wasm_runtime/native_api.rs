@@ -8,7 +8,7 @@ use freenet_stdlib::prelude::{
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 use super::contract_store::ContractStore;
 use super::delegate_store::DelegateStore;
@@ -290,6 +290,31 @@ thread_local! {
 }
 
 pub(super) type InstanceId = i64;
+
+/// The single allocator for WASM instance ids.
+///
+/// [`MEM_ADDR`], [`DELEGATE_ENV`] and [`CONTRACT_IO`] are process-GLOBAL maps
+/// keyed by instance id, so the id namespace is process-global too: two engines
+/// alive at the same time (two simulated nodes, two pooled executors, or two
+/// tests running in parallel in one test binary) must never be issued the same
+/// id. Every id therefore comes from this one counter, handed out by
+/// [`next_instance_id`] inside `WasmEngine::create_instance` and returned to
+/// the caller in the `InstanceHandle`; no caller can supply an id of its own.
+///
+/// Regression this shape prevents (#4213 / #5023): `create_instance` used to
+/// take a caller-supplied id, and the engine unit tests passed hand-picked ones
+/// (`0..10_001`, `0..STORE_REFRESH_THRESHOLD`, `999`, ...). Their
+/// `drop_instance` then removed the `MEM_ADDR` entry of a LIVE delegate or
+/// contract instance in a concurrently-running test that had been issued the
+/// same id here, and every host function on the victim instance began returning
+/// `ERR_NOT_IN_PROCESS`, surfacing as `SecretResult(None)` from a delegate
+/// secret read, or `error_code: -1` from a delegate contract call.
+static NEXT_INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
+
+/// Issue the next process-globally unique [`InstanceId`].
+pub(super) fn next_instance_id() -> InstanceId {
+    NEXT_INSTANCE_ID.fetch_add(1, Ordering::SeqCst)
+}
 
 // ---------------------------------------------------------------------------
 // Contract I/O: streaming refill buffers
