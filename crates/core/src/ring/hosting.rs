@@ -77,6 +77,12 @@ use dashmap::{DashMap, DashSet};
 use demand::ProximityPrior;
 use disk_usage::DiskUsageTracker;
 pub(crate) use disk_usage::{DiskBudgetExceeded, DiskUsageStats};
+/// Start-time disk-budget estimate (#5014), for the wasmtime compile-cache soft
+/// limit, which wasmtime fixes at `Cache::new` — before this manager's tracker
+/// is configured or seeded. Paired with the startup prune that brings an
+/// already-oversized cache under that freshly-resolved limit, since lowering the
+/// limit alone never shrinks an existing tree.
+pub(crate) use disk_usage::{prune_compile_cache_to_limit, startup_disk_budget_estimate};
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
@@ -505,6 +511,11 @@ pub(crate) struct HostingManager {
     /// installs a real value (the tracker is also unseeded before then, so the
     /// gate is a no-op regardless).
     disk_budget_bytes: AtomicU64,
+
+    /// Edge-trigger latch for [`Self::warn_if_compile_cache_over_share`] (#5014),
+    /// so the "compile cache exceeds its share of the live budget" warning fires
+    /// on each crossing rather than on every 60s recompute.
+    compile_cache_over_share_warned: std::sync::atomic::AtomicBool,
 }
 
 impl HostingManager {
@@ -552,6 +563,7 @@ impl HostingManager {
             disk_pct_bits: AtomicU64::new(DEFAULT_HOSTING_DISK_PCT.to_bits()),
             max_hosting_disk_bytes: AtomicU64::new(DEFAULT_MAX_HOSTING_DISK_BYTES),
             disk_budget_bytes: AtomicU64::new(u64::MAX),
+            compile_cache_over_share_warned: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -661,13 +673,13 @@ impl HostingManager {
     /// Returns the effective budget it installed (for telemetry/tests), or `None`
     /// when it was a no-op.
     pub(crate) fn recompute_effective_budget(&self, available: u64) -> Option<u64> {
-        let used = {
+        let (used, compile_cache_bytes) = {
             let guard = self.disk_tracker.read();
             let tracker = guard.as_ref()?;
             if !tracker.is_seeded() {
                 return None;
             }
-            tracker.total_bytes()
+            (tracker.total_bytes(), tracker.stats().compile_cache_bytes)
         };
         let pct = f64::from_bits(self.disk_pct_bits.load(Ordering::Relaxed));
         let cap = self.max_hosting_disk_bytes.load(Ordering::Relaxed);
@@ -678,11 +690,65 @@ impl HostingManager {
         // checks projected disk against THIS value (the aggregate bound), not the
         // effective floor installed on the cache below.
         self.disk_budget_bytes.store(disk_budget, Ordering::Relaxed);
+        self.warn_if_compile_cache_over_share(compile_cache_bytes, disk_budget);
         let effective = ram.min(disk_budget);
         // O(1) under the cache write lock; the expensive du-walk already ran
         // OUTSIDE any lock before this call.
         self.hosting_cache.write().set_budget_bytes(effective);
         Some(effective)
+    }
+
+    /// Surface the one residual hole in the #5014 bound: the compile cache
+    /// holding more than its share of the LIVE budget.
+    ///
+    /// The cache's soft limit is fixed at `Cache::new` from a budget ESTIMATED at
+    /// startup, and wasmtime offers no way to re-apply it on a live `Cache`. The
+    /// live budget, by contrast, is recomputed here every 60s. Freenet's own
+    /// writes cannot break the relation (the budget's basis is `used +
+    /// available`, invariant under moving bytes between the two on one mount),
+    /// but something OUTSIDE Freenet filling or resizing the data mount can: the
+    /// budget falls while the fixed limit does not. Past that point the wedge
+    /// #5014 closes is reachable again for the life of the process, and nothing
+    /// else reports it — the operator sees only rejected PUTs.
+    ///
+    /// Uses the same divisor the sizing rule uses, so this warns on exactly the
+    /// condition "the startup assumption no longer holds", not on a second,
+    /// drifting notion of it. The remedy is a restart, which re-derives the limit
+    /// from the shrunken mount and prunes the existing cache down to it
+    /// (`disk_usage::prune_compile_cache_to_limit`).
+    ///
+    /// Edge-triggered: a node parked in this state must not emit a warning every
+    /// 60s, and re-arming on recovery means a flapping mount reports each
+    /// crossing rather than only the first.
+    fn warn_if_compile_cache_over_share(&self, compile_cache_bytes: u64, disk_budget: u64) {
+        let over_share = compile_cache_bytes
+            .saturating_mul(crate::wasm_runtime::WASMTIME_CACHE_DISK_BUDGET_DIVISOR)
+            > disk_budget;
+        if self
+            .compile_cache_over_share_warned
+            .swap(over_share, Ordering::Relaxed)
+            == over_share
+        {
+            return;
+        }
+        if over_share {
+            tracing::warn!(
+                compile_cache_bytes,
+                disk_budget_bytes = disk_budget,
+                "wasmtime compile cache now exceeds its share of the aggregate disk \
+                 budget: the budget has shrunk since startup (something outside \
+                 Freenet is using the data mount) while the cache's soft limit is \
+                 fixed for this process. Eviction cannot reclaim compile-cache \
+                 bytes; restart the node to re-derive the limit and prune the cache \
+                 (#5014)"
+            );
+        } else {
+            tracing::info!(
+                compile_cache_bytes,
+                disk_budget_bytes = disk_budget,
+                "wasmtime compile cache is back within its share of the disk budget"
+            );
+        }
     }
 
     /// Pre-write admission gate for a state write (#4683, live since #4702): reject the write
@@ -7598,6 +7664,68 @@ mod tests {
                 .admit_state_update(&make_contract_key(1), 300 * MIB)
                 .is_err(),
             "growth over budget must still reject"
+        );
+    }
+
+    /// The one residual hole in the #5014 bound has to be VISIBLE (F1): the
+    /// compile cache's soft limit is fixed for the process, so an external
+    /// consumer filling the data mount drives the live budget below it and the
+    /// wedge returns with no in-process recovery. Nothing else reports that —
+    /// the operator sees only rejected PUTs.
+    ///
+    /// Asserts the latch transitions rather than captured log lines (subscriber-
+    /// capture tests are flaky here): the latch IS the emit decision, since the
+    /// helper returns early exactly when it does not change.
+    #[test]
+    fn compile_cache_over_share_warning_is_edge_triggered() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let armed = || {
+            manager
+                .compile_cache_over_share_warned
+                .load(Ordering::Relaxed)
+        };
+
+        // Well under its share: nothing to report.
+        manager.warn_if_compile_cache_over_share(10, 1000);
+        assert!(!armed());
+        // Exactly its share is NOT over — the sizing rule caps AT a quarter.
+        manager.warn_if_compile_cache_over_share(250, 1000);
+        assert!(!armed(), "the boundary must not warn");
+        // Crossing up reports once...
+        manager.warn_if_compile_cache_over_share(300, 1000);
+        assert!(armed());
+        // ...and a node parked in this state must not warn every 60s.
+        manager.warn_if_compile_cache_over_share(400, 1000);
+        assert!(armed());
+        // Recovery re-arms, so a flapping mount reports each crossing rather
+        // than only the first.
+        manager.warn_if_compile_cache_over_share(200, 1000);
+        assert!(!armed());
+
+        // The threshold must be the SIZING rule's own divisor, not a second,
+        // drifting notion of "its share": at 1000 the boundary sits at 250, so a
+        // divisor of 2 would stay quiet here and a divisor of 8 would warn.
+        assert_eq!(crate::wasm_runtime::WASMTIME_CACHE_DISK_BUDGET_DIVISOR, 4);
+    }
+
+    /// Pin: the 60s recompute must actually CALL the over-share check. The check
+    /// is the only surfacing of the residual hole above, and dropping the call is
+    /// invisible to every test of the helper itself.
+    #[test]
+    fn recompute_effective_budget_runs_the_over_share_check() {
+        let src = include_str!("hosting.rs");
+        let body = src
+            .split_once("pub(crate) fn recompute_effective_budget(")
+            .expect("recompute_effective_budget must exist")
+            .1
+            .split_once("\n    /// Surface the one residual hole")
+            .expect("end marker of recompute_effective_budget must exist")
+            .0;
+        assert!(
+            body.contains(concat!("self.warn_if_compile_", "cache_over_share(")),
+            "recompute_effective_budget must run the over-share check — it is the \
+             only signal that the compile cache's fixed soft limit no longer fits \
+             the live budget (#5014)"
         );
     }
 }
