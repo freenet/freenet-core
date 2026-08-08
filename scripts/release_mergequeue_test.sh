@@ -375,9 +375,9 @@ for job_name in publish_crates create_release; do
     # Presence is not enough. A guard placed AFTER the publish or the tag push
     # verifies nothing — the irreversible act has already happened — so assert
     # ORDER. Line numbers are relative to the extracted job body.
-    VERIFY_LINE=$(grep -nE '^[[:space:]]*run: (bash )?scripts/verify_release_checkout\.sh[[:space:]]*$' <<< "$JOB_BODY" | head -1 | cut -d: -f1)
-    CHECKOUT_LINE=$(grep -nE '^[[:space:]]*ref: \$\{\{ needs\.wait_for_pr\.outputs\.release_sha' <<< "$JOB_BODY" | head -1 | cut -d: -f1)
-    IRREVERSIBLE_LINE=$(grep -nE "^[^#]*${IRREVERSIBLE}" <<< "$JOB_BODY" | head -1 | cut -d: -f1)
+    VERIFY_LINE=$(grep -nE '^[[:space:]]*run: (bash )?scripts/verify_release_checkout\.sh[[:space:]]*$' <<< "$JOB_BODY" | head -1 | cut -d: -f1 || true)
+    CHECKOUT_LINE=$(grep -nE '^[[:space:]]*ref: \$\{\{ needs\.wait_for_pr\.outputs\.release_sha' <<< "$JOB_BODY" | head -1 | cut -d: -f1 || true)
+    IRREVERSIBLE_LINE=$(grep -nE "^[^#]*${IRREVERSIBLE}" <<< "$JOB_BODY" | head -1 | cut -d: -f1 || true)
 
     check "$job_name's irreversible step was located" \
       "$([ -n "$IRREVERSIBLE_LINE" ] && echo found || echo missing)" "found"

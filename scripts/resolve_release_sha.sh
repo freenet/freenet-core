@@ -7,9 +7,12 @@
 # release and of the tag, with no signal in the run log (#5233 — v0.2.122
 # shipped an unrelated commit this way, defeating a deliberate scope decision).
 #
-# The commit we want is the one the version-bump PR actually merged AS. That is
-# the tree the merge queue's full-suite release gate validated, and it is
-# immutable: later merges move `main` past it but never change it.
+# The commit we want is the one the version-bump PR actually merged AS. It is
+# immutable: later merges move `main` past it but never change it. It is also
+# the tree the merge queue gated (the full release suite runs when the bump is
+# the last entry in its merge group; a PR queued behind it shifts which group
+# head gets the full run, so read this as "the commit the queue merged",
+# not a guarantee about which suite ran).
 #
 # Emits `sha=<40-hex>` to $GITHUB_OUTPUT for downstream jobs to check out
 # explicitly. Fails closed — it never falls back to a moving reference.
@@ -100,11 +103,15 @@ fi
 # counting the listed commits is fine; if it ever saturates, the count would
 # understate and `.total_commits` would be the authoritative field.
 if ! RANGE=$(gh api "repos/$REPOSITORY/compare/$LAUNCH_SHA...$MERGE_SHA" \
-    --jq '.commits[] | "  \(.sha[0:9]) \(.commit.message | split("\n")[0])"' 2>/dev/null); then
+    --jq '.commits[] | "  \(.sha[0:9]) \(.commit.message | split("\n")[0])"' 2>"$GH_STDERR"); then
     # Never claim "main did not move" on the strength of a call that failed.
     # #5233's complaint was that the divergence was silent; a FALSE all-clear is
     # worse, because it terminates the investigation.
     echo "::warning title=Could not check whether main moved::The compare API call failed, so it is unknown whether commits other than the version bump are in this release. The release is still pinned to $MERGE_SHA."
+    if [ -s "$GH_STDERR" ]; then
+        echo "Last error from gh:"
+        sed 's/^/  /' "$GH_STDERR"
+    fi
     exit 0
 fi
 
@@ -112,7 +119,14 @@ fi
 # with the merge queue while `wait_for_pr` was blocked.
 COMMIT_COUNT=$(printf '%s' "$RANGE" | grep -c . || true)
 COMMIT_COUNT=${COMMIT_COUNT:-0}
-if [ "$COMMIT_COUNT" -le 1 ]; then
+if [ "$COMMIT_COUNT" -eq 0 ]; then
+    # Not an all-clear: the launch commit is not an ancestor of the release
+    # commit (force-push, or a rewritten base). Say so rather than implying the
+    # bump was the only change.
+    echo "::warning title=Could not check whether main moved::The compare from $LAUNCH_SHA to $MERGE_SHA returned no commits, which means the launch commit is not an ancestor of the release commit. The release is still pinned to $MERGE_SHA."
+    exit 0
+fi
+if [ "$COMMIT_COUNT" -eq 1 ]; then
     echo "✅ main did not move during this release: the version bump is the only new commit."
     exit 0
 fi

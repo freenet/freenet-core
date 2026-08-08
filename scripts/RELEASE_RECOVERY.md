@@ -39,10 +39,25 @@ cargo search freenet --limit 1
 - No git tag exists for version
 
 **Recovery:**
+
+Tag the **release commit**, not `main`. The release is cut from one pinned
+commit (the version-bump PR's merge commit), and `main` may have moved past it
+while the workflow was waiting on the merge queue. Tagging `main` by hand
+reintroduces #5233 — the bug the pipeline now prevents.
+
 ```bash
 cd ~/code/freenet/freenet-core/main
-git pull origin main
-git tag v0.1.X
+git fetch origin
+
+# The bump PR is the "build: release X.Y.Z" one. The release.yml run log also
+# prints "📌 Release pinned to <sha>".
+RELEASE_SHA=$(gh pr view <BUMP_PR> --repo freenet/freenet-core \
+  --json mergeCommit --jq '.mergeCommit.oid')
+
+# Confirm it really is the bump commit before tagging it.
+git show "$RELEASE_SHA:crates/core/Cargo.toml" | grep '^version'
+
+git tag -a v0.1.X "$RELEASE_SHA" -m "Release v0.1.X"
 git push origin v0.1.X
 ```
 
@@ -58,7 +73,7 @@ gh release create v0.1.X \
   --repo freenet/freenet-core \
   --title "v0.1.X" \
   --notes "$(gh api repos/freenet/freenet-core/releases/generate-notes \
-    -f tag_name=v0.1.X -f target_commitish=main --jq .body)"
+    -f tag_name=v0.1.X -f target_commitish="$RELEASE_SHA" --jq .body)"
 ```
 
 ### Step 4: Release Created but Crates Not Published
@@ -70,7 +85,9 @@ gh release create v0.1.X \
 **Recovery:**
 ```bash
 cd ~/code/freenet/freenet-core/main
-git pull origin main
+git fetch origin
+# Publish from the release commit, not from whatever main is now (see Step 2).
+git checkout "$RELEASE_SHA"
 
 # Publish freenet crate
 cargo publish -p freenet
@@ -190,11 +207,11 @@ gh pr create --title "chore: release 0.1.X" --body "Release v0.1.X" --base main
 
 # 2. Wait for CI and merge (or use gh pr merge --auto)
 
-# 3. Create tag
-git checkout main
-git pull
-git tag v0.1.X
-git push origin v0.1.X
+# 3. Create tag — on the bump PR's merge commit, NOT on main (see Step 2)
+git fetch origin
+RELEASE_SHA=$(gh pr view <BUMP_PR> --repo freenet/freenet-core \
+  --json mergeCommit --jq '.mergeCommit.oid')
+git tag -a v0.1.X "$RELEASE_SHA" -m "Release v0.1.X"
 
 # 4. Create GitHub release
 gh release create v0.1.X --repo freenet/freenet-core --generate-notes

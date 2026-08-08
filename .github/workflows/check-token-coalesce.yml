@@ -128,13 +128,17 @@ jobs:
             [[ -f "$f" ]] || continue
 
             # Look for the bad pattern: `GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}` # coalesce-exempt: prose describing the pattern, not a real usage
-            # or `token: ${{ github.token }}` near an event-emitting verb.
+            # or `token: ${{ github.token }}` near an event-emitting verb. # coalesce-exempt: prose describing the pattern, not a real usage
             # We're permissive: any new occurrence of bare GITHUB_TOKEN in a
             # workflow file is flagged for review. Suppress via inline comment
             # `# coalesce-exempt: <reason>` on the same line.
             ADDED=$(git diff "$BASE_SHA"..."$HEAD_SHA" -- "$f" | added_lines)
             if echo "$ADDED" | flags_bare_gh_token; then
-              ERRORS+=("$f: new step uses bare \`secrets.GITHUB_TOKEN\` — should coalesce on \`RELEASE_PAT\` (see AGENTS.md → Release Workflow). Add `# coalesce-exempt: <reason>` on the line if intentionally read-only and event-quiet.")
+              # The backticks around the remediation MUST be escaped. Unescaped,
+              # bash runs them as command substitution and the instruction is
+              # silently deleted from the message — which nobody noticed because
+              # the BRE bug meant this line had never once executed.
+              ERRORS+=("$f: new step uses bare \`secrets.GITHUB_TOKEN\` — should coalesce on \`RELEASE_PAT\` (see AGENTS.md → Release Workflow). Add \`# coalesce-exempt: <reason>\` on the line if intentionally read-only and event-quiet.")
             fi
             if echo "$ADDED" | flags_bare_checkout_token; then
               ERRORS+=("$f: new actions/checkout uses bare \`github.token\` — same coalesce rule applies for any subsequent \`git push\`.")
