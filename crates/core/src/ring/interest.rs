@@ -133,9 +133,10 @@ pub(crate) const RESYNC_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(30)
 /// which is safe.
 const RESYNC_THROTTLE_CACHE_SIZE: usize = 4096;
 
-/// Bound on the number of peers tracked by the full-bytes summary fallback
-/// rotation cursor (#5155). Keyed by remote socket address, so it MUST be
-/// bounded — see the per-key-collection rule in `.claude/rules/code-style.md`.
+/// Bound on the number of peers tracked by the periodic summary rotation
+/// cursor (#5155; every peer since #5238, not just the full-bytes minority).
+/// Keyed by remote socket address, so it MUST be bounded — see the
+/// per-key-collection rule in `.claude/rules/code-style.md`.
 ///
 /// Eviction costs a peer its place in the cycle, not coverage: a forgotten
 /// cursor restarts that peer's rotation at a random offset, so the contracts
@@ -143,12 +144,19 @@ const RESYNC_THROTTLE_CACHE_SIZE: usize = 4096;
 ///
 /// The random restart is load-bearing here, not decoration. Under a fixed
 /// restart, a single eviction would be harmless, but SUSTAINED eviction — more
-/// concurrently-syncing fallback peers than cache slots — would return every
-/// peer to the head of its set every round and starve the tail permanently. The
-/// cap is well above `max_connections`, so that is not the expected regime; the
+/// concurrently-syncing peers than cache slots — would return every peer to the
+/// head of its set every round and starve the tail permanently. The cap is well
+/// above `max_connections`, so that is not the expected regime; the
 /// randomisation is what makes it a slow cycle rather than a silent hole if it
-/// ever is. See [`InterestManager::fallback_window_start`].
-const SUMMARY_FALLBACK_CURSOR_CACHE_SIZE: usize = 4096;
+/// ever is. See [`InterestManager::summary_window_start`].
+///
+/// #5238 widened the tracked population from the full-bytes minority to every
+/// connected peer. That does not change the conclusion — 4096 still clears
+/// `max_connections` by an order of magnitude — but it does mean the headroom
+/// is no longer as large as the original margin suggested, so re-check it
+/// against `max_connections` rather than against this paragraph if either
+/// moves.
+const SUMMARY_WINDOW_CURSOR_CACHE_SIZE: usize = 4096;
 
 /// Bounds diagnostic correlation state influenced by remote (contract, peer)
 /// pairs. Eviction only loses classification detail; it never changes routing.
@@ -1095,11 +1103,11 @@ pub struct InterestManager<T: TimeSource> {
     /// issue #4857.
     resync_request_throttle: Mutex<LruCache<(ContractKey, SocketAddr), Instant>>,
 
-    /// Rotation cursor for the bounded full-bytes summary fallback (#5155),
-    /// keyed by the peer's socket address.
+    /// Rotation cursor for the bounded periodic summary reply (#5155, extended
+    /// to the digest form by #5238), keyed by the peer's socket address.
     ///
     /// Holds the contract id of the LAST entry included in that peer's previous
-    /// fallback reply — a KEY, not an index. That distinction is what preserves
+    /// reply — a KEY, not an index. That distinction is what preserves
     /// the coverage BOUND when the shared set changes between rounds.
     ///
     /// A stored index names a position, and a removal below it shifts every
@@ -1121,9 +1129,12 @@ pub struct InterestManager<T: TimeSource> {
     /// runs both designs over the same removal schedule and shows the index
     /// one missing contracts the key one covers.
     ///
-    /// Only the full-bytes fallback consults this. Digest-capable peers keep
-    /// receiving the complete set every round and never touch it.
-    summary_fallback_cursor: Mutex<LruCache<SocketAddr, ContractInstanceId>>,
+    /// BOTH wire forms consult this. It served only the full-bytes fallback
+    /// under #5155 — digest-capable peers received the complete set every round
+    /// and never touched it — and #5238 ended that, because the cost the window
+    /// really bounds is the per-entry summarize call, which the digest form
+    /// pays in full.
+    summary_window_cursor: Mutex<LruCache<SocketAddr, ContractInstanceId>>,
 
     /// Count of concurrently-outstanding queue-full-resync retry tasks (#4862 P1).
     /// Bounds aggregate retry tasks node-wide, independent of the throttle LRU
@@ -1194,9 +1205,9 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 NonZeroUsize::new(RESYNC_THROTTLE_CACHE_SIZE)
                     .expect("RESYNC_THROTTLE_CACHE_SIZE must be > 0"),
             )),
-            summary_fallback_cursor: Mutex::new(LruCache::new(
-                NonZeroUsize::new(SUMMARY_FALLBACK_CURSOR_CACHE_SIZE)
-                    .expect("SUMMARY_FALLBACK_CURSOR_CACHE_SIZE must be > 0"),
+            summary_window_cursor: Mutex::new(LruCache::new(
+                NonZeroUsize::new(SUMMARY_WINDOW_CURSOR_CACHE_SIZE)
+                    .expect("SUMMARY_WINDOW_CURSOR_CACHE_SIZE must be > 0"),
             )),
             missing_summary_history: Mutex::new(LruCache::new(
                 NonZeroUsize::new(MISSING_SUMMARY_HISTORY_SIZE)
@@ -2678,9 +2689,18 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         contracts
     }
 
-    /// Index at which `peer`'s next full-bytes fallback window starts, given
-    /// the shared-contract set in [`Self::get_matching_contracts`] order
+    /// Index at which `peer`'s next periodic summary window starts, given the
+    /// shared-contract set in [`Self::get_matching_contracts`] order
     /// (ascending by contract id).
+    ///
+    /// Serves BOTH wire forms. #5155 introduced it for the full-bytes fallback
+    /// only, hence the `fallback` names it used to carry; #5238 windows the
+    /// hash-first digest path too, because what the window really bounds is the
+    /// number of `summary_if_hosted_or_in_use` calls a reply makes, and that
+    /// cost is identical in either form. One cursor per peer is correct: a
+    /// peer's form is a property of its version and does not alternate, and
+    /// even if it did, the cursor names a position in id space rather than
+    /// anything form-specific.
     ///
     /// Mid-cycle this resumes immediately after the last contract SENT to that
     /// peer, which is what makes successive windows contiguous in id space
@@ -2713,11 +2733,11 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// covered first every time.
     ///
     /// `GlobalRng` keeps this deterministic under simulation and test.
-    pub(crate) fn fallback_window_start(&self, peer: SocketAddr, sorted: &[ContractKey]) -> usize {
+    pub(crate) fn summary_window_start(&self, peer: SocketAddr, sorted: &[ContractKey]) -> usize {
         if sorted.is_empty() {
             return 0;
         }
-        let after = { self.summary_fallback_cursor.lock().peek(&peer).copied() };
+        let after = { self.summary_window_cursor.lock().peek(&peer).copied() };
         let resumed = after.map(|after| first_index_after(sorted, &after));
         match resumed {
             // Mid-cycle: continue exactly where the last reply stopped.
@@ -2728,26 +2748,26 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     }
 
     /// Record the contract id of the last entry actually included in `peer`'s
-    /// fallback reply, so the next reply resumes after it.
+    /// periodic summary reply, so the next reply resumes after it.
     ///
     /// Takes what was SENT, not what was selected: the byte budget can cut a
     /// window short, and advancing past entries we dropped would skip them
     /// until the rotation wrapped all the way round.
-    pub(crate) fn record_fallback_cursor(&self, peer: SocketAddr, last_sent: ContractInstanceId) {
-        self.summary_fallback_cursor.lock().put(peer, last_sent);
+    pub(crate) fn record_summary_cursor(&self, peer: SocketAddr, last_sent: ContractInstanceId) {
+        self.summary_window_cursor.lock().put(peer, last_sent);
     }
 
     /// Test accessor for the stored cursor.
     #[cfg(test)]
-    pub(crate) fn peek_fallback_cursor(&self, peer: SocketAddr) -> Option<ContractInstanceId> {
-        self.summary_fallback_cursor.lock().peek(&peer).copied()
+    pub(crate) fn peek_summary_cursor(&self, peer: SocketAddr) -> Option<ContractInstanceId> {
+        self.summary_window_cursor.lock().peek(&peer).copied()
     }
 }
 
 /// First index in `sorted` (ascending by contract id, as
 /// [`InterestManager::get_matching_contracts`] returns it) whose id is strictly
 /// greater than `after`. Returns `sorted.len()` when `after` is at or past the
-/// end, which [`InterestManager::fallback_window_start`] reads as the end of a
+/// end, which [`InterestManager::summary_window_start`] reads as the end of a
 /// cycle and answers with a fresh random offset.
 ///
 /// This is the churn-safe half of the rotation. Because it is a binary search
@@ -7129,7 +7149,7 @@ mod tests {
     /// production uses at a cycle boundary. That is deliberate: these tests
     /// pin the WITHIN-cycle contiguity and coverage properties, which must hold
     /// from any starting offset, so the tests below sweep the starts explicitly
-    /// instead of sampling them. `fallback_window_start_randomises_the_cycle_
+    /// instead of sampling them. `summary_window_start_randomises_the_cycle_
     /// boundary` covers the production entry point.
     fn rotation_round(
         sorted: &[ContractKey],
@@ -7384,29 +7404,29 @@ mod tests {
     /// Mid-cycle the stored cursor round-trips and resumes deterministically,
     /// and cursors do not leak between peers.
     #[test]
-    fn fallback_cursor_round_trips_and_resumes_mid_cycle() {
+    fn summary_cursor_round_trips_and_resumes_mid_cycle() {
         let (mgr, _clock) = make_manager();
         let peer: SocketAddr = "127.0.0.1:9100".parse().unwrap();
         let sorted = sorted_keys(0..8);
 
-        assert_eq!(mgr.peek_fallback_cursor(peer), None);
+        assert_eq!(mgr.peek_summary_cursor(peer), None);
 
-        mgr.record_fallback_cursor(peer, *sorted[2].id());
-        assert_eq!(mgr.peek_fallback_cursor(peer), Some(*sorted[2].id()));
+        mgr.record_summary_cursor(peer, *sorted[2].id());
+        assert_eq!(mgr.peek_summary_cursor(peer), Some(*sorted[2].id()));
         assert_eq!(
-            mgr.fallback_window_start(peer, &sorted),
+            mgr.summary_window_start(peer, &sorted),
             3,
             "mid-cycle the resume point must be exactly after the last id sent"
         );
 
         // Cursors are per peer: one peer's progress must not advance another's.
         let other: SocketAddr = "127.0.0.1:9101".parse().unwrap();
-        mgr.record_fallback_cursor(other, *sorted[6].id());
-        assert_eq!(mgr.fallback_window_start(peer, &sorted), 3);
-        assert_eq!(mgr.fallback_window_start(other, &sorted), 7);
+        mgr.record_summary_cursor(other, *sorted[6].id());
+        assert_eq!(mgr.summary_window_start(peer, &sorted), 3);
+        assert_eq!(mgr.summary_window_start(other, &sorted), 7);
 
         // An empty shared set has no valid offset; it must not panic or draw.
-        assert_eq!(mgr.fallback_window_start(peer, &[]), 0);
+        assert_eq!(mgr.summary_window_start(peer, &[]), 0);
     }
 
     /// At a CYCLE BOUNDARY the start is random, not a fixed 0.
@@ -7423,7 +7443,7 @@ mod tests {
     /// at the end. With a fixed restart that alternation pins the window to the
     /// head forever; with a random one it cannot.
     #[test]
-    fn fallback_window_start_randomises_the_cycle_boundary() {
+    fn summary_window_start_randomises_the_cycle_boundary() {
         let (mgr, _clock) = make_manager();
         let sorted = sorted_keys(0..64);
 
@@ -7431,7 +7451,7 @@ mod tests {
         let mut seen = HashSet::new();
         for i in 0..40u32 {
             let peer: SocketAddr = format!("127.0.0.1:{}", 9200 + i).parse().unwrap();
-            let start = mgr.fallback_window_start(peer, &sorted);
+            let start = mgr.summary_window_start(peer, &sorted);
             assert!(start < sorted.len(), "start {start} out of range");
             seen.insert(start);
         }
@@ -7445,8 +7465,8 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:9300".parse().unwrap();
         let mut seen_wrapped = HashSet::new();
         for _ in 0..40 {
-            mgr.record_fallback_cursor(peer, *sorted[sorted.len() - 1].id());
-            seen_wrapped.insert(mgr.fallback_window_start(peer, &sorted));
+            mgr.record_summary_cursor(peer, *sorted[sorted.len() - 1].id());
+            seen_wrapped.insert(mgr.summary_window_start(peer, &sorted));
         }
         assert!(
             seen_wrapped.iter().all(|s| *s < sorted.len()),
@@ -7467,11 +7487,11 @@ mod tests {
     /// under the deterministic simulation harness, which would make any
     /// convergence simulation covering this path silently non-deterministic.
     #[test]
-    fn fallback_window_start_draws_its_offset_from_global_rng() {
+    fn summary_window_start_draws_its_offset_from_global_rng() {
         let src = include_str!("interest.rs");
         let at = src
-            .find("pub(crate) fn fallback_window_start(")
-            .expect("fallback_window_start not found");
+            .find("pub(crate) fn summary_window_start(")
+            .expect("summary_window_start not found");
         let body_end = at + src[at..].find("\n    }\n").expect("body end not found");
         let body = &src[at..body_end];
         assert!(
