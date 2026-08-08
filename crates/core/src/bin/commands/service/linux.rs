@@ -450,31 +450,31 @@ Environment=FREENET_SUPERVISED=1
 # (auto-updated but not reinstalled) or the mac/Windows wrapper keeps emitting the
 # self-healing exit 42 instead of a 45 the supervisor would mishandle.
 Environment={fast_crash_marker}=1
-# Stale-orphan self-heal (issue #3967): RestartPreventExitStatus=43 below
-# means an exit 43 ("another instance already running") never restarts the
-# unit. That is correct for a legitimate second instance, but if the port
-# holder is an ORPHANED `freenet network` (PPID=1) still running an OLD
-# binary, the unit would stand down and the orphan would serve stale assets
-# forever. This pre-flight runs before every start: it finds the port
-# holder, and kills it ONLY when it is an init-adopted orphan (PPID==1) whose
-# `Freenet version:` line differs from the binary this unit would launch (or
-# whose version can't be read). A user-run `freenet network` (parented by a
-# shell, PPID!=1) is always left alone, as is a current-version orphan.
+# Orphan self-heal (issue #3967): RestartPreventExitStatus=43 below means an
+# exit 43 ("another instance already running") never restarts the unit. That is
+# correct for a legitimate second instance, but an init-adopted ORPHANED
+# `freenet network` (PPID==1) holding the port wedges the unit permanently:
+# ExecStart exits 43, the unit reports success-but-dead, and the orphan runs
+# UNSUPERVISED forever — no Restart= on crash, no systemctl control, and (if it
+# is an old binary) stale assets served indefinitely. This pre-flight runs
+# before every start and kills ANY init-adopted orphan, regardless of version:
+# an earlier revision compared `Freenet version:` lines and spared a
+# current-version orphan, but that just wedges the unit into the unsupervised
+# state — when the operator starts this unit, a PPID==1 holder is always wrong.
+# A user-run `freenet network` (parented by a live shell, PPID!=1) is left
+# alone; it wins the port and the unit stands down via exit 43 as designed.
 #
 # systemd performs its own $VAR/${{VAR}} expansion on Exec* lines BEFORE handing
 # the string to /bin/sh, so every dollar the SHELL must see is written as $$
 # here (systemd collapses $$ -> a single $ for sh). Self-match guards: the
 # pre-flight sh's OWN argv contains the literal "freenet network" (it is the
 # substring `pgrep -f` matches), so the pre-flight excludes its own PID ($$$$ ->
-# the sh's $$) and PID 1 from the holder loop. We deliberately do NOT anchor on
-# the holder's exe equalling THIS unit's on-disk binary: a #3967 orphan is, by
-# definition, running an OLD/DIFFERENT binary, so an `exe == on-disk binary`
-# guard would skip exactly the orphan we must kill. The PPID==1 + version-line
-# checks below are what distinguish a stale orphan from a legitimate holder.
+# the sh's $$) and PID 1 from the holder loop.
 # PPID is read after the final ')' in /proc/PID/stat (comm is parenthesized) so
-# a comm containing whitespace can't shift the field. The '-' prefix means a
-# failure here never blocks the start.
-ExecStartPre=-/bin/sh -c 'self=$$$$; ondisk=$$(timeout 5 {binary} --version 2>/dev/null | grep "^Freenet version:"); for pid in $$(pgrep -f -u "$$(id -u)" "freenet network" 2>/dev/null); do [ "$$pid" = "$$self" ] && continue; [ "$$pid" = "1" ] && continue; exe=$$(readlink -f /proc/$$pid/exe 2>/dev/null); hv=""; [ -x "$$exe" ] && hv=$$(timeout 5 "$$exe" --version 2>/dev/null | grep "^Freenet version:"); ppid=$$(sed "s/.*) //" /proc/$$pid/stat 2>/dev/null | awk "{{print \$$2}}"); mismatch=1; [ -n "$$ondisk" ] && [ -n "$$hv" ] && [ "$$hv" != "$$ondisk" ] && mismatch=0; if [ "$$ppid" = "1" ] && {{ [ "$$mismatch" = "0" ] || [ -z "$$hv" ]; }}; then kill -TERM "$$pid" 2>/dev/null || true; w=0; while kill -0 "$$pid" 2>/dev/null && [ $$w -lt 12 ]; do sleep 1; w=$$((w+1)); done; kill -0 "$$pid" 2>/dev/null && kill -KILL "$$pid" 2>/dev/null || true; fi; done'
+# a comm containing whitespace can't shift the field; `cut` (not awk) extracts
+# the field so the line carries no backslash escapes for journald to warn
+# about. The '-' prefix means a failure here never blocks the start.
+ExecStartPre=-/bin/sh -c 'self=$$$$; for pid in $$(pgrep -f -u "$$(id -u)" "freenet network" 2>/dev/null); do [ "$$pid" = "$$self" ] && continue; [ "$$pid" = "1" ] && continue; ppid=$$(sed "s/.*) //" /proc/$$pid/stat 2>/dev/null | cut -d" " -f2); if [ "$$ppid" = "1" ]; then kill -TERM "$$pid" 2>/dev/null || true; w=0; while kill -0 "$$pid" 2>/dev/null && [ $$w -lt 12 ]; do sleep 1; w=$$((w+1)); done; kill -0 "$$pid" 2>/dev/null && kill -KILL "$$pid" 2>/dev/null || true; fi; done'
 ExecStart={binary} network
 Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops. The actual
@@ -620,19 +620,17 @@ Environment=FREENET_SUPERVISED=1
 # node emits exit 45 only when this is present (this unit handles 45); otherwise it
 # keeps the self-healing exit 42.
 Environment={fast_crash_marker}=1
-# Stale-orphan self-heal (issue #3967): see the matching comment in the user
-# unit (including the systemd $$-escaping, the PPID-after-final-')' parse, and
-# why we do NOT anchor on the holder's exe equalling this unit's on-disk binary
-# — a #3967 orphan runs an OLD/DIFFERENT binary, so that anchor would skip the
-# very process we must kill). The self-PID and PID-1 skips exclude the
-# pre-flight's own sh (whose argv contains the literal "freenet network").
-# RestartPreventExitStatus=43 means an exit 43 never restarts the unit, so an
-# init-adopted orphan (PPID==1) running an OLD binary would hold the port
-# forever. This pre-flight kills the holder ONLY when it is such an orphan whose
-# `Freenet version:` differs from (or can't be read against) the binary this
-# unit launches; a user-run instance (PPID!=1) is always left alone. The '-'
-# prefix means a failure here never blocks the start.
-ExecStartPre=-/bin/sh -c 'self=$$$$; ondisk=$$(timeout 5 {binary} --version 2>/dev/null | grep "^Freenet version:"); for pid in $$(pgrep -f -u "$$(id -u)" "freenet network" 2>/dev/null); do [ "$$pid" = "$$self" ] && continue; [ "$$pid" = "1" ] && continue; exe=$$(readlink -f /proc/$$pid/exe 2>/dev/null); hv=""; [ -x "$$exe" ] && hv=$$(timeout 5 "$$exe" --version 2>/dev/null | grep "^Freenet version:"); ppid=$$(sed "s/.*) //" /proc/$$pid/stat 2>/dev/null | awk "{{print \$$2}}"); mismatch=1; [ -n "$$ondisk" ] && [ -n "$$hv" ] && [ "$$hv" != "$$ondisk" ] && mismatch=0; if [ "$$ppid" = "1" ] && {{ [ "$$mismatch" = "0" ] || [ -z "$$hv" ]; }}; then kill -TERM "$$pid" 2>/dev/null || true; w=0; while kill -0 "$$pid" 2>/dev/null && [ $$w -lt 12 ]; do sleep 1; w=$$((w+1)); done; kill -0 "$$pid" 2>/dev/null && kill -KILL "$$pid" 2>/dev/null || true; fi; done'
+# Orphan self-heal (issue #3967): see the matching comment in the user unit
+# (including the systemd $$-escaping and the PPID-after-final-')' parse). The
+# self-PID and PID-1 skips exclude the pre-flight's own sh (whose argv contains
+# the literal "freenet network"). RestartPreventExitStatus=43 means an exit 43
+# never restarts the unit, so an init-adopted orphan (PPID==1) holding the port
+# would wedge the unit into success-but-dead and run unsupervised forever. This
+# pre-flight kills ANY such orphan regardless of version (an earlier revision
+# spared current-version orphans, which is exactly the wedge); a user-run
+# instance (PPID!=1) is always left alone. The '-' prefix means a failure here
+# never blocks the start.
+ExecStartPre=-/bin/sh -c 'self=$$$$; for pid in $$(pgrep -f -u "$$(id -u)" "freenet network" 2>/dev/null); do [ "$$pid" = "$$self" ] && continue; [ "$$pid" = "1" ] && continue; ppid=$$(sed "s/.*) //" /proc/$$pid/stat 2>/dev/null | cut -d" " -f2); if [ "$$ppid" = "1" ]; then kill -TERM "$$pid" 2>/dev/null || true; w=0; while kill -0 "$$pid" 2>/dev/null && [ $$w -lt 12 ]; do sleep 1; w=$$((w+1)); done; kill -0 "$$pid" 2>/dev/null && kill -KILL "$$pid" 2>/dev/null || true; fi; done'
 ExecStart={binary} network
 Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops. The actual
