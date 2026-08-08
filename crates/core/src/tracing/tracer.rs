@@ -789,15 +789,42 @@ pub fn init_cli_stderr_tracer(level: LevelFilter) -> anyhow::Result<()> {
         .from_env_lossy()
         .add_directive("moka=off".parse().expect("infallible"))
         .add_directive("sqlx=error".parse().expect("infallible"));
-    init_stdout_tracer(
-        level,
-        // The point of the function; see the docs above.
-        true,
-        use_json,
-        filter_layer,
-        None,
-        None,
-    )
+
+    // ANSI only for a human at a terminal. journald stores what it is given
+    // byte for byte, so colouring unconditionally would write escape sequences
+    // into the journal — which is the destination this whole function exists to
+    // reach. The file layers in `init_tracer` set `.with_ansi(false)` for the
+    // same reason.
+    let ansi = std::io::stderr().is_terminal();
+
+    use tracing_subscriber::layer::SubscriberExt;
+    let registry = Registry::default().with(filter_layer);
+    // `compact` rather than the `pretty` multi-line format `init_stdout_tracer`
+    // uses: one journal entry per event is far easier to read (and to grep)
+    // than an event split across several.
+    let result = if use_json {
+        tracing::subscriber::set_global_default(
+            registry.with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_ansi(false)
+                    .with_writer(std::io::stderr),
+            ),
+        )
+    } else {
+        tracing::subscriber::set_global_default(
+            registry.with(
+                tracing_subscriber::fmt::layer()
+                    .compact()
+                    .with_ansi(ansi)
+                    .with_writer(std::io::stderr),
+            ),
+        )
+    };
+    // Returned, not `expect`ed. `init_stdout_tracer` panics here, which for a
+    // CLI would turn "a subscriber was already installed" into a failed update
+    // — trading a diagnostics problem for an outage.
+    result.map_err(|e| anyhow::anyhow!("could not install the CLI subscriber: {e}"))
 }
 
 fn init_stdout_tracer(

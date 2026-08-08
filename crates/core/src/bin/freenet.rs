@@ -556,12 +556,6 @@ async fn run_network_node_with_signals(
             Some((major, minor, patch))
         }
 
-        // Once-per-process guard for the lockout report below. The lockout
-        // persists until an operator clears it, so this is a state to announce
-        // on each boot, not a 6-hourly repeat.
-        static LOCKOUT_REPORTED: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-
         const HARD_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
         // Stagger timer: random delay 0-4 hours before updating on decentralized discovery.
         const MAX_STAGGER_SECS: u64 = 4 * 3600;
@@ -875,28 +869,46 @@ async fn run_network_node_with_signals(
                             return;
                         }
                     }
-                } else if !LOCKOUT_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    // The second state where the update machinery is silently
-                    // OFF (#5244). This was `debug!`, which release builds
-                    // compile out entirely (`release_max_level_info`), and the
-                    // loud once-per-process warning in `check_if_update_available`
-                    // is only reachable from the PEER-signal triggers — so on a
-                    // node whose peers all share its version, nothing said this
-                    // node would never update again.
-                    //
-                    // Once per process, mirroring that existing `LOCKOUT_WARNED`
-                    // pattern: the condition is permanent until an operator
-                    // acts, so repeating it every 6h forever is noise, and one
-                    // line per restart is enough to find it.
-                    eprintln!(
-                        "Freenet: auto-update is LOCKED OUT on this node after repeated failed \
-                         installs (#3934). It will not detect or apply any further release until \
-                         you run `freenet update` manually to clear the counter."
-                    );
-                    tracing::warn!(
-                        "Periodic re-poll: skipped — auto-update locked out after repeated \
+                } else {
+                    // Once per process, not once per 6h tick: the lockout
+                    // persists until an operator acts, so this is a state to
+                    // announce on each boot rather than a recurring alarm.
+                    // Mirrors the existing `LOCKOUT_WARNED` pattern in
+                    // `check_if_update_available`.
+                    static LOCKOUT_REPORTED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !LOCKOUT_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        // The second state where the update machinery is silently
+                        // OFF (#5244). This was `debug!`, which release builds
+                        // compile out entirely (`release_max_level_info`), and the
+                        // loud once-per-process warning in `check_if_update_available`
+                        // is only reachable from the PEER-signal triggers — so on a
+                        // node whose peers all share its version, nothing said this
+                        // node would never update again.
+                        //
+                        // Once per process, mirroring that existing `LOCKOUT_WARNED`
+                        // pattern: the condition is permanent until an operator
+                        // acts, so repeating it every 6h forever is noise, and one
+                        // line per restart is enough to find it.
+                        // Names the file as well as the command: the lockout can
+                        // also be reached with the counter UNREADABLE, and in that
+                        // state `freenet update` cannot clear it (the removal is
+                        // best-effort and fails the same way the read did), so
+                        // "run freenet update" alone would be advice that does not
+                        // work. `--force` bypasses the gate for a one-off recovery.
+                        eprintln!(
+                            "Freenet: auto-update is LOCKED OUT on this node (repeated failed \
+                         installs, #3934, or an unreadable failure counter). It will not detect \
+                         or apply any further release until this is cleared: run `freenet \
+                         update` manually, or delete `update_failures` in the Freenet state \
+                         directory (~/.local/state/freenet on Linux). `freenet update --force` \
+                         bypasses the gate for a single run."
+                        );
+                        tracing::warn!(
+                            "Periodic re-poll: skipped — auto-update locked out after repeated \
                          failed installs (#3934); run `freenet update` to recover"
-                    );
+                        );
+                    }
                 }
             }
         }

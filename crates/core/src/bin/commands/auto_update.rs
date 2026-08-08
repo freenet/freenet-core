@@ -1062,9 +1062,14 @@ pub(crate) fn get_update_failure_count_at(dir: &std::path::Path) -> u32 {
         // Reading it as zero would silently RESET the lockout — a fail-OPEN on
         // the mechanism that bounds the #3934 restart loop, and an easier way to
         // defeat it than the partial-overwrite this function's doc already
-        // guards against. It also fails open at exactly the wrong moment: an
-        // unwritable state dir is what makes installs fail in the first place,
-        // so the counter would be unreadable precisely when it is needed.
+        // guards against.
+        //
+        // Note this is NOT the read-only/full state dir case: EROFS and ENOSPC
+        // break writes, while reads still succeed or report NotFound, which is
+        // handled above. The states that land here are anomalous ones — a
+        // chmod'd or wrong-owner file, a directory in its place, a failing mount
+        // — and treating them as fully-failed is self-healing, because the gate
+        // re-reads every time and recovers the moment the file is readable again.
         //
         // `read_github_poll_bucket_at` in this file makes the same distinction
         // for the same reason.
@@ -1087,10 +1092,34 @@ pub fn record_update_failure() {
 
 /// Testable variant of [`record_update_failure`] that writes into an
 /// explicit directory. Missing directories are created on demand.
+/// What to persist after an install failure, given the raw read of the existing
+/// counter — or `None` to write nothing at all.
+///
+/// Split out from [`record_update_failure_at`] so the decision is testable
+/// without contriving a filesystem that reads one way and writes another.
+///
+/// The subtle case is the unreadable one. [`get_update_failure_count_at`]
+/// deliberately reports an unreadable counter as [`MAX_UPDATE_FAILURES`] so the
+/// GATE stays closed while the file cannot be read — that is transient and
+/// self-healing, because the gate re-reads every time. Feeding that defensive
+/// answer back into the file would be neither: it would bake `MAX + 1` into
+/// disk and lock the node out of auto-update PERMANENTLY on one transient read
+/// error (a flaky network mount, an EIO). That is a worse failure than the
+/// fail-open it replaced, so an unreadable counter writes nothing.
+fn next_failure_count(existing: std::io::Result<String>) -> Option<u32> {
+    match existing {
+        Ok(s) => Some(s.trim().parse::<u32>().unwrap_or(0).saturating_add(1)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(1),
+        Err(_) => None,
+    }
+}
+
 pub(crate) fn record_update_failure_at(dir: &std::path::Path) {
     let _mkdir = fs::create_dir_all(dir);
-    let count = get_update_failure_count_at(dir) + 1;
-    let _write = fs::write(dir.join("update_failures"), count.to_string());
+    let path = dir.join("update_failures");
+    if let Some(count) = next_failure_count(fs::read_to_string(&path)) {
+        let _write = fs::write(&path, count.to_string());
+    }
 }
 
 /// Clear the update failure count. Called from the update command after a
@@ -1623,6 +1652,41 @@ pub fn jittered_repoll_interval(base: Duration, jitter_fraction: f64, rand_unit:
 
 #[cfg(test)]
 mod tests {
+    /// A transient read error must not be persisted as a permanent lockout.
+    ///
+    /// `get_update_failure_count_at` answers MAX_UPDATE_FAILURES when the
+    /// counter cannot be read, which keeps the GATE closed while the condition
+    /// lasts and heals by itself. Recording a failure used to feed that answer
+    /// straight back through `+ 1`, so one transient EIO would write 4 to disk
+    /// and lock auto-update off forever — turning the fail-CLOSED read into a
+    /// permanent brick, which is worse than the fail-open it replaced (#5244).
+    #[test]
+    fn an_unreadable_counter_is_never_persisted_as_a_count() {
+        use std::io::{Error, ErrorKind};
+
+        assert_eq!(
+            super::next_failure_count(Err(Error::from(ErrorKind::PermissionDenied))),
+            None,
+            "an unreadable counter must write NOTHING: we cannot know the real count, and \
+             inventing MAX+1 makes a transient error permanent"
+        );
+        assert_eq!(
+            super::next_failure_count(Err(Error::from(ErrorKind::NotFound))),
+            Some(1),
+            "a genuinely absent counter is the first failure"
+        );
+        assert_eq!(
+            super::next_failure_count(Ok("2".to_string())),
+            Some(3),
+            "the ordinary case still increments"
+        );
+        assert_eq!(
+            super::next_failure_count(Ok("garbage".to_string())),
+            Some(1),
+            "an unparseable counter restarts the count rather than inventing a lockout"
+        );
+    }
+
     /// An unreadable counter file must NOT read as "no failures".
     ///
     /// `Err(_) => 0` caught every read error, not just `NotFound`, so a counter
