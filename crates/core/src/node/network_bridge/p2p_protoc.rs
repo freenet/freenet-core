@@ -35,6 +35,7 @@ use crate::transport::{
     Socket, TransportError, TransportKeypair, TransportPublicKey, create_connection_handler,
     global_bandwidth::GlobalBandwidthManager, peer_connection::StreamId,
 };
+use crate::util::time_source::{DynTimeSource, InstantTimeSrc};
 use crate::{
     client_events::ClientId,
     config::GlobalExecutor,
@@ -678,6 +679,26 @@ fn collect_contract_states<O: ContractPresenceOracle + ?Sized>(
     states
 }
 
+/// Whole seconds elapsed between `started_at` and `clock`'s current instant.
+///
+/// Backs `NodeInfo::uptime_seconds` in the node-diagnostics reply. Truncates
+/// toward zero, so a node younger than one second reports `0` — that is the
+/// only case in which a healthy node legitimately reports zero uptime.
+///
+/// Saturating rather than panicking: `Instant` subtraction underflows if the
+/// clock reports an instant before `started_at`. Wall-clock `InstantTimeSrc` is
+/// monotonic and cannot do that, but an injected test clock can be constructed
+/// at an earlier epoch, and a diagnostics query must never take the node down.
+///
+/// Measures MONOTONIC time, which does not advance while the host is
+/// suspended. A laptop peer resumed after an overnight suspend therefore
+/// reports the time it was actually running, not wall-clock time since start.
+/// That is the more useful number for "how long has this node been serving",
+/// which is what the field is read for.
+fn uptime_seconds(clock: &DynTimeSource, started_at: Instant) -> u64 {
+    clock.now().saturating_duration_since(started_at).as_secs()
+}
+
 pub(in crate::node) struct P2pConnManager {
     pub(in crate::node) gateways: Vec<PeerKeyLocation>,
     pub(in crate::node) bridge: P2pBridge,
@@ -697,6 +718,17 @@ pub(in crate::node) struct P2pConnManager {
     listening_ip: IpAddr,
     listening_port: u16,
     is_gateway: bool,
+    /// Clock backing `NodeInfo::uptime_seconds` in the node-diagnostics reply.
+    ///
+    /// Always a wall-clock [`InstantTimeSrc`], including under simulation — see
+    /// the rationale at its construction in `build`. Held as a
+    /// [`DynTimeSource`] rather than a bare `Instant` so the computation goes
+    /// through the `TimeSource` abstraction and stays unit-testable.
+    uptime_clock: DynTimeSource,
+    /// Instant this node's network event loop was constructed, read from
+    /// [`Self::uptime_clock`]. `NodeInfo::uptime_seconds` is the elapsed time
+    /// since this point.
+    started_at: Instant,
     /// If set, will sent the location over network messages.
     ///
     /// It will also determine whether to trust the location of peers sent in network messages or derive them from IP.
@@ -1236,6 +1268,22 @@ impl P2pConnManager {
             .connection_manager
             .try_set_own_addr(advertised_addr);
 
+        // Uptime is measured from here — the last step of node construction,
+        // immediately before the event loop starts serving. Reading `now()` once
+        // and storing the instant (rather than re-deriving a start time later)
+        // keeps `uptime_seconds` monotonic for the life of the process.
+        //
+        // Deliberately NOT `config.hosting_time_source_override`, even though
+        // that is the node's injectable clock and `OpManager` sources the
+        // interest manager from it. Simulations freeze and jump that clock to
+        // drive hosting TTL and eviction, so borrowing it here would make a sim
+        // node report either a frozen 0 or a 24h uptime seconds after boot.
+        // Uptime and hosting TTL are unrelated concerns; injectability lives at
+        // the `uptime_seconds` helper boundary, which is where the unit tests
+        // drive a mock clock.
+        let uptime_clock: DynTimeSource = Arc::new(InstantTimeSrc::new());
+        let started_at = uptime_clock.now();
+
         Ok(P2pConnManager {
             gateways,
             bridge,
@@ -1248,6 +1296,8 @@ impl P2pConnManager {
             listening_ip: listener_ip,
             listening_port: listen_port,
             is_gateway: config.is_gateway,
+            uptime_clock,
+            started_at,
             this_location: config.location,
             check_version: !config.config.network_api.ignore_protocol_version,
             ack_version_floor_override: config.ack_version_floor_override,
@@ -1329,6 +1379,8 @@ impl P2pConnManager {
             listening_ip,
             listening_port,
             is_gateway,
+            uptime_clock,
+            started_at,
             this_location,
             check_version,
             bandwidth_limit,
@@ -1417,6 +1469,11 @@ impl P2pConnManager {
             listening_ip,
             listening_port,
             is_gateway,
+            // Carried across the destructure/rebuild, NOT re-read from the clock:
+            // re-reading here would restart the uptime measurement at event-loop
+            // entry and silently under-report it for the life of the process.
+            uptime_clock,
+            started_at,
             this_location,
             check_version,
             bandwidth_limit,
@@ -2525,11 +2582,14 @@ impl P2pConnManager {
                                     // Always include basic node info, but only include address/location if available
                                     response.node_info = Some(NodeInfo {
                                         peer_id: ctx.key_pair.public().to_string(),
-                                        is_gateway: self.is_gateway,
+                                        is_gateway: ctx.is_gateway,
                                         location: location.map(|loc| format!("{:.6}", loc.0)),
                                         listening_address: addr
                                             .map(|peer_addr| peer_addr.to_string()),
-                                        uptime_seconds: 0, // TODO: implement actual uptime tracking
+                                        uptime_seconds: uptime_seconds(
+                                            &ctx.uptime_clock,
+                                            ctx.started_at,
+                                        ),
                                     });
                                 }
 
@@ -5793,6 +5853,133 @@ pub(crate) mod tests {
             recv.is_none(),
             "dropping the callback must close the result channel (recv -> None), \
              so the resend-waiter short-circuits instead of waiting 20s"
+        );
+    }
+
+    /// `uptime_seconds` reports whole seconds of elapsed time, and in
+    /// particular reports a NON-zero value once the node has been up for at
+    /// least a second.
+    ///
+    /// This is the unit-level half of the #5223 regression: the diagnostics
+    /// reply hardcoded `uptime_seconds: 0`, so `freenet service report` claimed
+    /// zero uptime for nodes that had been running for hours (reports R7JSRK,
+    /// WEWYWY, R7W5NC).
+    #[test]
+    fn uptime_seconds_reports_elapsed_time() {
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let started_at = crate::util::time_source::TimeSource::now(&clock);
+        let dyn_clock: super::DynTimeSource = Arc::new(clock.clone());
+
+        // A node that has just started reports 0 — the ONE case where zero is
+        // the honest answer.
+        assert_eq!(super::uptime_seconds(&dyn_clock, started_at), 0);
+
+        // Sub-second uptime still truncates to 0 (boundary just below 1s).
+        clock.advance_time(Duration::from_millis(999));
+        assert_eq!(super::uptime_seconds(&dyn_clock, started_at), 0);
+
+        // Crossing one second must report 1, not 0.
+        clock.advance_time(Duration::from_millis(1));
+        assert_eq!(super::uptime_seconds(&dyn_clock, started_at), 1);
+
+        // The seven-hour case from report R7JSRK: the node had been up ~7h and
+        // reported 0. It must report the real elapsed seconds.
+        clock.advance_time(Duration::from_secs(7 * 3600) - Duration::from_secs(1));
+        assert_eq!(super::uptime_seconds(&dyn_clock, started_at), 7 * 3600);
+    }
+
+    /// A clock that reports an instant BEFORE `started_at` must yield 0 rather
+    /// than panicking on `Instant` subtraction underflow. Unreachable with the
+    /// production monotonic clock, but a diagnostics query must never be able
+    /// to take the node down.
+    #[test]
+    fn uptime_seconds_saturates_when_clock_precedes_start() {
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let epoch = crate::util::time_source::TimeSource::now(&clock);
+        let started_at = epoch + Duration::from_secs(60);
+        let dyn_clock: super::DynTimeSource = Arc::new(clock);
+
+        assert_eq!(
+            super::uptime_seconds(&dyn_clock, started_at),
+            0,
+            "a clock behind `started_at` must saturate to 0, not panic"
+        );
+    }
+
+    /// Source pin: the node-diagnostics reply must COMPUTE `uptime_seconds`,
+    /// never hardcode it.
+    ///
+    /// #5223: the field was `uptime_seconds: 0, // TODO: implement actual
+    /// uptime tracking` for the field's whole lifetime, so every uploaded
+    /// diagnostic report claimed zero uptime. The unit tests above cover the
+    /// helper, but only this pin fails if a future edit re-inlines a literal at
+    /// the call site — which is exactly how the bug existed.
+    ///
+    /// The scan is bounded to the `NodeInfo { .. }` literal in the
+    /// `QueryNodeDiagnostics` handler so it cannot pass vacuously by matching
+    /// some later occurrence (see AGENTS.md on source-scrape pins).
+    #[test]
+    fn node_diagnostics_computes_uptime_rather_than_hardcoding_it() {
+        let src = production_src();
+        const ANCHOR: &str = "response.node_info = Some(NodeInfo {";
+        let start = src.find(ANCHOR).expect(
+            "QueryNodeDiagnostics handler must build `response.node_info = Some(NodeInfo {`",
+        );
+        let rest = &src[start + ANCHOR.len()..];
+        let end = rest
+            .find("});")
+            .expect("the NodeInfo literal must be closed by `});`");
+        let node_info_literal = &rest[..end];
+
+        assert!(
+            node_info_literal.contains("uptime_seconds: uptime_seconds("),
+            "NodeInfo.uptime_seconds must be computed via the `uptime_seconds` \
+             helper. Found instead:\n{node_info_literal}"
+        );
+        assert!(
+            !node_info_literal.contains("uptime_seconds: 0"),
+            "NodeInfo.uptime_seconds must not be hardcoded to 0 — that is the \
+             #5223 bug (reports R7JSRK / WEWYWY / R7W5NC all read 0 uptime on \
+             nodes that had been up for hours). Found:\n{node_info_literal}"
+        );
+    }
+
+    /// Source pin: the `ctx` rebuild at event-loop entry must CARRY the start
+    /// instant across, never re-read it from the clock.
+    ///
+    /// `run_event_listener_with_socket` destructures `self` and rebuilds a
+    /// `P2pConnManager` for the loop. Writing `started_at: uptime_clock.now()`
+    /// there instead of the `started_at` shorthand would restart the
+    /// measurement at event-loop entry, silently under-reporting uptime by the
+    /// whole node-construction window for the life of the process.
+    ///
+    /// Nothing else catches this: uptime measured from event-loop entry is
+    /// still non-zero and still increasing, so both the end-to-end test and the
+    /// pin above stay green. The hazard is documented at that call site; this
+    /// is the check that makes the documentation load-bearing.
+    #[test]
+    fn event_loop_ctx_carries_start_instant_rather_than_re_reading_it() {
+        let src = production_src();
+        const ANCHOR: &str = "let mut ctx = P2pConnManager {";
+        let start = src
+            .find(ANCHOR)
+            .expect("run_event_listener_with_socket must rebuild `let mut ctx = P2pConnManager {`");
+        let rest = &src[start + ANCHOR.len()..];
+        let end = rest
+            .find("\n        };")
+            .expect("the ctx rebuild literal must be closed by `};`");
+        let ctx_literal = &rest[..end];
+
+        assert!(
+            ctx_literal.contains("started_at,"),
+            "the ctx rebuild must carry `started_at` through by shorthand. \
+             Found:\n{ctx_literal}"
+        );
+        assert!(
+            !ctx_literal.contains("started_at:"),
+            "the ctx rebuild must NOT re-initialise `started_at` — re-reading \
+             the clock here restarts the uptime measurement at event-loop \
+             entry. Found:\n{ctx_literal}"
         );
     }
 
