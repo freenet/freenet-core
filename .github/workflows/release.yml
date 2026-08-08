@@ -224,6 +224,11 @@ jobs:
       actions: read
       contents: read
       pull-requests: read
+    # The single immutable commit the rest of the pipeline builds, publishes
+    # and tags. Everything downstream MUST check this out explicitly instead of
+    # re-resolving `main`, which moves while this job waits (#5233).
+    outputs:
+      release_sha: ${{ steps.release_sha.outputs.sha }}
 
     steps:
       - name: Checkout code
@@ -238,21 +243,45 @@ jobs:
           PR_NUMBER: ${{ needs.update_versions.outputs.pr_number }}
         run: scripts/wait_for_release_pr.sh
 
+      - name: Resolve the release commit
+        id: release_sha
+        env:
+          # Same least-privilege rationale as the waiter above: read-only PR and
+          # compare lookups that emit no workflow-triggering event.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # coalesce-exempt: read-only lookup
+          PR_NUMBER: ${{ needs.update_versions.outputs.pr_number }}
+          LAUNCH_SHA: ${{ github.sha }}
+        run: scripts/resolve_release_sha.sh
+
   publish_crates:
     name: Publish to crates.io
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: [validate, wait_for_pr]
     if: always() && (needs.wait_for_pr.result == 'success' || inputs.dry_run)
+    env:
+      # NEVER `ref: main` here — see #5233. The `|| github.sha` fallback is not
+      # a convenience: an empty `ref:` makes actions/checkout default to the
+      # branch, which would reinstate the bug. It is reachable only on the
+      # dry-run-with-failed-wait path, and it is NOT benign there — the launch
+      # commit predates the version bump, so the verifier below aborts on
+      # purpose rather than dry-running the wrong tree.
+      RELEASE_SHA: ${{ needs.wait_for_pr.outputs.release_sha || github.sha }}
+      # Resolved independently of RELEASE_SHA, so the verifier has an oracle
+      # that does not just restate the value that drove the checkout.
+      EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
+      # Empty exactly when the `|| github.sha` fallback above engaged, so the
+      # verifier can name that cause instead of reporting a version mismatch.
+      RELEASE_SHA_RESOLVED: ${{ needs.wait_for_pr.outputs.release_sha }}
 
     steps:
-      - name: Checkout code
+      - name: Checkout the validated release commit
         uses: actions/checkout@v7
         with:
-          ref: main
+          ref: ${{ needs.wait_for_pr.outputs.release_sha || github.sha }}
 
-      - name: Pull latest changes
-        run: git pull origin main
+      - name: Verify the checkout is the validated release commit
+        run: bash scripts/verify_release_checkout.sh
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -297,14 +326,27 @@ jobs:
     name: Create GitHub release
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [validate, publish_crates]
+    # `wait_for_pr` is in `needs` only to carry `release_sha` through; the
+    # ordering it implies is already enforced via `publish_crates`.
+    needs: [validate, wait_for_pr, publish_crates]
     if: always() && (needs.publish_crates.result == 'success' || inputs.dry_run)
+    env:
+      # The tag MUST land on the same commit that was published to crates.io.
+      # `ref: main` here meant the tag could point at a tree nobody validated
+      # and that no published artifact was built from (#5233).
+      RELEASE_SHA: ${{ needs.wait_for_pr.outputs.release_sha || github.sha }}
+      # Resolved independently of RELEASE_SHA, so the verifier has an oracle
+      # that does not just restate the value that drove the checkout.
+      EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
+      # Empty exactly when the `|| github.sha` fallback above engaged, so the
+      # verifier can name that cause instead of reporting a version mismatch.
+      RELEASE_SHA_RESOLVED: ${{ needs.wait_for_pr.outputs.release_sha }}
 
     steps:
-      - name: Checkout code
+      - name: Checkout the validated release commit
         uses: actions/checkout@v7
         with:
-          ref: main
+          ref: ${{ needs.wait_for_pr.outputs.release_sha || github.sha }}
           fetch-depth: 0
           # `token:` is what `git push` uses later in this job to push the
           # `v$VERSION` tag. The tag push MUST use RELEASE_PAT (when set)
@@ -313,8 +355,8 @@ jobs:
           # anti-recursion safeguard (same root cause as #4118).
           token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
 
-      - name: Pull latest changes
-        run: git pull origin main
+      - name: Verify the checkout is the validated release commit
+        run: bash scripts/verify_release_checkout.sh
 
       - name: Generate release notes
         id: release_notes
@@ -333,9 +375,13 @@ jobs:
             NOTES="Release $VERSION"
           else
             # Generate notes using GitHub's API
+            # The tag does not exist yet at this point, so `target_commitish`
+            # decides which commits the notes describe. Pin it to the commit
+            # actually being released, not to `main` — otherwise the notes can
+            # describe commits that are not in the release (#5233).
             NOTES=$(gh api repos/:owner/:repo/releases/generate-notes \
               -f tag_name="v$VERSION" \
-              -f target_commitish=main \
+              -f target_commitish="$RELEASE_SHA" \
               -f previous_tag_name="$PREV_VERSION" \
               --jq '.body')
           fi

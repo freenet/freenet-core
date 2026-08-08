@@ -92,7 +92,7 @@ jobs:
         id: release_ready
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # coalesce-exempt: read-only release lookup, emits no event
         run: |
           set -euo pipefail
           TAG="v${{ steps.versions.outputs.freenet }}"
