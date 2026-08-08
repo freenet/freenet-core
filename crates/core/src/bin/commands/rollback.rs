@@ -486,19 +486,53 @@ fn remove_probation_at(dir: &Path) {
 /// Clear probation if the running version matches the marker (it has proven
 /// healthy). A marker for a DIFFERENT version is stale (e.g. left over after a
 /// rollback or external install) and is also removed.
+///
+/// Both outcomes DISARM rollback for the marker's version, so both are reported
+/// on stderr as well as through `tracing` (#5232). The node's `tracing` output
+/// goes to the rolling log files under the log dir, which systemd does NOT
+/// capture — only the process's stdout/stderr reach the journal. An operator
+/// (or an agent) reading `journalctl -u freenet` therefore saw the crash-count
+/// and rollback lines, which the installer prints on stderr, but never the
+/// commit that disarms them. #5232 was filed on exactly that asymmetry: the
+/// commit had been working all along and looked, from the journal, as though it
+/// had never once run. The other two decisions in this module are already on
+/// stderr; this puts the third one where the first two are.
+///
+/// The volume is bounded: at most one line per node start, and only when a
+/// probation marker actually exists.
 pub fn commit_probation(current_version: &str) {
     if let Some(dir) = state_dir() {
         match commit_probation_at(dir.as_path(), current_version) {
-            CommitOutcome::Committed => tracing::info!(
-                version = current_version,
-                "Auto-update probation passed: new version ran healthily for \
-                 {COMMIT_HEALTHY_UPTIME_SECS}s; committing (rollback disarmed)."
-            ),
-            CommitOutcome::ClearedStale { marker_version } => tracing::debug!(
-                running = current_version,
-                marker = %marker_version,
-                "Cleared stale auto-update probation marker for a different version."
-            ),
+            CommitOutcome::Committed => {
+                eprintln!(
+                    "Freenet {current_version}: post-update probation passed (ran healthily for \
+                     {COMMIT_HEALTHY_UPTIME_SECS}s); committed, auto-rollback disarmed."
+                );
+                tracing::info!(
+                    version = current_version,
+                    "Auto-update probation passed: new version ran healthily for \
+                     {COMMIT_HEALTHY_UPTIME_SECS}s; committing (rollback disarmed)."
+                );
+            }
+            CommitOutcome::ClearedStale { marker_version } => {
+                // Deliberately louder than the `debug!` this used to be. A
+                // release build compiles `debug!` out entirely, so this branch
+                // — which drops rollback protection for `marker_version`
+                // without committing anything — was completely silent in the
+                // field. It is the branch a version-comparison regression would
+                // take, and it is indistinguishable from a healthy commit by
+                // the state directory alone (both just delete the marker).
+                eprintln!(
+                    "Freenet {current_version}: discarded a post-update probation marker \
+                     belonging to {marker_version} (not the running version); auto-rollback \
+                     protection for {marker_version} is gone."
+                );
+                tracing::warn!(
+                    running = current_version,
+                    marker = %marker_version,
+                    "Cleared stale auto-update probation marker for a different version."
+                );
+            }
             CommitOutcome::Nothing => {}
         }
     }
