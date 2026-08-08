@@ -953,7 +953,25 @@ async fn get_latest_version() -> Result<String> {
     // Never bypasses the cooldown: this is the automated path, and the whole
     // point of the cooldown is to keep it quiet while the IP is limited. (The
     // check above already returned; the flag covers the re-check inside.)
-    fetch_latest_release_tag(false).await
+    //
+    // Normalise HERE, at the producer, not at the call sites. This function is
+    // the node's DETECTION path (see the rustdoc above): every consumer of it
+    // wants a comparable version, never a string that addresses the release.
+    // `fetch_latest_release_tag` returns the tag VERBATIM (`v0.2.121`) since
+    // #5104, which is correct for the INSTALLER — `update.rs` builds asset URLs
+    // from it — but every consumer on this path either parses it as semver or
+    // compares it against a stored version, and both reject the leading `v`.
+    //
+    // #5104 stripped at one consumer (`update.rs:389`) and left this path raw,
+    // which silently broke auto-update fleet-wide for v0.2.120 and v0.2.121:
+    // `semver::Version::parse("v0.2.121")` fails, the update is dropped with a
+    // `warn!`, and nothing else notices. Stripping per-call-site would fix the
+    // parses and leave the #4073 gates below (`is_version_pinned_bad`,
+    // `is_version_install_gated`) comparing a `v`-prefixed string against the
+    // stripped values their writers store — silently disabling the
+    // crash-loop-rollback pin. One normalisation at the boundary fixes both.
+    let tag = fetch_latest_release_tag(false).await?;
+    Ok(version_from_tag(&tag).to_string())
 }
 
 /// Get the state directory for update tracking files.
@@ -1694,6 +1712,62 @@ mod tests {
             Some("0.1.75".to_string())
         );
         assert_eq!(compare_versions_for_startup("0.1.75", "0.1.75-alpha"), None);
+    }
+
+    /// #5221: the node's detection path MUST normalise the release tag.
+    ///
+    /// `fetch_latest_release_tag` returns the tag VERBATIM (`v0.2.121`) since
+    /// #5104 — correct for the installer, which builds asset URLs from it. But
+    /// every consumer of `get_latest_version` either parses it as semver or
+    /// compares it against a stored version, and both reject the leading `v`.
+    /// #5104 stripped at `update.rs` only and left this path raw, so auto-update
+    /// was silently dead fleet-wide for v0.2.120 and v0.2.121.
+    ///
+    /// A source pin rather than a behavioural test because `get_latest_version`
+    /// does network I/O with no injection seam. Bounded to that function so it
+    /// cannot match a later occurrence (AGENTS.md, "WHEN writing a source-scrape
+    /// pin test").
+    #[test]
+    fn get_latest_version_normalises_the_tag() {
+        let src = include_str!("auto_update.rs");
+        let (_, after) = src
+            .split_once("async fn get_latest_version() -> Result<String> {")
+            .expect("get_latest_version definition not found");
+        let (body, _) = after
+            .split_once("/// Get the state directory")
+            .expect("could not bound get_latest_version");
+        let stripped: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+
+        assert!(
+            stripped.contains("version_from_tag("),
+            "get_latest_version must normalise through version_from_tag before \
+             returning. Without it the raw tag reaches semver::Version::parse \
+             (which rejects a leading 'v') AND the #4073 gates \
+             is_version_pinned_bad / is_version_install_gated, whose writers \
+             store STRIPPED values -- so those gates silently never match and \
+             the crash-loop-rollback pin is disabled."
+        );
+    }
+
+    /// Why the normalisation has to happen upstream: the consumers genuinely
+    /// cannot cope with a raw tag. Documents the exact #5221 production failure.
+    #[test]
+    fn raw_tag_is_rejected_by_the_consumers() {
+        // Production log was:
+        //   WARN failed to parse latest version 'v0.2.121':
+        //        unexpected character 'v' while parsing major version number
+        assert_eq!(
+            compare_versions_for_startup("0.2.120", "v0.2.121"),
+            None,
+            "a v-prefixed tag must NOT be treated as an available update -- it \
+             fails to parse and the update is dropped silently"
+        );
+        // Normalised, the very same tag is correctly seen as newer.
+        assert_eq!(
+            compare_versions_for_startup("0.2.120", version_from_tag("v0.2.121")),
+            Some("0.2.121".to_string()),
+            "once normalised the update must be detected"
+        );
     }
 
     #[tokio::test]
