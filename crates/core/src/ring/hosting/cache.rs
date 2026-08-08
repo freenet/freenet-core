@@ -2561,6 +2561,17 @@ impl<T: TimeSource> HostingCache<T> {
         }
     }
 
+    /// Current hosted rows for the fixed-cardinality hosting-REASON telemetry
+    /// (`HostingManager::hosted_by_reason`). Same contract-identity discipline
+    /// as [`Self::for_each_cost_eligibility_row`]: keys are visible to the
+    /// manager's classifier (which needs them to look up subscription state)
+    /// but are aggregated away before anything is exported.
+    pub(crate) fn for_each_reason_row(&self, mut visit: impl FnMut(&ContractKey, &HostedContract)) {
+        for (key, entry) in &self.contracts {
+            visit(key, entry);
+        }
+    }
+
     /// Per-contract rows for the local dashboard, in the cache-side EVICTION
     /// order: ascending `(recency_seq, key)` — least-recent eviction-recency
     /// first, the same order [`Self::keys_eviction_order`] uses. (That clock is

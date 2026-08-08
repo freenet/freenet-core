@@ -870,6 +870,7 @@ fn register_transport_metrics(meter: &opentelemetry::metrics::Meter) {
 /// Ring / topology state, mirroring the dashboard's connection-status tiles.
 fn register_ring_metrics(meter: &opentelemetry::metrics::Meter) {
     use crate::node::network_status::otel_metrics_snapshot as snapshot;
+    use crate::ring::HostingReason;
 
     let _connections = meter
         .u64_observable_gauge("freenet.ring.connections")
@@ -881,12 +882,43 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter) {
         })
         .build();
 
+    // Both hosted-contract gauges are attributed by `reason` and carry NO
+    // un-attributed total: emitting both on one instrument would make
+    // `sum by (reason)` double-count. `HostingReason` partitions the hosted
+    // set, so the total is `sum(freenet.node.contracts.hosted)`.
     let _hosted = meter
         .u64_observable_gauge("freenet.node.contracts.hosted")
-        .with_description("Contracts currently hosted by this node")
+        .with_description(
+            "Contracts currently hosted by this node, partitioned by why each one is held",
+        )
         .with_callback(|observer| {
             if let Some(s) = snapshot() {
-                observer.observe(s.ring.hosted_contracts as u64, &[]);
+                for reason in HostingReason::ALL {
+                    observer.observe(
+                        s.hosting_reasons.count(reason),
+                        &[KeyValue::new("reason", reason.as_str())],
+                    );
+                }
+            }
+        })
+        .build();
+
+    let _hosted_bytes = meter
+        .u64_observable_gauge("freenet.node.contracts.hosted.bytes")
+        .with_unit("By")
+        .with_description(
+            "Contract state bytes hosted by this node, partitioned by why each contract is \
+             held. State only — WASM code blobs and database overhead are excluded, matching \
+             what the hosting cache's byte budget measures.",
+        )
+        .with_callback(|observer| {
+            if let Some(s) = snapshot() {
+                for reason in HostingReason::ALL {
+                    observer.observe(
+                        s.hosting_reasons.bytes(reason),
+                        &[KeyValue::new("reason", reason.as_str())],
+                    );
+                }
             }
         })
         .build();

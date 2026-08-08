@@ -524,6 +524,15 @@ impl NodeP2P {
             hosting_ring.dashboard_hosting_snapshot()
         }));
 
+        // Per-reason hosted-contract breakdown for the OTel exporter only
+        // (count + state bytes per `HostingReason`). Kept off the ring-stats
+        // provider above because that one runs on every dashboard HTTP
+        // request and this is an O(hosted) walk under the cache read lock.
+        let reason_ring = self.op_manager.ring.clone();
+        super::network_status::set_hosting_reason_provider(std::sync::Arc::new(move || {
+            reason_ring.hosted_by_reason()
+        }));
+
         // Wire live ring stats for the dashboard: connection count +
         // hosted contracts + own public key, read on every homepage
         // request.
