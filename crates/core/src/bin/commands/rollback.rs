@@ -483,56 +483,95 @@ fn remove_probation_at(dir: &Path) {
     let _rm = std::fs::remove_file(dir.join(PROBATION_FILE));
 }
 
+/// The operator-facing line for a marker-clearing outcome, or `None` when
+/// nothing happened. Split out from [`commit_probation`] so both branches are
+/// unit-testable: `commit_probation` itself reads the process-global `$HOME`
+/// through [`state_dir`] and so cannot be driven from a test.
+///
+/// ## Why these go to stderr and not only to `tracing` (#5232)
+///
+/// **This is the canonical explanation; the other comments point here.** Under
+/// the shipped systemd deployment the node's `tracing` output goes to the
+/// rolling log files under the log dir (`tracing::tracer::init_tracer` adds the
+/// console layer only when stdout is a terminal, which it is not under a service
+/// manager), while the unit records `StandardOutput=journal` /
+/// `StandardError=journal`. So `tracing` does not reach the journal and
+/// stdout/stderr does. The three other decisions in this flow — the crash count,
+/// the rollback, and rollback-unavailable — are all `eprintln!` in
+/// [`super::update`], so `journalctl -u freenet` showed strikes accumulating
+/// against a probationary version and never once showed the commit that disarms
+/// them. #5232 was filed reading exactly that asymmetry. This puts the
+/// marker-clearing decisions on the same channel as the decisions they cancel.
+///
+/// (The fallback tracer — used when no log dir resolves, or when
+/// `FREENET_LOG_TO_STDERR` is set — does write to stdout, so on those paths the
+/// `tracing` line reaches the journal too and the operator sees both.)
+///
+/// Volume is bounded: at most one line per node start, and only when a probation
+/// marker actually exists.
+pub(crate) fn commit_announcement(
+    outcome: &CommitOutcome,
+    current_version: &str,
+) -> Option<String> {
+    match outcome {
+        CommitOutcome::Committed => Some(format!(
+            "Freenet {current_version}: post-update probation passed (ran healthily for \
+             {COMMIT_HEALTHY_UPTIME_SECS}s); committed, auto-rollback disarmed."
+        )),
+        // Deliberately as loud as the commit. This branch drops rollback
+        // protection for `marker_version` WITHOUT committing anything, it is the
+        // branch a version-comparison regression would take, and it is
+        // indistinguishable from a healthy commit by the state directory alone
+        // (both just delete the marker).
+        CommitOutcome::ClearedStale { marker_version } => Some(format!(
+            "Freenet {current_version}: discarded a post-update probation marker belonging to \
+             {marker_version} (not the running version); auto-rollback protection for \
+             {marker_version} is gone."
+        )),
+        CommitOutcome::Nothing => None,
+    }
+}
+
 /// Clear probation if the running version matches the marker (it has proven
-/// healthy). A marker for a DIFFERENT version is stale (e.g. left over after a
-/// rollback or external install) and is also removed.
+/// healthy). A marker for a DIFFERENT version is stale (e.g. an external install
+/// replaced the binary, or two binaries share a `$HOME`) and is also removed.
 ///
-/// Both outcomes DISARM rollback for the marker's version, so both are reported
-/// on stderr as well as through `tracing` (#5232). The node's `tracing` output
-/// goes to the rolling log files under the log dir, which systemd does NOT
-/// capture — only the process's stdout/stderr reach the journal. An operator
-/// (or an agent) reading `journalctl -u freenet` therefore saw the crash-count
-/// and rollback lines, which the installer prints on stderr, but never the
-/// commit that disarms them. #5232 was filed on exactly that asymmetry: the
-/// commit had been working all along and looked, from the journal, as though it
-/// had never once run. The other two decisions in this module are already on
-/// stderr; this puts the third one where the first two are.
+/// Both outcomes DISARM rollback for the marker's version, so both are announced
+/// on stderr as well as through `tracing` — see [`commit_announcement`] for why
+/// stderr specifically.
 ///
-/// The volume is bounded: at most one line per node start, and only when a
-/// probation marker actually exists.
+/// Reached only from the node's commit timer, so "survived the window ⇒
+/// committed" holds for a process that actually ran the network. A node parked
+/// by `freenet service disable` (`run_disabled_idle`) never reaches it and keeps
+/// its marker until the [`PROBATION_MAX_AGE_SECS`] TTL retires it. That is
+/// deliberate: a process that never joined the network has not demonstrated the
+/// health this probation tests for, so committing there would disarm rollback on
+/// evidence the mechanism does not have.
 pub fn commit_probation(current_version: &str) {
     if let Some(dir) = state_dir() {
-        match commit_probation_at(dir.as_path(), current_version) {
-            CommitOutcome::Committed => {
-                eprintln!(
-                    "Freenet {current_version}: post-update probation passed (ran healthily for \
-                     {COMMIT_HEALTHY_UPTIME_SECS}s); committed, auto-rollback disarmed."
-                );
-                tracing::info!(
-                    version = current_version,
-                    "Auto-update probation passed: new version ran healthily for \
-                     {COMMIT_HEALTHY_UPTIME_SECS}s; committing (rollback disarmed)."
-                );
-            }
-            CommitOutcome::ClearedStale { marker_version } => {
-                // Deliberately louder than the `debug!` this used to be. A
-                // release build compiles `debug!` out entirely, so this branch
-                // — which drops rollback protection for `marker_version`
-                // without committing anything — was completely silent in the
-                // field. It is the branch a version-comparison regression would
-                // take, and it is indistinguishable from a healthy commit by
-                // the state directory alone (both just delete the marker).
-                eprintln!(
-                    "Freenet {current_version}: discarded a post-update probation marker \
-                     belonging to {marker_version} (not the running version); auto-rollback \
-                     protection for {marker_version} is gone."
-                );
-                tracing::warn!(
-                    running = current_version,
-                    marker = %marker_version,
-                    "Cleared stale auto-update probation marker for a different version."
-                );
-            }
+        // Announce AFTER the state transition, never before. `eprintln!` panics
+        // on a write error (EPIPE once the supervisor's reader is gone), and a
+        // panic in front of the removal would leave a healthy node's marker
+        // armed — turning an observability line into a rollback bug. In this
+        // order the worst case is a lost announcement.
+        let outcome = commit_probation_at(dir.as_path(), current_version);
+        if let Some(line) = commit_announcement(&outcome, current_version) {
+            eprintln!("{line}");
+        }
+        match outcome {
+            CommitOutcome::Committed => tracing::info!(
+                version = current_version,
+                "Auto-update probation passed: new version ran healthily for \
+                 {COMMIT_HEALTHY_UPTIME_SECS}s; committing (rollback disarmed)."
+            ),
+            // Was `debug!`, which a release build compiles out entirely
+            // (`release_max_level_info`), so this branch was completely silent
+            // in the field. See `commit_announcement` for why that matters.
+            CommitOutcome::ClearedStale { marker_version } => tracing::warn!(
+                running = current_version,
+                marker = %marker_version,
+                "Cleared stale auto-update probation marker for a different version."
+            ),
             CommitOutcome::Nothing => {}
         }
     }
@@ -1051,6 +1090,52 @@ mod tests {
         assert!(read_probation_at(dir).is_none());
         // Idempotent.
         assert_eq!(commit_probation_at(dir, "0.2.84"), CommitOutcome::Nothing);
+    }
+
+    /// Both marker-clearing outcomes MUST announce themselves, and `Nothing`
+    /// must stay silent.
+    ///
+    /// The end-to-end test `tests/post_update_probation_commit.rs` greps the
+    /// node's stderr for a substring of the Committed line; these assertions are
+    /// what make a reword of either line fail in microseconds instead of after
+    /// that test's 60s window (and they are the only coverage the ClearedStale
+    /// line has, since reaching it end-to-end needs a second 60s node boot).
+    #[test]
+    fn both_marker_clearing_outcomes_are_announced() {
+        let committed = commit_announcement(&CommitOutcome::Committed, "0.2.123")
+            .expect("a commit must be announced");
+        assert!(
+            committed.contains("post-update probation passed"),
+            "the e2e test greps for this substring; keep them in step: {committed}"
+        );
+        assert!(committed.contains("0.2.123"), "{committed}");
+
+        let stale = commit_announcement(
+            &CommitOutcome::ClearedStale {
+                marker_version: "0.2.122".to_string(),
+            },
+            "0.2.123",
+        )
+        .expect("discarding a marker disarms rollback and must be announced");
+        assert!(
+            stale.contains("discarded a post-update probation marker"),
+            "{stale}"
+        );
+        // Both versions have to appear: which marker was dropped is the whole
+        // diagnostic value, and the running version is what distinguishes this
+        // from a healthy commit.
+        assert!(stale.contains("0.2.122"), "{stale}");
+        assert!(stale.contains("0.2.123"), "{stale}");
+        assert!(
+            !stale.contains("post-update probation passed"),
+            "a discarded marker must NOT read as a passed probation: {stale}"
+        );
+
+        assert_eq!(
+            commit_announcement(&CommitOutcome::Nothing, "0.2.123"),
+            None,
+            "no marker means no decision was made, so there is nothing to report"
+        );
     }
 
     #[test]

@@ -1,88 +1,97 @@
-//! End-to-end guard for the post-update probation COMMIT path (#5232, #4073).
+//! End-to-end guard for the post-update probation lifecycle (#5232, #4073).
 //!
 //! The crash-loop auto-rollback machinery (`commands::rollback`) arms a
-//! probation marker when a new version is installed, and the node is supposed
-//! to clear it once it has run healthily for `COMMIT_HEALTHY_UPTIME_SECS`
-//! (60s). If that commit ever stops happening, the marker stays armed and every
-//! later non-clean stop is scored as a crash of a probationary version — three
-//! of them roll the node BACK off the release it just installed and pin that
-//! release as known-bad locally. That is the failure #5232 was filed for.
+//! probation marker when a new version is installed. The node clears it once it
+//! has run healthily for `COMMIT_HEALTHY_UPTIME_SECS` (60s); until then, each
+//! non-clean stop counts a crash, and three of them roll the node BACK off the
+//! release it just installed and pin that release as known-bad. #5232 was filed
+//! believing the commit half never happened.
 //!
-//! ## Why this test spawns the real binary
+//! ## Why these tests spawn the real binary
 //!
 //! The commit is not a property of `commit_probation_at` — that function is
 //! already unit-tested and works. It is a property of its ONLY caller: a
-//! fire-and-forget `GlobalExecutor::spawn` in `bin/freenet.rs`'s
-//! `run_network_node_with_signals`, whose handle is dropped and which is
-//! aborted at shutdown. A unit test on `commit_probation_at` passes happily
-//! while that task never runs, never fires, or commits a version string that
-//! does not match the marker the installer wrote. Nothing short of running the
-//! node and watching the marker disappear covers that seam.
+//! `GlobalExecutor::spawn` in `bin/freenet.rs`'s `run_network_node_with_signals`
+//! whose handle nothing awaits or monitors (it is retained only to `.abort()` it
+//! at shutdown). A unit test on `commit_probation_at` passes happily while that
+//! task never runs, never fires, or commits a version string that does not match
+//! the marker the installer wrote. Nothing short of running the node and
+//! watching the marker covers that seam, and `commands::rollback` lives in the
+//! bin crate behind a `$HOME`-derived state dir, so no in-process harness
+//! (`#[freenet_test]`, `SimNetwork`) can reach it either.
 //!
-//! ## What it asserts (the two observable halves of #5232)
+//! ## The two halves, and why both are here
 //!
-//! 1. A node that has been up longer than the commit window has NO probation
-//!    marker left on disk, AND its log says it COMMITTED (rather than silently
-//!    dropping the marker as stale — see below).
-//! 2. A subsequent clean stop of that node records NO crash: the post-stop
-//!    `freenet update` must not report "during post-update probation".
+//! * `probation_is_committed_after_a_healthy_uptime_window` — up past the
+//!   window ⇒ marker gone, commit announced, and a following post-stop
+//!   `freenet update` records NO crash.
+//! * `probation_survives_a_stop_inside_the_commit_window` — stopped INSIDE the
+//!   window ⇒ marker retained and the stop IS counted, `1/3`.
 //!
-//! ## Why assertion 1 checks the announcement and not just the file
+//! The second is not decoration. It is the positive control for the first: it
+//! proves the fixture actually parses as a `ProbationState`, that
+//! `FREENET_POST_STOP_EXIT_CODE` is spelled right, that `HOME` really relocates
+//! the state dir, and that the crash line is producible in this harness at all.
+//! Without it, the first test's "no crash was recorded" would also hold if the
+//! post-stop command failed for some entirely unrelated reason — an assertion
+//! that cannot fail. It is also the half that produced the user-visible rollback
+//! in #5232 (three fast restarts), and it costs ~15s rather than ~65s because it
+//! never waits out the window.
 //!
-//! `commit_probation_at` removes the marker down BOTH of its branches: a
-//! version-matched `Committed`, and a `ClearedStale` for a marker belonging to
-//! some other version. So "the file is gone" alone would still pass if the
-//! version comparison regressed and every marker were dropped as stale — which
-//! would disable rollback entirely, a worse bug than the one this guards. The
-//! commit announcement is the only artifact that distinguishes the two paths.
+//! ## Why the commit assertion reads stderr, not the log files
 //!
-//! It is asserted on the node's **stderr**, not on its log files, and that is
-//! the point of the fix this test accompanies. `tracing` output goes to the
-//! rolling log files under the log dir; systemd captures only stdout/stderr. So
-//! the crash-count and rollback lines (printed by the installer on stderr) were
-//! in the journal while the commit that disarms them was not, and #5232 was
-//! filed reading a journal that showed three strikes accumulating and no commit
-//! ever happening. Asserting the log file instead would pass on a build where
-//! the journal is silent again — i.e. it would not hold the fix.
+//! Under the shipped systemd deployment `tracing` output goes to the rolling log
+//! files under the log dir and only stdout/stderr reach the journal, so the
+//! crash-count and rollback lines (printed by the installer on stderr) were in
+//! the journal while the commit that disarms them was not. #5232 was filed
+//! reading a journal that showed strikes accumulating and no commit ever
+//! happening. Asserting the log file would pass on a build where the journal is
+//! silent again, i.e. it would not hold the fix. `crates/core/src/bin/commands/
+//! rollback.rs::commit_announcement` carries the full rationale.
 //!
-//! ## Runtime
-//!
-//! This test necessarily spends the real commit window (60s) waiting, because
-//! the window is a hard-coded constant in the binary under test. Budget ~90s.
+//! Note that CI sets `RUST_LOG=error`, which filters the `tracing::info!` out
+//! entirely — another reason the log files are the wrong thing to assert on.
 
-// Unix-only: the second half stops the node with SIGTERM, which is what a
-// supervisor sends and what makes the stop a *graceful* one worth asserting on.
-// Windows has no equivalent that exercises the same node path.
+// Unix-only: both tests stop the node with SIGTERM, which is what a supervisor
+// sends and what makes the stop a *graceful* one worth asserting on. Windows has
+// no equivalent that exercises the same node path.
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The version the node under test reports. `build_info::VERSION` in the binary
 /// is `env!("CARGO_PKG_VERSION")` of this very crate, so the marker we plant
-/// carries the exact string the node will try to commit — a mismatch here would
-/// make the test vacuous (the node would clear our marker as stale instead of
-/// committing it, which assertion 1's log check also catches).
+/// carries the exact string the node will try to commit.
 const NODE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Mirrors `commands::rollback::COMMIT_HEALTHY_UPTIME_SECS`, which is
-/// `pub(crate)` in the binary crate and so not importable here. If that
-/// constant is ever raised, this test fails on the poll deadline below rather
-/// than passing silently — which is the correct outcome, since lengthening the
-/// window is a real behavioural change to the rollback machinery.
+/// `pub(crate)` in the binary crate and so not importable here. Raising the real
+/// constant past the deadline below fails these tests rather than passing
+/// silently — the correct outcome, since lengthening the window is a real
+/// behavioural change to the rollback machinery.
 const COMMIT_HEALTHY_UPTIME_SECS: u64 = 60;
 
-/// Generous slack over the commit window for a cold-started debug-build node.
-const COMMIT_POLL_DEADLINE: Duration = Duration::from_secs(COMMIT_HEALTHY_UPTIME_SECS + 90);
+/// How long to wait for the commit AFTER the node is up (not after spawn):
+/// readiness is waited for separately, so this budget covers only the window
+/// itself plus scheduling slack.
+const COMMIT_POLL_DEADLINE: Duration = Duration::from_secs(COMMIT_HEALTHY_UPTIME_SECS + 45);
 
-/// Substring of the line `commit_probation` announces on the `Committed`
-/// branch only. Matched against the node's stderr, which is what a supervisor
-/// records — see the module docs.
+/// How long a cold debug-build node may take to bind its WS port. Matches the
+/// budget `persistence_roundtrip.rs` allows for the same thing.
+const NODE_READY_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Substring of the line `commit_probation` announces on the `Committed` branch
+/// only. Pinned against a reword by
+/// `rollback.rs::tests::both_marker_clearing_outcomes_are_announced`, which
+/// fails in microseconds rather than after this test's 60s window.
 const COMMITTED_STDERR_NEEDLE: &str = "post-update probation passed";
 
-/// Substring of the stderr line `freenet update` prints when it counts a crash
-/// against an armed probation marker.
+/// Substring of the line `freenet update` prints when it counts a crash against
+/// an armed probation marker. Asserted PRESENT by the in-window test and ABSENT
+/// by the committed test — so a reword breaks the former loudly instead of
+/// silently disarming the latter.
 const CRASH_RECORDED_NEEDLE: &str = "during post-update probation";
 
 // ---------------------------------------------------------------------------
@@ -117,26 +126,57 @@ fn freenet_bin() -> PathBuf {
     release
 }
 
+/// Fail early and unambiguously if the binary on disk is not the one this test
+/// source describes. A stale `target/debug/freenet` from before a version bump
+/// would take the ClearedStale branch instead of committing, and the failure
+/// would read as a rollback regression rather than "rebuild your binary".
+fn assert_binary_matches_crate_version() {
+    let out = Command::new(freenet_bin())
+        .arg("--version")
+        .output()
+        .expect("run freenet --version");
+    let reported = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        reported.contains(NODE_VERSION),
+        "the freenet binary at {} reports {reported:?}, which does not contain this crate's \
+         version {NODE_VERSION}. Rebuild it (`cargo build --bin freenet`) — a stale binary makes \
+         these tests fail in a way that looks like a rollback bug.",
+        freenet_bin().display()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Probation state fixture
 // ---------------------------------------------------------------------------
 
 /// The auto-updater's state directory, as `commands::auto_update::state_dir`
 /// computes it: `dirs::home_dir()/.local/state/freenet`. The node resolves it
-/// from `$HOME`, NOT from `--config-dir`/`--data-dir`, so the test isolates it
-/// by giving the child process its own `HOME`.
+/// from `$HOME`, NOT from `--config-dir`/`--data-dir`, so the tests isolate it by
+/// giving the child process its own `HOME`.
 fn state_dir(home: &Path) -> PathBuf {
     home.join(".local/state/freenet")
 }
 
-/// Write a probation marker for `version` that is armed right now: a genuine
-/// `ProbationState` as `begin_probation_at` would have written it immediately
-/// after installing `version` over the previous binary.
+fn probation_path(home: &Path) -> PathBuf {
+    state_dir(home).join("update_probation.json")
+}
+
+/// Write a probation marker for `version`, armed right now — a `ProbationState`
+/// as `begin_probation_at` would have written it immediately after installing
+/// `version` over the previous binary.
 ///
-/// `installed_at_unix` is NOW on purpose. A marker older than
+/// `installed_at_unix` is NOW on purpose: a marker older than
 /// `PROBATION_MAX_AGE_SECS` (1h) is treated as stale by both the commit and the
-/// post-stop paths, so a backdated fixture would make both assertions pass for
+/// post-stop paths, so a backdated fixture would make the assertions pass for
 /// the wrong reason.
+///
+/// This is hand-written JSON because `ProbationState` is `pub(crate)` to the bin
+/// crate and cannot be constructed here. If a field is renamed in `rollback.rs`,
+/// `read_probation_at` returns `None` and the node behaves as if there were no
+/// probation at all. Nothing silently passes — but the failure surfaces in
+/// `probation_survives_a_stop_inside_the_commit_window`, which takes ~15s and
+/// reports "no crash was recorded", rather than in the 65s test. That is the
+/// intended ordering: the cheap test is the fixture's canary.
 fn arm_probation(home: &Path, version: &str) {
     let dir = state_dir(home);
     std::fs::create_dir_all(&dir).expect("create state dir");
@@ -144,36 +184,54 @@ fn arm_probation(home: &Path, version: &str) {
         .duration_since(UNIX_EPOCH)
         .expect("system clock after epoch")
         .as_secs();
-    let rollback_binary = dir.join("known_good_binary");
-    let target_binary = home.join(".local/bin/freenet");
-    // Written as JSON rather than by constructing `ProbationState`, which is
-    // `pub(crate)` to the binary crate. The shape is pinned by the binary's own
-    // serde round-trip tests in `rollback.rs`; a field rename there would make
-    // this parse as "no probation" and assertion 2 would stop being able to
-    // fail, so the fixture is re-read and checked below before the node starts.
-    let marker = format!(
-        r#"{{"new_version":"{version}","previous_version":"0.0.0",
-            "rollback_binary":"{}","target_binary":"{}",
-            "rollback_size":1,"rollback_sha256":"00","installed_at_unix":{now},
-            "crash_count":0}}"#,
-        rollback_binary.display(),
-        target_binary.display(),
-    );
-    std::fs::write(probation_path(home), marker).expect("write probation marker");
+    let marker = serde_json::json!({
+        "new_version": version,
+        "previous_version": "0.0.0",
+        "rollback_binary": dir.join("known_good_binary"),
+        "target_binary": home.join(".local/bin/freenet"),
+        "rollback_size": 1,
+        "rollback_sha256": "00",
+        "installed_at_unix": now,
+        "crash_count": 0,
+    });
+    std::fs::write(
+        probation_path(home),
+        serde_json::to_vec(&marker).expect("serialize probation fixture"),
+    )
+    .expect("write probation marker");
 }
 
-fn probation_path(home: &Path) -> PathBuf {
-    state_dir(home).join("update_probation.json")
+/// The marker's `crash_count`, or `None` if there is no marker.
+fn probation_crash_count(home: &Path) -> Option<u64> {
+    let raw = std::fs::read_to_string(probation_path(home)).ok()?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw).expect("marker must stay valid JSON");
+    Some(
+        parsed["crash_count"]
+            .as_u64()
+            .expect("marker must carry a numeric crash_count"),
+    )
 }
 
 // ---------------------------------------------------------------------------
 // Subprocess node lifecycle
 // ---------------------------------------------------------------------------
 
+/// Where the node's stderr is captured. This stands in for the journal: it is
+/// the channel a service supervisor records.
+fn stderr_path(dir: &Path) -> PathBuf {
+    dir.join("node.stderr")
+}
+
+fn read_node_stderr(dir: &Path) -> String {
+    std::fs::read_to_string(stderr_path(dir)).unwrap_or_default()
+}
+
 /// A `freenet network` subprocess, killed and reaped on drop so a panicking
 /// assertion never leaks a node.
 struct NodeProcess {
     child: Child,
+    ws_port: u16,
 }
 
 impl NodeProcess {
@@ -181,10 +239,10 @@ impl NodeProcess {
     /// `HOME` pointed at `dir` so the auto-updater state directory (and hence
     /// the probation marker) is the test's own.
     ///
-    /// stderr is captured to a file rather than a pipe: the assertions read it
-    /// while the node is still running, and a pipe nobody drains would block
-    /// the node once its buffer filled.
-    fn spawn(dir: &Path, ws_port: u16, network_port: u16, log_dir: &Path) -> Self {
+    /// stderr goes to a file rather than a pipe: the assertions read it while
+    /// the node is still running, and a pipe nobody drains would block the node
+    /// once its buffer filled.
+    fn spawn(dir: &Path, ws_port: u16, network_port: u16) -> Self {
         let stderr = std::fs::File::create(stderr_path(dir)).expect("create node stderr file");
         let child = Command::new(freenet_bin())
             .arg("network")
@@ -204,39 +262,88 @@ impl NodeProcess {
             .arg("--is-gateway")
             .arg("--skip-load-from-network")
             .arg("--ignore-protocol-checking")
-            // Keep the node from reaching GitHub and, worse, deciding a newer
-            // release exists and exiting 42 before the commit window elapses —
-            // which would make this test flaky against the real release feed.
-            // It does NOT gate the commit task, which is spawned
-            // unconditionally; if that ever changes, this test fails, correctly.
+            // Keeps the node from reaching GitHub and, worse, deciding a newer
+            // release exists and exiting 42 before the window elapses — which
+            // would make these tests flaky against the real release feed. It
+            // does NOT gate the commit task, which is spawned unconditionally;
+            // if that ever changes, these tests fail, correctly.
             .arg("--disable-auto-update")
             .args(["--location", "0.5"])
             .args(["--config-dir", &dir.to_string_lossy()])
             .args(["--data-dir", &dir.to_string_lossy()])
-            .args(["--log-dir", &log_dir.to_string_lossy()])
+            // Deliberately the state dir, not a separate directory: on Linux the
+            // log dir IS the auto-updater state dir in production, so the log
+            // pruner and the probation marker share it. Pointing this elsewhere
+            // would hide a pruner regression that started matching
+            // `update_probation.json` (see `tracer.rs::rotating_log_family`).
+            .args(["--log-dir", &state_dir(dir).to_string_lossy()])
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr))
             .spawn()
             .expect("spawn freenet network");
-        Self { child }
+        Self { child, ws_port }
     }
 
     fn has_exited(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(Some(_)))
     }
 
+    /// Block until the WS API accepts a TCP connection, so the commit window is
+    /// timed from a node that is actually up rather than from `spawn`.
+    fn wait_until_ready(&mut self, dir: &Path) {
+        let deadline = Instant::now() + NODE_READY_DEADLINE;
+        while Instant::now() < deadline {
+            if std::net::TcpStream::connect(("127.0.0.1", self.ws_port)).is_ok() {
+                return;
+            }
+            assert!(
+                !self.has_exited(),
+                "the node exited before its WS API came up.{}",
+                self.diagnostics(dir)
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        panic!(
+            "the node's WS API never came up within {NODE_READY_DEADLINE:?}.{}",
+            self.diagnostics(dir)
+        );
+    }
+
+    /// Everything worth knowing when an assertion fails. The node's own stderr
+    /// is included because the likeliest failures here — a port collision, a
+    /// bind error, a rejected flag — report themselves there, possibly before
+    /// `tracing` is even initialised.
+    fn diagnostics(&mut self, dir: &Path) -> String {
+        format!(
+            "\n--- node exit status: {:?}\n--- node stderr:\n{}",
+            self.child.try_wait(),
+            read_node_stderr(dir)
+        )
+    }
+
     /// Stop the node the way a supervisor does, and return its exit status.
-    fn stop_gracefully(mut self) -> std::process::ExitStatus {
+    /// Bounded: a shutdown hang is a real regression class here, and blocking
+    /// forever would surface as an opaque harness timeout with no output.
+    fn stop_gracefully(mut self, dir: &Path) -> ExitStatus {
         // SIGTERM is what `systemctl stop` sends; the node's signal handler
         // turns it into a graceful shutdown.
         let pid = self.child.id() as i32;
-        // SAFETY: `kill(2)` with a pid we own and a valid signal number; the
-        // child is reaped immediately below, so the pid cannot be recycled
-        // between the call and the wait.
+        // SAFETY: `kill(2)` with a pid we own and a valid signal number. The
+        // child is only reaped below, so the pid cannot be recycled in between.
         unsafe {
             libc::kill(pid, libc::SIGTERM);
         }
-        self.child.wait().expect("reap node")
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            if let Some(status) = self.child.try_wait().expect("poll node exit") {
+                return status;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let diagnostics = self.diagnostics(dir);
+        let _kill = self.child.kill();
+        let _reap = self.child.wait();
+        panic!("the node did not exit within 60s of SIGTERM.{diagnostics}");
     }
 }
 
@@ -253,110 +360,20 @@ fn reserve_port() -> u16 {
     listener.local_addr().expect("local addr").port()
 }
 
-/// Where the node's stderr is captured. This stands in for the journal: it is
-/// the channel a service supervisor records.
-fn stderr_path(dir: &Path) -> PathBuf {
-    dir.join("node.stderr")
-}
-
-fn read_node_stderr(dir: &Path) -> String {
-    std::fs::read_to_string(stderr_path(dir)).unwrap_or_default()
-}
-
-/// Concatenate every rolling log file the node wrote under `log_dir`.
-fn read_node_logs(log_dir: &Path) -> String {
-    let Ok(entries) = std::fs::read_dir(log_dir) else {
-        return String::new();
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with("freenet") && n.ends_with(".log"))
-        })
-        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-// ---------------------------------------------------------------------------
-// The test
-// ---------------------------------------------------------------------------
-
-/// #5232: a node up past the commit window must have committed its probation,
-/// and a clean stop after that must not be scored as a crash.
-#[test]
-#[cfg(unix)]
-fn probation_is_committed_after_a_healthy_uptime_window() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let home = tmp.path();
-    let log_dir = home.join("logs");
-    std::fs::create_dir_all(&log_dir).expect("create log dir");
-
-    arm_probation(home, NODE_VERSION);
-    assert!(
-        probation_path(home).exists(),
-        "fixture precondition: the probation marker must exist before the node starts"
-    );
-
-    let mut node = NodeProcess::spawn(home, reserve_port(), reserve_port(), &log_dir);
-
-    // ---- Assertion 1: the marker is cleared, and cleared by COMMITTING ----
-    let deadline = Instant::now() + COMMIT_POLL_DEADLINE;
-    let mut committed = false;
-    while Instant::now() < deadline {
-        if !probation_path(home).exists() {
-            committed = true;
-            break;
-        }
-        assert!(
-            !node.has_exited(),
-            "the node exited before the probation commit window elapsed, so this test \
-             proved nothing about the commit path. Node logs:\n{}",
-            read_node_logs(&log_dir)
-        );
-        std::thread::sleep(Duration::from_secs(2));
-    }
-
-    assert!(
-        committed,
-        "#5232: the node ran for more than {COMMIT_HEALTHY_UPTIME_SECS}s but the post-update \
-         probation marker at {} is STILL armed. Every later non-clean stop will now be scored \
-         as a crash of a probationary version, and three of them roll this node back off the \
-         release it just installed. Node logs:\n{}",
-        probation_path(home).display(),
-        read_node_logs(&log_dir)
-    );
-
-    let stderr = read_node_stderr(home);
-    assert!(
-        stderr.contains(COMMITTED_STDERR_NEEDLE),
-        "#5232: the probation marker was removed, but the node never announced \
-         {COMMITTED_STDERR_NEEDLE:?} on stderr. Either it was dropped down the ClearedStale \
-         branch (a marker for a DIFFERENT version) rather than committed — which disables \
-         rollback protection entirely — or the commit happened silently, leaving an operator \
-         reading `journalctl -u freenet` unable to tell a committed node from one still \
-         accumulating strikes. That is the misreading #5232 was filed on. Node stderr:\n{stderr}\
-         \n\nNode logs:\n{}",
-        read_node_logs(&log_dir)
-    );
-
-    // ---- Assertion 2: the clean stop that follows is not scored as a crash ----
-    let status = node.stop_gracefully();
-
-    // Reproduce what a supervisor does after the node stops: run `freenet
-    // update` with the node's stop status forwarded. `--check` is used so the
-    // test can never download and overwrite the binary it is testing; the
-    // probation/crash-counting branch runs BEFORE the check/install split, so
-    // it is exercised identically either way.
-    //
-    // Deliberately forwarding "1" rather than the observed status: 1 is what a
-    // graceful shutdown actually exits with today (#5227) and is classified as
-    // a crash, so this is the strictest input. If #5227's fix lands and clean
-    // stops exit 0, this assertion still holds and still tests the probation
-    // gate rather than the exit-code classifier.
-    let post_stop = Command::new(freenet_bin())
+/// Run the post-stop `freenet update` a supervisor runs after the node stops,
+/// and return its stderr.
+///
+/// `--check` is used so the tests can never download and overwrite the binary
+/// they are testing; the probation/crash-counting branch runs BEFORE the
+/// check/install split, so it is exercised identically either way.
+///
+/// The forwarded status is always `"1"`, not the node's observed status: 1 is
+/// what a graceful shutdown exits with today (#5227) and classifies as a crash,
+/// so it is the strictest input. If #5227's fix lands and clean stops exit 0,
+/// these assertions keep testing the probation gate rather than silently
+/// becoming a test of the exit-code classifier.
+fn post_stop_update(home: &Path) -> String {
+    let out = Command::new(freenet_bin())
         .arg("update")
         .arg("--check")
         .arg("--quiet")
@@ -365,18 +382,154 @@ fn probation_is_committed_after_a_healthy_uptime_window() {
         .env("FREENET_POST_STOP_EXIT_CODE", "1")
         .output()
         .expect("run post-stop freenet update");
-    let post_stop_stderr = String::from_utf8_lossy(&post_stop.stderr);
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// #5232: a node up past the commit window must have committed its probation —
+/// visibly — and a clean stop after that must not be scored as a crash.
+#[test]
+fn probation_is_committed_after_a_healthy_uptime_window() {
+    assert_binary_matches_crate_version();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path();
+
+    arm_probation(home, NODE_VERSION);
+    assert_eq!(
+        probation_crash_count(home),
+        Some(0),
+        "fixture precondition: an armed marker with no crashes yet"
+    );
+
+    let mut node = NodeProcess::spawn(home, reserve_port(), reserve_port());
+    node.wait_until_ready(home);
+
+    // ---- Assertion 1: committed, and said so ----
+    //
+    // Polls for the ANNOUNCEMENT rather than for the marker's absence.
+    // `commit_probation_at` deletes the file before `commit_probation` prints,
+    // so a poll on the file can observe "gone" microseconds before the line is
+    // written — and the announcement is the specific artifact this guards.
+    let deadline = Instant::now() + COMMIT_POLL_DEADLINE;
+    let mut announced = false;
+    while Instant::now() < deadline {
+        if read_node_stderr(home).contains(COMMITTED_STDERR_NEEDLE) {
+            announced = true;
+            break;
+        }
+        assert!(
+            !node.has_exited(),
+            "the node exited before the probation commit window elapsed, so this test proved \
+             nothing about the commit path.{}",
+            node.diagnostics(home)
+        );
+        std::thread::sleep(Duration::from_secs(2));
+    }
+
+    let stderr = read_node_stderr(home);
+    assert!(
+        announced,
+        "#5232: the node ran for more than {COMMIT_HEALTHY_UPTIME_SECS}s but never announced \
+         {COMMITTED_STDERR_NEEDLE:?} on stderr. Either it did not commit — in which case the \
+         marker is still armed, every later non-clean stop is scored as a crash of a \
+         probationary version, and three of them roll this node back off the release it just \
+         installed — or it committed silently, leaving an operator reading `journalctl -u \
+         freenet` unable to tell a committed node from one accumulating strikes. That is the \
+         misreading #5232 was filed on. Marker crash_count now: {:?}\n--- node stderr:\n{stderr}",
+        probation_crash_count(home),
+    );
+    assert!(
+        !stderr.contains("discarded a post-update probation marker"),
+        "the marker was DISCARDED as belonging to another version rather than committed, so \
+         rollback protection was dropped without the version ever proving itself. The planted \
+         marker names {NODE_VERSION}, the same string the node commits, so this means the \
+         version comparison regressed (the #5104 `v`-prefix class).\n--- node stderr:\n{stderr}"
+    );
+    assert_eq!(
+        probation_crash_count(home),
+        None,
+        "the commit was announced but the marker is still on disk at {}",
+        probation_path(home).display()
+    );
+
+    // ---- Assertion 2: the clean stop that follows is not scored as a crash ----
+    let status = node.stop_gracefully(home);
+    let post_stop_stderr = post_stop_update(home);
     assert!(
         !post_stop_stderr.contains(CRASH_RECORDED_NEEDLE),
         "#5232: a clean stop of a node that had already committed its probation was still \
-         counted as a probation crash. Three of these roll the node back. \
-         Node stop status was {status:?}; post-stop `freenet update` said:\n{post_stop_stderr}"
+         counted as a probation crash. Three of these roll the node back. Node stop status was \
+         {status:?}; post-stop `freenet update` said:\n{post_stop_stderr}"
+    );
+    assert_eq!(
+        probation_crash_count(home),
+        None,
+        "the post-stop `freenet update` re-armed a marker that had already been committed"
+    );
+}
+
+/// The other half of the contract, and the positive control for the test above:
+/// a node stopped INSIDE the commit window keeps its marker, and the stop IS
+/// counted against it.
+///
+/// This is what makes the committed test's "no crash was recorded" meaningful.
+/// That assertion is a negative on a subprocess's stderr, so on its own it would
+/// also hold if the post-stop command never reached the probation branch at all
+/// — a wrong env var name, a `HOME` that did not relocate the state dir, an
+/// unparseable fixture, or a reworded needle. Here the same fixture, the same
+/// env var and the same needle must produce a crash line, so all of it is
+/// pinned. Runs in ~15s and makes no network call: the crash branch exits before
+/// `freenet update` probes GitHub.
+#[test]
+fn probation_survives_a_stop_inside_the_commit_window() {
+    assert_binary_matches_crate_version();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path();
+
+    arm_probation(home, NODE_VERSION);
+
+    let mut node = NodeProcess::spawn(home, reserve_port(), reserve_port());
+    node.wait_until_ready(home);
+    // Stop well inside the window. `wait_until_ready` returns as soon as the WS
+    // port answers, which is before the commit task's sleep elapses, so there is
+    // no race to lose here — but assert it rather than trusting it.
+    let stderr_at_stop = read_node_stderr(home);
+    assert!(
+        !stderr_at_stop.contains(COMMITTED_STDERR_NEEDLE),
+        "the node committed before this test could stop it, so it is no longer testing an \
+         in-window stop. Did COMMIT_HEALTHY_UPTIME_SECS shrink?\n{stderr_at_stop}"
+    );
+    let status = node.stop_gracefully(home);
+
+    assert_eq!(
+        probation_crash_count(home),
+        Some(0),
+        "a node stopped inside the commit window must keep its armed marker: that is what lets \
+         a genuinely crash-looping release be rolled back. Node stop status: {status:?}"
+    );
+
+    let post_stop_stderr = post_stop_update(home);
+    assert!(
+        post_stop_stderr.contains(CRASH_RECORDED_NEEDLE),
+        "a crash of an uncommitted probationary version must be counted, and reported on stderr \
+         where the supervisor records it. If this fails, the committed test's \"no crash was \
+         recorded\" assertion is no longer able to fail either — check the fixture parses, \
+         `FREENET_POST_STOP_EXIT_CODE` is still the env var name, and the needle \
+         {CRASH_RECORDED_NEEDLE:?} still matches what `freenet update` prints.\n\
+         post-stop `freenet update` said:\n{post_stop_stderr}"
     );
     assert!(
-        !probation_path(home).exists(),
-        "the post-stop `freenet update` re-armed a probation marker that had already been \
-         committed at {}",
-        probation_path(home).display()
+        post_stop_stderr.contains("1/3"),
+        "the first crash of a probationary version must count as 1 of 3, not something else:\n\
+         {post_stop_stderr}"
+    );
+    assert_eq!(
+        probation_crash_count(home),
+        Some(1),
+        "the crash must be PERSISTED, or crashes cannot accumulate toward the rollback threshold \
+         across restarts and a genuinely bad release is never rolled back"
     );
 }
