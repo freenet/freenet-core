@@ -10306,46 +10306,66 @@ mod tests {
         /// performance fix's clothes.
         #[tokio::test]
         async fn bounding_the_reply_does_not_bound_interest_registration() {
-            let h = build_harness("hf-bound-interest", 17150, vec![7u8; 64]).await;
-            let keys = host_many(&h, 200);
-            let hashes = distinct_hashes(&keys);
+            // #5238: run against BOTH wire forms. Under #5155 only the
+            // full-bytes reply was windowed, so `old_peer` was the only case
+            // where a contract could be registered-but-unadvertised. Now that
+            // both are windowed the invariant matters for every peer, and a
+            // test that only covers one form would not notice if the
+            // registration loop were moved inside the window for the other.
+            for (label, peer) in [("full-bytes", 17150u16), ("digests", 17151)] {
+                let h =
+                    build_harness(&format!("hf-bound-interest-{label}"), peer, vec![7u8; 64]).await;
+                let target = if label == "digests" {
+                    h.new_peer
+                } else {
+                    h.old_peer
+                };
+                let keys = host_many(&h, 200);
+                let hashes = distinct_hashes(&keys);
 
-            let reply = handle_interest_sync_message(
-                &h.op_manager,
-                h.old_peer,
-                InterestMessage::Interests {
-                    hashes: hashes.clone(),
-                },
-            )
-            .await;
-            let advertised: HashSet<u32> = match reply {
-                Some(InterestMessage::Summaries { ref entries, .. }) => {
-                    entries.iter().map(|e| e.hash).collect()
-                }
-                other => panic!("expected full bytes, got {other:?}"),
-            };
-            assert!(
-                advertised.len() < hashes.len(),
-                "premise: this round must NOT have advertised everything, or \
-                 the test cannot distinguish registered-for-all from \
-                 registered-for-the-window"
-            );
-
-            let pk = h.peer_key_of(h.old_peer);
-            let unadvertised: Vec<&ContractKey> = keys
-                .iter()
-                .filter(|k| !advertised.contains(&contract_hash(k)))
-                .collect();
-            assert!(!unadvertised.is_empty(), "premise: some contract was cut");
-            for key in unadvertised {
+                let reply = handle_interest_sync_message(
+                    &h.op_manager,
+                    target,
+                    InterestMessage::Interests {
+                        hashes: hashes.clone(),
+                    },
+                )
+                .await;
+                let advertised: HashSet<u32> = match reply {
+                    Some(InterestMessage::Summaries { ref entries, .. }) => {
+                        entries.iter().map(|e| e.hash).collect()
+                    }
+                    Some(InterestMessage::SummaryDigests { ref entries, .. }) => {
+                        entries.iter().map(|e| e.hash).collect()
+                    }
+                    other => panic!("{label}: unexpected reply {other:?}"),
+                };
                 assert!(
-                    h.op_manager
-                        .interest_manager
-                        .get_peer_interest(key, &pk)
-                        .is_some(),
-                    "peer interest must be registered for {key} even though \
-                     this round's window did not advertise it"
+                    advertised.len() < hashes.len(),
+                    "{label} premise: this round must NOT have advertised \
+                     everything, or the test cannot distinguish \
+                     registered-for-all from registered-for-the-window"
                 );
+
+                let pk = h.peer_key_of(target);
+                let unadvertised: Vec<&ContractKey> = keys
+                    .iter()
+                    .filter(|k| !advertised.contains(&contract_hash(k)))
+                    .collect();
+                assert!(
+                    !unadvertised.is_empty(),
+                    "{label} premise: some contract was cut"
+                );
+                for key in unadvertised {
+                    assert!(
+                        h.op_manager
+                            .interest_manager
+                            .get_peer_interest(key, &pk)
+                            .is_some(),
+                        "{label}: peer interest must be registered for {key} \
+                         even though this round's window did not advertise it"
+                    );
+                }
             }
         }
 
@@ -11018,12 +11038,36 @@ mod tests {
             let h = build_harness("hf-cap", 17065, vec![5u8; 128]).await;
             let hash = contract_hash(&h.key);
 
+            // #5238: the KNOWN hash is INTERLEAVED through the unknowns, once
+            // every 32 entries, not appended as a block.
+            //
+            // Without a known hash at all, nothing resolves, the
+            // `SummaryRequest` arm below is unreachable and this degenerates
+            // into a no-panic smoke test — tolerable when the cap was 4,096 of
+            // 6,096 entries, much less so now that only 64 are processed.
+            //
+            // Appending it as a block does not work either, and the reason is
+            // worth recording because it is not the obvious probability
+            // argument: pair dedup collapses every copy of the known hash to a
+            // SINGLE pair, so a 2,000-entry block still contributes one, and
+            // the scan stops after 64 DISTINCT pairs. A rotation landing
+            // anywhere in the ~6,000 unknowns therefore fills its quota long
+            // before reaching the block. Measured: it missed outright under the
+            // seeded rotation. Interleaving at a period below the cap puts a
+            // copy inside every possible 64-entry window, so inclusion is
+            // structural rather than probabilistic.
             let mut entries = Vec::new();
             for i in 0..(MAX_SUMMARY_HASHES_PER_MESSAGE as u32 + 2_000) {
                 entries.push(SummaryDigestEntry {
                     hash: hash.wrapping_add(i + 1),
                     summary_digest: Some(summary_digest(b"divergent")),
                 });
+                if i % 32 == 0 {
+                    entries.push(SummaryDigestEntry {
+                        hash,
+                        summary_digest: Some(summary_digest(b"divergent")),
+                    });
+                }
             }
             assert!(
                 entries.len() > MAX_SUMMARY_COMPARISONS_PER_MESSAGE,
@@ -11041,13 +11085,17 @@ mod tests {
             )
             .await;
 
-            // Every hash here is unknown to this node, so nothing resolves and
-            // no request is warranted. The property under test is that an
-            // over-cap message is absorbed without panic and without
-            // manufacturing work: `lookup_by_hash` yields nothing for any of
-            // them, so the peer's 6,096 entries buy it exactly nothing.
+            // The known hash MUST come back, and it must come back alone.
+            //
+            // The 2,000 unknowns-plus-one-known shape is what makes this a real
+            // assertion rather than a no-panic smoke test: pair dedup collapses
+            // all 2,000 copies of the known hash to a single pair, so the
+            // reply can name it at most once however the rotation lands, while
+            // the ~6,096 unknown hashes resolve to nothing whatever the peer
+            // does. The known hash is ~25% of the message and the scan takes at
+            // least 64 distinct pairs, so its omission has probability ~1e-8 —
+            // and the seed above makes the outcome deterministic regardless.
             match reply {
-                None => {}
                 Some(InterestMessage::SummaryRequest { hashes }) => {
                     assert!(
                         hashes.len() <= MAX_SUMMARY_COMPARISONS_PER_MESSAGE,
@@ -11055,8 +11103,18 @@ mod tests {
                          MAX_SUMMARY_COMPARISONS_PER_MESSAGE, got {}",
                         hashes.len()
                     );
+                    assert_eq!(
+                        hashes,
+                        vec![hash],
+                        "an over-cap message must still answer for the one \
+                         contract this node tracks, and must not let 6,096 \
+                         unknown hashes inflate the reply"
+                    );
                 }
-                other => panic!("unexpected reply {other:?}"),
+                other => panic!(
+                    "the known hash must provoke a bounded SummaryRequest; got \
+                     {other:?}"
+                ),
             }
         }
 
