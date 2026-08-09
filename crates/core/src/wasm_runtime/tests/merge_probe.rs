@@ -191,6 +191,45 @@ async fn merge_probe() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    println!("\n  --- pairwise symmetry: merge(X,Y) vs merge(Y,X) (needs only 2 states) ---");
+    for i in 0..states.len() {
+        for j in (i + 1)..states.len() {
+            let (xn, xb) = &states[i];
+            let (yn, yb) = &states[j];
+            let xy = apply_seq(
+                &mut rt,
+                &key,
+                &params,
+                &WrappedState::new(xb.clone()),
+                &[yb.clone()],
+            );
+            let yx = apply_seq(
+                &mut rt,
+                &key,
+                &params,
+                &WrappedState::new(yb.clone()),
+                &[xb.clone()],
+            );
+            match (&xy, &yx) {
+                (Ok(a), Ok(b)) => println!(
+                    "  X={xn:12} Y={yn:12} SYMMETRIC={:<5} merge(X,Y)=(len {} sha {}) merge(Y,X)=(len {} sha {})  [XY==Y:{} YX==X:{}]",
+                    a == b,
+                    a.len(),
+                    sha(a),
+                    b.len(),
+                    sha(b),
+                    a == yb,
+                    b == xb
+                ),
+                _ => println!(
+                    "  X={xn:12} Y={yn:12} err XY={:?} YX={:?}",
+                    xy.as_ref().err(),
+                    yx.as_ref().err()
+                ),
+            }
+        }
+    }
+
     println!("\n  --- commutativity: base + A + B  vs  base + B + A ---");
     for i in 0..states.len() {
         for j in 0..states.len() {
