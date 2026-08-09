@@ -101,6 +101,21 @@ async fn merge_probe() -> Result<(), Box<dyn std::error::Error>> {
         println!("state {n:12} len={:<8} sha={}", b.len(), sha(b));
     }
 
+    // ---------- (v) validate_state ----------
+    println!("\n===== (v) validate_state =====");
+    for (name, sb) in &states {
+        let ws = WrappedState::new(sb.clone());
+        let related = freenet_stdlib::prelude::RelatedContracts::default();
+        match rt.validate_state(&key, &params, &ws, &related) {
+            Ok(v) => println!("  {name:26} len={:<9} sha={} => {v:?}", sb.len(), sha(sb)),
+            Err(e) => println!(
+                "  {name:26} len={:<9} sha={} => RuntimeError: {e}",
+                sb.len(),
+                sha(sb)
+            ),
+        }
+    }
+
     // ---------- (a) summarize_state determinism ----------
     println!("\n===== (a) summarize_state determinism (3 calls per state) =====");
     let mut summaries: Vec<Option<Vec<u8>>> = Vec::new();
