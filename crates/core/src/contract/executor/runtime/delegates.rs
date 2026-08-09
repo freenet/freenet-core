@@ -7,51 +7,6 @@
 
 use super::*;
 
-/// Upper bound on the number of UNIQUE predecessor delegate keys a single
-/// `RegisterDelegateWithPredecessors` request may drive copy-forward for
-/// (#4117 P2/M1). The predecessor list is client-controlled, and each
-/// predecessor drives synchronous marker/index/redb writes on the contract
-/// loop, so an unbounded (or duplicate-padded) list is a disk-growth / loop-
-/// stall amplification vector. 64 matches the delegate-lineage / probe-hop
-/// bound used by the app-side migration driver (`DEFAULT_MAX_PROBE_HOPS`): a
-/// realistic delegate never accumulates anywhere near 64 retired generations.
-/// This is the DEDUPED cap, enforced on the UNIQUE count: a request whose
-/// unique predecessor count exceeds it is REJECTED whole (never silently
-/// truncated, which would strand older generations — the client splits its
-/// request). Duplicates are dropped first and never count against it, so a
-/// duplicate-heavy but genuinely-small list is accepted. A separate, much
-/// larger raw-length sanity bound ([`MAX_MIGRATION_PREDECESSORS_RAW`]) rejects a
-/// giant list up front so the dedupe work itself stays bounded.
-pub(super) const MAX_MIGRATION_PREDECESSORS: usize = 64;
-
-/// Pre-dedupe SANITY bound on the RAW predecessor-list length: 16× the deduped
-/// cap [`MAX_MIGRATION_PREDECESSORS`]. This is pure DoS protection — it caps the
-/// dedupe / `HashSet`-insert work for a giant list BEFORE any per-element
-/// processing — NOT the semantic limit. No legitimate client comes anywhere
-/// near it: a realistic delegate has a handful of retired generations, and even
-/// a duplicate-heavy legitimate list stays far under 1024. The semantic limit
-/// is the deduped cap above; a list whose UNIQUE count is within the cap is
-/// accepted even when the raw list carried duplicates.
-pub(super) const MAX_MIGRATION_PREDECESSORS_RAW: usize = MAX_MIGRATION_PREDECESSORS * 16;
-
-/// Dedupe a client-supplied predecessor list, preserving newest-first order
-/// (#4117 P2/M1). A duplicate is pure waste (the migration is idempotent per
-/// pair), so it is dropped SILENTLY. The cap is enforced by the CALLER on the
-/// deduped length: over the cap, the whole request is REJECTED before
-/// registration (never silently truncated, which would strand older
-/// generations — the client is expected to split its request). Extracted as a
-/// free function so the dedupe is unit-testable without standing up an executor.
-fn dedupe_predecessors(predecessors: Vec<DelegateKey>) -> Vec<DelegateKey> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out: Vec<DelegateKey> = Vec::with_capacity(predecessors.len());
-    for p in predecessors {
-        if seen.insert(p.clone()) {
-            out.push(p);
-        }
-    }
-    out
-}
-
 impl Executor<Runtime> {
     /// Export this hosted user's per-user delegate secrets into an encrypted
     /// bundle, sealed under the user's `token` (hosted-mode export, P3-live of
@@ -148,12 +103,19 @@ impl Executor<Runtime> {
             })
     }
 
-    /// Register a delegate and record its WebApp origin, shared by the
-    /// `RegisterDelegate` and `RegisterDelegateWithPredecessors` request arms so
-    /// the two cannot drift. Installs the client-supplied cipher/nonce, records
-    /// `origin_contract` as this delegate's attestation, and registers the WASM
-    /// module. Returns the delegate key on success, or a mapped
-    /// [`ExecutorError`] (already carrying `RegisterError(key)`) on failure.
+    /// Register a delegate and record its WebApp origin, for the
+    /// `RegisterDelegate` request arm. Installs the client-supplied
+    /// cipher/nonce, records `origin_contract` as this delegate's attestation,
+    /// and registers the WASM module. Returns the delegate key on success, or a
+    /// mapped [`ExecutorError`] (already carrying `RegisterError(key)`) on
+    /// failure.
+    ///
+    /// This was previously shared with a second `RegisterDelegateWithPredecessors`
+    /// arm, which drove a predecessor secret copy-forward (#4117). That handler
+    /// was disabled unconditionally in #5199 (GHSA-824h-7x5x-wfmf) and the wire
+    /// variant was then removed in freenet-stdlib 0.9.0, so only one caller
+    /// remains. Do NOT re-introduce a copy-forward arm here without first
+    /// hardening how `origin_contract` is attested — see #5201.
     fn register_delegate_and_record_origin(
         &mut self,
         delegate: DelegateContainer,
@@ -322,89 +284,6 @@ impl Executor<Runtime> {
                 }),
                 Err(err) => Err(err),
             },
-            DelegateRequest::RegisterDelegateWithPredecessors {
-                delegate,
-                cipher,
-                nonce,
-                predecessors,
-            } => {
-                // Bound the client-controlled predecessor list BEFORE registering
-                // (#4117 P2b/M1) with TWO tiers, so the DoS bound and the
-                // documented DEDUPED semantics both hold:
-                //   (a) a cheap pre-dedupe SANITY check on the RAW length rejects
-                //       a giant list up front, keeping the dedupe / HashSet work
-                //       itself bounded (a giant list can't burn the contract
-                //       loop just to be rejected);
-                //   (b) dedupe silently (a repeat is pure waste — migration is
-                //       idempotent per pair);
-                //   (c) enforce the real cap on the UNIQUE count, matching every
-                //       docstring and test. A duplicate-heavy but genuinely-small
-                //       list is ACCEPTED; an over-cap UNIQUE list is REJECTED
-                //       whole (silent truncation would strand older generations —
-                //       the client splits its request).
-                // Each predecessor drives synchronous marker/index/redb writes,
-                // so an unbounded list is a disk-growth / loop-stall vector.
-                if predecessors.len() > MAX_MIGRATION_PREDECESSORS_RAW {
-                    let key = delegate.key().clone();
-                    tracing::warn!(
-                        delegate_key = %key,
-                        predecessors = predecessors.len(),
-                        raw_cap = MAX_MIGRATION_PREDECESSORS_RAW,
-                        "RegisterDelegateWithPredecessors rejected: raw predecessor list too large (DoS sanity bound)"
-                    );
-                    return Err(ExecutorError::other(anyhow::anyhow!(
-                        "RegisterDelegateWithPredecessors: raw predecessor list of {} exceeds the sanity bound of {}",
-                        predecessors.len(),
-                        MAX_MIGRATION_PREDECESSORS_RAW
-                    )));
-                }
-                let deduped = dedupe_predecessors(predecessors);
-                if deduped.len() > MAX_MIGRATION_PREDECESSORS {
-                    let key = delegate.key().clone();
-                    tracing::warn!(
-                        delegate_key = %key,
-                        unique_predecessors = deduped.len(),
-                        cap = MAX_MIGRATION_PREDECESSORS,
-                        "RegisterDelegateWithPredecessors rejected: too many UNIQUE predecessors (split the request)"
-                    );
-                    return Err(ExecutorError::other(anyhow::anyhow!(
-                        "RegisterDelegateWithPredecessors: {} unique predecessors exceeds the cap of {}",
-                        deduped.len(),
-                        MAX_MIGRATION_PREDECESSORS
-                    )));
-                }
-
-                // SECURITY (GHSA-824h-7x5x-wfmf): the predecessor secret
-                // copy-forward below `self.runtime.migrate_delegate_secrets(...)`
-                // is INTENTIONALLY NEVER CALLED. `SecretsStore::migrate_secrets`
-                // gates the copy on `origin_contract` matching the predecessor's
-                // recorded first-registration origin, but `origin_contract` is
-                // forgeable by any HTTP client through the webapp-shell token
-                // issuance path (see GHSA-824h-7x5x-wfmf for the full exploit chain) — so the
-                // gate does not actually authorize anything. Do NOT re-enable
-                // this call without first hardening how `origin_contract` is
-                // attested; the gate itself remains sound given a trustworthy
-                // origin. The feature has zero known callers (every app in this
-                // ecosystem has its own client-driven secret-continuity
-                // mechanism instead), so disabling it changes no observed
-                // behavior. Registration proceeds exactly as `RegisterDelegate`.
-                if !deduped.is_empty() {
-                    tracing::warn!(
-                        delegate_key = %delegate.key(),
-                        predecessors = deduped.len(),
-                        "RegisterDelegateWithPredecessors: predecessor secret \
-                         copy-forward is disabled pending a security fix (see \
-                         GHSA-824h-7x5x-wfmf); registering the delegate \
-                         without migrating any secrets"
-                    );
-                }
-
-                self.register_delegate_and_record_origin(delegate, cipher, nonce, origin_contract)
-                    .map(|key| DelegateResponse {
-                        key,
-                        values: Vec::new(),
-                    })
-            }
             DelegateRequest::UnregisterDelegate(key) => {
                 self.delegate_origin_ids.remove(&key);
 
@@ -599,27 +478,6 @@ mod resolve_message_origin_tests {
     /// and both are gone. See #4813.
     fn origins() -> crate::wasm_runtime::SharedInheritedOrigins {
         crate::wasm_runtime::new_inherited_origins()
-    }
-
-    /// #4117 P2/M1: the predecessor list is deduped silently, preserving
-    /// newest-first order (first occurrence wins). The cap itself is enforced in
-    /// the handler on the deduped length (over-cap → the whole request is
-    /// rejected, never silently truncated).
-    #[test]
-    fn dedupe_predecessors_preserves_order_and_drops_duplicates() {
-        // Unique → unchanged, order preserved.
-        let keys: Vec<DelegateKey> = (0u8..5).map(dkey).collect();
-        assert_eq!(dedupe_predecessors(keys.clone()), keys);
-
-        // Duplicates dropped, first occurrence wins, order preserved.
-        let dupes = vec![dkey(1), dkey(2), dkey(1), dkey(3), dkey(2)];
-        assert_eq!(dedupe_predecessors(dupes), vec![dkey(1), dkey(2), dkey(3)]);
-
-        // Dedupe does not itself cap: a large unique list passes through (the
-        // handler rejects it against MAX_MIGRATION_PREDECESSORS).
-        let many: Vec<DelegateKey> = (0u8..200).map(dkey).collect();
-        assert_eq!(dedupe_predecessors(many).len(), 200);
-        assert!(200 > MAX_MIGRATION_PREDECESSORS);
     }
 
     /// Caller delegate identity wins over a concurrently-supplied WebApp

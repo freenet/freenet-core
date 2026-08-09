@@ -159,8 +159,16 @@ muda = "0.19"
 zip = { version = "8", default-features = false, features = ["deflate", "time"] }
 
 # Freenet
-# 0.8.4 adds `DelegateRequest::RegisterDelegateWithPredecessors` (stdlib PR #86),
-# consumed by the #4117 delegate secret copy-forward.
+# 0.9.0 REMOVES `DelegateRequest::RegisterDelegateWithPredecessors` (stdlib PR
+# #91), the variant 0.8.4 had added (stdlib #86) for the #4117 delegate secret
+# copy-forward. freenet-core's node-side handler for it was already disabled
+# unconditionally in #5199 (GHSA-824h-7x5x-wfmf: its `origin_contract`
+# authorization gate is forgeable by any HTTP client), so nothing emitted or
+# acted on the variant. Removing a public enum variant is source-breaking, which
+# is why this is a semver-minor bump and not a patch; there is no wire break,
+# because no client ever constructed the variant and its bincode tag (3) was the
+# last one, so `ApplicationMessages` (0), `RegisterDelegate` (1) and
+# `UnregisterDelegate` (2) keep their tags. See freenet-core#5201.
 #
 # 0.8.5 fixes the FlatBuffers client-request boundary (stdlib #85/#87/#88).
 # Behaviour changes for FBS clients, none for native ones:
@@ -178,7 +186,7 @@ zip = { version = "8", default-features = false, features = ["deflate", "time"] 
 # Exposure is FBS-only: `client_events/websocket.rs` falls back to
 # Flatbuffers when no encoding is specified, and every first-party client
 # (fdev, riverctl, River UI, the test harness) explicitly pins native.
-freenet-stdlib = "0.8.5"
+freenet-stdlib = "0.9.0"
 
 # Crypto (secrets-at-rest KEK + DEK derivation, see crates/core/src/config/kek.rs).
 # `sha2` is already declared above (workspace-wide); only `hkdf` and `keyring`

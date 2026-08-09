@@ -2548,19 +2548,21 @@ impl SecretsStore {
     /// the next registration (and picked up if its secrets arrive later); this
     /// also denies a client the ability to drive marker writes with bogus keys.
     ///
-    /// Runs synchronously on the caller (the contract loop, via the
-    /// `RegisterDelegateWithPredecessors` handler), mirroring the on-loop write
-    /// discipline of `store_secret` / the live bundle import. The work is bounded
-    /// by the predecessors' own on-disk secret count.
+    /// Runs synchronously on the caller (historically the contract loop),
+    /// mirroring the on-loop write discipline of `store_secret` / the live bundle
+    /// import. The work is bounded by the predecessors' own on-disk secret count.
     ///
-    /// UNREACHABLE FROM PRODUCTION as of GHSA-824h-7x5x-wfmf: the H1 gate
-    /// above is sound only if `origin_contract` is trustworthy, and it isn't —
-    /// any HTTP client can forge an `origin_contract` value for an arbitrary
-    /// public contract key (see GHSA-824h-7x5x-wfmf). The one caller
-    /// (`RegisterDelegateWithPredecessors`'s handler) no longer invokes this
-    /// method; it is kept, with its test suite, for potential reactivation once
-    /// `origin_contract` attestation is hardened. Do not re-wire a caller to
-    /// this method without first fixing that.
+    /// UNREACHABLE FROM PRODUCTION, with NO caller anywhere: the H1 gate above is
+    /// sound only if `origin_contract` is trustworthy, and it isn't — any HTTP
+    /// client can forge an `origin_contract` value for an arbitrary public
+    /// contract key (see GHSA-824h-7x5x-wfmf). Its only caller was the
+    /// `RegisterDelegateWithPredecessors` handler, disabled in #5199 and then
+    /// deleted in #5201 once freenet-stdlib 0.9.0 removed the wire variant.
+    ///
+    /// This method and its test suite are kept deliberately, for potential
+    /// reactivation once `origin_contract` attestation is hardened. Do not
+    /// re-wire a caller to this method without first fixing that — the copy
+    /// itself is fine; the authorization it depends on is what was broken.
     pub fn migrate_secrets(
         &mut self,
         predecessors: &[DelegateKey],

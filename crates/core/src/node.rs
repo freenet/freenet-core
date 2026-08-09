@@ -4908,9 +4908,6 @@ pub async fn run_local_node(
                 // if the token expired between WebSocket connect and this request)
                 let op_name = match op {
                     DelegateRequest::RegisterDelegate { .. } => "RegisterDelegate",
-                    DelegateRequest::RegisterDelegateWithPredecessors { .. } => {
-                        "RegisterDelegateWithPredecessors"
-                    }
                     DelegateRequest::ApplicationMessages { .. } => "ApplicationMessages",
                     DelegateRequest::UnregisterDelegate(_) => "UnregisterDelegate",
                     _ => "Unknown",

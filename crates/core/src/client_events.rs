@@ -1561,26 +1561,17 @@ async fn process_open_request(
                     freenet_stdlib::client_api::DelegateRequest::UnregisterDelegate(key) => {
                         crate::contract::delegate_app_registry::remove_delegate(key);
                     }
-                    // RegisterDelegate and RegisterDelegateWithPredecessors both
-                    // INSTALL a delegate binary (admin ops), not an app
-                    // conversation, so neither registers a routing path — the
-                    // path is established by an ApplicationMessages request that
-                    // carries a notification channel (above), never by
-                    // registration. RegisterDelegateWithPredecessors's
-                    // node-side secret copy-forward (#4117) is unconditionally
-                    // disabled as of GHSA-824h-7x5x-wfmf (its origin_contract gate is
-                    // forgeable) — it was likewise never an app-routing event
-                    // even when active. Both are listed EXPLICITLY (not swept)
-                    // per this match's contract that
-                    // app-facing variants must be handled above the wildcard; the
-                    // wildcard remains ONLY to satisfy `#[non_exhaustive]` for
-                    // genuinely future variants (see git-workflow.md).
+                    // RegisterDelegate INSTALLS a delegate binary (an admin op),
+                    // not an app conversation, so it registers no routing path —
+                    // the path is established by an ApplicationMessages request
+                    // that carries a notification channel (above), never by
+                    // registration. It is listed EXPLICITLY (not swept) per this
+                    // match's contract that app-facing variants must be handled
+                    // above the wildcard; the wildcard remains ONLY to satisfy
+                    // `#[non_exhaustive]` for genuinely future variants (see
+                    // git-workflow.md).
                     #[allow(clippy::wildcard_enum_match_arm)]
-                    freenet_stdlib::client_api::DelegateRequest::RegisterDelegate { .. }
-                    | freenet_stdlib::client_api::DelegateRequest::RegisterDelegateWithPredecessors {
-                        ..
-                    }
-                    | _ => {}
+                    freenet_stdlib::client_api::DelegateRequest::RegisterDelegate { .. } | _ => {}
                 }
 
                 // Derive a short discriminant tag for the INFO logs, but only when INFO is
@@ -1632,9 +1623,6 @@ async fn process_open_request(
                         freenet_stdlib::client_api::DelegateRequest::RegisterDelegate {
                             ..
                         } => "RegisterDelegate".to_string(),
-                        freenet_stdlib::client_api::DelegateRequest::RegisterDelegateWithPredecessors {
-                            ..
-                        } => "RegisterDelegateWithPredecessors".to_string(),
                         freenet_stdlib::client_api::DelegateRequest::UnregisterDelegate(_) => {
                             "UnregisterDelegate".to_string()
                         }

@@ -1702,243 +1702,30 @@ mod remove_contract_tests {
         }
     }
 
-    /// Handler-level (GHSA-824h-7x5x-wfmf): `RegisterDelegateWithPredecessors`
-    /// NEVER copies a predecessor's secrets, even when the registering request's
-    /// `origin_contract` exactly matches the predecessor's recorded
-    /// first-registration origin (the one case the H1 same-origin gate in
-    /// `SecretsStore::migrate_secrets` would otherwise allow). The copy-forward
-    /// call is disabled at the handler level because `origin_contract` itself is
-    /// forgeable by any HTTP client (see GHSA-824h-7x5x-wfmf) — so even a "matching" origin
-    /// proves nothing. Registration still succeeds, exactly as plain
-    /// `RegisterDelegate` would. This replaces the pre-advisory test asserting the
-    /// copy DID happen on a matching origin.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn register_delegate_with_predecessors_never_copies_secrets() {
-        use crate::wasm_runtime::SecretScope;
-        use freenet_stdlib::client_api::{DelegateRequest, HostResponse};
-        use freenet_stdlib::prelude::{
-            ContractInstanceId, Delegate, DelegateContainer, DelegateWasmAPIVersion, SecretsId,
-        };
-        use zeroize::Zeroizing;
-
-        const ORIGIN: [u8; 32] = [0x11u8; 32];
-
-        let temp_dir = crate::util::tests::get_temp_dir();
-        let db = Storage::new(temp_dir.path()).await.expect("create db");
-        let contract_store =
-            ContractStore::new(temp_dir.path().join("contracts"), 10_000, db.clone())
-                .expect("create contract store");
-        let delegate_store =
-            DelegateStore::new(temp_dir.path().join("delegate"), 10_000, db.clone())
-                .expect("create delegate store");
-        let secrets_dir = temp_dir.path().join("secrets");
-        let mut secrets_store =
-            SecretsStore::new(secrets_dir.clone(), Default::default(), db.clone())
-                .expect("create secrets store");
-
-        // Same params, different code == an ABI bump that mints a new key.
-        let pred = Delegate::from((&vec![0u8].into(), &vec![1u8].into()));
-        let succ = Delegate::from((&vec![0u8].into(), &vec![2u8].into()));
-
-        // Seed a predecessor Local secret under its DERIVED DEK (the at-rest
-        // path) BEFORE moving the secrets store into the runtime.
-        let secret_id = SecretsId::new(b"room:alice".to_vec());
-        secrets_store
-            .store_secret(
-                pred.key(),
-                &secret_id,
-                SecretScope::Local,
-                Zeroizing::new(b"profile".to_vec()),
-            )
-            .expect("seed predecessor secret");
-
-        // Record the predecessor's FIRST-registration origin (H1 same-origin
-        // gate): the migrating registration below must present this SAME origin
-        // for the copy to be allowed.
-        secrets_store
-            .record_delegate_registration_origin(pred.key(), Some(ORIGIN))
-            .unwrap();
-
-        let successor_secret_path = secrets_dir
-            .join(succ.key().encode())
-            .join(secret_id.encode());
-        assert!(
-            !successor_secret_path.exists(),
-            "successor secret must not exist before migration"
-        );
-
-        let state_store = StateStore::new(db, 10_000_000).expect("create state store");
-        let runtime = Runtime::build(contract_store, delegate_store, secrets_store, false)
-            .expect("build runtime");
-        let mut executor = Executor::new(
-            state_store,
-            || Ok(()),
-            crate::contract::executor::OperationMode::Local,
-            runtime,
-            None,
-        )
-        .await
-        .expect("create executor");
-
-        let origin_contract = ContractInstanceId::new(ORIGIN);
-
-        let req = DelegateRequest::RegisterDelegateWithPredecessors {
-            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ.clone())),
-            cipher: [7u8; 32],
-            nonce: [9u8; 24],
-            predecessors: vec![pred.key().clone()],
-        };
-        let resp = executor
-            .delegate_request(
-                req,
-                Some(&origin_contract),
-                None,
-                crate::client_events::ConnectionScope::Local,
-                None,
-            )
-            .expect("register-with-predecessors must succeed");
-        match resp {
-            HostResponse::DelegateResponse { key, .. } => {
-                assert_eq!(&key, succ.key(), "response carries the successor key");
-            }
-            other => panic!("expected DelegateResponse, got {other:?}"),
-        }
-
-        // The predecessor's Local secret must NOT be copied — the copy-forward
-        // is unconditionally disabled (GHSA-824h-7x5x-wfmf), even though the supplied
-        // `origin_contract` matches the predecessor's recorded origin exactly
-        // (the one case the underlying H1 gate would otherwise have allowed).
-        assert!(
-            !successor_secret_path.exists(),
-            "successor secret file must NOT exist: copy-forward is disabled (GHSA-824h-7x5x-wfmf) \
-             regardless of origin_contract"
-        );
-
-        // The predecessor's own secret is untouched (registration never mutates
-        // or deletes a predecessor's data, disabled copy-forward or not).
-        let predecessor_secret_path = secrets_dir
-            .join(pred.key().encode())
-            .join(secret_id.encode());
-        assert!(
-            predecessor_secret_path.exists(),
-            "predecessor secret must remain untouched"
-        );
-    }
-
-    /// Regression test for GHSA-824h-7x5x-wfmf, directory-level: a
-    /// predecessor holding MULTIPLE Local secrets, named in a
-    /// `RegisterDelegateWithPredecessors` request with a matching
-    /// `origin_contract`, must leave the successor's on-disk secrets
-    /// directory completely absent (or empty) — not merely missing one
-    /// known secret ID. This is stronger than
-    /// `register_delegate_with_predecessors_never_copies_secrets`, which
-    /// only checks a single secret path; a copy-forward bug that mis-copies
-    /// a DIFFERENT secret ID than the one under test would slip past a
-    /// single-path check but not a whole-directory scan.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn register_delegate_with_predecessors_successor_dir_stays_empty() {
-        use crate::wasm_runtime::SecretScope;
-        use freenet_stdlib::client_api::{DelegateRequest, HostResponse};
-        use freenet_stdlib::prelude::{
-            ContractInstanceId, Delegate, DelegateContainer, DelegateWasmAPIVersion, SecretsId,
-        };
-        use zeroize::Zeroizing;
-
-        const ORIGIN: [u8; 32] = [0x22u8; 32];
-
-        let temp_dir = crate::util::tests::get_temp_dir();
-        let db = Storage::new(temp_dir.path()).await.expect("create db");
-        let contract_store =
-            ContractStore::new(temp_dir.path().join("contracts"), 10_000, db.clone())
-                .expect("create contract store");
-        let delegate_store =
-            DelegateStore::new(temp_dir.path().join("delegate"), 10_000, db.clone())
-                .expect("create delegate store");
-        let secrets_dir = temp_dir.path().join("secrets");
-        let mut secrets_store =
-            SecretsStore::new(secrets_dir.clone(), Default::default(), db.clone())
-                .expect("create secrets store");
-
-        let pred = Delegate::from((&vec![9u8].into(), &vec![1u8].into()));
-        let succ = Delegate::from((&vec![9u8].into(), &vec![2u8].into()));
-
-        // Seed THREE Local secrets under the predecessor.
-        for i in 0u8..3 {
-            secrets_store
-                .store_secret(
-                    pred.key(),
-                    &SecretsId::new(format!("secret-{i}").into_bytes()),
-                    SecretScope::Local,
-                    Zeroizing::new(format!("value-{i}").into_bytes()),
-                )
-                .expect("seed predecessor secret");
-        }
-        secrets_store
-            .record_delegate_registration_origin(pred.key(), Some(ORIGIN))
-            .unwrap();
-
-        let successor_secrets_dir = secrets_dir.join(succ.key().encode());
-        assert!(
-            !successor_secrets_dir.exists(),
-            "successor secrets directory must not exist before registration"
-        );
-
-        let state_store = StateStore::new(db, 10_000_000).expect("create state store");
-        let runtime = Runtime::build(contract_store, delegate_store, secrets_store, false)
-            .expect("build runtime");
-        let mut executor = Executor::new(
-            state_store,
-            || Ok(()),
-            crate::contract::executor::OperationMode::Local,
-            runtime,
-            None,
-        )
-        .await
-        .expect("create executor");
-
-        let origin_contract = ContractInstanceId::new(ORIGIN);
-        let req = DelegateRequest::RegisterDelegateWithPredecessors {
-            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ.clone())),
-            cipher: [7u8; 32],
-            nonce: [9u8; 24],
-            predecessors: vec![pred.key().clone()],
-        };
-        let resp = executor
-            .delegate_request(
-                req,
-                Some(&origin_contract),
-                None,
-                crate::client_events::ConnectionScope::Local,
-                None,
-            )
-            .expect("register-with-predecessors must succeed");
-        assert!(matches!(resp, HostResponse::DelegateResponse { .. }));
-
-        // Whole-directory check: NOTHING was copied into the successor's
-        // namespace, whether the directory was never created or was created
-        // empty.
-        let successor_has_any_secret = successor_secrets_dir
-            .read_dir()
-            .map(|mut entries| entries.next().is_some())
-            .unwrap_or(false);
-        assert!(
-            !successor_has_any_secret,
-            "successor secrets directory must be absent or empty: copy-forward is \
-             disabled (GHSA-824h-7x5x-wfmf) regardless of origin_contract or predecessor secret count"
-        );
-    }
-
     /// Handler-level (#4117 H1, persistence-succeeds-before-usable): if the
     /// first-writer origin record cannot be DURABLY persisted, the WHOLE
-    /// registration is aborted — for BOTH the plain `RegisterDelegate` and the
-    /// `RegisterDelegateWithPredecessors` variants. The delegate is NOT
-    /// registered (no `.reg` file) and no predecessor secret is copied, so a
-    /// registered-but-recordless delegate (a claimable first-writer slot an
-    /// attacker could later name as its own) can never exist. Once the disk
-    /// recovers, the app's retry registers and records normally (copy-forward
-    /// itself is unconditionally disabled, GHSA-824h-7x5x-wfmf, so it never copies — see
-    /// the final assertion). Uses the fault-injecting redb backend to fail the
-    /// origin-record write on demand.
+    /// `RegisterDelegate` is aborted. The delegate is NOT registered (no `.reg`
+    /// file), so a registered-but-recordless delegate (a claimable first-writer
+    /// slot an attacker could later name as its own) can never exist. Once the
+    /// disk recovers, the app's retry registers and records normally.
+    ///
+    /// This test previously covered the same invariant for a second
+    /// `RegisterDelegateWithPredecessors` variant alongside the plain one. That
+    /// variant's copy-forward handler was disabled in #5199
+    /// (GHSA-824h-7x5x-wfmf) and the wire variant was removed in freenet-stdlib
+    /// 0.9.0 (#5201), so only the plain path remains — but the H1 invariant it
+    /// asserts is unchanged and still live, which is why this test is kept and
+    /// narrowed rather than deleted with its two sibling copy-forward tests.
+    ///
+    /// The unrelated-delegate secret-namespace assertions are also kept: they
+    /// now pin the (weaker but still real) property that a plain
+    /// `RegisterDelegate` never reads or writes ANOTHER delegate's secret
+    /// namespace, in either the failed or the recovered case. That is the
+    /// structural residue of the removed vulnerability — there is no longer any
+    /// request shape that could ask for such a copy.
+    ///
+    /// Uses the fault-injecting redb backend to fail the origin-record write on
+    /// demand.
     #[cfg(feature = "redb")]
     #[tokio::test(flavor = "multi_thread")]
     async fn register_aborts_when_origin_record_fails_then_recovers() {
@@ -2012,12 +1799,12 @@ mod remove_contract_tests {
         // ---- The disk now fails: the successor's origin-record write cannot persist.
         backend.start_failing();
 
-        // (a) RegisterDelegateWithPredecessors MUST abort: no register, no copy.
-        let req = DelegateRequest::RegisterDelegateWithPredecessors {
+        // (a) Registering the successor MUST abort: nothing registered, and the
+        //     unrelated predecessor's secret namespace is not touched.
+        let req = DelegateRequest::RegisterDelegate {
             delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ.clone())),
             cipher: [7u8; 32],
             nonce: [9u8; 24],
-            predecessors: vec![pred.key().clone()],
         };
         assert!(
             executor
@@ -2037,10 +1824,12 @@ mod remove_contract_tests {
         );
         assert!(
             !succ_secret_path.exists(),
-            "an aborted registration must copy NOTHING"
+            "an aborted registration must copy NOTHING into the successor's namespace"
         );
 
-        // (b) Plain RegisterDelegate MUST abort under the SAME failure (both variants).
+        // (b) A SECOND, independent delegate MUST abort under the SAME failure,
+        //     so the abort is a property of the record-write failure and not of
+        //     anything specific to `succ`.
         let plain = Delegate::from((&vec![0u8].into(), &vec![3u8].into()));
         let plain_reg_path = delegate_dir
             .join(plain.key().encode())
@@ -2067,10 +1856,10 @@ mod remove_contract_tests {
             "an aborted RegisterDelegate must register NOTHING"
         );
 
-        // The predecessor's own secret is untouched throughout.
+        // The unrelated delegate's own secret is untouched throughout.
         assert!(
             pred_secret_path.exists(),
-            "the predecessor's own secret must survive the failed migrating registrations"
+            "an unrelated delegate's secret must survive the failed registrations"
         );
 
         // ---- Recovery: the disk heals (a fresh handle over a healthy backend);
@@ -2104,11 +1893,10 @@ mod remove_contract_tests {
         .await
         .expect("create executor 2");
 
-        let req2 = DelegateRequest::RegisterDelegateWithPredecessors {
+        let req2 = DelegateRequest::RegisterDelegate {
             delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ.clone())),
             cipher: [7u8; 32],
             nonce: [9u8; 24],
-            predecessors: vec![pred.key().clone()],
         };
         executor2
             .delegate_request(
@@ -2123,209 +1911,14 @@ mod remove_contract_tests {
             succ_reg_path.exists(),
             "after recovery the successor IS registered (.reg present)"
         );
-        // Copy-forward is unconditionally disabled (GHSA-824h-7x5x-wfmf): the retry succeeds
-        // (registration itself was only ever blocked by the origin-record
-        // write failure, now healed), but no secret is ever copied.
+        // The retry succeeds (registration was only ever blocked by the
+        // origin-record write failure, now healed), and registration never
+        // populates the new delegate's secret namespace from anywhere. The
+        // copy-forward that once could have is gone entirely: disabled in #5199
+        // (GHSA-824h-7x5x-wfmf), wire variant removed in stdlib 0.9.0 (#5201).
         assert!(
             !succ_secret_path.exists(),
-            "the predecessor secret must NOT be copied forward: copy-forward is disabled (GHSA-824h-7x5x-wfmf)"
-        );
-    }
-
-    /// #4117 P2b/M1: the predecessor-list bound is TWO-tiered and enforced
-    /// through the real `Executor::delegate_request` path (not just the pure
-    /// dedupe fn). The cap is on the UNIQUE count, matching the docstrings:
-    ///   - 65 DISTINCT predecessors (> the deduped cap of 64) → request REJECTED,
-    ///     nothing registered (silent truncation would strand older generations);
-    ///   - a duplicate-heavy list whose UNIQUE count is within the cap → ACCEPTED
-    ///     (duplicates dropped, not counted);
-    ///   - a raw list past the DoS sanity bound → REJECTED up front regardless of
-    ///     unique count.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn register_with_predecessors_cap_is_on_unique_count_end_to_end() {
-        use super::delegates::{MAX_MIGRATION_PREDECESSORS, MAX_MIGRATION_PREDECESSORS_RAW};
-        use freenet_stdlib::client_api::DelegateRequest;
-        use freenet_stdlib::prelude::{Delegate, DelegateContainer, DelegateWasmAPIVersion};
-
-        let (mut executor, _contracts_dir, temp_dir) = build_disk_executor("pred-cap").await;
-        let delegate_dir = temp_dir.path().join("delegate");
-
-        let make_pred = |i: u8| {
-            Delegate::from((&vec![i].into(), &vec![0u8].into()))
-                .key()
-                .clone()
-        };
-        let reg_path =
-            |succ: &Delegate| delegate_dir.join(succ.key().encode()).with_extension("reg");
-
-        // (1) 65 UNIQUE predecessors > the deduped cap of 64 → REJECTED.
-        let succ_over = Delegate::from((&vec![0u8].into(), &vec![0xA1u8].into()));
-        let over: Vec<_> = (0u8..=64).map(make_pred).collect(); // 65 distinct
-        assert_eq!(over.len(), MAX_MIGRATION_PREDECESSORS + 1);
-        let req_over = DelegateRequest::RegisterDelegateWithPredecessors {
-            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ_over.clone())),
-            cipher: [7u8; 32],
-            nonce: [9u8; 24],
-            predecessors: over,
-        };
-        assert!(
-            executor
-                .delegate_request(
-                    req_over,
-                    None,
-                    None,
-                    crate::client_events::ConnectionScope::Local,
-                    None
-                )
-                .is_err(),
-            "an over-cap UNIQUE predecessor list must be rejected"
-        );
-        assert!(
-            !reg_path(&succ_over).exists(),
-            "a rejected over-cap request must register NOTHING"
-        );
-
-        // (2) A duplicate-heavy list whose UNIQUE count (3) is within the cap →
-        //     ACCEPTED (duplicates dropped, not counted).
-        let succ_ok = Delegate::from((&vec![0u8].into(), &vec![0xB2u8].into()));
-        let mut dupes: Vec<_> = Vec::new();
-        for _ in 0..40 {
-            dupes.push(make_pred(1));
-            dupes.push(make_pred(2));
-            dupes.push(make_pred(3));
-        } // 120 raw, 3 unique
-        assert!(
-            dupes.len() > MAX_MIGRATION_PREDECESSORS
-                && dupes.len() <= MAX_MIGRATION_PREDECESSORS_RAW,
-            "the duplicate-heavy list must exceed the deduped cap in RAW length \
-             yet stay under the raw sanity bound, to isolate the dedupe semantics"
-        );
-        let req_ok = DelegateRequest::RegisterDelegateWithPredecessors {
-            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ_ok.clone())),
-            cipher: [7u8; 32],
-            nonce: [9u8; 24],
-            predecessors: dupes,
-        };
-        executor
-            .delegate_request(
-                req_ok,
-                None,
-                None,
-                crate::client_events::ConnectionScope::Local,
-                None,
-            )
-            .expect("a duplicate-heavy but under-cap-UNIQUE list must be accepted");
-        assert!(
-            reg_path(&succ_ok).exists(),
-            "an accepted request must register the successor"
-        );
-
-        // (3) A raw list past the DoS sanity bound → REJECTED up front regardless
-        //     of unique count (all identical here: unique = 1, raw > the bound).
-        let succ_raw = Delegate::from((&vec![0u8].into(), &vec![0xC3u8].into()));
-        let raw_huge = vec![make_pred(7); MAX_MIGRATION_PREDECESSORS_RAW + 1];
-        let req_raw = DelegateRequest::RegisterDelegateWithPredecessors {
-            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ_raw.clone())),
-            cipher: [7u8; 32],
-            nonce: [9u8; 24],
-            predecessors: raw_huge,
-        };
-        assert!(
-            executor
-                .delegate_request(
-                    req_raw,
-                    None,
-                    None,
-                    crate::client_events::ConnectionScope::Local,
-                    None
-                )
-                .is_err(),
-            "a raw list past the DoS sanity bound must be rejected even when unique count is small"
-        );
-        assert!(
-            !reg_path(&succ_raw).exists(),
-            "a rejected raw-oversize request must register NOTHING"
-        );
-
-        // (4) EXACTLY 64 UNIQUE predecessors (the at-cap boundary) → ACCEPTED.
-        let succ_at_cap = Delegate::from((&vec![0u8].into(), &vec![0xD4u8].into()));
-        let at_cap: Vec<_> = (0u8..64).map(make_pred).collect(); // 64 distinct
-        assert_eq!(at_cap.len(), MAX_MIGRATION_PREDECESSORS);
-        let req_at_cap = DelegateRequest::RegisterDelegateWithPredecessors {
-            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ_at_cap.clone())),
-            cipher: [7u8; 32],
-            nonce: [9u8; 24],
-            predecessors: at_cap,
-        };
-        executor
-            .delegate_request(
-                req_at_cap,
-                None,
-                None,
-                crate::client_events::ConnectionScope::Local,
-                None,
-            )
-            .expect("an exactly-at-cap UNIQUE count (64) must be accepted");
-        assert!(
-            reg_path(&succ_at_cap).exists(),
-            "the at-cap boundary (64 unique) must register the successor"
-        );
-
-        // (5) EMPTY predecessor list → ACCEPTED, behaving like a plain
-        //     RegisterDelegate (successor registered, nothing to copy). Pins the
-        //     intended zero-predecessor semantics (the code does NOT reject empty).
-        let succ_empty = Delegate::from((&vec![0u8].into(), &vec![0xE5u8].into()));
-        let req_empty = DelegateRequest::RegisterDelegateWithPredecessors {
-            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ_empty.clone())),
-            cipher: [7u8; 32],
-            nonce: [9u8; 24],
-            predecessors: Vec::new(),
-        };
-        executor
-            .delegate_request(
-                req_empty,
-                None,
-                None,
-                crate::client_events::ConnectionScope::Local,
-                None,
-            )
-            .expect("an empty predecessor list must be accepted (plain-register equivalent)");
-        assert!(
-            reg_path(&succ_empty).exists(),
-            "an empty-predecessor request must register the successor"
-        );
-
-        // (6) A raw list at EXACTLY the sanity bound (1024) with a within-cap
-        //     UNIQUE count (64) → ACCEPTED (the raw-bound boundary: only > the
-        //     bound is rejected).
-        let succ_raw_boundary = Delegate::from((&vec![0u8].into(), &vec![0xF6u8].into()));
-        let mut raw_at_bound: Vec<_> = Vec::new();
-        for _ in 0..(MAX_MIGRATION_PREDECESSORS_RAW / MAX_MIGRATION_PREDECESSORS) {
-            for i in 0..MAX_MIGRATION_PREDECESSORS as u8 {
-                raw_at_bound.push(make_pred(i));
-            }
-        } // 16 * 64 = 1024 raw, 64 unique
-        assert_eq!(raw_at_bound.len(), MAX_MIGRATION_PREDECESSORS_RAW);
-        let req_raw_boundary = DelegateRequest::RegisterDelegateWithPredecessors {
-            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(
-                succ_raw_boundary.clone(),
-            )),
-            cipher: [7u8; 32],
-            nonce: [9u8; 24],
-            predecessors: raw_at_bound,
-        };
-        executor
-            .delegate_request(
-                req_raw_boundary,
-                None,
-                None,
-                crate::client_events::ConnectionScope::Local,
-                None,
-            )
-            .expect("a raw list at exactly the sanity bound (unique within cap) must be accepted");
-        assert!(
-            reg_path(&succ_raw_boundary).exists(),
-            "the raw-bound boundary (raw == 1024, 64 unique) must register the successor"
+            "registration must not populate the new delegate's secret namespace"
         );
     }
 

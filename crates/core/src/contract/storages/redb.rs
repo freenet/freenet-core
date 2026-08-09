@@ -170,19 +170,17 @@ pub(crate) const MIGRATION_MARKER_TABLE: TableDefinition<&[u8], &[u8]> =
 
 /// Durable record of the web-app contract origins under which each delegate has
 /// been registered (#4117 H1 same-origin gate). Written on EVERY successful
-/// delegate registration (both `RegisterDelegate` and
-/// `RegisterDelegateWithPredecessors`). Copy-forward consults it: a predecessor's
-/// Local secrets are copied into a successor ONLY when the registering request's
-/// origin is among the predecessor's recorded origins (or both are the Admin/None
-/// class).
+/// `RegisterDelegate`. Copy-forward consults it: a predecessor's Local secrets
+/// are copied into a successor ONLY when the registering request's origin is
+/// among the predecessor's recorded origins (or both are the Admin/None class).
 ///
 /// **This gate alone is NOT sufficient protection (GHSA-824h-7x5x-wfmf).**
 /// The registering request's `origin_contract` is itself forgeable by any HTTP
 /// client (see GHSA-824h-7x5x-wfmf for the exploit chain), so a malicious web-app CAN obtain
-/// a value that matches an unrelated victim delegate's recorded origin. The
-/// actual protection today is that the copy-forward's sole caller
-/// (`RegisterDelegateWithPredecessors`'s handler) is unconditionally disabled —
-/// this gate is not currently invoked in production at all. Do not treat this
+/// a value that matches an unrelated victim delegate's recorded origin. The gate
+/// is not invoked at all today: copy-forward's only caller was the
+/// `RegisterDelegateWithPredecessors` handler, disabled in #5199 and deleted in
+/// #5201 once freenet-stdlib 0.9.0 removed the wire variant. Do not treat this
 /// table as a sufficient authorization control if the copy-forward is ever
 /// re-wired; `origin_contract` attestation needs hardening first. See
 /// `SecretsStore::delegate_origins` and `SecretsStore::migrate_secrets`.

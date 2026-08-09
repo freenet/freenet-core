@@ -548,11 +548,10 @@ where
     P: UserInputPrompter,
 {
     // Extract initial params from the request (only ApplicationMessages has params we need).
-    // The registration variants (including RegisterDelegateWithPredecessors,
-    // #4117) carry no params relevant here — registration's empty response exits
-    // the loop before params are read — but the new variant is listed EXPLICITLY
-    // for local consistency with this match's style; the wildcard remains only to
-    // satisfy `#[non_exhaustive]`.
+    // The registration variants carry no params relevant here — registration's
+    // empty response exits the loop before params are read — but they are listed
+    // EXPLICITLY for local consistency with this match's style; the wildcard
+    // remains only to satisfy `#[non_exhaustive]`.
     // GATE THE ORIGIN BEFORE ANY CONSUMER IN THIS FUNCTION
     // (GHSA-824h-7x5x-wfmf).
     //
@@ -575,10 +574,9 @@ where
 
     let initial_params = match &initial_req {
         DelegateRequest::ApplicationMessages { params, .. } => params.clone(),
-        DelegateRequest::RegisterDelegate { .. }
-        | DelegateRequest::RegisterDelegateWithPredecessors { .. }
-        | DelegateRequest::UnregisterDelegate(_)
-        | _ => Parameters::from(Vec::new()),
+        DelegateRequest::RegisterDelegate { .. } | DelegateRequest::UnregisterDelegate(_) | _ => {
+            Parameters::from(Vec::new())
+        }
     };
 
     let mut current_req = initial_req;
