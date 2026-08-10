@@ -1797,12 +1797,10 @@ mod remove_contract_tests {
                 None,
             )
             .expect("register-with-predecessors must succeed");
-        match resp {
-            HostResponse::DelegateResponse { key, .. } => {
-                assert_eq!(&key, succ.key(), "response carries the successor key");
-            }
-            other => panic!("expected DelegateResponse, got {other:?}"),
-        }
+        let HostResponse::DelegateResponse { key, .. } = &resp else {
+            panic!("expected DelegateResponse, got {resp:?}");
+        };
+        assert_eq!(key, succ.key(), "response carries the successor key");
 
         // The predecessor's Local secret must NOT be copied — the copy-forward
         // is unconditionally disabled (GHSA-824h-7x5x-wfmf), even though the supplied

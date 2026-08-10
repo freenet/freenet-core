@@ -3041,7 +3041,7 @@ mod tests {
         let cohosts: HashSet<TransportPublicKey> = [cohost.0.clone()].into_iter().collect();
 
         let targets = proactive_summary_targets(
-            &[cohost.clone()],
+            std::slice::from_ref(&cohost),
             &cohosts,
             "127.0.0.1:9999".parse().unwrap(),
             None,

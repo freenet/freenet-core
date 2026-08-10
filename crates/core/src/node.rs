@@ -6043,6 +6043,13 @@ mod tests {
         let handler_key = key;
         let _handler = tokio::spawn(async move {
             while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "a stand-in executor loop: it only serves the two \
+                              queries this test issues, and ContractHandlerEvent \
+                              has 20+ variants — any other event reaching it is \
+                              an unexpected-input panic, not a silent fallthrough"
+                )]
                 let response = match ev {
                     ContractHandlerEvent::GetQuery { .. } => ContractHandlerEvent::GetResponse {
                         key: Some(handler_key),
@@ -6162,6 +6169,14 @@ mod tests {
         let handler_flag = update_query_seen.clone();
         let _handler = tokio::spawn(async move {
             while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "a stand-in executor loop: it only serves the one \
+                              query this test expects, and ContractHandlerEvent \
+                              has 20+ variants — any other event reaching it is \
+                              the regression under test, so it panics rather \
+                              than falling through silently"
+                )]
                 let response = match ev {
                     ContractHandlerEvent::UpdateQuery { .. } => {
                         handler_flag.store(true, Ordering::SeqCst);
@@ -6291,6 +6306,13 @@ mod tests {
         let handler_flag = update_query_seen.clone();
         let _handler = tokio::spawn(async move {
             while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "a stand-in executor loop: it only serves the one \
+                              query this test expects, and ContractHandlerEvent \
+                              has 20+ variants — any other event reaching it is \
+                              an unexpected-input panic, not a silent fallthrough"
+                )]
                 let response = match ev {
                     ContractHandlerEvent::UpdateQuery { .. } => {
                         handler_flag.store(true, Ordering::SeqCst);
@@ -8975,6 +8997,14 @@ mod tests {
             let queries_for_handler = std::sync::Arc::clone(&summary_queries);
             let handler = tokio::spawn(async move {
                 while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                    #[allow(
+                        clippy::wildcard_enum_match_arm,
+                        reason = "a stand-in executor loop: it only serves the \
+                                  three queries this test issues, and \
+                                  ContractHandlerEvent has 20+ variants — any \
+                                  other event reaching it is an unexpected-input \
+                                  panic, not a silent fallthrough"
+                    )]
                     let response = match ev {
                         ContractHandlerEvent::GetSummaryQuery { key } => {
                             queries_for_handler.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

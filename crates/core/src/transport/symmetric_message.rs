@@ -685,14 +685,12 @@ mod test {
         assert_ne!(legacy_plain.data(), versioned_plain.data());
 
         let deser = SymmetricMessage::deser(versioned_plain.data()).unwrap();
-        match deser.payload {
-            SymmetricMessagePayload::AckConnectionV2 { connection } => {
-                assert_eq!(connection.key, sym_key);
-                assert_eq!(connection.remote_addr, addr);
-                assert_eq!(connection.protoc_version, version);
-            }
-            other => panic!("expected AckConnectionV2, got {other}"),
-        }
+        let SymmetricMessagePayload::AckConnectionV2 { connection } = &deser.payload else {
+            panic!("expected AckConnectionV2, got {}", deser.payload);
+        };
+        assert_eq!(connection.key, sym_key);
+        assert_eq!(connection.remote_addr, addr);
+        assert_eq!(connection.protoc_version, version);
         assert_eq!(deser.packet_id, SymmetricMessage::FIRST_PACKET_ID);
     }
 

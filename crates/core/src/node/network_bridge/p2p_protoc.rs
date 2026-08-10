@@ -6569,7 +6569,6 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn install_pending_op_callback_replaces_a_closed_incumbent() {
         use crate::transport::ExpectedInboundTracker;
-        use tokio::sync::mpsc::error::TryRecvError;
 
         let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
         let tx = crate::dev_tool::Transaction::new::<crate::operations::put::PutMsg>();
