@@ -62,6 +62,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
 
+use crate::ring::futile_repair::{FutileRepairDetector, FutileRepairSnapshot};
 use crate::transport::TransportPublicKey;
 use crate::util::time_source::TimeSource;
 
@@ -1146,6 +1147,12 @@ pub struct InterestManager<T: TimeSource> {
     /// concurrent racers, not fixed at one).
     missing_summary_active: DashMap<(ContractKey, PeerKey), u16>,
     interest_lifecycle_metrics: InterestLifecycleMetrics,
+
+    /// SHADOW MODE. Counts (contract, peer) edges whose repairs keep failing to
+    /// converge — the observable signature of a contract whose merge is not
+    /// commutative. Observes only: it never gates, throttles, or suppresses a
+    /// heal. See [`crate::ring::futile_repair`].
+    futile_repair: FutileRepairDetector,
 }
 
 /// Delivery-gated lifecycle accounting. Dropping an unmarked guard records no
@@ -1204,6 +1211,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             )),
             missing_summary_active: DashMap::new(),
             interest_lifecycle_metrics: InterestLifecycleMetrics::new(),
+            futile_repair: FutileRepairDetector::new(),
         }
     }
 
@@ -1560,6 +1568,41 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    /// SHADOW MODE — record that a `SyncStateToPeer` heal was actually emitted
+    /// for this (contract, peer) edge.
+    ///
+    /// Call from the one site that emits the heal
+    /// (`node::emit_stale_peer_syncs`) and only for contracts that really got
+    /// one: a contract skipped for being banned, having no local state, or
+    /// exceeding the per-message emit budget is not an attempt. Changes no
+    /// behaviour — see [`crate::ring::futile_repair`].
+    pub(crate) fn record_repair_attempt(&self, contract: &ContractKey, peer: &PeerKey) {
+        self.futile_repair
+            .record_repair_attempt(contract, peer, self.now());
+    }
+
+    /// SHADOW MODE — record the verdict of a TWO-SIDED summary comparison for
+    /// this (contract, peer) edge, settling any outstanding repair attempt.
+    ///
+    /// `converged` is the anti-entropy staleness verdict inverted: pass
+    /// `!is_stale` from the comparison that produced it. Only call this where
+    /// BOTH sides reported a real summary — a one-sided comparison is not an
+    /// outcome, because there was no divergence to repair. Changes no
+    /// behaviour.
+    pub(crate) fn record_repair_outcome(
+        &self,
+        contract: &ContractKey,
+        peer: &PeerKey,
+        converged: bool,
+    ) {
+        self.futile_repair
+            .record_repair_outcome(contract, peer, converged, self.now());
+    }
+
+    pub(crate) fn futile_repair_snapshot(&self) -> FutileRepairSnapshot {
+        self.futile_repair.snapshot()
     }
 
     pub(crate) fn interest_lifecycle_snapshot(&self) -> InterestLifecycleSnapshot {

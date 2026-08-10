@@ -3362,8 +3362,27 @@ mod tests {
 
         const BUSY_FLEET_COUNTER: u64 = 999_999;
         const MAX_EMPTY_JSON_BYTES: usize = 2_048;
-        const MAX_BUSY_JSON_BYTES: usize = 5_120;
-        const MAX_WORST_CASE_JSON_BYTES: usize = 14_336;
+        // Raised from 5_120 to admit `futile` + `futile_ladder`, the
+        // shadow-mode futile-repair block (`crate::ring::futile_repair`). This
+        // is the first time the JSON-bytes budgets have moved, so the same
+        // arithmetic the OTLP budgets carry is owed here:
+        //
+        //   19 new counters (11 scalars + an 8-rung survival ladder)
+        //   +162 JSON bytes at busy-fleet values (5095 measured -> 5257)
+        //   emitted once per ~30 min per peer, ~2000 reporting peers
+        //   => 48 * 2000 * ~162 B ~= 16 MB/day
+        //
+        // against a collector ingesting ~88.8 GB/day: about 0.02%. The block
+        // is already the minimum that answers its question — the ladder is 8
+        // rungs rather than a per-value histogram, and there is deliberately
+        // no per-contract or per-peer label (the cardinality would be
+        // attacker-controlled). Do NOT raise this again without redoing the
+        // arithmetic.
+        const MAX_BUSY_JSON_BYTES: usize = 5_376;
+        // Raised from 14_336 alongside the busy budget, same 19 counters. This
+        // is the MATHEMATICAL ceiling (every counter at u64::MAX, 20 digits),
+        // so it constrains schema shape rather than real bytes.
+        const MAX_WORST_CASE_JSON_BYTES: usize = 14_848;
         const MAX_EMPTY_OTLP_MARGINAL_BYTES: usize = 2_048;
         // Raised from 5_120 (2026-08-07) to admit `ms_size` + `ms_unt_age`,
         // the two counters added for #5153. The budget exists to force this
@@ -3379,12 +3398,15 @@ mod tests {
         // of 10 classes (the other 6 are a measured zero) and 6 size buckets
         // rather than 8. Do NOT raise this again without redoing the
         // arithmetic; the JSON-bytes budgets above are deliberately unchanged.
-        const MAX_BUSY_OTLP_MARGINAL_BYTES: usize = 5_376;
+        // Raised again from 5_376 for the 19 futile-repair counters; see the
+        // arithmetic on MAX_BUSY_JSON_BYTES above.
+        const MAX_BUSY_OTLP_MARGINAL_BYTES: usize = 5_632;
         // Raised from 14_336 alongside the busy budget above, same 30 new
-        // counters, same #5153 rationale. This bound is the MATHEMATICAL
-        // ceiling (every counter at u64::MAX, 20 digits); no fleet value
-        // approaches it, so it constrains schema shape rather than real bytes.
-        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 14_592;
+        // counters, same #5153 rationale, then again for the 19 futile-repair
+        // counters. This bound is the MATHEMATICAL ceiling (every counter at
+        // u64::MAX, 20 digits); no fleet value approaches it, so it constrains
+        // schema shape rather than real bytes.
+        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 15_104;
         const MAX_NULL_OTLP_MARGINAL_BYTES: usize = 64;
 
         let diagnostic = |value| crate::router::NetworkEfficiencyV1 {
@@ -3421,6 +3443,8 @@ mod tests {
             tel: [value; 15],
             shadow: [[value; 9]; 7],
             eff: [value; 8],
+            futile: [value; crate::ring::futile_repair::SNAPSHOT_SCALARS],
+            futile_ladder: [value; crate::ring::futile_repair::LADDER_LEN],
         };
 
         let mut u = arbitrary::Unstructured::new(&[0_u8; 32_768]);
@@ -3434,7 +3458,7 @@ mod tests {
         let object = block
             .as_object()
             .expect("network_efficiency_v1 must remain a JSON object");
-        assert_eq!(object.len(), 33, "schema must remain fixed-cardinality");
+        assert_eq!(object.len(), 35, "schema must remain fixed-cardinality");
         let encoded = serde_json::to_vec(block).expect("serialize diagnostic block");
         assert!(
             encoded.len() <= MAX_BUSY_JSON_BYTES,

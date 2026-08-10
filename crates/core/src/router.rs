@@ -293,6 +293,33 @@ pub(crate) struct NetworkEfficiencyV1 {
     /// Delivery path for this diagnostic block itself; order is documented in
     /// `TelemetryLocalMetricsSnapshot::network_efficiency_delivery`.
     pub eff: [u64; 8],
+    /// SHADOW-MODE futile-repair detector (`crate::ring::futile_repair`): how
+    /// often does an anti-entropy heal leave the (contract, peer) edge still
+    /// diverged? A non-commutative contract merge cannot converge, so the
+    /// repair loop runs forever — seven contract instances were 32.7% of all
+    /// update applies on 2026-08-09 for exactly this reason. Aggregate only,
+    /// no per-contract or per-peer label.
+    ///
+    /// Order (`FutileRepairSnapshot::to_row`, which is the wire contract):
+    /// attempts, futile, productive, observations_unpaired,
+    /// attempts_superseded, attempts_expired, would_quarantine,
+    /// edges_at_threshold, tracked_edges, evictions,
+    /// evictions_losing_streak.
+    ///
+    /// `would_quarantine` is the headline: edges that reached
+    /// `futile_repair::QUARANTINE_THRESHOLD` consecutive futile repairs.
+    /// NOTHING is quarantined — this release only measures. Read
+    /// `tracked_edges` against `futile_repair::EDGE_CAPACITY` and
+    /// `evictions_losing_streak` BEFORE reading the rest: a saturated LRU makes
+    /// every futility count an undercount, which is how `ms_unt_age` became
+    /// useless.
+    pub futile: [u64; crate::ring::futile_repair::SNAPSHOT_SCALARS],
+    /// Survival curve of consecutive-futility streaks over the rungs
+    /// `futile_repair::LADDER_RUNGS` (1, 2, 3, 4, 5, 8, 16, 32): entry `i`
+    /// counts streaks that REACHED rung `i`, at most once per rung per streak,
+    /// so the series is monotonically non-increasing and reads as "of the
+    /// streaks that got to 1, how many got to 32".
+    pub futile_ladder: [u64; crate::ring::futile_repair::LADDER_LEN],
 }
 
 /// Periodic snapshot of the router model state for telemetry.

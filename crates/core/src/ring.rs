@@ -86,6 +86,8 @@ mod connection_backoff;
 mod connection_manager;
 pub(crate) mod contract_ban_list;
 pub(crate) mod delta_incompat;
+/// Shadow-mode detector for repairs that never converge (see the module docs).
+pub(crate) mod futile_repair;
 pub(crate) use connection_manager::ConnectionManager;
 // Nearest-neighbor ring lattice (successor+predecessor base edges).
 // `nn_lattice_active_for` is the full activation gate — the flag AND the
@@ -2089,6 +2091,12 @@ impl Ring {
                 )
             {
                 let lifecycle = op_manager.interest_manager.interest_lifecycle_snapshot();
+                // SHADOW MODE: futile-repair evidence (#nc-merge). Rides the
+                // same fixed-cardinality block for the same reason the rest of
+                // it does — `network_efficiency_v1` is the only family that
+                // bypasses both the node rate limiter and the collector's 5%
+                // sampler, so a rare-but-decisive counter is not sampled away.
+                let futile_repair = op_manager.interest_manager.futile_repair_snapshot();
                 let receiver = op_manager.payload_mix.receiver_apply_stats();
                 let queue = crate::node::BROADCAST_QUEUE_EFFICIENCY_METRICS.snapshot();
                 let state_rejections = crate::contract::state_size_rejection_snapshot();
@@ -2222,6 +2230,8 @@ impl Ring {
                     tel,
                     shadow,
                     eff: telemetry.network_efficiency_delivery,
+                    futile: futile_repair.to_row(),
+                    futile_ladder: futile_repair.ladder,
                 });
             }
 
