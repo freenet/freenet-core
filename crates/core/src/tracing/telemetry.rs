@@ -437,25 +437,48 @@ const MAX_EVENTS_PER_SECOND: usize = 10;
 ///
 /// Shadow telemetry is admitted under this sub-budget, carved out of the
 /// aggregate [`MAX_EVENTS_PER_SECOND`] cap, so that always-on background
-/// emitters cannot starve operational telemetry (#4380). There are five shadow
-/// streams — `shadow_rtt_aggregate`, `shadow_rate_demand`,
-/// `shadow_outbound_class` (always-on) plus `shadow_reference_ping` /
-/// `shadow_iface_tx` (opt-in on gateways). Each samples at 1 Hz but only emits
-/// one rolled-up event per
-/// `transport::shadow_stats::SHADOW_ROLLUP_WINDOW_SECS`, so the steady-state
-/// shadow rate is well below 1 event/sec.
+/// emitters cannot starve operational telemetry (#4380). The streams are
+/// enumerated by [`KnownShadowRollup`]; there are currently seven, in two
+/// cadence groups:
 ///
-/// The catch: all five aggregator tickers start at node startup and share the
-/// same window length, so their emit ticks ALIGN on the same second every
-/// window — five rollups contend for the sub-budget simultaneously. The cap is
-/// therefore set to 6, one slot above the five aligned rollups, so no window's
-/// rollup is ever dropped for lack of a shadow slot (at a cap of 4 the fifth
-/// aligned rollup was deterministically dropped every window). This still
-/// reserves `MAX_EVENTS_PER_SECOND - MAX_SHADOW_EVENTS_PER_SECOND` (= 4)
-/// slots/sec for operational telemetry, and leaves one slot of headroom for a
-/// sixth stream (e.g. Phase 2 adding a shadow controller decision log). Shadow
-/// events still also count against the aggregate cap, so under genuine
-/// operational load they continue to yield.
+/// - Five 30 s shadow-stat rollups (`transport::shadow_stats::
+///   SHADOW_ROLLUP_WINDOW_SECS`): `shadow_rtt_aggregate`,
+///   `shadow_rate_demand`, `shadow_outbound_class` (always-on) plus
+///   `shadow_reference_ping` / `shadow_iface_tx` (opt-in, set on gateways).
+///   Each samples at 1 Hz but emits only one rolled-up event per window.
+/// - Two 60 s mix rollups, `outbound_message_mix` and
+///   `broadcast_payload_mix`.
+///
+/// Steady-state shadow volume is therefore well below 1 event/sec. What the
+/// cap has to survive is not the average but the ALIGNMENT: every aggregator
+/// is spawned from the same block in [`crate::node::p2p_impl`], so tickers
+/// that share a window length emit on the same second, and the sub-budget is
+/// a per-second tumbling window.
+///
+/// The cap is 6 because five 30 s rollups align (at a cap of 4 the fifth was
+/// deterministically dropped every window), and it stays at 6 rather than
+/// growing with the stream count: raising it to 7 would leave only
+/// `10 - 7 = 3` slots/sec for operational telemetry. The two 60 s rollups are
+/// kept off the 30 s boundary by
+/// [`crate::node::network_bridge::broadcast_payload_mix::ROLLUP_PHASE_OFFSET`]
+/// instead, which costs no volume at all.
+///
+/// IMPORTANT, because it is easy to over-claim here and this docstring already
+/// did once: this sub-budget is NOT what limits shadow telemetry in
+/// production. [`Self::admit_event`] tests the aggregate
+/// [`MAX_EVENTS_PER_SECOND`] cap BEFORE this one and returns early, so on any
+/// node already emitting 10 events in that second the shadow branch is never
+/// reached. Measured over 1382 nodes: this sub-budget has dropped 54 events
+/// fleet-wide in total (0.0005 %), while the aggregate cap discards ~31 % of
+/// shadow and ~77 % of operational telemetry (#5197). Treat the sub-budget as
+/// a latent invariant to keep correct, not as an active control.
+///
+/// So the invariant this constant carries is NOT "cap >= number of streams",
+/// it is "cap >= the most streams that can share one second", which
+/// [`tests::shadow_rollup_emit_schedule_fits_the_shadow_sub_budget`] derives
+/// from the cadence constants. Adding a stream means checking that test, not
+/// bumping this number. Shadow events still also count against the aggregate
+/// cap, so under genuine operational load they continue to yield.
 const MAX_SHADOW_EVENTS_PER_SECOND: usize = 6;
 
 /// Initial backoff duration on failure
@@ -4932,38 +4955,43 @@ mod tests {
     }
 
     #[test]
-    fn test_all_aligned_shadow_rollups_are_admitted() {
-        // Regression: the five shadow streams (shadow_rtt_aggregate,
+    fn test_all_aligned_30s_shadow_rollups_are_admitted() {
+        // Regression: the five 30 s shadow-stat streams (shadow_rtt_aggregate,
         // shadow_rate_demand, shadow_outbound_class, shadow_reference_ping,
         // shadow_iface_tx) each emit one rollup per SHADOW_ROLLUP_WINDOW_SECS.
         // Their aggregator tickers all start at node startup and share the same
         // window length, so their emit ticks align on the same second every
         // window. The shadow sub-budget must admit all five in that one second,
         // or a full 30 s rollup is deterministically dropped every window. A
-        // cap of 4 dropped the fifth; the cap must fit all five with headroom.
-        const SHADOW_STREAMS: usize = 5;
-        const {
-            assert!(
-                MAX_SHADOW_EVENTS_PER_SECOND > SHADOW_STREAMS,
-                "shadow sub-budget must fit all five aligned rollups with headroom"
-            );
-        }
+        // cap of 4 dropped the fifth.
+        //
+        // SCOPE: this covers the 30 s GROUP ONLY, which is why the count below
+        // is 5 and not `KnownShadowRollup::ALL.len()`. It is deliberately NOT
+        // the guard on "does the cap fit every stream" — it once carried a
+        // `MAX_SHADOW_EVENTS_PER_SECOND > 5` assertion that read like one, and
+        // that is exactly how two streams were added without anyone revisiting
+        // the cap. The real invariant is "the cap fits the most streams that
+        // can share ONE SECOND", which depends on the emit phases and is
+        // guarded by `shadow_rollup_emit_schedule_fits_the_shadow_sub_budget`.
+        // Add a stream there, not here.
+        const ALIGNED_30S_STREAMS: usize = 5;
 
         let mut worker = rate_limit_test_worker();
         let now = Instant::now();
 
-        // All five rollups arrive in the same aligned second (no operational
-        // load competing for the aggregate cap).
+        // All five arrive in the same aligned second (no operational load
+        // competing for the aggregate cap — see the note on the schedule test
+        // about what that does and does not model).
         let admitted = admit_n(
             &mut worker,
             EventPriority::Shadow,
             "test_shadow",
-            SHADOW_STREAMS,
+            ALIGNED_30S_STREAMS,
             now,
         );
         assert_eq!(
-            admitted, SHADOW_STREAMS,
-            "all five aligned shadow rollups must be admitted; none dropped"
+            admitted, ALIGNED_30S_STREAMS,
+            "all five aligned 30 s shadow rollups must be admitted; none dropped"
         );
     }
 
@@ -5302,6 +5330,169 @@ mod tests {
             snapshot.known_shadow_rollups[KnownShadowRollup::OutboundMessageMix.index()]
                 .retry_truncated_total,
             1
+        );
+    }
+
+    /// Each shadow rollup's emit cadence as `(first emit second, period)`,
+    /// derived from the production constants rather than restated.
+    ///
+    /// The array is sized by `KnownShadowRollup::ALL.len()`, so adding a
+    /// stream fails to COMPILE here until its cadence is declared — which is
+    /// the point, since a new stream is exactly what would re-break the
+    /// budget.
+    fn shadow_rollup_emit_schedule() -> [(KnownShadowRollup, u64, u64); KnownShadowRollup::ALL.len()]
+    {
+        // The five shadow-stat streams run a 1 Hz aggregator that emits when
+        // its window closes, so they first emit one window in and repeat every
+        // window.
+        let stat = u64::from(crate::transport::shadow_stats::SHADOW_ROLLUP_WINDOW_SECS);
+        // The two mix rollups tick one window PLUS the phase offset in.
+        let mix = crate::node::MIX_ROLLUP_WINDOW.as_secs();
+        let mix_offset = crate::node::MIX_ROLLUP_PHASE_OFFSET.as_secs();
+        [
+            (KnownShadowRollup::ShadowRttAggregate, stat, stat),
+            (KnownShadowRollup::ShadowRateDemand, stat, stat),
+            (KnownShadowRollup::ShadowOutboundClass, stat, stat),
+            (KnownShadowRollup::ShadowReferencePing, stat, stat),
+            (KnownShadowRollup::ShadowIfaceTx, stat, stat),
+            (KnownShadowRollup::OutboundMessageMix, mix + mix_offset, mix),
+            (
+                KnownShadowRollup::BroadcastPayloadMix,
+                mix + mix_offset,
+                mix,
+            ),
+        ]
+    }
+
+    /// The sub-budget must survive the WORST second, not the average rate.
+    ///
+    /// Regression test for the gateway rollup drop: seven shadow streams
+    /// against a cap of six, with every ticker started in the same block, so
+    /// all seven emitted in the same second every 60 s and exactly one rollup
+    /// was silently dropped per minute on gateways (which are the only nodes
+    /// running the two opt-in streams, and the nodes whose rollups get read).
+    ///
+    /// This drives the REAL `admit_event` rather than asserting arithmetic, so
+    /// a change to the admission policy is caught too. Deleting
+    /// `ROLLUP_PHASE_OFFSET` (setting it to zero) makes this fail at t=60s.
+    #[test]
+    fn shadow_rollup_emit_schedule_fits_the_shadow_sub_budget() {
+        let schedule = shadow_rollup_emit_schedule();
+        for stream in KnownShadowRollup::ALL {
+            assert_eq!(
+                schedule.iter().filter(|(s, _, _)| *s == stream).count(),
+                1,
+                "{} is missing from (or duplicated in) the modelled schedule",
+                stream.as_str()
+            );
+        }
+
+        let mut worker = rate_limit_test_worker();
+        let t0 = Instant::now();
+        // An hour covers many multiples of the 30 s / 60 s least-common
+        // multiple, so every recurring alignment is visited.
+        const HORIZON_SECS: u64 = 3600;
+        let mut busiest = (0u64, 0usize);
+
+        for t in 0..=HORIZON_SECS {
+            let now = t0 + Duration::from_secs(t);
+            let mut sharing_this_second = 0usize;
+            for (stream, first_emit, period) in schedule {
+                if t < first_emit || (t - first_emit) % period != 0 {
+                    continue;
+                }
+                sharing_this_second += 1;
+                assert!(
+                    worker.admit_event(EventPriority::Shadow, stream.as_str(), now),
+                    "{} was dropped at t={t}s: {sharing_this_second} shadow rollups \
+                     share that second, against a sub-budget of \
+                     {MAX_SHADOW_EVENTS_PER_SECOND}. Either phase the new stream \
+                     off the occupied second (see ROLLUP_PHASE_OFFSET) or accept \
+                     that one rollup per window is lost.",
+                    stream.as_str()
+                );
+            }
+            if sharing_this_second > busiest.1 {
+                busiest = (t, sharing_this_second);
+            }
+        }
+
+        // Guard against a vacuous pass: if the model never puts two streams in
+        // one second, it is not exercising the alignment this test exists for.
+        assert!(
+            busiest.1 > 1,
+            "modelled schedule never aligns two streams (busiest second t={}s had {}), \
+             so the sub-budget is never actually tested",
+            busiest.0,
+            busiest.1
+        );
+        assert!(
+            busiest.1 <= MAX_SHADOW_EVENTS_PER_SECOND,
+            "busiest second t={}s has {} aligned rollups, over the sub-budget of {}",
+            busiest.0,
+            busiest.1,
+            MAX_SHADOW_EVENTS_PER_SECOND
+        );
+    }
+
+    /// The companion to the schedule test, and the more production-relevant
+    /// of the two: on a real node the shadow sub-budget is NOT what binds.
+    ///
+    /// [`TelemetryWorker::admit_event`] tests the aggregate cap first and
+    /// returns early, so once operational telemetry has filled the second,
+    /// every shadow rollup is refused there and the sub-budget branch is never
+    /// reached. That ordering is why the sub-budget has dropped 54 events
+    /// fleet-wide across 1382 nodes while the aggregate cap discards ~31 % of
+    /// shadow and ~77 % of operational telemetry (#5197).
+    ///
+    /// This exists because the schedule test above deliberately models ZERO
+    /// operational load, which is the alignment invariant's own terms but not
+    /// the condition production runs in. Without this test the pair would
+    /// imply a guarantee the code does not provide.
+    ///
+    /// It is also the guard on the ordering itself: #5197 will change how the
+    /// aggregate cap works, and if it reorders these two checks the drops move
+    /// from one counter to the other and every reading built on them shifts.
+    #[test]
+    fn the_aggregate_cap_not_the_shadow_subbudget_is_what_binds_under_load() {
+        let mut worker = rate_limit_test_worker();
+        let now = Instant::now();
+
+        // Operational telemetry fills the whole aggregate budget for this
+        // second, exactly as it does on a busy node.
+        assert_eq!(
+            admit_n(
+                &mut worker,
+                EventPriority::Operational,
+                "op_event",
+                MAX_EVENTS_PER_SECOND,
+                now,
+            ),
+            MAX_EVENTS_PER_SECOND,
+        );
+
+        // Now every shadow rollup is refused, no matter how few of them there
+        // are or how well phased. The offset cannot help here, and is not
+        // meant to.
+        for stream in KnownShadowRollup::ALL {
+            assert!(
+                !worker.admit_event(EventPriority::Shadow, stream.as_str(), now),
+                "{} must be refused once the aggregate cap is full",
+                stream.as_str()
+            );
+        }
+
+        let snapshot = worker.metrics.snapshot();
+        assert_eq!(
+            snapshot.dropped_aggregate_limit_shadow_total,
+            KnownShadowRollup::ALL.len() as u64,
+            "every refused rollup must be charged to the AGGREGATE cap"
+        );
+        assert_eq!(
+            snapshot.dropped_shadow_limit_total, 0,
+            "the shadow sub-budget must NOT be credited with these drops: \
+             admit_event returns at the aggregate check first, which is why \
+             the sub-budget looks idle in production telemetry"
         );
     }
 
