@@ -3362,29 +3362,46 @@ mod tests {
 
         const BUSY_FLEET_COUNTER: u64 = 999_999;
         const MAX_EMPTY_JSON_BYTES: usize = 2_048;
-        // Raised from 5_120 (2026-08-09) to admit the hosting-observability
-        // counters: `host_begin` (7 causes) + `host_reads` (6 buckets) +
-        // `host_recency` (5 buckets). Arithmetic, as the budget demands:
+        // Raised from 5_120 to admit TWO independently-developed blocks that
+        // landed together on this soak branch:
         //
-        //   18 new counters
-        //   +173 JSON bytes at busy-fleet values (5095 -> 5268 measured)
+        //  * the hosting-observability counters (#4642): `host_begin`
+        //    (7 causes) + `host_reads` (6 buckets) + `host_recency`
+        //    (5 buckets) = 18 counters, +173 JSON bytes at busy-fleet values
+        //    (5095 -> 5268, measured on that branch alone);
+        //  * the shadow-mode futile-repair block
+        //    (`crate::ring::futile_repair`): `futile` (14 scalars) +
+        //    `futile_ladder` (an 8-rung survival ladder) = 22 counters,
+        //    +183 JSON bytes at busy-fleet values (5095 -> 5278, measured on
+        //    that branch alone).
+        //
+        // The two costs are ADDITIVE and each branch had independently raised
+        // this budget to 5_376, which merges without a conflict marker because
+        // both sides are the same text. The merged busy-fleet block is
+        // MEASURED at 5451 bytes (5095 base + 173 + 183), which OVERFLOWS
+        // 5_376 by 75, so the budget is raised one further 256-byte step.
+        //
+        //   40 new counters
+        //   +356 JSON bytes at busy-fleet values
         //   emitted once per ~30 min per peer, ~2000 reporting peers
-        //   => 48 * 2000 * ~173 B ~= 17 MB/day
+        //   => 48 * 2000 * ~356 B ~= 34 MB/day
         //
-        // against a collector ingesting ~88.8 GB/day: about 0.019%. The block
-        // is deliberately narrow for what it buys — the hosting-begin row is
-        // the ONLY record of why a peer hosts anything, and the two histograms
-        // are the only fleet-wide view of `read_count` / `last_genuine_access`,
-        // the demand signals the eviction ranking is built on (they previously
-        // reached the node's own HTML dashboard and nothing else). Per-contract
-        // labels were never an option: contract keys are attacker-chosen, so
+        // against a collector ingesting ~88.8 GB/day: about 0.04%. Both blocks
+        // are already the minimum that answers their question — the hosting
+        // rows are the ONLY record of why a peer hosts anything plus the only
+        // fleet-wide view of `read_count` / `last_genuine_access` (the demand
+        // signals the eviction ranking is built on, previously reaching the
+        // node's own HTML dashboard and nothing else), and the futile ladder is
+        // 8 rungs rather than a per-value histogram. Neither carries a
+        // per-contract or per-peer label: contract keys are attacker-chosen, so
         // labelling would hand an attacker control of collector cardinality.
-        const MAX_BUSY_JSON_BYTES: usize = 5_376;
-        // Raised from 14_336 alongside the busy budget, same 18 counters. This
+        // Do NOT raise this again without redoing the arithmetic.
+        const MAX_BUSY_JSON_BYTES: usize = 5_632;
+        // Raised from 14_336 alongside the busy budget, same 40 counters. This
         // is the MATHEMATICAL ceiling (every counter at u64::MAX, 20 digits),
-        // measured 14_704; no fleet value approaches it, so it constrains
+        // measured 15195; no fleet value approaches it, so it constrains
         // schema shape rather than real bytes.
-        const MAX_WORST_CASE_JSON_BYTES: usize = 14_848;
+        const MAX_WORST_CASE_JSON_BYTES: usize = 15_360;
         const MAX_EMPTY_OTLP_MARGINAL_BYTES: usize = 2_048;
         // Raised from 5_120 (2026-08-07) to admit `ms_size` + `ms_unt_age`,
         // the two counters added for #5153. The budget exists to force this
@@ -3400,13 +3417,20 @@ mod tests {
         // of 10 classes (the other 6 are a measured zero) and 6 size buckets
         // rather than 8. Do NOT raise this again without redoing the
         // arithmetic; the JSON-bytes budgets above are deliberately unchanged.
-        const MAX_BUSY_OTLP_MARGINAL_BYTES: usize = 5_376;
-        // Raised from 14_336 for #5153, then from 14_592 (2026-08-09) for the
-        // 18 hosting-observability counters — measured 14_772. Same
-        // MATHEMATICAL-ceiling character as `MAX_WORST_CASE_JSON_BYTES`: no
-        // fleet value approaches it. The busy OTLP marginal moved 5157 -> 5336
-        // and still fits its unchanged 5_376 budget.
-        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 14_848;
+        // Raised again from 5_376 for the 40 counters of the two blocks merged
+        // onto this soak branch (hosting observability + futile repair); see
+        // the arithmetic on MAX_BUSY_JSON_BYTES above. Measured 5523. Note
+        // the OTLP marginal is NOT the JSON figure plus a constant — it is a
+        // different axis (the JSON block re-encoded as an escaped OTLP string
+        // body), so it is measured separately rather than inferred.
+        const MAX_BUSY_OTLP_MARGINAL_BYTES: usize = 5_632;
+        // Raised from 14_336 alongside the busy budget above, same 30 new
+        // counters, same #5153 rationale, then again for the 40 counters of the
+        // two blocks merged onto this soak branch — measured 15267. This
+        // bound is the MATHEMATICAL ceiling (every counter at u64::MAX, 20
+        // digits); no fleet value approaches it, so it constrains schema shape
+        // rather than real bytes.
+        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 15_360;
         const MAX_NULL_OTLP_MARGINAL_BYTES: usize = 64;
 
         let diagnostic = |value| crate::router::NetworkEfficiencyV1 {
@@ -3446,6 +3470,8 @@ mod tests {
             host_begin: [value; 7],
             host_reads: [value; 6],
             host_recency: [value; 5],
+            futile: [value; crate::ring::futile_repair::SNAPSHOT_SCALARS],
+            futile_ladder: [value; crate::ring::futile_repair::LADDER_LEN],
         };
 
         let mut u = arbitrary::Unstructured::new(&[0_u8; 32_768]);
@@ -3459,7 +3485,7 @@ mod tests {
         let object = block
             .as_object()
             .expect("network_efficiency_v1 must remain a JSON object");
-        assert_eq!(object.len(), 36, "schema must remain fixed-cardinality");
+        assert_eq!(object.len(), 38, "schema must remain fixed-cardinality");
         let encoded = serde_json::to_vec(block).expect("serialize diagnostic block");
         assert!(
             encoded.len() <= MAX_BUSY_JSON_BYTES,

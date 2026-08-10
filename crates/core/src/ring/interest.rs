@@ -62,6 +62,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
 
+use crate::ring::futile_repair::{FutileRepairDetector, FutileRepairSnapshot, OutcomeEvidence};
 use crate::transport::TransportPublicKey;
 use crate::util::time_source::TimeSource;
 
@@ -1146,6 +1147,12 @@ pub struct InterestManager<T: TimeSource> {
     /// concurrent racers, not fixed at one).
     missing_summary_active: DashMap<(ContractKey, PeerKey), u16>,
     interest_lifecycle_metrics: InterestLifecycleMetrics,
+
+    /// SHADOW MODE. Counts (contract, peer) edges whose repairs keep failing to
+    /// converge — the observable signature of a contract whose merge is not
+    /// commutative. Observes only: it never gates, throttles, or suppresses a
+    /// heal. See [`crate::ring::futile_repair`].
+    futile_repair: FutileRepairDetector,
 }
 
 /// Delivery-gated lifecycle accounting. Dropping an unmarked guard records no
@@ -1204,6 +1211,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             )),
             missing_summary_active: DashMap::new(),
             interest_lifecycle_metrics: InterestLifecycleMetrics::new(),
+            futile_repair: FutileRepairDetector::new(),
         }
     }
 
@@ -1560,6 +1568,48 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    /// SHADOW MODE — record that a `SyncStateToPeer` heal was actually emitted
+    /// for this (contract, peer) edge.
+    ///
+    /// Call from the one site that emits the heal
+    /// (`node::emit_stale_peer_syncs`) and only for contracts that really got
+    /// one: a contract skipped for being banned, having no local state, or
+    /// exceeding the per-message emit budget is not an attempt. Changes no
+    /// behaviour — see [`crate::ring::futile_repair`].
+    pub(crate) fn record_repair_attempt(&self, contract: &ContractKey, peer: &PeerKey) {
+        self.futile_repair
+            .record_repair_attempt(contract, peer, self.now());
+    }
+
+    /// SHADOW MODE — record the verdict of a TWO-SIDED summary comparison for
+    /// this (contract, peer) edge, settling any outstanding repair attempt.
+    ///
+    /// `converged` is the anti-entropy staleness verdict inverted: pass
+    /// `!is_stale` from the comparison that produced it. Only call this where
+    /// BOTH sides reported a real summary — a one-sided comparison is not an
+    /// outcome, because there was no divergence to repair.
+    ///
+    /// `evidence` says what that verdict rests on. `is_stale` collapses a real
+    /// verdict together with two conservative defaults (probe budget spent,
+    /// probe unavailable) that classify as STALE with nothing behind them, and
+    /// whose frequency grows with load; pass the right
+    /// [`OutcomeEvidence`] so the detector can keep them out of the headline.
+    /// Changes no behaviour.
+    pub(crate) fn record_repair_outcome(
+        &self,
+        contract: &ContractKey,
+        peer: &PeerKey,
+        converged: bool,
+        evidence: OutcomeEvidence,
+    ) {
+        self.futile_repair
+            .record_repair_outcome(contract, peer, converged, evidence, self.now());
+    }
+
+    pub(crate) fn futile_repair_snapshot(&self) -> FutileRepairSnapshot {
+        self.futile_repair.snapshot()
     }
 
     pub(crate) fn interest_lifecycle_snapshot(&self) -> InterestLifecycleSnapshot {
@@ -2235,6 +2285,20 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             .iter()
             .filter(|contract| self.remove_peer_interest_for(contract, peer, cause))
             .count();
+
+        // SHADOW MODE (futile-repair detector). The edge's state dies with the
+        // peer's interest state: this is what bounds the lifetime of an
+        // outstanding repair attempt now that pairing an attempt with its
+        // outcome is NOT wall-clock gated (a wall-clock gate expired every
+        // attempt on slow-rotation links — see `crate::ring::futile_repair`,
+        // "Pairing an attempt with its outcome"). Nothing will settle a heal
+        // sent to a peer that is gone, so the attempt is discarded rather than
+        // left for a comparison after some later reconnect. Pure accounting:
+        // no gate, no behaviour change. Deliberately hooked HERE and not in
+        // the per-contract `remove_peer_interest`, so ordinary interest churn
+        // (a `ChangeInterests` message) does not throw away live attempts.
+        self.futile_repair
+            .discard_peer_attempts(peer, contracts.iter());
 
         if removed_count > 0 {
             tracing::debug!(removed_count, "Removed peer interests on disconnect");
@@ -3326,6 +3390,70 @@ mod tests {
         let time_source = SharedMockTimeSource::new();
         let manager = InterestManager::new(time_source.clone());
         (manager, time_source)
+    }
+
+    /// Wiring pin for the SHADOW-MODE futile-repair detector's attempt
+    /// lifetime.
+    ///
+    /// Pairing an attempt with its outcome is deliberately not wall-clock
+    /// gated: on links still taking the byte-budgeted full-bytes summary
+    /// fallback a contract is re-compared on the order of ten hours, and the
+    /// 30-minute expiry this replaces would have expired every attempt on
+    /// exactly the heavy-summary links the detector exists to find. What bounds
+    /// the attempt instead is the edge's own lifetime — so peer-interest
+    /// teardown MUST discard it, or a comparison made after some later
+    /// reconnect settles a long-dead heal as though it had just failed.
+    ///
+    /// The detector's own unit tests cover `discard_peer_attempts`; what they
+    /// cannot see is whether disconnect teardown actually calls it.
+    #[test]
+    fn disconnect_teardown_discards_outstanding_repair_attempts() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let departing = make_peer_key(1);
+        let staying = make_peer_key(2);
+
+        for peer in [&departing, &staying] {
+            manager.register_peer_interest(&contract, peer.clone(), None, false);
+            manager.record_repair_attempt(&contract, peer);
+        }
+        assert_eq!(manager.futile_repair_snapshot().tracked_edges, 2);
+
+        manager.remove_all_peer_interests(&departing);
+
+        let snap = manager.futile_repair_snapshot();
+        assert_eq!(
+            snap.attempts_discarded, 1,
+            "the departing peer's outstanding heal must be discarded when its \
+             interest state is torn down — nothing will ever settle it"
+        );
+        assert_eq!(
+            snap.tracked_edges, 1,
+            "only the departing peer's edge is dropped"
+        );
+
+        // The departed peer's attempt is gone, so a comparison after a
+        // reconnect is unpaired rather than futile...
+        manager.record_repair_outcome(
+            &contract,
+            &departing,
+            false,
+            crate::ring::futile_repair::OutcomeEvidence::Verdict,
+        );
+        // ...while the peer that stayed still has its attempt to settle.
+        manager.record_repair_outcome(
+            &contract,
+            &staying,
+            false,
+            crate::ring::futile_repair::OutcomeEvidence::Verdict,
+        );
+
+        let snap = manager.futile_repair_snapshot();
+        assert_eq!(snap.observations_unpaired, 1);
+        assert_eq!(
+            snap.futile, 1,
+            "teardown must be scoped to the departing peer, not to the contract"
+        );
     }
 
     /// [`summary_digest`] must be a FIXED function of the bytes — identical on
