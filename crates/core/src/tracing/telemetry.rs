@@ -3362,8 +3362,29 @@ mod tests {
 
         const BUSY_FLEET_COUNTER: u64 = 999_999;
         const MAX_EMPTY_JSON_BYTES: usize = 2_048;
-        const MAX_BUSY_JSON_BYTES: usize = 5_120;
-        const MAX_WORST_CASE_JSON_BYTES: usize = 14_336;
+        // Raised from 5_120 (2026-08-09) to admit the hosting-observability
+        // counters: `host_begin` (7 causes) + `host_reads` (6 buckets) +
+        // `host_recency` (5 buckets). Arithmetic, as the budget demands:
+        //
+        //   18 new counters
+        //   +173 JSON bytes at busy-fleet values (5095 -> 5268 measured)
+        //   emitted once per ~30 min per peer, ~2000 reporting peers
+        //   => 48 * 2000 * ~173 B ~= 17 MB/day
+        //
+        // against a collector ingesting ~88.8 GB/day: about 0.019%. The block
+        // is deliberately narrow for what it buys — the hosting-begin row is
+        // the ONLY record of why a peer hosts anything, and the two histograms
+        // are the only fleet-wide view of `read_count` / `last_genuine_access`,
+        // the demand signals the eviction ranking is built on (they previously
+        // reached the node's own HTML dashboard and nothing else). Per-contract
+        // labels were never an option: contract keys are attacker-chosen, so
+        // labelling would hand an attacker control of collector cardinality.
+        const MAX_BUSY_JSON_BYTES: usize = 5_376;
+        // Raised from 14_336 alongside the busy budget, same 18 counters. This
+        // is the MATHEMATICAL ceiling (every counter at u64::MAX, 20 digits),
+        // measured 14_704; no fleet value approaches it, so it constrains
+        // schema shape rather than real bytes.
+        const MAX_WORST_CASE_JSON_BYTES: usize = 14_848;
         const MAX_EMPTY_OTLP_MARGINAL_BYTES: usize = 2_048;
         // Raised from 5_120 (2026-08-07) to admit `ms_size` + `ms_unt_age`,
         // the two counters added for #5153. The budget exists to force this
@@ -3380,11 +3401,12 @@ mod tests {
         // rather than 8. Do NOT raise this again without redoing the
         // arithmetic; the JSON-bytes budgets above are deliberately unchanged.
         const MAX_BUSY_OTLP_MARGINAL_BYTES: usize = 5_376;
-        // Raised from 14_336 alongside the busy budget above, same 30 new
-        // counters, same #5153 rationale. This bound is the MATHEMATICAL
-        // ceiling (every counter at u64::MAX, 20 digits); no fleet value
-        // approaches it, so it constrains schema shape rather than real bytes.
-        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 14_592;
+        // Raised from 14_336 for #5153, then from 14_592 (2026-08-09) for the
+        // 18 hosting-observability counters — measured 14_772. Same
+        // MATHEMATICAL-ceiling character as `MAX_WORST_CASE_JSON_BYTES`: no
+        // fleet value approaches it. The busy OTLP marginal moved 5157 -> 5336
+        // and still fits its unchanged 5_376 budget.
+        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 14_848;
         const MAX_NULL_OTLP_MARGINAL_BYTES: usize = 64;
 
         let diagnostic = |value| crate::router::NetworkEfficiencyV1 {
@@ -3421,6 +3443,9 @@ mod tests {
             tel: [value; 15],
             shadow: [[value; 9]; 7],
             eff: [value; 8],
+            host_begin: [value; 7],
+            host_reads: [value; 6],
+            host_recency: [value; 5],
         };
 
         let mut u = arbitrary::Unstructured::new(&[0_u8; 32_768]);
@@ -3434,7 +3459,7 @@ mod tests {
         let object = block
             .as_object()
             .expect("network_efficiency_v1 must remain a JSON object");
-        assert_eq!(object.len(), 33, "schema must remain fixed-cardinality");
+        assert_eq!(object.len(), 36, "schema must remain fixed-cardinality");
         let encoded = serde_json::to_vec(block).expect("serialize diagnostic block");
         assert!(
             encoded.len() <= MAX_BUSY_JSON_BYTES,
@@ -3512,6 +3537,50 @@ mod tests {
         assert!(
             worst_otlp <= MAX_WORST_OTLP_MARGINAL_BYTES,
             "worst-case OTLP marginal {worst_otlp} > {MAX_WORST_OTLP_MARGINAL_BYTES}"
+        );
+    }
+
+    /// The hosting-observability rows must survive SERIALIZATION into the
+    /// `router_snapshot` body, not merely exist as struct fields.
+    ///
+    /// `network_efficiency_v1` is the only telemetry family that bypasses both
+    /// the node-side rate limiter (which drops ~69-77% of operational events,
+    /// load-proportionally) and the collector's 5% sampler, so a field that
+    /// silently fails to serialize is not "degraded" — it is absent, with no
+    /// second path to notice by. Each row is given a DISTINCT value so a
+    /// transposed assignment (`host_reads` fed from `host_recency`, say) fails
+    /// here instead of quietly publishing the wrong series.
+    #[test]
+    fn router_snapshot_json_carries_hosting_observability_rows() {
+        use arbitrary::Arbitrary;
+
+        let mut u = arbitrary::Unstructured::new(&[0_u8; 32_768]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        let mut block_bytes = arbitrary::Unstructured::new(&[0_u8; 32_768]);
+        let mut block = crate::router::NetworkEfficiencyV1::arbitrary(&mut block_bytes)
+            .expect("construct NetworkEfficiencyV1 for test");
+        block.host_begin = [11, 12, 13, 14, 15, 16, 17];
+        block.host_reads = [21, 22, 23, 24, 25, 26];
+        block.host_recency = [31, 32, 33, 34, 35];
+        info.network_efficiency_v1 = Some(block);
+
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        let efficiency = &json["network_efficiency_v1"];
+        assert_eq!(
+            efficiency["host_begin"],
+            serde_json::json!([11, 12, 13, 14, 15, 16, 17]),
+            "hosting-begin causes must reach the OTLP body"
+        );
+        assert_eq!(
+            efficiency["host_reads"],
+            serde_json::json!([21, 22, 23, 24, 25, 26]),
+            "the read_count gauge must reach the OTLP body"
+        );
+        assert_eq!(
+            efficiency["host_recency"],
+            serde_json::json!([31, 32, 33, 34, 35]),
+            "the genuine-access recency gauge must reach the OTLP body"
         );
     }
 

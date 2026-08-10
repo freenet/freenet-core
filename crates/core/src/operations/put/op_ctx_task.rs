@@ -631,6 +631,8 @@ async fn try_summary_first_put(
         related.clone(),
         htl,
         crate::contract::Priority::ClientLocal,
+        // Summary-first PUT runs on the ORIGINATOR: a real client-initiated PUT.
+        crate::ring::HostingCause::ClientPut,
     )
     .await
     {
@@ -1695,6 +1697,7 @@ where
         related_contracts.clone(),
         htl,
         store_priority,
+        put_store_cause(op_manager, upstream_addr),
     )
     .await?;
 
@@ -2424,6 +2427,24 @@ fn put_store_priority(
     }
 }
 
+/// Hosting attribution for a relay-driver local store: is this PUT actually our
+/// own client's (dispatch maps an originator-loopback PUT to
+/// `upstream_addr == own_addr`), or someone else's PUT in transit?
+///
+/// Reads the SAME authoritative signal as [`put_store_priority`] rather than
+/// inferring the cause from the priority it returns: priority is a scheduling
+/// lane that may be re-tuned, and a counter that reads a proxy silently
+/// re-labels itself when the proxy moves.
+fn put_store_cause(
+    op_manager: &Arc<OpManager>,
+    upstream_addr: SocketAddr,
+) -> crate::ring::HostingCause {
+    match op_manager.ring.connection_manager.get_own_addr() {
+        Some(own) if own == upstream_addr => crate::ring::HostingCause::ClientPut,
+        _ => crate::ring::HostingCause::RelayPut,
+    }
+}
+
 // NAMING LANDMINE: "store" (and the "relay_" prefix) here means HOSTING, not a
 // lesser cache tier or a hollow relay. A peer stores a contract because a PUT routed
 // through it, and a routed PUT is a demand signal, so the peer HOSTS the contract
@@ -2440,6 +2461,13 @@ async fn relay_put_store_locally(
     related_contracts: RelatedContracts<'static>,
     htl: usize,
     priority: crate::contract::Priority,
+    // Hosting attribution: this one chokepoint serves BOTH the client-loopback
+    // PUT and the relay-hop PUT (see the comment on the `host_contract` call
+    // below), so the caller names which it is. `priority` correlates today
+    // (`ClientLocal` vs `NetworkRelay`) but is a scheduling knob, not an
+    // attribution: deriving the cause from it would silently re-label the
+    // counter the first time a lane is re-tuned. Telemetry only.
+    cause: crate::ring::HostingCause,
 ) -> Result<WrappedState, OpError> {
     // EXPERIMENT-ONLY (findability_probe): suppress the every-hop PUT store so
     // the copy lands ONLY at the routing terminus (stored there explicitly by
@@ -2514,6 +2542,7 @@ async fn relay_put_store_locally(
         key,
         merged_value.size() as u64,
         crate::ring::AccessType::Put,
+        cause,
     );
 
     // Gate the first-time-hosting side effects on the ATOMIC `host_contract`
@@ -2726,6 +2755,7 @@ async fn relay_put_finalize_scatter_disabled_store(
                     key,
                     merged.size() as u64,
                     crate::ring::AccessType::Put,
+                    crate::ring::HostingCause::RelayPut,
                 );
             }
         }
@@ -3473,6 +3503,7 @@ where
         related_contracts,
         htl,
         store_priority,
+        put_store_cause(op_manager, upstream_addr),
     )
     .await?;
 

@@ -5102,9 +5102,12 @@ mod tests {
         );
         // Make the local node host the contract so drive_client_update's
         // target=None path applies the update locally instead of erroring.
-        op_manager
-            .ring
-            .host_contract(key, 100, crate::ring::AccessType::Put);
+        op_manager.ring.host_contract(
+            key,
+            100,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
 
         let remote_sender: SocketAddr = "127.0.0.1:12700".parse().unwrap();
         let probe_sender: SocketAddr = "127.0.0.1:12800".parse().unwrap();
@@ -5188,9 +5191,12 @@ mod tests {
             ContractInstanceId::new([63u8; 32]),
             CodeHash::new([64u8; 32]),
         );
-        op_manager
-            .ring
-            .host_contract(key, 100, crate::ring::AccessType::Put);
+        op_manager.ring.host_contract(
+            key,
+            100,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
 
         let remote_sender: SocketAddr = "127.0.0.1:15100".parse().unwrap();
         let probe_sender: SocketAddr = "127.0.0.1:15200".parse().unwrap();
@@ -5273,9 +5279,12 @@ mod tests {
             ContractInstanceId::new([65u8; 32]),
             CodeHash::new([66u8; 32]),
         );
-        op_manager
-            .ring
-            .host_contract(key, 100, crate::ring::AccessType::Put);
+        op_manager.ring.host_contract(
+            key,
+            100,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
 
         let remote_sender: SocketAddr = "127.0.0.1:15300".parse().unwrap();
         let probe_sender: SocketAddr = "127.0.0.1:15400".parse().unwrap();

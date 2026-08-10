@@ -8943,9 +8943,12 @@ mod tests {
             // Hosted + locally interested + hash-indexed, so
             // `summary_if_hosted_or_in_use` will summarize it and
             // `lookup_by_hash` will resolve the peer's advertised hash to it.
-            let _ = op_manager
-                .ring
-                .host_contract(key, 128, crate::ring::AccessType::Put);
+            let _ = op_manager.ring.host_contract(
+                key,
+                128,
+                crate::ring::AccessType::Put,
+                crate::ring::HostingCause::Other,
+            );
             op_manager.interest_manager.register_local_hosting(&key);
 
             // Two connected peers, distinguished ONLY by whether a remote
@@ -9250,10 +9253,12 @@ mod tests {
                 code[4] = 0xC0;
                 let key =
                     ContractKey::from_id_and_code(ContractInstanceId::new(id), CodeHash::new(code));
-                let _ = h
-                    .op_manager
-                    .ring
-                    .host_contract(key, 128, crate::ring::AccessType::Put);
+                let _ = h.op_manager.ring.host_contract(
+                    key,
+                    128,
+                    crate::ring::AccessType::Put,
+                    crate::ring::HostingCause::Other,
+                );
                 h.op_manager.interest_manager.register_local_hosting(&key);
                 keys.push(key);
             }
@@ -9995,10 +10000,12 @@ mod tests {
             // and makes the dropped entry invisible.
             let h = build_harness("hf-collision", 17080, vec![3u8; 64]).await;
             for k in [key_a, key_b] {
-                let _ = h
-                    .op_manager
-                    .ring
-                    .host_contract(k, 128, crate::ring::AccessType::Put);
+                let _ = h.op_manager.ring.host_contract(
+                    k,
+                    128,
+                    crate::ring::AccessType::Put,
+                    crate::ring::HostingCause::Other,
+                );
                 h.op_manager.interest_manager.register_local_hosting(&k);
             }
 
@@ -10191,10 +10198,12 @@ mod tests {
                     ContractInstanceId::new([i.wrapping_add(100); 32]),
                     CodeHash::new([i; 32]),
                 );
-                let _ = h
-                    .op_manager
-                    .ring
-                    .host_contract(k, 128, crate::ring::AccessType::Put);
+                let _ = h.op_manager.ring.host_contract(
+                    k,
+                    128,
+                    crate::ring::AccessType::Put,
+                    crate::ring::HostingCause::Other,
+                );
                 h.op_manager.interest_manager.register_local_hosting(&k);
                 hashes.push(contract_hash(&k));
             }
@@ -10279,10 +10288,12 @@ mod tests {
                     ContractInstanceId::new([i.wrapping_add(160); 32]),
                     CodeHash::new([i.wrapping_add(3); 32]),
                 );
-                let _ = h
-                    .op_manager
-                    .ring
-                    .host_contract(k, 128, crate::ring::AccessType::Put);
+                let _ = h.op_manager.ring.host_contract(
+                    k,
+                    128,
+                    crate::ring::AccessType::Put,
+                    crate::ring::HostingCause::Other,
+                );
                 h.op_manager.interest_manager.register_local_hosting(&k);
                 hashes.push(contract_hash(&k));
             }

@@ -3432,9 +3432,12 @@ mod tests {
         let (op_manager, mut rx, _guard) =
             build_notification_test_node("notif-exclusion-subset-4965").await;
         let key = crate::operations::test_utils::make_contract_key(11);
-        op_manager
-            .ring
-            .host_contract(key, 1024, crate::ring::AccessType::Put);
+        op_manager.ring.host_contract(
+            key,
+            1024,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
 
         // A and B: advertised co-hosts AND interested — the excluded
         //          population. TWO of them, deliberately: with only one, a

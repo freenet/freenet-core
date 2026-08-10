@@ -293,6 +293,36 @@ pub(crate) struct NetworkEfficiencyV1 {
     /// Delivery path for this diagnostic block itself; order is documented in
     /// `TelemetryLocalMetricsSnapshot::network_efficiency_delivery`.
     pub eff: [u64; 8],
+    /// Monotonic hosting-BEGIN counts by CAUSE; row order is
+    /// `ring::hosting::HostingCause::ALL`: client GET, relay GET, sub-op GET,
+    /// client PUT, relay PUT, startup restore, unattributed.
+    ///
+    /// Answers "why is this peer hosting this contract" in aggregate, which
+    /// nothing recorded before: `AccessType` distinguishes only GET from PUT and
+    /// so cannot separate a client's own request from transit — the distinction
+    /// every hosting-policy decision rests on. In particular a subscribe-fetch
+    /// travels the ordinary GET driver as a sub-op, and was indistinguishable
+    /// from a plain GET until this split.
+    ///
+    /// Counted at the cache branch that inserts, so a refresh of an
+    /// already-hosted contract is NOT counted. `Other` (last row) is a leak
+    /// detector, not a category: it should be 0 in the field, and a nonzero
+    /// value means some production path began hosting without naming a cause.
+    pub host_begin: [u64; crate::ring::HostingCause::COUNT],
+    /// GAUGE (not a counter — do not difference): distribution of `read_count`
+    /// across the currently hosted set. Buckets: 0, 1, 2-3, 4-9, 10-99, >=100.
+    ///
+    /// `read_count` is half of the demand signal the subscriber-primary eviction
+    /// ranking is built on, and it previously reached only the node's own local
+    /// HTML dashboard — no `send_event` call site touched it — so the shape of
+    /// the signal the policy depends on was unobservable fleet-wide.
+    pub host_reads: [u64; crate::ring::READ_COUNT_HIST_BUCKETS],
+    /// GAUGE: distribution of `last_genuine_access` AGE across the currently
+    /// hosted set. Buckets: within the 5-minute cost window, <20 min, <2 h,
+    /// older, never genuinely accessed. Bucket 0 over the hosted-set total is
+    /// the share cost-pressure eviction currently treats as recently-accessed.
+    /// The other half of the previously node-local demand signal.
+    pub host_recency: [u64; crate::ring::GENUINE_ACCESS_RECENCY_BUCKETS],
 }
 
 /// Periodic snapshot of the router model state for telemetry.
