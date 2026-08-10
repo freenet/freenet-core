@@ -74,8 +74,11 @@ async fn merge_probe() -> Result<(), Box<dyn std::error::Error>> {
         10_000_000,
         db.clone(),
     )?;
-    let secrets_store =
-        crate::wasm_runtime::SecretsStore::new(temp_dir.path().join("secrets"), Default::default(), db)?;
+    let secrets_store = crate::wasm_runtime::SecretsStore::new(
+        temp_dir.path().join("secrets"),
+        Default::default(),
+        db,
+    )?;
     let mut rt =
         crate::wasm_runtime::Runtime::build(contract_store, delegate_store, secrets_store, false)?;
 
