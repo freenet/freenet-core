@@ -3087,6 +3087,31 @@ where
     }
 }
 
+/// Hosting attribution for a local store made by the GET forwarding driver:
+/// did this node's OWN request put the contract here, or did someone else's
+/// merely transit?
+///
+/// `node.rs` maps a locally-originated GET (`source_addr = None`) to
+/// `upstream_addr = own_addr` and drives it through this same forwarding driver,
+/// so "this driver is running" does NOT imply transit. Counting that loopback as
+/// transit defeats the whole point of the enum, which exists to separate our own
+/// demand from someone else's. `start_relay_get` already applies exactly this
+/// gate before `record_relayed_get`; this is the hosting-side twin of it.
+///
+/// Fails safe to [`HostingCause::TransitGet`] when our own address is unknown:
+/// an unattributable store is someone else's until proven otherwise, and the
+/// symmetric mistake (inflating this node's own demand) is the one that would
+/// mislead a hosting-policy decision.
+fn relay_get_hosting_cause(
+    own_addr: Option<SocketAddr>,
+    upstream_addr: SocketAddr,
+) -> crate::ring::HostingCause {
+    match own_addr {
+        Some(own) if own == upstream_addr => crate::ring::HostingCause::ClientGet,
+        _ => crate::ring::HostingCause::TransitGet,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_relay_get_inner<CB>(
     op_manager: &Arc<OpManager>,
@@ -3157,9 +3182,19 @@ where
         return Ok(());
     }
 
+    let own_addr = op_manager.ring.connection_manager.get_own_addr();
+
+    // Hosting attribution for EVERY local store this driver makes. Computed once
+    // here, at the one place that knows whether this driver invocation is transit
+    // at all, and threaded down — a per-callsite literal is how the loopback case
+    // leaked into the transit row in the first place. See
+    // `relay_get_hosting_cause` for why loopback is not transit; `start_relay_get`
+    // applies the identical gate to `record_relayed_get`.
+    let hosting_cause = relay_get_hosting_cause(own_addr, upstream_addr);
+
     // ── Update visited set: mark this peer and the upstream ─────────────
     let mut new_visited = visited.with_transaction(&incoming_tx);
-    if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
+    if let Some(own_addr) = own_addr {
         new_visited.mark_visited(own_addr);
     }
     new_visited.mark_visited(upstream_addr);
@@ -3304,15 +3339,7 @@ where
             hop_count,
         )
         .await;
-        cache_contract_locally(
-            op_manager,
-            key,
-            state,
-            contract,
-            false,
-            crate::ring::HostingCause::RelayGet,
-        )
-        .await;
+        cache_contract_locally(op_manager, key, state, contract, false, hosting_cause).await;
         send_result?;
         return Ok(());
     }
@@ -3402,15 +3429,8 @@ where
                         hop_count,
                     )
                     .await;
-                    cache_contract_locally(
-                        op_manager,
-                        key,
-                        state,
-                        contract,
-                        false,
-                        crate::ring::HostingCause::RelayGet,
-                    )
-                    .await;
+                    cache_contract_locally(op_manager, key, state, contract, false, hosting_cause)
+                        .await;
                     send_result?;
                     return Ok(());
                 }
@@ -3799,15 +3819,9 @@ where
                 // hosting at a relay is still broadcast (matches legacy
                 // `get.rs:2370` which announces on any first-time relay
                 // cache).
-                let state_present = cache_contract_locally(
-                    op_manager,
-                    key,
-                    state,
-                    contract,
-                    false,
-                    crate::ring::HostingCause::RelayGet,
-                )
-                .await;
+                let state_present =
+                    cache_contract_locally(op_manager, key, state, contract, false, hosting_cause)
+                        .await;
                 send_result?;
 
                 // Register the requester as a downstream subscriber (subscribe
@@ -3948,7 +3962,7 @@ where
                                         state,
                                         contract,
                                         false,
-                                        crate::ring::HostingCause::RelayGet,
+                                        hosting_cause,
                                     )
                                     .await;
                                     // Loopback delivery succeeded (state cached
@@ -4084,7 +4098,7 @@ where
                                     state,
                                     contract,
                                     false,
-                                    crate::ring::HostingCause::RelayGet,
+                                    hosting_cause,
                                 )
                                 .await
                             } else {
@@ -6814,16 +6828,73 @@ mod tests {
                  `false` for is_client_requester (relay is not the client). \
                  Call text: {call}"
             );
-            // The hosting attribution must match the same fact: a relay callsite
-            // records TRANSIT, so a `ClientGet` here would report someone else's
-            // request as this node's own client demand.
-            assert!(
-                args[5].ends_with("HostingCause::RelayGet"),
-                "Relay callsite #{idx} of cache_contract_locally must attribute \
-                 hosting to `HostingCause::RelayGet` — this node is forwarding \
-                 someone else's GET, not serving its own client. Call text: {call}"
+            // The hosting attribution must be the DRIVER-COMPUTED `hosting_cause`,
+            // never a per-callsite literal. `is_client_requester` is `false` at
+            // every one of these sites because a forwarder is never the client;
+            // the CAUSE is not that simple, because dispatch drives a
+            // locally-originated GET through this same driver with
+            // `upstream_addr = own_addr`. A hardcoded `TransitGet` here therefore
+            // reports this node's OWN request as someone else's transit, which is
+            // precisely the distinction the enum exists to make. Threading one
+            // value computed by `relay_get_hosting_cause` is what keeps that
+            // impossible; a literal at any site re-opens it.
+            assert_eq!(
+                args[5], "hosting_cause",
+                "Relay callsite #{idx} of cache_contract_locally must pass the \
+                 driver-computed `hosting_cause`, not a hardcoded variant — \
+                 dispatch routes an originator-loopback GET through this same \
+                 driver, so a literal `HostingCause::TransitGet` would file this \
+                 node's own request under transit. Call text: {call}"
             );
         }
+        // ...and `hosting_cause` must be the loopback-aware value, not a
+        // constant bound to make the assertion above pass. Matched with
+        // whitespace stripped so a future rustfmt line-split cannot disarm it.
+        let packed: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            packed.contains("lethosting_cause=relay_get_hosting_cause(own_addr,upstream_addr);"),
+            "drive_relay_get_inner must bind `hosting_cause` from \
+             `relay_get_hosting_cause(own_addr, upstream_addr)`; binding it to a \
+             constant would satisfy the per-callsite check while re-introducing \
+             the mislabelling."
+        );
+    }
+
+    /// The loopback gate itself: `relay_get_hosting_cause` must map an
+    /// originator-loopback GET to `ClientGet` and a genuine forward to
+    /// `TransitGet`.
+    ///
+    /// Dispatch (`node.rs`) maps a locally-originated GET (`source_addr = None`)
+    /// to `upstream_addr = own_addr` and runs it through the forwarding driver,
+    /// so the driver cannot infer transit from its own existence. Recording that
+    /// case as transit is not a cosmetic mislabel: the ONLY thing this enum adds
+    /// over `AccessType` is the own-demand-vs-transit split, so leaking one into
+    /// the other empties the counter of meaning while it keeps reporting
+    /// plausible numbers.
+    #[test]
+    fn relay_get_hosting_cause_attributes_originator_loopback_to_client_get() {
+        let own: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let peer: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+
+        assert_eq!(
+            super::relay_get_hosting_cause(Some(own), own),
+            crate::ring::HostingCause::ClientGet,
+            "an originator-loopback GET (upstream == own_addr) is this node's \
+             OWN demand, not transit"
+        );
+        assert_eq!(
+            super::relay_get_hosting_cause(Some(own), peer),
+            crate::ring::HostingCause::TransitGet,
+            "a GET forwarded from a genuine upstream peer is transit"
+        );
+        // Fail safe: an unknown own address must not be read as loopback, or a
+        // node that has not yet learned its address would file every forwarded
+        // GET as its own client demand.
+        assert_eq!(
+            super::relay_get_hosting_cause(None, peer),
+            crate::ring::HostingCause::TransitGet,
+            "unknown own address must fall back to transit"
+        );
     }
 
     /// The `client_driver`-side callsite (drive_client_get_inner's

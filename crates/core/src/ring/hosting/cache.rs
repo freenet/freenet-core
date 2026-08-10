@@ -426,14 +426,24 @@ pub enum AccessType {
 ///
 /// Fixed cardinality, no per-contract or per-peer labels: the whole array is
 /// [`COUNT`](Self::COUNT) counters wide, exported as one aggregate row.
+///
+/// NAMING: the two forwarding variants are `Transit*`, NOT `Relay*`.
+/// `.claude/rules/hosting-invariants.md` records that "relay" is a fossil of the
+/// hollow-relay firefight against #3763 and says outright: do not name new code
+/// `relay`. Forwarding a request toward its key is ROUTING, not a persistent
+/// role — which is exactly what these two variants mean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HostingCause {
-    /// A GET this node's own client originated (`is_client_requester`), stored
-    /// on the client driver's return path.
+    /// A GET this node itself originated: either its own client's GET
+    /// (`is_client_requester`, stored on the client driver's return path) or a
+    /// node-internal loopback GET, which dispatch routes through the SAME
+    /// forwarding driver with `upstream_addr = own_addr` (see
+    /// `get/op_ctx_task.rs::relay_get_hosting_cause`). Both are this node's own
+    /// demand; neither is transit.
     ClientGet = 0,
-    /// The GET return-path store on a node that was merely RELAYING someone
+    /// The GET return-path store on a node that was merely FORWARDING someone
     /// else's GET — transit, not local demand.
-    RelayGet = 1,
+    TransitGet = 1,
     /// A sub-operation GET: subscribe-fetch (`operations/subscribe.rs` spawns a
     /// sub-op GET when it must fetch state before subscribing), related-contract
     /// auto-fetch, phantom repair. Structurally indistinguishable from a plain
@@ -441,8 +451,8 @@ pub(crate) enum HostingCause {
     SubOpGet = 2,
     /// A PUT this node's own client originated (originator loopback).
     ClientPut = 3,
-    /// The every-hop PUT store on a node relaying someone else's PUT.
-    RelayPut = 4,
+    /// The every-hop PUT store on a node forwarding someone else's PUT.
+    TransitPut = 4,
     /// Restored from the persisted hosting metadata at startup — NOT a fresh
     /// hosting decision at all. Kept separate so a restart's bulk reload cannot
     /// masquerade as live demand (the same confound `seeded_this_run` exists to
@@ -459,13 +469,15 @@ pub(crate) enum HostingCause {
 impl HostingCause {
     /// Every variant, in discriminant order. This is the exported array order
     /// for `NetworkEfficiencyV1::host_begin`; appending is safe, reordering is
-    /// not (it silently relabels historical series).
+    /// not (it silently relabels historical series). RENAMING a variant is also
+    /// safe — the wire carries positions, not names. Pinned by
+    /// `hosting_cause_all_is_in_discriminant_order`.
     pub(crate) const ALL: [HostingCause; 7] = [
         HostingCause::ClientGet,
-        HostingCause::RelayGet,
+        HostingCause::TransitGet,
         HostingCause::SubOpGet,
         HostingCause::ClientPut,
-        HostingCause::RelayPut,
+        HostingCause::TransitPut,
         HostingCause::StartupRestore,
         HostingCause::Other,
     ];
@@ -2438,6 +2450,86 @@ mod tests {
         cache.stats().hosting_begins[cause.index()]
     }
 
+    /// This file's source with the test module cut off, so a source pin cannot
+    /// match its own needle in a test's string literal.
+    fn production_source() -> &'static str {
+        const FULL: &str = include_str!("cache.rs");
+        // Anchor on the module header, NOT a bare `#[cfg(test)]`: several
+        // test-only methods inside the production `impl` carry that attribute,
+        // and cutting at the first one would hide most of the file from every
+        // pin below (silently, while still passing).
+        let cutoff = FULL
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("file must end with a `#[cfg(test)] mod tests` block");
+        &FULL[..cutoff]
+    }
+
+    /// `HostingCause::ALL` is the EXPORT ORDER of `NetworkEfficiencyV1::host_begin`
+    /// and `index()` is the discriminant used to address the counter array. If
+    /// they ever disagree, every historical series is silently relabelled: the
+    /// dashboards keep drawing, the numbers stay plausible, and "client GET" now
+    /// means something else.
+    ///
+    /// Nothing else checks this — `ALL` is hand-written next to the discriminants,
+    /// which is exactly the kind of hand-maintained parallel list that drifts when
+    /// a variant is inserted rather than appended.
+    #[test]
+    fn hosting_cause_all_is_in_discriminant_order() {
+        for (i, cause) in HostingCause::ALL.iter().enumerate() {
+            assert_eq!(
+                cause.index(),
+                i,
+                "HostingCause::ALL[{i}] is {cause:?}, whose discriminant is {}. \
+                 ALL must stay in discriminant order: it is the exported row \
+                 order, so a mismatch relabels historical telemetry series \
+                 rather than failing loudly.",
+                cause.index(),
+            );
+        }
+        assert_eq!(
+            HostingCause::COUNT,
+            HostingCause::ALL.len(),
+            "COUNT is the counter-array width and must equal ALL's length"
+        );
+    }
+
+    /// Exactly two branches insert into `contracts`, and each one attributes the
+    /// hosting begin it just made.
+    ///
+    /// The counter's whole design is that it is incremented AT the branch that
+    /// decides, never re-derived by a caller (`.claude/rules/bug-prevention-patterns.md`).
+    /// That only holds while the set of deciding branches is the set that counts:
+    /// a third insert added later would begin hosting without attribution, and the
+    /// symptom is a counter that is quietly LOW while still rising — the failure
+    /// mode that terminates investigation rather than starting one.
+    #[test]
+    fn every_hosting_insert_site_records_its_cause() {
+        let src = production_source();
+        let sites: Vec<usize> = src
+            .match_indices("self.contracts.insert(")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            sites.len(),
+            2,
+            "expected exactly two `self.contracts.insert(` sites (the \
+             record_access_with_demand insert arm and the \
+             load_persisted_entry_with_demand insert); found {}. A new insert \
+             begins hosting, so it must also call note_hosting_begin — update \
+             this pin deliberately once it does.",
+            sites.len(),
+        );
+        for (idx, site) in sites.into_iter().enumerate() {
+            let window = &src[site..(site + 900).min(src.len())];
+            assert!(
+                window.contains("self.note_hosting_begin("),
+                "insert site #{idx} must be followed by a \
+                 `self.note_hosting_begin(..)` call attributing the hosting \
+                 begin it just made. Window: {window}"
+            );
+        }
+    }
+
     /// The counter must fire ONLY on the transition into hosting, and must land
     /// in the row the caller named.
     ///
@@ -2470,10 +2562,10 @@ mod tests {
             AccessType::Put,
             0,
             NEUTRAL_DEMAND,
-            HostingCause::RelayPut,
+            HostingCause::TransitPut,
             |_| (0, 0),
         );
-        assert_eq!(begins(&cache, HostingCause::RelayPut), 1);
+        assert_eq!(begins(&cache, HostingCause::TransitPut), 1);
 
         // Same contract again: a REFRESH, not a new hosting decision. The whole
         // point of the counter is that this does not move it.
@@ -2483,7 +2575,7 @@ mod tests {
             AccessType::Put,
             0,
             NEUTRAL_DEMAND,
-            HostingCause::RelayPut,
+            HostingCause::TransitPut,
             |_| (0, 0),
         );
         // ... and again through a DIFFERENT cause, which must not open a second
@@ -2498,7 +2590,7 @@ mod tests {
             |_| (0, 0),
         );
         assert_eq!(
-            begins(&cache, HostingCause::RelayPut),
+            begins(&cache, HostingCause::TransitPut),
             1,
             "a refresh of an already-hosted contract is not a hosting BEGIN — if \
              this reads 2, the increment fires on the refresh path too and the \
@@ -2521,11 +2613,11 @@ mod tests {
             |_| (0, 0),
         );
         assert_eq!(begins(&cache, HostingCause::ClientGet), 1);
-        assert_eq!(begins(&cache, HostingCause::RelayPut), 1);
+        assert_eq!(begins(&cache, HostingCause::TransitPut), 1);
 
         // Nothing leaked into the rows nobody named.
         for cause in [
-            HostingCause::RelayGet,
+            HostingCause::TransitGet,
             HostingCause::SubOpGet,
             HostingCause::ClientPut,
             HostingCause::StartupRestore,
@@ -2554,10 +2646,10 @@ mod tests {
         );
         for cause in [
             HostingCause::ClientGet,
-            HostingCause::RelayGet,
+            HostingCause::TransitGet,
             HostingCause::SubOpGet,
             HostingCause::ClientPut,
-            HostingCause::RelayPut,
+            HostingCause::TransitPut,
             HostingCause::Other,
         ] {
             assert_eq!(
@@ -2582,7 +2674,7 @@ mod tests {
             AccessType::Put,
             0,
             NEUTRAL_DEMAND,
-            HostingCause::RelayPut,
+            HostingCause::TransitPut,
             |_| (0, 0),
         );
         // A SUBSCRIBE-only entry never stamps `last_genuine_access` at all.
@@ -2668,7 +2760,7 @@ mod tests {
             AccessType::Get,
             0,
             NEUTRAL_DEMAND,
-            HostingCause::RelayGet,
+            HostingCause::TransitGet,
             |_| (0, 0),
         );
         assert_eq!(
@@ -2690,7 +2782,7 @@ mod tests {
             "the begin counter is monotonic: eviction does not un-decide the \
              hosting that happened"
         );
-        assert_eq!(stats.hosting_begins[HostingCause::RelayGet.index()], 1);
+        assert_eq!(stats.hosting_begins[HostingCause::TransitGet.index()], 1);
     }
 
     /// Project the `(key, write_generation)` reclaim pairs out of a

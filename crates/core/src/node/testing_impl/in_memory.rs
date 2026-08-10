@@ -508,7 +508,7 @@ async fn append_contracts(
                     state_size,
                     crate::ring::AccessType::Put,
                     // Harness seed: models the state a relay PUT hop leaves.
-                    crate::ring::HostingCause::RelayPut,
+                    crate::ring::HostingCause::TransitPut,
                 );
                 // In the new lease-based model, register an active subscription
                 op_manager.ring.subscribe(key);
@@ -553,7 +553,7 @@ async fn append_contracts(
                     crate::ring::AccessType::Get,
                     // Harness seed: models the every-hop store a RELAY hop
                     // leaves on a GET return path, matching the AccessType.
-                    crate::ring::HostingCause::RelayGet,
+                    crate::ring::HostingCause::TransitGet,
                 );
                 let _ = op_manager.interest_manager.register_local_hosting(&key);
                 // Advertisement is a separate concern from the local serve gate

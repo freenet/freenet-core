@@ -3336,15 +3336,15 @@ mod tests {
         let relayed = make_contract_key(1);
         let fetched = make_contract_key(2);
 
-        manager.record_contract_access(relayed, 100, AccessType::Put, HostingCause::RelayPut);
+        manager.record_contract_access(relayed, 100, AccessType::Put, HostingCause::TransitPut);
         // A repeat PUT of the same contract: recency refresh, NOT a new hosting
         // decision — the counter must not move.
-        manager.record_contract_access(relayed, 100, AccessType::Put, HostingCause::RelayPut);
+        manager.record_contract_access(relayed, 100, AccessType::Put, HostingCause::TransitPut);
         manager.record_contract_access(fetched, 100, AccessType::Get, HostingCause::SubOpGet);
 
         let stats = manager.hosting_cache_stats();
         assert_eq!(
-            stats.hosting_begins[HostingCause::RelayPut.index()],
+            stats.hosting_begins[HostingCause::TransitPut.index()],
             1,
             "two PUTs of one contract are ONE hosting begin; a 2 here means the \
              counter fires on refresh and is really counting writes"

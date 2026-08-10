@@ -1687,7 +1687,11 @@ where
     // Originator-loopback (a local client's own PUT, mapped to
     // upstream_addr=own_addr in dispatch) is ClientLocal so it lands in the
     // reserved fair-queue lane; a genuine relay store stays NetworkRelay (#4534).
-    let store_priority = put_store_priority(op_manager, upstream_addr);
+    let originator_loopback = put_is_originator_loopback(
+        op_manager.ring.connection_manager.get_own_addr(),
+        upstream_addr,
+    );
+    let store_priority = put_store_priority(originator_loopback);
     let merged_value = relay_put_store_locally(
         op_manager,
         incoming_tx,
@@ -1697,7 +1701,7 @@ where
         related_contracts.clone(),
         htl,
         store_priority,
-        put_store_cause(op_manager, upstream_addr),
+        put_store_cause(originator_loopback),
     )
     .await?;
 
@@ -2412,36 +2416,44 @@ where
 /// `put_failure` telemetry event and propagate.
 /// Fair-queue priority for a relay PUT's local store (#4534).
 ///
-/// A local client's own PUT enters the relay driver via originator-loopback,
-/// which dispatch maps to `upstream_addr = own_addr` (see operations.md). That
-/// case is `ClientLocal` so the store uses the reserved admission lane; any
-/// genuine upstream peer is `NetworkRelay`. If our own address is unknown we
-/// fail safe to `NetworkRelay` (never over-prioritize an ambiguous store).
-fn put_store_priority(
-    op_manager: &Arc<OpManager>,
-    upstream_addr: SocketAddr,
-) -> crate::contract::Priority {
-    match op_manager.ring.connection_manager.get_own_addr() {
-        Some(own) if own == upstream_addr => crate::contract::Priority::ClientLocal,
-        _ => crate::contract::Priority::NetworkRelay,
+/// A local client's own PUT enters the forwarding driver via originator-loopback,
+/// which dispatch maps to `upstream_addr = own_addr` (see operations.md) — see
+/// [`put_is_originator_loopback`], which is where that fact is read. That case is
+/// `ClientLocal` so the store uses the reserved admission lane; any genuine
+/// upstream peer is `NetworkRelay`.
+fn put_store_priority(originator_loopback: bool) -> crate::contract::Priority {
+    if originator_loopback {
+        crate::contract::Priority::ClientLocal
+    } else {
+        crate::contract::Priority::NetworkRelay
     }
 }
 
-/// Hosting attribution for a relay-driver local store: is this PUT actually our
-/// own client's (dispatch maps an originator-loopback PUT to
-/// `upstream_addr == own_addr`), or someone else's PUT in transit?
+/// Did this PUT reach the forwarding driver via originator-loopback — i.e. is it
+/// our OWN client's PUT rather than someone else's in transit?
 ///
-/// Reads the SAME authoritative signal as [`put_store_priority`] rather than
-/// inferring the cause from the priority it returns: priority is a scheduling
-/// lane that may be re-tuned, and a counter that reads a proxy silently
-/// re-labels itself when the proxy moves.
-fn put_store_cause(
-    op_manager: &Arc<OpManager>,
-    upstream_addr: SocketAddr,
-) -> crate::ring::HostingCause {
-    match op_manager.ring.connection_manager.get_own_addr() {
-        Some(own) if own == upstream_addr => crate::ring::HostingCause::ClientPut,
-        _ => crate::ring::HostingCause::RelayPut,
+/// The single authoritative read of that fact. Both the scheduling lane
+/// ([`put_store_priority`]) and the hosting attribution ([`put_store_cause`])
+/// derive from it, so they cannot disagree, and the `get_own_addr()` lock is
+/// taken once per store rather than once per consumer.
+///
+/// Fails safe to `false` when our own address is unknown: never over-prioritize
+/// an ambiguous store, and never credit an unattributable one to a local client.
+fn put_is_originator_loopback(own_addr: Option<SocketAddr>, upstream_addr: SocketAddr) -> bool {
+    matches!(own_addr, Some(own) if own == upstream_addr)
+}
+
+/// Hosting attribution for a forwarding-driver local store.
+///
+/// Derived from the same [`put_is_originator_loopback`] fact as
+/// [`put_store_priority`], NOT from the priority that function returns:
+/// priority is a scheduling lane that may be re-tuned, and a counter that reads
+/// a proxy silently re-labels itself when the proxy moves.
+fn put_store_cause(originator_loopback: bool) -> crate::ring::HostingCause {
+    if originator_loopback {
+        crate::ring::HostingCause::ClientPut
+    } else {
+        crate::ring::HostingCause::TransitPut
     }
 }
 
@@ -2755,7 +2767,7 @@ async fn relay_put_finalize_scatter_disabled_store(
                     key,
                     merged.size() as u64,
                     crate::ring::AccessType::Put,
-                    crate::ring::HostingCause::RelayPut,
+                    crate::ring::HostingCause::TransitPut,
                 );
             }
         }
@@ -3492,8 +3504,13 @@ where
     // forward (#4509) before the store consumes `related_contracts`.
     let replicate_payload =
         terminus_replicate_to.map(|addr| (addr, contract.clone(), related_contracts.clone()));
-    // Originator-loopback client PUT → ClientLocal reserved lane (#4534).
-    let store_priority = put_store_priority(op_manager, upstream_addr);
+    // Originator-loopback client PUT → ClientLocal reserved lane (#4534), and the
+    // same fact names the hosting cause.
+    let originator_loopback = put_is_originator_loopback(
+        op_manager.ring.connection_manager.get_own_addr(),
+        upstream_addr,
+    );
+    let store_priority = put_store_priority(originator_loopback);
     let merged_value = relay_put_store_locally(
         op_manager,
         incoming_tx,
@@ -3503,7 +3520,7 @@ where
         related_contracts,
         htl,
         store_priority,
-        put_store_cause(op_manager, upstream_addr),
+        put_store_cause(originator_loopback),
     )
     .await?;
 
@@ -4822,6 +4839,55 @@ mod tests {
             "drive_client_put_inner must reference both advancement \
              caps by name in the selection so future readers see the \
              split — bare integer literals are forbidden here."
+        );
+    }
+
+    /// The scheduling lane and the hosting attribution must BOTH follow the
+    /// originator-loopback fact, and must agree — they are two readings of one
+    /// question ("is this our own client's PUT?"), and a node whose store runs
+    /// in the client-reserved lane while its telemetry files the contract under
+    /// transit is reporting something no operator could reconcile.
+    ///
+    /// Both derive from `put_is_originator_loopback` for that reason, so this
+    /// pins the mapping rather than the (now impossible) disagreement.
+    #[test]
+    fn put_store_lane_and_cause_follow_originator_loopback() {
+        let own: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let peer: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+
+        assert!(
+            super::put_is_originator_loopback(Some(own), own),
+            "upstream == own_addr is the originator-loopback PUT"
+        );
+        assert!(
+            !super::put_is_originator_loopback(Some(own), peer),
+            "a genuine upstream peer is not loopback"
+        );
+        // Fail safe: unknown own address must not be read as loopback, or a node
+        // that has not yet learned its address would both over-prioritize every
+        // forwarded store and credit it to a local client.
+        assert!(
+            !super::put_is_originator_loopback(None, peer),
+            "unknown own address must not be treated as loopback"
+        );
+
+        assert_eq!(
+            super::put_store_priority(true),
+            crate::contract::Priority::ClientLocal
+        );
+        assert_eq!(
+            super::put_store_priority(false),
+            crate::contract::Priority::NetworkRelay
+        );
+        assert_eq!(
+            super::put_store_cause(true),
+            crate::ring::HostingCause::ClientPut,
+            "our own client's PUT is ClientPut, never transit"
+        );
+        assert_eq!(
+            super::put_store_cause(false),
+            crate::ring::HostingCause::TransitPut,
+            "someone else's PUT storing at this hop is transit"
         );
     }
 

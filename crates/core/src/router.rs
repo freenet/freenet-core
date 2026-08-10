@@ -294,8 +294,8 @@ pub(crate) struct NetworkEfficiencyV1 {
     /// `TelemetryLocalMetricsSnapshot::network_efficiency_delivery`.
     pub eff: [u64; 8],
     /// Monotonic hosting-BEGIN counts by CAUSE; row order is
-    /// `ring::hosting::HostingCause::ALL`: client GET, relay GET, sub-op GET,
-    /// client PUT, relay PUT, startup restore, unattributed.
+    /// `ring::hosting::HostingCause::ALL`: client GET, transit GET, sub-op GET,
+    /// client PUT, transit PUT, startup restore, unattributed.
     ///
     /// Answers "why is this peer hosting this contract" in aggregate, which
     /// nothing recorded before: `AccessType` distinguishes only GET from PUT and
