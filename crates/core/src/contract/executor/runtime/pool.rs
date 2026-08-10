@@ -63,6 +63,15 @@ pub struct RuntimePool {
     replacements_count: AtomicUsize,
     /// Shared StateStore used by all executors (ReDb uses exclusive file locking)
     shared_state_store: StateStore<Storage>,
+    /// Soft size limit for the wasmtime on-disk compile cache, resolved ONCE for
+    /// this pool by [`Self::new`] (#5014). Held so a replacement executor is
+    /// built with the same value instead of re-walking the data-dir mount.
+    ///
+    /// Resolving once is not merely an optimization: the resolver
+    /// (`default_wasmtime_cache_size_bytes`) reads the compile cache's own
+    /// on-disk size, so a per-executor re-derivation would sample a directory
+    /// that the first executor's engine has already begun writing into.
+    wasmtime_cache_size_bytes: u64,
     /// Shared notification channels for all subscribed clients.
     /// Stored at pool level to avoid race condition where subscriptions registered
     /// while an executor is checked out would be missed by that executor.
@@ -291,6 +300,68 @@ impl RuntimePool {
 
         let (_, _, _, shared_state_store) = Executor::<Runtime>::get_stores(&config).await?;
 
+        // Soft size limit for the wasmtime ON-DISK compile cache (#4683, #5014).
+        // Resolved exactly once here, before any executor exists, because:
+        //   * wasmtime fixes the limit at `Cache::new` (reached from the FIRST
+        //     executor's `create_backend_engine`) and never re-reads it, and
+        //   * the estimate measures the data-dir mount — the contracts dir, the
+        //     compile-cache dir, and free space — which is both wasteful to
+        //     repeat `pool_size` times and wrong to re-sample once the first
+        //     executor's engine has started writing into that cache dir.
+        // The limit is bounded by the aggregate DISK budget the cache is charged
+        // against, not only by RAM: `DiskUsageTracker::total_bytes()` counts the
+        // compile cache, that total gates every state/wasm admission, and the
+        // hosting sweep cannot reclaim compile-cache bytes — so a RAM-derived
+        // bound left a disk-tight, RAM-rich host able to wedge its own admission
+        // gate (#5014).
+        //
+        // The disk budget is estimated HERE rather than inside the resolver so
+        // that `wasm_runtime` needs no `ring` dependency: the hosting knobs are
+        // ring's, and the pool already passes these same four values to
+        // `Ring::set_hosting_disk_paths` (see `contract/handler.rs`).
+        //
+        // On `spawn_blocking`: two `du` walks, a `statvfs`, and (only when the
+        // existing cache is oversized) a bounded set of `remove_file`s. The
+        // identical walks in the 60s sweep are pushed onto a blocking thread for
+        // exactly this reason — `contracts_dir` is unbounded and non-self-pruning
+        // — and although this runs at startup, the session actor, the result
+        // router and the Ring background loops are already spawned, so it must
+        // not sit on the reactor either.
+        let contracts_dir = config.contracts_dir();
+        let compile_cache_dir = config.wasmtime_cache_dir();
+        let hosting_disk_pct = config.hosting_disk_pct;
+        let max_hosting_disk = config.max_hosting_disk;
+        let (startup_disk_budget, wasmtime_cache_size_bytes, compile_cache_reclaimed_bytes) =
+            tokio::task::spawn_blocking(move || {
+                let disk_budget = crate::ring::startup_disk_budget_estimate(
+                    &contracts_dir,
+                    &compile_cache_dir,
+                    hosting_disk_pct,
+                    max_hosting_disk,
+                );
+                let limit = crate::wasm_runtime::default_wasmtime_cache_size_bytes(disk_budget);
+                // Lowering the soft limit does NOT shrink an existing cache:
+                // wasmtime reads the limit only in its cleanup pass, that pass is
+                // reachable only from the cache-WRITE path, and it is gated behind
+                // a once-per-hour lock. A node with a stable contract-blob set
+                // performs only cache hits after a restart, so a cache written
+                // under an older, larger limit would persist indefinitely — and on
+                // the wedged node from #5014 that is self-sustaining, since a node
+                // whose admission gate is rejecting cannot take on the new
+                // contracts whose compiles would trigger a cleanup. Prune it here,
+                // before the first `Cache::new`, so a restart is a real remedy.
+                let reclaimed =
+                    crate::ring::prune_compile_cache_to_limit(&compile_cache_dir, limit);
+                (disk_budget, limit, reclaimed)
+            })
+            .await?;
+        tracing::info!(
+            wasmtime_cache_size_bytes,
+            startup_disk_budget_bytes = startup_disk_budget,
+            compile_cache_reclaimed_bytes,
+            "Resolved wasmtime on-disk compile-cache soft limit"
+        );
+
         // Create shared notification storage BEFORE creating executors
         // so we can pass references to each executor
         let shared_notifications: SharedNotifications = Arc::new(DashMap::new());
@@ -424,6 +495,7 @@ impl RuntimePool {
             shared_inherited_origins.clone(),
             None, // No shared backend yet — this executor creates the engine
             shared_contract_index.clone(),
+            wasmtime_cache_size_bytes,
         )
         .await?;
         let shared_backend_engine = first_executor.runtime.clone_backend_engine();
@@ -448,6 +520,7 @@ impl RuntimePool {
                 shared_inherited_origins.clone(),
                 Some(shared_backend_engine.clone()),
                 shared_contract_index.clone(),
+                wasmtime_cache_size_bytes,
             )
             .await?;
 
@@ -506,6 +579,7 @@ impl RuntimePool {
             checked_out: AtomicUsize::new(0),
             replacements_count: AtomicUsize::new(0),
             shared_state_store,
+            wasmtime_cache_size_bytes,
             shared_notifications,
             shared_summaries,
             shared_client_counts,
@@ -701,6 +775,11 @@ impl RuntimePool {
             self.shared_inherited_origins.clone(),
             Some(self.shared_backend_engine.clone()),
             self.shared_contract_index.clone(),
+            // Reuse the pool's resolved limit rather than re-deriving it: the
+            // shared backend engine already fixed wasmtime's soft limit at
+            // startup, and re-measuring now would sample a cache dir the engine
+            // has been writing into (#5014).
+            self.wasmtime_cache_size_bytes,
         )
         .await?;
 

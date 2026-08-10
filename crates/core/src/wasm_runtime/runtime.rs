@@ -209,9 +209,10 @@ pub struct RuntimeConfig {
     /// Soft size limit (bytes) for the wasmtime compile cache (#4683). `Some`
     /// overrides wasmtime's 512 MiB default via
     /// `CacheConfig::with_files_total_size_soft_limit`; `None` keeps the default.
-    /// Production resolves it from
-    /// [`default_wasmtime_cache_size_bytes`], which scales it to the memory the
-    /// node may use instead of pinning a flat constant.
+    /// Production resolves it in `RuntimePool::new` from
+    /// [`default_wasmtime_cache_size_bytes`], which takes the smaller of a
+    /// RAM-scaled ceiling and a quarter of the aggregate DISK budget this cache
+    /// is charged against (#5014) instead of pinning a flat constant.
     pub wasmtime_cache_size_bytes: Option<u64>,
 }
 
@@ -262,9 +263,18 @@ pub struct RuntimeConfig {
 /// (`MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES`, 64 MiB), so it evicts compiled
 /// modules from RAM more often and leans on this on-disk cache *more* than a
 /// large host does. It is set equal to the hosting budget's own floor
-/// (`MIN_DEFAULT_HOSTING_BUDGET_BYTES`, also 128 MiB) so the two on-disk
-/// allowances stay consistent: the smallest node the code contemplates gets the
-/// same floor for the state it hosts and for the compiled code that serves it.
+/// (`MIN_DEFAULT_HOSTING_BUDGET_BYTES`, also 128 MiB) so the two RAM-derived
+/// allowances stay consistent at every host size.
+///
+/// # This floors the RAM TERM, not the resolved limit (#5014)
+///
+/// Since #5014 the resolved limit is `min(ram_term, disk_budget / 4)`, and the
+/// `min` is taken AFTER this clamp. So a disk-tight host legitimately resolves
+/// BELOW 128 MiB — down to 32 MiB, a quarter of the disk budget's own 128 MiB
+/// floor. That is deliberate and is the defect being fixed: a floor that ignores
+/// disk is a bound a disk-tight host cannot honor, and re-imposing one after the
+/// `min` would restore the wedge. See [`default_wasmtime_cache_size_bytes`] and
+/// `disk_term_may_fall_below_the_ram_floor`.
 pub(crate) const MIN_WASMTIME_CACHE_SIZE_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Upper clamp for the node-relative wasmtime on-disk compile cache soft limit
@@ -293,9 +303,16 @@ pub(crate) const MAX_WASMTIME_CACHE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 /// set by how many distinct contract blobs the node executes, and that population
 /// is what the RAM-scaled hosting budget already bounds. Sharing the divisor
 /// makes the relationship exact instead of coincidental — with the same divisor,
-/// the same floor, and a strictly lower ceiling, the compile-cache **default**
-/// can never exceed the hosted-state **default** for the same host (pinned by
-/// `compile_cache_default_never_exceeds_hosting_default`). That is the shape of
+/// the same RAM-term floor, and a strictly lower ceiling, the compile-cache
+/// **default** can never exceed the hosted-state **default** for the same host
+/// (pinned by `compile_cache_default_never_exceeds_hosting_default`).
+///
+/// Both halves of that reasoning are about the RAM TERM. Since #5014 the
+/// resolved limit takes a `min` with a quarter of the disk budget, which only
+/// lowers it — so the ordering conclusion survives, but do not restate its
+/// premise as "the two budgets share a floor": the resolved compile-cache limit
+/// can fall to 32 MiB while the hosted-state budget sits at its own 128 MiB
+/// floor. That is the shape of
 /// the defect this replaced: on a peer under a 2 GiB cgroup the flat 512 MiB
 /// limit let the compile cache reach ~306 MB while that node's entire
 /// contract-state budget was 256 MiB.
@@ -311,13 +328,74 @@ pub(crate) const MAX_WASMTIME_CACHE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 /// defaults* stay ordered at every host size. Do not restate this as a
 /// system-level invariant.
 ///
-/// Note also that a RAM signal is not the right shape for this cache's real
-/// constraint: the compile cache is charged against the aggregate **disk** budget
-/// (`DiskUsageTracker::total_bytes()` sums state + wasm + compile-cache bytes and
-/// gates `admit_state_write` / `admit_wasm_write`), so a disk-tight but RAM-rich
-/// host is not protected by any RAM-derived bound. Tracked separately in #5014;
-/// this constant narrows the exposure on RAM-poor hosts without closing it.
+/// A RAM signal is not, on its own, the right shape for this cache's real
+/// constraint: the compile cache is charged against the aggregate **disk**
+/// budget (`DiskUsageTracker::total_bytes()` sums state + wasm + compile-cache
+/// bytes and gates `admit_state_write` / `admit_wasm_write`), so a disk-tight
+/// but RAM-rich host was not protected by any RAM-derived bound (#5014). The
+/// RAM term therefore survives only as the UPPER bound — a large disk must not
+/// license an unbounded cache — and the *binding* constraint on a disk-tight
+/// host is [`WASMTIME_CACHE_DISK_BUDGET_DIVISOR`]. See
+/// [`default_wasmtime_cache_size_bytes`].
 const WASMTIME_CACHE_RAM_DIVISOR: u64 = 8;
+
+/// Fraction of the **aggregate disk budget** the on-disk compile cache may claim
+/// as its soft limit: 1/4 (#5014).
+///
+/// # Why the disk budget, and not RAM, is the binding term
+///
+/// The cache is charged against the aggregate disk budget and is NOT reclaimable
+/// by the thing that defends that budget: the hosting sweep sheds contract
+/// *state*, and `compile_cache_bytes` is outside its reach. So a cache sized
+/// from a signal unrelated to disk could occupy the whole budget on a disk-tight
+/// host, at which point `total_bytes() > budget_bytes` holds before a single new
+/// byte is considered, every `admit_state_write` / `admit_wasm_write` rejects,
+/// and eviction cannot dig out no matter how much state it sheds. Wasmtime's own
+/// prune does not rescue it either — it stops at 70% of the soft limit.
+///
+/// # Why 1/4
+///
+/// It is chosen from the failure mode, not from a preference about cache size:
+/// a divisor of 1 lets the cache claim the entire budget, which IS the defect,
+/// and any divisor >= 2 buys the property that the cache never holds the
+/// majority of the budget. 4 picks a comfortable margin inside that — the steady
+/// state after a prune is `0.25 × 0.7 = 17.5%`, so the typical case leaves the
+/// budget overwhelmingly to consumers the node can act on.
+///
+/// # What the cap actually guarantees, and what it does not
+///
+/// It bounds **this cache's** contribution to the aggregate budget. Two things
+/// it must NOT be read as:
+///
+/// - It is not a bound on the cache's instantaneous footprint. Wasmtime's
+///   `update_data` writes the artifact FIRST and only then posts the cleanup
+///   notification, and the prune is gated behind a once-per-hour lock, so the
+///   real bound is `0.7 × L + (bytes written since the last cleanup)` and the
+///   tree can legitimately sit above `L` between cleanups. Freenet's
+///   distinct-blob arrival rate is low (418 artifacts against 185 live blobs on
+///   the production gateway), so the practical overshoot is small — but that is a
+///   rate argument about this workload, not a guarantee.
+/// - It is not a guarantee that the remaining 75% of the budget is reclaimable.
+///   Contract state is reclaimable (eviction sheds it) and WASM blobs dedupe on
+///   their own, but the storage term also carries redb dead space, which only the
+///   restart compaction reclaims and eviction cannot touch. The cap bounds one
+///   unreclaimable consumer; it does not make the rest of the budget reclaimable.
+///
+/// What it does buy is the thing the defect needed: the cache alone can no longer
+/// exceed the budget it is charged against, so `total_bytes() > budget` can no
+/// longer be true before a single new byte is considered — and eviction always
+/// has SOMETHING it can shed.
+///
+/// # It changes nothing for a host with room
+///
+/// The disk term only becomes the smaller of the two when
+/// `disk_budget < 4 × ram_term`, i.e. when Freenet-reachable capacity on the data
+/// mount is under ~4 GiB for a host at the 512 MiB RAM ceiling. Every host with
+/// more disk than that — a laptop, a normally-provisioned VM, the production
+/// gateway — resolves to exactly the RAM-derived value #5011 already gave it, so
+/// no node that works today has its cache slashed into a recompile-per-restart
+/// regime. Pinned by `disk_term_is_inert_on_hosts_with_room`.
+pub(crate) const WASMTIME_CACHE_DISK_BUDGET_DIVISOR: u64 = 4;
 
 /// Fallback "memory the node may use" estimate (1 GiB) when the OS query fails.
 ///
@@ -327,16 +405,99 @@ const WASMTIME_CACHE_RAM_DIVISOR: u64 = 8;
 /// largest.
 const WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// Default soft size limit for the wasmtime **on-disk compile cache**, scaled to
-/// the memory the node may use (host RAM, or a smaller cgroup limit when
-/// containerized — see [`read_total_ram_bytes`](super::read_total_ram_bytes))
-/// and clamped to a sane floor/ceiling.
+/// Default soft size limit for the wasmtime **on-disk compile cache**:
+/// `min(ram_term, disk_term)`, where the disk term is the binding one on the
+/// host shape that actually wedges (#5014).
 ///
-/// Returns `clamp(total_ram / WASMTIME_CACHE_RAM_DIVISOR,
-/// MIN_WASMTIME_CACHE_SIZE_BYTES, MAX_WASMTIME_CACHE_SIZE_BYTES)` — currently
-/// `clamp(total_ram / 8, 128 MiB, 512 MiB)`. It replaces a flat 512 MiB constant
-/// that applied regardless of machine size, which let a 2 GiB-cgroup node keep a
-/// compile cache larger than its whole 256 MiB contract-state budget.
+/// - **`ram_term`** = [`wasmtime_cache_size_for_ram`] — `clamp(total_ram / 8,
+///   128 MiB, 512 MiB)` against the memory the node may use (host RAM, or a
+///   smaller cgroup limit when containerized, see
+///   [`read_total_ram_bytes`](super::read_total_ram_bytes)). Kept as the UPPER
+///   bound: a host with an enormous disk must not license an unbounded cache,
+///   and the useful size of this cache is set by how many distinct contract
+///   blobs the node executes, a population the RAM-scaled hosting budget already
+///   bounds.
+/// - **`disk_term`** = [`wasmtime_cache_size_for_disk_budget`] — a quarter of the
+///   aggregate disk budget this cache is charged against.
+///
+/// # Why the disk term has to exist
+///
+/// `DiskUsageTracker::total_bytes()` sums state + wasm + **compile-cache** bytes,
+/// and that total gates `admit_state_write` / `admit_wasm_write` and feeds the
+/// eviction floor `min(ram_budget, disk_budget)`. Bounding a disk consumer by a
+/// RAM signal protects the RAM-poor host and leaves the RAM-rich, disk-tight one
+/// completely exposed: on a 16 GiB VM with 400 MiB free on the data mount, the
+/// old RAM-derived limit resolved to its 512 MiB ceiling while the disk budget
+/// was ~456 MiB, so `total_bytes()` exceeded the budget before any new state was
+/// considered, every admission rejected, and the hosting sweep could not recover
+/// because it sheds contract state and cannot touch the compile cache. With the
+/// disk term that same host resolves to ~114 MiB and keeps ~342 MiB of the
+/// budget for reclaimable consumers.
+///
+/// # The disk term may go BELOW `MIN_WASMTIME_CACHE_SIZE_BYTES`, deliberately
+///
+/// `min()` is taken after each term's own clamp, so on a host whose entire
+/// Freenet-reachable disk capacity is around a gigabyte the result lands below
+/// the 128 MiB RAM floor (its own lower bound is the disk budget's 128 MiB MIN
+/// over the divisor, i.e. 32 MiB — roughly 40 artifacts at the measured p90,
+/// 67 at the mean). Re-introducing an absolute floor here would recreate exactly
+/// the defect this closes: a floor that ignores disk is a bound that a
+/// disk-tight host cannot honor. Pinned by
+/// `disk_term_may_fall_below_the_ram_floor`.
+///
+/// # Ordering: `disk_budget` is a start-time ESTIMATE, resolved by the caller
+///
+/// Wasmtime fixes the soft limit once, at `Cache::new`, reached from
+/// `Executor::from_config_with_shared_modules` — which runs before
+/// `Ring::set_hosting_disk_paths` configures the `DiskUsageTracker` and long
+/// before the first sweep tick seeds it. So the disk budget cannot be read from
+/// the tracker, and `RuntimePool::new` derives it from the filesystem with
+/// [`crate::ring::startup_disk_budget_estimate`], using the live budget's own
+/// clamp math on the same `freenet_used + available` basis.
+///
+/// The estimate is resolved by the CALLER rather than here on purpose: the
+/// hosting-policy knobs it needs (`hosting_disk_pct`, `max_hosting_disk`, the
+/// data-dir paths) are `ring`'s business and the pool already holds all four a
+/// few lines from where it calls `Ring::set_hosting_disk_paths` with the same
+/// values. Taking the resolved budget as one `u64` keeps `wasm_runtime` free of
+/// any `ring` dependency, the direction this module already states elsewhere.
+///
+/// That estimate omits persisted state bytes (unreadable before storage exists)
+/// and is monotone in that term, so it is always `<=` the budget the first
+/// recompute installs — the cache therefore claims at most a quarter of the LIVE
+/// budget too, never more.
+///
+/// # There is no live re-application path; a RESTART is the recovery
+///
+/// Wasmtime reads the soft limit once and offers no way to change it on a live
+/// `Cache`; rebuilding one would mean tearing down the backend engine that every
+/// pool executor shares and discarding its compiled modules. So the limit is
+/// fixed for the lifetime of the process, and this is the residual hole that
+/// leaves — stated plainly rather than as a mitigation:
+///
+/// The live budget is recomputed every 60s as `clamp(pct × (used + available))`,
+/// while the cache's limit `L` does not move. Work the algebra at the margin:
+/// after the sweep has shed everything it can, the node is over budget iff
+/// `L > pct × (L + available)`, i.e. at the default pct = 0.5 iff `L >
+/// available`. So **any consumer outside Freenet that drives free space on the
+/// data mount below the compile cache's size re-creates the #5014 wedge for the
+/// rest of the process's life**, and no amount of eviction digs out.
+///
+/// What bounds that hole:
+///
+/// - It cannot be reached by Freenet's own writes. The estimate's basis is
+///   `freenet_used + available`, the mount's Freenet-reachable capacity, which is
+///   invariant under Freenet's own writes (a byte the cache gains is a byte
+///   `available` loses on the same mount). Only something outside Freenet filling
+///   or resizing the mount moves it.
+/// - It is now visible: `HostingManager::recompute_effective_budget` warns
+///   (edge-triggered) the first time `compile_cache_bytes` exceeds a quarter of
+///   the live budget, which is exactly the condition "the startup assumption no
+///   longer holds".
+/// - It is now recoverable: a restart re-derives the limit from the shrunken
+///   mount AND `ring::prune_compile_cache_to_limit` deletes the existing cache
+///   down to it, so "restart the node" is a real remedy rather than a hope that
+///   wasmtime's write-path cleanup happens to fire.
 ///
 /// # This is a SOFT limit, and the steady state is 70% of it
 ///
@@ -348,8 +509,9 @@ const WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES: u64 = 1024 * 1024 * 1024;
 /// - The steady-state footprint after a prune is `soft_limit × 0.7`, not
 ///   `soft_limit`.
 /// - Between cleanups the cache may legitimately sit at the FULL soft limit, so
-///   the disk it is charged against must tolerate the un-pruned figure, not just
-///   the steady-state one.
+///   the disk it is charged against must tolerate the un-pruned figure. This is
+///   why [`WASMTIME_CACHE_DISK_BUDGET_DIVISOR`] is applied to the soft limit
+///   rather than to the steady state: 25% is the worst case, 17.5% the typical.
 ///
 /// # Margin at the smallest shape is thin, not comfortable
 ///
@@ -363,6 +525,12 @@ const WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES: u64 = 1024 * 1024 * 1024;
 /// deliberately — the alternative was a cache bigger than the node's entire state
 /// budget.
 ///
+/// Those figures describe the RAM term, i.e. a 2 GiB host with disk to spare. A
+/// host that is ALSO disk-tight lands lower still, down to 32 MiB at the disk
+/// budget's floor. That is the correct trade in the other direction: the cost of
+/// too small a cache is Cranelift recompiles, while the cost of too large a one
+/// on a disk-tight host was a node that could not accept a PUT at all.
+///
 /// # Which cache this is
 ///
 /// The **on-disk** cache of compiled artifacts wasmtime writes under the data
@@ -373,20 +541,45 @@ const WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES: u64 = 1024 * 1024 * 1024;
 /// caches with separate budgets; this one has no operator override today (it
 /// never had one — it was a private constant), so this derived default is its
 /// only source.
-pub(crate) fn default_wasmtime_cache_size_bytes() -> u64 {
+pub(crate) fn default_wasmtime_cache_size_bytes(disk_budget: u64) -> u64 {
     let total_ram = super::read_total_ram_bytes()
         .map(|v| v as u64)
         .unwrap_or(WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES);
-    wasmtime_cache_size_for_ram(total_ram)
+    wasmtime_cache_size_for(total_ram, disk_budget)
 }
 
-/// Pure clamp math behind [`default_wasmtime_cache_size_bytes`], split out so the
-/// small-box / large-box / cgroup boundary behavior is unit-testable without
-/// depending on the test host's real RAM. Mirrors the `budget_for_ram` /
-/// `disk_budget_for_clamped` pattern used by the sibling budgets.
+/// Pure math behind [`default_wasmtime_cache_size_bytes`], split out so the
+/// small-box / large-box / cgroup / disk-tight boundary behavior is unit-testable
+/// without depending on the test host's real RAM or disk. Mirrors the
+/// `budget_for_ram` / `disk_budget_for_clamped` pattern used by the sibling
+/// budgets.
+///
+/// `min()` of the two terms, taken AFTER each has applied its own clamp — so the
+/// disk term can legitimately land below `MIN_WASMTIME_CACHE_SIZE_BYTES`. That is
+/// the point: a floor that ignores disk is unhonorable on a disk-tight host, and
+/// re-imposing one here would restore the defect.
+pub(crate) fn wasmtime_cache_size_for(total_ram: u64, disk_budget: u64) -> u64 {
+    wasmtime_cache_size_for_ram(total_ram).min(wasmtime_cache_size_for_disk_budget(disk_budget))
+}
+
+/// The RAM term: `clamp(total_ram / 8, 128 MiB, 512 MiB)`. Upper bound only —
+/// see [`WASMTIME_CACHE_RAM_DIVISOR`].
 pub(crate) fn wasmtime_cache_size_for_ram(total_ram: u64) -> u64 {
     (total_ram / WASMTIME_CACHE_RAM_DIVISOR)
         .clamp(MIN_WASMTIME_CACHE_SIZE_BYTES, MAX_WASMTIME_CACHE_SIZE_BYTES)
+}
+
+/// The disk term: the share of the aggregate disk budget the compile cache may
+/// claim, `disk_budget / WASMTIME_CACHE_DISK_BUDGET_DIVISOR` (#5014).
+///
+/// Deliberately unclamped on both ends. There is no floor because the disk
+/// budget already carries one (`MIN_DEFAULT_HOSTING_BUDGET_BYTES`, 128 MiB), so
+/// this cannot return less than 32 MiB, and adding a second, disk-blind floor is
+/// the defect being fixed. There is no ceiling because
+/// [`wasmtime_cache_size_for`] takes the `min` with the RAM term, which is
+/// already ceilinged.
+pub(crate) fn wasmtime_cache_size_for_disk_budget(disk_budget: u64) -> u64 {
+    disk_budget / WASMTIME_CACHE_DISK_BUDGET_DIVISOR
 }
 
 impl Default for RuntimeConfig {
@@ -1110,7 +1303,7 @@ mod wasmtime_disk_cache_sizing_tests {
     use super::{
         MAX_WASMTIME_CACHE_SIZE_BYTES, MIN_WASMTIME_CACHE_SIZE_BYTES,
         WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES, default_wasmtime_cache_size_bytes,
-        wasmtime_cache_size_for_ram,
+        wasmtime_cache_size_for, wasmtime_cache_size_for_disk_budget, wasmtime_cache_size_for_ram,
     };
     use crate::ring::hosting_budget_for_ram;
 
@@ -1288,37 +1481,241 @@ mod wasmtime_disk_cache_sizing_tests {
         let signal = crate::wasm_runtime::read_total_ram_bytes()
             .map(|v| v as u64)
             .unwrap_or(WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES);
+
+        // A disk budget pinned at its own 128 MiB MIN floor yields 32 MiB on
+        // EVERY host — below the 128 MiB RAM floor, which is the whole point:
+        // the disk signal, not RAM, decides on a disk-starved host. Concrete and
+        // host-independent, so this is the assertion doing the work.
         assert_eq!(
-            default_wasmtime_cache_size_bytes(),
+            default_wasmtime_cache_size_bytes(128 * MIB),
+            32 * MIB,
+            "a node whose disk budget is pinned at the 128 MiB floor gets a \
+             quarter of it, NOT the 128 MiB RAM floor"
+        );
+        // The reader must apply the pure math to the host's RAM signal rather
+        // than carrying its own arithmetic. Give the disk term room so the RAM
+        // term is the binding one; on a host at or above the ceiling-binding
+        // point (>= 4 GiB, i.e. most CI machines) both sides still evaluate to
+        // the ceiling, so this cannot distinguish a reader that ignores RAM —
+        // `default_soft_limit_reader_derives_from_ram_and_disk_signals` is what
+        // covers that host-independently.
+        assert_eq!(
+            default_wasmtime_cache_size_bytes(u64::MAX),
             wasmtime_cache_size_for_ram(signal),
-            "the live reader must apply the pure clamp to the RAM signal"
+            "with disk unconstrained the RAM term must decide, through the pure \
+             math"
         );
     }
 
-    /// Host-independent pin: the live reader must derive its value from the
-    /// shared RAM signal and delegate to the pure clamp. Fails if a future edit
-    /// re-hardcodes the limit or introduces a second notion of machine size —
-    /// the mutation a runtime assertion cannot catch on a large CI host.
+    /// Host-independent pin: the live reader must consult BOTH signals and
+    /// delegate to the pure math. Fails if a future edit re-hardcodes the limit,
+    /// drops the disk term back to a RAM-only bound (the #5014 defect), or
+    /// introduces a second notion of machine size — mutations a runtime
+    /// assertion cannot catch on a CI host whose RAM and disk are both ample.
+    ///
+    /// Needles are assembled from `concat!` fragments that appear nowhere
+    /// verbatim in this file, so the pin cannot satisfy itself by matching its
+    /// own source through `include_str!`.
     #[test]
-    fn default_soft_limit_reader_derives_from_the_ram_signal() {
+    fn default_soft_limit_reader_derives_from_ram_and_disk_signals() {
         let src = include_str!("runtime.rs");
         let body = src
-            .split("pub(crate) fn default_wasmtime_cache_size_bytes() -> u64 {")
-            .nth(1)
+            .split_once(concat!(
+                "pub(crate) fn ",
+                "default_wasmtime_cache_size_bytes(disk_budget: u64) -> u64 {\n"
+            ))
             .expect("default_wasmtime_cache_size_bytes must exist")
-            .split("\n}\n")
-            .next()
-            .expect("end of default_wasmtime_cache_size_bytes");
+            .1
+            .split_once("\n}\n")
+            .expect("end marker of default_wasmtime_cache_size_bytes must exist")
+            .0;
         assert!(
-            body.contains("read_total_ram_bytes()"),
+            body.contains(concat!("read_total_", "ram_bytes()")),
             "the reader must consult the shared read_total_ram_bytes() signal, not \
              a second notion of machine size"
         );
+        // The `disk_budget` parameter must reach the pure math. Dropping it (or
+        // substituting `u64::MAX`, a constant, or the RAM term) compiles fine and
+        // silently restores the RAM-only bound that left a disk-tight host
+        // unprotected (#5014). The budget itself is derived by the CALLER —
+        // `RuntimePool::new`, pinned by
+        // `runtime_pool_resolves_compile_cache_limit_from_the_disk_signal` — so
+        // that `wasm_runtime` needs no `ring` dependency.
         assert!(
-            body.contains("wasmtime_cache_size_for_ram("),
-            "the reader must delegate to the pure clamp so the boundary math has \
-             exactly one implementation"
+            body.contains(concat!(
+                "wasmtime_cache_",
+                "size_for(total_ram, disk_budget)"
+            )),
+            "the reader must delegate to the pure math with BOTH signals, so the \
+             boundary behavior has exactly one implementation and the disk term \
+             cannot be silently dropped"
         );
+        assert!(
+            !body.contains("crate::ring::"),
+            "the resolver must take the disk budget as a parameter rather than \
+             reaching into `ring`: `ring` already depends on `wasm_runtime`, so \
+             the reverse edge closes a module cycle"
+        );
+    }
+
+    /// The defect, stated as an invariant: the resolved soft limit must never
+    /// exceed a quarter of the aggregate disk budget it is charged against.
+    ///
+    /// This is what makes the wedge unreachable. `DiskUsageTracker::total_bytes()`
+    /// counts the compile cache, that total gates every state/wasm admission, and
+    /// the hosting sweep sheds contract STATE — it cannot reclaim compile-cache
+    /// bytes. So if the cache may occupy the whole budget, admission rejects
+    /// forever and eviction cannot dig out. A quarter leaves >= 75% of the budget
+    /// with consumers the node can actually reclaim.
+    #[test]
+    fn resolved_limit_never_claims_more_than_its_share_of_the_disk_budget() {
+        for total_ram in [0, GIB, 2 * GIB, 4 * GIB, 16 * GIB, 125 * GIB, u64::MAX] {
+            for disk_budget in [
+                0,
+                128 * MIB,
+                456 * MIB,
+                512 * MIB,
+                2 * GIB,
+                32 * GIB,
+                u64::MAX,
+            ] {
+                let limit = wasmtime_cache_size_for(total_ram, disk_budget);
+                // The `4` is a LITERAL on purpose. Written against
+                // `WASMTIME_CACHE_DISK_BUDGET_DIVISOR` this assertion would be
+                // self-referential — it would still pass if the divisor were
+                // mutated to 1, i.e. if the cache were allowed to claim the
+                // entire budget, which is precisely the defect.
+                assert!(
+                    limit.saturating_mul(4) <= disk_budget,
+                    "at ram={total_ram} disk_budget={disk_budget} the limit {limit} \
+                     claims more than a quarter of the budget it is charged against"
+                );
+            }
+        }
+
+        // The pre-fix behavior, shown failing that invariant at the exact shape
+        // from the report: a 16 GiB VM with 400 MiB free on the data mount, where
+        // freenet already occupies ~512 MiB, has a ~456 MiB disk budget.
+        let wedging_disk_budget = 456 * MIB;
+        let ram_only = wasmtime_cache_size_for_ram(16 * GIB);
+        assert_eq!(ram_only, 512 * MIB);
+        assert!(
+            ram_only > wedging_disk_budget,
+            "the RAM-derived limit exceeded the ENTIRE disk budget — total_bytes() \
+             was over budget before any new state was considered"
+        );
+        assert_eq!(
+            wasmtime_cache_size_for(16 * GIB, wedging_disk_budget),
+            114 * MIB,
+            "the disk-aware limit must fit inside the budget with room for the \
+             state and wasm the sweep can actually reclaim"
+        );
+    }
+
+    /// The three machine shapes this change was sized against. The first and
+    /// third must be BIT-IDENTICAL to what #5011 already gave them: a node that
+    /// works today must not have its cache slashed into a recompile-per-restart
+    /// regime just because a disk term now exists.
+    #[test]
+    fn disk_term_is_inert_on_hosts_with_room() {
+        // (a) 2 GiB-cgroup laptop, large disk: the disk budget clamps to its
+        // 32 GiB cap, so the disk term is 8 GiB and the RAM term still decides.
+        assert_eq!(wasmtime_cache_size_for(2 * GIB, 32 * GIB), 256 * MIB);
+        assert_eq!(
+            wasmtime_cache_size_for(2 * GIB, 32 * GIB),
+            wasmtime_cache_size_for_ram(2 * GIB),
+            "a RAM-poor host with disk to spare must see NO change from #5011"
+        );
+
+        // (c) 125 GiB server, 3.7 TB disk: same, at the ceiling. This is the
+        // production gateway — it keeps the 512 MiB it runs with today.
+        assert_eq!(wasmtime_cache_size_for(125 * GIB, 32 * GIB), 512 * MIB);
+        assert_eq!(
+            wasmtime_cache_size_for(125 * GIB, 32 * GIB),
+            wasmtime_cache_size_for_ram(125 * GIB),
+        );
+
+        // (b) 16 GiB VM, 400 MiB free: the ONLY one of the three that moves.
+        assert_eq!(wasmtime_cache_size_for(16 * GIB, 456 * MIB), 114 * MIB);
+        assert!(
+            wasmtime_cache_size_for(16 * GIB, 456 * MIB) < wasmtime_cache_size_for_ram(16 * GIB)
+        );
+
+        // The crossover, stated exactly: the disk term binds only when the disk
+        // budget is under 4x the RAM term. At the 512 MiB ceiling that is a
+        // 2 GiB budget, i.e. ~4 GiB of Freenet-reachable capacity on the mount.
+        assert_eq!(wasmtime_cache_size_for(16 * GIB, 2 * GIB), 512 * MIB);
+        assert_eq!(
+            wasmtime_cache_size_for(16 * GIB, 2 * GIB - 4),
+            512 * MIB - 1
+        );
+    }
+
+    /// The disk term MUST be able to fall below `MIN_WASMTIME_CACHE_SIZE_BYTES`.
+    /// Re-imposing the RAM floor after the `min` would restore the exact defect:
+    /// a floor that ignores disk is a bound a disk-tight host cannot honor.
+    ///
+    /// Its real lower bound is inherited from the disk budget's own 128 MiB MIN
+    /// clamp, so the resolved limit can never reach zero either.
+    #[test]
+    fn disk_term_may_fall_below_the_ram_floor() {
+        // A node whose entire Freenet-reachable disk capacity pins the budget to
+        // its MIN floor gets a quarter of it — a quarter of the RAM floor.
+        assert_eq!(wasmtime_cache_size_for(16 * GIB, 128 * MIB), 32 * MIB);
+        assert!(wasmtime_cache_size_for(16 * GIB, 128 * MIB) < MIN_WASMTIME_CACHE_SIZE_BYTES);
+
+        // The floor of the whole composition: the disk budget cannot be below
+        // 128 MiB (`disk_budget_for_clamped` clamps it there), so no legal input
+        // produces a zero-size, recompile-everything cache.
+        assert_eq!(wasmtime_cache_size_for_disk_budget(128 * MIB), 32 * MIB);
+        assert!(wasmtime_cache_size_for_disk_budget(128 * MIB) > 0);
+
+        // Only a budget BELOW the clamp floor — unreachable in production —
+        // degenerates further, and even then it saturates rather than panicking.
+        assert_eq!(wasmtime_cache_size_for_disk_budget(0), 0);
+        assert_eq!(wasmtime_cache_size_for(16 * GIB, 0), 0);
+    }
+
+    /// Disk-term boundaries in their own right: monotone, no overflow, and
+    /// concrete values (not expressed against the divisor constant, which would
+    /// make the assertions self-referential and survive a mutation of it).
+    #[test]
+    fn disk_term_boundaries_and_monotonicity() {
+        assert_eq!(wasmtime_cache_size_for_disk_budget(0), 0);
+        assert_eq!(wasmtime_cache_size_for_disk_budget(3), 0);
+        assert_eq!(wasmtime_cache_size_for_disk_budget(4), 1);
+        assert_eq!(wasmtime_cache_size_for_disk_budget(GIB), 256 * MIB);
+        assert_eq!(wasmtime_cache_size_for_disk_budget(32 * GIB), 8 * GIB);
+        // u64::MAX must divide, not wrap or panic.
+        assert_eq!(wasmtime_cache_size_for_disk_budget(u64::MAX), u64::MAX / 4);
+
+        let mut previous = 0;
+        for budget in [0, 128 * MIB, 456 * MIB, 2 * GIB, 32 * GIB, u64::MAX] {
+            let term = wasmtime_cache_size_for_disk_budget(budget);
+            assert!(
+                term >= previous,
+                "disk term must not shrink as the budget grows"
+            );
+            previous = term;
+        }
+    }
+
+    /// Composition sanity: the result is always exactly one of the two terms,
+    /// never some third value, and it is `min`-shaped (never larger than either).
+    #[test]
+    fn resolved_limit_is_the_smaller_of_the_two_terms() {
+        for total_ram in [0, GIB, 2 * GIB, 4 * GIB, 16 * GIB, u64::MAX] {
+            for disk_budget in [0, 128 * MIB, 456 * MIB, 2 * GIB, 32 * GIB, u64::MAX] {
+                let ram_term = wasmtime_cache_size_for_ram(total_ram);
+                let disk_term = wasmtime_cache_size_for_disk_budget(disk_budget);
+                let resolved = wasmtime_cache_size_for(total_ram, disk_budget);
+                // Against `disk_term`, not `disk_budget`: the budget is 4x the
+                // term, so the weaker form would hold even if the cache were
+                // allowed three quarters of the budget.
+                assert!(resolved <= ram_term && resolved <= disk_term);
+                assert!(resolved == ram_term || resolved == disk_term);
+            }
+        }
     }
 
     /// The OS-query fallback is itself a legal, conservative value: an
