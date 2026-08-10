@@ -793,6 +793,50 @@ mod tests {
         assert_eq!(stream.buffered_count(), 0);
     }
 
+    /// One byte past a full fragment: the sender emits two fragments, so the
+    /// pipe must expect two.
+    ///
+    /// This is the case that separates the fragment-size fix from the bug it
+    /// replaced. The old `MAX_DATA_SIZE - 40` overstated the payload by one
+    /// byte, so `div_ceil(1131, 1131)` computed `total_fragments = 1`: the pipe
+    /// declared itself complete after fragment #1 and then REJECTED the genuine
+    /// final fragment as out of range. The failure is silent truncation, not a
+    /// visible error, because `is_complete()` has already returned true by the
+    /// time the rejection happens.
+    ///
+    /// `test_partial_cascade` below does not distinguish the two - 6500 bytes
+    /// is 6 fragments under both formulas.
+    #[test]
+    fn test_fragment_count_one_byte_past_a_full_fragment() {
+        let total_bytes = (super::super::MAX_DATA_SIZE + 1) as u64;
+        let stream = PipedStream::new(
+            make_stream_id(),
+            total_bytes,
+            1,
+            PipedStreamConfig::default(),
+        );
+        assert_eq!(
+            stream.total_fragments(),
+            2,
+            "one byte past a full fragment takes two fragments, not one"
+        );
+
+        let forwarded = stream
+            .push_fragment(1, Bytes::from(vec![0u8; super::super::MAX_DATA_SIZE]))
+            .expect("fragment #1 is in range");
+        assert_eq!(forwarded.len(), 1);
+        assert!(
+            !stream.is_complete(),
+            "the stream must not report completion while a fragment is outstanding"
+        );
+
+        let forwarded = stream
+            .push_fragment(2, Bytes::from_static(&[0u8]))
+            .expect("the genuine final fragment must be accepted, not rejected as out of range");
+        assert_eq!(forwarded.len(), 1);
+        assert!(stream.is_complete());
+    }
+
     #[test]
     fn test_partial_cascade() {
         // 6 fragments at 1130 bytes/fragment: ceil(6500/1130) = 6
