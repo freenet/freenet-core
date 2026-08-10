@@ -3534,6 +3534,17 @@ async fn handle_interest_sync_message(
                         // differ byte-wise; ask the contract itself whether we
                         // hold state the peer lacks. See
                         // `summary_indicates_stale_peer`.
+                        // SHADOW MODE (futile-repair detector). What the
+                        // `is_stale` below actually RESTS ON. `is_stale` is the
+                        // right heal decision in all three cases, but only one
+                        // of them is evidence about convergence: the other two
+                        // default to stale with nothing behind them, and their
+                        // frequency grows with peer breadth and node load
+                        // rather than with brokenness. Tracked alongside rather
+                        // than re-derived afterwards, because only the branch
+                        // that TOOK the default knows it took one. See
+                        // `crate::ring::futile_repair::OutcomeEvidence`.
+                        let mut evidence = crate::ring::futile_repair::OutcomeEvidence::Verdict;
                         let is_stale = match (our_summary.as_ref(), their_summary.as_ref()) {
                             (Some(ours), Some(theirs)) => {
                                 let identical = ours.as_ref() == theirs.as_ref();
@@ -3580,12 +3591,22 @@ async fn handle_interest_sync_message(
                                         }
                                         StalenessProbeAction::RunProbe => {
                                             staleness_probes_used += 1;
-                                            op_manager
+                                            let verdict = op_manager
                                                 .interest_manager
                                                 .peer_summary_has_pending_state(
                                                     op_manager, &contract, theirs, ours,
                                                 )
-                                                .await
+                                                .await;
+                                            if verdict.is_none() {
+                                                // The probe ran and produced no
+                                                // answer (delta error, timeout,
+                                                // unexpected response), so the
+                                                // byte-compare default below is
+                                                // not a convergence verdict.
+                                                evidence = crate::ring::futile_repair::
+                                                    OutcomeEvidence::ProbeUnavailable;
+                                            }
+                                            verdict
                                         }
                                         StalenessProbeAction::BudgetExhaustedFallBack => {
                                             // Budget spent for this message: fall
@@ -3595,6 +3616,15 @@ async fn handle_interest_sync_message(
                                             // Re-evaluated next heartbeat once the
                                             // cache warms. `None` => byte-compare in
                                             // `summary_indicates_stale_peer`.
+                                            //
+                                            // This is the load-correlated channel:
+                                            // everything past the 32-probe budget
+                                            // reads as stale every round with no
+                                            // divergence at all, so it must never
+                                            // reach the futile-repair detector as a
+                                            // verdict.
+                                            evidence = crate::ring::futile_repair::
+                                                OutcomeEvidence::ProbeBudgetExhausted;
                                             None
                                         }
                                     }
@@ -3638,12 +3668,13 @@ async fn handle_interest_sync_message(
                         //
                         // Passing `!is_stale` rather than a constant is the
                         // whole detector: it is what separates a repair that
-                        // failed to converge from one that worked. Pure
-                        // accounting, no behaviour change.
+                        // failed to converge from one that worked. `evidence`
+                        // is what keeps the two conservative defaults out of
+                        // that number. Pure accounting, no behaviour change.
                         if our_summary.is_some() && their_summary.is_some() {
                             op_manager
                                 .interest_manager
-                                .record_repair_outcome(&contract, &pk, !is_stale);
+                                .record_repair_outcome(&contract, &pk, !is_stale, evidence);
                         }
 
                         // #4952: upsert (not update) when the peer reported a
@@ -4006,11 +4037,21 @@ async fn handle_interest_sync_message(
                                 // `Summaries` arm does. `NeedBytes` deliberately
                                 // records nothing — it defers to the full-bytes
                                 // `Summaries` reply, which observes there, so
-                                // one divergence is never counted twice. Pure
-                                // accounting, no behaviour change.
-                                op_manager
-                                    .interest_manager
-                                    .record_repair_outcome(&contract, &pk, !is_stale);
+                                // one divergence is never counted twice.
+                                //
+                                // Evidence is `Verdict` by construction and NOT
+                                // a shortcut: `summary_indicates_stale_peer` is
+                                // called on byte-identical operands here, which
+                                // short-circuits before any delta probe, so no
+                                // probe budget is consulted and no default can
+                                // be taken. Pure accounting, no behaviour
+                                // change.
+                                op_manager.interest_manager.record_repair_outcome(
+                                    &contract,
+                                    &pk,
+                                    !is_stale,
+                                    crate::ring::futile_repair::OutcomeEvidence::Verdict,
+                                );
                                 // #4952: seed the peer-summary cache so an
                                 // advertised co-host does not stay a
                                 // full-state broadcast target. Fact, not
@@ -8641,14 +8682,27 @@ mod tests {
         fn futile_repair_attempt_is_recorded_only_where_the_heal_is_emitted() {
             const SOURCE: &str = include_str!("node.rs");
 
-            let start = SOURCE
-                .find("for contract in stale_contracts {")
-                .expect("stale-contract emission loop not found");
-            let window_end = SOURCE[start..]
-                .find("for (key, state_hash) in confirmed_states {")
-                .map(|off| start + off)
-                .unwrap_or(SOURCE.len());
-            let window = &SOURCE[start..window_end];
+            // Scoped to `emit_stale_peer_syncs`'s OWN body. An earlier revision
+            // ran the window from the loop header to an anchor ~500 lines later
+            // in the `Summaries` arm, so it stayed green for a
+            // `record_repair_attempt` moved clean out of the function — which
+            // is precisely the regression it names. The function's body ends at
+            // the first `\n}` in column 0 after its signature, which is what a
+            // top-level `fn` terminator looks like in this file.
+            let fn_start = SOURCE
+                .find("async fn emit_stale_peer_syncs(")
+                .expect("emit_stale_peer_syncs not found — update this pin");
+            let fn_end = fn_start
+                + SOURCE[fn_start..]
+                    .find("\n}\n")
+                    .expect("end of emit_stale_peer_syncs not found")
+                + 1;
+            let body = &SOURCE[fn_start..fn_end];
+            let start = fn_start
+                + body
+                    .find("for contract in stale_contracts {")
+                    .expect("stale-contract emission loop not found");
+            let window = &SOURCE[start..fn_end];
 
             let record = window.find("record_repair_attempt(").expect(
                 "the futile-repair attempt is no longer recorded in the heal \
@@ -8723,19 +8777,52 @@ mod tests {
                  one-sided reports as successful repairs",
                 sites.len()
             );
+            let mut passes_tracked_evidence = 0usize;
             for (pos, _) in sites {
                 let call = &body[pos..body[pos..]
                     .find(");")
                     .map(|o| pos + o)
                     .unwrap_or(body.len())];
+                // Whitespace-stripped: rustfmt collapses or explodes an
+                // argument list depending on how long the arguments are, so a
+                // pin that matches raw source breaks the first time an argument
+                // is renamed — and a broken pin gets weakened, not fixed. Only
+                // the argument SEQUENCE is load-bearing here.
+                let squashed_call: String = call.split_whitespace().collect();
                 assert!(
-                    call.contains("!is_stale"),
+                    squashed_call.contains("!is_stale"),
                     "a futile-repair outcome site passes something other than \
                      `!is_stale`: the verdict IS the detector — a constant \
                      there measures repair volume, not repair failure. Got: \
                      {call}"
                 );
+                // The verdict alone is not enough. `is_stale` also comes out
+                // `true` when the per-message probe budget ran out or the delta
+                // probe failed, neither of which is evidence about convergence,
+                // and the first of those grows with peer breadth rather than
+                // with brokenness. Every site must say which it is.
+                assert!(
+                    squashed_call.contains("evidence")
+                        || squashed_call.contains("OutcomeEvidence::"),
+                    "a futile-repair outcome site no longer passes an \
+                     `OutcomeEvidence`: without it the load-correlated \
+                     budget-exhausted default is counted as futility and the \
+                     headline number tracks how busy this node is. Got: {call}"
+                );
+                if squashed_call.contains("!is_stale,evidence") {
+                    passes_tracked_evidence += 1;
+                }
             }
+            assert_eq!(
+                passes_tracked_evidence, 1,
+                "exactly one outcome site (the `Summaries` arm) must pass the \
+                 `evidence` TRACKED alongside the staleness decision. \
+                 Hard-coding `OutcomeEvidence::Verdict` there re-derives the \
+                 provenance away from the branch that took the default, which \
+                 is the whole finding — only the `SummaryDigests` agreement \
+                 arm may name a literal, and only because it compares \
+                 byte-identical operands and can take no default"
+            );
             // Whitespace-stripped so rustfmt wrapping the condition cannot
             // break the pin.
             let squashed: String = body.split_whitespace().collect();
@@ -9087,7 +9174,41 @@ mod tests {
         /// `contract_state_present` returns `true` when no hosting storage is
         /// attached, so the `should_summarize_or_broadcast` gate is satisfied
         /// by `host_contract` alone and no redb temp dir is needed.
+        /// What the stand-in contract handler answers a `GetDeltaQuery` — the
+        /// semantic-staleness probe (#4857) — with.
+        ///
+        /// These are the three things `interest::peer_summary_has_pending_state`
+        /// can return, and they produce three DIFFERENT provenances for one
+        /// `is_stale: bool`. The futile-repair detector has to tell them apart
+        /// (see `crate::ring::futile_repair::OutcomeEvidence`), so the harness
+        /// has to be able to produce them.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum DeltaBehavior {
+            /// The contract holds state the peer lacks: a byte mismatch is a
+            /// real divergence and heals. The default, and what every
+            /// pre-existing test here assumes.
+            NonEmpty,
+            /// The contract says the peer is logically converged despite
+            /// differing summary bytes — the non-deterministic-serialization
+            /// shape #4857 exists for. A real verdict, and it is NOT stale.
+            Empty,
+            /// The probe produced no verdict at all.
+            /// `summary_indicates_stale_peer` then falls back to the
+            /// conservative byte compare, so the peer reads STALE on no
+            /// evidence whatsoever.
+            Failing,
+        }
+
         async fn build_harness(id: &str, port_base: u16, our_summary: Vec<u8>) -> Harness {
+            build_harness_with(id, port_base, our_summary, DeltaBehavior::NonEmpty).await
+        }
+
+        async fn build_harness_with(
+            id: &str,
+            port_base: u16,
+            our_summary: Vec<u8>,
+            delta_behavior: DeltaBehavior,
+        ) -> Harness {
             let config_args = crate::config::ConfigArgs {
                 id: Some(id.to_string()),
                 mode: Some(crate::contract::OperationMode::Local),
@@ -9177,18 +9298,29 @@ mod tests {
                                 }),
                             }
                         }
-                        // The semantic-staleness probe (#4857): a NON-EMPTY
-                        // delta is the contract answering "yes, I hold state
-                        // this peer lacks", which is what turns a byte
-                        // mismatch into a real heal. Returning an empty delta
-                        // here would make every divergence test vacuous.
+                        // The semantic-staleness probe (#4857). The default
+                        // (`NonEmpty`) is the contract answering "yes, I hold
+                        // state this peer lacks", which is what turns a byte
+                        // mismatch into a real heal — returning an empty delta
+                        // by default would make every divergence test vacuous.
+                        // The other two variants exist so a test can produce
+                        // the OTHER two provenances of `is_stale`; see
+                        // `DeltaBehavior`.
                         ContractHandlerEvent::GetDeltaQuery { key, .. } => {
-                            ContractHandlerEvent::GetDeltaResponse {
-                                key,
-                                delta: Ok(freenet_stdlib::prelude::StateDelta::from(vec![
-                                    1u8, 2, 3,
-                                ])),
-                            }
+                            let delta = match delta_behavior {
+                                DeltaBehavior::NonEmpty => {
+                                    Ok(freenet_stdlib::prelude::StateDelta::from(vec![1u8, 2, 3]))
+                                }
+                                DeltaBehavior::Empty => {
+                                    Ok(freenet_stdlib::prelude::StateDelta::from(Vec::<u8>::new()))
+                                }
+                                DeltaBehavior::Failing => {
+                                    Err(crate::contract::ExecutorError::other(
+                                        crate::contract::ContractQueueFull,
+                                    ))
+                                }
+                            };
+                            ContractHandlerEvent::GetDeltaResponse { key, delta }
                         }
                         other => panic!("unexpected handler event: {other:?}"),
                     };
@@ -11085,6 +11217,205 @@ mod tests {
                     "both wire forms must reach the detector as observations — \
                      a zero here on either arm means that observation site is \
                      not wired at all"
+                );
+            }
+
+            /// HIGH-2, the load-correlated false-positive channel, end to end.
+            ///
+            /// `MAX_STALENESS_PROBES_PER_SUMMARIES` caps semantic-staleness
+            /// probes at 32 per `Summaries` message. Past that,
+            /// `summary_indicates_stale_peer` takes the conservative
+            /// bytes-differ-means-stale DEFAULT — correct as a heal decision,
+            /// but it means everything after position 32 reads as stale every
+            /// round with no divergence at all. If that fed the detector, the
+            /// headline number would grow with how many contracts a peer
+            /// reports, i.e. with peer breadth and node load, rather than with
+            /// brokenness.
+            ///
+            /// This drives exactly that shape through the real handler: a
+            /// filler contract burns the whole probe budget, and the contract
+            /// we track is always the entry past the budget. Its bytes differ
+            /// every round, but the contract's own delta is EMPTY — it is
+            /// logically converged (the #4857 non-deterministic-summary shape)
+            /// and would be scored converged if it were ever probed. Nothing
+            /// here is broken.
+            ///
+            /// Mutation that must fail this test: pass
+            /// `OutcomeEvidence::Verdict` unconditionally at the `Summaries`
+            /// outcome site — i.e. the pre-fix code, which passed `!is_stale`
+            /// alone. The tracked contract then accrues a futile streak of
+            /// `QUARANTINE_THRESHOLD` from load alone and reports
+            /// `would_quarantine == 1`.
+            #[tokio::test]
+            async fn probe_budget_exhaustion_is_not_counted_as_futility() {
+                let ours = vec![5u8; 128];
+                let mut h =
+                    build_harness_with("futile-budget", 17130, ours.clone(), DeltaBehavior::Empty)
+                        .await;
+                let peer = h.new_peer;
+
+                // A second hosted contract, purely to burn the probe budget.
+                // The one from the harness (`h.key`) is the one we track.
+                let filler = ContractKey::from_id_and_code(
+                    ContractInstanceId::new([77u8; 32]),
+                    CodeHash::new([78u8; 32]),
+                );
+                let _ = h
+                    .op_manager
+                    .ring
+                    .host_contract(filler, 128, crate::ring::AccessType::Put);
+                h.op_manager
+                    .interest_manager
+                    .register_local_hosting(&filler);
+
+                let filler_hash = contract_hash(&filler);
+                let tracked_hash = contract_hash(&h.key);
+                // Novel bytes every entry and every round, so every lookup is a
+                // genuine cache MISS — a cache hit costs no budget and would
+                // answer with a real verdict, defeating the setup.
+                let mut nonce = 0u16;
+                let mut novel = |len: usize| {
+                    nonce += 1;
+                    let mut bytes = vec![0u8; len];
+                    bytes[0] = (nonce & 0xff) as u8;
+                    bytes[1] = (nonce >> 8) as u8;
+                    bytes
+                };
+
+                // One extra round for the same reason as the stuck-edge test:
+                // the opening round has no outstanding attempt to settle.
+                for _ in 0..=QUARANTINE_THRESHOLD {
+                    let mut entries: Vec<SummaryEntry> = (0..MAX_STALENESS_PROBES_PER_SUMMARIES)
+                        .map(|_| SummaryEntry {
+                            hash: filler_hash,
+                            summary_bytes: Some(novel(64)),
+                        })
+                        .collect();
+                    // The budget is now spent, so THIS entry is defaulted.
+                    entries.push(SummaryEntry {
+                        hash: tracked_hash,
+                        summary_bytes: Some(novel(64)),
+                    });
+                    handle_interest_sync_message(
+                        &h.op_manager,
+                        peer,
+                        InterestMessage::Summaries {
+                            emitter: crate::message::SummariesEmitter::Other,
+                            entries,
+                        },
+                    )
+                    .await;
+                    // SHADOW MODE: the defaulted verdict still heals, exactly
+                    // as before. Only the accounting changes.
+                    let heals = h.drain_heals();
+                    assert_eq!(
+                        heals,
+                        vec![(h.key, peer)],
+                        "the conservative default must still emit its heal — \
+                         this change must not alter behaviour"
+                    );
+                }
+
+                // The harm first, so a regression names it rather than naming
+                // a bookkeeping row.
+                let snap = h.op_manager.interest_manager.futile_repair_snapshot();
+                assert_eq!(
+                    snap.would_quarantine, 0,
+                    "a contract that is logically CONVERGED reached the shadow \
+                     threshold purely because the peer reported more contracts \
+                     than the probe budget covers — the headline is now a load \
+                     metric: {snap:?}"
+                );
+                assert_eq!(
+                    snap.futile, 0,
+                    "running out of probe budget is not evidence that a repair \
+                     failed — counting it makes the headline grow with peer \
+                     breadth and node load instead of with brokenness"
+                );
+                assert_eq!(
+                    snap.outcomes_probe_budget_exhausted,
+                    u64::from(QUARANTINE_THRESHOLD) + 1,
+                    "every round's over-budget entry must be recorded as a \
+                     defaulted verdict, one per message"
+                );
+                assert_eq!(snap.edges_at_threshold, 0);
+                assert!(
+                    snap.attempts >= u64::from(QUARANTINE_THRESHOLD),
+                    "the heals were emitted and charged as attempts; only \
+                     their OUTCOMES are unclassifiable, got {snap:?}"
+                );
+                // The readable signature of the "we cannot tell" regime, and
+                // the one an evasion attempt would produce (see the module
+                // docs' second known limitation): heals keep going out and
+                // keep being superseded unsettled, while `futile` and
+                // `productive` both stay flat. A defaulted outcome must NOT
+                // consume the attempt, so the count rises.
+                assert!(
+                    snap.attempts_superseded >= u64::from(QUARANTINE_THRESHOLD) - 1,
+                    "an unclassifiable outcome must leave the attempt \
+                     outstanding, so the next heal supersedes it — that pairing \
+                     of high `attempts_superseded` with flat futile/productive \
+                     is how the regime is recognised in the field: {snap:?}"
+                );
+            }
+
+            /// The other evidence-free provenance: the probe RAN and produced
+            /// no verdict (delta error / timeout). `summary_indicates_stale_peer`
+            /// falls back to the byte compare and reports stale, so without the
+            /// evidence split a contract-side or runtime-side fault would
+            /// manufacture a full futility streak on a healthy edge.
+            ///
+            /// Mutation that must fail this test: as above, pass
+            /// `OutcomeEvidence::Verdict` unconditionally — `would_quarantine`
+            /// goes to 1 and `futile` to `QUARANTINE_THRESHOLD`.
+            #[tokio::test]
+            async fn a_failed_delta_probe_is_not_counted_as_futility() {
+                let ours = vec![5u8; 128];
+                let mut h = build_harness_with(
+                    "futile-probe-fail",
+                    17140,
+                    ours.clone(),
+                    DeltaBehavior::Failing,
+                )
+                .await;
+                let peer = h.new_peer;
+
+                let mut rounds = 0u64;
+                for round in 0..=QUARANTINE_THRESHOLD {
+                    // Novel bytes each round: a repeated pair would be served
+                    // from the delta cache rather than re-probed.
+                    let theirs = vec![(round as u8).wrapping_add(1); 64];
+                    let heals = report_summary(&mut h, peer, &theirs).await;
+                    assert_eq!(
+                        heals.len(),
+                        1,
+                        "a failed probe still falls back to the byte compare \
+                         and still heals — behaviour is unchanged"
+                    );
+                    rounds += 1;
+                }
+
+                // The harm first, so a regression names it rather than naming
+                // a bookkeeping row.
+                let snap = h.op_manager.interest_manager.futile_repair_snapshot();
+                assert_eq!(
+                    snap.would_quarantine, 0,
+                    "a contract-side or runtime-side probe fault manufactured a \
+                     quarantine candidate on a healthy edge: {snap:?}"
+                );
+                assert_eq!(
+                    snap.futile, 0,
+                    "a probe that produced no verdict is not evidence that a \
+                     repair failed"
+                );
+                assert_eq!(
+                    snap.outcomes_probe_unavailable, rounds,
+                    "each round's unanswerable probe must be recorded as its \
+                     own class, separate from budget exhaustion"
+                );
+                assert_eq!(
+                    snap.attempts, rounds,
+                    "every round still emitted (and charged) its heal"
                 );
             }
         }

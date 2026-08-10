@@ -8311,6 +8311,57 @@ mod instant_now_pin_test {
     }
 }
 
+/// Wiring pin for the shadow-mode futile-repair rows on
+/// `network_efficiency_v1` (`crate::ring::futile_repair`).
+///
+/// The detector's state machine is unit-tested in its own module and its
+/// handler wiring in `node.rs`. What NEITHER can see is the assignment in
+/// `router_snapshot_telemetry` that connects the two: drop it, or feed a row
+/// from the wrong source, and every one of those tests stays green while the
+/// fleet publishes zeros — for a release whose entire purpose is to establish
+/// the detector's real frequency in production. That is the #4009/#4010
+/// manually-mirrored-telemetry footgun, and the snapshot loop is a 30-minute
+/// background cadence inside a fully-built `Ring`, which is why it is pinned by
+/// source scrape rather than executed.
+#[cfg(test)]
+mod futile_repair_wiring_pin {
+    /// Production source only: the needles below appear in this module too, and
+    /// a pin that matches its own source is a pin that can never fail.
+    fn production_source() -> &'static str {
+        const FULL: &str = include_str!("ring.rs");
+        let cutoff = FULL
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("ring.rs must have a top-level #[cfg(test)] mod section");
+        &FULL[..cutoff]
+    }
+
+    #[test]
+    fn network_efficiency_block_is_fed_from_the_futile_repair_snapshot() {
+        let src = production_source();
+        assert!(
+            src.contains(
+                "let futile_repair = op_manager.interest_manager.futile_repair_snapshot();"
+            ),
+            "the futile-repair snapshot is no longer taken in the \
+             router_snapshot block — the detector then collects its counters \
+             and exports nothing, while every test for it still passes"
+        );
+        for (field, source_expr) in [
+            ("futile", "futile_repair.to_row()"),
+            ("futile_ladder", "futile_repair.ladder"),
+        ] {
+            let needle = format!("{field}: {source_expr},");
+            assert!(
+                src.contains(&needle),
+                "`NetworkEfficiencyV1.{field}` must be populated as `{needle}` \
+                 in the router_snapshot block. Dropping it, or feeding it from \
+                 anything else, publishes an empty or wrong series with no \
+                 failing test — #4009/#4010."
+            );
+        }
+    }
+}
+
 /// Pin tests for the periodic hosting-advertisement re-request (#4642 spec step
 /// 1, "Fix 1"): the reliability backstop that heals a dropped on-connect
 /// advertisement exchange or a dropped per-eviction retraction. It is PIGGYBACKED

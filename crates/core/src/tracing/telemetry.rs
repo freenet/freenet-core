@@ -3367,10 +3367,10 @@ mod tests {
         // is the first time the JSON-bytes budgets have moved, so the same
         // arithmetic the OTLP budgets carry is owed here:
         //
-        //   19 new counters (11 scalars + an 8-rung survival ladder)
-        //   +162 JSON bytes at busy-fleet values (5095 measured -> 5257)
+        //   22 new counters (14 scalars + an 8-rung survival ladder)
+        //   +183 JSON bytes at busy-fleet values (5095 measured -> 5278)
         //   emitted once per ~30 min per peer, ~2000 reporting peers
-        //   => 48 * 2000 * ~162 B ~= 16 MB/day
+        //   => 48 * 2000 * ~183 B ~= 18 MB/day
         //
         // against a collector ingesting ~88.8 GB/day: about 0.02%. The block
         // is already the minimum that answers its question — the ladder is 8
@@ -3378,8 +3378,14 @@ mod tests {
         // no per-contract or per-peer label (the cardinality would be
         // attacker-controlled). Do NOT raise this again without redoing the
         // arithmetic.
+        //
+        // The scalar count went 11 -> 14 during review (the three rows that
+        // say when the headline must NOT be read at face value:
+        // `outcomes_probe_budget_exhausted`, `outcomes_probe_unavailable`,
+        // `outcomes_after_long_gap`). That cost 21 bytes and needed no further
+        // raise — the figure above is re-measured, not extrapolated.
         const MAX_BUSY_JSON_BYTES: usize = 5_376;
-        // Raised from 14_336 alongside the busy budget, same 19 counters. This
+        // Raised from 14_336 alongside the busy budget, same 22 counters. This
         // is the MATHEMATICAL ceiling (every counter at u64::MAX, 20 digits),
         // so it constrains schema shape rather than real bytes.
         const MAX_WORST_CASE_JSON_BYTES: usize = 14_848;
@@ -3398,11 +3404,11 @@ mod tests {
         // of 10 classes (the other 6 are a measured zero) and 6 size buckets
         // rather than 8. Do NOT raise this again without redoing the
         // arithmetic; the JSON-bytes budgets above are deliberately unchanged.
-        // Raised again from 5_376 for the 19 futile-repair counters; see the
+        // Raised again from 5_376 for the 22 futile-repair counters; see the
         // arithmetic on MAX_BUSY_JSON_BYTES above.
         const MAX_BUSY_OTLP_MARGINAL_BYTES: usize = 5_632;
         // Raised from 14_336 alongside the busy budget above, same 30 new
-        // counters, same #5153 rationale, then again for the 19 futile-repair
+        // counters, same #5153 rationale, then again for the 22 futile-repair
         // counters. This bound is the MATHEMATICAL ceiling (every counter at
         // u64::MAX, 20 digits); no fleet value approaches it, so it constrains
         // schema shape rather than real bytes.

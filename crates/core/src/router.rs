@@ -302,17 +302,59 @@ pub(crate) struct NetworkEfficiencyV1 {
     ///
     /// Order (`FutileRepairSnapshot::to_row`, which is the wire contract):
     /// attempts, futile, productive, observations_unpaired,
-    /// attempts_superseded, attempts_expired, would_quarantine,
-    /// edges_at_threshold, tracked_edges, evictions,
-    /// evictions_losing_streak.
+    /// attempts_superseded, attempts_discarded,
+    /// outcomes_probe_budget_exhausted, outcomes_probe_unavailable,
+    /// outcomes_after_long_gap, would_quarantine, edges_at_threshold,
+    /// tracked_edges, evictions, evictions_losing_streak.
     ///
     /// `would_quarantine` is the headline: edges that reached
     /// `futile_repair::QUARANTINE_THRESHOLD` consecutive futile repairs.
-    /// NOTHING is quarantined — this release only measures. Read
-    /// `tracked_edges` against `futile_repair::EDGE_CAPACITY` and
-    /// `evictions_losing_streak` BEFORE reading the rest: a saturated LRU makes
-    /// every futility count an undercount, which is how `ms_unt_age` became
-    /// useless.
+    /// NOTHING is quarantined — this release only measures.
+    ///
+    /// # Read these four rows BEFORE the headline
+    ///
+    /// Each is a way the headline can be wrong, in the direction named:
+    ///
+    /// * `outcomes_probe_budget_exhausted` — comparisons where "stale" was the
+    ///   conservative DEFAULT because the per-message WASM probe budget
+    ///   (`node::MAX_STALENESS_PROBES_PER_SUMMARIES` = 32) was spent, not a
+    ///   verdict. Excluded from `futile` for exactly this reason: it grows with
+    ///   peer breadth and node load, so a large value means the heal path is
+    ///   classifying load as staleness and any future gating threshold has to
+    ///   be set knowing that.
+    /// * `outcomes_probe_unavailable` — the same default, but because the
+    ///   contract's own `get_state_delta` errored or timed out. Contract or
+    ///   runtime health, not divergence.
+    /// * `outcomes_after_long_gap` — classified outcomes settled more than
+    ///   `futile_repair::LONG_GAP_THRESHOLD` after their attempt. Not a
+    ///   separate class (these ARE in `futile`/`productive`), but the longer the
+    ///   gap the likelier something other than our heal moved the state. On
+    ///   links still taking the byte-budgeted full-bytes fallback a contract is
+    ///   re-compared on the order of ten hours, so these can dominate; if they
+    ///   do, the headline is measuring rotation latency.
+    /// * `attempts_discarded` — attempts dropped unsettled because the peer's
+    ///   interest state was torn down after the disconnect grace period. An
+    ///   undercount, and the honest denominator for `futile + productive`
+    ///   alongside `attempts`.
+    ///
+    /// Then read `tracked_edges` against `futile_repair::EDGE_CAPACITY`
+    /// together with `evictions_losing_streak`: a saturated LRU makes every
+    /// futility count an undercount, which is how `ms_unt_age` became useless.
+    ///
+    /// # Two things a fleet aggregation gets wrong by default
+    ///
+    /// * **Every row is PER OBSERVER.** Divergence is symmetric — A sees B
+    ///   stale while B sees A stale — so both ends of a stuck edge heal it,
+    ///   observe futility, and count it. A fleet SUM of `would_quarantine` is
+    ///   roughly **2x** the number of distinct stuck edges, and nothing on the
+    ///   wire carries an edge identity to deduplicate with. Halve it, or treat
+    ///   it as an upper bound.
+    /// * **`futile : productive` is not a repair-efficacy ratio.** Attempts are
+    ///   recorded only for anti-entropy heals, but an edge also converges via
+    ///   the proximity-overlap heal or plain live UPDATE fan-out, neither of
+    ///   which records anything — so `productive` credits the outstanding
+    ///   anti-entropy heal for whatever actually fixed it. It says "converged
+    ///   by the next comparison", not "our heal converged it".
     pub futile: [u64; crate::ring::futile_repair::SNAPSHOT_SCALARS],
     /// Survival curve of consecutive-futility streaks over the rungs
     /// `futile_repair::LADDER_RUNGS` (1, 2, 3, 4, 5, 8, 16, 32): entry `i`
@@ -1851,6 +1893,66 @@ pub enum RouteOutcome {
 #[cfg(test)]
 mod tests {
     use crate::ring::Distance;
+
+    /// `NetworkEfficiencyV1`'s `futile` rustdoc, isolated from this test module
+    /// — the needles below appear here too, and a pin that matches its own
+    /// source can never fail.
+    fn futile_row_doc() -> &'static str {
+        const FULL: &str = include_str!("router.rs");
+        let start = FULL
+            .find("pub(crate) struct NetworkEfficiencyV1")
+            .expect("NetworkEfficiencyV1 not found");
+        let end = FULL[start..]
+            .find("pub futile_ladder")
+            .map(|off| start + off)
+            .expect("the futile row must still be declared on NetworkEfficiencyV1");
+        &FULL[start..end]
+    }
+
+    /// The `futile` row's rustdoc is the only place a reader of the fleet data
+    /// meets these counters, and several of them are wrong in a specific,
+    /// plausible direction if read naively. Each caveat below was a review
+    /// finding; each would regress into a wrong published number rather than a
+    /// failing test, so the doc is pinned like code.
+    #[test]
+    fn futile_row_doc_carries_the_reading_caveats() {
+        let doc = futile_row_doc();
+        for (needle, why) in [
+            (
+                "outcomes_probe_budget_exhausted",
+                "the load-correlated channel: past the 32-probe budget every \
+                 further contract reads as stale with no divergence at all, so \
+                 the reader has to be able to size it",
+            ),
+            (
+                "outcomes_after_long_gap",
+                "on byte-budgeted fallback links a contract is re-compared on \
+                 the order of ten hours, so the headline can be carried by \
+                 outcomes whose attempt is long stale",
+            ),
+            (
+                "attempts_discarded",
+                "attempts dropped at peer teardown are where the undercount \
+                 lives, and are the counter most likely to be non-zero",
+            ),
+            (
+                "PER OBSERVER",
+                "both ends of a diverged edge count the same stuck edge, so a \
+                 fleet SUM of would_quarantine is ~2x the distinct population",
+            ),
+            (
+                "not a repair-efficacy ratio",
+                "an edge also converges via the proximity-overlap heal or live \
+                 UPDATE fan-out, neither of which records an attempt, so \
+                 `productive` credits our heal for someone else's fix",
+            ),
+        ] {
+            assert!(
+                doc.contains(needle),
+                "the `futile` row rustdoc no longer mentions `{needle}` — {why}"
+            );
+        }
+    }
 
     use super::*;
 
