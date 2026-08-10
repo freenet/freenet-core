@@ -11301,15 +11301,12 @@ mod tests {
                     ContractInstanceId::new([77u8; 32]),
                     CodeHash::new([78u8; 32]),
                 );
-                let _ = h
-                    .op_manager
-                    .ring
-                    .host_contract(
-                        filler,
-                        128,
-                        crate::ring::AccessType::Put,
-                        crate::ring::HostingCause::Other,
-                    );
+                let _ = h.op_manager.ring.host_contract(
+                    filler,
+                    128,
+                    crate::ring::AccessType::Put,
+                    crate::ring::HostingCause::Other,
+                );
                 h.op_manager
                     .interest_manager
                     .register_local_hosting(&filler);
