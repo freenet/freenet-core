@@ -3120,20 +3120,18 @@ mod tests {
         let got = probe_release_tag_at(&server.url_str("/releases/latest"))
             .await
             .expect("a 403 is a normal outcome, not a transport error");
-        match got {
-            ProbeResult::RateLimited { retry_after } => {
-                let secs = retry_after
-                    .expect("reset header must yield a wait")
-                    .as_secs();
-                // Converted from absolute to delta; allow a second of clock drift
-                // between the header being built and being parsed.
-                assert!(
-                    (1_499..=1_500).contains(&secs),
-                    "expected ~1500s derived from x-ratelimit-reset, got {secs}"
-                );
-            }
-            other => panic!("403 must classify as rate-limited, got {other:?}"),
-        }
+        let ProbeResult::RateLimited { retry_after } = &got else {
+            panic!("403 must classify as rate-limited, got {got:?}");
+        };
+        let secs = retry_after
+            .expect("reset header must yield a wait")
+            .as_secs();
+        // Converted from absolute to delta; allow a second of clock drift
+        // between the header being built and being parsed.
+        assert!(
+            (1_499..=1_500).contains(&secs),
+            "expected ~1500s derived from x-ratelimit-reset, got {secs}"
+        );
     }
 
     #[tokio::test]
@@ -3256,13 +3254,13 @@ mod tests {
                 )),
         );
 
-        match probe_release_tag_at(&server.url_str("/releases/latest"))
+        let got = probe_release_tag_at(&server.url_str("/releases/latest"))
             .await
-            .expect("an off-host redirect must resolve to Unusable, not error")
-        {
-            ProbeResult::Unusable { status, .. } => assert_eq!(status, 301),
-            other => panic!("off-host redirect must not be followed, got {other:?}"),
-        }
+            .expect("an off-host redirect must resolve to Unusable, not error");
+        let ProbeResult::Unusable { status, .. } = &got else {
+            panic!("off-host redirect must not be followed, got {got:?}");
+        };
+        assert_eq!(*status, 301);
     }
 
     #[test]
@@ -3352,14 +3350,14 @@ mod tests {
             .expect("exceeding the deadline is a normal outcome, not an error");
         let elapsed = started.elapsed();
 
-        match got {
-            ProbeResult::Aborted { reason } => assert!(
-                reason.contains("chain deadline"),
-                "hitting the deadline must say so, so an operator can tell it from \
-                 a malformed redirect"
-            ),
-            other => panic!("a chain that never resolves must end Unusable, got {other:?}"),
-        }
+        let ProbeResult::Aborted { reason } = &got else {
+            panic!("a chain that never resolves must end Unusable, got {got:?}");
+        };
+        assert!(
+            reason.contains("chain deadline"),
+            "hitting the deadline must say so, so an operator can tell it from \
+             a malformed redirect"
+        );
         // Generous upper bound: the point is that it stops near the deadline
         // rather than running all 4 hops (800ms+), not that it is precise.
         assert!(
@@ -3423,18 +3421,16 @@ mod tests {
                 .respond_with(status_code(302).append_header("location", "/loop")),
         );
 
-        match probe_release_tag_at(&server.url_str("/loop"))
+        let got = probe_release_tag_at(&server.url_str("/loop"))
             .await
-            .expect("a redirect loop must terminate, not error out")
-        {
-            ProbeResult::Aborted { reason } => {
-                assert!(
-                    reason.contains("redirect limit"),
-                    "giving up on a loop should say so"
-                );
-            }
-            other => panic!("a redirect loop must end Unusable, got {other:?}"),
-        }
+            .expect("a redirect loop must terminate, not error out");
+        let ProbeResult::Aborted { reason } = &got else {
+            panic!("a redirect loop must end Unusable, got {got:?}");
+        };
+        assert!(
+            reason.contains("redirect limit"),
+            "giving up on a loop should say so"
+        );
     }
 
     #[tokio::test]

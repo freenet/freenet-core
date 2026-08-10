@@ -1337,7 +1337,10 @@ mod wasmtime_disk_cache_sizing_tests {
     /// *increase* for hosts that are unaffected today.
     #[test]
     fn clamp_bounds_are_ordered_and_ceiling_is_the_historical_default() {
-        assert!(MIN_WASMTIME_CACHE_SIZE_BYTES < MAX_WASMTIME_CACHE_SIZE_BYTES);
+        // Compile-time tripwire: the clamp bounds are consts, so checking their
+        // ordering at compile time catches a regression immediately rather than
+        // only when this test happens to run.
+        const _: () = assert!(MIN_WASMTIME_CACHE_SIZE_BYTES < MAX_WASMTIME_CACHE_SIZE_BYTES);
         assert_eq!(MAX_WASMTIME_CACHE_SIZE_BYTES, LEGACY_FLAT_SOFT_LIMIT_BYTES);
     }
 }

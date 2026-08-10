@@ -228,6 +228,19 @@ fn retry_loading_page() -> String {
     )
 }
 
+/// Minimal HTML entity escaping for error bodies rendered at the node origin.
+///
+/// Deliberately duplicated from `permission_prompts::html_escape` rather than
+/// shared: this module is on the error path of every route and must not depend
+/// on a sibling that may itself fail to build.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -470,17 +483,4 @@ mod tests {
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
-}
-
-/// Minimal HTML entity escaping for error bodies rendered at the node origin.
-///
-/// Deliberately duplicated from `permission_prompts::html_escape` rather than
-/// shared: this module is on the error path of every route and must not depend
-/// on a sibling that may itself fail to build.
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#x27;")
 }

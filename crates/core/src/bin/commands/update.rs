@@ -108,6 +108,19 @@ static FREENET_REVOCATION_PUBKEY: [u8; 32] = [
 ///     auto-update.
 const REQUIRE_RELEASE_SIGNATURE: bool = false;
 
+// Tripwire for the two-release rollout, checked at compile time so flipping
+// the constant fails the build immediately rather than only when the test
+// suite happens to run. Flipping this to `true` makes an ABSENT signature
+// refuse the install, which bricks auto-update for any node still updating
+// from an unsigned older release. Only flip it (and then update this
+// assertion) once every release a live node could be updating from publishes
+// SHA256SUMS.txt.sig. See REQUIRE_RELEASE_SIGNATURE's doc comment above.
+const _: () = assert!(
+    !REQUIRE_RELEASE_SIGNATURE,
+    "do not require signatures until the signed floor is established; \
+     see the two-release transition note on REQUIRE_RELEASE_SIGNATURE"
+);
+
 /// Exit code returned when the binary is already up to date (no update performed).
 /// Used by the service wrapper to avoid unnecessary restarts.
 pub const EXIT_CODE_ALREADY_UP_TO_DATE: i32 = 2;
@@ -4093,19 +4106,10 @@ done
             .expect("baked-in revocation public key must be a valid ed25519 point");
     }
 
-    #[test]
-    fn transition_flag_is_false_until_signed_floor_established() {
-        // Tripwire for the two-release rollout. Flipping this to `true` makes
-        // an ABSENT signature refuse the install, which bricks auto-update for
-        // any node still updating from an unsigned older release. Only flip it
-        // (and then update this test) once every release a live node could be
-        // updating from publishes SHA256SUMS.txt.sig. See REQUIRE_RELEASE_SIGNATURE.
-        assert!(
-            !REQUIRE_RELEASE_SIGNATURE,
-            "do not require signatures until the signed floor is established; \
-             see the two-release transition note on REQUIRE_RELEASE_SIGNATURE"
-        );
-    }
+    // transition_flag_is_false_until_signed_floor_established: superseded by
+    // the `const _: () = assert!(...)` compile-time tripwire next to
+    // REQUIRE_RELEASE_SIGNATURE's definition, which catches the flip at
+    // build time instead of only when this test happens to run.
 
     #[test]
     fn valid_signature_accepted() {

@@ -4152,19 +4152,19 @@ mod tests {
             InterestRegistrationSource::SubscribeRelay,
         ));
 
-        let first = match manager.begin_peer_summary_broadcast(&contract, &missing_peer) {
-            PeerSummaryForBroadcast::Missing {
-                attempt: Some(attempt),
-                ..
-            } => attempt,
-            _ => panic!("missing peer must produce a tracked attempt"),
+        let PeerSummaryForBroadcast::Missing {
+            attempt: Some(first),
+            ..
+        } = manager.begin_peer_summary_broadcast(&contract, &missing_peer)
+        else {
+            panic!("missing peer must produce a tracked attempt");
         };
-        let second = match manager.begin_peer_summary_broadcast(&contract, &missing_peer) {
-            PeerSummaryForBroadcast::Missing {
-                attempt: Some(attempt),
-                ..
-            } => attempt,
-            _ => panic!("overlapping missing send must produce another attempt"),
+        let PeerSummaryForBroadcast::Missing {
+            attempt: Some(second),
+            ..
+        } = manager.begin_peer_summary_broadcast(&contract, &missing_peer)
+        else {
+            panic!("overlapping missing send must produce another attempt");
         };
         assert_eq!(second.class, MissingSummaryClass::TrackedRepeatInflight);
         drop(manager.missing_summary_attempt_guard(first));
@@ -4219,15 +4219,15 @@ mod tests {
         let (manager, _time) = make_manager();
 
         for seed in 0..=MISSING_SUMMARY_HISTORY_SIZE as u32 {
-            let attempt = match manager.begin_peer_summary_broadcast(
+            let PeerSummaryForBroadcast::Missing {
+                attempt: Some(attempt),
+                ..
+            } = manager.begin_peer_summary_broadcast(
                 &make_unique_contract_key(seed),
                 &make_unique_peer_key(seed),
-            ) {
-                PeerSummaryForBroadcast::Missing {
-                    attempt: Some(attempt),
-                    ..
-                } => attempt,
-                _ => panic!("untracked pair must produce an attempt"),
+            )
+            else {
+                panic!("untracked pair must produce an attempt");
             };
             drop(manager.missing_summary_attempt_guard(attempt));
         }
@@ -4239,15 +4239,15 @@ mod tests {
         let active_probe_start = MISSING_SUMMARY_HISTORY_SIZE as u32 + 10_000;
         for seed in active_probe_start..active_probe_start + MISSING_SUMMARY_ACTIVE_SIZE as u32 + 1
         {
-            let attempt = match manager.begin_peer_summary_broadcast(
+            let PeerSummaryForBroadcast::Missing {
+                attempt: Some(attempt),
+                ..
+            } = manager.begin_peer_summary_broadcast(
                 &make_unique_contract_key(seed),
                 &make_unique_peer_key(seed),
-            ) {
-                PeerSummaryForBroadcast::Missing {
-                    attempt: Some(attempt),
-                    ..
-                } => attempt,
-                _ => panic!("untracked pair must produce an attempt"),
+            )
+            else {
+                panic!("untracked pair must produce an attempt");
             };
             guards.push(manager.missing_summary_attempt_guard(attempt));
         }
@@ -4280,15 +4280,15 @@ mod tests {
         );
 
         for seed in 0..WORKING_SET {
-            let attempt = match manager.begin_peer_summary_broadcast(
+            let PeerSummaryForBroadcast::Missing {
+                attempt: Some(attempt),
+                ..
+            } = manager.begin_peer_summary_broadcast(
                 &make_unique_contract_key(seed),
                 &make_unique_peer_key(seed),
-            ) {
-                PeerSummaryForBroadcast::Missing {
-                    attempt: Some(attempt),
-                    ..
-                } => attempt,
-                _ => panic!("untracked pair must produce an attempt"),
+            )
+            else {
+                panic!("untracked pair must produce an attempt");
             };
             drop(manager.missing_summary_attempt_guard(attempt));
         }
