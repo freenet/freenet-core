@@ -255,8 +255,15 @@ impl<T: TimeSource> PipedStream<T> {
         config: PipedStreamConfig,
         time_source: T,
     ) -> Self {
-        // Calculate total fragments
-        const FRAGMENT_PAYLOAD_SIZE: usize = crate::transport::packet_data::MAX_DATA_SIZE - 40;
+        // Calculate total fragments.
+        //
+        // This MUST be the same payload size the sender actually fragments at,
+        // or `total_fragments` is wrong and `is_complete()` fires at the wrong
+        // point. Take it from the one constant rather than re-deriving the
+        // overhead here: this site said `MAX_DATA_SIZE - 40` while every other
+        // site subtracts 41 (the extra byte is the `Option` discriminant of
+        // `metadata_bytes`; see `peer_connection::MAX_DATA_SIZE`).
+        const FRAGMENT_PAYLOAD_SIZE: usize = super::MAX_DATA_SIZE;
         let total_fragments = if total_bytes == 0 {
             0
         } else {
@@ -788,7 +795,7 @@ mod tests {
 
     #[test]
     fn test_partial_cascade() {
-        // 6 fragments at ~1131 bytes/fragment: ceil(6500/1131) = 6
+        // 6 fragments at 1130 bytes/fragment: ceil(6500/1130) = 6
         let stream = PipedStream::new(make_stream_id(), 6500, 1, PipedStreamConfig::default());
         assert_eq!(stream.total_fragments(), 6);
 

@@ -3072,6 +3072,408 @@ mod tests {
         Ok(())
     }
 
+    // ------------------------------------------------------------------
+    // Multi-fragment byte-identity roundtrip coverage (#5256)
+    // ------------------------------------------------------------------
+    //
+    // `test_inbound_outbound_interaction` above sends 1000 bytes, which is a
+    // SINGLE fragment, so nothing in the transport crate exercised
+    // fragmentation plus reassembly end to end. That is the path every large
+    // contract state travels.
+    //
+    // The tests below drive the real `send_stream` fragmentation, capture the
+    // fragments off the simulated wire, and reassemble them through the real
+    // `recv_stream`/`InboundStream`, asserting the received bytes are
+    // BYTE-IDENTICAL to what was sent.
+    //
+    // Byte identity, not length, is the assertion that matters here.
+    // Reassembly already completes only on an exact byte count, so a length
+    // check proves nothing about a length-preserving mid-payload corruption -
+    // which is exactly the failure mode observed on the live network (16
+    // contiguous bytes zeroed inside an otherwise byte-identical contract
+    // state).
+
+    /// A multi-fragment stream captured off the simulated wire.
+    struct CapturedStream {
+        /// `(fragment_number, payload)` in the order the sender emitted them.
+        fragments: Vec<(u32, bytes::Bytes)>,
+        /// Metadata the sender embedded in fragment #1, if any.
+        embedded_metadata: Option<bytes::Bytes>,
+        /// `total_length_bytes` as advertised on the wire.
+        total_length_bytes: u64,
+    }
+
+    /// Runs `payload` through the real outbound fragmentation path and returns
+    /// every fragment the sender put on the wire, decrypted and deserialized.
+    ///
+    /// Uses the in-test `TestSocket` (a channel-backed `Socket` impl) rather
+    /// than a real UDP socket, and `VirtualTime` rather than the wall clock.
+    async fn capture_stream_fragments(
+        payload: &[u8],
+        metadata: Option<bytes::Bytes>,
+    ) -> CapturedStream {
+        let (sender, mut receiver) = mpsc::channel(8);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let mut key = [0u8; 16];
+        crate::config::GlobalRng::fill_bytes(&mut key);
+        let cipher = Aes128Gcm::new(&key.into());
+
+        let time_source = crate::simulation::VirtualTime::new();
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(
+            SentPacketTracker::new_with_time_source(time_source.clone()),
+        ));
+
+        // Nothing ACKs in this harness, so flightsize only ever grows, and
+        // `VirtualTime` does not advance on its own - a token-bucket wait would
+        // deadlock the test rather than merely slow it down. Budget the
+        // congestion window and the token bucket above the whole transfer so
+        // neither can gate a fragment.
+        let budget = payload.len() + metadata.as_ref().map_or(0, |m| m.len()) + 64 * 1024;
+        let congestion_controller =
+            crate::transport::congestion_control::CongestionControlConfig::default()
+                .with_initial_cwnd(budget)
+                .with_min_cwnd(budget)
+                .with_max_cwnd(budget)
+                .build_arc_with_time_source(time_source.clone());
+        let token_bucket = Arc::new(TokenBucket::new_with_time_source(
+            budget,
+            budget,
+            time_source.clone(),
+        ));
+
+        let stream_id = StreamId::next();
+        let outbound = GlobalExecutor::spawn(send_stream(
+            stream_id,
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(sender)),
+            remote_addr,
+            bytes::Bytes::copy_from_slice(payload),
+            cipher.clone(),
+            sent_tracker,
+            token_bucket,
+            congestion_controller,
+            time_source,
+            metadata,
+            None,
+            None,
+        ));
+
+        let collect = async {
+            let mut fragments = Vec::new();
+            let mut embedded_metadata: Option<bytes::Bytes> = None;
+            let mut total_length_bytes: Option<u64> = None;
+            while let Some((_, network_packet)) = receiver.recv().await {
+                let decrypted = PacketData::<_, MAX_PACKET_SIZE>::from_buf(&network_packet)
+                    .try_decrypt_sym(&cipher)
+                    .expect("every emitted fragment must decrypt");
+                let SymmetricMessage {
+                    payload:
+                        SymmetricMessagePayload::StreamFragment {
+                            fragment_number,
+                            payload,
+                            metadata_bytes,
+                            total_length_bytes: advertised,
+                            ..
+                        },
+                    ..
+                } = SymmetricMessage::deser(decrypted.data()).expect("symmetric message")
+                else {
+                    panic!("send_stream must only emit StreamFragment packets");
+                };
+                if let Some(previous) = total_length_bytes {
+                    assert_eq!(
+                        previous, advertised,
+                        "every fragment must advertise the same total_length_bytes"
+                    );
+                }
+                total_length_bytes = Some(advertised);
+                if let Some(meta) = metadata_bytes {
+                    assert_eq!(fragment_number, 1, "metadata may only ride on fragment #1");
+                    assert!(
+                        embedded_metadata.replace(meta).is_none(),
+                        "metadata must be embedded exactly once"
+                    );
+                }
+                fragments.push((fragment_number, payload));
+            }
+            CapturedStream {
+                fragments,
+                embedded_metadata,
+                total_length_bytes: total_length_bytes
+                    .expect("send_stream must emit at least one fragment"),
+            }
+        };
+
+        let (send_result, captured) = tokio::join!(outbound, collect);
+        send_result
+            .expect("send_stream task panicked")
+            .expect("send_stream failed");
+        captured
+    }
+
+    /// Feeds `delivery` through the real `recv_stream`/`InboundStream` path.
+    ///
+    /// Returns the reassembled payload, or `Err(stream_id)` if reassembly never
+    /// completed after every fragment in `delivery` had been offered.
+    async fn reassemble(
+        total_length_bytes: u64,
+        delivery: Vec<(u32, bytes::Bytes)>,
+    ) -> std::result::Result<Vec<u8>, StreamId> {
+        let (tx, rx) = mpsc::channel(delivery.len().max(1));
+        for fragment in delivery {
+            tx.send(fragment).await.expect("receiver is alive");
+        }
+        drop(tx);
+        recv_stream(StreamId::next(), rx, InboundStream::new(total_length_bytes))
+            .await
+            .map(|(_, msg)| msg)
+    }
+
+    /// Strict reverse arrival: fragment #1, the one that may carry metadata and
+    /// is the only one that can start the contiguous run, lands last.
+    fn deliver_reversed(captured: &CapturedStream) -> Vec<(u32, bytes::Bytes)> {
+        let mut delivery = captured.fragments.clone();
+        delivery.reverse();
+        delivery
+    }
+
+    /// Every even-numbered fragment, then every odd-numbered one: a maximally
+    /// interleaved arrival that keeps a gap open until the final fragment.
+    fn deliver_interleaved(captured: &CapturedStream) -> Vec<(u32, bytes::Bytes)> {
+        let (odd, even): (Vec<_>, Vec<_>) = captured
+            .fragments
+            .iter()
+            .cloned()
+            .partition(|(number, _)| number % 2 == 1);
+        even.into_iter().chain(odd).collect()
+    }
+
+    /// Every fragment delivered twice, back to back, in send order.
+    fn deliver_duplicated(captured: &CapturedStream) -> Vec<(u32, bytes::Bytes)> {
+        captured
+            .fragments
+            .iter()
+            .flat_map(|fragment| [fragment.clone(), fragment.clone()])
+            .collect()
+    }
+
+    /// The adversarial replay pattern: deliver a prefix in order, replay a
+    /// fragment the reassembler has ALREADY consumed, then deliver the rest out
+    /// of order.
+    ///
+    /// A reassembler that buffers the replay rather than dropping it wedges its
+    /// own drain loop: the stale key sits at the front of the pending map
+    /// forever, so no later fragment can drain and the stream never completes.
+    fn deliver_replay_then_gap(captured: &CapturedStream) -> Vec<(u32, bytes::Bytes)> {
+        assert!(
+            captured.fragments.len() >= 4,
+            "replay-then-gap needs at least 4 fragments to open a gap behind the replay"
+        );
+        let mut delivery = captured.fragments[..2].to_vec();
+        delivery.push(captured.fragments[0].clone());
+        delivery.extend(captured.fragments[2..].iter().rev().cloned());
+        delivery
+    }
+
+    /// Byte-identity assertion with a compact failure message. A bare
+    /// `assert_eq!` on a megabyte payload would dump both copies.
+    fn assert_bytes_identical(received: &[u8], sent: &[u8], context: &str) {
+        assert_eq!(
+            received.len(),
+            sent.len(),
+            "{context}: reassembled length differs from what was sent"
+        );
+        if let Some(offset) = received.iter().zip(sent).position(|(a, b)| a != b) {
+            let differing = received.iter().zip(sent).filter(|(a, b)| a != b).count();
+            panic!(
+                "{context}: payload CORRUPTED in transit - first differing byte at offset \
+                 {offset} of {}: sent {:#04x}, received {:#04x}; {differing} bytes differ in total",
+                sent.len(),
+                sent[offset],
+                received[offset],
+            );
+        }
+    }
+
+    /// Asserts a `payload_len`-byte payload survives fragmentation and
+    /// reassembly byte-identically under every delivery order.
+    ///
+    /// `expected_fragments` is stated explicitly rather than recomputed from
+    /// the sender's own formula: re-deriving it here would make the assertion
+    /// self-checking and blind to an off-by-one in that formula.
+    /// `fragment_count_literals_are_computed_for_this_max_data_size` pins the
+    /// constant these literals were computed against.
+    async fn assert_multi_fragment_roundtrip(
+        payload_len: usize,
+        metadata: Option<bytes::Bytes>,
+        expected_fragments: usize,
+    ) {
+        assert!(
+            expected_fragments >= 2,
+            "this helper exists to cover MULTI-fragment payloads"
+        );
+
+        let mut payload = vec![0u8; payload_len];
+        crate::config::GlobalRng::fill_bytes(&mut payload);
+
+        let captured = capture_stream_fragments(&payload, metadata.clone()).await;
+        let described = format!(
+            "{payload_len} bytes, metadata={}",
+            metadata.as_ref().map_or(0, |m| m.len())
+        );
+
+        assert_eq!(
+            captured.fragments.len(),
+            expected_fragments,
+            "{described}: unexpected fragment count"
+        );
+        assert_eq!(
+            captured.total_length_bytes, payload_len as u64,
+            "{described}: advertised total_length_bytes must match the payload"
+        );
+        assert_eq!(
+            captured.embedded_metadata, metadata,
+            "{described}: embedded metadata must round-trip byte-identically"
+        );
+
+        // Fragment numbers are 1-indexed, contiguous, and emitted in order.
+        assert_eq!(
+            captured
+                .fragments
+                .iter()
+                .map(|(number, _)| *number)
+                .collect::<Vec<_>>(),
+            (1..=expected_fragments as u32).collect::<Vec<_>>(),
+            "{described}: fragment numbering must be 1-indexed and contiguous"
+        );
+
+        // The sender's own fragmentation must be lossless before reassembly is
+        // even in the picture.
+        let concatenated: Vec<u8> = captured
+            .fragments
+            .iter()
+            .flat_map(|(_, fragment)| fragment.iter().copied())
+            .collect();
+        assert_bytes_identical(
+            &concatenated,
+            &payload,
+            &format!("{described}: fragmentation"),
+        );
+
+        // Fragment #1 is the asymmetric one: embedded metadata steals room from
+        // its payload. Pin that capacity explicitly - an off-by-one in the
+        // metadata overhead is invisible to a whole-payload check because the
+        // sender's total_packets calculation compensates for it.
+        let first_fragment_capacity = match &metadata {
+            Some(meta) => MAX_DATA_SIZE - (1 + 8 + meta.len()),
+            None => MAX_DATA_SIZE,
+        };
+        assert_eq!(
+            captured.fragments[0].1.len(),
+            first_fragment_capacity,
+            "{described}: fragment #1 must be filled to its metadata-reduced capacity"
+        );
+        for (number, fragment) in &captured.fragments[1..expected_fragments - 1] {
+            assert_eq!(
+                fragment.len(),
+                MAX_DATA_SIZE,
+                "{described}: interior fragment #{number} must be full"
+            );
+        }
+
+        let mut orders: Vec<(&str, Vec<(u32, bytes::Bytes)>)> = vec![
+            ("in order", captured.fragments.clone()),
+            ("reversed", deliver_reversed(&captured)),
+            ("interleaved", deliver_interleaved(&captured)),
+            ("duplicated", deliver_duplicated(&captured)),
+        ];
+        if captured.fragments.len() >= 4 {
+            orders.push(("replay then gap", deliver_replay_then_gap(&captured)));
+        }
+
+        for (order, delivery) in orders {
+            let context = format!("{described}, delivered {order}");
+            let received = reassemble(captured.total_length_bytes, delivery)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{context}: reassembly never completed despite every byte arriving")
+                });
+            assert_bytes_identical(&received, &payload, &context);
+        }
+    }
+
+    /// The `expected_fragments` literals in the tests below were computed for
+    /// this fragment payload size. Pin it so a change to the fragment overhead
+    /// fails loudly here instead of silently re-scoping that coverage.
+    #[test]
+    fn fragment_count_literals_are_computed_for_this_max_data_size() {
+        assert_eq!(
+            MAX_DATA_SIZE, 1130,
+            "MAX_DATA_SIZE changed - recompute the expected fragment counts in the \
+             multi-fragment roundtrip tests"
+        );
+    }
+
+    /// 24,832 bytes is the size of the corrupt contract state observed on the
+    /// live network (16 contiguous bytes zeroed inside an otherwise
+    /// byte-identical copy). It spans 22 fragments.
+    ///
+    /// Byte identity here is what formally closes the fragment path as a
+    /// candidate source of that corruption: reassembly is pure ordered
+    /// concatenation, so a length-preserving hole would have to survive
+    /// fragmentation, AES-128-GCM sealing, and reassembly to reach the caller.
+    #[tokio::test]
+    async fn multi_fragment_roundtrip_is_byte_identical() {
+        assert_multi_fragment_roundtrip(24_832, None, 22).await;
+    }
+
+    /// Same payload, but with metadata embedded in fragment #1 (fix #2757).
+    /// The first fragment then carries less payload than every other fragment,
+    /// and that asymmetry is exactly where an off-by-one would live.
+    #[tokio::test]
+    async fn multi_fragment_roundtrip_with_metadata_is_byte_identical() {
+        let mut metadata = vec![0u8; 256];
+        crate::config::GlobalRng::fill_bytes(&mut metadata);
+        assert_multi_fragment_roundtrip(24_832, Some(bytes::Bytes::from(metadata)), 23).await;
+    }
+
+    /// A payload far larger than any single-fragment case: 1 MiB over 928
+    /// fragments. Corruption that only shows up deep into a long stream (a
+    /// wrapped counter, an exhausted window, a reused buffer) needs a stream
+    /// long enough to reach it.
+    #[tokio::test]
+    async fn large_multi_fragment_roundtrip_is_byte_identical() {
+        assert_multi_fragment_roundtrip(1_048_576, None, 928).await;
+    }
+
+    /// Boundary triple with no metadata: exactly N full fragments, one byte
+    /// under (still N, last one short), and one byte over (N+1, last one a
+    /// single byte).
+    #[tokio::test]
+    async fn fragment_size_boundaries_are_byte_identical() {
+        assert_multi_fragment_roundtrip(MAX_DATA_SIZE * 8, None, 8).await;
+        assert_multi_fragment_roundtrip(MAX_DATA_SIZE * 8 - 1, None, 8).await;
+        assert_multi_fragment_roundtrip(MAX_DATA_SIZE * 8 + 1, None, 9).await;
+    }
+
+    /// The same boundary triple with metadata embedded, where the exact
+    /// multiple is `first_fragment_capacity + 7 * MAX_DATA_SIZE` rather than a
+    /// multiple of `MAX_DATA_SIZE`. This is the boundary the sender's
+    /// `total_packets` calculation gets wrong if the metadata overhead is
+    /// mis-stated.
+    #[tokio::test]
+    async fn metadata_fragment_size_boundaries_are_byte_identical() {
+        let mut metadata = vec![0u8; 256];
+        crate::config::GlobalRng::fill_bytes(&mut metadata);
+        let metadata = bytes::Bytes::from(metadata);
+        let first_fragment_capacity = MAX_DATA_SIZE - (1 + 8 + metadata.len());
+        let exact = first_fragment_capacity + MAX_DATA_SIZE * 7;
+
+        assert_multi_fragment_roundtrip(exact, Some(metadata.clone()), 8).await;
+        assert_multi_fragment_roundtrip(exact - 1, Some(metadata.clone()), 8).await;
+        assert_multi_fragment_roundtrip(exact + 1, Some(metadata), 9).await;
+    }
+
     /// Verify that bincode serialization is fast enough to run on async runtime.
     ///
     /// This test documents the assumption behind removing spawn_blocking from send().
