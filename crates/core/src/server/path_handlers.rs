@@ -4876,17 +4876,43 @@ mod tests {
             "overlay must declare role=dialog for a11y"
         );
         assert!(html.contains("aria-modal"), "overlay must set aria-modal");
-        // Subscribes to the new SSE endpoint and POSTs back with the response.
-        // /permission/pending is still referenced as the bootstrap-on-connect
-        // and `resync` reconciliation endpoint, plus the no-EventSource
-        // fallback, so the assertion below still holds.
+        // Subscribes to the permission-event WebSocket and POSTs back with the
+        // response. /permission/pending is still referenced as the
+        // bootstrap-on-connect and `resync` reconciliation endpoint, plus the
+        // no-WebSocket fallback, so the assertion below still holds.
         assert!(
-            html.contains("/permission/events"),
-            "shell JS must subscribe to /permission/events (SSE)"
+            html.contains("/permission/events/ws"),
+            "shell JS must subscribe to the /permission/events/ws WebSocket"
         );
         assert!(
             html.contains("/permission/pending"),
             "shell JS must reference /permission/pending for bootstrap/resync"
+        );
+        // #5213 regression pin. The permission channel MUST NOT ride a
+        // long-lived HTTP request. Every open tab holds it for the tab's whole
+        // life and all Freenet apps share one origin, so an SSE/EventSource
+        // (or any other held-open HTTP request) permanently consumes one of
+        // the browser's ~6 connections per origin PER TAB. At six tabs the
+        // budget is gone and a seventh tab's document request queues forever
+        // with no error surfaced — reproduced as a hard stall at tab 7, with
+        // tabs 1-6 loading in ~30ms.
+        //
+        // This asserts on the SHELL JS only. The server still serves the
+        // legacy SSE route for tabs opened before a node upgrade, so pinning
+        // the absence of the route itself would be wrong; what must not come
+        // back is the CLIENT holding one.
+        assert!(
+            !html.contains("new EventSource("),
+            "shell JS must not open an EventSource: one held-open HTTP request \
+             per tab exhausts the browser's ~6-connections-per-origin budget \
+             and hangs the 7th Freenet tab (#5213)"
+        );
+        // The WebSocket has no auto-reconnect (EventSource did), so the shell
+        // owns reconnection. Without it a single node restart would leave
+        // every open tab permanently on the 3s polling fallback.
+        assert!(
+            html.contains("schedulePermReconnect"),
+            "shell JS must reconnect the permission WebSocket itself (#5213)"
         );
         assert!(
             html.contains("/respond"),
@@ -4898,15 +4924,18 @@ mod tests {
             html.contains("r.status === 404"),
             "shell JS must treat 404 on respond as 'already answered' and hide the card"
         );
-        // SSE event names the server emits. Pinning these here ensures the
-        // shell stays in sync with the gateway's wire format.
+        // Event names the server emits. Pinning these here ensures the shell
+        // stays in sync with the gateway's wire format. The names and payload
+        // shapes are shared by both transports (the WebSocket carries the name
+        // inside a JSON envelope; the legacy SSE route uses its `event:`
+        // field), so these assertions are transport-independent.
         assert!(
             html.contains("'prompt_added'") || html.contains("\"prompt_added\""),
-            "shell JS must subscribe to the prompt_added SSE event"
+            "shell JS must handle the prompt_added event"
         );
         assert!(
             html.contains("'prompt_removed'") || html.contains("\"prompt_removed\""),
-            "shell JS must subscribe to the prompt_removed SSE event"
+            "shell JS must handle the prompt_removed event"
         );
         // All delegate-controlled strings must go through textContent, never
         // innerHTML — guards against a future refactor re-opening XSS into
@@ -4918,11 +4947,13 @@ mod tests {
         // Bound the overlay code path by the explicit `perm-overlay-flow`
         // markers in shell_bridge.js, NOT a code anchor. The previous bound
         // (`setInterval(reconcileFromPending` / `EventSource`) stopped SHORT of
-        // the SSE `prompt_added`/`prompt_removed` handlers, which ARE part of
-        // the prompt-render flow #3836 protects — so a browser Notification
-        // reintroduced into an SSE handler would have slipped past this guard.
-        // The markers bracket the whole overlay + SSE region so the asserts
-        // below scan all of it (#4849 F2).
+        // the `prompt_added`/`prompt_removed` handlers, which ARE part of the
+        // prompt-render flow #3836 protects — so a browser Notification
+        // reintroduced into an event handler would have slipped past this
+        // guard. The markers bracket the whole overlay + event-channel region
+        // so the asserts below scan all of it (#4849 F2). Note the old code
+        // anchor named `EventSource`, which #5213 removed: another reason
+        // marker bounds beat code anchors here.
         let overlay_start = html
             .find("perm-overlay-flow:BEGIN")
             .expect("perm-overlay-flow:BEGIN marker must bracket the overlay flow");

@@ -1853,17 +1853,27 @@ function freenetBridge(authToken, userToken, hostedMode) {
       .catch(function () {});
   }
 
-  // Open a Server-Sent Events connection so prompts appear with no polling
-  // delay and on every open Freenet tab regardless of foreground/background
-  // state. The browser's EventSource auto-reconnects with exponential
-  // backoff if the connection drops; on each reconnect we re-bootstrap from
-  // /permission/pending so we don't miss anything during the gap.
+  // Open a WebSocket so prompts appear with no polling delay and on every
+  // open Freenet tab regardless of foreground/background state.
   //
-  // While the EventSource is in the disconnected state (its `error` event
-  // has fired and `readyState !== 1`), we run a 3-second polling fallback
-  // against /permission/pending so a tab whose stream fails (gateway
-  // restart, connection-cap rejection, transient network) still receives
-  // prompt updates. The fallback shuts off as soon as the stream re-opens.
+  // Why a WebSocket rather than Server-Sent Events (#5213): every open tab
+  // holds this channel for its entire life, and every Freenet app is served
+  // from the SAME origin. Over SSE that permanently consumed one of the
+  // browser's ~6 HTTP/1.1 connections per origin PER TAB, so at six open tabs
+  // the budget was gone and a seventh tab's own document, wasm and asset
+  // requests queued behind the held-open streams forever. Nothing errored, so
+  // no fallback fired and the app sat on "Loading..." indefinitely. Browsers
+  // pool WebSockets separately and far more generously (~255 per profile in
+  // Chrome, 200 in Firefox), so this channel no longer competes with page
+  // loads. Do NOT move this back onto a long-lived HTTP request.
+  //
+  // Unlike EventSource, a WebSocket does NOT auto-reconnect, so we reconnect
+  // ourselves with exponential backoff plus jitter. While disconnected we run
+  // the same 3-second /permission/pending poll the SSE path used, so a tab
+  // whose socket fails (node restart, cap rejection, transient error) still
+  // receives prompt updates. The poll stops as soon as the socket re-opens,
+  // and every (re)connect re-bootstraps from /permission/pending so nothing
+  // is missed across the gap.
   var fallbackPollHandle = null;
   function startFallbackPoll() {
     if (fallbackPollHandle !== null) return;
@@ -1875,44 +1885,134 @@ function freenetBridge(authToken, userToken, hostedMode) {
     clearInterval(fallbackPollHandle);
     fallbackPollHandle = null;
   }
-  if (typeof EventSource !== 'undefined') {
-    var es = new EventSource('/permission/events');
-    es.addEventListener('prompt_added', function (e) {
-      try {
-        var p = JSON.parse(e.data);
-        if (!p || typeof p.nonce !== 'string') return;
-        if (overlayCards[p.nonce]) return;
-        showCard(p.nonce, createCard(p));
-      } catch (err) {}
-    });
-    es.addEventListener('prompt_removed', function (e) {
-      try {
-        var p = JSON.parse(e.data);
-        if (!p || typeof p.nonce !== 'string') return;
-        hideCard(p.nonce);
-      } catch (err) {}
-    });
-    // The server emits `resync` when its broadcast channel laps a slow
-    // subscriber. Reconcile from the polling endpoint instead of clearing
-    // first: the reconcile path's diff already adds new cards and hides
-    // ones that disappeared, with no flicker on cards that survive.
-    es.addEventListener('resync', reconcileFromPending);
-    // EventSource fires `open` on initial connect AND on every reconnect.
-    // Reconcile each time so a transient disconnect doesn't leave us out
-    // of date, and stop the fallback poll if it had taken over.
-    es.addEventListener('open', function () {
+  // Reconnect state. Backoff starts at 1s and doubles to a 30s ceiling,
+  // reset to 1s on every successful open.
+  var permSocket = null;
+  var permReconnectDelay = 1000;
+  var permReconnectHandle = null;
+  var PERM_RECONNECT_MAX = 30000;
+
+  // perm-ws-decisions:BEGIN — pure helpers for the permission WebSocket,
+  // extracted so shell_bridge_permission_ws.test.mjs can exercise them
+  // directly. Keep them free of DOM/global access: everything they need
+  // arrives as an argument, which is what makes them testable at all.
+  function permSocketUrl(loc) {
+    // Derive the scheme from the page so a TLS-served shell upgrades to wss
+    // rather than tripping the browser's mixed-content block.
+    var scheme = loc.protocol === 'https:' ? 'wss://' : 'ws://';
+    return scheme + loc.host + '/permission/events/ws';
+  }
+
+  // Exponential backoff with a ceiling. Separate from the jitter below so the
+  // growth curve can be asserted without a stubbed RNG.
+  function nextPermReconnectDelay(current, max) {
+    return Math.min(current * 2, max);
+  }
+
+  // +/-20% jitter so every tab recovering from one node restart doesn't
+  // reconnect in lockstep and hammer the subscriber cap. `rand` is
+  // `Math.random()`'s output, passed in so the spread is testable.
+  function permReconnectJitter(delay, rand) {
+    return delay * (0.8 + rand * 0.4);
+  }
+
+  // Classify one inbound envelope. Returns the action the imperative wrapper
+  // should take, so malformed or delegate-controlled payloads are rejected in
+  // one auditable place rather than across three branches. Event names and
+  // `data` shapes are identical to the SSE stream this replaced; only the
+  // framing differs (the name rides inside the JSON envelope because a
+  // WebSocket frame has no `event:` slot).
+  function permEventAction(envelope) {
+    if (!envelope || typeof envelope.event !== 'string')
+      return { action: 'ignore' };
+    var data = envelope.data;
+    if (envelope.event === 'resync') return { action: 'resync' };
+    if (
+      envelope.event === 'prompt_added' ||
+      envelope.event === 'prompt_removed'
+    ) {
+      if (!data || typeof data.nonce !== 'string') return { action: 'ignore' };
+      return {
+        action: envelope.event === 'prompt_added' ? 'add' : 'remove',
+        nonce: data.nonce,
+        data: data,
+      };
+    }
+    return { action: 'ignore' };
+  }
+  // perm-ws-decisions:END
+
+  function handlePermEnvelope(envelope) {
+    var decision = permEventAction(envelope);
+    if (decision.action === 'add') {
+      if (overlayCards[decision.nonce]) return;
+      showCard(decision.nonce, createCard(decision.data));
+    } else if (decision.action === 'remove') {
+      hideCard(decision.nonce);
+    } else if (decision.action === 'resync') {
+      // The server emits `resync` when its broadcast channel laps a slow
+      // subscriber. Reconcile from the polling endpoint instead of clearing
+      // first: the reconcile path's diff already adds new cards and hides
+      // ones that disappeared, with no flicker on cards that survive.
+      reconcileFromPending();
+    }
+  }
+
+  function schedulePermReconnect() {
+    if (permReconnectHandle !== null) return;
+    var jittered = permReconnectJitter(permReconnectDelay, Math.random());
+    permReconnectHandle = setTimeout(function () {
+      permReconnectHandle = null;
+      openPermSocket();
+    }, jittered);
+    permReconnectDelay = nextPermReconnectDelay(
+      permReconnectDelay,
+      PERM_RECONNECT_MAX,
+    );
+  }
+
+  function openPermSocket() {
+    var sock;
+    try {
+      sock = new WebSocket(permSocketUrl(location));
+    } catch (err) {
+      // Constructor throws on a malformed URL or a blocked scheme. Treat it
+      // exactly like a dropped socket so we still poll and still retry.
+      startFallbackPoll();
+      schedulePermReconnect();
+      return;
+    }
+    permSocket = sock;
+    sock.onopen = function () {
+      permReconnectDelay = 1000;
       stopFallbackPoll();
       reconcileFromPending();
-    });
-    // `error` fires on connect failure, transient drops, and when the
-    // server caps us out. Switch to polling until the EventSource
-    // re-opens; the browser auto-reconnects in the background.
-    es.addEventListener('error', startFallbackPoll);
-    // Initial bootstrap so we're populated before the SSE handshake
-    // completes (avoids a brief empty state on slow connections).
+    };
+    sock.onmessage = function (e) {
+      try {
+        handlePermEnvelope(JSON.parse(e.data));
+      } catch (err) {}
+    };
+    // Recovery is driven from `close` alone. The socket always fires `close`
+    // after `error`, so handling both would double-schedule the reconnect and
+    // halve the effective backoff.
+    sock.onclose = function () {
+      if (permSocket === sock) permSocket = null;
+      startFallbackPoll();
+      schedulePermReconnect();
+    };
+  }
+
+  if (typeof WebSocket !== 'undefined') {
+    openPermSocket();
+    // Initial bootstrap so we're populated before the handshake completes
+    // (avoids a brief empty state on slow connections). Deliberately NOT
+    // inside openPermSocket: reconnect attempts already reconcile via the
+    // fallback poll on close and via `onopen` on success, so doing it per
+    // attempt would just add a redundant fetch to every retry.
     reconcileFromPending();
   } else {
-    // EventSource missing in some embedded webviews -- fall back to the
+    // WebSocket missing in some embedded webviews -- fall back to the
     // legacy 3-second poll so users on those clients still see prompts.
     startFallbackPoll();
   }
