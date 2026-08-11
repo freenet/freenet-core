@@ -77,7 +77,7 @@ use dashmap::{DashMap, DashSet};
 use demand::ProximityPrior;
 use disk_usage::DiskUsageTracker;
 pub(crate) use disk_usage::{DiskBudgetExceeded, DiskUsageStats};
-use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
+use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1621,6 +1621,50 @@ impl HostingManager {
     /// an unbounded GC exemption here.
     pub fn contract_in_use(&self, contract: &ContractKey) -> bool {
         self.has_client_subscriptions(contract.id()) || self.has_downstream_subscribers(contract)
+    }
+
+    /// Whether ANY contract instance whose WASM resolves to `code` is in use, in
+    /// exactly the [`contract_in_use`](Self::contract_in_use) sense (a live local
+    /// client subscription or a downstream peer subscriber).
+    ///
+    /// This is the per-code-hash lift of `contract_in_use`, needed because the
+    /// compiled-module cache is keyed by WASM code hash rather than by contract
+    /// instance (#5268): one cached module serves every instance of that binary,
+    /// so it is "of interest" while any one of them is. `code_of` resolves an
+    /// instance id to the code hash this node has indexed for it — the caller
+    /// supplies it because the instance→code index lives in `ContractStore`, not
+    /// in the ring.
+    ///
+    /// Cost is O(contracts with live demand) with an early exit on the first
+    /// match, where the instance-keyed `contract_in_use` is O(1). Both callers
+    /// stay cheap under that:
+    ///
+    /// - The O(entries) interest/telemetry scan
+    ///   (`ModuleCache::recompute_interest_split`) is throttled to at most once
+    ///   per 10 s, and now runs over one entry per distinct BINARY — the same
+    ///   keying change that motivates this method is what collapses that entry
+    ///   count (~17x on a measured gateway).
+    /// - The eviction path (`ModuleCache::lru_cold_key`) stops at the FIRST cold
+    ///   entry, and in steady state almost every entry is cold (fleet median:
+    ///   0.43% of the cache is of interest), so an eviction step normally costs
+    ///   one call, not one per entry.
+    pub(crate) fn any_in_use_with_code(
+        &self,
+        code: &CodeHash,
+        code_of: impl Fn(&ContractInstanceId) -> Option<CodeHash>,
+    ) -> bool {
+        let matches = |instance: &ContractInstanceId| code_of(instance).as_ref() == Some(code);
+        self.client_subscriptions
+            .iter()
+            .any(|entry| !entry.value().is_empty() && matches(entry.key()))
+            || self
+                .downstream_subscribers
+                .iter()
+                // Resolve through the same local index rather than reading the
+                // key's own `code` field: that field arrives from a peer's
+                // SUBSCRIBE and is never verified (see
+                // `Runtime::prepare_contract_call_inner`).
+                .any(|entry| !entry.value().is_empty() && matches(entry.key().id()))
     }
 
     /// The SPLIT genuine-demand counts pinning `contract`:
@@ -4206,6 +4250,60 @@ mod tests {
 
         manager.add_client_subscription(contract.id(), client_id);
         assert!(manager.is_receiving_updates(&contract));
+    }
+
+    /// `any_in_use_with_code` is the per-code-hash lift of `contract_in_use`
+    /// used as the compiled-module cache's interest predicate (#5268). Since one
+    /// cached module serves EVERY instance of a binary, it must report interest
+    /// when any single instance is in use — from either demand source — and must
+    /// not leak interest across binaries.
+    #[test]
+    fn any_in_use_with_code_covers_every_instance_of_the_binary() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let shared_code = CodeHash::new([9u8; 32]);
+        let other_code = CodeHash::new([10u8; 32]);
+
+        // Three instances over one binary, plus one instance of another binary.
+        let by_client = ContractInstanceId::new([1u8; 32]);
+        let by_downstream = ContractInstanceId::new([2u8; 32]);
+        let idle = ContractInstanceId::new([3u8; 32]);
+        let other = ContractInstanceId::new([4u8; 32]);
+        let index = |instance: &ContractInstanceId| {
+            if *instance == other {
+                Some(other_code)
+            } else {
+                Some(shared_code)
+            }
+        };
+
+        assert!(
+            !manager.any_in_use_with_code(&shared_code, index),
+            "no demand anywhere ⇒ not of interest"
+        );
+
+        // Demand on ONE instance makes the shared module of interest...
+        manager.add_client_subscription(&by_client, crate::client_events::ClientId::next());
+        assert!(manager.any_in_use_with_code(&shared_code, index));
+        assert!(
+            !manager.any_in_use_with_code(&other_code, index),
+            "demand must not leak to a different binary"
+        );
+
+        // ...and so does demand from the downstream side alone.
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        manager.add_downstream_subscriber(
+            &ContractKey::from_id_and_code(by_downstream, shared_code),
+            make_peer_key(42),
+        );
+        assert!(manager.any_in_use_with_code(&shared_code, index));
+
+        // An instance with no demand contributes nothing on its own.
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        manager.add_client_subscription(&idle, crate::client_events::ClientId::next());
+        assert!(
+            !manager.any_in_use_with_code(&other_code, index),
+            "an in-use instance of a DIFFERENT binary is not interest in this one"
+        );
     }
 
     /// Characterizes the dashboard subscription snapshot: it must carry the

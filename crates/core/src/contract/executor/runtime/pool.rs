@@ -71,8 +71,10 @@ pub struct RuntimePool {
     shared_summaries: SharedSummaries,
     /// Per-client subscription count for O(1) limit enforcement.
     shared_client_counts: SharedClientCounts,
-    /// Shared compiled contract module cache (avoids 16x duplication across pool executors).
-    shared_contract_modules: SharedModuleCache<ContractKey>,
+    /// Shared compiled contract module cache (avoids 16x duplication across pool
+    /// executors). Keyed by WASM **code hash**, so instances of one binary that
+    /// differ only in parameters also share a single compiled module (#5268).
+    shared_contract_modules: SharedModuleCache<CodeHash>,
     /// Shared contract instance index (`ContractInstanceId -> CodeHash`) so a
     /// contract stored / indexed / removed via any executor is visible to all
     /// the others (#4218). Cloned into every executor's `ContractStore` at
@@ -327,18 +329,38 @@ impl RuntimePool {
         // process-global) keeps the gauges per-node. Both caches share one sink;
         // they're routed apart by their `"contract"` / `"delegate"` label.
         let module_cache_metrics = op_manager.ring.module_cache_metrics();
-        // Interest predicate for the CONTRACT cache only: a contract is "of
-        // interest" while `Ring::contract_in_use` holds (a live local client
-        // subscription OR a downstream peer subscriber — deliberately NOT an
-        // upstream-only subscription, which would be unbounded). This drives the
-        // interest-weighted (two-tier) eviction policy AND the always-on shadow
-        // metrics. The delegate cache has no interest concept, so it gets none
-        // and stays pure byte-LRU. Capturing a clone of the `Arc<Ring>` keeps
-        // `wasm_runtime` free of any `ring` dependency. See #4441 / #4534.
+        // Pool-owned contract instance index (`ContractInstanceId -> CodeHash`)
+        // shared by every executor's `ContractStore` (#4218). The first executor
+        // loads it from ReDb; the rest inherit the same live `Arc`. Created here,
+        // ahead of the module caches, because the contract cache's interest
+        // predicate resolves instance ids through it (see below).
+        let shared_contract_index: SharedContractIndex = Arc::new(DashMap::new());
+        // Interest predicate for the CONTRACT cache only: an entry is "of
+        // interest" while `Ring::contract_in_use` holds for some contract it
+        // serves (a live local client subscription OR a downstream peer
+        // subscriber — deliberately NOT an upstream-only subscription, which
+        // would be unbounded). This drives the interest-weighted (two-tier)
+        // eviction policy AND the always-on shadow metrics. The delegate cache
+        // has no interest concept, so it gets none and stays pure byte-LRU.
+        // Capturing a clone of the `Arc<Ring>` keeps `wasm_runtime` free of any
+        // `ring` dependency. See #4441 / #4534.
+        //
+        // The cache is keyed by WASM code hash (#5268), and one compiled module
+        // serves EVERY instance of that binary, so the question the predicate
+        // must answer is "is any instance of this code in use?" — hence
+        // `any_in_use_with_code` rather than `contract_in_use`. Instance ids are
+        // resolved to code hashes through the shared index, i.e. through what
+        // this node itself recorded, never through the unverified `code` field a
+        // `ContractKey` carries (see `Runtime::prepare_contract_call_inner`).
         let ring_for_interest = op_manager.ring.clone();
-        let contract_interest: crate::wasm_runtime::InterestPredicate<ContractKey> =
-            Arc::new(move |key: &ContractKey| ring_for_interest.contract_in_use(key));
-        let shared_contract_modules: SharedModuleCache<ContractKey> =
+        let index_for_interest = shared_contract_index.clone();
+        let contract_interest: crate::wasm_runtime::InterestPredicate<CodeHash> =
+            Arc::new(move |code: &CodeHash| {
+                ring_for_interest.any_in_use_with_code(code, |instance| {
+                    index_for_interest.get(instance).map(|entry| *entry.value())
+                })
+            });
+        let shared_contract_modules: SharedModuleCache<CodeHash> =
             Arc::new(Mutex::new(ModuleCache::with_label_and_interest(
                 contract_cache_budget,
                 "contract",
@@ -404,10 +426,9 @@ impl RuntimePool {
         let shared_recovery_guard: super::CorruptedStateRecoveryGuard =
             Arc::new(std::sync::Mutex::new(HashSet::new()));
 
-        // Pool-owned contract instance index shared by every executor's
-        // `ContractStore` (#4218). The first executor loads it from ReDb; the
-        // rest inherit the same live `Arc`.
-        let shared_contract_index: SharedContractIndex = Arc::new(DashMap::new());
+        // (`shared_contract_index` is created earlier, above the module caches,
+        // because the contract cache's interest predicate resolves instance ids
+        // through it.)
 
         // Create the first executor to obtain a backend engine, then share it
         // with all subsequent executors. All executors MUST share the same backend

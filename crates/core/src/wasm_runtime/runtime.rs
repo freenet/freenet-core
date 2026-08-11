@@ -39,6 +39,26 @@ use super::ModuleCache;
 ///   *count* cap did (the eviction-recompilation cycle behind issue #4441).
 /// - It bounds the cache's absolute memory footprint regardless of contract
 ///   count, which a count cap could not (1024 large modules ≫ 1024 small ones).
+///
+/// # The contract cache is keyed by CODE hash, not by contract instance (#5268)
+///
+/// A compiled module is a function of the WASM **code alone**: compilation never
+/// sees a contract's parameters (`prepare_contract_call_inner` compiles
+/// `contract_v1.code().data()`; parameters are written into the instance's
+/// linear memory at call time). But `ContractKey`'s `Hash`/`Eq` compare only its
+/// `instance` field, and `instance = blake3(code_hash ‖ params)` — so keying
+/// this cache by `ContractKey` compiled and stored one module PER PARAMETER SET
+/// over identical code. Measured on the live network: 3,746 resident modules for
+/// 215 distinct `.wasm` files on one gateway (~17x duplication), with 61% of
+/// fleet samples pinned at ≥99% of the module-cache budget (i.e. thrashing) and
+/// a median 247 MiB of the cache wasted on duplicates.
+///
+/// Keying by [`CodeHash`] collapses those duplicates to one entry per distinct
+/// binary — the same identity the **source-bytes** cache one layer down already
+/// uses (`ContractStore::fetch_contract`). The hash is always one the node
+/// computed itself, never the unverified `code` field carried on a
+/// `ContractKey`; see `Runtime::prepare_contract_call_inner` for why that
+/// distinction is load-bearing.
 pub(crate) type SharedModuleCache<K> = Arc<Mutex<ModuleCache<K, <Engine as WasmEngine>::Module>>>;
 
 static INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
@@ -486,8 +506,10 @@ pub struct Runtime {
 
     /// Local contract storage.
     pub(crate) contract_store: ContractStore,
-    /// LRU cache of compiled contract modules (shared across pool executors).
-    pub(super) contract_modules: SharedModuleCache<ContractKey>,
+    /// LRU cache of compiled contract modules (shared across pool executors),
+    /// keyed by the WASM **code hash** so that N contract instances over one
+    /// binary share a single compiled module (#5268). See [`SharedModuleCache`].
+    pub(super) contract_modules: SharedModuleCache<CodeHash>,
 
     /// Optional state storage backend for V2 delegate contract access.
     pub(crate) state_store_db: Option<crate::contract::storages::Storage>,
@@ -736,7 +758,7 @@ impl Runtime {
         delegate_store: DelegateStore,
         secret_store: SecretsStore,
         host_mem: bool,
-        contract_modules: SharedModuleCache<ContractKey>,
+        contract_modules: SharedModuleCache<CodeHash>,
         delegate_modules: SharedModuleCache<DelegateKey>,
         delegate_contexts: super::native_api::DelegateContextCache,
         created_delegates_count: super::native_api::SharedDelegateCounter,
@@ -950,21 +972,54 @@ impl Runtime {
         req_bytes: usize,
         already_fetched: Option<&ContractContainer>,
     ) -> RuntimeResult<RunningInstance> {
+        // The cache is keyed by CODE hash, not by contract instance (#5268):
+        // compilation is a function of the WASM bytes alone (the compile below
+        // feeds `contract_v1.code().data()` and nothing else — parameters reach
+        // the guest through linear memory at call time), so every instance of
+        // one binary, however many parameter sets, shares one compiled module.
+        //
+        // # Which code hash, and why NOT `key.code_hash()`
+        //
+        // `ContractKey`'s `code` field is not a hash this node computed. It
+        // rides the wire verbatim on the bincode paths (peer `PutMsg` /
+        // `GetResult`, and the client API's `Native` encoding), and — because
+        // `ContractKey` equality and hashing are instance-only — a dozen
+        // production call sites deliberately synthesize keys carrying an
+        // all-zero code hash (`grep -rn 'CodeHash::new(\[0u8; 32\])'`). Keying
+        // this cache off that field would therefore let the caller choose which
+        // slot its contract lands in, which is the one way a dedup like this can
+        // go badly wrong: serving one contract's compiled module for another. So
+        // this path never touches it. Two hashes are used instead, both of which
+        // the node computed itself:
+        //
+        // 1. The **indexed** hash, `code_hash_from_id(key.id())` — this node's
+        //    own record of which WASM blob this instance resolves to, and the
+        //    same map `fetch_contract` gates on. Used only for the pre-fetch
+        //    lookup, so a hit still requires the instance to be locally indexed.
+        // 2. The **actual** hash, `CodeHash::from_code(&code)` — BLAKE3 of the
+        //    exact bytes handed to the compiler. Everything is INSERTED under
+        //    this one, so a cache entry can only ever be shared by callers whose
+        //    code really does hash to it.
+        //
+        // On a consistent store the two agree and this is a single lookup. If
+        // they ever disagree the only cost is an extra fetch (the pre-fetch
+        // lookup misses); nothing is mis-shared.
+        let indexed_code_hash = self.contract_store.code_hash_from_id(key.id());
         // Check shared cache first. The lock is held only for the duration of
         // the lookup + Module clone (an Arc bump) and is ALWAYS dropped before
         // the compile below — never held across the blocking compile.
-        let cached = self.contract_modules.lock().unwrap().get(key).cloned();
+        let cached = indexed_code_hash
+            .and_then(|hash| self.contract_modules.lock().unwrap().get(&hash).cloned());
         let module = if let Some(module) = cached {
             tracing::debug!(contract = %key, "Module cache hit");
             module
         } else {
-            tracing::info!(contract = %key, "Module cache miss — compiling");
-            // Cache miss — obtain the code and compile with the lock released
-            // so the (potentially multi-hundred-millisecond) Cranelift compile
-            // never blocks other executors waiting on the shared cache. When
-            // `offload_compilation` is set, `engine.compile` further offloads
-            // the compile to a blocking thread so it does not pin the
-            // single-threaded contract-handling loop (issue #4441).
+            // Obtain the code with the cache lock released so the (potentially
+            // multi-hundred-millisecond) Cranelift compile never blocks other
+            // executors waiting on the shared cache. When `offload_compilation`
+            // is set, `engine.compile` further offloads the compile to a
+            // blocking thread so it does not pin the single-threaded
+            // contract-handling loop (issue #4441).
             //
             // Prefer the caller-supplied contract (already in hand — no need
             // to round-trip through `contract_store`); fall back to fetching
@@ -994,19 +1049,40 @@ impl Runtime {
                 }
                 ContractContainer::Wasm(_) | _ => unimplemented!(),
             };
-            let module = self.engine.compile(&code)?;
-            let compiled_size = self.engine.module_compiled_size(&module);
-            // Re-check cache: the lock was released before compilation, so
-            // another executor may have compiled and cached this contract
-            // (the per-hash coalescing mutex in the engine prevents the
-            // duplicate Cranelift work, but two distinct misses can still race
-            // to this insert). Prefer the already-cached clone if present.
-            let mut cache = self.contract_modules.lock().unwrap();
-            if let Some(existing) = cache.get(key).cloned() {
-                existing
-            } else {
-                cache.insert(*key, module.clone(), compiled_size);
+            // BLAKE3 of the bytes we are about to compile — computed here rather
+            // than read off the container, whose embedded `code_hash` is a
+            // serde field that survives a wire round-trip unverified. One hash
+            // pass over the WASM is negligible next to the Cranelift compile it
+            // guards.
+            let code_hash = CodeHash::from_code(&code);
+            // Second lookup, now under the trustworthy hash: a contract that was
+            // not yet indexed (a brand-new instance arriving with its bytes on a
+            // PUT) still finds an already-compiled module for the same binary.
+            let cached_by_code = self
+                .contract_modules
+                .lock()
+                .unwrap()
+                .get(&code_hash)
+                .cloned();
+            if let Some(module) = cached_by_code {
+                tracing::debug!(contract = %key, %code_hash, "Module cache hit (by code hash)");
                 module
+            } else {
+                tracing::info!(contract = %key, %code_hash, "Module cache miss — compiling");
+                let module = self.engine.compile(&code)?;
+                let compiled_size = self.engine.module_compiled_size(&module);
+                // Re-check cache: the lock was released before compilation, so
+                // another executor may have compiled and cached this contract
+                // (the per-hash coalescing mutex in the engine prevents the
+                // duplicate Cranelift work, but two distinct misses can still
+                // race to this insert). Prefer the already-cached clone.
+                let mut cache = self.contract_modules.lock().unwrap();
+                if let Some(existing) = cache.get(&code_hash).cloned() {
+                    existing
+                } else {
+                    cache.insert(code_hash, module.clone(), compiled_size);
+                    module
+                }
             }
         };
         RunningInstance::new(

@@ -20,7 +20,7 @@ use tokio::time::Instant;
 use tracing::Instrument;
 
 use either::Either;
-use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
+use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
 use parking_lot::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
@@ -3913,6 +3913,18 @@ impl Ring {
     /// machinery would refresh the lease unboundedly).
     pub(crate) fn contract_in_use(&self, contract: &ContractKey) -> bool {
         self.hosting_manager.contract_in_use(contract)
+    }
+
+    /// Per-code-hash lift of [`contract_in_use`](Self::contract_in_use): is any
+    /// instance of this WASM binary in use? Used as the compiled-module cache's
+    /// interest predicate, which is keyed by code hash (#5268). See
+    /// `HostingManager::any_in_use_with_code`.
+    pub(crate) fn any_in_use_with_code(
+        &self,
+        code: &CodeHash,
+        code_of: impl Fn(&ContractInstanceId) -> Option<CodeHash>,
+    ) -> bool {
+        self.hosting_manager.any_in_use_with_code(code, code_of)
     }
 
     /// Single helper for every state-write chokepoint. Does the three
