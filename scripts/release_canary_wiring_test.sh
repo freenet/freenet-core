@@ -138,7 +138,35 @@ if [[ -n "$CANARY_LINE" ]]; then
     fi
 fi
 
-# --- 4. release.sh and the workflow agree on the job name -------------------
+# --- 4. CI must not pre-set CANARY_EXPECTED_LATEST --------------------------
+# Gate A resolves the expected release itself, from the same `releases/latest`
+# redirect the node uses, and refuses if it cannot. A value supplied by the
+# workflow would displace that resolution with a hand-maintained string.
+#
+# Note what this does and does not protect against, because the commit that
+# introduced the skip branch overstated it. A pinned value can only make the
+# check FAIL -- it cannot make it PASS vacuously -- provided the pinned value
+# is WRONG. Pin it CORRECTLY (say to the tag being released, which during
+# Gate A is not yet what `releases/latest` returns) and you have replaced a
+# resolved fact with an asserted one: the gate then compares the node's answer
+# against a constant somebody typed, which is precisely the class of check this
+# canary exists to replace. Either way it should not be here, so pin its
+# absence rather than reasoning about which failure mode it would cause.
+#
+# Nothing sets it today; that is the state being pinned.
+ARMED="$(printf '%s\n' "$JOB_BLOCK" | grep -cE 'CANARY_EXPECTED_LATEST')"
+if [[ "$ARMED" -eq 0 ]]; then
+    pass "the workflow does not pre-set CANARY_EXPECTED_LATEST (Gate A resolves it)"
+else
+    fail "the attach-to-release job sets CANARY_EXPECTED_LATEST" \
+        "Gate A resolves the expected release from the same redirect the node reads," \
+        "and refuses if it cannot. A workflow-supplied value replaces that resolved" \
+        "fact with a hand-maintained constant -- and if it is wrong, it fails a" \
+        "healthy release for a difference that is not a bug." \
+        "$(printf '%s\n' "$JOB_BLOCK" | grep -E 'CANARY_EXPECTED_LATEST')"
+fi
+
+# --- 5. release.sh and the workflow agree on the job name -------------------
 # release.sh reads this job's status by DISPLAY NAME. Nothing else pins the
 # pair, and a rename on either side is silent: the driver simply never sees the
 # job, waits out its 20-minute timeout, and reports UNKNOWN for a release that

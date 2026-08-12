@@ -133,6 +133,19 @@ MARKER_CHECK_COMPLETE='Startup update check complete'
 # the value against the tag GitHub actually published (see
 # CANARY_EXPECTED_LATEST) and fail on a mismatch.
 MARKER_LATEST_SEEN='Startup update check: GitHub reports latest release'
+# The first release whose binary EMITS the line above. It is new in #5236, and
+# Gate B's subject is the PREVIOUS release -- so for exactly one release the
+# binary under test predates the marker and has no observed-latest line to
+# compare. Arming the equality check against it would fail the gate for a line
+# that binary was never built to emit: a release blocked by its predecessor's
+# age. Gate B therefore arms the check only from `prev_version` onwards, which
+# makes this self-retiring -- permanently true from the release AFTER this
+# constant's value.
+#
+# If a Gate B run reports "never logged which release it compared against" for
+# a previous release at or above this version, the marker was REMOVED (a real
+# finding) or this constant is set one release too early (bump it).
+MARKER_LATEST_SEEN_SINCE='0.2.124'
 
 MUSL_ASSET='freenet-x86_64-unknown-linux-musl.tar.gz'
 RELEASE_BASE='https://github.com/freenet/freenet-core/releases/download'
@@ -564,6 +577,14 @@ normalise_release_tag() {
   printf '%s' "${1#v}"
 }
 
+# version_at_least <a> <b> -- true when semver <a> is >= <b>.
+#
+# `sort -V` rather than a field split: it gets 0.2.9 < 0.2.10 right, which a
+# lexical compare does not, and equal inputs land on the last line either way.
+version_at_least() {
+  [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]
+}
+
 resolve_expected_latest() {
   local url tag
   url="$(curl -fsS --max-time 30 -o /dev/null -w '%{redirect_url}' \
@@ -598,11 +619,18 @@ cmd_preflight() {
   # produces. Returning 1 here (not 2) because the retry loop below re-runs the
   # whole attempt for rc=2, and a resolution failure is not something a node
   # re-run fixes -- it is an infrastructure problem the operator must see.
-  # A caller may pin the expected release (the lifecycle test does, to stay
-  # off the network). Safe to honour: a pinned value can only make the equality
-  # check FAIL, never pass -- the only way to skip the check is to leave it
-  # empty, and that path resolves from GitHub or refuses. Empty is treated as
-  # unset so `CANARY_EXPECTED_LATEST=` cannot quietly disarm the gate.
+  # A caller may pin the expected release (the lifecycle test does, to stay off
+  # the network). What a pinned value cannot do is DISARM the check: skipping
+  # needs an EMPTY value, and empty is treated as unset here, so
+  # `CANARY_EXPECTED_LATEST=` falls through to resolving from GitHub or
+  # refusing.
+  #
+  # It CAN make the check PASS, though, and an earlier version of this comment
+  # claimed otherwise. Pin a value that happens to agree with a comparator that
+  # is silently wrong and the equality check confirms the wrong answer -- the
+  # asserted-instead-of-resolved shape this gate exists to replace. So the
+  # release path must never pin it; the workflow does not, and
+  # `release_canary_wiring_test.sh` pins that it stays that way.
   if [ -n "${CANARY_EXPECTED_LATEST:-}" ]; then
     log "using the caller-supplied expected release '$CANARY_EXPECTED_LATEST' (not resolving from GitHub)."
   elif ! CANARY_EXPECTED_LATEST="$(resolve_expected_latest)"; then
@@ -673,6 +701,28 @@ cmd_selfupdate() {
   local starting
   starting="$("$work/bin/freenet" --version | head -1)"
   log "starting from: $starting"
+
+  # Arm the positive-equality check, as Gate A does. Gate B runs AFTER
+  # publication, so `releases/latest` IS this release: the previous release's
+  # binary must observe `expected_version`, and there is no need to re-resolve
+  # it from GitHub -- the caller already knows which release it just published,
+  # and asking again would only introduce a second source allowed to disagree.
+  #
+  # Without this the deliberately-loud "CANARY_EXPECTED_LATEST is unset" NOTE
+  # fired on EVERY healthy Gate B run (the command runs in its own process, so
+  # nothing Gate A exported reaches it). A warning that appears on every good
+  # release is one everybody learns to scroll past, which is worse than no
+  # warning: it is the same alarm-fatigue failure that let `--disable-auto-update`
+  # sit on `framework` for nine days.
+  #
+  # Version-gated for the one release where the previous binary predates the
+  # marker -- see MARKER_LATEST_SEEN_SINCE.
+  if version_at_least "$prev_version" "$MARKER_LATEST_SEEN_SINCE"; then
+    export CANARY_EXPECTED_LATEST="$expected_version"
+  else
+    unset CANARY_EXPECTED_LATEST
+    note "NOTE: v$prev_version predates the observed-latest log line (#5236, first emitted by v$MARKER_LATEST_SEEN_SINCE), so Gate B's positive-equality check is SKIPPED. It arms itself once the previous release is v$MARKER_LATEST_SEEN_SINCE or newer; no action needed."
+  fi
 
   run_node_until_check "$work/bin/freenet" "$work"
 

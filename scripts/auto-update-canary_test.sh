@@ -231,8 +231,25 @@ check_vs_expected "equality: no observed-latest line at all -> fail" \
     "0.2.122" 1 "$HEALTHY_UP_TO_DATE" "never logged which release it compared against"
 # Unset is the pre-#5236 behaviour and must still work (the lifecycle test and
 # `assert-logs` drive it that way), but it must SAY it proved less.
+#
+# The message assertion is the whole case, and it was missing: with only the
+# exit code compared, replacing the entire `note "NOTE: CANARY_EXPECTED_LATEST
+# is unset..."` in auto-update-canary.sh with `:` left this green. The skip
+# branch could be silently emptied -- and a silent skip is precisely the
+# vacuous pass this gate exists to remove, since a reader of a green log would
+# have no way to tell the equality check ran from it having been skipped.
+#
+# Explicitly unset rather than relying on the variable happening to be unset.
+# It is not leaking from `check_vs_expected` today -- bash restores a
+# `VAR=x func` assignment when the function returns, verified -- but this is
+# the one case whose meaning depends on ambient environment, and the way it
+# would go wrong is silent: SEEN_OK carries latest=0.2.122, so an inherited
+# CANARY_EXPECTED_LATEST=0.2.122 sends it down the EQUALITY branch, still
+# exiting 0, testing the opposite of what its name says. The `unset` costs
+# nothing and makes the case mean one thing.
+unset CANARY_EXPECTED_LATEST
 check "equality: unset expected-latest -> still passes, but says it skipped" \
-    0 "$SEEN_OK"
+    0 "$SEEN_OK" "CANARY_EXPECTED_LATEST is unset, so the positive-equality check was SKIPPED"
 
 # --- the tag normaliser -----------------------------------------------------
 # It has to agree with version_from_tag exactly. If it strips differently, the
@@ -373,6 +390,72 @@ else
     echo "       Falling through would run Gate A with its positive check silently skipped." >&2
     FAILURES=$((FAILURES + 1))
 fi
+
+# --- Gate B must arm the equality check too ---------------------------------
+# `cmd_selfupdate` runs in its own process, so nothing Gate A exported reaches
+# it: before this, the deliberately-loud "CANARY_EXPECTED_LATEST is unset" NOTE
+# fired on EVERY healthy Gate B run. A warning that appears on every good
+# release is one everybody learns to scroll past. Same pin shape as
+# cmd_preflight's above, and for the same reason -- the skip branch is only as
+# harmless as the callers that do not take it.
+selfupdate_body="$(awk '/^cmd_selfupdate\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$CANARY_SH")"
+# shellcheck disable=SC2016  # literal source text; must not expand
+if [[ -z "$selfupdate_body" ]]; then
+    echo "FAIL - could not locate cmd_selfupdate() in $(basename "$CANARY_SH")" >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ "$selfupdate_body" != *'export CANARY_EXPECTED_LATEST="$expected_version"'* ]]; then
+    echo "FAIL - cmd_selfupdate does not arm the positive-equality check." >&2
+    echo "       Gate B knows exactly which release it just published; without exporting it, the" >&2
+    echo "       gate drops to 'the node did not complain' and prints the unset NOTE on every" >&2
+    echo "       healthy release until nobody reads it (#5236)." >&2
+    FAILURES=$((FAILURES + 1))
+# ...and it must arm it from the version it was told to expect, not from a
+# second lookup. Re-resolving would introduce a source allowed to disagree with
+# the caller -- the failure-that-is-not-a-bug this file already avoids in
+# resolve_expected_latest.
+elif [[ "$selfupdate_body" == *'resolve_expected_latest'* ]]; then
+    echo "FAIL - cmd_selfupdate re-resolves the expected release instead of using its argument." >&2
+    echo "       Two sources that may disagree produce a failed release that is not a bug." >&2
+    FAILURES=$((FAILURES + 1))
+else
+    echo "ok   - cmd_selfupdate arms the equality check from its expected-version argument"
+fi
+
+# The version gate around it. The observed-latest marker is new in #5236 and
+# Gate B drives the PREVIOUS release, so for one release there is no line to
+# compare; the gate must skip rather than fail. Both halves are pinned, because
+# either one alone is wrong: no gate blocks a release on its predecessor's age,
+# and no arming leaves Gate B permanently vacuous.
+# shellcheck disable=SC2016  # literal source text; must not expand
+if [[ "$selfupdate_body" != *'version_at_least "$prev_version" "$MARKER_LATEST_SEEN_SINCE"'* ]]; then
+    echo "FAIL - cmd_selfupdate arms the equality check without the MARKER_LATEST_SEEN_SINCE gate." >&2
+    echo "       A previous release built before #5236 emits no observed-latest line, so Gate B" >&2
+    echo "       would fail for a line that binary was never built to emit." >&2
+    FAILURES=$((FAILURES + 1))
+else
+    echo "ok   - cmd_selfupdate gates the equality check on MARKER_LATEST_SEEN_SINCE"
+fi
+
+# `version_at_least` decides whether the gate above arms, so it gets its own
+# cases: an off-by-one here silently disarms Gate B's only positive assertion.
+version_ge_case() {
+    # version_ge_case <a> <b> <yes|no>
+    local got
+    if version_at_least "$1" "$2"; then got=yes; else got=no; fi
+    if [[ "$got" == "$3" ]]; then
+        echo "ok   - version_at_least '$1' '$2' -> $3"
+    else
+        echo "FAIL - version_at_least '$1' '$2' said '$got', expected '$3'" >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+version_ge_case "0.2.124" "0.2.124" yes   # the release the marker lands in
+version_ge_case "0.2.125" "0.2.124" yes
+version_ge_case "0.2.123" "0.2.124" no    # the one release that must skip
+version_ge_case "0.3.0"   "0.2.124" yes
+# Numeric, not lexical: a lexical compare puts 0.2.99 above 0.2.124 and would
+# disarm the gate for every release in between.
+version_ge_case "0.2.99"  "0.2.124" no
 
 # --- markers must still exist in the Rust source ----------------------------
 # Without this the fixtures above are a self-consistent copy of strings that

@@ -71,8 +71,17 @@ COMPLETE_LINE='INFO freenet: Startup update check complete: staying on the curre
 LATEST_SEEN_LINE='INFO freenet::commands::auto_update: Startup update check: GitHub reports latest release latest=0.2.121'
 
 # Pin what the node is expected to have compared against, so cmd_preflight does
-# not reach GitHub from a test. Safe: a pinned value can only make the
-# equality check FAIL -- skipping it requires an EMPTY value, which
+# not reach GitHub from a test.
+#
+# Safe HERE, and only here: the node is a synthetic fixture and this file
+# chooses BOTH sides of the comparison on purpose. It is not safe on the
+# release path -- a pinned value that happens to agree with a silently-wrong
+# comparator makes the equality check confirm the wrong answer rather than
+# catch it. (An earlier version of this comment said a pinned value "can only
+# make the check FAIL". That is true of skipping it, not of passing it.)
+# `release_canary_wiring_test.sh` pins that the workflow leaves it unset.
+#
+# Skipping is what a pinned value cannot do: that needs an EMPTY value, which
 # cmd_preflight treats as unset and then resolves or refuses. Cases that fail
 # earlier (parse failure, no outcome) never reach the check at all.
 export CANARY_EXPECTED_LATEST=0.2.121
