@@ -1857,6 +1857,9 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // because F1 is the newest response at the moment it lands. Comparing each
   // card's `_fnShownAt` against when this request was ISSUED is what makes it
   // correct: a snapshot taken before the card existed can never hide it.
+  // perm-reconcile:BEGIN
+  // Extracted verbatim by shell_bridge_permission_ws.test.mjs, which runs it
+  // against injected `fetch` / `Date` / card helpers. Keep the markers.
   function reconcileFromPending() {
     var issuedAt = Date.now();
     fetch('/permission/pending')
@@ -1876,12 +1879,19 @@ function freenetBridge(authToken, userToken, hostedMode) {
           if (seen[nonce]) return;
           var card = overlayCards[nonce];
           // Only hide what this snapshot could actually have observed.
-          if (card && card._fnShownAt > issuedAt) return;
+          // `>=`, not `>`: Date.now() has millisecond granularity and the node
+          // is on loopback, so a card shown in the SAME millisecond the fetch
+          // was issued is genuinely ambiguous. Resolve that tie toward keeping
+          // the card. The two errors are not symmetric — a card kept one beat
+          // too long is corrected by the next event or reconcile, whereas a
+          // card hidden wrongly destroys a live security prompt outright.
+          if (card && card._fnShownAt >= issuedAt) return;
           hideCard(nonce);
         });
       })
       .catch(function () {});
   }
+  // perm-reconcile:END
 
   // Open a WebSocket so prompts appear with no polling delay and on every
   // open Freenet tab regardless of foreground/background state.

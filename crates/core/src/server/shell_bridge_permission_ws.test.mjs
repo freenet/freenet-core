@@ -64,8 +64,14 @@ function check(name, cond) {
 //    HTTP request per tab exhausts the browser's per-origin connection budget
 //    and hangs every Freenet tab past the sixth. Pinned here as well as in the
 //    Rust guard so it fails in whichever suite runs first.
+//
+//    SCOPE: this rules out the one spelling that actually shipped. A streamed
+//    fetch() or a long-poll would break the same invariant and still pass, so
+//    it is a fast signal, not the guard. The invariant itself is checked in a
+//    real browser by
+//    crates/core/tests/playwright/tests/connection-exhaustion.spec.ts.
 {
-  check('shell opens no EventSource (#5213)', !src.includes('new EventSource('));
+  check('shell opens no EventSource (#5213)', !src.includes('EventSource('));
   check('shell opens the permission WebSocket', src.includes('/permission/events/ws'));
 }
 
@@ -336,6 +342,155 @@ function check(name, cond) {
     sock.close(); // stale close on an already-cleared socket
     advance(5000);
     check('a duplicate close does not double-schedule', calls.sockets.length === 2);
+  }
+}
+
+// 7. `reconcileFromPending` must never destroy a prompt it could not have
+//    known about. Found in review of PR #5269, and it is the worst failure
+//    mode in this file: the card is removed from the DOM with a healthy socket
+//    and nothing to re-add it, so the prompt auto-denies at the server timeout
+//    and the USER NEVER SEES IT. Reachable on any node restart —
+//
+//      1. socket closes, the fallback poll issues fetch F1 (slow, node is
+//         restarting)
+//      2. socket reconnects; stopFallbackPoll clears the interval but cannot
+//         cancel F1
+//      3. prompt X arrives over the fresh socket -> showCard(X)
+//      4. F1 lands carrying the PRE-restart list, which has no X
+//
+//    A generation counter does not fix this: F1 is the newest response at the
+//    moment it lands. Only comparing each card's `_fnShownAt` against when the
+//    request was ISSUED does.
+{
+  const reconcileSrc = extractFrom(
+    'perm-reconcile:BEGIN',
+    'perm-reconcile:END',
+    'function reconcileFromPending(',
+  );
+
+  // Free variables of the extracted region, supplied as parameters so the real
+  // source runs unmodified against stubs.
+  const makeReconcile = new Function(
+    'Date',
+    'fetch',
+    'overlayCards',
+    'showCard',
+    'createCard',
+    'hideCard',
+    `${reconcileSrc}\nreturn reconcileFromPending;`,
+  );
+
+  function build(pending) {
+    const clock = { t: 1000 };
+    const DateStub = { now: () => clock.t };
+    const overlayCards = {};
+    const hidden = [];
+    let release = null;
+    const fetchStub = () =>
+      new Promise((res) => {
+        release = () => res({ json: () => Promise.resolve(pending) });
+      });
+    // Mirrors the real showCard's stamping. Pinned against the real source
+    // separately below, since showCard itself lives outside the region.
+    const showCard = (nonce, card) => {
+      card._fnShownAt = DateStub.now();
+      overlayCards[nonce] = card;
+    };
+    const createCard = (p) => ({ nonce: p.nonce });
+    const hideCard = (nonce) => {
+      delete overlayCards[nonce];
+      hidden.push(nonce);
+    };
+    return {
+      clock,
+      overlayCards,
+      hidden,
+      showCard,
+      createCard,
+      reconcile: makeReconcile(
+        DateStub,
+        fetchStub,
+        overlayCards,
+        showCard,
+        createCard,
+        hideCard,
+      ),
+      settle: async () => {
+        release();
+        // Two hops: r.json() is itself a promise.
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      },
+    };
+  }
+
+  // 7a. The regression itself: a card raised AFTER the request went out must
+  //     survive a snapshot that predates it.
+  {
+    const env = build([]);
+    env.reconcile();
+    env.clock.t = 1001;
+    env.showCard('X', env.createCard({ nonce: 'X' }));
+    await env.settle();
+    check(
+      'a prompt raised while the snapshot was in flight is NOT destroyed',
+      env.overlayCards.X !== undefined && env.hidden.length === 0,
+    );
+  }
+
+  // 7b. The tie. Date.now() is millisecond-granular and the node is on
+  //     loopback, so same-millisecond is genuinely ambiguous; it must resolve
+  //     toward keeping the card, because a wrongly-kept card is corrected by
+  //     the next reconcile whereas a wrongly-hidden one is gone for good.
+  {
+    const env = build([]);
+    env.reconcile();
+    env.showCard('X', env.createCard({ nonce: 'X' })); // same ms as issuedAt
+    await env.settle();
+    check(
+      'a card shown in the SAME millisecond the request was issued survives',
+      env.overlayCards.X !== undefined,
+    );
+  }
+
+  // 7c. Control. Without this the fix could degenerate into "never hide
+  //     anything", and cross-tab dismissal would silently stop working: a
+  //     prompt answered in another tab would stay on screen forever.
+  {
+    const env = build([]);
+    env.clock.t = 999;
+    env.showCard('X', env.createCard({ nonce: 'X' }));
+    env.clock.t = 1000;
+    env.reconcile();
+    await env.settle();
+    check(
+      'a card the snapshot COULD have seen, and did not, is still hidden',
+      env.overlayCards.X === undefined && env.hidden[0] === 'X',
+    );
+  }
+
+  // 7d. The additive half of reconciliation still works.
+  {
+    const env = build([{ nonce: 'Y' }]);
+    env.reconcile();
+    await env.settle();
+    check('a pending prompt not yet on screen is shown', env.overlayCards.Y !== undefined);
+  }
+
+  // 7e. The stamp itself. 7a-7c stub showCard, so they would all still pass if
+  //     the real showCard stopped recording `_fnShownAt` — every card would
+  //     then compare `undefined >= issuedAt` (false) and be hidden, which is
+  //     precisely the bug. Bound the scrape to showCard's own body: an
+  //     unbounded search would match the stub-mirroring comment above.
+  {
+    const fnStart = src.indexOf('function showCard(');
+    const after = src.indexOf('\n  function ', fnStart + 1);
+    const body = fnStart < 0 ? '' : src.slice(fnStart, after < 0 ? undefined : after);
+    check(
+      'showCard records _fnShownAt, which the comparison above depends on',
+      body.includes('_fnShownAt = Date.now()'),
+    );
   }
 }
 

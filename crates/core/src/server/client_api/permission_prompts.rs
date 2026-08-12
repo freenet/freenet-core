@@ -14,7 +14,9 @@
 //! connections per origin PER TAB, so a seventh tab's own document and assets
 //! queued forever behind the held-open streams (#5213). Browsers pool
 //! WebSockets separately and far more generously. The SSE route is still
-//! served for tabs opened before a node upgrade; see [`routes`].
+//! served for tabs opened before a node upgrade, though only to spare them the
+//! polling fallback rather than to keep them working at all; see [`routes`]
+//! and #5272.
 //!
 //! The `/permission/pending` JSON polling endpoint is retained as the
 //! always-on fallback while the socket is down or its handshake is hanging,
@@ -108,6 +110,15 @@ use crate::contract::user_input::{
 use crate::server::{AllowedHosts, AllowedSourceCidrs};
 
 /// Register permission prompt routes.
+///
+/// `/permission/events` is the legacy SSE transport, kept only for tabs that
+/// were already open when the node upgraded past #5213 — no current shell JS
+/// opens it. Retiring it is tracked in #5272. Be precise about what removal
+/// would cost: the pre-#5213 client registers an error listener on the
+/// `EventSource` and falls back to polling `/permission/pending` every 3s, so
+/// deleting the route degrades those tabs to that fallback (a prompt takes up
+/// to ~3s to appear) rather than breaking them. Latency for pre-upgrade tabs,
+/// not correctness.
 pub(super) fn routes() -> Router {
     Router::new()
         .route("/permission/pending", get(pending_prompts))
@@ -731,6 +742,14 @@ fn origin_matches_allowed_host(
 /// [`is_origin_trusted`], which is shared with `hosted_import` and
 /// `pending_prompts` — tightening it wholesale is a wider blast radius than
 /// this endpoint needs.
+///
+/// Reads the `Host` header specifically. That is correct today because the
+/// local listener is HTTP/1.1 only (`axum` is pinned with no `http2` feature),
+/// so `Host` is always present. If h2 is ever enabled, the authority moves to
+/// the `:authority` pseudo-header and `Host` disappears: this returns `false`
+/// and the socket is refused. That is the safe direction — the overlay falls
+/// back to polling rather than the gate silently opening — but whoever enables
+/// h2 has to teach this function to read `uri.authority()` too.
 fn origin_is_exactly_same_origin(headers: &HeaderMap) -> bool {
     let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) else {
         return false;
@@ -2000,7 +2019,7 @@ mod tests {
     /// The bug this PR closes: a `prompt_added` lifecycle event must be
     /// pushed to a subscribed SSE client without polling.
     #[tokio::test]
-    #[serial_test::serial(sse_global_counter)]
+    #[serial_test::serial(permission_subscriber_counter)]
     async fn test_sse_emits_added_when_prompt_inserted() {
         let initial_subs = prompt_events().receiver_count();
         let mut body = open_sse_with_origin(Some("http://localhost:7509")).await;
@@ -2029,7 +2048,7 @@ mod tests {
     /// `prompt_removed` must arrive over SSE so every tab dismisses its
     /// overlay simultaneously when one tab clicks a button.
     #[tokio::test]
-    #[serial_test::serial(sse_global_counter)]
+    #[serial_test::serial(permission_subscriber_counter)]
     async fn test_sse_emits_removed_when_prompt_responded() {
         let initial_subs = prompt_events().receiver_count();
         let mut body = open_sse_with_origin(Some("http://localhost:7509")).await;
@@ -2096,7 +2115,7 @@ mod tests {
     /// handler emits `prompt_added` for it) instead of the live broadcast,
     /// to keep the test deterministic under parallel execution.
     #[tokio::test]
-    #[serial_test::serial(sse_global_counter)]
+    #[serial_test::serial(permission_subscriber_counter)]
     async fn test_sse_allows_same_origin_and_none_sec_fetch() {
         let pending = crate::contract::user_input::pending_prompts();
         for site in ["same-origin", "same-site", "none"] {
@@ -2129,7 +2148,7 @@ mod tests {
     /// new live events arrive. Avoids the race where a prompt added between
     /// the page load and the SSE subscribe would be invisible.
     #[tokio::test]
-    #[serial_test::serial(sse_global_counter)]
+    #[serial_test::serial(permission_subscriber_counter)]
     async fn test_sse_replays_existing_pending_on_subscribe() {
         // Insert into the global registry before subscribing.
         let pending = crate::contract::user_input::pending_prompts();
@@ -2171,7 +2190,7 @@ mod tests {
     /// chain order, a refreshed tab could dedup-skip a re-broadcast Added
     /// for an entry that hadn't been delivered yet.
     #[tokio::test]
-    #[serial_test::serial(sse_global_counter)]
+    #[serial_test::serial(permission_subscriber_counter)]
     async fn test_sse_bootstrap_replay_arrives_before_live() {
         let pending = crate::contract::user_input::pending_prompts();
         let pre_nonce = "ssetest_order_pre".to_string();
@@ -2262,12 +2281,12 @@ mod tests {
     /// the GuardedStream's drop semantics (no permanent leak after a
     /// client disconnects mid-flight).
     ///
-    /// Uses `#[serial_test::serial(sse_global_counter)]` so any other
+    /// Uses `#[serial_test::serial(permission_subscriber_counter)]` so any other
     /// test that opens an SSE stream can't perturb the shared
     /// `PERMISSION_SUBSCRIBERS` counter mid-assertion. Tests that only construct
     /// the rejected path (no slot consumed) don't need the lock.
     #[tokio::test]
-    #[serial_test::serial(sse_global_counter)]
+    #[serial_test::serial(permission_subscriber_counter)]
     async fn test_sse_connection_cap_and_release_on_drop() {
         // Local-mutex pattern retained as a defence-in-depth against a
         // future test that opens an SSE stream without the serial
@@ -2843,7 +2862,7 @@ mod tests {
     /// stream. Asserts the stream is NOT immediately closed with the
     /// `:untrusted-origin` comment.
     #[tokio::test]
-    #[serial_test::serial(sse_global_counter)]
+    #[serial_test::serial(permission_subscriber_counter)]
     async fn test_sse_accepts_lan_same_ip_origin() {
         let pending = crate::contract::user_input::pending_prompts();
         let nonce = "ssetest_lan_accept";
@@ -2878,7 +2897,7 @@ mod tests {
 
     /// `allowed-host` hostname with matching Origin must accept SSE.
     #[tokio::test]
-    #[serial_test::serial(sse_global_counter)]
+    #[serial_test::serial(permission_subscriber_counter)]
     async fn test_sse_accepts_allowed_host_with_matching_origin() {
         let pending = crate::contract::user_input::pending_prompts();
         let nonce = "ssetest_allowed_host_accept";
@@ -3307,7 +3326,7 @@ mod tests {
     /// whole group would be vacuous. A same-origin loopback handshake MUST
     /// succeed.
     #[tokio::test]
-    #[serial_test::serial(sse_global_counter)]
+    #[serial_test::serial(permission_subscriber_counter)]
     async fn permission_ws_accepts_same_origin_loopback_handshake() {
         let addr = spawn_ws_server(ws_test_app(empty_pending(), Some(loopback_peer()))).await;
         let sock = try_ws_connect(addr, Some(&same_origin(addr))).await;
@@ -3333,7 +3352,7 @@ mod tests {
     /// is a textbook cross-site WebSocket hijack. Paired with the same-origin
     /// control above so it cannot pass vacuously.
     #[tokio::test]
-    #[serial_test::serial(sse_global_counter)]
+    #[serial_test::serial(permission_subscriber_counter)]
     async fn permission_ws_rejects_cross_origin_handshake() {
         let addr = spawn_ws_server(ws_test_app(empty_pending(), Some(loopback_peer()))).await;
         for evil in [
@@ -3367,7 +3386,7 @@ mod tests {
     /// `origin_is_exactly_same_origin` rejects them. That makes this test the
     /// sole guard on that check.
     #[tokio::test]
-    #[serial_test::serial(sse_global_counter)]
+    #[serial_test::serial(permission_subscriber_counter)]
     async fn permission_ws_rejects_other_localhost_ports() {
         let addr = spawn_ws_server(ws_test_app(empty_pending(), Some(loopback_peer()))).await;
         for other in [
@@ -3394,7 +3413,7 @@ mod tests {
     /// every WebSocket handshake. Rejecting the absent case puts that
     /// reasoning in the code rather than in a comment.
     #[tokio::test]
-    #[serial_test::serial(sse_global_counter)]
+    #[serial_test::serial(permission_subscriber_counter)]
     async fn permission_ws_rejects_handshake_without_origin() {
         let addr = spawn_ws_server(ws_test_app(empty_pending(), Some(loopback_peer()))).await;
         let result = try_ws_connect(addr, None).await;
@@ -3409,7 +3428,7 @@ mod tests {
     /// raw nonces, so an off-box LAN peer must be refused even when the main
     /// listener binds 0.0.0.0.
     #[tokio::test]
-    #[serial_test::serial(sse_global_counter)]
+    #[serial_test::serial(permission_subscriber_counter)]
     async fn permission_ws_rejects_lan_peer() {
         let lan = SocketAddr::from(([192, 168, 1, 50], 40000));
         let addr = spawn_ws_server(ws_test_app(empty_pending(), Some(lan))).await;
@@ -3426,7 +3445,7 @@ mod tests {
     /// proof that the WebSocket handler actually consults `peer_is_loopback`
     /// rather than trusting the transport.
     #[tokio::test]
-    #[serial_test::serial(sse_global_counter)]
+    #[serial_test::serial(permission_subscriber_counter)]
     async fn permission_ws_rejects_missing_connect_info() {
         let addr = spawn_ws_server(ws_test_app(empty_pending(), None)).await;
         let result = try_ws_connect(addr, Some(&same_origin(addr))).await;
@@ -3446,7 +3465,7 @@ mod tests {
     /// through, so a cap rejection is transient rather than permanently
     /// wedging the channel.
     #[tokio::test]
-    #[serial_test::serial(sse_global_counter)]
+    #[serial_test::serial(permission_subscriber_counter)]
     async fn permission_ws_honours_shared_subscriber_cap() {
         let addr = spawn_ws_server(ws_test_app(empty_pending(), Some(loopback_peer()))).await;
 
@@ -3512,7 +3531,7 @@ mod tests {
     /// node's lifetime and silently degrades every tab to 3s polling, which is
     /// the same failure class as #5213 itself.
     #[tokio::test]
-    #[serial_test::serial(sse_global_counter)]
+    #[serial_test::serial(permission_subscriber_counter)]
     async fn permission_ws_slot_is_held_while_live_and_released_on_disconnect() {
         let addr = spawn_ws_server(ws_test_app(empty_pending(), Some(loopback_peer()))).await;
 
@@ -3580,7 +3599,7 @@ mod tests {
     /// tab dismisses simultaneously. This is the behaviour #4023 introduced;
     /// #5213 only changes the transport carrying it, so it must survive.
     #[tokio::test]
-    #[serial_test::serial(sse_global_counter)]
+    #[serial_test::serial(permission_subscriber_counter)]
     async fn permission_ws_delivers_added_and_removed_end_to_end() {
         let initial_subs = prompt_events().receiver_count();
         let addr = spawn_ws_server(ws_test_app(empty_pending(), Some(loopback_peer()))).await;
@@ -3629,7 +3648,7 @@ mod tests {
     /// the replay, refreshing the only open tab would strand a live prompt
     /// with nothing rendering it.
     #[tokio::test]
-    #[serial_test::serial(sse_global_counter)]
+    #[serial_test::serial(permission_subscriber_counter)]
     async fn permission_ws_replays_pending_on_connect() {
         let pending = empty_pending();
         let nonce = "wstest_replay_002".to_string();
@@ -3737,7 +3756,7 @@ mod tests {
     /// without this, the WebSocket's lag branch was pinned only by the shape
     /// of a hand-built envelope and never actually executed.
     #[tokio::test]
-    #[serial_test::serial(sse_global_counter)]
+    #[serial_test::serial(permission_subscriber_counter)]
     async fn permission_ws_pump_emits_resync_when_the_broadcast_laps_it() {
         let (tx, rx) = tokio::sync::broadcast::channel::<PromptEvent>(2);
         for i in 0..5 {
@@ -3784,7 +3803,7 @@ mod tests {
     /// Time is paused, so the wait costs no wall-clock; the assertion is that
     /// the pump RETURNS at all rather than hanging in `send`.
     #[tokio::test(start_paused = true)]
-    #[serial_test::serial(sse_global_counter)]
+    #[serial_test::serial(permission_subscriber_counter)]
     async fn permission_ws_pump_gives_up_on_a_client_that_stops_reading() {
         let baseline = PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed);
         let guard = try_claim_subscriber_slot().expect("a slot must be free");

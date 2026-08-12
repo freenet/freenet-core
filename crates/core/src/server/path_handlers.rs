@@ -4901,8 +4901,19 @@ mod tests {
         // legacy SSE route for tabs opened before a node upgrade, so pinning
         // the absence of the route itself would be wrong; what must not come
         // back is the CLIENT holding one.
+        //
+        // SCOPE, so nobody mistakes this for the real guard: a substring check
+        // can only rule out the ONE spelling of the violation that shipped. A
+        // streamed `fetch()`, a long-poll, or any other request the shell
+        // never lets finish would reintroduce #5213 and keep this assertion
+        // green. The invariant itself ("the shell holds no HTTP request open")
+        // is enforced behaviourally in a real browser by
+        // crates/core/tests/playwright/tests/connection-exhaustion.spec.ts,
+        // which loads the shell, waits, and fails if any request is still
+        // unfinished. Keep this cheap check as the fast local signal, but if
+        // you change how the shell subscribes, that spec is what must pass.
         assert!(
-            !html.contains("new EventSource("),
+            !html.contains("EventSource("),
             "shell JS must not open an EventSource: one held-open HTTP request \
              per tab exhausts the browser's ~6-connections-per-origin budget \
              and hangs the 7th Freenet tab (#5213)"
