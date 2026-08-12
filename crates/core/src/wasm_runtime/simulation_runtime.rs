@@ -141,19 +141,12 @@ impl InMemoryContractStore {
         Ok(())
     }
 
-    /// Ensure a contract key is indexed (instance_id -> code_hash mapping exists).
-    pub fn ensure_key_indexed(&self, key: &ContractKey) -> Result<(), anyhow::Error> {
-        let mut inner = self.inner.lock().unwrap();
-        if !inner.instance_to_code.contains_key(key.id()) {
-            let code_hash = *key.code_hash();
-            // We don't have params here, so use empty. The code hash is the important part
-            // for lookup_key reconstruction.
-            inner
-                .instance_to_code
-                .insert(*key.id(), (code_hash, Parameters::from(Vec::<u8>::new())));
-        }
-        Ok(())
-    }
+    // NOTE: there is deliberately no `ensure_key_indexed` here. The executor's
+    // "code already stored, index this new instance" branch routes through
+    // `store_contract`, which is the single guarded ingress on both backends —
+    // see `ContractStoreBridge::store_contract`. The removed helper also
+    // recorded EMPTY parameters for the instance, which `store_contract` gets
+    // right, so this backend became more faithful by losing it.
 
     /// Clear all stored contracts (for testing).
     pub fn clear(&self) {

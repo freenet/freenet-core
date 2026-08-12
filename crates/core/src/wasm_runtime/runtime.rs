@@ -1096,11 +1096,6 @@ impl super::contract::ContractStoreBridge for Runtime {
         self.contract_store.remove_contract(key)?;
         Ok(())
     }
-
-    fn ensure_key_indexed(&mut self, key: &ContractKey) -> Result<(), anyhow::Error> {
-        self.contract_store.ensure_key_indexed(key)?;
-        Ok(())
-    }
 }
 
 impl super::contract::ContractRuntimeBridge for Runtime {}

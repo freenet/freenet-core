@@ -69,11 +69,20 @@ pub(crate) trait ContractStoreBridge {
     /// disk budget. See [`super::ContractStore::code_blob_stored`] (#4218).
     fn code_blob_stored(&self, code_hash: &CodeHash) -> bool;
 
+    /// The store's ONE ingress for the durable instance→code index.
+    ///
+    /// This is deliberately the only index-writing method on this trait. An
+    /// `ensure_key_indexed` sibling used to sit here, which wrote that row with
+    /// none of the preconditions `store_contract` enforces, so the executor's
+    /// "code already on disk, index this new instance" branch was an unguarded
+    /// second ingress to the row the guarded path protects. `store_contract`'s
+    /// own fast paths already do that indexing when the blob is present, so the
+    /// second entry point bought nothing and cost two invariants (see
+    /// `ContractStore::verify_contract_identity` and #5280). Do not add another
+    /// index writer here.
     fn store_contract(&mut self, contract: ContractContainer) -> Result<(), anyhow::Error>;
 
     fn remove_contract(&mut self, key: &ContractKey) -> Result<(), anyhow::Error>;
-
-    fn ensure_key_indexed(&mut self, key: &ContractKey) -> Result<(), anyhow::Error>;
 }
 
 /// Combined trait: WASM execution + contract storage. Implemented by `Runtime`

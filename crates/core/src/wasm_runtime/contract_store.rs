@@ -247,6 +247,18 @@ impl ContractStore {
     /// Deriving the id via the stdlib helper rather than re-implementing
     /// `BLAKE3(hash ‖ params)` here is deliberate: a local copy of that formula
     /// would silently diverge if the derivation ever changed.
+    ///
+    /// # Note for a future fuzz or property test
+    ///
+    /// A container built with `Arbitrary` fails check 1 BY CONSTRUCTION and is
+    /// not a bug here: `ContractCode` derives `Arbitrary` with `code_hash` as
+    /// random bytes unrelated to `data`, and `WrappedContract::arbitrary` then
+    /// derives the key from that unrelated hash — so such a container satisfies
+    /// check 2 and fails check 1. Nothing in core or fdev builds contract
+    /// containers that way today, so this is not reachable; but feeding
+    /// `WrappedContract::arbitrary()` to `store_contract` would fail in a way
+    /// that looks like a real defect. Hash the bytes you want the container to
+    /// carry, or go through `WrappedContract::new`.
     fn verify_contract_identity(
         key: &ContractKey,
         code: &ContractCode<'_>,
@@ -541,11 +553,33 @@ impl ContractStore {
         self.key_to_code_part.get(id).map(|r| *r.value())
     }
 
-    /// Ensures the key_to_code_part mapping exists for the given contract key.
-    /// This is needed because when contract code is already cached, store_contract
-    /// may not be called, but we still need to index new ContractInstanceIds that
-    /// use the same code (different parameters = different rooms).
-    /// See issue #2380.
+    /// Index a contract instance from a bare key. **Test fixtures only.**
+    ///
+    /// Indexing a new instance of already-stored code (different parameters =
+    /// different rooms, issue #2380) is real and necessary, but it is
+    /// [`Self::store_contract`]'s job: its fast paths do exactly this work when
+    /// the blob is already present, and they do it AFTER
+    /// [`Self::verify_contract_identity`] has established that the key is
+    /// derived from the code and parameters in hand.
+    ///
+    /// This entry point cannot do that, and that is why it is no longer
+    /// production-reachable. It receives only a `&ContractKey` — no code bytes,
+    /// no parameters — so it can neither derive the identity it is filing nor
+    /// confirm the blob it points at exists. It used to be called directly from
+    /// `bridged_upsert_contract_state_inner` on the common "code already stored"
+    /// path, which made it a second, unguarded writer of the durable
+    /// instance→code row, and it was implicated twice over for two DIFFERENT
+    /// missing preconditions: no derivation check (the hole
+    /// `verify_contract_identity` closes) and no blob-existence check (the
+    /// candidate mechanism for the dangling index entries in #5280). One helper,
+    /// two invariants missed, because a store with real invariants had an ingress
+    /// that could not check them.
+    ///
+    /// It survives `#[cfg(test)]`-gated because several fixtures legitimately
+    /// want "index this key and nothing else". The gate is the enforcement: a
+    /// future production caller does not compile. If you need this from
+    /// production code, you need `store_contract`.
+    #[cfg(test)]
     pub fn ensure_key_indexed(&mut self, key: &ContractKey) -> RuntimeResult<()> {
         // Public entry point: take the shared store/remove lock (issue #4216)
         // so an external caller indexing a new instance is serialized against a
@@ -558,27 +592,59 @@ impl ContractStore {
         self.ensure_key_indexed_locked(key)
     }
 
-    /// Unlocked body of [`ensure_key_indexed`]. The caller MUST hold the shared
-    /// `contract_blob_lock` (issue #4216). Called by `store_contract`, which
-    /// already holds the lock.
+    /// Unlocked body of [`Self::ensure_key_indexed`]. The caller MUST hold the
+    /// shared `contract_blob_lock` (issue #4216). In production this is reached
+    /// only from `store_contract`, which already holds the lock and has already
+    /// verified `key` against the code and parameters it arrived with.
+    ///
+    /// # Why a disagreeing row is corrected rather than left alone
+    ///
+    /// This used to insert only when the instance was ABSENT, which made a wrong
+    /// row STICKY: once `instance -> X` existed, a later honest store of that
+    /// instance could not correct it, because the only unconditional overwrite is
+    /// in `store_contract`'s slow path and that path runs only when the
+    /// instance's own blob is missing. So a row written before the derivation
+    /// check existed would outlive it indefinitely.
+    ///
+    /// An instance id is `BLAKE3(code_hash ‖ params)`, so a verified key's
+    /// instance determines its code hash uniquely: a stored row that disagrees
+    /// with a key the caller has just verified is wrong, not an alternative
+    /// mapping. Overwriting it is therefore both safe and the only self-healing
+    /// path for rows that predate the check. It logs at WARN — not `debug!`,
+    /// which compiles out in release — because a disagreement means the node held
+    /// a mapping it could not have derived, which an operator should see once.
     fn ensure_key_indexed_locked(&mut self, key: &ContractKey) -> RuntimeResult<()> {
         let code_hash = key.code_hash();
-        if !self.key_to_code_part.contains_key(key.id()) {
-            // Store in ReDb
-            self.db
-                .store_contract_index(key.id(), code_hash)
-                .map_err(|e| anyhow::anyhow!("Failed to store contract index: {e}"))?;
-
-            // Update in-memory map
-            self.key_to_code_part.insert(*key.id(), *code_hash);
-
-            tracing::debug!(
-                contract = %key,
-                instance_id = %key.id(),
-                code_hash = %code_hash,
-                "Indexed contract instance (same code, different params)"
-            );
+        let existing = self.key_to_code_part.get(key.id()).map(|e| *e.value());
+        match existing {
+            Some(recorded) if recorded == *code_hash => return Ok(()),
+            Some(recorded) => {
+                tracing::warn!(
+                    contract = %key,
+                    instance_id = %key.id(),
+                    recorded = %recorded,
+                    derived = %code_hash,
+                    "Correcting an instance→code index row that disagrees with the \
+                     contract's own derived identity"
+                );
+            }
+            None => {}
         }
+
+        // Store in ReDb
+        self.db
+            .store_contract_index(key.id(), code_hash)
+            .map_err(|e| anyhow::anyhow!("Failed to store contract index: {e}"))?;
+
+        // Update in-memory map
+        self.key_to_code_part.insert(*key.id(), *code_hash);
+
+        tracing::debug!(
+            contract = %key,
+            instance_id = %key.id(),
+            code_hash = %code_hash,
+            "Indexed contract instance (same code, different params)"
+        );
         Ok(())
     }
 }
@@ -1210,6 +1276,298 @@ mod test {
             _ => panic!("unexpected container version"),
         }
         Ok(())
+    }
+
+    /// Build a `ContractCode` carrying `data` but claiming `claimed_hash` as its
+    /// own stored hash.
+    ///
+    /// `ContractCode::code_hash` is `pub(crate)` to the stdlib, so an in-memory
+    /// value cannot be edited — but it is an ordinary serde field, which is the
+    /// whole reason check 1 tests it. `ContractCode` is `data` then `code_hash`,
+    /// so the hash is the final 32 bytes of the encoding; the assertion pins that
+    /// layout so a stdlib field reorder fails this fixture loudly instead of
+    /// quietly patching the wrong bytes.
+    fn code_claiming_hash(data: Vec<u8>, claimed_hash: CodeHash) -> ContractCode<'static> {
+        let honest = ContractCode::from(data);
+        let mut bytes = bincode::serialize(&honest).expect("code must serialize");
+        let len = bytes.len();
+        assert!(len > 32, "encoding too short to carry a 32-byte hash");
+        assert_eq!(
+            &bytes[len - 32..],
+            honest.hash().as_ref(),
+            "fixture is stale: ContractCode's stored hash is not the final 32 bytes"
+        );
+        bytes[len - 32..].copy_from_slice(claimed_hash.as_ref());
+        bincode::deserialize::<ContractCode>(&bytes)
+            .expect("a patched code must still deserialize")
+            .into_owned()
+    }
+
+    /// `ContractCode`'s OWN stored hash must be checked, not just the key's copy.
+    ///
+    /// Check 1 asserts the recomputed hash against BOTH `key.code_hash()` and
+    /// `code.hash()`. The second clause is the one holding check 2 up, and
+    /// dropping it re-opens the hole on its own: `ContractInstanceId::
+    /// from_params_and_code` derives from `code.hash()`, i.e. the code's STORED
+    /// field (stdlib `key.rs::generate_id`). So a container that claims a correct
+    /// hash on the KEY while carrying a bogus one on the CODE satisfies the
+    /// key-side clause, and then check 2 derives the instance from the bogus
+    /// value and agrees with itself — leaving the instance id arbitrary.
+    ///
+    /// The three fixtures above all forge the key's copy and leave `code.hash()`
+    /// correct, so the key-side clause alone fails them and none of them would
+    /// notice the second clause being deleted. This one fails without it.
+    #[tokio::test]
+    async fn store_contract_rejects_a_code_whose_own_stored_hash_is_not_its_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let contract_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(contract_dir.path())?;
+        let db = create_test_db(contract_dir.path()).await;
+        let mut store = ContractStore::new(contract_dir.path().into(), 10_000, db)?;
+
+        let params: Parameters = [0u8, 1].as_ref().into();
+        let data = vec![1u8, 2, 3, 4];
+        let honest_hash = CodeHash::from_code(&data);
+        let bogus_hash = CodeHash::new([7u8; 32]);
+
+        let forged_code = Arc::new(code_claiming_hash(data.clone(), bogus_hash));
+        assert_eq!(
+            forged_code.data(),
+            data.as_slice(),
+            "the fixture must keep the real bytes"
+        );
+        assert_eq!(
+            *forged_code.hash(),
+            bogus_hash,
+            "the fixture must claim the bogus hash on the CODE"
+        );
+
+        // The instance is derived from the BOGUS hash (that is what
+        // `from_params_and_code` reads), while the key's own code hash is the
+        // CORRECT one — so the key-side clause of check 1 passes, and check 2
+        // agrees with itself.
+        let instance = ContractInstanceId::from_params_and_code(&params, &*forged_code);
+        let key = ContractKey::from_id_and_code(instance, honest_hash);
+        assert_eq!(
+            *key.code_hash(),
+            honest_hash,
+            "the key's copy must be correct, or this tests the wrong clause"
+        );
+        assert_eq!(
+            ContractInstanceId::from_params_and_code(&params, &*forged_code),
+            *key.id(),
+            "check 2 must be satisfiable by this fixture, or it proves nothing \
+             about the clause under test"
+        );
+
+        // `WrappedContract` is `#[non_exhaustive]`, so build it through `new` and
+        // then set the two public fields this fixture needs to control.
+        let mut forged = WrappedContract::new(forged_code.clone(), params.clone().into_owned());
+        forged.data = forged_code;
+        forged.key = key;
+        let err = store
+            .store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(forged)))
+            .expect_err("a code whose own stored hash is not its bytes must be refused");
+        assert!(
+            matches!(
+                err.deref(),
+                crate::wasm_runtime::RuntimeInnerError::ContractIdentityMismatch { .. }
+            ),
+            "expected ContractIdentityMismatch, got: {err}"
+        );
+        assert!(
+            store.code_hash_from_id(&instance).is_none(),
+            "no index entry may be written for a refused contract"
+        );
+        Ok(())
+    }
+
+    /// Verification must hold on the "code blob already stored" path, because
+    /// that is the path a new instance of existing code takes.
+    ///
+    /// Several instances share one code blob (every River room shares one room
+    /// contract, #2380), so the common case is: blob already on disk, cache warm,
+    /// only a new instance→code row to write. `store_contract` reaches that
+    /// through its fast paths, and the check runs before them — this pins that,
+    /// because a check placed after them would miss the majority of real PUTs.
+    /// The executor's equivalent branch routes here for exactly this reason (see
+    /// `bridged_upsert_contract_state_inner`).
+    #[tokio::test]
+    async fn store_contract_verifies_even_when_the_code_blob_is_already_stored()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let contract_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(contract_dir.path())?;
+        let db = create_test_db(contract_dir.path()).await;
+        let mut store = ContractStore::new(contract_dir.path().into(), 10_000, db)?;
+
+        let code = Arc::new(ContractCode::from(vec![1u8, 2, 3, 4]));
+        let params_a: Parameters = [0u8].as_ref().into();
+        let params_b: Parameters = [9u8].as_ref().into();
+
+        // First instance: stores the blob, warms the cache.
+        let first = WrappedContract::new(code.clone(), params_a.clone().into_owned());
+        let key_a = *first.key();
+        store.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(first)))?;
+        assert!(
+            store.code_blob_stored(key_a.code_hash()),
+            "fixture must leave the code blob on disk"
+        );
+
+        // Control: an HONEST second instance of that same blob is still accepted
+        // and indexed. Without this the refusal below would also pass if the fast
+        // paths refused every second instance.
+        let honest_b = WrappedContract::new(code.clone(), params_b.clone().into_owned());
+        let key_b = *honest_b.key();
+        assert_ne!(key_a.id(), key_b.id(), "fixture must be a NEW instance");
+        store.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+            honest_b,
+        )))?;
+        assert_eq!(
+            store.code_hash_from_id(key_b.id()),
+            Some(*code.hash()),
+            "an honest new instance of already-stored code must be indexed"
+        );
+
+        // Now the same shape with an instance id that is not derived from this
+        // code and these params.
+        let params_c: Parameters = [5u8].as_ref().into();
+        let unrelated_instance = *WrappedContract::new(code.clone(), params_c.into_owned())
+            .key()
+            .id();
+        let mut forged = WrappedContract::new(code.clone(), params_b.clone().into_owned());
+        forged.key = ContractKey::from_id_and_code(unrelated_instance, *code.hash());
+
+        let err = store
+            .store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(forged)))
+            .expect_err("an undervied instance must be refused even when the blob is present");
+        assert!(
+            matches!(
+                err.deref(),
+                crate::wasm_runtime::RuntimeInnerError::ContractIdentityMismatch { .. }
+            ),
+            "expected ContractIdentityMismatch, got: {err}"
+        );
+        assert!(
+            store.code_hash_from_id(&unrelated_instance).is_none(),
+            "the already-stored fast path must not index an unverified instance"
+        );
+        Ok(())
+    }
+
+    /// An instance→code row that disagrees with a verified key is corrected.
+    ///
+    /// `ensure_key_indexed_locked` used to write only when the instance was
+    /// ABSENT, which made a wrong row permanent: the sole unconditional overwrite
+    /// is `store_contract`'s slow path, reached only when the instance's blob is
+    /// missing, so an honest store of that instance would find the blob present,
+    /// take a fast path, see the instance "already indexed", and leave the wrong
+    /// row in place. Rows written before verification existed would therefore
+    /// outlive it. An instance id is `BLAKE3(code_hash ‖ params)`, so a row that
+    /// disagrees with a verified key is wrong rather than an alternative mapping,
+    /// and correcting it is the self-healing path.
+    #[tokio::test]
+    async fn store_contract_corrects_an_index_row_that_disagrees_with_the_derived_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let contract_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(contract_dir.path())?;
+        let db = create_test_db(contract_dir.path()).await;
+        let mut store = ContractStore::new(contract_dir.path().into(), 10_000, db)?;
+
+        let params: Parameters = [0u8, 1].as_ref().into();
+        let code_a = vec![1u8, 2, 3, 4];
+        let honest = WrappedContract::new(
+            Arc::new(ContractCode::from(code_a.clone())),
+            params.clone().into_owned(),
+        );
+        let key_a = *honest.key();
+        let hash_a = *key_a.code_hash();
+
+        // Plant a wrong row for A's instance, the way one written before
+        // verification existed would look. `ensure_key_indexed` is the test-only
+        // bare writer that used to be production-reachable.
+        let hash_b = *WrappedContract::new(
+            Arc::new(ContractCode::from(vec![9u8, 9, 9, 9, 9])),
+            params.clone().into_owned(),
+        )
+        .key()
+        .code_hash();
+        assert_ne!(hash_a, hash_b, "fixture must plant a DIFFERENT code hash");
+        store.ensure_key_indexed(&ContractKey::from_id_and_code(*key_a.id(), hash_b))?;
+        assert_eq!(
+            store.code_hash_from_id(key_a.id()),
+            Some(hash_b),
+            "fixture must leave a disagreeing row in place"
+        );
+
+        // A now stores honestly. Its blob is absent, so this takes the slow path…
+        store.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+            honest.clone(),
+        )))?;
+        assert_eq!(
+            store.code_hash_from_id(key_a.id()),
+            Some(hash_a),
+            "an honest store must correct a disagreeing row"
+        );
+
+        // …and it is corrected on the already-stored fast paths too, which is
+        // where the stickiness actually bit: re-plant and re-store with the blob
+        // now present.
+        store.ensure_key_indexed(&ContractKey::from_id_and_code(*key_a.id(), hash_b))?;
+        assert_eq!(store.code_hash_from_id(key_a.id()), Some(hash_b));
+        assert!(
+            store.code_blob_stored(&hash_a),
+            "the blob must now be present, so this exercises a fast path"
+        );
+        store.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(honest)))?;
+        assert_eq!(
+            store.code_hash_from_id(key_a.id()),
+            Some(hash_a),
+            "the fast paths must correct a disagreeing row, not skip it"
+        );
+        Ok(())
+    }
+
+    /// There must be exactly ONE production ingress to the durable
+    /// instance→code index.
+    ///
+    /// `store_contract_index` has two call sites in this file — `store_contract`'s
+    /// slow path and `ensure_key_indexed_locked` — and that is fine only because
+    /// the second is reachable in production solely THROUGH the first, after
+    /// verification. The bare public wrapper is `#[cfg(test)]`, so a production
+    /// caller does not compile.
+    ///
+    /// This pin exists because that helper was implicated twice, hours apart, for
+    /// two different missing preconditions (no derivation check; no blob-existence
+    /// check, the candidate mechanism for #5280). A third writer appearing
+    /// unnoticed is the failure mode to prevent.
+    #[test]
+    fn the_durable_index_has_one_production_writer() {
+        let src = include_str!("contract_store.rs");
+
+        // Ignore this test module itself: its assertions quote these names.
+        let production = &src[..src
+            .find("#[cfg(test)]\nmod test {")
+            .expect("test module marker not found")];
+
+        assert_eq!(
+            production.matches(".store_contract_index(").count(),
+            2,
+            "exactly two call sites are expected: store_contract's slow path and \
+             ensure_key_indexed_locked. A new one needs its own verification, or \
+             it must route through store_contract."
+        );
+
+        let gate = production
+            .find("#[cfg(test)]\n    pub fn ensure_key_indexed(")
+            .expect(
+                "the bare index writer must stay #[cfg(test)]-gated — it takes only a \
+                 &ContractKey, so it can verify neither the identity it files nor that \
+                 the blob exists",
+            );
+        let locked = production
+            .find("fn ensure_key_indexed_locked(")
+            .expect("ensure_key_indexed_locked not found");
+        assert!(gate < locked, "unexpected ordering of the two helpers");
     }
 
     /// Regression test for the latent shared-WASM deletion bug: removing one
