@@ -361,7 +361,12 @@ jobs:
   attach-to-release:
     name: Attach binaries to GitHub release
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Raised from 10 for the auto-update pre-flight canary (#5222). The job
+    # itself takes ~40s; the canary adds ~70s on the happy path but up to ~8
+    # min if it has to retry an unreachable GitHub. At the old budget a retry
+    # got the job CANCELLED before the `Publish release` step ran, leaving a
+    # permanently stuck draft — the exact failure the retry existed to avoid.
+    timeout-minutes: 25
     needs: [build-x86_64-linux, build-arm64-linux, build-arm64-macos, build-x86_64-macos, build-x86_64-windows, build-macos-dmg]
     if: startsWith(github.ref, 'refs/tags/v')
 
@@ -578,14 +583,174 @@ jobs:
           gh release upload "$TAG_NAME" $ASSETS \
             --repo ${{ github.repository }} \
             --clobber
+          echo "✅ Assets uploaded to draft release $TAG_NAME"
 
-          # Publish the release now that binaries are attached.
-          # The release is created as a draft by release.sh/release.yml to
-          # prevent the installer from seeing a version before binaries exist.
+      # ---------------------------------------------------------------------
+      # Gate A of the auto-update canary (#5222) — BLOCKS PUBLICATION.
+      #
+      # #5104 made the node's release-tag fetch return the tag verbatim
+      # ("v0.2.121") and normalised it at only one of its two consumers. The
+      # DETECTION path kept the raw tag, semver parsing failed, and auto-update
+      # was dead fleet-wide for v0.2.120 AND v0.2.121 — silently, for two
+      # releases, until ~1,100 nodes had to be updated by hand. A broken
+      # updater cannot deliver its own fix, which is what makes this class of
+      # bug worth a blocking gate rather than a report.
+      #
+      # This runs the binary we are ABOUT to ship and asserts its updater can
+      # read GitHub's current release tag. It sits here, between upload and
+      # un-draft, deliberately:
+      #   - the assets exist, so we are testing the real artifact;
+      #   - the release is still a DRAFT, so nothing has reached a user yet and
+      #     a failure costs us a stuck draft rather than a broken fleet;
+      #   - it is a `needs`-chained step, not a `release: published` listener,
+      #     so it cannot silently stop running if RELEASE_PAT lapses (that
+      #     token already suppresses downstream events when unset — see #4118).
+      #
+      # It adds ~1 minute: the node's startup check fires after a 0-60s jitter
+      # and the script returns as soon as it has a verdict.
+      #
+      # IF THIS FAILS: the release stays an unpublished draft, which is the
+      # correct fail-closed state. Do NOT un-draft it by hand to "unblock" the
+      # release — the updater in that binary is broken and publishing it
+      # strands the fleet on the previous version. Fix the detection path on
+      # the release branch, then re-run this workflow for the tag.
+      # ---------------------------------------------------------------------
+      # This job downloads artifacts and never checks out the repo, so the
+      # canary script is not on disk. Sparse-checkout just that one file into
+      # its own subdirectory: `actions/checkout` cleans its target path, and
+      # the release assets live in the workspace ROOT, so scoping the path is
+      # what keeps this from wiping the very artifacts we are about to publish.
+      # The default ref for a tag push is the tag itself, so the script version
+      # matches the release it is gating.
+      - name: Check out the canary script
+        uses: actions/checkout@v7
+        with:
+          path: _canary
+          sparse-checkout: scripts/auto-update-canary.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Auto-update pre-flight canary (blocks publish)
+        # Step-level bound so a hung canary is reported as the canary timing
+        # out, not as the whole publish job dying for unclear reasons.
+        timeout-minutes: 12
+        run: |
+          tar xzf freenet-x86_64-unknown-linux-musl.tar.gz -C /tmp
+          chmod +x /tmp/freenet
+          bash _canary/scripts/auto-update-canary.sh preflight /tmp/freenet
+
+      - name: Publish release
+        env:
+          # Coalesce on RELEASE_PAT so `--draft=false` fires a
+          # `release.published` event that downstream workflows
+          # (`gateway-update.yml`, `release-announce.yml`) can react to.
+          # GITHUB_TOKEN suppresses workflow-triggering events as an
+          # anti-recursion safeguard, which broke the v0.2.57 release cascade
+          # and required manual `workflow_dispatch`. See issue #4118 and
+          # `AGENTS.md` → "Release Workflow & RELEASE_PAT".
+          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          # Publish the release now that binaries are attached AND the shipping
+          # binary's updater has been verified. The release is created as a
+          # draft by release.sh/release.yml to prevent the installer from
+          # seeing a version before binaries exist.
           gh release edit "$TAG_NAME" \
             --repo ${{ github.repository }} \
             --draft=false
           echo "✅ Release $TAG_NAME published with all binaries attached"
+
+  # -----------------------------------------------------------------------
+  # Gate B of the auto-update canary (#5222) — end-to-end, after publication.
+  #
+  # Gate A proved the binary we shipped can PARSE GitHub's release tags. This
+  # proves the transition that actually matters to the fleet: a node on the
+  # PREVIOUS release detects this one, exits 42, and self-replaces via
+  # `freenet update`. Not "the log looks right" but "the old version ends up
+  # on the new one".
+  #
+  # It necessarily runs AFTER publication: the node's detection path is
+  # hardwired to GitHub's `/releases/latest`, and a draft release does not
+  # appear there, so there is no way to exercise the real path earlier. That
+  # is why Gate A exists as the blocking half — this one is the alarm.
+  #
+  # A failure here means the fleet will NOT converge onto this release on its
+  # own. The release is already public at that point, so the job is red and
+  # notifies rather than blocking; the response is to ship a fix and/or roll
+  # the fleet by hand, exactly as v0.2.120/v0.2.121 required.
+  # -----------------------------------------------------------------------
+  auto-update-selfupdate-canary:
+    name: Auto-update self-update canary (previous release -> this one)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: attach-to-release
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve the previous published release
+        id: prev
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # coalesce-exempt: read-only `gh api` release listing; emits no downstream event
+        run: |
+          set -euo pipefail
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          THIS_VERSION="${TAG_NAME#v}"
+          # Newest published, non-draft, non-prerelease release that is not the
+          # one we just cut. Drafts and prereleases are excluded because the
+          # fleet never runs them, so they are not the version we need to prove
+          # a transition from.
+          PREV_TAG=$(gh api "repos/${{ github.repository }}/releases?per_page=30" \
+            --jq "[.[] | select(.draft==false and .prerelease==false) | .tag_name]
+                  | map(select(. != \"$TAG_NAME\")) | .[0] // empty")
+          if [ -z "$PREV_TAG" ]; then
+            echo "::error::could not resolve a previous published release to canary from."
+            exit 1
+          fi
+          echo "this_version=$THIS_VERSION"  >> "$GITHUB_OUTPUT"
+          echo "prev_version=${PREV_TAG#v}"  >> "$GITHUB_OUTPUT"
+          echo "Canarying ${PREV_TAG} -> ${TAG_NAME}"
+
+      - name: Previous release self-updates to this release
+        run: |
+          bash scripts/auto-update-canary.sh selfupdate \
+            "${{ steps.prev.outputs.prev_version }}" \
+            "${{ steps.prev.outputs.this_version }}"
+
+  # A red job in a release run is the primary signal, but nobody is guaranteed
+  # to be watching Actions at release time — and a silent fail-closed is
+  # indistinguishable from working. Mirror it into the dev room.
+  # Covers BOTH gates. An earlier revision hung this off Gate B alone, which
+  # left the BLOCKING gate silent: a Gate A failure fails `attach-to-release`,
+  # which SKIPS Gate B, so `needs.auto-update-selfupdate-canary.result` is
+  # 'skipped' and no message went out — leaving a release stuck as an
+  # unpublished draft with nobody told. That is precisely the
+  # silent-fail-closed shape this whole change exists to remove.
+  notify-auto-update-canary-failure:
+    name: Notify dev room if the release pre-flight failed
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [attach-to-release, auto-update-selfupdate-canary]
+    if: |
+      always() && startsWith(github.ref, 'refs/tags/v') &&
+      (needs.attach-to-release.result == 'failure' ||
+       needs.attach-to-release.result == 'cancelled' ||
+       needs.auto-update-selfupdate-canary.result == 'failure' ||
+       needs.auto-update-selfupdate-canary.result == 'cancelled')
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/river-dev-notify
+        with:
+          # Deliberately does NOT assert which failure happened. The job can be
+          # red because the updater is broken OR because GitHub was unreachable,
+          # and a message that overstates ("the fleet is stranded") on a network
+          # blip trains people to ignore the channel.
+          message: "\U0001F6A8 RELEASE PRE-FLIGHT did not pass for ${{ github.ref_name }} (publish job: ${{ needs.attach-to-release.result }}, auto-update self-update canary: ${{ needs.auto-update-selfupdate-canary.result }}). Check WHICH step failed before concluding anything: the publish job also does artifact download, checksumming and signing, so a red result here is not by itself an auto-update fault. If the publish job failed, the release is STUCK AS A DRAFT and needs a decision. If the self-update canary failed, a node on the previous release may not be able to auto-update to this one (#5221 failure mode — the fleet would need `freenet update` by hand). ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
+          room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
+          gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}
 
   verify-signing-key:
     name: Verify release signing key (dry-run)

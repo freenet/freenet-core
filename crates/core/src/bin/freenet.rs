@@ -540,7 +540,27 @@ async fn run_network_node_with_signals(
                 return;
             }
         }
-        tracing::debug!("Startup update check: no newer version found");
+        // INFO, not `debug!`: release builds set `release_max_level_info`
+        // (crates/core/Cargo.toml), so a `debug!` here is compiled OUT of every
+        // shipped binary. That left the startup check with no observable ENDING
+        // on the outcome it takes most often. "The check finished and decided to
+        // stay put" looked exactly like "the check was killed mid-request", and
+        // the release canary (#5222) cannot pass a binary safely without telling
+        // those apart: absence of a parse error is evidence that parsing worked
+        // only if the check is known to have finished. Without this line Gate A
+        // would wave through a binary carrying the #5221 bug whenever GitHub
+        // answered slowly enough that the canary stopped the node first.
+        //
+        // Reached on EVERY non-triggering outcome -- already up to date, GitHub
+        // unreachable, unparseable tag, #4073 locally-blocked version -- so it
+        // claims only that the check ended. The WARN above it, if any, says why.
+        // Do not reword it into a claim about the version, and do not change the
+        // leading phrase: scripts/auto-update-canary.sh greps for it, and
+        // scripts/auto-update-canary_test.sh pins it against this file.
+        tracing::info!(
+            current = build_info::VERSION,
+            "Startup update check complete: staying on the current version"
+        );
 
         /// Parse our version string into a (major, minor, patch) tuple for comparison.
         fn parse_our_version() -> Option<(u8, u8, u16)> {
