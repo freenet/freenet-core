@@ -114,6 +114,13 @@ impl Report {
         self.ops.push(op);
     }
 
+    /// The operations recorded so far, in the order they ran. Exists so a test
+    /// can read back what was recorded; the run itself only ever writes.
+    #[cfg(test)]
+    pub fn ops(&self) -> &[OpReport] {
+        &self.ops
+    }
+
     /// Whether every recorded operation succeeded.
     pub fn all_ok(&self) -> bool {
         self.ops.iter().all(|o| o.ok)

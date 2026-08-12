@@ -21,3 +21,8 @@ tempfile = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 x25519-dalek = { workspace = true }
+
+[dev-dependencies]
+# Driving the fake node in `client`'s tests: Sink/Stream extensions for the
+# server half of the websocket.
+futures = { workspace = true }

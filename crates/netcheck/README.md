@@ -12,11 +12,16 @@ Each `put-get` run:
 2. Boots an **ephemeral peer** (`freenet network` child process with an
    empty data dir) that joins the network **through a different gateway**.
    Having no replicas of its own, it cannot answer any of its own GETs.
-3. GETs this run's contracts through that peer and verifies byte-identity.
-4. Re-GETs contracts published by previous runs (24 h / 48 h / 7 d windows,
-   tracked in a persistent JSON manifest) and verifies their blake3 state
-   hashes.
-5. Prints one JSON line per operation on stdout and exits non-zero if
+3. GETs this run's contracts through that peer (verifying byte-identity)
+   together with contracts published by previous runs (24 h / 48 h / 7 d
+   windows, tracked in a persistent JSON manifest, verified against their
+   blake3 state hashes). The two are issued as **one interleaved
+   sequence**: with a fixed 0 h → 24 h → 48 h → 7 d order, "how old the
+   contract is" and "how late in the run the GET was issued" were the same
+   variable, so an age effect could not be told apart from a
+   within-run session effect. The order is shuffled from a seed derived
+   from the run id, and that seed is logged, so a run stays reproducible.
+4. Prints one JSON line per operation on stdout and exits non-zero if
    anything failed. No retries by design: an operation that only succeeds
    on retry is the regression netcheck exists to surface.
 
@@ -70,6 +75,12 @@ One `"event":"run"` line with the conditions of the run, then one
 `freenet_version` is what separates "the network broke" from "the release
 that landed last night broke". Without it a failure cannot be attributed
 after the fact.
+
+`latency_ms` is a measurement on **both** arms. A failed op reports how
+long it actually took, not the configured `--op-timeout-secs`: reporting
+the deadline for every failure hid the difference between a fast terminal
+error from the node and the client giving up waiting, which is the
+distinction the field exists to draw.
 
 ## Production use (nova)
 
