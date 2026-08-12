@@ -570,6 +570,24 @@ mod tests {
     }
 
     #[test]
+    fn elevated_script_escapes_backslash_and_quote_together_in_correct_order() {
+        // A single fixture containing BOTH special characters together, so a
+        // regression that swaps applescript_escape's replace order (quote
+        // before backslash, instead of backslash before quote) is actually
+        // detectable: escaping backslash-then-quote turns `\"` into 3
+        // backslashes + a quote; escaping quote-then-backslash instead
+        // produces 4 backslashes + a quote. The two split tests above each
+        // contain only ONE of the two characters, so neither can tell these
+        // orders apart on its own — this is the test that actually pins it.
+        let script = build_elevated_symlink_script(&[(
+            "Weird\\\"Folder.app/Contents/MacOS/freenet-bin",
+            "/usr/local/bin/freenet",
+        )]);
+        assert!(script.contains(r#"Weird\\\"Folder.app"#));
+        assert!(!script.contains(r#"Weird\\\\\"Folder.app"#));
+    }
+
+    #[test]
     fn different_tool_in_same_bundle_shape_is_skipped() {
         // The existing link's target is inside SOME .app/Contents/MacOS/ (so
         // `is_freenet_app_bundle_binary` alone would say yes) but for a
@@ -580,6 +598,28 @@ mod tests {
         assert_eq!(
             decide_cli_symlink_action(true, true, true, Some(existing), expected),
             CliSymlinkAction::SkipForeignOccupant
+        );
+    }
+
+    #[test]
+    fn same_tool_different_app_bundle_is_still_repaired_by_design() {
+        // Accepted residual risk, NOT a bug: if a DIFFERENT app's bundle
+        // happens to ship a binary with the exact same basename inside its
+        // own Contents/MacOS/ (e.g. "freenet-bin"), the basename+bundle-shape
+        // check alone can't distinguish it from an old link into a prior
+        // Freenet.app location, so this is still classified CreateOrRepair.
+        // Judged acceptable because the symlink TARGET is always our own
+        // trusted binary — repointing here only reclaims a path claim, it
+        // never substitutes code. Full hardening would check bundle identity
+        // (e.g. Info.plist CFBundleIdentifier); left as a follow-up given how
+        // unlikely a same-named-binary collision across unrelated apps is.
+        // Pinned explicitly so a future editor sees this is deliberate, not
+        // overlooked.
+        let existing = Path::new("/Applications/SomeOtherApp.app/Contents/MacOS/freenet-bin");
+        let expected = Path::new("/Applications/Freenet.app/Contents/MacOS/freenet-bin");
+        assert_eq!(
+            decide_cli_symlink_action(true, true, true, Some(existing), expected),
+            CliSymlinkAction::CreateOrRepair
         );
     }
 
