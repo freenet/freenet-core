@@ -1814,6 +1814,15 @@ mod queue {
                                 // Hold the scheduling bundle (and therefore the
                                 // lane permit) for the lifetime of the "send".
                                 let _scheduling = scheduling;
+                                // Observation channel; a dropped receiver is
+                                // expected. Neither spelling is lint-clean here:
+                                // `let _ =` trips the crate-wide deny on
+                                // `let_underscore_must_use`, and `drop(...)`
+                                // trips `dropping_copy_types` because this
+                                // `Result` is `Copy`, so the drop does nothing.
+                                // Allow the former per-site; see the note beside
+                                // the lint declarations in crates/core/Cargo.toml.
+                                #[allow(clippy::let_underscore_must_use)]
                                 let _ = tx.send((lane, entry.key));
                                 // Never completes: the permit stays held, so the
                                 // test can saturate a lane deterministically.
@@ -1941,7 +1950,7 @@ mod queue {
                     let tx = tx.clone();
                     async move {
                         let _scheduling = scheduling;
-                        let _ = tx.send(entry.fanout);
+                        drop(tx.send(entry.fanout));
                     }
                 },
             ));
@@ -2110,6 +2119,15 @@ mod queue {
                         move |entry: BroadcastEntry, _s: QueueScheduling| {
                             let tx = tx.clone();
                             async move {
+                                // Observation channel; a dropped receiver is
+                                // expected. Neither spelling is lint-clean here:
+                                // `let _ =` trips the crate-wide deny on
+                                // `let_underscore_must_use`, and `drop(...)`
+                                // trips `dropping_copy_types` because this
+                                // `Result` is `Copy`, so the drop does nothing.
+                                // Allow the former per-site; see the note beside
+                                // the lint declarations in crates/core/Cargo.toml.
+                                #[allow(clippy::let_underscore_must_use)]
                                 let _ = tx.send((lane, entry.key));
                             }
                         },
@@ -2139,7 +2157,7 @@ mod queue {
             );
 
             large.abort();
-            let _ = large.await;
+            drop(large.await);
 
             assert!(
                 small_permits.is_closed(),
@@ -2215,9 +2233,26 @@ mod queue {
                             let tx = tx.clone();
                             let release = release.clone();
                             async move {
+                                // Observation channel; a dropped receiver is
+                                // expected. Neither spelling is lint-clean here:
+                                // `let _ =` trips the crate-wide deny on
+                                // `let_underscore_must_use`, and `drop(...)`
+                                // trips `dropping_copy_types` because this
+                                // `Result` is `Copy`, so the drop does nothing.
+                                // Allow the former per-site; see the note beside
+                                // the lint declarations in crates/core/Cargo.toml.
+                                #[allow(clippy::let_underscore_must_use)]
                                 let _ = tx.send((lane, entry.key));
                                 if matches!(lane, QueuedPayloadClass::Large) {
-                                    let _ = release.acquire_owned().await;
+                                    // A BARRIER, not a held permit: wait until
+                                    // capacity exists, then release immediately.
+                                    // `drop(...)` preserves that exactly, since
+                                    // `let _ = x` also drops at end of statement.
+                                    // Do NOT "fix" this to `let _permit = ...` --
+                                    // binding it holds the permit for the rest of
+                                    // the block and changes when the large lane
+                                    // unblocks.
+                                    drop(release.acquire_owned().await);
                                 } else {
                                     scheduling.permit.ensure_capacity_for(BIG).await;
                                 }

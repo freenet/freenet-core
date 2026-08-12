@@ -1267,12 +1267,10 @@ mod test {
         let fetched = store
             .fetch_contract(&honest_key, &params)
             .expect("the honest contract must still be served");
-        match fetched {
-            ContractContainer::Wasm(ContractWasmAPIVersion::V1(c)) => {
-                assert_eq!(c.code().data(), honest_code.as_slice());
-            }
-            _ => panic!("unexpected container version"),
-        }
+        let ContractContainer::Wasm(ContractWasmAPIVersion::V1(c)) = fetched else {
+            panic!("unexpected container version");
+        };
+        assert_eq!(c.code().data(), honest_code.as_slice());
         Ok(())
     }
 
@@ -1309,16 +1307,14 @@ mod test {
         let fetched = store
             .fetch_contract(&mixed_key, &params)
             .expect("instance A is indexed, so a lookup for it must resolve");
-        match fetched {
-            ContractContainer::Wasm(ContractWasmAPIVersion::V1(c)) => {
-                assert_eq!(
-                    c.code().data(),
-                    code_a.as_slice(),
-                    "must serve the code the INDEX records for this instance, not the code hash the caller named"
-                );
-            }
-            _ => panic!("unexpected container version"),
-        }
+        let ContractContainer::Wasm(ContractWasmAPIVersion::V1(c)) = fetched else {
+            panic!("unexpected container version");
+        };
+        assert_eq!(
+            c.code().data(),
+            code_a.as_slice(),
+            "must serve the code the INDEX records for this instance, not the code hash the caller named"
+        );
         Ok(())
     }
 
