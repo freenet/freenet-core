@@ -103,9 +103,19 @@ pub(super) fn decide_cli_symlink_action(
     if !link_is_symlink {
         return CliSymlinkAction::SkipForeignOccupant;
     }
+    // The basename check matters as much as the bundle-shape check below: a
+    // path can be inside SOME `.app/Contents/MacOS/` without being a path we
+    // recognize for THIS tool (e.g. an unrelated app that happens to ship a
+    // binary named `freenet`). Requiring both means we only ever repoint a
+    // link whose old target both looks like an app bundle binary AND was for
+    // the same tool `expected_target` is for.
     match link_target {
         Some(t) if t == expected_target => CliSymlinkAction::NoOp,
-        Some(t) if is_freenet_app_bundle_binary(t) => CliSymlinkAction::CreateOrRepair,
+        Some(t)
+            if is_freenet_app_bundle_binary(t) && t.file_name() == expected_target.file_name() =>
+        {
+            CliSymlinkAction::CreateOrRepair
+        }
         _ => CliSymlinkAction::SkipForeignOccupant,
     }
 }
@@ -117,7 +127,10 @@ pub(super) fn decide_cli_symlink_action(
 /// unrelated app) is left untouched: the same "never clobber an install we
 /// don't own" reasoning as `is_legacy_freenet_wrapper`'s content-signature
 /// check in `launch_at_login.rs`, just applied to a symlink target instead of
-/// a script's contents.
+/// a script's contents. Callers MUST also compare basenames (see
+/// `decide_cli_symlink_action`) — this check alone only rules out a symlink
+/// that isn't inside any app bundle at all; it does not by itself prove the
+/// bundle is Freenet's or that the binary is the same tool.
 #[allow(dead_code)]
 pub(super) fn is_freenet_app_bundle_binary(path: &Path) -> bool {
     path.to_string_lossy().contains(".app/Contents/MacOS/")
@@ -164,7 +177,49 @@ fn applescript_quoted_form_of(path: &str) -> String {
     )
 }
 
+/// True if `path` is under Gatekeeper's App Translocation mount
+/// (`/private/var/folders/.../AppTranslocation/<uuid>/d/...`). macOS
+/// translocates a quarantined `.app` to a randomized, ephemeral path whenever
+/// it is launched directly from its mounted disk image without first being
+/// copied elsewhere (e.g. double-clicking `Freenet.app` inside the DMG's
+/// Finder window instead of dragging it to `/Applications` first) — this is
+/// one of the most common first-launch patterns for a DMG-distributed app.
+/// `std::env::current_exe()` resolves to a path under the translocation
+/// mount in that case, which is torn down once the disk image is ejected (or
+/// replaced with a fresh random uuid on a later translocated launch). A
+/// symlink created against that path would dangle, so the caller must skip
+/// symlink setup — and critically must NOT write the one-shot marker — when
+/// this returns true, or the fix would never get a chance to run again after
+/// the user does the right thing (drags the app to `/Applications` and
+/// relaunches from there).
+#[allow(dead_code)]
+pub(super) fn is_translocated_path(path: &Path) -> bool {
+    path.to_string_lossy().contains("/AppTranslocation/")
+}
+
 // ── macOS-only execution ────────────────────────────────────────────────────
+
+/// Desktop notification for the declined/failed elevated-install case,
+/// same `osascript display notification` mechanism as `notify_stuck_wrapper`
+/// in `wrapper.rs`. Best-effort: a notification failure must never block or
+/// panic the wrapper.
+#[cfg(target_os = "macos")]
+fn notify_cli_symlink_declined() {
+    let body = super::wrapper::applescript_escape(
+        "freenet/fdev were not added to your PATH. See the Freenet log for the manual command to run.",
+    );
+    let title = super::wrapper::applescript_escape("Freenet command-line tools not installed");
+    let script = format!("display notification \"{body}\" with title \"{title}\"");
+    let _ = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        // Null all three handles: the wrapper has detached from its console
+        // (see the FreeConsole cross-reference in wrapper.rs::run_wrapper).
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
 
 /// Best-effort, one-shot: ensure `freenet` and `fdev` are symlinked into
 /// [`CLI_BIN_DIR`] so they're on `PATH` from Terminal. No-ops after the first
@@ -191,6 +246,18 @@ pub(super) fn macos_ensure_cli_symlinks(log_dir: &Path) {
         );
         return;
     };
+    if is_translocated_path(&exe) {
+        // Do NOT write the marker: this is not a permanent state. The next
+        // launch (e.g. after the user drags the app to /Applications, or
+        // even a later re-translocated launch) gets another chance.
+        log_wrapper_event(
+            log_dir,
+            "CLI symlink setup skipped: app is running from Gatekeeper's App \
+             Translocation mount (launched directly from the DMG rather than \
+             /Applications). Will retry on a future non-translocated launch.",
+        );
+        return;
+    }
     let Some(macos_dir) = exe.parent() else {
         return;
     };
@@ -269,7 +336,14 @@ pub(super) fn macos_ensure_cli_symlinks(log_dir: &Path) {
     }
 
     // Attempt 2: elevated, ONE administrator-privileges prompt covering
-    // everything attempt 1 couldn't do unprivileged.
+    // everything attempt 1 couldn't do unprivileged. Tracks whether osascript
+    // itself failed to even RUN (as opposed to running and the user
+    // declining, or the shell command failing) — that distinction decides
+    // whether the one-shot marker below gets written: a transient inability
+    // to spawn osascript (e.g. momentary resource exhaustion) must not
+    // permanently disable this feature the way a deliberate user decline
+    // reasonably should.
+    let mut osascript_spawn_failed = false;
     if !still_needed.is_empty() {
         let pairs: Vec<(&str, &str)> = still_needed
             .iter()
@@ -295,26 +369,42 @@ pub(super) fn macos_ensure_cli_symlinks(log_dir: &Path) {
                 log_dir,
                 "CLI symlink setup: installed via administrator privileges",
             ),
-            Ok(_) => log_wrapper_event(
-                log_dir,
-                &format!(
-                    "CLI symlink setup: declined or failed under administrator privileges. \
-                     Run manually, e.g.: sudo ln -sf <bundle-binary> <link> for: {}",
-                    still_needed
-                        .iter()
-                        .map(|(_, l)| l.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            ),
-            Err(e) => log_wrapper_event(
-                log_dir,
-                &format!("CLI symlink setup: failed to run osascript: {e}"),
-            ),
+            Ok(_) => {
+                log_wrapper_event(
+                    log_dir,
+                    &format!(
+                        "CLI symlink setup: declined or failed under administrator privileges. \
+                         Run manually, e.g.: sudo ln -sf <bundle-binary> <link> for: {}",
+                        still_needed
+                            .iter()
+                            .map(|(_, l)| l.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
+                // The log line above is invisible to a GUI menu-bar app user
+                // with no terminal open, and the one-shot marker means this
+                // is the only signal they get that freenet/fdev did NOT end
+                // up on PATH — so also surface it as a desktop notification.
+                notify_cli_symlink_declined();
+            }
+            Err(e) => {
+                osascript_spawn_failed = true;
+                log_wrapper_event(
+                    log_dir,
+                    &format!(
+                        "CLI symlink setup: failed to run osascript ({e}); will retry on next launch."
+                    ),
+                );
+            }
         }
     }
 
-    // One-shot regardless of outcome — never auto-prompt again. A user who
+    if osascript_spawn_failed {
+        return;
+    }
+
+    // One-shot for everything else — never auto-prompt again. A user who
     // declines can still run the manual command logged above; a later launch
     // will not nag them a second time.
     if let Err(e) = mark_first_run_complete_at(&marker) {
@@ -455,12 +545,51 @@ mod tests {
     }
 
     #[test]
-    fn elevated_script_escapes_quotes_and_backslashes_in_paths() {
+    fn elevated_script_escapes_quotes_in_paths() {
         // Pathological but possible: a renamed .app containing a quote.
         let script = build_elevated_symlink_script(&[(
             "/Applications/Freenet \"weird\".app/Contents/MacOS/freenet-bin",
             "/usr/local/bin/freenet",
         )]);
         assert!(script.contains("Freenet \\\"weird\\\".app"));
+    }
+
+    #[test]
+    fn elevated_script_escapes_backslashes_in_paths() {
+        // A literal backslash is legal in an APFS/HFS+ filename. Escaping
+        // ORDER matters here (backslash must be escaped before quotes, or a
+        // quote's escaping backslash gets double-escaped) — this exercises
+        // that independently of the quote-escaping test above, since the
+        // pathological-quote fixture contains no literal backslash and so
+        // cannot catch an order regression on its own.
+        let script = build_elevated_symlink_script(&[(
+            "/Applications/Weird\\Folder.app/Contents/MacOS/freenet-bin",
+            "/usr/local/bin/freenet",
+        )]);
+        assert!(script.contains("Weird\\\\Folder.app"));
+    }
+
+    #[test]
+    fn different_tool_in_same_bundle_shape_is_skipped() {
+        // The existing link's target is inside SOME .app/Contents/MacOS/ (so
+        // `is_freenet_app_bundle_binary` alone would say yes) but for a
+        // DIFFERENT tool than what `freenet` should point at — must not be
+        // silently repointed to the wrong binary.
+        let existing = Path::new("/Applications/Freenet.app/Contents/MacOS/fdev");
+        let expected = Path::new("/Applications/Freenet.app/Contents/MacOS/freenet-bin");
+        assert_eq!(
+            decide_cli_symlink_action(true, true, true, Some(existing), expected),
+            CliSymlinkAction::SkipForeignOccupant
+        );
+    }
+
+    #[test]
+    fn translocated_path_is_detected() {
+        assert!(is_translocated_path(Path::new(
+            "/private/var/folders/zz/abc123/T/AppTranslocation/1234-5678/d/Freenet.app/Contents/MacOS/freenet-bin"
+        )));
+        assert!(!is_translocated_path(Path::new(
+            "/Applications/Freenet.app/Contents/MacOS/freenet-bin"
+        )));
     }
 }

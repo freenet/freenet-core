@@ -1383,6 +1383,23 @@ mod tests {
     }
 
     #[test]
+    fn onboarding_markers_are_distinct_files() {
+        // The whole point of splitting cli_symlinks_marker_path (and
+        // legacy_migration_marker_path) out from first_run_marker_path is
+        // that an already-onboarded user — who has the first-run marker set
+        // — still needs the CLI-symlink one-shot (and the legacy migration)
+        // to run once on their next launch. If a future edit accidentally
+        // collapsed these onto the same path, that guarantee would silently
+        // break and this is the only thing that would catch it.
+        let first_run = first_run_marker_path().unwrap();
+        let legacy_migration = legacy_migration_marker_path().unwrap();
+        let cli_symlinks = cli_symlinks_marker_path().unwrap();
+        assert_ne!(first_run, legacy_migration);
+        assert_ne!(first_run, cli_symlinks);
+        assert_ne!(legacy_migration, cli_symlinks);
+    }
+
+    #[test]
     #[cfg(target_os = "linux")]
     fn test_systemd_user_service_file_generation() {
         let binary_path = PathBuf::from("/usr/local/bin/freenet");
