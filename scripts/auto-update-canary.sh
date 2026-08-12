@@ -55,16 +55,20 @@
 #                 and a draft release does not appear there.
 #
 # Run either locally. Both keep their FILES to their own temp directory
-# (isolated HOME, config, data, log dirs and TMPDIR), so nothing outside it is
-# touched.
+# (isolated HOME, TMPDIR, webapp cache, and config/data/log dirs), so nothing
+# outside it is touched.
 #
-# TMPDIR is in that list for a reason and must stay there: the node's contract
-# web directory is `std::env::temp_dir()/freenet/webs`, hardwired, and does NOT
-# follow `--data-dir`. Until v0.2.124 this file did not set TMPDIR, so the claim
-# above was false -- and worse, `cross-compile.yml` stages the binary under test
-# at `/tmp/freenet`, the exact path the node then tries to create a directory
-# under. The node panicked on ENOTDIR before reaching the update task, and Gate A
-# blocked a release whose binary was perfectly healthy. See `run_node_until_check`.
+# TMPDIR is in that list for a reason and must stay there, and the reason is not
+# the one it looks like. `client_api.rs` unconditionally `create_dir_all`s
+# `std::env::temp_dir()/freenet/webs` (`let contract_web_path =`) when it builds
+# the router. That directory is VESTIGIAL: nothing in the tree reads or writes
+# it, and web contracts are unpacked elsewhere (`default_webapp_cache_dir`). Its
+# one surviving effect is the panic when the mkdir FAILS -- `$TMPDIR/freenet`
+# being a FILE, or a directory owned by another user. Through v0.2.124 this file
+# did not set TMPDIR, and `cross-compile.yml` stages the binary under test at
+# `/tmp/freenet`, which is exactly that path: ENOTDIR, panic (exit 101) before
+# the update task spawned, and Gate A blocked a release whose binary was
+# perfectly healthy. See `run_node_until_check`.
 #
 # PORTS are the exception, and an earlier version of this header overstated it
 # by calling the runs "safe to run on a machine already running a node". They
@@ -563,29 +567,53 @@ run_node_until_check() {
     # var removes the class outright for the cost of one line. Only the
     # canary's own throwaway node is affected.
     export FREENET_DISABLE_LOG_RATE_LIMIT=1
-    # The node's contract web directory is `std::env::temp_dir()/freenet/webs`
-    # (client_api.rs), hardwired -- it does NOT follow `--data-dir`. Two
-    # consequences, and the first one blocked a healthy release:
+    # `client_api.rs` unconditionally `create_dir_all`s
+    # `std::env::temp_dir()/freenet/webs` (`let contract_web_path =`) when it
+    # builds the router, and that path does NOT follow `--data-dir`. The
+    # directory itself is VESTIGIAL -- nothing reads or writes it (`"webs"` has
+    # exactly one occurrence in `crates/`, the mkdir), and unpacked web
+    # contracts live under `default_webapp_cache_dir` instead. So the only thing
+    # it can still do is PANIC when the mkdir fails, which it does two ways:
     #
-    #   1. `cross-compile.yml` stages the binary it is about to gate at
-    #      `/tmp/freenet`, which is exactly the path the node then tries to
-    #      `mkdir` under. `create_dir_all` hits ENOTDIR against the binary FILE
-    #      and the node panics (exit 101) before the update task ever spawns, so
-    #      Gate A reports "the startup update check never ran" and blocks. That
-    #      is what happened to v0.2.124: the shipping binary was fine, and the
-    #      gate's own harness was not. Verified on the released artifact --
-    #      UNVERIFIED with the default TMPDIR, `rc=0` and
-    #      "compared against '0.2.123'" with TMPDIR isolated. Relocating the
-    #      binary alone is NOT sufficient; the isolation is the fix.
-    #   2. Without this the canary is not self-contained, contradicting this
-    #      file's own header: two nodes on one machine share
-    #      `/tmp/freenet/webs`. The header's "safe to run on a machine already
-    #      running a node" claim was corrected for PORTS earlier; this is the
-    #      other half of the same claim.
+    #   1. `$TMPDIR/freenet` is a FILE. `cross-compile.yml` stages the binary it
+    #      is about to gate at `/tmp/freenet`, exactly that path, so
+    #      `create_dir_all` hits ENOTDIR against the binary and the node panics
+    #      (exit 101) before the update task ever spawns. Gate A then reports
+    #      "the startup update check never ran" and blocks. That is what
+    #      happened to v0.2.124: the shipping binary was fine, the gate's own
+    #      harness was not. Measured on the SHIPPED v0.2.124 artifact staged at
+    #      that path, this fix against a reverted-fix control:
+    #          fixed    rc=0, "compared against '0.2.123'"
+    #          control  rc=1, node exited 101, panicked in `client_api.rs`
+    #                   ("Not a directory (os error 20)")
+    #   2. `$TMPDIR/freenet` is a directory owned by ANOTHER USER and has no
+    #      `webs` child yet -- EACCES, same panic, which is what the panic's own
+    #      "may happen if ... was created by another user" text is about. Two
+    #      canary runs on one host do NOT collide here: they would share a
+    #      directory that is always empty and never read. PORTS are the shared
+    #      resource that actually collides; see the header.
     #
-    # Scoped to the subshell, so only the canary's throwaway node is affected.
+    # Relocating the staged binary would only address (1). Isolating TMPDIR
+    # addresses both, and is scoped to this subshell so only the canary's
+    # throwaway node is affected.
     mkdir -p "$work/tmp"
+    # shellcheck disable=SC2030  # subshell-local is the point, same as HOME
+    # above: the caller's TMPDIR must not move on a machine already running a
+    # node. Gate B's `freenet update` sets its own (see `cmd_selfupdate`),
+    # which is what makes shellcheck notice this one at all.
     export TMPDIR="$work/tmp"
+    # The webapp cache does not follow TMPDIR or --data-dir either: it resolves
+    # through `directories::ProjectDirs` (`default_webapp_cache_dir`), which
+    # reads XDG_CACHE_HOME AHEAD of HOME, and `FREENET_WEBAPP_CACHE_DIR`
+    # overrides both. `WebappCache::with_root` create_dir_all's it on every
+    # boot, so on a host with XDG_CACHE_HOME set the canary would write outside
+    # its workdir. Unlike the vestigial mkdir above this one fails SOFT (a warn,
+    # the node carries on), so it never blocked a release -- it is here to make
+    # the header's isolation claim true rather than nearly true. Setting the
+    # explicit override is what closes it; XDG_CACHE_HOME is scoped too so any
+    # other cache-dir consumer lands in the workdir as well.
+    export XDG_CACHE_HOME="$work/cache"
+    export FREENET_WEBAPP_CACHE_DIR="$work/cache/freenet-webapp"
     exec timeout "$CANARY_TIMEOUT_SECS" "$binary" network \
       --config-dir "$work/cfg" \
       --data-dir "$work/data" \
@@ -944,6 +972,18 @@ cmd_selfupdate() {
     # shellcheck disable=SC2031  # deliberate: `freenet update` must read the
     # same isolated state dir the node wrote, and nothing outside it.
     export HOME="$work/home"
+    # `download_and_install` stages the downloaded tarball in
+    # `tempfile::tempdir()` (`update.rs`, and the macOS DMG path likewise),
+    # which follows TMPDIR. Without this the header's "both runs keep their
+    # FILES to their own temp directory" was true of Gate A only: Gate B wrote
+    # a release tarball into the ambient system temp dir. Safe for the swap --
+    # `replace_binary` copies to a `.freenet.new.tmp` beside the DESTINATION
+    # and renames there, so the atomic same-filesystem rename never involves
+    # TMPDIR.
+    mkdir -p "$work/tmp"
+    # shellcheck disable=SC2031  # deliberate, as for HOME above: this subshell
+    # sets its own copy; nothing outside it reads the change.
+    export TMPDIR="$work/tmp"
     "$work/bin/freenet" update --quiet
   ); then
     fail "\`freenet update\` failed -- the node asked for an update and the installer could not apply it."
