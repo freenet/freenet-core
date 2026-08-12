@@ -3107,9 +3107,16 @@ pub(crate) fn full_summaries_message(
 /// IDENTICAL heal path rather than growing a second copy that can drift. The
 /// hash-first exchange must not cost convergence, so there is exactly one
 /// implementation of "we decided this peer is stale, now fix it".
+///
+/// `peer_key` is the stable identity of `source`, carried in solely so the
+/// shadow-mode futile-repair detector can attribute the attempt to the same
+/// (contract, peer) edge the outcome is later observed on
+/// (`crate::ring::futile_repair`). It gates nothing: a `None` here suppresses
+/// only the diagnostic recording, never a heal.
 async fn emit_stale_peer_syncs(
     op_manager: &Arc<OpManager>,
     source: std::net::SocketAddr,
+    peer_key: Option<&crate::ring::interest::PeerKey>,
     mut stale_contracts: Vec<freenet_stdlib::prelude::ContractKey>,
 ) {
     // #3798 Gap 1: cap the number of SyncStateToPeer events emitted per
@@ -3176,6 +3183,17 @@ async fn emit_stale_peer_syncs(
         // the budget — the dropped event is retried next cycle exactly like an
         // over-cap one.
         emitted += 1;
+        // SHADOW MODE (futile-repair detector, `crate::ring::futile_repair`).
+        // Recorded HERE — past the ban and no-local-state gates and inside the
+        // budget — because those three skips mean no repair was sent. Charging
+        // the edge for a heal we never emitted would make the detector measure
+        // our own emit budget rather than whether repair works. Pure
+        // accounting: no gate, no early return, no behaviour change.
+        if let Some(pk) = peer_key {
+            op_manager
+                .interest_manager
+                .record_repair_attempt(&contract, pk);
+        }
         // Fires per stale-peer detection during interest sync, which is
         // dominant on hot contracts. Diagnostic-grade rather than
         // user-actionable; keep accessible via RUST_LOG=…=debug.
@@ -3457,7 +3475,13 @@ async fn handle_interest_sync_message(
             let mut confirmed_states: Vec<(freenet_stdlib::prelude::ContractKey, String)> =
                 Vec::new();
 
-            if let Some(pk) = peer_key {
+            // Cloned rather than moved so `peer_key` survives for the
+            // `emit_stale_peer_syncs` call below, which needs the peer's stable
+            // identity to attribute the heal to a futile-repair edge. A
+            // `PeerKey` wraps an x25519 `PublicKey` — a 32-byte `Copy` — so
+            // this is a byte copy, not a key operation, and it happens once per
+            // InterestSync message.
+            if let Some(pk) = peer_key.clone() {
                 // Per-message budget for semantic-staleness WASM probes
                 // (`get_state_delta`), spent across ALL entries/contracts in
                 // this Summaries message. Bounds the DoS surface of a peer
@@ -3510,6 +3534,17 @@ async fn handle_interest_sync_message(
                         // differ byte-wise; ask the contract itself whether we
                         // hold state the peer lacks. See
                         // `summary_indicates_stale_peer`.
+                        // SHADOW MODE (futile-repair detector). What the
+                        // `is_stale` below actually RESTS ON. `is_stale` is the
+                        // right heal decision in all three cases, but only one
+                        // of them is evidence about convergence: the other two
+                        // default to stale with nothing behind them, and their
+                        // frequency grows with peer breadth and node load
+                        // rather than with brokenness. Tracked alongside rather
+                        // than re-derived afterwards, because only the branch
+                        // that TOOK the default knows it took one. See
+                        // `crate::ring::futile_repair::OutcomeEvidence`.
+                        let mut evidence = crate::ring::futile_repair::OutcomeEvidence::Verdict;
                         let is_stale = match (our_summary.as_ref(), their_summary.as_ref()) {
                             (Some(ours), Some(theirs)) => {
                                 let identical = ours.as_ref() == theirs.as_ref();
@@ -3556,12 +3591,22 @@ async fn handle_interest_sync_message(
                                         }
                                         StalenessProbeAction::RunProbe => {
                                             staleness_probes_used += 1;
-                                            op_manager
+                                            let verdict = op_manager
                                                 .interest_manager
                                                 .peer_summary_has_pending_state(
                                                     op_manager, &contract, theirs, ours,
                                                 )
-                                                .await
+                                                .await;
+                                            if verdict.is_none() {
+                                                // The probe ran and produced no
+                                                // answer (delta error, timeout,
+                                                // unexpected response), so the
+                                                // byte-compare default below is
+                                                // not a convergence verdict.
+                                                evidence = crate::ring::futile_repair::
+                                                    OutcomeEvidence::ProbeUnavailable;
+                                            }
+                                            verdict
                                         }
                                         StalenessProbeAction::BudgetExhaustedFallBack => {
                                             // Budget spent for this message: fall
@@ -3571,6 +3616,15 @@ async fn handle_interest_sync_message(
                                             // Re-evaluated next heartbeat once the
                                             // cache warms. `None` => byte-compare in
                                             // `summary_indicates_stale_peer`.
+                                            //
+                                            // This is the load-correlated channel:
+                                            // everything past the 32-probe budget
+                                            // reads as stale every round with no
+                                            // divergence at all, so it must never
+                                            // reach the futile-repair detector as a
+                                            // verdict.
+                                            evidence = crate::ring::futile_repair::
+                                                OutcomeEvidence::ProbeBudgetExhausted;
                                             None
                                         }
                                     }
@@ -3600,6 +3654,28 @@ async fn handle_interest_sync_message(
                             }
                             _ => false,
                         };
+
+                        // SHADOW MODE (futile-repair detector,
+                        // `crate::ring::futile_repair`). This is the OUTCOME
+                        // observation: a two-sided comparison — both sides
+                        // reported a real summary — that settles whatever heal
+                        // we last sent on this edge. Gated on two-sidedness
+                        // because a one-sided comparison is not a verdict about
+                        // convergence; the `(None, Some(_))` and `_` arms above
+                        // return `false` for "no basis to heal", not for
+                        // "agreed", and feeding that in would score every
+                        // contract we don't host as a successful repair.
+                        //
+                        // Passing `!is_stale` rather than a constant is the
+                        // whole detector: it is what separates a repair that
+                        // failed to converge from one that worked. `evidence`
+                        // is what keeps the two conservative defaults out of
+                        // that number. Pure accounting, no behaviour change.
+                        if our_summary.is_some() && their_summary.is_some() {
+                            op_manager
+                                .interest_manager
+                                .record_repair_outcome(&contract, &pk, !is_stale, evidence);
+                        }
 
                         // #4952: upsert (not update) when the peer reported a
                         // real summary, so the ~5-min anti-entropy exchange can
@@ -3656,7 +3732,7 @@ async fn handle_interest_sync_message(
             // many peers reported mismatches within the same heartbeat cycle.
             // The bounded, targeted emission lives in `emit_stale_peer_syncs`,
             // shared verbatim with the `SummaryDigests` arm.
-            emit_stale_peer_syncs(op_manager, source, stale_contracts).await;
+            emit_stale_peer_syncs(op_manager, source, peer_key.as_ref(), stale_contracts).await;
 
             // Emit deferred StateConfirmed telemetry so the convergence
             // checker has up-to-date state hashes for CRDT-merged state.
@@ -3726,7 +3802,13 @@ async fn handle_interest_sync_message(
                 Vec::new();
             let mut request_hashes: Vec<u32> = Vec::new();
 
-            if let Some(pk) = peer_key {
+            // Cloned rather than moved so `peer_key` survives for the
+            // `emit_stale_peer_syncs` call below, which needs the peer's stable
+            // identity to attribute the heal to a futile-repair edge. A
+            // `PeerKey` wraps an x25519 `PublicKey` — a 32-byte `Copy` — so
+            // this is a byte copy, not a key operation, and it happens once per
+            // InterestSync message.
+            if let Some(pk) = peer_key.clone() {
                 // See `MAX_SUMMARY_HASHES_PER_MESSAGE`: entries are
                 // peer-supplied and cheap for the peer to fabricate, so
                 // deduplicate by hash and process a bounded window. The window
@@ -3947,6 +4029,29 @@ async fn handle_interest_sync_message(
                                 let is_stale = crate::ring::interest::summary_indicates_stale_peer(
                                     &ours, &ours, None,
                                 );
+                                // SHADOW MODE (futile-repair detector,
+                                // `crate::ring::futile_repair`). Two-sided by
+                                // construction: the digest PROVED the peer's
+                                // summary bytes are ours, so this settles an
+                                // outstanding heal on the edge exactly as the
+                                // `Summaries` arm does. `NeedBytes` deliberately
+                                // records nothing — it defers to the full-bytes
+                                // `Summaries` reply, which observes there, so
+                                // one divergence is never counted twice.
+                                //
+                                // Evidence is `Verdict` by construction and NOT
+                                // a shortcut: `summary_indicates_stale_peer` is
+                                // called on byte-identical operands here, which
+                                // short-circuits before any delta probe, so no
+                                // probe budget is consulted and no default can
+                                // be taken. Pure accounting, no behaviour
+                                // change.
+                                op_manager.interest_manager.record_repair_outcome(
+                                    &contract,
+                                    &pk,
+                                    !is_stale,
+                                    crate::ring::futile_repair::OutcomeEvidence::Verdict,
+                                );
                                 // #4952: seed the peer-summary cache so an
                                 // advertised co-host does not stay a
                                 // full-state broadcast target. Fact, not
@@ -4014,7 +4119,7 @@ async fn handle_interest_sync_message(
             // sub-second RTT is not a convergence risk, but it is a real
             // regression in heal LATENCY on the legs that ship digests, and it
             // is the price of not shipping the summary every cycle.
-            emit_stale_peer_syncs(op_manager, source, stale_contracts).await;
+            emit_stale_peer_syncs(op_manager, source, peer_key.as_ref(), stale_contracts).await;
 
             // A contract on the mismatch path is confirmed TWICE: once here,
             // once again when the requested bytes arrive at the `Summaries`
@@ -6043,6 +6148,13 @@ mod tests {
         let handler_key = key;
         let _handler = tokio::spawn(async move {
             while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "a stand-in executor loop: it only serves the two \
+                              queries this test issues, and ContractHandlerEvent \
+                              has 20+ variants — any other event reaching it is \
+                              an unexpected-input panic, not a silent fallthrough"
+                )]
                 let response = match ev {
                     ContractHandlerEvent::GetQuery { .. } => ContractHandlerEvent::GetResponse {
                         key: Some(handler_key),
@@ -6162,6 +6274,14 @@ mod tests {
         let handler_flag = update_query_seen.clone();
         let _handler = tokio::spawn(async move {
             while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "a stand-in executor loop: it only serves the one \
+                              query this test expects, and ContractHandlerEvent \
+                              has 20+ variants — any other event reaching it is \
+                              the regression under test, so it panics rather \
+                              than falling through silently"
+                )]
                 let response = match ev {
                     ContractHandlerEvent::UpdateQuery { .. } => {
                         handler_flag.store(true, Ordering::SeqCst);
@@ -6291,6 +6411,13 @@ mod tests {
         let handler_flag = update_query_seen.clone();
         let _handler = tokio::spawn(async move {
             while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "a stand-in executor loop: it only serves the one \
+                              query this test expects, and ContractHandlerEvent \
+                              has 20+ variants — any other event reaching it is \
+                              an unexpected-input panic, not a silent fallthrough"
+                )]
                 let response = match ev {
                     ContractHandlerEvent::UpdateQuery { .. } => {
                         handler_flag.store(true, Ordering::SeqCst);
@@ -8562,6 +8689,173 @@ mod tests {
                  breaks simulation determinism"
             );
         }
+
+        /// Source-scrape pin: the shadow-mode futile-repair attempt is recorded
+        /// only where a heal is ACTUALLY emitted.
+        ///
+        /// The behavioural tests in `futile_repair_shadow` cannot see this: the
+        /// harness contract is never banned, always has local state, and never
+        /// exceeds the emit budget, so moving `record_repair_attempt` above
+        /// those gates leaves them all green. But a heal we did not send is not
+        /// a repair, and counting one would turn the detector into a measure of
+        /// our own emit budget — the exact "metric re-derived away from the
+        /// decision" failure in `.claude/rules/bug-prevention-patterns.md`.
+        #[test]
+        fn futile_repair_attempt_is_recorded_only_where_the_heal_is_emitted() {
+            const SOURCE: &str = include_str!("node.rs");
+
+            // Scoped to `emit_stale_peer_syncs`'s OWN body. An earlier revision
+            // ran the window from the loop header to an anchor ~500 lines later
+            // in the `Summaries` arm, so it stayed green for a
+            // `record_repair_attempt` moved clean out of the function — which
+            // is precisely the regression it names. The function's body ends at
+            // the first `\n}` in column 0 after its signature, which is what a
+            // top-level `fn` terminator looks like in this file.
+            let fn_start = SOURCE
+                .find("async fn emit_stale_peer_syncs(")
+                .expect("emit_stale_peer_syncs not found — update this pin");
+            let fn_end = fn_start
+                + SOURCE[fn_start..]
+                    .find("\n}\n")
+                    .expect("end of emit_stale_peer_syncs not found")
+                + 1;
+            let body = &SOURCE[fn_start..fn_end];
+            let start = fn_start
+                + body
+                    .find("for contract in stale_contracts {")
+                    .expect("stale-contract emission loop not found");
+            let window = &SOURCE[start..fn_end];
+
+            let record = window.find("record_repair_attempt(").expect(
+                "the futile-repair attempt is no longer recorded in the heal \
+                 emission loop — the detector cannot pair an outcome with an \
+                 attempt that was never recorded",
+            );
+            for (gate, why) in [
+                (
+                    "if emitted >= emit_budget {",
+                    "an over-budget contract is deferred, not healed",
+                ),
+                (
+                    "is_banned(contract.id())",
+                    "a banned contract is skipped, not healed",
+                ),
+                (
+                    "Skipping stale-peer sync",
+                    "a contract with no local state is skipped, not healed",
+                ),
+                (
+                    "emitted += 1;",
+                    "the attempt must be counted with the emission it belongs to",
+                ),
+            ] {
+                let gate_pos = window.find(gate).unwrap_or_else(|| {
+                    panic!("heal-loop gate `{gate}` not found — update this pin")
+                });
+                assert!(
+                    gate_pos < record,
+                    "record_repair_attempt must come AFTER `{gate}`: {why}, so \
+                     charging the edge for it makes the futile-repair detector \
+                     measure our own emit budget instead of whether repair works"
+                );
+            }
+        }
+
+        /// Source-scrape pin: the outcome sites must pass the COMPARISON
+        /// VERDICT, not a constant.
+        ///
+        /// This is the mutation the feature is defined against — a detector fed
+        /// `false` unconditionally counts every repair as futile and is
+        /// measuring load. `futile_repair_shadow` fails under that mutation
+        /// too; this pin survives a `#[cfg(test)]` module being cut, and names
+        /// the two observation sites so a third one cannot be added silently.
+        #[test]
+        fn futile_repair_outcome_sites_pass_the_staleness_verdict() {
+            use crate::node::tests::code_only;
+
+            const SOURCE: &str = include_str!("node.rs");
+            let handler = SOURCE
+                .find("async fn handle_interest_sync_message(")
+                .expect("handle_interest_sync_message not found");
+            // Bound the window to the handler region. Without this the pin
+            // matches its OWN source (this test names every needle it looks
+            // for) and passes no matter what the handler does — the
+            // self-matching-needle trap.
+            let handler_end = handler
+                + SOURCE[handler..]
+                    .find("\n#[cfg(test)]")
+                    .or_else(|| SOURCE[handler..].find("\nmod tests {"))
+                    .expect("end of handler region not found");
+            let body = code_only(&SOURCE[handler..handler_end]);
+
+            let sites: Vec<_> = body.match_indices("record_repair_outcome(").collect();
+            assert_eq!(
+                sites.len(),
+                2,
+                "expected exactly two futile-repair outcome sites (the \
+                 `Summaries` two-sided comparison and the `SummaryDigests` \
+                 agreement); found {}. A new site must be a genuinely \
+                 two-sided comparison, or the detector starts scoring \
+                 one-sided reports as successful repairs",
+                sites.len()
+            );
+            let mut passes_tracked_evidence = 0usize;
+            for (pos, _) in sites {
+                let call = &body[pos..body[pos..]
+                    .find(");")
+                    .map(|o| pos + o)
+                    .unwrap_or(body.len())];
+                // Whitespace-stripped: rustfmt collapses or explodes an
+                // argument list depending on how long the arguments are, so a
+                // pin that matches raw source breaks the first time an argument
+                // is renamed — and a broken pin gets weakened, not fixed. Only
+                // the argument SEQUENCE is load-bearing here.
+                let squashed_call: String = call.split_whitespace().collect();
+                assert!(
+                    squashed_call.contains("!is_stale"),
+                    "a futile-repair outcome site passes something other than \
+                     `!is_stale`: the verdict IS the detector — a constant \
+                     there measures repair volume, not repair failure. Got: \
+                     {call}"
+                );
+                // The verdict alone is not enough. `is_stale` also comes out
+                // `true` when the per-message probe budget ran out or the delta
+                // probe failed, neither of which is evidence about convergence,
+                // and the first of those grows with peer breadth rather than
+                // with brokenness. Every site must say which it is.
+                assert!(
+                    squashed_call.contains("evidence")
+                        || squashed_call.contains("OutcomeEvidence::"),
+                    "a futile-repair outcome site no longer passes an \
+                     `OutcomeEvidence`: without it the load-correlated \
+                     budget-exhausted default is counted as futility and the \
+                     headline number tracks how busy this node is. Got: {call}"
+                );
+                if squashed_call.contains("!is_stale,evidence") {
+                    passes_tracked_evidence += 1;
+                }
+            }
+            assert_eq!(
+                passes_tracked_evidence, 1,
+                "exactly one outcome site (the `Summaries` arm) must pass the \
+                 `evidence` TRACKED alongside the staleness decision. \
+                 Hard-coding `OutcomeEvidence::Verdict` there re-derives the \
+                 provenance away from the branch that took the default, which \
+                 is the whole finding — only the `SummaryDigests` agreement \
+                 arm may name a literal, and only because it compares \
+                 byte-identical operands and can take no default"
+            );
+            // Whitespace-stripped so rustfmt wrapping the condition cannot
+            // break the pin.
+            let squashed: String = body.split_whitespace().collect();
+            assert!(
+                squashed.contains("our_summary.is_some()&&their_summary.is_some()"),
+                "the `Summaries` outcome site no longer gates on a TWO-SIDED \
+                 comparison — the one-sided arms return `false` for \"no basis \
+                 to heal\", not for \"converged\", and feeding those in scores \
+                 every contract we do not host as a successful repair"
+            );
+        }
     }
 
     // ───────────────────────────────────────────────────────────
@@ -8902,7 +9196,41 @@ mod tests {
         /// `contract_state_present` returns `true` when no hosting storage is
         /// attached, so the `should_summarize_or_broadcast` gate is satisfied
         /// by `host_contract` alone and no redb temp dir is needed.
+        /// What the stand-in contract handler answers a `GetDeltaQuery` — the
+        /// semantic-staleness probe (#4857) — with.
+        ///
+        /// These are the three things `interest::peer_summary_has_pending_state`
+        /// can return, and they produce three DIFFERENT provenances for one
+        /// `is_stale: bool`. The futile-repair detector has to tell them apart
+        /// (see `crate::ring::futile_repair::OutcomeEvidence`), so the harness
+        /// has to be able to produce them.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum DeltaBehavior {
+            /// The contract holds state the peer lacks: a byte mismatch is a
+            /// real divergence and heals. The default, and what every
+            /// pre-existing test here assumes.
+            NonEmpty,
+            /// The contract says the peer is logically converged despite
+            /// differing summary bytes — the non-deterministic-serialization
+            /// shape #4857 exists for. A real verdict, and it is NOT stale.
+            Empty,
+            /// The probe produced no verdict at all.
+            /// `summary_indicates_stale_peer` then falls back to the
+            /// conservative byte compare, so the peer reads STALE on no
+            /// evidence whatsoever.
+            Failing,
+        }
+
         async fn build_harness(id: &str, port_base: u16, our_summary: Vec<u8>) -> Harness {
+            build_harness_with(id, port_base, our_summary, DeltaBehavior::NonEmpty).await
+        }
+
+        async fn build_harness_with(
+            id: &str,
+            port_base: u16,
+            our_summary: Vec<u8>,
+            delta_behavior: DeltaBehavior,
+        ) -> Harness {
             let config_args = crate::config::ConfigArgs {
                 id: Some(id.to_string()),
                 mode: Some(crate::contract::OperationMode::Local),
@@ -8943,9 +9271,12 @@ mod tests {
             // Hosted + locally interested + hash-indexed, so
             // `summary_if_hosted_or_in_use` will summarize it and
             // `lookup_by_hash` will resolve the peer's advertised hash to it.
-            let _ = op_manager
-                .ring
-                .host_contract(key, 128, crate::ring::AccessType::Put);
+            let _ = op_manager.ring.host_contract(
+                key,
+                128,
+                crate::ring::AccessType::Put,
+                crate::ring::HostingCause::Other,
+            );
             op_manager.interest_manager.register_local_hosting(&key);
 
             // Two connected peers, distinguished ONLY by whether a remote
@@ -8975,6 +9306,14 @@ mod tests {
             let queries_for_handler = std::sync::Arc::clone(&summary_queries);
             let handler = tokio::spawn(async move {
                 while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                    #[allow(
+                        clippy::wildcard_enum_match_arm,
+                        reason = "a stand-in executor loop: it only serves the \
+                                  three queries this test issues, and \
+                                  ContractHandlerEvent has 20+ variants — any \
+                                  other event reaching it is an unexpected-input \
+                                  panic, not a silent fallthrough"
+                    )]
                     let response = match ev {
                         ContractHandlerEvent::GetSummaryQuery { key } => {
                             queries_for_handler.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -8992,18 +9331,29 @@ mod tests {
                                 }),
                             }
                         }
-                        // The semantic-staleness probe (#4857): a NON-EMPTY
-                        // delta is the contract answering "yes, I hold state
-                        // this peer lacks", which is what turns a byte
-                        // mismatch into a real heal. Returning an empty delta
-                        // here would make every divergence test vacuous.
+                        // The semantic-staleness probe (#4857). The default
+                        // (`NonEmpty`) is the contract answering "yes, I hold
+                        // state this peer lacks", which is what turns a byte
+                        // mismatch into a real heal — returning an empty delta
+                        // by default would make every divergence test vacuous.
+                        // The other two variants exist so a test can produce
+                        // the OTHER two provenances of `is_stale`; see
+                        // `DeltaBehavior`.
                         ContractHandlerEvent::GetDeltaQuery { key, .. } => {
-                            ContractHandlerEvent::GetDeltaResponse {
-                                key,
-                                delta: Ok(freenet_stdlib::prelude::StateDelta::from(vec![
-                                    1u8, 2, 3,
-                                ])),
-                            }
+                            let delta = match delta_behavior {
+                                DeltaBehavior::NonEmpty => {
+                                    Ok(freenet_stdlib::prelude::StateDelta::from(vec![1u8, 2, 3]))
+                                }
+                                DeltaBehavior::Empty => {
+                                    Ok(freenet_stdlib::prelude::StateDelta::from(Vec::<u8>::new()))
+                                }
+                                DeltaBehavior::Failing => {
+                                    Err(crate::contract::ExecutorError::other(
+                                        crate::contract::ContractQueueFull,
+                                    ))
+                                }
+                            };
+                            ContractHandlerEvent::GetDeltaResponse { key, delta }
                         }
                         other => panic!("unexpected handler event: {other:?}"),
                     };
@@ -9250,10 +9600,12 @@ mod tests {
                 code[4] = 0xC0;
                 let key =
                     ContractKey::from_id_and_code(ContractInstanceId::new(id), CodeHash::new(code));
-                let _ = h
-                    .op_manager
-                    .ring
-                    .host_contract(key, 128, crate::ring::AccessType::Put);
+                let _ = h.op_manager.ring.host_contract(
+                    key,
+                    128,
+                    crate::ring::AccessType::Put,
+                    crate::ring::HostingCause::Other,
+                );
                 h.op_manager.interest_manager.register_local_hosting(&key);
                 keys.push(key);
             }
@@ -9995,10 +10347,12 @@ mod tests {
             // and makes the dropped entry invisible.
             let h = build_harness("hf-collision", 17080, vec![3u8; 64]).await;
             for k in [key_a, key_b] {
-                let _ = h
-                    .op_manager
-                    .ring
-                    .host_contract(k, 128, crate::ring::AccessType::Put);
+                let _ = h.op_manager.ring.host_contract(
+                    k,
+                    128,
+                    crate::ring::AccessType::Put,
+                    crate::ring::HostingCause::Other,
+                );
                 h.op_manager.interest_manager.register_local_hosting(&k);
             }
 
@@ -10191,10 +10545,12 @@ mod tests {
                     ContractInstanceId::new([i.wrapping_add(100); 32]),
                     CodeHash::new([i; 32]),
                 );
-                let _ = h
-                    .op_manager
-                    .ring
-                    .host_contract(k, 128, crate::ring::AccessType::Put);
+                let _ = h.op_manager.ring.host_contract(
+                    k,
+                    128,
+                    crate::ring::AccessType::Put,
+                    crate::ring::HostingCause::Other,
+                );
                 h.op_manager.interest_manager.register_local_hosting(&k);
                 hashes.push(contract_hash(&k));
             }
@@ -10279,10 +10635,12 @@ mod tests {
                     ContractInstanceId::new([i.wrapping_add(160); 32]),
                     CodeHash::new([i.wrapping_add(3); 32]),
                 );
-                let _ = h
-                    .op_manager
-                    .ring
-                    .host_contract(k, 128, crate::ring::AccessType::Put);
+                let _ = h.op_manager.ring.host_contract(
+                    k,
+                    128,
+                    crate::ring::AccessType::Put,
+                    crate::ring::HostingCause::Other,
+                );
                 h.op_manager.interest_manager.register_local_hosting(&k);
                 hashes.push(contract_hash(&k));
             }
@@ -10679,7 +11037,9 @@ mod tests {
                 .expect("end of SummaryDigests arm not found");
             let body = &code_only(&src[arm..arm + end]);
             assert!(
-                body.contains("emit_stale_peer_syncs(op_manager, source, stale_contracts)"),
+                body.contains(
+                    "emit_stale_peer_syncs(op_manager, source, peer_key.as_ref(), stale_contracts)"
+                ),
                 "the SummaryDigests arm must delegate healing to the shared \
                  emit_stale_peer_syncs"
             );
@@ -10708,6 +11068,399 @@ mod tests {
                  identical/differing comparison, or the telemetry that \
                  justifies this change stops being able to measure it"
             );
+        }
+
+        /// End-to-end wiring for the SHADOW-MODE futile-repair detector
+        /// (`crate::ring::futile_repair`).
+        ///
+        /// The detector's whole claim is that it measures an OUTCOME — whether
+        /// this node's repair actually made the edge converge — rather than
+        /// how much repair traffic there is. These tests drive the REAL
+        /// `handle_interest_sync_message` and hold the attempt count fixed
+        /// while varying only what the peer reports back, so a detector that
+        /// counted attempts (or scored every outcome as failure) cannot pass
+        /// them.
+        mod futile_repair_shadow {
+            use super::*;
+            use crate::ring::futile_repair::QUARANTINE_THRESHOLD;
+
+            /// Feed one full-bytes `Summaries` report from `peer` and return
+            /// the heals it produced.
+            async fn report_summary(
+                h: &mut Harness,
+                peer: SocketAddr,
+                summary: &[u8],
+            ) -> Vec<(ContractKey, SocketAddr)> {
+                let hash = contract_hash(&h.key);
+                handle_interest_sync_message(
+                    &h.op_manager,
+                    peer,
+                    InterestMessage::Summaries {
+                        emitter: crate::message::SummariesEmitter::Other,
+                        entries: vec![SummaryEntry {
+                            hash,
+                            summary_bytes: Some(summary.to_vec()),
+                        }],
+                    },
+                )
+                .await;
+                h.drain_heals()
+            }
+
+            /// THE test for this feature. Two peers, the SAME number of
+            /// repairs emitted to each. The only difference is what the next
+            /// summary exchange said: one peer stays diverged forever (the
+            /// non-commutative-merge signature), the other converges after
+            /// every heal.
+            ///
+            /// A detector that counted repair ATTEMPTS would score these two
+            /// edges identically and report `would_quarantine == 2` with
+            /// `productive == 0`. That is exactly the documented mutation:
+            /// replacing `!is_stale` with `false` at the `Summaries` arm's
+            /// `record_repair_outcome` call makes this test fail on both
+            /// counts.
+            #[tokio::test]
+            async fn a_stuck_edge_is_separated_from_a_converging_one() {
+                let ours = vec![5u8; 128];
+                let theirs = vec![6u8; 128];
+                let mut h = build_harness("futile-shadow", 17100, ours.clone()).await;
+                let (stuck_peer, healthy_peer, key) = (h.new_peer, h.old_peer, h.key);
+
+                // STUCK edge: the peer reports a divergent summary every
+                // round and never moves — no heal can land.
+                //
+                // One extra round because the first exchange has no
+                // outstanding attempt to settle: round 1 only emits the first
+                // heal, rounds 2..=N+1 each settle the previous one as futile.
+                for round in 0..=QUARANTINE_THRESHOLD {
+                    let heals = report_summary(&mut h, stuck_peer, &theirs).await;
+                    assert_eq!(
+                        heals.len(),
+                        1,
+                        "round {round}: shadow mode must not suppress the heal \
+                         — every diverged round still emits exactly one \
+                         targeted SyncStateToPeer"
+                    );
+                    assert_eq!(heals[0], (key, stuck_peer), "the heal must stay targeted");
+                }
+
+                // CONVERGING edge: same number of heals emitted, but each one
+                // lands, so the following round reports OUR summary back.
+                for _ in 0..QUARANTINE_THRESHOLD {
+                    let heals = report_summary(&mut h, healthy_peer, &theirs).await;
+                    assert_eq!(heals.len(), 1, "a diverged round emits one heal");
+                    let healed = report_summary(&mut h, healthy_peer, &ours).await;
+                    assert!(healed.is_empty(), "a converged round must not emit a heal");
+                }
+
+                let snap = h.op_manager.interest_manager.futile_repair_snapshot();
+                assert_eq!(
+                    snap.attempts,
+                    u64::from(QUARANTINE_THRESHOLD) * 2 + 1,
+                    "both edges were healed the same number of times \
+                     (the stuck edge has one extra opening round)"
+                );
+                assert_eq!(
+                    snap.futile,
+                    u64::from(QUARANTINE_THRESHOLD),
+                    "only the stuck edge's repairs left the summaries differing"
+                );
+                assert_eq!(
+                    snap.productive,
+                    u64::from(QUARANTINE_THRESHOLD),
+                    "every repair to the converging edge landed — a detector \
+                     that ignored the comparison verdict would report zero here"
+                );
+                assert_eq!(
+                    snap.would_quarantine, 1,
+                    "exactly ONE edge reached the shadow threshold; a detector \
+                     counting attempts rather than outcomes would report two"
+                );
+                assert_eq!(
+                    snap.edges_at_threshold, 1,
+                    "the converging edge must never be at the threshold"
+                );
+                assert_eq!(
+                    snap.evictions, 0,
+                    "two edges cannot overflow the LRU — a non-zero eviction \
+                     count here would mean the counts above are unreliable"
+                );
+            }
+
+            /// A repair that lands resets the streak, so an edge that recovers
+            /// one round before the threshold never crosses it. This is what
+            /// stops a busy-but-healthy contract from being flagged.
+            #[tokio::test]
+            async fn a_late_recovery_clears_the_streak() {
+                let ours = vec![9u8; 64];
+                let theirs = vec![8u8; 64];
+                let mut h = build_harness("futile-recover", 17110, ours.clone()).await;
+                let peer = h.new_peer;
+
+                // Diverge for one round short of the threshold...
+                for _ in 0..QUARANTINE_THRESHOLD {
+                    report_summary(&mut h, peer, &theirs).await;
+                }
+                let snap = h.op_manager.interest_manager.futile_repair_snapshot();
+                assert_eq!(snap.futile, u64::from(QUARANTINE_THRESHOLD) - 1);
+                assert_eq!(snap.would_quarantine, 0, "not yet at the threshold");
+
+                // ...then the heal finally lands.
+                report_summary(&mut h, peer, &ours).await;
+                let snap = h.op_manager.interest_manager.futile_repair_snapshot();
+                assert_eq!(snap.productive, 1);
+                assert_eq!(
+                    snap.would_quarantine, 0,
+                    "one landed repair clears the streak"
+                );
+                assert_eq!(snap.edges_at_threshold, 0);
+            }
+
+            /// A peer that agrees from the outset produces no attempts and no
+            /// futility — the detector must not manufacture a signal out of
+            /// ordinary anti-entropy traffic. Covers BOTH wire forms, since
+            /// the `SummaryDigests` agreement arm is a second observation site
+            /// that could drift from the `Summaries` one.
+            #[tokio::test]
+            async fn an_agreeing_peer_produces_no_futility_on_either_wire_form() {
+                let ours = vec![3u8; 32];
+                let mut h = build_harness("futile-agree", 17120, ours.clone()).await;
+                let hash = contract_hash(&h.key);
+                let peer = h.new_peer;
+
+                for _ in 0..QUARANTINE_THRESHOLD {
+                    assert!(report_summary(&mut h, peer, &ours).await.is_empty());
+                    handle_interest_sync_message(
+                        &h.op_manager,
+                        peer,
+                        InterestMessage::SummaryDigests {
+                            emitter: crate::message::SummariesEmitter::Other,
+                            entries: vec![SummaryDigestEntry {
+                                hash,
+                                summary_digest: Some(summary_digest(&ours)),
+                            }],
+                        },
+                    )
+                    .await;
+                    assert!(h.drain_heals().is_empty());
+                }
+
+                let snap = h.op_manager.interest_manager.futile_repair_snapshot();
+                assert_eq!(
+                    snap.attempts, 0,
+                    "nothing was healed, so nothing was attempted"
+                );
+                assert_eq!(snap.futile, 0);
+                assert_eq!(snap.would_quarantine, 0);
+                assert_eq!(
+                    snap.observations_unpaired,
+                    u64::from(QUARANTINE_THRESHOLD) * 2,
+                    "both wire forms must reach the detector as observations — \
+                     a zero here on either arm means that observation site is \
+                     not wired at all"
+                );
+            }
+
+            /// HIGH-2, the load-correlated false-positive channel, end to end.
+            ///
+            /// `MAX_STALENESS_PROBES_PER_SUMMARIES` caps semantic-staleness
+            /// probes at 32 per `Summaries` message. Past that,
+            /// `summary_indicates_stale_peer` takes the conservative
+            /// bytes-differ-means-stale DEFAULT — correct as a heal decision,
+            /// but it means everything after position 32 reads as stale every
+            /// round with no divergence at all. If that fed the detector, the
+            /// headline number would grow with how many contracts a peer
+            /// reports, i.e. with peer breadth and node load, rather than with
+            /// brokenness.
+            ///
+            /// This drives exactly that shape through the real handler: a
+            /// filler contract burns the whole probe budget, and the contract
+            /// we track is always the entry past the budget. Its bytes differ
+            /// every round, but the contract's own delta is EMPTY — it is
+            /// logically converged (the #4857 non-deterministic-summary shape)
+            /// and would be scored converged if it were ever probed. Nothing
+            /// here is broken.
+            ///
+            /// Mutation that must fail this test: pass
+            /// `OutcomeEvidence::Verdict` unconditionally at the `Summaries`
+            /// outcome site — i.e. the pre-fix code, which passed `!is_stale`
+            /// alone. The tracked contract then accrues a futile streak of
+            /// `QUARANTINE_THRESHOLD` from load alone and reports
+            /// `would_quarantine == 1`.
+            #[tokio::test]
+            async fn probe_budget_exhaustion_is_not_counted_as_futility() {
+                let ours = vec![5u8; 128];
+                let mut h =
+                    build_harness_with("futile-budget", 17130, ours.clone(), DeltaBehavior::Empty)
+                        .await;
+                let peer = h.new_peer;
+
+                // A second hosted contract, purely to burn the probe budget.
+                // The one from the harness (`h.key`) is the one we track.
+                let filler = ContractKey::from_id_and_code(
+                    ContractInstanceId::new([77u8; 32]),
+                    CodeHash::new([78u8; 32]),
+                );
+                let _ = h.op_manager.ring.host_contract(
+                    filler,
+                    128,
+                    crate::ring::AccessType::Put,
+                    crate::ring::HostingCause::Other,
+                );
+                h.op_manager
+                    .interest_manager
+                    .register_local_hosting(&filler);
+
+                let filler_hash = contract_hash(&filler);
+                let tracked_hash = contract_hash(&h.key);
+                // Novel bytes every entry and every round, so every lookup is a
+                // genuine cache MISS — a cache hit costs no budget and would
+                // answer with a real verdict, defeating the setup.
+                let mut nonce = 0u16;
+                let mut novel = |len: usize| {
+                    nonce += 1;
+                    let mut bytes = vec![0u8; len];
+                    bytes[0] = (nonce & 0xff) as u8;
+                    bytes[1] = (nonce >> 8) as u8;
+                    bytes
+                };
+
+                // One extra round for the same reason as the stuck-edge test:
+                // the opening round has no outstanding attempt to settle.
+                for _ in 0..=QUARANTINE_THRESHOLD {
+                    let mut entries: Vec<SummaryEntry> = (0..MAX_STALENESS_PROBES_PER_SUMMARIES)
+                        .map(|_| SummaryEntry {
+                            hash: filler_hash,
+                            summary_bytes: Some(novel(64)),
+                        })
+                        .collect();
+                    // The budget is now spent, so THIS entry is defaulted.
+                    entries.push(SummaryEntry {
+                        hash: tracked_hash,
+                        summary_bytes: Some(novel(64)),
+                    });
+                    handle_interest_sync_message(
+                        &h.op_manager,
+                        peer,
+                        InterestMessage::Summaries {
+                            emitter: crate::message::SummariesEmitter::Other,
+                            entries,
+                        },
+                    )
+                    .await;
+                    // SHADOW MODE: the defaulted verdict still heals, exactly
+                    // as before. Only the accounting changes.
+                    let heals = h.drain_heals();
+                    assert_eq!(
+                        heals,
+                        vec![(h.key, peer)],
+                        "the conservative default must still emit its heal — \
+                         this change must not alter behaviour"
+                    );
+                }
+
+                // The harm first, so a regression names it rather than naming
+                // a bookkeeping row.
+                let snap = h.op_manager.interest_manager.futile_repair_snapshot();
+                assert_eq!(
+                    snap.would_quarantine, 0,
+                    "a contract that is logically CONVERGED reached the shadow \
+                     threshold purely because the peer reported more contracts \
+                     than the probe budget covers — the headline is now a load \
+                     metric: {snap:?}"
+                );
+                assert_eq!(
+                    snap.futile, 0,
+                    "running out of probe budget is not evidence that a repair \
+                     failed — counting it makes the headline grow with peer \
+                     breadth and node load instead of with brokenness"
+                );
+                assert_eq!(
+                    snap.outcomes_probe_budget_exhausted,
+                    u64::from(QUARANTINE_THRESHOLD) + 1,
+                    "every round's over-budget entry must be recorded as a \
+                     defaulted verdict, one per message"
+                );
+                assert_eq!(snap.edges_at_threshold, 0);
+                assert!(
+                    snap.attempts >= u64::from(QUARANTINE_THRESHOLD),
+                    "the heals were emitted and charged as attempts; only \
+                     their OUTCOMES are unclassifiable, got {snap:?}"
+                );
+                // The readable signature of the "we cannot tell" regime, and
+                // the one an evasion attempt would produce (see the module
+                // docs' second known limitation): heals keep going out and
+                // keep being superseded unsettled, while `futile` and
+                // `productive` both stay flat. A defaulted outcome must NOT
+                // consume the attempt, so the count rises.
+                assert!(
+                    snap.attempts_superseded >= u64::from(QUARANTINE_THRESHOLD) - 1,
+                    "an unclassifiable outcome must leave the attempt \
+                     outstanding, so the next heal supersedes it — that pairing \
+                     of high `attempts_superseded` with flat futile/productive \
+                     is how the regime is recognised in the field: {snap:?}"
+                );
+            }
+
+            /// The other evidence-free provenance: the probe RAN and produced
+            /// no verdict (delta error / timeout). `summary_indicates_stale_peer`
+            /// falls back to the byte compare and reports stale, so without the
+            /// evidence split a contract-side or runtime-side fault would
+            /// manufacture a full futility streak on a healthy edge.
+            ///
+            /// Mutation that must fail this test: as above, pass
+            /// `OutcomeEvidence::Verdict` unconditionally — `would_quarantine`
+            /// goes to 1 and `futile` to `QUARANTINE_THRESHOLD`.
+            #[tokio::test]
+            async fn a_failed_delta_probe_is_not_counted_as_futility() {
+                let ours = vec![5u8; 128];
+                let mut h = build_harness_with(
+                    "futile-probe-fail",
+                    17140,
+                    ours.clone(),
+                    DeltaBehavior::Failing,
+                )
+                .await;
+                let peer = h.new_peer;
+
+                let mut rounds = 0u64;
+                for round in 0..=QUARANTINE_THRESHOLD {
+                    // Novel bytes each round: a repeated pair would be served
+                    // from the delta cache rather than re-probed.
+                    let theirs = vec![(round as u8).wrapping_add(1); 64];
+                    let heals = report_summary(&mut h, peer, &theirs).await;
+                    assert_eq!(
+                        heals.len(),
+                        1,
+                        "a failed probe still falls back to the byte compare \
+                         and still heals — behaviour is unchanged"
+                    );
+                    rounds += 1;
+                }
+
+                // The harm first, so a regression names it rather than naming
+                // a bookkeeping row.
+                let snap = h.op_manager.interest_manager.futile_repair_snapshot();
+                assert_eq!(
+                    snap.would_quarantine, 0,
+                    "a contract-side or runtime-side probe fault manufactured a \
+                     quarantine candidate on a healthy edge: {snap:?}"
+                );
+                assert_eq!(
+                    snap.futile, 0,
+                    "a probe that produced no verdict is not evidence that a \
+                     repair failed"
+                );
+                assert_eq!(
+                    snap.outcomes_probe_unavailable, rounds,
+                    "each round's unanswerable probe must be recorded as its \
+                     own class, separate from budget exhaustion"
+                );
+                assert_eq!(
+                    snap.attempts, rounds,
+                    "every round still emitted (and charged) its heal"
+                );
+            }
         }
     }
 

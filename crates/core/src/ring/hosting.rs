@@ -38,6 +38,11 @@ pub(crate) mod reconcile;
 
 use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
 use crate::util::time_source::{DynTimeSource, InstantTimeSrc, TimeSource};
+/// Hosting-BEGIN attribution (#5090-family observability): WHY a peer started
+/// hosting a contract. Re-exported so the operation drivers — the only code that
+/// knows whether a store is client-originated, transit, or a sub-op fetch — can
+/// name their cause at the `Ring::host_contract` boundary.
+pub(crate) use cache::HostingCause;
 pub(crate) use cache::HostingContractScore;
 /// The pre-A2 flat 1 GiB budget, used as the upgrade-migration sentinel in
 /// `config::ConfigArgs::build` (see the constant's docs).
@@ -72,6 +77,10 @@ pub(crate) use cache::{COST_RATE_MIN_WINDOW, CostAxisPressure, build_cost_axes};
 /// so `config` can resolve the persisted `hosting-disk-pct` / `max-hosting-disk`
 /// defaults and `ring`/`HostingManager` can size the eviction floor.
 pub(crate) use cache::{DEFAULT_HOSTING_DISK_PCT, DEFAULT_MAX_HOSTING_DISK_BYTES};
+/// Widths of the two hosted-set demand-signal histograms exported on the router
+/// snapshot. Re-exported so `router` can size the wire arrays from the single
+/// definition next to the bucketing code.
+pub(crate) use cache::{GENUINE_ACCESS_RECENCY_BUCKETS, READ_COUNT_HIST_BUCKETS};
 use cache::{HostingCache, HostingCacheStats, disk_budget_for_clamped};
 use dashmap::{DashMap, DashSet};
 use demand::ProximityPrior;
@@ -2092,11 +2101,16 @@ impl HostingManager {
     ///
     /// Automatically persists hosting metadata for the accessed contract and
     /// removes persisted metadata for evicted contracts.
+    ///
+    /// `cause` is the hosting ATTRIBUTION (see [`HostingCause`]); it is passed
+    /// straight through to the cache, which counts it only if this access
+    /// actually begins hosting. It influences nothing else.
     pub fn record_contract_access(
         &self,
         key: ContractKey,
         size_bytes: u64,
         access_type: AccessType,
+        cause: HostingCause,
     ) -> RecordAccessResult {
         // `contract_in_use` reads only the client_subscriptions /
         // downstream_subscribers / active_subscriptions DashMaps — never
@@ -2124,6 +2138,7 @@ impl HostingManager {
             access_type,
             current_generation,
             predicted_demand,
+            cause,
             |k: &ContractKey| self.local_and_downstream_counts(k),
         );
 
@@ -3304,6 +3319,59 @@ mod tests {
         )
     }
 
+    /// End-to-end through the PRODUCTION entry point (`record_contract_access`,
+    /// which `Ring::host_contract` delegates to): the caller's cause reaches the
+    /// exported stats, and only a real hosting BEGIN moves it.
+    ///
+    /// The manager layer is where the attribution could most plausibly be lost —
+    /// it re-shapes the result (teardown lists, demand training, metadata
+    /// persistence) between the caller and the cache. This asserts the pass-
+    /// through survives all of that.
+    ///
+    /// Mutation verified to FAIL: replacing the forwarded `cause` with a
+    /// constant, and deleting the increment in the cache's insert branch.
+    #[tokio::test]
+    async fn record_contract_access_reports_hosting_begins_by_cause() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let relayed = make_contract_key(1);
+        let fetched = make_contract_key(2);
+
+        manager.record_contract_access(relayed, 100, AccessType::Put, HostingCause::TransitPut);
+        // A repeat PUT of the same contract: recency refresh, NOT a new hosting
+        // decision — the counter must not move.
+        manager.record_contract_access(relayed, 100, AccessType::Put, HostingCause::TransitPut);
+        manager.record_contract_access(fetched, 100, AccessType::Get, HostingCause::SubOpGet);
+
+        let stats = manager.hosting_cache_stats();
+        assert_eq!(
+            stats.hosting_begins[HostingCause::TransitPut.index()],
+            1,
+            "two PUTs of one contract are ONE hosting begin; a 2 here means the \
+             counter fires on refresh and is really counting writes"
+        );
+        assert_eq!(
+            stats.hosting_begins[HostingCause::SubOpGet.index()],
+            1,
+            "a subscribe-fetch / auto-fetch travels the ordinary GET driver — \
+             this row is the only thing that separates it from a client GET"
+        );
+        assert_eq!(
+            stats.hosting_begins[HostingCause::ClientGet.index()],
+            0,
+            "no caller named ClientGet"
+        );
+        assert_eq!(
+            stats.hosting_begins[HostingCause::Other.index()],
+            0,
+            "a production path must never lose its attribution"
+        );
+        assert_eq!(
+            stats.hosting_begins.iter().sum::<u64>(),
+            stats.contract_count,
+            "with no evictions, begins and the hosted set agree"
+        );
+    }
+
     #[tokio::test]
     async fn test_subscribe_creates_new_subscription() {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
@@ -3338,8 +3406,8 @@ mod tests {
         );
         let junk = make_contract_key(1);
         let hot_subscribed = make_contract_key(2);
-        manager.record_contract_access(junk, 121, AccessType::Put);
-        manager.record_contract_access(hot_subscribed, 121, AccessType::Put);
+        manager.record_contract_access(junk, 121, AccessType::Put, HostingCause::Other);
+        manager.record_contract_access(hot_subscribed, 121, AccessType::Put, HostingCause::Other);
         manager.add_downstream_subscriber(&hot_subscribed, make_peer_key(10));
         // Age the PUT-seed genuine-access stamps past the cost window: the
         // storm has been running long past it with no genuine GET/PUT.
@@ -3543,14 +3611,19 @@ mod tests {
             DEFAULT_HOSTING_BUDGET_BYTES,
             std::sync::Arc::new(clock.clone()),
         );
-        manager.record_contract_access(junk, 121, AccessType::Put);
-        manager.record_contract_access(read_hot, 121, AccessType::Put);
-        manager.record_contract_access(burst, 5 * 1024 * 1024, AccessType::Put);
-        manager.record_contract_access(old_then_burst, 121, AccessType::Put);
+        manager.record_contract_access(junk, 121, AccessType::Put, HostingCause::Other);
+        manager.record_contract_access(read_hot, 121, AccessType::Put, HostingCause::Other);
+        manager.record_contract_access(
+            burst,
+            5 * 1024 * 1024,
+            AccessType::Put,
+            HostingCause::Other,
+        );
+        manager.record_contract_access(old_then_burst, 121, AccessType::Put, HostingCause::Other);
         // The storm has run long past the cost window with no genuine access…
         clock.advance_time(cache::COST_RATE_MIN_WINDOW + Duration::from_secs(1));
         // …but read_hot was genuinely GET-read just now.
-        manager.record_contract_access(read_hot, 121, AccessType::Get);
+        manager.record_contract_access(read_hot, 121, AccessType::Get, HostingCause::Other);
 
         let result = manager.sweep_expired_hosting_with_cost(&axes);
         let expired_keys: Vec<ContractKey> = result.expired.iter().map(|(k, _)| *k).collect();
@@ -3633,7 +3706,7 @@ mod tests {
             DEFAULT_HOSTING_BUDGET_BYTES,
             std::sync::Arc::new(clock.clone()),
         );
-        manager.record_contract_access(fast_junk, 121, AccessType::Put);
+        manager.record_contract_access(fast_junk, 121, AccessType::Put, HostingCause::Other);
         // Long past the cost window with no genuine access.
         clock.advance_time(cache::COST_RATE_MIN_WINDOW + Duration::from_secs(1));
 
@@ -3654,7 +3727,7 @@ mod tests {
     async fn sweep_without_cost_axes_never_cost_evicts() {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let junk = make_contract_key(1);
-        manager.record_contract_access(junk, 121, AccessType::Put);
+        manager.record_contract_access(junk, 121, AccessType::Put, HostingCause::Other);
         let result = manager.sweep_expired_hosting();
         assert!(result.expired.is_empty());
         assert!(manager.is_hosting_contract(&junk));
@@ -3796,8 +3869,8 @@ mod tests {
         // Learn our location, then read the contract twice. The second read has
         // non-zero residency (floored at 1s), so it yields a training sample.
         manager.set_own_location(Location::new(0.5));
-        manager.record_contract_access(key, 1_000, AccessType::Get);
-        manager.record_contract_access(key, 1_000, AccessType::Get);
+        manager.record_contract_access(key, 1_000, AccessType::Get, HostingCause::Other);
+        manager.record_contract_access(key, 1_000, AccessType::Get, HostingCause::Other);
 
         assert_eq!(
             manager.demand_estimator.read().len(),
@@ -3822,8 +3895,8 @@ mod tests {
         let key = make_contract_key(1);
         manager.set_own_location(Location::new(0.5));
 
-        manager.record_contract_access(key, 1_000, AccessType::Put);
-        manager.record_contract_access(key, 1_000, AccessType::Put);
+        manager.record_contract_access(key, 1_000, AccessType::Put, HostingCause::Other);
+        manager.record_contract_access(key, 1_000, AccessType::Put, HostingCause::Other);
 
         assert_eq!(
             manager.demand_estimator.read().len(),
@@ -3861,7 +3934,7 @@ mod tests {
 
         // Host the contract (a new-entry insert yields no rate sample), then
         // serve it locally: the touch has non-zero residency so it trains.
-        manager.record_contract_access(key, 1_000, AccessType::Get);
+        manager.record_contract_access(key, 1_000, AccessType::Get, HostingCause::Other);
         let before = manager.demand_estimator.read().len();
         manager.touch_hosting(&key);
         assert!(
@@ -4118,7 +4191,7 @@ mod tests {
         assert!(!manager.is_hosting_contract(&key));
         assert_eq!(manager.hosting_contracts_count(), 0);
 
-        manager.record_contract_access(key, 1000, AccessType::Put);
+        manager.record_contract_access(key, 1000, AccessType::Put, HostingCause::Other);
 
         assert!(manager.is_hosting_contract(&key));
         assert_eq!(manager.hosting_contracts_count(), 1);
@@ -4154,7 +4227,7 @@ mod tests {
         assert!(!manager.should_host(&contract));
 
         // Add to hosting cache
-        manager.record_contract_access(contract, 1000, AccessType::Put);
+        manager.record_contract_access(contract, 1000, AccessType::Put, HostingCause::Other);
         assert!(manager.should_host(&contract));
     }
 
@@ -4164,7 +4237,7 @@ mod tests {
     fn test_hosted_contract_not_in_renewal_after_restart() {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(42);
-        manager.record_contract_access(contract, 1000, AccessType::Get);
+        manager.record_contract_access(contract, 1000, AccessType::Get, HostingCause::Other);
         assert!(manager.is_hosting_contract(&contract));
         assert!(
             manager.contracts_needing_renewal().is_empty(),
@@ -4183,7 +4256,7 @@ mod tests {
         assert!(!manager.is_receiving_updates(&contract));
 
         // Add to hosting cache only — should_host true, is_receiving_updates false
-        manager.record_contract_access(contract, 1000, AccessType::Put);
+        manager.record_contract_access(contract, 1000, AccessType::Put, HostingCause::Other);
         assert!(manager.should_host(&contract));
         assert!(
             !manager.is_receiving_updates(&contract),
@@ -4266,8 +4339,8 @@ mod tests {
         // is no longer a `min_ttl` cold-start floor to protect it.
         let evictable = make_contract_key(2);
         let pinned = make_contract_key(3);
-        manager.record_contract_access(evictable, 100, AccessType::Get);
-        manager.record_contract_access(pinned, 100, AccessType::Get);
+        manager.record_contract_access(evictable, 100, AccessType::Get, HostingCause::Other);
+        manager.record_contract_access(pinned, 100, AccessType::Get, HostingCause::Other);
         // Pin `pinned` with a local client subscription → contract_in_use true.
         let client = crate::client_events::ClientId::next();
         manager.add_client_subscription(pinned.id(), client);
@@ -4299,7 +4372,7 @@ mod tests {
         let contract = make_contract_key(1);
 
         // Add to hosting cache (simulating GET operation)
-        manager.record_contract_access(contract, 1000, AccessType::Get);
+        manager.record_contract_access(contract, 1000, AccessType::Get, HostingCause::Other);
 
         // Hosted-only contracts should NOT be renewed -- subscribing to all
         // hosted contracts causes subscription storms (#3546). The local
@@ -4390,7 +4463,7 @@ mod tests {
     fn test_hosted_contract_renewed_despite_no_interest() {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(42);
-        manager.record_contract_access(contract, 1000, AccessType::Get);
+        manager.record_contract_access(contract, 1000, AccessType::Get, HostingCause::Other);
         assert!(manager.is_hosting_contract(&contract));
         // Before #3546: contracts_needing_renewal() included this during startup window
         // After #3546: hosted-only contracts are never included
@@ -4408,7 +4481,7 @@ mod tests {
     fn test_startup_revalidation_includes_hosted_contracts() {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
-        manager.record_contract_access(contract, 1000, AccessType::Get);
+        manager.record_contract_access(contract, 1000, AccessType::Get, HostingCause::Other);
         // Before #3546: during startup window, this would be in renewal list
         // After #3546: hosted-only contracts are never renewed
         let needs_renewal = manager.contracts_needing_renewal();
@@ -4424,7 +4497,7 @@ mod tests {
     fn test_startup_revalidation_skips_already_subscribed() {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
-        manager.record_contract_access(contract, 1000, AccessType::Get);
+        manager.record_contract_access(contract, 1000, AccessType::Get, HostingCause::Other);
         manager.subscribe(contract);
         let needs_renewal = manager.contracts_needing_renewal();
         assert!(
@@ -4439,7 +4512,7 @@ mod tests {
     fn test_startup_revalidation_window_expires() {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
-        manager.record_contract_access(contract, 1000, AccessType::Get);
+        manager.record_contract_access(contract, 1000, AccessType::Get, HostingCause::Other);
         let needs_renewal = manager.contracts_needing_renewal();
         assert!(
             !needs_renewal.contains(&contract),
@@ -4455,9 +4528,9 @@ mod tests {
         let contract_a = make_contract_key(1);
         let contract_b = make_contract_key(2);
         let contract_c = make_contract_key(3);
-        manager.record_contract_access(contract_a, 1000, AccessType::Get);
-        manager.record_contract_access(contract_b, 1000, AccessType::Get);
-        manager.record_contract_access(contract_c, 1000, AccessType::Get);
+        manager.record_contract_access(contract_a, 1000, AccessType::Get, HostingCause::Other);
+        manager.record_contract_access(contract_b, 1000, AccessType::Get, HostingCause::Other);
+        manager.record_contract_access(contract_c, 1000, AccessType::Get, HostingCause::Other);
         manager.subscribe(contract_b);
         let client_id = crate::client_events::ClientId::next();
         manager.add_client_subscription(contract_c.id(), client_id);
@@ -4489,7 +4562,7 @@ mod tests {
         // Simulate 200 relay-cached contracts loaded from disk
         for i in 0..200u8 {
             let contract = make_contract_key(i);
-            manager.record_contract_access(contract, 1000, AccessType::Get);
+            manager.record_contract_access(contract, 1000, AccessType::Get, HostingCause::Other);
         }
         assert_eq!(manager.hosting_contracts_count(), 200);
 
@@ -5806,7 +5879,7 @@ mod tests {
         assert_eq!(manager.state_generation(&key), 3);
 
         // Recording the access captures the current generation (3).
-        manager.record_contract_access(key, 100, AccessType::Get);
+        manager.record_contract_access(key, 100, AccessType::Get, HostingCause::Other);
 
         // Simulate a state write that races ahead of `EvictContract`.
         let new_generation = manager.bump_state_generation(&key);
@@ -5818,7 +5891,8 @@ mod tests {
         // `RuntimePool::remove_contract` will compare this captured
         // value (3) against the current `state_generation` (4) and
         // SKIP the on-disk reclamation, closing the re-host race.
-        let result = manager.record_contract_access(trigger, 100, AccessType::Get);
+        let result =
+            manager.record_contract_access(trigger, 100, AccessType::Get, HostingCause::Other);
         assert_eq!(
             result.evicted,
             vec![(key, 3)],
@@ -5874,7 +5948,7 @@ mod tests {
         let new_gen = manager.bump_state_generation(&key);
         assert_eq!(new_gen, 1);
         manager.refresh_cache_generation(&key, new_gen);
-        manager.record_contract_access(key, 100, AccessType::Get);
+        manager.record_contract_access(key, 100, AccessType::Get, HostingCause::Other);
 
         // Simulate an UPDATE that bumps the counter to 2 AND refreshes
         // the cached snapshot — this is the bump+refresh pair installed
@@ -5888,7 +5962,8 @@ mod tests {
         // would carry the stale snapshot (1), and `RuntimePool::remove_contract`
         // would see a mismatch against the current generation (2) and
         // SKIP reclamation — leaking the on-disk state forever.
-        let result = manager.record_contract_access(trigger, 100, AccessType::Get);
+        let result =
+            manager.record_contract_access(trigger, 100, AccessType::Get, HostingCause::Other);
         assert_eq!(
             result.evicted,
             vec![(key, 2)],
@@ -5992,13 +6067,14 @@ mod tests {
         manager.add_client_subscription(in_use.id(), client);
         assert!(manager.contract_in_use(&in_use));
 
-        manager.record_contract_access(in_use, 100, AccessType::Get);
-        manager.record_contract_access(filler, 100, AccessType::Get);
+        manager.record_contract_access(in_use, 100, AccessType::Get, HostingCause::Other);
+        manager.record_contract_access(filler, 100, AccessType::Get, HostingCause::Other);
 
         // Inserting `trigger` puts the cache over budget. A naive LRU would evict
         // `in_use` (oldest) — but it is locally subscribed so it is ordered LAST,
         // and one eviction of the zero-subscriber `filler` is enough.
-        let result = manager.record_contract_access(trigger, 100, AccessType::Get);
+        let result =
+            manager.record_contract_access(trigger, 100, AccessType::Get, HostingCause::Other);
         assert_eq!(
             result.evicted,
             vec![(filler, 0)],
@@ -6019,7 +6095,8 @@ mod tests {
         manager.remove_client_subscription(in_use.id(), client);
         assert!(!manager.contract_in_use(&in_use));
 
-        let result = manager.record_contract_access(filler, 100, AccessType::Get);
+        let result =
+            manager.record_contract_access(filler, 100, AccessType::Get, HostingCause::Other);
         assert!(
             result.evicted.iter().any(|(k, _)| *k == in_use),
             "once the subscription is removed the contract is evicted normally \
@@ -6065,15 +6142,16 @@ mod tests {
             manager.add_downstream_subscriber(&trigger, p.clone());
         }
 
-        manager.record_contract_access(few, 100, AccessType::Get);
-        manager.record_contract_access(many, 100, AccessType::Get);
+        manager.record_contract_access(few, 100, AccessType::Get, HostingCause::Other);
+        manager.record_contract_access(many, 100, AccessType::Get, HostingCause::Other);
         assert!(manager.contract_in_use(&few));
         assert!(manager.contract_in_use(&many));
 
         // Insert `trigger` over budget. Nothing is zero-subscriber, so the fewest-
         // downstream contract `few` (1 sub) is shed as the last resort ahead of
         // `many` (3 subs).
-        let result = manager.record_contract_access(trigger, 100, AccessType::Get);
+        let result =
+            manager.record_contract_access(trigger, 100, AccessType::Get, HostingCause::Other);
         assert_eq!(
             result.evicted,
             vec![(few, 0)],
@@ -6138,14 +6216,15 @@ mod tests {
             manager.subscribe(*k);
         }
 
-        manager.record_contract_access(victim, 100, AccessType::Get);
-        manager.record_contract_access(keep, 100, AccessType::Get);
+        manager.record_contract_access(victim, 100, AccessType::Get, HostingCause::Other);
+        manager.record_contract_access(keep, 100, AccessType::Get, HostingCause::Other);
         assert!(manager.contract_in_use(&victim));
 
         // Insert `trigger` over budget. Every contract is locally subscribed
         // (local = 1), so ties break by least-recent GET → `victim` (accessed
         // first) is shed as the last resort and torn down.
-        let result = manager.record_contract_access(trigger, 100, AccessType::Get);
+        let result =
+            manager.record_contract_access(trigger, 100, AccessType::Get, HostingCause::Other);
         assert_eq!(
             result.evicted_in_use,
             vec![victim],
@@ -6479,8 +6558,8 @@ mod tests {
         let relay_contract = make_contract_key(2);
 
         // Both contracts get hosted via GET
-        manager.record_contract_access(local_contract, 1000, AccessType::Get);
-        manager.record_contract_access(relay_contract, 1000, AccessType::Get);
+        manager.record_contract_access(local_contract, 1000, AccessType::Get, HostingCause::Other);
+        manager.record_contract_access(relay_contract, 1000, AccessType::Get, HostingCause::Other);
 
         // Only the local one gets marked as locally accessed
         manager.mark_local_client_access(&local_contract);
@@ -6513,9 +6592,19 @@ mod tests {
         let subscribed_size = 3 * 1024 * 1024;
         let recent_size = 4 * 1024 * 1024;
 
-        manager.record_contract_access(eligible, eligible_size, AccessType::Get);
-        manager.record_contract_access(subscribed, subscribed_size, AccessType::Get);
-        manager.record_contract_access(recent, recent_size, AccessType::Get);
+        manager.record_contract_access(
+            eligible,
+            eligible_size,
+            AccessType::Get,
+            HostingCause::Other,
+        );
+        manager.record_contract_access(
+            subscribed,
+            subscribed_size,
+            AccessType::Get,
+            HostingCause::Other,
+        );
+        manager.record_contract_access(recent, recent_size, AccessType::Get, HostingCause::Other);
         manager.add_downstream_subscriber(&subscribed, make_peer_key(12));
 
         clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
@@ -6565,7 +6654,7 @@ mod tests {
         // Simulate 200 relay-cached contracts (no local_client_access)
         for i in 0..200u8 {
             let contract = make_contract_key(i);
-            manager.record_contract_access(contract, 1000, AccessType::Get);
+            manager.record_contract_access(contract, 1000, AccessType::Get, HostingCause::Other);
         }
 
         // Mark only 2 as locally accessed (simulating River user)
@@ -6592,7 +6681,7 @@ mod tests {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
 
-        manager.record_contract_access(contract, 1000, AccessType::Get);
+        manager.record_contract_access(contract, 1000, AccessType::Get, HostingCause::Other);
         manager.mark_local_client_access(&contract);
         manager.subscribe(contract);
 
@@ -6623,12 +6712,12 @@ mod tests {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
 
-        manager.record_contract_access(contract, 1000, AccessType::Get);
+        manager.record_contract_access(contract, 1000, AccessType::Get, HostingCause::Other);
         manager.mark_local_client_access(&contract);
         assert!(manager.has_local_client_access(&contract));
 
         // Refresh via a relay PUT -- should NOT clear the local flag
-        manager.record_contract_access(contract, 1000, AccessType::Put);
+        manager.record_contract_access(contract, 1000, AccessType::Put, HostingCause::Other);
         assert!(
             manager.has_local_client_access(&contract),
             "local_client_access should persist across access type changes"
@@ -6692,21 +6781,21 @@ mod tests {
         let contract_c = make_contract_key(3);
 
         // Add A (locally accessed) and B
-        manager.record_contract_access(contract_a, 100, AccessType::Get);
+        manager.record_contract_access(contract_a, 100, AccessType::Get, HostingCause::Other);
         manager.mark_local_client_access(&contract_a);
-        manager.record_contract_access(contract_b, 100, AccessType::Get);
+        manager.record_contract_access(contract_b, 100, AccessType::Get, HostingCause::Other);
 
         assert!(manager.has_local_client_access(&contract_a));
 
         // Add C -- should evict A (oldest in LRU)
-        manager.record_contract_access(contract_c, 100, AccessType::Get);
+        manager.record_contract_access(contract_c, 100, AccessType::Get, HostingCause::Other);
         assert!(
             !manager.is_hosting_contract(&contract_a),
             "contract_a should have been evicted"
         );
 
         // Re-add A via relay (no mark_local_client_access)
-        manager.record_contract_access(contract_a, 100, AccessType::Get);
+        manager.record_contract_access(contract_a, 100, AccessType::Get, HostingCause::Other);
         assert!(
             !manager.has_local_client_access(&contract_a),
             "Re-added via relay should NOT have local_client_access"
@@ -6913,7 +7002,7 @@ mod tests {
         // the hosting cache (record_contract_access ≈ what
         // `host_contract` does in production).
         manager.bump_state_generation(&contract);
-        manager.record_contract_access(contract, 128, AccessType::Put);
+        manager.record_contract_access(contract, 128, AccessType::Put, HostingCause::Other);
         assert!(manager.is_hosting_contract(&contract));
 
         // The `RuntimePool::remove_contract` generation-mismatch +
@@ -6962,7 +7051,7 @@ mod tests {
         // should_unsubscribe_upstream() reads only has_client_subscriptions()
         // + has_downstream_subscribers(), never the hosting cache or the lease
         // map. The decision keys solely off the downstream-subscriber map here.
-        manager.record_contract_access(contract, 1000, AccessType::Get);
+        manager.record_contract_access(contract, 1000, AccessType::Get, HostingCause::Other);
         manager.subscribe(contract);
         assert!(
             manager
@@ -7016,7 +7105,7 @@ mod tests {
         let contract = make_contract_key(0x33);
 
         // Contract is in the hosting cache (durable fallback) ...
-        manager.record_contract_access(contract, 1000, AccessType::Get);
+        manager.record_contract_access(contract, 1000, AccessType::Get, HostingCause::Other);
         assert!(manager.is_hosting_contract(&contract));
 
         // ... and an active, non-expired subscription reads as receiving.
@@ -7068,7 +7157,12 @@ mod tests {
         // 50 purely-cached contracts (e.g. relay-cached from GETs) — no
         // subscription, no client, no local-client access.
         for i in 0..50u8 {
-            manager.record_contract_access(make_contract_key(i), 1000, AccessType::Get);
+            manager.record_contract_access(
+                make_contract_key(i),
+                1000,
+                AccessType::Get,
+                HostingCause::Other,
+            );
         }
         assert_eq!(manager.hosting_contracts_count(), 50);
         assert!(
@@ -7112,7 +7206,7 @@ mod tests {
             lease.expires_at = Instant::now() + Duration::from_secs(30);
         }
         let expired = make_contract_key(0xE0);
-        manager.record_contract_access(expired, 1000, AccessType::Get);
+        manager.record_contract_access(expired, 1000, AccessType::Get, HostingCause::Other);
         manager.subscribe(expired);
         if let Some(mut lease) = manager.active_subscriptions.get_mut(&expired) {
             lease.expires_at = Instant::now() - Duration::from_secs(1);
@@ -7345,6 +7439,7 @@ mod tests {
                     make_contract_key((i % 250) as u8),
                     i % 4096,
                     AccessType::Get,
+                    HostingCause::Other,
                 );
             }
         });

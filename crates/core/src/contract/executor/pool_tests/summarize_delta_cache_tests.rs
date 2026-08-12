@@ -470,9 +470,12 @@ async fn summary_cache_covers_live_hosted_count_not_fixed_cap() {
             )
             .await
             .expect("PUT");
-            op_manager
-                .ring
-                .host_contract(key, state.as_ref().len() as u64, AccessType::Get);
+            op_manager.ring.host_contract(
+                key,
+                state.as_ref().len() as u64,
+                AccessType::Get,
+                crate::ring::HostingCause::Other,
+            );
             keys.push(key);
         }
         assert_eq!(

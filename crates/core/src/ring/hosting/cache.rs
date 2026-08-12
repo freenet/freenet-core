@@ -336,6 +336,30 @@ pub(crate) struct HostingCacheStats {
     /// byte-budget zero-demand, byte-budget in-use, cost pressure.
     pub eviction_victim_counts: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
     pub eviction_victim_bytes: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
+    /// Monotonic count of times this peer BEGAN hosting a contract, attributed
+    /// by [`HostingCause`] (array order is [`HostingCause::ALL`]). Only a
+    /// transition into hosting is counted — a refresh of an already-hosted
+    /// contract is not — because the question these answer is "why is this peer
+    /// hosting this contract", which a refresh does not re-decide. Incremented
+    /// at the two branches that actually insert (see [`HostingCause`]), never
+    /// re-derived from cache sizes. Aggregate, fixed-cardinality: no
+    /// per-contract or per-peer labels.
+    pub hosting_begins: [u64; HostingCause::COUNT],
+    /// Point-in-time distribution of `read_count` across the CURRENTLY hosted
+    /// set (buckets: 0, 1, 2-3, 4-9, 10-99, >=100 — see
+    /// [`READ_COUNT_HIST_UPPER_BOUNDS`]). `read_count` is half the demand signal
+    /// the subscriber-primary eviction ranking is built on, and until now it
+    /// reached only this node's own local HTML dashboard: no `send_event` call
+    /// site touched it, so the fleet-wide shape of the signal the policy depends
+    /// on was unobservable. A gauge, not a counter — do NOT difference it.
+    pub read_count_hist: [u64; READ_COUNT_HIST_BUCKETS],
+    /// Point-in-time distribution of `last_genuine_access` AGE across the
+    /// currently hosted set. Bucket 0 is "within [`COST_RATE_MIN_WINDOW`]" — the
+    /// share of the hosted set that cost-pressure eviction currently treats as
+    /// recently-accessed — then <20 min, <2 h, older, and finally "never
+    /// genuinely accessed" (`None`). The other half of the demand signal, same
+    /// invisibility as [`Self::read_count_hist`]. A gauge, not a counter.
+    pub genuine_access_recency: [u64; GENUINE_ACCESS_RECENCY_BUCKETS],
 }
 
 /// Per-contract Greedy-Dual priority row for the local-peer dashboard.
@@ -381,6 +405,124 @@ pub enum AccessType {
     /// Used in tests and reserved for future use when explicit SUBSCRIBE triggers hosting
     #[cfg_attr(not(test), allow(dead_code))]
     Subscribe,
+}
+
+/// WHY this peer began hosting a contract — the attribution that
+/// [`AccessType`] is structurally unable to carry.
+///
+/// `AccessType` says only GET-vs-PUT, which cannot separate a contract this
+/// node's OWN client asked for from one that merely transited it on a routed
+/// GET/PUT return path. That distinction is the entire question every hosting
+/// policy decision rests on ("why is this peer hosting this contract"), and
+/// before this enum nothing recorded it: `EventKind` had no hosting variant and
+/// `network_status` had only a `hosted_contracts` gauge.
+///
+/// Counted ONLY at the branch that actually begins hosting — the insert arm of
+/// [`HostingCache::record_access_with_demand`] and the insert in
+/// [`HostingCache::load_persisted_entry_with_demand`] — never re-derived by a
+/// caller from `is_new` or from cache-size arithmetic (the
+/// `.claude/rules/bug-prevention-patterns.md` "metric describing a decision"
+/// rule; three wrong counts in a row came from re-derivation).
+///
+/// Fixed cardinality, no per-contract or per-peer labels: the whole array is
+/// [`COUNT`](Self::COUNT) counters wide, exported as one aggregate row.
+///
+/// NAMING: the two forwarding variants are `Transit*`, NOT `Relay*`.
+/// `.claude/rules/hosting-invariants.md` records that "relay" is a fossil of the
+/// hollow-relay firefight against #3763 and says outright: do not name new code
+/// `relay`. Forwarding a request toward its key is ROUTING, not a persistent
+/// role — which is exactly what these two variants mean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostingCause {
+    /// A GET this node itself originated: either its own client's GET
+    /// (`is_client_requester`, stored on the client driver's return path) or a
+    /// node-internal loopback GET, which dispatch routes through the SAME
+    /// forwarding driver with `upstream_addr = own_addr` (see
+    /// `get/op_ctx_task.rs::relay_get_hosting_cause`). Both are this node's own
+    /// demand; neither is transit.
+    ClientGet = 0,
+    /// The GET return-path store on a node that was merely FORWARDING someone
+    /// else's GET — transit, not local demand.
+    TransitGet = 1,
+    /// A sub-operation GET: subscribe-fetch (`operations/subscribe.rs` spawns a
+    /// sub-op GET when it must fetch state before subscribing), related-contract
+    /// auto-fetch, phantom repair. Structurally indistinguishable from a plain
+    /// GET without this attribution, because it travels the same driver.
+    SubOpGet = 2,
+    /// A PUT this node's own client originated (originator loopback).
+    ClientPut = 3,
+    /// The every-hop PUT store on a node forwarding someone else's PUT.
+    TransitPut = 4,
+    /// Restored from the persisted hosting metadata at startup — NOT a fresh
+    /// hosting decision at all. Kept separate so a restart's bulk reload cannot
+    /// masquerade as live demand (the same confound `seeded_this_run` exists to
+    /// keep out of the unread-seed falsifier).
+    StartupRestore = 5,
+    /// No cause was supplied. Reached only by the neutral-demand test wrapper
+    /// [`HostingCache::record_access`]; every production hosting path passes a
+    /// real cause. A NONZERO value in the field therefore means a production
+    /// path began hosting without attribution — read it as a leak detector for
+    /// this enum, not as a real category.
+    Other = 6,
+}
+
+impl HostingCause {
+    /// Every variant, in discriminant order. This is the exported array order
+    /// for `NetworkEfficiencyV1::host_begin`; appending is safe, reordering is
+    /// not (it silently relabels historical series). RENAMING a variant is also
+    /// safe — the wire carries positions, not names. Pinned by
+    /// `hosting_cause_all_is_in_discriminant_order`.
+    pub(crate) const ALL: [HostingCause; 7] = [
+        HostingCause::ClientGet,
+        HostingCause::TransitGet,
+        HostingCause::SubOpGet,
+        HostingCause::ClientPut,
+        HostingCause::TransitPut,
+        HostingCause::StartupRestore,
+        HostingCause::Other,
+    ];
+
+    pub(crate) const COUNT: usize = Self::ALL.len();
+
+    #[inline]
+    pub(crate) const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Upper bounds (inclusive) of the first `READ_COUNT_HIST_BUCKETS - 1` buckets
+/// of the hosted-set `read_count` histogram; the final bucket is the overflow
+/// bin. Log-ish spacing: 0 (never read), 1, 2-3, 4-9, 10-99, >=100.
+pub(crate) const READ_COUNT_HIST_UPPER_BOUNDS: [u32; 5] = [0, 1, 3, 9, 99];
+
+/// Width of the hosted-set `read_count` histogram
+/// (`READ_COUNT_HIST_UPPER_BOUNDS` plus the overflow bin).
+pub(crate) const READ_COUNT_HIST_BUCKETS: usize = READ_COUNT_HIST_UPPER_BOUNDS.len() + 1;
+
+/// Width of the hosted-set `last_genuine_access` recency histogram. Buckets, in
+/// order: within [`COST_RATE_MIN_WINDOW`] (the cost window), <20 min, <2 h,
+/// older, and finally "never genuinely accessed since it was hosted/reloaded"
+/// (`last_genuine_access == None`).
+pub(crate) const GENUINE_ACCESS_RECENCY_BUCKETS: usize = 5;
+
+/// Bucket index for a hosted contract's `read_count`.
+fn read_count_bucket(read_count: u32) -> usize {
+    READ_COUNT_HIST_UPPER_BOUNDS
+        .iter()
+        .position(|bound| read_count <= *bound)
+        .unwrap_or(READ_COUNT_HIST_BUCKETS - 1)
+}
+
+/// Bucket index for a hosted contract's `last_genuine_access` age. `None` (never
+/// genuinely accessed) lands in the final bucket.
+fn genuine_access_recency_bucket(age: Option<Duration>) -> usize {
+    match age {
+        None => GENUINE_ACCESS_RECENCY_BUCKETS - 1,
+        Some(age) if age < COST_RATE_MIN_WINDOW => 0,
+        Some(age) if age < Duration::from_secs(20 * 60) => 1,
+        Some(age) if age < Duration::from_secs(2 * 60 * 60) => 2,
+        Some(_) => 3,
+    }
 }
 
 /// Coarse memory-pressure state handed to the over-budget eviction sweep, which
@@ -773,6 +915,12 @@ pub struct HostingCache<T: TimeSource> {
     cost_evictions_total: u64,
     eviction_victim_counts: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
     eviction_victim_bytes: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
+    /// Monotonic hosting-BEGIN counts by [`HostingCause`]. Incremented ONLY by
+    /// the two insert branches (`record_access_with_demand`'s not-cached arm and
+    /// `load_persisted_entry_with_demand`'s insert), so it counts transitions
+    /// into hosting and nothing else. See
+    /// [`HostingCacheStats::hosting_begins`].
+    hosting_begins: [u64; HostingCause::COUNT],
     /// Time source for testability
     time_source: T,
 }
@@ -1017,8 +1165,22 @@ impl<T: TimeSource> HostingCache<T> {
             cost_evictions_total: 0,
             eviction_victim_counts: [[0; STATE_SIZE_BUCKET_COUNT]; 3],
             eviction_victim_bytes: [[0; STATE_SIZE_BUCKET_COUNT]; 3],
+            hosting_begins: [0; HostingCause::COUNT],
             time_source,
         }
+    }
+
+    /// Record that this peer BEGAN hosting a contract, attributed to `cause`.
+    ///
+    /// Deliberately private and deliberately tiny: the only callers are the two
+    /// branches that actually insert into `contracts`. Keeping the increment
+    /// adjacent to the insert (rather than at a caller that inspects
+    /// `is_new`, or that diffs `len()` before/after) is what stops the counter
+    /// from silently absorbing refreshes — the failure mode
+    /// `.claude/rules/bug-prevention-patterns.md` records for decision metrics.
+    #[inline]
+    fn note_hosting_begin(&mut self, cause: HostingCause) {
+        self.hosting_begins[cause.index()] = self.hosting_begins[cause.index()].saturating_add(1);
     }
 
     /// Next monotonic access sequence number, stamped onto an entry on every
@@ -1296,8 +1458,11 @@ impl<T: TimeSource> HostingCache<T> {
     /// then-current generation at deletion time.
     // Neutral-demand convenience wrapper. Production always goes through
     // `record_access_with_demand` (the `HostingManager` supplies the
-    // proximity-prior estimate), so in a non-test build this wrapper is unused;
-    // it is retained for callers/tests that have no demand estimate.
+    // proximity-prior estimate AND the real `HostingCause`), so in a non-test
+    // build this wrapper is unused; it is retained for callers/tests that have
+    // no demand estimate. Hosting begins through it are attributed
+    // `HostingCause::Other` — see that variant's doc: a nonzero `Other` in the
+    // field means a production path lost its attribution.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn record_access<G>(
         &mut self,
@@ -1321,6 +1486,7 @@ impl<T: TimeSource> HostingCache<T> {
             access_type,
             write_generation,
             NEUTRAL_DEMAND,
+            HostingCause::Other,
             subscriber_counts,
         )
     }
@@ -1345,6 +1511,17 @@ impl<T: TimeSource> HostingCache<T> {
     ///   generation, the stored `predicted_demand`, AND `recency_seq` (a PUT is
     ///   genuine client access — invariant 3, decision 2026-07-08), but no read
     ///   count and no `keep_score` refresh (a PUT is a write, not a read).
+    ///
+    /// `cause` is the hosting ATTRIBUTION (see [`HostingCause`]) and is consumed
+    /// on the not-cached branch only, where it counts a hosting BEGIN. It has no
+    /// effect on eviction, retention, or any returned value: this is
+    /// observability, never policy.
+    // 8 parameters: this is the single hosting-record chokepoint, and each
+    // argument is an independent input the cache cannot derive (identity, size,
+    // access kind, write generation, demand prior, attribution, subscriber
+    // lookup). Bundling them into a struct would only move the same fields
+    // behind one more name at every call site.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_access_with_demand<G>(
         &mut self,
         key: ContractKey,
@@ -1352,6 +1529,7 @@ impl<T: TimeSource> HostingCache<T> {
         access_type: AccessType,
         write_generation: u64,
         predicted_demand: f64,
+        cause: HostingCause,
         subscriber_counts: G,
     ) -> RecordAccessResult
     where
@@ -1449,6 +1627,12 @@ impl<T: TimeSource> HostingCache<T> {
             };
             self.contracts.insert(key, contract);
             self.current_bytes = self.current_bytes.saturating_add(size_bytes);
+            // THIS is the branch that begins hosting — the same branch that sets
+            // `is_new = true` below. Counting here rather than at a caller is the
+            // point: a caller-side increment would have to re-test `is_new`, and
+            // the recurring regression is exactly that the re-test drifts (or is
+            // dropped) and the counter starts including refreshes.
+            self.note_hosting_begin(cause);
 
             // A fresh insert always evicts under AtCapacity: an insert never
             // constitutes genuine RAM overflow, so it must not pierce the op-scoped
@@ -1752,7 +1936,28 @@ impl<T: TimeSource> HostingCache<T> {
     /// Snapshot the cache's aggregate resource gauges under a single read for
     /// per-node telemetry. See [`HostingCacheStats`].
     pub fn stats(&self) -> HostingCacheStats {
+        // Demand-signal gauges (`read_count` / `last_genuine_access`): bucketed
+        // here, under the same read that produces the resource gauges, so the
+        // exported shape can never disagree with the hosted set it describes.
+        // Aggregate only — the per-contract identities never leave this loop.
+        let now = self.time_source.now();
+        let mut read_count_hist = [0_u64; READ_COUNT_HIST_BUCKETS];
+        let mut genuine_access_recency = [0_u64; GENUINE_ACCESS_RECENCY_BUCKETS];
+        for entry in self.contracts.values() {
+            let read_bucket = read_count_bucket(entry.read_count);
+            read_count_hist[read_bucket] = read_count_hist[read_bucket].saturating_add(1);
+            let recency_bucket = genuine_access_recency_bucket(
+                entry
+                    .last_genuine_access
+                    .map(|at| now.saturating_duration_since(at)),
+            );
+            genuine_access_recency[recency_bucket] =
+                genuine_access_recency[recency_bucket].saturating_add(1);
+        }
         HostingCacheStats {
+            hosting_begins: self.hosting_begins,
+            read_count_hist,
+            genuine_access_recency,
             budget_bytes: self.budget_bytes,
             current_bytes: self.current_bytes,
             contract_count: self.contracts.len() as u64,
@@ -2155,6 +2360,12 @@ impl<T: TimeSource> HostingCache<T> {
 
         self.contracts.insert(key, contract);
         self.current_bytes = self.current_bytes.saturating_add(size_bytes);
+        // Counted HERE, past the `contains_key` early-return above, so a
+        // duplicate load is not counted as a second begin. The four
+        // `HostingManager` call sites cannot make that distinction — the
+        // early-return is invisible to them — which is precisely why the
+        // increment does not live there.
+        self.note_hosting_begin(HostingCause::StartupRestore);
     }
 
     /// Neutral-demand convenience wrapper over
@@ -2232,6 +2443,346 @@ mod tests {
         let time_source = SharedMockTimeSource::new();
         let cache = HostingCache::new(budget, time_source.clone());
         (cache, time_source)
+    }
+
+    /// Hosting-begin count for one cause, read through the exported stats.
+    fn begins(cache: &HostingCache<SharedMockTimeSource>, cause: HostingCause) -> u64 {
+        cache.stats().hosting_begins[cause.index()]
+    }
+
+    /// This file's source with the test module cut off, so a source pin cannot
+    /// match its own needle in a test's string literal.
+    fn production_source() -> &'static str {
+        const FULL: &str = include_str!("cache.rs");
+        // Anchor on the module header, NOT a bare `#[cfg(test)]`: several
+        // test-only methods inside the production `impl` carry that attribute,
+        // and cutting at the first one would hide most of the file from every
+        // pin below (silently, while still passing).
+        let cutoff = FULL
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("file must end with a `#[cfg(test)] mod tests` block");
+        &FULL[..cutoff]
+    }
+
+    /// `HostingCause::ALL` is the EXPORT ORDER of `NetworkEfficiencyV1::host_begin`
+    /// and `index()` is the discriminant used to address the counter array. If
+    /// they ever disagree, every historical series is silently relabelled: the
+    /// dashboards keep drawing, the numbers stay plausible, and "client GET" now
+    /// means something else.
+    ///
+    /// Nothing else checks this — `ALL` is hand-written next to the discriminants,
+    /// which is exactly the kind of hand-maintained parallel list that drifts when
+    /// a variant is inserted rather than appended.
+    #[test]
+    fn hosting_cause_all_is_in_discriminant_order() {
+        for (i, cause) in HostingCause::ALL.iter().enumerate() {
+            assert_eq!(
+                cause.index(),
+                i,
+                "HostingCause::ALL[{i}] is {cause:?}, whose discriminant is {}. \
+                 ALL must stay in discriminant order: it is the exported row \
+                 order, so a mismatch relabels historical telemetry series \
+                 rather than failing loudly.",
+                cause.index(),
+            );
+        }
+        assert_eq!(
+            HostingCause::COUNT,
+            HostingCause::ALL.len(),
+            "COUNT is the counter-array width and must equal ALL's length"
+        );
+    }
+
+    /// Exactly two branches insert into `contracts`, and each one attributes the
+    /// hosting begin it just made.
+    ///
+    /// The counter's whole design is that it is incremented AT the branch that
+    /// decides, never re-derived by a caller (`.claude/rules/bug-prevention-patterns.md`).
+    /// That only holds while the set of deciding branches is the set that counts:
+    /// a third insert added later would begin hosting without attribution, and the
+    /// symptom is a counter that is quietly LOW while still rising — the failure
+    /// mode that terminates investigation rather than starting one.
+    #[test]
+    fn every_hosting_insert_site_records_its_cause() {
+        let src = production_source();
+        let sites: Vec<usize> = src
+            .match_indices("self.contracts.insert(")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            sites.len(),
+            2,
+            "expected exactly two `self.contracts.insert(` sites (the \
+             record_access_with_demand insert arm and the \
+             load_persisted_entry_with_demand insert); found {}. A new insert \
+             begins hosting, so it must also call note_hosting_begin — update \
+             this pin deliberately once it does.",
+            sites.len(),
+        );
+        for (idx, site) in sites.into_iter().enumerate() {
+            let window = &src[site..(site + 900).min(src.len())];
+            assert!(
+                window.contains("self.note_hosting_begin("),
+                "insert site #{idx} must be followed by a \
+                 `self.note_hosting_begin(..)` call attributing the hosting \
+                 begin it just made. Window: {window}"
+            );
+        }
+    }
+
+    /// The counter must fire ONLY on the transition into hosting, and must land
+    /// in the row the caller named.
+    ///
+    /// # Why the refresh half is the load-bearing half
+    ///
+    /// The regression this guards is not "the counter is missing" (loud, and any
+    /// smoke test finds it) but "the counter is wired to a site that also fires
+    /// on refresh" — which yields a plausible, monotonically-rising, WRONG
+    /// number. A hot contract re-PUT every few seconds would dominate
+    /// `hosting_begins` while beginning hosting exactly once, and the answer to
+    /// "why is this peer hosting this contract" would silently become "how often
+    /// is it written". So the second access below is not a nicety: an assertion
+    /// that only checks the first access passes under precisely the mutation
+    /// that matters.
+    ///
+    /// Mutations verified to FAIL this test:
+    /// 1. delete the `note_hosting_begin(cause)` call in the insert branch;
+    /// 2. move it above the `if let Some(existing)` so it also counts refreshes
+    ///    (caught by the `== 1` after the repeat access, not by the first);
+    /// 3. attribute a constant cause instead of the caller's.
+    #[test]
+    fn hosting_begin_counts_the_insert_only_and_by_cause() {
+        let (mut cache, _) = make_cache(10_000);
+        let relayed = make_key(1);
+        let client = make_key(2);
+
+        cache.record_access_with_demand(
+            relayed,
+            100,
+            AccessType::Put,
+            0,
+            NEUTRAL_DEMAND,
+            HostingCause::TransitPut,
+            |_| (0, 0),
+        );
+        assert_eq!(begins(&cache, HostingCause::TransitPut), 1);
+
+        // Same contract again: a REFRESH, not a new hosting decision. The whole
+        // point of the counter is that this does not move it.
+        cache.record_access_with_demand(
+            relayed,
+            100,
+            AccessType::Put,
+            0,
+            NEUTRAL_DEMAND,
+            HostingCause::TransitPut,
+            |_| (0, 0),
+        );
+        // ... and again through a DIFFERENT cause, which must not open a second
+        // row for a contract that is already hosted.
+        cache.record_access_with_demand(
+            relayed,
+            100,
+            AccessType::Get,
+            0,
+            NEUTRAL_DEMAND,
+            HostingCause::ClientGet,
+            |_| (0, 0),
+        );
+        assert_eq!(
+            begins(&cache, HostingCause::TransitPut),
+            1,
+            "a refresh of an already-hosted contract is not a hosting BEGIN — if \
+             this reads 2, the increment fires on the refresh path too and the \
+             counter is measuring write frequency, not hosting decisions"
+        );
+        assert_eq!(
+            begins(&cache, HostingCause::ClientGet),
+            0,
+            "a refresh must not open a row for its cause either"
+        );
+
+        // A genuinely new contract, attributed to the cause its caller named.
+        cache.record_access_with_demand(
+            client,
+            100,
+            AccessType::Get,
+            0,
+            NEUTRAL_DEMAND,
+            HostingCause::ClientGet,
+            |_| (0, 0),
+        );
+        assert_eq!(begins(&cache, HostingCause::ClientGet), 1);
+        assert_eq!(begins(&cache, HostingCause::TransitPut), 1);
+
+        // Nothing leaked into the rows nobody named.
+        for cause in [
+            HostingCause::TransitGet,
+            HostingCause::SubOpGet,
+            HostingCause::ClientPut,
+            HostingCause::StartupRestore,
+            HostingCause::Other,
+        ] {
+            assert_eq!(begins(&cache, cause), 0, "unexpected count in {cause:?}");
+        }
+    }
+
+    /// A restart's bulk reload is counted, counted ONCE per contract, and never
+    /// as live demand. The duplicate load is the reason the increment lives past
+    /// `load_persisted_entry_with_demand`'s `contains_key` early-return rather
+    /// than at the four `HostingManager` call sites, which cannot see it.
+    #[test]
+    fn startup_restore_counted_once_per_contract_and_never_as_live_demand() {
+        let (mut cache, _) = make_cache(10_000);
+        let key = make_key(7);
+
+        cache.load_persisted_entry(key, 100, AccessType::Get, Duration::from_secs(30), false);
+        cache.load_persisted_entry(key, 100, AccessType::Get, Duration::from_secs(30), false);
+
+        assert_eq!(
+            begins(&cache, HostingCause::StartupRestore),
+            1,
+            "a duplicate load short-circuits and must not count a second begin"
+        );
+        for cause in [
+            HostingCause::ClientGet,
+            HostingCause::TransitGet,
+            HostingCause::SubOpGet,
+            HostingCause::ClientPut,
+            HostingCause::TransitPut,
+            HostingCause::Other,
+        ] {
+            assert_eq!(
+                begins(&cache, cause),
+                0,
+                "a reload is not live demand; {cause:?} must stay 0"
+            );
+        }
+    }
+
+    /// The two demand-signal gauges describe the CURRENTLY hosted set: reads
+    /// bucketed by `read_count`, recency bucketed by `last_genuine_access` age.
+    #[test]
+    fn demand_signal_gauges_bucket_the_hosted_set() {
+        let (mut cache, time) = make_cache(10_000);
+
+        // never read, and (after the advance below) genuinely accessed long ago
+        let seeded = make_key(1);
+        cache.record_access_with_demand(
+            seeded,
+            100,
+            AccessType::Put,
+            0,
+            NEUTRAL_DEMAND,
+            HostingCause::TransitPut,
+            |_| (0, 0),
+        );
+        // A SUBSCRIBE-only entry never stamps `last_genuine_access` at all.
+        let subscribed_only = make_key(2);
+        cache.record_access_with_demand(
+            subscribed_only,
+            100,
+            AccessType::Subscribe,
+            0,
+            NEUTRAL_DEMAND,
+            HostingCause::SubOpGet,
+            |_| (0, 0),
+        );
+
+        time.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+
+        // read four times => read_count 4 (bucket 3: 4-9) and genuinely accessed
+        // inside the cost window (bucket 0).
+        let hot = make_key(3);
+        for _ in 0..4 {
+            cache.record_access_with_demand(
+                hot,
+                100,
+                AccessType::Get,
+                0,
+                NEUTRAL_DEMAND,
+                HostingCause::ClientGet,
+                |_| (0, 0),
+            );
+        }
+
+        let stats = cache.stats();
+        assert_eq!(
+            stats.read_count_hist,
+            // 0 reads: seeded; 1 read: subscribed_only (SUBSCRIBE counts as a
+            // read for read_count); 4-9 reads: hot.
+            [1, 1, 0, 1, 0, 0],
+            "read_count histogram must describe the hosted set"
+        );
+        assert_eq!(
+            stats.genuine_access_recency,
+            // within the cost window: hot; >= cost window but < 20 min: seeded
+            // (a PUT stamps genuine access); never: subscribed_only.
+            [1, 1, 0, 0, 1],
+            "genuine-access recency histogram must describe the hosted set"
+        );
+        assert_eq!(
+            stats.read_count_hist.iter().sum::<u64>(),
+            stats.contract_count,
+            "every hosted contract lands in exactly one read bucket"
+        );
+        assert_eq!(
+            stats.genuine_access_recency.iter().sum::<u64>(),
+            stats.contract_count,
+            "every hosted contract lands in exactly one recency bucket"
+        );
+    }
+
+    /// The exported gauges are a snapshot of the CURRENT hosted set, so an
+    /// evicted contract leaves them — while the monotonic begin counter keeps
+    /// its record of the decision that hosted it. Guards against someone
+    /// "simplifying" the histograms into monotonic counters, which would make
+    /// them un-interpretable as a distribution.
+    #[test]
+    fn demand_signal_gauges_follow_eviction_but_begins_do_not() {
+        let (mut cache, _) = make_cache(100);
+        let first = make_key(1);
+        let second = make_key(2);
+
+        cache.record_access_with_demand(
+            first,
+            100,
+            AccessType::Get,
+            0,
+            NEUTRAL_DEMAND,
+            HostingCause::ClientGet,
+            |_| (0, 0),
+        );
+        // Budget is exactly one contract wide, so this insert sheds `first`.
+        let result = cache.record_access_with_demand(
+            second,
+            100,
+            AccessType::Get,
+            0,
+            NEUTRAL_DEMAND,
+            HostingCause::TransitGet,
+            |_| (0, 0),
+        );
+        assert_eq!(
+            result.evicted,
+            vec![(first, 0)],
+            "premise: `first` was shed"
+        );
+
+        let stats = cache.stats();
+        assert_eq!(stats.contract_count, 1);
+        assert_eq!(
+            stats.read_count_hist.iter().sum::<u64>(),
+            1,
+            "the gauge tracks the live hosted set, not everything ever hosted"
+        );
+        assert_eq!(
+            stats.hosting_begins[HostingCause::ClientGet.index()],
+            1,
+            "the begin counter is monotonic: eviction does not un-decide the \
+             hosting that happened"
+        );
+        assert_eq!(stats.hosting_begins[HostingCause::TransitGet.index()], 1);
     }
 
     /// Project the `(key, write_generation)` reclaim pairs out of a
@@ -3891,13 +4442,29 @@ mod tests {
         let key = make_key(1);
 
         // Insert at floor 0 with demand 3.0 -> keep_score 3.0.
-        cache.record_access_with_demand(key, 100, AccessType::Get, 0, 3.0, |_| (0, 0));
+        cache.record_access_with_demand(
+            key,
+            100,
+            AccessType::Get,
+            0,
+            3.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         assert_eq!(cache.get(&key).unwrap().keep_score, 3.0);
         assert_eq!(cache.get(&key).unwrap().predicted_demand, 3.0);
         assert_eq!(cache.get(&key).unwrap().read_count, 1);
 
         // A read with a new demand estimate refreshes keep_score = floor + demand.
-        cache.record_access_with_demand(key, 100, AccessType::Get, 0, 5.0, |_| (0, 0));
+        cache.record_access_with_demand(
+            key,
+            100,
+            AccessType::Get,
+            0,
+            5.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         assert_eq!(cache.get(&key).unwrap().keep_score, 5.0);
         assert_eq!(cache.get(&key).unwrap().read_count, 2);
     }
@@ -3918,16 +4485,39 @@ mod tests {
 
         // `high` inserted first (older) with strong demand; `low` inserted after
         // with weak demand. A recency-only (LRU) policy would evict `high`.
-        cache.record_access_with_demand(high, 100, AccessType::Get, 0, 10.0, |_| (0, 0));
-        cache.record_access_with_demand(low, 100, AccessType::Get, 0, 1.0, |_| (0, 0));
+        cache.record_access_with_demand(
+            high,
+            100,
+            AccessType::Get,
+            0,
+            10.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
+        cache.record_access_with_demand(
+            low,
+            100,
+            AccessType::Get,
+            0,
+            1.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         assert_eq!(cache.current_bytes(), 200);
 
         time.advance_time(Duration::from_secs(61));
 
         // Over-budget insert must evict the LOWEST keep_score (`low`), not the
         // oldest (`high`).
-        let result =
-            cache.record_access_with_demand(trigger, 100, AccessType::Get, 0, 1.0, |_| (0, 0));
+        let result = cache.record_access_with_demand(
+            trigger,
+            100,
+            AccessType::Get,
+            0,
+            1.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         assert_eq!(
             result.evicted,
             vec![(low, 0)],
@@ -3972,8 +4562,24 @@ mod tests {
         let trigger = make_key(3);
 
         // Insert both cold (zero samples), scored only by the distance prior.
-        cache.record_access_with_demand(near, 100, AccessType::Get, 0, near_demand, |_| (0, 0));
-        cache.record_access_with_demand(far, 100, AccessType::Get, 0, far_demand, |_| (0, 0));
+        cache.record_access_with_demand(
+            near,
+            100,
+            AccessType::Get,
+            0,
+            near_demand,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
+        cache.record_access_with_demand(
+            far,
+            100,
+            AccessType::Get,
+            0,
+            far_demand,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         assert_eq!(cache.current_bytes(), 200);
         assert!(
             cache.get(&near).unwrap().keep_score > cache.get(&far).unwrap().keep_score,
@@ -3990,6 +4596,7 @@ mod tests {
             AccessType::Get,
             0,
             NEUTRAL_DEMAND,
+            HostingCause::Other,
             |_| (0, 0),
         );
         assert_eq!(
@@ -4042,7 +4649,15 @@ mod tests {
 
         // Seed the room with strong demand, then read it repeatedly (simulating
         // recurring GETs). These reads are the room's LAST accesses.
-        cache.record_access_with_demand(room, 100, AccessType::Get, 0, 10.0, |_| (0, 0));
+        cache.record_access_with_demand(
+            room,
+            100,
+            AccessType::Get,
+            0,
+            10.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         for _ in 0..3 {
             time.advance_time(Duration::from_secs(5));
             cache.touch(&room);
@@ -4051,7 +4666,15 @@ mod tests {
         // Junk arrives AFTER the room's last read, so junk is the more-recently-
         // accessed entry — and carries weak demand.
         time.advance_time(Duration::from_secs(5));
-        cache.record_access_with_demand(junk, 100, AccessType::Get, 0, 1.0, |_| (0, 0));
+        cache.record_access_with_demand(
+            junk,
+            100,
+            AccessType::Get,
+            0,
+            1.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
 
         // Advance so BOTH are past TTL and eviction-eligible; the room, last read
         // 5s before junk, is the least-recently-accessed of the two.
@@ -4076,8 +4699,15 @@ mod tests {
         // Over-budget insert: the fuel gauge evicts the lowest keep_score (junk).
         // Byte-LRU-with-TTL would instead evict the room (the oldest past-TTL
         // entry) — so this assertion is what fails under a recency-only policy.
-        let result =
-            cache.record_access_with_demand(trigger, 100, AccessType::Get, 0, 1.0, |_| (0, 0));
+        let result = cache.record_access_with_demand(
+            trigger,
+            100,
+            AccessType::Get,
+            0,
+            1.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         assert_eq!(
             result.evicted,
             vec![(junk, 0)],
@@ -4108,10 +4738,26 @@ mod tests {
         // Insert a demand-7 contract, let it age, then evict it via an
         // over-budget insert; the floor must climb to 7.
         let a = make_key(1);
-        cache.record_access_with_demand(a, 100, AccessType::Get, 0, 7.0, |_| (0, 0));
+        cache.record_access_with_demand(
+            a,
+            100,
+            AccessType::Get,
+            0,
+            7.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         time.advance_time(Duration::from_secs(61));
         let b = make_key(2);
-        let r = cache.record_access_with_demand(b, 100, AccessType::Get, 0, 2.0, |_| (0, 0));
+        let r = cache.record_access_with_demand(
+            b,
+            100,
+            AccessType::Get,
+            0,
+            2.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         assert_eq!(r.evicted, vec![(a, 0)]);
         assert_eq!(
             cache.eviction_floor(),
@@ -4123,7 +4769,15 @@ mod tests {
         // lower-scored victim must not drop the floor below 7.
         time.advance_time(Duration::from_secs(61));
         let c = make_key(3);
-        let r = cache.record_access_with_demand(c, 100, AccessType::Get, 0, 1.0, |_| (0, 0));
+        let r = cache.record_access_with_demand(
+            c,
+            100,
+            AccessType::Get,
+            0,
+            1.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         assert_eq!(r.evicted, vec![(b, 0)], "b (keep_score 2) evicts");
         assert_eq!(
             cache.eviction_floor(),
@@ -4141,14 +4795,30 @@ mod tests {
         let key = make_key(1);
 
         // Seed via PUT: keep_score = floor(0) + demand, read_count 0.
-        cache.record_access_with_demand(key, 100, AccessType::Put, 0, 2.0, |_| (0, 0));
+        cache.record_access_with_demand(
+            key,
+            100,
+            AccessType::Put,
+            0,
+            2.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         assert_eq!(cache.get(&key).unwrap().read_count, 0, "PUT is not a read");
         let seed_score = cache.get(&key).unwrap().keep_score;
         assert_eq!(seed_score, 2.0);
 
         // Manually raise the floor by evicting something else would be indirect;
         // instead assert that a re-PUT does NOT refresh keep_score or read_count.
-        cache.record_access_with_demand(key, 100, AccessType::Put, 0, 9.0, |_| (0, 0));
+        cache.record_access_with_demand(
+            key,
+            100,
+            AccessType::Put,
+            0,
+            9.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         assert_eq!(
             cache.get(&key).unwrap().read_count,
             0,
@@ -4161,7 +4831,15 @@ mod tests {
         );
 
         // A GET, by contrast, IS read-demand and refreshes both.
-        cache.record_access_with_demand(key, 100, AccessType::Get, 0, 9.0, |_| (0, 0));
+        cache.record_access_with_demand(
+            key,
+            100,
+            AccessType::Get,
+            0,
+            9.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         assert_eq!(cache.get(&key).unwrap().read_count, 1);
         assert_eq!(cache.get(&key).unwrap().keep_score, 9.0);
     }
@@ -4179,7 +4857,15 @@ mod tests {
         time.advance_time(Duration::from_secs(61));
         // Evict it by inserting a higher-demand junk (so read_twice is the victim).
         let junk = make_key(2);
-        let r = cache.record_access_with_demand(junk, 100, AccessType::Get, 0, 5.0, |_| (0, 0));
+        let r = cache.record_access_with_demand(
+            junk,
+            100,
+            AccessType::Get,
+            0,
+            5.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         assert_eq!(r.evicted, vec![(read_twice, 0)]);
         assert_eq!(
             cache.stats().evictions_of_recently_read_total,
@@ -4191,7 +4877,15 @@ mod tests {
         time.advance_time(Duration::from_secs(61));
         let seed = make_key(3);
         // junk currently has demand 5 (>seed's), so make the new one higher.
-        let r = cache.record_access_with_demand(seed, 100, AccessType::Get, 0, 9.0, |_| (0, 0));
+        let r = cache.record_access_with_demand(
+            seed,
+            100,
+            AccessType::Get,
+            0,
+            9.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         assert_eq!(r.evicted, vec![(junk, 0)], "junk (read once) evicts");
         assert_eq!(
             cache.stats().evictions_of_recently_read_total,
@@ -4213,16 +4907,38 @@ mod tests {
         let other = make_key(2);
         let trigger = make_key(3);
 
-        cache.record_access_with_demand(subscribed, 100, AccessType::Get, 0, 0.1, |_| (0, 0));
-        cache.record_access_with_demand(other, 100, AccessType::Get, 0, 5.0, |_| (0, 0));
+        cache.record_access_with_demand(
+            subscribed,
+            100,
+            AccessType::Get,
+            0,
+            0.1,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
+        cache.record_access_with_demand(
+            other,
+            100,
+            AccessType::Get,
+            0,
+            5.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         time.advance_time(Duration::from_secs(61));
 
         // Over budget by one entry: `subscribed` has the lowest keep_score and a
         // naive demand order would evict it first, but it is downstream-subscribed
         // so it sorts LAST — the zero-subscriber `other` is shed instead.
-        let result = cache.record_access_with_demand(trigger, 100, AccessType::Get, 0, 5.0, |k| {
-            (0, (*k == subscribed) as usize)
-        });
+        let result = cache.record_access_with_demand(
+            trigger,
+            100,
+            AccessType::Get,
+            0,
+            5.0,
+            HostingCause::Other,
+            |k| (0, (*k == subscribed) as usize),
+        );
         assert_eq!(
             result.evicted,
             vec![(other, 0)],

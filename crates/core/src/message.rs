@@ -1327,6 +1327,10 @@ mod tests {
         let bytes = bincode::serialize(&msg).expect("serialize SummaryDigests");
         let decoded: InterestMessage =
             bincode::deserialize(&bytes).expect("deserialize SummaryDigests");
+        #[allow(
+            clippy::wildcard_enum_match_arm,
+            reason = "a round-trip test asserts ONE variant; any other variant is a loud panic, not a silent fallthrough"
+        )]
         match decoded {
             InterestMessage::SummaryDigests { entries, .. } => {
                 assert_eq!(entries.len(), 2);
@@ -1349,10 +1353,10 @@ mod tests {
         let bytes = bincode::serialize(&req).expect("serialize SummaryRequest");
         let decoded: InterestMessage =
             bincode::deserialize(&bytes).expect("deserialize SummaryRequest");
-        match decoded {
-            InterestMessage::SummaryRequest { hashes } => assert_eq!(hashes, vec![1, 2, 3]),
-            other => panic!("expected SummaryRequest, got {other:?}"),
-        }
+        let InterestMessage::SummaryRequest { hashes } = &decoded else {
+            panic!("expected SummaryRequest, got {decoded:?}");
+        };
+        assert_eq!(hashes, &vec![1, 2, 3]);
     }
 
     /// A `SummaryDigests` message must be dramatically smaller than the
@@ -1742,19 +1746,17 @@ mod tests {
         );
 
         let decoded: InterestMessage = bincode::deserialize(&notification).expect("deserialize");
-        match decoded {
-            InterestMessage::Summaries { entries, emitter } => {
-                assert_eq!(entries.len(), 1, "payload must survive the round trip");
-                assert_eq!(entries[0].hash, 0xDEAD_BEEF);
-                assert_eq!(
-                    emitter,
-                    SummariesEmitter::Other,
-                    "a decoded message carries no provenance, so it must land \
-                     in the residual arm rather than claim an emitter"
-                );
-            }
-            other => panic!("expected Summaries, got {other:?}"),
-        }
+        let InterestMessage::Summaries { entries, emitter } = &decoded else {
+            panic!("expected Summaries, got {decoded:?}");
+        };
+        assert_eq!(entries.len(), 1, "payload must survive the round trip");
+        assert_eq!(entries[0].hash, 0xDEAD_BEEF);
+        assert_eq!(
+            *emitter,
+            SummariesEmitter::Other,
+            "a decoded message carries no provenance, so it must land \
+             in the residual arm rather than claim an emitter"
+        );
     }
 
     #[test]

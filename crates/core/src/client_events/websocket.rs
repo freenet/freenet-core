@@ -2756,9 +2756,15 @@ mod tests {
         tokio::spawn(async move {
             while let Some(conn) = req_rx.recv().await {
                 if let ClientConnection::NewConnection { callbacks, .. } = conn {
-                    let _ = callbacks.send(HostCallbackResult::NewId {
-                        id: ClientId::next(),
-                    });
+                    if callbacks
+                        .send(HostCallbackResult::NewId {
+                            id: ClientId::next(),
+                        })
+                        .is_err()
+                    {
+                        // The connection under test hung up; nothing left to serve.
+                        break;
+                    }
                 }
             }
         });
@@ -2769,19 +2775,23 @@ mod tests {
         ) -> impl IntoResponse {
             ws.on_upgrade(move |socket| async move {
                 // `token_is_invalid = true` drives the stale-token close path.
-                let _ = websocket_interface(
-                    rs,
-                    None,
-                    None,
-                    ConnectionScope::Local,
-                    None,
-                    None,
-                    true,
-                    EncodingProtocol::Native,
-                    ApiVersion::V1,
-                    socket,
-                )
-                .await;
+                // The interface's own return value is not the signal under test:
+                // the assertion is the close CODE the client observes.
+                drop(
+                    websocket_interface(
+                        rs,
+                        None,
+                        None,
+                        ConnectionScope::Local,
+                        None,
+                        None,
+                        true,
+                        EncodingProtocol::Native,
+                        ApiVersion::V1,
+                        socket,
+                    )
+                    .await,
+                );
             })
         }
 
@@ -2793,7 +2803,9 @@ mod tests {
             .unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            // Serving ends when the test drops the listener task; its result is
+            // teardown noise, not a signal.
+            drop(axum::serve(listener, app).await);
         });
 
         let (mut client, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
@@ -2804,6 +2816,10 @@ mod tests {
         // skip anything that is not a Close and read the close code.
         let observed_close_code = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(frame) = client.next().await {
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "the test reads the CLOSE frame only; every other tungstenite frame kind is deliberately skipped, and that stays right for any variant tungstenite adds"
+                )]
                 match frame.expect("ws frame") {
                     tokio_tungstenite::tungstenite::Message::Close(Some(cf)) => {
                         return Some(u16::from(cf.code));
@@ -3487,15 +3503,13 @@ mod tests {
             !matches!(err, DelegateError::Missing(_)),
             "throttling must not masquerade as an unregistered delegate"
         );
-        match &err {
-            DelegateError::ExecutionError(msg) => {
-                assert!(
-                    msg.contains("rate limited"),
-                    "the cause should be legible in the message: {msg}"
-                );
-            }
-            other => panic!("expected ExecutionError, got {other:?}"),
-        }
+        let DelegateError::ExecutionError(msg) = &err else {
+            panic!("expected ExecutionError, got {err:?}");
+        };
+        assert!(
+            msg.contains("rate limited"),
+            "the cause should be legible in the message: {msg}"
+        );
 
         // And it carries no key, so it cannot be mistaken for a per-delegate
         // failure by the tracker.

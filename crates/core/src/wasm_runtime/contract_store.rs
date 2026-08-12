@@ -1227,7 +1227,12 @@ mod test {
         store_b.set_after_blob_write_hook(Box::new(move || {
             let mut store_a = store_a_opt.take().expect("hook is invoked exactly once");
             let handle = std::thread::spawn(move || {
-                let _ = store_a.remove_contract(&key1);
+                // Must succeed: a failing remove would leave the blob on disk for
+                // the WRONG reason and the post-condition below would pass
+                // vacuously. `handle.join()` surfaces this panic.
+                store_a
+                    .remove_contract(&key1)
+                    .expect("concurrent remove_contract(X1) must succeed");
             });
             // Real wall-clock sleep: this is a genuine cross-thread race test,
             // so a deterministic TimeSource cannot model the interleaving.

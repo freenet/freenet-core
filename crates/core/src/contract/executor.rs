@@ -1674,6 +1674,14 @@ mod tests {
     mod byte_bounded_lru_cache_tests {
         use super::*;
 
+        // `&Vec<u8>` (not `&[u8]`) is required here: this is passed as a
+        // `fn(&V) -> usize` to `ByteBoundedLruCache::new` with `V = Vec<u8>`,
+        // and a bare fn-item's signature must match the generic parameter's
+        // instantiated type exactly — `&[u8]` would not coerce.
+        #[allow(
+            clippy::ptr_arg,
+            reason = "must match ByteBoundedLruCache<_, Vec<u8>>'s fn(&V) -> usize weigh signature exactly"
+        )]
         fn vec_len(v: &Vec<u8>) -> usize {
             v.len()
         }
@@ -2471,20 +2479,23 @@ mod tests {
                 !put_err.is_contract_exec_rejection(),
                 "a Put variant is NOT an UPDATE-side exec rejection"
             );
-            match put_err.unwrap_request() {
-                RequestError::ContractError(StdContractError::Put { .. }) => {}
-                other => panic!("fresh-PUT validation error must be a Put variant, got {other:?}"),
-            }
+            let put_request_err = put_err.unwrap_request();
+            let RequestError::ContractError(StdContractError::Put { .. }) = &put_request_err else {
+                panic!("fresh-PUT validation error must be a Put variant, got {put_request_err:?}");
+            };
 
             // UPDATE op → Update variant, is_contract_exec_rejection true, timeout true.
             let upd_err =
                 ExecutorError::execution(mk(), Some(super::super::InnerOpError::Upsert(key)));
             assert!(upd_err.is_wasm_timeout());
             assert!(upd_err.is_contract_exec_rejection());
-            match upd_err.unwrap_request() {
-                RequestError::ContractError(StdContractError::Update { .. }) => {}
-                other => panic!("UPDATE validation error must be an Update variant, got {other:?}"),
-            }
+            let upd_request_err = upd_err.unwrap_request();
+            let RequestError::ContractError(StdContractError::Update { .. }) = &upd_request_err
+            else {
+                panic!(
+                    "UPDATE validation error must be an Update variant, got {upd_request_err:?}"
+                );
+            };
         }
 
         /// Source-scrape pin (#4864 round-7 Codex P1, updated round-9 item 4): the
