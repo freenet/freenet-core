@@ -1684,7 +1684,7 @@ async fn process_open_request(
                     )
                     .await
                 {
-                    Ok(ContractHandlerEvent::DelegateResponse(res)) => {
+                    Ok(ContractHandlerEvent::DelegateResponse(Ok(res))) => {
                         if let Some(ref mt) = msg_type {
                             tracing::info!(
                                 delegate = %delegate_key,
@@ -1695,6 +1695,22 @@ async fn process_open_request(
                             );
                         }
                         res
+                    }
+                    // Genuine delegate execution failure (#5263). Previously
+                    // this arm didn't exist: a failure was indistinguishable
+                    // from `Ok(ContractHandlerEvent::DelegateResponse(Ok(vec![])))`,
+                    // so the client silently received an empty successful
+                    // response instead of an error.
+                    Ok(ContractHandlerEvent::DelegateResponse(Err(exec_err))) => {
+                        tracing::error!(
+                            client_id = %client_id,
+                            request_id = %request_id,
+                            delegate = %delegate_key,
+                            error = %exec_err,
+                            phase = "error",
+                            "Delegate execution failed"
+                        );
+                        return Err(Error::Executor(exec_err));
                     }
                     Err(err) => {
                         tracing::error!(
