@@ -566,7 +566,14 @@ cmd_preflight() {
   # produces. Returning 1 here (not 2) because the retry loop below re-runs the
   # whole attempt for rc=2, and a resolution failure is not something a node
   # re-run fixes -- it is an infrastructure problem the operator must see.
-  if ! CANARY_EXPECTED_LATEST="$(resolve_expected_latest)"; then
+  # A caller may pin the expected release (the lifecycle test does, to stay
+  # off the network). Safe to honour: a pinned value can only make the equality
+  # check FAIL, never pass -- the only way to skip the check is to leave it
+  # empty, and that path resolves from GitHub or refuses. Empty is treated as
+  # unset so `CANARY_EXPECTED_LATEST=` cannot quietly disarm the gate.
+  if [ -n "${CANARY_EXPECTED_LATEST:-}" ]; then
+    log "using the caller-supplied expected release '$CANARY_EXPECTED_LATEST' (not resolving from GitHub)."
+  elif ! CANARY_EXPECTED_LATEST="$(resolve_expected_latest)"; then
     fail "could not resolve GitHub's latest release tag, so the canary cannot check WHICH release the node compared against. This is an UNVERIFIED result, not a detected bug: re-run this job. Do NOT un-draft the release by hand -- an unverified gate is not a passed gate."
     return 1
   fi

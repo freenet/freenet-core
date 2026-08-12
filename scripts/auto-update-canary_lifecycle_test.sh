@@ -68,6 +68,14 @@ CHECK_LINE='INFO freenet: Startup update check against GitHub current="0.2.122" 
 PARSE_FAIL_LINE="WARN freenet::commands::auto_update: Startup update check: failed to parse latest version 'v0.2.123': unexpected character 'v' while parsing major version number"
 TRIGGER_LINE='INFO freenet: Startup check: newer version on GitHub, triggering auto-update new_version=0.2.123'
 COMPLETE_LINE='INFO freenet: Startup update check complete: staying on the current version current="0.2.122"'
+LATEST_SEEN_LINE='INFO freenet::commands::auto_update: Startup update check: GitHub reports latest release latest=0.2.121'
+
+# Pin what the node is expected to have compared against, so cmd_preflight does
+# not reach GitHub from a test. Safe: a pinned value can only make the
+# equality check FAIL -- skipping it requires an EMPTY value, which
+# cmd_preflight treats as unset and then resolves or refuses. Cases that fail
+# earlier (parse failure, no outcome) never reach the check at all.
+export CANARY_EXPECTED_LATEST=0.2.121
 
 # make_fake_node <path> <exit-code> <extra-log-line> [linger-seconds] [extra-delay-seconds]
 #
@@ -119,7 +127,10 @@ bad()  { echo "FAIL - $1" >&2; FAILURES=$((FAILURES + 1)); }
 #    "can it ever go red?" side -- neither is worth much alone.
 # ---------------------------------------------------------------------------
 FAKE_OK="$TMPROOT/fake-healthy"
-make_fake_node "$FAKE_OK" 0 "$COMPLETE_LINE" 0
+# Emits the observed-latest line as well as the completion line: a real
+# post-#5236 healthy node logs both, and Gate A now requires both.
+make_fake_node "$FAKE_OK" 0 "$LATEST_SEEN_LINE
+2026-08-08T02:00:00.200000Z  $COMPLETE_LINE" 0
 if cmd_preflight "$FAKE_OK" >/dev/null 2>&1; then
     ok "cmd_preflight returns 0 for a healthy binary"
 else
@@ -137,6 +148,30 @@ if cmd_preflight "$FAKE_BAD" >/dev/null 2>&1; then
     bad "cmd_preflight returned 0 for a binary with a BROKEN updater"
 else
     ok "cmd_preflight fails a binary whose updater cannot parse the tag"
+fi
+
+# ---------------------------------------------------------------------------
+# 2b. A SILENTLY WRONG comparator must fail the gate too (#5236 finding 32).
+#
+#     This node does everything right except the one thing that matters: it
+#     compares against the wrong release. It does not fail to parse, it does
+#     not fail to fetch, it runs to completion -- so every assertion the canary
+#     had before this change is satisfied and Gate A reported OK. Driven
+#     through cmd_preflight rather than assert_detection_healthy so the
+#     resolve/export wiring is exercised, not just the comparison.
+# ---------------------------------------------------------------------------
+FAKE_WRONG="$TMPROOT/fake-wrong-release"
+make_fake_node "$FAKE_WRONG" 0 \
+    'INFO freenet::commands::auto_update: Startup update check: GitHub reports latest release latest=0.2.1
+2026-08-08T02:00:00.200000Z  '"$COMPLETE_LINE" 0
+WRONG_OUT="$(cmd_preflight "$FAKE_WRONG" 2>&1)"
+WRONG_RC=$?
+if [ "$WRONG_RC" -eq 0 ]; then
+    bad "cmd_preflight returned OK for a node that compared against the WRONG release (0.2.1 vs 0.2.121) -- the silently-wrong-comparator hole is open"
+elif printf '%s' "$WRONG_OUT" | grep -qF "compared against the WRONG release"; then
+    ok "cmd_preflight fails a node that compared against the wrong release, with the right diagnosis"
+else
+    bad "cmd_preflight failed the wrong-release node but with the wrong diagnosis: $WRONG_OUT"
 fi
 
 # ---------------------------------------------------------------------------
