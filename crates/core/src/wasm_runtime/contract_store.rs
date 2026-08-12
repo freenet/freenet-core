@@ -178,9 +178,7 @@ impl ContractStore {
         //    entitled to while choosing WHICH cached code came back for it. The
         //    index is what this node itself recorded, so resolving through it
         //    makes the answer a function of the instance alone.
-        let Some(code_hash) = self.key_to_code_part.get(key.id()).map(|e| *e.value()) else {
-            return None;
-        };
+        let code_hash = self.key_to_code_part.get(key.id()).map(|e| *e.value())?;
 
         if let Some(data) = self.contract_cache.get(&code_hash) {
             return Some(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
