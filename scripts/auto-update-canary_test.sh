@@ -629,9 +629,98 @@ else
     echo "FAIL - source pin: the '$MARKER_CHECK_COMPLETE' line is no longer an INFO-level tracing::info! in freenet.rs -- release builds compile out anything below INFO, so the canary would go blind (#5236)" >&2
     FAILURES=$((FAILURES + 1))
 fi
-pin_marker "source pin: trigger phrase"         "$SRC"    "$MARKER_TRIGGERED"
+# The trigger phrase gets the same NEGATIVE SUBTRACTION the runtime detector
+# does, instead of a plain pin_marker. `MARKER_TRIGGERED` whitespace-stripped is
+# `triggeringauto-update`, which is a SUBSTRING of the #4073 refusal line
+# `not triggering auto-update`. So the refusal alone satisfied a plain
+# containment check: the pin was tracking a line whose job is to say the
+# OPPOSITE of the thing it claimed to pin. Demonstrated by rewording all four
+# plain trigger sites in freenet.rs -- that assertion stayed green, and only the
+# count pin below went red.
+#
+# `node_decided_to_update` has always subtracted the refusals; this brings the
+# source pin into line with the detector it is supposed to protect. Counting
+# OCCURRENCES rather than testing containment is what makes the subtraction
+# possible at all.
+TRIG_NEEDLE="${MARKER_TRIGGERED// /}"
+SRC_SQUEEZED="$(sed 's/\\$//' "$SRC" | tr -d '[:space:]')"
+# `grep -o | wc -l`: occurrences, not lines -- the squeezed source is ONE line,
+# so `grep -c` would answer 1 no matter how many sites there are. Neither stage
+# short-circuits, so this is not the `| grep -q` SIGPIPE shape banned below.
+trig_all="$(printf '%s' "$SRC_SQUEEZED" | grep -oF -- "$TRIG_NEEDLE" | wc -l)"
+trig_neg="$(printf '%s' "$SRC_SQUEEZED" | grep -oF -- "not$TRIG_NEEDLE" | wc -l)"
+trig_pos=$(( trig_all - trig_neg ))
+if [[ "$trig_pos" -gt 0 ]]; then
+    echo "ok   - source pin: trigger phrase appears at $trig_pos site(s) that are NOT the #4073 refusal"
+else
+    echo "FAIL - source pin: every '$MARKER_TRIGGERED' occurrence in freenet.rs is part of" >&2
+    echo "       '$MARKER_NOT_TRIGGERED' ($trig_all total, $trig_neg of them refusals)." >&2
+    echo "       No site actually announces a trigger with this wording, so the canary's" >&2
+    echo "       fixed-string half is dead. A containment check cannot see this: the" >&2
+    echo "       refusal CONTAINS the trigger phrase, which is how this pin passed while" >&2
+    echo "       all four plain trigger sites were reworded." >&2
+    FAILURES=$((FAILURES + 1))
+fi
 pin_marker "source pin: #4073 refusal phrase"   "$SRC"    "$MARKER_NOT_TRIGGERED"
 pin_marker "source pin: disabled marker"        "$SRC"    "$MARKER_DISABLED"
+
+# --- the MARKER_LATEST_SEEN_SINCE constant itself ---------------------------
+# Gate B's version gate is now pinned in both directions (the behavioural cases
+# on `prev_emits_latest_seen`, and the un-negated call site), but neither looks
+# at the CONSTANT they compare against. Raising it 0.2.124 -> 0.2.999 left the
+# whole suite green while permanently disarming Gate B's only positive
+# assertion -- the same silent direction as the `!` inversion, reached by
+# editing a different line.
+#
+# Anchored against the crate version, which the constant cannot influence. The
+# relationship is real rather than arbitrary: the constant names the first
+# release whose binary emits MARKER_LATEST_SEEN, that marker is emitted by THIS
+# source tree (pinned above), and this tree ships as the NEXT release. So the
+# constant must be just ahead of the version in Cargo.toml -- not behind it (the
+# marker is new here, so no already-published release emits it) and not far
+# ahead of it (that is a typo, or a change that has sat unmerged for many
+# releases and needs the value re-confirmed rather than assumed).
+#
+# The window is a guard against a wrong constant, not a proof of the right one.
+# If a release genuinely slips further than this, update the constant on
+# purpose -- which is the outcome this assertion exists to force.
+CORE_TOML="$SCRIPT_DIR/../crates/core/Cargo.toml"
+SINCE_SKEW_MAX=5
+if [[ ! -f "$CORE_TOML" ]]; then
+    echo "FAIL - cannot check MARKER_LATEST_SEEN_SINCE: $CORE_TOML not found" >&2
+    FAILURES=$((FAILURES + 1))
+else
+    crate_version="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$CORE_TOML" | head -1)"
+    IFS=. read -r c_maj c_min c_pat <<< "$crate_version"
+    IFS=. read -r s_maj s_min s_pat <<< "$MARKER_LATEST_SEEN_SINCE"
+    if [[ -z "$crate_version" ]]; then
+        echo "FAIL - could not read the crate version from $CORE_TOML" >&2
+        FAILURES=$((FAILURES + 1))
+    elif [[ "$s_maj" != "$c_maj" || "$s_min" != "$c_min" ]]; then
+        echo "FAIL - MARKER_LATEST_SEEN_SINCE ($MARKER_LATEST_SEEN_SINCE) is not on the same" >&2
+        echo "       major.minor as the crate ($crate_version). Gate B skips its positive" >&2
+        echo "       equality check for every release below the constant, so a constant set" >&2
+        echo "       too high leaves the gate permanently vacuous and silent about it." >&2
+        FAILURES=$((FAILURES + 1))
+    elif [[ "$s_pat" -lt "$c_pat" ]]; then
+        echo "FAIL - MARKER_LATEST_SEEN_SINCE ($MARKER_LATEST_SEEN_SINCE) is BELOW the crate" >&2
+        echo "       version ($crate_version). It names the first release that emits" >&2
+        echo "       '$MARKER_LATEST_SEEN', and that marker is new in this tree -- no" >&2
+        echo "       already-published release emits it, so Gate B would demand the line" >&2
+        echo "       from binaries never built to log it." >&2
+        FAILURES=$((FAILURES + 1))
+    elif [[ "$s_pat" -gt $(( c_pat + SINCE_SKEW_MAX )) ]]; then
+        echo "FAIL - MARKER_LATEST_SEEN_SINCE ($MARKER_LATEST_SEEN_SINCE) is more than" >&2
+        echo "       $SINCE_SKEW_MAX patch releases ahead of the crate version ($crate_version)." >&2
+        echo "       Gate B skips its only positive assertion for every release below the" >&2
+        echo "       constant, so an over-high value disarms the gate permanently and" >&2
+        echo "       silently. If the release really has slipped this far, re-confirm the" >&2
+        echo "       value and widen SINCE_SKEW_MAX deliberately." >&2
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "ok   - MARKER_LATEST_SEEN_SINCE ($MARKER_LATEST_SEEN_SINCE) is the next release after the crate version ($crate_version)"
+    fi
+fi
 # The parse-failure marker gets a STRONGER pin than pin_marker can give.
 # `failed to parse latest version` appears twice in auto_update.rs: the
 # production warn!, and a comment inside its own `#[cfg(test)] mod tests`
