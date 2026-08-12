@@ -273,6 +273,18 @@ jobs:
           name: binaries-x86_64-macos-freenet
           path: bin-x86_64
 
+      - name: Download ARM64 macOS fdev binary
+        uses: actions/download-artifact@v8
+        with:
+          name: binaries-arm64-macos-fdev
+          path: bin-arm64
+
+      - name: Download x86_64 macOS fdev binary
+        uses: actions/download-artifact@v8
+        with:
+          name: binaries-x86_64-macos-fdev
+          path: bin-x86_64
+
       - name: Install packaging dependencies
         run: |
           brew install create-dmg librsvg
@@ -336,12 +348,14 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
           FREENET_ARM64_BIN: bin-arm64/freenet
           FREENET_X86_BIN: bin-x86_64/freenet
+          FREENET_ARM64_FDEV_BIN: bin-arm64/fdev
+          FREENET_X86_FDEV_BIN: bin-x86_64/fdev
           CODESIGN_IDENTITY: "Developer ID Application: Ian CLARKE (R55ZESJCXG)"
           ASC_API_KEY_ID: ${{ secrets.APPLE_ASC_API_KEY_ID }}
           ASC_API_ISSUER_ID: ${{ secrets.APPLE_ASC_API_KEY_ISSUER_ID }}
           # ASC_API_KEY_PATH set by the previous step via $GITHUB_ENV.
         run: |
-          chmod +x bin-arm64/freenet bin-x86_64/freenet
+          chmod +x bin-arm64/freenet bin-x86_64/freenet bin-arm64/fdev bin-x86_64/fdev
           ./scripts/package-macos.sh
 
       - name: Clean up secrets from runner

@@ -11,12 +11,14 @@
 //! - `log_utils` – log file rotation helpers
 //! - `single_instance` – macOS wrapper single-instance lock (flock-based)
 //! - `launch_at_login` – macOS Launch at Login, plist helpers, legacy migration
+//! - `cli_symlinks` – macOS first-launch `freenet`/`fdev` PATH symlink setup
 //! - `wrapper` – process wrapper loop, state machine, log events
 //! - `purge` – data purge, doctor, process-reaping
 //! - `linux` – Linux/systemd service management
 //! - `macos` – macOS/launchd service management
 //! - `windows` – Windows registry/task service management
 
+mod cli_symlinks;
 mod launch_at_login;
 mod linux;
 mod log_utils;
@@ -250,6 +252,19 @@ pub(super) fn mark_first_run_complete_at(marker: &Path) -> std::io::Result<()> {
 #[allow(dead_code)]
 pub(super) fn legacy_migration_marker_path() -> Option<PathBuf> {
     dirs::data_local_dir().map(|d| d.join("freenet").join(".legacy-migration-complete"))
+}
+
+/// Path of the CLI-symlink setup marker (`freenet`/`fdev` on `PATH` via
+/// `/usr/local/bin`). Same reasoning as `legacy_migration_marker_path`: a
+/// user who already onboarded via an older DMG has the first-run marker set
+/// but never got a CLI symlink, so this cannot be gated on onboarding state
+/// either. Its own one-shot marker, so the (possibly password-prompting)
+/// symlink setup runs exactly once per install, whether the user is on their
+/// very first launch or upgrading from a build that predates this feature.
+/// See `service::cli_symlinks`.
+#[allow(dead_code)]
+pub(super) fn cli_symlinks_marker_path() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("freenet").join(".cli-symlinks-setup-attempted"))
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
