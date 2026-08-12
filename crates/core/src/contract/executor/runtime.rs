@@ -1602,7 +1602,7 @@ mod remove_contract_tests {
         let code = ContractCode::from(vec![3u8; 64]);
         let real_params = Parameters::from(vec![3u8; 8]);
         let unrelated_instance =
-            *ContractKey::from_params_and_code(&Parameters::from(vec![200u8; 8]), &code).id();
+            *ContractKey::from_params_and_code(Parameters::from(vec![200u8; 8]), &code).id();
         let mut forged = WrappedContract::new(Arc::new(code.clone()), real_params);
         forged.key = ContractKey::from_id_and_code(unrelated_instance, *code.hash());
         let forged_key = forged.key;
