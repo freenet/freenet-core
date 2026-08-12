@@ -716,12 +716,19 @@ function check(name, cond) {
     'hideCard',
     'ctl',
     `var __removals = Object.create(null);
+     var __inFlight = [];
      function removalObservedSince(nonce, since) {
        var at = __removals[nonce];
        return at !== undefined && at >= since;
      }
+     function noteReconcileStarted(t) { __inFlight.push(t); }
+     function noteReconcileFinished(t) {
+       var i = __inFlight.indexOf(t);
+       if (i >= 0) __inFlight.splice(i, 1);
+     }
      ${reconcileSrc}
      ctl.noteRemoval = function (t, nonce) { __removals[nonce || 'X'] = t; };
+     ctl.inFlight = function () { return __inFlight.slice(); };
      return reconcileFromPending;`,
   );
 
@@ -773,10 +780,53 @@ function check(name, cond) {
       settle: async (elapsed = 50) => {
         clock.t += elapsed;
         release();
-        // Two hops: r.json() is itself a promise.
-        await Promise.resolve();
-        await Promise.resolve();
-        await Promise.resolve();
+        // Drain the chain: fetch -> r.json() -> handler -> catch ->
+        // deregister. Each is its own microtask hop, so under-awaiting here
+        // silently skips the tail of the chain (which is how the
+        // deregistration checks first failed).
+        for (let i = 0; i < 8; i++) await Promise.resolve();
+      },
+    };
+  }
+
+  // Variant of build() whose fetch REJECTS, for the deregistration path.
+  function buildRejecting() {
+    const clock = { t: 1000 };
+    const permNow = () => clock.t;
+    const overlayCards = {};
+    const hidden = [];
+    const ctl = {};
+    let release = null;
+    const fetchStub = () =>
+      new Promise((_res, rej) => {
+        release = () => rej(new Error('network down'));
+      });
+    const showCard = (nonce, card) => {
+      card._fnShownAt = permNow();
+      overlayCards[nonce] = card;
+    };
+    const createCard = (p) => ({ nonce: p.nonce });
+    const hideCard = (nonce) => {
+      delete overlayCards[nonce];
+      hidden.push(nonce);
+    };
+    return {
+      clock,
+      overlayCards,
+      hidden,
+      ctl,
+      reconcile: makeReconcile(
+        permNow,
+        fetchStub,
+        overlayCards,
+        showCard,
+        createCard,
+        hideCard,
+        ctl,
+      ),
+      settle: async () => {
+        release();
+        for (let i = 0; i < 8; i++) await Promise.resolve();
       },
     };
   }
@@ -963,6 +1013,34 @@ function check(name, cond) {
       'a malformed entry is skipped while a valid sibling still renders',
       env.overlayCards.GOOD !== undefined && env.overlayCards[42] === undefined,
     );
+  }
+
+  // 7m. In-flight bookkeeping. The removal map is pruned against the OLDEST
+  //     outstanding request, so a request must be registered while it runs and
+  //     deregistered on EVERY outcome. A leak here pins the prune floor
+  //     forever and the map grows without bound; a missing registration lets a
+  //     wedged-node fetch (minutes, no timeout) have its removal record pruned
+  //     and resurrect an answered prompt on arrival.
+  {
+    const env = build([]);
+    env.reconcile();
+    check('a running reconcile is registered in-flight', env.ctl.inFlight().length === 1);
+    await env.settle();
+    check('and deregistered when it lands', env.ctl.inFlight().length === 0);
+  }
+  {
+    // Non-array body: the early return must still deregister.
+    const env = build({ not: 'an array' });
+    env.reconcile();
+    await env.settle();
+    check('a malformed body still deregisters', env.ctl.inFlight().length === 0);
+  }
+  {
+    // A rejected fetch must deregister too — this is the leak case.
+    const env = buildRejecting();
+    env.reconcile();
+    await env.settle();
+    check('a FAILED fetch still deregisters', env.ctl.inFlight().length === 0);
   }
 
   // 7e. The stamp itself. 7a-7c stub showCard, so they would all still pass if

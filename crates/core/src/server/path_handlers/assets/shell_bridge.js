@@ -1803,17 +1803,47 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // than a contrived race. Suppressing only the nonce actually removed keeps
   // the resurrection fix while removing the collateral.
   //
-  // Bounded: entries older than the retention window are pruned on write, so a
-  // long-lived tab cannot accumulate them. The window only has to outlive one
-  // in-flight `/permission/pending`.
+  // Bounded, and pruned against the OLDEST IN-FLIGHT request rather than a bare
+  // wall-clock window. An entry only matters to a reconcile whose `issuedAt`
+  // precedes it, so once no outstanding request is older than the entry, the
+  // entry can never change an outcome and is safe to drop.
+  //
+  // A fixed window alone would be wrong in exactly the case that matters: a
+  // wedged node leaves `/permission/pending` fetches outstanding for minutes
+  // (they carry no timeout, and the poll keeps firing every 3s), so a removal
+  // could be pruned while a request older than it was still in flight — and
+  // that request landing afterwards would resurrect the answered prompt, the
+  // very bug this map exists to prevent. The window is kept as a backstop for
+  // the no-requests-in-flight case so a long-lived tab cannot accumulate
+  // entries.
+  //
+  // `Object.create(null)`: no prototype, so a nonce spelled `__proto__` or
+  // `constructor` is an ordinary own key and cannot reach Object.prototype.
+  // Nonces are 32 hex chars today, but this must not depend on that.
   var REMOVAL_MEMORY_MS = 60000;
   var removalObservedAt = Object.create(null);
+  // `issuedAt` of every reconcile whose response has not landed yet.
+  var reconcilesInFlight = [];
+  function noteReconcileStarted(issuedAt) {
+    reconcilesInFlight.push(issuedAt);
+  }
+  function noteReconcileFinished(issuedAt) {
+    var i = reconcilesInFlight.indexOf(issuedAt);
+    if (i >= 0) reconcilesInFlight.splice(i, 1);
+  }
   function noteRemovalObserved(nonce) {
     var now = permNow();
     if (typeof nonce === 'string') removalObservedAt[nonce] = now;
+    var oldestInFlight = Infinity;
+    for (var i = 0; i < reconcilesInFlight.length; i++) {
+      if (reconcilesInFlight[i] < oldestInFlight)
+        oldestInFlight = reconcilesInFlight[i];
+    }
     for (var k in removalObservedAt) {
-      if (now - removalObservedAt[k] > REMOVAL_MEMORY_MS)
-        delete removalObservedAt[k];
+      var at = removalObservedAt[k];
+      // Still able to affect an outstanding request: keep.
+      if (at >= oldestInFlight) continue;
+      if (now - at > REMOVAL_MEMORY_MS) delete removalObservedAt[k];
     }
   }
   function removalObservedSince(nonce, since) {
@@ -1916,6 +1946,9 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // against injected `fetch` / `permNow` / card helpers. Keep the markers.
   function reconcileFromPending() {
     var issuedAt = permNow();
+    // Registered so removal records this request could still need are not
+    // pruned out from under it while it is outstanding.
+    noteReconcileStarted(issuedAt);
     fetch('/permission/pending')
       .then(function (r) {
         return r.json();
@@ -1956,7 +1989,13 @@ function freenetBridge(authToken, userToken, hostedMode) {
           hideCard(nonce);
         });
       })
-      .catch(function () {});
+      .catch(function () {})
+      // Deregister on EVERY outcome — including the non-array early return and
+      // a rejected fetch — or a single failure would pin the prune floor
+      // forever and the map would grow without bound.
+      .then(function () {
+        noteReconcileFinished(issuedAt);
+      });
   }
   // perm-reconcile:END
 
