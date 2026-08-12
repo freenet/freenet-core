@@ -2536,7 +2536,8 @@ pub struct WebsocketApiArgs {
 
     /// Additional hostname(s) to accept in the Host header for the local
     /// HTTP/WebSocket API (including the delegate permission-prompt
-    /// endpoints `/permission/pending`, `/permission/events`, and
+    /// endpoints `/permission/pending`, `/permission/events`,
+    /// `/permission/events/ws`, and
     /// `/permission/{nonce}/respond`).
     /// Use when accessing the node via a custom domain (e.g., through a reverse proxy).
     /// Can be specified multiple times. If omitted, only the machine's hostname and
