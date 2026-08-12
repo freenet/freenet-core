@@ -173,7 +173,11 @@ MARKER_LATEST_SEEN='Startup update check: GitHub reports latest release'
 # If a Gate B run reports "never logged which release it compared against" for
 # a previous release at or above this version, the marker was REMOVED (a real
 # finding) or this constant is set one release too early (bump it).
-MARKER_LATEST_SEEN_SINCE='0.2.124'
+# 0.2.125, not 0.2.124: the marker landed in the 0.2.124 tree, but that release
+# was never PUBLISHED (Gate A blocked it on the TMPDIR harness bug, #5290) and a
+# draft is invisible to `/releases/latest`. So no release a node can reach emits
+# this line until 0.2.125, and Gate B must not demand it from 0.2.123.
+MARKER_LATEST_SEEN_SINCE='0.2.125'
 
 MUSL_ASSET='freenet-x86_64-unknown-linux-musl.tar.gz'
 RELEASE_BASE='https://github.com/freenet/freenet-core/releases/download'
