@@ -524,6 +524,18 @@ What does cover the comparison is the Rust unit tests on
 directions and the equal case. Gate B covers it end-to-end for real, but only
 for the PREVIOUS release's binary.
 
+**An orphaned node was observed once, and the pin cannot see it.** After a real
+`preflight` returned, a `timeout 240 target/release/freenet network …` was still
+alive about four minutes later, its workdir already deleted by the EXIT trap. It
+did not reproduce: 0 leaks in 9 subsequent runs, so there is no known rate and
+no mechanism. Lifecycle case 4 pins exactly this property, but against a bash
+fake node with none of a real node's SIGTERM handling or graceful shutdown, so
+the environment that test runs in cannot produce the fault — a green case 4 is
+not evidence the leak is gone. If a canary run ever seems to hang or a later run
+reports "the startup update check never ran" for no clear reason, check for a
+stray `freenet network` process first; a leaked node holds its ports and burns
+CPU, which is how this surfaced before (see the lifecycle test's case 2 notes).
+
 **Gate B's own code is never executed by any test.** The two gaps above are
 about what the gates cannot observe when they run. This one is about the tests
 *behind* the gates, and it is worth stating separately because it is easy to
@@ -571,8 +583,20 @@ nightly `binstall-smoke-test` will go red. crates.io versions cannot be
 un-published, so **do not delete the tag** — a yanked-looking crate pointing at
 a tag that no longer exists is worse than the draft.
 
-1. Read the job log; it names the offending line and distinguishes a genuine
-   parse failure from `UNVERIFIED` (GitHub was unreachable).
+1. Read the job log. It distinguishes a genuine parse failure from `UNVERIFIED`
+   (GitHub was unreachable) or a port collision (exit 43, another node or
+   canary run on the host — re-run the job).
+
+   It does not always name an offending *line*, and an earlier version of this
+   step said it did. The parse-fail and fetch-fail branches echo the offending
+   log lines; the two branches most likely to fire on a healthy release — "the
+   check never ran" and "started but never logged an outcome" — have no single
+   line to name. Those now print a `canary node evidence` group holding the tail
+   of `node.out` and of the node log, because the canary deletes its workdir on
+   exit and a blocking run used to leave nothing at all behind. Read that group
+   first: a startup failure there (gateway-list fetch, config, port bind) means
+   the node never reached the update task, and the update path is not the
+   problem.
 2. **If the failure was `UNVERIFIED` or a job timeout**, it is infrastructure,
    not a bug: use **Re-run failed jobs** on the cross-compile run. The build
    artifacts persist, so `attach-to-release` re-runs on its own and publishes
