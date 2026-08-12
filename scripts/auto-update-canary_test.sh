@@ -278,6 +278,38 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
+# The SAME defect, in `assert_detection_healthy` itself, which is the part the
+# release gate calls. The two helpers above were fixed when the mechanism was
+# first diagnosed; the four checks inside the function they serve were not, and
+# unlike the helpers this one was not latent -- it hit 2 of 3 real preflight
+# runs. Gate A's normal path is a binary NEWER than latest, so the node does
+# not exit 42 and keeps logging (~33 KB/s) until the canary kills it seconds
+# later, which puts the markers far behind the 64 KB pipe buffer.
+#
+# The fixtures elsewhere in this file are a few hundred bytes, so none of them
+# can see it: the verdict was a function of log VOLUME, not of what the node
+# did. These two are deliberately past the buffer, with the markers FIRST and
+# the bulk after them -- the real geometry.
+#
+# Both directions are pinned. The healthy one is what actually broke (a good
+# release blocked by "the startup update check never ran", naming the wrong
+# subsystem). The broken one guards the far worse direction: if the ordering of
+# these checks ever changes so the positive check no longer runs first, a
+# SIGPIPE'd negative check reads the #5221 signature as ABSENT and the gate
+# goes GREEN on the exact bug it exists to catch.
+BULK="$(for _ in $(seq 1 1200); do
+    echo '2026-08-08T02:00:01.000000Z  INFO freenet::node: connection established peer=abc123 remaining=7'
+done)"
+check "volume: healthy markers behind >64KB of later output -> still pass" \
+    0 "$SEEN_OK
+$BULK"
+check_vs_expected "volume: equality check still sees the observed-latest line behind >64KB" \
+    "0.2.122" 0 "$SEEN_OK
+$BULK"
+check "volume: #5221 parse failure behind >64KB of later output -> still fail" \
+    1 "$BROKEN
+$BULK" "could not parse the version GitHub returned"
+
 # --- numeric-override validation (review finding 36) ------------------------
 # A non-numeric CANARY_TIMEOUT_SECS reaches an arithmetic context and, under
 # `set -u`, kills the canary with a shell error instead of a verdict -- a

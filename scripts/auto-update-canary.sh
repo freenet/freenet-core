@@ -225,6 +225,37 @@ node_check_settled() {
   node_decided_to_update "$logdir"
 }
 
+# Fixed-string presence / extraction over the node's log FILES.
+#
+# These exist because the obvious spelling is broken in the same way the two
+# functions above are, and it bit a REAL run rather than staying latent: with
+# the logs slurped into a shell variable, `printf '%s' "$logs" | grep -aqF ...`
+# has `grep -q` exit at its first match and SIGPIPE the `printf`, which dies
+# 141; `set -o pipefail` (top of this file) promotes that to the pipeline's
+# status, so the `if` reads a marker that IS PRESENT as ABSENT.
+#
+# It only fires once the log passes the 64 KB pipe buffer, which is why the
+# fixtures never saw it -- but Gate A's normal path does: when the shipping
+# binary is newer than latest the node does not exit 42, so it keeps logging
+# (~33 KB/s measured) until the canary kills it 1-4s later. Measured on a real
+# 3.65 MB node log: `grep -acF` = 1 (the line is there), piped `grep -q` = 141,
+# direct `grep -q` = 0. Same content with only trailing volume varied: 1 KB
+# passes, 200 KB reports "the startup update check never ran". It hit 2 of 3
+# preflight runs, and `cmd_preflight` does not retry an rc=1 -- so a healthy
+# release was blocked by an error naming the wrong subsystem.
+#
+# `grep -a`: the node writes some non-UTF8 bytes, and without it grep calls the
+# file binary and prints nothing -- which would silently satisfy every NEGATIVE
+# check. Exactly the vacuous-pass shape this canary exists to prevent.
+log_has() {
+  # log_has <log-dir> <fixed-string>
+  grep -aqF -- "$2" "$1"/freenet.*.log 2>/dev/null
+}
+log_lines() {
+  # log_lines <log-dir> <fixed-string>  -- matching lines on stdout, no headers
+  grep -ahF -- "$2" "$1"/freenet.*.log 2>/dev/null
+}
+
 
 # One workdir for the whole run, cleaned by a single EXIT trap.
 #
@@ -257,14 +288,15 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 assert_detection_healthy() {
   local logdir="$1"
-  local logs
-  # `grep -a` everywhere below: the node writes some non-UTF8 bytes, and
-  # without it grep calls the file binary and prints nothing -- which would
-  # silently satisfy every NEGATIVE check. Exactly the vacuous-pass shape this
-  # canary exists to prevent.
-  logs="$(cat "$logdir"/freenet.*.log 2>/dev/null)"
 
-  if [ -z "$logs" ]; then
+  # Every read below goes through `log_has`/`log_lines`, which grep the FILES.
+  # Slurping them into a variable and piping it is what produced the
+  # pipefail+SIGPIPE misreads documented on `log_has` -- do not reintroduce it.
+  #
+  # Emptiness is likewise tested without slurping: `grep -q ''` matches any
+  # line, so this is "at least one non-empty log file exists". A missing glob
+  # makes grep fail to open the literal name, which is also (correctly) empty.
+  if ! grep -aq '' "$logdir"/freenet.*.log 2>/dev/null; then
     # Distinct wording on purpose: this is NOT evidence that the updater is
     # broken. The update task is spawned well inside network-node startup, so
     # anything that stops the node booting (port bind, config, gateway list)
@@ -277,32 +309,32 @@ assert_detection_healthy() {
   # (-) Did something silence the updater? Checked FIRST: it explains a missing
   #     startup line, and reporting "check never ran" instead would send the
   #     reader hunting for a parsing bug that isn't there.
-  if printf '%s' "$logs" | grep -aqF "$MARKER_DISABLED"; then
+  if log_has "$logdir" "$MARKER_DISABLED"; then
     fail "auto-update is DISABLED on the canary node. The canary cannot test the updater while the updater is turned off -- this is the #5040 drop-in failure mode that hid #5221 for two releases."
-    printf '%s' "$logs" | grep -aF "$MARKER_DISABLED" | head -2 >&2
+    log_lines "$logdir" "$MARKER_DISABLED" | head -2 >&2
     return 1
   fi
 
   # (+) POSITIVE side. Without this, every assertion below passes vacuously on
   #     a node that never checked for updates.
-  if ! printf '%s' "$logs" | grep -aqF "$MARKER_CHECK_RAN"; then
+  if ! log_has "$logdir" "$MARKER_CHECK_RAN"; then
     fail "the startup update check never ran: no '$MARKER_CHECK_RAN' line. Absence of a parse error here proves NOTHING -- the check did not happen."
     return 1
   fi
 
   # (-) NEGATIVE side: the #5221 signature.
-  if printf '%s' "$logs" | grep -aqF "$MARKER_PARSE_FAIL"; then
+  if log_has "$logdir" "$MARKER_PARSE_FAIL"; then
     fail "the node could not parse the version GitHub returned -- auto-update is BROKEN. This is the #5221 regression: the release tag reached the detection path without being normalised."
-    printf '%s' "$logs" | grep -aF "$MARKER_PARSE_FAIL" | head -2 >&2
+    log_lines "$logdir" "$MARKER_PARSE_FAIL" | head -2 >&2
     return 1
   fi
 
   # Infrastructure, not a product bug: GitHub was unreachable or rate-limited,
   # so the check ran but learned nothing. Distinct exit code so the caller can
   # retry instead of failing a release on a transient network blip.
-  if printf '%s' "$logs" | grep -aqF "$MARKER_FETCH_FAIL"; then
+  if log_has "$logdir" "$MARKER_FETCH_FAIL"; then
     note "INDETERMINATE: could not reach GitHub to fetch the latest version."
-    printf '%s' "$logs" | grep -aF "$MARKER_FETCH_FAIL" | head -2 >&2
+    log_lines "$logdir" "$MARKER_FETCH_FAIL" | head -2 >&2
     return 2
   fi
 
@@ -338,7 +370,7 @@ assert_detection_healthy() {
   #     to remove.
   if [ -n "${CANARY_EXPECTED_LATEST:-}" ]; then
     local seen_line seen
-    seen_line="$(printf '%s' "$logs" | grep -aF "$MARKER_LATEST_SEEN" | tail -1)"
+    seen_line="$(log_lines "$logdir" "$MARKER_LATEST_SEEN" | tail -1)"
     if [ -z "$seen_line" ]; then
       fail "the node never logged which release it compared against (no '$MARKER_LATEST_SEEN'). Without it a comparator that silently returns the wrong version -- a constant, or a truncated tag -- produces a log byte-identical to a healthy one, so 'no error' is not evidence that detection works."
       return 1
@@ -362,7 +394,7 @@ assert_detection_healthy() {
   fi
 
   log "OK: startup update check ran to completion and parsed GitHub's response."
-  printf '%s' "$logs" | grep -aF "$MARKER_CHECK_RAN" | head -2
+  log_lines "$logdir" "$MARKER_CHECK_RAN" | head -2
   return 0
 }
 
