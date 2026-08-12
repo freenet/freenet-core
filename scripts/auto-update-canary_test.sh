@@ -483,22 +483,68 @@ fi
 # `MARKER_TRIGGERED_RE` has to match every site that requests an update. It
 # missed the urgent one at :609 for as long as that site has existed, because
 # the marker was a fixed string and the site says "triggering IMMEDIATE
-# auto-update". Pin the COUNT so a sixth site cannot be added silently: a new
-# site that the regex does not match makes the count too low, and one it does
-# match makes it too high -- either way the enumeration in the canary's marker
-# comment gets revisited instead of quietly rotting.
+# auto-update".
+#
+# The expected count must NOT come from the regex being audited. The first
+# version of this pin computed it as `grep -cE "$MARKER_TRIGGERED_RE"`, so a
+# site the regex failed to match was invisible to the count as well -- the pin
+# could not detect the one thing it exists to detect. Demonstrated: adding a
+# sixth site worded "triggering a fresh auto-update" left this suite fully
+# green, including this assertion. (Rewording an EXISTING site was caught, so
+# the pin was not useless, just blind in the direction that matters most.)
+#
+# Derive the expectation from the CODE DECISION instead. Every real trigger
+# ends in `update_tx.send(...)`, which is what makes the node exit 42; the log
+# line is commentary on that send. Two anchors, neither of them the regex:
+#
+#   total sends            -- every path that requests an update, whatever it
+#                             logs. Catches a site added with a send spelled
+#                             some other way.
+#   versioned sends        -- `update_tx.send(new_version)`, the sites that
+#                             detected a specific newer release. These are
+#                             exactly the sites that must carry a trigger log
+#                             line, so this is the number the regex must find.
+#
+# The remaining sends are the two forced-exit paths that send a SENTINEL rather
+# than a detected version (`"unknown (hard timeout)"`, `"unknown (gateway
+# mismatch)"`). They deliberately carry no trigger phrase -- they are "leave
+# for auto-update", not "this release detected". `node_decided_to_update` does
+# not see them, which is correct for the gates: neither is reachable in a
+# canary run (both need hours of isolation with a version mismatch).
+EXPECTED_SEND_SITES=7
 EXPECTED_TRIGGER_SITES=5
+# shellcheck disable=SC2016  # literal source text, must not expand
+total_sends="$(grep -cF 'update_tx.send(' "$SRC" 2>/dev/null || echo 0)"
+# shellcheck disable=SC2016
+versioned_sends="$(grep -cF 'update_tx.send(new_version)' "$SRC" 2>/dev/null || echo 0)"
 actual_sites="$(grep -cE "$MARKER_TRIGGERED_RE" "$SRC" 2>/dev/null || echo 0)"
 actual_refusals="$(grep -cF "$MARKER_NOT_TRIGGERED" "$SRC" 2>/dev/null || echo 0)"
 actual_triggers=$((actual_sites - actual_refusals))
-if [[ "$actual_triggers" -eq "$EXPECTED_TRIGGER_SITES" ]]; then
-    echo "ok   - source pin: freenet.rs has exactly $EXPECTED_TRIGGER_SITES trigger sites, all matched by MARKER_TRIGGERED_RE"
+
+if [[ "$total_sends" -eq "$EXPECTED_SEND_SITES" && "$versioned_sends" -eq "$EXPECTED_TRIGGER_SITES" ]]; then
+    echo "ok   - source pin: freenet.rs has $EXPECTED_SEND_SITES update_tx.send sites, $EXPECTED_TRIGGER_SITES of them version-detecting"
 else
-    echo "FAIL - source pin: expected $EXPECTED_TRIGGER_SITES auto-update trigger sites in freenet.rs, found $actual_triggers" >&2
-    echo "       ($actual_sites regex matches minus $actual_refusals refusals). Either a site was added/removed," >&2
-    echo "       or a new one is worded so MARKER_TRIGGERED_RE does not match it -- which is how the" >&2
-    echo "       urgent site at :609 went unseen. Update the enumeration comment in" >&2
-    echo "       auto-update-canary.sh and this count together." >&2
+    echo "FAIL - source pin: freenet.rs has $total_sends 'update_tx.send(' sites ($versioned_sends versioned)," >&2
+    echo "       expected $EXPECTED_SEND_SITES ($EXPECTED_TRIGGER_SITES versioned). An auto-update trigger path was added or removed." >&2
+    echo "       Update the enumeration comment in auto-update-canary.sh, MARKER_TRIGGERED_RE if the new" >&2
+    echo "       site's wording needs it, and these two counts -- together." >&2
+    grep -nF 'update_tx.send(' "$SRC" >&2
+    FAILURES=$((FAILURES + 1))
+fi
+
+# ...and the regex must match every one of the version-detecting sites. This is
+# the assertion the old count could not make, because both sides of it were the
+# same grep.
+if [[ "$actual_triggers" -eq "$versioned_sends" ]]; then
+    echo "ok   - source pin: MARKER_TRIGGERED_RE matches all $versioned_sends version-detecting trigger sites"
+else
+    echo "FAIL - source pin: MARKER_TRIGGERED_RE matches $actual_triggers trigger log lines, but freenet.rs has" >&2
+    echo "       $versioned_sends version-detecting trigger sites ('update_tx.send(new_version)')." >&2
+    echo "       ($actual_sites regex matches minus $actual_refusals refusals.) If the regex matches FEWER, a" >&2
+    echo "       trigger site is worded so the canary cannot see it -- a node that took that path reads as one" >&2
+    echo "       that never decided to update, which is how the urgent site at :609 went unseen. If it matches" >&2
+    echo "       MORE, the regex is picking up prose. Either way, reconcile MARKER_TRIGGERED_RE with the" >&2
+    echo "       enumeration comment in auto-update-canary.sh." >&2
     grep -nE "$MARKER_TRIGGERED_RE" "$SRC" >&2
     FAILURES=$((FAILURES + 1))
 fi

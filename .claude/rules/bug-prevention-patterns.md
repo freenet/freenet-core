@@ -84,7 +84,7 @@ documentation. The source pin then tracks the comment, not the code.
 | Marker | How it broke |
 |--------|--------------|
 | `Startup update check complete` | Emitted at `debug!`, so absent from every release binary. The canary's "did the check finish?" assertion could never observe it. |
-| `failed to parse latest version` | Occurs twice in `auto_update.rs`: the production `tracing::warn!` (:1546) and a comment in its own test module (:1757). Rewording the production line left all 22 assertions green — including `ok - source pin: parse-failure marker` — while a node carrying the #5221 bug then logged check-ran + reworded-warn + check-complete and the canary reported `OK: parsed GitHub's response`. An ordinary log reword deletes the gate, with CI green throughout. |
+| `failed to parse latest version` | Occurs twice in `auto_update.rs`: the production `tracing::warn!` (the format literal `Startup update check: failed to parse latest version '{}'`) and a prose comment inside that file's own `#[cfg(test)] mod tests` (`// WARN failed to parse latest version 'v0.2.121':`). Both are quoted rather than cited by line number on purpose — the first version of this row cited `:1546`/`:1757`, which this very commit's +23 lines had already shifted to `:1569`/`:1780`. A line number in a rule about stale pins rots faster than the thing it describes. Rewording the production line left all 22 assertions green — including `ok - source pin: parse-failure marker` — while a node carrying the #5221 bug then logged check-ran + reworded-warn + check-complete and the canary reported `OK: parsed GitHub's response`. An ordinary log reword deletes the gate, with CI green throughout. |
 | (no marker at all) | The gate had nothing to say WHICH release the node compared against, so its healthy verdict was byte-identical to a silently-wrong comparator's — see the positive-fact rule below. Closed by `MARKER_LATEST_SEEN`. |
 | `triggering auto-update` | A fixed string, so it never matched `freenet.rs:609`'s "triggering IMMEDIATE auto-update". A node that took the urgent path read as one that never decided to update, for as long as that site had existed. Fail-closed, hence unnoticed. Closed by `MARKER_TRIGGERED_RE` plus a count pin. |
 
@@ -97,8 +97,8 @@ documentation. The source pin then tracks the comment, not the code.
 - **Pin every arm that shares the marker.** `compare_versions_for_startup` has
   two parse-failure arms; a pin on one lets the other drift.
 - Prefer a marker string that is **specific enough not to appear in prose** —
-  keeping the `Startup update check: ` prefix is what stops the comment at
-  :1757 from matching at all.
+  keeping the `Startup update check: ` prefix is what stops the test-module
+  comment quoted above from matching at all.
 - **Assert a POSITIVE fact, not the absence of an error.** "No error appeared"
   is satisfied by a component that is silently WRONG as well as by one that
   works: a `version_from_tag` regressed to a constant, or a normaliser
@@ -115,8 +115,19 @@ documentation. The source pin then tracks the comment, not the code.
   the urgent path read as one that never decided to update. It failed CLOSED,
   which is exactly why nobody noticed — **fail-closed is not the same as
   correct, and it is the condition under which a wrong enumeration survives
-  longest.** A count pin turns both "a site was added" and "a site is worded so
-  the marker misses it" into a CI failure.
+  longest.** But **the count must not be derived from the marker it audits.**
+  The first version of that pin computed the actual site count as
+  `grep -cE "$MARKER_TRIGGERED_RE"` — the very regex under audit — so a site
+  the regex failed to match was missing from the count too, and the two errors
+  cancelled. Demonstrated: adding a sixth trigger site worded "triggering a
+  fresh auto-update" left the suite fully green, including the assertion
+  claiming exactly five sites. It caught a REWORDED existing site (count drops)
+  and nothing else, which is the weaker half of what it advertised. Derive the
+  expected count from a **structural** anchor the marker cannot influence —
+  here `update_tx.send(new_version)`, the call that actually requests the
+  update — then assert the marker matches all of them. Same shape as the
+  "metric re-derived at the call site" row below: an audit whose two operands
+  come from one source cannot report a disagreement.
 - **A skip branch in a gate is a vacuous-pass waiting to happen.** If the gate
   can only run its check when some input is present, pin the caller that
   supplies it. `assert_detection_healthy` skips the equality check when
