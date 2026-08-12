@@ -4876,17 +4876,58 @@ mod tests {
             "overlay must declare role=dialog for a11y"
         );
         assert!(html.contains("aria-modal"), "overlay must set aria-modal");
-        // Subscribes to the new SSE endpoint and POSTs back with the response.
-        // /permission/pending is still referenced as the bootstrap-on-connect
-        // and `resync` reconciliation endpoint, plus the no-EventSource
-        // fallback, so the assertion below still holds.
+        // Subscribes to the permission-event WebSocket and POSTs back with the
+        // response. /permission/pending is still referenced as the
+        // bootstrap-on-connect and `resync` reconciliation endpoint, plus the
+        // no-WebSocket fallback, so the assertion below still holds.
         assert!(
-            html.contains("/permission/events"),
-            "shell JS must subscribe to /permission/events (SSE)"
+            html.contains("/permission/events/ws"),
+            "shell JS must subscribe to the /permission/events/ws WebSocket"
         );
         assert!(
             html.contains("/permission/pending"),
             "shell JS must reference /permission/pending for bootstrap/resync"
+        );
+        // #5213 regression pin. The permission channel MUST NOT ride a
+        // long-lived HTTP request. Every open tab holds it for the tab's whole
+        // life and all Freenet apps share one origin, so an SSE/EventSource
+        // (or any other held-open HTTP request) permanently consumes one of
+        // the browser's ~6 connections per origin PER TAB. At six tabs the
+        // budget is gone and a seventh tab's document request queues forever
+        // with no error surfaced — reproduced as a hard stall at tab 7, with
+        // tabs 1-6 loading in ~30ms.
+        //
+        // This asserts on the SHELL JS only. The server still serves the
+        // legacy SSE route for tabs opened before a node upgrade, so pinning
+        // the absence of the route itself would be wrong; what must not come
+        // back is the CLIENT holding one.
+        //
+        // SCOPE, so nobody mistakes this for the real guard: a substring check
+        // can only rule out the ONE spelling of the violation that shipped. A
+        // streamed `fetch()`, a long-poll, or any other request the shell
+        // never lets finish would reintroduce #5213 and keep this assertion
+        // green. The invariant itself ("the shell holds no HTTP request open")
+        // is enforced behaviourally in a real browser by
+        // crates/core/tests/playwright/tests/connection-exhaustion.spec.ts,
+        // which loads the shell, waits, and fails if any request is still
+        // unfinished. Keep this cheap check as the fast local signal, but if
+        // you change how the shell subscribes, that spec is what must pass.
+        //
+        // Note that spec runs in a workflow that is path-filtered and NOT a
+        // required check, so the strongest guard for this invariant cannot
+        // block a merge while this weaker one can. Tracked in #5275.
+        assert!(
+            !html.contains("EventSource("),
+            "shell JS must not open an EventSource: one held-open HTTP request \
+             per tab exhausts the browser's ~6-connections-per-origin budget \
+             and hangs the 7th Freenet tab (#5213)"
+        );
+        // The WebSocket has no auto-reconnect (EventSource did), so the shell
+        // owns reconnection. Without it a single node restart would leave
+        // every open tab permanently on the 3s polling fallback.
+        assert!(
+            html.contains("schedulePermReconnect"),
+            "shell JS must reconnect the permission WebSocket itself (#5213)"
         );
         assert!(
             html.contains("/respond"),
@@ -4898,15 +4939,18 @@ mod tests {
             html.contains("r.status === 404"),
             "shell JS must treat 404 on respond as 'already answered' and hide the card"
         );
-        // SSE event names the server emits. Pinning these here ensures the
-        // shell stays in sync with the gateway's wire format.
+        // Event names the server emits. Pinning these here ensures the shell
+        // stays in sync with the gateway's wire format. The names and payload
+        // shapes are shared by both transports (the WebSocket carries the name
+        // inside a JSON envelope; the legacy SSE route uses its `event:`
+        // field), so these assertions are transport-independent.
         assert!(
             html.contains("'prompt_added'") || html.contains("\"prompt_added\""),
-            "shell JS must subscribe to the prompt_added SSE event"
+            "shell JS must handle the prompt_added event"
         );
         assert!(
             html.contains("'prompt_removed'") || html.contains("\"prompt_removed\""),
-            "shell JS must subscribe to the prompt_removed SSE event"
+            "shell JS must handle the prompt_removed event"
         );
         // All delegate-controlled strings must go through textContent, never
         // innerHTML — guards against a future refactor re-opening XSS into
@@ -4918,11 +4962,13 @@ mod tests {
         // Bound the overlay code path by the explicit `perm-overlay-flow`
         // markers in shell_bridge.js, NOT a code anchor. The previous bound
         // (`setInterval(reconcileFromPending` / `EventSource`) stopped SHORT of
-        // the SSE `prompt_added`/`prompt_removed` handlers, which ARE part of
-        // the prompt-render flow #3836 protects — so a browser Notification
-        // reintroduced into an SSE handler would have slipped past this guard.
-        // The markers bracket the whole overlay + SSE region so the asserts
-        // below scan all of it (#4849 F2).
+        // the `prompt_added`/`prompt_removed` handlers, which ARE part of the
+        // prompt-render flow #3836 protects — so a browser Notification
+        // reintroduced into an event handler would have slipped past this
+        // guard. The markers bracket the whole overlay + event-channel region
+        // so the asserts below scan all of it (#4849 F2). Note the old code
+        // anchor named `EventSource`, which #5213 removed: another reason
+        // marker bounds beat code anchors here.
         let overlay_start = html
             .find("perm-overlay-flow:BEGIN")
             .expect("perm-overlay-flow:BEGIN marker must bracket the overlay flow");
@@ -4931,14 +4977,14 @@ mod tests {
             .expect("perm-overlay-flow:END marker must bracket the overlay flow");
         let overlay_slice = &html[overlay_start..overlay_start + overlay_end];
         // The negative asserts below are only meaningful if the slice actually
-        // CONTAINS the SSE prompt-render surface. Pin that the marker-bounded
+        // CONTAINS the permission prompt-render surface. Pin that the marker-bounded
         // region includes the `prompt_added`/`prompt_removed` handlers, so a
         // refactor that moves them past `perm-overlay-flow:END` (shrinking the
         // slice) fails HERE rather than silently making the negative asserts
         // pass vacuously — the exact regression F2 exists to prevent (#4849).
         assert!(
             overlay_slice.contains("'prompt_added'") && overlay_slice.contains("'prompt_removed'"),
-            "overlay guard slice must cover the SSE prompt handlers (#4849 F2)"
+            "overlay guard slice must cover the permission prompt handlers (#4849 F2)"
         );
         assert!(
             !overlay_slice.contains("innerHTML"),
@@ -4948,7 +4994,7 @@ mod tests {
         // The old permission-prompt-via-Notification flow must be gone: the
         // permission OVERLAY code path must not request or construct a browser
         // Notification (#3836 — delegate permission prompts must render as the
-        // in-page SSE overlay, never as a browser Notification users
+        // in-page permission overlay, never as a browser Notification users
         // block/miss/dismiss). Scoped to `overlay_slice`, NOT the whole shell:
         // browser Notifications are now legitimately used ELSEWHERE in the
         // bridge for new-MESSAGE notifications (a best-effort UX where a
@@ -4969,8 +5015,9 @@ mod tests {
                 && !html.contains("window.open(\"/permission/"),
             "shell must no longer open /permission/{{nonce}} as a popup (#3836)"
         );
-        // The visibility-gated polling loop has been replaced by SSE. SSE
-        // pushes regardless of tab visibility, so the visibility-skip code
+        // The visibility-gated polling loop was replaced by a pushed channel
+        // (SSE originally, a WebSocket since #5213). A push arrives
+        // regardless of tab visibility, so the visibility-skip code
         // path that caused the originating tab to silently miss prompts
         // when in the background MUST NOT be reintroduced. Pin this
         // contract by asserting `visibilityState` no longer appears in the
@@ -4981,7 +5028,8 @@ mod tests {
         assert!(
             !html.contains("visibilityState"),
             "overlay must not gate on document.visibilityState; \
-             visibility-skip caused background tabs to miss prompts (SSE replaces polling)"
+             visibility-skip caused background tabs to miss prompts (the permission \
+             channel replaces polling)"
         );
 
         // Regression test for issue #3857: the overlay must read the new

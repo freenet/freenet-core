@@ -31,6 +31,8 @@ When unsure which bucket a change is in, open an issue first.
    → operations/      → Check .claude/rules/operations.md
    → transport/       → Check .claude/rules/transport.md
    → contract/wasm_runtime/ → Check .claude/rules/contracts.md
+   → server/path_handlers* or server/client_api* → Check .claude/rules/browser-assets.md
+     (the injected JS, plus the HTML/CSP wrappers that decide what it may do)
 
 3. Is this Rust code?
    → Check .claude/rules/code-style.md
@@ -192,6 +194,7 @@ docs/architecture/    # Design docs
 | Operations | `.claude/rules/operations.md` |
 | Transport | `.claude/rules/transport.md` |
 | Contracts | `.claude/rules/contracts.md` |
+| Browser assets (injected JS + its HTML/CSP wrappers) | `.claude/rules/browser-assets.md` |
 
 ### General Rules
 

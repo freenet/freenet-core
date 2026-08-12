@@ -2536,7 +2536,8 @@ pub struct WebsocketApiArgs {
 
     /// Additional hostname(s) to accept in the Host header for the local
     /// HTTP/WebSocket API (including the delegate permission-prompt
-    /// endpoints `/permission/pending`, `/permission/events`, and
+    /// endpoints `/permission/pending`, `/permission/events`,
+    /// `/permission/events/ws`, and
     /// `/permission/{nonce}/respond`).
     /// Use when accessing the node via a custom domain (e.g., through a reverse proxy).
     /// Can be specified multiple times. If omitted, only the machine's hostname and
@@ -4457,6 +4458,7 @@ std::thread_local! {
     static GLOBAL_PENDING_OP_INSERTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_REMOVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_HWM: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_PENDING_OP_SKIPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_NEIGHBOR_HOSTING_UPDATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Recipients dropped from a proactive summary notification because they
     /// are advertised co-hosts the broadcast already covered (#4965).
@@ -4556,6 +4558,7 @@ impl GlobalTestMetrics {
         GLOBAL_REDUNDANT_BROADCAST_DELIVERIES.with(|c| c.set(0));
         GLOBAL_FULL_STATE_SENDS.with(|c| c.set(0));
         GLOBAL_PENDING_OP_INSERTS.with(|c| c.set(0));
+        GLOBAL_PENDING_OP_SKIPS.with(|c| c.set(0));
         GLOBAL_PENDING_OP_REMOVES.with(|c| c.set(0));
         GLOBAL_PENDING_OP_HWM.with(|c| c.set(0));
         GLOBAL_NEIGHBOR_HOSTING_UPDATES.with(|c| c.set(0));
@@ -4782,6 +4785,20 @@ impl GlobalTestMetrics {
 
     pub fn pending_op_removes() -> u64 {
         GLOBAL_PENDING_OP_REMOVES.with(|c| c.get())
+    }
+
+    /// A waiter install was refused because a LIVE incumbent already held the tx.
+    ///
+    /// Expected to stay at zero: the invariant is one live waiter per tx per
+    /// node, so a non-zero count means either a genuine collision or that the
+    /// guard is refusing a legitimate waiter — the latter otherwise surfaces
+    /// only as a driver retry with nothing pointing back here.
+    pub fn record_pending_op_skip() {
+        GLOBAL_PENDING_OP_SKIPS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub fn pending_op_skips() -> u64 {
+        GLOBAL_PENDING_OP_SKIPS.with(|c| c.get())
     }
 
     /// Track high-water mark for pending_op_results size.

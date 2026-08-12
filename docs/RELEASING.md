@@ -251,6 +251,9 @@ gh workflow run release.yml
             └─→ creates "build: release X.Y.Z" PR
             └─→ ci.yml runs on PR (using RELEASE_PAT scope)
             └─→ PR auto-merges to main
+    └─→ release.yml: wait_for_pr
+            └─→ resolves the bump PR's merge commit -> RELEASE_SHA
+                (everything below checks out that exact commit; see #5233)
     └─→ release.yml: publish_crates
             └─→ cargo publish freenet
             └─→ cargo publish fdev
@@ -312,8 +315,9 @@ If it failed with "please provide a non-empty token" or similar, the
 then `gh run rerun --failed`.
 
 If a single crate failed mid-publish (e.g. `fdev` failed but `freenet`
-succeeded), `cargo publish -p fdev` from a clean main checkout, then
-manually move forward to tag + draft release as below.
+succeeded), `cargo publish -p fdev` from a checkout of the **release commit**
+(see below — not from whatever `main` is now), then manually move forward to
+tag + draft release as below.
 
 ### `create_release` failed
 
@@ -324,8 +328,21 @@ the runner. Fixed by [PR #4135] — if it recurs, check that the
 
 To unblock manually:
 
+Tag the **release commit**, not `main`. The release is cut from one pinned
+commit — the version-bump PR's merge commit — and `main` may have moved past
+it since (that is #5233; tagging `main` reintroduces exactly the bug the
+pipeline now prevents). Resolve it the same way the workflow does:
+
 ```bash
-git tag -a vX.Y.Z <main-sha> -m "Release vX.Y.Z"
+# The bump PR is the "build: release X.Y.Z" one; the run log also prints
+# "📌 Release pinned to <sha>".
+RELEASE_SHA=$(gh pr view <BUMP_PR> --repo freenet/freenet-core \
+  --json mergeCommit --jq '.mergeCommit.oid')
+
+# Sanity-check it really is the bump commit before tagging it.
+git show "$RELEASE_SHA:crates/core/Cargo.toml" | grep '^version'
+
+git tag -a vX.Y.Z "$RELEASE_SHA" -m "Release vX.Y.Z"
 git push origin vX.Y.Z
 gh release create vX.Y.Z --title "vX.Y.Z" \
     --notes "Release vX.Y.Z (binaries attached by cross-compile workflow)" \
