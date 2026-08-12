@@ -38,7 +38,8 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // bfcache restore does NOT re-run this IIFE, so a page restored from the
   // back-forward cache keeps its stale in-memory flood-cap window. Resync it
   // from the store on a persisted `pageshow` so a Back-restored contract page
-  // can't reset the cap (#4849). The shell's open WebSocket + EventSource
+  // can't reset the cap (#4849). The shell's open WebSockets (the proxied
+  // app socket and the permission-event socket)
   // usually make it bfcache-ineligible, but this doesn't rely on that.
   window.addEventListener('pageshow', function (e) {
     if (e && e.persisted) notifyLimiter.resync();
@@ -1473,22 +1474,24 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // is pending. The shell is trusted and same-origin with the gateway, so
   // the sandboxed contract cannot reach into this DOM. See issue #3836.
   //
-  // Every open Freenet tab subscribes to /permission/events (Server-Sent
-  // Events) and renders the overlay as soon as the gateway pushes an
-  // `prompt_added` event. When the user responds in one tab, the gateway
-  // emits `prompt_removed` and every tab dismisses its card. This was
-  // previously a 3-second polling loop with a visibility-skip optimisation
-  // that caused the originating tab to silently miss prompts whenever it
-  // wasn't foregrounded; SSE eliminates both the polling-floor latency and
-  // the visibility race.
+  // Every open Freenet tab subscribes to /permission/events/ws (a WebSocket)
+  // and renders the overlay as soon as the gateway pushes a `prompt_added`
+  // event. When the user responds in one tab, the gateway emits
+  // `prompt_removed` and every tab dismisses its card. This was originally a
+  // 3-second polling loop with a visibility-skip optimisation that caused the
+  // originating tab to silently miss prompts whenever it wasn't foregrounded;
+  // a pushed channel eliminates both the polling-floor latency and the
+  // visibility race. It was Server-Sent Events until #5213, when per-tab SSE
+  // turned out to exhaust the browser's per-origin HTTP connection budget --
+  // see the full explanation at `openPermSocket` below.
   // perm-overlay-flow:BEGIN — the delegate permission-prompt overlay and its
-  // Server-Sent-Events stream. #3836 requires that NOTHING in this whole region
+  // event channel. #3836 requires that NOTHING in this whole region
   // constructs a browser Notification: delegate permission prompts must render
   // as in-page overlay cards, never as OS notifications a user can miss or
   // dismiss. The Rust guard `shell_page_permission_overlay_present_and_safe`
-  // scans this marker-bounded region (NOT a code anchor), so the SSE
-  // `prompt_added`/`prompt_removed` handlers below — part of the prompt-render
-  // flow — are INSIDE the guarded region (#4849 F2). The legitimate
+  // scans this marker-bounded region (NOT a code anchor), so the
+  // `prompt_added`/`prompt_removed` handling below — part of the prompt-render
+  // flow — is INSIDE the guarded region (#4849 F2). The legitimate
   // message-notification code (showAppNotification) sits far above BEGIN, so it
   // is outside this region and unaffected.
   var overlayRoot = null;
@@ -1775,6 +1778,10 @@ function freenetBridge(authToken, userToken, hostedMode) {
     var root = ensureOverlayRoot();
     root.appendChild(card);
     root.style.display = 'flex';
+    // When this card became visible. `reconcileFromPending` compares against
+    // it so a snapshot taken BEFORE the card existed cannot hide it. See the
+    // causal-ordering note there.
+    card._fnShownAt = Date.now();
     overlayCards[nonce] = card;
     // Move keyboard focus to the primary button so Enter/Space answer the
     // prompt without requiring a mouse click.
@@ -1828,11 +1835,30 @@ function freenetBridge(authToken, userToken, hostedMode) {
         });
       });
   }
-  // Snapshot the current pending list and reconcile against the open
-  // overlay cards. Used for initial bootstrap, on `resync` events when an
-  // SSE subscriber lagged, and as a fallback while the EventSource is
-  // reconnecting.
+  // Snapshot the current pending list and reconcile against the open overlay
+  // cards. Used for initial bootstrap, on `resync` events when a subscriber
+  // lagged, and as a fallback while the socket is down or reconnecting.
+  //
+  // The hide pass is gated on CAUSAL ORDERING, not recency, and that gate is
+  // load-bearing: without it this function silently and permanently destroys
+  // live prompts. The fetch is async and nothing cancels an in-flight one, so
+  // the sequence below is reachable on an ordinary node restart:
+  //
+  //   1. socket closes -> startFallbackPoll() issues fetch F1 (node is
+  //      restarting, so F1 is slow)
+  //   2. socket reconnects -> onopen calls stopFallbackPoll(), which clears
+  //      the INTERVAL but cannot cancel F1, still in flight
+  //   3. prompt X is raised and arrives over the socket -> showCard(X)
+  //   4. F1 resolves carrying the PRE-restart list, which has no X -> X is
+  //      hidden, with a healthy socket and no poll running to re-add it
+  //
+  // X then auto-denies at the server timeout and the user never sees it. A
+  // generation counter would fix "stale response wins" but NOT step 3->4,
+  // because F1 is the newest response at the moment it lands. Comparing each
+  // card's `_fnShownAt` against when this request was ISSUED is what makes it
+  // correct: a snapshot taken before the card existed can never hide it.
   function reconcileFromPending() {
+    var issuedAt = Date.now();
     fetch('/permission/pending')
       .then(function (r) {
         return r.json();
@@ -1847,7 +1873,11 @@ function freenetBridge(authToken, userToken, hostedMode) {
           showCard(p.nonce, createCard(p));
         });
         Object.keys(overlayCards).forEach(function (nonce) {
-          if (!seen[nonce]) hideCard(nonce);
+          if (seen[nonce]) return;
+          var card = overlayCards[nonce];
+          // Only hide what this snapshot could actually have observed.
+          if (card && card._fnShownAt > issuedAt) return;
+          hideCard(nonce);
         });
       })
       .catch(function () {});
@@ -1887,15 +1917,37 @@ function freenetBridge(authToken, userToken, hostedMode) {
   }
   // Reconnect state. Backoff starts at 1s and doubles to a 30s ceiling,
   // reset to 1s on every successful open.
+  // perm-ws-machine:BEGIN — the stateful half of the permission-event socket:
+  // connection state, reconnect scheduling, and the open/close transitions.
+  // shell_bridge_permission_ws.test.mjs extracts this whole region and runs it
+  // against stubbed `WebSocket`/timers/`fetch`, so the reconnect behaviour is
+  // tested rather than merely name-pinned. Everything this region needs from
+  // outside (showCard/hideCard/createCard/overlayCards/reconcileFromPending/
+  // startFallbackPoll/stopFallbackPoll/location) is referenced but not
+  // defined here, and the test supplies those.
   var permSocket = null;
   var permReconnectDelay = 1000;
   var permReconnectHandle = null;
+  var permStableTimer = null;
   var PERM_RECONNECT_MAX = 30000;
+  // How long a socket must stay open before we treat it as healthy and reset
+  // the backoff. See the note in `onopen`.
+  var PERM_STABLE_AFTER = 10000;
+  var permConsecutiveFailures = 0;
+  var PERM_WARN_AFTER_FAILURES = 5;
 
   // perm-ws-decisions:BEGIN — pure helpers for the permission WebSocket,
   // extracted so shell_bridge_permission_ws.test.mjs can exercise them
   // directly. Keep them free of DOM/global access: everything they need
   // arrives as an argument, which is what makes them testable at all.
+  //
+  // This block must stay NESTED INSIDE `perm-overlay-flow`. Hoisting these
+  // pure helpers to module scope is the obvious next refactor, and it would
+  // break the #4849 F2 guard: every remaining `'prompt_added'` /
+  // `'prompt_removed'` literal inside the guarded region now lives in
+  // `permEventAction` below, and F2's non-vacuity check asserts the region
+  // still contains them. It fails loudly, but the message points at the guard
+  // rather than at the move, so this note is the signpost.
   function permSocketUrl(loc) {
     // Derive the scheme from the page so a TLS-served shell upgrades to wss
     // rather than tripping the browser's mixed-content block.
@@ -1960,6 +2012,22 @@ function freenetBridge(authToken, userToken, hostedMode) {
 
   function schedulePermReconnect() {
     if (permReconnectHandle !== null) return;
+    // Make a persistently degraded tab diagnosable. A tab stuck on the 3s poll
+    // (a proxy eating the upgrade, a node stuck at the subscriber cap, a
+    // downgraded node with no /ws route) still shows prompts, so it is
+    // otherwise indistinguishable from a healthy one. #5213 was hard to find
+    // for exactly that reason: nothing errored, so nothing surfaced. One line
+    // at a threshold, not per attempt, so it cannot become its own noise.
+    permConsecutiveFailures++;
+    if (permConsecutiveFailures === PERM_WARN_AFTER_FAILURES) {
+      try {
+        console.warn(
+          'Freenet: permission-event WebSocket has failed ' +
+            PERM_WARN_AFTER_FAILURES +
+            ' times; falling back to polling. Prompts still work but arrive up to 3s late.',
+        );
+      } catch (e) {}
+    }
     var jittered = permReconnectJitter(permReconnectDelay, Math.random());
     permReconnectHandle = setTimeout(function () {
       permReconnectHandle = null;
@@ -1972,21 +2040,40 @@ function freenetBridge(authToken, userToken, hostedMode) {
   }
 
   function openPermSocket() {
+    // Poll FIRST, and let `onopen` stop it. The poll is the always-on safety
+    // net and the socket is the accelerator, which is what this design claims
+    // to be. Starting it only from `onclose` left one gap: if the upgrade
+    // HANGS rather than fails — a reverse proxy swallowing `Upgrade:`, the
+    // common WebSocket-through-proxy failure — no close event fires, so a tab
+    // showed no prompts and ran no poll until the browser's own handshake
+    // timeout. This also covers the initial bootstrap, since startFallbackPoll
+    // reconciles immediately.
+    startFallbackPoll();
     var sock;
     try {
       sock = new WebSocket(permSocketUrl(location));
     } catch (err) {
       // Constructor throws on a malformed URL or a blocked scheme. Treat it
-      // exactly like a dropped socket so we still poll and still retry.
-      startFallbackPoll();
+      // exactly like a dropped socket: the poll is already running, so just
+      // schedule the retry.
       schedulePermReconnect();
       return;
     }
     permSocket = sock;
     sock.onopen = function () {
-      permReconnectDelay = 1000;
+      permConsecutiveFailures = 0;
       stopFallbackPoll();
       reconcileFromPending();
+      // Reset the backoff only once the socket has PROVEN stable, not the
+      // instant it opens. A peer that accepts the upgrade and drops it
+      // immediately (a reverse proxy that half-supports WebSockets) would
+      // otherwise pin the cycle at open -> reset to 1s -> close -> retry in
+      // ~1s, forever, with no growth and two /permission/pending fetches per
+      // cycle. That is the same shape of silent unbounded loop as #5213.
+      permStableTimer = setTimeout(function () {
+        permStableTimer = null;
+        permReconnectDelay = 1000;
+      }, PERM_STABLE_AFTER);
     };
     sock.onmessage = function (e) {
       try {
@@ -1996,21 +2083,30 @@ function freenetBridge(authToken, userToken, hostedMode) {
     // Recovery is driven from `close` alone. The socket always fires `close`
     // after `error`, so handling both would double-schedule the reconnect and
     // halve the effective backoff.
+    //
+    // Everything here is inside the identity guard. Only the CURRENT socket's
+    // close may drive recovery: if a future trigger (a `visibilitychange` or
+    // `online` handler, the natural next addition) ever opens a second socket,
+    // a stale socket's close would otherwise schedule a reconnect that
+    // orphans the live one, leaking a server-side slot until its send timeout.
     sock.onclose = function () {
-      if (permSocket === sock) permSocket = null;
+      if (permSocket !== sock) return;
+      permSocket = null;
+      if (permStableTimer !== null) {
+        clearTimeout(permStableTimer);
+        permStableTimer = null;
+      }
       startFallbackPoll();
       schedulePermReconnect();
     };
   }
+  // perm-ws-machine:END
 
   if (typeof WebSocket !== 'undefined') {
+    // openPermSocket starts the fallback poll itself, which also performs the
+    // initial bootstrap reconcile, so there is no separate bootstrap call
+    // here and no redundant fetch per retry.
     openPermSocket();
-    // Initial bootstrap so we're populated before the handshake completes
-    // (avoids a brief empty state on slow connections). Deliberately NOT
-    // inside openPermSocket: reconnect attempts already reconcile via the
-    // fallback poll on close and via `onopen` on success, so doing it per
-    // attempt would just add a redundant fetch to every retry.
-    reconcileFromPending();
   } else {
     // WebSocket missing in some embedded webviews -- fall back to the
     // legacy 3-second poll so users on those clients still see prompts.

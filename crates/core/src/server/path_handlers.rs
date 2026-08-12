@@ -5000,8 +5000,9 @@ mod tests {
                 && !html.contains("window.open(\"/permission/"),
             "shell must no longer open /permission/{{nonce}} as a popup (#3836)"
         );
-        // The visibility-gated polling loop has been replaced by SSE. SSE
-        // pushes regardless of tab visibility, so the visibility-skip code
+        // The visibility-gated polling loop was replaced by a pushed channel
+        // (SSE originally, a WebSocket since #5213). A push arrives
+        // regardless of tab visibility, so the visibility-skip code
         // path that caused the originating tab to silently miss prompts
         // when in the background MUST NOT be reintroduced. Pin this
         // contract by asserting `visibilityState` no longer appears in the

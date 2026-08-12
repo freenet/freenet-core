@@ -2,15 +2,24 @@
 //!
 //! When a delegate emits `RequestUserInput`, the `DashboardPrompter` stores the
 //! pending prompt and broadcasts a `PromptEvent::Added`. The gateway shell
-//! page's JS subscribes to `/permission/events` (Server-Sent Events) and
-//! renders the prompt as an in-page overlay (see issue #3836) on every open
-//! Freenet tab. When the user clicks a button in any tab the response is
-//! POSTed to `/permission/{nonce}/respond`; the gateway then emits
-//! `PromptEvent::Removed` and every tab dismisses its overlay.
+//! page's JS subscribes to `/permission/events/ws` (WebSocket) and renders the
+//! prompt as an in-page overlay (see issue #3836) on every open Freenet tab.
+//! When the user clicks a button in any tab the response is POSTed to
+//! `/permission/{nonce}/respond`; the gateway then emits `PromptEvent::Removed`
+//! and every tab dismisses its overlay.
 //!
-//! The legacy `/permission/pending` JSON polling endpoint is retained as a
-//! fallback for environments without `EventSource`, for the SSE bootstrap
-//! reconciliation (used on connect/reconnect/resync), and for tests. The
+//! The channel is a WebSocket rather than Server-Sent Events because every tab
+//! holds it for the tab's whole life and every Freenet app shares one origin:
+//! over SSE that permanently consumed one of the browser's ~6 HTTP/1.1
+//! connections per origin PER TAB, so a seventh tab's own document and assets
+//! queued forever behind the held-open streams (#5213). Browsers pool
+//! WebSockets separately and far more generously. The SSE route is still
+//! served for tabs opened before a node upgrade; see [`routes`].
+//!
+//! The `/permission/pending` JSON polling endpoint is retained as the
+//! always-on fallback while the socket is down or its handshake is hanging,
+//! for bootstrap reconciliation on connect/reconnect/resync, for environments
+//! with no `WebSocket`, and for tests. The
 //! standalone `/permission/{nonce}` HTML page is retained as a fallback
 //! (e.g. if JS is disabled in the shell, or for debugging / manual testing).
 //!
@@ -78,7 +87,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{Message, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, Path};
 use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -135,9 +144,19 @@ fn peer_is_loopback(connect_info: Option<&ConnectInfo<SocketAddr>>) -> bool {
 }
 
 /// Cap on simultaneous permission-event subscribers, across BOTH transports
-/// (the WebSocket channel and the legacy SSE stream). A single browser
-/// typically opens one subscriber per Freenet tab; 64 is generous headroom and
-/// protects against runaway tab counts or a buggy client looping reconnects.
+/// (the WebSocket channel and the legacy SSE stream). A single browser opens
+/// one subscriber per Freenet tab.
+///
+/// Note this number now BINDS where it previously could not. Its original
+/// "generous headroom" was calibrated against SSE, where the browser's own
+/// ~6-connections-per-origin limit meant one profile could never hold more
+/// than about six subscribers — which is the very bug #5213 fixed. WebSockets
+/// pool at ~255 per profile, so 65 tabs in one browser now reaches this cap.
+/// It is kept at 64 deliberately: past it, tabs degrade to the 3s
+/// `/permission/pending` poll rather than losing prompts, and 64 concurrent
+/// pump tasks plus broadcast receivers is a reasonable ceiling for a local
+/// node. Raise it only with a reason to believe the degraded path is being
+/// hit in practice.
 ///
 /// The cap is deliberately shared rather than per-transport: it bounds the
 /// number of live broadcast receivers and pump tasks, and that cost is the
@@ -520,13 +539,22 @@ async fn permission_respond(
     }
 }
 
-/// Combined origin check used by /permission/events.
+/// Combined origin check used by `/permission/events` (SSE) and, as one of
+/// two required checks, by `/permission/events/ws`.
 ///
-/// EventSource is the wire that matters here, and browsers send `Origin`
-/// only for cross-origin EventSource requests; same-origin GETs from the
-/// gateway shell page often arrive with no `Origin`. So we can't simply
-/// require a trusted `Origin`. Instead we combine two browser-attested
-/// signals:
+/// **This function alone is NOT sufficient for the WebSocket.** It accepts any
+/// localhost origin on any port, and it accepts a request with no `Origin` at
+/// all. On the SSE path both are safe: the trusted branch sets no
+/// `Access-Control-Allow-Origin`, so a cross-origin `EventSource` that passes
+/// this gate still has its body withheld by the browser — CORS is the real
+/// enforcement. WebSocket handshakes get no CORS and no same-origin policy, so
+/// that path pairs this with [`origin_is_exactly_same_origin`], which requires
+/// Origin authority == `Host`. Read that function before changing either.
+///
+/// On the SSE wire, browsers send `Origin` only for cross-origin `EventSource`
+/// requests; same-origin GETs from the gateway shell page often arrive with no
+/// `Origin`. So this check cannot simply require a trusted `Origin`. Instead
+/// it combines two browser-attested signals:
 ///
 /// * `Origin` present → must be a trusted loopback origin.
 /// * `Sec-Fetch-Site: cross-site` → reject regardless of `Origin`.
@@ -670,6 +698,53 @@ fn origin_matches_allowed_host(
         return false;
     };
     origin_authority.eq_ignore_ascii_case(host_header)
+}
+
+/// True iff the request carries an `Origin` whose authority is byte-equal
+/// (case-insensitively) to its `Host` header — i.e. exact same-origin.
+///
+/// This is STRICTER than [`is_caller_trusted`] and exists solely for the
+/// permission-event WebSocket. `is_origin_trusted` accepts any localhost
+/// origin on ANY port, and on the SSE path that leniency was harmless because
+/// the trusted branch deliberately sets no `Access-Control-Allow-Origin` (see
+/// the rationale on [`pending_prompts`]): a page on `http://localhost:3000`
+/// passed the server gate but the BROWSER withheld the body. CORS was doing
+/// the real enforcement.
+///
+/// WebSocket handshakes get no CORS. Without this check, any other page on any
+/// port of the same loopback host — a dev server, a notebook, another local
+/// app's UI, anything with an XSS on `127.0.0.1:*` — could open the socket and
+/// read raw permission nonces, delegate-authored prompt text, the delegate key
+/// and caller identity, and could hold slots against the subscriber cap.
+///
+/// A missing `Origin` is rejected too. `is_caller_trusted` tolerates its
+/// absence (a non-browser caller), but this endpoint exists ONLY for the shell
+/// page, and the whole cross-site argument rests on browsers being required to
+/// send `Origin` on every WebSocket handshake. Requiring it makes that
+/// reasoning load-bearing in code rather than in a comment.
+///
+/// The real client always satisfies this: `permSocketUrl` in `shell_bridge.js`
+/// builds the socket URL from `location.host`, so Origin authority and Host
+/// are the same string for both `127.0.0.1:7509` and `localhost:7509`.
+///
+/// Deliberately applied at the WebSocket gate rather than inside
+/// [`is_origin_trusted`], which is shared with `hosted_import` and
+/// `pending_prompts` — tightening it wholesale is a wider blast radius than
+/// this endpoint needs.
+fn origin_is_exactly_same_origin(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let Some(host_header) = headers
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+    else {
+        return false;
+    };
+    let Some(authority) = origin_authority(origin) else {
+        return false;
+    };
+    authority.eq_ignore_ascii_case(host_header)
 }
 
 /// Returns the scheme-stripped authority of an Origin header value with
@@ -918,11 +993,19 @@ async fn permission_events_ws(
 
     // Cross-origin rejection, BEFORE consuming a slot, so a hostile page
     // cannot exhaust the cap by looping handshakes. See the CSWSH note above.
+    //
+    // BOTH checks are required and neither subsumes the other:
+    // `is_caller_trusted` applies the shared policy (allowed hosts, operator
+    // CIDRs, `Sec-Fetch-Site`, `Origin: null`), while
+    // `origin_is_exactly_same_origin` closes the cross-PORT localhost hole
+    // that CORS silently covered on the SSE path and cannot cover here. Do
+    // not drop either one.
     if !is_caller_trusted(
         &headers,
         allowed_hosts.as_ref().map(|Extension(v)| v),
         allowed_source_cidrs.as_ref().map(|Extension(v)| v),
-    ) {
+    ) || !origin_is_exactly_same_origin(&headers)
+    {
         tracing::debug!("Rejecting /permission/events/ws upgrade from untrusted origin");
         return axum::http::StatusCode::FORBIDDEN.into_response();
     }
@@ -959,9 +1042,30 @@ async fn permission_events_ws(
         })
         .collect();
 
-    ws.on_upgrade(move |socket| async move {
-        pump_permission_events(socket, rx, initial, guard).await;
-    })
+    // This channel is strictly server->client; the inbound arm discards
+    // everything it reads and exists only to observe disconnects. Left at the
+    // tungstenite defaults that would be 64 MiB per message and 16 MiB per
+    // frame of buffering per socket, times the subscriber cap, for data that
+    // is thrown away. Cap it at something no legitimate client exceeds.
+    ws.max_message_size(1024)
+        .max_frame_size(1024)
+        .on_upgrade(move |socket| async move {
+            let (sink, stream) = socket.split();
+            pump_permission_events(sink, stream, rx, initial, guard).await;
+        })
+}
+
+/// Bounded send: see [`PERMISSION_WS_SEND_TIMEOUT`]. Returns false when the
+/// socket is gone or too slow, which ends the pump and frees the slot.
+async fn send_bounded<Si>(sink: &mut Si, msg: Message) -> bool
+where
+    Si: futures::Sink<Message> + Unpin,
+{
+    use futures::SinkExt;
+    matches!(
+        tokio::time::timeout(PERMISSION_WS_SEND_TIMEOUT, sink.send(msg)).await,
+        Ok(Ok(()))
+    )
 }
 
 /// Drives one permission-event WebSocket until the client goes away.
@@ -971,32 +1075,40 @@ async fn permission_events_ws(
 /// losing a race never drops an event. The guard is moved in and dropped on
 /// return, releasing the subscriber slot on every exit path including error
 /// and client disconnect.
-async fn pump_permission_events(
-    socket: WebSocket,
+///
+/// Generic over the socket halves rather than taking a `WebSocket` so tests
+/// can drive the real state machine with a sink that never accepts (proving
+/// the send timeout fires and releases the slot) and with a deliberately
+/// lagged broadcast receiver (proving the `resync` branch fires). Neither is
+/// reachable through a real socket without a flaky timing setup, and both are
+/// safety mechanisms this fix's own argument depends on.
+async fn pump_permission_events<Si, St, E>(
+    mut sink: Si,
+    mut stream: St,
     mut rx: tokio::sync::broadcast::Receiver<PromptEvent>,
     initial: Vec<String>,
     _guard: PermissionSubscriberGuard,
-) {
-    use futures::SinkExt;
-
-    let (mut sink, mut stream) = socket.split();
-
-    // Bounded send: see PERMISSION_WS_SEND_TIMEOUT. Returns false when the
-    // socket is gone or too slow, which ends the pump and frees the slot.
-    async fn send_bounded(
-        sink: &mut futures::stream::SplitSink<WebSocket, Message>,
-        msg: Message,
-    ) -> bool {
-        matches!(
-            tokio::time::timeout(PERMISSION_WS_SEND_TIMEOUT, sink.send(msg)).await,
-            Ok(Ok(()))
-        )
-    }
-
-    for payload in initial {
-        if !send_bounded(&mut sink, Message::Text(payload.into())).await {
-            return;
+) where
+    Si: futures::Sink<Message> + Unpin,
+    St: futures::Stream<Item = Result<Message, E>> + Unpin,
+{
+    // ONE deadline for the whole replay phase, not one per message. With
+    // `MAX_PENDING_PROMPTS = 32` in flight, a per-message deadline would let a
+    // client that completes the handshake and then stops reading hold its slot
+    // for ~32 x PERMISSION_WS_SEND_TIMEOUT (~320s) rather than the 10s the
+    // constant's contract implies.
+    let replay = tokio::time::timeout(PERMISSION_WS_SEND_TIMEOUT, async {
+        use futures::SinkExt;
+        for payload in initial {
+            if sink.send(Message::Text(payload.into())).await.is_err() {
+                return false;
+            }
         }
+        true
+    })
+    .await;
+    if !matches!(replay, Ok(true)) {
+        return;
     }
 
     let mut ping = tokio::time::interval(PERMISSION_WS_PING_INTERVAL);
@@ -3147,6 +3259,14 @@ mod tests {
         SocketAddr::from(([127, 0, 0, 1], 45678))
     }
 
+    /// The Origin a legitimate shell page would send: exactly the authority it
+    /// was served from, which is what tungstenite also puts in `Host`. Any
+    /// OTHER localhost origin (a different port) must now be refused, so tests
+    /// cannot use a hard-coded `http://localhost:7509` here.
+    fn same_origin(addr: SocketAddr) -> String {
+        format!("http://{addr}")
+    }
+
     async fn spawn_ws_server(app: Router) -> SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3190,7 +3310,7 @@ mod tests {
     #[serial_test::serial(sse_global_counter)]
     async fn permission_ws_accepts_same_origin_loopback_handshake() {
         let addr = spawn_ws_server(ws_test_app(empty_pending(), Some(loopback_peer()))).await;
-        let sock = try_ws_connect(addr, Some("http://localhost:7509")).await;
+        let sock = try_ws_connect(addr, Some(&same_origin(addr))).await;
         assert!(
             sock.is_ok(),
             "a same-origin loopback upgrade must be accepted; if this fails the \
@@ -3232,6 +3352,59 @@ mod tests {
         }
     }
 
+    /// The hole CORS was silently covering on the SSE path.
+    ///
+    /// `is_origin_trusted` accepts ANY localhost origin on ANY port. Over SSE
+    /// that was harmless: the trusted branch sets no
+    /// `Access-Control-Allow-Origin`, so a page on `http://localhost:3000`
+    /// passed the server gate and the BROWSER withheld the body. WebSocket
+    /// handshakes get no CORS, so without an exact same-origin check any other
+    /// local web app — a dev server, a notebook, anything with an XSS on
+    /// `127.0.0.1:*` — could read raw permission nonces and delegate-authored
+    /// prompt text, and hold slots against the subscriber cap.
+    ///
+    /// These origins all pass `is_caller_trusted`; only
+    /// `origin_is_exactly_same_origin` rejects them. That makes this test the
+    /// sole guard on that check.
+    #[tokio::test]
+    #[serial_test::serial(sse_global_counter)]
+    async fn permission_ws_rejects_other_localhost_ports() {
+        let addr = spawn_ws_server(ws_test_app(empty_pending(), Some(loopback_peer()))).await;
+        for other in [
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "http://[::1]:3000",
+            "https://localhost:7509",
+        ] {
+            let result = try_ws_connect(addr, Some(other)).await;
+            assert_eq!(
+                result.err(),
+                Some(403),
+                "a page on {other} is a DIFFERENT origin from the node and must not \
+                 read the permission stream; CORS covered this on SSE and cannot here"
+            );
+        }
+    }
+
+    /// A handshake with no `Origin` at all must be refused.
+    ///
+    /// `is_caller_trusted` tolerates a missing Origin (a non-browser caller),
+    /// but this endpoint exists only for the shell page and the entire
+    /// cross-site argument rests on browsers being REQUIRED to send Origin on
+    /// every WebSocket handshake. Rejecting the absent case puts that
+    /// reasoning in the code rather than in a comment.
+    #[tokio::test]
+    #[serial_test::serial(sse_global_counter)]
+    async fn permission_ws_rejects_handshake_without_origin() {
+        let addr = spawn_ws_server(ws_test_app(empty_pending(), Some(loopback_peer()))).await;
+        let result = try_ws_connect(addr, None).await;
+        assert_eq!(
+            result.err(),
+            Some(403),
+            "an Origin-less handshake must be refused, not treated as trusted"
+        );
+    }
+
     /// Loopback boundary parity with the SSE stream (#3819). The socket emits
     /// raw nonces, so an off-box LAN peer must be refused even when the main
     /// listener binds 0.0.0.0.
@@ -3240,7 +3413,7 @@ mod tests {
     async fn permission_ws_rejects_lan_peer() {
         let lan = SocketAddr::from(([192, 168, 1, 50], 40000));
         let addr = spawn_ws_server(ws_test_app(empty_pending(), Some(lan))).await;
-        let result = try_ws_connect(addr, Some("http://localhost:7509")).await;
+        let result = try_ws_connect(addr, Some(&same_origin(addr))).await;
         assert_eq!(
             result.err(),
             Some(403),
@@ -3256,7 +3429,7 @@ mod tests {
     #[serial_test::serial(sse_global_counter)]
     async fn permission_ws_rejects_missing_connect_info() {
         let addr = spawn_ws_server(ws_test_app(empty_pending(), None)).await;
-        let result = try_ws_connect(addr, Some("http://localhost:7509")).await;
+        let result = try_ws_connect(addr, Some(&same_origin(addr))).await;
         assert_eq!(
             result.err(),
             Some(403),
@@ -3277,6 +3450,26 @@ mod tests {
     async fn permission_ws_honours_shared_subscriber_cap() {
         let addr = spawn_ws_server(ws_test_app(empty_pending(), Some(loopback_peer()))).await;
 
+        // Wait for the counter to settle before sampling the baseline.
+        // WebSocket slots are released by a server-side SPAWNED TASK when it
+        // observes the disconnect, not synchronously like the SSE path's
+        // `GuardedStream` (which lives in a response body the test itself
+        // drops). `serial_test`'s lock releases at the end of the async body,
+        // BEFORE `#[tokio::test]` tears the runtime down, so a previous test's
+        // pump can still be unwinding when this one starts. Without this loop
+        // the baseline can be read high and drop mid-test, which both breaks
+        // the assert below and would let the "must be refused" handshake
+        // wrongly succeed. Same shape as the SSE cap test's quiesce loop.
+        let settle = tokio::time::Instant::now() + Duration::from_secs(5);
+        while PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed) != 0 {
+            if tokio::time::Instant::now() >= settle {
+                // A genuinely leaked slot is a real bug, but for this test's
+                // purposes accept the baseline rather than fail on it.
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
         // Fill every slot through the SAME helper the SSE path uses. If the
         // WebSocket had its own counter these would be invisible to it and the
         // handshake below would wrongly succeed.
@@ -3290,7 +3483,7 @@ mod tests {
             MAX_PERMISSION_SUBSCRIBERS
         );
 
-        let refused = try_ws_connect(addr, Some("http://localhost:7509")).await;
+        let refused = try_ws_connect(addr, Some(&same_origin(addr))).await;
         assert_eq!(
             refused.err(),
             Some(503),
@@ -3299,13 +3492,66 @@ mod tests {
 
         // Release one slot; the next handshake must be admitted.
         held.pop();
-        let admitted = try_ws_connect(addr, Some("http://localhost:7509")).await;
+        let admitted = try_ws_connect(addr, Some(&same_origin(addr))).await;
         assert!(
             admitted.is_ok(),
             "freeing a slot must re-admit; a cap rejection must be transient (got {:?})",
             admitted.err()
         );
         drop(held);
+    }
+
+    /// A LIVE socket must hold exactly one slot, and dropping the client must
+    /// return it.
+    ///
+    /// The cap test above fills slots with guards directly, so nothing there
+    /// proves the guard survives into `pump_permission_events` (it is passed
+    /// as `_guard`) — a regression dropping it early would admit unlimited
+    /// sockets with every existing test still green. Nor does anything prove
+    /// release on disconnect; a leak there wedges the channel at 64 for the
+    /// node's lifetime and silently degrades every tab to 3s polling, which is
+    /// the same failure class as #5213 itself.
+    #[tokio::test]
+    #[serial_test::serial(sse_global_counter)]
+    async fn permission_ws_slot_is_held_while_live_and_released_on_disconnect() {
+        let addr = spawn_ws_server(ws_test_app(empty_pending(), Some(loopback_peer()))).await;
+
+        let settle = tokio::time::Instant::now() + Duration::from_secs(5);
+        while PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed) != 0 {
+            if tokio::time::Instant::now() >= settle {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let baseline = PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed);
+
+        let sock = try_ws_connect(addr, Some(&same_origin(addr)))
+            .await
+            .expect("handshake must succeed");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed) != baseline + 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a live socket must hold exactly one subscriber slot (saw {}, expected {})",
+                PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed),
+                baseline + 1
+            );
+            tokio::task::yield_now().await;
+        }
+
+        drop(sock);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed) != baseline {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the slot must be released when the client disconnects, or the \
+                 channel wedges at the cap for the node's lifetime (stuck at {})",
+                PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// Read frames until one satisfies `pred`, ignoring pings and any events
@@ -3338,7 +3584,7 @@ mod tests {
     async fn permission_ws_delivers_added_and_removed_end_to_end() {
         let initial_subs = prompt_events().receiver_count();
         let addr = spawn_ws_server(ws_test_app(empty_pending(), Some(loopback_peer()))).await;
-        let mut sock = try_ws_connect(addr, Some("http://localhost:7509"))
+        let mut sock = try_ws_connect(addr, Some(&same_origin(addr)))
             .await
             .expect("handshake must succeed");
 
@@ -3396,7 +3642,7 @@ mod tests {
             webapp_caller("cid-ws-replay"),
         );
         let addr = spawn_ws_server(ws_test_app(pending, Some(loopback_peer()))).await;
-        let mut sock = try_ws_connect(addr, Some("http://localhost:7509"))
+        let mut sock = try_ws_connect(addr, Some(&same_origin(addr)))
             .await
             .expect("handshake must succeed");
 
@@ -3410,13 +3656,18 @@ mod tests {
         assert_eq!(replayed["data"]["message"], "pre-existing");
     }
 
-    /// The envelope is the whole wire contract between this handler and the
-    /// shell bridge: the bridge dispatches on `event` and reads `data`, so a
-    /// change to either shape silently stops prompts rendering. Event names
-    /// and `data` payloads must match the SSE stream exactly, which is what
-    /// lets the bridge share one set of handlers.
+    /// `ws_envelope` must wrap its payload without altering it: the bridge
+    /// dispatches on `event` and reads `data`, so a change to either key
+    /// silently stops prompts rendering.
+    ///
+    /// Named for what it actually checks. It does NOT read the SSE handler, so
+    /// it cannot prove cross-transport agreement — the expected value is
+    /// computed with the same `snapshot_to_json` the production path calls, so
+    /// it is self-consistency plus a pin on the `event`/`data` key names. The
+    /// event names themselves are covered off-the-wire by the end-to-end tests
+    /// above, which is where a rename would actually be caught.
     #[test]
-    fn ws_envelope_matches_the_sse_event_contract() {
+    fn ws_envelope_wraps_data_unchanged() {
         let snapshot = PromptSnapshot {
             nonce: "n1".into(),
             message: "m".into(),
@@ -3442,5 +3693,130 @@ mod tests {
         let resync: serde_json::Value =
             serde_json::from_str(&ws_envelope("resync", serde_json::json!({}))).unwrap();
         assert_eq!(resync["event"], "resync");
+    }
+
+    /// A sink that never accepts a message: models a client that stopped
+    /// reading (suspended tab, wedged renderer) with its receive window full.
+    struct StalledSink;
+
+    impl futures::Sink<Message> for StalledSink {
+        type Error = std::convert::Infallible;
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+        fn start_send(self: std::pin::Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+            unreachable!("start_send is unreachable while poll_ready never completes")
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    fn never_inbound() -> futures::stream::Pending<Result<Message, std::convert::Infallible>> {
+        futures::stream::pending()
+    }
+
+    /// A subscriber that falls behind must be told to `resync`, not left
+    /// silently missing prompts. Drives the REAL pump with a deliberately
+    /// lapped receiver: capacity 2 with five sends queued before the pump ever
+    /// polls, so its first `recv` returns `Lagged`.
+    ///
+    /// The SSE transport has an equivalent (`test_sse_emits_resync_on_lag`);
+    /// without this, the WebSocket's lag branch was pinned only by the shape
+    /// of a hand-built envelope and never actually executed.
+    #[tokio::test]
+    #[serial_test::serial(sse_global_counter)]
+    async fn permission_ws_pump_emits_resync_when_the_broadcast_laps_it() {
+        let (tx, rx) = tokio::sync::broadcast::channel::<PromptEvent>(2);
+        for i in 0..5 {
+            drop(tx.send(PromptEvent::Removed {
+                nonce: format!("lag-{i}"),
+            }));
+        }
+
+        let (sink, mut out) = futures::channel::mpsc::unbounded::<Message>();
+        let guard = try_claim_subscriber_slot().expect("a slot must be free");
+        let pump = tokio::spawn(pump_permission_events(
+            sink,
+            never_inbound(),
+            rx,
+            Vec::new(),
+            guard,
+        ));
+
+        let msg = tokio::time::timeout(Duration::from_secs(5), out.next())
+            .await
+            .expect("the pump must emit promptly after a lag")
+            .expect("the sink must receive a frame");
+        let Message::Text(text) = msg else {
+            panic!("expected a text frame");
+        };
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            value["event"], "resync",
+            "a lapped subscriber must be told to resync so the shell re-bootstraps \
+             from /permission/pending; silently dropping the gap loses prompts"
+        );
+
+        pump.abort();
+    }
+
+    /// The send timeout must actually fire and release the subscriber slot.
+    ///
+    /// This is the mechanism `PERMISSION_WS_SEND_TIMEOUT` exists for: without
+    /// it, one client that stops reading pins a slot against
+    /// `MAX_PERMISSION_SUBSCRIBERS` forever, and 64 such clients deny the
+    /// permission channel to every legitimate tab. The fix's own safety
+    /// argument rests on this, so it is tested rather than asserted.
+    ///
+    /// Time is paused, so the wait costs no wall-clock; the assertion is that
+    /// the pump RETURNS at all rather than hanging in `send`.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(sse_global_counter)]
+    async fn permission_ws_pump_gives_up_on_a_client_that_stops_reading() {
+        let baseline = PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed);
+        let guard = try_claim_subscriber_slot().expect("a slot must be free");
+        assert_eq!(
+            PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed),
+            baseline + 1,
+            "the guard must have claimed a slot"
+        );
+
+        // Keep the sender alive so the pump blocks on the stalled sink rather
+        // than exiting early via `RecvError::Closed`.
+        let (_tx, rx) = tokio::sync::broadcast::channel::<PromptEvent>(8);
+        // One queued frame is enough: the pump tries to send it immediately,
+        // before it ever reaches the select! loop.
+        let pump = tokio::spawn(pump_permission_events(
+            StalledSink,
+            never_inbound(),
+            rx,
+            vec![ws_envelope("resync", serde_json::json!({}))],
+            guard,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(120), pump)
+            .await
+            .expect("the pump must give up on a stalled client, not hang forever")
+            .expect("the pump task must not panic");
+
+        assert_eq!(
+            PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed),
+            baseline,
+            "the subscriber slot must be released once the pump gives up, or a \
+             stalled client pins it against the cap permanently"
+        );
     }
 }

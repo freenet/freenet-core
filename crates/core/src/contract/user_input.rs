@@ -105,7 +105,7 @@ pub(crate) fn pending_prompts() -> PendingPrompts {
 /// Maximum concurrent pending prompts to prevent memory exhaustion.
 const MAX_PENDING_PROMPTS: usize = 32;
 
-/// Snapshot of a prompt's display fields, sufficient for the SSE handler to
+/// Snapshot of a prompt's display fields, sufficient for the event handlers to
 /// render an `Added` event without holding the DashMap entry. Cloned out of
 /// the registry so the broadcast path doesn't pin the entry's lock.
 #[derive(Clone, Debug)]
@@ -117,7 +117,8 @@ pub(crate) struct PromptSnapshot {
     pub caller: CallerIdentity,
 }
 
-/// Lifecycle event for a permission prompt. Consumed by the SSE endpoint to
+/// Lifecycle event for a permission prompt. Consumed by the permission-event
+/// endpoints (WebSocket, and the retained SSE route) to
 /// push state changes to every open Freenet tab in real time. The polling
 /// endpoint at `/permission/pending` is retained as a fallback and is not
 /// driven by this stream.
@@ -129,8 +130,9 @@ pub(crate) enum PromptEvent {
 
 /// Broadcast capacity. Each lifecycle is two events (Added + Removed), and
 /// MAX_PENDING_PROMPTS caps concurrent in-flight prompts at 32, so 128 leaves
-/// healthy headroom even if a transient SSE subscriber lags briefly. On
-/// `RecvError::Lagged`, the SSE handler resyncs from the DashMap snapshot.
+/// healthy headroom even if a transient subscriber lags briefly. On
+/// `RecvError::Lagged`, the handler emits `resync` and the client
+/// re-bootstraps from `/permission/pending`.
 const PROMPT_EVENT_CAPACITY: usize = 128;
 
 /// Global lifecycle broadcast for permission prompts.
@@ -210,7 +212,8 @@ impl DashboardPrompter {
     }
 
     /// Alert the user out-of-band when a freshly-created prompt has no dashboard
-    /// tab to display it. `subscriber_count` is the number of live SSE
+    /// tab to display it. `subscriber_count` is the number of live
+    /// permission-event
     /// subscribers to the prompt-event broadcast
     /// ([`prompt_events()`]`.receiver_count()`); each connected gateway tab
     /// holds exactly one. Zero means every tab is closed, so the prompt would
@@ -400,7 +403,7 @@ impl UserInputPrompter for DashboardPrompter {
             },
         );
 
-        // Fire the broadcast Added event AFTER the DashMap insert so any SSE
+        // Fire the broadcast Added event AFTER the DashMap insert so any
         // subscriber that wakes up on the event can immediately find the entry
         // if it falls back to a registry lookup.
         emit_prompt_event(PromptEvent::Added(PromptSnapshot {

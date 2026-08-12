@@ -159,6 +159,186 @@ function check(name, cond) {
   }
 }
 
+// 6. The STATEFUL half: connection lifecycle, fallback-poll transitions and
+//    reconnect backoff. Sections 2-5 cover pure helpers; everything that
+//    actually decides whether a tab recovers from a node restart lives here.
+//    Without this, deleting the backoff reset or the poll-on-close still
+//    passed every test while leaving every tab degraded.
+//
+//    The region is run against stubbed `WebSocket`, timers and `fetch`, so no
+//    real IO happens and time is advanced by hand.
+{
+  function buildMachine() {
+    const calls = { polls: 0, stops: 0, reconciles: 0, sockets: [] };
+    const timers = [];
+    let now = 0;
+
+    function setTimeoutStub(fn, ms) {
+      const t = { fn, at: now + ms, cancelled: false };
+      timers.push(t);
+      return t;
+    }
+    function clearTimeoutStub(t) {
+      if (t) t.cancelled = true;
+    }
+    function advance(ms) {
+      now += ms;
+      // Copy: a fired timer may schedule another.
+      for (const t of timers.slice()) {
+        if (!t.cancelled && t.at <= now) {
+          t.cancelled = true;
+          t.fn();
+        }
+      }
+    }
+
+    class FakeWebSocket {
+      constructor(url) {
+        this.url = url;
+        calls.sockets.push(this);
+      }
+      open() {
+        if (this.onopen) this.onopen();
+      }
+      close() {
+        if (this.onclose) this.onclose();
+      }
+    }
+
+    const src = extractFrom('perm-ws-machine:BEGIN', 'perm-ws-machine:END', 'var permSocket');
+    const factory = new Function(
+      'WebSocket',
+      'setTimeout',
+      'clearTimeout',
+      'Math',
+      'location',
+      'console',
+      'calls',
+      `
+      function startFallbackPoll() { calls.polls++; }
+      function stopFallbackPoll() { calls.stops++; }
+      function reconcileFromPending() { calls.reconciles++; }
+      var overlayCards = {};
+      function showCard() {}
+      function hideCard() {}
+      function createCard() { return {}; }
+      ${src}
+      return {
+        openPermSocket: openPermSocket,
+        state: function () {
+          return { delay: permReconnectDelay, socket: permSocket };
+        },
+      };
+      `,
+    );
+    // Deterministic jitter at the midpoint, so scheduled delays are nominal.
+    // Built explicitly rather than spread from `Math`, whose methods are
+    // non-enumerable and would silently not be copied.
+    const mathStub = { min: Math.min, max: Math.max, random: () => 0.5 };
+    const machine = factory(
+      FakeWebSocket,
+      setTimeoutStub,
+      clearTimeoutStub,
+      mathStub,
+      { protocol: 'http:', host: '127.0.0.1:7509' },
+      { warn() {} },
+      calls,
+    );
+    return { machine, calls, advance, timers };
+  }
+
+  // 6a. Opening starts the fallback poll immediately, so a HANGING handshake
+  //     (a proxy swallowing Upgrade:) still shows prompts. This is the gap
+  //     that existed when the poll started only from `onclose`.
+  {
+    const { machine, calls } = buildMachine();
+    machine.openPermSocket();
+    check('opening starts the fallback poll before the socket resolves', calls.polls === 1);
+    check('a socket was constructed', calls.sockets.length === 1);
+    check(
+      'the socket URL is the ws endpoint',
+      calls.sockets[0].url === 'ws://127.0.0.1:7509/permission/events/ws',
+    );
+  }
+
+  // 6b. A successful open stops the poll and reconciles.
+  {
+    const { machine, calls } = buildMachine();
+    machine.openPermSocket();
+    calls.sockets[0].open();
+    check('open stops the fallback poll', calls.stops === 1);
+    check('open reconciles so nothing is missed across the gap', calls.reconciles >= 1);
+  }
+
+  // 6c. Close restarts the poll and schedules exactly one reconnect.
+  {
+    const { machine, calls, advance } = buildMachine();
+    machine.openPermSocket();
+    calls.sockets[0].open();
+    calls.sockets[0].close();
+    check('close restarts the fallback poll', calls.polls === 2);
+    advance(5000);
+    check('close schedules exactly one reconnect', calls.sockets.length === 2);
+  }
+
+  // 6d. The backoff must NOT reset the instant the socket opens. A peer that
+  //     accepts the upgrade then drops it immediately would otherwise pin
+  //     retries at ~1s forever with no growth — the same shape of silent
+  //     unbounded loop as #5213 itself.
+  //
+  //     The assertion must check COMPOUND growth, not merely `> 1000`. With
+  //     an immediate reset each cycle is reset-to-1s then double-to-2s, so a
+  //     `> 1000` check passes under the very bug it is meant to catch — this
+  //     test was vacuous until a mutation run caught it. Four cycles give
+  //     1s→2s→4s→8s→16s when correct, versus a flat 2s when broken.
+  {
+    const { machine, calls, advance } = buildMachine();
+    machine.openPermSocket();
+    for (let i = 0; i < 4; i++) {
+      const sock = calls.sockets[calls.sockets.length - 1];
+      sock.open();
+      sock.close(); // dies immediately, well inside PERM_STABLE_AFTER
+      advance(60000);
+    }
+    check(
+      'accept-then-immediately-close compounds the backoff (not pinned at ~1Hz)',
+      machine.state().delay >= 8000,
+    );
+  }
+
+  // 6e. A socket that stays up past the stability window DOES reset it, so a
+  //     genuine recovery is fast rather than stuck at the 30s ceiling.
+  {
+    const { machine, calls, advance } = buildMachine();
+    machine.openPermSocket();
+    // Drive the delay up first.
+    for (let i = 0; i < 3; i++) {
+      const s = calls.sockets[calls.sockets.length - 1];
+      s.open();
+      s.close();
+      advance(60000);
+    }
+    const grown = machine.state().delay;
+    check('precondition: backoff grew', grown > 1000);
+    calls.sockets[calls.sockets.length - 1].open();
+    advance(15000); // past PERM_STABLE_AFTER
+    check('a stable socket resets the backoff to 1s', machine.state().delay === 1000);
+  }
+
+  // 6f. No double-scheduling: a second close while a reconnect is pending must
+  //     not queue a second one (that would halve the effective backoff).
+  {
+    const { machine, calls, advance } = buildMachine();
+    machine.openPermSocket();
+    const sock = calls.sockets[0];
+    sock.open();
+    sock.close();
+    sock.close(); // stale close on an already-cleared socket
+    advance(5000);
+    check('a duplicate close does not double-schedule', calls.sockets.length === 2);
+  }
+}
+
 if (failures > 0) {
   console.error(`permission-ws: ${failures} check(s) failed`);
   process.exit(1);
