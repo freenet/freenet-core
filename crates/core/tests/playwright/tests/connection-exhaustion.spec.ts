@@ -57,14 +57,26 @@ test.describe.configure({ timeout: 180_000 });
 // Track every request the page issues and which of them have completed, so a
 // request that is being held open is distinguishable from one that finished.
 function trackInFlight(page: Page): {
-  inFlight: () => Request[];
+  heldOpen: () => string[];
 } {
   const started = new Map<Request, number>();
   page.on("request", (r) => started.set(r, Date.now()));
   page.on("requestfinished", (r) => started.delete(r));
   page.on("requestfailed", (r) => started.delete(r));
   return {
-    inFlight: () => [...started.keys()],
+    // Only requests that have been outstanding LONGER than the threshold
+    // count. A bare "anything in flight right now" sample is wrong twice over:
+    // the shell issues a /permission/pending fetch on load and every 3s until
+    // the socket opens, so on a contended runner one can legitimately be in
+    // flight at the sample instant, and a slow-but-completing asset would be
+    // reported as "#5213 is back" — pointing the next reader at the wrong
+    // cause. Age is what separates HELD from merely slow.
+    heldOpen: () => {
+      const now = Date.now();
+      return [...started.entries()]
+        .filter(([, at]) => now - at >= HELD_OPEN_AFTER_MS)
+        .map(([r, at]) => `${r.method()} ${r.url()} (open ${now - at}ms)`);
+    },
   };
 }
 
@@ -72,14 +84,33 @@ function trackInFlight(page: Page): {
 // positive control for the tab tests below: without it they could pass simply
 // because the shell subscribed to nothing at all, which would hold no
 // connection and prove nothing about the fix.
-function trackPermissionSockets(page: Page): { urls: string[] } {
-  const urls: string[] = [];
+function trackPermissionSockets(page: Page): {
+  live: () => number;
+  failed: () => string[];
+} {
+  // Playwright emits `websocket` when the socket is CREATED, before the
+  // handshake resolves — a 403'd upgrade fires it too. Counting creations
+  // would therefore stay green even if every tab's permission socket were
+  // refused: the shell would silently fall back to the 3s poll, hold no HTTP
+  // request open, and the whole spec would pass while proving nothing.
+  //
+  // That matters here specifically. The same-origin gate is the strictest new
+  // check on this route and this spec is the only place it runs against a real
+  // browser, so a per-engine Origin/Host formatting difference would ship as a
+  // silent degradation — exactly the failure class this PR is about. Track
+  // whether the socket SURVIVED instead.
+  let created = 0;
+  let closed = 0;
+  const failed: string[] = [];
   page.on("websocket", (ws) => {
-    if (ws.url().includes("/permission/events")) {
-      urls.push(ws.url());
-    }
+    if (!ws.url().includes("/permission/events")) return;
+    created++;
+    ws.on("socketerror", (err) => failed.push(`${ws.url()}: ${err}`));
+    ws.on("close", () => {
+      closed++;
+    });
   });
-  return { urls };
+  return { live: () => created - closed, failed: () => failed };
 }
 
 test("the shell holds no HTTP request open for the life of the tab (#5213)", async ({
@@ -95,7 +126,7 @@ test("the shell holds no HTTP request open for the life of the tab (#5213)", asy
   // merely slow, and give the permission subscription time to be established.
   await page.waitForTimeout(HELD_OPEN_AFTER_MS);
 
-  const stuck = tracker.inFlight().map((r) => `${r.method()} ${r.url()}`);
+  const stuck = tracker.heldOpen();
   expect(
     stuck,
     "the shell must not hold any HTTP request open: each one permanently " +
@@ -105,20 +136,26 @@ test("the shell holds no HTTP request open for the life of the tab (#5213)", asy
       "fetch() or a long-poll would break it the same way.",
   ).toEqual([]);
 
-  // Non-vacuity: the permission channel must actually exist. If it did not,
-  // the assertion above would pass for the wrong reason.
+  // Non-vacuity: the permission channel must exist AND have been accepted. If
+  // it did not exist, or the handshake were refused, the assertion above would
+  // pass for the wrong reason.
   expect(
-    sockets.urls,
-    "the shell must subscribe to permission prompts over a WebSocket, which " +
-      "browsers pool separately from the per-origin HTTP budget",
-  ).not.toEqual([]);
+    sockets.failed(),
+    "the permission WebSocket handshake must not error",
+  ).toEqual([]);
+  expect(
+    sockets.live(),
+    "the shell must hold a LIVE permission WebSocket, which browsers pool " +
+      "separately from the per-origin HTTP budget. A refused handshake would " +
+      "also hold no HTTP request open, so counting attempts proves nothing",
+  ).toBeGreaterThan(0);
 });
 
 test(`${TAB_COUNT} Freenet tabs can be open at once and a ${TAB_COUNT + 1}th still loads (#5213)`, async ({
   context,
 }) => {
   const pages: Page[] = [];
-  const socketTrackers: Array<{ urls: string[] }> = [];
+  const socketTrackers: Array<ReturnType<typeof trackPermissionSockets>> = [];
 
   // Same BrowserContext for every tab: the per-origin connection budget is a
   // property of the profile, so separate contexts would each get their own
@@ -142,11 +179,15 @@ test(`${TAB_COUNT} Freenet tabs can be open at once and a ${TAB_COUNT + 1}th sti
   // holds no connection and says nothing about #5213.
   for (let i = 0; i < TAB_COUNT; i++) {
     await expect
-      .poll(() => socketTrackers[i].urls.length, {
-        message: `tab ${i + 1} never opened a permission WebSocket, so this run proves nothing about connection exhaustion`,
+      .poll(() => socketTrackers[i].live(), {
+        message: `tab ${i + 1} has no LIVE permission WebSocket, so this run proves nothing about connection exhaustion`,
         timeout: 15_000,
       })
       .toBeGreaterThan(0);
+    expect(
+      socketTrackers[i].failed(),
+      `tab ${i + 1}'s permission WebSocket errored`,
+    ).toEqual([]);
   }
 
   // The user-visible symptom was "new links stop loading" — a NEW navigation

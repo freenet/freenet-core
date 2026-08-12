@@ -417,7 +417,8 @@ impl UserInputPrompter for DashboardPrompter {
         // #3820: if no dashboard tab is connected to display this prompt, the
         // user would never see it and it would silently auto-deny after
         // USER_INPUT_TIMEOUT. A connected gateway tab subscribes to the
-        // prompt-event broadcast (one receiver per SSE connection), so zero
+        // prompt-event broadcast (one receiver per WebSocket or legacy SSE
+        // subscriber), so zero
         // receivers means every tab is closed -- open the standalone permission
         // page in the user's browser so the prompt stays actionable. On a
         // headless service (no DISPLAY/WAYLAND_DISPLAY) the browser-open is a
@@ -439,7 +440,7 @@ impl UserInputPrompter for DashboardPrompter {
         // Always emit Removed so subscribers can hide their overlay
         // regardless of which path retired the prompt; a duplicate Removed
         // (when both the HTTP handler and this cleanup fire) is harmless,
-        // because the SSE client's hide is idempotent on nonce.
+        // because the shell client's hide is idempotent on nonce.
         let was_present = self.pending.remove(&nonce).is_some();
         if was_present {
             emit_prompt_event(PromptEvent::Removed {
@@ -984,7 +985,8 @@ mod tests {
         // That path is only fired when the prompter's own cleanup
         // actually removes the entry (timeout / channel-dropped paths).
         // The HTTP `/respond` handler fires Removed in the success
-        // path; that's covered by the SSE endpoint integration tests.
+        // path; that's covered by the permission-endpoint integration tests
+        // (WebSocket and legacy SSE).
         assert!(
             !saw_removed,
             "this test exercises the manual-remove path; \
@@ -994,7 +996,7 @@ mod tests {
     }
 
     /// When the prompter's own timeout cleanup runs, it must emit Removed
-    /// so SSE subscribers dismiss the overlay.
+    /// so subscribers on either transport dismiss the overlay.
     #[tokio::test(start_paused = true)]
     async fn test_prompt_timeout_emits_removed() {
         let mut rx = prompt_events().subscribe();
@@ -1052,10 +1054,11 @@ mod tests {
     }
 
     // #3820: when a permission prompt is created and no dashboard tab is
-    // connected to display it (zero SSE subscribers), the prompter must open
+    // connected to display it (zero permission subscribers), the prompter must open
     // the standalone permission page in the user's browser so the prompt stays
     // actionable instead of silently auto-denying after the timeout. When a tab
-    // IS connected it receives the prompt via SSE and the browser must NOT be
+    // IS connected it receives the prompt over the permission channel and the
+    // browser must NOT be
     // opened. We drive `maybe_alert_no_tab` directly with a recording notifier
     // because the prompt-event broadcast is a process-global shared across
     // tests, so its live `receiver_count()` isn't deterministic here.

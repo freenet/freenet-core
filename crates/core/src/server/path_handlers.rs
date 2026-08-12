@@ -4973,14 +4973,14 @@ mod tests {
             .expect("perm-overlay-flow:END marker must bracket the overlay flow");
         let overlay_slice = &html[overlay_start..overlay_start + overlay_end];
         // The negative asserts below are only meaningful if the slice actually
-        // CONTAINS the SSE prompt-render surface. Pin that the marker-bounded
+        // CONTAINS the permission prompt-render surface. Pin that the marker-bounded
         // region includes the `prompt_added`/`prompt_removed` handlers, so a
         // refactor that moves them past `perm-overlay-flow:END` (shrinking the
         // slice) fails HERE rather than silently making the negative asserts
         // pass vacuously — the exact regression F2 exists to prevent (#4849).
         assert!(
             overlay_slice.contains("'prompt_added'") && overlay_slice.contains("'prompt_removed'"),
-            "overlay guard slice must cover the SSE prompt handlers (#4849 F2)"
+            "overlay guard slice must cover the permission prompt handlers (#4849 F2)"
         );
         assert!(
             !overlay_slice.contains("innerHTML"),
@@ -4990,7 +4990,7 @@ mod tests {
         // The old permission-prompt-via-Notification flow must be gone: the
         // permission OVERLAY code path must not request or construct a browser
         // Notification (#3836 — delegate permission prompts must render as the
-        // in-page SSE overlay, never as a browser Notification users
+        // in-page permission overlay, never as a browser Notification users
         // block/miss/dismiss). Scoped to `overlay_slice`, NOT the whole shell:
         // browser Notifications are now legitimately used ELSEWHERE in the
         // bridge for new-MESSAGE notifications (a best-effort UX where a
@@ -5024,7 +5024,8 @@ mod tests {
         assert!(
             !html.contains("visibilityState"),
             "overlay must not gate on document.visibilityState; \
-             visibility-skip caused background tabs to miss prompts (SSE replaces polling)"
+             visibility-skip caused background tabs to miss prompts (the permission \
+             channel replaces polling)"
         );
 
         // Regression test for issue #3857: the overlay must read the new

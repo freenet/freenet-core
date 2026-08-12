@@ -175,7 +175,17 @@ function check(name, cond) {
 //    real IO happens and time is advanced by hand.
 {
   function buildMachine() {
-    const calls = { polls: 0, stops: 0, reconciles: 0, sockets: [] };
+    const calls = {
+      polls: 0,
+      stops: 0,
+      reconciles: 0,
+      sockets: [],
+      shown: [],
+      hidden: [],
+      warnings: [],
+      constructAttempts: 0,
+      constructorThrows: false,
+    };
     const timers = [];
     let now = 0;
 
@@ -200,39 +210,76 @@ function check(name, cond) {
 
     class FakeWebSocket {
       constructor(url) {
+        calls.constructAttempts++;
+        // A constructor that throws is the one path that reaches
+        // schedulePermReconnect WITHOUT going through onclose's identity
+        // guard, which is what makes the handle dedup observable on its own.
+        if (calls.constructorThrows) throw new Error('blocked scheme');
         this.url = url;
+        this.closed = false;
         calls.sockets.push(this);
       }
       open() {
         if (this.onopen) this.onopen();
       }
       close() {
+        this.closed = true;
         if (this.onclose) this.onclose();
+      }
+      // Drive a real inbound frame. Without this the dispatch code was LOADED
+      // but never RUN: inverting `prompt_added` to hide the card left the whole
+      // suite green.
+      message(obj) {
+        if (this.onmessage) this.onmessage({ data: JSON.stringify(obj) });
       }
     }
 
-    const src = extractFrom('perm-ws-machine:BEGIN', 'perm-ws-machine:END', 'var permSocket');
+    // Real interval bookkeeping, not a stub counter. `startFallbackPoll`'s
+    // idempotency guard is load-bearing now that openPermSocket AND onclose
+    // both call it; only counting LIVE intervals can express the leak that
+    // dropping the guard would cause.
+    let nextIntervalId = 1;
+    const liveIntervals = new Map();
+    function setIntervalStub(fn, ms) {
+      const id = nextIntervalId++;
+      liveIntervals.set(id, { fn, ms });
+      calls.polls++;
+      return id;
+    }
+    function clearIntervalStub(id) {
+      if (liveIntervals.delete(id)) calls.stops++;
+    }
+
+    const src = extractFrom(
+      'perm-ws-machine:BEGIN',
+      'perm-ws-machine:END',
+      'var fallbackPollHandle',
+    );
     const factory = new Function(
       'WebSocket',
       'setTimeout',
       'clearTimeout',
+      'setInterval',
+      'clearInterval',
       'Math',
       'location',
       'console',
       'calls',
+      'overlayCards',
       `
-      function startFallbackPoll() { calls.polls++; }
-      function stopFallbackPoll() { calls.stops++; }
       function reconcileFromPending() { calls.reconciles++; }
-      var overlayCards = {};
-      function showCard() {}
-      function hideCard() {}
-      function createCard() { return {}; }
+      function showCard(nonce) { calls.shown.push(nonce); overlayCards[nonce] = {}; }
+      function hideCard(nonce) { calls.hidden.push(nonce); delete overlayCards[nonce]; }
+      function createCard(p) { return { nonce: p && p.nonce }; }
       ${src}
       return {
         openPermSocket: openPermSocket,
         state: function () {
-          return { delay: permReconnectDelay, socket: permSocket };
+          return {
+            delay: permReconnectDelay,
+            socket: permSocket,
+            pollHandle: fallbackPollHandle,
+          };
         },
       };
       `,
@@ -241,16 +288,20 @@ function check(name, cond) {
     // Built explicitly rather than spread from `Math`, whose methods are
     // non-enumerable and would silently not be copied.
     const mathStub = { min: Math.min, max: Math.max, random: () => 0.5 };
+    const overlayCards = {};
     const machine = factory(
       FakeWebSocket,
       setTimeoutStub,
       clearTimeoutStub,
+      setIntervalStub,
+      clearIntervalStub,
       mathStub,
       { protocol: 'http:', host: '127.0.0.1:7509' },
-      { warn() {} },
+      { warn: (...a) => calls.warnings.push(a.join(' ')) },
       calls,
+      overlayCards,
     );
-    return { machine, calls, advance, timers };
+    return { machine, calls, advance, timers, overlayCards, liveIntervals };
   }
 
   // 6a. Opening starts the fallback poll immediately, so a HANGING handshake
@@ -331,6 +382,125 @@ function check(name, cond) {
     check('a stable socket resets the backoff to 1s', machine.state().delay === 1000);
   }
 
+  // 6g. INBOUND DISPATCH. Proven missing by mutation: inverting `prompt_added`
+  //     to hide the card, and disabling the `resync -> reconcileFromPending`
+  //     branch, both left the entire suite green. Section 5 proves
+  //     `permEventAction` CLASSIFIES an envelope; nothing drove the wire
+  //     between that classification and the DOM, which is the code this change
+  //     wrote.
+  {
+    const { machine, calls, overlayCards } = buildMachine();
+    machine.openPermSocket();
+    const sock = calls.sockets[0];
+    sock.open();
+    const reconcilesAfterOpen = calls.reconciles;
+
+    sock.message({ event: 'prompt_added', data: { nonce: 'n1' } });
+    check('an inbound prompt_added renders the card', overlayCards.n1 !== undefined);
+    check('prompt_added does not hide anything', calls.hidden.length === 0);
+
+    sock.message({ event: 'prompt_removed', data: { nonce: 'n1' } });
+    check('an inbound prompt_removed dismisses the card', overlayCards.n1 === undefined);
+    check('prompt_removed hid the right nonce', calls.hidden[0] === 'n1');
+
+    sock.message({ event: 'resync' });
+    check(
+      'an inbound resync re-bootstraps from /permission/pending',
+      calls.reconciles === reconcilesAfterOpen + 1,
+    );
+
+    // Delegate-controlled payloads must not reach the renderer.
+    const shownBefore = calls.shown.length;
+    sock.message({ event: 'prompt_added', data: { nonce: 7 } });
+    sock.message({ event: 'prompt_exploded', data: { nonce: 'n2' } });
+    check('a malformed inbound frame renders nothing', calls.shown.length === shownBefore);
+
+    // A non-JSON frame must not throw out of onmessage.
+    let threw = false;
+    try {
+      sock.onmessage({ data: 'not json' });
+    } catch (e) {
+      threw = true;
+    }
+    check('a non-JSON frame is swallowed, not thrown', threw === false);
+  }
+
+  // 6h. The fallback poll must never accumulate intervals. openPermSocket
+  //     starts it AND onclose starts it again, so every retry cycle calls
+  //     startFallbackPoll twice; without its idempotency guard each cycle
+  //     leaks a live interval hammering /permission/pending forever. Counting
+  //     LIVE intervals is the point — a stub counter cannot express a leak.
+  {
+    const { machine, calls, advance, liveIntervals } = buildMachine();
+    machine.openPermSocket();
+    for (let i = 0; i < 4; i++) {
+      const s2 = calls.sockets[calls.sockets.length - 1];
+      s2.close();
+      advance(60000);
+    }
+    check(
+      'repeated reconnect cycles never accumulate poll intervals',
+      liveIntervals.size <= 1,
+    );
+    const live = calls.sockets[calls.sockets.length - 1];
+    live.open();
+    check('a successful open leaves no poll interval running', liveIntervals.size === 0);
+  }
+
+  // 6i. The socket-identity guard, on its own. 6f cannot test this: the
+  //     identity guard and schedulePermReconnect's handle dedup each
+  //     short-circuit before the other is reached, so 6f stayed green under
+  //     deletion of EITHER. Two live sockets is the only shape that isolates
+  //     the identity guard.
+  {
+    const { machine, calls } = buildMachine();
+    machine.openPermSocket();
+    const a = calls.sockets[0];
+    a.open();
+    // A second open (the `visibilitychange`/`online` trigger the guard's
+    // comment anticipates) retires A and installs B.
+    machine.openPermSocket();
+    const b = calls.sockets[calls.sockets.length - 1];
+    check('a second open installs a new socket', b !== a);
+    b.open();
+    // Now the STALE socket closes. It must not disturb the live one.
+    a.close();
+    check(
+      "a stale socket's close does not orphan the live socket",
+      machine.state().socket === b,
+    );
+  }
+
+  // 6j. schedulePermReconnect's handle dedup, on its own — the other half 6f
+  //     could not isolate, because onclose's identity guard short-circuits
+  //     before the dedup is ever reached, so 6f stayed green under deletion of
+  //     EITHER guard. The constructor-throw path is the one route to
+  //     schedulePermReconnect that does NOT pass through onclose, so two failed
+  //     opens reach the dedup twice with nothing else in the way.
+  {
+    const { machine, calls, advance } = buildMachine();
+    calls.constructorThrows = true;
+    machine.openPermSocket(); // attempt 1, schedules
+    machine.openPermSocket(); // attempt 2, must be deduped
+    advance(60000); // fires whatever was pending -> attempt 3
+    check(
+      'two failed opens schedule ONE reconnect, not two',
+      calls.constructAttempts === 3,
+    );
+  }
+
+  // 6k. The degraded-tab warning must actually fire. It is the only signal a
+  //     user or developer gets that a tab is stuck on the 3s poll.
+  {
+    const { machine, calls, advance } = buildMachine();
+    machine.openPermSocket();
+    for (let i = 0; i < 6; i++) {
+      calls.sockets[calls.sockets.length - 1].close();
+      advance(60000);
+    }
+    check('a persistently failing socket warns', calls.warnings.length > 0);
+  }
+
   // 6f. No double-scheduling: a second close while a reconnect is pending must
   //     not queue a second one (that would halve the effective backoff).
   {
@@ -371,20 +541,25 @@ function check(name, cond) {
   // Free variables of the extracted region, supplied as parameters so the real
   // source runs unmodified against stubs.
   const makeReconcile = new Function(
-    'Date',
+    'permNow',
     'fetch',
     'overlayCards',
     'showCard',
     'createCard',
     'hideCard',
-    `${reconcileSrc}\nreturn reconcileFromPending;`,
+    'ctl',
+    `var lastRemovalObservedAt = -1;
+     ${reconcileSrc}
+     ctl.noteRemoval = function (t) { lastRemovalObservedAt = t; };
+     return reconcileFromPending;`,
   );
 
   function build(pending) {
     const clock = { t: 1000 };
-    const DateStub = { now: () => clock.t };
+    const permNow = () => clock.t;
     const overlayCards = {};
     const hidden = [];
+    const ctl = {};
     let release = null;
     const fetchStub = () =>
       new Promise((res) => {
@@ -393,7 +568,7 @@ function check(name, cond) {
     // Mirrors the real showCard's stamping. Pinned against the real source
     // separately below, since showCard itself lives outside the region.
     const showCard = (nonce, card) => {
-      card._fnShownAt = DateStub.now();
+      card._fnShownAt = permNow();
       overlayCards[nonce] = card;
     };
     const createCard = (p) => ({ nonce: p.nonce });
@@ -407,13 +582,15 @@ function check(name, cond) {
       hidden,
       showCard,
       createCard,
+      ctl,
       reconcile: makeReconcile(
-        DateStub,
+        permNow,
         fetchStub,
         overlayCards,
         showCard,
         createCard,
         hideCard,
+        ctl,
       ),
       settle: async () => {
         release();
@@ -478,6 +655,37 @@ function check(name, cond) {
     check('a pending prompt not yet on screen is shown', env.overlayCards.Y !== undefined);
   }
 
+  // 7f. The ADD pass needs the mirror of the hide pass's causal check, or a
+  //     stale snapshot RESURRECTS a prompt answered after the request went
+  //     out. With a healthy socket nothing then removes the ghost, so the user
+  //     is left looking at a security prompt for a dead nonce.
+  {
+    const env = build([{ nonce: 'X' }]);
+    env.reconcile(); // issuedAt = 1000
+    env.clock.t = 1001;
+    env.ctl.noteRemoval(1001); // X answered in another tab, after F1 went out
+    await env.settle();
+    check(
+      'a snapshot that predates a known removal does not resurrect the prompt',
+      env.overlayCards.X === undefined,
+    );
+  }
+
+  // 7g. Control for 7f. A removal observed BEFORE the request was issued says
+  //     nothing about this snapshot, so the add must still happen — otherwise
+  //     the guard would degenerate into "never add anything again".
+  {
+    const env = build([{ nonce: 'X' }]);
+    env.ctl.noteRemoval(999);
+    env.clock.t = 1000;
+    env.reconcile(); // issuedAt = 1000, strictly after the removal
+    await env.settle();
+    check(
+      'a removal older than the request does not block the add',
+      env.overlayCards.X !== undefined,
+    );
+  }
+
   // 7e. The stamp itself. 7a-7c stub showCard, so they would all still pass if
   //     the real showCard stopped recording `_fnShownAt` — every card would
   //     then compare `undefined >= issuedAt` (false) and be hidden, which is
@@ -488,8 +696,8 @@ function check(name, cond) {
     const after = src.indexOf('\n  function ', fnStart + 1);
     const body = fnStart < 0 ? '' : src.slice(fnStart, after < 0 ? undefined : after);
     check(
-      'showCard records _fnShownAt, which the comparison above depends on',
-      body.includes('_fnShownAt = Date.now()'),
+      'showCard records _fnShownAt on the MONOTONIC clock, which the comparison depends on',
+      body.includes('_fnShownAt = permNow()'),
     );
   }
 }

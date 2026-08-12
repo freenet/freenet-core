@@ -144,6 +144,16 @@ pub(super) fn routes() -> Router {
 /// (see `server.rs`) injects the `ConnectInfo<SocketAddr>` extension for every
 /// connection, so it is present on the production serve path.
 ///
+/// SCOPE — this is a boundary against a DIRECT off-box connection, and only
+/// that. Behind a reverse proxy on the same host (a deployment `config.rs`
+/// documents as supported) every remote client's `ConnectInfo` is the proxy's
+/// own loopback address, so this check passes for the entire internet and a
+/// non-browser client can then set `Host` and `Origin` freely. That makes the
+/// whole permission surface remotely reachable in that deployment. It is
+/// PRE-EXISTING and tracked in #5264 — this surface has no authentication of
+/// any kind — but do not read the paragraph above as "these endpoints are
+/// local-only"; it means "a direct LAN peer cannot reach them".
+///
 /// Fail closed: a MISSING `ConnectInfo` cannot prove loopback and is rejected.
 /// (It is absent only in unit tests that build a request without connect-info;
 /// those tests inject it explicitly to exercise both sides of this boundary.)
@@ -177,6 +187,44 @@ fn peer_is_loopback(connect_info: Option<&ConnectInfo<SocketAddr>>) -> bool {
 /// would silently allow twice the intended ceiling.
 const MAX_PERMISSION_SUBSCRIBERS: usize = 64;
 
+/// Ceiling for the LEGACY SSE transport specifically, below
+/// [`MAX_PERMISSION_SUBSCRIBERS`], so SSE can never consume the last slots and
+/// starve the WebSocket path.
+///
+/// Sharing one counter (see above) is right for bounding total cost, but it
+/// created an interaction worth blocking: the WebSocket pump bounds a client
+/// that stops reading with [`PERMISSION_WS_SEND_TIMEOUT`], and the SSE path has
+/// no equivalent — a backpressured `Sse` body holds its
+/// `PermissionSubscriberGuard` for as long as the peer keeps the socket open.
+/// With a single shared ceiling, stalled SSE streams could therefore occupy all
+/// 64 slots indefinitely and every new tab's WebSocket handshake would 503,
+/// degrading the whole browser to the 3s poll with nothing surfaced — the same
+/// "nothing errors, so nothing is visible" shape as #5213 itself.
+///
+/// Reserving the top quarter for WebSockets means the legacy path cannot do
+/// that. It costs nothing in practice: SSE subscribers only exist for tabs
+/// opened before a node upgrade, and the browser's own ~6-per-origin limit —
+/// the #5213 bug — caps how many any one profile can hold anyway. The whole
+/// mechanism disappears with the route in #5272.
+const MAX_SSE_SUBSCRIBERS: usize = MAX_PERMISSION_SUBSCRIBERS * 3 / 4;
+
+/// Which transport is claiming a subscriber slot. Only affects the ceiling
+/// applied; the slot itself, and the counter, are shared.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SubscriberTransport {
+    WebSocket,
+    LegacySse,
+}
+
+impl SubscriberTransport {
+    fn ceiling(self) -> usize {
+        match self {
+            SubscriberTransport::WebSocket => MAX_PERMISSION_SUBSCRIBERS,
+            SubscriberTransport::LegacySse => MAX_SSE_SUBSCRIBERS,
+        }
+    }
+}
+
 /// Live permission-event subscriber count (WebSocket + SSE). Used to enforce
 /// `MAX_PERMISSION_SUBSCRIBERS`.
 static PERMISSION_SUBSCRIBERS: AtomicUsize = AtomicUsize::new(0);
@@ -200,10 +248,14 @@ impl Drop for PermissionSubscriberGuard {
 /// transient overshoot window, and on Relaxed ordering no upper bound under
 /// heavy reconnect storms. Shared by both transports so the cap is enforced
 /// identically whichever one the client picked.
-fn try_claim_subscriber_slot() -> Option<PermissionSubscriberGuard> {
+///
+/// `transport` selects the ceiling: see [`MAX_SSE_SUBSCRIBERS`] for why the
+/// legacy path gets a lower one.
+fn try_claim_subscriber_slot(transport: SubscriberTransport) -> Option<PermissionSubscriberGuard> {
+    let ceiling = transport.ceiling();
     let mut current = PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed);
     loop {
-        if current >= MAX_PERMISSION_SUBSCRIBERS {
+        if current >= ceiling {
             return None;
         }
         match PERMISSION_SUBSCRIBERS.compare_exchange_weak(
@@ -529,7 +581,7 @@ async fn permission_respond(
                 if prompt.response_tx.send(body.index).is_err() {
                     tracing::debug!(nonce = %nonce, "Permission response channel already closed");
                 }
-                // Notify SSE subscribers so every open Freenet tab dismisses
+                // Notify permission subscribers so every open Freenet tab dismisses
                 // its overlay immediately instead of waiting for the polling
                 // fallback (#3836 follow-up).
                 emit_prompt_event(PromptEvent::Removed {
@@ -763,7 +815,60 @@ fn origin_is_exactly_same_origin(headers: &HeaderMap) -> bool {
     let Some(authority) = origin_authority(origin) else {
         return false;
     };
-    authority.eq_ignore_ascii_case(host_header)
+    if !authority.eq_ignore_ascii_case(host_header) {
+        return false;
+    }
+    origin_scheme_matches_forwarded_proto(headers, origin)
+}
+
+/// The `Host` header carries no scheme, so an authority comparison alone treats
+/// `http://h` and `https://h` as the same origin. They are NOT the same origin,
+/// and on the reverse-proxy deployment `config.rs` documents as supported the
+/// difference is reachable: with the node behind TLS at
+/// `https://node.example.com`, a page an attacker serves at
+/// `http://node.example.com` (an on-path attacker on port 80 with no HSTS, or
+/// an unrelated plain-HTTP vhost on the same name) sends
+/// `Origin: http://node.example.com` with `Host: node.example.com`. Authority
+/// matches, and the allowed-host branch of [`is_origin_trusted`] passes too, so
+/// that page could open the socket and read raw permission nonces.
+///
+/// So compare the scheme as well, deriving the expected one the way
+/// [`crate::server::client_api::sandbox_origin_from_headers`] already does.
+///
+/// Be honest about the strength of this: `X-Forwarded-Proto` is set by the
+/// proxy and a careless proxy passes a client-supplied value straight through,
+/// in which case an attacker able to forge headers can also forge this one. It
+/// is therefore defence-in-depth, not a trust boundary — it closes the BROWSER
+/// -reachable version of the attack above (a browser cannot set either header)
+/// while doing nothing against a header-forging client. The real fix for a
+/// non-browser caller is authenticating this surface, tracked in #5264.
+///
+/// Enforced ONLY when `X-Forwarded-Proto` is present, i.e. when the
+/// client-facing scheme is actually knowable. An absent header is NOT treated
+/// as "therefore http": a TLS-terminating proxy that rewrites `Host` correctly
+/// but omits `X-Forwarded-Proto` is a common misconfiguration, and rejecting it
+/// would refuse the socket for a legitimate deployment and drop every tab to
+/// the 3s poll with nothing surfaced — reintroducing the silent-degradation
+/// class this whole change exists to remove. Where the scheme cannot be
+/// determined this falls back to the authority-only comparison, which is no
+/// weaker than the behaviour before this check existed.
+///
+/// The attack in the doc above needs a proxy in front of the node, and a proxy
+/// configured well enough to be worth attacking sets `X-Forwarded-Proto` — so
+/// the case this closes and the case it declines to guess about are largely
+/// disjoint.
+fn origin_scheme_matches_forwarded_proto(headers: &HeaderMap, origin: &str) -> bool {
+    let Some(expected) = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(',').next().unwrap_or(v).trim().to_ascii_lowercase())
+    else {
+        return true;
+    };
+    match origin.split_once("://") {
+        Some((scheme, _)) => scheme.eq_ignore_ascii_case(&expected),
+        None => false,
+    }
 }
 
 /// Returns the scheme-stripped authority of an Origin header value with
@@ -775,20 +880,30 @@ fn origin_is_exactly_same_origin(headers: &HeaderMap) -> bool {
 /// that helper returns the *host* component only (no port), which is
 /// what the WS Host-IP CIDR check needs. This one returns the full
 /// authority (host plus port) so it can be byte-compared against the
-/// HTTP `Host` header. Both strip userinfo to defend against
-/// `Origin: http://victim@evil.com:7509` style spoof attempts.
+/// HTTP `Host` header.
+///
+/// REJECTS, rather than strips, any authority containing `@`, `?` or `#`. A
+/// real browser `Origin` is `scheme://host[:port]` and can contain none of
+/// them, so nothing legitimate is lost — and stripping is actively dangerous
+/// here, because it makes this parser disagree with
+/// [`crate::client_events::websocket::is_localhost_origin`], which is plain
+/// prefix matching. Under the old strip-userinfo behaviour
+/// `http://127.0.0.1:7509@evil.com` was "localhost" to that helper and
+/// `evil.com` to this one, so paired with `Host: evil.com` BOTH gates passed.
+/// Symmetrically, not stripping a query let `http://evil.com?x=@127.0.0.1:7509`
+/// resolve to authority `127.0.0.1:7509`. Two parsers that disagree about what
+/// an origin is are a gate that can be walked between; refusing the ambiguous
+/// input is the only version that cannot drift.
 fn origin_authority(origin: &str) -> Option<&str> {
     let (_, after_scheme) = origin.split_once("://")?;
     let authority = after_scheme
         .split_once('/')
         .map(|(a, _)| a)
         .unwrap_or(after_scheme);
-    Some(
-        authority
-            .rsplit_once('@')
-            .map(|(_, host_and_port)| host_and_port)
-            .unwrap_or(authority),
-    )
+    if authority.contains(['@', '?', '#']) {
+        return None;
+    }
+    Some(authority)
 }
 
 /// HTML for when a permission request has expired or already been answered.
@@ -872,8 +987,9 @@ async fn permission_events(
             .into_response();
     }
 
-    // Subscriber cap, shared with the WebSocket transport.
-    let guard = match try_claim_subscriber_slot() {
+    // Subscriber cap, shared with the WebSocket transport but with a lower
+    // ceiling for this legacy path so it cannot starve the WebSocket one.
+    let guard = match try_claim_subscriber_slot(SubscriberTransport::LegacySse) {
         Some(guard) => guard,
         None => {
             tracing::warn!(
@@ -1030,7 +1146,7 @@ async fn permission_events_ws(
     }
 
     // Subscriber cap, shared with the SSE transport.
-    let guard = match try_claim_subscriber_slot() {
+    let guard = match try_claim_subscriber_slot(SubscriberTransport::WebSocket) {
         Some(guard) => guard,
         None => {
             tracing::warn!(
@@ -1986,7 +2102,7 @@ mod tests {
         while sender.receiver_count() < target {
             if tokio::time::Instant::now() >= deadline {
                 panic!(
-                    "timed out waiting for {target} SSE subscribers; have {}",
+                    "timed out waiting for {target} permission subscribers; have {}",
                     sender.receiver_count()
                 );
             }
@@ -2314,15 +2430,18 @@ mod tests {
         }
         let baseline = PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed);
 
-        // Open enough subscribers to exhaust the cap.
+        // Open enough subscribers to exhaust the cap. Note the ceiling for
+        // THIS transport is MAX_SSE_SUBSCRIBERS, not MAX_PERMISSION_SUBSCRIBERS:
+        // the legacy SSE path is deliberately held below the shared total so it
+        // cannot starve the WebSocket path (see MAX_SSE_SUBSCRIBERS).
         let mut held: Vec<_> = Vec::new();
-        for _ in baseline..MAX_PERMISSION_SUBSCRIBERS {
+        for _ in baseline..MAX_SSE_SUBSCRIBERS {
             held.push(open_sse_with_origin(Some("http://localhost:7509")).await);
         }
         assert_eq!(
             PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed),
-            MAX_PERMISSION_SUBSCRIBERS,
-            "all slots must be filled before testing the cap"
+            MAX_SSE_SUBSCRIBERS,
+            "all SSE slots must be filled before testing the cap"
         );
 
         // The next subscriber MUST be rejected with a closed stream.
@@ -2338,7 +2457,7 @@ mod tests {
         drop(dropped);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            if PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed) < MAX_PERMISSION_SUBSCRIBERS {
+            if PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed) < MAX_SSE_SUBSCRIBERS {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -2349,7 +2468,7 @@ mod tests {
 
         // A new subscriber should now succeed.
         let _accepted = open_sse_with_origin(Some("http://localhost:7509")).await;
-        assert!(PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed) <= MAX_PERMISSION_SUBSCRIBERS);
+        assert!(PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed) <= MAX_SSE_SUBSCRIBERS);
 
         // Cleanup: drop everything so the counter returns to baseline for
         // the next time this test runs (matters when test runs are not
@@ -2731,18 +2850,50 @@ mod tests {
         assert_eq!(origin_authority(""), None);
     }
 
-    /// `parse_origin_host` (websocket.rs) strips `user@` from Origin to
-    /// defeat scheme-spoof attempts; this layer's `origin_authority` does
-    /// the same so a `Origin: http://victim@evil.com:7509` value can't be
-    /// crafted to compare equal to any operator-allowed Host.
+    /// SUPERSEDED SEMANTICS, deliberately inverted: `origin_authority` used to
+    /// STRIP `user@` (mirroring `parse_origin_host` in websocket.rs). It now
+    /// REJECTS any authority containing `@`, `?` or `#`.
+    ///
+    /// Stripping was the weaker choice. `is_localhost_origin` is plain prefix
+    /// matching, so `http://127.0.0.1:7509@evil.com` was "localhost" to that
+    /// helper while stripping made it `evil.com` here — paired with
+    /// `Host: evil.com`, BOTH gates passed. Not stripping the query gave the
+    /// symmetric hole: `http://evil.com?x=@127.0.0.1:7509` resolved to
+    /// authority `127.0.0.1:7509`. A gate assembled from two parsers that
+    /// disagree about what an origin is can be walked between; refusing the
+    /// ambiguous input is the only version that cannot drift.
+    ///
+    /// Nothing legitimate is lost: a browser `Origin` is `scheme://host[:port]`
+    /// and can contain none of these characters.
     #[test]
-    fn test_origin_authority_strips_userinfo() {
+    fn test_origin_authority_rejects_ambiguous_authorities() {
+        // Userinfo: previously stripped to the trailing host, now refused.
         assert_eq!(
             origin_authority("http://victim@mynode.example.com:7509"),
+            None
+        );
+        assert_eq!(origin_authority("https://attacker@[::1]:7509/path"), None);
+        // The prefix-match trap: `is_localhost_origin` reads this as localhost.
+        assert!(crate::client_events::websocket::is_localhost_origin(
+            "http://127.0.0.1:7509@evil.example"
+        ));
+        assert_eq!(origin_authority("http://127.0.0.1:7509@evil.example"), None);
+        // Query and fragment forms.
+        assert_eq!(
+            origin_authority("http://evil.example?x=@127.0.0.1:7509"),
+            None
+        );
+        assert_eq!(
+            origin_authority("http://evil.example#@127.0.0.1:7509"),
+            None
+        );
+        // Ordinary origins still parse.
+        assert_eq!(
+            origin_authority("http://mynode.example.com:7509"),
             Some("mynode.example.com:7509")
         );
         assert_eq!(
-            origin_authority("https://attacker@[::1]:7509/path"),
+            origin_authority("https://[::1]:7509/path"),
             Some("[::1]:7509")
         );
     }
@@ -3306,6 +3457,17 @@ mod tests {
     /// refused with, so a test can distinguish 403 (gate) from 503 (cap) from
     /// an unrelated failure.
     async fn try_ws_connect(addr: SocketAddr, origin: Option<&str>) -> Result<TestWsStream, u16> {
+        try_ws_connect_with(addr, origin, &[]).await
+    }
+
+    /// As [`try_ws_connect`], plus arbitrary extra request headers. Needed to
+    /// simulate a reverse proxy, which is where the Origin SCHEME (as opposed
+    /// to its authority) starts to matter.
+    async fn try_ws_connect_with(
+        addr: SocketAddr,
+        origin: Option<&str>,
+        extra: &[(&str, &str)],
+    ) -> Result<TestWsStream, u16> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let mut req = format!("ws://{addr}/permission/events/ws")
             .into_client_request()
@@ -3313,11 +3475,185 @@ mod tests {
         if let Some(o) = origin {
             req.headers_mut().insert("origin", o.parse().unwrap());
         }
+        for (k, v) in extra {
+            req.headers_mut().insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
         match tokio_tungstenite::connect_async(req).await {
             Ok((stream, _resp)) => Ok(stream),
             Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => Err(resp.status().as_u16()),
             Err(other) => panic!("unexpected handshake failure: {other}"),
         }
+    }
+
+    fn ws_test_app_with_hosts(
+        pending: PendingPrompts,
+        peer: Option<SocketAddr>,
+        hosts: &[&str],
+    ) -> Router {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+        let set: HashSet<String> = hosts.iter().map(|h| h.to_string()).collect();
+        let app = super::routes()
+            .layer(Extension(pending))
+            .layer(Extension::<AllowedHosts>(Arc::new(set)))
+            .layer(Extension(AllowedSourceCidrs::default()));
+        match peer {
+            Some(p) => app.layer(Extension(ConnectInfo(p))),
+            None => app,
+        }
+    }
+
+    /// The Origin scheme must match, not just the authority.
+    ///
+    /// `Host` carries no scheme, so comparing authority alone makes
+    /// `http://h` and `https://h` the same origin. Behind a TLS-terminating
+    /// reverse proxy that is reachable: a page an attacker serves at
+    /// `http://node.example.com` sends an Origin whose authority equals `Host`,
+    /// and would otherwise be handed raw permission nonces.
+    #[tokio::test]
+    #[serial_test::serial(permission_subscriber_counter)]
+    async fn permission_ws_rejects_http_origin_when_proxy_terminated_tls() {
+        let addr = spawn_ws_server(ws_test_app(empty_pending(), Some(loopback_peer()))).await;
+
+        let refused = try_ws_connect_with(
+            addr,
+            Some(&format!("http://{addr}")),
+            &[("x-forwarded-proto", "https")],
+        )
+        .await;
+        assert_eq!(
+            refused.err(),
+            Some(403),
+            "an http:// page is a different origin from the https:// node and must \
+             not read the permission stream, even though the authorities match"
+        );
+
+        // Control: same request, matching scheme, must be admitted. Without
+        // this the assertion above could be passing because the extra header
+        // broke the handshake for some unrelated reason.
+        let admitted = try_ws_connect_with(
+            addr,
+            Some(&format!("https://{addr}")),
+            &[("x-forwarded-proto", "https")],
+        )
+        .await;
+        assert!(
+            admitted.is_ok(),
+            "the matching-scheme handshake must still be accepted (got {:?})",
+            admitted.err()
+        );
+
+        // And with NO X-Forwarded-Proto the scheme is unknowable, so it must
+        // NOT be guessed at. A TLS proxy that rewrites Host correctly but omits
+        // the header is a common misconfiguration; refusing it would drop every
+        // tab of a legitimate deployment to the 3s poll with nothing surfaced,
+        // which is the silent-degradation class this change exists to remove.
+        let unknown_scheme = try_ws_connect(addr, Some(&format!("https://{addr}"))).await;
+        assert!(
+            unknown_scheme.is_ok(),
+            "with no X-Forwarded-Proto the scheme must not be inferred (got {:?})",
+            unknown_scheme.err()
+        );
+    }
+
+    /// An Origin containing userinfo, a query or a fragment is refused rather
+    /// than normalised.
+    ///
+    /// `is_localhost_origin` is prefix matching, so it reads
+    /// `http://127.0.0.1:7509@evil.com` as localhost, while `origin_authority`
+    /// used to strip the userinfo and read it as `evil.com`. Two parsers that
+    /// disagree about what an origin is can be walked between; the only version
+    /// that cannot drift is refusing the ambiguous input.
+    #[tokio::test]
+    #[serial_test::serial(permission_subscriber_counter)]
+    async fn permission_ws_rejects_ambiguous_origin_forms() {
+        let addr = spawn_ws_server(ws_test_app(empty_pending(), Some(loopback_peer()))).await;
+        for hostile in [
+            format!("http://{addr}@evil.example"),
+            format!("http://evil.example?x=@{addr}"),
+            format!("http://evil.example#@{addr}"),
+        ] {
+            let result = try_ws_connect(addr, Some(&hostile)).await;
+            assert_eq!(
+                result.err(),
+                Some(403),
+                "an Origin no browser can produce ({hostile}) must be refused, not \
+                 parsed into something that matches Host"
+            );
+        }
+    }
+
+    /// The gate still holds when an `allowed-host` policy is configured.
+    ///
+    /// Every other WebSocket test runs with an EMPTY `AllowedHosts`, which
+    /// exercises only the loopback + localhost-origin branch. A configured
+    /// allowed-host opens a second branch in `is_origin_trusted`, and that is
+    /// exactly the deployment where the scheme gap above lives.
+    #[tokio::test]
+    #[serial_test::serial(permission_subscriber_counter)]
+    async fn permission_ws_rejects_cross_origin_under_a_configured_allowed_host() {
+        let app = ws_test_app_with_hosts(
+            empty_pending(),
+            Some(loopback_peer()),
+            &["node.example.com", "node.example.com:7509"],
+        );
+        let addr = spawn_ws_server(app).await;
+
+        let refused = try_ws_connect(addr, Some("http://node.example.com")).await;
+        assert_eq!(
+            refused.err(),
+            Some(403),
+            "an allowed HOST is not a licence to be a different ORIGIN: the \
+             handshake's Host is the test server, so this must not match"
+        );
+
+        let admitted = try_ws_connect(addr, Some(&same_origin(addr))).await;
+        assert!(
+            admitted.is_ok(),
+            "a genuine same-origin handshake must still be admitted with a host \
+             policy configured (got {:?})",
+            admitted.err()
+        );
+    }
+
+    /// The legacy SSE transport must not be able to consume every slot.
+    ///
+    /// The WebSocket pump bounds a client that stops reading with a send
+    /// timeout; the SSE path has no equivalent, so a backpressured stream holds
+    /// its slot for as long as the peer keeps the socket open. Sharing one
+    /// ceiling would let stalled SSE streams take all 64 and silently degrade
+    /// every new tab to the 3s poll.
+    #[tokio::test]
+    #[serial_test::serial(permission_subscriber_counter)]
+    async fn legacy_sse_cannot_starve_the_websocket_transport() {
+        let baseline = PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed);
+        assert_eq!(baseline, 0, "test must start from a quiesced counter");
+
+        let mut held: Vec<PermissionSubscriberGuard> = Vec::new();
+        for _ in 0..MAX_SSE_SUBSCRIBERS {
+            held.push(
+                try_claim_subscriber_slot(SubscriberTransport::LegacySse)
+                    .expect("SSE slots below its own ceiling must be claimable"),
+            );
+        }
+
+        assert!(
+            try_claim_subscriber_slot(SubscriberTransport::LegacySse).is_none(),
+            "SSE must be refused at its own lower ceiling"
+        );
+
+        let ws = try_claim_subscriber_slot(SubscriberTransport::WebSocket);
+        assert!(
+            ws.is_some(),
+            "the WebSocket transport must still have reserved headroom when SSE \
+             has taken everything it is allowed to"
+        );
+
+        drop(ws);
+        drop(held);
     }
 
     /// Control for the rejection tests below. Without it, all of them could be
@@ -3495,7 +3831,10 @@ mod tests {
         let baseline = PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed);
         let mut held: Vec<PermissionSubscriberGuard> = Vec::new();
         for _ in baseline..MAX_PERMISSION_SUBSCRIBERS {
-            held.push(try_claim_subscriber_slot().expect("slot below cap must be claimable"));
+            held.push(
+                try_claim_subscriber_slot(SubscriberTransport::WebSocket)
+                    .expect("slot below cap must be claimable"),
+            );
         }
         assert_eq!(
             PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed),
@@ -3766,7 +4105,8 @@ mod tests {
         }
 
         let (sink, mut out) = futures::channel::mpsc::unbounded::<Message>();
-        let guard = try_claim_subscriber_slot().expect("a slot must be free");
+        let guard =
+            try_claim_subscriber_slot(SubscriberTransport::WebSocket).expect("a slot must be free");
         let pump = tokio::spawn(pump_permission_events(
             sink,
             never_inbound(),
@@ -3789,7 +4129,31 @@ mod tests {
              from /permission/pending; silently dropping the gap loses prompts"
         );
 
+        // Await the abort rather than just firing it. `pump` holds a
+        // `PermissionSubscriberGuard`; a bare abort releases it asynchronously,
+        // on a runtime being torn down after `serial_test`'s lock is already
+        // free, so the next test can observe a non-zero baseline that then
+        // drops mid-assertion.
         pump.abort();
+        let _ = pump.await;
+    }
+
+    /// Wait for the shared subscriber counter to quiesce, then return it.
+    ///
+    /// WebSocket slots are released by a server-side SPAWNED TASK, and
+    /// `serial_test`'s lock releases at the end of the async body, BEFORE
+    /// `#[tokio::test]` tears the runtime down — so a previous test's pump can
+    /// still be unwinding when this one starts. Reading the counter without
+    /// settling first makes any exact-equality assertion on it a coin flip.
+    async fn quiesced_subscriber_baseline() -> usize {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed) != 0 {
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed)
     }
 
     /// The send timeout must actually fire and release the subscriber slot.
@@ -3800,13 +4164,24 @@ mod tests {
     /// permission channel to every legitimate tab. The fix's own safety
     /// argument rests on this, so it is tested rather than asserted.
     ///
+    /// `initial` is deliberately EMPTY. An earlier version of this test passed
+    /// one replay frame, which meant the pump exited from the REPLAY deadline
+    /// and never reached the `select!` loop — so `send_bounded`, the timeout
+    /// this doc comment is about, was never executed. Mutating `send_bounded`
+    /// to drop its timeout left the whole suite green. With no replay frames
+    /// the replay phase completes instantly and the loop's ping tick is what
+    /// must time out against `StalledSink`. The replay deadline keeps its own
+    /// test below; one test cannot be credited with both, since whichever
+    /// deadline fires first is the only one exercised.
+    ///
     /// Time is paused, so the wait costs no wall-clock; the assertion is that
     /// the pump RETURNS at all rather than hanging in `send`.
     #[tokio::test(start_paused = true)]
     #[serial_test::serial(permission_subscriber_counter)]
     async fn permission_ws_pump_gives_up_on_a_client_that_stops_reading() {
-        let baseline = PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed);
-        let guard = try_claim_subscriber_slot().expect("a slot must be free");
+        let baseline = quiesced_subscriber_baseline().await;
+        let guard =
+            try_claim_subscriber_slot(SubscriberTransport::WebSocket).expect("a slot must be free");
         assert_eq!(
             PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed),
             baseline + 1,
@@ -3816,13 +4191,11 @@ mod tests {
         // Keep the sender alive so the pump blocks on the stalled sink rather
         // than exiting early via `RecvError::Closed`.
         let (_tx, rx) = tokio::sync::broadcast::channel::<PromptEvent>(8);
-        // One queued frame is enough: the pump tries to send it immediately,
-        // before it ever reaches the select! loop.
         let pump = tokio::spawn(pump_permission_events(
             StalledSink,
             never_inbound(),
             rx,
-            vec![ws_envelope("resync", serde_json::json!({}))],
+            Vec::new(),
             guard,
         ));
 
@@ -3836,6 +4209,37 @@ mod tests {
             baseline,
             "the subscriber slot must be released once the pump gives up, or a \
              stalled client pins it against the cap permanently"
+        );
+    }
+
+    /// The REPLAY phase has its own deadline, distinct from the steady-state
+    /// send timeout above. One bootstrap frame against a sink that never
+    /// accepts must not hang the pump either.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(permission_subscriber_counter)]
+    async fn permission_ws_pump_gives_up_replaying_to_a_stalled_client() {
+        let baseline = quiesced_subscriber_baseline().await;
+        let guard =
+            try_claim_subscriber_slot(SubscriberTransport::WebSocket).expect("a slot must be free");
+
+        let (_tx, rx) = tokio::sync::broadcast::channel::<PromptEvent>(8);
+        let pump = tokio::spawn(pump_permission_events(
+            StalledSink,
+            never_inbound(),
+            rx,
+            vec![ws_envelope("resync", serde_json::json!({}))],
+            guard,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(120), pump)
+            .await
+            .expect("the pump must give up replaying to a stalled client")
+            .expect("the pump task must not panic");
+
+        assert_eq!(
+            PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed),
+            baseline,
+            "the slot must be released when replay gives up too"
         );
     }
 }

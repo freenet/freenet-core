@@ -1774,6 +1774,25 @@ function freenetBridge(authToken, userToken, hostedMode) {
     card.appendChild(timer);
     return card;
   }
+  // Monotonic millisecond clock for the causal-ordering comparison in
+  // reconcileFromPending. `Date.now()` is wall-clock and steps BACKWARDS on an
+  // NTP correction, a VM resume, or a user changing the system clock; a
+  // backwards step between `issuedAt` and a later `showCard` makes the card
+  // look older than the request that could not have seen it, which re-opens
+  // the exact prompt-destroying window the comparison exists to close.
+  // `performance.now()` cannot step backwards. Fall back to Date.now() only
+  // where performance is unavailable, which is no worse than before.
+  function permNow() {
+    return typeof performance !== 'undefined' && performance && performance.now
+      ? performance.now()
+      : Date.now();
+  }
+  // When a removal was last OBSERVED, on the same monotonic clock. See the
+  // add-pass guard in reconcileFromPending.
+  var lastRemovalObservedAt = -1;
+  function noteRemovalObserved() {
+    lastRemovalObservedAt = permNow();
+  }
   function showCard(nonce, card) {
     var root = ensureOverlayRoot();
     root.appendChild(card);
@@ -1781,7 +1800,7 @@ function freenetBridge(authToken, userToken, hostedMode) {
     // When this card became visible. `reconcileFromPending` compares against
     // it so a snapshot taken BEFORE the card existed cannot hide it. See the
     // causal-ordering note there.
-    card._fnShownAt = Date.now();
+    card._fnShownAt = permNow();
     overlayCards[nonce] = card;
     // Move keyboard focus to the primary button so Enter/Space answer the
     // prompt without requiring a mouse click.
@@ -1793,6 +1812,14 @@ function freenetBridge(authToken, userToken, hostedMode) {
     }
   }
   function hideCard(nonce) {
+    // Note the removal BEFORE the early return. Every removal path funnels
+    // here — the socket's `prompt_removed`, the 404 from `/respond` meaning
+    // another tab answered, and reconcile's own hide pass — so this one line
+    // is what keeps `reconcileFromPending`'s add-pass staleness check honest.
+    // Above the return on purpose: a `prompt_removed` for a nonce this tab
+    // never rendered is still an OBSERVED removal, and it is exactly the case
+    // a stale snapshot would otherwise resurrect.
+    noteRemovalObserved();
     var card = overlayCards[nonce];
     if (!card) return;
     if (card._fnTimerId) {
@@ -1859,9 +1886,9 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // correct: a snapshot taken before the card existed can never hide it.
   // perm-reconcile:BEGIN
   // Extracted verbatim by shell_bridge_permission_ws.test.mjs, which runs it
-  // against injected `fetch` / `Date` / card helpers. Keep the markers.
+  // against injected `fetch` / `permNow` / card helpers. Keep the markers.
   function reconcileFromPending() {
-    var issuedAt = Date.now();
+    var issuedAt = permNow();
     fetch('/permission/pending')
       .then(function (r) {
         return r.json();
@@ -1869,18 +1896,35 @@ function freenetBridge(authToken, userToken, hostedMode) {
       .then(function (prompts) {
         if (!Array.isArray(prompts)) return;
         var seen = {};
+        // The ADD pass needs the mirror of the hide pass's causal check. A
+        // stale snapshot can otherwise RESURRECT a prompt that was answered
+        // after the request went out: F1 is issued and sees X; X is answered
+        // in another tab; F1 lands, X is absent from overlayCards, so X is
+        // shown again. With a healthy socket nothing then removes the ghost,
+        // and the user is looking at a delegate-authored security prompt for a
+        // dead nonce until they click it (404 -> hide) or the socket cycles.
+        //
+        // One timestamp rather than a per-nonce map, deliberately: a map keyed
+        // by nonce grows without bound in a long-lived tab, and the precision
+        // buys nothing here. If ANY removal was observed after this request
+        // was issued, the snapshot predates known state and its additions are
+        // untrustworthy, so skip them. Cheap to be wrong in this direction —
+        // a genuinely-new prompt arrives over the socket anyway, and the next
+        // reconcile re-adds it.
+        var addsAreStale = lastRemovalObservedAt >= issuedAt;
         prompts.forEach(function (p) {
           if (!p || typeof p.nonce !== 'string') return;
           seen[p.nonce] = true;
           if (overlayCards[p.nonce]) return;
+          if (addsAreStale) return;
           showCard(p.nonce, createCard(p));
         });
         Object.keys(overlayCards).forEach(function (nonce) {
           if (seen[nonce]) return;
           var card = overlayCards[nonce];
           // Only hide what this snapshot could actually have observed.
-          // `>=`, not `>`: Date.now() has millisecond granularity and the node
-          // is on loopback, so a card shown in the SAME millisecond the fetch
+          // `>=`, not `>`: the clock is millisecond-granular and the node is
+          // on loopback, so a card shown in the SAME millisecond the fetch
           // was issued is genuinely ambiguous. Resolve that tie toward keeping
           // the card. The two errors are not symmetric — a card kept one beat
           // too long is corrected by the next event or reconcile, whereas a
@@ -1914,6 +1958,23 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // receives prompt updates. The poll stops as soon as the socket re-opens,
   // and every (re)connect re-bootstraps from /permission/pending so nothing
   // is missed across the gap.
+  // Reconnect state. Backoff starts at 1s and doubles to a 30s ceiling,
+  // reset to 1s once the socket has proved stable.
+  // perm-ws-machine:BEGIN — the stateful half of the permission-event socket:
+  // connection state, reconnect scheduling, and the open/close transitions.
+  // shell_bridge_permission_ws.test.mjs extracts this whole region and runs it
+  // against stubbed `WebSocket`/timers/`fetch`, so the reconnect behaviour is
+  // tested rather than merely name-pinned. Everything this region needs from
+  // outside (showCard/hideCard/createCard/overlayCards/reconcileFromPending/
+  // startFallbackPoll/stopFallbackPoll/location) is referenced but not
+  // defined here, and the test supplies those.
+  // The idempotency guard here is load-bearing as of #5213: openPermSocket
+  // starts the poll before the handshake resolves AND onclose starts it again,
+  // so every retry cycle calls this twice. Without the guard each cycle would
+  // leak a fresh interval hammering /permission/pending forever — an unbounded
+  // silent loop of exactly the shape this file's comments warn about. Kept
+  // inside the marker region so the test drives the REAL interval bookkeeping
+  // rather than a stub that cannot express the leak.
   var fallbackPollHandle = null;
   function startFallbackPoll() {
     if (fallbackPollHandle !== null) return;
@@ -1925,16 +1986,6 @@ function freenetBridge(authToken, userToken, hostedMode) {
     clearInterval(fallbackPollHandle);
     fallbackPollHandle = null;
   }
-  // Reconnect state. Backoff starts at 1s and doubles to a 30s ceiling,
-  // reset to 1s on every successful open.
-  // perm-ws-machine:BEGIN — the stateful half of the permission-event socket:
-  // connection state, reconnect scheduling, and the open/close transitions.
-  // shell_bridge_permission_ws.test.mjs extracts this whole region and runs it
-  // against stubbed `WebSocket`/timers/`fetch`, so the reconnect behaviour is
-  // tested rather than merely name-pinned. Everything this region needs from
-  // outside (showCard/hideCard/createCard/overlayCards/reconcileFromPending/
-  // startFallbackPoll/stopFallbackPoll/location) is referenced but not
-  // defined here, and the test supplies those.
   var permSocket = null;
   var permReconnectDelay = 1000;
   var permReconnectHandle = null;
@@ -2059,6 +2110,25 @@ function freenetBridge(authToken, userToken, hostedMode) {
     // timeout. This also covers the initial bootstrap, since startFallbackPoll
     // reconciles immediately.
     startFallbackPoll();
+    // Retire any previous socket BEFORE opening a new one. The identity guard
+    // on `onclose` exists for the case where a future trigger opens a second
+    // socket, but on its own it makes that case WORSE: the guard's early
+    // return also skips the `permStableTimer` cleanup, so socket A's timer
+    // outlives A, fires, and both resets the backoff for a dead socket and
+    // nulls the handle belonging to socket B — silently defeating the
+    // anti-flap protection in precisely the scenario the guard names. Clearing
+    // here means the invariant holds however this function comes to be called.
+    if (permStableTimer !== null) {
+      clearTimeout(permStableTimer);
+      permStableTimer = null;
+    }
+    if (permSocket !== null) {
+      var stale = permSocket;
+      permSocket = null;
+      try {
+        stale.close();
+      } catch (err) {}
+    }
     var sock;
     try {
       sock = new WebSocket(permSocketUrl(location));
@@ -2071,7 +2141,6 @@ function freenetBridge(authToken, userToken, hostedMode) {
     }
     permSocket = sock;
     sock.onopen = function () {
-      permConsecutiveFailures = 0;
       stopFallbackPoll();
       reconcileFromPending();
       // Reset the backoff only once the socket has PROVEN stable, not the
@@ -2083,6 +2152,12 @@ function freenetBridge(authToken, userToken, hostedMode) {
       permStableTimer = setTimeout(function () {
         permStableTimer = null;
         permReconnectDelay = 1000;
+        // Reset the failure counter HERE, with the backoff, not on bare open.
+        // Resetting it the instant the socket opened meant the accept-then-drop
+        // case — the exact scenario the stability window exists for — grew the
+        // backoff as intended but never reached PERM_WARN_AFTER_FAILURES, so a
+        // permanently degraded tab stayed undiagnosable.
+        permConsecutiveFailures = 0;
       }, PERM_STABLE_AFTER);
     };
     sock.onmessage = function (e) {
