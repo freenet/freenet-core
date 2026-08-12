@@ -171,12 +171,22 @@ MARKER_LATEST_SEEN='Startup update check: GitHub reports latest release'
 # constant's value.
 #
 # If a Gate B run reports "never logged which release it compared against" for
-# a previous release at or above this version, the marker was REMOVED (a real
-# finding) or this constant is set one release too early (bump it).
+# a previous release at or above this version, the marker was REMOVED -- that is
+# a real finding about the node, not a reason to touch this constant.
+#
 # 0.2.125, not 0.2.124: the marker landed in the 0.2.124 tree, but that release
 # was never PUBLISHED (Gate A blocked it on the TMPDIR harness bug, #5290) and a
 # draft is invisible to `/releases/latest`. So no release a node can reach emits
 # this line until 0.2.125, and Gate B must not demand it from 0.2.123.
+#
+# FROZEN. This is a fact about release history -- which release first shipped
+# the line -- and release history does not change, so the value must NOT track
+# the version being cut. Raising it to the current release skips Gate B's only
+# positive assertion for that release, and a constant kept level with the crate
+# version disarms the gate on every release while looking maintained.
+# `auto-update-canary_test.sh` pins both halves: the value against this literal,
+# and the constant against the crate version so it can never sit ABOVE it (from
+# where `prev_emits_latest_seen` could never arm at all).
 MARKER_LATEST_SEEN_SINCE='0.2.125'
 
 MUSL_ASSET='freenet-x86_64-unknown-linux-musl.tar.gz'

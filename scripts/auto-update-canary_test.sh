@@ -471,7 +471,10 @@ gate_b_arm_case() {
     fi
 }
 gate_b_arm_case "$MARKER_LATEST_SEEN_SINCE" yes   # the release the marker lands in
-gate_b_arm_case "0.2.125"                   yes   # every release after it
+# Was a literal `0.2.125`, which is the constant's own value and so duplicated
+# the case above rather than covering "after it". The constant is frozen (pinned
+# below), so a later release is a literal one release on.
+gate_b_arm_case "0.2.126"                   yes   # every release after it
 gate_b_arm_case "0.3.0"                     yes
 gate_b_arm_case "0.2.123"                   no    # the one release that must skip
 gate_b_arm_case "0.2.99"                    no    # numeric, not lexical
@@ -730,61 +733,91 @@ pin_marker "source pin: #4073 refusal phrase"   "$SRC"    "$MARKER_NOT_TRIGGERED
 pin_marker "source pin: disabled marker"        "$SRC"    "$MARKER_DISABLED"
 
 # --- the MARKER_LATEST_SEEN_SINCE constant itself ---------------------------
-# Gate B's version gate is now pinned in both directions (the behavioural cases
-# on `prev_emits_latest_seen`, and the un-negated call site), but neither looks
-# at the CONSTANT they compare against. Raising it 0.2.124 -> 0.2.999 left the
+# Gate B's version gate is pinned in both directions (the behavioural cases on
+# `prev_emits_latest_seen`, and the un-negated call site), but neither looks at
+# the CONSTANT they compare against. Raising it 0.2.124 -> 0.2.999 left the
 # whole suite green while permanently disarming Gate B's only positive
 # assertion -- the same silent direction as the `!` inversion, reached by
 # editing a different line.
 #
-# Anchored against the crate version, which the constant cannot influence. The
-# relationship is real rather than arbitrary: the constant names the first
-# release whose binary emits MARKER_LATEST_SEEN, that marker is emitted by THIS
-# source tree (pinned above), and this tree ships as the NEXT release. So the
-# constant must be just ahead of the version in Cargo.toml -- not behind it (the
-# marker is new here, so no already-published release emits it) and not far
-# ahead of it (that is a typo, or a change that has sat unmerged for many
-# releases and needs the value re-confirmed rather than assumed).
+# THE RELATION IS `constant <= crate version`, AND IT USED TO BE THE OPPOSITE.
+# The first version of this block asserted the constant was NOT BELOW the crate
+# version. Its premise was stated in its own comment: "the marker is new in this
+# tree, so no already-published release emits it". That premise was true for
+# exactly as long as 0.2.125 was unpublished, and it EXPIRED the moment 0.2.125
+# shipped. The constant is a historical fact and correctly stays at 0.2.125
+# forever, so the old assertion would have gone red on the 0.2.126 bump and
+# blocked a healthy release -- a self-detonating pin, verified by setting the
+# crate version to 0.2.126 and watching it fail.
 #
-# The window is a guard against a wrong constant, not a proof of the right one.
-# If a release genuinely slips further than this, update the constant on
-# purpose -- which is the outcome this assertion exists to force.
+# The relation worth pinning is the other one, because only one direction is
+# SILENT:
+#
+#   constant ABOVE the crate version -- `prev_emits_latest_seen` compares the
+#     PREVIOUS release against it, and the previous release is always below the
+#     crate version, so the gate can never arm. Gate B's only positive assertion
+#     is skipped on every release, indefinitely, and the run still reports
+#     success. This is the dangerous direction and the one asserted below.
+#
+#   constant AT or BELOW the crate version -- the check runs (from the release
+#     after the constant onwards). Nothing to catch.
+#
+# Anchored against the crate version, which the constant cannot influence.
 CORE_TOML="$SCRIPT_DIR/../crates/core/Cargo.toml"
-SINCE_SKEW_MAX=5
 if [[ ! -f "$CORE_TOML" ]]; then
     echo "FAIL - cannot check MARKER_LATEST_SEEN_SINCE: $CORE_TOML not found" >&2
     FAILURES=$((FAILURES + 1))
 else
     crate_version="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$CORE_TOML" | head -1)"
-    IFS=. read -r c_maj c_min c_pat <<< "$crate_version"
-    IFS=. read -r s_maj s_min s_pat <<< "$MARKER_LATEST_SEEN_SINCE"
     if [[ -z "$crate_version" ]]; then
         echo "FAIL - could not read the crate version from $CORE_TOML" >&2
         FAILURES=$((FAILURES + 1))
-    elif [[ "$s_maj" != "$c_maj" || "$s_min" != "$c_min" ]]; then
-        echo "FAIL - MARKER_LATEST_SEEN_SINCE ($MARKER_LATEST_SEEN_SINCE) is not on the same" >&2
-        echo "       major.minor as the crate ($crate_version). Gate B skips its positive" >&2
-        echo "       equality check for every release below the constant, so a constant set" >&2
-        echo "       too high leaves the gate permanently vacuous and silent about it." >&2
-        FAILURES=$((FAILURES + 1))
-    elif [[ "$s_pat" -lt "$c_pat" ]]; then
-        echo "FAIL - MARKER_LATEST_SEEN_SINCE ($MARKER_LATEST_SEEN_SINCE) is BELOW the crate" >&2
-        echo "       version ($crate_version). It names the first release that emits" >&2
-        echo "       '$MARKER_LATEST_SEEN', and that marker is new in this tree -- no" >&2
-        echo "       already-published release emits it, so Gate B would demand the line" >&2
-        echo "       from binaries never built to log it." >&2
-        FAILURES=$((FAILURES + 1))
-    elif [[ "$s_pat" -gt $(( c_pat + SINCE_SKEW_MAX )) ]]; then
-        echo "FAIL - MARKER_LATEST_SEEN_SINCE ($MARKER_LATEST_SEEN_SINCE) is more than" >&2
-        echo "       $SINCE_SKEW_MAX patch releases ahead of the crate version ($crate_version)." >&2
-        echo "       Gate B skips its only positive assertion for every release below the" >&2
-        echo "       constant, so an over-high value disarms the gate permanently and" >&2
-        echo "       silently. If the release really has slipped this far, re-confirm the" >&2
-        echo "       value and widen SINCE_SKEW_MAX deliberately." >&2
+    elif ! version_at_least "$crate_version" "$MARKER_LATEST_SEEN_SINCE"; then
+        echo "FAIL - MARKER_LATEST_SEEN_SINCE ($MARKER_LATEST_SEEN_SINCE) is ABOVE the crate" >&2
+        echo "       version ($crate_version). Gate B arms its positive-equality check only" >&2
+        echo "       when the PREVIOUS release is >= the constant, and the previous release is" >&2
+        echo "       always below this tree's version -- so a constant set above it can never" >&2
+        echo "       arm. Gate B then skips its only positive assertion on every release," >&2
+        echo "       reports success, and the silently-wrong-comparator hole it exists to" >&2
+        echo "       close is open again." >&2
         FAILURES=$((FAILURES + 1))
     else
-        echo "ok   - MARKER_LATEST_SEEN_SINCE ($MARKER_LATEST_SEEN_SINCE) is the next release after the crate version ($crate_version)"
+        echo "ok   - MARKER_LATEST_SEEN_SINCE ($MARKER_LATEST_SEEN_SINCE) is at or below the crate version ($crate_version), so Gate B's equality check can arm"
     fi
+fi
+
+# ...and the value itself, which the relation above deliberately does not pin.
+#
+# `constant <= crate version` permits the constant to CREEP FORWARD with each
+# release. That creep passes every assertion in this file and is wrong every
+# time: setting the constant to the version being cut skips Gate B's equality
+# check for that release, so a constant kept level with the crate version
+# disarms the gate on every release while looking maintained.
+#
+# There is exactly one correct value, and it is not a policy choice: 0.2.125 is
+# the first release a running node can REACH whose binary emits
+# MARKER_LATEST_SEEN. The marker landed in the 0.2.124 tree, but 0.2.124 was
+# never published (Gate A blocked it on the #5290 TMPDIR harness bug) and a
+# draft does not appear at `/releases/latest`, so no node ever saw a 0.2.124
+# binary. That makes the constant a statement about release history, not about
+# this tree, and release history does not change -- FREEZE IT.
+#
+# Moving it forward is therefore always a mistake. If the FACT turns out to be
+# wrong (0.2.125 does not emit the line after all), change both the constant and
+# this expectation in the same commit and say why. That deliberate edit is the
+# outcome this assertion exists to force; the accidental bump is what it stops.
+MARKER_LATEST_SEEN_SINCE_FROZEN='0.2.125'
+if [[ "$MARKER_LATEST_SEEN_SINCE" == "$MARKER_LATEST_SEEN_SINCE_FROZEN" ]]; then
+    echo "ok   - MARKER_LATEST_SEEN_SINCE is frozen at the historical value ($MARKER_LATEST_SEEN_SINCE_FROZEN)"
+else
+    echo "FAIL - MARKER_LATEST_SEEN_SINCE is '$MARKER_LATEST_SEEN_SINCE', expected the frozen" >&2
+    echo "       historical value '$MARKER_LATEST_SEEN_SINCE_FROZEN'. The constant records WHICH" >&2
+    echo "       published release first emitted '$MARKER_LATEST_SEEN'" >&2
+    echo "       -- a fact about release history, which does not change. Raising it skips Gate" >&2
+    echo "       B's positive-equality check for every release below the new value, silently." >&2
+    echo "       If the historical fact is genuinely wrong, change the constant and this" >&2
+    echo "       expectation together, in one commit, with the reason." >&2
+    FAILURES=$((FAILURES + 1))
 fi
 # The parse-failure marker gets a STRONGER pin than pin_marker can give.
 # `failed to parse latest version` appears twice in auto_update.rs: the
