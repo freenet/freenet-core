@@ -86,6 +86,8 @@ mod connection_backoff;
 mod connection_manager;
 pub(crate) mod contract_ban_list;
 pub(crate) mod delta_incompat;
+/// Shadow-mode detector for repairs that never converge (see the module docs).
+pub(crate) mod futile_repair;
 pub(crate) use connection_manager::ConnectionManager;
 // Nearest-neighbor ring lattice (successor+predecessor base edges).
 // `nn_lattice_active_for` is the full activation gate — the flag AND the
@@ -105,6 +107,9 @@ pub(crate) use broken_invariants::{BrokenInvariant, BrokenInvariantsTracker};
 /// executor chokepoints so a write that would overflow the aggregate disk
 /// budget is refused before any bytes land.
 pub(crate) use hosting::DiskBudgetExceeded;
+/// Hosting-BEGIN attribution: WHY this peer started hosting a contract. Every
+/// production caller of [`Ring::host_contract`] names one.
+pub(crate) use hosting::HostingCause;
 /// The pre-A2 flat 1 GiB budget, used as the upgrade-migration sentinel in
 /// `config::ConfigArgs::build` so an upgraded node re-derives its hosting budget
 /// instead of keeping the historically-pinned default (#4565).
@@ -128,6 +133,10 @@ pub use hosting::{AccessType, RecordAccessResult};
 /// `hosting-disk-pct` / `max-hosting-disk` defaults from these so the operator-
 /// facing defaults and the in-code sizing math share one source of truth.
 pub(crate) use hosting::{DEFAULT_HOSTING_DISK_PCT, DEFAULT_MAX_HOSTING_DISK_BYTES};
+/// Widths of the two hosted-set demand-signal histograms carried on the router
+/// snapshot, re-exported so `router` sizes its wire arrays from the same
+/// definition the bucketing code uses.
+pub(crate) use hosting::{GENUINE_ACCESS_RECENCY_BUCKETS, READ_COUNT_HIST_BUCKETS};
 /// Clamp bounds re-exported only for the config-default round-trip test.
 #[cfg(test)]
 pub(crate) use hosting::{MAX_DEFAULT_HOSTING_BUDGET_BYTES, MIN_DEFAULT_HOSTING_BUDGET_BYTES};
@@ -2089,6 +2098,12 @@ impl Ring {
                 )
             {
                 let lifecycle = op_manager.interest_manager.interest_lifecycle_snapshot();
+                // SHADOW MODE: futile-repair evidence (#nc-merge). Rides the
+                // same fixed-cardinality block for the same reason the rest of
+                // it does — `network_efficiency_v1` is the only family that
+                // bypasses both the node rate limiter and the collector's 5%
+                // sampler, so a rare-but-decisive counter is not sampled away.
+                let futile_repair = op_manager.interest_manager.futile_repair_snapshot();
                 let receiver = op_manager.payload_mix.receiver_apply_stats();
                 let queue = crate::node::BROADCAST_QUEUE_EFFICIENCY_METRICS.snapshot();
                 let state_rejections = crate::contract::state_size_rejection_snapshot();
@@ -2222,6 +2237,16 @@ impl Ring {
                     tel,
                     shadow,
                     eff: telemetry.network_efficiency_delivery,
+                    // Hosting observability (#4642): WHY this peer began hosting
+                    // each contract, and the two demand-signal gauges the
+                    // eviction ranking is built on. `hosting` is the same
+                    // `hosting_cache_stats()` read that feeds `vict_n`/`vict_b`
+                    // above, so all four describe one consistent hosted set.
+                    host_begin: hosting.hosting_begins,
+                    host_reads: hosting.read_count_hist,
+                    host_recency: hosting.genuine_access_recency,
+                    futile: futile_repair.to_row(),
+                    futile_ladder: futile_repair.ladder,
                 });
             }
 
@@ -3299,22 +3324,33 @@ impl Ring {
     /// Returns a `RecordAccessResult` containing:
     /// - `is_new`: Whether this contract was newly added (vs. refreshed existing)
     /// - `evicted`: Contracts that were evicted to make room
+    ///
+    /// `cause` attributes WHY this peer is (possibly) starting to host: the
+    /// caller is the only code that knows whether this is its own client's
+    /// request, someone else's request in transit, or a sub-op fetch. It feeds
+    /// telemetry only — it changes nothing about what is hosted or evicted.
     pub fn host_contract(
         &self,
         key: ContractKey,
         size_bytes: u64,
         access_type: AccessType,
+        cause: HostingCause,
     ) -> RecordAccessResult {
         self.hosting_manager
-            .record_contract_access(key, size_bytes, access_type)
+            .record_contract_access(key, size_bytes, access_type, cause)
     }
 
     /// Record a GET access to a contract in the hosting cache.
     ///
     /// Returns a `RecordAccessResult` indicating whether this was a new addition
     /// and which contracts were evicted (if any).
-    pub fn record_get_access(&self, key: ContractKey, size_bytes: u64) -> RecordAccessResult {
-        self.host_contract(key, size_bytes, AccessType::Get)
+    pub fn record_get_access(
+        &self,
+        key: ContractKey,
+        size_bytes: u64,
+        cause: HostingCause,
+    ) -> RecordAccessResult {
+        self.host_contract(key, size_bytes, AccessType::Get, cause)
     }
 
     /// Record that a local-client GET was answered from local hosted state
@@ -8301,6 +8337,57 @@ mod instant_now_pin_test {
     }
 }
 
+/// Wiring pin for the shadow-mode futile-repair rows on
+/// `network_efficiency_v1` (`crate::ring::futile_repair`).
+///
+/// The detector's state machine is unit-tested in its own module and its
+/// handler wiring in `node.rs`. What NEITHER can see is the assignment in
+/// `router_snapshot_telemetry` that connects the two: drop it, or feed a row
+/// from the wrong source, and every one of those tests stays green while the
+/// fleet publishes zeros — for a release whose entire purpose is to establish
+/// the detector's real frequency in production. That is the #4009/#4010
+/// manually-mirrored-telemetry footgun, and the snapshot loop is a 30-minute
+/// background cadence inside a fully-built `Ring`, which is why it is pinned by
+/// source scrape rather than executed.
+#[cfg(test)]
+mod futile_repair_wiring_pin {
+    /// Production source only: the needles below appear in this module too, and
+    /// a pin that matches its own source is a pin that can never fail.
+    fn production_source() -> &'static str {
+        const FULL: &str = include_str!("ring.rs");
+        let cutoff = FULL
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("ring.rs must have a top-level #[cfg(test)] mod section");
+        &FULL[..cutoff]
+    }
+
+    #[test]
+    fn network_efficiency_block_is_fed_from_the_futile_repair_snapshot() {
+        let src = production_source();
+        assert!(
+            src.contains(
+                "let futile_repair = op_manager.interest_manager.futile_repair_snapshot();"
+            ),
+            "the futile-repair snapshot is no longer taken in the \
+             router_snapshot block — the detector then collects its counters \
+             and exports nothing, while every test for it still passes"
+        );
+        for (field, source_expr) in [
+            ("futile", "futile_repair.to_row()"),
+            ("futile_ladder", "futile_repair.ladder"),
+        ] {
+            let needle = format!("{field}: {source_expr},");
+            assert!(
+                src.contains(&needle),
+                "`NetworkEfficiencyV1.{field}` must be populated as `{needle}` \
+                 in the router_snapshot block. Dropping it, or feeding it from \
+                 anything else, publishes an empty or wrong series with no \
+                 failing test — #4009/#4010."
+            );
+        }
+    }
+}
+
 /// Pin tests for the periodic hosting-advertisement re-request (#4642 spec step
 /// 1, "Fix 1"): the reliability backstop that heals a dropped on-connect
 /// advertisement exchange or a dropped per-eviction retraction. It is PIGGYBACKED
@@ -8667,6 +8754,48 @@ mod sleep_or_shutdown_tests {
     }
 }
 
+/// Wiring pin for the hosting-observability rows on `network_efficiency_v1`.
+///
+/// The counters themselves are unit-tested in `ring::hosting` (attribution) and
+/// `tracing::telemetry` (serialization). What NEITHER can see is the assignment
+/// in `router_snapshot_telemetry` that connects them: drop it, or feed a row
+/// from the wrong source, and every one of those tests stays green while the
+/// fleet publishes zeros or the wrong series. That is the #4009/#4010
+/// manually-mirrored-telemetry footgun, and the snapshot loop is a 30-minute
+/// background cadence inside a fully-built `Ring`, which is why it is pinned by
+/// source scrape rather than executed.
+#[cfg(test)]
+mod hosting_observability_wiring_pin {
+    /// Production source only: the needles below appear in this module too, and
+    /// a pin that matches its own source is a pin that can never fail.
+    fn production_source() -> &'static str {
+        const FULL: &str = include_str!("ring.rs");
+        let cutoff = FULL
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("ring.rs must have a top-level #[cfg(test)] mod section");
+        &FULL[..cutoff]
+    }
+
+    #[test]
+    fn network_efficiency_block_is_fed_from_the_hosting_cache_stats() {
+        let src = production_source();
+        for (field, source_expr) in [
+            ("host_begin", "hosting.hosting_begins"),
+            ("host_reads", "hosting.read_count_hist"),
+            ("host_recency", "hosting.genuine_access_recency"),
+        ] {
+            let needle = format!("{field}: {source_expr},");
+            assert!(
+                src.contains(&needle),
+                "`NetworkEfficiencyV1.{field}` must be populated as `{needle}` in \
+                 the router_snapshot block. Without this assignment the hosting \
+                 counters are collected and never exported, and every unit test \
+                 for them still passes — the exact failure mode of #4009/#4010."
+            );
+        }
+    }
+}
+
 /// End-to-end seam test for cost-aware eviction (#4861 / #4903 review):
 /// drives the message axis through the REAL production reporter
 /// (`Ring::report_contract_resource_usage` → topology meter) and the REAL
@@ -8740,9 +8869,24 @@ mod cost_pressure_seam_tests {
         let read_hot = seam_key(3);
 
         // Host all three through the production entry point (PUT seeds).
-        let _ = ring.host_contract(junk, 121, crate::ring::AccessType::Put);
-        let _ = ring.host_contract(subscribed, 121, crate::ring::AccessType::Put);
-        let _ = ring.host_contract(read_hot, 121, crate::ring::AccessType::Put);
+        let _ = ring.host_contract(
+            junk,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+        let _ = ring.host_contract(
+            subscribed,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+        let _ = ring.host_contract(
+            read_hot,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
         assert!(ring.is_hosting_contract(&junk), "precondition: hosted");
 
         // Age the PUT-seed recency stamps past the cost window, so only the
@@ -8761,7 +8905,7 @@ mod cost_pressure_seam_tests {
             ),
             crate::ring::hosting::AddSubscriberOutcome::Rejected
         ));
-        let _ = ring.record_get_access(read_hot, 121);
+        let _ = ring.record_get_access(read_hot, 121, crate::ring::HostingCause::Other);
 
         // The FX2j storm profile, reported for ALL THREE contracts through
         // the production reporter: one 58-target fan-out dispatch every 1.6s
@@ -8935,8 +9079,18 @@ mod cost_pressure_seam_tests {
         let junk = seam_key(1);
         let subscribed = seam_key(2);
 
-        let _ = ring.host_contract(junk, 121, crate::ring::AccessType::Put);
-        let _ = ring.host_contract(subscribed, 121, crate::ring::AccessType::Put);
+        let _ = ring.host_contract(
+            junk,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+        let _ = ring.host_contract(
+            subscribed,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
         // Both advertised to co-hosts — the state this fix is about. Set directly
         // (not via `announce_contract_hosted`) so the only `HostingAnnounce` the
         // channel can carry is a retraction.
@@ -9031,7 +9185,12 @@ mod cost_pressure_seam_tests {
 
         // (1) Re-hosted: present in the hosting cache when the reclaim runs.
         let rehosted = seam_key(4);
-        let _ = ring.host_contract(rehosted, 121, crate::ring::AccessType::Put);
+        let _ = ring.host_contract(
+            rehosted,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
         op_manager.neighbor_hosting.on_contract_hosted(&rehosted);
 
         // (2) Back in use: absent from the hosting cache, but a downstream

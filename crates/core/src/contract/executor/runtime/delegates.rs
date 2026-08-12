@@ -619,7 +619,10 @@ mod resolve_message_origin_tests {
         // handler rejects it against MAX_MIGRATION_PREDECESSORS).
         let many: Vec<DelegateKey> = (0u8..200).map(dkey).collect();
         assert_eq!(dedupe_predecessors(many).len(), 200);
-        assert!(200 > MAX_MIGRATION_PREDECESSORS);
+        // Compile-time tripwire: if MAX_MIGRATION_PREDECESSORS is ever raised to
+        // >= 200 this fails the build, so the "many" fixture above always stays
+        // large enough to actually exercise the over-cap scenario elsewhere.
+        const _: () = assert!(200 > MAX_MIGRATION_PREDECESSORS);
     }
 
     /// Caller delegate identity wins over a concurrently-supplied WebApp
