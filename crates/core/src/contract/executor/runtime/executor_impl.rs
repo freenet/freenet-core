@@ -310,21 +310,41 @@ where
                         key: key.into(),
                     }));
                 }
-            } else {
-                // Contract already in store. ensure_key_indexed handles the case of contracts
-                // that reuse the same WASM code with different parameters (e.g., different
-                // River rooms). Without this, lookup_key() fails for the new instance_id.
-                // See issue #2380.
+            } else if let Some(ref contract_code) = code {
+                // Contract code already on disk, but this may be a NEW instance of
+                // it: instances that reuse the same WASM with different parameters
+                // (e.g. different River rooms) each need their own
+                // instance→code row, or `lookup_key()` fails for the new
+                // instance id. See issue #2380.
                 //
-                // We only index when code was provided in this request (code.is_some()).
-                // When code is None, this is a state-only update to an existing contract
-                // that should already be indexed.
-                if code.is_some() {
-                    self.runtime
-                        .ensure_key_indexed(&key)
-                        .map_err(ExecutorError::other)?;
-                }
-                (false, code.is_some(), None)
+                // This goes through `store_contract`, NOT through a bare
+                // index-write helper, and that is the point. `store_contract` is
+                // the store's ONE guarded ingress: it verifies that the key is
+                // derived from the code and parameters in hand (see
+                // `ContractStore::verify_contract_identity`) before it writes
+                // anything, and its own fast paths then do exactly the
+                // "just index this instance" work this branch needs — the blob is
+                // already on disk, so no blob is rewritten and no byte is
+                // re-charged against the disk budget.
+                //
+                // It used to call `ContractStore::ensure_key_indexed` directly,
+                // which wrote the durable instance→code row with no derivation
+                // check at all. That made this — the COMMON path, since any
+                // contract reusing an already-stored binary lands here — an
+                // unverified second ingress to the same index that
+                // `store_contract` guards. Two writers of one durable row, one
+                // guarded and one not, is the structure to avoid; do NOT
+                // reintroduce a direct index write here.
+                //
+                // Only reached when code was provided in this request. With no
+                // code this is a state-only update to a contract that is already
+                // indexed, and there is nothing to verify against.
+                self.runtime
+                    .store_contract(contract_code.clone())
+                    .map_err(ExecutorError::other)?;
+                (false, true, None)
+            } else {
+                (false, false, None)
             };
 
         let is_new_contract = self.state_store.get(&key).await.is_err();
@@ -2963,6 +2983,18 @@ mod full_state_version_gate_pins {
         &after[..end]
     }
 
+    /// `upsert_body` with `//` comment lines removed, so a pin can assert that a
+    /// name does not appear in the CODE without tripping over prose that
+    /// deliberately names it (the removed index writer is discussed in a comment
+    /// right where it used to be called).
+    fn upsert_code_only() -> String {
+        upsert_body()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// A full state over EXISTING state must reach the contract's
     /// `update_state` (the contract's version acceptance is the ONLY version
     /// oracle core has), and the only WASM-merge bypass writing an initial
@@ -3005,6 +3037,66 @@ mod full_state_version_gate_pins {
             1,
             "exactly one direct state_store.store call is allowed in the \
              upsert path (the is_new_contract initial install)"
+        );
+    }
+
+    /// The "code already stored" branch must route through `store_contract`,
+    /// the store's one guarded ingress, and must not write the durable
+    /// instance→code index by any other means.
+    ///
+    /// This branch is the COMMON path, not an edge case: any contract reusing an
+    /// already-stored binary lands here, which is every River room after the
+    /// first. It used to call `ContractStore::ensure_key_indexed`, which wrote
+    /// that durable row from a bare `&ContractKey` — no code, no parameters — so
+    /// it could verify neither the identity it was filing nor that the blob it
+    /// pointed at existed. Both gaps were found the same day
+    /// (`verify_contract_identity` for the first, #5280 for the second), which is
+    /// what makes this structural rather than two coincidences.
+    ///
+    /// Reverting the call site alone no longer compiles, since
+    /// `ContractStoreBridge` has no index-writing method any more — this pin
+    /// covers the case where someone restores the trait method too.
+    #[test]
+    fn already_stored_branch_routes_through_the_guarded_store_ingress() {
+        let body = upsert_code_only();
+
+        assert!(
+            !body.contains("ensure_key_indexed"),
+            "the upsert path must not write the instance→code index directly; \
+             route through store_contract, which verifies the key against the \
+             code and parameters first (see ContractStore::verify_contract_identity)"
+        );
+
+        // Slice the branch's OWN region — anchor to its `else if`, and stop at the
+        // `} else {` that closes it. Searching from the anchor to the end of the
+        // function would only prove "a store_contract call exists somewhere at or
+        // after this branch", which an unconditional call hoisted out of the
+        // branch satisfies just as well. That is not the property being pinned.
+        const ANCHOR: &str = "} else if let Some(ref contract_code) = code {";
+        let branch_start = body
+            .find(ANCHOR)
+            .expect("the 'code already stored' branch is not where this pin expects it");
+        let after_anchor = branch_start + ANCHOR.len();
+        let branch_end = body[after_anchor..]
+            .find("} else {")
+            .map(|offset| after_anchor + offset)
+            .expect("the already-stored branch must be closed by an else arm");
+        let branch = &body[branch_start..branch_end];
+
+        assert!(
+            branch.contains(".store_contract(contract_code.clone())"),
+            "the already-stored branch must index the new instance by calling \
+             store_contract INSIDE the branch — its fast paths do exactly that \
+             work once the identity is verified"
+        );
+        // Both `store_contract` calls in this body are legitimate: the new-code
+        // branch and this one. A third needs thought, and a call hoisted out of
+        // the branch would push this to three.
+        assert_eq!(
+            body.matches(".store_contract(").count(),
+            2,
+            "expected exactly two store_contract calls in the upsert path: the \
+             new-code branch and the already-stored branch"
         );
     }
 

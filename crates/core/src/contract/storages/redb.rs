@@ -1225,7 +1225,7 @@ impl ReDb {
     // These replace the legacy KEY_DATA file in contracts directory
 
     /// Store a contract index entry: ContractInstanceId → CodeHash
-    pub fn store_contract_index(
+    pub(crate) fn store_contract_index(
         &self,
         instance_id: &ContractInstanceId,
         code_hash: &CodeHash,
@@ -1309,7 +1309,7 @@ impl ReDb {
 
     /// Store a delegate index entry: DelegateKey → CodeHash
     /// DelegateKey is serialized as 64 bytes (32 byte key + 32 byte code_hash)
-    pub fn store_delegate_index(
+    pub(crate) fn store_delegate_index(
         &self,
         delegate_key: &DelegateKey,
         code_hash: &CodeHash,

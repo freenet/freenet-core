@@ -80,7 +80,10 @@ async fn setup_runtime(
             &vec![].into(),
         ))))
     };
-    let _stored = runtime.delegate_store.store_delegate(delegate.clone());
+    runtime
+        .delegate_store
+        .store_delegate(delegate.clone())
+        .expect("fixture delegate must store: Delegate::from derives its key");
 
     let key = XChaCha20Poly1305::generate_key(&mut OsRng);
     let cipher = XChaCha20Poly1305::new(&key);
@@ -2216,7 +2219,10 @@ async fn test_v1_delegate_detected_as_v1_with_state_store() -> Result<(), Box<dy
             &vec![].into(),
         ))))
     };
-    let _stored = runtime.delegate_store.store_delegate(delegate.clone());
+    runtime
+        .delegate_store
+        .store_delegate(delegate.clone())
+        .expect("fixture delegate must store: Delegate::from derives its key");
 
     let key = XChaCha20Poly1305::generate_key(&mut OsRng);
     let cipher = XChaCha20Poly1305::new(&key);
@@ -2349,7 +2355,10 @@ async fn test_v2_delegate_reads_contract_state() -> Result<(), Box<dyn std::erro
             &vec![].into(),
         ))))
     };
-    let _stored = runtime.delegate_store.store_delegate(delegate.clone());
+    runtime
+        .delegate_store
+        .store_delegate(delegate.clone())
+        .expect("fixture delegate must store: Delegate::from derives its key");
 
     let key = XChaCha20Poly1305::generate_key(&mut OsRng);
     let cipher = XChaCha20Poly1305::new(&key);
@@ -2446,7 +2455,10 @@ async fn test_v2_delegate_contract_not_found() -> Result<(), Box<dyn std::error:
             &vec![].into(),
         ))))
     };
-    let _stored = runtime.delegate_store.store_delegate(delegate.clone());
+    runtime
+        .delegate_store
+        .store_delegate(delegate.clone())
+        .expect("fixture delegate must store: Delegate::from derives its key");
 
     let key = XChaCha20Poly1305::generate_key(&mut OsRng);
     let cipher = XChaCha20Poly1305::new(&key);
@@ -2552,7 +2564,10 @@ async fn setup_v2_runtime_with_contract(
             &vec![].into(),
         ))))
     };
-    let _stored = runtime.delegate_store.store_delegate(delegate.clone());
+    runtime
+        .delegate_store
+        .store_delegate(delegate.clone())
+        .expect("fixture delegate must store: Delegate::from derives its key");
 
     let key = XChaCha20Poly1305::generate_key(&mut OsRng);
     let cipher = XChaCha20Poly1305::new(&key);
@@ -3146,7 +3161,10 @@ async fn test_subscribe_then_notify_roundtrip() -> Result<(), Box<dyn std::error
             &vec![].into(),
         ))))
     };
-    let _stored = runtime.delegate_store.store_delegate(delegate.clone());
+    runtime
+        .delegate_store
+        .store_delegate(delegate.clone())
+        .expect("fixture delegate must store: Delegate::from derives its key");
 
     let key = XChaCha20Poly1305::generate_key(&mut OsRng);
     let cipher = XChaCha20Poly1305::new(&key);
@@ -3393,7 +3411,10 @@ async fn test_notification_application_message_routed_to_registered_app()
             &vec![].into(),
         ))))
     };
-    let _stored = runtime.delegate_store.store_delegate(delegate.clone());
+    runtime
+        .delegate_store
+        .store_delegate(delegate.clone())
+        .expect("fixture delegate must store: Delegate::from derives its key");
     let key = XChaCha20Poly1305::generate_key(&mut OsRng);
     let cipher = XChaCha20Poly1305::new(&key);
     let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
@@ -3654,7 +3675,10 @@ async fn setup_runtime_with_params(
             &params.into(),
         ))))
     };
-    let _stored = runtime.delegate_store.store_delegate(delegate.clone());
+    runtime
+        .delegate_store
+        .store_delegate(delegate.clone())
+        .expect("fixture delegate must store: Delegate::from derives its key");
 
     let key = XChaCha20Poly1305::generate_key(&mut OsRng);
     let cipher = XChaCha20Poly1305::new(&key);
