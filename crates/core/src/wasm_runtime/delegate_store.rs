@@ -349,10 +349,10 @@ impl DelegateStore {
         // Verify the identity BEFORE anything durable happens — before the .reg
         // write and the ReDb row that the cache/disk early-return paths below
         // perform via `ensure_index_entry`, and before the blob write further
-        // down. This is pure computation (one BLAKE3 pass over the WASM,
-        // negligible against the compile it precedes), and a refusal therefore
-        // leaves no blob, no .reg record, no index row and no commit, so it is
-        // idempotent under retry. See `verify_delegate_identity`.
+        // down. This is pure computation (one BLAKE3 pass over the WASM) on a path
+        // that only runs at registration, so its cost is not on any hot path. A
+        // refusal therefore leaves no blob, no .reg record, no index row and no
+        // commit, so it is idempotent under retry. See `verify_delegate_identity`.
         if let Err(err) = Self::verify_delegate_identity(key, delegate.code(), &params) {
             // WARN, not debug: this is the node declining to file bytes under an
             // identity it did not derive. It should be visible in an operator's

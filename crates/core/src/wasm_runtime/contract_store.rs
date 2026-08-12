@@ -244,6 +244,29 @@ impl ContractStore {
     /// identity. Check 1 alone would still allow a well-formed container to be
     /// filed under an unrelated instance id; check 2 alone is circular.
     ///
+    /// Two distinct `(code, params)` pairs cannot legitimately derive the same
+    /// instance id by a length-shifting trick, only by a genuine BLAKE3
+    /// collision: the first operand of the concatenation is a fixed-length
+    /// 32-byte hash, so `BLAKE3(code_hash ‖ params)` is unambiguously parseable
+    /// and `(code_hash, params)` is uniquely recoverable from the hashed string.
+    /// (Were the first operand variable-length, `a ‖ b` and `a' ‖ b'` could agree
+    /// while the pairs differed, and a cheap preimage would exist without
+    /// breaking the hash.) That is what makes it sound for
+    /// `ensure_key_indexed_locked` to treat an index row disagreeing with a
+    /// verified key as WRONG rather than as an alternative mapping.
+    ///
+    /// # Cost, and where it is paid
+    ///
+    /// One BLAKE3 pass over the WASM per call. Since #5268's follow-up this runs
+    /// on the COMMON path, not just on first store: the executor's "code already
+    /// on disk" branch routes here so that a new instance of an existing binary
+    /// is verified before it is indexed, and on that path there is no module
+    /// compile to be negligible against — the blob is cached and nothing is
+    /// rewritten. It is still small beside the `validate_state` / `update_state`
+    /// WASM call the same PUT performs, which is the honest comparison. Do not
+    /// move the check later to save it: the whole point is that it precedes every
+    /// durable effect.
+    ///
     /// Deriving the id via the stdlib helper rather than re-implementing
     /// `BLAKE3(hash ‖ params)` here is deliberate: a local copy of that formula
     /// would silently diverge if the derivation ever changed.
@@ -309,15 +332,24 @@ impl ContractStore {
                 contract_v1.code().clone(),
                 contract_v1.params().clone(),
             ),
-            ContractContainer::Wasm(_) | _ => unimplemented!(),
+            // Return, don't `unimplemented!()`. Unreachable today (V1 is the only
+            // variant), but `ContractWasmAPIVersion` is `#[non_exhaustive]`, so a
+            // future variant would otherwise panic — and since this function moved
+            // onto the COMMON PUT path (it now handles new instances of
+            // already-stored code, not just first stores), that panic would be
+            // reachable from ordinary traffic rather than from a first store. The
+            // delegate store already answers this case with an error; match it.
+            ContractContainer::Wasm(_) | _ => {
+                return Err(anyhow::anyhow!("unsupported contract container version").into());
+            }
         };
 
         // Verify the identity BEFORE anything durable happens, and before taking
-        // the blob lock: this is pure computation (one BLAKE3 pass over the WASM,
-        // negligible against the compile it precedes), so there is no reason to
-        // hold a process-wide lock across it, and nothing below should run at all
-        // for a container whose key we cannot derive. See
-        // `verify_contract_identity`.
+        // the blob lock: this is pure computation (one BLAKE3 pass over the WASM),
+        // so there is no reason to hold a process-wide lock across it, and nothing
+        // below should run at all for a container whose key we cannot derive.
+        // See `verify_contract_identity`, including what that pass costs on the
+        // already-stored path — where there is no module compile to hide behind.
         if let Err(err) = Self::verify_contract_identity(&key, &code, &params) {
             // WARN, not debug: this is the node declining to file bytes under an
             // identity it did not derive. It should be visible in an operator's
@@ -619,6 +651,18 @@ impl ContractStore {
         match existing {
             Some(recorded) if recorded == *code_hash => return Ok(()),
             Some(recorded) => {
+                // Correcting the row can leave `recorded`'s blob referenced by no
+                // index row at all, if this was its last referent. That is a
+                // bounded disk leak and NOT a correctness problem: `fetch_contract`
+                // resolves code through this index, so an unreferenced blob is
+                // never served, and the disk-budget counter is reconciled against
+                // ground truth by the next `refresh_wasm` walk. It is also strictly
+                // better than the state it replaces, where the wrong row persisted
+                // forever. Deliberately not cleaned up here — orphan reconciliation
+                // in both directions is tracked as #5281, which already covers
+                // orphaned blobs and orphaned state/params rows from other
+                // triggers; a one-off sweep at this call site would be a second,
+                // partial mechanism.
                 tracing::warn!(
                     contract = %key,
                     instance_id = %key.id(),
@@ -1439,7 +1483,7 @@ mod test {
 
         let err = store
             .store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(forged)))
-            .expect_err("an undervied instance must be refused even when the blob is present");
+            .expect_err("an underived instance must be refused even when the blob is present");
         assert!(
             matches!(
                 err.deref(),
@@ -1524,6 +1568,25 @@ mod test {
             Some(hash_a),
             "the fast paths must correct a disagreeing row, not skip it"
         );
+
+        // Everything above reads `code_hash_from_id`, which consults the in-memory
+        // `DashMap` and never the durable ReDb row. So drop the store and rebuild
+        // from the same directory, forcing the index to load from ReDb alone: that
+        // is what proves the correction was made DURABLE rather than only in
+        // memory. Not reachable today, because `ensure_key_indexed_locked` writes
+        // ReDb before updating the map — but it would break silently under a
+        // refactor that reordered them, and an in-memory-only correction would be
+        // undone by the next restart. Same shape as
+        // `test_index_persistence_after_restart`.
+        drop(store);
+        let reopened_db = create_test_db(contract_dir.path()).await;
+        let reopened = ContractStore::new(contract_dir.path().into(), 10_000, reopened_db)?;
+        assert_eq!(
+            reopened.code_hash_from_id(key_a.id()),
+            Some(hash_a),
+            "the correction must be durable: an index rebuilt from ReDb must not \
+             resurrect the disagreeing row"
+        );
         Ok(())
     }
 
@@ -1557,17 +1620,13 @@ mod test {
              it must route through store_contract."
         );
 
-        let gate = production
+        production
             .find("#[cfg(test)]\n    pub fn ensure_key_indexed(")
             .expect(
                 "the bare index writer must stay #[cfg(test)]-gated — it takes only a \
                  &ContractKey, so it can verify neither the identity it files nor that \
                  the blob exists",
             );
-        let locked = production
-            .find("fn ensure_key_indexed_locked(")
-            .expect("ensure_key_indexed_locked not found");
-        assert!(gate < locked, "unexpected ordering of the two helpers");
     }
 
     /// Regression test for the latent shared-WASM deletion bug: removing one

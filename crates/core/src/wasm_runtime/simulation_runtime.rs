@@ -143,10 +143,19 @@ impl InMemoryContractStore {
 
     // NOTE: there is deliberately no `ensure_key_indexed` here. The executor's
     // "code already stored, index this new instance" branch routes through
-    // `store_contract`, which is the single guarded ingress on both backends —
-    // see `ContractStoreBridge::store_contract`. The removed helper also
-    // recorded EMPTY parameters for the instance, which `store_contract` gets
-    // right, so this backend became more faithful by losing it.
+    // `store_contract` on both backends — see `ContractStoreBridge::store_contract`.
+    // The removed helper also recorded EMPTY parameters for the instance, which
+    // `store_contract` gets right, so this backend became more faithful by
+    // losing it.
+    //
+    // But note what "single ingress" does and does not mean here. It is the
+    // single ingress on both backends; it is only GUARDED on the production one.
+    // The `store_contract` above performs no identity verification at all — the
+    // derivation check lives in `ContractStore::verify_contract_identity`, which
+    // this type does not use. So no simulation test and no mock-executor test can
+    // catch a mis-derived container, and a regression test for that behaviour
+    // cannot live here. It has to be a `ContractStore` unit test or a
+    // `crates/core/tests/` integration test against the real store.
 
     /// Clear all stored contracts (for testing).
     pub fn clear(&self) {

@@ -3067,25 +3067,37 @@ mod full_state_version_gate_pins {
              code and parameters first (see ContractStore::verify_contract_identity)"
         );
 
-        let already_stored = body
-            .find("} else if let Some(ref contract_code) = code {")
+        // Slice the branch's OWN region — anchor to its `else if`, and stop at the
+        // `} else {` that closes it. Searching from the anchor to the end of the
+        // function would only prove "a store_contract call exists somewhere at or
+        // after this branch", which an unconditional call hoisted out of the
+        // branch satisfies just as well. That is not the property being pinned.
+        const ANCHOR: &str = "} else if let Some(ref contract_code) = code {";
+        let branch_start = body
+            .find(ANCHOR)
             .expect("the 'code already stored' branch is not where this pin expects it");
-        let store_call = body[already_stored..]
-            .find(".store_contract(contract_code.clone())")
-            .expect(
-                "the already-stored branch must index the new instance by calling \
-                 store_contract — its fast paths do exactly that work once the \
-                 identity is verified",
-            );
+        let after_anchor = branch_start + ANCHOR.len();
+        let branch_end = body[after_anchor..]
+            .find("} else {")
+            .map(|offset| after_anchor + offset)
+            .expect("the already-stored branch must be closed by an else arm");
+        let branch = &body[branch_start..branch_end];
+
+        assert!(
+            branch.contains(".store_contract(contract_code.clone())"),
+            "the already-stored branch must index the new instance by calling \
+             store_contract INSIDE the branch — its fast paths do exactly that \
+             work once the identity is verified"
+        );
         // Both `store_contract` calls in this body are legitimate: the new-code
-        // branch and this one. Two is the expected count; a third needs thought.
+        // branch and this one. A third needs thought, and a call hoisted out of
+        // the branch would push this to three.
         assert_eq!(
             body.matches(".store_contract(").count(),
             2,
             "expected exactly two store_contract calls in the upsert path: the \
              new-code branch and the already-stored branch"
         );
-        assert!(store_call > 0, "unexpected slice offset");
     }
 
     /// The corrupted-state recovery path (the ONE branch that replaces
