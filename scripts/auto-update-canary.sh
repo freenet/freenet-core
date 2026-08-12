@@ -94,8 +94,13 @@ MARKER_DISABLED='Auto-update is DISABLED'
 # was reported as never having decided to update. It failed CLOSED (Gate B
 # refuses rather than passes), so nothing broke visibly -- which is precisely
 # why an enumeration that had been wrong since the urgent path was added went
-# unnoticed. `auto-update-canary_test.sh` now pins the COUNT at five, so a
-# sixth site cannot be added silently.
+# unnoticed. `auto-update-canary_test.sh` pins the count of
+# `update_tx.send(new_version)` call sites -- a structural anchor this regex
+# cannot influence -- and then requires this regex to match all of them. A
+# sixth site therefore cannot be added silently whether or not the regex
+# happens to match its wording. (Deriving the expected count FROM this regex,
+# as the first version of that pin did, made a site the regex missed invisible
+# to the count as well: the two errors cancelled.)
 MARKER_TRIGGERED_RE='triggering ([a-z]+ )?auto-update'
 # Kept for the negative subtraction and for messages: the refusal is a fixed
 # string and matching it loosely would swallow real triggers.
