@@ -1371,6 +1371,23 @@ wait_for_binaries() {
         status="${job_state%%:*}"
         conclusion="${job_state#*:}"
 
+        # No job at all, and the RUN has finished: the job was cancelled before
+        # it was created, or renamed out from under ATTACH_JOB_NAME. Nothing is
+        # ever going to appear, so stop rather than burn the full timeout --
+        # watching the job instead of the run must not cost us this fast exit.
+        # Reported as UNKNOWN, never as a pass.
+        if [[ -z "$job_state" ]]; then
+            local run_status
+            run_status=$(gh run view "$run_id" --repo freenet/freenet-core --json status --jq '.status' 2>/dev/null)
+            if [[ "$run_status" == "completed" ]]; then
+                echo "  ✗ '$ATTACH_JOB_NAME' never reported a result, and the run has finished"
+                echo "     (cancelled before the job started, or the job was renamed --"
+                echo "     if renamed, update ATTACH_JOB_NAME in this script)."
+                echo "     Check: https://github.com/freenet/freenet-core/actions/runs/$run_id"
+                return 1
+            fi
+        fi
+
         if [[ "$status" == "completed" ]]; then
             if [[ "$conclusion" == "success" ]]; then
                 echo "  ✓ Binaries attached and release published"
