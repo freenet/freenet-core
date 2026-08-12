@@ -194,9 +194,18 @@ pin_marker() {
         FAILURES=$((FAILURES + 1))
         return
     fi
-    # Rust string literals wrap across lines, so compare against the source
-    # with newlines and run-together indentation squeezed out.
-    if tr '\n' ' ' < "$file" | tr -s ' ' | grep -qF "$needle"; then
+    # Rust wraps a long string literal two ways: a plain wrap, and a
+    # `\`-continuation, which also swallows the next line's indentation.
+    # Squeezing newlines into spaces handled only the first -- a continuation
+    # left a stray `\` mid-phrase, so the needle silently failed to match.
+    # `not triggering auto-update` is emitted at two sites in freenet.rs and
+    # only one has the phrase unbroken, so this pin was passing on the
+    # coincidence of which site rustfmt happened to leave intact; reflowing
+    # that one site would have reported the marker gone while it was still
+    # emitted. Drop the continuation backslash first, then strip whitespace
+    # from both sides (as the INFO-level pin below already does), so the pin
+    # tracks the marker rather than the formatting.
+    if sed 's/\\$//' "$file" | tr -d '[:space:]' | grep -qF "${needle//[[:space:]]/}"; then
         echo "ok   - $desc"
     else
         echo "FAIL - $desc: '$needle' no longer appears in $(basename "$file")" >&2

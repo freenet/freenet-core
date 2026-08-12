@@ -1220,6 +1220,14 @@ ATTACH_JOB_NAME='Attach binaries to GitHub release'
 # Empty output means "we do not know" -- the job has not started, was renamed,
 # or `gh` failed -- and every caller must treat it as such rather than as a
 # pass. A rename shows up as a wait that times out loudly; it cannot fail open.
+#
+# CALLERS MUST WRITE `$(attach_job_state "$id" || echo "")`. This function ends
+# in a bare `gh`, so a `gh` failure IS its exit status, and `var=$(cmd)` is a
+# simple command whose status is `cmd`'s -- under `set -e` that aborts the whole
+# driver rather than yielding the "we do not know" this comment promises. The
+# same guard is needed on every bare `$(gh ...)` in this file, including
+# `$(gh ... | head -1)`, which `set -o pipefail` makes fail too. Pinned by
+# scripts/release_wait_for_binaries_test.sh.
 attach_job_state() {
     local run_id="$1"
     gh run view "$run_id" --repo freenet/freenet-core --json jobs \
@@ -1256,7 +1264,9 @@ publish_draft_release() {
         --json databaseId --jq '.[0].databaseId // empty' 2>/dev/null || echo "")
     job_state=""
     if [[ -n "$run_id" ]]; then
-        job_state=$(attach_job_state "$run_id")
+        # `|| echo ""` per attach_job_state's contract: without it a `gh` blip
+        # aborts the driver here instead of printing the refusal below.
+        job_state=$(attach_job_state "$run_id" || echo "")
     fi
     if [[ "$job_state" != "completed:success" ]]; then
         echo "  ⏸  NOT publishing v$VERSION: '$ATTACH_JOB_NAME' is '${job_state:-unknown}'." >&2
@@ -1336,7 +1346,10 @@ wait_for_binaries() {
     local find_elapsed=0
     local find_max=120  # 2 minutes to find the run
     while [[ $find_elapsed -lt $find_max ]]; do
-        run_id=$(gh run list --workflow=cross-compile.yml --repo freenet/freenet-core --json databaseId,headBranch --jq ".[] | select(.headBranch == \"v$VERSION\") | .databaseId" 2>/dev/null | head -1)
+        # `|| echo ""` so a transient `gh` failure retries on the next tick
+        # instead of aborting the driver. `set -o pipefail` propagates `gh`'s
+        # status out of the pipeline, so `head -1` does NOT absorb it.
+        run_id=$(gh run list --workflow=cross-compile.yml --repo freenet/freenet-core --json databaseId,headBranch --jq ".[] | select(.headBranch == \"v$VERSION\") | .databaseId" 2>/dev/null | head -1 || echo "")
         if [[ -n "$run_id" ]]; then
             break
         fi
@@ -1366,8 +1379,12 @@ wait_for_binaries() {
         # explicitly non-blocking -- see attach_job_state for what waiting on
         # the run instead costs. An empty state means the job has not started
         # yet (it waits on all six build jobs), so keep waiting.
+        # `|| echo ""` per attach_job_state's contract. A single rate-limit or
+        # 5xx anywhere in this multi-minute wait would otherwise abort the
+        # driver mid-release: the release publishes, but the gateways are never
+        # updated and it is never announced. Empty just means "poll again".
         local job_state status conclusion
-        job_state=$(attach_job_state "$run_id")
+        job_state=$(attach_job_state "$run_id" || echo "")
         status="${job_state%%:*}"
         conclusion="${job_state#*:}"
 
@@ -1377,8 +1394,11 @@ wait_for_binaries() {
         # watching the job instead of the run must not cost us this fast exit.
         # Reported as UNKNOWN, never as a pass.
         if [[ -z "$job_state" ]]; then
+            # Same guard, and it matters most here: this branch is the whole
+            # build window (job_state is empty until the six build jobs finish),
+            # so it is the busiest `gh` call in the release.
             local run_status
-            run_status=$(gh run view "$run_id" --repo freenet/freenet-core --json status --jq '.status' 2>/dev/null)
+            run_status=$(gh run view "$run_id" --repo freenet/freenet-core --json status --jq '.status' 2>/dev/null || echo "")
             if [[ "$run_status" == "completed" ]]; then
                 echo "  ✗ '$ATTACH_JOB_NAME' never reported a result, and the run has finished"
                 echo "     (cancelled before the job started, or the job was renamed --"
