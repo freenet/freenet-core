@@ -55,7 +55,16 @@
 #                 and a draft release does not appear there.
 #
 # Run either locally. Both keep their FILES to their own temp directory
-# (isolated HOME, config, data and log dirs), so nothing outside it is touched.
+# (isolated HOME, config, data, log dirs and TMPDIR), so nothing outside it is
+# touched.
+#
+# TMPDIR is in that list for a reason and must stay there: the node's contract
+# web directory is `std::env::temp_dir()/freenet/webs`, hardwired, and does NOT
+# follow `--data-dir`. Until v0.2.124 this file did not set TMPDIR, so the claim
+# above was false -- and worse, `cross-compile.yml` stages the binary under test
+# at `/tmp/freenet`, the exact path the node then tries to create a directory
+# under. The node panicked on ENOTDIR before reaching the update task, and Gate A
+# blocked a release whose binary was perfectly healthy. See `run_node_until_check`.
 #
 # PORTS are the exception, and an earlier version of this header overstated it
 # by calling the runs "safe to run on a machine already running a node". They
@@ -554,6 +563,29 @@ run_node_until_check() {
     # var removes the class outright for the cost of one line. Only the
     # canary's own throwaway node is affected.
     export FREENET_DISABLE_LOG_RATE_LIMIT=1
+    # The node's contract web directory is `std::env::temp_dir()/freenet/webs`
+    # (client_api.rs), hardwired -- it does NOT follow `--data-dir`. Two
+    # consequences, and the first one blocked a healthy release:
+    #
+    #   1. `cross-compile.yml` stages the binary it is about to gate at
+    #      `/tmp/freenet`, which is exactly the path the node then tries to
+    #      `mkdir` under. `create_dir_all` hits ENOTDIR against the binary FILE
+    #      and the node panics (exit 101) before the update task ever spawns, so
+    #      Gate A reports "the startup update check never ran" and blocks. That
+    #      is what happened to v0.2.124: the shipping binary was fine, and the
+    #      gate's own harness was not. Verified on the released artifact --
+    #      UNVERIFIED with the default TMPDIR, `rc=0` and
+    #      "compared against '0.2.123'" with TMPDIR isolated. Relocating the
+    #      binary alone is NOT sufficient; the isolation is the fix.
+    #   2. Without this the canary is not self-contained, contradicting this
+    #      file's own header: two nodes on one machine share
+    #      `/tmp/freenet/webs`. The header's "safe to run on a machine already
+    #      running a node" claim was corrected for PORTS earlier; this is the
+    #      other half of the same claim.
+    #
+    # Scoped to the subshell, so only the canary's throwaway node is affected.
+    mkdir -p "$work/tmp"
+    export TMPDIR="$work/tmp"
     exec timeout "$CANARY_TIMEOUT_SECS" "$binary" network \
       --config-dir "$work/cfg" \
       --data-dir "$work/data" \
