@@ -177,7 +177,14 @@ WRONG_OUT="$(cmd_preflight "$FAKE_WRONG" 2>&1)"
 WRONG_RC=$?
 if [ "$WRONG_RC" -eq 0 ]; then
     bad "cmd_preflight returned OK for a node that compared against the WRONG release (0.2.1 vs 0.2.121) -- the silently-wrong-comparator hole is open"
-elif printf '%s' "$WRONG_OUT" | grep -qF "compared against the WRONG release"; then
+# Glob match, not `printf … | grep -qF`: that pipeline's status is 141 under
+# `pipefail` once the producer has more than a pipe buffer left to write when
+# `grep -q` short-circuits, so a diagnosis that IS present reads as absent and
+# this branch reports "the wrong diagnosis" for the right one. cmd_preflight's
+# output is small today, so this is latent rather than live -- which is exactly
+# how the same defect survived in assert_detection_healthy until a real 3.65 MB
+# node log hit it. See .claude/rules/bug-prevention-patterns.md.
+elif [[ "$WRONG_OUT" == *"compared against the WRONG release"* ]]; then
     ok "cmd_preflight fails a node that compared against the wrong release, with the right diagnosis"
 else
     bad "cmd_preflight failed the wrong-release node but with the wrong diagnosis: $WRONG_OUT"

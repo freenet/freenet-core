@@ -1,6 +1,7 @@
 ---
 paths:
   - "crates/core/src/bin/**"
+  - "scripts/**"
 ---
 
 # Bug Prevention Patterns (freenet-core)
@@ -203,3 +204,112 @@ not known to work.
 ```bash
 grep -rn 'include_str!("' crates/core/src/bin/ | grep -v assets
 ```
+
+## SIGPIPE under `pipefail`: a present marker reads as absent
+
+In a script that sets `set -o pipefail`, piping a producer into a consumer that
+**short-circuits** — `grep -q`, `head -n`, `read` — makes the producer die with
+SIGPIPE (exit 141) as soon as the consumer stops reading. `pipefail` then
+promotes 141 to the pipeline's status. So:
+
+```bash
+set -uo pipefail
+if printf '%s' "$logs" | grep -qF "$MARKER"; then   # WRONG
+```
+
+reports **false for a marker that is present**. The `if` is not testing whether
+the marker is there; it is testing whether the producer finished writing.
+
+Three properties make this worse than an ordinary bug:
+
+**It is volume-dependent, so it is intermittent.** Below the 64 KB pipe buffer
+the producer finishes before `grep -q` exits and nothing happens. Above it, the
+producer is still writing and takes the signal. Every small fixture passes; the
+failure waits for a real input. Measured on #5236's canary, same log content
+with only trailing volume varied: 1 KB → `rc=0`; 200 KB → `rc=1` with a wrong
+diagnosis; a real 3.65 MB node log → `grep -acF` finds the line (count 1) while
+the piped `grep -q` exits **141** and the direct `grep -q` exits 0.
+
+**It corrupts the diagnosis, not just the verdict.** The gate blamed
+"the startup update check never ran" — pointing the next reader at auto-update
+detection when the fault was a shell pipeline. It hit 2 of 3 real preflight
+runs and `cmd_preflight` does not retry an rc=1, so a healthy release was
+blocked by an error about the wrong subsystem.
+
+**Framing decides whether it fires, invisibly.** Whether the consumer can
+short-circuit early depends on where the match falls and how the stream is
+split into lines, neither of which is visible at the call site. Same file, same
+consumer, match on line 1 of a 165 KB source:
+
+```bash
+sed 's/\\$//' "$AU" | grep -qF 'Auto-update'                # rc=141
+sed 's/\\$//' "$AU" | tr -d '[:space:]' | grep -qF '…'      # rc=0
+```
+
+The second is safe only because `tr` deletes every newline, leaving one line
+grep must read to EOF before it can report. `pin_marker` depended on that
+accident without knowing it — deleting the `tr` as a "simplification" would
+have armed the hazard on every source pin in the file at once.
+
+### Repeat offender history
+
+| Site | How it broke |
+|------|--------------|
+| `node_decided_to_update`, `node_check_settled` (`scripts/auto-update-canary.sh`) | Diagnosed and fixed when the mechanism was first found. Latent — canary logs never got large enough. |
+| Four checks in `assert_detection_healthy`, same file, same commit | NOT fixed by that pass, and not latent: Gate A's normal path leaves the node logging ~33 KB/s until it is killed seconds later, so the markers sit far behind the buffer. |
+| `pin_marker` (`scripts/auto-update-canary_test.sh`) | Safe only by accident of an intervening `tr -d '[:space:]'`, as above. |
+| `printf '%s' "$WRONG_OUT" \| grep -qF` (`scripts/auto-update-canary_lifecycle_test.sh`) | Latent; would have reported "the wrong diagnosis" for the right one. |
+
+### The rule
+
+**When you fix this, fix every instance in the repo, not the one you were
+reading.** That is the actual lesson of #5236: the same commit correctly
+diagnosed the mechanism, wrote the explanation down in a comment, fixed two
+helpers — and left four call sites inside the very function those helpers
+serve. Grep first, fix the set, then write the comment.
+
+Safe forms, in order of preference:
+
+- **Grep the file directly** rather than slurping it into a variable and piping
+  it: `grep -aqF -- "$needle" "$dir"/*.log`. No pipe, no producer to kill.
+- **Match the variable with a bash glob**: `[[ "$out" == *"$needle"* ]]`. Also
+  cheaper than forking grep.
+- **Take a count and test it**: `[ "$(grep -acF …)" -gt 0 ]` — the pipeline's
+  value is used, not its status.
+- **`|| true`** where the producer's status genuinely does not matter — but
+  prefer one of the above, since `|| true` also swallows real errors.
+
+`head` in a command substitution (`v="$(cmd | head -1)"`) is the same class but
+is normally fine: the value is used and the status discarded. It is only a
+hazard when something consumes the pipeline's status.
+
+### Audit
+
+```bash
+# which scripts are exposed at all
+grep -ln 'pipefail' scripts/*.sh
+
+# candidate sites; cross-reference against that list
+grep -rnE '\|[[:space:]]*(grep[[:space:]]+-[a-zA-Z]*q|head[[:space:]]|read[[:space:]])' scripts/
+```
+
+A hit matters when the pipeline's **status** is consumed — an `if`/`elif`,
+`&&`/`||`, a `while` condition, or a function whose last command it is. A hit
+whose stdout is captured and whose status is ignored is benign.
+
+The release-gate scripts that set `pipefail` are pinned against regression by
+`scripts/auto-update-canary_test.sh` ("no 'pipe into grep -q' …"), which fails
+if the form reappears in any of them. Regression tests in the same file drive
+>64 KB fixtures through `assert_detection_healthy` in both directions, since a
+small-fixture test cannot see this class at all.
+
+**The rest of `scripts/` is NOT pinned and has not been audited site by site.**
+As of #5236 the greps above return 20 scripts setting `pipefail` and ~69
+candidate sites across all of `scripts/`. Two that look worth a closer read
+when someone next touches those files, neither investigated here:
+`deploy-to-gateways.sh`'s health check pipes 100 journalctl lines into
+`grep -q` and consumes the status, and `deploy-local-gateway.sh` pipes
+`systemctl list-unit-files` (47 KB on one ordinary host, and it grows with the
+machine) into `grep -q` at five sites. Both would fail in the safe direction —
+reporting a healthy service as unhealthy — which is precisely the direction
+that survives unnoticed.

@@ -457,6 +457,53 @@ version_ge_case "0.3.0"   "0.2.124" yes
 # disarm the gate for every release in between.
 version_ge_case "0.2.99"  "0.2.124" no
 
+# --- no status-consuming pipe into a short-circuiting reader ----------------
+# The defect that produced this rule: `printf '%s' "$logs" | grep -aqF …` under
+# `set -o pipefail`. `grep -q` exits at its first match, the producer dies with
+# SIGPIPE (141), pipefail promotes 141 to the pipeline's status, and the `if`
+# reads a marker that IS PRESENT as ABSENT. It is volume-dependent, so it does
+# not fire below the 64 KB pipe buffer and no small fixture can see it -- it
+# waits for a real log. On a 3.65 MB node log, `grep -acF` found the line while
+# the piped `grep -q` exited 141 and Gate A blamed the wrong subsystem.
+#
+# The reason this is a pin and not just a fix: the commit that first diagnosed
+# it fixed two helper functions and left four call sites inside the very
+# function those helpers serve, plus two more elsewhere in these scripts. A fix
+# applied where you happened to be reading is how this pattern survives.
+#
+# Scope is the release-gate scripts that set `pipefail`, where a wrong answer
+# blocks or waves through a release. Alternatives, all used above: grep the
+# FILE directly (`log_has`), match the variable with a bash glob
+# (`[[ "$x" == *needle* ]]`), or take a count and test that.
+#
+# `head` is the same class but is NOT banned here: `$(… | head -1)` is used for
+# its stdout, not its status, and banning it would be noise. Watch it manually
+# when the pipeline's status is consumed.
+SIGPIPE_SCRIPTS=(
+    "$CANARY_SH"
+    "$SCRIPT_DIR/auto-update-canary_test.sh"
+    "$SCRIPT_DIR/auto-update-canary_lifecycle_test.sh"
+    "$SCRIPT_DIR/release_wait_for_binaries_test.sh"
+    "$SCRIPT_DIR/release_canary_wiring_test.sh"
+)
+# Verified not to match its own defining line: after the `|` comes `[`, not
+# whitespace-then-grep. A pin that finds its own needle is the self-satisfying
+# shape this repo's rules file documents separately.
+SIGPIPE_RE='\|[[:space:]]*grep[[:space:]]+-[a-zA-Z]*q'
+sigpipe_hits="$(grep -nE "$SIGPIPE_RE" "${SIGPIPE_SCRIPTS[@]}" 2>/dev/null \
+    | grep -vE ':[[:space:]]*#')"
+if [[ -z "$sigpipe_hits" ]]; then
+    echo "ok   - no 'pipe into grep -q' in the pipefail release-gate scripts (SIGPIPE/pipefail hazard)"
+else
+    echo "FAIL - a pipeline ending in 'grep -q' has come back in a pipefail script." >&2
+    echo "       Under pipefail the producer's SIGPIPE (141) becomes the pipeline's status, so a" >&2
+    echo "       marker that IS present reads as ABSENT once the producer exceeds the 64 KB pipe" >&2
+    echo "       buffer. Small fixtures cannot see it; a real node log can. Grep the file directly," >&2
+    echo "       or match the variable with [[ \"\$x\" == *needle* ]]." >&2
+    printf '%s\n' "$sigpipe_hits" >&2
+    FAILURES=$((FAILURES + 1))
+fi
+
 # --- markers must still exist in the Rust source ----------------------------
 # Without this the fixtures above are a self-consistent copy of strings that
 # may no longer be emitted: the canary would go quietly blind while its own
@@ -482,7 +529,21 @@ pin_marker() {
     # emitted. Drop the continuation backslash first, then strip whitespace
     # from both sides (as the INFO-level pin below already does), so the pin
     # tracks the marker rather than the formatting.
-    if sed 's/\\$//' "$file" | tr -d '[:space:]' | grep -qF "${needle//[[:space:]]/}"; then
+    #
+    # A bash glob match on a command substitution rather than `... | grep -qF`,
+    # matching the shape the sibling pins below already use. The pipe version
+    # consumed the PIPELINE's status, which under `pipefail` is 141 whenever
+    # `grep -q` short-circuits and the producer still has more than a pipe
+    # buffer to write -- so a marker that IS present reads as absent. Measured
+    # on auto_update.rs (165 KB), matching a string on line 1:
+    #     sed ... | grep -qF 'Auto-update'              -> rc=141
+    #     sed ... | tr -d '[:space:]' | grep -qF ...    -> rc=0
+    # It passed only because `tr` deletes every newline, leaving one enormous
+    # line that grep must read to EOF before it can report a match. That is an
+    # accident of the whitespace stripping, not a property of the pin: anyone
+    # "simplifying" the `tr` away would silently arm the hazard on every source
+    # pin in this file at once. Take the status out of the pipeline instead.
+    if [[ "$(sed 's/\\$//' "$file" | tr -d '[:space:]')" == *"${needle//[[:space:]]/}"* ]]; then
         echo "ok   - $desc"
     else
         echo "FAIL - $desc: '$needle' no longer appears in $(basename "$file")" >&2
