@@ -60,9 +60,7 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
     let mut put_ok: Vec<&contracts::RunContract> = Vec::new();
     for c in &run_contracts {
         let key = c.contract.key();
-        // `latency` comes back on both arms: a failed PUT reports the time it
-        // actually took, never the configured timeout.
-        let (outcome, latency) = client::put(
+        let attempt = client::put(
             &mut gw,
             c.contract.clone(),
             c.state.clone(),
@@ -70,17 +68,14 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
             op_timeout,
         )
         .await;
-        let ok = outcome.is_ok();
-        report.push(OpReport {
-            op: "put".to_string(),
-            age: "0h".to_string(),
-            label: c.label.clone(),
-            key: key.to_string(),
-            ok,
-            latency_ms: latency.as_millis(),
-            size: c.state.as_ref().len(),
-            error: outcome.err().map(|e| format!("{e:#}")),
-        });
+        let ok = attempt.outcome.is_ok();
+        push_put_report(
+            &mut report,
+            &c.label,
+            key.to_string(),
+            c.state.as_ref().len(),
+            attempt,
+        );
         if ok {
             put_ok.push(c);
         }
@@ -162,39 +157,38 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
     );
 
     for op in &ops {
-        // `latency` comes back on both arms; see the PUT loop above.
-        let (outcome, latency) = client::get(&mut peer, op.id, &op.label, op_timeout).await;
-        let outcome = outcome.and_then(|(contract, state)| match op.verify {
-            Verify::Identity(c) => {
-                anyhow::ensure!(
-                    contract == c.contract,
-                    "returned contract differs from what was PUT"
-                );
-                anyhow::ensure!(
-                    state == c.state,
-                    "returned state differs (got {} bytes, want {})",
-                    state.as_ref().len(),
-                    c.state.as_ref().len()
-                );
-                Ok(())
-            }
-            Verify::Hash(want) => {
-                let hash = blake3::hash(state.as_ref()).to_hex().to_string();
-                anyhow::ensure!(
-                    hash == want,
-                    "state hash mismatch (got {hash}, want {want})"
-                );
-                Ok(())
-            }
-        });
+        let attempt = client::get(&mut peer, op.id, &op.label, op_timeout)
+            .await
+            .and_then(|(contract, state)| match op.verify {
+                Verify::Identity(c) => {
+                    anyhow::ensure!(
+                        contract == c.contract,
+                        "returned contract differs from what was PUT"
+                    );
+                    anyhow::ensure!(
+                        state == c.state,
+                        "returned state differs (got {} bytes, want {})",
+                        state.as_ref().len(),
+                        c.state.as_ref().len()
+                    );
+                    Ok(())
+                }
+                Verify::Hash(want) => {
+                    let hash = blake3::hash(state.as_ref()).to_hex().to_string();
+                    anyhow::ensure!(
+                        hash == want,
+                        "state hash mismatch (got {hash}, want {want})"
+                    );
+                    Ok(())
+                }
+            });
         push_get_report(
             &mut report,
             op.age,
             &op.label,
             op.key.clone(),
             op.size,
-            outcome,
-            latency,
+            attempt,
         );
     }
 
@@ -277,28 +271,56 @@ fn interleave<T>(ops: &mut [T], seed: u64) {
 
 /// Record a GET.
 ///
-/// `latency` is what the operation actually took and is used on both arms.
-/// A failure used to report the configured op timeout instead, which looked
-/// like a measurement while being a constant: it made a fast terminal failure
-/// from the node indistinguishable from the client giving up at its deadline.
+/// The latency written is what the operation actually took, on both arms. A
+/// failure used to report the configured op timeout instead, which looked like
+/// a measurement while being a constant: it made a fast terminal failure from
+/// the node indistinguishable from the client giving up at its deadline. The
+/// timeout is deliberately not a parameter here, so no path through this
+/// function can synthesize one.
 fn push_get_report(
     report: &mut Report,
     age: &'static str,
     label: &str,
     key: String,
     size: usize,
-    outcome: Result<()>,
-    latency: Duration,
+    attempt: client::Attempt<()>,
 ) {
     report.push(OpReport {
+        seq: Report::SEQ_ASSIGNED_ON_PUSH,
         op: "get".to_string(),
         age: age.to_string(),
         label: label.to_string(),
         key,
-        ok: outcome.is_ok(),
-        latency_ms: latency.as_millis(),
+        ok: attempt.outcome.is_ok(),
+        latency_ms: attempt.latency.as_millis(),
         size,
-        error: outcome.err().map(|e| format!("{e:#}")),
+        errors_ignored: attempt.errors_ignored,
+        error: attempt.outcome.err().map(|e| format!("{e:#}")),
+    });
+}
+
+/// Record a PUT. Same contract as [`push_get_report`], and for the same
+/// reason: the PUT loop had the identical hardcoded-timeout defect, and its
+/// failures land in the same report with the same field.
+fn push_put_report(
+    report: &mut Report,
+    label: &str,
+    key: String,
+    size: usize,
+    attempt: client::Attempt<()>,
+) {
+    report.push(OpReport {
+        seq: Report::SEQ_ASSIGNED_ON_PUSH,
+        op: "put".to_string(),
+        // Every PUT is this run's own contract, so there is no other age.
+        age: "0h".to_string(),
+        label: label.to_string(),
+        key,
+        ok: attempt.outcome.is_ok(),
+        latency_ms: attempt.latency.as_millis(),
+        size,
+        errors_ignored: attempt.errors_ignored,
+        error: attempt.outcome.err().map(|e| format!("{e:#}")),
     });
 }
 
@@ -394,6 +416,17 @@ mod tests {
         );
     }
 
+    /// A failed operation that took `latency`, as the client would return it.
+    fn failed_after(latency: Duration) -> client::Attempt<()> {
+        client::Attempt {
+            outcome: Err(anyhow::anyhow!(
+                "stream assembly: no fragments received within inactivity timeout"
+            )),
+            latency,
+            errors_ignored: 0,
+        }
+    }
+
     #[test]
     fn a_failed_get_reports_the_time_it_actually_took() {
         // The nightly's configured deadline. Before the fix every failure
@@ -408,10 +441,7 @@ mod tests {
             "20260730-051006/small-2",
             "some-key".to_string(),
             1024,
-            Err(anyhow::anyhow!(
-                "stream assembly: no fragments received within inactivity timeout"
-            )),
-            measured,
+            failed_after(measured),
         );
 
         let op = report.ops().last().expect("one op was recorded");
@@ -426,6 +456,123 @@ mod tests {
             op_timeout.as_millis(),
             "reporting the configured timeout makes a fast terminal failure look like the client \
              giving up at its deadline"
+        );
+    }
+
+    #[test]
+    fn a_failed_put_reports_the_time_it_actually_took() {
+        // The PUT loop had the identical defect. Its failures land in the same
+        // report under the same field, so it needs the same guard.
+        let op_timeout = Duration::from_secs(120);
+        let measured = Duration::from_millis(37);
+
+        let mut report = Report::default();
+        push_put_report(
+            &mut report,
+            "small-2",
+            "some-key".to_string(),
+            1024,
+            failed_after(measured),
+        );
+
+        let op = report.ops().last().expect("one op was recorded");
+        assert!(!op.ok);
+        assert_eq!(
+            op.latency_ms,
+            measured.as_millis(),
+            "a failed PUT must carry its measured latency"
+        );
+        assert_ne!(
+            op.latency_ms,
+            op_timeout.as_millis(),
+            "reporting the configured timeout makes a fast terminal PUT failure look like the \
+             client giving up at its deadline"
+        );
+    }
+
+    #[test]
+    fn a_report_records_how_many_errors_the_key_filter_absorbed() {
+        // Without this the count reaches stderr only, i.e. the workflow log
+        // rather than the artifact people analyse: "was there a stale error
+        // during this run?" becomes unanswerable from `last-run.jsonl`.
+        let mut report = Report::default();
+        push_get_report(
+            &mut report,
+            "0h",
+            "small-0",
+            "some-key".to_string(),
+            1024,
+            client::Attempt {
+                outcome: Ok(()),
+                latency: Duration::from_millis(12),
+                errors_ignored: 2,
+            },
+        );
+        assert_eq!(report.ops().last().expect("one op").errors_ignored, 2);
+    }
+
+    /// The body of a column-0 free function, bounded to that function.
+    ///
+    /// Copied from `commands::auto_update`, which carries the incident this
+    /// exists for (#5102): a bare `split_once` on a moved anchor does not fail,
+    /// it matches a later occurrence — usually the pin's own assertion string —
+    /// and the pin then passes vacuously under a name that says it is covered.
+    fn fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        let at = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("definition not found: {signature}"));
+        let tests_at = src
+            .find("\n#[cfg(test)]\nmod ")
+            .map(|i| i + 1)
+            .expect("test module not located — this guard cannot verify anything");
+        assert!(
+            at < tests_at,
+            "`{signature}` matched inside the test module — this pin is scraping its own source \
+             and would pass vacuously"
+        );
+        assert!(
+            at == 0 || src.as_bytes()[at - 1] == b'\n',
+            "fn_body only supports column-0 free functions; `{signature}` is indented (a \
+             method?), where the `\\n}}\\n` end-anchor would slice to the end of the enclosing impl"
+        );
+        let after = &src[at + signature.len()..];
+        let (body, _) = after
+            .split_once("\n}\n")
+            .unwrap_or_else(|| panic!("could not locate end of: {signature}"));
+        assert!(
+            !body.contains("\n#[cfg(test)]\nmod "),
+            "scoped region for `{signature}` escaped into the test module — this pin would pass \
+             vacuously"
+        );
+        body
+    }
+
+    #[test]
+    fn the_run_shuffles_the_real_op_list_after_both_loops_have_filled_it() {
+        // Every other ordering test drives `interleave` against a synthetic
+        // vector, which says nothing about the call site. Moving the call three
+        // lines up — above the retention loop — restores the exact confound
+        // this change removes, every night, with tests and clippy green.
+        let body = fn_body(
+            include_str!("put_get.rs"),
+            "pub async fn run(args: PutGetArgs) -> Result<bool> {",
+        );
+        let (before, after) = body
+            .split_once("interleave(&mut ops, seed);")
+            .expect("run() must shuffle the op list it is about to issue");
+
+        assert!(
+            before.contains("for c in &put_ok {"),
+            "the shuffle must come after this run's own contracts are added, or they are not in it"
+        );
+        assert!(
+            before.contains("for (window, run) in &retention {"),
+            "the shuffle must come after the retention windows are added, or the oldest contracts \
+             are back at the end of every run — the confound this exists to remove"
+        );
+        assert!(
+            after.contains("for op in &ops {"),
+            "the GETs must be issued after the shuffle, or it changed nothing"
         );
     }
 }
