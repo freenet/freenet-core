@@ -185,6 +185,7 @@ function check(name, cond) {
       warnings: [],
       constructAttempts: 0,
       constructorThrows: false,
+      created: [],
     };
     const timers = [];
     let now = 0;
@@ -270,7 +271,7 @@ function check(name, cond) {
       function reconcileFromPending() { calls.reconciles++; }
       function showCard(nonce) { calls.shown.push(nonce); overlayCards[nonce] = {}; }
       function hideCard(nonce) { calls.hidden.push(nonce); delete overlayCards[nonce]; }
-      function createCard(p) { return { nonce: p && p.nonce }; }
+      function createCard(p) { calls.created.push(p); return { nonce: p && p.nonce }; }
       ${src}
       return {
         openPermSocket: openPermSocket,
@@ -322,9 +323,17 @@ function check(name, cond) {
   {
     const { machine, calls } = buildMachine();
     machine.openPermSocket();
+    const reconcilesBeforeOpen = calls.reconciles;
     calls.sockets[0].open();
     check('open stops the fallback poll', calls.stops === 1);
-    check('open reconciles so nothing is missed across the gap', calls.reconciles >= 1);
+    // A DELTA, not `>= 1`: startFallbackPoll already contributed one reconcile
+    // before the handshake resolved, so `>= 1` cannot tell whether onopen
+    // reconciled at all. Deleting the onopen reconcile passed under `>= 1` —
+    // the same vacuity family as the old `> 1000` backoff assertion.
+    check(
+      'open reconciles so nothing is missed across the gap',
+      calls.reconciles === reconcilesBeforeOpen + 1,
+    );
   }
 
   // 6c. Close restarts the poll and schedules exactly one reconnect.
@@ -425,6 +434,58 @@ function check(name, cond) {
     check('a non-JSON frame is swallowed, not thrown', threw === false);
   }
 
+  // 6t. The FIRST retry must use the current delay, not the advanced one.
+  //     `permReconnectDelay` is advanced after the timer is armed; swapping
+  //     those two lines makes the first reconnect wait 2s instead of 1s, and
+  //     every existing assertion (which only looks at the final delay) stays
+  //     green.
+  {
+    const { machine, calls, advance, timers } = buildMachine();
+    machine.openPermSocket();
+    calls.sockets[0].close();
+    const armed = timers.filter((t) => !t.cancelled);
+    check(
+      'the first reconnect is armed at ~1s, not the doubled delay',
+      armed.length === 1 && armed[0].at === 1000,
+    );
+    advance(1000);
+    check('and it fires at that time', calls.sockets.length === 2);
+  }
+
+  // 6r. A repeated prompt_added for a nonce already on screen must be ignored.
+  //     Without the guard, showCard overwrites overlayCards[nonce] and the
+  //     first card element is orphaned in the DOM forever — a leak a hostile
+  //     or merely retrying delegate can drive.
+  {
+    const { machine, calls, overlayCards } = buildMachine();
+    machine.openPermSocket();
+    const sock = calls.sockets[0];
+    sock.open();
+    sock.message({ event: 'prompt_added', data: { nonce: 'dup' } });
+    sock.message({ event: 'prompt_added', data: { nonce: 'dup' } });
+    check('a repeated prompt_added is ignored, not re-rendered', calls.shown.length === 1);
+    check('the card is still present after the duplicate', overlayCards.dup !== undefined);
+  }
+
+  // 6s. The card must be built from the delegate's payload, not just its nonce.
+  //     Passing only the nonce would render a prompt with no message, no
+  //     button labels and no delegate hash — a security prompt the user cannot
+  //     evaluate. 6g's stub reads only `nonce`, so it could not see this.
+  {
+    const { machine, calls } = buildMachine();
+    machine.openPermSocket();
+    const sock = calls.sockets[0];
+    sock.open();
+    sock.message({
+      event: 'prompt_added',
+      data: { nonce: 'n9', message: 'Allow?', labels: ['yes', 'no'] },
+    });
+    check(
+      'createCard receives the full payload, not just the nonce',
+      calls.created.length === 1 && calls.created[0].message === 'Allow?',
+    );
+  }
+
   // 6h. The fallback poll must never accumulate intervals. openPermSocket
   //     starts it AND onclose starts it again, so every retry cycle calls
   //     startFallbackPoll twice; without its idempotency guard each cycle
@@ -501,6 +562,112 @@ function check(name, cond) {
     check('a persistently failing socket warns', calls.warnings.length > 0);
   }
 
+  // 6l. Constants and bootstrap, all previously unpinned. Each of these is a
+  //     magnitude the code's own comments rely on, and each could be changed to
+  //     an absurd value with every other test still green.
+  {
+    const { machine, calls, liveIntervals } = buildMachine();
+    machine.openPermSocket();
+    const iv = [...liveIntervals.values()][0];
+    // 3s, because auto-deny is 60s: any interval near or past that makes the
+    // fallback useless while every other stated invariant still holds.
+    check('the fallback poll interval is 3s', iv && iv.ms === 3000);
+    // The immediate bootstrap. 6a asserts an interval EXISTS; that is not the
+    // same as having fetched anything, and deleting the immediate reconcile
+    // passed. This is the documented "no separate bootstrap call" path.
+    check('opening reconciles immediately, not only on the next tick', calls.reconciles === 1);
+  }
+
+  // 6m. The reconnect ceiling. Section 3 passes the ceiling in as a literal
+  //     argument, so the CONSTANT is never read by any test; raising it to
+  //     300000 changed nothing.
+  {
+    const { machine, calls, advance } = buildMachine();
+    machine.openPermSocket();
+    for (let i = 0; i < 12; i++) {
+      calls.sockets[calls.sockets.length - 1].close();
+      advance(600000);
+    }
+    check('the reconnect delay is capped at 30s', machine.state().delay === 30000);
+  }
+
+  // 6n. PERM_STABLE_AFTER's MAGNITUDE. 6d/6e close synchronously after open
+  //     with zero elapsed time, so any window > 0 passed — the constant could
+  //     be 1ms and the anti-flap protection would be gone while 6d still
+  //     asserted growth.
+  {
+    const { machine, calls, advance } = buildMachine();
+    machine.openPermSocket();
+    // Grow the backoff first.
+    for (let i = 0; i < 3; i++) {
+      calls.sockets[calls.sockets.length - 1].close();
+      advance(60000);
+    }
+    const grown = machine.state().delay;
+    check('precondition: backoff grew before the short-lived open', grown > 1000);
+    // A socket that lives 2s is NOT stable; the backoff must not reset.
+    calls.sockets[calls.sockets.length - 1].open();
+    advance(2000);
+    check(
+      'a 2s-lived socket does not count as stable (window is not ~0)',
+      machine.state().delay === grown,
+    );
+  }
+
+  // 6o. The retired socket must actually be CLOSED, not merely dropped.
+  //     6i asserts which socket is installed; deleting the whole retire block
+  //     passed. The consequence is a leaked server-side subscriber slot
+  //     against MAX_PERMISSION_SUBSCRIBERS until its send timeout — the exact
+  //     resource the Rust side spends two tests defending.
+  {
+    const { machine, calls } = buildMachine();
+    machine.openPermSocket();
+    const a = calls.sockets[0];
+    a.open();
+    machine.openPermSocket();
+    check('opening a second socket closes the first', a.closed === true);
+  }
+
+  // 6p. The stale STABILITY timer must be cleared when a new socket opens.
+  //     6i drives two live sockets but never advances time, so A's timer never
+  //     fired and deleting the clear passed. If it survives, A's timer resets
+  //     the backoff for a dead socket and nulls B's handle.
+  {
+    const { machine, calls, advance } = buildMachine();
+    machine.openPermSocket();
+    for (let i = 0; i < 3; i++) {
+      calls.sockets[calls.sockets.length - 1].close();
+      advance(60000);
+    }
+    const grown = machine.state().delay;
+    calls.sockets[calls.sockets.length - 1].open(); // A opens, arms its timer
+    advance(9000); // still inside PERM_STABLE_AFTER
+    machine.openPermSocket(); // B replaces A; A's timer must be cleared
+    advance(5000); // A's timer would have fired at 10s
+    check(
+      "a replaced socket's stability timer cannot reset the backoff",
+      machine.state().delay === grown,
+    );
+  }
+
+  // 6q. The failure counter must reset WITH the backoff, not on bare open.
+  //     6k only closes sockets it never opened, so the reset location was
+  //     unreachable from it and moving it back to onopen — the documented old
+  //     bug — passed. Accept-then-drop is the case that distinguishes them.
+  {
+    const { machine, calls, advance } = buildMachine();
+    machine.openPermSocket();
+    for (let i = 0; i < 6; i++) {
+      const sk = calls.sockets[calls.sockets.length - 1];
+      sk.open(); // accepted...
+      sk.close(); // ...then dropped immediately, never reaching stability
+      advance(60000);
+    }
+    check('accept-then-drop still reaches the warning threshold', calls.warnings.length > 0);
+    // And the warning must not become its own noise, which the code claims.
+    check('the warning fires once, not on every attempt', calls.warnings.length === 1);
+  }
+
   // 6f. No double-scheduling: a second close while a reconnect is pending must
   //     not queue a second one (that would halve the effective backoff).
   {
@@ -548,9 +715,13 @@ function check(name, cond) {
     'createCard',
     'hideCard',
     'ctl',
-    `var lastRemovalObservedAt = -1;
+    `var __removals = Object.create(null);
+     function removalObservedSince(nonce, since) {
+       var at = __removals[nonce];
+       return at !== undefined && at >= since;
+     }
      ${reconcileSrc}
-     ctl.noteRemoval = function (t) { lastRemovalObservedAt = t; };
+     ctl.noteRemoval = function (t, nonce) { __removals[nonce || 'X'] = t; };
      return reconcileFromPending;`,
   );
 
@@ -592,7 +763,15 @@ function check(name, cond) {
         hideCard,
         ctl,
       ),
-      settle: async () => {
+      // `elapsed` ADVANCES THE CLOCK before the response lands. Without it the
+      // fixture froze time across the fetch, so `permNow()` at response time
+      // equalled `issuedAt` and the two readings this whole section exists to
+      // distinguish were numerically identical — mutating the hide pass to
+      // compare against response time instead of request time passed every
+      // test in the section while destroying, in a real browser, every card
+      // raised during an in-flight fetch. That is the #5269 bug itself.
+      settle: async (elapsed = 50) => {
+        clock.t += elapsed;
         release();
         // Two hops: r.json() is itself a promise.
         await Promise.resolve();
@@ -620,6 +799,8 @@ function check(name, cond) {
   //     loopback, so same-millisecond is genuinely ambiguous; it must resolve
   //     toward keeping the card, because a wrongly-kept card is corrected by
   //     the next reconcile whereas a wrongly-hidden one is gone for good.
+  //     (With permNow() on performance.now() an exact tie is essentially
+  //     unreachable in practice; this pins the direction, not a live case.)
   {
     const env = build([]);
     env.reconcile();
@@ -663,11 +844,33 @@ function check(name, cond) {
     const env = build([{ nonce: 'X' }]);
     env.reconcile(); // issuedAt = 1000
     env.clock.t = 1001;
-    env.ctl.noteRemoval(1001); // X answered in another tab, after F1 went out
+    env.ctl.noteRemoval(1001, 'X'); // X answered in another tab, after F1 went out
     await env.settle();
     check(
       'a snapshot that predates a known removal does not resurrect the prompt',
       env.overlayCards.X === undefined,
+    );
+  }
+
+  // 7h. The guard must suppress ONLY the nonce actually removed. A single
+  //     shared timestamp meant one removal blocked every add, and on the
+  //     `resync` path that loss is PERMANENT: resync exists because the server
+  //     dropped prompt_added frames (never resent), the socket is healthy so
+  //     the 3s poll is stopped, and reconcile is the only add mechanism left.
+  //     An unrelated removal landing inside that fetch window would bury the
+  //     dropped prompt until the server auto-denied it.
+  //
+  //     7f/7g cannot catch this: they use the same nonce for the removal and
+  //     the add, so cross-nonce over-suppression passes vacuously there.
+  {
+    const env = build([{ nonce: 'DROPPED' }]);
+    env.reconcile(); // resync's fetch goes out at 1000
+    env.clock.t = 1001;
+    env.ctl.noteRemoval(1001, 'UNRELATED'); // a different prompt is answered
+    await env.settle();
+    check(
+      "an unrelated nonce's removal does not suppress a dropped prompt (resync)",
+      env.overlayCards.DROPPED !== undefined,
     );
   }
 
@@ -676,13 +879,89 @@ function check(name, cond) {
   //     the guard would degenerate into "never add anything again".
   {
     const env = build([{ nonce: 'X' }]);
-    env.ctl.noteRemoval(999);
+    env.ctl.noteRemoval(999, 'X');
     env.clock.t = 1000;
     env.reconcile(); // issuedAt = 1000, strictly after the removal
     await env.settle();
     check(
       'a removal older than the request does not block the add',
       env.overlayCards.X !== undefined,
+    );
+  }
+
+  // 7i. STEADY STATE — the commonest case of all, and it had no test: a card
+  //     on screen AND present in the snapshot must be left alone. 7c covers
+  //     absent->hide and 7d covers present->show; without this, deleting the
+  //     `seen[p.nonce] = true` marking passes, and every reconcile would hide
+  //     every visible card — every 3s on every degraded tab, and on every
+  //     resync.
+  {
+    const env = build([{ nonce: 'KEEP' }]);
+    env.clock.t = 900;
+    env.showCard('KEEP', env.createCard({ nonce: 'KEEP' }));
+    env.clock.t = 1000;
+    env.reconcile();
+    await env.settle();
+    check(
+      'a card that is on screen AND in the snapshot is left alone',
+      env.overlayCards.KEEP !== undefined && env.hidden.length === 0,
+    );
+  }
+
+  // 7j. The one-line editing slip: moving the add-pass guard ABOVE the
+  //     seen-marking. Skipping the add would then also un-mark the nonce, so
+  //     the hide pass below destroys the live card — turning the 7f fix into a
+  //     card-destroyer. 7f/7g cannot see it: they run with an empty
+  //     overlayCards, so the hide pass has nothing to act on.
+  {
+    const env = build([{ nonce: 'LIVE' }]);
+    env.clock.t = 900;
+    env.showCard('LIVE', env.createCard({ nonce: 'LIVE' }));
+    env.clock.t = 1000;
+    env.reconcile();
+    env.clock.t = 1001;
+    env.ctl.noteRemoval(1001, 'LIVE'); // makes the add-pass guard fire for LIVE
+    await env.settle();
+    check(
+      'a suppressed add still marks the nonce seen, so the hide pass spares it',
+      env.overlayCards.LIVE !== undefined,
+    );
+  }
+
+  // 7k. The ADD-pass tie, mirroring 7b on the hide side. A removal stamped at
+  //     EXACTLY issuedAt is ambiguous; resolve it toward NOT resurrecting,
+  //     which is the conservative direction here (showing a dead prompt is the
+  //     harm this guard exists to prevent).
+  {
+    const env = build([{ nonce: 'X' }]);
+    env.reconcile(); // issuedAt = 1000
+    env.ctl.noteRemoval(1000, 'X'); // exactly the tie
+    await env.settle();
+    check('an add whose removal ties with issuedAt is suppressed', env.overlayCards.X === undefined);
+  }
+
+  // 7l. Snapshot input validation. `/permission/pending` is delegate-influenced
+  //     content; a non-array body or an entry with a non-string nonce must not
+  //     reach the renderer or corrupt the seen-set.
+  {
+    const env = build({ not: 'an array' });
+    env.clock.t = 900;
+    env.showCard('KEEP', env.createCard({ nonce: 'KEEP' }));
+    env.clock.t = 1000;
+    env.reconcile();
+    await env.settle();
+    check(
+      'a non-array snapshot is ignored and destroys nothing',
+      env.overlayCards.KEEP !== undefined && env.hidden.length === 0,
+    );
+  }
+  {
+    const env = build([{ nonce: 42 }, { nonce: 'GOOD' }]);
+    env.reconcile();
+    await env.settle();
+    check(
+      'a malformed entry is skipped while a valid sibling still renders',
+      env.overlayCards.GOOD !== undefined && env.overlayCards[42] === undefined,
     );
   }
 
@@ -695,6 +974,40 @@ function check(name, cond) {
     const fnStart = src.indexOf('function showCard(');
     const after = src.indexOf('\n  function ', fnStart + 1);
     const body = fnStart < 0 ? '' : src.slice(fnStart, after < 0 ? undefined : after);
+    // 7e-bis. The PRODUCER of the 7f/7g signal. Those tests inject the removal
+    // through the harness, so the guard is exercised but nothing that feeds it
+    // is: deleting `noteRemovalObserved(nonce)` from hideCard, or moving it
+    // BELOW the `if (!card) return;` early return, both left the suite green.
+    // The position is load-bearing and argued at length in the source — a
+    // `prompt_removed` for a nonce this tab never rendered is still an
+    // observed removal — so pin the position, not just the presence. This is
+    // the sibling of the showCard pin below; its absence was an asymmetry.
+    {
+      const fnStart = src.indexOf('function hideCard(');
+      const after = src.indexOf('\n  function ', fnStart + 1);
+      const body = fnStart < 0 ? '' : src.slice(fnStart, after < 0 ? undefined : after);
+      const callAt = body.indexOf('noteRemovalObserved(nonce)');
+      const returnAt = body.indexOf('if (!card) return;');
+      // And the clock itself. Without this, `permNow` could be rewritten to
+      // return Date.now() unconditionally and every check here — including the
+      // one literally named "MONOTONIC" — would stay green, re-opening the
+      // NTP-step-backwards window the source argues about at length.
+      {
+        const nStart = src.indexOf('function permNow(');
+        const nAfter = src.indexOf('\n  ', src.indexOf('}', nStart));
+        const nBody = nStart < 0 ? '' : src.slice(nStart, nAfter < 0 ? undefined : nAfter);
+        check(
+          'permNow prefers performance.now(), not the wall clock',
+          nBody.includes('performance.now()'),
+        );
+      }
+
+      check(
+        'hideCard records the removal, ABOVE its early return',
+        callAt >= 0 && returnAt >= 0 && callAt < returnAt,
+      );
+    }
+
     check(
       'showCard records _fnShownAt on the MONOTONIC clock, which the comparison depends on',
       body.includes('_fnShownAt = permNow()'),

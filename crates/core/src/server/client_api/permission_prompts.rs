@@ -201,12 +201,15 @@ const MAX_PERMISSION_SUBSCRIBERS: usize = 64;
 /// degrading the whole browser to the 3s poll with nothing surfaced — the same
 /// "nothing errors, so nothing is visible" shape as #5213 itself.
 ///
-/// Reserving the top quarter for WebSockets means the legacy path cannot do
-/// that. It costs nothing in practice: SSE subscribers only exist for tabs
-/// opened before a node upgrade, and the browser's own ~6-per-origin limit —
-/// the #5213 bug — caps how many any one profile can hold anyway. The whole
+/// A small ABSOLUTE cap rather than a fraction of the total. Fractions get this
+/// backwards: three quarters would hand the legacy, un-timeout-able transport
+/// most of the budget and leave the primary one a 16-slot floor. SSE
+/// subscribers only exist for tabs opened before a node upgrade, and the
+/// browser's own ~6-per-origin limit — the #5213 bug itself — caps how many any
+/// one profile can hold, so 16 covers a couple of browser profiles' worth of
+/// pre-upgrade tabs while leaving 48 slots that SSE can never touch. The whole
 /// mechanism disappears with the route in #5272.
-const MAX_SSE_SUBSCRIBERS: usize = MAX_PERMISSION_SUBSCRIBERS * 3 / 4;
+const MAX_SSE_SUBSCRIBERS: usize = 16;
 
 /// Which transport is claiming a subscriber slot. Only affects the ceiling
 /// applied; the slot itself, and the counter, are shared.
@@ -853,15 +856,59 @@ fn origin_is_exactly_same_origin(headers: &HeaderMap) -> bool {
 /// determined this falls back to the authority-only comparison, which is no
 /// weaker than the behaviour before this check existed.
 ///
-/// The attack in the doc above needs a proxy in front of the node, and a proxy
-/// configured well enough to be worth attacking sets `X-Forwarded-Proto` — so
-/// the case this closes and the case it declines to guess about are largely
-/// disjoint.
+/// Be precise about the coverage, because an earlier version of this comment
+/// overstated it. The two cases are NOT disjoint: they are the same
+/// misconfiguration on two different listeners. The natural nginx shape is a
+/// `listen 443` block that sets `X-Forwarded-Proto $scheme` alongside a
+/// `listen 80` block that also proxies to the node but omits that line — and
+/// port 80 is exactly the listener the attack arrives on. Such a request
+/// reaches us with no `X-Forwarded-Proto`, so this returns `true` without
+/// comparing anything and the socket opens.
+///
+/// So this closes the attack only where the plain-HTTP vhost is also
+/// correctly configured. It is a real narrowing, not a fix. Refusing on an
+/// absent header would not fix it either — it would just break honest
+/// deployments (see above). The actual remedy is an operator-declared expected
+/// origin compared instead of guessed, which needs a config surface this PR
+/// does not add; the underlying "this API has no authentication" problem is
+/// #5264. What we CAN do here is make the gap observable rather than silent,
+/// which is what the warning below does.
 fn origin_scheme_matches_forwarded_proto(headers: &HeaderMap, origin: &str) -> bool {
+    // The deployment where this gate provably is not running: something in
+    // front of us is rewriting the request (so we are proxied) but did not say
+    // which scheme the client used. Warn once — an unobservable degraded gate
+    // is the failure mode this whole change is about.
+    if !headers.contains_key("x-forwarded-proto")
+        && (headers.contains_key("x-forwarded-host") || headers.contains_key("forwarded"))
+    {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "permission WebSocket: request carries forwarding headers but no \
+                 X-Forwarded-Proto, so the Origin scheme cannot be checked. Set \
+                 `proxy_set_header X-Forwarded-Proto $scheme;` on EVERY listener \
+                 that proxies to this node, including any plain-HTTP one."
+            );
+        });
+    }
     let Some(expected) = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.split(',').next().unwrap_or(v).trim().to_ascii_lowercase())
+        // First element: for X-Forwarded-Proto the head of the list is the
+        // CLIENT-facing scheme, which is the one an Origin should match.
+        .map(|v| {
+            v.split(',')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+        })
+        // Present-but-blank (a proxy interpolating an unset variable) must be
+        // treated as ABSENT. Comparing against "" matches no scheme, which
+        // would refuse every handshake on that deployment and drop every tab to
+        // the 3s poll with nothing surfaced — the silent degradation this whole
+        // change exists to remove.
+        .filter(|v| !v.is_empty())
     else {
         return true;
     };
@@ -900,7 +947,7 @@ fn origin_authority(origin: &str) -> Option<&str> {
         .split_once('/')
         .map(|(a, _)| a)
         .unwrap_or(after_scheme);
-    if authority.contains(['@', '?', '#']) {
+    if authority.contains(['@', '?', '#', '\\', ' ', '\t']) {
         return None;
     }
     Some(authority)
@@ -993,7 +1040,11 @@ async fn permission_events(
         Some(guard) => guard,
         None => {
             tracing::warn!(
-                limit = MAX_PERMISSION_SUBSCRIBERS,
+                // The ceiling this path ENFORCES, which is the SSE sub-cap, not
+                // the shared total. Logging the total on a refusal that happened
+                // lower makes an operator conclude the counter is broken.
+                limit = SubscriberTransport::LegacySse.ceiling(),
+                total = MAX_PERMISSION_SUBSCRIBERS,
                 "permission subscriber cap reached, refusing new /permission/events subscriber"
             );
             let stream = stream::once(async {
@@ -3629,8 +3680,11 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(permission_subscriber_counter)]
     async fn legacy_sse_cannot_starve_the_websocket_transport() {
-        let baseline = PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed);
-        assert_eq!(baseline, 0, "test must start from a quiesced counter");
+        let baseline = quiesced_subscriber_baseline().await;
+        assert_eq!(
+            baseline, 0,
+            "test must start from a quiesced counter (settle loop above)"
+        );
 
         let mut held: Vec<PermissionSubscriberGuard> = Vec::new();
         for _ in 0..MAX_SSE_SUBSCRIBERS {
@@ -4082,6 +4136,51 @@ mod tests {
         }
     }
 
+    /// A sink that accepts each message, but only after `delay`. Distinguishes
+    /// a WHOLE-PHASE replay deadline from a per-message one: with a per-message
+    /// deadline every message under `delay` succeeds and all of them get
+    /// through, whereas one deadline over the phase cuts the replay off partway.
+    struct SlowSink {
+        delay: Duration,
+        sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+        sent: std::sync::Arc<AtomicUsize>,
+    }
+
+    impl futures::Sink<Message> for SlowSink {
+        type Error = std::convert::Infallible;
+        fn poll_ready(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            let delay = self.delay;
+            let slot = &mut self.as_mut().get_mut().sleep;
+            let fut = slot.get_or_insert_with(|| Box::pin(tokio::time::sleep(delay)));
+            match fut.as_mut().poll(cx) {
+                std::task::Poll::Ready(()) => {
+                    *slot = None;
+                    std::task::Poll::Ready(Ok(()))
+                }
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        }
+        fn start_send(self: std::pin::Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+            self.sent.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
     fn never_inbound() -> futures::stream::Pending<Result<Message, std::convert::Infallible>> {
         futures::stream::pending()
     }
@@ -4209,6 +4308,62 @@ mod tests {
             baseline,
             "the subscriber slot must be released once the pump gives up, or a \
              stalled client pins it against the cap permanently"
+        );
+    }
+
+    /// The replay deadline bounds the WHOLE PHASE, not each message.
+    ///
+    /// With exactly one replay frame the two designs are indistinguishable, so
+    /// the sibling test above cannot pin this. The comment on
+    /// `PERMISSION_WS_SEND_TIMEOUT`'s use in the replay loop argues the phase
+    /// bound matters precisely because a per-message deadline would allow
+    /// ~32 x 10s against a client that accepts just slowly enough. Three frames
+    /// against a sink that takes 4s each separates them: one deadline over the
+    /// phase cuts the replay off partway, a per-message deadline lets all three
+    /// through.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(permission_subscriber_counter)]
+    async fn permission_ws_replay_deadline_bounds_the_whole_phase() {
+        let baseline = quiesced_subscriber_baseline().await;
+        let guard =
+            try_claim_subscriber_slot(SubscriberTransport::WebSocket).expect("a slot must be free");
+
+        let sent = std::sync::Arc::new(AtomicUsize::new(0));
+        let sink = SlowSink {
+            delay: Duration::from_secs(4),
+            sleep: None,
+            sent: sent.clone(),
+        };
+        let (_tx, rx) = tokio::sync::broadcast::channel::<PromptEvent>(8);
+        let initial = vec![
+            ws_envelope("resync", serde_json::json!({})),
+            ws_envelope("resync", serde_json::json!({})),
+            ws_envelope("resync", serde_json::json!({})),
+        ];
+
+        let pump = tokio::spawn(pump_permission_events(
+            sink,
+            never_inbound(),
+            rx,
+            initial,
+            guard,
+        ));
+        tokio::time::timeout(Duration::from_secs(120), pump)
+            .await
+            .expect("the pump must give up when the replay PHASE runs over")
+            .expect("the pump task must not panic");
+
+        assert!(
+            sent.load(Ordering::Relaxed) < 3,
+            "the replay deadline must bound the whole phase: all 3 frames got \
+             through, which is what a PER-MESSAGE deadline would allow (each 4s \
+             send is under the 10s timeout) and is exactly the ~32x overrun the \
+             phase bound exists to prevent"
+        );
+        assert_eq!(
+            PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed),
+            baseline,
+            "the slot must be released when the replay phase gives up"
         );
     }
 

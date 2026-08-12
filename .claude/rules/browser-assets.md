@@ -52,12 +52,17 @@ The suite lives in `crates/core/tests/playwright/`, is driven by
 and runs in `.github/workflows/playwright-shell.yml`, path-filtered to
 `crates/core/src/server/**`.
 
+Know its limit: that workflow is **not a required check**, so the strongest
+guard for these invariants cannot block a merge while the weaker substring pins
+can. Tracked in #5275. Until that is fixed, treat a red Playwright run as
+blocking by hand even though CI will not enforce it.
+
 Keep the Rust substring assertions — they are a fast local signal — but do not
 mistake them for the guard. State their scope in a comment where they live.
 
 ### 2. Pin the invariant, not the spelling of one violation
 
-`!html.contains("new EventSource(")` rules out exactly the construct that
+`!html.contains("EventSource(")` rules out exactly the construct that
 shipped. A streamed `fetch()` or a long-poll breaks the same invariant and
 passes. Where a real invariant exists ("the shell holds no HTTP request open"),
 assert it behaviourally: see

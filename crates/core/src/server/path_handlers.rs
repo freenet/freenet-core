@@ -4912,6 +4912,10 @@ mod tests {
         // which loads the shell, waits, and fails if any request is still
         // unfinished. Keep this cheap check as the fast local signal, but if
         // you change how the shell subscribes, that spec is what must pass.
+        //
+        // Note that spec runs in a workflow that is path-filtered and NOT a
+        // required check, so the strongest guard for this invariant cannot
+        // block a merge while this weaker one can. Tracked in #5275.
         assert!(
             !html.contains("EventSource("),
             "shell JS must not open an EventSource: one held-open HTTP request \

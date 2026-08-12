@@ -1787,11 +1787,38 @@ function freenetBridge(authToken, userToken, hostedMode) {
       ? performance.now()
       : Date.now();
   }
-  // When a removal was last OBSERVED, on the same monotonic clock. See the
+  // When each nonce's removal was OBSERVED, on the monotonic clock. See the
   // add-pass guard in reconcileFromPending.
-  var lastRemovalObservedAt = -1;
-  function noteRemovalObserved() {
-    lastRemovalObservedAt = permNow();
+  //
+  // PER NONCE, not one global timestamp. A single shared stamp meant a removal
+  // of ANY nonce suppressed the add of EVERY nonce, and on the `resync` path
+  // that loss is permanent: resync exists precisely because the server DROPPED
+  // `prompt_added` frames, so the socket will never resend them; the socket is
+  // healthy, so the 3s poll is stopped and there is no retry; and a
+  // `prompt_removed` arriving in the few ms while resync's `/permission/pending`
+  // fetch is in flight would skip the dropped prompt forever. It would sit
+  // invisible until the server auto-denied it. A backgrounded tab draining a
+  // churn burst is exactly what produces the lag AND exactly what delivers a
+  // removal in that window, so it is the expected shape of the recovery rather
+  // than a contrived race. Suppressing only the nonce actually removed keeps
+  // the resurrection fix while removing the collateral.
+  //
+  // Bounded: entries older than the retention window are pruned on write, so a
+  // long-lived tab cannot accumulate them. The window only has to outlive one
+  // in-flight `/permission/pending`.
+  var REMOVAL_MEMORY_MS = 60000;
+  var removalObservedAt = Object.create(null);
+  function noteRemovalObserved(nonce) {
+    var now = permNow();
+    if (typeof nonce === 'string') removalObservedAt[nonce] = now;
+    for (var k in removalObservedAt) {
+      if (now - removalObservedAt[k] > REMOVAL_MEMORY_MS)
+        delete removalObservedAt[k];
+    }
+  }
+  function removalObservedSince(nonce, since) {
+    var at = removalObservedAt[nonce];
+    return at !== undefined && at >= since;
   }
   function showCard(nonce, card) {
     var root = ensureOverlayRoot();
@@ -1819,7 +1846,7 @@ function freenetBridge(authToken, userToken, hostedMode) {
     // Above the return on purpose: a `prompt_removed` for a nonce this tab
     // never rendered is still an OBSERVED removal, and it is exactly the case
     // a stale snapshot would otherwise resurrect.
-    noteRemovalObserved();
+    noteRemovalObserved(nonce);
     var card = overlayCards[nonce];
     if (!card) return;
     if (card._fnTimerId) {
@@ -1904,31 +1931,27 @@ function freenetBridge(authToken, userToken, hostedMode) {
         // and the user is looking at a delegate-authored security prompt for a
         // dead nonce until they click it (404 -> hide) or the socket cycles.
         //
-        // One timestamp rather than a per-nonce map, deliberately: a map keyed
-        // by nonce grows without bound in a long-lived tab, and the precision
-        // buys nothing here. If ANY removal was observed after this request
-        // was issued, the snapshot predates known state and its additions are
-        // untrustworthy, so skip them. Cheap to be wrong in this direction —
-        // a genuinely-new prompt arrives over the socket anyway, and the next
-        // reconcile re-adds it.
-        var addsAreStale = lastRemovalObservedAt >= issuedAt;
+        // Skip only the nonce whose OWN removal this snapshot could not have
+        // seen. Suppressing every add on any removal is what created a
+        // permanent loss on the resync path; see removalObservedAt.
         prompts.forEach(function (p) {
           if (!p || typeof p.nonce !== 'string') return;
           seen[p.nonce] = true;
           if (overlayCards[p.nonce]) return;
-          if (addsAreStale) return;
+          if (removalObservedSince(p.nonce, issuedAt)) return;
           showCard(p.nonce, createCard(p));
         });
         Object.keys(overlayCards).forEach(function (nonce) {
           if (seen[nonce]) return;
           var card = overlayCards[nonce];
           // Only hide what this snapshot could actually have observed.
-          // `>=`, not `>`: the clock is millisecond-granular and the node is
-          // on loopback, so a card shown in the SAME millisecond the fetch
-          // was issued is genuinely ambiguous. Resolve that tie toward keeping
-          // the card. The two errors are not symmetric — a card kept one beat
-          // too long is corrected by the next event or reconcile, whereas a
-          // card hidden wrongly destroys a live security prompt outright.
+          // `>=`, not `>`. With `permNow()` on `performance.now()` — a
+          // sub-millisecond float — an exact tie is essentially unreachable, so
+          // this is about which way to resolve one if it ever happens rather
+          // than a case we expect. Keep the card: the two errors are not
+          // symmetric. A card kept one beat too long is corrected by the next
+          // event or reconcile; a card hidden wrongly destroys a live security
+          // prompt outright.
           if (card && card._fnShownAt >= issuedAt) return;
           hideCard(nonce);
         });
@@ -2004,10 +2027,13 @@ function freenetBridge(authToken, userToken, hostedMode) {
   //
   // This block must stay NESTED INSIDE `perm-overlay-flow`. Hoisting these
   // pure helpers to module scope is the obvious next refactor, and it would
-  // break the #4849 F2 guard: every remaining `'prompt_added'` /
-  // `'prompt_removed'` literal inside the guarded region now lives in
+  // break the #4849 F2 guard: every remaining prompt-added / prompt-removed
+  // event-name literal inside the guarded region now lives in
   // `permEventAction` below, and F2's non-vacuity check asserts the region
-  // still contains them. It fails loudly, but the message points at the guard
+  // still contains them. (Written WITHOUT the quoted literals on purpose —
+  // spelling them here makes the pin match its own signpost and pass
+  // vacuously, which is the self-match class AGENTS.md says has shipped
+  // twice.) It fails loudly, but the message points at the guard
   // rather than at the move, so this note is the signpost.
   function permSocketUrl(loc) {
     // Derive the scheme from the page so a TLS-served shell upgrades to wss
@@ -2121,6 +2147,16 @@ function freenetBridge(authToken, userToken, hostedMode) {
     if (permStableTimer !== null) {
       clearTimeout(permStableTimer);
       permStableTimer = null;
+    }
+    // Also disarm any pending reconnect. Without this the prologue's stated
+    // invariant is incomplete: socket closes -> a reconnect is armed -> some
+    // future trigger calls openPermSocket -> B opens and goes healthy -> the
+    // orphaned timer fires and closes healthy B, burning a server-side slot
+    // cycle. We are opening right now, so a queued retry is by definition
+    // redundant.
+    if (permReconnectHandle !== null) {
+      clearTimeout(permReconnectHandle);
+      permReconnectHandle = null;
     }
     if (permSocket !== null) {
       var stale = permSocket;
