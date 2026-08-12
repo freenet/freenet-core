@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use std::path::Path;
 
 #[cfg(target_os = "macos")]
+use super::cli_symlinks::macos_ensure_cli_symlinks;
+#[cfg(target_os = "macos")]
 use super::launch_at_login::macos_launch_at_login_startup;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use super::single_instance::{AcquireWrapperLockOutcome, acquire_wrapper_single_instance_lock};
@@ -587,6 +589,19 @@ pub(super) fn run_wrapper(version: &str) -> Result<()> {
         // launchd agent is still present.
         #[cfg(target_os = "macos")]
         macos_launch_at_login_startup(&log_dir);
+
+        // macOS: one-shot CLI symlink setup (`freenet`/`fdev` on PATH via
+        // /usr/local/bin). Runs on its OWN background thread, not inline
+        // here: unlike Launch at Login above, this can pop a blocking
+        // administrator-privileges password dialog (see cli_symlinks.rs),
+        // and that must never delay the tray icon from appearing.
+        #[cfg(target_os = "macos")]
+        {
+            let log_dir_for_cli_symlinks = log_dir.clone();
+            std::thread::spawn(move || {
+                macos_ensure_cli_symlinks(&log_dir_for_cli_symlinks);
+            });
+        }
 
         // Wrapper loop runs on a background thread
         let loop_handle = std::thread::spawn(move || {
