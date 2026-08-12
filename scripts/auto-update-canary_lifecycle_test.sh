@@ -412,10 +412,18 @@ fi
 #    comes from the kernel refusing to mkdir under a file, not from a fixture
 #    that prints a panic message on cue.
 #
+#    This case catches the isolation being ABSENT; case 10 catches it being
+#    WRONG. Not a redundant pair, and mutation testing is what separated them:
+#    rewriting the export to `TMPDIR=/tmp` leaves THIS case green on any host
+#    where `/tmp/freenet` happens to be a usable directory (it is one on nova),
+#    because the node's mkdir then succeeds somewhere useless rather than
+#    failing. Case 10 reads the value the node actually got, so it fails on
+#    that mutation unconditionally. Deleting the export fails both.
+#
 #    A source scrape in auto-update-canary_test.sh also pins `export TMPDIR`,
-#    and that pin is worth keeping for the ordering it checks (before `exec`,
-#    before `freenet update`) -- but it asserts TEXT. It cannot tell a working
-#    `export TMPDIR="$work/tmp"` from `export TMPDIR=/tmp`. This case can.
+#    kept for the ordering it checks (before `exec`, before `freenet update`)
+#    and for the Gate B half. It asserts TEXT, so it is green on BOTH mutations
+#    above -- verified, not assumed.
 # ---------------------------------------------------------------------------
 CITMP="$TMPROOT/citmp"
 mkdir -p "$CITMP"
@@ -486,7 +494,10 @@ fi
 #     "no supervisor" error instead of taking the exit-42 path Gate B asserts).
 #
 #     The fake dumps its own environment, so this asserts what the node
-#     actually receives rather than what the script appears to set.
+#     actually receives rather than what the script appears to set -- which is
+#     also what makes it the case that survives a WRONG value rather than only
+#     a missing one (see case 9). Mutation-checked: deleting
+#     `export FREENET_SUPERVISED=1` fails here and nowhere else.
 # ---------------------------------------------------------------------------
 ENVDUMP="$TMPROOT/node-env.txt"
 FAKE_ENVDUMP="$TMPROOT/fake-envdump"
