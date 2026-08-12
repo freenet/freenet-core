@@ -643,6 +643,28 @@ impl OutboundMix {
     /// only the receive arm knows the shape of the message the entry came in,
     /// and a rate re-derived later from arithmetic over separately-reported
     /// totals would silently absorb every other filter between them.
+    ///
+    /// # `p` AS MEASURED IS A CEILING, NOT A FLOOR
+    ///
+    /// State this to anyone sizing R4b from these counters. On the
+    /// `SummaryDigests` leg a genuine digest disagreement is recorded not at
+    /// the mismatch itself but when the requested bytes arrive back here — see
+    /// the `DigestVerdict::NeedBytes` branch in `node.rs`, which deliberately
+    /// records nothing so one divergence is not counted twice. **If the
+    /// `SummaryRequest` or its reply is lost, that divergence is never recorded
+    /// at all.** The numerator is untouched and the denominator is short by
+    /// one, so `p` comes out HIGHER than reality, by the loss rate on one
+    /// request/reply round trip.
+    ///
+    /// The direction is the point. Double-counting would have biased `p`
+    /// DOWNWARD — conservative, costing at worst a mechanism worth building.
+    /// This biases it UPWARD, which risks building R4b on an agreement rate
+    /// better than the network actually achieves, and that is the more
+    /// expensive mistake. Correct arithmetic with a known-direction bias still
+    /// beats a wrong number, so the deferral stays; the bias is documented
+    /// instead of removed. It is also the same lost-deferred-round-trip
+    /// fragility R4b's own design work flagged separately, so it is a coherent
+    /// known limitation rather than a surprise.
     pub(crate) fn record_summary_comparison(
         &self,
         contract: &ContractInstanceId,

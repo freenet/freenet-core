@@ -4116,6 +4116,21 @@ async fn handle_interest_sync_message(
                                 // per requested hash, so a single-entry digest
                                 // mismatch produces a single-entry reply and
                                 // classifies the same way on arrival.
+                                //
+                                // ACCEPTED BIAS, and it runs in the dangerous
+                                // direction: if the `SummaryRequest` or its
+                                // reply is DROPPED, this divergence is never
+                                // recorded anywhere. The numerator is untouched
+                                // and the denominator is short, so `p` reads
+                                // HIGH — it is a CEILING, not a floor, by the
+                                // loss rate on one round trip. Double-counting
+                                // would have erred the safe way (declining a
+                                // mechanism worth building); this errs toward
+                                // building on an agreement rate better than
+                                // reality. Correct arithmetic with a
+                                // known-direction bias still beats a wrong
+                                // number, so this stays — see
+                                // `OutboundMix::record_summary_comparison`.
                                 // #4965 review S2: separate "we hold nothing,
                                 // they do" from a genuine digest disagreement.
                                 // Only the former sat outside the 98.1%
