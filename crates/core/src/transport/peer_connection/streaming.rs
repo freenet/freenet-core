@@ -1819,7 +1819,11 @@ mod tests {
         let mut stream = handle.stream();
 
         let mut yielded = 0usize;
-        for expected in [reduced_payload, FRAGMENT_PAYLOAD_SIZE, FRAGMENT_PAYLOAD_SIZE] {
+        for expected in [
+            reduced_payload,
+            FRAGMENT_PAYLOAD_SIZE,
+            FRAGMENT_PAYLOAD_SIZE,
+        ] {
             match stream.poll_next_unpin(&mut cx) {
                 Poll::Ready(Some(Ok(data))) => {
                     assert_eq!(data.len(), expected);
