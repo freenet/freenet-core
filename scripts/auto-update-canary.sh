@@ -590,6 +590,20 @@ version_at_least() {
   [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]
 }
 
+# prev_emits_latest_seen <prev-version> -- true when a binary at that version
+# emits MARKER_LATEST_SEEN, so Gate B's positive-equality check can arm.
+#
+# A named function rather than the comparison inlined at its one call site, so
+# the DECISION can be tested directly. Inlined, the only thing pinning it was a
+# grep for the literal call text -- and `if ! version_at_least …` contains that
+# text just as `if version_at_least …` does, so the pin stayed green under an
+# inversion. Inverted, Gate B arms against pre-#5236 binaries (a spurious red)
+# and SKIPS for post-#5236 ones, which is the silent direction: its only
+# positive assertion goes permanently vacuous while every release looks fine.
+prev_emits_latest_seen() {
+  version_at_least "$1" "$MARKER_LATEST_SEEN_SINCE"
+}
+
 resolve_expected_latest() {
   local url tag
   url="$(curl -fsS --max-time 30 -o /dev/null -w '%{redirect_url}' \
@@ -722,7 +736,7 @@ cmd_selfupdate() {
   #
   # Version-gated for the one release where the previous binary predates the
   # marker -- see MARKER_LATEST_SEEN_SINCE.
-  if version_at_least "$prev_version" "$MARKER_LATEST_SEEN_SINCE"; then
+  if prev_emits_latest_seen "$prev_version"; then
     export CANARY_EXPECTED_LATEST="$expected_version"
   else
     unset CANARY_EXPECTED_LATEST

@@ -433,15 +433,48 @@ fi
 # compare; the gate must skip rather than fail. Both halves are pinned, because
 # either one alone is wrong: no gate blocks a release on its predecessor's age,
 # and no arming leaves Gate B permanently vacuous.
+#
+# Pinned in two parts, because a single literal-text grep was not enough. The
+# earlier form matched `version_at_least "$prev_version" "$MARKER_LATEST_SEEN_SINCE"`
+# anywhere in the body -- and `if ! version_at_least …` CONTAINS that string, so
+# inverting the gate left all assertions green. Demonstrated on this branch.
+# So: the decision now lives in `prev_emits_latest_seen`, whose BEHAVIOUR is
+# tested below, and the call site is matched INCLUDING its `if ` prefix so a
+# `!` cannot slip between them.
 # shellcheck disable=SC2016  # literal source text; must not expand
-if [[ "$selfupdate_body" != *'version_at_least "$prev_version" "$MARKER_LATEST_SEEN_SINCE"'* ]]; then
-    echo "FAIL - cmd_selfupdate arms the equality check without the MARKER_LATEST_SEEN_SINCE gate." >&2
-    echo "       A previous release built before #5236 emits no observed-latest line, so Gate B" >&2
-    echo "       would fail for a line that binary was never built to emit." >&2
+if [[ "$selfupdate_body" != *'if prev_emits_latest_seen "$prev_version"; then'* ]]; then
+    echo "FAIL - cmd_selfupdate no longer gates the equality check on prev_emits_latest_seen." >&2
+    echo "       Expected the call site verbatim, INCLUDING the 'if ' prefix:" >&2
+    echo '           if prev_emits_latest_seen "$prev_version"; then' >&2
+    echo "       Matching the bare call would also match a NEGATED one. Un-gated, a previous" >&2
+    echo "       release built before #5236 emits no observed-latest line and Gate B fails for" >&2
+    echo "       a line that binary was never built to emit; negated, Gate B skips the check on" >&2
+    echo "       every modern release and goes permanently vacuous." >&2
     FAILURES=$((FAILURES + 1))
 else
-    echo "ok   - cmd_selfupdate gates the equality check on MARKER_LATEST_SEEN_SINCE"
+    echo "ok   - cmd_selfupdate gates the equality check on prev_emits_latest_seen (un-negated)"
 fi
+
+# ...and what that gate DECIDES, which the text match above cannot see. An
+# inversion inside the function flips both of these.
+gate_b_arm_case() {
+    # gate_b_arm_case <prev-version> <yes|no>
+    local got
+    if prev_emits_latest_seen "$1"; then got=yes; else got=no; fi
+    if [[ "$got" == "$2" ]]; then
+        echo "ok   - prev_emits_latest_seen '$1' -> $2 (Gate B equality check ${2/yes/arms})"
+    else
+        echo "FAIL - prev_emits_latest_seen '$1' said '$got', expected '$2'." >&2
+        echo "       Inverted, Gate B skips its only positive assertion on every release from" >&2
+        echo "       v$MARKER_LATEST_SEEN_SINCE onward -- vacuous, and silent about it." >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+gate_b_arm_case "$MARKER_LATEST_SEEN_SINCE" yes   # the release the marker lands in
+gate_b_arm_case "0.2.125"                   yes   # every release after it
+gate_b_arm_case "0.3.0"                     yes
+gate_b_arm_case "0.2.123"                   no    # the one release that must skip
+gate_b_arm_case "0.2.99"                    no    # numeric, not lexical
 
 # `version_at_least` decides whether the gate above arms, so it gets its own
 # cases: an off-by-one here silently disarms Gate B's only positive assertion.

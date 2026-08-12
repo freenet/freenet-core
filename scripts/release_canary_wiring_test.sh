@@ -78,6 +78,23 @@ line_of() {
     printf '%s\n' "$JOB_BLOCK" | grep -E "$1" | head -1 | cut -d: -f1
 }
 
+# step_block <line> -- the whole STEP containing <line>, as `NNN:text` lines.
+#
+# Bounded by the `- name:` at or above <line> and the next one below it (or the
+# end of the job). Step keys such as `if:` and `continue-on-error:` sit ABOVE
+# the `run:` that holds the invocation, so anything anchored on the invocation
+# line alone cannot see them -- which is exactly how the publish step's own
+# `if:` went unpinned while the canary step's was covered.
+step_block() {
+    local at="$1" start end
+    start="$(printf '%s\n' "$JOB_BLOCK" \
+        | awk -F: -v a="$at" '$1 <= a && /^[0-9]+:      - name:/ { n = $1 } END { print n }')"
+    end="$(printf '%s\n' "$JOB_BLOCK" \
+        | awk -F: -v a="$at" '$1 > a && /^[0-9]+:      - name:/ { print $1; exit }')"
+    [[ -z "$end" ]] && end=999999
+    printf '%s\n' "$JOB_BLOCK" | awk -F: -v a="$start" -v b="$end" '$1 >= a && $1 < b'
+}
+
 # --- 1. the canary step still runs ------------------------------------------
 CANARY_LINE="$(line_of 'auto-update-canary\.sh preflight')"
 if [[ -n "$CANARY_LINE" ]]; then
@@ -119,22 +136,51 @@ fi
 # them entirely -- verified by mutation: this assertion did not fire until the
 # bounds were widened to the step.
 if [[ -n "$CANARY_LINE" ]]; then
-    # Step boundaries: the `- name:` at or above the invocation, and the next
-    # `- name:` below it (or the end of the job).
-    STEP_START="$(printf '%s\n' "$JOB_BLOCK" \
-        | awk -F: -v a="$CANARY_LINE" '$1 <= a && /^[0-9]+:      - name:/ { n = $1 } END { print n }')"
-    STEP_END="$(printf '%s\n' "$JOB_BLOCK" \
-        | awk -F: -v a="$CANARY_LINE" '$1 > a && /^[0-9]+:      - name:/ { print $1; exit }')"
-    [[ -z "$STEP_END" ]] && STEP_END=999999
-    NEUTERED="$(printf '%s\n' "$JOB_BLOCK" \
-        | awk -F: -v a="$STEP_START" -v b="$STEP_END" '$1 >= a && $1 < b' \
+    CANARY_STEP="$(step_block "$CANARY_LINE")"
+    NEUTERED="$(printf '%s\n' "$CANARY_STEP" \
         | grep -cE 'continue-on-error:[[:space:]]*true|^[0-9]+:        if:[[:space:]]*false')"
     if [[ "$NEUTERED" -eq 0 ]]; then
-        pass "the canary step is not disabled in place (lines $STEP_START-$STEP_END)"
+        pass "the canary step is not disabled in place"
     else
         fail "the canary step is disabled in place ('continue-on-error: true' or 'if: false')" \
             "It still runs and still reports, but the job publishes the release" \
             "whatever it finds. That is a gate in appearance only."
+    fi
+fi
+
+# --- 3b. ...and the PUBLISH step is not made unconditional ------------------
+# The mirror image of the check above, and the hole it left. Assertion 3 asks
+# whether the CANARY is disabled; nothing asked whether the PUBLISH step was
+# made to run regardless of it. Both produce the same outcome -- a red canary
+# that no longer blocks publication -- and only one was pinned.
+#
+# Demonstrated on this branch: adding `if: always()` to the `Publish release`
+# step neutered Gate A completely and all six assertions here stayed GREEN.
+# release.sh's belt-and-suspenders check gives no cover either, because the
+# workflow really did publish, so `isDraft` reads false.
+#
+# Steps default to running only if every earlier step in the job succeeded, and
+# that default IS the gate. Any `if:` naming always()/failure()/cancelled()
+# overrides it. A conditional that does not (say, a repository check) is not
+# this hazard, so it is allowed through rather than banned outright.
+if [[ -n "$PUBLISH_LINE" ]]; then
+    PUBLISH_STEP="$(step_block "$PUBLISH_LINE")"
+    PUBLISH_IF="$(printf '%s\n' "$PUBLISH_STEP" | grep -E '^[0-9]+:        if:')"
+    OVERRIDE="$(printf '%s\n' "$PUBLISH_STEP" \
+        | grep -cE '^[0-9]+:        if:.*(always\(\)|failure\(\)|cancelled\(\))')"
+    if [[ "$OVERRIDE" -eq 0 ]]; then
+        if [[ -z "$PUBLISH_IF" ]]; then
+            pass "the publish step has no 'if:', so it still runs only when the canary passed"
+        else
+            pass "the publish step's 'if:' does not override the on-success default"
+        fi
+    else
+        fail "the publish step overrides the on-success default with always()/failure()/cancelled()" \
+            "$(printf '%s\n' "$PUBLISH_IF")" \
+            "Steps run only after every earlier step succeeded, and that default is" \
+            "the ENTIRE mechanism by which the canary blocks publication. With this" \
+            "'if:', the canary can fail and the release publishes anyway -- the gate" \
+            "is gone, and it is gone without touching the canary step at all."
     fi
 fi
 
@@ -191,6 +237,89 @@ else
         "release.sh:        '$SH_JOB_NAME'" \
         "The driver polls for the workflow's name, so it would wait for a job" \
         "that never appears and time out reporting UNKNOWN."
+fi
+
+# --- 6. the failure notification still covers BOTH gates --------------------
+# Gate A blocks publication by failing, which leaves the release stuck as a
+# DRAFT -- a silent state. Nobody is watching the Actions tab during a release;
+# the Matrix message is how anyone finds out. Gate B runs after publication and
+# cannot block anything, so the notification is its ONLY output.
+#
+# Neither the notify job nor Gate B's job was referenced by any test in this
+# repo before this. Demonstrated on this branch: deleting the two
+# `needs.attach-to-release.result` clauses from the notify job's `if:` --
+# reinstating exactly the silent-Gate-A regression the workflow comment
+# describes -- left all four suites GREEN.
+#
+# Whole-file scan, not the attach-to-release block: these are separate
+# top-level jobs.
+notify_block="$(awk '
+    /^  notify-auto-update-canary-failure:[[:space:]]*$/ { inblock = 1; print; next }
+    inblock && /^  [A-Za-z_.-]+:/                        { inblock = 0 }
+    inblock                                              { print }
+' "$WF")"
+
+if [[ -z "$notify_block" ]]; then
+    fail "the 'notify-auto-update-canary-failure' job is gone from cross-compile.yml" \
+        "A failed Gate A leaves the release stuck as a draft and says nothing;" \
+        "a failed Gate B has no other output at all. This job is how either" \
+        "one reaches a human."
+else
+    pass "cross-compile.yml still has the pre-flight failure notification job"
+
+    # Each gate contributes two result states. `failure` alone is not enough:
+    # a cancelled job is not a passed one, and treating it as passed is how a
+    # timed-out gate goes unreported.
+    missing=()
+    for clause in \
+        "needs.attach-to-release.result == 'failure'" \
+        "needs.attach-to-release.result == 'cancelled'" \
+        "needs.auto-update-selfupdate-canary.result == 'failure'" \
+        "needs.auto-update-selfupdate-canary.result == 'cancelled'"
+    do
+        [[ "$notify_block" == *"$clause"* ]] || missing+=("$clause")
+    done
+
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        pass "the notification fires for failure AND cancellation of both gates"
+    else
+        fail "the notification no longer covers every gate outcome" \
+            "Missing from the notify job's 'if:':" \
+            "${missing[@]}" \
+            "A gate whose failure notifies nobody is a gate nobody acts on. Gate A" \
+            "failing leaves the release a silent DRAFT; Gate B has no other output."
+    fi
+
+    # `always()` is what lets the job run at all after a needed job failed.
+    # Without it the notification is skipped in exactly the case it exists for.
+    if [[ "$notify_block" == *'always()'* ]]; then
+        pass "the notify job runs under always() (so a failed gate does not skip it)"
+    else
+        fail "the notify job's 'if:' no longer calls always()" \
+            "A job whose dependency failed is SKIPPED unless its condition calls" \
+            "always(). Without it this job never runs on the one path it exists for."
+    fi
+
+    # It must also still DEPEND on both, or the results it tests are always ''.
+    for needed in attach-to-release auto-update-selfupdate-canary; do
+        if [[ "$notify_block" == *"needs:"*"$needed"* ]]; then
+            pass "the notify job still needs '$needed'"
+        else
+            fail "the notify job no longer lists '$needed' in 'needs:'" \
+                "A result expression for a job that is not needed evaluates to the" \
+                "empty string, so every clause above silently stops matching."
+        fi
+    done
+fi
+
+# --- 7. Gate B's job still exists -------------------------------------------
+# The notify job's clauses are only meaningful if the job they name is real.
+if grep -qE '^  auto-update-selfupdate-canary:[[:space:]]*$' "$WF"; then
+    pass "cross-compile.yml still has the 'auto-update-selfupdate-canary' job (Gate B)"
+else
+    fail "the 'auto-update-selfupdate-canary' job (Gate B) is gone from cross-compile.yml" \
+        "Gate B is what proves a node on the PREVIOUS release can actually reach" \
+        "this one -- the #5221 failure mode. Nothing else covers it."
 fi
 
 echo
