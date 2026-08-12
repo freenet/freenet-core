@@ -74,6 +74,18 @@ pub(crate) enum RuntimeInnerError {
     #[error("contract {0} not found in store")]
     ContractNotFound(ContractKey),
 
+    /// A contract offered for storage carries a key that is not derived from
+    /// its own code and parameters, so the node cannot store it under an
+    /// identity it has verified. See `ContractStore::verify_contract_identity`.
+    #[error(
+        "contract {key} identity does not match its code: {detail} \
+         (the key a contract is stored under must be derived from its bytes)"
+    )]
+    ContractIdentityMismatch {
+        key: Box<ContractKey>,
+        detail: String,
+    },
+
     #[error(transparent)]
     ContractExecError(#[from] runtime::ContractExecError),
 

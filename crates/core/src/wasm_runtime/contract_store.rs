@@ -164,45 +164,162 @@ impl ContractStore {
         key: &ContractKey,
         params: &Parameters<'_>,
     ) -> Option<ContractContainer> {
-        // Gate on the shared index: an instance that is no longer indexed
-        // (e.g. removed via a sibling executor) must not be served from a stale
-        // per-executor cache entry.
-        if !self.key_to_code_part.contains_key(key.id()) {
+        // Resolve the code hash from the shared INDEX, never from the `code`
+        // field the caller's `ContractKey` carries. Two reasons, and the second
+        // is why this is not merely a tidiness point:
+        //
+        // 1. It gates on the index, so an instance that is no longer indexed
+        //    (e.g. removed via a sibling executor) is not served from a stale
+        //    per-executor cache entry (#4218 problem 2).
+        // 2. That `code` field is an unverified serde field (see
+        //    `verify_contract_identity`), and `ContractKey`'s `Eq`/`Hash` ignore
+        //    it, so it does not have to correspond to this instance at all.
+        //    Keying the cache lookup off it let a caller name an instance it is
+        //    entitled to while choosing WHICH cached code came back for it. The
+        //    index is what this node itself recorded, so resolving through it
+        //    makes the answer a function of the instance alone.
+        let Some(code_hash) = self.key_to_code_part.get(key.id()).map(|e| *e.value()) else {
             return None;
-        }
+        };
 
-        let code_hash = key.code_hash();
-        if let Some(data) = self.contract_cache.get(code_hash) {
+        if let Some(data) = self.contract_cache.get(&code_hash) {
             return Some(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
                 WrappedContract::new(data, params.clone().into_owned()),
             )));
         }
 
-        self.key_to_code_part.get(key.id()).and_then(|entry| {
-            let code_hash = *entry.value();
-            let path = code_hash.encode();
-            let key_path = self.contracts_dir.join(path).with_extension("wasm");
-            // Load with version prefix stripping (fixes #2924)
-            // Files are stored with to_bytes_versioned() which adds a version prefix.
-            // Must use load_versioned_from_path() to strip it before compilation.
-            let (code, _ver) = ContractCode::load_versioned_from_path(&key_path)
-                .map_err(|err| {
-                    tracing::debug!("contract not found: {err}");
-                    err
-                })
-                .ok()?;
-            let params = params.clone().into_owned();
-            // add back the contract part to the mem store
-            self.contract_cache
-                .insert(code_hash, Arc::new(code.clone()));
-            Some(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
-                WrappedContract::new(Arc::new(code), params),
-            )))
-        })
+        let key_path = self
+            .contracts_dir
+            .join(code_hash.encode())
+            .with_extension("wasm");
+        // Load with version prefix stripping (fixes #2924)
+        // Files are stored with to_bytes_versioned() which adds a version prefix.
+        // Must use load_versioned_from_path() to strip it before compilation.
+        let (code, _ver) = ContractCode::load_versioned_from_path(&key_path)
+            .map_err(|err| {
+                tracing::debug!("contract not found: {err}");
+                err
+            })
+            .ok()?;
+        let params = params.clone().into_owned();
+        // add back the contract part to the mem store
+        self.contract_cache
+            .insert(code_hash, Arc::new(code.clone()));
+        Some(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+            WrappedContract::new(Arc::new(code), params),
+        )))
+    }
+
+    /// Check that a contract's key is actually derived from the bytes it ships
+    /// with, and refuse it otherwise.
+    ///
+    /// # Why this has to be checked here
+    ///
+    /// A `ContractKey` is two fields, `instance` and `code`, and BOTH are
+    /// ordinary serde fields that survive a wire round-trip exactly as sent:
+    /// nothing recomputes them on deserialization, and `ContractKey`'s `Hash` /
+    /// `Eq` compare `instance` alone, so the `code` half is never even consulted
+    /// for identity. `ContractCode` carries the same shape: `ContractCode::hash()`
+    /// returns a stored field rather than hashing the bytes, and its `PartialEq`
+    /// compares only that field. So a container's claimed identity and its actual
+    /// content are independent until something derives one from the other.
+    ///
+    /// [`ContractStore`] is where that stops being merely untidy: `store_contract`
+    /// uses the claimed code hash as the blob FILENAME and as the value written
+    /// into the instance→code index, both in memory and durably in ReDb, and the
+    /// index is what `fetch_contract` and the compiled-module cache later resolve
+    /// through. An identity the node never derived would therefore decide, durably,
+    /// which bytes it believes are a given contract's code.
+    ///
+    /// # The two checks, and why the order matters
+    ///
+    /// 1. `CodeHash::from_code(code.data())` must equal the code hash the
+    ///    container claims (on the key AND on the code itself). This is the only
+    ///    check that touches the bytes, so it has to come first.
+    /// 2. `instance` must equal `ContractInstanceId::from_params_and_code(params,
+    ///    code)`. That derivation is `BLAKE3(code.hash() ‖ params)` and it reads
+    ///    `code.hash()`, i.e. the stored field, so it is only meaningful ONCE
+    ///    check 1 has established that the field matches the bytes. Doing 2 alone
+    ///    would verify a claim against another claim.
+    ///
+    /// Both together are what bind instance, code hash and bytes into one
+    /// identity. Check 1 alone would still allow a well-formed container to be
+    /// filed under an unrelated instance id; check 2 alone is circular.
+    ///
+    /// Deriving the id via the stdlib helper rather than re-implementing
+    /// `BLAKE3(hash ‖ params)` here is deliberate: a local copy of that formula
+    /// would silently diverge if the derivation ever changed.
+    fn verify_contract_identity(
+        key: &ContractKey,
+        code: &ContractCode<'_>,
+        params: &Parameters<'_>,
+    ) -> RuntimeResult<()> {
+        let actual_code_hash = CodeHash::from_code(code.data());
+
+        // Check 1: the claimed code hash(es) must be the hash of these bytes.
+        // Both the key's copy and the code's own copy are checked, because they
+        // are separate fields and either could be the one a later reader trusts.
+        if actual_code_hash != *key.code_hash() || actual_code_hash != *code.hash() {
+            return Err(crate::wasm_runtime::RuntimeInnerError::ContractIdentityMismatch {
+                key: Box::new(*key),
+                detail: format!(
+                    "code hashes to {actual_code_hash} but the key claims {} and the code claims {}",
+                    key.code_hash(),
+                    code.hash()
+                ),
+            }
+            .into());
+        }
+
+        // Check 2: sound only now that check 1 passed (see rustdoc).
+        let derived_instance = ContractInstanceId::from_params_and_code(params, code);
+        if derived_instance != *key.id() {
+            return Err(
+                crate::wasm_runtime::RuntimeInnerError::ContractIdentityMismatch {
+                    key: Box::new(*key),
+                    detail: format!(
+                        "instance {} is not derived from this code and these {} parameter byte(s) \
+                     (derivation gives {derived_instance})",
+                        key.id(),
+                        params.as_ref().len()
+                    ),
+                }
+                .into(),
+            );
+        }
+
+        Ok(())
     }
 
     /// Store a copy of the contract in the local store, in case it hasn't been stored previously.
     pub fn store_contract(&mut self, contract: ContractContainer) -> RuntimeResult<()> {
+        let (key, code, params) = match contract.clone() {
+            ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_v1)) => (
+                *contract_v1.key(),
+                contract_v1.code().clone(),
+                contract_v1.params().clone(),
+            ),
+            ContractContainer::Wasm(_) | _ => unimplemented!(),
+        };
+
+        // Verify the identity BEFORE anything durable happens, and before taking
+        // the blob lock: this is pure computation (one BLAKE3 pass over the WASM,
+        // negligible against the compile it precedes), so there is no reason to
+        // hold a process-wide lock across it, and nothing below should run at all
+        // for a container whose key we cannot derive. See
+        // `verify_contract_identity`.
+        if let Err(err) = Self::verify_contract_identity(&key, &code, &params) {
+            // WARN, not debug: this is the node declining to file bytes under an
+            // identity it did not derive. It should be visible in an operator's
+            // log without a rebuild (`debug!` compiles out in release builds).
+            tracing::warn!(
+                contract = %key,
+                code_bytes = code.data().len(),
+                "refusing to store contract: {err}"
+            );
+            return Err(err);
+        }
+
         // Serialize against concurrent store/remove on the SAME shared code
         // hash across sibling-executor `ContractStore`s (issue #4216). Without
         // this, a `remove_contract` on another executor can run its
@@ -217,12 +334,6 @@ impl ContractStore {
         let blob_lock = self.db.contract_blob_lock();
         let _blob_guard = blob_lock.lock().unwrap_or_else(|e| e.into_inner());
 
-        let (key, code) = match contract.clone() {
-            ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_v1)) => {
-                (*contract_v1.key(), contract_v1.code().clone())
-            }
-            ContractContainer::Wasm(_) | _ => unimplemented!(),
-        };
         let code_hash = key.code_hash();
         let key_path = code_hash.encode();
         let key_path = self.contracts_dir.join(key_path).with_extension("wasm");
@@ -870,6 +981,236 @@ mod test {
             "Removed contract must not be served from cache (ghost contract)"
         );
 
+        Ok(())
+    }
+
+    /// A contract whose key IS derived from its own code and parameters stores
+    /// normally. This is the control for the three rejection tests below: without
+    /// it, they would all still pass if `verify_contract_identity` simply rejected
+    /// everything, and a check that cannot come out clean is not evidence.
+    #[tokio::test]
+    async fn store_contract_accepts_a_key_derived_from_its_own_code()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let contract_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(contract_dir.path())?;
+        let db = create_test_db(contract_dir.path()).await;
+        let mut store = ContractStore::new(contract_dir.path().into(), 10_000, db)?;
+
+        let params: Parameters = [0u8, 1].as_ref().into();
+        // `WrappedContract::new` derives the key from (params, code), so this is
+        // exactly what an honest publisher produces.
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1u8, 2, 3, 4])),
+            params.clone(),
+        );
+        let key = *contract.key();
+
+        store.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+            contract,
+        )))?;
+        assert!(
+            store.fetch_contract(&key, &params).is_some(),
+            "an honestly-derived contract must still be storable and fetchable"
+        );
+        Ok(())
+    }
+
+    /// The claimed code hash must be the hash of the code actually supplied.
+    ///
+    /// `ContractKey`'s `code` field is an unverified serde field, so a container
+    /// can name a code hash unrelated to its bytes. `store_contract` uses that
+    /// value as the blob filename and as the index value, so accepting it would
+    /// let bytes be filed under a code hash they do not hash to.
+    #[tokio::test]
+    async fn store_contract_rejects_code_hash_that_is_not_the_hash_of_the_code()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let contract_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(contract_dir.path())?;
+        let db = create_test_db(contract_dir.path()).await;
+        let mut store = ContractStore::new(contract_dir.path().into(), 10_000, db)?;
+
+        let params: Parameters = [0u8, 1].as_ref().into();
+        let mut contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1u8, 2, 3, 4])),
+            params.clone(),
+        );
+        // Keep the instance, claim a code hash that is not this code's hash.
+        let bogus_code_hash = CodeHash::new([7u8; 32]);
+        contract.key = ContractKey::from_id_and_code(*contract.key.id(), bogus_code_hash);
+        let forged_key = contract.key;
+
+        let err = store
+            .store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+                contract,
+            )))
+            .expect_err("a code hash that does not match the code must be refused");
+        assert!(
+            matches!(
+                err.deref(),
+                crate::wasm_runtime::RuntimeInnerError::ContractIdentityMismatch { .. }
+            ),
+            "expected ContractIdentityMismatch, got: {err}"
+        );
+
+        // Nothing durable may have happened: no blob under the claimed hash, and
+        // no index entry for the instance.
+        let claimed_path = contract_dir
+            .path()
+            .join(bogus_code_hash.encode())
+            .with_extension("wasm");
+        assert!(
+            !claimed_path.exists(),
+            "no blob may be written under an unverified code hash"
+        );
+        assert!(
+            store.code_hash_from_id(forged_key.id()).is_none(),
+            "no index entry may be written for a refused contract"
+        );
+        Ok(())
+    }
+
+    /// The instance id must be derived from the code and parameters supplied.
+    ///
+    /// This is the case an internally-consistent container can still forge: the
+    /// code hash genuinely matches the bytes, and only the instance id is
+    /// unrelated to them. Checking the code hash alone would accept this and file
+    /// well-formed code under an arbitrary instance id.
+    #[tokio::test]
+    async fn store_contract_rejects_instance_not_derived_from_code_and_params()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let contract_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(contract_dir.path())?;
+        let db = create_test_db(contract_dir.path()).await;
+        let mut store = ContractStore::new(contract_dir.path().into(), 10_000, db)?;
+
+        let code = Arc::new(ContractCode::from(vec![1u8, 2, 3, 4]));
+        let params_a: Parameters = [0u8].as_ref().into();
+        let params_b: Parameters = [9u8].as_ref().into();
+
+        let instance_a = *WrappedContract::new(code.clone(), params_a).key().id();
+        let mut forged = WrappedContract::new(code.clone(), params_b);
+        // Correct code hash for these bytes, but another instance's id.
+        forged.key = ContractKey::from_id_and_code(instance_a, *forged.key.code_hash());
+
+        let err = store
+            .store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(forged)))
+            .expect_err("an instance id not derived from this code and params must be refused");
+        assert!(
+            matches!(
+                err.deref(),
+                crate::wasm_runtime::RuntimeInnerError::ContractIdentityMismatch { .. }
+            ),
+            "expected ContractIdentityMismatch, got: {err}"
+        );
+        assert!(
+            store.code_hash_from_id(&instance_a).is_none(),
+            "a refused contract must not create an index entry"
+        );
+        Ok(())
+    }
+
+    /// A refused contract must not re-point an EXISTING instance's code.
+    ///
+    /// `store_contract`'s slow path overwrites the instance→code index
+    /// unconditionally (both the in-memory mirror and the durable ReDb row), and
+    /// `fetch_contract` plus the compiled-module cache resolve through that index.
+    /// So an accepted forgery would not merely add a bad entry, it would change
+    /// which code an already-stored, legitimate contract resolves to.
+    #[tokio::test]
+    async fn store_contract_refusal_leaves_an_existing_instance_pointing_at_its_own_code()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let contract_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(contract_dir.path())?;
+        let db = create_test_db(contract_dir.path()).await;
+        let mut store = ContractStore::new(contract_dir.path().into(), 10_000, db)?;
+
+        let params: Parameters = [0u8, 1].as_ref().into();
+        let honest_code = vec![1u8, 2, 3, 4];
+        let honest = WrappedContract::new(
+            Arc::new(ContractCode::from(honest_code.clone())),
+            params.clone(),
+        );
+        let honest_key = *honest.key();
+        let honest_hash = *honest_key.code_hash();
+        store.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(honest)))?;
+        assert_eq!(store.code_hash_from_id(honest_key.id()), Some(honest_hash));
+
+        // Different code, internally consistent, but claiming the honest
+        // contract's instance id.
+        let other_code = Arc::new(ContractCode::from(vec![9u8, 9, 9, 9, 9]));
+        let mut forged = WrappedContract::new(other_code.clone(), params.clone());
+        let other_hash = *forged.key.code_hash();
+        assert_ne!(
+            other_hash, honest_hash,
+            "fixture must use genuinely different code"
+        );
+        forged.key = ContractKey::from_id_and_code(*honest_key.id(), other_hash);
+
+        store
+            .store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(forged)))
+            .expect_err("a forged instance id must be refused");
+
+        // The honest instance still resolves to its own code, and still serves it.
+        assert_eq!(
+            store.code_hash_from_id(honest_key.id()),
+            Some(honest_hash),
+            "a refused store must not re-point an existing instance's code"
+        );
+        let fetched = store
+            .fetch_contract(&honest_key, &params)
+            .expect("the honest contract must still be served");
+        match fetched {
+            ContractContainer::Wasm(ContractWasmAPIVersion::V1(c)) => {
+                assert_eq!(c.code().data(), honest_code.as_slice());
+            }
+            _ => panic!("unexpected container version"),
+        }
+        Ok(())
+    }
+
+    /// `fetch_contract` must resolve code through the node's own index, not
+    /// through the `code` field on the caller's key.
+    ///
+    /// The cache fast path used to look up `key.code_hash()` directly, gated only
+    /// on the instance being indexed at all. Since that field is unverified and
+    /// excluded from `ContractKey`'s `Eq`/`Hash`, a caller could name an instance
+    /// while choosing which cached code came back for it.
+    #[tokio::test]
+    async fn fetch_contract_resolves_code_through_the_index_not_the_callers_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let contract_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(contract_dir.path())?;
+        let db = create_test_db(contract_dir.path()).await;
+        let mut store = ContractStore::new(contract_dir.path().into(), 10_000, db)?;
+
+        let params: Parameters = [0u8, 1].as_ref().into();
+        let code_a = vec![1u8, 2, 3, 4];
+        let code_b = vec![9u8, 9, 9, 9, 9];
+
+        let a = WrappedContract::new(Arc::new(ContractCode::from(code_a.clone())), params.clone());
+        let key_a = *a.key();
+        let b = WrappedContract::new(Arc::new(ContractCode::from(code_b.clone())), params.clone());
+        let hash_b = *b.key().code_hash();
+
+        // Store both, so B's code is warm in the per-executor cache.
+        store.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(a)))?;
+        store.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(b)))?;
+
+        // Name instance A, but claim B's code hash.
+        let mixed_key = ContractKey::from_id_and_code(*key_a.id(), hash_b);
+        let fetched = store
+            .fetch_contract(&mixed_key, &params)
+            .expect("instance A is indexed, so a lookup for it must resolve");
+        match fetched {
+            ContractContainer::Wasm(ContractWasmAPIVersion::V1(c)) => {
+                assert_eq!(
+                    c.code().data(),
+                    code_a.as_slice(),
+                    "must serve the code the INDEX records for this instance, not the code hash the caller named"
+                );
+            }
+            _ => panic!("unexpected container version"),
+        }
         Ok(())
     }
 
