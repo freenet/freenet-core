@@ -1200,6 +1200,32 @@ trigger_gateway_updates() {
     fi
 }
 
+# The display name of the cross-compile job that uploads the assets, runs the
+# BLOCKING pre-flight canary, and un-drafts the release. Must match `name:` on
+# the `attach-to-release` job in .github/workflows/cross-compile.yml.
+ATTACH_JOB_NAME='Attach binaries to GitHub release'
+
+# That job's own "status:conclusion", empty when it cannot be determined.
+#
+# Deliberately NOT the run's aggregate. The same run also contains the
+# post-publish self-update canary (Gate B, #5222), which is by design
+# NON-blocking: it starts only after `attach-to-release` has already published
+# the release, and its job exists to report, not to gate. Reading the run's
+# status therefore makes this script (a) keep waiting after the release is
+# published and (b) treat a Gate B failure as a failed release -- and since
+# `wait_for_binaries` is called bare under `set -e`, that aborts the driver
+# before it updates the gateways or announces to Matrix and River. A release
+# that published perfectly well would silently never be announced.
+#
+# Empty output means "we do not know" -- the job has not started, was renamed,
+# or `gh` failed -- and every caller must treat it as such rather than as a
+# pass. A rename shows up as a wait that times out loudly; it cannot fail open.
+attach_job_state() {
+    local run_id="$1"
+    gh run view "$run_id" --repo freenet/freenet-core --json jobs \
+        --jq "[.jobs[] | select(.name == \"$ATTACH_JOB_NAME\")] | .[0] | select(. != null) | \"\(.status):\(.conclusion)\"" 2>/dev/null
+}
+
 publish_draft_release() {
     # Publish the draft release (idempotent -- no-op if already published).
     #
@@ -1220,17 +1246,20 @@ publish_draft_release() {
     fi
 
     # It IS still a draft, so the gate's verdict decides. Anything other than a
-    # successfully-concluded run means "we do not know that the canary passed",
-    # and publishing on an unknown gate state is the fail-open this guard
-    # exists to prevent. Note an EMPTY run list yields the literal "null:null"
-    # (jq interpolates .[0] == null), and a `gh` failure yields "" -- both are
-    # "we do not know", and both must refuse.
-    local run_state
-    run_state=$(gh run list --repo freenet/freenet-core \
+    # successfully-concluded ATTACH job means "we do not know that the canary
+    # passed", and publishing on an unknown gate state is the fail-open this
+    # guard exists to prevent. A missing run, a missing job, or a `gh` failure
+    # all yield "" -- all of them are "we do not know", and all must refuse.
+    local run_id job_state
+    run_id=$(gh run list --repo freenet/freenet-core \
         --workflow=cross-compile.yml --branch "v$VERSION" \
-        --json status,conclusion --jq '.[0] | "\(.status):\(.conclusion)"' 2>/dev/null || echo "")
-    if [[ "$run_state" != "completed:success" ]]; then
-        echo "  ⏸  NOT publishing v$VERSION: cross-compile is '${run_state:-unknown}'." >&2
+        --json databaseId --jq '.[0].databaseId // empty' 2>/dev/null || echo "")
+    job_state=""
+    if [[ -n "$run_id" ]]; then
+        job_state=$(attach_job_state "$run_id")
+    fi
+    if [[ "$job_state" != "completed:success" ]]; then
+        echo "  ⏸  NOT publishing v$VERSION: '$ATTACH_JOB_NAME' is '${job_state:-unknown}'." >&2
         echo "     Publication is gated on the auto-update pre-flight canary (#5222)," >&2
         echo "     which runs between asset upload and un-draft. Let the workflow" >&2
         echo "     publish, or fix the gate. Do NOT un-draft by hand -- a release" >&2
@@ -1331,13 +1360,20 @@ wait_for_binaries() {
     local interval=30
 
     while [[ $elapsed -lt $max_wait ]]; do
-        local status conclusion
-        status=$(gh run view "$run_id" --repo freenet/freenet-core --json status --jq '.status' 2>/dev/null)
+        # Watch the JOB that attaches and publishes, not the whole RUN. The run
+        # also carries the post-publish self-update canary (Gate B, #5222),
+        # which starts only after this job has published the release and is
+        # explicitly non-blocking -- see attach_job_state for what waiting on
+        # the run instead costs. An empty state means the job has not started
+        # yet (it waits on all six build jobs), so keep waiting.
+        local job_state status conclusion
+        job_state=$(attach_job_state "$run_id")
+        status="${job_state%%:*}"
+        conclusion="${job_state#*:}"
 
         if [[ "$status" == "completed" ]]; then
-            conclusion=$(gh run view "$run_id" --repo freenet/freenet-core --json conclusion --jq '.conclusion' 2>/dev/null)
             if [[ "$conclusion" == "success" ]]; then
-                echo "  ✓ Cross-compile workflow completed successfully"
+                echo "  ✓ Binaries attached and release published"
 
                 # Verify all required platform binaries are uploaded
                 sleep 5  # Brief delay for asset upload
@@ -1346,19 +1382,21 @@ wait_for_binaries() {
                     publish_draft_release
                     return 0
                 else
-                    echo "  ✗ Cross-compile succeeded but some required binaries are missing"
+                    echo "  ✗ Attach job succeeded but some required binaries are missing"
                     echo "     Check: https://github.com/freenet/freenet-core/actions/runs/$run_id"
                     return 1
                 fi
             else
-                echo "  ✗ Cross-compile workflow failed (conclusion: $conclusion)"
-                echo "     Binaries will NOT be available for auto-update."
+                echo "  ✗ '$ATTACH_JOB_NAME' failed (conclusion: $conclusion)"
+                echo "     Either a build is missing or the BLOCKING auto-update"
+                echo "     pre-flight canary (#5222) rejected the binary. Binaries"
+                echo "     will NOT be available for auto-update."
                 echo "     Check: https://github.com/freenet/freenet-core/actions/runs/$run_id"
                 return 1
             fi
         fi
 
-        printf "  Waiting... (%ds elapsed, status: %s)\r" "$elapsed" "$status"
+        printf "  Waiting... (%ds elapsed, status: %s)\r" "$elapsed" "${status:-pending}"
         sleep $interval
         elapsed=$((elapsed + interval))
     done

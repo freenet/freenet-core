@@ -212,8 +212,11 @@ jobs:
       # root/sudo. shellcheck guards the installer/uninstaller scripts too.
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
+      # The canary scripts are linted here too. They were claimed shellcheck
+      # clean when they landed but were not actually in this list, so nothing
+      # held them to it. `-x` because the two test scripts `source` the canary.
       - name: Lint install/uninstall scripts (shellcheck)
-        run: shellcheck scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh
+        run: shellcheck -x scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh
       - name: Self-test install.sh service-mode decision
         run: sh scripts/test-install-sh.sh
       - name: Self-test uninstall.sh

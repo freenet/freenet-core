@@ -80,6 +80,19 @@ check() {
 HEALTHY='2026-08-08T02:02:59.369148Z  INFO freenet: Startup update check against GitHub current="0.2.119" jitter_secs=38
 2026-08-08T02:02:59.538127Z  INFO freenet: Startup check: newer version on GitHub, triggering auto-update new_version=0.2.122'
 
+# The OTHER healthy shape, and the one Gate A actually sees: the binary about
+# to ship is NEWER than the latest release, so the check finishes without
+# triggering anything. Until #5236 that outcome was a `debug!` -- compiled out
+# of release builds -- so a healthy Gate A run produced no ending at all and
+# was byte-for-byte indistinguishable from a run cut short.
+HEALTHY_UP_TO_DATE='2026-08-08T02:00:00.000000Z  INFO freenet: Startup update check against GitHub current="0.2.123" jitter_secs=7
+2026-08-08T02:00:00.412000Z  INFO freenet: Startup update check complete: staying on the current version current="0.2.123"'
+
+# The vacuous pass #5236 closed: the check STARTED and the log stops there,
+# because the canary killed the node while GitHub was still answering. Every
+# negative assertion is satisfied; none of them can see that nothing happened.
+PENDING='2026-08-08T02:00:00.000000Z  INFO freenet: Startup update check against GitHub current="0.2.123" jitter_secs=7'
+
 # Verbatim from a real v0.2.121 run, 2026-08-08T01:59:35Z -- the #5221 break.
 BROKEN='2026-08-08T01:59:35.950835Z  INFO freenet: Startup update check against GitHub current="0.2.121" jitter_secs=40
 2026-08-08T01:59:36.111073Z  WARN freenet::commands::auto_update: Startup update check: failed to parse latest version '"'"'v0.2.122'"'"': unexpected character '"'"'v'"'"' while parsing major version number'
@@ -92,8 +105,9 @@ DIRTY='2026-08-08T02:00:00.000000Z  WARN freenet: Auto-update is DISABLED for th
 FETCH_FAIL='2026-08-08T02:00:00.000000Z  INFO freenet: Startup update check against GitHub current="0.2.121" jitter_secs=12
 2026-08-08T02:00:00.500000Z  WARN freenet::commands::auto_update: Startup update check: failed to fetch latest version: error sending request. Continuing with current binary.'
 
-# --- the positive case ------------------------------------------------------
-check "healthy: check ran and parsed -> pass" 0 "$HEALTHY"
+# --- the positive cases -----------------------------------------------------
+check "healthy: check ran, parsed, triggered -> pass" 0 "$HEALTHY"
+check "healthy: check ran and completed up-to-date -> pass" 0 "$HEALTHY_UP_TO_DATE"
 
 # --- the regression this canary exists to catch -----------------------------
 check "broken: #5221 unparseable tag -> fail" 1 "$BROKEN" \
@@ -122,7 +136,16 @@ check "disabled: dirty build silently skips the check -> fail" 1 "$DIRTY" \
 # GitHub unreachable is NOT a broken updater. It must be distinguishable, or
 # a network blip either fails a good release or (worse) gets papered over with
 # a retry that also swallows a real parse failure.
-check "indeterminate: GitHub unreachable -> retry, not fail" 2 "$FETCH_FAIL"
+check "indeterminate: GitHub unreachable -> retry, not fail" 2 "$FETCH_FAIL" \
+    "could not reach GitHub to fetch the latest version"
+
+# --- unknown must never read as OK (#5236) ----------------------------------
+# The check started and the log stops. Distinguishing this from success is the
+# entire assertion: "no parse error" is evidence that parsing worked only if
+# the check is known to have got as far as parsing. Exit 2, not 0 and not 1 --
+# nothing was detected, nothing was proved, and the caller retries.
+check "unknown: check started but logged no outcome -> indeterminate, NOT ok" 2 "$PENDING" \
+    "never logged an outcome"
 
 # --- the update-trigger detector --------------------------------------------
 # `node_decided_to_update` must fire for ALL FOUR "triggering auto-update"
@@ -182,6 +205,21 @@ pin_marker() {
 }
 
 pin_marker "source pin: startup-check marker"   "$SRC"    "$MARKER_CHECK_RAN"
+# The completion marker is load-bearing in a way the others are not: if it stops
+# being emitted, every healthy run becomes INDETERMINATE and Gate A blocks every
+# release. It must also stay at INFO -- a `debug!` is compiled out of release
+# builds entirely (`release_max_level_info`), which is exactly how this outcome
+# came to be invisible in the first place (#5236).
+pin_marker "source pin: check-complete marker" "$SRC"    "$MARKER_CHECK_COMPLETE"
+# Whitespace stripped from BOTH sides, so this pins the macro rather than the
+# formatting: a rustfmt reflow of the same call must not decide whether the
+# canary is protected.
+if [[ "$(tr -d '[:space:]' < "$SRC")" == *"tracing::info!(current=build_info::VERSION,\"${MARKER_CHECK_COMPLETE// /}"* ]]; then
+    echo "ok   - source pin: check-complete marker is emitted at INFO"
+else
+    echo "FAIL - source pin: the '$MARKER_CHECK_COMPLETE' line is no longer an INFO-level tracing::info! in freenet.rs -- release builds compile out anything below INFO, so the canary would go blind (#5236)" >&2
+    FAILURES=$((FAILURES + 1))
+fi
 pin_marker "source pin: trigger phrase"         "$SRC"    "$MARKER_TRIGGERED"
 pin_marker "source pin: #4073 refusal phrase"   "$SRC"    "$MARKER_NOT_TRIGGERED"
 pin_marker "source pin: disabled marker"        "$SRC"    "$MARKER_DISABLED"

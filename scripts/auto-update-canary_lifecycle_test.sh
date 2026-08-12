@@ -26,6 +26,16 @@
 #      update check never ran" on a HEALTHY binary. Case 4 pins this one
 #      directly: reintroducing the bug makes it fail (verified).
 #
+#   3. The gate could go green with no evidence (#5236). After the "check
+#      started" line it slept a flat 5s and killed the node -- but that line is
+#      logged BEFORE the network request, which production bounds at 10s
+#      (PROBE_CHAIN_TIMEOUT). Any GitHub answer in the 5-10s band was killed
+#      before it could log ANY outcome, and "no parse error in the log" was
+#      then read as "parsing works". A binary with the exact #5221 bug would
+#      have passed Gate A and shipped. Cases 5 and 6 pin it: 5 is the outcome
+#      that arrives late (verified to fail against the pre-fix script), 6 is
+#      the outcome that never arrives.
+#
 # Instead of booting a real Freenet node (slow, needs network, non-deterministic
 # jitter), these drive the real functions against a FAKE node binary that emits
 # the same log lines. The functions under test are the real ones, sourced.
@@ -57,14 +67,20 @@ trap 'rm -rf "$TMPROOT"; cleanup' EXIT
 CHECK_LINE='INFO freenet: Startup update check against GitHub current="0.2.122" jitter_secs=1'
 PARSE_FAIL_LINE="WARN freenet::commands::auto_update: Startup update check: failed to parse latest version 'v0.2.123': unexpected character 'v' while parsing major version number"
 TRIGGER_LINE='INFO freenet: Startup check: newer version on GitHub, triggering auto-update new_version=0.2.123'
+COMPLETE_LINE='INFO freenet: Startup update check complete: staying on the current version current="0.2.122"'
 
-# make_fake_node <path> <exit-code> <extra-log-line> [linger-seconds]
+# make_fake_node <path> <exit-code> <extra-log-line> [linger-seconds] [extra-delay-seconds]
 #
 # Writes a stand-in for the freenet binary: it answers --version, parses just
 # enough of the real flag set to find --log-dir, writes the log lines a real
 # node would, then lingers before exiting with the requested code.
+#
+# `extra-delay-seconds` is the gap between the "check started" line and the
+# outcome line. It models the only variable a real node has here: how long
+# GitHub takes to answer. Production bounds that at PROBE_CHAIN_TIMEOUT (10s),
+# and the whole of case 5 is a value inside that bound.
 make_fake_node() {
-    local path="$1" exit_code="$2" extra="$3" linger="${4:-0}"
+    local path="$1" exit_code="$2" extra="$3" linger="${4:-0}" delay="${5:-0}"
     cat > "$path" <<FAKE
 #!/usr/bin/env bash
 if [ "\${1:-}" = "--version" ]; then
@@ -80,10 +96,11 @@ while [ \$# -gt 0 ]; do
 done
 mkdir -p "\$logdir"
 sleep 1
-{
-    echo "2026-08-08T02:00:00.000000Z  $CHECK_LINE"
-    [ -n "$extra" ] && echo "2026-08-08T02:00:00.100000Z  $extra"
-} >> "\$logdir/freenet.2026-08-08-02.log"
+echo "2026-08-08T02:00:00.000000Z  $CHECK_LINE" >> "\$logdir/freenet.2026-08-08-02.log"
+if [ -n "$extra" ]; then
+    sleep $delay
+    echo "2026-08-08T02:00:00.100000Z  $extra" >> "\$logdir/freenet.2026-08-08-02.log"
+fi
 sleep $linger
 exit $exit_code
 FAKE
@@ -102,7 +119,7 @@ bad()  { echo "FAIL - $1" >&2; FAILURES=$((FAILURES + 1)); }
 #    "can it ever go red?" side -- neither is worth much alone.
 # ---------------------------------------------------------------------------
 FAKE_OK="$TMPROOT/fake-healthy"
-make_fake_node "$FAKE_OK" 0 "" 0
+make_fake_node "$FAKE_OK" 0 "$COMPLETE_LINE" 0
 if cmd_preflight "$FAKE_OK" >/dev/null 2>&1; then
     ok "cmd_preflight returns 0 for a healthy binary"
 else
@@ -149,7 +166,7 @@ fi
 # ---------------------------------------------------------------------------
 MARKER="canaryleak$$"
 FAKE_LONG="$TMPROOT/$MARKER"
-make_fake_node "$FAKE_LONG" 0 "" 30   # lingers well past the gate's return
+make_fake_node "$FAKE_LONG" 0 "$COMPLETE_LINE" 30   # lingers well past the gate's return
 WORKL="$TMPROOT/workleak"
 mkdir -p "$WORKL"
 run_node_until_check "$FAKE_LONG" "$WORKL" >/dev/null 2>&1
@@ -161,6 +178,68 @@ if pgrep -f "$MARKER" >/dev/null 2>&1; then
 else
     ok "no node survives run_node_until_check"
 fi
+
+# ---------------------------------------------------------------------------
+# 5. THE VACUOUS PASS (#5236). A broken updater whose outcome lands more than
+#    five seconds after the "check started" line must still FAIL the gate.
+#
+#    The gate used to `sleep 5` after that line and then kill the node. The
+#    line is logged BEFORE the network request, and the request is bounded by
+#    PROBE_CHAIN_TIMEOUT = 10s, so any GitHub answer between 5s and 10s --
+#    loaded runner, redirect hop, mild rate-limit backoff -- was SIGTERMed
+#    before it could log success, a parse failure, or a fetch failure. The
+#    assertion then saw "check ran, no parse error" and returned OK. A binary
+#    carrying the exact #5221 bug this canary exists to catch would have
+#    passed Gate A and shipped.
+#
+#    The fake below is that binary: it logs the parse failure 8s after the
+#    check line -- inside what production allows, outside what the gate used
+#    to watch. Verified to FAIL against the pre-fix script (which returned 0,
+#    reporting a broken updater as healthy) and to pass after.
+#
+#    Asserting on the DIAGNOSIS, not just the exit code: the point is that the
+#    canary now SEES the parse failure, not merely that it stopped saying OK.
+# ---------------------------------------------------------------------------
+FAKE_SLOW="$TMPROOT/fake-slow-parsefail"
+make_fake_node "$FAKE_SLOW" 0 "$PARSE_FAIL_LINE" 0 8
+WAS_TIMEOUT=$CANARY_TIMEOUT_SECS
+WAS_WAIT=${CANARY_OUTCOME_WAIT_SECS:-20}
+CANARY_TIMEOUT_SECS=40
+CANARY_OUTCOME_WAIT_SECS=25
+SLOW_OUT="$(cmd_preflight "$FAKE_SLOW" 2>&1)"
+SLOW_RC=$?
+CANARY_TIMEOUT_SECS=$WAS_TIMEOUT
+CANARY_OUTCOME_WAIT_SECS=$WAS_WAIT
+if [[ "$SLOW_RC" -eq 0 ]]; then
+    bad "cmd_preflight returned OK for a binary whose updater FAILED TO PARSE, because the failure was logged 8s after the check started (the #5236 vacuous pass)"
+elif [[ "$SLOW_OUT" != *"could not parse the version GitHub returned"* ]]; then
+    bad "cmd_preflight failed the slow parse-failure binary but did not name the parse failure; got: $SLOW_OUT"
+else
+    ok "a parse failure logged 8s after the check still fails the gate, with the right diagnosis"
+fi
+
+# ---------------------------------------------------------------------------
+# 6. NO OUTCOME AT ALL must not read as OK either.
+#
+#    Case 5 covers the outcome that arrives late. This covers the one that
+#    never arrives -- a check wedged in its request, a node killed for any
+#    other reason. There is nothing to detect here and the gate must not
+#    pretend otherwise: it reports UNVERIFIED and refuses, rather than
+#    reporting a pass it has no evidence for.
+#
+#    Short outcome budget on purpose: what is under test is the verdict for a
+#    log that never settles, not how long the canary is willing to wait.
+# ---------------------------------------------------------------------------
+FAKE_SILENT="$TMPROOT/fake-silent"
+make_fake_node "$FAKE_SILENT" 0 "" 20   # logs the check line and nothing else
+WAS_WAIT=${CANARY_OUTCOME_WAIT_SECS:-20}
+CANARY_OUTCOME_WAIT_SECS=4
+if cmd_preflight "$FAKE_SILENT" >/dev/null 2>&1; then
+    bad "cmd_preflight returned OK for a node that logged NO outcome -- absence of an answer is being read as success (#5236)"
+else
+    ok "a check that never logs an outcome is UNVERIFIED, not OK"
+fi
+CANARY_OUTCOME_WAIT_SECS=$WAS_WAIT
 
 echo
 if [[ "$FAILURES" -eq 0 ]]; then

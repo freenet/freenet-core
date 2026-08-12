@@ -25,9 +25,15 @@
 # that never reached the update task all produce. A canary that can only go
 # green is worth nothing.
 #
-# So `assert_detection_healthy` requires BOTH:
+# So `assert_detection_healthy` requires ALL of:
 #   (+) the "Startup update check against GitHub" INFO line is PRESENT
-#       -- proves the check actually ran
+#       -- proves the check actually STARTED
+#   (+) a terminal outcome line is PRESENT -- either "Startup update check
+#       complete" or a trigger
+#       -- proves the check FINISHED. Absence of a parse error is evidence
+#          that parsing worked only if the check is known to have got that
+#          far; a run stopped mid-request has no parse error either. See
+#          `run_node_until_check` for the specific way that used to happen.
 #   (-) no "failed to parse latest version" WARN
 #       -- proves it parsed what GitHub returned
 #   (-) no "Auto-update is DISABLED" WARN
@@ -76,6 +82,22 @@ MARKER_DISABLED='Auto-update is DISABLED'
 # update" for a node that did. So: match the phrase, subtract the refusal.
 MARKER_TRIGGERED='triggering auto-update'
 MARKER_NOT_TRIGGERED='not triggering auto-update'
+# freenet.rs -- the check ENDED without requesting an update. Emitted on every
+# non-triggering outcome (already up to date, GitHub unreachable, unparseable
+# tag, #4073 locally-blocked version), so it is a completion signal, not a
+# verdict: it says the check got to the end, and the WARN above it, if any,
+# says what it found. This was a `debug!` until #5236, which release builds
+# compile out entirely (`release_max_level_info`) -- so on a shipped binary the
+# most common outcome of the whole check was invisible, and "finished, staying
+# put" was indistinguishable from "killed mid-request".
+#
+# A binary built BEFORE #5236 never emits it. That matters only in Gate B,
+# whose subject is the PREVIOUS release: a healthy one triggers an update and
+# settles on that, but an old one that neither triggers nor fails now reports
+# UNVERIFIED instead of "did NOT decide to update". Still a refusal, and still
+# the right one -- just a less specific message, and only until the previous
+# release is itself post-#5236.
+MARKER_CHECK_COMPLETE='Startup update check complete'
 
 MUSL_ASSET='freenet-x86_64-unknown-linux-musl.tar.gz'
 RELEASE_BASE='https://github.com/freenet/freenet-core/releases/download'
@@ -105,8 +127,26 @@ case "$CANARY_ATTEMPTS" in
 esac
 CANARY_RETRY_SLEEP="${CANARY_RETRY_SLEEP:-20}"
 
+# How long to wait, AFTER the "check started" line appears, for the check to
+# log an outcome. The floor is set by production, not by taste: the check's
+# network round trip is bounded by PROBE_CHAIN_TIMEOUT (10s, whole-chain --
+# DNS, connect, redirects; crates/core/src/bin/commands/auto_update.rs), the
+# parse is immediate after it, and the "check started" line is logged BEFORE
+# the request begins. So any outcome that is ever going to be logged is logged
+# within ~10s of that line, and this is 2x that. Below PROBE_CHAIN_TIMEOUT the
+# canary stops the node mid-request and reads the resulting silence as health
+# (#5236).
+CANARY_OUTCOME_WAIT_SECS="${CANARY_OUTCOME_WAIT_SECS:-20}"
+case "$CANARY_OUTCOME_WAIT_SECS" in
+  ''|*[!0-9]*|0) CANARY_OUTCOME_WAIT_SECS=20 ;;
+esac
+
 log()  { printf '%s\n' "$*"; }
 fail() { printf '::error::%s\n' "$*" >&2; }
+# An UNVERIFIED result, not a detected fault. Deliberately not `::error::`:
+# annotating an unreachable GitHub as a workflow error trains people to ignore
+# the annotation, and the caller decides whether to retry or fail.
+note() { printf '%s\n' "$*" >&2; }
 
 # True when the logs show the node DECIDED to update. See the marker comments
 # above for why this is a subtraction rather than a single grep.
@@ -114,6 +154,21 @@ node_decided_to_update() {
   local logdir="$1"
   grep -ahF "$MARKER_TRIGGERED" "$logdir"/freenet.*.log 2>/dev/null \
     | grep -vF "$MARKER_NOT_TRIGGERED" | grep -q .
+}
+
+# True when the startup check reached a TERMINAL outcome -- any outcome, healthy
+# or not. Either it ran to the end (MARKER_CHECK_COMPLETE, emitted on every
+# non-triggering path) or it decided to update and returned early.
+#
+# This is the difference between "the check found nothing wrong" and "we stopped
+# watching before it said anything", which every negative assertion in this file
+# silently depends on and none of them can see on its own.
+node_check_settled() {
+  local logdir="$1"
+  if grep -ahF "$MARKER_CHECK_COMPLETE" "$logdir"/freenet.*.log 2>/dev/null | grep -q .; then
+    return 0
+  fi
+  node_decided_to_update "$logdir"
 }
 
 
@@ -192,12 +247,28 @@ assert_detection_healthy() {
   # so the check ran but learned nothing. Distinct exit code so the caller can
   # retry instead of failing a release on a transient network blip.
   if printf '%s' "$logs" | grep -aqF "$MARKER_FETCH_FAIL"; then
-    log "INDETERMINATE: could not reach GitHub to fetch the latest version."
-    printf '%s' "$logs" | grep -aF "$MARKER_FETCH_FAIL" | head -2
+    note "INDETERMINATE: could not reach GitHub to fetch the latest version."
+    printf '%s' "$logs" | grep -aF "$MARKER_FETCH_FAIL" | head -2 >&2
     return 2
   fi
 
-  log "OK: startup update check ran and parsed GitHub's response."
+  # (+) The check STARTED (asserted above) but never reached an outcome: no
+  #     completion line, no trigger, and none of the failure markers either.
+  #
+  #     This is NOT success, and the whole point of the canary is that the two
+  #     are told apart. Every negative check above is satisfied by a log that
+  #     simply stops early, so without this branch a truncated run reports OK
+  #     -- and a binary carrying the #5221 unparseable-tag bug passes Gate A
+  #     and ships, as long as GitHub answered slower than the canary waited
+  #     (#5236). Returning 2 rather than 1 because it is genuinely unknown:
+  #     the caller retries, and a run that still cannot produce an answer
+  #     fails the gate as UNVERIFIED instead of masquerading as a verdict.
+  if ! node_check_settled "$logdir"; then
+    note "INDETERMINATE: the startup update check started but never logged an outcome (no '$MARKER_CHECK_COMPLETE', no trigger, no failure). The check did not finish inside the canary's window, so this run proves NOTHING about the updater -- it is not evidence that parsing works."
+    return 2
+  fi
+
+  log "OK: startup update check ran to completion and parsed GitHub's response."
   printf '%s' "$logs" | grep -aF "$MARKER_CHECK_RAN" | head -2
   return 0
 }
@@ -268,9 +339,30 @@ run_node_until_check() {
       break   # node exited on its own (exit 42 on the selfupdate path)
     fi
     if grep -aqF "$MARKER_CHECK_RAN" "$work/logs"/freenet.*.log 2>/dev/null; then
-      # The check ran. Give it a moment to log the OUTCOME (parse failure,
-      # trigger, or fetch failure) before we read the verdict.
-      sleep 5
+      # The check has STARTED. Wait for it to FINISH.
+      #
+      # This was a flat `sleep 5`, which was shorter than the timeout the check
+      # itself runs under. The marker matched above is logged BEFORE the network
+      # request begins, and that request is bounded by PROBE_CHAIN_TIMEOUT (10s).
+      # So a GitHub that answered in 6s -- a loaded runner, a redirect hop, a
+      # mild rate-limit backoff -- had its node SIGTERMed before it could log
+      # success OR a parse failure OR a fetch failure, and
+      # `assert_detection_healthy` then read that silence as health. A binary
+      # carrying the exact #5221 bug this canary exists to catch would have
+      # passed Gate A and been published (#5236).
+      #
+      # Poll for the outcome instead, on a budget with real headroom over
+      # PROBE_CHAIN_TIMEOUT, and stop the moment it arrives -- so the common
+      # case is FASTER than the old fixed sleep, not slower. If the outcome
+      # never arrives the logs say so and `assert_detection_healthy` returns
+      # INDETERMINATE; the one thing that must not happen is reporting OK.
+      local outcome_deadline=$(( $(date +%s) + CANARY_OUTCOME_WAIT_SECS ))
+      while [ "$(date +%s)" -lt "$outcome_deadline" ] && [ "$(date +%s)" -lt "$deadline" ]; do
+        node_check_settled "$work/logs" && break
+        # A node that has exited has logged everything it is going to log.
+        kill -0 "$node_pid" 2>/dev/null || break
+        sleep 1
+      done
       # If the node decided to update, it exits 42 on its own. Killing it here
       # would replace that with 143 and silently defeat Gate B's exit-42
       # assertion -- the canary would report "no update requested" for a node
@@ -333,12 +425,12 @@ cmd_preflight() {
     rc=$?
     [ "$rc" -eq 2 ] || return "$rc"
     if [ "$attempt" -lt "$CANARY_ATTEMPTS" ]; then
-      log "indeterminate (GitHub unreachable); retrying in ${CANARY_RETRY_SLEEP}s"
+      log "indeterminate (no verdict from the update check); retrying in ${CANARY_RETRY_SLEEP}s"
       sleep "$CANARY_RETRY_SLEEP"
     fi
   done
 
-  fail "could not reach GitHub in $CANARY_ATTEMPTS attempts -- cannot confirm the shipping binary's updater works. This is an UNVERIFIED result, not a detected bug: re-run this job once GitHub is reachable. Do NOT un-draft the release by hand to work around it."
+  fail "the shipping binary's update check produced no verdict in $CANARY_ATTEMPTS attempts -- GitHub unreachable, or the check never logged an outcome. Cannot confirm its updater works. This is an UNVERIFIED result, not a detected bug: re-run this job. Do NOT un-draft the release by hand to work around it -- an unverified gate is not a passed gate."
   return 1
 }
 
@@ -384,7 +476,7 @@ cmd_selfupdate() {
     # on an unverified run is the vacuous-pass this canary exists to prevent --
     # but worded so nobody reads it as "the fleet is broken" and learns to
     # ignore the alarm.
-    fail "UNVERIFIED: GitHub was unreachable, so the canary could not determine whether v$prev_version reaches v$expected_version. This is NOT evidence that auto-update is broken, and NOT evidence that it works. Re-run the job."
+    fail "UNVERIFIED: the update check produced no verdict (GitHub unreachable, or it never logged an outcome), so the canary could not determine whether v$prev_version reaches v$expected_version. This is NOT evidence that auto-update is broken, and NOT evidence that it works. Re-run the job."
     return 1
   fi
   [ "$rc" -eq 0 ] || return 1
