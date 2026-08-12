@@ -492,9 +492,41 @@ caught by Gate B one release later, when that binary becomes the previous one.
 Gate B is also post-publish and non-blocking, so even then it reports rather
 than stops.
 
-Net: the installer half of a shipping binary has no blocking gate. Treat a
-green Gate A as "this binary can still see new releases", not as "auto-update
-works".
+**Gate A cannot see a wrong COMPARISON of correct values.** Since #5236 it
+checks the version the node says it observed (`latest=`) against the tag
+`releases/latest` actually resolves to, so a fetch or normaliser that returns
+the wrong string is caught. The comparison that follows it is not covered.
+Mutate `compare_versions_for_startup`'s `latest_ver > current_ver`
+(`crates/core/src/bin/commands/auto_update.rs`) to `<` and Gate A stays green:
+the fetch is right, the parse is right, the observed value is right, and every
+marker the gate reads is exactly what a healthy run produces.
+
+This is structural, not something the gate is failing to do properly. Gate A's
+subject is by construction NEWER than `releases/latest` — the release it
+belongs to is still a draft — so there is no newer release for it to find and
+"decided not to update" is the correct outcome of a healthy run. A gate whose
+input can only produce one answer cannot distinguish comparators by their
+answer.
+
+Worth being precise about the direction, because the obvious reading is the
+wrong way round: inverting that operator does not make the node quietly do
+nothing. `latest < current` is TRUE for a Gate A run, so the node returns the
+OLDER release and requests an update to it — a self-downgrade. Gate A reports
+green on it, because a trigger is one of the outcomes it accepts. (Gate A's
+verdict comes only from `assert_detection_healthy`; it does not assert that
+the shipping binary declined to update. Adding that assertion would close this
+particular hole, at the cost of failing any release cut from a branch whose
+version is genuinely below `releases/latest` — a hotfix on an older line. It
+has not been added.)
+
+What does cover the comparison is the Rust unit tests on
+`compare_versions_for_startup` (same file, `mod tests`), which assert both
+directions and the equal case. Gate B covers it end-to-end for real, but only
+for the PREVIOUS release's binary.
+
+Net: the installer half of a shipping binary has no blocking gate, and neither
+does its comparison logic. Treat a green Gate A as "this binary can still fetch
+and read new release tags", not as "auto-update works".
 
 ### If Gate A fails
 
