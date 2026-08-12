@@ -78,8 +78,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y mold
 
-      - name: Install nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      # nextest via the maintained action, not a hand-rolled download.
+      # Rationale at the first of these in ci.yml (test_unit job); see #5296.
+      - uses: taiki-e/install-action@v2
+        id: install-nextest
+        with:
+          tool: cargo-nextest
 
       - name: Clean test directories
         run: |

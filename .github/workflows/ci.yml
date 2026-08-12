@@ -619,8 +619,29 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      # nextest is installed by the maintained action on every platform, NOT by
+      # a hand-rolled download. That is a reliability fix and it is worth not
+      # undoing: the one-liners this replaced fetched from get.nexte.st, and on
+      # 2026-08-12 that host failed four times across four PRs and BOTH
+      # platforms within ~78 minutes -- `curl: (56) Connection died` on Linux,
+      # `The response ended prematurely` from Invoke-WebRequest on Windows. Two
+      # different HTTP clients failing against one host is what identifies the
+      # HOST as the fault, so retrying it harder was not the answer.
+      #
+      # The action downloads from GitHub Releases
+      # (github.com/nextest-rs/nextest/releases), so it does not touch that
+      # host at all. It also retries (curl --retry 10 inside a 10-iteration
+      # backoff loop), verifies a SHA256 checksum, and can fall back to
+      # cargo-binstall. The Windows form it replaced had NO retry budget at
+      # all, in a ~34-minute job. It does NOT cache -- see #5296 if the
+      # download cost ever matters.
+      #
+      # There are seven of these across ci.yml, playwright-shell.yml and
+      # simulation-nightly.yml; the others point here. See #5296.
+      - uses: taiki-e/install-action@v2
+        id: install-nextest
+        with:
+          tool: cargo-nextest
 
       - name: Build
         env:
@@ -664,7 +685,13 @@ jobs:
             --profile ci -E 'not test(blocked_peers)'
 
       - name: Test blocked-peers (serial)
-        if: ${{ !cancelled() }}
+        # `!cancelled()` deliberately keeps this running after an earlier
+        # TEST failure, so a red test does not hide the rest of the suite.
+        # But it also ran after an INSTALL failure, where it died with
+        # `error: no such command: nextest` -- so the red check named this
+        # step, and a reader saw a plausible test regression instead of a
+        # tool-acquisition problem. Require the install to have succeeded.
+        if: ${{ !cancelled() && steps.install-nextest.conclusion == 'success' }}
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
@@ -677,7 +704,13 @@ jobs:
             -E 'test(blocked_peers)' -j 1
 
       - name: Test ping-types
-        if: ${{ !cancelled() }}
+        # `!cancelled()` deliberately keeps this running after an earlier
+        # TEST failure, so a red test does not hide the rest of the suite.
+        # But it also ran after an INSTALL failure, where it died with
+        # `error: no such command: nextest` -- so the red check named this
+        # step, and a reader saw a plausible test regression instead of a
+        # tool-acquisition problem. Require the install to have succeeded.
+        if: ${{ !cancelled() && steps.install-nextest.conclusion == 'success' }}
         # freenet-ping-types tests need the std feature (default).
         # Run separately since the main step uses --no-default-features.
         run: cargo nextest run -p freenet-ping-types --profile ci
@@ -713,8 +746,12 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install nextest
-        run: curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+      # nextest via the maintained action, not a hand-rolled download.
+      # Rationale at the first of these in ci.yml (test_unit job); see #5296.
+      - uses: taiki-e/install-action@v2
+        id: install-nextest
+        with:
+          tool: cargo-nextest
 
       - name: Build freenet bin
         run: cargo build --locked -p freenet --bin freenet
@@ -765,13 +802,12 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install nextest
-        run: |
-          $tmp = New-TemporaryFile | Rename-Item -NewName { $_ -replace 'tmp$', 'zip' } -PassThru
-          Invoke-WebRequest -OutFile $tmp https://get.nexte.st/latest/windows
-          $outputDir = if ($Env:CARGO_HOME) { Join-Path $Env:CARGO_HOME "bin" } else { "$Env:USERPROFILE\.cargo\bin" }
-          $tmp | Expand-Archive -DestinationPath $outputDir -Force
-          $tmp | Remove-Item
+      # nextest via the maintained action, not a hand-rolled download.
+      # Rationale at the first of these in ci.yml (test_unit job); see #5296.
+      - uses: taiki-e/install-action@v2
+        id: install-nextest
+        with:
+          tool: cargo-nextest
 
       - name: Build freenet bin
         run: cargo build --locked -p freenet --bin freenet
@@ -837,9 +873,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: steps.skip_check.outputs.skip != 'true'
 
-      - name: Install nextest
+      # nextest via the maintained action, not a hand-rolled download.
+      # Rationale at the first of these in ci.yml (test_unit job); see #5296.
+      - uses: taiki-e/install-action@v2
+        id: install-nextest
         if: steps.skip_check.outputs.skip != 'true'
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        with:
+          tool: cargo-nextest
 
       # Build the simulation test binaries and fdev up-front in one cargo
       # invocation so they share a single compile of freenet/deps. Then the
@@ -1086,9 +1126,13 @@ jobs:
         if: steps.skip_check.outputs.skip != 'true'
         run: docker pull alpine:latest
 
-      - name: Install nextest
+      # nextest via the maintained action, not a hand-rolled download.
+      # Rationale at the first of these in ci.yml (test_unit job); see #5296.
+      - uses: taiki-e/install-action@v2
+        id: install-nextest
         if: steps.skip_check.outputs.skip != 'true'
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        with:
+          tool: cargo-nextest
 
       - name: Build
         if: steps.skip_check.outputs.skip != 'true'
