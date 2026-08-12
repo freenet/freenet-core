@@ -91,6 +91,35 @@ const MAX_TRACKED_CONTRACTS: usize = 256;
 /// which the top few answer, and the aggregate counts above carry the rest.
 const TOP_DIFFERING_CONTRACTS_REPORTED: usize = 10;
 
+/// Per-contract differing-comparison counts: the total, and the single-entry
+/// subset.
+///
+/// One struct rather than a second map keyed the same way. The key is
+/// contract-controlled, so a parallel `HashMap` would double the amplification
+/// surface [`MAX_TRACKED_CONTRACTS`] exists to bound, and would let the two
+/// views disagree about which contracts were tracked when the cap binds on one
+/// and not the other. Widening the value keeps one bound, one admission
+/// decision, and `single <= total` true per contract by construction.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+struct DifferingCount {
+    /// Every differing comparison attributed to this contract.
+    total: u64,
+    /// Of those, the ones that arrived in a SINGLE-entry message — the
+    /// notification-leg proxy. See [`OutboundMix::record_summary_comparison`].
+    single: u64,
+}
+
+impl DifferingCount {
+    /// Count one differing comparison, saturating for the same reason every
+    /// other counter here does.
+    fn add(&mut self, single_entry: bool) {
+        self.total = self.total.saturating_add(1);
+        if single_entry {
+            self.single = self.single.saturating_add(1);
+        }
+    }
+}
+
 /// Rollup cadence, matching [`super::broadcast_payload_mix`] so the two
 /// rollups can be joined per node-minute without interpolation.
 const ROLLUP_WINDOW: Duration = Duration::from_secs(60);
@@ -417,6 +446,33 @@ struct Window {
     summary_entries_identical: u64,
     /// Same, but the summary bytes DIFFERED.
     summary_entries_differing: u64,
+    /// The SINGLE-ENTRY subset of [`Window::summary_entries_identical`] — the
+    /// R4b (#5153) instrument.
+    ///
+    /// R4b would replace the proactive summary NOTIFICATION's full summary
+    /// bytes (mean 41.6 KB, 18.7-24.4% of all outbound across three measured
+    /// windows) with a 21-byte digest, falling back to bytes on mismatch. That
+    /// trade wins or loses entirely on `p`, the agreement rate **on that leg**
+    /// — and the fleet-wide rate is inadmissible for it, because comparisons
+    /// are recorded per ENTRY and a notification carries 1.000 entries/message
+    /// against the heartbeat's 222.97. A 99.73% aggregate is therefore almost
+    /// entirely the heartbeat's population.
+    ///
+    /// A notification today already IS a single-entry full-bytes `Summaries`
+    /// message, and its receiver already performs exactly the comparison a
+    /// digest would have made. So splitting the counters above by
+    /// `entries.len() == 1` reads `p` BACKWARD off real production traffic,
+    /// with no wire change and no behaviour change — which is what lets the
+    /// instrument land a release ahead of the mechanism it judges (regime rule
+    /// 7; 0.2.120 is permanently unattributable for want of exactly this).
+    ///
+    /// See [`OutboundMix::record_summary_comparison`] for the discriminator's
+    /// limits, including the measured `Rejection` contamination.
+    summary_entries_identical_single: u64,
+    /// The SINGLE-ENTRY subset of [`Window::summary_entries_differing`]. The
+    /// denominator half of `p` — without it a low single-entry agreement COUNT
+    /// and a low single-entry VOLUME look the same.
+    summary_entries_differing_single: u64,
     /// Comparisons where exactly ONE side held a summary (#4965 review S2).
     ///
     /// The 98.1% identical figure has a structural hole:
@@ -430,6 +486,13 @@ struct Window {
     /// Counted so the post-deploy data can size it rather than leaving the
     /// headline extrapolated over a population it never observed.
     summary_entries_one_sided: u64,
+    /// The SINGLE-ENTRY subset of [`Window::summary_entries_one_sided`].
+    ///
+    /// Carried for the same reason the one-sided total is: under a digest-first
+    /// notification this population classifies as `NeedBytes`, so it is a COST
+    /// on the R4b leg rather than a neutral case, and `p` computed without it
+    /// would be extrapolated over a population it never observed.
+    summary_entries_one_sided_single: u64,
     /// Which contracts the differing comparisons belonged to, bounded at
     /// [`MAX_TRACKED_CONTRACTS`].
     ///
@@ -439,7 +502,16 @@ struct Window {
     /// `contract-summary-determinism.md`). Only the DIFFERING side is
     /// attributed — the identical side needs no diagnosis, and tracking it
     /// would double the map for no decision.
-    differing_by_contract: HashMap<ContractInstanceId, u64>,
+    ///
+    /// Split by single-entry (see [`DifferingCount`]) because an AGGREGATE `p`
+    /// would hide the population that decides R4b. A contract whose merge does
+    /// not converge has `p` structurally 0 — no digest can ever agree — and
+    /// non-converging merges are 32.7% of all update applies (#5153). Two such
+    /// contracts were measured at 9.64% and 2.67% of ALL differing comparisons,
+    /// so "is the notification leg's disagreement a handful of broken contracts
+    /// or the whole population" is a question the per-contract single count
+    /// answers and the ratio alone cannot.
+    differing_by_contract: HashMap<ContractInstanceId, DifferingCount>,
     /// Recipients the proactive summary notification actually sent to, summed
     /// over the window's notifications. See
     /// [`OutboundMix::record_notification_recipients`].
@@ -543,11 +615,40 @@ impl OutboundMix {
     /// interpolation), and the telemetry budget has room for exactly one more
     /// aligned rollup stream (`telemetry.rs`, `MAX_SHADOW_EVENTS_PER_SECOND`),
     /// which this measurement does not deserve to consume.
+    ///
+    /// # The `single_entry` split (R4b instrument, #5153)
+    ///
+    /// `single_entry` is `entries.len() == 1` for the message this comparison
+    /// arrived in, and it is a PROXY for "this comparison happened on the
+    /// proactive-notification leg". It is a proxy rather than the fact because
+    /// the fact is not on the wire: `InterestMessage::Summaries::emitter` is
+    /// `#[serde(skip)]` (`message.rs`), so an inbound message always decodes as
+    /// [`SummariesEmitter::Other`] and the receiver cannot read the true
+    /// emitter. Plumbing it through would be a wire change, which is precisely
+    /// what this instrument exists to avoid needing.
+    ///
+    /// The proxy holds because the state-change-driven send sites are
+    /// single-entry by construction while the heartbeat and interest-churn
+    /// replies are multi-entry: notifications measured 1.000 entries/message
+    /// against the heartbeat's 222.97.
+    ///
+    /// KNOWN CONTAMINATION, stated rather than designed around:
+    /// `entries.len() == 1` also matches [`SummariesEmitter::Rejection`], the
+    /// summary-back on a rejected update. Measured at **535 messages against
+    /// 3,579,282 notifications (0.015%)** — four orders of magnitude below the
+    /// signal, so it cannot move `p`. It is named here so a future reader does
+    /// not rediscover it and mistake the bucket for pure notification traffic.
+    ///
+    /// Recording it here rather than deriving it downstream is deliberate:
+    /// only the receive arm knows the shape of the message the entry came in,
+    /// and a rate re-derived later from arithmetic over separately-reported
+    /// totals would silently absorb every other filter between them.
     pub(crate) fn record_summary_comparison(
         &self,
         contract: &ContractInstanceId,
         ours: &[u8],
         theirs: &[u8],
+        single_entry: bool,
         counted_this_message: &mut HashSet<ContractInstanceId>,
     ) {
         // The per-message dedup lives HERE, not at the call site, for the same
@@ -570,9 +671,17 @@ impl OutboundMix {
         let mut w = self.window.lock();
         if identical {
             w.summary_entries_identical = w.summary_entries_identical.saturating_add(1);
+            if single_entry {
+                w.summary_entries_identical_single =
+                    w.summary_entries_identical_single.saturating_add(1);
+            }
             return;
         }
         w.summary_entries_differing = w.summary_entries_differing.saturating_add(1);
+        if single_entry {
+            w.summary_entries_differing_single =
+                w.summary_entries_differing_single.saturating_add(1);
+        }
         let mut dropped = false;
         // Bounded for the same reason the payload mix bounds its attribution:
         // the key is contract-controlled, so an unbounded map here would be an
@@ -594,11 +703,11 @@ impl OutboundMix {
         let len = w.differing_by_contract.len();
         match w.differing_by_contract.entry(*contract) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
-                *e.get_mut() = e.get().saturating_add(1);
+                e.get_mut().add(single_entry);
             }
             std::collections::hash_map::Entry::Vacant(e) => {
                 if len < MAX_TRACKED_CONTRACTS {
-                    e.insert(1);
+                    e.insert(DifferingCount::default()).add(single_entry);
                 } else {
                     dropped = true;
                 }
@@ -629,9 +738,13 @@ impl OutboundMix {
     /// Shares the caller's per-message dedup set for the same reason the
     /// two-sided counter does: `entries` is peer-supplied and may repeat a
     /// hash, so without it a peer could inflate this bucket at will.
+    ///
+    /// `single_entry` carries the same meaning, and the same known limits, as
+    /// in [`Self::record_summary_comparison`] — read that doc for both.
     pub(crate) fn record_summary_one_sided(
         &self,
         contract: &ContractInstanceId,
+        single_entry: bool,
         counted_this_message: &mut HashSet<ContractInstanceId>,
     ) {
         if !counted_this_message.insert(*contract) {
@@ -639,6 +752,10 @@ impl OutboundMix {
         }
         let mut w = self.window.lock();
         w.summary_entries_one_sided = w.summary_entries_one_sided.saturating_add(1);
+        if single_entry {
+            w.summary_entries_one_sided_single =
+                w.summary_entries_one_sided_single.saturating_add(1);
+        }
     }
 
     /// Record one proactive summary notification's recipient split (#4965).
@@ -670,6 +787,20 @@ impl OutboundMix {
     /// Atomically take the current window, leaving a fresh empty one.
     fn take_window(&self) -> Window {
         std::mem::take(&mut *self.window.lock())
+    }
+
+    /// The rollup body this node would emit right now, WITHOUT draining the
+    /// window.
+    ///
+    /// Exists so a handler test can assert on what production telemetry would
+    /// actually carry, rather than on a counter the test also computed. The
+    /// discriminator that decides the R4b instrument's buckets is chosen in
+    /// `node.rs`'s receive arms, so a unit test on this type alone cannot tell
+    /// a live discriminator from a constant `false` — only a test that drives
+    /// the real handler can, and it needs a way to read the result.
+    #[cfg(test)]
+    pub(crate) fn rollup_body_for_test(&self) -> serde_json::Value {
+        outbound_mix_json(&self.window.lock(), 60)
     }
 }
 
@@ -754,6 +885,27 @@ fn outbound_mix_json(w: &Window, window_secs: u64) -> serde_json::Value {
         w.differing_attribution_dropped.into(),
     );
 
+    // R4b instrument (#5153): the SINGLE-ENTRY subset of the three counters
+    // above, which is the notification leg's own agreement rate `p`. Emitted
+    // unconditionally INCLUDING as zeros, same rule as everything else on this
+    // rollup — a field that disappears when zero is invisible to the analysis,
+    // and "this node saw no single-entry comparisons" is a data point, not an
+    // absence. Each of these is a SUBSET of its total by construction (both are
+    // written under one lock in the same branch), so `single <= total` holds per
+    // window and is asserted rather than assumed.
+    body.insert(
+        "summary_entries_identical_single".into(),
+        w.summary_entries_identical_single.into(),
+    );
+    body.insert(
+        "summary_entries_differing_single".into(),
+        w.summary_entries_differing_single.into(),
+    );
+    body.insert(
+        "summary_entries_one_sided_single".into(),
+        w.summary_entries_one_sided_single.into(),
+    );
+
     // #4965 co-host exclusion, measured in the release build. Emitted
     // unconditionally as a PAIR: `skipped` alone cannot be read (100 of 100 and
     // 100 of 10,000 are different findings), and a dropped field must not look
@@ -771,12 +923,12 @@ fn outbound_mix_json(w: &Window, window_secs: u64) -> serde_json::Value {
     // "specific contracts are non-deterministic" vs "the design is wrong".
     // Capped in the emitted body as well as in the map: the map bound stops
     // unbounded GROWTH, this bound stops an unbounded RECORD.
-    let mut differing: Vec<(String, u64)> = w
+    let mut differing: Vec<(String, DifferingCount)> = w
         .differing_by_contract
         .iter()
         .map(|(k, v)| (k.to_string(), *v))
         .collect();
-    differing.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    differing.sort_unstable_by(|a, b| b.1.total.cmp(&a.1.total).then_with(|| a.0.cmp(&b.0)));
     differing.truncate(TOP_DIFFERING_CONTRACTS_REPORTED);
     body.insert(
         "summary_differing_contracts".into(),
@@ -786,7 +938,13 @@ fn outbound_mix_json(w: &Window, window_secs: u64) -> serde_json::Value {
                 .map(|(key, count)| {
                     let mut o = serde_json::Map::new();
                     o.insert("contract".into(), key.into());
-                    o.insert("count".into(), count.into());
+                    o.insert("count".into(), count.total.into());
+                    // R4b (#5153): the notification-leg share of THIS
+                    // contract's divergence. Ranking stays by `count` — the
+                    // question this list answers is which contracts diverge, and
+                    // re-ranking by the subset would change what the top-N means
+                    // for every existing reader of the field.
+                    o.insert("single_count".into(), count.single.into());
                     serde_json::Value::Object(o)
                 })
                 .collect(),
@@ -999,17 +1157,17 @@ mod tests {
         let a = test_instance_id(1);
         let b = test_instance_id(2);
 
-        mix.record_summary_comparison(&a, b"same", b"same", &mut HashSet::new());
-        mix.record_summary_comparison(&a, b"ours", b"theirs", &mut HashSet::new());
-        mix.record_summary_comparison(&b, b"ours", b"theirs", &mut HashSet::new());
-        mix.record_summary_comparison(&a, b"same", b"same", &mut HashSet::new());
+        mix.record_summary_comparison(&a, b"same", b"same", false, &mut HashSet::new());
+        mix.record_summary_comparison(&a, b"ours", b"theirs", false, &mut HashSet::new());
+        mix.record_summary_comparison(&b, b"ours", b"theirs", false, &mut HashSet::new());
+        mix.record_summary_comparison(&a, b"same", b"same", false, &mut HashSet::new());
 
         let w = mix.take_window();
         assert_eq!(w.summary_entries_identical, 2);
         assert_eq!(w.summary_entries_differing, 2);
         // Only the differing side is attributed per contract.
-        assert_eq!(w.differing_by_contract.get(&a).copied(), Some(1));
-        assert_eq!(w.differing_by_contract.get(&b).copied(), Some(1));
+        assert_eq!(w.differing_by_contract.get(&a).map(|c| c.total), Some(1));
+        assert_eq!(w.differing_by_contract.get(&b).map(|c| c.total), Some(1));
     }
 
     /// The per-contract map is bounded, and an ALREADY-TRACKED contract keeps
@@ -1024,7 +1182,7 @@ mod tests {
     fn differing_attribution_is_bounded_but_keeps_accruing_known_contracts() {
         let mix = OutboundMix::new();
         let tracked = test_instance_id(0);
-        mix.record_summary_comparison(&tracked, b"ours", b"theirs", &mut HashSet::new());
+        mix.record_summary_comparison(&tracked, b"ours", b"theirs", false, &mut HashSet::new());
 
         // Fill well past the cap with distinct ids.
         for i in 1..(MAX_TRACKED_CONTRACTS as u32 + 300) {
@@ -1032,11 +1190,12 @@ mod tests {
                 &test_instance_id(i),
                 b"ours",
                 b"theirs",
+                false,
                 &mut HashSet::new(),
             );
         }
         // ...then hit the already-tracked one again.
-        mix.record_summary_comparison(&tracked, b"ours", b"theirs", &mut HashSet::new());
+        mix.record_summary_comparison(&tracked, b"ours", b"theirs", false, &mut HashSet::new());
 
         let w = mix.take_window();
         assert!(
@@ -1045,7 +1204,7 @@ mod tests {
             w.differing_by_contract.len()
         );
         assert_eq!(
-            w.differing_by_contract.get(&tracked).copied(),
+            w.differing_by_contract.get(&tracked).map(|c| c.total),
             Some(2),
             "an already-tracked contract must keep accruing past the cap"
         );
@@ -1075,6 +1234,7 @@ mod tests {
                     &test_instance_id(i),
                     b"ours",
                     b"theirs",
+                    false,
                     &mut HashSet::new(),
                 );
             }
@@ -1124,10 +1284,10 @@ mod tests {
         let mix = OutboundMix::new();
         let c = test_instance_id(1);
         for _ in 0..3 {
-            mix.record_summary_comparison(&c, b"same", b"same", &mut HashSet::new());
+            mix.record_summary_comparison(&c, b"same", b"same", false, &mut HashSet::new());
         }
         for _ in 0..5 {
-            mix.record_summary_comparison(&c, b"ours", b"theirs", &mut HashSet::new());
+            mix.record_summary_comparison(&c, b"ours", b"theirs", false, &mut HashSet::new());
         }
         let body = outbound_mix_json(&mix.take_window(), 60);
         assert_eq!(
@@ -1142,6 +1302,240 @@ mod tests {
             Some(5),
             "differing count must reach the body under its own key"
         );
+    }
+
+    // ===== R4b instrument (#5153): the single-entry split =====
+
+    /// Each single-entry bucket counts ONLY single-entry observations, and is a
+    /// subset of its total.
+    ///
+    /// The `single <= total` half is what makes the emitted pair readable as a
+    /// rate at all: `p` is `identical_single / (identical_single +
+    /// differing_single)`, and a bucket that could exceed its total would mean
+    /// the two were counting different populations. The "only single-entry"
+    /// half is the discriminator itself — if the flag were ignored and every
+    /// observation landed in the single bucket, `p` would silently become the
+    /// fleet-wide rate again, which is the exact number this instrument exists
+    /// because it CANNOT use.
+    ///
+    /// Distinguishable counts per bucket so a copy-paste between the three
+    /// pairs cannot pass.
+    #[test]
+    fn single_entry_buckets_count_only_single_entry_observations() {
+        let mix = OutboundMix::new();
+        let c = test_instance_id(1);
+
+        // identical: 2 single, 3 multi.
+        for _ in 0..2 {
+            mix.record_summary_comparison(&c, b"same", b"same", true, &mut HashSet::new());
+        }
+        for _ in 0..3 {
+            mix.record_summary_comparison(&c, b"same", b"same", false, &mut HashSet::new());
+        }
+        // differing: 4 single, 1 multi.
+        for _ in 0..4 {
+            mix.record_summary_comparison(&c, b"ours", b"theirs", true, &mut HashSet::new());
+        }
+        mix.record_summary_comparison(&c, b"ours", b"theirs", false, &mut HashSet::new());
+        // one-sided: 5 single, 2 multi.
+        for _ in 0..5 {
+            mix.record_summary_one_sided(&c, true, &mut HashSet::new());
+        }
+        for _ in 0..2 {
+            mix.record_summary_one_sided(&c, false, &mut HashSet::new());
+        }
+
+        let w = mix.take_window();
+        assert_eq!(w.summary_entries_identical, 5);
+        assert_eq!(w.summary_entries_identical_single, 2);
+        assert_eq!(w.summary_entries_differing, 5);
+        assert_eq!(w.summary_entries_differing_single, 4);
+        assert_eq!(w.summary_entries_one_sided, 7);
+        assert_eq!(w.summary_entries_one_sided_single, 5);
+
+        for (single, total, label) in [
+            (
+                w.summary_entries_identical_single,
+                w.summary_entries_identical,
+                "identical",
+            ),
+            (
+                w.summary_entries_differing_single,
+                w.summary_entries_differing,
+                "differing",
+            ),
+            (
+                w.summary_entries_one_sided_single,
+                w.summary_entries_one_sided,
+                "one_sided",
+            ),
+        ] {
+            assert!(
+                single <= total,
+                "{label}: single-entry bucket ({single}) must be a SUBSET of \
+                 its total ({total}) — otherwise the two count different \
+                 populations and their ratio is not a rate"
+            );
+        }
+    }
+
+    /// Passing `single_entry: false` everywhere drives every single bucket to
+    /// EXACTLY zero while leaving the totals untouched.
+    ///
+    /// This is the mutation this instrument's whole value rests on. If the
+    /// discriminator in `node.rs` were replaced by a constant `false` — the
+    /// realistic edit, since it is one token — the totals would still look
+    /// perfectly healthy and only these three fields would go quiet. Asserting
+    /// "exactly 0" rather than "smaller" is the point: a bucket that stayed
+    /// non-zero under the mutation would be measuring something other than the
+    /// flag, which is the failure mode that produced three wrong counts in a
+    /// row for the #4965 co-host filter.
+    #[test]
+    fn single_entry_buckets_are_exactly_zero_when_the_discriminator_is_false() {
+        let mix = OutboundMix::new();
+        let c = test_instance_id(1);
+        mix.record_summary_comparison(&c, b"same", b"same", false, &mut HashSet::new());
+        mix.record_summary_comparison(&c, b"ours", b"theirs", false, &mut HashSet::new());
+        mix.record_summary_one_sided(&c, false, &mut HashSet::new());
+
+        let w = mix.take_window();
+        assert_eq!(
+            w.summary_entries_identical, 1,
+            "the total must be unchanged"
+        );
+        assert_eq!(
+            w.summary_entries_differing, 1,
+            "the total must be unchanged"
+        );
+        assert_eq!(
+            w.summary_entries_one_sided, 1,
+            "the total must be unchanged"
+        );
+        assert_eq!(w.summary_entries_identical_single, 0);
+        assert_eq!(w.summary_entries_differing_single, 0);
+        assert_eq!(w.summary_entries_one_sided_single, 0);
+        assert_eq!(
+            w.differing_by_contract.get(&c).map(|d| d.single),
+            Some(0),
+            "the per-contract single count must go to zero too, or a deleted \
+             discriminator would still look attributed"
+        );
+    }
+
+    /// The three single-entry counters reach the emitted body under their own
+    /// keys, and an idle window emits them as explicit zeros.
+    ///
+    /// Distinguishable counts (2/4/6) so a swapped key cannot pass: emitting
+    /// the differing subset under the identical key would invert `p` and send
+    /// the R4b decision the wrong way with every other test green. The idle
+    /// half matters because a field that vanishes when zero is invisible to the
+    /// analysis — "this node saw no notification-leg comparisons" is a data
+    /// point, not an absence.
+    #[test]
+    fn single_entry_counters_reach_the_rollup_body_under_the_right_keys() {
+        let mix = OutboundMix::new();
+        let c = test_instance_id(1);
+        for _ in 0..2 {
+            mix.record_summary_comparison(&c, b"same", b"same", true, &mut HashSet::new());
+        }
+        for _ in 0..4 {
+            mix.record_summary_comparison(&c, b"ours", b"theirs", true, &mut HashSet::new());
+        }
+        for _ in 0..6 {
+            mix.record_summary_one_sided(&c, true, &mut HashSet::new());
+        }
+        let body = outbound_mix_json(&mix.take_window(), 60);
+        assert_eq!(
+            body.get("summary_entries_identical_single")
+                .and_then(|v| v.as_u64()),
+            Some(2)
+        );
+        assert_eq!(
+            body.get("summary_entries_differing_single")
+                .and_then(|v| v.as_u64()),
+            Some(4)
+        );
+        assert_eq!(
+            body.get("summary_entries_one_sided_single")
+                .and_then(|v| v.as_u64()),
+            Some(6)
+        );
+
+        let idle = outbound_mix_json(&Window::default(), 60);
+        for key in [
+            "summary_entries_identical_single",
+            "summary_entries_differing_single",
+            "summary_entries_one_sided_single",
+        ] {
+            assert_eq!(
+                idle.get(key).and_then(|v| v.as_u64()),
+                Some(0),
+                "{key} must be emitted as an explicit zero on an idle window"
+            );
+        }
+    }
+
+    /// The per-contract list carries the single-entry subset alongside the
+    /// total, and keeps ranking by the total.
+    ///
+    /// Not decoration. A contract whose merge does not converge has `p`
+    /// structurally 0 — no digest can agree — and those are 32.7% of all update
+    /// applies (#5153), with two measured at 9.64% and 2.67% of ALL differing
+    /// comparisons. An aggregate `p` would hide them, so the per-contract
+    /// single count is what separates "a handful of broken contracts" from "the
+    /// notification leg disagrees in general". Ranking must stay on the total,
+    /// because re-ranking by the subset would silently change what the existing
+    /// `summary_differing_contracts` field means to its current readers.
+    #[test]
+    fn per_contract_attribution_carries_the_single_entry_subset() {
+        let mix = OutboundMix::new();
+        // `busy` diverges more overall; `noisy` diverges ONLY on the
+        // notification leg. Ranking must follow `busy`, and the subset must
+        // still expose `noisy` as the notification-leg offender.
+        let busy = test_instance_id(1);
+        let noisy = test_instance_id(2);
+        for _ in 0..5 {
+            mix.record_summary_comparison(&busy, b"ours", b"theirs", false, &mut HashSet::new());
+        }
+        mix.record_summary_comparison(&busy, b"ours", b"theirs", true, &mut HashSet::new());
+        for _ in 0..3 {
+            mix.record_summary_comparison(&noisy, b"ours", b"theirs", true, &mut HashSet::new());
+        }
+
+        let body = outbound_mix_json(&mix.take_window(), 60);
+        let listed = body
+            .get("summary_differing_contracts")
+            .and_then(|v| v.as_array())
+            .expect("summary_differing_contracts must be an array")
+            .clone();
+        let read = |i: usize, field: &str| {
+            listed[i]
+                .get(field)
+                .and_then(|v| v.as_u64())
+                .unwrap_or_else(|| panic!("entry {i} must carry {field}"))
+        };
+        assert_eq!(listed.len(), 2);
+        assert_eq!(
+            listed[0].get("contract").and_then(|v| v.as_str()),
+            Some(busy.to_string().as_str()),
+            "ranking must stay on the TOTAL, not the single-entry subset"
+        );
+        assert_eq!(read(0, "count"), 6);
+        assert_eq!(read(0, "single_count"), 1);
+        assert_eq!(read(1, "count"), 3);
+        assert_eq!(
+            read(1, "single_count"),
+            3,
+            "a contract that diverges only on the notification leg must be \
+             visible as such"
+        );
+        for i in 0..listed.len() {
+            assert!(
+                read(i, "single_count") <= read(i, "count"),
+                "entry {i}: the per-contract single count must be a subset of \
+                 its total"
+            );
+        }
     }
 
     /// The #4965 notification split accumulates and reaches the body under
@@ -1211,13 +1605,13 @@ mod tests {
         // One message that repeats `c` five times and names `other` once.
         let mut first_message = HashSet::new();
         for _ in 0..5 {
-            mix.record_summary_comparison(&c, b"ours", b"theirs", &mut first_message);
+            mix.record_summary_comparison(&c, b"ours", b"theirs", false, &mut first_message);
         }
-        mix.record_summary_comparison(&other, b"same", b"same", &mut first_message);
+        mix.record_summary_comparison(&other, b"same", b"same", false, &mut first_message);
 
         // A second message names `c` again — a genuinely new observation.
         let mut second_message = HashSet::new();
-        mix.record_summary_comparison(&c, b"ours", b"theirs", &mut second_message);
+        mix.record_summary_comparison(&c, b"ours", b"theirs", false, &mut second_message);
 
         let w = mix.take_window();
         assert_eq!(
@@ -1226,7 +1620,7 @@ mod tests {
         );
         assert_eq!(w.summary_entries_identical, 1);
         assert_eq!(
-            w.differing_by_contract.get(&c).copied(),
+            w.differing_by_contract.get(&c).map(|c| c.total),
             Some(2),
             "per-contract attribution must dedup the same way as the aggregate"
         );
@@ -1282,6 +1676,7 @@ mod tests {
                 &test_instance_id(i),
                 b"ours",
                 b"theirs",
+                false,
                 &mut HashSet::new(),
             );
         }
