@@ -91,6 +91,62 @@ const MAX_TRACKED_CONTRACTS: usize = 256;
 /// which the top few answer, and the aggregate counts above carry the rest.
 const TOP_DIFFERING_CONTRACTS_REPORTED: usize = 10;
 
+/// What a summary comparison's message was shaped like, and which receive arm
+/// saw it — the R4b (#5153) discriminator.
+///
+/// One enum rather than a `bool` because the two facts are not independent and
+/// the illegal pairing must be unrepresentable: a single-entry observation on
+/// the DIGEST leg is, today, provably **not** notification traffic (a
+/// notification ships full bytes unconditionally,
+/// `operations/update.rs::send_summary_notification`), so folding it in with the
+/// full-bytes leg would mix two populations under one name. A caller holding a
+/// `bool` cannot express that difference; this type forces it to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SummaryObservation {
+    /// Multi-entry message: heartbeat or interest-churn shaped, and not the
+    /// population R4b's `p` is about.
+    MultiEntry,
+    /// Single-entry FULL-BYTES `Summaries`. The R4b population — but see
+    /// [`OutboundMix::record_summary_comparison`]: it is ~15% not-notification,
+    /// and the per-arm census is what makes that subtractable.
+    SingleEntryFullBytes,
+    /// Single-entry `SummaryDigests`. Counted SEPARATELY and deliberately: it
+    /// cannot be notification traffic while notifications ship full bytes, so it
+    /// is churn-leg, and merging it into the full-bytes bucket would buy
+    /// post-R4b series continuity by corrupting the pre-R4b measurement.
+    SingleEntryDigest,
+}
+
+impl SummaryObservation {
+    /// The full-bytes-leg classification for a message of `entries` length.
+    pub(crate) fn full_bytes(single_entry: bool) -> Self {
+        if single_entry {
+            Self::SingleEntryFullBytes
+        } else {
+            Self::MultiEntry
+        }
+    }
+
+    /// The digest-leg classification for a message of `entries` length.
+    pub(crate) fn digest(single_entry: bool) -> Self {
+        if single_entry {
+            Self::SingleEntryDigest
+        } else {
+            Self::MultiEntry
+        }
+    }
+
+    /// Does this land in the full-bytes single-entry bucket (the R4b population)?
+    fn is_single_full_bytes(self) -> bool {
+        matches!(self, Self::SingleEntryFullBytes)
+    }
+
+    /// Does this land in the digest-leg single-entry bucket?
+    fn is_single_digest(self) -> bool {
+        matches!(self, Self::SingleEntryDigest)
+    }
+}
+
 /// Per-contract differing-comparison counts: the total, and the single-entry
 /// subset.
 ///
@@ -112,9 +168,14 @@ struct DifferingCount {
 impl DifferingCount {
     /// Count one differing comparison, saturating for the same reason every
     /// other counter here does.
-    fn add(&mut self, single_entry: bool) {
+    ///
+    /// `single` tracks the FULL-BYTES leg only, matching
+    /// [`Window::summary_entries_differing_single`]: the digest leg is a
+    /// different population (see [`SummaryObservation`]) and must not be folded
+    /// in here either.
+    fn add(&mut self, obs: SummaryObservation) {
         self.total = self.total.saturating_add(1);
-        if single_entry {
+        if obs.is_single_full_bytes() {
             self.single = self.single.saturating_add(1);
         }
     }
@@ -265,12 +326,23 @@ pub(crate) struct SummariesDetail {
     /// `entries.len()` — how many `SummaryEntry` this one message carried.
     ///
     /// The independent check on the attribution, and the reason it is worth
-    /// recording: the notification and rejection emitters are single-entry by
-    /// construction while both reply emitters are multi-entry, so a mean of
-    /// entries-per-message far from 1 on a single-entry arm (or exactly 1 on a
-    /// reply arm) means a call site is mislabelled. Byte totals alone cannot
-    /// show that — they look plausible either way, which is precisely how the
-    /// combined arm misled for as long as it did.
+    /// recording: a mean of entries-per-message far from 1 on an arm that should
+    /// be single-entry means a call site is mislabelled. Byte totals alone
+    /// cannot show that — they look plausible either way, which is precisely how
+    /// the combined arm misled for as long as it did.
+    ///
+    /// CORRECTED 2026-08-12 (#5153 review F1), because the earlier claim here
+    /// was measurably false and three sites in this tree repeated it: it said
+    /// "both reply emitters are multi-entry". **`ChangeInterestsReply` is
+    /// single-entry, essentially always.** `broadcast_change_interests` is
+    /// called with one contract per gossip, so the reply built for it carries
+    /// exactly one entry, and the field agrees — mean **1.000** entries/msg with
+    /// `max_entries` **1** over 418,476 messages on 1,284 peers in one window.
+    /// Only `InterestsReply` is genuinely multi-entry (mean ~224, max 2,401).
+    ///
+    /// That matters far beyond a doc nit: it is why `entries.len() == 1` is NOT
+    /// a clean proxy for "this is a notification", and why the per-arm
+    /// [`Window::summaries_single_entry_msgs`] census exists.
     entries: u64,
 }
 
@@ -441,6 +513,30 @@ struct Window {
     /// reply is moderately wide" from "one peer shares 400 contracts with us",
     /// which the mean cannot.
     summaries_max_entries: [u64; SUMMARIES_ARMS.len()],
+    /// How many messages this arm SENT carrying exactly one entry — the R4b
+    /// (#5153) contamination census, and the thing that turns the receive-side
+    /// proxy from an assumption into arithmetic.
+    ///
+    /// The receive side cannot know which emitter a `Summaries` came from: the
+    /// tag is `#[serde(skip)]`, so an inbound message always decodes as
+    /// [`SummariesEmitter::Other`] and `entries.len() == 1` is the only
+    /// discriminator available there. The SEND side has both facts at once, in
+    /// [`SummariesDetail`], at a single choke point. Counting single-entry
+    /// messages per emitter here therefore measures exactly what the receive-side
+    /// proxy is unable to separate.
+    ///
+    /// Why it is needed, in numbers (one window, 2026-08-12): `notification`
+    /// 3,194,108 single-entry messages, but `change_interests_reply` 418,476
+    /// (mean 1.000, max 1) and `request_reply` at least 131,153 — so **~15% of
+    /// single-entry `Summaries` are not notifications.** An earlier version of
+    /// this instrument documented only `rejection` (669 messages, 0.015%) as the
+    /// contamination, which was the smallest of three by three orders of
+    /// magnitude and left the largest unnamed.
+    ///
+    /// With this census the analysis can bound `p` instead of asserting it:
+    /// notification's share of the single-entry population is measured per node
+    /// per minute rather than assumed to be ~1.
+    summaries_single_entry_msgs: [u64; SUMMARIES_ARMS.len()],
     /// InterestSync summary comparisons where both sides held a summary and
     /// the bytes were IDENTICAL. See [`OutboundMix::record_summary_comparison`].
     summary_entries_identical: u64,
@@ -466,13 +562,43 @@ struct Window {
     /// instrument land a release ahead of the mechanism it judges (regime rule
     /// 7; 0.2.120 is permanently unattributable for want of exactly this).
     ///
-    /// See [`OutboundMix::record_summary_comparison`] for the discriminator's
-    /// limits, including the measured `Rejection` contamination.
+    /// **This bucket is the FULL-BYTES leg only, and it is ~15%
+    /// not-notification.** Read
+    /// [`OutboundMix::record_summary_comparison`] before quoting a number off
+    /// it — the contamination is measurable but NOT negligible, and it biases
+    /// `p` in BOTH directions. Subtract it using
+    /// [`Window::summaries_single_entry_msgs`].
     summary_entries_identical_single: u64,
-    /// The SINGLE-ENTRY subset of [`Window::summary_entries_differing`]. The
-    /// denominator half of `p` — without it a low single-entry agreement COUNT
-    /// and a low single-entry VOLUME look the same.
+    /// The SINGLE-ENTRY subset of [`Window::summary_entries_differing`], full-bytes
+    /// leg. The denominator half of `p` — without it a low single-entry agreement
+    /// COUNT and a low single-entry VOLUME look the same.
+    ///
+    /// **This is the bucket the contamination hurts most.** A single-entry
+    /// `SummaryRequestReply` is differing BY CONSTRUCTION (bytes are only
+    /// requested after a digest mismatch, so they cannot then compare equal),
+    /// and there were >=131,153 such messages in one window against a fleet
+    /// `summary_entries_differing` of 559,992. So a large part of this counter is
+    /// digest-mismatch reply traffic rather than notification disagreement, which
+    /// inflates `p`'s denominator and makes `p` read LOW.
     summary_entries_differing_single: u64,
+    /// Single-entry observations seen on the `SummaryDigests` leg, kept apart
+    /// from the full-bytes buckets above.
+    ///
+    /// NOT notification traffic, and that is the point of separating them: a
+    /// notification ships full bytes unconditionally today
+    /// (`operations/update.rs::send_summary_notification`), while
+    /// `ChangeInterestsReply` does route through the version gate — so a
+    /// single-entry observation arriving on the digest leg is churn-leg by
+    /// construction. Folding these into `*_single` would have bought post-R4b
+    /// series continuity by corrupting the pre-R4b measurement, which is the one
+    /// the build/no-build decision rests on.
+    ///
+    /// After R4b ships, notifications move onto this leg and these become the
+    /// interesting counters. Both are emitted throughout so the transition is
+    /// visible rather than inferred.
+    summary_entries_identical_single_digest: u64,
+    /// Digest-leg sibling of [`Window::summary_entries_differing_single`].
+    summary_entries_differing_single_digest: u64,
     /// Comparisons where exactly ONE side held a summary (#4965 review S2).
     ///
     /// The 98.1% identical figure has a structural hole:
@@ -486,12 +612,20 @@ struct Window {
     /// Counted so the post-deploy data can size it rather than leaving the
     /// headline extrapolated over a population it never observed.
     summary_entries_one_sided: u64,
-    /// The SINGLE-ENTRY subset of [`Window::summary_entries_one_sided`].
+    /// The SINGLE-ENTRY subset of [`Window::summary_entries_one_sided`],
+    /// full-bytes leg.
     ///
     /// Carried for the same reason the one-sided total is: under a digest-first
     /// notification this population classifies as `NeedBytes`, so it is a COST
     /// on the R4b leg rather than a neutral case, and `p` computed without it
     /// would be extrapolated over a population it never observed.
+    ///
+    /// No digest-leg sibling, and that is deliberate rather than an omission:
+    /// the digest arm no longer records one-sided at all. It used to, and the
+    /// same contract was then counted a SECOND time when the requested bytes
+    /// arrived at the full-bytes arm — different messages, different per-message
+    /// dedup sets, so nothing suppressed it (#5153 review F2). The digest arm now
+    /// defers one-sided accounting exactly as it already deferred `differing`.
     summary_entries_one_sided_single: u64,
     /// Which contracts the differing comparisons belonged to, bounded at
     /// [`MAX_TRACKED_CONTRACTS`].
@@ -591,6 +725,15 @@ impl OutboundMix {
             w.summaries_max_bytes[s] = w.summaries_max_bytes[s].max(b);
             w.summaries_entries[s] = w.summaries_entries[s].saturating_add(detail.entries);
             w.summaries_max_entries[s] = w.summaries_max_entries[s].max(detail.entries);
+            // R4b contamination census (#5153 review F1). Recorded HERE because
+            // this is the only place that holds the true emitter and the entry
+            // count together — the receive side has just the count, which is
+            // exactly why its proxy needs this to be interpretable. Same branch
+            // as the parent update, so it cannot disagree about a message.
+            if detail.entries == 1 {
+                w.summaries_single_entry_msgs[s] =
+                    w.summaries_single_entry_msgs[s].saturating_add(1);
+            }
         }
     }
 
@@ -627,26 +770,59 @@ impl OutboundMix {
     /// emitter. Plumbing it through would be a wire change, which is precisely
     /// what this instrument exists to avoid needing.
     ///
-    /// The proxy holds because the state-change-driven send sites are
-    /// single-entry by construction while the heartbeat and interest-churn
-    /// replies are multi-entry: notifications measured 1.000 entries/message
-    /// against the heartbeat's 222.97.
+    /// The SIGNAL half of the proxy is exact and field-confirmed: a notification
+    /// is single-entry by construction, measuring mean **1.000** entries/message
+    /// with `max_entries` 1 in every window checked.
     ///
-    /// KNOWN CONTAMINATION, stated rather than designed around:
-    /// `entries.len() == 1` also matches [`SummariesEmitter::Rejection`], the
-    /// summary-back on a rejected update. Measured at **535 messages against
-    /// 3,579,282 notifications (0.015%)** — four orders of magnitude below the
-    /// signal, so it cannot move `p`. It is named here so a future reader does
-    /// not rediscover it and mistake the bucket for pure notification traffic.
+    /// # CONTAMINATION IS ~15%, AND IT BIASES `p` BOTH WAYS
+    ///
+    /// Corrected 2026-08-12 (#5153 review F1). An earlier version of this doc
+    /// named [`SummariesEmitter::Rejection`] as the contamination and put it at
+    /// 0.015%. Rejection is real but is the SMALLEST of three contaminants by
+    /// three orders of magnitude (669 messages in one window). The two that
+    /// matter were unnamed:
+    ///
+    /// | single-entry `Summaries` sender | msgs, one window | effect on `p` |
+    /// |---|---|---|
+    /// | `Notification` (the signal) | 3,194,108 | — |
+    /// | `ChangeInterestsReply` | 418,476 (mean 1.000, max 1, 1,284 peers) | either |
+    /// | `SummaryRequestReply` | >=131,153 | **downward** |
+    /// | `Rejection` | 669 | either |
+    ///
+    /// So **~15% of single-entry observations are not notifications.**
+    ///
+    /// `ChangeInterestsReply` is single-entry because
+    /// `broadcast_change_interests` is called with one contract per gossip, so
+    /// the reply carries exactly one entry. Three places in this tree asserted
+    /// it was multi-entry; all are corrected, because that claim is what made
+    /// `entries.len() == 1` look clean.
+    ///
+    /// **The `SummaryRequestReply` term is the dangerous one, and it runs
+    /// DOWNWARD.** Bytes are requested only after a digest mismatch, so when
+    /// they arrive they cannot compare equal — such a reply lands in
+    /// `differing` by construction. Single-entry ones therefore inflate `p`'s
+    /// DENOMINATOR only, and at real scale: >=131,153 such messages against a
+    /// fleet `summary_entries_differing` of 559,992 in the same window. A true
+    /// notification-leg `p` of 99% would measure around **95%**.
+    ///
+    /// So `p` off this counter is NOT a clean ceiling. It has an upward term
+    /// (divergences lost to a dropped round trip, below) and a larger downward
+    /// term (request-reply denominator inflation). **Do not quote a point
+    /// estimate.** Use [`Window::summaries_single_entry_msgs`] — the send-side
+    /// per-emitter census — to bound the notification share and report an
+    /// interval.
     ///
     /// Recording it here rather than deriving it downstream is deliberate:
     /// only the receive arm knows the shape of the message the entry came in,
     /// and a rate re-derived later from arithmetic over separately-reported
     /// totals would silently absorb every other filter between them.
     ///
-    /// # `p` AS MEASURED IS A CEILING, NOT A FLOOR
+    /// # THE UPWARD TERM: divergences lost to a dropped round trip
     ///
-    /// State this to anyone sizing R4b from these counters. On the
+    /// This was previously documented as making `p` a pure CEILING. That was
+    /// wrong — it is only one of two biases, and the contamination term above
+    /// pushes the other way and is larger today. Both are stated so neither is
+    /// mistaken for the whole story. On the
     /// `SummaryDigests` leg a genuine digest disagreement is recorded not at
     /// the mismatch itself but when the requested bytes arrive back here — see
     /// the `DigestVerdict::NeedBytes` branch in `node.rs`, which deliberately
@@ -656,21 +832,26 @@ impl OutboundMix {
     /// one, so `p` comes out HIGHER than reality, by the loss rate on one
     /// request/reply round trip.
     ///
-    /// The direction is the point. Double-counting would have biased `p`
-    /// DOWNWARD — conservative, costing at worst a mechanism worth building.
-    /// This biases it UPWARD, which risks building R4b on an agreement rate
-    /// better than the network actually achieves, and that is the more
-    /// expensive mistake. Correct arithmetic with a known-direction bias still
-    /// beats a wrong number, so the deferral stays; the bias is documented
-    /// instead of removed. It is also the same lost-deferred-round-trip
-    /// fragility R4b's own design work flagged separately, so it is a coherent
-    /// known limitation rather than a surprise.
+    /// Double-counting instead would have biased `p` downward, so the deferral
+    /// is still the right call — recording one divergence twice is simply wrong
+    /// arithmetic. It is also the same lost-deferred-round-trip fragility R4b's
+    /// own design work flagged separately, so it is a coherent known limitation
+    /// rather than a surprise. It is expected to be SMALL (it needs a lost
+    /// message) next to the contamination term above, which is structural and
+    /// ~15%.
+    ///
+    /// # NET: bound it, do not point-estimate it
+    ///
+    /// Two biases, opposite signs, the larger one downward. The honest reading
+    /// of these counters is an interval computed with the send-side census, not
+    /// a single number — and a build/no-build call for R4b should be made on
+    /// that interval.
     pub(crate) fn record_summary_comparison(
         &self,
         contract: &ContractInstanceId,
         ours: &[u8],
         theirs: &[u8],
-        single_entry: bool,
+        obs: SummaryObservation,
         counted_this_message: &mut HashSet<ContractInstanceId>,
     ) {
         // The per-message dedup lives HERE, not at the call site, for the same
@@ -693,16 +874,24 @@ impl OutboundMix {
         let mut w = self.window.lock();
         if identical {
             w.summary_entries_identical = w.summary_entries_identical.saturating_add(1);
-            if single_entry {
+            if obs.is_single_full_bytes() {
                 w.summary_entries_identical_single =
                     w.summary_entries_identical_single.saturating_add(1);
+            }
+            if obs.is_single_digest() {
+                w.summary_entries_identical_single_digest =
+                    w.summary_entries_identical_single_digest.saturating_add(1);
             }
             return;
         }
         w.summary_entries_differing = w.summary_entries_differing.saturating_add(1);
-        if single_entry {
+        if obs.is_single_full_bytes() {
             w.summary_entries_differing_single =
                 w.summary_entries_differing_single.saturating_add(1);
+        }
+        if obs.is_single_digest() {
+            w.summary_entries_differing_single_digest =
+                w.summary_entries_differing_single_digest.saturating_add(1);
         }
         let mut dropped = false;
         // Bounded for the same reason the payload mix bounds its attribution:
@@ -725,11 +914,11 @@ impl OutboundMix {
         let len = w.differing_by_contract.len();
         match w.differing_by_contract.entry(*contract) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
-                e.get_mut().add(single_entry);
+                e.get_mut().add(obs);
             }
             std::collections::hash_map::Entry::Vacant(e) => {
                 if len < MAX_TRACKED_CONTRACTS {
-                    e.insert(DifferingCount::default()).add(single_entry);
+                    e.insert(DifferingCount::default()).add(obs);
                 } else {
                     dropped = true;
                 }
@@ -761,12 +950,20 @@ impl OutboundMix {
     /// two-sided counter does: `entries` is peer-supplied and may repeat a
     /// hash, so without it a peer could inflate this bucket at will.
     ///
-    /// `single_entry` carries the same meaning, and the same known limits, as
-    /// in [`Self::record_summary_comparison`] — read that doc for both.
+    /// `obs` carries the same meaning, and the same known limits, as in
+    /// [`Self::record_summary_comparison`] — read that doc for both.
+    ///
+    /// **Only the FULL-BYTES arm may call this.** The digest arm used to, and
+    /// because the same contract was then observed again when the requested
+    /// bytes arrived, one divergence was counted twice (#5153 review F2). A
+    /// [`SummaryObservation::SingleEntryDigest`] reaching here is therefore a
+    /// bug, and is counted in the total but deliberately in no single bucket —
+    /// dropping it silently would hide the regression, while giving it a bucket
+    /// would re-open the double count.
     pub(crate) fn record_summary_one_sided(
         &self,
         contract: &ContractInstanceId,
-        single_entry: bool,
+        obs: SummaryObservation,
         counted_this_message: &mut HashSet<ContractInstanceId>,
     ) {
         if !counted_this_message.insert(*contract) {
@@ -774,7 +971,7 @@ impl OutboundMix {
         }
         let mut w = self.window.lock();
         w.summary_entries_one_sided = w.summary_entries_one_sided.saturating_add(1);
-        if single_entry {
+        if obs.is_single_full_bytes() {
             w.summary_entries_one_sided_single =
                 w.summary_entries_one_sided_single.saturating_add(1);
         }
@@ -885,6 +1082,14 @@ fn outbound_mix_json(w: &Window, window_secs: u64) -> serde_json::Value {
             format!("{stem}_max_entries"),
             w.summaries_max_entries[s].into(),
         );
+        // R4b contamination census (#5153 review F1). Seven more integers on a
+        // rollup that already carries five per arm — the same cost argument, and
+        // it is what makes the receive-side single-entry buckets interpretable
+        // rather than merely present.
+        body.insert(
+            format!("{stem}_single_entry_msgs"),
+            w.summaries_single_entry_msgs[s].into(),
+        );
     }
 
     // #4965 falsifier. Emitted unconditionally (including as a pair of zeros)
@@ -926,6 +1131,19 @@ fn outbound_mix_json(w: &Window, window_secs: u64) -> serde_json::Value {
     body.insert(
         "summary_entries_one_sided_single".into(),
         w.summary_entries_one_sided_single.into(),
+    );
+    // Digest-leg siblings, kept as separate keys rather than merged: today they
+    // are churn-leg traffic and NOT notifications, and after R4b ships the
+    // notification population moves onto this leg. Emitting both makes that
+    // migration visible in the data instead of something an analyst has to
+    // assume happened.
+    body.insert(
+        "summary_entries_identical_single_digest".into(),
+        w.summary_entries_identical_single_digest.into(),
+    );
+    body.insert(
+        "summary_entries_differing_single_digest".into(),
+        w.summary_entries_differing_single_digest.into(),
     );
 
     // #4965 co-host exclusion, measured in the release build. Emitted
@@ -1179,10 +1397,34 @@ mod tests {
         let a = test_instance_id(1);
         let b = test_instance_id(2);
 
-        mix.record_summary_comparison(&a, b"same", b"same", false, &mut HashSet::new());
-        mix.record_summary_comparison(&a, b"ours", b"theirs", false, &mut HashSet::new());
-        mix.record_summary_comparison(&b, b"ours", b"theirs", false, &mut HashSet::new());
-        mix.record_summary_comparison(&a, b"same", b"same", false, &mut HashSet::new());
+        mix.record_summary_comparison(
+            &a,
+            b"same",
+            b"same",
+            SummaryObservation::MultiEntry,
+            &mut HashSet::new(),
+        );
+        mix.record_summary_comparison(
+            &a,
+            b"ours",
+            b"theirs",
+            SummaryObservation::MultiEntry,
+            &mut HashSet::new(),
+        );
+        mix.record_summary_comparison(
+            &b,
+            b"ours",
+            b"theirs",
+            SummaryObservation::MultiEntry,
+            &mut HashSet::new(),
+        );
+        mix.record_summary_comparison(
+            &a,
+            b"same",
+            b"same",
+            SummaryObservation::MultiEntry,
+            &mut HashSet::new(),
+        );
 
         let w = mix.take_window();
         assert_eq!(w.summary_entries_identical, 2);
@@ -1204,7 +1446,13 @@ mod tests {
     fn differing_attribution_is_bounded_but_keeps_accruing_known_contracts() {
         let mix = OutboundMix::new();
         let tracked = test_instance_id(0);
-        mix.record_summary_comparison(&tracked, b"ours", b"theirs", false, &mut HashSet::new());
+        mix.record_summary_comparison(
+            &tracked,
+            b"ours",
+            b"theirs",
+            SummaryObservation::MultiEntry,
+            &mut HashSet::new(),
+        );
 
         // Fill well past the cap with distinct ids.
         for i in 1..(MAX_TRACKED_CONTRACTS as u32 + 300) {
@@ -1212,12 +1460,18 @@ mod tests {
                 &test_instance_id(i),
                 b"ours",
                 b"theirs",
-                false,
+                SummaryObservation::MultiEntry,
                 &mut HashSet::new(),
             );
         }
         // ...then hit the already-tracked one again.
-        mix.record_summary_comparison(&tracked, b"ours", b"theirs", false, &mut HashSet::new());
+        mix.record_summary_comparison(
+            &tracked,
+            b"ours",
+            b"theirs",
+            SummaryObservation::MultiEntry,
+            &mut HashSet::new(),
+        );
 
         let w = mix.take_window();
         assert!(
@@ -1256,7 +1510,7 @@ mod tests {
                     &test_instance_id(i),
                     b"ours",
                     b"theirs",
-                    false,
+                    SummaryObservation::MultiEntry,
                     &mut HashSet::new(),
                 );
             }
@@ -1306,10 +1560,22 @@ mod tests {
         let mix = OutboundMix::new();
         let c = test_instance_id(1);
         for _ in 0..3 {
-            mix.record_summary_comparison(&c, b"same", b"same", false, &mut HashSet::new());
+            mix.record_summary_comparison(
+                &c,
+                b"same",
+                b"same",
+                SummaryObservation::MultiEntry,
+                &mut HashSet::new(),
+            );
         }
         for _ in 0..5 {
-            mix.record_summary_comparison(&c, b"ours", b"theirs", false, &mut HashSet::new());
+            mix.record_summary_comparison(
+                &c,
+                b"ours",
+                b"theirs",
+                SummaryObservation::MultiEntry,
+                &mut HashSet::new(),
+            );
         }
         let body = outbound_mix_json(&mix.take_window(), 60);
         assert_eq!(
@@ -1349,22 +1615,50 @@ mod tests {
 
         // identical: 2 single, 3 multi.
         for _ in 0..2 {
-            mix.record_summary_comparison(&c, b"same", b"same", true, &mut HashSet::new());
+            mix.record_summary_comparison(
+                &c,
+                b"same",
+                b"same",
+                SummaryObservation::SingleEntryFullBytes,
+                &mut HashSet::new(),
+            );
         }
         for _ in 0..3 {
-            mix.record_summary_comparison(&c, b"same", b"same", false, &mut HashSet::new());
+            mix.record_summary_comparison(
+                &c,
+                b"same",
+                b"same",
+                SummaryObservation::MultiEntry,
+                &mut HashSet::new(),
+            );
         }
         // differing: 4 single, 1 multi.
         for _ in 0..4 {
-            mix.record_summary_comparison(&c, b"ours", b"theirs", true, &mut HashSet::new());
+            mix.record_summary_comparison(
+                &c,
+                b"ours",
+                b"theirs",
+                SummaryObservation::SingleEntryFullBytes,
+                &mut HashSet::new(),
+            );
         }
-        mix.record_summary_comparison(&c, b"ours", b"theirs", false, &mut HashSet::new());
+        mix.record_summary_comparison(
+            &c,
+            b"ours",
+            b"theirs",
+            SummaryObservation::MultiEntry,
+            &mut HashSet::new(),
+        );
         // one-sided: 5 single, 2 multi.
         for _ in 0..5 {
-            mix.record_summary_one_sided(&c, true, &mut HashSet::new());
+            mix.record_summary_one_sided(
+                &c,
+                SummaryObservation::SingleEntryFullBytes,
+                &mut HashSet::new(),
+            );
         }
         for _ in 0..2 {
-            mix.record_summary_one_sided(&c, false, &mut HashSet::new());
+            mix.record_summary_one_sided(&c, SummaryObservation::MultiEntry, &mut HashSet::new());
         }
 
         let w = mix.take_window();
@@ -1416,9 +1710,21 @@ mod tests {
     fn single_entry_buckets_are_exactly_zero_when_the_discriminator_is_false() {
         let mix = OutboundMix::new();
         let c = test_instance_id(1);
-        mix.record_summary_comparison(&c, b"same", b"same", false, &mut HashSet::new());
-        mix.record_summary_comparison(&c, b"ours", b"theirs", false, &mut HashSet::new());
-        mix.record_summary_one_sided(&c, false, &mut HashSet::new());
+        mix.record_summary_comparison(
+            &c,
+            b"same",
+            b"same",
+            SummaryObservation::MultiEntry,
+            &mut HashSet::new(),
+        );
+        mix.record_summary_comparison(
+            &c,
+            b"ours",
+            b"theirs",
+            SummaryObservation::MultiEntry,
+            &mut HashSet::new(),
+        );
+        mix.record_summary_one_sided(&c, SummaryObservation::MultiEntry, &mut HashSet::new());
 
         let w = mix.take_window();
         assert_eq!(
@@ -1458,13 +1764,29 @@ mod tests {
         let mix = OutboundMix::new();
         let c = test_instance_id(1);
         for _ in 0..2 {
-            mix.record_summary_comparison(&c, b"same", b"same", true, &mut HashSet::new());
+            mix.record_summary_comparison(
+                &c,
+                b"same",
+                b"same",
+                SummaryObservation::SingleEntryFullBytes,
+                &mut HashSet::new(),
+            );
         }
         for _ in 0..4 {
-            mix.record_summary_comparison(&c, b"ours", b"theirs", true, &mut HashSet::new());
+            mix.record_summary_comparison(
+                &c,
+                b"ours",
+                b"theirs",
+                SummaryObservation::SingleEntryFullBytes,
+                &mut HashSet::new(),
+            );
         }
         for _ in 0..6 {
-            mix.record_summary_one_sided(&c, true, &mut HashSet::new());
+            mix.record_summary_one_sided(
+                &c,
+                SummaryObservation::SingleEntryFullBytes,
+                &mut HashSet::new(),
+            );
         }
         let body = outbound_mix_json(&mix.take_window(), 60);
         assert_eq!(
@@ -1517,11 +1839,29 @@ mod tests {
         let busy = test_instance_id(1);
         let noisy = test_instance_id(2);
         for _ in 0..5 {
-            mix.record_summary_comparison(&busy, b"ours", b"theirs", false, &mut HashSet::new());
+            mix.record_summary_comparison(
+                &busy,
+                b"ours",
+                b"theirs",
+                SummaryObservation::MultiEntry,
+                &mut HashSet::new(),
+            );
         }
-        mix.record_summary_comparison(&busy, b"ours", b"theirs", true, &mut HashSet::new());
+        mix.record_summary_comparison(
+            &busy,
+            b"ours",
+            b"theirs",
+            SummaryObservation::SingleEntryFullBytes,
+            &mut HashSet::new(),
+        );
         for _ in 0..3 {
-            mix.record_summary_comparison(&noisy, b"ours", b"theirs", true, &mut HashSet::new());
+            mix.record_summary_comparison(
+                &noisy,
+                b"ours",
+                b"theirs",
+                SummaryObservation::SingleEntryFullBytes,
+                &mut HashSet::new(),
+            );
         }
 
         let body = outbound_mix_json(&mix.take_window(), 60);
@@ -1627,13 +1967,31 @@ mod tests {
         // One message that repeats `c` five times and names `other` once.
         let mut first_message = HashSet::new();
         for _ in 0..5 {
-            mix.record_summary_comparison(&c, b"ours", b"theirs", false, &mut first_message);
+            mix.record_summary_comparison(
+                &c,
+                b"ours",
+                b"theirs",
+                SummaryObservation::MultiEntry,
+                &mut first_message,
+            );
         }
-        mix.record_summary_comparison(&other, b"same", b"same", false, &mut first_message);
+        mix.record_summary_comparison(
+            &other,
+            b"same",
+            b"same",
+            SummaryObservation::MultiEntry,
+            &mut first_message,
+        );
 
         // A second message names `c` again — a genuinely new observation.
         let mut second_message = HashSet::new();
-        mix.record_summary_comparison(&c, b"ours", b"theirs", false, &mut second_message);
+        mix.record_summary_comparison(
+            &c,
+            b"ours",
+            b"theirs",
+            SummaryObservation::MultiEntry,
+            &mut second_message,
+        );
 
         let w = mix.take_window();
         assert_eq!(
@@ -1698,7 +2056,7 @@ mod tests {
                 &test_instance_id(i),
                 b"ours",
                 b"theirs",
-                false,
+                SummaryObservation::MultiEntry,
                 &mut HashSet::new(),
             );
         }
@@ -1827,6 +2185,143 @@ mod tests {
                 w.summaries_msgs[summaries_index(emitter)],
                 1,
                 "each emitter sent exactly one message: {emitter:?}"
+            );
+        }
+    }
+
+    /// The per-arm single-entry census counts single-entry messages PER EMITTER,
+    /// which is the whole point of it (#5153 review F1).
+    ///
+    /// The receive side sees only `entries.len()`, so it cannot tell a
+    /// notification from a `ChangeInterestsReply` — and field data says ~15% of
+    /// single-entry `Summaries` are NOT notifications. This census is the only
+    /// place both facts exist together, so it is what converts that
+    /// contamination from an unstated assumption into a subtractable number.
+    ///
+    /// The fixture mirrors the measured shape deliberately: notification and
+    /// change-interests-reply single-entry, interests-reply wide. If the census
+    /// counted messages rather than SINGLE-ENTRY messages, the wide arm would be
+    /// non-zero and this fails.
+    #[test]
+    fn single_entry_census_is_per_emitter_and_excludes_wide_messages() {
+        let mix = OutboundMix::new();
+        // Notification: single-entry by construction (field: mean 1.000).
+        record_summaries(&mix, SummariesEmitter::Notification, 1, 100);
+        record_summaries(&mix, SummariesEmitter::Notification, 1, 100);
+        record_summaries(&mix, SummariesEmitter::Notification, 1, 100);
+        // ChangeInterestsReply: ALSO single-entry (field: mean 1.000, max 1) —
+        // the contaminant an earlier version of this instrument missed.
+        record_summaries(&mix, SummariesEmitter::ChangeInterestsReply, 1, 400);
+        // InterestsReply: genuinely wide (field: mean ~224). Must NOT be counted.
+        record_summaries(&mix, SummariesEmitter::InterestsReply, 224, 200);
+        // A request reply can be either; a single-entry one is differing by
+        // construction, which is the downward-bias term.
+        record_summaries(&mix, SummariesEmitter::SummaryRequestReply, 1, 1600);
+        record_summaries(&mix, SummariesEmitter::SummaryRequestReply, 7, 1600);
+
+        let w = mix.take_window();
+        let census = |e| w.summaries_single_entry_msgs[summaries_index(e)];
+        assert_eq!(census(SummariesEmitter::Notification), 3);
+        assert_eq!(
+            census(SummariesEmitter::ChangeInterestsReply),
+            1,
+            "the largest contaminant must be counted, not assumed away"
+        );
+        assert_eq!(
+            census(SummariesEmitter::InterestsReply),
+            0,
+            "a 224-entry message is not single-entry; counting it would make the \
+             census meaningless"
+        );
+        assert_eq!(
+            census(SummariesEmitter::SummaryRequestReply),
+            1,
+            "one of the two request replies was single-entry"
+        );
+
+        // The decision this feeds: notification's share of the single-entry
+        // population. Computable from the census alone, which is the property
+        // that lets the analysis bound `p` instead of asserting it.
+        let total_single: u64 = SUMMARIES_ARMS.iter().map(|e| census(*e)).sum();
+        assert_eq!(total_single, 5);
+        assert_eq!(census(SummariesEmitter::Notification), 3);
+
+        let body = outbound_mix_json(&w, 60);
+        assert_eq!(
+            body.get("interest_sync_summaries_notification_single_entry_msgs")
+                .and_then(|v| v.as_u64()),
+            Some(3),
+            "the census must reach the rollup under a per-arm key"
+        );
+        assert_eq!(
+            body.get("interest_sync_summaries_change_interests_reply_single_entry_msgs")
+                .and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            body.get("interest_sync_summaries_interests_reply_single_entry_msgs")
+                .and_then(|v| v.as_u64()),
+            Some(0),
+            "emitted as an explicit zero, like every other field here"
+        );
+    }
+
+    /// A DIGEST-leg single-entry observation must not land in the full-bytes
+    /// bucket (#5153 review F1).
+    ///
+    /// Today a notification ships full bytes unconditionally, so a single-entry
+    /// observation on the digest leg is churn-leg traffic by construction —
+    /// merging the two would buy post-R4b series continuity by corrupting the
+    /// pre-R4b measurement that the build/no-build decision rests on. Asserting
+    /// the full-bytes bucket is EXACTLY 0 is what makes that separation real
+    /// rather than nominal.
+    #[test]
+    fn digest_leg_single_entry_observations_stay_out_of_the_full_bytes_bucket() {
+        let mix = OutboundMix::new();
+        let c = test_instance_id(1);
+        mix.record_summary_comparison(
+            &c,
+            b"same",
+            b"same",
+            SummaryObservation::SingleEntryDigest,
+            &mut HashSet::new(),
+        );
+        mix.record_summary_comparison(
+            &c,
+            b"ours",
+            b"theirs",
+            SummaryObservation::SingleEntryDigest,
+            &mut HashSet::new(),
+        );
+
+        let w = mix.take_window();
+        assert_eq!(w.summary_entries_identical, 1, "totals still count it");
+        assert_eq!(w.summary_entries_differing, 1, "totals still count it");
+        assert_eq!(
+            w.summary_entries_identical_single, 0,
+            "a digest-leg observation is NOT the R4b full-bytes population"
+        );
+        assert_eq!(w.summary_entries_differing_single, 0);
+        assert_eq!(w.summary_entries_identical_single_digest, 1);
+        assert_eq!(w.summary_entries_differing_single_digest, 1);
+        assert_eq!(
+            w.differing_by_contract.get(&c).map(|d| d.single),
+            Some(0),
+            "per-contract attribution must follow the same split, or the \
+             notification-leg share of a contract's divergence is overstated"
+        );
+
+        let body = outbound_mix_json(&w, 60);
+        for (key, want) in [
+            ("summary_entries_identical_single", 0),
+            ("summary_entries_differing_single", 0),
+            ("summary_entries_identical_single_digest", 1),
+            ("summary_entries_differing_single_digest", 1),
+        ] {
+            assert_eq!(
+                body.get(key).and_then(|v| v.as_u64()),
+                Some(want),
+                "{key} must reach the rollup with the leg split intact"
             );
         }
     }
