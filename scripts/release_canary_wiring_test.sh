@@ -146,6 +146,36 @@ if [[ -n "$CANARY_LINE" ]]; then
             "It still runs and still reports, but the job publishes the release" \
             "whatever it finds. That is a gate in appearance only."
     fi
+
+    # --- 3a. ...and its shell does not swallow the canary's exit status ------
+    # The step-key checks above are blind to the SHELL. Appending `|| true` to
+    # the invocation leaves the step present, before the publish, and without
+    # `continue-on-error` -- every assertion here passed under exactly that
+    # mutation, because assertion 1 matches the invocation as a SUBSTRING and
+    # anything appended to the line is invisible to it.
+    #
+    # This is the likelier of the two neutering routes, and the worse one.
+    # `|| true` is the reflex fix when a gate false-positives at 2am, and it
+    # does not read as disabling a gate -- which is exactly why it has to fail
+    # loudly here. The value of this gate is that removing it cannot be quiet.
+    #
+    # Scanning the whole step rather than just the canary line: `set +e`
+    # anywhere in the run block has the same effect, and the step is three
+    # lines, so there is no legitimate use of these to trip over. Comment-only
+    # lines were dropped when JOB_BLOCK was built, so a `# || true` in prose
+    # cannot fire this.
+    SWALLOWED="$(printf '%s\n' "$CANARY_STEP" \
+        | grep -cE '\|\|[[:space:]]*(true|:)[[:space:]]*$|set[[:space:]]+\+e')"
+    if [[ "$SWALLOWED" -eq 0 ]]; then
+        pass "the canary step's shell does not swallow its own exit status"
+    else
+        fail "the canary step swallows its own exit status ('|| true', '|| :' or 'set +e')" \
+            "$(printf '%s\n' "$CANARY_STEP" | grep -E '\|\|[[:space:]]*(true|:)[[:space:]]*$|set[[:space:]]+\+e')" \
+            "The step still runs, still reports, and still sits before the publish," \
+            "but it can no longer fail -- so nothing blocks publication. This is the" \
+            "cheapest possible way to disable the gate and the least visible: it looks" \
+            "like error handling, not like removing a release gate."
+    fi
 fi
 
 # --- 3b. ...and the PUBLISH step is not made unconditional ------------------
@@ -160,27 +190,30 @@ fi
 # workflow really did publish, so `isDraft` reads false.
 #
 # Steps default to running only if every earlier step in the job succeeded, and
-# that default IS the gate. Any `if:` naming always()/failure()/cancelled()
-# overrides it. A conditional that does not (say, a repository check) is not
-# this hazard, so it is allowed through rather than banned outright.
+# that default IS the gate. The publish step has no `if:` today, and this pins
+# that state rather than trying to judge which conditionals are safe.
+#
+# Deliberately stricter than "no always()/failure()/cancelled()". Whether an
+# expression can evaluate true after a failed step is not something a grep
+# should be deciding -- `success() || github.actor == 'x'` overrides the default
+# without naming any of those functions. An `if:` on the one step whose
+# conditional execution IS the release gate deserves a human look, so any `if:`
+# at all fails here. If a legitimate one is ever needed, the person adding it
+# updates this assertion on purpose, which is the point.
 if [[ -n "$PUBLISH_LINE" ]]; then
     PUBLISH_STEP="$(step_block "$PUBLISH_LINE")"
     PUBLISH_IF="$(printf '%s\n' "$PUBLISH_STEP" | grep -E '^[0-9]+:        if:')"
-    OVERRIDE="$(printf '%s\n' "$PUBLISH_STEP" \
-        | grep -cE '^[0-9]+:        if:.*(always\(\)|failure\(\)|cancelled\(\))')"
-    if [[ "$OVERRIDE" -eq 0 ]]; then
-        if [[ -z "$PUBLISH_IF" ]]; then
-            pass "the publish step has no 'if:', so it still runs only when the canary passed"
-        else
-            pass "the publish step's 'if:' does not override the on-success default"
-        fi
+    if [[ -z "$PUBLISH_IF" ]]; then
+        pass "the publish step has no 'if:', so it still runs only when the canary passed"
     else
-        fail "the publish step overrides the on-success default with always()/failure()/cancelled()" \
+        fail "the publish step has acquired an 'if:'" \
             "$(printf '%s\n' "$PUBLISH_IF")" \
             "Steps run only after every earlier step succeeded, and that default is" \
-            "the ENTIRE mechanism by which the canary blocks publication. With this" \
-            "'if:', the canary can fail and the release publishes anyway -- the gate" \
-            "is gone, and it is gone without touching the canary step at all."
+            "the ENTIRE mechanism by which the canary blocks publication. An 'if:'" \
+            "here can override it -- 'if: always()' publishes the release even when" \
+            "the canary failed, and the gate is gone without the canary step being" \
+            "touched at all. If this conditional is genuinely wanted, confirm it" \
+            "cannot evaluate true after a failed step, then update this assertion."
     fi
 fi
 
