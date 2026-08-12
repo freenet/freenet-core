@@ -879,7 +879,10 @@ fn origin_scheme_matches_forwarded_proto(headers: &HeaderMap, origin: &str) -> b
     // which scheme the client used. Warn once — an unobservable degraded gate
     // is the failure mode this whole change is about.
     if !headers.contains_key("x-forwarded-proto")
-        && (headers.contains_key("x-forwarded-host") || headers.contains_key("forwarded"))
+        && (headers.contains_key("x-forwarded-host")
+            || headers.contains_key("forwarded")
+            || headers.contains_key("x-forwarded-for")
+            || headers.contains_key("x-real-ip"))
     {
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| {
@@ -929,7 +932,8 @@ fn origin_scheme_matches_forwarded_proto(headers: &HeaderMap, origin: &str) -> b
 /// authority (host plus port) so it can be byte-compared against the
 /// HTTP `Host` header.
 ///
-/// REJECTS, rather than strips, any authority containing `@`, `?` or `#`. A
+/// REJECTS, rather than strips, any authority containing `@`, `?`, `#`, `\`,
+/// space or tab. A
 /// real browser `Origin` is `scheme://host[:port]` and can contain none of
 /// them, so nothing legitimate is lost — and stripping is actively dangerous
 /// here, because it makes this parser disagree with
@@ -2938,6 +2942,17 @@ mod tests {
             origin_authority("http://evil.example#@127.0.0.1:7509"),
             None
         );
+        // The characters added after the first review round. Dropping any one
+        // of them lets the two parsers disagree again, and none was pinned.
+        assert_eq!(
+            origin_authority("http://127.0.0.1:7509\\evil.example"),
+            None
+        );
+        assert!(crate::client_events::websocket::is_localhost_origin(
+            "http://127.0.0.1:7509\\evil.example"
+        ));
+        assert_eq!(origin_authority("http://exa mple.com:7509"), None);
+        assert_eq!(origin_authority("http://exa\tmple.com:7509"), None);
         // Ordinary origins still parse.
         assert_eq!(
             origin_authority("http://mynode.example.com:7509"),
@@ -3597,6 +3612,25 @@ mod tests {
             admitted.err()
         );
 
+        // A PRESENT-BUT-BLANK header (a proxy interpolating an unset variable)
+        // must also be treated as absent. Comparing against "" matches no
+        // scheme, so without the filter this refuses every handshake on that
+        // deployment and drops every tab to the 3s poll.
+        for blank in ["", "   "] {
+            let admitted_blank = try_ws_connect_with(
+                addr,
+                Some(&format!("https://{addr}")),
+                &[("x-forwarded-proto", blank)],
+            )
+            .await;
+            assert!(
+                admitted_blank.is_ok(),
+                "a blank X-Forwarded-Proto must be treated as absent, not as a \
+                 scheme that matches nothing (got {:?})",
+                admitted_blank.err()
+            );
+        }
+
         // And with NO X-Forwarded-Proto the scheme is unknowable, so it must
         // NOT be guessed at. A TLS proxy that rewrites Host correctly but omits
         // the header is a common misconfiguration; refusing it would drop every
@@ -4250,7 +4284,11 @@ mod tests {
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
-            tokio::task::yield_now().await;
+            // `sleep`, not `yield_now`: under `#[tokio::test(start_paused)]`
+            // the runtime always has a ready task, so time never auto-advances
+            // and a `yield_now` spin makes the deadline unreachable — a stuck
+            // counter would hang the test instead of breaking out.
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
         PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed)
     }
@@ -4353,8 +4391,13 @@ mod tests {
             .expect("the pump must give up when the replay PHASE runs over")
             .expect("the pump task must not panic");
 
-        assert!(
-            sent.load(Ordering::Relaxed) < 3,
+        // EXACTLY 2, not `< 3`. Under `start_paused` the timeline is exact:
+        // 4s + 4s, cut off by the 10s phase deadline. A loose bound would still
+        // pass if a future change made it 0 — at which point the test no longer
+        // distinguishes whole-phase from per-message, which is its whole point.
+        assert_eq!(
+            sent.load(Ordering::Relaxed),
+            2,
             "the replay deadline must bound the whole phase: all 3 frames got \
              through, which is what a PER-MESSAGE deadline would allow (each 4s \
              send is under the 10s timeout) and is exactly the ~32x overrun the \

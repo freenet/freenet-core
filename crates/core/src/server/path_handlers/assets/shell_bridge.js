@@ -1495,7 +1495,10 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // message-notification code (showAppNotification) sits far above BEGIN, so it
   // is outside this region and unaffected.
   var overlayRoot = null;
-  var overlayCards = {}; // nonce -> card element
+  // Null-prototype for the same reason as removalObservedAt: a key spelled
+  // `__proto__` must be an ordinary own key, not a prototype assignment that
+  // makes the card unhideable and leaks into every other lookup.
+  var overlayCards = Object.create(null); // nonce -> card element
   var OVERLAY_CSS =
     '#__freenet_perm_overlay{position:fixed;inset:0;z-index:2147483647;' +
     'background:rgba(8,10,14,0.62);backdrop-filter:blur(4px);' +
@@ -1817,10 +1820,34 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // the no-requests-in-flight case so a long-lived tab cannot accumulate
   // entries.
   //
+  // The in-flight exemption is OVERRIDDEN BY ABSOLUTE AGE, per the project rule
+  // that a GC exemption must either expire or be overridden. Without that
+  // override this had the exact recurring shape the rule exists to catch: a
+  // single `/permission/pending` fetch that never resolves freezes
+  // `oldestInFlight` at that instant, every removal recorded afterwards
+  // satisfies `at >= oldestInFlight` forever, and neither the record map nor
+  // the in-flight list can ever shrink again — a sustained node hang would turn
+  // this into unbounded per-tab growth for the rest of the session rather than
+  // for the hang's duration.
+  //
+  // So a request outstanding longer than the hard bound is treated as DEAD and
+  // dropped from the in-flight list: no real response is coming, and its
+  // absence lets `oldestInFlight` advance so records become collectable again.
+  // Records themselves get the same absolute override as a second line of
+  // defence, so neither structure depends on the other being correct.
+  //
   // `Object.create(null)`: no prototype, so a nonce spelled `__proto__` or
   // `constructor` is an ordinary own key and cannot reach Object.prototype.
   // Nonces are 32 hex chars today, but this must not depend on that.
+  // perm-removal-memory:BEGIN
+  // Extracted and RUN by shell_bridge_permission_ws.test.mjs. It used to
+  // re-implement these in the harness, which meant every test of the last two
+  // rounds asserted properties of the duplicate: deleting the real guard,
+  // never stamping, or reverting the whole in-flight prune all left the suite
+  // green. Keep the markers, and never satisfy one of these names from the
+  // test side again.
   var REMOVAL_MEMORY_MS = 60000;
+  var REMOVAL_MEMORY_HARD_MS = 600000;
   var removalObservedAt = Object.create(null);
   // `issuedAt` of every reconcile whose response has not landed yet.
   var reconcilesInFlight = [];
@@ -1834,13 +1861,23 @@ function freenetBridge(authToken, userToken, hostedMode) {
   function noteRemovalObserved(nonce) {
     var now = permNow();
     if (typeof nonce === 'string') removalObservedAt[nonce] = now;
+    // Drop dead requests FIRST, so the floor they hold can advance.
+    var live = [];
     var oldestInFlight = Infinity;
     for (var i = 0; i < reconcilesInFlight.length; i++) {
-      if (reconcilesInFlight[i] < oldestInFlight)
-        oldestInFlight = reconcilesInFlight[i];
+      var t = reconcilesInFlight[i];
+      if (now - t > REMOVAL_MEMORY_HARD_MS) continue;
+      live.push(t);
+      if (t < oldestInFlight) oldestInFlight = t;
     }
+    reconcilesInFlight = live;
     for (var k in removalObservedAt) {
       var at = removalObservedAt[k];
+      // Past the absolute bound: collected regardless of what is in flight.
+      if (now - at > REMOVAL_MEMORY_HARD_MS) {
+        delete removalObservedAt[k];
+        continue;
+      }
       // Still able to affect an outstanding request: keep.
       if (at >= oldestInFlight) continue;
       if (now - at > REMOVAL_MEMORY_MS) delete removalObservedAt[k];
@@ -1850,6 +1887,7 @@ function freenetBridge(authToken, userToken, hostedMode) {
     var at = removalObservedAt[nonce];
     return at !== undefined && at >= since;
   }
+  // perm-removal-memory:END
   function showCard(nonce, card) {
     var root = ensureOverlayRoot();
     root.appendChild(card);
@@ -1946,16 +1984,25 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // against injected `fetch` / `permNow` / card helpers. Keep the markers.
   function reconcileFromPending() {
     var issuedAt = permNow();
-    // Registered so removal records this request could still need are not
-    // pruned out from under it while it is outstanding.
+    var pending;
+    try {
+      pending = fetch('/permission/pending');
+    } catch (err) {
+      // A SYNCHRONOUS throw must not leave a registration behind. Registering
+      // before the call meant such a throw skipped the deregistering `.then`
+      // entirely and that entry pinned the prune floor forever.
+      return;
+    }
+    // Registered only once the request actually exists, so every registration
+    // has a matching deregistration path.
     noteReconcileStarted(issuedAt);
-    fetch('/permission/pending')
+    pending
       .then(function (r) {
         return r.json();
       })
       .then(function (prompts) {
         if (!Array.isArray(prompts)) return;
-        var seen = {};
+        var seen = Object.create(null);
         // The ADD pass needs the mirror of the hide pass's causal check. A
         // stale snapshot can otherwise RESURRECT a prompt that was answered
         // after the request went out: F1 is issued and sees X; X is answered
@@ -2187,16 +2234,20 @@ function freenetBridge(authToken, userToken, hostedMode) {
       clearTimeout(permStableTimer);
       permStableTimer = null;
     }
-    // Also disarm any pending reconnect. Without this the prologue's stated
-    // invariant is incomplete: socket closes -> a reconnect is armed -> some
-    // future trigger calls openPermSocket -> B opens and goes healthy -> the
-    // orphaned timer fires and closes healthy B, burning a server-side slot
-    // cycle. We are opening right now, so a queued retry is by definition
-    // redundant.
-    if (permReconnectHandle !== null) {
-      clearTimeout(permReconnectHandle);
-      permReconnectHandle = null;
-    }
+    // A pending reconnect is deliberately LEFT ARMED. Two reviewers reached
+    // opposite conclusions here and the tiebreak is which failure self-heals:
+    //
+    //   clearing it   — a hung upgrade (no open, no close: the common
+    //                   WebSocket-through-proxy failure this file names above)
+    //                   leaves no pending retry at all, so the tab sits on the
+    //                   3s poll for the rest of its life.
+    //   leaving it    — the stale timer may fire and close a HEALTHY socket,
+    //                   which immediately triggers onclose -> reconnect. One
+    //                   wasted cycle, then back to normal.
+    //
+    // Permanent degradation loses to a transient blip, so the timer stays. The
+    // completing half, if a `visibilitychange`/`online` trigger is ever added,
+    // is a handshake watchdog rather than clearing this.
     if (permSocket !== null) {
       var stale = permSocket;
       permSocket = null;

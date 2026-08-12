@@ -435,10 +435,12 @@ function check(name, cond) {
   }
 
   // 6t. The FIRST retry must use the current delay, not the advanced one.
-  //     `permReconnectDelay` is advanced after the timer is armed; swapping
-  //     those two lines makes the first reconnect wait 2s instead of 1s, and
-  //     every existing assertion (which only looks at the final delay) stays
-  //     green.
+  //     `permReconnectDelay` is advanced after the timer is armed. NOTE the
+  //     mutation that actually produces the bug is moving that advance ABOVE
+  //     `var jittered = ...`; merely swapping the advance with the setTimeout
+  //     is a no-op, because `jittered` is already computed from the pre-advance
+  //     value. Naming the no-op here would send a future editor to a mutation
+  //     that stays green and invite them to delete this pin as vacuous.
   {
     const { machine, calls, advance, timers } = buildMachine();
     machine.openPermSocket();
@@ -450,6 +452,27 @@ function check(name, cond) {
     );
     advance(1000);
     check('and it fires at that time', calls.sockets.length === 2);
+  }
+
+  // 6u. A pending reconnect must SURVIVE a new open. Two reviewers disagreed
+  //     about clearing it; the tiebreak is that a hung upgrade (no open, no
+  //     close — the common WebSocket-through-proxy failure) leaves nothing else
+  //     to retry, so clearing it strands the tab on the 3s poll permanently,
+  //     whereas leaving it costs at most one wasted cycle that self-heals.
+  //     Pin the behaviour so the clear cannot come back unnoticed.
+  {
+    const { machine, calls, advance } = buildMachine();
+    machine.openPermSocket();
+    calls.sockets[0].close(); // arms a reconnect
+    const beforeOpen = calls.sockets.length;
+    machine.openPermSocket(); // the hypothetical visibilitychange trigger
+    const hung = calls.sockets[calls.sockets.length - 1]; // never opens, never closes
+    advance(60000);
+    check(
+      'a hung open still gets retried by the armed reconnect',
+      calls.sockets.length > beforeOpen + 1,
+    );
+    check('the hung socket was retired', hung.closed === true);
   }
 
   // 6r. A repeated prompt_added for a nonce already on screen must be ignored.
@@ -704,6 +727,11 @@ function check(name, cond) {
     'perm-reconcile:END',
     'function reconcileFromPending(',
   );
+  const removalMemorySrc = extractFrom(
+    'perm-removal-memory:BEGIN',
+    'perm-removal-memory:END',
+    'var REMOVAL_MEMORY_MS',
+  );
 
   // Free variables of the extracted region, supplied as parameters so the real
   // source runs unmodified against stubs.
@@ -715,20 +743,21 @@ function check(name, cond) {
     'createCard',
     'hideCard',
     'ctl',
-    `var __removals = Object.create(null);
-     var __inFlight = [];
-     function removalObservedSince(nonce, since) {
-       var at = __removals[nonce];
-       return at !== undefined && at >= since;
-     }
-     function noteReconcileStarted(t) { __inFlight.push(t); }
-     function noteReconcileFinished(t) {
-       var i = __inFlight.indexOf(t);
-       if (i >= 0) __inFlight.splice(i, 1);
-     }
+    // The REAL removal-memory block, extracted and run — not a harness copy.
+    // A duplicate here is how four mutations to the shipped guard (delete it,
+    // never stamp, prune instantly, revert the in-flight fix wholesale) all
+    // passed: the tests were asserting properties of the stand-in.
+    `${removalMemorySrc}
      ${reconcileSrc}
-     ctl.noteRemoval = function (t, nonce) { __removals[nonce || 'X'] = t; };
-     ctl.inFlight = function () { return __inFlight.slice(); };
+     ctl.noteRemoval = function (t, nonce) {
+       var save = ctl.clock.t;
+       ctl.clock.t = t;
+       noteRemovalObserved(nonce || 'X');
+       ctl.clock.t = save;
+     };
+     ctl.inFlight = function () { return reconcilesInFlight.slice(); };
+     ctl.records = function () { return Object.keys(removalObservedAt).length; };
+     ctl.observed = function (nonce, since) { return removalObservedSince(nonce, since); };
      return reconcileFromPending;`,
   );
 
@@ -738,6 +767,7 @@ function check(name, cond) {
     const overlayCards = {};
     const hidden = [];
     const ctl = {};
+    ctl.clock = clock; // the real noteRemovalObserved reads permNow()
     let release = null;
     const fetchStub = () =>
       new Promise((res) => {
@@ -796,6 +826,7 @@ function check(name, cond) {
     const overlayCards = {};
     const hidden = [];
     const ctl = {};
+    ctl.clock = clock; // the real noteRemovalObserved reads permNow()
     let release = null;
     const fetchStub = () =>
       new Promise((_res, rej) => {
@@ -1041,6 +1072,58 @@ function check(name, cond) {
     env.reconcile();
     await env.settle();
     check('a FAILED fetch still deregisters', env.ctl.inFlight().length === 0);
+  }
+
+  // 7n. PRUNING. Two mutations to the shipped prune survived even after the
+  //     real block was extracted, because nothing drove it: dropping
+  //     REMOVAL_MEMORY_MS to 0, and reverting to a bare wall-clock window.
+  //     Both are the difference between "the guard exists" and "the guard is
+  //     still there when the response lands".
+  {
+    // (a) A record an OLD in-flight request could still need must SURVIVE the
+    //     soft window. This is the wedged-node case: /permission/pending has
+    //     no timeout, so a fetch can outlive the window, and pruning its record
+    //     resurrects the answered prompt on arrival.
+    const env = build([]);
+    env.reconcile(); // R1 issued at 1000 and left in flight
+    env.ctl.noteRemoval(1001, 'X');
+    env.clock.t = 1001 + 70000; // well past REMOVAL_MEMORY_MS
+    env.ctl.noteRemoval(env.clock.t, 'DRIVE'); // drives the prune
+    check(
+      'a record an in-flight request still needs survives the soft window',
+      env.ctl.observed('X', 1000) === true,
+    );
+  }
+  {
+    // (b) With nothing in flight a record still has to live for the window,
+    //     or the guard evaporates before any response can use it.
+    const env = build([]);
+    env.ctl.noteRemoval(1000, 'X');
+    env.clock.t = 1100;
+    env.ctl.noteRemoval(1100, 'DRIVE');
+    check(
+      'a fresh record is not pruned immediately',
+      env.ctl.observed('X', 1000) === true,
+    );
+  }
+  {
+    // (c) The absolute-age override. A request that never resolves must stop
+    //     pinning the floor, or the exemption has neither a TTL nor an age
+    //     bound and both structures grow for the rest of the session — the
+    //     recurring cleanup-exemption bug class this project tracks.
+    const env = build([]);
+    env.reconcile(); // R1 at 1000, never settled
+    env.ctl.noteRemoval(1001, 'X');
+    env.clock.t = 1001 + 700000; // past REMOVAL_MEMORY_HARD_MS
+    env.ctl.noteRemoval(env.clock.t, 'DRIVE');
+    check(
+      'a dead in-flight request stops pinning the prune floor',
+      env.ctl.inFlight().length === 0,
+    );
+    check(
+      'and records past the absolute bound are collected',
+      env.ctl.observed('X', 1000) === false,
+    );
   }
 
   // 7e. The stamp itself. 7a-7c stub showCard, so they would all still pass if
