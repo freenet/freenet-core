@@ -308,12 +308,19 @@ fi
 # did. These two are deliberately past the buffer, with the markers FIRST and
 # the bulk after them -- the real geometry.
 #
-# Both directions are pinned. The healthy one is what actually broke (a good
-# release blocked by "the startup update check never ran", naming the wrong
-# subsystem). The broken one guards the far worse direction: if the ordering of
-# these checks ever changes so the positive check no longer runs first, a
-# SIGPIPE'd negative check reads the #5221 signature as ABSENT and the gate
-# goes GREEN on the exact bug it exists to catch.
+# Both directions are pinned, and both test the same property: that the verdict
+# does not change with log VOLUME. The healthy one is what actually broke (a
+# good release blocked by "the startup update check never ran", naming the wrong
+# subsystem). The broken one covers the far worse direction -- a SIGPIPE'd
+# negative check reading the #5221 signature as ABSENT, so the gate goes GREEN
+# on the exact bug it exists to catch.
+#
+# What the broken case does NOT test, despite an earlier version of this comment
+# saying so, is check ORDERING. `assert_detection_healthy` reaches the parse
+# check via `log_has`, which greps the fixture FILES directly, so the marker is
+# found whatever order the checks run in and a reordering leaves this green.
+# Volume-resistance is what is pinned here; it is real, and it is the property
+# that broke.
 BULK="$(for _ in $(seq 1 1200); do
     echo '2026-08-08T02:00:01.000000Z  INFO freenet::node: connection established peer=abc123 remaining=7'
 done)"
@@ -479,13 +486,35 @@ version_ge_case "0.2.99"  "0.2.124" no
 # `head` is the same class but is NOT banned here: `$(… | head -1)` is used for
 # its stdout, not its status, and banning it would be noise. Watch it manually
 # when the pipeline's status is consumed.
+#
+# `release.sh` is in scope because it is the DRIVER: it sets `pipefail`, and its
+# `verify_required_binaries` used `echo "$assets" | grep -xqF` -- the same shape,
+# on the path that decides whether a release's binaries exist. Measured at 46
+# false "missing" verdicts in 20000 iterations under 24-way CPU load (0 in a
+# quiet window), which is why it survived: it needs a contended runner. The
+# consequence was the worst-placed one in the file, `wait_for_binaries` failing
+# AFTER publish and BEFORE the gateway updates and announcements -- exactly what
+# the comment above `verify_release_published` warns about. The file was never
+# out of the regex's reach, only out of this list's.
 SIGPIPE_SCRIPTS=(
     "$CANARY_SH"
     "$SCRIPT_DIR/auto-update-canary_test.sh"
     "$SCRIPT_DIR/auto-update-canary_lifecycle_test.sh"
     "$SCRIPT_DIR/release_wait_for_binaries_test.sh"
     "$SCRIPT_DIR/release_canary_wiring_test.sh"
+    "$SCRIPT_DIR/release.sh"
 )
+# A renamed or moved entry must fail LOUDLY. Without this, `grep`'s complaint
+# about a missing file goes to the `2>/dev/null` below and the entry simply
+# stops being audited -- the pin keeps reporting "ok" over a file it no longer
+# reads. Same reason `pin_marker` checks `[[ -f ]]` before scraping.
+for _sigpipe_script in "${SIGPIPE_SCRIPTS[@]}"; do
+    if [[ ! -f "$_sigpipe_script" ]]; then
+        echo "FAIL - SIGPIPE_SCRIPTS names a file that does not exist: $_sigpipe_script" >&2
+        echo "       A renamed entry would otherwise drop out of the audit silently." >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+done
 # Verified not to match its own defining line: after the `|` comes `[`, not
 # whitespace-then-grep. A pin that finds its own needle is the self-satisfying
 # shape this repo's rules file documents separately.

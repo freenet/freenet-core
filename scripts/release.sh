@@ -365,23 +365,34 @@ detect_pr_state() {
 }
 
 # Detect if tag exists
+#
+# No `... | grep -q` anywhere below: this script sets `pipefail`, and a
+# short-circuiting reader makes the producer die with SIGPIPE (141), which
+# pipefail then promotes to the pipeline's status -- so a tag that IS present
+# reads as ABSENT. See the SIGPIPE section of .claude/rules/bug-prevention-patterns.md.
+# Ask git for the one ref we care about and test whether the answer is empty.
 detect_tag_state() {
     # Check local tags
-    if git tag -l | grep -q "^v$VERSION$"; then
+    if [[ -n "$(git tag -l "v$VERSION")" ]]; then
         COMPLETED_STEPS["TAG_CREATED"]=1
         return
     fi
 
     # Check remote tags
-    if git ls-remote --tags origin 2>/dev/null | grep -q "refs/tags/v$VERSION$"; then
+    if [[ -n "$(git ls-remote --tags origin "refs/tags/v$VERSION" 2>/dev/null)" ]]; then
         COMPLETED_STEPS["TAG_CREATED"]=1
     fi
 }
 
 # Detect if crates are published
 detect_crates_state() {
-    # Check if freenet is published at this version
-    if cargo search freenet --limit 1 2>/dev/null | grep -q "freenet = \"$VERSION\""; then
+    # Check if freenet is published at this version.
+    # `|| true` because the old form ran inside an `if` condition, where errexit
+    # is disabled; a bare assignment is not, so a failing `cargo search` would
+    # otherwise abort the release.
+    local search_out
+    search_out="$(cargo search freenet --limit 1 2>/dev/null || true)"
+    if [[ "$search_out" == *"freenet = \"$VERSION\""* ]]; then
         COMPLETED_STEPS["CRATES_PUBLISHED"]=1
     fi
 }
@@ -1023,7 +1034,9 @@ publish_crates() {
 
     # Check if freenet is already published
     echo -n "  Checking if freenet $VERSION is already published... "
-    if cargo search freenet --limit 1 2>/dev/null | grep -q "freenet = \"$VERSION\""; then
+    local freenet_search
+    freenet_search="$(cargo search freenet --limit 1 2>/dev/null || true)"
+    if [[ "$freenet_search" == *"freenet = \"$VERSION\""* ]]; then
         echo "yes"
         echo "  ✓ freenet $VERSION already published to crates.io"
         freenet_published=true
@@ -1040,7 +1053,9 @@ publish_crates() {
 
     # Check if fdev is already published
     echo -n "  Checking if fdev $FDEV_VERSION is already published... "
-    if cargo search fdev --limit 1 2>/dev/null | grep -q "fdev = \"$FDEV_VERSION\""; then
+    local fdev_search
+    fdev_search="$(cargo search fdev --limit 1 2>/dev/null || true)"
+    if [[ "$fdev_search" == *"fdev = \"$FDEV_VERSION\""* ]]; then
         echo "yes"
         echo "  ✓ fdev $FDEV_VERSION already published to crates.io"
         fdev_published=true
@@ -1090,7 +1105,7 @@ create_github_release() {
     fi
 
     # Check if tag already exists
-    if git tag | grep -q "^v$VERSION$"; then
+    if [[ -n "$(git tag -l "v$VERSION")" ]]; then
         echo "  ℹ️  Tag v$VERSION already exists locally"
         mark_completed "TAG_CREATED"
     else
@@ -1098,7 +1113,7 @@ create_github_release() {
     fi
 
     # Check if tag exists on remote
-    if git ls-remote --tags origin | grep -q "refs/tags/v$VERSION$"; then
+    if [[ -n "$(git ls-remote --tags origin "refs/tags/v$VERSION" 2>/dev/null)" ]]; then
         echo "  ℹ️  Tag v$VERSION already exists on remote"
         mark_completed "TAG_CREATED"
     else
@@ -1306,8 +1321,18 @@ verify_required_binaries() {
         return 1
     fi
     local missing=()
+    # Whole-line match against the asset list, done with a bash glob rather than
+    # `echo "$assets" | grep -xqF`. Under `pipefail` that form makes `echo` take
+    # SIGPIPE the moment `grep -q` short-circuits on a match, and 141 becomes the
+    # pipeline's status -- so a binary that IS present reads as MISSING. Measured
+    # here at 46 hits in 20000 iterations under 24-way CPU load (0 in a quiet
+    # window), i.e. it fires exactly on the contended runners this gate runs on.
+    # The consequence is the one the comment above warns about: wait_for_binaries
+    # returns 1 and the driver dies AFTER publishing but BEFORE the gateway
+    # updates and announcements.
+    local assets_nl=$'\n'"$assets"$'\n'
     for bin in "${required[@]}"; do
-        if ! echo "$assets" | grep -xqF "$bin"; then
+        if [[ "$assets_nl" != *$'\n'"$bin"$'\n'* ]]; then
             missing+=("$bin")
         fi
     done
