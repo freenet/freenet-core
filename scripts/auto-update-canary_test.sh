@@ -1,0 +1,853 @@
+#!/usr/bin/env bash
+# Regression test for auto-update-canary.sh -- the two-sided assertion that
+# decides whether a release's auto-updater actually works (#5222).
+#
+# The fixtures below are VERBATIM log lines captured from real runs on
+# 2026-08-08, not invented strings:
+#   - the BROKEN fixture is released v0.2.121 failing to parse the v0.2.122
+#     tag: the live #5221 regression that broke auto-update fleet-wide;
+#   - the HEALTHY fixture is released v0.2.119 correctly detecting v0.2.122
+#     and requesting the update.
+#
+# What this test is FOR: `assert_detection_healthy` is the load-bearing part
+# of the canary, and its whole value is that it can go RED. A canary nobody
+# has ever seen fail is indistinguishable from one that cannot fail. So the
+# cases that matter most here are the negative ones -- especially
+# `vacuous: clean log with no check` and `disabled`, which are precisely the
+# inputs a one-sided "no error in the log" assertion would wave through.
+#
+# The real function is sourced (not copied) so the test cannot drift from the
+# code CI runs -- mirroring release-agent/verify-version-decision_test.sh.
+#
+# Run manually: bash scripts/auto-update-canary_test.sh
+# Also wired into CI (the Fmt job in .github/workflows/ci.yml).
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CANARY_SH="$SCRIPT_DIR/auto-update-canary.sh"
+
+if [[ ! -f "$CANARY_SH" ]]; then
+    echo "FAIL: $CANARY_SH not found" >&2
+    exit 1
+fi
+
+# Source the real implementation.
+# shellcheck source=scripts/auto-update-canary.sh
+source "$CANARY_SH"
+
+FAILURES=0
+TMPROOT="$(mktemp -d)"
+# Chain, do not replace: sourcing auto-update-canary.sh installed its own
+# `trap cleanup EXIT`, and overwriting it leaks that script's workdir on every
+# CI run.
+trap 'rm -rf "$TMPROOT"; cleanup' EXIT
+
+# check <description> <expected-exit> <log-content> [expected-message-substring]
+#
+# The optional message assertion is not decoration. Several branches of
+# `assert_detection_healthy` return the SAME exit code for different reasons,
+# so an exit-code-only test cannot tell them apart -- and mutation testing
+# confirmed it: deleting the `Auto-update is DISABLED` branch entirely left an
+# exit-code-only suite fully green, because a disabled node also has no
+# "check ran" line and fails the next assertion anyway. What that branch
+# actually contributes is the correct DIAGNOSIS, so that is what gets pinned.
+check() {
+    local desc="$1" expected="$2" content="$3" want_msg="${4:-}"
+    local dir actual stderr
+    dir="$(mktemp -d "$TMPROOT/case.XXXXXX")"
+    if [[ -n "$content" ]]; then
+        printf '%s\n' "$content" > "$dir/freenet.2026-08-08-02.log"
+    fi
+    stderr="$(assert_detection_healthy "$dir" 2>&1 >/dev/null)"
+    actual=$?
+    if [[ "$actual" != "$expected" ]]; then
+        echo "FAIL - $desc (got exit $actual, expected $expected)" >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if [[ -n "$want_msg" && "$stderr" != *"$want_msg"* ]]; then
+        echo "FAIL - $desc (exit $actual correct, but diagnosis wrong)" >&2
+        echo "       wanted message containing: $want_msg" >&2
+        echo "       got: $stderr" >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    echo "ok   - $desc"
+}
+
+# Verbatim from a real v0.2.119 run, 2026-08-08T02:02:59Z.
+HEALTHY='2026-08-08T02:02:59.369148Z  INFO freenet: Startup update check against GitHub current="0.2.119" jitter_secs=38
+2026-08-08T02:02:59.538127Z  INFO freenet: Startup check: newer version on GitHub, triggering auto-update new_version=0.2.122'
+
+# The OTHER healthy shape, and the one Gate A actually sees: the binary about
+# to ship is NEWER than the latest release, so the check finishes without
+# triggering anything. Until #5236 that outcome was a `debug!` -- compiled out
+# of release builds -- so a healthy Gate A run produced no ending at all and
+# was byte-for-byte indistinguishable from a run cut short.
+HEALTHY_UP_TO_DATE='2026-08-08T02:00:00.000000Z  INFO freenet: Startup update check against GitHub current="0.2.123" jitter_secs=7
+2026-08-08T02:00:00.412000Z  INFO freenet: Startup update check complete: staying on the current version current="0.2.123"'
+
+# The vacuous pass #5236 closed: the check STARTED and the log stops there,
+# because the canary killed the node while GitHub was still answering. Every
+# negative assertion is satisfied; none of them can see that nothing happened.
+PENDING='2026-08-08T02:00:00.000000Z  INFO freenet: Startup update check against GitHub current="0.2.123" jitter_secs=7'
+
+# Verbatim from a real v0.2.121 run, 2026-08-08T01:59:35Z -- the #5221 break.
+BROKEN='2026-08-08T01:59:35.950835Z  INFO freenet: Startup update check against GitHub current="0.2.121" jitter_secs=40
+2026-08-08T01:59:36.111073Z  WARN freenet::commands::auto_update: Startup update check: failed to parse latest version '"'"'v0.2.122'"'"': unexpected character '"'"'v'"'"' while parsing major version number'
+
+# Verbatim from framework, 2026-08-07T15:36:35Z -- the stale #5040 drop-in.
+DISABLED='2026-08-07T15:36:35.289311Z  WARN freenet: Auto-update is DISABLED by configuration (--disable-auto-update): this node will NOT detect or apply updates and will stay on version 0.2.120 until you update it out-of-band.'
+
+DIRTY='2026-08-08T02:00:00.000000Z  WARN freenet: Auto-update is DISABLED for this dirty (locally modified) build: this node will NOT detect or apply updates and will stay on version 0.2.122 until you act.'
+
+FETCH_FAIL='2026-08-08T02:00:00.000000Z  INFO freenet: Startup update check against GitHub current="0.2.121" jitter_secs=12
+2026-08-08T02:00:00.500000Z  WARN freenet::commands::auto_update: Startup update check: failed to fetch latest version: error sending request. Continuing with current binary.'
+
+# --- fixtures for the POSITIVE-EQUALITY check (#5236, review finding 32) ----
+#
+# The shape Gate A sees on a healthy run, now carrying the observed latest.
+SEEN_OK='2026-08-08T02:00:00.000000Z  INFO freenet: Startup update check against GitHub current="0.2.123" jitter_secs=7
+2026-08-08T02:00:00.300000Z  INFO freenet::commands::auto_update: Startup update check: GitHub reports latest release latest=0.2.122
+2026-08-08T02:00:00.412000Z  INFO freenet: Startup update check complete: staying on the current version current="0.2.123"'
+
+# A SILENTLY WRONG comparator, which is the whole point of the check. This is
+# what a `version_from_tag` that truncates `0.2.122` to `0.2.12` emits: it does
+# not fail to parse, it parses the WRONG thing. Every other assertion in
+# assert_detection_healthy passes on it -- the check ran, no parse error, no
+# fetch error, it completed -- and before this check the canary called it OK.
+SEEN_TRUNCATED='2026-08-08T02:00:00.000000Z  INFO freenet: Startup update check against GitHub current="0.2.123" jitter_secs=7
+2026-08-08T02:00:00.300000Z  INFO freenet::commands::auto_update: Startup update check: GitHub reports latest release latest=0.2.12
+2026-08-08T02:00:00.412000Z  INFO freenet: Startup update check complete: staying on the current version current="0.2.123"'
+
+# The other silently-wrong shape: a comparator pinned to a constant.
+SEEN_CONSTANT='2026-08-08T02:00:00.000000Z  INFO freenet: Startup update check against GitHub current="0.2.123" jitter_secs=7
+2026-08-08T02:00:00.300000Z  INFO freenet::commands::auto_update: Startup update check: GitHub reports latest release latest=0.0.0
+2026-08-08T02:00:00.412000Z  INFO freenet: Startup update check complete: staying on the current version current="0.2.123"'
+
+# --- the positive cases -----------------------------------------------------
+check "healthy: check ran, parsed, triggered -> pass" 0 "$HEALTHY"
+check "healthy: check ran and completed up-to-date -> pass" 0 "$HEALTHY_UP_TO_DATE"
+
+# --- the regression this canary exists to catch -----------------------------
+check "broken: #5221 unparseable tag -> fail" 1 "$BROKEN" \
+    "could not parse the version GitHub returned"
+
+# --- THE VACUOUS-PASS CASES -------------------------------------------------
+# Each of these contains NO error line. A one-sided "grep -q 'failed to parse'
+# && fail" assertion passes all of them, which is exactly how a dead updater
+# comes to look identical to a working one.
+check "vacuous: log with no update check at all -> fail" 1 \
+    '2026-08-08T02:00:00.000000Z  INFO freenet: Node started, listening on [::]:31337' \
+    "the startup update check never ran"
+check "vacuous: empty log directory -> fail" 1 "" \
+    "no node logs at all"
+
+# Deliverable of #5222: "auto-update disabled on the canary" is a RED BUILD,
+# not something a human has to remember. Both disable paths must be named as
+# such -- the exit code alone would be satisfied by the missing-check branch,
+# so the diagnosis is the assertion (see the note on `check` above).
+check "disabled: --disable-auto-update (the #5040 drop-in) -> fail" 1 "$DISABLED" \
+    "auto-update is DISABLED on the canary node"
+check "disabled: dirty build silently skips the check -> fail" 1 "$DIRTY" \
+    "auto-update is DISABLED on the canary node"
+
+# --- infrastructure vs product bug ------------------------------------------
+# GitHub unreachable is NOT a broken updater. It must be distinguishable, or
+# a network blip either fails a good release or (worse) gets papered over with
+# a retry that also swallows a real parse failure.
+check "indeterminate: GitHub unreachable -> retry, not fail" 2 "$FETCH_FAIL" \
+    "could not reach GitHub to fetch the latest version"
+
+# --- unknown must never read as OK (#5236) ----------------------------------
+# The check started and the log stops. Distinguishing this from success is the
+# entire assertion: "no parse error" is evidence that parsing worked only if
+# the check is known to have got as far as parsing. Exit 2, not 0 and not 1 --
+# nothing was detected, nothing was proved, and the caller retries.
+check "unknown: check started but logged no outcome -> indeterminate, NOT ok" 2 "$PENDING" \
+    "never logged an outcome"
+
+# --- the update-trigger detector --------------------------------------------
+# `node_decided_to_update` must fire for ALL FOUR "triggering auto-update"
+# sites in freenet.rs and must NOT fire for the #4073 refusal, which shares the
+# phrase ("...not triggering auto-update"). Two ways to get this wrong, both
+# found in review: the bare substring counts the refusal as a trigger, and
+# anchoring on one site's full phrase misses the other three -- reporting "did
+# not decide to update" for a node that did.
+trigger_case() {
+    # trigger_case <description> <expect: yes|no> <log-line>
+    local desc="$1" expect="$2" line="$3"
+    local dir
+    dir="$(mktemp -d "$TMPROOT/trig.XXXXXX")"
+    printf '%s\n' "$line" > "$dir/freenet.2026-08-08-02.log"
+    if node_decided_to_update "$dir"; then local got=yes; else local got=no; fi
+    if [[ "$got" == "$expect" ]]; then
+        echo "ok   - $desc"
+    else
+        echo "FAIL - $desc (detector said '$got', expected '$expect')" >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
+trigger_case "trigger: startup check" yes \
+    '2026-08-08T02:02:59Z  INFO freenet: Startup check: newer version on GitHub, triggering auto-update new_version=0.2.122'
+trigger_case "trigger: post-stagger confirm" yes \
+    '2026-08-08T02:02:59Z  INFO freenet: Update confirmed on GitHub after stagger, triggering auto-update new_version=0.2.122'
+trigger_case "trigger: peer-signal confirm" yes \
+    '2026-08-08T02:02:59Z  INFO freenet: Newer version confirmed on GitHub, triggering auto-update new_version=0.2.122'
+trigger_case "trigger: periodic re-poll" yes \
+    '2026-08-08T02:02:59Z  INFO freenet: Periodic re-poll: newer version on GitHub, triggering auto-update new_version=0.2.122'
+# The FIFTH site, and the one the fixed-string marker silently missed: it says
+# "triggering IMMEDIATE auto-update", so `triggering auto-update` did not match
+# and a node that took the urgent path was reported as never having decided to
+# update. Fail-closed, so nothing broke loudly -- which is why it survived.
+trigger_case "trigger: urgent path (the site the fixed-string marker missed)" yes \
+    '2026-08-08T02:02:59Z  INFO freenet: Urgent update confirmed on GitHub, triggering immediate auto-update new_version=0.2.122'
+trigger_case "NOT a trigger: #4073 locally-blocked refusal" no \
+    '2026-08-08T02:02:59Z  WARN freenet: Startup check: newer version is locally blocked (crash-loop known-bad pin or repeated install failures); not triggering auto-update (#4073)'
+
+# --- the POSITIVE-EQUALITY check (#5236, review finding 32) -----------------
+#
+# Everything above this point is satisfied by a comparator that is silently
+# WRONG rather than broken. These drive assert_detection_healthy with
+# CANARY_EXPECTED_LATEST set, which is how Gate A runs it.
+check_vs_expected() {
+    # check_vs_expected <description> <expected-latest> <expected-exit> <log> [msg]
+    local desc="$1" expected_latest="$2" expected="$3" content="$4" want_msg="${5:-}"
+    CANARY_EXPECTED_LATEST="$expected_latest" check "$desc" "$expected" "$content" "$want_msg"
+}
+
+check_vs_expected "equality: node compared against the right release -> pass" \
+    "0.2.122" 0 "$SEEN_OK"
+# The two silently-wrong comparators. Before this check both reported OK.
+check_vs_expected "equality: TRUNCATED tag (0.2.122 -> 0.2.12) -> fail" \
+    "0.2.122" 1 "$SEEN_TRUNCATED" "compared against the WRONG release"
+check_vs_expected "equality: comparator pinned to a constant -> fail" \
+    "0.2.122" 1 "$SEEN_CONSTANT" "compared against the WRONG release"
+# A binary that never logs the observed value cannot be checked at all, and
+# "cannot be checked" must not read as "checked and fine".
+check_vs_expected "equality: no observed-latest line at all -> fail" \
+    "0.2.122" 1 "$HEALTHY_UP_TO_DATE" "never logged which release it compared against"
+# Unset is the pre-#5236 behaviour and must still work (the lifecycle test and
+# `assert-logs` drive it that way), but it must SAY it proved less.
+#
+# The message assertion is the whole case, and it was missing: with only the
+# exit code compared, replacing the entire `note "NOTE: CANARY_EXPECTED_LATEST
+# is unset..."` in auto-update-canary.sh with `:` left this green. The skip
+# branch could be silently emptied -- and a silent skip is precisely the
+# vacuous pass this gate exists to remove, since a reader of a green log would
+# have no way to tell the equality check ran from it having been skipped.
+#
+# Explicitly unset rather than relying on the variable happening to be unset.
+# It is not leaking from `check_vs_expected` today -- bash restores a
+# `VAR=x func` assignment when the function returns, verified -- but this is
+# the one case whose meaning depends on ambient environment, and the way it
+# would go wrong is silent: SEEN_OK carries latest=0.2.122, so an inherited
+# CANARY_EXPECTED_LATEST=0.2.122 sends it down the EQUALITY branch, still
+# exiting 0, testing the opposite of what its name says. The `unset` costs
+# nothing and makes the case mean one thing.
+unset CANARY_EXPECTED_LATEST
+check "equality: unset expected-latest -> still passes, but says it skipped" \
+    0 "$SEEN_OK" "CANARY_EXPECTED_LATEST is unset, so the positive-equality check was SKIPPED"
+
+# --- the tag normaliser -----------------------------------------------------
+# It has to agree with version_from_tag exactly. If it strips differently, the
+# equality check above compares two spellings of the same release and fails a
+# release for a difference that is not a bug.
+norm_case() {
+    # norm_case <input> <expected>
+    local got
+    got="$(normalise_release_tag "$1")"
+    if [[ "$got" == "$2" ]]; then
+        echo "ok   - normalise_release_tag '$1' -> '$2'"
+    else
+        echo "FAIL - normalise_release_tag '$1' gave '$got', expected '$2'" >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+norm_case "v0.2.122" "0.2.122"
+norm_case "0.2.122"  "0.2.122"
+# At most ONE `v`, matching `strip_prefix` rather than the greedy
+# `trim_start_matches` -- the hazard version_from_tag's rustdoc calls out.
+norm_case "vv1.2.3"  "v1.2.3"
+
+# --- the SIGPIPE regression (review finding 35) -----------------------------
+# `grep -q` at the end of a pipe exits at its first match and SIGPIPEs the
+# upstream grep; under `pipefail` that 141 became the pipeline's status and the
+# detector answered "no" for a node that plainly did decide to update. It only
+# bites once output passes the 64 KB pipe buffer, so a small fixture cannot see
+# it -- this one is deliberately large enough to.
+sigpipe_dir="$(mktemp -d "$TMPROOT/sigpipe.XXXXXX")"
+{
+    for _ in $(seq 1 700); do
+        echo '2026-08-08T02:02:59Z  INFO freenet: Startup check: newer version on GitHub, triggering auto-update new_version=0.2.122'
+    done
+} > "$sigpipe_dir/freenet.2026-08-08-02.log"
+if node_decided_to_update "$sigpipe_dir"; then
+    echo "ok   - trigger detection survives >64KB of matching output (no SIGPIPE)"
+else
+    echo "FAIL - trigger detection returned FALSE on a log full of triggers." >&2
+    echo "       This is the pipefail+SIGPIPE regression: a trailing 'grep -q' closes the" >&2
+    echo "       pipe at the first match, the upstream grep dies 141, and pipefail makes" >&2
+    echo "       that the pipeline's status -- so a node that decided to update reads as" >&2
+    echo "       one that did not." >&2
+    FAILURES=$((FAILURES + 1))
+fi
+
+# The SAME defect, in `assert_detection_healthy` itself, which is the part the
+# release gate calls. The two helpers above were fixed when the mechanism was
+# first diagnosed; the four checks inside the function they serve were not, and
+# unlike the helpers this one was not latent -- it hit 2 of 3 real preflight
+# runs. Gate A's normal path is a binary NEWER than latest, so the node does
+# not exit 42 and keeps logging (~33 KB/s) until the canary kills it seconds
+# later, which puts the markers far behind the 64 KB pipe buffer.
+#
+# The fixtures elsewhere in this file are a few hundred bytes, so none of them
+# can see it: the verdict was a function of log VOLUME, not of what the node
+# did. These two are deliberately past the buffer, with the markers FIRST and
+# the bulk after them -- the real geometry.
+#
+# Both directions are pinned, and both test the same property: that the verdict
+# does not change with log VOLUME. The healthy one is what actually broke (a
+# good release blocked by "the startup update check never ran", naming the wrong
+# subsystem). The broken one covers the far worse direction -- a SIGPIPE'd
+# negative check reading the #5221 signature as ABSENT, so the gate goes GREEN
+# on the exact bug it exists to catch.
+#
+# What the broken case does NOT test, despite an earlier version of this comment
+# saying so, is check ORDERING. `assert_detection_healthy` reaches the parse
+# check via `log_has`, which greps the fixture FILES directly, so the marker is
+# found whatever order the checks run in and a reordering leaves this green.
+# Volume-resistance is what is pinned here; it is real, and it is the property
+# that broke.
+BULK="$(for _ in $(seq 1 1200); do
+    echo '2026-08-08T02:00:01.000000Z  INFO freenet::node: connection established peer=abc123 remaining=7'
+done)"
+check "volume: healthy markers behind >64KB of later output -> still pass" \
+    0 "$SEEN_OK
+$BULK"
+check_vs_expected "volume: equality check still sees the observed-latest line behind >64KB" \
+    "0.2.122" 0 "$SEEN_OK
+$BULK"
+check "volume: #5221 parse failure behind >64KB of later output -> still fail" \
+    1 "$BROKEN
+$BULK" "could not parse the version GitHub returned"
+
+# --- numeric-override validation (review finding 36) ------------------------
+# A non-numeric CANARY_TIMEOUT_SECS reaches an arithmetic context and, under
+# `set -u`, kills the canary with a shell error instead of a verdict -- a
+# release-blocking failure whose message says nothing about the release. Its two
+# neighbours were already guarded; this one was not.
+timeout_guard_case() {
+    # timeout_guard_case <override> <expected-effective-value>
+    local got
+    got="$(CANARY_TIMEOUT_SECS="$1" bash -c '
+        set -uo pipefail
+        # shellcheck source=/dev/null
+        source "$1" >/dev/null 2>&1 || true
+        printf "%s" "$CANARY_TIMEOUT_SECS"' _ "$CANARY_SH")"
+    if [[ "$got" == "$2" ]]; then
+        echo "ok   - CANARY_TIMEOUT_SECS='$1' is sanitised to $2"
+    else
+        echo "FAIL - CANARY_TIMEOUT_SECS='$1' became '$got', expected '$2'" >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+timeout_guard_case "abc" "240"
+timeout_guard_case "0"   "240"
+timeout_guard_case ""    "240"
+timeout_guard_case "90"  "90"
+
+# --- Gate A must actually ARM the equality check -----------------------------
+# `assert_detection_healthy` skips the positive-equality check when
+# CANARY_EXPECTED_LATEST is unset, which is right for the pure/unit-testable
+# shape but means the check is only as real as the caller that sets it. Nothing
+# else pins that, so a refactor dropping the assignment would leave every
+# assertion here green while Gate A silently reverted to "the node did not
+# complain" -- the exact vacuous shape this PR exists to remove.
+#
+# Scoped to cmd_preflight's body, not a whole-file grep: the variable is named
+# in comments elsewhere in the file, and a file-wide match would be satisfied by
+# the prose describing the mechanism rather than the code implementing it.
+preflight_body="$(awk '/^cmd_preflight\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$CANARY_SH")"
+# shellcheck disable=SC2016  # the needles below match LITERAL source text, so
+# the `$(...)` inside them must not expand -- that is the point of the pin.
+if [[ -z "$preflight_body" ]]; then
+    echo "FAIL - could not locate cmd_preflight() in $(basename "$CANARY_SH")" >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ "$preflight_body" != *'CANARY_EXPECTED_LATEST="$(resolve_expected_latest)"'* ]]; then
+    echo "FAIL - cmd_preflight no longer resolves CANARY_EXPECTED_LATEST." >&2
+    echo "       Gate A's only positive assertion is skipped when that is unset, so the gate" >&2
+    echo "       drops back to 'the node did not complain' -- which a silently-wrong" >&2
+    echo "       comparator satisfies (#5236, review finding 32)." >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ "$preflight_body" != *'export CANARY_EXPECTED_LATEST'* ]]; then
+    echo "FAIL - cmd_preflight resolves CANARY_EXPECTED_LATEST but does not export it." >&2
+    FAILURES=$((FAILURES + 1))
+else
+    echo "ok   - cmd_preflight resolves and exports CANARY_EXPECTED_LATEST (the equality check is armed)"
+fi
+# ...and refuses rather than passing when it cannot resolve it. A resolution
+# failure that fell through would run the gate with the check skipped.
+if [[ "$preflight_body" == *'if ! CANARY_EXPECTED_LATEST='*'return 1'* ]]; then
+    echo "ok   - cmd_preflight refuses (returns non-zero) when the expected release cannot be resolved"
+else
+    echo "FAIL - cmd_preflight does not refuse when resolve_expected_latest fails." >&2
+    echo "       Falling through would run Gate A with its positive check silently skipped." >&2
+    FAILURES=$((FAILURES + 1))
+fi
+
+# --- Gate B must arm the equality check too ---------------------------------
+# `cmd_selfupdate` runs in its own process, so nothing Gate A exported reaches
+# it: before this, the deliberately-loud "CANARY_EXPECTED_LATEST is unset" NOTE
+# fired on EVERY healthy Gate B run. A warning that appears on every good
+# release is one everybody learns to scroll past. Same pin shape as
+# cmd_preflight's above, and for the same reason -- the skip branch is only as
+# harmless as the callers that do not take it.
+selfupdate_body="$(awk '/^cmd_selfupdate\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$CANARY_SH")"
+# shellcheck disable=SC2016  # literal source text; must not expand
+if [[ -z "$selfupdate_body" ]]; then
+    echo "FAIL - could not locate cmd_selfupdate() in $(basename "$CANARY_SH")" >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ "$selfupdate_body" != *'export CANARY_EXPECTED_LATEST="$expected_version"'* ]]; then
+    echo "FAIL - cmd_selfupdate does not arm the positive-equality check." >&2
+    echo "       Gate B knows exactly which release it just published; without exporting it, the" >&2
+    echo "       gate drops to 'the node did not complain' and prints the unset NOTE on every" >&2
+    echo "       healthy release until nobody reads it (#5236)." >&2
+    FAILURES=$((FAILURES + 1))
+# ...and it must arm it from the version it was told to expect, not from a
+# second lookup. Re-resolving would introduce a source allowed to disagree with
+# the caller -- the failure-that-is-not-a-bug this file already avoids in
+# resolve_expected_latest.
+elif [[ "$selfupdate_body" == *'resolve_expected_latest'* ]]; then
+    echo "FAIL - cmd_selfupdate re-resolves the expected release instead of using its argument." >&2
+    echo "       Two sources that may disagree produce a failed release that is not a bug." >&2
+    FAILURES=$((FAILURES + 1))
+else
+    echo "ok   - cmd_selfupdate arms the equality check from its expected-version argument"
+fi
+
+# The version gate around it. The observed-latest marker is new in #5236 and
+# Gate B drives the PREVIOUS release, so for one release there is no line to
+# compare; the gate must skip rather than fail. Both halves are pinned, because
+# either one alone is wrong: no gate blocks a release on its predecessor's age,
+# and no arming leaves Gate B permanently vacuous.
+#
+# Pinned in two parts, because a single literal-text grep was not enough. The
+# earlier form matched `version_at_least "$prev_version" "$MARKER_LATEST_SEEN_SINCE"`
+# anywhere in the body -- and `if ! version_at_least …` CONTAINS that string, so
+# inverting the gate left all assertions green. Demonstrated on this branch.
+# So: the decision now lives in `prev_emits_latest_seen`, whose BEHAVIOUR is
+# tested below, and the call site is matched INCLUDING its `if ` prefix so a
+# `!` cannot slip between them.
+# shellcheck disable=SC2016  # literal source text; must not expand
+if [[ "$selfupdate_body" != *'if prev_emits_latest_seen "$prev_version"; then'* ]]; then
+    echo "FAIL - cmd_selfupdate no longer gates the equality check on prev_emits_latest_seen." >&2
+    echo "       Expected the call site verbatim, INCLUDING the 'if ' prefix:" >&2
+    echo '           if prev_emits_latest_seen "$prev_version"; then' >&2
+    echo "       Matching the bare call would also match a NEGATED one. Un-gated, a previous" >&2
+    echo "       release built before #5236 emits no observed-latest line and Gate B fails for" >&2
+    echo "       a line that binary was never built to emit; negated, Gate B skips the check on" >&2
+    echo "       every modern release and goes permanently vacuous." >&2
+    FAILURES=$((FAILURES + 1))
+else
+    echo "ok   - cmd_selfupdate gates the equality check on prev_emits_latest_seen (un-negated)"
+fi
+
+# ...and what that gate DECIDES, which the text match above cannot see. An
+# inversion inside the function flips both of these.
+gate_b_arm_case() {
+    # gate_b_arm_case <prev-version> <yes|no>
+    local got
+    if prev_emits_latest_seen "$1"; then got=yes; else got=no; fi
+    if [[ "$got" == "$2" ]]; then
+        echo "ok   - prev_emits_latest_seen '$1' -> $2 (Gate B equality check ${2/yes/arms})"
+    else
+        echo "FAIL - prev_emits_latest_seen '$1' said '$got', expected '$2'." >&2
+        echo "       Inverted, Gate B skips its only positive assertion on every release from" >&2
+        echo "       v$MARKER_LATEST_SEEN_SINCE onward -- vacuous, and silent about it." >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+gate_b_arm_case "$MARKER_LATEST_SEEN_SINCE" yes   # the release the marker lands in
+gate_b_arm_case "0.2.125"                   yes   # every release after it
+gate_b_arm_case "0.3.0"                     yes
+gate_b_arm_case "0.2.123"                   no    # the one release that must skip
+gate_b_arm_case "0.2.99"                    no    # numeric, not lexical
+
+# `version_at_least` decides whether the gate above arms, so it gets its own
+# cases: an off-by-one here silently disarms Gate B's only positive assertion.
+version_ge_case() {
+    # version_ge_case <a> <b> <yes|no>
+    local got
+    if version_at_least "$1" "$2"; then got=yes; else got=no; fi
+    if [[ "$got" == "$3" ]]; then
+        echo "ok   - version_at_least '$1' '$2' -> $3"
+    else
+        echo "FAIL - version_at_least '$1' '$2' said '$got', expected '$3'" >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+version_ge_case "0.2.124" "0.2.124" yes   # the release the marker lands in
+version_ge_case "0.2.125" "0.2.124" yes
+version_ge_case "0.2.123" "0.2.124" no    # the one release that must skip
+version_ge_case "0.3.0"   "0.2.124" yes
+# Numeric, not lexical: a lexical compare puts 0.2.99 above 0.2.124 and would
+# disarm the gate for every release in between.
+version_ge_case "0.2.99"  "0.2.124" no
+
+# --- no status-consuming pipe into a short-circuiting reader ----------------
+# The defect that produced this rule: `printf '%s' "$logs" | grep -aqF …` under
+# `set -o pipefail`. `grep -q` exits at its first match, the producer dies with
+# SIGPIPE (141), pipefail promotes 141 to the pipeline's status, and the `if`
+# reads a marker that IS PRESENT as ABSENT. It is volume-dependent, so it does
+# not fire below the 64 KB pipe buffer and no small fixture can see it -- it
+# waits for a real log. On a 3.65 MB node log, `grep -acF` found the line while
+# the piped `grep -q` exited 141 and Gate A blamed the wrong subsystem.
+#
+# The reason this is a pin and not just a fix: the commit that first diagnosed
+# it fixed two helper functions and left four call sites inside the very
+# function those helpers serve, plus two more elsewhere in these scripts. A fix
+# applied where you happened to be reading is how this pattern survives.
+#
+# Scope is the release-gate scripts that set `pipefail`, where a wrong answer
+# blocks or waves through a release. Alternatives, all used above: grep the
+# FILE directly (`log_has`), match the variable with a bash glob
+# (`[[ "$x" == *needle* ]]`), or take a count and test that.
+#
+# `head` is the same class but is NOT banned here: `$(… | head -1)` is used for
+# its stdout, not its status, and banning it would be noise. Watch it manually
+# when the pipeline's status is consumed.
+#
+# `release.sh` is in scope because it is the DRIVER: it sets `pipefail`, and its
+# `verify_required_binaries` used `echo "$assets" | grep -xqF` -- the same shape,
+# on the path that decides whether a release's binaries exist. Measured at 46
+# false "missing" verdicts in 20000 iterations under 24-way CPU load (0 in a
+# quiet window), which is why it survived: it needs a contended runner. The
+# consequence was the worst-placed one in the file, `wait_for_binaries` failing
+# AFTER publish and BEFORE the gateway updates and announcements -- exactly what
+# the comment above `verify_release_published` warns about. The file was never
+# out of the regex's reach, only out of this list's.
+SIGPIPE_SCRIPTS=(
+    "$CANARY_SH"
+    "$SCRIPT_DIR/auto-update-canary_test.sh"
+    "$SCRIPT_DIR/auto-update-canary_lifecycle_test.sh"
+    "$SCRIPT_DIR/release_wait_for_binaries_test.sh"
+    "$SCRIPT_DIR/release_canary_wiring_test.sh"
+    "$SCRIPT_DIR/release.sh"
+)
+# A renamed or moved entry must fail LOUDLY. Without this, `grep`'s complaint
+# about a missing file goes to the `2>/dev/null` below and the entry simply
+# stops being audited -- the pin keeps reporting "ok" over a file it no longer
+# reads. Same reason `pin_marker` checks `[[ -f ]]` before scraping.
+for _sigpipe_script in "${SIGPIPE_SCRIPTS[@]}"; do
+    if [[ ! -f "$_sigpipe_script" ]]; then
+        echo "FAIL - SIGPIPE_SCRIPTS names a file that does not exist: $_sigpipe_script" >&2
+        echo "       A renamed entry would otherwise drop out of the audit silently." >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+done
+# Verified not to match its own defining line: after the `|` comes `[`, not
+# whitespace-then-grep. A pin that finds its own needle is the self-satisfying
+# shape this repo's rules file documents separately.
+SIGPIPE_RE='\|[[:space:]]*grep[[:space:]]+-[a-zA-Z]*q'
+sigpipe_hits="$(grep -nE "$SIGPIPE_RE" "${SIGPIPE_SCRIPTS[@]}" 2>/dev/null \
+    | grep -vE ':[[:space:]]*#')"
+if [[ -z "$sigpipe_hits" ]]; then
+    echo "ok   - no 'pipe into grep -q' in the pipefail release-gate scripts (SIGPIPE/pipefail hazard)"
+else
+    echo "FAIL - a pipeline ending in 'grep -q' has come back in a pipefail script." >&2
+    echo "       Under pipefail the producer's SIGPIPE (141) becomes the pipeline's status, so a" >&2
+    echo "       marker that IS present reads as ABSENT once the producer exceeds the 64 KB pipe" >&2
+    echo "       buffer. Small fixtures cannot see it; a real node log can. Grep the file directly," >&2
+    echo "       or match the variable with [[ \"\$x\" == *needle* ]]." >&2
+    printf '%s\n' "$sigpipe_hits" >&2
+    FAILURES=$((FAILURES + 1))
+fi
+
+# --- markers must still exist in the Rust source ----------------------------
+# Without this the fixtures above are a self-consistent copy of strings that
+# may no longer be emitted: the canary would go quietly blind while its own
+# test stayed green. Pin against the source of truth instead.
+SRC="$SCRIPT_DIR/../crates/core/src/bin/freenet.rs"
+AU_SRC="$SCRIPT_DIR/../crates/core/src/bin/commands/auto_update.rs"
+pin_marker() {
+    # pin_marker <description> <file> <needle>
+    local desc="$1" file="$2" needle="$3"
+    if [[ ! -f "$file" ]]; then
+        echo "FAIL - $desc (source file not found: $file)" >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    # Rust wraps a long string literal two ways: a plain wrap, and a
+    # `\`-continuation, which also swallows the next line's indentation.
+    # Squeezing newlines into spaces handled only the first -- a continuation
+    # left a stray `\` mid-phrase, so the needle silently failed to match.
+    # `not triggering auto-update` is emitted at two sites in freenet.rs and
+    # only one has the phrase unbroken, so this pin was passing on the
+    # coincidence of which site rustfmt happened to leave intact; reflowing
+    # that one site would have reported the marker gone while it was still
+    # emitted. Drop the continuation backslash first, then strip whitespace
+    # from both sides (as the INFO-level pin below already does), so the pin
+    # tracks the marker rather than the formatting.
+    #
+    # A bash glob match on a command substitution rather than `... | grep -qF`,
+    # matching the shape the sibling pins below already use. The pipe version
+    # consumed the PIPELINE's status, which under `pipefail` is 141 whenever
+    # `grep -q` short-circuits and the producer still has more than a pipe
+    # buffer to write -- so a marker that IS present reads as absent. Measured
+    # on auto_update.rs (165 KB), matching a string on line 1:
+    #     sed ... | grep -qF 'Auto-update'              -> rc=141
+    #     sed ... | tr -d '[:space:]' | grep -qF ...    -> rc=0
+    # It passed only because `tr` deletes every newline, leaving one enormous
+    # line that grep must read to EOF before it can report a match. That is an
+    # accident of the whitespace stripping, not a property of the pin: anyone
+    # "simplifying" the `tr` away would silently arm the hazard on every source
+    # pin in this file at once. Take the status out of the pipeline instead.
+    if [[ "$(sed 's/\\$//' "$file" | tr -d '[:space:]')" == *"${needle//[[:space:]]/}"* ]]; then
+        echo "ok   - $desc"
+    else
+        echo "FAIL - $desc: '$needle' no longer appears in $(basename "$file")" >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
+pin_marker "source pin: startup-check marker"   "$SRC"    "$MARKER_CHECK_RAN"
+# The completion marker is load-bearing in a way the others are not: if it stops
+# being emitted, every healthy run becomes INDETERMINATE and Gate A blocks every
+# release. It must also stay at INFO -- a `debug!` is compiled out of release
+# builds entirely (`release_max_level_info`), which is exactly how this outcome
+# came to be invisible in the first place (#5236).
+pin_marker "source pin: check-complete marker" "$SRC"    "$MARKER_CHECK_COMPLETE"
+# Whitespace stripped from BOTH sides, so this pins the macro rather than the
+# formatting: a rustfmt reflow of the same call must not decide whether the
+# canary is protected.
+if [[ "$(tr -d '[:space:]' < "$SRC")" == *"tracing::info!(current=build_info::VERSION,\"${MARKER_CHECK_COMPLETE// /}"* ]]; then
+    echo "ok   - source pin: check-complete marker is emitted at INFO"
+else
+    echo "FAIL - source pin: the '$MARKER_CHECK_COMPLETE' line is no longer an INFO-level tracing::info! in freenet.rs -- release builds compile out anything below INFO, so the canary would go blind (#5236)" >&2
+    FAILURES=$((FAILURES + 1))
+fi
+# The trigger phrase gets the same NEGATIVE SUBTRACTION the runtime detector
+# does, instead of a plain pin_marker. `MARKER_TRIGGERED` whitespace-stripped is
+# `triggeringauto-update`, which is a SUBSTRING of the #4073 refusal line
+# `not triggering auto-update`. So the refusal alone satisfied a plain
+# containment check: the pin was tracking a line whose job is to say the
+# OPPOSITE of the thing it claimed to pin. Demonstrated by rewording all four
+# plain trigger sites in freenet.rs -- that assertion stayed green, and only the
+# count pin below went red.
+#
+# `node_decided_to_update` has always subtracted the refusals; this brings the
+# source pin into line with the detector it is supposed to protect. Counting
+# OCCURRENCES rather than testing containment is what makes the subtraction
+# possible at all.
+TRIG_NEEDLE="${MARKER_TRIGGERED// /}"
+SRC_SQUEEZED="$(sed 's/\\$//' "$SRC" | tr -d '[:space:]')"
+# `grep -o | wc -l`: occurrences, not lines -- the squeezed source is ONE line,
+# so `grep -c` would answer 1 no matter how many sites there are. Neither stage
+# short-circuits, so this is not the `| grep -q` SIGPIPE shape banned below.
+trig_all="$(printf '%s' "$SRC_SQUEEZED" | grep -oF -- "$TRIG_NEEDLE" | wc -l)"
+trig_neg="$(printf '%s' "$SRC_SQUEEZED" | grep -oF -- "not$TRIG_NEEDLE" | wc -l)"
+trig_pos=$(( trig_all - trig_neg ))
+if [[ "$trig_pos" -gt 0 ]]; then
+    echo "ok   - source pin: trigger phrase appears at $trig_pos site(s) that are NOT the #4073 refusal"
+else
+    echo "FAIL - source pin: every '$MARKER_TRIGGERED' occurrence in freenet.rs is part of" >&2
+    echo "       '$MARKER_NOT_TRIGGERED' ($trig_all total, $trig_neg of them refusals)." >&2
+    echo "       No site actually announces a trigger with this wording, so the canary's" >&2
+    echo "       fixed-string half is dead. A containment check cannot see this: the" >&2
+    echo "       refusal CONTAINS the trigger phrase, which is how this pin passed while" >&2
+    echo "       all four plain trigger sites were reworded." >&2
+    FAILURES=$((FAILURES + 1))
+fi
+pin_marker "source pin: #4073 refusal phrase"   "$SRC"    "$MARKER_NOT_TRIGGERED"
+pin_marker "source pin: disabled marker"        "$SRC"    "$MARKER_DISABLED"
+
+# --- the MARKER_LATEST_SEEN_SINCE constant itself ---------------------------
+# Gate B's version gate is now pinned in both directions (the behavioural cases
+# on `prev_emits_latest_seen`, and the un-negated call site), but neither looks
+# at the CONSTANT they compare against. Raising it 0.2.124 -> 0.2.999 left the
+# whole suite green while permanently disarming Gate B's only positive
+# assertion -- the same silent direction as the `!` inversion, reached by
+# editing a different line.
+#
+# Anchored against the crate version, which the constant cannot influence. The
+# relationship is real rather than arbitrary: the constant names the first
+# release whose binary emits MARKER_LATEST_SEEN, that marker is emitted by THIS
+# source tree (pinned above), and this tree ships as the NEXT release. So the
+# constant must be just ahead of the version in Cargo.toml -- not behind it (the
+# marker is new here, so no already-published release emits it) and not far
+# ahead of it (that is a typo, or a change that has sat unmerged for many
+# releases and needs the value re-confirmed rather than assumed).
+#
+# The window is a guard against a wrong constant, not a proof of the right one.
+# If a release genuinely slips further than this, update the constant on
+# purpose -- which is the outcome this assertion exists to force.
+CORE_TOML="$SCRIPT_DIR/../crates/core/Cargo.toml"
+SINCE_SKEW_MAX=5
+if [[ ! -f "$CORE_TOML" ]]; then
+    echo "FAIL - cannot check MARKER_LATEST_SEEN_SINCE: $CORE_TOML not found" >&2
+    FAILURES=$((FAILURES + 1))
+else
+    crate_version="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$CORE_TOML" | head -1)"
+    IFS=. read -r c_maj c_min c_pat <<< "$crate_version"
+    IFS=. read -r s_maj s_min s_pat <<< "$MARKER_LATEST_SEEN_SINCE"
+    if [[ -z "$crate_version" ]]; then
+        echo "FAIL - could not read the crate version from $CORE_TOML" >&2
+        FAILURES=$((FAILURES + 1))
+    elif [[ "$s_maj" != "$c_maj" || "$s_min" != "$c_min" ]]; then
+        echo "FAIL - MARKER_LATEST_SEEN_SINCE ($MARKER_LATEST_SEEN_SINCE) is not on the same" >&2
+        echo "       major.minor as the crate ($crate_version). Gate B skips its positive" >&2
+        echo "       equality check for every release below the constant, so a constant set" >&2
+        echo "       too high leaves the gate permanently vacuous and silent about it." >&2
+        FAILURES=$((FAILURES + 1))
+    elif [[ "$s_pat" -lt "$c_pat" ]]; then
+        echo "FAIL - MARKER_LATEST_SEEN_SINCE ($MARKER_LATEST_SEEN_SINCE) is BELOW the crate" >&2
+        echo "       version ($crate_version). It names the first release that emits" >&2
+        echo "       '$MARKER_LATEST_SEEN', and that marker is new in this tree -- no" >&2
+        echo "       already-published release emits it, so Gate B would demand the line" >&2
+        echo "       from binaries never built to log it." >&2
+        FAILURES=$((FAILURES + 1))
+    elif [[ "$s_pat" -gt $(( c_pat + SINCE_SKEW_MAX )) ]]; then
+        echo "FAIL - MARKER_LATEST_SEEN_SINCE ($MARKER_LATEST_SEEN_SINCE) is more than" >&2
+        echo "       $SINCE_SKEW_MAX patch releases ahead of the crate version ($crate_version)." >&2
+        echo "       Gate B skips its only positive assertion for every release below the" >&2
+        echo "       constant, so an over-high value disarms the gate permanently and" >&2
+        echo "       silently. If the release really has slipped this far, re-confirm the" >&2
+        echo "       value and widen SINCE_SKEW_MAX deliberately." >&2
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "ok   - MARKER_LATEST_SEEN_SINCE ($MARKER_LATEST_SEEN_SINCE) is the next release after the crate version ($crate_version)"
+    fi
+fi
+# The parse-failure marker gets a STRONGER pin than pin_marker can give.
+# `failed to parse latest version` appears twice in auto_update.rs: the
+# production warn!, and a comment inside its own `#[cfg(test)] mod tests`
+# block. A whole-file grep is satisfied by the COMMENT, so rewording the
+# real warn! left every assertion green -- and a node carrying the #5221 bug
+# then logs check-ran + reworded-warn + check-complete, which the canary
+# reports as "OK: parsed GitHub's response". The gate this PR exists to
+# install would have been removable by an ordinary log reword, with CI green
+# throughout. Bound the pin to the emitting call instead, so what is pinned
+# is the code that runs. Both arms are pinned: they fail the same way and
+# neither may drift silently.
+pin_warn_literal() {
+    # pin_warn_literal <description> <file> <literal-prefix>
+    local desc="$1" file="$2" literal="$3"
+    if [[ ! -f "$file" ]]; then
+        echo "FAIL - $desc (source file not found: $file)" >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    # Whitespace stripped from both sides, as the INFO-level pin above does,
+    # so a rustfmt reflow cannot decide whether the canary is protected.
+    if [[ "$(tr -d '[:space:]' < "$file")" == *"tracing::warn!(\"${literal//[[:space:]]/}"* ]]; then
+        echo "ok   - $desc"
+    else
+        echo "FAIL - $desc: no 'tracing::warn!' in $(basename "$file") still emits" >&2
+        echo "       '$literal' -- the canary greps for that text, so rewording it here" >&2
+        echo "       makes a broken updater indistinguishable from a healthy one (#5236)." >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+pin_warn_literal "source pin: parse-failure marker (latest-version arm)" \
+    "$AU_SRC" "$MARKER_PARSE_FAIL latest version"
+pin_warn_literal "source pin: parse-failure marker (current-version arm)" \
+    "$AU_SRC" "$MARKER_PARSE_FAIL current version"
+pin_marker "source pin: fetch-failure marker"   "$AU_SRC" "$MARKER_FETCH_FAIL"
+
+# The observed-latest marker, pinned to its emitting `tracing::info!` for the
+# same reason the parse-failure arms are pinned to their `warn!`: a whole-file
+# grep tracks prose, and this one carries the gate's only POSITIVE assertion.
+# It must also stay at INFO -- `release_max_level_info` compiles out anything
+# below, so a `debug!` here would delete the equality check from every shipped
+# binary while leaving all 30 assertions green.
+if [[ "$(tr -d '[:space:]' < "$AU_SRC")" == *"tracing::info!(latest=%latest,\"${MARKER_LATEST_SEEN//[[:space:]]/}"* ]]; then
+    echo "ok   - source pin: observed-latest marker is emitted at INFO with a latest= field"
+else
+    echo "FAIL - source pin: no 'tracing::info!(latest = %latest, \"$MARKER_LATEST_SEEN\")' in auto_update.rs." >&2
+    echo "       Gate A's only positive assertion reads that line and that field. Without it the" >&2
+    echo "       gate falls back to 'the node did not complain', which a silently-wrong comparator" >&2
+    echo "       satisfies (#5236, review finding 32). A 'debug!' here is equally fatal: release" >&2
+    echo "       builds compile it out." >&2
+    FAILURES=$((FAILURES + 1))
+fi
+
+# --- the trigger-site ENUMERATION -------------------------------------------
+# `MARKER_TRIGGERED_RE` has to match every site that requests an update. It
+# missed the urgent one at :609 for as long as that site has existed, because
+# the marker was a fixed string and the site says "triggering IMMEDIATE
+# auto-update".
+#
+# The expected count must NOT come from the regex being audited. The first
+# version of this pin computed it as `grep -cE "$MARKER_TRIGGERED_RE"`, so a
+# site the regex failed to match was invisible to the count as well -- the pin
+# could not detect the one thing it exists to detect. Demonstrated: adding a
+# sixth site worded "triggering a fresh auto-update" left this suite fully
+# green, including this assertion. (Rewording an EXISTING site was caught, so
+# the pin was not useless, just blind in the direction that matters most.)
+#
+# Derive the expectation from the CODE DECISION instead. Every real trigger
+# ends in `update_tx.send(...)`, which is what makes the node exit 42; the log
+# line is commentary on that send. Two anchors, neither of them the regex:
+#
+#   total sends            -- every path that requests an update, whatever it
+#                             logs. Catches a site added with a send spelled
+#                             some other way.
+#   versioned sends        -- `update_tx.send(new_version)`, the sites that
+#                             detected a specific newer release. These are
+#                             exactly the sites that must carry a trigger log
+#                             line, so this is the number the regex must find.
+#
+# The remaining sends are the two forced-exit paths that send a SENTINEL rather
+# than a detected version (`"unknown (hard timeout)"`, `"unknown (gateway
+# mismatch)"`). They deliberately carry no trigger phrase -- they are "leave
+# for auto-update", not "this release detected". `node_decided_to_update` does
+# not see them, which is correct for the gates: neither is reachable in a
+# canary run (both need hours of isolation with a version mismatch).
+EXPECTED_SEND_SITES=7
+EXPECTED_TRIGGER_SITES=5
+# shellcheck disable=SC2016  # literal source text, must not expand
+total_sends="$(grep -cF 'update_tx.send(' "$SRC" 2>/dev/null || echo 0)"
+# shellcheck disable=SC2016
+versioned_sends="$(grep -cF 'update_tx.send(new_version)' "$SRC" 2>/dev/null || echo 0)"
+actual_sites="$(grep -cE "$MARKER_TRIGGERED_RE" "$SRC" 2>/dev/null || echo 0)"
+actual_refusals="$(grep -cF "$MARKER_NOT_TRIGGERED" "$SRC" 2>/dev/null || echo 0)"
+actual_triggers=$((actual_sites - actual_refusals))
+
+if [[ "$total_sends" -eq "$EXPECTED_SEND_SITES" && "$versioned_sends" -eq "$EXPECTED_TRIGGER_SITES" ]]; then
+    echo "ok   - source pin: freenet.rs has $EXPECTED_SEND_SITES update_tx.send sites, $EXPECTED_TRIGGER_SITES of them version-detecting"
+else
+    echo "FAIL - source pin: freenet.rs has $total_sends 'update_tx.send(' sites ($versioned_sends versioned)," >&2
+    echo "       expected $EXPECTED_SEND_SITES ($EXPECTED_TRIGGER_SITES versioned). An auto-update trigger path was added or removed." >&2
+    echo "       Update the enumeration comment in auto-update-canary.sh, MARKER_TRIGGERED_RE if the new" >&2
+    echo "       site's wording needs it, and these two counts -- together." >&2
+    grep -nF 'update_tx.send(' "$SRC" >&2
+    FAILURES=$((FAILURES + 1))
+fi
+
+# ...and the regex must match every one of the version-detecting sites. This is
+# the assertion the old count could not make, because both sides of it were the
+# same grep.
+if [[ "$actual_triggers" -eq "$versioned_sends" ]]; then
+    echo "ok   - source pin: MARKER_TRIGGERED_RE matches all $versioned_sends version-detecting trigger sites"
+else
+    echo "FAIL - source pin: MARKER_TRIGGERED_RE matches $actual_triggers trigger log lines, but freenet.rs has" >&2
+    echo "       $versioned_sends version-detecting trigger sites ('update_tx.send(new_version)')." >&2
+    echo "       ($actual_sites regex matches minus $actual_refusals refusals.) If the regex matches FEWER, a" >&2
+    echo "       trigger site is worded so the canary cannot see it -- a node that took that path reads as one" >&2
+    echo "       that never decided to update, which is how the urgent site at :609 went unseen. If it matches" >&2
+    echo "       MORE, the regex is picking up prose. Either way, reconcile MARKER_TRIGGERED_RE with the" >&2
+    echo "       enumeration comment in auto-update-canary.sh." >&2
+    grep -nE "$MARKER_TRIGGERED_RE" "$SRC" >&2
+    FAILURES=$((FAILURES + 1))
+fi
+
+echo
+if [[ "$FAILURES" -eq 0 ]]; then
+    echo "All auto-update-canary assertions passed."
+else
+    echo "$FAILURES assertion(s) FAILED." >&2
+    exit 1
+fi

@@ -30,8 +30,9 @@ VERSION=""
 MIN_COMPATIBLE=""
 DRY_RUN=false
 SKIP_TESTS=false
-DEPLOY_LOCAL=false
-DEPLOY_REMOTE=false
+# No DEPLOY_LOCAL / DEPLOY_REMOTE: `--deploy-local` and `--deploy-remote` are
+# deprecated and their handler below only prints a note, so the two variables
+# were written once and never read again.
 
 # Release steps for state tracking (in execution order)
 RELEASE_STEPS=(
@@ -152,13 +153,19 @@ version_compare() {
     local v1="$1"
     local v2="$2"
 
-    local v1_major=$(echo "$v1" | cut -d. -f1)
-    local v1_minor=$(echo "$v1" | cut -d. -f2)
-    local v1_patch=$(echo "$v1" | cut -d. -f3)
+    local v1_major
+    v1_major=$(echo "$v1" | cut -d. -f1) || true
+    local v1_minor
+    v1_minor=$(echo "$v1" | cut -d. -f2) || true
+    local v1_patch
+    v1_patch=$(echo "$v1" | cut -d. -f3) || true
 
-    local v2_major=$(echo "$v2" | cut -d. -f1)
-    local v2_minor=$(echo "$v2" | cut -d. -f2)
-    local v2_patch=$(echo "$v2" | cut -d. -f3)
+    local v2_major
+    v2_major=$(echo "$v2" | cut -d. -f1) || true
+    local v2_minor
+    v2_minor=$(echo "$v2" | cut -d. -f2) || true
+    local v2_patch
+    v2_patch=$(echo "$v2" | cut -d. -f3) || true
 
     if [[ $v1_major -gt $v2_major ]]; then echo "1"; return; fi
     if [[ $v1_major -lt $v2_major ]]; then echo "-1"; return; fi
@@ -177,7 +184,8 @@ download_release_binary() {
     local target_dir="${2:-/tmp}"
 
     # Detect architecture
-    local arch=$(uname -m)
+    local arch
+    arch=$(uname -m) || true
     local asset_name=""
 
     case "$arch" in
@@ -227,7 +235,8 @@ download_release_binary() {
         echo "    Binary: $binary_path" >&2
 
         # Verify the binary
-        local dl_version=$("$binary_path" --version 2>/dev/null | head -1)
+        local dl_version
+        dl_version=$("$binary_path" --version 2>/dev/null | head -1) || true
         echo "    Version: $dl_version" >&2
 
         # Output only the path to stdout for capture
@@ -345,15 +354,18 @@ detect_pr_state() {
     local branch_name="release/v$VERSION"
 
     # Check for existing PR
-    local pr_info=$(gh pr list --head "$branch_name" --state all --limit 1 \
+    local pr_info
+    pr_info=$(gh pr list --head "$branch_name" --state all --limit 1 \
         --json number,state 2>/dev/null | jq -r '.[0] | "\(.number)|\(.state)"' 2>/dev/null || echo "")
 
     if [[ -z "$pr_info" || "$pr_info" == "null|null" ]]; then
         return  # No PR exists
     fi
 
-    local pr_number=$(echo "$pr_info" | cut -d'|' -f1)
-    local pr_state=$(echo "$pr_info" | cut -d'|' -f2)
+    local pr_number
+    pr_number=$(echo "$pr_info" | cut -d'|' -f1) || true
+    local pr_state
+    pr_state=$(echo "$pr_info" | cut -d'|' -f2) || true
 
     if [[ -n "$pr_number" && "$pr_number" != "null" ]]; then
         COMPLETED_STEPS["PR_CREATED"]=1
@@ -365,23 +377,34 @@ detect_pr_state() {
 }
 
 # Detect if tag exists
+#
+# No `... | grep -q` anywhere below: this script sets `pipefail`, and a
+# short-circuiting reader makes the producer die with SIGPIPE (141), which
+# pipefail then promotes to the pipeline's status -- so a tag that IS present
+# reads as ABSENT. See the SIGPIPE section of .claude/rules/bug-prevention-patterns.md.
+# Ask git for the one ref we care about and test whether the answer is empty.
 detect_tag_state() {
     # Check local tags
-    if git tag -l | grep -q "^v$VERSION$"; then
+    if [[ -n "$(git tag -l "v$VERSION")" ]]; then
         COMPLETED_STEPS["TAG_CREATED"]=1
         return
     fi
 
     # Check remote tags
-    if git ls-remote --tags origin 2>/dev/null | grep -q "refs/tags/v$VERSION$"; then
+    if [[ -n "$(git ls-remote --tags origin "refs/tags/v$VERSION" 2>/dev/null)" ]]; then
         COMPLETED_STEPS["TAG_CREATED"]=1
     fi
 }
 
 # Detect if crates are published
 detect_crates_state() {
-    # Check if freenet is published at this version
-    if cargo search freenet --limit 1 2>/dev/null | grep -q "freenet = \"$VERSION\""; then
+    # Check if freenet is published at this version.
+    # `|| true` because the old form ran inside an `if` condition, where errexit
+    # is disabled; a bare assignment is not, so a failing `cargo search` would
+    # otherwise abort the release.
+    local search_out
+    search_out="$(cargo search freenet --limit 1 2>/dev/null || true)"
+    if [[ "$search_out" == *"freenet = \"$VERSION\""* ]]; then
         COMPLETED_STEPS["CRATES_PUBLISHED"]=1
     fi
 }
@@ -717,11 +740,13 @@ create_release_pr() {
 
     # Check if a release PR for this version already exists or was merged
     echo -n "  Checking for existing release PR... "
-    local existing_pr=$(gh pr list --head "$branch_name" --state all --limit 1 --json number,state,title --jq '.[] | "\(.number)|\(.state)|\(.title)"' 2>/dev/null || echo "")
+    local existing_pr
+    existing_pr=$(gh pr list --head "$branch_name" --state all --limit 1 --json number,state,title --jq '.[] | "\(.number)|\(.state)|\(.title)"' 2>/dev/null || echo "")
 
     if [[ -n "$existing_pr" ]]; then
         pr_number=$(echo "$existing_pr" | cut -d'|' -f1)
-        local pr_state=$(echo "$existing_pr" | cut -d'|' -f2)
+        local pr_state
+        pr_state=$(echo "$existing_pr" | cut -d'|' -f2) || true
         echo "found #$pr_number ($pr_state)"
 
         if [[ "$pr_state" == "MERGED" ]]; then
@@ -886,7 +911,9 @@ Generated by: \`scripts/release.sh\`" \
                         failed_jobs=$(gh run view "$run_id" --json jobs --jq '.jobs[] | select(.conclusion == "failure") | .name' 2>/dev/null || echo "")
                         if [[ -n "$failed_jobs" ]]; then
                             echo "    Failed jobs:"
-                            echo "$failed_jobs" | sed 's/^/      - /'
+                            while IFS= read -r _job; do
+                                echo "      - $_job"
+                            done <<< "$failed_jobs"
                             echo
                             echo "    To view logs: gh run view $run_id --log-failed"
                         fi
@@ -920,7 +947,8 @@ generate_release_notes() {
     local version="$1"
 
     # Find the previous release to determine what PRs to include
-    local prev_version=$(gh release list --limit 50 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[].tagName' 2>/dev/null | grep -v "^v${version}$" | head -1 | sed 's/^v//')
+    local prev_version
+    prev_version=$(gh release list --limit 50 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[].tagName' 2>/dev/null | grep -v "^v${version}$" | head -1 | sed 's/^v//') || true
 
     if [[ -z "$prev_version" ]]; then
         # Fallback to basic release notes if we can't find previous release
@@ -936,10 +964,12 @@ See commit history for detailed changes.
         return
     fi
 
-    local prev_date=$(gh release view "v${prev_version}" --json createdAt --jq '.createdAt' 2>/dev/null)
+    local prev_date
+    prev_date=$(gh release view "v${prev_version}" --json createdAt --jq '.createdAt' 2>/dev/null) || true
 
     # Fetch merged PRs since the previous release
-    local prs=$(gh pr list --search "is:pr is:merged merged:>${prev_date}" --limit 100 --json number,title --jq '.[] | "#\(.number)|\(.title)"' 2>/dev/null || echo "")
+    local prs
+    prs=$(gh pr list --search "is:pr is:merged merged:>${prev_date}" --limit 100 --json number,title --jq '.[] | "#\(.number)|\(.title)"' 2>/dev/null || echo "")
 
     if [[ -z "$prs" ]]; then
         echo "Release $version
@@ -958,8 +988,10 @@ See commit history for detailed changes.
     local maintenance=""
 
     while IFS= read -r pr; do
-        local number=$(echo "$pr" | cut -d'|' -f1)
-        local title=$(echo "$pr" | cut -d'|' -f2-)
+        local number
+        number=$(echo "$pr" | cut -d'|' -f1) || true
+        local title
+        title=$(echo "$pr" | cut -d'|' -f2-) || true
 
         # Skip the release PR itself
         if [[ "$title" =~ ^🚀\ Release || "$title" =~ ^Release\ v ]]; then
@@ -1023,7 +1055,9 @@ publish_crates() {
 
     # Check if freenet is already published
     echo -n "  Checking if freenet $VERSION is already published... "
-    if cargo search freenet --limit 1 2>/dev/null | grep -q "freenet = \"$VERSION\""; then
+    local freenet_search
+    freenet_search="$(cargo search freenet --limit 1 2>/dev/null || true)"
+    if [[ "$freenet_search" == *"freenet = \"$VERSION\""* ]]; then
         echo "yes"
         echo "  ✓ freenet $VERSION already published to crates.io"
         freenet_published=true
@@ -1040,7 +1074,9 @@ publish_crates() {
 
     # Check if fdev is already published
     echo -n "  Checking if fdev $FDEV_VERSION is already published... "
-    if cargo search fdev --limit 1 2>/dev/null | grep -q "fdev = \"$FDEV_VERSION\""; then
+    local fdev_search
+    fdev_search="$(cargo search fdev --limit 1 2>/dev/null || true)"
+    if [[ "$fdev_search" == *"fdev = \"$FDEV_VERSION\""* ]]; then
         echo "yes"
         echo "  ✓ fdev $FDEV_VERSION already published to crates.io"
         fdev_published=true
@@ -1090,7 +1126,7 @@ create_github_release() {
     fi
 
     # Check if tag already exists
-    if git tag | grep -q "^v$VERSION$"; then
+    if [[ -n "$(git tag -l "v$VERSION")" ]]; then
         echo "  ℹ️  Tag v$VERSION already exists locally"
         mark_completed "TAG_CREATED"
     else
@@ -1098,7 +1134,7 @@ create_github_release() {
     fi
 
     # Check if tag exists on remote
-    if git ls-remote --tags origin | grep -q "refs/tags/v$VERSION$"; then
+    if [[ -n "$(git ls-remote --tags origin "refs/tags/v$VERSION" 2>/dev/null)" ]]; then
         echo "  ℹ️  Tag v$VERSION already exists on remote"
         mark_completed "TAG_CREATED"
     else
@@ -1107,7 +1143,8 @@ create_github_release() {
     fi
 
     echo -n "  Generating release notes... "
-    local release_notes=$(generate_release_notes "$VERSION")
+    local release_notes
+    release_notes=$(generate_release_notes "$VERSION") || true
     echo "✓"
 
     echo -n "  Creating GitHub release... "
@@ -1200,17 +1237,102 @@ trigger_gateway_updates() {
     fi
 }
 
+# The display name of the cross-compile job that uploads the assets, runs the
+# BLOCKING pre-flight canary, and un-drafts the release. Must match `name:` on
+# the `attach-to-release` job in .github/workflows/cross-compile.yml.
+ATTACH_JOB_NAME='Attach binaries to GitHub release'
+
+# That job's own "status:conclusion", empty when it cannot be determined.
+#
+# Deliberately NOT the run's aggregate. The same run also contains the
+# post-publish self-update canary (Gate B, #5222), which is by design
+# NON-blocking: it starts only after `attach-to-release` has already published
+# the release, and its job exists to report, not to gate. Reading the run's
+# status therefore makes this script (a) keep waiting after the release is
+# published and (b) treat a Gate B failure as a failed release -- and since
+# `wait_for_binaries` is called bare under `set -e`, that aborts the driver
+# before it updates the gateways or announces to Matrix and River. A release
+# that published perfectly well would silently never be announced.
+#
+# Empty output means "we do not know" -- the job has not started, was renamed,
+# or `gh` failed -- and every caller must treat it as such rather than as a
+# pass. A rename shows up as a wait that times out loudly; it cannot fail open.
+#
+# CALLERS MUST WRITE `$(attach_job_state "$id" || echo "")`. This function ends
+# in a bare `gh`, so a `gh` failure IS its exit status, and `var=$(cmd)` is a
+# simple command whose status is `cmd`'s -- under `set -e` that aborts the whole
+# driver rather than yielding the "we do not know" this comment promises. The
+# same guard is needed on every bare `$(gh ...)` in this file, including
+# `$(gh ... | head -1)`, which `set -o pipefail` makes fail too. Pinned by
+# scripts/release_wait_for_binaries_test.sh.
+attach_job_state() {
+    local run_id="$1"
+    gh run view "$run_id" --repo freenet/freenet-core --json jobs \
+        --jq "[.jobs[] | select(.name == \"$ATTACH_JOB_NAME\")] | .[0] | select(. != null) | \"\(.status):\(.conclusion)\"" 2>/dev/null
+}
+
 publish_draft_release() {
     # Publish the draft release (idempotent -- no-op if already published).
-    # The cross-compile workflow also publishes via gh release edit --draft=false
-    # as a belt-and-suspenders measure (see cross-compile.yml).
+    #
+    # The cross-compile workflow publishes via `gh release edit --draft=false`
+    # as its final step, AFTER the blocking auto-update pre-flight canary
+    # (#5222). This belt-and-suspenders copy must therefore never fire while
+    # that workflow is still deciding: between asset upload and the canary's
+    # verdict there is now a multi-minute window in which every asset is
+    # present but the release has deliberately NOT been published. The caller
+    # below reaches this function on exactly that condition ("all required
+    # binaries already available"), so without this guard the local driver
+    # would race in and publish a release whose updater the gate was in the
+    # middle of rejecting -- silently turning a blocking gate into no gate.
     local is_draft
-    is_draft=$(gh release view "v$VERSION" --repo freenet/freenet-core --json isDraft --jq '.isDraft' 2>/dev/null || echo "false")
-    if [[ "$is_draft" == "true" ]]; then
-        echo -n "  Publishing draft release... "
-        gh release edit "v$VERSION" --repo freenet/freenet-core --draft=false > /dev/null
-        echo "✓"
+    is_draft=$(gh release view "v$VERSION" --repo freenet/freenet-core --json isDraft --jq '.isDraft' 2>/dev/null || echo "unknown")
+    if [[ "$is_draft" == "false" ]]; then
+        return 0   # already published by the workflow -- nothing left to gate
     fi
+    if [[ "$is_draft" != "true" ]]; then
+        # `gh` failed, so we do not know whether this is still a draft. Every
+        # other unknown in this function refuses, and this one must too: it
+        # coerced to "false" and returned 0, which never published an ungated
+        # release, but DID report success to the caller -- so the driver went on
+        # to update the gateways and announce a release that may still have been
+        # an unpublished draft.
+        echo "  ⏸  Cannot tell whether v$VERSION is still a draft ('gh' failed)." >&2
+        echo "     Refusing to report success: on an unknown the driver would" >&2
+        echo "     otherwise update the gateways and announce to Matrix and River" >&2
+        echo "     a release that may still be an unpublished draft." >&2
+        return 1
+    fi
+
+    # It IS still a draft, so the gate's verdict decides. Anything other than a
+    # successfully-concluded ATTACH job means "we do not know that the canary
+    # passed", and publishing on an unknown gate state is the fail-open this
+    # guard exists to prevent. A missing run, a missing job, or a `gh` failure
+    # all yield "" -- all of them are "we do not know", and all must refuse.
+    local run_id job_state
+    run_id=$(gh run list --repo freenet/freenet-core \
+        --workflow=cross-compile.yml --branch "v$VERSION" \
+        --json databaseId --jq '.[0].databaseId // empty' 2>/dev/null || echo "")
+    job_state=""
+    if [[ -n "$run_id" ]]; then
+        # `|| echo ""` per attach_job_state's contract: without it a `gh` blip
+        # aborts the driver here instead of printing the refusal below.
+        job_state=$(attach_job_state "$run_id" || echo "")
+    fi
+    if [[ "$job_state" != "completed:success" ]]; then
+        echo "  ⏸  NOT publishing v$VERSION: '$ATTACH_JOB_NAME' is '${job_state:-unknown}'." >&2
+        echo "     Publication is gated on the auto-update pre-flight canary (#5222)," >&2
+        echo "     which runs between asset upload and un-draft. Let the workflow" >&2
+        echo "     publish, or fix the gate. Do NOT un-draft by hand -- a release" >&2
+        echo "     whose updater is broken cannot deliver its own fix." >&2
+        # MUST be non-zero. Returning 0 here made the caller report success, so
+        # the driver went on to update the gateways and announce to Matrix and
+        # River a release that was still an unpublished draft.
+        return 1
+    fi
+
+    echo -n "  Publishing draft release... "
+    gh release edit "v$VERSION" --repo freenet/freenet-core --draft=false > /dev/null
+    echo "✓"
 }
 
 verify_required_binaries() {
@@ -1221,8 +1343,18 @@ verify_required_binaries() {
         return 1
     fi
     local missing=()
+    # Whole-line match against the asset list, done with a bash glob rather than
+    # `echo "$assets" | grep -xqF`. Under `pipefail` that form makes `echo` take
+    # SIGPIPE the moment `grep -q` short-circuits on a match, and 141 becomes the
+    # pipeline's status -- so a binary that IS present reads as MISSING. Measured
+    # here at 46 hits in 20000 iterations under 24-way CPU load (0 in a quiet
+    # window), i.e. it fires exactly on the contended runners this gate runs on.
+    # The consequence is the one the comment above warns about: wait_for_binaries
+    # returns 1 and the driver dies AFTER publishing but BEFORE the gateway
+    # updates and announcements.
+    local assets_nl=$'\n'"$assets"$'\n'
     for bin in "${required[@]}"; do
-        if ! echo "$assets" | grep -xqF "$bin"; then
+        if [[ "$assets_nl" != *$'\n'"$bin"$'\n'* ]]; then
             missing+=("$bin")
         fi
     done
@@ -1274,7 +1406,10 @@ wait_for_binaries() {
     local find_elapsed=0
     local find_max=120  # 2 minutes to find the run
     while [[ $find_elapsed -lt $find_max ]]; do
-        run_id=$(gh run list --workflow=cross-compile.yml --repo freenet/freenet-core --json databaseId,headBranch --jq ".[] | select(.headBranch == \"v$VERSION\") | .databaseId" 2>/dev/null | head -1)
+        # `|| echo ""` so a transient `gh` failure retries on the next tick
+        # instead of aborting the driver. `set -o pipefail` propagates `gh`'s
+        # status out of the pipeline, so `head -1` does NOT absorb it.
+        run_id=$(gh run list --workflow=cross-compile.yml --repo freenet/freenet-core --json databaseId,headBranch --jq ".[] | select(.headBranch == \"v$VERSION\") | .databaseId" 2>/dev/null | head -1 || echo "")
         if [[ -n "$run_id" ]]; then
             break
         fi
@@ -1298,13 +1433,44 @@ wait_for_binaries() {
     local interval=30
 
     while [[ $elapsed -lt $max_wait ]]; do
-        local status conclusion
-        status=$(gh run view "$run_id" --repo freenet/freenet-core --json status --jq '.status' 2>/dev/null)
+        # Watch the JOB that attaches and publishes, not the whole RUN. The run
+        # also carries the post-publish self-update canary (Gate B, #5222),
+        # which starts only after this job has published the release and is
+        # explicitly non-blocking -- see attach_job_state for what waiting on
+        # the run instead costs. An empty state means the job has not started
+        # yet (it waits on all six build jobs), so keep waiting.
+        # `|| echo ""` per attach_job_state's contract. A single rate-limit or
+        # 5xx anywhere in this multi-minute wait would otherwise abort the
+        # driver mid-release: the release publishes, but the gateways are never
+        # updated and it is never announced. Empty just means "poll again".
+        local job_state status conclusion
+        job_state=$(attach_job_state "$run_id" || echo "")
+        status="${job_state%%:*}"
+        conclusion="${job_state#*:}"
+
+        # No job at all, and the RUN has finished: the job was cancelled before
+        # it was created, or renamed out from under ATTACH_JOB_NAME. Nothing is
+        # ever going to appear, so stop rather than burn the full timeout --
+        # watching the job instead of the run must not cost us this fast exit.
+        # Reported as UNKNOWN, never as a pass.
+        if [[ -z "$job_state" ]]; then
+            # Same guard, and it matters most here: this branch is the whole
+            # build window (job_state is empty until the six build jobs finish),
+            # so it is the busiest `gh` call in the release.
+            local run_status
+            run_status=$(gh run view "$run_id" --repo freenet/freenet-core --json status --jq '.status' 2>/dev/null || echo "")
+            if [[ "$run_status" == "completed" ]]; then
+                echo "  ✗ '$ATTACH_JOB_NAME' never reported a result, and the run has finished"
+                echo "     (cancelled before the job started, or the job was renamed --"
+                echo "     if renamed, update ATTACH_JOB_NAME in this script)."
+                echo "     Check: https://github.com/freenet/freenet-core/actions/runs/$run_id"
+                return 1
+            fi
+        fi
 
         if [[ "$status" == "completed" ]]; then
-            conclusion=$(gh run view "$run_id" --repo freenet/freenet-core --json conclusion --jq '.conclusion' 2>/dev/null)
             if [[ "$conclusion" == "success" ]]; then
-                echo "  ✓ Cross-compile workflow completed successfully"
+                echo "  ✓ Binaries attached and release published"
 
                 # Verify all required platform binaries are uploaded
                 sleep 5  # Brief delay for asset upload
@@ -1313,19 +1479,21 @@ wait_for_binaries() {
                     publish_draft_release
                     return 0
                 else
-                    echo "  ✗ Cross-compile succeeded but some required binaries are missing"
+                    echo "  ✗ Attach job succeeded but some required binaries are missing"
                     echo "     Check: https://github.com/freenet/freenet-core/actions/runs/$run_id"
                     return 1
                 fi
             else
-                echo "  ✗ Cross-compile workflow failed (conclusion: $conclusion)"
-                echo "     Binaries will NOT be available for auto-update."
+                echo "  ✗ '$ATTACH_JOB_NAME' failed (conclusion: $conclusion)"
+                echo "     Either a build is missing or the BLOCKING auto-update"
+                echo "     pre-flight canary (#5222) rejected the binary. Binaries"
+                echo "     will NOT be available for auto-update."
                 echo "     Check: https://github.com/freenet/freenet-core/actions/runs/$run_id"
                 return 1
             fi
         fi
 
-        printf "  Waiting... (%ds elapsed, status: %s)\r" "$elapsed" "$status"
+        printf "  Waiting... (%ds elapsed, status: %s)\r" "$elapsed" "${status:-pending}"
         sleep $interval
         elapsed=$((elapsed + interval))
     done
