@@ -396,6 +396,155 @@ else
     ok "a blocking gate dumps the node's own log before the workdir is deleted"
 fi
 
+# ---------------------------------------------------------------------------
+# 9. The canary must not let its own TMPDIR reach the node.
+#
+#    This is the #5290 fault, and it blocked v0.2.124 on a binary that was
+#    perfectly healthy. `client_api.rs` unconditionally `create_dir_all`s
+#    `std::env::temp_dir()/freenet/webs` when it builds the router and PANICS
+#    (exit 101) if it cannot -- and `cross-compile.yml` stages the binary it is
+#    about to gate at `/tmp/freenet`, which is exactly the path that mkdir
+#    needs to be a directory. ENOTDIR, dead node, and Gate A reports "the
+#    startup update check never ran" of a product that was fine.
+#
+#    The fake node here IS the regular file staged at `$TMPDIR/freenet`, which
+#    is what makes this a real test rather than a story about one: the ENOTDIR
+#    comes from the kernel refusing to mkdir under a file, not from a fixture
+#    that prints a panic message on cue.
+#
+#    A source scrape in auto-update-canary_test.sh also pins `export TMPDIR`,
+#    and that pin is worth keeping for the ordering it checks (before `exec`,
+#    before `freenet update`) -- but it asserts TEXT. It cannot tell a working
+#    `export TMPDIR="$work/tmp"` from `export TMPDIR=/tmp`. This case can.
+# ---------------------------------------------------------------------------
+CITMP="$TMPROOT/citmp"
+mkdir -p "$CITMP"
+FAKE_STAGED="$CITMP/freenet"
+cat > "$FAKE_STAGED" <<FAKESTAGED
+#!/usr/bin/env bash
+if [ "\${1:-}" = "--version" ]; then
+    echo "Freenet version: 0.2.122 (deadbeefcafe)"
+    exit 0
+fi
+logdir=""
+while [ \$# -gt 0 ]; do
+    case "\$1" in
+        --log-dir) logdir="\$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+mkdir -p "\$logdir"
+# Models client_api.rs: hardwired to temp_dir(), does NOT follow --data-dir,
+# and panics rather than degrading when the directory cannot be created.
+webdir="\${TMPDIR:-/tmp}/freenet/webs"
+if ! mkdir -p "\$webdir" 2>/dev/null; then
+    echo "thread 'main' panicked at crates/core/src/server/client_api.rs:256:13:" >&2
+    echo "Failed to create contract web directory at \$webdir: Not a directory (os error 20)" >&2
+    exit 101
+fi
+sleep 1
+echo "2026-08-08T02:00:00.000000Z  $CHECK_LINE" >> "\$logdir/freenet.2026-08-08-02.log"
+echo "2026-08-08T02:00:00.100000Z  $LATEST_SEEN_LINE" >> "\$logdir/freenet.2026-08-08-02.log"
+echo "2026-08-08T02:00:00.200000Z  $COMPLETE_LINE" >> "\$logdir/freenet.2026-08-08-02.log"
+exit 0
+FAKESTAGED
+chmod +x "$FAKE_STAGED"
+
+# Save and restore rather than running in a subshell: `cmd_preflight` sets
+# NODE_EXIT and the workdir trap in THIS shell, and a subshell would discard
+# both. `${TMPDIR+x}` distinguishes unset from empty, which matters under
+# `set -u`.
+STAGED_OUTER_SET=0
+STAGED_OUTER_WAS=""
+# shellcheck disable=SC2031  # the sourced canary sets TMPDIR inside its node
+# subshell; THIS one is the caller's, which is exactly what the case has to
+# manipulate to model a CI runner whose /tmp holds the staged binary.
+if [ -n "${TMPDIR+x}" ]; then STAGED_OUTER_SET=1; STAGED_OUTER_WAS="$TMPDIR"; fi
+# shellcheck disable=SC2031
+export TMPDIR="$CITMP"
+STAGED_OUT="$(cmd_preflight "$FAKE_STAGED" 2>&1)"
+STAGED_RC=$?
+if [ "$STAGED_OUTER_SET" -eq 1 ]; then export TMPDIR="$STAGED_OUTER_WAS"; else unset TMPDIR; fi
+
+if [ "$STAGED_RC" -eq 0 ]; then
+    ok "the gate passes a HEALTHY binary staged at \$TMPDIR/freenet (the canary isolates TMPDIR)"
+elif [[ "$STAGED_OUT" == *"client_api.rs"* || "$STAGED_OUT" == *"contract web directory"* ]]; then
+    bad "the canary let its own TMPDIR reach the node: the node died creating \$TMPDIR/freenet/webs against the binary under test, and a HEALTHY release was blocked (exit $STAGED_RC). This is #5290 -- CI stages the gated binary at /tmp/freenet."
+else
+    bad "the gate failed a healthy binary for some other reason (exit $STAGED_RC): $STAGED_OUT"
+fi
+
+# ---------------------------------------------------------------------------
+# 10. The ENVIRONMENT handed to the node, asserted behaviourally.
+#
+#     Case 9 covers TMPDIR because TMPDIR is the one that broke a release. The
+#     other three exports are in the same position it was: nothing observes
+#     them, so deleting `export HOME=` or `export FREENET_SUPERVISED=1` leaves
+#     every suite green while the canary quietly stops being isolated (HOME:
+#     the node's GitHub poll bucket lands in the caller's home) or stops
+#     testing the real fleet transition (FREENET_SUPERVISED: the node logs a
+#     "no supervisor" error instead of taking the exit-42 path Gate B asserts).
+#
+#     The fake dumps its own environment, so this asserts what the node
+#     actually receives rather than what the script appears to set.
+# ---------------------------------------------------------------------------
+ENVDUMP="$TMPROOT/node-env.txt"
+FAKE_ENVDUMP="$TMPROOT/fake-envdump"
+cat > "$FAKE_ENVDUMP" <<FAKEENV
+#!/usr/bin/env bash
+if [ "\${1:-}" = "--version" ]; then
+    echo "Freenet version: 0.2.122 (deadbeefcafe)"
+    exit 0
+fi
+logdir=""
+while [ \$# -gt 0 ]; do
+    case "\$1" in
+        --log-dir) logdir="\$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+mkdir -p "\$logdir"
+{
+  echo "HOME=\${HOME:-<unset>}"
+  echo "TMPDIR=\${TMPDIR:-<unset>}"
+  echo "FREENET_SUPERVISED=\${FREENET_SUPERVISED:-<unset>}"
+  echo "FREENET_DISABLE_LOG_RATE_LIMIT=\${FREENET_DISABLE_LOG_RATE_LIMIT:-<unset>}"
+} > "$ENVDUMP"
+sleep 1
+echo "2026-08-08T02:00:00.000000Z  $CHECK_LINE" >> "\$logdir/freenet.2026-08-08-02.log"
+exit 0
+FAKEENV
+chmod +x "$FAKE_ENVDUMP"
+
+ENVWORK="$TMPROOT/envwork"
+mkdir -p "$ENVWORK"
+run_node_until_check "$FAKE_ENVDUMP" "$ENVWORK" >/dev/null 2>&1
+
+if [ ! -f "$ENVDUMP" ]; then
+    bad "the env-dump fake node never ran, so the canary's exports are unverified"
+else
+    if grep -qaF "HOME=$ENVWORK/home" "$ENVDUMP"; then
+        ok "the node's HOME is inside the canary workdir"
+    else
+        bad "the node's HOME is not isolated to the workdir -- its GitHub poll bucket lands in the caller's home, so one gate's budget throttles the other's check"
+    fi
+    if grep -qaF "TMPDIR=$ENVWORK/tmp" "$ENVDUMP"; then
+        ok "the node's TMPDIR is inside the canary workdir"
+    else
+        bad "the node's TMPDIR is NOT isolated to the workdir: its \$TMPDIR/freenet/webs mkdir escapes into the caller's temp dir, and in CI collides with the binary under test (#5290)"
+    fi
+    if grep -qaF "FREENET_SUPERVISED=1" "$ENVDUMP"; then
+        ok "the node runs with FREENET_SUPERVISED=1 (the exit-42 path Gate B asserts)"
+    else
+        bad "FREENET_SUPERVISED is not set, so the node logs a 'no supervisor' error and stays put instead of taking the exit-42 path Gate B asserts"
+    fi
+    if grep -qaF "FREENET_DISABLE_LOG_RATE_LIMIT=1" "$ENVDUMP"; then
+        ok "the node runs with log rate limiting disabled (a dropped WARN cannot fake a green gate)"
+    else
+        bad "FREENET_DISABLE_LOG_RATE_LIMIT is not set: a dropped parse-failure WARN leaves every negative assertion satisfied, which is a false GREEN on a binary carrying the #5221 bug"
+    fi
+fi
+
 echo
 if [[ "$FAILURES" -eq 0 ]]; then
     echo "All auto-update-canary lifecycle assertions passed."

@@ -527,7 +527,18 @@ assert_detection_healthy() {
 NODE_EXIT=""
 run_node_until_check() {
   local binary="$1" work="$2"
-  mkdir -p "$work/home/.local/state/freenet" "$work/cfg" "$work/data" "$work/logs"
+  # `$work/tmp` is created HERE, with the rest of the tree, rather than inside
+  # the subshell next to the `export TMPDIR` that uses it. Gate A would not
+  # care -- the node's own `create_dir_all` builds its parents -- but Gate B
+  # does: the real updater stages through `tempfile::tempdir()` (`update.rs`),
+  # which requires TMPDIR to EXIST and will not create it. A `mkdir` inside the
+  # backgrounded subshell also fails invisibly (no `set -e`, and its output
+  # goes to `node.out`), so a broken workdir would surface as a mystery
+  # update-path failure rather than as itself.
+  if ! mkdir -p "$work/home/.local/state/freenet" "$work/cfg" "$work/data" \
+                "$work/logs" "$work/tmp"; then
+    fail "could not create the canary workdir under $work -- this is a harness/disk problem, not an auto-update fault."
+  fi
 
   # An isolated HOME matters for more than tidiness: the node keeps its GitHub
   # poll token-bucket under $HOME/.local/state/freenet, so a shared HOME would
@@ -593,10 +604,21 @@ run_node_until_check() {
     #      directory that is always empty and never read. PORTS are the shared
     #      resource that actually collides; see the header.
     #
-    # Relocating the staged binary would only address (1). Isolating TMPDIR
-    # addresses both, and is scoped to this subshell so only the canary's
-    # throwaway node is affected.
-    mkdir -p "$work/tmp"
+    # Relocating the staged binary in `cross-compile.yml` WOULD have unblocked
+    # v0.2.124 -- tested: pre-fix script, a scratch TMPDIR with no `freenet`
+    # entry in it, binary staged outside it, and the gate returns rc=0 "the node
+    # compared against '0.2.123'". An earlier version of this comment claimed
+    # relocation was "NOT sufficient"; that was wrong, and it was wrong for an
+    # instructive reason -- the run behind it was on a host where
+    # `/tmp/freenet` already existed as another user's directory, i.e. case (2),
+    # generalised into a claim about case (1).
+    #
+    # Isolation is still the better fix, for (2) rather than (1): relocation
+    # leaves the canary sharing the caller's temp dir, so on a machine already
+    # running a node under another user the gate can still panic on a
+    # `/tmp/freenet` it does not own -- an auto-update verdict decided by who
+    # owns a directory. Scoped to this subshell, so only the canary's throwaway
+    # node is affected.
     # shellcheck disable=SC2030  # subshell-local is the point, same as HOME
     # above: the caller's TMPDIR must not move on a machine already running a
     # node. Gate B's `freenet update` sets its own (see `cmd_selfupdate`),
@@ -979,8 +1001,8 @@ cmd_selfupdate() {
     # a release tarball into the ambient system temp dir. Safe for the swap --
     # `replace_binary` copies to a `.freenet.new.tmp` beside the DESTINATION
     # and renames there, so the atomic same-filesystem rename never involves
-    # TMPDIR.
-    mkdir -p "$work/tmp"
+    # TMPDIR. The directory itself is created with the rest of the workdir in
+    # `run_node_until_check`, which Gate B always runs before reaching here.
     # shellcheck disable=SC2031  # deliberate, as for HOME above: this subshell
     # sets its own copy; nothing outside it reads the change.
     export TMPDIR="$work/tmp"

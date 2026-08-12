@@ -575,17 +575,22 @@ fi
 # is about to gate at exactly `/tmp/freenet`, so with an unisolated TMPDIR that
 # is not a hypothetical: it blocked v0.2.124, a release whose binary was fine.
 #
-# The reason this is a pin and not just a fix: deleting `export TMPDIR` leaves
-# all four suites green. The fault reappears only at the next release, in CI,
-# as a blocked release with a diagnosis ("the startup update check never ran")
-# that points at the product rather than the harness. There is no behavioural
-# test that can see it -- reproducing it means staging a real binary at the
-# colliding path -- so a source scrape of the launch sites is the check.
+# This is the WEAKER of the two checks on this fix, and it should be read that
+# way. `auto-update-canary_lifecycle_test.sh` case 9 covers the Gate A half
+# BEHAVIOURALLY: its fake node IS the regular file staged at `$TMPDIR/freenet`,
+# so a missing isolation blocks a healthy binary on a real kernel ENOTDIR. That
+# is the one that matters. A source scrape asserts TEXT and cannot tell a
+# working `export TMPDIR="$work/tmp"` from `export TMPDIR=/tmp`.
 #
-# ORDER is asserted, not just presence: an export that lands after `exec` never
-# runs at all (exec replaces the shell), and one that lands after the `freenet
-# update` call is equally decorative. Cross-file (this scrapes CANARY_SH), so
-# it cannot be satisfied by its own assertion text.
+# Two things it still adds, which is why it stays:
+#   - the GATE B half. Isolating the `freenet update` subshell cannot be
+#     exercised without downloading and installing a real release, so for that
+#     one a scrape is what there is.
+#   - ORDER. An export that lands after `exec` never runs at all (exec replaces
+#     the shell), and one after the `freenet update` call is equally
+#     decorative.
+# Cross-file (it scrapes CANARY_SH), so it cannot be satisfied by its own
+# assertion text.
 tmpdir_first_export="$(grep -n '^[[:space:]]*export TMPDIR=' "$CANARY_SH" | head -1 | cut -d: -f1)"
 tmpdir_exports="$(grep -c '^[[:space:]]*export TMPDIR=' "$CANARY_SH")"
 node_exec_line="$(grep -n '^[[:space:]]*exec timeout' "$CANARY_SH" | head -1 | cut -d: -f1)"
