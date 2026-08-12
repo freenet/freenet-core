@@ -324,6 +324,92 @@ respond jobs    1 1                         # <-- transient gh failure at the ga
 check "gh failure at the publish gate -> refuses to publish AND says why" \
     no 1 "NOT publishing v0.0.0-test"
 
+# ===========================================================================
+# 7. `gh` fails while reading isDraft -> refuse, do not report success.
+#
+# This one never published an ungated release, so it looked harmless. What it
+# did was coerce the failure to "false" ("not a draft, nothing to gate") and
+# return 0, so the driver went on to update the gateways and announce a release
+# that may still have been an unpublished draft. Every other unknown in
+# publish_draft_release refuses; this is the one that did not.
+# ===========================================================================
+new_scenario
+respond assets  1 0 "${ALL_BINARIES[@]}"
+respond isdraft 1 1                         # <-- gh failure, draft state unknown
+check "gh failure reading isDraft -> refuses instead of announcing a maybe-draft" \
+    no 1 "Cannot tell whether v0.0.0-test is still a draft"
+
+# ===========================================================================
+# 8. isDraft=false -> the workflow already published; nothing left to gate.
+#
+# Distinguishing this from case 7 is the whole point of the change: a real
+# "false" must still short-circuit to success, or every release would refuse.
+# ===========================================================================
+new_scenario
+respond assets  1 0 "${ALL_BINARIES[@]}"
+respond isdraft 1 0 "false"
+check "isDraft=false -> already published, driver continues" yes 0 \
+    "All required platform binaries already available"
+
+# ===========================================================================
+# 9-12. One case per `job_state` value, pinning the DECISION each produces.
+#
+# release.sh:1206-1288 added ~100 lines of decision logic to the release
+# critical path, in a function whose own comment records a prior fail-open
+# ("Returning 0 here made the caller report success, so the driver went on to
+# update the gateways and announce..."). The four values are the whole state
+# space of that switch, and each maps to a different, load-bearing outcome.
+#
+# `in_progress:` is the one with no other coverage: it is neither empty (so the
+# run-finished fast-exit does not apply) nor completed (so the terminal switch
+# does not fire), and the only correct behaviour is to keep polling. If it ever
+# fell through to "not completed, therefore fine", the driver would announce
+# mid-build.
+# ===========================================================================
+new_scenario
+respond assets    1 0
+respond runlist   1 0 "9001"
+respond jobs      1 0 "in_progress:"        # queued/running, no conclusion yet
+respond jobs      2 0 "in_progress:"
+respond jobs      3 0 "completed:success"
+respond assets    2 0 "${ALL_BINARIES[@]}"
+respond isdraft   1 0 "false"
+check "job_state 'in_progress:' -> keeps polling, never treated as terminal" \
+    yes 0 "Binaries attached and release published"
+check_call_count "  and it polled through both in_progress ticks" jobs 3
+# `in_progress:` must NOT reach the run-status branch: that branch is gated on
+# an EMPTY job_state, and firing it here would mean the switch had lost track of
+# a job that is plainly still running.
+check_call_count "  and it never consulted run status for a running job" runstatus 0
+
+new_scenario
+respond assets    1 0
+respond runlist   1 0 "9001"
+respond jobs      1 0 "completed:cancelled"  # any non-success conclusion
+check "job_state 'completed:cancelled' -> fails the release loudly" \
+    no 1 "failed (conclusion: cancelled)"
+
+# `completed:success` but the assets are NOT all there: the job lied, or an
+# upload was lost. Publishing on this would ship a release that cannot be
+# installed on the missing platform.
+new_scenario
+respond assets    1 0
+respond runlist   1 0 "9001"
+respond jobs      1 0 "completed:success"
+respond assets    2 0 "${ALL_BINARIES[@]:0:9}"   # windows fdev zip missing
+check "job_state 'completed:success' but an asset is missing -> fails" \
+    no 1 "some required binaries are missing"
+
+# The publish gate itself: still a draft, and the attach job did NOT succeed.
+# Publishing here would turn the blocking pre-flight canary into no gate at all.
+new_scenario
+respond assets  1 0 "${ALL_BINARIES[@]}"
+respond isdraft 1 0 "true"
+respond runlist 1 0 "9001"
+respond jobs    1 0 "completed:failure"
+check "publish gate: still a draft and attach job failed -> refuses to publish" \
+    no 1 "NOT publishing v0.0.0-test"
+
 echo
 if [[ "$FAILURES" -eq 0 ]]; then
     echo "All release wait_for_binaries assertions passed."

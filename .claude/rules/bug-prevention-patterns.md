@@ -59,6 +59,64 @@ A future revert of any of these null-stdio calls fails CI with a
 specific, issue-numbered error message rather than shipping the
 regression silently.
 
+## Log markers that a CI gate greps for
+
+A gate that decides whether a release ships by grepping the node's log is only
+as real as the marker it greps for. Two independent mechanisms silently turn
+such a gate into one that cannot fail, and #5236 hit both at once — in the
+canary whose entire purpose was to stop a vacuous release signal.
+
+**1. Level.** `crates/core/Cargo.toml:124` enables tracing's
+`release_max_level_info`, which compiles out everything below INFO *in release
+builds*. A `debug!` marker therefore does not exist in the binary the gate
+inspects. It is present in every debug build, so it looks fine locally and in
+any test that runs a debug binary; the gate observes nothing and can only pass
+vacuously. The `Startup update check complete` marker was a `debug!`, which made
+the most common healthy outcome ("finished, staying on this version") produce no
+log ending at all — byte-for-byte indistinguishable from a node killed
+mid-request.
+
+**2. Anchor.** A whole-file `grep -F` for the marker is satisfied by ANY
+occurrence in the file, including a `//` comment — very often one inside the
+file's own `#[cfg(test)] mod tests` block, where log excerpts get pasted as
+documentation. The source pin then tracks the comment, not the code.
+
+| Marker | How it broke |
+|--------|--------------|
+| `Startup update check complete` | Emitted at `debug!`, so absent from every release binary. The canary's "did the check finish?" assertion could never observe it. |
+| `failed to parse latest version` | Occurs twice in `auto_update.rs`: the production `tracing::warn!` (:1546) and a comment in its own test module (:1757). Rewording the production line left all 22 assertions green — including `ok - source pin: parse-failure marker` — while a node carrying the #5221 bug then logged check-ran + reworded-warn + check-complete and the canary reported `OK: parsed GitHub's response`. An ordinary log reword deletes the gate, with CI green throughout. |
+
+### The rule
+
+- Emit any gate-observed marker at **`info!` or above**. Never `debug!`/`trace!`.
+- **Pin the emitting call, not the file.** Match the macro together with its
+  literal (`tracing::warn!("<marker>`), whitespace-stripped on both sides so a
+  rustfmt reflow cannot disarm it. A bare file grep is satisfied by prose.
+- **Pin every arm that shares the marker.** `compare_versions_for_startup` has
+  two parse-failure arms; a pin on one lets the other drift.
+- Prefer a marker string that is **specific enough not to appear in prose** —
+  keeping the `Startup update check: ` prefix is what stops the comment at
+  :1757 from matching at all.
+
+### Audit
+
+Every marker a script greps for must resolve to production code at every
+occurrence, and its pin must be mutation-tested by rewording the real call and
+confirming the pin goes RED.
+
+```bash
+grep -n '^MARKER_' scripts/auto-update-canary.sh
+# then, for each marker, confirm no occurrence is a comment:
+grep -n "<marker>" crates/core/src/bin/commands/auto_update.rs \
+                   crates/core/src/bin/freenet.rs
+```
+
+Source-level regression pins live in
+`scripts/auto-update-canary_test.sh` (`pin_warn_literal`, plus the INFO-level
+check on `MARKER_CHECK_COMPLETE`), and the gate's own WIRING — that the canary
+still runs, and still runs before `--draft=false` — is pinned by
+`scripts/release_canary_wiring_test.sh`.
+
 ## Self-satisfying `include_str!` source-scrape pins
 
 A source-scrape pin — a test that `include_str!`s its own crate's source

@@ -1248,9 +1248,22 @@ publish_draft_release() {
     # would race in and publish a release whose updater the gate was in the
     # middle of rejecting -- silently turning a blocking gate into no gate.
     local is_draft
-    is_draft=$(gh release view "v$VERSION" --repo freenet/freenet-core --json isDraft --jq '.isDraft' 2>/dev/null || echo "false")
+    is_draft=$(gh release view "v$VERSION" --repo freenet/freenet-core --json isDraft --jq '.isDraft' 2>/dev/null || echo "unknown")
+    if [[ "$is_draft" == "false" ]]; then
+        return 0   # already published by the workflow -- nothing left to gate
+    fi
     if [[ "$is_draft" != "true" ]]; then
-        return 0   # already published (or unknown) -- nothing to gate
+        # `gh` failed, so we do not know whether this is still a draft. Every
+        # other unknown in this function refuses, and this one must too: it
+        # coerced to "false" and returned 0, which never published an ungated
+        # release, but DID report success to the caller -- so the driver went on
+        # to update the gateways and announce a release that may still have been
+        # an unpublished draft.
+        echo "  ⏸  Cannot tell whether v$VERSION is still a draft ('gh' failed)." >&2
+        echo "     Refusing to report success: on an unknown the driver would" >&2
+        echo "     otherwise update the gateways and announce to Matrix and River" >&2
+        echo "     a release that may still be an unpublished draft." >&2
+        return 1
     fi
 
     # It IS still a draft, so the gate's verdict decides. Anything other than a

@@ -169,14 +169,24 @@ FAKE_LONG="$TMPROOT/$MARKER"
 make_fake_node "$FAKE_LONG" 0 "$COMPLETE_LINE" 30   # lingers well past the gate's return
 WORKL="$TMPROOT/workleak"
 mkdir -p "$WORKL"
+LEAK_T0=$(date +%s)
 run_node_until_check "$FAKE_LONG" "$WORKL" >/dev/null 2>&1
 sleep 2
+LEAK_ELAPSED=$(( $(date +%s) - LEAK_T0 ))
 if pgrep -f "$MARKER" >/dev/null 2>&1; then
     bad "a node survived run_node_until_check (process-group regression); leftovers:"
     pgrep -af "$MARKER" >&2
     pkill -f "$MARKER" 2>/dev/null
+elif [[ "$LEAK_ELAPSED" -ge "$CANARY_TIMEOUT_SECS" ]]; then
+    # The fake is launched under `timeout $CANARY_TIMEOUT_SECS` (canary
+    # script's run_node_until_check). Past that point it is dead whether or not
+    # the process-group cleanup works, so "no survivors" stops being evidence
+    # and this case silently proves nothing. Fail rather than report a pass we
+    # did not earn: on a loaded runner this is exactly how a re-introduced leak
+    # would go unnoticed.
+    bad "case 4 was VACUOUS: ${LEAK_ELAPSED}s elapsed >= CANARY_TIMEOUT_SECS (${CANARY_TIMEOUT_SECS}s), so the fake was reaped by its own timeout rather than by the cleanup under test"
 else
-    ok "no node survives run_node_until_check"
+    ok "no node survives run_node_until_check (checked ${LEAK_ELAPSED}s in, well inside the ${CANARY_TIMEOUT_SECS}s timeout)"
 fi
 
 # ---------------------------------------------------------------------------

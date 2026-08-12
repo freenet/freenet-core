@@ -63,8 +63,15 @@ set -uo pipefail
 # --- log markers (must match crates/core/src/bin/) --------------------------
 # freenet.rs      -- emitted unconditionally at the top of the startup check
 MARKER_CHECK_RAN='Startup update check against GitHub'
-# auto_update.rs  -- the #5221 regression signature
-MARKER_PARSE_FAIL='failed to parse latest version'
+# auto_update.rs  -- the #5221 regression signature. Deliberately stops at
+# `parse` so it covers BOTH arms of compare_versions_for_startup: the LATEST
+# version (the #5221 break) and the CURRENT one. Both return None, both then
+# reach the completion line, so a node that failed the current-version parse
+# looked identical to a healthy one under the longer marker. The
+# `Startup update check: ` prefix is load-bearing, not decoration -- without
+# it the string also occurs in a comment inside auto_update.rs's own test
+# module, which is enough to satisfy a whole-file source pin.
+MARKER_PARSE_FAIL='Startup update check: failed to parse'
 # auto_update.rs  -- GitHub unreachable / rate-limited: infrastructure, not a bug
 MARKER_FETCH_FAIL='failed to fetch latest version'
 # freenet.rs      -- either --disable-auto-update or a dirty build

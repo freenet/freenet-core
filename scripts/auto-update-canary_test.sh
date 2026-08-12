@@ -232,7 +232,40 @@ fi
 pin_marker "source pin: trigger phrase"         "$SRC"    "$MARKER_TRIGGERED"
 pin_marker "source pin: #4073 refusal phrase"   "$SRC"    "$MARKER_NOT_TRIGGERED"
 pin_marker "source pin: disabled marker"        "$SRC"    "$MARKER_DISABLED"
-pin_marker "source pin: parse-failure marker"   "$AU_SRC" "$MARKER_PARSE_FAIL"
+# The parse-failure marker gets a STRONGER pin than pin_marker can give.
+# `failed to parse latest version` appears twice in auto_update.rs: the
+# production warn!, and a comment inside its own `#[cfg(test)] mod tests`
+# block. A whole-file grep is satisfied by the COMMENT, so rewording the
+# real warn! left every assertion green -- and a node carrying the #5221 bug
+# then logs check-ran + reworded-warn + check-complete, which the canary
+# reports as "OK: parsed GitHub's response". The gate this PR exists to
+# install would have been removable by an ordinary log reword, with CI green
+# throughout. Bound the pin to the emitting call instead, so what is pinned
+# is the code that runs. Both arms are pinned: they fail the same way and
+# neither may drift silently.
+pin_warn_literal() {
+    # pin_warn_literal <description> <file> <literal-prefix>
+    local desc="$1" file="$2" literal="$3"
+    if [[ ! -f "$file" ]]; then
+        echo "FAIL - $desc (source file not found: $file)" >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    # Whitespace stripped from both sides, as the INFO-level pin above does,
+    # so a rustfmt reflow cannot decide whether the canary is protected.
+    if [[ "$(tr -d '[:space:]' < "$file")" == *"tracing::warn!(\"${literal//[[:space:]]/}"* ]]; then
+        echo "ok   - $desc"
+    else
+        echo "FAIL - $desc: no 'tracing::warn!' in $(basename "$file") still emits" >&2
+        echo "       '$literal' -- the canary greps for that text, so rewording it here" >&2
+        echo "       makes a broken updater indistinguishable from a healthy one (#5236)." >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+pin_warn_literal "source pin: parse-failure marker (latest-version arm)" \
+    "$AU_SRC" "$MARKER_PARSE_FAIL latest version"
+pin_warn_literal "source pin: parse-failure marker (current-version arm)" \
+    "$AU_SRC" "$MARKER_PARSE_FAIL current version"
 pin_marker "source pin: fetch-failure marker"   "$AU_SRC" "$MARKER_FETCH_FAIL"
 
 echo

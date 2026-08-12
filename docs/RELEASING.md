@@ -463,7 +463,9 @@ release is already public by then.
 
 Both assertions are deliberately **two-sided**: the `Startup update check
 against GitHub` line must be PRESENT *and* there must be no
-`failed to parse latest version` warning. Absence of the error on its own
+`Startup update check: failed to parse` warning (the marker stops at
+`parse` so it covers the current-version arm as well as the latest-version
+one). Absence of the error on its own
 proves nothing — it is equally consistent with the check never running, which
 is exactly what `--disable-auto-update` or a dirty build produces. The canary
 also fails if the node under test has auto-update disabled at all, so
@@ -471,6 +473,28 @@ also fails if the node under test has auto-update disabled at all, so
 someone has to remember. (It had been forgotten: `framework`, the designated
 real-NAT pre-release smoke peer, ran with `--disable-auto-update` for nine days
 after a #5040 measurement window, which is why it never caught this.)
+
+### What the gates do NOT cover
+
+Worth knowing before you conclude "we have an auto-update canary, why didn't it
+catch this?"
+
+**Gate A proves exactly one chain: fetch → tag normalise → semver parse →
+compare.** That is the #5221 break and nothing more. It does *not* exercise
+signature verification, checksum-manifest matching, asset download, the binary
+swap, the exit-42 supervisor plumbing, or crash-loop rollback. A release whose
+*detection* works and whose *installer* is broken passes Gate A cleanly.
+
+**Gate B does cover download, signature, checksum and swap — but it runs the
+PREVIOUS release's binary**, because a node can only self-update *from*
+something. So a break in the installer half of the binary you are shipping is
+caught by Gate B one release later, when that binary becomes the previous one.
+Gate B is also post-publish and non-blocking, so even then it reports rather
+than stops.
+
+Net: the installer half of a shipping binary has no blocking gate. Treat a
+green Gate A as "this binary can still see new releases", not as "auto-update
+works".
 
 ### If Gate A fails
 
