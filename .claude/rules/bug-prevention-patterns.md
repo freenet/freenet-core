@@ -85,6 +85,8 @@ documentation. The source pin then tracks the comment, not the code.
 |--------|--------------|
 | `Startup update check complete` | Emitted at `debug!`, so absent from every release binary. The canary's "did the check finish?" assertion could never observe it. |
 | `failed to parse latest version` | Occurs twice in `auto_update.rs`: the production `tracing::warn!` (:1546) and a comment in its own test module (:1757). Rewording the production line left all 22 assertions green — including `ok - source pin: parse-failure marker` — while a node carrying the #5221 bug then logged check-ran + reworded-warn + check-complete and the canary reported `OK: parsed GitHub's response`. An ordinary log reword deletes the gate, with CI green throughout. |
+| (no marker at all) | The gate had nothing to say WHICH release the node compared against, so its healthy verdict was byte-identical to a silently-wrong comparator's — see the positive-fact rule below. Closed by `MARKER_LATEST_SEEN`. |
+| `triggering auto-update` | A fixed string, so it never matched `freenet.rs:609`'s "triggering IMMEDIATE auto-update". A node that took the urgent path read as one that never decided to update, for as long as that site had existed. Fail-closed, hence unnoticed. Closed by `MARKER_TRIGGERED_RE` plus a count pin. |
 
 ### The rule
 
@@ -97,6 +99,30 @@ documentation. The source pin then tracks the comment, not the code.
 - Prefer a marker string that is **specific enough not to appear in prose** —
   keeping the `Startup update check: ` prefix is what stops the comment at
   :1757 from matching at all.
+- **Assert a POSITIVE fact, not the absence of an error.** "No error appeared"
+  is satisfied by a component that is silently WRONG as well as by one that
+  works: a `version_from_tag` regressed to a constant, or a normaliser
+  truncating `0.2.121` to `0.2.12`, parses, compares, declines to update and
+  logs a clean completion — a log byte-identical to a healthy node's. Make the
+  code log the value it acted on, and have the gate compare it against an
+  independently-obtained expected value. Resolve that expected value from the
+  **same source the code uses** (here, the `releases/latest` redirect, not
+  `api.github.com`): two sources that are allowed to disagree produce failures
+  that are not bugs.
+- **Pin the COUNT when a marker is supposed to match a SET of call sites.** A
+  fixed-string `MARKER_TRIGGERED` missed `freenet.rs:609` ("triggering
+  IMMEDIATE auto-update") for as long as that site existed, so a node taking
+  the urgent path read as one that never decided to update. It failed CLOSED,
+  which is exactly why nobody noticed — **fail-closed is not the same as
+  correct, and it is the condition under which a wrong enumeration survives
+  longest.** A count pin turns both "a site was added" and "a site is worded so
+  the marker misses it" into a CI failure.
+- **A skip branch in a gate is a vacuous-pass waiting to happen.** If the gate
+  can only run its check when some input is present, pin the caller that
+  supplies it. `assert_detection_healthy` skips the equality check when
+  `CANARY_EXPECTED_LATEST` is unset — correct for keeping the function pure and
+  fixture-testable, but it makes the check only as real as `cmd_preflight`, so
+  that assignment is itself pinned.
 
 ### Audit
 
@@ -112,9 +138,11 @@ grep -n "<marker>" crates/core/src/bin/commands/auto_update.rs \
 ```
 
 Source-level regression pins live in
-`scripts/auto-update-canary_test.sh` (`pin_warn_literal`, plus the INFO-level
-check on `MARKER_CHECK_COMPLETE`), and the gate's own WIRING — that the canary
-still runs, and still runs before `--draft=false` — is pinned by
+`scripts/auto-update-canary_test.sh`: `pin_warn_literal` for the parse-failure
+arms, the INFO-level checks on `MARKER_CHECK_COMPLETE` and
+`MARKER_LATEST_SEEN`, the trigger-site COUNT pin, and the pin that
+`cmd_preflight` still arms the equality check. The gate's own WIRING — that the
+canary still runs, and still runs before `--draft=false` — is pinned by
 `scripts/release_canary_wiring_test.sh`.
 
 ## Self-satisfying `include_str!` source-scrape pins
