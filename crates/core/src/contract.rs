@@ -542,7 +542,7 @@ async fn handle_delegate_with_contract_requests<CH, P>(
     user_context: Option<&UserSecretContext>,
     delegate_key: &DelegateKey,
     prompter: &P,
-) -> Vec<OutboundDelegateMsg>
+) -> Result<Vec<OutboundDelegateMsg>, ExecutorError>
 where
     CH: ContractHandler + Send + 'static,
     P: UserInputPrompter,
@@ -596,7 +596,7 @@ where
                 "Exceeded maximum contract request iterations, possible infinite loop"
             );
             // Return whatever we accumulated so far
-            return accumulated_messages;
+            return Ok(accumulated_messages);
         }
 
         // Execute the delegate request
@@ -622,26 +622,30 @@ where
                     "Unexpected response type from delegate request"
                 );
                 // Return whatever we accumulated so far
-                return accumulated_messages;
+                return Ok(accumulated_messages);
             }
             Err(err) => {
                 // Downgrade "not found" to warn — expected during legacy
-                // migration probes when old delegate WASM isn't on this node
+                // migration probes when old delegate WASM isn't on this node.
+                // A missing-delegate probe stays a benign empty response
+                // rather than a client-visible error; only genuine execution
+                // failures propagate as Err below (#5263 — previously EVERY
+                // failure here, including real ones, silently became an
+                // empty successful DelegateResponse to the client).
                 if err.is_missing_delegate() {
                     tracing::warn!(
                         delegate_key = %delegate_key,
                         "Delegate not found in store (expected for migration probes)"
                     );
-                } else {
-                    tracing::error!(
-                        delegate_key = %delegate_key,
-                        error = %err,
-                        phase = "execution_failed",
-                        "Failed executing delegate request"
-                    );
+                    return Ok(accumulated_messages);
                 }
-                // Return whatever we accumulated so far
-                return accumulated_messages;
+                tracing::error!(
+                    delegate_key = %delegate_key,
+                    error = %err,
+                    phase = "execution_failed",
+                    "Failed executing delegate request"
+                );
+                return Err(err);
             }
         };
 
@@ -690,7 +694,7 @@ where
             && delegate_messages.is_empty()
             && user_input_requests.is_empty()
         {
-            return accumulated_messages;
+            return Ok(accumulated_messages);
         }
 
         let mut inbound_responses: Vec<InboundDelegateMsg<'static>> = Vec::new();
@@ -2134,6 +2138,15 @@ async fn handle_delegate_notification<CH, P>(
         prompter,
     )
     .await;
+
+    // Notification-driven: there is no client waiting to answer, so an
+    // execution failure has nothing to propagate to. Already logged inside
+    // `handle_delegate_with_contract_requests`; just stop here, matching the
+    // pre-existing behavior of falling through with nothing to route (#5263
+    // only changes what happens on the CLIENT-driven path below).
+    let Ok(outbound) = outbound else {
+        return;
+    };
 
     // Route outbound ApplicationMessages to the apps registered with this
     // delegate (#3275). handle_delegate_with_contract_requests already
@@ -5167,6 +5180,64 @@ mod hol_4391_tests {
                 );
             }
             other => panic!("expected RegisterSubscriberListenerResponse, got {other}"),
+        }
+    }
+
+    /// Regression for #5263: when a delegate's execution fails, the client
+    /// driving `ContractHandlerEvent::DelegateRequest` through
+    /// `handle_contract_event` MUST see the failure ride back as
+    /// `DelegateResponse(Err(_))`, not a fake empty successful response.
+    ///
+    /// `MockWasmRuntime::execute_delegate_request` unconditionally returns a
+    /// generic `ExecutorError::other(...)` for any delegate request — not the
+    /// `is_missing_delegate()` case, which stays a benign empty response for
+    /// legacy migration probes (see `handle_delegate_with_contract_requests`)
+    /// — so no delegate needs to be registered to exercise the genuine
+    /// execution-failure branch this test targets.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegate_request_surfaces_execution_failure_5263() {
+        let (send_halve, rcv_halve, _) = handler::contract_handler_channel();
+        let mut handler = MockWasmContractHandler::new_test(rcv_halve, None, "del_fail_5263").await;
+
+        let delegate_key = DelegateKey::new([7u8; 32], CodeHash::new([0u8; 32]));
+        let req = DelegateRequest::ApplicationMessages {
+            key: delegate_key,
+            params: Parameters::from(vec![]),
+            inbound: vec![],
+        };
+        let event = ContractHandlerEvent::DelegateRequest {
+            req,
+            origin_contract: None,
+            connection_scope: crate::client_events::ConnectionScope::Local,
+            user_context: None,
+        };
+        let send_fut = send_halve.send_to_handler(event);
+        let recv_fut = async {
+            let (id, received, _priority) = handler
+                .channel()
+                .recv_from_sender()
+                .await
+                .expect("handler channel should be open");
+            handle_contract_event(
+                &mut handler,
+                id,
+                received,
+                &user_input::AutoApprovePrompter,
+                None,
+            )
+            .await
+            .expect("dispatch must not error");
+        };
+        let (send_res, ()) = tokio::join!(send_fut, recv_fut);
+        match send_res.expect("must receive a response") {
+            ContractHandlerEvent::DelegateResponse(result) => {
+                assert!(
+                    result.is_err(),
+                    "a delegate execution failure must surface an error to the \
+                     client, not a fake empty success (#5263)"
+                );
+            }
+            other => panic!("expected DelegateResponse, got {other}"),
         }
     }
 }

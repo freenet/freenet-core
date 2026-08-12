@@ -1293,7 +1293,7 @@ mod tests {
             ),
             (
                 "DelegateResponse",
-                ContractHandlerEvent::DelegateResponse(vec![]),
+                ContractHandlerEvent::DelegateResponse(Ok(vec![])),
             ),
             (
                 "ClientDisconnect",
