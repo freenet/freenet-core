@@ -1519,6 +1519,29 @@ where
             return None;
         }
     };
+    // The OBSERVED half of the check, as distinct from the DECISION.
+    //
+    // Every other line on this path reports what the node decided; none reports
+    // what it was deciding ABOUT. That left the release canary (#5236) able to
+    // assert only the ABSENCE of an error, and absence is satisfied by a
+    // comparator that is silently wrong rather than loudly broken: a
+    // `version_from_tag` that regressed to a constant, or a normaliser that
+    // truncated `0.2.121` to `0.2.12`, still parses, still compares, still
+    // declines to update, and still logs a clean completion. The log was
+    // byte-identical to a healthy one, so Gate A could not tell them apart.
+    //
+    // Emitting the value makes the gate's assertion POSITIVE: the canary
+    // compares this against the tag GitHub actually published and fails on a
+    // mismatch. INFO, not `debug!` -- release builds set
+    // `release_max_level_info`, so a `debug!` here would not exist in the
+    // binary the gate inspects (the mistake that made the completion marker
+    // unobservable in the first place). `scripts/auto-update-canary.sh` greps
+    // for this text and `scripts/auto-update-canary_test.sh` pins it against
+    // this call, so do not reword it without updating both.
+    tracing::info!(
+        latest = %latest,
+        "Startup update check: GitHub reports latest release"
+    );
     compare_versions_for_startup(current_version, &latest)
 }
 

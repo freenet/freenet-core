@@ -105,6 +105,27 @@ DIRTY='2026-08-08T02:00:00.000000Z  WARN freenet: Auto-update is DISABLED for th
 FETCH_FAIL='2026-08-08T02:00:00.000000Z  INFO freenet: Startup update check against GitHub current="0.2.121" jitter_secs=12
 2026-08-08T02:00:00.500000Z  WARN freenet::commands::auto_update: Startup update check: failed to fetch latest version: error sending request. Continuing with current binary.'
 
+# --- fixtures for the POSITIVE-EQUALITY check (#5236, review finding 32) ----
+#
+# The shape Gate A sees on a healthy run, now carrying the observed latest.
+SEEN_OK='2026-08-08T02:00:00.000000Z  INFO freenet: Startup update check against GitHub current="0.2.123" jitter_secs=7
+2026-08-08T02:00:00.300000Z  INFO freenet::commands::auto_update: Startup update check: GitHub reports latest release latest=0.2.122
+2026-08-08T02:00:00.412000Z  INFO freenet: Startup update check complete: staying on the current version current="0.2.123"'
+
+# A SILENTLY WRONG comparator, which is the whole point of the check. This is
+# what a `version_from_tag` that truncates `0.2.122` to `0.2.12` emits: it does
+# not fail to parse, it parses the WRONG thing. Every other assertion in
+# assert_detection_healthy passes on it -- the check ran, no parse error, no
+# fetch error, it completed -- and before this check the canary called it OK.
+SEEN_TRUNCATED='2026-08-08T02:00:00.000000Z  INFO freenet: Startup update check against GitHub current="0.2.123" jitter_secs=7
+2026-08-08T02:00:00.300000Z  INFO freenet::commands::auto_update: Startup update check: GitHub reports latest release latest=0.2.12
+2026-08-08T02:00:00.412000Z  INFO freenet: Startup update check complete: staying on the current version current="0.2.123"'
+
+# The other silently-wrong shape: a comparator pinned to a constant.
+SEEN_CONSTANT='2026-08-08T02:00:00.000000Z  INFO freenet: Startup update check against GitHub current="0.2.123" jitter_secs=7
+2026-08-08T02:00:00.300000Z  INFO freenet::commands::auto_update: Startup update check: GitHub reports latest release latest=0.0.0
+2026-08-08T02:00:00.412000Z  INFO freenet: Startup update check complete: staying on the current version current="0.2.123"'
+
 # --- the positive cases -----------------------------------------------------
 check "healthy: check ran, parsed, triggered -> pass" 0 "$HEALTHY"
 check "healthy: check ran and completed up-to-date -> pass" 0 "$HEALTHY_UP_TO_DATE"
@@ -177,8 +198,41 @@ trigger_case "trigger: peer-signal confirm" yes \
     '2026-08-08T02:02:59Z  INFO freenet: Newer version confirmed on GitHub, triggering auto-update new_version=0.2.122'
 trigger_case "trigger: periodic re-poll" yes \
     '2026-08-08T02:02:59Z  INFO freenet: Periodic re-poll: newer version on GitHub, triggering auto-update new_version=0.2.122'
+# The FIFTH site, and the one the fixed-string marker silently missed: it says
+# "triggering IMMEDIATE auto-update", so `triggering auto-update` did not match
+# and a node that took the urgent path was reported as never having decided to
+# update. Fail-closed, so nothing broke loudly -- which is why it survived.
+trigger_case "trigger: urgent path (the site the fixed-string marker missed)" yes \
+    '2026-08-08T02:02:59Z  INFO freenet: Urgent update confirmed on GitHub, triggering immediate auto-update new_version=0.2.122'
 trigger_case "NOT a trigger: #4073 locally-blocked refusal" no \
     '2026-08-08T02:02:59Z  WARN freenet: Startup check: newer version is locally blocked (crash-loop known-bad pin or repeated install failures); not triggering auto-update (#4073)'
+
+# --- the POSITIVE-EQUALITY check (#5236, review finding 32) -----------------
+#
+# Everything above this point is satisfied by a comparator that is silently
+# WRONG rather than broken. These drive assert_detection_healthy with
+# CANARY_EXPECTED_LATEST set, which is how Gate A runs it.
+check_vs_expected() {
+    # check_vs_expected <description> <expected-latest> <expected-exit> <log> [msg]
+    local desc="$1" expected_latest="$2" expected="$3" content="$4" want_msg="${5:-}"
+    CANARY_EXPECTED_LATEST="$expected_latest" check "$desc" "$expected" "$content" "$want_msg"
+}
+
+check_vs_expected "equality: node compared against the right release -> pass" \
+    "0.2.122" 0 "$SEEN_OK"
+# The two silently-wrong comparators. Before this check both reported OK.
+check_vs_expected "equality: TRUNCATED tag (0.2.122 -> 0.2.12) -> fail" \
+    "0.2.122" 1 "$SEEN_TRUNCATED" "compared against the WRONG release"
+check_vs_expected "equality: comparator pinned to a constant -> fail" \
+    "0.2.122" 1 "$SEEN_CONSTANT" "compared against the WRONG release"
+# A binary that never logs the observed value cannot be checked at all, and
+# "cannot be checked" must not read as "checked and fine".
+check_vs_expected "equality: no observed-latest line at all -> fail" \
+    "0.2.122" 1 "$HEALTHY_UP_TO_DATE" "never logged which release it compared against"
+# Unset is the pre-#5236 behaviour and must still work (the lifecycle test and
+# `assert-logs` drive it that way), but it must SAY it proved less.
+check "equality: unset expected-latest -> still passes, but says it skipped" \
+    0 "$SEEN_OK"
 
 # --- markers must still exist in the Rust source ----------------------------
 # Without this the fixtures above are a self-consistent copy of strings that
@@ -267,6 +321,47 @@ pin_warn_literal "source pin: parse-failure marker (latest-version arm)" \
 pin_warn_literal "source pin: parse-failure marker (current-version arm)" \
     "$AU_SRC" "$MARKER_PARSE_FAIL current version"
 pin_marker "source pin: fetch-failure marker"   "$AU_SRC" "$MARKER_FETCH_FAIL"
+
+# The observed-latest marker, pinned to its emitting `tracing::info!` for the
+# same reason the parse-failure arms are pinned to their `warn!`: a whole-file
+# grep tracks prose, and this one carries the gate's only POSITIVE assertion.
+# It must also stay at INFO -- `release_max_level_info` compiles out anything
+# below, so a `debug!` here would delete the equality check from every shipped
+# binary while leaving all 30 assertions green.
+if [[ "$(tr -d '[:space:]' < "$AU_SRC")" == *"tracing::info!(latest=%latest,\"${MARKER_LATEST_SEEN//[[:space:]]/}"* ]]; then
+    echo "ok   - source pin: observed-latest marker is emitted at INFO with a latest= field"
+else
+    echo "FAIL - source pin: no 'tracing::info!(latest = %latest, \"$MARKER_LATEST_SEEN\")' in auto_update.rs." >&2
+    echo "       Gate A's only positive assertion reads that line and that field. Without it the" >&2
+    echo "       gate falls back to 'the node did not complain', which a silently-wrong comparator" >&2
+    echo "       satisfies (#5236, review finding 32). A 'debug!' here is equally fatal: release" >&2
+    echo "       builds compile it out." >&2
+    FAILURES=$((FAILURES + 1))
+fi
+
+# --- the trigger-site ENUMERATION -------------------------------------------
+# `MARKER_TRIGGERED_RE` has to match every site that requests an update. It
+# missed the urgent one at :609 for as long as that site has existed, because
+# the marker was a fixed string and the site says "triggering IMMEDIATE
+# auto-update". Pin the COUNT so a sixth site cannot be added silently: a new
+# site that the regex does not match makes the count too low, and one it does
+# match makes it too high -- either way the enumeration in the canary's marker
+# comment gets revisited instead of quietly rotting.
+EXPECTED_TRIGGER_SITES=5
+actual_sites="$(grep -cE "$MARKER_TRIGGERED_RE" "$SRC" 2>/dev/null || echo 0)"
+actual_refusals="$(grep -cF "$MARKER_NOT_TRIGGERED" "$SRC" 2>/dev/null || echo 0)"
+actual_triggers=$((actual_sites - actual_refusals))
+if [[ "$actual_triggers" -eq "$EXPECTED_TRIGGER_SITES" ]]; then
+    echo "ok   - source pin: freenet.rs has exactly $EXPECTED_TRIGGER_SITES trigger sites, all matched by MARKER_TRIGGERED_RE"
+else
+    echo "FAIL - source pin: expected $EXPECTED_TRIGGER_SITES auto-update trigger sites in freenet.rs, found $actual_triggers" >&2
+    echo "       ($actual_sites regex matches minus $actual_refusals refusals). Either a site was added/removed," >&2
+    echo "       or a new one is worded so MARKER_TRIGGERED_RE does not match it -- which is how the" >&2
+    echo "       urgent site at :609 went unseen. Update the enumeration comment in" >&2
+    echo "       auto-update-canary.sh and this count together." >&2
+    grep -nE "$MARKER_TRIGGERED_RE" "$SRC" >&2
+    FAILURES=$((FAILURES + 1))
+fi
 
 echo
 if [[ "$FAILURES" -eq 0 ]]; then

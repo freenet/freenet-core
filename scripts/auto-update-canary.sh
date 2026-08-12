@@ -77,16 +77,31 @@ MARKER_FETCH_FAIL='failed to fetch latest version'
 # freenet.rs      -- either --disable-auto-update or a dirty build
 MARKER_DISABLED='Auto-update is DISABLED'
 # freenet.rs -- detection succeeded and an update was requested. There are
-# FOUR such sites (startup check, post-stagger confirm, peer-signal confirm,
-# periodic re-poll) and one REFUSAL that shares the phrase:
+# FIVE such sites and one REFUSAL that shares the phrase:
 #   :524 "Startup check: newer version on GitHub, triggering auto-update"
-#   :650 "Update confirmed on GitHub after stagger, triggering auto-update"
-#   :731 "Newer version confirmed on GitHub, triggering auto-update"
-#   :853 "Periodic re-poll: newer version on GitHub, triggering auto-update"
-#   :519 "...repeated install failures); NOT triggering auto-update (#4073)"
+#   :609 "Urgent update confirmed on GitHub, triggering immediate auto-update"
+#   :670 "Update confirmed on GitHub after stagger, triggering auto-update"
+#   :751 "Newer version confirmed on GitHub, triggering auto-update"
+#   :873 "Periodic re-poll: newer version on GitHub, triggering auto-update"
+#   :519 "...repeated install failures); not triggering auto-update (#4073)"
 # Matching the bare substring counts the refusal as a trigger; anchoring on any
-# ONE site's full phrase misses the other three, reporting "did not decide to
+# ONE site's full phrase misses the others, reporting "did not decide to
 # update" for a node that did. So: match the phrase, subtract the refusal.
+#
+# A REGEX, not a fixed string, and that is the whole point: the urgent site at
+# :609 says "triggering IMMEDIATE auto-update", so the fixed substring
+# `triggering auto-update` did not match it. A node that took the urgent path
+# was reported as never having decided to update. It failed CLOSED (Gate B
+# refuses rather than passes), so nothing broke visibly -- which is precisely
+# why an enumeration that had been wrong since the urgent path was added went
+# unnoticed. `auto-update-canary_test.sh` now pins the COUNT at five, so a
+# sixth site cannot be added silently.
+MARKER_TRIGGERED_RE='triggering ([a-z]+ )?auto-update'
+# Kept for the negative subtraction and for messages: the refusal is a fixed
+# string and matching it loosely would swallow real triggers.
+# shellcheck disable=SC2034  # read by auto-update-canary_test.sh, which sources
+# this file and pins the literal against freenet.rs; the regex above is what the
+# runtime detector uses.
 MARKER_TRIGGERED='triggering auto-update'
 MARKER_NOT_TRIGGERED='not triggering auto-update'
 # freenet.rs -- the check ENDED without requesting an update. Emitted on every
@@ -105,6 +120,19 @@ MARKER_NOT_TRIGGERED='not triggering auto-update'
 # the right one -- just a less specific message, and only until the previous
 # release is itself post-#5236.
 MARKER_CHECK_COMPLETE='Startup update check complete'
+# auto_update.rs -- the OBSERVED latest release, emitted with a `latest=` field
+# as soon as the fetch succeeds and before the comparison happens.
+#
+# Every other marker here is about what the node DECIDED. This one is about what
+# it decided ABOUT, and that difference is what lets the gate assert a positive
+# fact. Without it the healthy verdict is "no error appeared", which a silently
+# WRONG comparator satisfies just as well as a correct one: a `version_from_tag`
+# regressed to a constant, or a normaliser that truncated `0.2.121` to `0.2.12`,
+# parses, compares, declines to update and logs a clean completion. The log is
+# byte-identical to a healthy node's. With this marker the canary can compare
+# the value against the tag GitHub actually published (see
+# CANARY_EXPECTED_LATEST) and fail on a mismatch.
+MARKER_LATEST_SEEN='Startup update check: GitHub reports latest release'
 
 MUSL_ASSET='freenet-x86_64-unknown-linux-musl.tar.gz'
 RELEASE_BASE='https://github.com/freenet/freenet-core/releases/download'
@@ -119,6 +147,13 @@ CANARY_WS_PORT="${CANARY_WS_PORT:-39509}"
 # 60s by a healthy margin; it is a ceiling, not a wait (both gates return as
 # soon as they have their answer, typically ~40s).
 CANARY_TIMEOUT_SECS="${CANARY_TIMEOUT_SECS:-240}"
+# Validated like its two neighbours below. Without this a non-numeric override
+# reaches the `$((...))` in the lifecycle guard and, under `set -u`, kills the
+# canary with a shell arithmetic error rather than a canary verdict -- a
+# release-blocking failure whose message says nothing about the release.
+case "$CANARY_TIMEOUT_SECS" in
+  ''|*[!0-9]*|0) CANARY_TIMEOUT_SECS=240 ;;
+esac
 
 # Retry budget for the INDETERMINATE (GitHub unreachable) case only. Kept
 # small on purpose: this sits on the release critical path inside a job with a
@@ -157,10 +192,20 @@ note() { printf '%s\n' "$*" >&2; }
 
 # True when the logs show the node DECIDED to update. See the marker comments
 # above for why this is a subtraction rather than a single grep.
+#
+# No trailing `| grep -q .`: `grep -q` exits at its FIRST match and closes the
+# pipe, so the upstream grep takes SIGPIPE and dies 141. Under `set -o pipefail`
+# (set at the top of this file) 141 becomes the pipeline's status, and the
+# function reports "did not decide to update" for a node that plainly did.
+# Measured: rc=0 at 400 matching lines, rc=141 at 700, 30/30 reproducible once
+# the output passes the 64 KB pipe buffer. Canary logs never get that big, so
+# this was latent rather than live -- but it fails in the direction of a wrong
+# answer, not a loud one, and the fix is to not truncate the reader.
 node_decided_to_update() {
-  local logdir="$1"
-  grep -ahF "$MARKER_TRIGGERED" "$logdir"/freenet.*.log 2>/dev/null \
-    | grep -vF "$MARKER_NOT_TRIGGERED" | grep -q .
+  local logdir="$1" hits
+  hits="$(grep -ahE "$MARKER_TRIGGERED_RE" "$logdir"/freenet.*.log 2>/dev/null \
+    | grep -vF "$MARKER_NOT_TRIGGERED")"
+  [ -n "$hits" ]
 }
 
 # True when the startup check reached a TERMINAL outcome -- any outcome, healthy
@@ -170,9 +215,11 @@ node_decided_to_update() {
 # This is the difference between "the check found nothing wrong" and "we stopped
 # watching before it said anything", which every negative assertion in this file
 # silently depends on and none of them can see on its own.
+# No pipe here either, for the SIGPIPE reason documented on
+# `node_decided_to_update`: `grep -q` reads the files directly instead.
 node_check_settled() {
   local logdir="$1"
-  if grep -ahF "$MARKER_CHECK_COMPLETE" "$logdir"/freenet.*.log 2>/dev/null | grep -q .; then
+  if grep -aqF "$MARKER_CHECK_COMPLETE" "$logdir"/freenet.*.log 2>/dev/null; then
     return 0
   fi
   node_decided_to_update "$logdir"
@@ -275,6 +322,43 @@ assert_detection_healthy() {
     return 2
   fi
 
+  # (+) POSITIVE EQUALITY. Everything above is satisfied by a comparator that is
+  #     silently WRONG rather than broken: nothing so far has looked at the
+  #     value the node compared against, only at whether it complained. Assert
+  #     the observed latest equals the tag GitHub actually published.
+  #
+  #     `CANARY_EXPECTED_LATEST` is supplied by the CALLER, not fetched here, so
+  #     this function stays pure and unit-testable against log fixtures. The
+  #     caller (cmd_preflight) resolves it from the GitHub API and returns
+  #     INDETERMINATE if it cannot -- so "unset" never reaches here on the
+  #     release path, and the skip below cannot silently disarm the gate on a
+  #     real run. `release_canary_wiring_test.sh` pins that the preflight path
+  #     sets it.
+  if [ -n "${CANARY_EXPECTED_LATEST:-}" ]; then
+    local seen_line seen
+    seen_line="$(printf '%s' "$logs" | grep -aF "$MARKER_LATEST_SEEN" | tail -1)"
+    if [ -z "$seen_line" ]; then
+      fail "the node never logged which release it compared against (no '$MARKER_LATEST_SEEN'). Without it a comparator that silently returns the wrong version -- a constant, or a truncated tag -- produces a log byte-identical to a healthy one, so 'no error' is not evidence that detection works."
+      return 1
+    fi
+    # `latest=0.2.121` -- Display-formatted, so unquoted; take the last field
+    # and strip any trailing punctuation the formatter may add.
+    seen="${seen_line##*latest=}"
+    seen="${seen%% *}"
+    seen="$(printf '%s' "$seen" | tr -d '"'"'"'\r')"
+    if [ "$seen" != "$CANARY_EXPECTED_LATEST" ]; then
+      fail "the node compared against the WRONG release: it logged latest='$seen' but GitHub's latest published release is '$CANARY_EXPECTED_LATEST'. Detection is silently broken -- it did not fail to parse, it parsed the wrong thing, which is why every other check above passed. A constant-returning or truncating version_from_tag looks exactly like this."
+      printf '%s\n' "$seen_line" >&2
+      return 1
+    fi
+    log "OK: the node compared against '$seen', which matches GitHub's latest release."
+  else
+    # Deliberately loud. Reaching this on the release path would mean the
+    # caller stopped resolving the expected tag, and the gate would quietly
+    # drop from "compared against the right release" to "did not complain".
+    note "NOTE: CANARY_EXPECTED_LATEST is unset, so the positive-equality check was SKIPPED. This run does not prove the node compared against the right release."
+  fi
+
   log "OK: startup update check ran to completion and parsed GitHub's response."
   printf '%s' "$logs" | grep -aF "$MARKER_CHECK_RAN" | head -2
   return 0
@@ -316,6 +400,19 @@ run_node_until_check() {
     # so it takes the real exit-42 path rather than logging a "no supervisor"
     # error and staying put.
     export FREENET_SUPERVISED=1
+    # The gate reads the node's log, and release builds rate-limit that log
+    # (1000 events/s aggregate plus a per-callsite cap, tracing/tracer.rs:557).
+    # A dropped line is indistinguishable from a line that was never emitted,
+    # and the directions are not symmetric: losing MARKER_CHECK_RAN or the
+    # completion line fails the gate LOUDLY (red / indeterminate), but losing
+    # the parse-failure WARN while the completion line survives leaves the
+    # negative check satisfied and the canary reporting OK on a binary carrying
+    # the #5221 bug -- a false GREEN, the exact class this canary exists to
+    # remove. The startup check emits a handful of lines and comes nowhere near
+    # either cap, so this is a latent risk rather than an observed one; the env
+    # var removes the class outright for the cost of one line. Only the
+    # canary's own throwaway node is affected.
+    export FREENET_DISABLE_LOG_RATE_LIMIT=1
     exec timeout "$CANARY_TIMEOUT_SECS" "$binary" network \
       --config-dir "$work/cfg" \
       --data-dir "$work/data" \
@@ -395,6 +492,44 @@ run_node_until_check() {
 }
 
 # ---------------------------------------------------------------------------
+# resolve_expected_latest
+#
+# The tag GitHub currently publishes as "latest", normalised the way
+# `version_from_tag` normalises it (strip AT MOST one leading `v`). Echoes it
+# on stdout; returns 1 if it cannot be determined.
+#
+# Deliberately the SAME source the node itself uses --
+# `github.com/{repo}/releases/latest`, read from the 302 `Location` -- and not
+# `api.github.com`. Two reasons, both load-bearing:
+#
+#   1. Comparing the node's answer against a DIFFERENT endpoint would compare
+#      two things that are allowed to disagree, and the mismatch would fail a
+#      release for a reason that is not a bug.
+#   2. The REST API allows 60 unauthenticated requests/hour per source IP,
+#      shared across everything on that runner. The redirect endpoint is served
+#      by the web front end and draws on no such budget -- which is exactly why
+#      #5102 moved the node off the API. Spending REST quota here would
+#      reintroduce that cost on the release critical path.
+#
+# During Gate A our own release is still a DRAFT, so this correctly resolves to
+# the PREVIOUS release -- the same thing the node under test sees.
+# ---------------------------------------------------------------------------
+resolve_expected_latest() {
+  local url tag
+  url="$(curl -fsS --max-time 30 -o /dev/null -w '%{redirect_url}' \
+    'https://github.com/freenet/freenet-core/releases/latest' 2>/dev/null)" || return 1
+  case "$url" in
+    */releases/tag/*) tag="${url##*/releases/tag/}" ;;
+    *) return 1 ;;
+  esac
+  [ -n "$tag" ] || return 1
+  # `${tag#v}` strips at most one leading `v`, matching version_from_tag's
+  # `strip_prefix` (NOT `trim_start_matches`, which is greedy -- see the
+  # rustdoc on version_from_tag).
+  printf '%s' "${tag#v}"
+}
+
+# ---------------------------------------------------------------------------
 # Gate A: preflight -- BLOCKS publication.
 #
 # Runs the binary we are about to ship against the CURRENT latest release and
@@ -408,6 +543,20 @@ cmd_preflight() {
 
   log "=== Gate A: auto-update pre-flight on the binary about to ship ==="
   "$binary" --version
+
+  # Resolve what the node SHOULD see before booting it, so the log assertion can
+  # be a positive equality rather than an absence-of-error. Failing to resolve
+  # it is INDETERMINATE, never a pass: without it the gate silently weakens to
+  # "the node did not complain", which is what a silently-wrong comparator
+  # produces. Returning 1 here (not 2) because the retry loop below re-runs the
+  # whole attempt for rc=2, and a resolution failure is not something a node
+  # re-run fixes -- it is an infrastructure problem the operator must see.
+  if ! CANARY_EXPECTED_LATEST="$(resolve_expected_latest)"; then
+    fail "could not resolve GitHub's latest release tag, so the canary cannot check WHICH release the node compared against. This is an UNVERIFIED result, not a detected bug: re-run this job. Do NOT un-draft the release by hand -- an unverified gate is not a passed gate."
+    return 1
+  fi
+  export CANARY_EXPECTED_LATEST
+  log "GitHub's latest published release is '$CANARY_EXPECTED_LATEST'; the node must compare against exactly that."
 
   # Retry only the INDETERMINATE case. A parse failure is deterministic and
   # retrying it just burns release time; a GitHub blip is worth a second look
