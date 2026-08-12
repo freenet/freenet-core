@@ -332,8 +332,10 @@ assert_detection_healthy() {
   #     caller (cmd_preflight) resolves it from the GitHub API and returns
   #     INDETERMINATE if it cannot -- so "unset" never reaches here on the
   #     release path, and the skip below cannot silently disarm the gate on a
-  #     real run. `release_canary_wiring_test.sh` pins that the preflight path
-  #     sets it.
+  #     real run. `auto-update-canary_test.sh` pins that cmd_preflight resolves
+  #     it, exports it, and refuses when it cannot -- without that pin this
+  #     skip branch would be exactly the vacuous escape hatch the gate exists
+  #     to remove.
   if [ -n "${CANARY_EXPECTED_LATEST:-}" ]; then
     local seen_line seen
     seen_line="$(printf '%s' "$logs" | grep -aF "$MARKER_LATEST_SEEN" | tail -1)"

@@ -303,6 +303,45 @@ timeout_guard_case "0"   "240"
 timeout_guard_case ""    "240"
 timeout_guard_case "90"  "90"
 
+# --- Gate A must actually ARM the equality check -----------------------------
+# `assert_detection_healthy` skips the positive-equality check when
+# CANARY_EXPECTED_LATEST is unset, which is right for the pure/unit-testable
+# shape but means the check is only as real as the caller that sets it. Nothing
+# else pins that, so a refactor dropping the assignment would leave every
+# assertion here green while Gate A silently reverted to "the node did not
+# complain" -- the exact vacuous shape this PR exists to remove.
+#
+# Scoped to cmd_preflight's body, not a whole-file grep: the variable is named
+# in comments elsewhere in the file, and a file-wide match would be satisfied by
+# the prose describing the mechanism rather than the code implementing it.
+preflight_body="$(awk '/^cmd_preflight\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$CANARY_SH")"
+# shellcheck disable=SC2016  # the needles below match LITERAL source text, so
+# the `$(...)` inside them must not expand -- that is the point of the pin.
+if [[ -z "$preflight_body" ]]; then
+    echo "FAIL - could not locate cmd_preflight() in $(basename "$CANARY_SH")" >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ "$preflight_body" != *'CANARY_EXPECTED_LATEST="$(resolve_expected_latest)"'* ]]; then
+    echo "FAIL - cmd_preflight no longer resolves CANARY_EXPECTED_LATEST." >&2
+    echo "       Gate A's only positive assertion is skipped when that is unset, so the gate" >&2
+    echo "       drops back to 'the node did not complain' -- which a silently-wrong" >&2
+    echo "       comparator satisfies (#5236, review finding 32)." >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ "$preflight_body" != *'export CANARY_EXPECTED_LATEST'* ]]; then
+    echo "FAIL - cmd_preflight resolves CANARY_EXPECTED_LATEST but does not export it." >&2
+    FAILURES=$((FAILURES + 1))
+else
+    echo "ok   - cmd_preflight resolves and exports CANARY_EXPECTED_LATEST (the equality check is armed)"
+fi
+# ...and refuses rather than passing when it cannot resolve it. A resolution
+# failure that fell through would run the gate with the check skipped.
+if [[ "$preflight_body" == *'if ! CANARY_EXPECTED_LATEST='*'return 1'* ]]; then
+    echo "ok   - cmd_preflight refuses (returns non-zero) when the expected release cannot be resolved"
+else
+    echo "FAIL - cmd_preflight does not refuse when resolve_expected_latest fails." >&2
+    echo "       Falling through would run Gate A with its positive check silently skipped." >&2
+    FAILURES=$((FAILURES + 1))
+fi
+
 # --- markers must still exist in the Rust source ----------------------------
 # Without this the fixtures above are a self-consistent copy of strings that
 # may no longer be emitted: the canary would go quietly blind while its own
