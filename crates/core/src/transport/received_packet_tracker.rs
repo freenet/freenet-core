@@ -64,7 +64,31 @@ impl<T: TimeSource> ReceivedPacketTracker<T> {
         let current_time = self.time_source.now();
 
         match self.time_by_packet_id.entry(packet_id) {
-            std::collections::hash_map::Entry::Occupied(_) => ReportResult::AlreadyReceived,
+            std::collections::hash_map::Entry::Occupied(_) => {
+                // Re-acknowledge. A duplicate almost always means the sender
+                // retransmitted because our original receipt never made it back:
+                // receipts ride on noop/piggybacked packets, which are themselves
+                // unreliable and are never retransmitted. Staying silent here left
+                // the sender with no way to ever learn the packet arrived, so its
+                // bytes stayed in flight until the retransmit budget ran out. With
+                // a full congestion window that is fatal well before then: the
+                // stream blocks in cwnd wait and aborts after CWND_WAIT_TIMEOUT
+                // (3s), which the receiver sees as a transfer that simply stopped
+                // mid-stream. Re-acknowledging is exactly what the retransmit is
+                // asking for, and it is the only signal that can drain the window.
+                //
+                // Deduplicated because a burst of retransmits for the same id would
+                // otherwise queue the same receipt repeatedly; the sender only needs
+                // to be told once per flush.
+                if !self.pending_receipts.contains(&packet_id) {
+                    self.pending_receipts.push(packet_id);
+                }
+                // Deliberately still `AlreadyReceived` rather than `QueueFull`: the
+                // caller relies on this variant to skip re-processing a payload it
+                // has already handled. The re-queued receipt goes out on the next
+                // background ACK tick or the next packet that flushes receipts.
+                ReportResult::AlreadyReceived
+            }
             std::collections::hash_map::Entry::Vacant(e) => {
                 e.insert(current_time);
                 self.packet_id_time.push_back((packet_id, current_time));
@@ -174,8 +198,71 @@ pub(in crate::transport) mod tests {
             tracker.report_received_packet(0),
             ReportResult::AlreadyReceived
         );
+        // Still one pending receipt, not two: the duplicate must not queue a
+        // second copy of a receipt that has not been sent yet.
         assert_eq!(tracker.pending_receipts.len(), 1);
         assert_eq!(tracker.time_by_packet_id.len(), 1);
+    }
+
+    /// A retransmitted packet must be acknowledged again, even though its
+    /// payload is ignored.
+    ///
+    /// This is the production scenario, not a synthetic one. The sender only
+    /// retransmits because it saw no receipt, and the overwhelmingly likely
+    /// reason is that the receipt itself was lost -- receipts travel on noop /
+    /// piggybacked packets, which are never retransmitted. If the duplicate is
+    /// met with silence, that packet's bytes stay in the sender's flight
+    /// accounting with no remaining way to clear them. Once flight reaches the
+    /// congestion window the sender blocks, and `CWND_WAIT_TIMEOUT` (3s) aborts
+    /// the whole stream. Downstream this surfaces as a multi-fragment GET dying
+    /// partway through with a stream-assembly inactivity timeout.
+    ///
+    /// Note the drain between the two reports: that is what makes this test
+    /// discriminating. Without it the receipt from the *first* report is still
+    /// queued, so the assertion would pass whether or not the duplicate
+    /// re-acknowledges anything.
+    #[test]
+    fn retransmitted_packet_is_reacknowledged_after_its_receipt_was_sent() {
+        let mut tracker = mock_received_packet_tracker();
+
+        assert_eq!(tracker.report_received_packet(7), ReportResult::Ok);
+        // The receipt is handed to the transport, which puts it on the wire --
+        // where it is lost. Nothing is pending any more.
+        assert_eq!(tracker.get_receipts(), vec![7]);
+        assert!(tracker.pending_receipts.is_empty());
+
+        // The sender, having heard nothing, retransmits.
+        assert_eq!(
+            tracker.report_received_packet(7),
+            ReportResult::AlreadyReceived
+        );
+
+        assert_eq!(
+            tracker.get_receipts(),
+            vec![7],
+            "a retransmit must be re-acknowledged, otherwise the sender can \
+             never drain this packet from its congestion window"
+        );
+    }
+
+    /// A burst of retransmits for the same packet must not queue the same
+    /// receipt several times over -- one flush tells the sender everything it
+    /// needs to know, and the receipt list is a fixed-capacity signal.
+    #[test]
+    fn repeated_retransmits_queue_one_receipt_per_flush() {
+        let mut tracker = mock_received_packet_tracker();
+
+        assert_eq!(tracker.report_received_packet(3), ReportResult::Ok);
+        assert_eq!(tracker.get_receipts(), vec![3]);
+
+        for _ in 0..5 {
+            assert_eq!(
+                tracker.report_received_packet(3),
+                ReportResult::AlreadyReceived
+            );
+        }
+
+        assert_eq!(tracker.get_receipts(), vec![3]);
     }
 
     #[test]
