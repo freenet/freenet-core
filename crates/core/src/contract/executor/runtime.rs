@@ -1522,6 +1522,113 @@ mod remove_contract_tests {
             .with_extension("wasm")
     }
 
+    /// The executor's "code already stored" branch must refuse a container whose
+    /// instance id is not derived from its own code and parameters — tested at the
+    /// executor entry point, not at the store.
+    ///
+    /// This test exists because of WHERE the original defect lived. Every test for
+    /// the identity check was scoped to `contract_store.rs`, and the bypass was one
+    /// layer up: `bridged_upsert_contract_state_inner` reached the durable
+    /// instance→code index through a bare index-write helper instead of through
+    /// `store_contract`, so the store's own tests could not see it and a four-lens
+    /// review did not catch it. A pin on the source text is not the same thing as
+    /// exercising the entry point, so this drives the real
+    /// `Executor<Runtime>` — real `ContractStore`, real `StateStore`, no network.
+    ///
+    /// # Why garbage WASM bytes are sufficient
+    ///
+    /// The refusal happens in the store/index branch, BEFORE
+    /// `fetch_related_for_validation` (and therefore before any WASM call), so the
+    /// forged container is rejected without the module ever being compiled. The
+    /// control below relies on the same ordering from the other side: an HONEST
+    /// second instance gets past the identity check and is indexed, then fails
+    /// later in WASM validation because `vec![3u8; 64]` is not a real module. That
+    /// asymmetry — indexed-and-failed-late versus refused-and-not-indexed — is
+    /// what makes this discriminating rather than a blanket "PUT fails" assertion.
+    #[tokio::test]
+    async fn already_stored_branch_refuses_an_underived_instance() {
+        use crate::contract::executor::ContractExecutor;
+        use crate::wasm_runtime::ContractStoreBridge;
+        use either::Either;
+        use freenet_stdlib::prelude::RelatedContracts;
+
+        let (mut executor, contracts_dir, _temp) = build_disk_executor("identity-gate").await;
+
+        // Precondition: the code blob is on disk, so `code_blob_stored` reports
+        // true and a PUT of another instance of that code takes the already-stored
+        // branch. Established through the store directly because this is setup,
+        // not the behaviour under test — and because routing it through the
+        // executor would fail in WASM validation and then remove the blob again.
+        let (honest, honest_key) = make_contract(3, 3);
+        executor
+            .runtime
+            .store_contract(honest)
+            .expect("seeding the code blob must succeed");
+        assert!(
+            wasm_path(&contracts_dir, &honest_key).exists(),
+            "fixture must leave the code blob on disk"
+        );
+
+        // CONTROL first: an honest second instance of the same code. Its identity
+        // is derived, so the branch indexes it; it then dies in WASM validation.
+        let (honest_b, honest_b_key) = make_contract(3, 9);
+        assert_eq!(
+            honest_b_key.code_hash(),
+            honest_key.code_hash(),
+            "fixture must share the code blob"
+        );
+        assert_ne!(honest_b_key.id(), honest_key.id(), "must be a NEW instance");
+        let control = executor
+            .upsert_contract_state(
+                honest_b_key,
+                Either::Left(WrappedState::new(vec![7u8; 8])),
+                RelatedContracts::default(),
+                Some(honest_b),
+            )
+            .await;
+        assert!(
+            !format!("{control:?}").contains("identity does not match its code"),
+            "an honestly-derived instance must pass the identity check (it may fail \
+             later in WASM validation): {control:?}"
+        );
+        assert_eq!(
+            executor.runtime.code_hash_from_id(honest_b_key.id()),
+            Some(*honest_key.code_hash()),
+            "the honest new instance must have been indexed by the guarded ingress"
+        );
+
+        // Now the forgery: same code, so the blob is present and the branch is
+        // taken, but an instance id derived from DIFFERENT parameters.
+        let code = ContractCode::from(vec![3u8; 64]);
+        let real_params = Parameters::from(vec![3u8; 8]);
+        let unrelated_instance =
+            *ContractKey::from_params_and_code(Parameters::from(vec![200u8; 8]), &code).id();
+        let mut forged = WrappedContract::new(Arc::new(code.clone()), real_params);
+        forged.key = ContractKey::from_id_and_code(unrelated_instance, *code.hash());
+        let forged_key = forged.key;
+
+        let err = executor
+            .upsert_contract_state(
+                forged_key,
+                Either::Left(WrappedState::new(vec![7u8; 8])),
+                RelatedContracts::default(),
+                Some(ContractContainer::Wasm(ContractWasmAPIVersion::V1(forged))),
+            )
+            .await
+            .expect_err("an underived instance must be refused at the executor entry point");
+        assert!(
+            format!("{err:?}").contains("identity does not match its code"),
+            "expected the store's identity refusal to surface here, got: {err:?}"
+        );
+        assert!(
+            executor
+                .runtime
+                .code_hash_from_id(&unrelated_instance)
+                .is_none(),
+            "a refused container must not leave an instance→code index row"
+        );
+    }
+
     /// GHSA-824h-7x5x-wfmf regression: a NON-LOCAL registration must not be able
     /// to write the durable first-registration origin record.
     ///

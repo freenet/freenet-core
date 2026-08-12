@@ -651,18 +651,33 @@ impl ContractStore {
         match existing {
             Some(recorded) if recorded == *code_hash => return Ok(()),
             Some(recorded) => {
-                // Correcting the row can leave `recorded`'s blob referenced by no
-                // index row at all, if this was its last referent. That is a
-                // bounded disk leak and NOT a correctness problem: `fetch_contract`
-                // resolves code through this index, so an unreferenced blob is
-                // never served, and the disk-budget counter is reconciled against
-                // ground truth by the next `refresh_wasm` walk. It is also strictly
-                // better than the state it replaces, where the wrong row persisted
-                // forever. Deliberately not cleaned up here — orphan reconciliation
-                // in both directions is tracked as #5281, which already covers
-                // orphaned blobs and orphaned state/params rows from other
-                // triggers; a one-off sweep at this call site would be a second,
+                // WHAT THIS TRADE ACTUALLY IS. Correcting the row can leave
+                // `recorded`'s blob referenced by no index row, if this was its last
+                // referent. What the correction BUYS is much larger than what it
+                // costs: without it, instance `key.id()` resolves durably and
+                // forever to code it was never derived from — and the
+                // compiled-module cache is keyed off that resolution — whereas with
+                // it the residue is one unreferenced file on disk.
+                //
+                // The file is never served, because `fetch_contract` resolves code
+                // through this index. But do not read the leak as self-clearing:
+                // NOTHING in the tree frees it. `refresh_wasm` is a `du`-walk that
+                // re-measures bytes for the disk-budget counter and deletes nothing,
+                // and `remove_contract` — the only blob GC — is driven off live
+                // instances. So the bytes stay CORRECTLY counted forever, which
+                // means the orphan permanently consumes admission headroom via
+                // `admit_wasm_write`'s `total_bytes() + blob_len > budget_bytes`
+                // gate. Honest accounting, genuinely spent capacity. Orphan
+                // reconciliation in both directions is #5281 ("orphans of both are
+                // permanent"); a one-off sweep at this call site would be a second,
                 // partial mechanism.
+                //
+                // Nor is a disagreeing row only possible on binaries predating this
+                // check. ReDb rows outlive the binary, and crash-loop auto-rollback
+                // (#4073) can reinstall a pre-check binary during probation, which
+                // can mint fresh disagreeing rows that the next upgrade corrects
+                // here. So this WARN recurring is not evidence of a bug in the
+                // check.
                 tracing::warn!(
                     contract = %key,
                     instance_id = %key.id(),
@@ -1614,6 +1629,24 @@ mod test {
             "exactly two call sites are expected: store_contract's slow path and \
              ensure_key_indexed_locked. A new one needs its own verification, or \
              it must route through store_contract."
+        );
+
+        // The index has TWO halves, and counting only the durable one leaves the
+        // nastier writer class uncovered: a helper that inserts into
+        // `key_to_code_part` WITHOUT calling `store_contract_index` passes the
+        // assertion above while creating a memory-versus-ReDb divergence that
+        // survives until restart — and `remove_contract` decides blob liveness from
+        // ReDb, so the two halves would then disagree about what is referenced.
+        // Three sites are expected: the startup load from ReDb, `store_contract`'s
+        // slow path, and `ensure_key_indexed_locked`. The startup loader is counted
+        // rather than excluded, because a change there is worth noticing too.
+        assert_eq!(
+            production.matches("key_to_code_part.insert(").count(),
+            3,
+            "exactly three in-memory index writes are expected: the startup ReDb \
+             load, store_contract's slow path, and ensure_key_indexed_locked. A new \
+             one that does not also write ReDb would diverge the in-memory index \
+             from the durable one until the next restart."
         );
 
         production

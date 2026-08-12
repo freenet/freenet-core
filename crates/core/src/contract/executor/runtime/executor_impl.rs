@@ -2987,6 +2987,16 @@ mod full_state_version_gate_pins {
     /// name does not appear in the CODE without tripping over prose that
     /// deliberately names it (the removed index writer is discussed in a comment
     /// right where it used to be called).
+    ///
+    /// This strips whole-line `//` comments only — not block comments, not trailing
+    /// comments, not `//` inside a string literal. That narrowness is deliberate
+    /// rather than an oversight: every gap in it produces a false FAILURE, never a
+    /// false pass, because a real call's identifier can never sit on a line whose
+    /// `trim_start()` begins with `//`. So the filter is sound in the direction that
+    /// matters and does not need to become a lexer. There are no block or trailing
+    /// comments in the scraped region today; if someone adds one naming a forbidden
+    /// symbol, the pin fails with a confusing message, which is why the assertion
+    /// text says how to word it.
     fn upsert_code_only() -> String {
         upsert_body()
             .lines()
@@ -3064,7 +3074,10 @@ mod full_state_version_gate_pins {
             !body.contains("ensure_key_indexed"),
             "the upsert path must not write the instance→code index directly; \
              route through store_contract, which verifies the key against the \
-             code and parameters first (see ContractStore::verify_contract_identity)"
+             code and parameters first (see ContractStore::verify_contract_identity). \
+             If you are seeing this because you MENTIONED the old helper in prose \
+             rather than called it: use a `//` line — only whole-line `//` comments \
+             are stripped, so block comments and string literals still match."
         );
 
         // Slice the branch's OWN region — anchor to its `else if`, and stop at the
