@@ -615,33 +615,59 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
-        if: success() || steps.test.conclusion == 'failure'
+        # No `if:` here on purpose. This used to read
+        # `success() || steps.test.conclusion == 'failure'`, intending to save the
+        # cache even when tests failed -- but no step declares `id: test`, so
+        # `steps.test.conclusion` was the empty string and the whole condition
+        # collapsed to `success()`, the default. It was never expressible at this
+        # position anyway: this step runs BEFORE the tests. Do not re-add it; a
+        # post-test cache save would have to be a separate step after them.
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # nextest is installed by the maintained action on every platform, NOT by
-      # a hand-rolled download. That is a reliability fix and it is worth not
-      # undoing: the one-liners this replaced fetched from get.nexte.st, and on
-      # 2026-08-12 that host failed four times across four PRs and BOTH
-      # platforms within ~78 minutes -- `curl: (56) Connection died` on Linux,
-      # `The response ended prematurely` from Invoke-WebRequest on Windows. Two
-      # different HTTP clients failing against one host is what identifies the
-      # HOST as the fault, so retrying it harder was not the answer.
+      # a hand-rolled download. Worth not undoing: on 2026-08-12 the one-liners
+      # this replaced failed four times across four PRs and BOTH platforms
+      # within ~78 minutes, blocking the merge queue -- `curl: (56) Connection
+      # died` on Linux, `The response ended prematurely` from Invoke-WebRequest
+      # on Windows.
       #
-      # The action downloads from GitHub Releases
-      # (github.com/nextest-rs/nextest/releases), so it does not touch that
-      # host at all. It also retries (curl --retry 10 inside a 10-iteration
-      # backoff loop), verifies a SHA256 checksum, and can fall back to
-      # cargo-binstall. The Windows form it replaced had NO retry budget at
-      # all, in a ~34-minute job. It does NOT cache -- see #5296 if the
-      # download cost ever matters.
+      # What actually changed, stated carefully because the obvious reading is
+      # wrong: this did NOT move the download off a bad host.
+      # `get.nexte.st/latest/linux` 302s to the same
+      # github.com/nextest-rs/nextest release asset the action's manifest
+      # names, and both then 302 to release-assets.githubusercontent.com. The
+      # only host removed serves a zero-byte redirect, and both observed errors
+      # are body-transfer failures, which by construction occur downstream of
+      # that redirect -- on the asset host BOTH paths use.
+      #
+      # The win is what wraps the download: `retry curl --retry 10` inside a
+      # 10-iteration backoff loop (main.sh), and a SHA256 checksum verified
+      # against the hash in the action's pinned manifest. The form this replaced
+      # on Windows had NO retry budget at all, in a ~34-minute job, and none of
+      # the three verified what it extracted into $CARGO_HOME/bin before the
+      # next step executed it.
+      #
+      # `fallback: none` is deliberate: it keeps GITHUB_TOKEN out of the
+      # action's environment (action.yml only populates DEFAULT_GITHUB_TOKEN
+      # when fallback == 'cargo-binstall'). It costs nothing, because the
+      # fallback is unreachable for this tool anyway -- it is entered only when
+      # the manifest lacks the tool or the version/platform, never on a network
+      # or checksum failure, which `bail` under `set -e`.
+      #
+      # timeout-minutes bounds that retry budget: 11 attempts x curl --retry 10
+      # with no --retry-max-time can exceed any job budget here, and would be
+      # reported as a job timeout rather than as a failed download.
       #
       # There are seven of these across ci.yml, playwright-shell.yml and
       # simulation-nightly.yml; the others point here. See #5296.
-      - uses: taiki-e/install-action@v2
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
         id: install-nextest
+        timeout-minutes: 5
         with:
           tool: cargo-nextest
+          fallback: none
 
       - name: Build
         env:
@@ -742,16 +768,25 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
-        if: success() || steps.test.conclusion == 'failure'
+        # No `if:` here on purpose. This used to read
+        # `success() || steps.test.conclusion == 'failure'`, intending to save the
+        # cache even when tests failed -- but no step declares `id: test`, so
+        # `steps.test.conclusion` was the empty string and the whole condition
+        # collapsed to `success()`, the default. It was never expressible at this
+        # position anyway: this step runs BEFORE the tests. Do not re-add it; a
+        # post-test cache save would have to be a separate step after them.
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # nextest via the maintained action, not a hand-rolled download.
       # Rationale at the first of these in ci.yml (test_unit job); see #5296.
-      - uses: taiki-e/install-action@v2
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
         id: install-nextest
+        timeout-minutes: 5
         with:
           tool: cargo-nextest
+          fallback: none
 
       - name: Build freenet bin
         run: cargo build --locked -p freenet --bin freenet
@@ -804,10 +839,13 @@ jobs:
 
       # nextest via the maintained action, not a hand-rolled download.
       # Rationale at the first of these in ci.yml (test_unit job); see #5296.
-      - uses: taiki-e/install-action@v2
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
         id: install-nextest
+        timeout-minutes: 5
         with:
           tool: cargo-nextest
+          fallback: none
 
       - name: Build freenet bin
         run: cargo build --locked -p freenet --bin freenet
@@ -875,11 +913,14 @@ jobs:
 
       # nextest via the maintained action, not a hand-rolled download.
       # Rationale at the first of these in ci.yml (test_unit job); see #5296.
-      - uses: taiki-e/install-action@v2
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
         id: install-nextest
         if: steps.skip_check.outputs.skip != 'true'
+        timeout-minutes: 5
         with:
           tool: cargo-nextest
+          fallback: none
 
       # Build the simulation test binaries and fdev up-front in one cargo
       # invocation so they share a single compile of freenet/deps. Then the
@@ -1128,11 +1169,14 @@ jobs:
 
       # nextest via the maintained action, not a hand-rolled download.
       # Rationale at the first of these in ci.yml (test_unit job); see #5296.
-      - uses: taiki-e/install-action@v2
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
         id: install-nextest
         if: steps.skip_check.outputs.skip != 'true'
+        timeout-minutes: 5
         with:
           tool: cargo-nextest
+          fallback: none
 
       - name: Build
         if: steps.skip_check.outputs.skip != 'true'

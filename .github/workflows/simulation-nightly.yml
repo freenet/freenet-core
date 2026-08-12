@@ -80,10 +80,13 @@ jobs:
 
       # nextest via the maintained action, not a hand-rolled download.
       # Rationale at the first of these in ci.yml (test_unit job); see #5296.
-      - uses: taiki-e/install-action@v2
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
         id: install-nextest
+        timeout-minutes: 5
         with:
           tool: cargo-nextest
+          fallback: none
 
       - name: Clean test directories
         run: |
