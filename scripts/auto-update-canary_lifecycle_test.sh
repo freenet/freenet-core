@@ -302,6 +302,100 @@ else
 fi
 CANARY_OUTCOME_WAIT_SECS=$WAS_WAIT
 
+# ---------------------------------------------------------------------------
+# 7. A PORT COLLISION must be diagnosed as one, not as an auto-update fault.
+#
+#    Reproduced before the fix: two `preflight` runs started 2s apart, the
+#    second reporting "the startup update check never ran". Exit 43 is
+#    EXIT_CODE_ALREADY_RUNNING -- the node found its WS port occupied and died
+#    before the update task existed. `assert_detection_healthy` never consults
+#    NODE_EXIT, so the log assertion is the only thing that spoke, and it named
+#    the wrong subsystem on a release someone was waiting for.
+#
+#    Both halves are asserted, because the diagnosis is the point: the message
+#    must name the collision AND must no longer claim the update check never
+#    ran. Only the second of those was wrong before; a fix that added the new
+#    wording while leaving the old would still send the reader to the wrong
+#    place.
+# ---------------------------------------------------------------------------
+FAKE_43="$TMPROOT/fake-port-collision"
+cat > "$FAKE_43" <<'FAKE43'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then
+    echo "Freenet version: 0.2.122 (deadbeefcafe)"
+    exit 0
+fi
+logdir=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --log-dir) logdir="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+mkdir -p "$logdir"
+# A real node dies here BEFORE the update task is spawned, but the tracer is
+# already up -- so the log dir is non-empty and the "no logs at all" branch is
+# not the one that fires. That is what makes this land on the update-check
+# branch and get misdiagnosed.
+echo "2026-08-08T02:00:00.000000Z  INFO freenet: another instance is already running" \
+    >> "$logdir/freenet.2026-08-08-02.log"
+exit 43
+FAKE43
+chmod +x "$FAKE_43"
+COLLIDE_OUT="$(cmd_preflight "$FAKE_43" 2>&1)"
+if [[ "$COLLIDE_OUT" != *"port collision"* ]]; then
+    bad "cmd_preflight did not diagnose exit 43 as a port collision; got: $COLLIDE_OUT"
+elif [[ "$COLLIDE_OUT" == *"the startup update check never ran"* ]]; then
+    bad "cmd_preflight still reports a port collision as 'the startup update check never ran' -- the misdiagnosis is back"
+else
+    ok "exit 43 is diagnosed as a port collision, not as an auto-update fault"
+fi
+
+# ---------------------------------------------------------------------------
+# 8. A BLOCKING gate must leave the node's own output behind.
+#
+#    `cleanup` rm -rf's the workdir on EXIT, and the two branches likeliest to
+#    fire on a healthy release -- "the check never ran" and "started but never
+#    logged an outcome" -- printed nothing from the node, unlike the parse-fail
+#    and fetch-fail branches. So a real blocking run left no evidence at all,
+#    while docs/RELEASING.md told the operator to "read the job log; it names
+#    the offending line".
+#
+#    Driven through the "check never ran" branch specifically, because that is
+#    one of the two that printed nothing: a fixture whose node logs something
+#    identifiable but never the check line. Asserting the node's OWN line comes
+#    back is what distinguishes a real dump from a header that says "evidence".
+# ---------------------------------------------------------------------------
+FAKE_NOCHECK="$TMPROOT/fake-no-check-line"
+cat > "$FAKE_NOCHECK" <<'FAKENC'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then
+    echo "Freenet version: 0.2.122 (deadbeefcafe)"
+    exit 0
+fi
+logdir=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --log-dir) logdir="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+mkdir -p "$logdir"
+echo "2026-08-08T02:00:00.000000Z  INFO freenet: DISTINCTIVE_STARTUP_EVIDENCE_LINE" \
+    >> "$logdir/freenet.2026-08-08-02.log"
+sleep 1
+exit 0
+FAKENC
+chmod +x "$FAKE_NOCHECK"
+EVIDENCE_OUT="$(cmd_preflight "$FAKE_NOCHECK" 2>&1)"
+if [[ "$EVIDENCE_OUT" != *"canary node evidence"* ]]; then
+    bad "a blocking gate produced no evidence block; got: $EVIDENCE_OUT"
+elif [[ "$EVIDENCE_OUT" != *"DISTINCTIVE_STARTUP_EVIDENCE_LINE"* ]]; then
+    bad "the evidence block is present but does not contain the node's own log output; got: $EVIDENCE_OUT"
+else
+    ok "a blocking gate dumps the node's own log before the workdir is deleted"
+fi
+
 echo
 if [[ "$FAILURES" -eq 0 ]]; then
     echo "All auto-update-canary lifecycle assertions passed."

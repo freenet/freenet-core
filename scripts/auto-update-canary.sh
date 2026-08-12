@@ -54,9 +54,19 @@
 #                 detection path is hardwired to GitHub's `/releases/latest`,
 #                 and a draft release does not appear there.
 #
-# Run either locally; both are self-contained and touch nothing outside their
-# own temp directory (isolated HOME, config, data, log dirs, non-default
-# ports), so this is safe to run on a machine already running a node.
+# Run either locally. Both keep their FILES to their own temp directory
+# (isolated HOME, config, data and log dirs), so nothing outside it is touched.
+#
+# PORTS are the exception, and an earlier version of this header overstated it
+# by calling the runs "safe to run on a machine already running a node". They
+# bind real ports, so a run collides with anything already holding them --
+# including ANOTHER canary run, which is the likelier case. The node then exits
+# 43 (EXIT_CODE_ALREADY_RUNNING, `freenet.rs`). Two mitigations, neither a
+# guarantee: the ports are drawn from a random per-run block (below) rather than
+# fixed constants, and a 43 is classified as ENVIRONMENTAL so the gate retries on
+# a fresh block instead of reporting an auto-update fault. Reproduced before
+# that: two `preflight` runs started 2s apart, the second reporting "the startup
+# update check never ran" for what was purely a port collision.
 #
 set -uo pipefail
 
@@ -155,10 +165,29 @@ MARKER_LATEST_SEEN_SINCE='0.2.124'
 MUSL_ASSET='freenet-x86_64-unknown-linux-musl.tar.gz'
 RELEASE_BASE='https://github.com/freenet/freenet-core/releases/download'
 
-# Ports deliberately off the defaults (31337 / 7509) so a canary run never
-# collides with a real node on the same host.
-CANARY_NETWORK_PORT="${CANARY_NETWORK_PORT:-39337}"
-CANARY_WS_PORT="${CANARY_WS_PORT:-39509}"
+# The node's exit code for "another instance already holds my WS port"
+# (EXIT_CODE_ALREADY_RUNNING in crates/core/src/bin/freenet.rs). Environmental,
+# not an updater fault -- see where it is classified in the gate commands.
+EXIT_CODE_ALREADY_RUNNING=43
+
+# Ports deliberately off the node defaults (31337 / 7509) so a canary run does
+# not collide with a real node on the same host.
+#
+# Drawn from a random 8-port BLOCK per run rather than fixed constants. Fixed
+# ports made two canary runs on one host collide by construction: reproduced
+# with two `preflight` runs started 2s apart, the second dying with exit 43 and
+# being reported as "the startup update check never ran". CI is a fresh VM per
+# job today, but other jobs in this repo already use self-hosted runners, where
+# that becomes a silent and permanently-misdiagnosed release blocker -- and it
+# breaks the local-debugging path this file's header invites, which is exactly
+# when someone is trying to understand a blocked release.
+#
+# Block of 8 with the WS port at +4, so the per-attempt increments below (at
+# most +2, for CANARY_ATTEMPTS=3) can never walk the network port onto this
+# run's own WS port. Both stay overridable; the lifecycle test pins them.
+CANARY_PORT_BLOCK="${CANARY_PORT_BLOCK:-$(( 39000 + (RANDOM % 320) * 8 ))}"
+CANARY_NETWORK_PORT="${CANARY_NETWORK_PORT:-$CANARY_PORT_BLOCK}"
+CANARY_WS_PORT="${CANARY_WS_PORT:-$(( CANARY_PORT_BLOCK + 4 ))}"
 
 # How long to let the node run before giving up on the startup check. The
 # check fires after a 0-60s anti-thundering-herd jitter, so this must clear
@@ -262,9 +291,18 @@ node_check_settled() {
 # preflight runs, and `cmd_preflight` does not retry an rc=1 -- so a healthy
 # release was blocked by an error naming the wrong subsystem.
 #
-# `grep -a`: the node writes some non-UTF8 bytes, and without it grep calls the
-# file binary and prints nothing -- which would silently satisfy every NEGATIVE
-# check. Exactly the vacuous-pass shape this canary exists to prevent.
+# `grep -a`: the node writes some non-UTF8 bytes, and without it grep treats the
+# file as binary. Keep it -- but for the opposite reason an earlier version of
+# this comment gave. It claimed dropping `-a` "would silently satisfy every
+# NEGATIVE check", i.e. a vacuous pass. Measured on GNU grep 3.11 with a NUL in
+# the log, that is wrong: `grep -q` still reports matches in a binary file, so
+# `log_has` is unaffected in BOTH directions (present -> rc=0, absent -> rc=1).
+# What breaks is `log_lines`, whose STDOUT goes empty ("binary file matches"
+# goes to stderr instead of the line). The first consumer to notice is the
+# equality check's `seen_line`, which reads empty and fails with "the node never
+# logged which release it compared against" -- a spurious BLOCKED release, not a
+# vacuous pass. Fail-closed, so the direction matters to whoever is diagnosing
+# it at the time.
 log_has() {
   # log_has <log-dir> <fixed-string>
   grep -aqF -- "$2" "$1"/freenet.*.log 2>/dev/null
@@ -272,6 +310,47 @@ log_has() {
 log_lines() {
   # log_lines <log-dir> <fixed-string>  -- matching lines on stdout, no headers
   grep -ahF -- "$2" "$1"/freenet.*.log 2>/dev/null
+}
+
+# NOTE on the glob above: `freenet.*.log` also matches `freenet.error.*.log`,
+# which the node writes as a WARN+ subset of the same events. So a WARN-level
+# marker is read from two files and matches twice. Harmless for every consumer
+# today -- `log_has` only wants presence, and `log_lines` output is consumed by
+# `head -2` or `tail -1` -- but a future count-based assertion would silently
+# double for WARN markers and not for INFO ones. Narrow the glob before adding
+# one.
+
+# dump_node_evidence <workdir> -- the node's own output, to stderr.
+#
+# Gate A blocking with no evidence is the failure mode this exists for. The two
+# branches most likely to fire on a HEALTHY release -- "the check never ran" and
+# "started but never logged an outcome" -- printed no node output at all, unlike
+# the parse-fail and fetch-fail branches which echo the offending lines. The
+# EXIT trap then deletes the workdir, so a real blocking run left nothing
+# behind, while `docs/RELEASING.md` told the operator to "read the job log; it
+# names the offending line" -- true for a parse failure, false for exactly the
+# two branches most likely to block a good release.
+#
+# Called by the gate commands rather than from inside `assert_detection_healthy`
+# on purpose: that function is pure (log dir in, verdict out), which is what
+# makes it unit-testable against fixtures, and it never sees the workdir.
+dump_node_evidence() {
+  local work="$1"
+  printf '::group::canary node evidence (%s)\n' "$work" >&2
+  if [ -s "$work/node.out" ]; then
+    printf -- '--- node.out (last 40 lines) ---\n' >&2
+    tail -40 "$work/node.out" >&2
+  else
+    printf -- '--- node.out is empty or absent ---\n' >&2
+  fi
+  # `ls` first: "which log files exist" is itself the answer when none do.
+  printf -- '--- %s/logs ---\n' "$work" >&2
+  ls -la "$work/logs" >&2 2>/dev/null || printf 'no log directory\n' >&2
+  if grep -aq '' "$work/logs"/freenet.*.log 2>/dev/null; then
+    printf -- '--- node log (last 40 lines) ---\n' >&2
+    tail -q -n 40 "$work/logs"/freenet.*.log >&2 2>/dev/null
+  fi
+  printf '::endgroup::\n' >&2
 }
 
 
@@ -336,7 +415,17 @@ assert_detection_healthy() {
   # (+) POSITIVE side. Without this, every assertion below passes vacuously on
   #     a node that never checked for updates.
   if ! log_has "$logdir" "$MARKER_CHECK_RAN"; then
-    fail "the startup update check never ran: no '$MARKER_CHECK_RAN' line. Absence of a parse error here proves NOTHING -- the check did not happen."
+    # Hedged the same way the empty-log branch above is, and for the same
+    # reason. The update task is spawned well inside network-node startup, so
+    # anything that kills the node before it gets there lands HERE, not in that
+    # branch -- the tracer is already up, so the log dir is non-empty. The
+    # common one is a fresh config dir with no `gateways.toml`, which makes
+    # `NodeConfig::new` fetch the remote gateway index
+    # (`crates/core/src/config.rs`); if the runner cannot reach freenet.org the
+    # node dies before the updater exists. Naming only the update path sends the
+    # reader after a parsing bug that is not there, on a release someone is
+    # waiting for.
+    fail "the startup update check never ran: no '$MARKER_CHECK_RAN' line. Absence of a parse error here proves NOTHING -- the check did not happen. This is NOT by itself evidence that auto-update is broken: anything that stops the node reaching the update task lands here too (gateway-list fetch, config, port bind). Check the node output below for a startup failure BEFORE investigating the update path."
     return 1
   fi
 
@@ -524,10 +613,16 @@ run_node_until_check() {
       # assertion -- the canary would report "no update requested" for a node
       # that requested one. Let it finish.
       if node_decided_to_update "$work/logs"; then
-        local settle=0
-        while kill -0 "$node_pid" 2>/dev/null && [ "$settle" -lt 60 ]; do
+        # Clamped by `deadline` as well as by its own 60s budget. Every other
+        # wait in this loop honours the outer ceiling; this was the one arm that
+        # ignored it, so CANARY_TIMEOUT_SECS could be overrun by up to a minute.
+        # It was bounded in practice only because the node dies at its own
+        # `timeout $CANARY_TIMEOUT_SECS` -- an accident of a sibling mechanism,
+        # not a guarantee this loop makes.
+        local settle_deadline=$(( $(date +%s) + 60 ))
+        [ "$settle_deadline" -gt "$deadline" ] && settle_deadline="$deadline"
+        while kill -0 "$node_pid" 2>/dev/null && [ "$(date +%s)" -lt "$settle_deadline" ]; do
           sleep 2
-          settle=$((settle + 2))
         done
       fi
       break
@@ -606,7 +701,16 @@ prev_emits_latest_seen() {
 
 resolve_expected_latest() {
   local url tag
-  url="$(curl -fsS --max-time 30 -o /dev/null -w '%{redirect_url}' \
+  # `--retry`: this call has no second chance anywhere else. Its failure returns
+  # 1 from cmd_preflight BEFORE the attempt loop is entered, so unlike every
+  # node-side indeterminate -- which gets CANARY_ATTEMPTS tries -- a single
+  # transient blip here blocks the release outright. The comment above justifies
+  # the no-retry stance with "not something a re-run fixes", which is true of the
+  # NODE's verdict and not of one curl. `--retry-all-errors` because the
+  # interesting failures (connection reset, DNS blip) are not HTTP statuses,
+  # which is all bare `--retry` covers.
+  url="$(curl -fsS --max-time 30 --retry 2 --retry-all-errors \
+    -o /dev/null -w '%{redirect_url}' \
     'https://github.com/freenet/freenet-core/releases/latest' 2>/dev/null)" || return 1
   case "$url" in
     */releases/tag/*) tag="${url##*/releases/tag/}" ;;
@@ -678,8 +782,26 @@ cmd_preflight() {
     CANARY_NETWORK_PORT=$((CANARY_NETWORK_PORT + 1))
     CANARY_WS_PORT=$((CANARY_WS_PORT + 1))
     run_node_until_check "$binary" "$work"
-    assert_detection_healthy "$work/logs"
-    rc=$?
+    # Classify the port collision BEFORE the log assertion, because the log
+    # assertion cannot see it: `assert_detection_healthy` never consults
+    # NODE_EXIT, so a node that died on exit 43 without an update-check line
+    # reads as "the startup update check never ran" -- an auto-update fault
+    # reported for another process holding the port. Reproduced with two
+    # `preflight` runs 2s apart.
+    #
+    # Returning 2 (environmental) rather than 1 is the load-bearing half: rc=1
+    # skips the retry loop, and the ports are redrawn every attempt, so the very
+    # next attempt would have succeeded. This is precisely what rc=2 is for.
+    if [ "$NODE_EXIT" = "$EXIT_CODE_ALREADY_RUNNING" ]; then
+      note "INDETERMINATE: the node exited $EXIT_CODE_ALREADY_RUNNING (another instance already holds ports $CANARY_NETWORK_PORT/$CANARY_WS_PORT). This is a port collision on this host -- another canary run, or a local node -- not an auto-update fault. Retrying on a fresh port."
+      rc=2
+    else
+      assert_detection_healthy "$work/logs"
+      rc=$?
+    fi
+    # Keep the evidence before the next attempt wipes the tree, or the EXIT trap
+    # deletes it. Only on a non-zero verdict, so a healthy release stays quiet.
+    [ "$rc" -eq 0 ] || dump_node_evidence "$work"
     [ "$rc" -eq 2 ] || return "$rc"
     if [ "$attempt" -lt "$CANARY_ATTEMPTS" ]; then
       log "indeterminate (no verdict from the update check); retrying in ${CANARY_RETRY_SLEEP}s"
@@ -745,11 +867,24 @@ cmd_selfupdate() {
 
   run_node_until_check "$work/bin/freenet" "$work"
 
+  # Same port-collision classification as Gate A, and for the same reason: the
+  # log assertion below never consults NODE_EXIT, so a 43 reads as an
+  # auto-update fault. Gate B has no retry loop, so this corrects only the
+  # DIAGNOSIS -- but that is the difference between "re-run this job" and
+  # someone hunting a fleet-wide updater break that does not exist.
+  if [ "$NODE_EXIT" = "$EXIT_CODE_ALREADY_RUNNING" ]; then
+    dump_node_evidence "$work"
+    fail "UNVERIFIED: the node exited $EXIT_CODE_ALREADY_RUNNING (another instance already holds ports $CANARY_NETWORK_PORT/$CANARY_WS_PORT), so Gate B never got to test the updater. This is a port collision on this host -- another canary run, or a local node -- NOT an auto-update fault. Re-run the job."
+    return 1
+  fi
+
   # The two-sided log assertion first: it LOCALISES the failure. If detection
   # is broken the version check below would also fail, but with a far less
   # useful message.
   assert_detection_healthy "$work/logs"
   local rc=$?
+  # Keep the node's own output before the EXIT trap deletes the workdir.
+  [ "$rc" -eq 0 ] || dump_node_evidence "$work"
   if [ "$rc" -eq 2 ]; then
     # Infrastructure, not a stranded fleet. Still a failure -- reporting green
     # on an unverified run is the vacuous-pass this canary exists to prevent --
