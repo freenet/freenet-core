@@ -234,6 +234,75 @@ check_vs_expected "equality: no observed-latest line at all -> fail" \
 check "equality: unset expected-latest -> still passes, but says it skipped" \
     0 "$SEEN_OK"
 
+# --- the tag normaliser -----------------------------------------------------
+# It has to agree with version_from_tag exactly. If it strips differently, the
+# equality check above compares two spellings of the same release and fails a
+# release for a difference that is not a bug.
+norm_case() {
+    # norm_case <input> <expected>
+    local got
+    got="$(normalise_release_tag "$1")"
+    if [[ "$got" == "$2" ]]; then
+        echo "ok   - normalise_release_tag '$1' -> '$2'"
+    else
+        echo "FAIL - normalise_release_tag '$1' gave '$got', expected '$2'" >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+norm_case "v0.2.122" "0.2.122"
+norm_case "0.2.122"  "0.2.122"
+# At most ONE `v`, matching `strip_prefix` rather than the greedy
+# `trim_start_matches` -- the hazard version_from_tag's rustdoc calls out.
+norm_case "vv1.2.3"  "v1.2.3"
+
+# --- the SIGPIPE regression (review finding 35) -----------------------------
+# `grep -q` at the end of a pipe exits at its first match and SIGPIPEs the
+# upstream grep; under `pipefail` that 141 became the pipeline's status and the
+# detector answered "no" for a node that plainly did decide to update. It only
+# bites once output passes the 64 KB pipe buffer, so a small fixture cannot see
+# it -- this one is deliberately large enough to.
+sigpipe_dir="$(mktemp -d "$TMPROOT/sigpipe.XXXXXX")"
+{
+    for _ in $(seq 1 700); do
+        echo '2026-08-08T02:02:59Z  INFO freenet: Startup check: newer version on GitHub, triggering auto-update new_version=0.2.122'
+    done
+} > "$sigpipe_dir/freenet.2026-08-08-02.log"
+if node_decided_to_update "$sigpipe_dir"; then
+    echo "ok   - trigger detection survives >64KB of matching output (no SIGPIPE)"
+else
+    echo "FAIL - trigger detection returned FALSE on a log full of triggers." >&2
+    echo "       This is the pipefail+SIGPIPE regression: a trailing 'grep -q' closes the" >&2
+    echo "       pipe at the first match, the upstream grep dies 141, and pipefail makes" >&2
+    echo "       that the pipeline's status -- so a node that decided to update reads as" >&2
+    echo "       one that did not." >&2
+    FAILURES=$((FAILURES + 1))
+fi
+
+# --- numeric-override validation (review finding 36) ------------------------
+# A non-numeric CANARY_TIMEOUT_SECS reaches an arithmetic context and, under
+# `set -u`, kills the canary with a shell error instead of a verdict -- a
+# release-blocking failure whose message says nothing about the release. Its two
+# neighbours were already guarded; this one was not.
+timeout_guard_case() {
+    # timeout_guard_case <override> <expected-effective-value>
+    local got
+    got="$(CANARY_TIMEOUT_SECS="$1" bash -c '
+        set -uo pipefail
+        # shellcheck source=/dev/null
+        source "$1" >/dev/null 2>&1 || true
+        printf "%s" "$CANARY_TIMEOUT_SECS"' _ "$CANARY_SH")"
+    if [[ "$got" == "$2" ]]; then
+        echo "ok   - CANARY_TIMEOUT_SECS='$1' is sanitised to $2"
+    else
+        echo "FAIL - CANARY_TIMEOUT_SECS='$1' became '$got', expected '$2'" >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+timeout_guard_case "abc" "240"
+timeout_guard_case "0"   "240"
+timeout_guard_case ""    "240"
+timeout_guard_case "90"  "90"
+
 # --- markers must still exist in the Rust source ----------------------------
 # Without this the fixtures above are a self-consistent copy of strings that
 # may no longer be emitted: the canary would go quietly blind while its own

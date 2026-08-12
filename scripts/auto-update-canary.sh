@@ -514,6 +514,22 @@ run_node_until_check() {
 # During Gate A our own release is still a DRAFT, so this correctly resolves to
 # the PREVIOUS release -- the same thing the node under test sees.
 # ---------------------------------------------------------------------------
+
+# normalise_release_tag <tag>
+#
+# Split out from the fetch so it can be tested without a network: the whole
+# check turns on this matching what the node does, and a normaliser nobody can
+# test is how the mismatch it exists to catch would be introduced.
+#
+# `${tag#v}` strips AT MOST ONE leading `v`, mirroring version_from_tag's
+# `strip_prefix` -- deliberately not the greedy `${tag##v*}`, because
+# `trim_start_matches` semantics would turn `vv1.2.3` into `1.2.3` and lose what
+# is needed to address the release. The rustdoc on version_from_tag documents
+# the same hazard.
+normalise_release_tag() {
+  printf '%s' "${1#v}"
+}
+
 resolve_expected_latest() {
   local url tag
   url="$(curl -fsS --max-time 30 -o /dev/null -w '%{redirect_url}' \
@@ -523,10 +539,7 @@ resolve_expected_latest() {
     *) return 1 ;;
   esac
   [ -n "$tag" ] || return 1
-  # `${tag#v}` strips at most one leading `v`, matching version_from_tag's
-  # `strip_prefix` (NOT `trim_start_matches`, which is greedy -- see the
-  # rustdoc on version_from_tag).
-  printf '%s' "${tag#v}"
+  normalise_release_tag "$tag"
 }
 
 # ---------------------------------------------------------------------------
