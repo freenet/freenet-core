@@ -67,6 +67,23 @@ pub(crate) enum RuntimeInnerError {
     #[error("delegate {0} not found in store")]
     DelegateNotFound(DelegateKey),
 
+    /// A delegate offered for storage carries a key that is not derived from
+    /// its own code and parameters, so the node cannot store it under an
+    /// identity it has verified. See `DelegateStore::verify_delegate_identity`.
+    ///
+    /// This is the delegate sibling of [`Self::ContractIdentityMismatch`]. It is
+    /// a separate variant rather than a shared one because the two carry
+    /// different key types, and a caller matching on the error wants to know
+    /// which store refused.
+    #[error(
+        "delegate {key} identity does not match its code: {detail} \
+         (the key a delegate is stored under must be derived from its bytes)"
+    )]
+    DelegateIdentityMismatch {
+        key: Box<DelegateKey>,
+        detail: String,
+    },
+
     #[error(transparent)]
     DelegateExecError(#[from] delegate::DelegateExecError),
 
