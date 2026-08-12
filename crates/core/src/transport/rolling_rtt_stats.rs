@@ -205,13 +205,17 @@ impl<T: TimeSource> RttSnapshotProvider for RollingRttStats<T> {
     }
 }
 
+/// Map from peer address to its RTT stats source. Named so the pure
+/// aggregation helpers below can be pointed at either the process-global
+/// registry or, in tests, a caller-owned instance.
+pub(crate) type RttRegistry = DashMap<SocketAddr, Arc<dyn RttSnapshotProvider>>;
+
 /// Process-wide registry of per-peer rolling RTT stats. Populated by
 /// `RollingRttStatsHandle::new` on connection establishment and pruned
 /// when the handle drops. The cross-connection aggregator reads this
 /// registry once per second; nothing in the controller path writes to
 /// it.
-pub(crate) static SHADOW_RTT_REGISTRY: LazyLock<DashMap<SocketAddr, Arc<dyn RttSnapshotProvider>>> =
-    LazyLock::new(DashMap::new);
+pub(crate) static SHADOW_RTT_REGISTRY: LazyLock<RttRegistry> = LazyLock::new(DashMap::new);
 
 /// RAII handle that owns a peer's `RollingRttStats` and registers it
 /// with the global shadow registry for the lifetime of the connection.
@@ -250,13 +254,26 @@ impl<T: TimeSource> Drop for RollingRttStatsHandle<T> {
     }
 }
 
-/// Snapshot every live per-peer entry. Skips peers whose baseline
-/// window is still empty.
-pub(crate) fn registry_snapshot() -> Vec<(SocketAddr, RttSnapshot)> {
-    SHADOW_RTT_REGISTRY
+/// Snapshot every live per-peer entry of `registry`. Skips peers whose
+/// baseline window is still empty.
+///
+/// Takes the registry as a parameter so the aggregation logic can be
+/// exercised against a caller-owned instance. Tests MUST use this form
+/// rather than aggregating over the process-global registry: any test
+/// that builds a `RemoteConnection` registers a peer there, so an
+/// aggregate computed over the global map depends on which other tests
+/// happen to be in flight. See `cross_connection_median_inflation`.
+fn snapshot_registry(registry: &RttRegistry) -> Vec<(SocketAddr, RttSnapshot)> {
+    registry
         .iter()
         .filter_map(|kv| kv.value().snapshot().map(|s| (*kv.key(), s)))
         .collect()
+}
+
+/// Snapshot every live per-peer entry of the process-global registry.
+/// Skips peers whose baseline window is still empty.
+pub(crate) fn registry_snapshot() -> Vec<(SocketAddr, RttSnapshot)> {
+    snapshot_registry(&SHADOW_RTT_REGISTRY)
 }
 
 /// Cross-connection median RTT inflation across all live peers with a
@@ -273,7 +290,31 @@ pub(crate) fn registry_snapshot() -> Vec<(SocketAddr, RttSnapshot)> {
 /// before treating the result as a contention signal. Phase 1 only
 /// logs the value, so the small-N case is documentation, not a bug.
 pub(crate) fn cross_connection_median_inflation() -> Option<Duration> {
-    let mut inflations: Vec<u64> = registry_snapshot()
+    median_inflation_in(&SHADOW_RTT_REGISTRY)
+}
+
+/// Cross-peer median inflation over `registry`. Peers with no defined
+/// inflation (no recent samples, so no `recent_median`) are skipped
+/// entirely rather than counted as zero.
+///
+/// Parameterised over the registry so tests can assert an exact median
+/// against an instance they own. **Do not write a test that asserts a
+/// value returned by aggregating over `SHADOW_RTT_REGISTRY`.** That map
+/// is process-global and every `RemoteConnection` registers into it
+/// (including the fixtures in `peer_connection.rs` and
+/// `connection_handler.rs`, whose steady RTTs yield `Some(ZERO)`), so
+/// the input set depends on which other tests are running concurrently.
+///
+/// An inequality is NOT a safe way to tolerate that cross-talk here,
+/// which is the trap this signature exists to remove: **a median is not
+/// monotone under added zeros.** One 70 ms peer plus two zero-inflation
+/// peers sorts to `[0, 0, 70ms]`, and the upper-middle pick at index
+/// `len / 2` = 1 is `0` — so `median > ZERO` fails. (A max would have
+/// been monotone and safe; a median is not.) The only claims that
+/// survive cross-talk on the global map are monotone ones such as
+/// `is_some()`.
+fn median_inflation_in(registry: &RttRegistry) -> Option<Duration> {
+    let mut inflations: Vec<u64> = snapshot_registry(registry)
         .into_iter()
         .filter_map(|(_, s)| s.inflation.map(|d| d.as_nanos() as u64))
         .collect();
@@ -641,15 +682,55 @@ mod tests {
         );
     }
 
-    // Registry / handle tests use a unique IP per test to stay
-    // independent under nextest's per-process isolation. They reach
-    // into the global SHADOW_RTT_REGISTRY, so a per-test addr keeps
-    // them safe even when a single process happens to run more than
-    // one of them.
+    // Registry / handle tests use a unique IP per test. That keeps
+    // ADDR-SCOPED assertions ("my addr is/isn't present") sound on the
+    // process-global SHADOW_RTT_REGISTRY even when one process runs
+    // several of them, because no other test claims the same key.
+    //
+    // A unique addr does NOT make an AGGREGATE assertion sound: a
+    // median/mean/count over the whole registry still sees every other
+    // live entry, including the zero-inflation peers that any
+    // `RemoteConnection` fixture registers. Aggregate assertions belong
+    // on a test-local `RttRegistry` via `median_inflation_in` — see the
+    // rustdoc on that function.
 
     fn unique_addr(octet: u8, port: u16) -> SocketAddr {
         use std::net::Ipv4Addr;
         SocketAddr::new(Ipv4Addr::new(192, 0, 2, octet).into(), port)
+    }
+
+    /// Build a test-local registry holding one peer per
+    /// `(baseline_ms, recent_ms)` pair. Each peer ends up with
+    /// `inflation == recent_ms - baseline_ms` (pass equal values for a
+    /// zero-inflation peer). All peers share one `VirtualTime` so they
+    /// see the same window boundaries.
+    fn registry_with_inflations(pairs: &[(u64, u64)]) -> RttRegistry {
+        let ts = VirtualTime::new();
+        let peers: Vec<Arc<RollingRttStats<VirtualTime>>> = pairs
+            .iter()
+            .map(|_| Arc::new(RollingRttStats::new(ts.clone())))
+            .collect();
+        // Establish each peer's baseline at t=0.
+        for (peer, (baseline_ms, _)) in peers.iter().zip(pairs) {
+            for _ in 0..3 {
+                peer.record(dur_ms(*baseline_ms));
+            }
+        }
+        // Past the 10s recent window, still inside the 5min baseline, so
+        // the baseline samples set `baseline_min` and only what follows
+        // counts toward `recent_median`.
+        ts.advance(Duration::from_secs(30));
+        for (peer, (_, recent_ms)) in peers.iter().zip(pairs) {
+            for _ in 0..5 {
+                peer.record(dur_ms(*recent_ms));
+            }
+        }
+        let registry = RttRegistry::new();
+        for (i, peer) in peers.into_iter().enumerate() {
+            let erased: Arc<dyn RttSnapshotProvider> = peer;
+            registry.insert(unique_addr(100 + i as u8, 51000 + i as u16), erased);
+        }
+        registry
     }
 
     #[test]
@@ -697,67 +778,133 @@ mod tests {
 
     #[test]
     fn cross_connection_median_is_robust_to_one_outlier() {
-        // Three peers with ~zero inflation; one peer with very high
-        // inflation. The median computed over only our peers must
-        // ignore the outlier. We filter to our own addresses so this
-        // test is independent of any other test's registry entries
-        // running concurrently.
-        let ts = VirtualTime::new();
-        let addrs: Vec<SocketAddr> = (10..14u8)
-            .map(|i| unique_addr(i, 50100 + i as u16))
-            .collect();
-        let peers: Vec<_> = addrs
-            .iter()
-            .map(|a| RollingRttStatsHandle::new(*a, ts.clone()))
-            .collect();
-
-        // Establish a clean baseline on every peer.
-        for h in &peers {
-            for _ in 0..3 {
-                h.record(dur_ms(50));
-            }
-        }
-        ts.advance(Duration::from_secs(30));
-        // Three peers stay near 50ms recent; one inflates to 500ms.
-        for (i, h) in peers.iter().enumerate() {
-            let recent = if i == 3 { dur_ms(500) } else { dur_ms(55) };
-            for _ in 0..5 {
-                h.record(recent);
-            }
-        }
-
-        let mut my_inflations: Vec<u64> = registry_snapshot()
-            .into_iter()
-            .filter(|(a, _)| addrs.contains(a))
-            .filter_map(|(_, s)| s.inflation.map(|d| d.as_nanos() as u64))
-            .collect();
-        my_inflations.sort_unstable();
+        // Three peers near baseline; one badly inflated. The outlier
+        // must not drive the signal.
+        //
+        // Runs against a test-local registry so this asserts the EXACT
+        // median through the real production helper. The previous
+        // version filtered the global registry to its own addresses and
+        // then re-implemented the median in the test, which could only
+        // ever prove the test agreed with itself.
+        let registry = registry_with_inflations(&[(50, 55), (50, 55), (50, 55), (50, 500)]);
+        // Inflations are [5, 5, 5, 450] ms; sorted, index len/2 = 2 is 5 ms.
         assert_eq!(
-            my_inflations.len(),
-            4,
-            "all four peers should have inflation"
+            median_inflation_in(&registry),
+            Some(dur_ms(5)),
+            "the 500ms outlier must not pull the median off baseline"
         );
-        let median = Duration::from_nanos(my_inflations[my_inflations.len() / 2]);
-        // Inflations across our peers are ~[5, 5, 5, 450] ms. The
-        // upper-middle median is ~5 ms; anything below 50 ms proves
-        // the outlier didn't drive the signal.
-        assert!(
-            median < dur_ms(50),
-            "median {median:?} should be near baseline, not pulled by the 500ms outlier"
-        );
-
-        // Drop everything for hygiene.
-        drop(peers);
     }
 
-    /// Direct call into `cross_connection_median_inflation()`. The
-    /// outlier-robustness test above filters to its own peers and
-    /// open-codes the median, so without this test the public
-    /// function itself is uncovered. Use a single peer with a known
-    /// inflation so cross-talk from any other test's registry entry
-    /// can be tolerated by an inequality assertion.
+    /// Cross-peer median takes the upper-middle value, matching the
+    /// per-peer `recent_median` convention.
     #[test]
-    fn cross_connection_median_returns_some_when_a_peer_has_inflation() {
+    fn median_inflation_takes_upper_middle_across_peers() {
+        // Odd count: [5, 20, 70] ms, index 3/2 = 1 -> 20 ms.
+        let registry = registry_with_inflations(&[(50, 55), (50, 70), (50, 120)]);
+        assert_eq!(median_inflation_in(&registry), Some(dur_ms(20)));
+
+        // Even count: [5, 70] ms, index 2/2 = 1 -> 70 ms (upper-middle,
+        // not the mean and not the lower-middle).
+        let registry = registry_with_inflations(&[(50, 55), (50, 120)]);
+        assert_eq!(median_inflation_in(&registry), Some(dur_ms(70)));
+    }
+
+    /// A peer that is registered but has no recent samples has no
+    /// defined inflation, and must contribute NOTHING — not a zero.
+    ///
+    /// This is the property the old global-registry assertion got wrong
+    /// in the opposite direction: zeros in the input really do drag the
+    /// median down (see the test below), so it matters that absent
+    /// inflation never becomes a zero in the first place.
+    #[test]
+    fn median_inflation_ignores_peers_with_no_recent_samples() {
+        let ts = VirtualTime::new();
+        let quiet = Arc::new(RollingRttStats::new(ts.clone()));
+        let active = Arc::new(RollingRttStats::new(ts.clone()));
+        for _ in 0..3 {
+            quiet.record(dur_ms(50));
+            active.record(dur_ms(50));
+        }
+        // Past the recent window: `quiet` goes silent (recent_median
+        // None -> inflation None), `active` keeps sending.
+        ts.advance(Duration::from_secs(30));
+        for _ in 0..5 {
+            active.record(dur_ms(120));
+        }
+
+        let registry = RttRegistry::new();
+        let quiet_erased: Arc<dyn RttSnapshotProvider> = quiet;
+        let active_erased: Arc<dyn RttSnapshotProvider> = active;
+        registry.insert(unique_addr(120, 51200), quiet_erased);
+        registry.insert(unique_addr(121, 51201), active_erased);
+
+        // Only `active` has a defined inflation, so the median is its
+        // 70ms. Were `quiet` counted as zero, [0, 70] would yield 70 by
+        // luck of the upper-middle pick, so assert the skip directly too.
+        assert_eq!(median_inflation_in(&registry), Some(dur_ms(70)));
+        assert_eq!(
+            snapshot_registry(&registry)
+                .iter()
+                .filter(|(_, s)| s.inflation.is_some())
+                .count(),
+            1,
+            "the silent peer must have no defined inflation at all"
+        );
+    }
+
+    /// Regression pin for the reasoning error this module's tests used to
+    /// make: **a median is not monotone under added zeros**, so an
+    /// inequality assertion does NOT tolerate cross-talk from other
+    /// peers. Adding two zero-inflation peers to one 70ms peer moves the
+    /// median DOWN to zero.
+    ///
+    /// Zero-inflation peers are not hypothetical: every steady-RTT
+    /// `RemoteConnection` fixture in `peer_connection.rs` /
+    /// `connection_handler.rs` registers one in the process-global
+    /// registry, which is why an aggregate assertion over that map was
+    /// only ever sound under per-process isolation.
+    #[test]
+    fn median_inflation_is_dragged_to_zero_by_zero_inflation_peers() {
+        let registry = registry_with_inflations(&[(50, 50), (50, 50), (50, 120)]);
+        // Inflations [0, 0, 70] ms; sorted, index 3/2 = 1 is 0.
+        assert_eq!(
+            median_inflation_in(&registry),
+            Some(Duration::ZERO),
+            "two zero-inflation peers must be able to drag the median to zero"
+        );
+    }
+
+    #[test]
+    fn median_inflation_is_none_for_an_empty_registry() {
+        assert_eq!(median_inflation_in(&RttRegistry::new()), None);
+    }
+
+    /// The public entry point must actually read the process-global
+    /// `SHADOW_RTT_REGISTRY`, so that the aggregator sees real peers.
+    /// Exact-median coverage lives in the `median_inflation_in` tests
+    /// above, against a registry those tests own.
+    ///
+    /// This asserts only `is_some()`, and that is deliberate rather than
+    /// lazy. The global registry is shared with every other test that
+    /// builds a `RemoteConnection`, so its contents are not ours to
+    /// control; `is_some()` is the strongest claim that stays true under
+    /// that cross-talk, because it IS monotone under added entries — a
+    /// concurrent peer can only add an inflation to the vector, never
+    /// remove ours, and a non-empty vector always yields `Some`. It is
+    /// still a real assertion: it fails if the delegation stops reading
+    /// the global registry.
+    ///
+    /// Do NOT strengthen this to `median > ZERO`. That was the previous
+    /// assertion and it is unsound for the reason pinned by
+    /// `median_inflation_is_dragged_to_zero_by_zero_inflation_peers`: a
+    /// median is not monotone under added zeros, so two concurrently
+    /// registered steady-RTT peers turn `[70ms]` into `[0, 0, 70ms]`,
+    /// whose upper-middle pick is `0`. It passed under `cargo nextest`
+    /// (a process per test) and failed under plain `cargo test`.
+    /// `>= ZERO` is not the fix either — `inflation` is a
+    /// `saturating_sub`, so that assertion cannot fail at all.
+    #[test]
+    fn cross_connection_median_reads_the_process_global_registry() {
         let ts = VirtualTime::new();
         let addr = unique_addr(30, 50300);
         let h = RollingRttStatsHandle::new(addr, ts.clone());
@@ -768,12 +915,10 @@ mod tests {
         for _ in 0..5 {
             h.record(dur_ms(120));
         }
-        let median =
-            cross_connection_median_inflation().expect("at least one peer has defined inflation");
-        // We can't assert an exact value because other tests may
-        // contribute peers, but the result must be non-zero (someone
-        // has inflation) and bounded.
-        assert!(median > Duration::ZERO);
+        assert!(
+            cross_connection_median_inflation().is_some(),
+            "our peer has a defined inflation, so the global read must yield Some"
+        );
         drop(h);
     }
 
