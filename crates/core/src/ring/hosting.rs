@@ -1635,19 +1635,40 @@ impl HostingManager {
     /// supplies it because the instance→code index lives in `ContractStore`, not
     /// in the ring.
     ///
-    /// Cost is O(contracts with live demand) with an early exit on the first
-    /// match, where the instance-keyed `contract_in_use` is O(1). Both callers
-    /// stay cheap under that:
+    /// NOT an exact lift of `contract_in_use`, in one direction worth knowing: an
+    /// instance genuinely in use but not yet INDEXED resolves to `None` through
+    /// `code_of` and contributes no interest here, where `contract_in_use` would
+    /// have returned `true`. That is reachable — a downstream subscriber can
+    /// register before the blob is stored. It fails SAFE (the entry looks colder
+    /// than it is, biasing eviction toward discarding it, never toward serving a
+    /// wrong module), but it makes this "interest among indexed instances".
     ///
-    /// - The O(entries) interest/telemetry scan
-    ///   (`ModuleCache::recompute_interest_split`) is throttled to at most once
-    ///   per 10 s, and now runs over one entry per distinct BINARY — the same
-    ///   keying change that motivates this method is what collapses that entry
-    ///   count (~17x on a measured gateway).
+    /// # Cost — and the case that gets NO early exit
+    ///
+    /// O(contracts with live demand), against O(1) for the instance-keyed
+    /// `contract_in_use` this lifts. The early exit on the first match only helps
+    /// the "in use" answer; proving the NEGATIVE requires scanning both maps to
+    /// the end, and per fleet telemetry the negative is the overwhelmingly common
+    /// answer (median 0.43% of the cache is of interest). So assume the full scan
+    /// on essentially every call, and read the two callers that way:
+    ///
+    /// - The interest/telemetry scan (`ModuleCache::recompute_interest_split`) is
+    ///   O(entries) with no early exit of its own, so it is really
+    ///   O(entries × live-demand). Re-keying by code hash collapsed `entries`
+    ///   ~17x on a measured gateway (#5268) while raising the per-entry factor
+    ///   from O(1); it is throttled to at most once per 10 s, which is what keeps
+    ///   it off the hot path.
     /// - The eviction path (`ModuleCache::lru_cold_key`) stops at the FIRST cold
-    ///   entry, and in steady state almost every entry is cold (fleet median:
-    ///   0.43% of the cache is of interest), so an eviction step normally costs
-    ///   one call, not one per entry.
+    ///   entry, and almost every entry is cold, so an eviction step normally
+    ///   makes ONE call — but that one call is a full demand scan, not O(1).
+    ///
+    /// What bounds this in practice is that BOTH demand maps are pruned to live
+    /// demand: `client_subscriptions` drops its key when the last client
+    /// unsubscribes, and `downstream_subscribers` does the same via `remove_if`.
+    /// Neither retains empty entries, so the scan is bounded by concurrent demand
+    /// (tens to low hundreds), not by hosted-contract count (thousands). If that
+    /// ever stops holding, hoist the in-use code hashes into a set once per scan
+    /// instead of re-deriving them per entry.
     pub(crate) fn any_in_use_with_code(
         &self,
         code: &CodeHash,
@@ -1661,9 +1682,9 @@ impl HostingManager {
                 .downstream_subscribers
                 .iter()
                 // Resolve through the same local index rather than reading the
-                // key's own `code` field: that field arrives from a peer's
-                // SUBSCRIBE and is never verified (see
-                // `Runtime::prepare_contract_call_inner`).
+                // key's own `code` field, for the reason given in
+                // `Runtime::prepare_contract_call_inner`: that field is not by
+                // itself evidence about the bytes this node holds.
                 .any(|entry| !entry.value().is_empty() && matches(entry.key().id()))
     }
 

@@ -2259,7 +2259,9 @@ where
             // router-snapshot cadence; a burst of SubscribeHints would otherwise
             // be gated against a stale-low hot-occupancy reading and over-admit,
             // re-opening the #4534 thrash window (Codex review). The refresh is an
-            // O(entries) scan under the cache mutex, so under plain LRU — where the
+            // O(entries × contracts-with-live-demand) scan under the cache mutex
+            // (per-entry interest stopped being O(1) when #5268 re-keyed the
+            // contract cache by code hash), so under plain LRU — where the
             // gate decision uses RAW occupancy (already fresh, O(1) per
             // insert/remove) and never reads the interested gauge — we skip it to
             // avoid paying that per-hint cost for nothing (Codex review). The
@@ -2525,6 +2527,28 @@ fn plan_staleness_probe(cached: Option<bool>, probes_used: usize) -> StalenessPr
 /// migration storm is bounded separately, #4440/#4145); accounting for in-flight,
 /// not-yet-compiled migrations would need a reserved-bytes counter with its own
 /// leak/TTL risk and is deliberately left as a follow-up.
+///
+/// # RE-VALIDATE THIS CONSTANT BEFORE RE-ENABLING PLACEMENT MIGRATION (#5268)
+///
+/// Since #5268 re-keyed the contract module cache by WASM code hash, BOTH
+/// occupancy signals this gate can read count **distinct binaries**, not contract
+/// instances. Two consequences, both in the over-admission direction:
+///
+/// - Raw occupancy fell ~17x on a measured gateway, so the plain-LRU branch
+///   essentially stops refusing at this ceiling.
+/// - An inbound hint adds an INSTANCE. An instance of an already-cached binary
+///   adds ZERO cache bytes, so instance growth is now invisible to this signal —
+///   the very growth the gate exists to throttle. That growth still has a real
+///   resident cost (~1 MB/contract), it simply is not module-cache bytes.
+///
+/// This is inert today: production has
+/// `PLACEMENT_MIGRATION_ENABLED == false` and inbound `SubscribeHint` is refused
+/// before this gate is consulted, so nothing reads it in the field. It is
+/// recorded here because the 90% figure was tuned (0.2.86) against
+/// instance-scaled occupancy, and re-enabling migration on top of a
+/// binary-scaled signal would silently admit far more than the tuning intended.
+/// Whoever re-enables migration owns re-deriving this number, or moving the gate
+/// onto a signal that still tracks instance count.
 const MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_INTERESTED_OCCUPANCY_PCT: u64 = 90;
 
 /// Whether to accept an inbound placement-migration hint given the selected

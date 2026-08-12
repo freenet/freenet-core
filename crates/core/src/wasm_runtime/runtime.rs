@@ -55,10 +55,10 @@ use super::ModuleCache;
 ///
 /// Keying by [`CodeHash`] collapses those duplicates to one entry per distinct
 /// binary — the same identity the **source-bytes** cache one layer down already
-/// uses (`ContractStore::fetch_contract`). The hash is always one the node
-/// computed itself, never the unverified `code` field carried on a
-/// `ContractKey`; see `Runtime::prepare_contract_call_inner` for why that
-/// distinction is load-bearing.
+/// uses (`ContractStore::fetch_contract`). Entries are always inserted under a
+/// hash the node computed from the compiled bytes, rather than under the `code`
+/// field carried on a `ContractKey`; see `Runtime::prepare_contract_call_inner`
+/// for why that distinction is load-bearing.
 pub(crate) type SharedModuleCache<K> = Arc<Mutex<ModuleCache<K, <Engine as WasmEngine>::Module>>>;
 
 static INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
@@ -980,30 +980,33 @@ impl Runtime {
         //
         // # Which code hash, and why NOT `key.code_hash()`
         //
-        // `ContractKey`'s `code` field is not a hash this node computed. It
-        // rides the wire verbatim on the bincode paths (peer `PutMsg` /
-        // `GetResult`, and the client API's `Native` encoding), and — because
-        // `ContractKey` equality and hashing are instance-only — a dozen
-        // production call sites deliberately synthesize keys carrying an
-        // all-zero code hash (`grep -rn 'CodeHash::new(\[0u8; 32\])'`). Keying
-        // this cache off that field would therefore let the caller choose which
-        // slot its contract lands in, which is the one way a dedup like this can
-        // go badly wrong: serving one contract's compiled module for another. So
-        // this path never touches it. Two hashes are used instead, both of which
-        // the node computed itself:
+        // A `ContractKey`'s `code` field is a serde field that survives a wire
+        // round-trip as-is, so it is not by itself evidence about the bytes this
+        // node holds for that instance. Since sharing one compiled module across
+        // instances means a key-choice mistake becomes a wrong-code-executed
+        // mistake rather than a mere cache miss, this path does not key off that
+        // field at all. It uses two hashes instead:
         //
         // 1. The **indexed** hash, `code_hash_from_id(key.id())` — this node's
-        //    own record of which WASM blob this instance resolves to, and the
-        //    same map `fetch_contract` gates on. Used only for the pre-fetch
-        //    lookup, so a hit still requires the instance to be locally indexed.
+        //    stored record of which WASM blob this instance resolves to, and the
+        //    same map `fetch_contract` resolves through. Used only for the
+        //    pre-fetch lookup, so a hit requires the instance to be locally
+        //    indexed.
         // 2. The **actual** hash, `CodeHash::from_code(&code)` — BLAKE3 of the
         //    exact bytes handed to the compiler. Everything is INSERTED under
-        //    this one, so a cache entry can only ever be shared by callers whose
-        //    code really does hash to it.
+        //    this one, so an entry can only be shared by callers whose code
+        //    really does hash to it.
         //
-        // On a consistent store the two agree and this is a single lookup. If
-        // they ever disagree the only cost is an extra fetch (the pre-fetch
-        // lookup misses); nothing is mis-shared.
+        // On a consistent store the two agree and this is a single lookup. Note
+        // the guarantee each direction gives, because they differ: the INSERT
+        // side is self-verifying (the key is computed from the compiled bytes),
+        // whereas a pre-fetch HIT returns a module without re-reading the bytes
+        // it corresponds to, so it inherits whatever the instance→code index
+        // says. That index is the same one `fetch_contract` has always resolved
+        // through, so this is the store's existing consistency assumption rather
+        // than a new one — but it IS an assumption, and a disagreement is not
+        // free in the hit direction. Tightening the index's own provenance is
+        // tracked separately; do not weaken this to `key.code_hash()`.
         let indexed_code_hash = self.contract_store.code_hash_from_id(key.id());
         // Check shared cache first. The lock is held only for the duration of
         // the lookup + Module clone (an Arc bump) and is ALWAYS dropped before

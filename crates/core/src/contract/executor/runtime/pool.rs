@@ -350,7 +350,7 @@ impl RuntimePool {
         // must answer is "is any instance of this code in use?" — hence
         // `any_in_use_with_code` rather than `contract_in_use`. Instance ids are
         // resolved to code hashes through the shared index, i.e. through what
-        // this node itself recorded, never through the unverified `code` field a
+        // this node itself recorded, rather than through the `code` field a
         // `ContractKey` carries (see `Runtime::prepare_contract_call_inner`).
         let ring_for_interest = op_manager.ring.clone();
         let index_for_interest = shared_contract_index.clone();

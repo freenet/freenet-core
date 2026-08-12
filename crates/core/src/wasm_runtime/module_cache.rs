@@ -49,16 +49,29 @@ use lru::LruCache;
 /// this node, i.e. something still depends on it being resident.
 ///
 /// For the contract cache this is wired to
-/// [`Ring::contract_in_use`](crate::ring::Ring::contract_in_use) (a live local
-/// client subscription OR a downstream peer subscriber — deliberately NOT an
-/// upstream-only subscription, which is unbounded). It is `None` for caches
-/// that have no interest concept (the delegate cache, unlabeled/test caches),
-/// in which case eviction is always pure byte-LRU regardless of the feature
-/// flag.
+/// [`Ring::any_in_use_with_code`](crate::ring::Ring::any_in_use_with_code) — the
+/// per-code-hash lift of `contract_in_use`, because that cache is keyed by WASM
+/// code hash rather than by contract instance (#5268), so one entry is "of
+/// interest" while ANY instance of that binary is. The underlying demand notion
+/// is unchanged: a live local client subscription OR a downstream peer
+/// subscriber, deliberately NOT an upstream-only subscription, which is
+/// unbounded. It is `None` for caches that have no interest concept (the
+/// delegate cache, unlabeled/test caches), in which case eviction is always pure
+/// byte-LRU regardless of the feature flag.
 ///
-/// Read inside `evict_to_budget` (under the cache `Mutex`); the predicate reads
-/// only the Ring's subscription DashMaps and never the cache, so there is no
-/// lock-order hazard (see `HostingManager::contract_in_use` rustdoc).
+/// Read inside `evict_to_budget` (under the cache `Mutex`). The predicate reads
+/// the Ring's subscription DashMaps plus the pool-owned instance→code index, and
+/// never the cache itself, so there is still no lock-order hazard (see
+/// `HostingManager::any_in_use_with_code` rustdoc). Note the index is a
+/// DIFFERENT map from the Ring's own: it is the `SharedContractIndex` created in
+/// `RuntimePool::new`, held only for the duration of one `get` on it.
+///
+/// Cost note: unlike the O(1) instance-keyed `contract_in_use` it replaces, this
+/// predicate is O(contracts with live demand) — and gets NO early exit in the
+/// common "not of interest" case, since proving absence means scanning both
+/// demand maps. Both maps are pruned to live demand only (their key is removed
+/// when the last subscriber leaves), so that bound is set by concurrent demand,
+/// not by hosted-contract count.
 pub(crate) type InterestPredicate<K> = Arc<dyn Fn(&K) -> bool + Send + Sync>;
 
 /// Environment variable that controls the interest-weighted (two-tier) eviction
@@ -160,7 +173,8 @@ pub(crate) struct ModuleCache<K: Hash + Eq, V> {
     /// See [`ModuleCacheMetrics`].
     metrics: Option<Arc<ModuleCacheMetrics>>,
     /// Optional "is this key still of interest?" predicate (the contract cache
-    /// wires it to `Ring::contract_in_use`; `None` for the delegate / test
+    /// wires it to `Ring::any_in_use_with_code`, since that cache is keyed by
+    /// code hash — see [`InterestPredicate`]; `None` for the delegate / test
     /// caches). Drives the interest-tier of eviction AND the always-on shadow
     /// metrics (cold-evictable vs interested bytes, would-reclassify count).
     /// See [`InterestPredicate`].
@@ -183,9 +197,9 @@ pub(crate) struct ModuleCache<K: Hash + Eq, V> {
 }
 
 // `K: Clone` is required so the two-tier eviction can name (clone) the LRU cold
-// key it selects before `pop`-ing it; the real keys (`ContractKey`,
-// `DelegateKey`) and every test key (`u64`) are `Clone`, so this is not a new
-// restriction in practice.
+// key it selects before `pop`-ing it; the real keys (`CodeHash` for the contract
+// cache since #5268, `DelegateKey` for the delegate one) and every test key
+// (`u64`) are `Clone`, so this is not a new restriction in practice.
 impl<K: Hash + Eq + Clone, V> ModuleCache<K, V> {
     /// Create an empty cache with the given byte budget, an unlabeled
     /// ("module") operator-warning tag, and no metrics sink. Prefer
@@ -307,8 +321,13 @@ impl<K: Hash + Eq + Clone, V> ModuleCache<K, V> {
     /// metrics sink.
     ///
     /// Called from EVERY cache-touching path (get/insert/remove): the split is
-    /// O(entries) and calls `Ring::contract_in_use` per entry under the shared
-    /// cache mutex, so on a node with thousands of cached modules an unthrottled
+    /// O(entries) and calls the interest predicate per entry under the shared
+    /// cache mutex — for the contract cache that is `Ring::any_in_use_with_code`,
+    /// itself O(contracts with live demand) rather than O(1), so the scan is
+    /// O(entries × live-demand). Re-keying by code hash cut `entries` by ~17x on a
+    /// measured gateway (#5268), but the per-entry factor grew, so the throttle
+    /// below matters MORE than it did, not less. On a node with thousands of
+    /// cached modules an unthrottled
     /// recompute on every cold insert/compile would serialize an O(cache-size)
     /// scan into the hot path even with the feature flag OFF (Codex review).
     /// Throttling bounds that to once per interval; the gauges are consumed only
