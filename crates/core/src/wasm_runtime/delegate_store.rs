@@ -811,9 +811,12 @@ mod test {
             "the forged container must claim A's key"
         );
 
-        store
-            .store_delegate(forged)
-            .expect_err("code that does not hash to the claimed name must be refused");
+        // The refusal itself is what the two tests above pin, so hold it and
+        // check the CONSEQUENCE first. Otherwise removing the verification makes
+        // this test fail at the `expect_err` and it never reaches the outcome it
+        // exists to describe — a legitimate delegate resolving to code that is
+        // not its own — leaving that half unpinned.
+        let refusal = store.store_delegate(forged);
 
         // A now registers honestly and must resolve to its OWN code.
         store.store_delegate(honest_a)?;
@@ -823,7 +826,12 @@ mod test {
         assert_eq!(
             fetched.code().data(),
             code_a.as_slice(),
-            "a refused store must not decide which code a legitimate delegate resolves to"
+            "a legitimate delegate must resolve to its own code, whatever was \
+             offered for its content-addressed name earlier"
+        );
+        assert!(
+            refusal.is_err_and(|err| is_identity_mismatch(&err)),
+            "code that does not hash to the claimed name must be refused"
         );
         Ok(())
     }
