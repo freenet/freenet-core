@@ -73,12 +73,18 @@ struct CheckOp<'a> {
     run_id: &'a str,
     vantage: &'a str,
     op: &'a str,
+    /// Position of this operation in the order the run executed. Every record
+    /// of a run is published with the same timestamp, so this is the only thing
+    /// that says which came first.
+    seq: usize,
     dimension: &'a str,
     dimension_secs: Option<i64>,
     contract_key: &'a str,
     ok: bool,
     latency_ms: u128,
     bytes: usize,
+    /// Errors this operation attributed to another contract and skipped.
+    errors_ignored: usize,
     error: Option<&'a str>,
     extra: serde_json::Value,
 }
@@ -217,12 +223,14 @@ pub async fn run(args: EmitArgs) -> Result<bool> {
                 run_id: &run_id,
                 vantage: &args.vantage,
                 op: &op.op,
+                seq: op.seq,
                 dimension: &op.age,
                 dimension_secs: dimension_secs(&op.age),
                 contract_key: &op.key,
                 ok: op.ok,
                 latency_ms: op.latency_ms,
                 bytes: op.size,
+                errors_ignored: op.errors_ignored,
                 error: op.error.as_deref(),
                 extra: serde_json::json!({ "label": op.label }),
             },
@@ -285,6 +293,7 @@ mod tests {
 
     fn op(op: &str, age: &str, ok: bool) -> OpReport {
         OpReport {
+            seq: 3,
             op: op.to_string(),
             age: age.to_string(),
             label: "small-0".to_string(),
@@ -292,6 +301,7 @@ mod tests {
             ok,
             latency_ms: 42,
             size: 123,
+            errors_ignored: 2,
             error: (!ok).then(|| "boom".to_string()),
         }
     }
@@ -312,6 +322,8 @@ mod tests {
         assert_eq!(read.ok, written.ok);
         assert_eq!(read.size, written.size);
         assert_eq!(read.error, written.error);
+        assert_eq!(read.seq, written.seq);
+        assert_eq!(read.errors_ignored, written.errors_ignored);
     }
 
     #[test]
