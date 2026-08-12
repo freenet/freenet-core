@@ -267,6 +267,23 @@ unsafe_op_in_unsafe_fn = "deny"
 [lints.clippy]
 # Disallow `let _ = expr` when `expr` is #[must_use].
 # Forces explicit handling or an intentional `drop()` call.
+#
+# CAVEAT, learned the hard way (#5292): the suggested `drop()` escape hatch is
+# NOT always available, and then the two lints forbid opposite spellings of the
+# same statement. If the discarded value is `#[must_use]` AND `Copy` (e.g. a
+# `Result<(), SendError<T>>` where `T: Copy`), `let _ = x` is denied here while
+# `drop(x)` is denied by rustc's `dropping_copy_types` -- the drop genuinely
+# does nothing, so the lint is right. The same applies to a `#[must_use]` type
+# with no `Drop` glue, via `clippy::drop_non_drop`.
+#
+# When that happens, the resolution is a PER-SITE
+# `#[allow(clippy::let_underscore_must_use)]` with a comment saying why the
+# value is ignorable -- see `broadcast_queue.rs` in `mod observation_tests`.
+# Do NOT widen this to a module-level allow (it un-gates every future discard in
+# that module) and do NOT disable `dropping_copy_types`/`drop_non_drop`
+# crate-wide to make `drop()` work everywhere: both catch real mistakes, and
+# suppressing a lint to make a fix convenient is what produced the test-code
+# blind spot #5292 had to close.
 let_underscore_must_use = "deny"
 
 # Flag `_ =>` catch-all arms on non-exhaustive enums.

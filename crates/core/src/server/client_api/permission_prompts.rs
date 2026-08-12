@@ -4268,7 +4268,14 @@ mod tests {
         // free, so the next test can observe a non-zero baseline that then
         // drops mid-assertion.
         pump.abort();
-        let _ = pump.await;
+        // `drop(...)` rather than `let _ = ...`, because
+        // `let_underscore_must_use` is denied crate-wide. Not asserted because
+        // the `JoinResult` carries nothing this test is about: a pump panic
+        // before the frame is already surfaced by the `out.next()` expectation
+        // above, and after the frame the pump is parked (empty `initial`,
+        // `pending()` inbound, live `tx`), so there is nothing else to report.
+        // The await itself is the point -- see the comment above.
+        drop(pump.await);
     }
 
     /// Wait for the shared subscriber counter to quiesce, then return it.
