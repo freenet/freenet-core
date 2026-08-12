@@ -421,9 +421,17 @@ jobs:
             # test-exempt. Without this, a genuine shell regression test scores
             # zero against TEST_ATTR_RE (Rust-only) and the fix is wrongly
             # rejected — the gap that hid the announce-to-river fix's own test.
+            # `check` is one of several assertion helpers in this repo's shell
+            # self-tests; `auto-update-canary_lifecycle_test.sh` reports through
+            # `ok`/`bad` instead. Matching only `check` made this rule miss a
+            # genuine behavioural regression test (#5290 added a lifecycle case
+            # that reproduces the fault and goes red without the fix) and demand
+            # `test-exempt` for a PR that had exactly the test the rule wants —
+            # the same "gate cannot see its subject" shape the comment above
+            # describes. Match the helpers actually in use.
             NEW_SHELL_TESTS=$(git diff "$BASE"..."$HEAD" -- '**/*_test.sh' \
               | grep -E '^\+' | grep -vF '+++' \
-              | grep -cE '^\+[[:space:]]*check[[:space:]]' || true)
+              | grep -cE '^\+[[:space:]]*(check|ok)[[:space:]]' || true)
             if [ "$NEW_TESTS" -eq 0 ] && [ "$NEW_SHELL_TESTS" -eq 0 ]; then
               ERRORS="$ERRORS
           ERROR: fix: PR must include at least one new regression test

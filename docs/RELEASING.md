@@ -633,6 +633,14 @@ a tag that no longer exists is worse than the draft.
    (`build_info::GIT_DIRTY`), so the canary will report *auto-update is
    DISABLED* rather than reproducing the parse failure. Commit or stash first.
 
+   A clean run here is **not** evidence that the harness is sound. CI stages
+   the binary differently — `cross-compile.yml` puts it at `/tmp/freenet`,
+   which used to collide with a directory the node creates under `$TMPDIR` and
+   blocked v0.2.124 on a healthy binary. Running from `./target/release/` is
+   precisely the environment where that class of fault cannot occur, which is
+   why local validation went 4/4 green while CI blocked. If local reproduces
+   nothing, suspect the staging environment before the binary.
+
 ### If Gate B fails
 
 The release is already public and the fleet will **not** converge onto it on

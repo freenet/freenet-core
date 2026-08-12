@@ -566,6 +566,71 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
+# --- TMPDIR must be scoped before either process starts ---------------------
+# `client_api.rs` unconditionally `create_dir_all`s
+# `std::env::temp_dir()/freenet/webs` at router construction. The directory is
+# vestigial (nothing reads it), but the mkdir can FAIL -- `$TMPDIR/freenet`
+# being a file, or another user's directory -- and it panics when it does, exit
+# 101, before the update task spawns. `cross-compile.yml` stages the binary it
+# is about to gate at exactly `/tmp/freenet`, so with an unisolated TMPDIR that
+# is not a hypothetical: it blocked v0.2.124, a release whose binary was fine.
+#
+# This is the WEAKER of the two checks on this fix, and it should be read that
+# way. `auto-update-canary_lifecycle_test.sh` case 9 covers the Gate A half
+# BEHAVIOURALLY: its fake node IS the regular file staged at `$TMPDIR/freenet`,
+# so a missing isolation blocks a healthy binary on a real kernel ENOTDIR. That
+# is the one that matters. A source scrape asserts TEXT and cannot tell a
+# working `export TMPDIR="$work/tmp"` from `export TMPDIR=/tmp`.
+#
+# Two things it still adds, which is why it stays:
+#   - the GATE B half. Isolating the `freenet update` subshell cannot be
+#     exercised without downloading and installing a real release, so for that
+#     one a scrape is what there is.
+#   - ORDER. An export that lands after `exec` never runs at all (exec replaces
+#     the shell), and one after the `freenet update` call is equally
+#     decorative.
+# Cross-file (it scrapes CANARY_SH), so it cannot be satisfied by its own
+# assertion text.
+tmpdir_first_export="$(grep -n '^[[:space:]]*export TMPDIR=' "$CANARY_SH" | head -1 | cut -d: -f1)"
+tmpdir_exports="$(grep -c '^[[:space:]]*export TMPDIR=' "$CANARY_SH")"
+node_exec_line="$(grep -n '^[[:space:]]*exec timeout' "$CANARY_SH" | head -1 | cut -d: -f1)"
+update_call_line="$(grep -n 'freenet" update' "$CANARY_SH" | head -1 | cut -d: -f1)"
+# The anchors themselves must resolve, or the pin quietly stops auditing.
+if [[ -z "$node_exec_line" || -z "$update_call_line" ]]; then
+    echo "FAIL - TMPDIR pin: cannot locate the canary's launch sites (exec timeout: '${node_exec_line:-none}', freenet update: '${update_call_line:-none}')." >&2
+    echo "       The pin scrapes for those two anchors; if they were renamed, update this pin rather than dropping it." >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ -z "$tmpdir_first_export" ]]; then
+    echo "FAIL - TMPDIR pin: auto-update-canary.sh no longer exports TMPDIR at all." >&2
+    echo "       The node create_dir_all's \$TMPDIR/freenet/webs and PANICS (exit 101) if that path" >&2
+    echo "       is a file or another user's directory. cross-compile.yml stages the gated binary at" >&2
+    echo "       /tmp/freenet, which is that path -- this is what blocked v0.2.124 on a healthy binary." >&2
+    FAILURES=$((FAILURES + 1))
+elif (( tmpdir_first_export >= node_exec_line )); then
+    echo "FAIL - TMPDIR pin: the node's 'exec timeout' (line $node_exec_line) is not preceded by an" >&2
+    echo "       'export TMPDIR=' (first one at line $tmpdir_first_export). exec REPLACES the shell, so an" >&2
+    echo "       export below it never runs and the node inherits the ambient temp dir." >&2
+    FAILURES=$((FAILURES + 1))
+elif (( tmpdir_exports < 2 )); then
+    echo "FAIL - TMPDIR pin: only $tmpdir_exports 'export TMPDIR=' in auto-update-canary.sh; Gate B's" >&2
+    echo "       'freenet update' subshell (line $update_call_line) needs its own. download_and_install stages" >&2
+    echo "       the release tarball in tempfile::tempdir(), which follows TMPDIR, so without it Gate B" >&2
+    echo "       writes outside the workdir and the header's isolation claim is true of Gate A only." >&2
+    FAILURES=$((FAILURES + 1))
+else
+    # The Gate B export must be inside that subshell: after the node's exec,
+    # before the update call. A second export anywhere else does not isolate it.
+    tmpdir_gate_b="$(grep -n '^[[:space:]]*export TMPDIR=' "$CANARY_SH" | awk -F: -v lo="$node_exec_line" -v hi="$update_call_line" '$1 > lo && $1 < hi {print $1; exit}')"
+    if [[ -z "$tmpdir_gate_b" ]]; then
+        echo "FAIL - TMPDIR pin: no 'export TMPDIR=' between the node's exec (line $node_exec_line) and the" >&2
+        echo "       'freenet update' call (line $update_call_line), so Gate B's installer runs with the ambient" >&2
+        echo "       temp dir and stages a release tarball outside the canary's workdir." >&2
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "ok   - source pin: TMPDIR is scoped before the node exec (line $tmpdir_first_export < $node_exec_line) and before \`freenet update\` (line $tmpdir_gate_b < $update_call_line)"
+    fi
+fi
+
 # --- markers must still exist in the Rust source ----------------------------
 # Without this the fixtures above are a self-consistent copy of strings that
 # may no longer be emitted: the canary would go quietly blind while its own
