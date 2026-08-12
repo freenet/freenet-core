@@ -524,6 +524,32 @@ What does cover the comparison is the Rust unit tests on
 directions and the equal case. Gate B covers it end-to-end for real, but only
 for the PREVIOUS release's binary.
 
+**Gate B's own code is never executed by any test.** The two gaps above are
+about what the gates cannot observe when they run. This one is about the tests
+*behind* the gates, and it is worth stating separately because it is easy to
+mistake a large green suite for coverage it does not have.
+
+`scripts/auto-update-canary_test.sh` runs the canary's pure helpers against
+fixtures and source-scrapes the rest. `cmd_selfupdate` — the whole of Gate B —
+is never invoked, and neither is `resolve_expected_latest`. So nothing at any
+level runs the previous release's tarball download, the extraction check, the
+exit-42 assertion, `freenet update --quiet`, or the `awk '{print $3}'` field
+split that reads the updated binary's version. Those run for the first time
+during a real release, against a real GitHub.
+
+What the suite does pin around that code is real, and the distinction matters
+when reading a failure: the version gate that decides whether Gate B's equality
+check arms is tested behaviourally (`prev_emits_latest_seen`), and the call
+site that consumes it is pinned including its `if ` prefix, so neither a
+negation nor a reworded call can disarm the gate silently. That is the decision
+logic. The I/O sequence it guards has no test.
+
+Practical consequence: a Gate B failure is more likely to be the canary's own
+plumbing than the fleet's updater, and it is non-blocking either way. Read the
+job log before concluding anything about auto-update. Closing this needs a
+runtime test with a stubbed release archive; it is a known gap, deliberately
+deferred, not an oversight.
+
 Net: the installer half of a shipping binary has no blocking gate, and neither
 does its comparison logic. Treat a green Gate A as "this binary can still fetch
 and read new release tags", not as "auto-update works".
