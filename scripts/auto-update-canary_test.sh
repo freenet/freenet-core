@@ -813,10 +813,30 @@ pin_marker "source pin: disabled marker"        "$SRC"    "$MARKER_DISABLED"
 #
 # Freezing the PAIR is what closes that: a reword fails HERE, in the same edit,
 # with the version constant named.
-MARKER_LATEST_SEEN_FROZEN='Startup update check: GitHub reports latest release'
+#
+# THE EXPECTED TEXT IS BASE64, AND THAT IS THE WHOLE MECHANISM. The first
+# version of this pin stored the marker as a plain literal, and it did not
+# survive its own mutation test: a reword is performed as a `sed` sweep over the
+# files that mention the marker, that sweep rewrote this expectation along with
+# everything else, and the suite stayed green. Same shape as the source pin this
+# was meant to compensate for -- an expectation textually identical to the value
+# under test follows any rename of it. Encoded, a text sweep cannot reach it.
+#
+# To change it deliberately:  printf '%s' '<new marker text>' | base64 -w0
+MARKER_LATEST_SEEN_FROZEN_B64='U3RhcnR1cCB1cGRhdGUgY2hlY2s6IEdpdEh1YiByZXBvcnRzIGxhdGVzdCByZWxlYXNl'
+MARKER_LATEST_SEEN_FROZEN="$(printf '%s' "$MARKER_LATEST_SEEN_FROZEN_B64" | base64 -d)"
+# The version half stays plain. It is not exposed to the same hazard: the edit
+# that would rewrite it is a repo-wide `sed` on a version string, and version
+# bumps here touch Cargo.toml and the lockfile, not these scripts. The realistic
+# wrong edit is a human raising it on purpose, which a plain comparison catches.
 MARKER_LATEST_SEEN_SINCE_FROZEN='0.2.125'
 
-if [[ "$MARKER_LATEST_SEEN" == "$MARKER_LATEST_SEEN_FROZEN" ]]; then
+if [[ -z "$MARKER_LATEST_SEEN_FROZEN" ]]; then
+    # `base64 -d` failing would leave the expectation empty and make the
+    # comparison below vacuous in the quiet direction.
+    echo "FAIL - could not decode MARKER_LATEST_SEEN_FROZEN_B64; the marker freeze is not running" >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ "$MARKER_LATEST_SEEN" == "$MARKER_LATEST_SEEN_FROZEN" ]]; then
     echo "ok   - MARKER_LATEST_SEEN still matches the text v$MARKER_LATEST_SEEN_SINCE_FROZEN shipped"
 else
     echo "FAIL - the observed-latest MARKER TEXT changed, and MARKER_LATEST_SEEN_SINCE must be" >&2
@@ -831,7 +851,9 @@ else
     echo "       Matrix alarm whose text blames the node." >&2
     echo "       Nothing else in this suite would have told you: the source pin interpolates" >&2
     echo "       \$MARKER_LATEST_SEEN and follows the rename by construction. This assertion is" >&2
-    echo "       the only prompt. Update BOTH frozen values here once you have decided." >&2
+    echo "       the only prompt. Once you have decided, update BOTH frozen values here:" >&2
+    echo "         MARKER_LATEST_SEEN_FROZEN_B64=\"\$(printf '%s' '$MARKER_LATEST_SEEN' | base64 -w0)\"" >&2
+    echo "         MARKER_LATEST_SEEN_SINCE_FROZEN=<first release that will SHIP the new text>" >&2
     FAILURES=$((FAILURES + 1))
 fi
 
