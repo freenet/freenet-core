@@ -700,6 +700,11 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read
+    outputs:
+      # 'ok' | 'environmental' | 'fault'. Read by the notify job below to pick
+      # its message. Job outputs are still populated when the job fails, which
+      # is the only case that reads this one.
+      classification: ${{ steps.canary.outputs.classification }}
     steps:
       - uses: actions/checkout@v7
 
@@ -726,11 +731,37 @@ jobs:
           echo "prev_version=${PREV_TAG#v}"  >> "$GITHUB_OUTPUT"
           echo "Canarying ${PREV_TAG} -> ${TAG_NAME}"
 
+      # Exit 75 (EX_TEMPFAIL, EXIT_UNVERIFIED_ENVIRONMENTAL in the canary) means
+      # the run was environmental -- the previous release's binary could not
+      # reach GitHub from this runner, or the ports were held -- so nothing was
+      # learned about the updater in either direction. The step still FAILS on
+      # it: unverified is not verified, and a green job here would be the
+      # vacuous pass the canary exists to remove. What the classification buys
+      # is the WORDING of the Matrix message below, which otherwise tells the
+      # dev room a node on the previous release may not be able to auto-update
+      # -- the #5221 alarm -- because a socket did not open.
+      #
+      # Not hypothetical: the node's startup fetch has no retry, and `framework`
+      # logged that WARN twice on 2026-08-11. Gate B's subject is a PUBLISHED
+      # binary, so that cannot be fixed from this side.
+      #
+      # `|| rc=$?` and NOT `|| true`: the exit code is re-raised at the end of
+      # the step. Swallowing it is how this gate would stop gating.
       - name: Previous release self-updates to this release
+        id: canary
         run: |
+          rc=0
           bash scripts/auto-update-canary.sh selfupdate \
             "${{ steps.prev.outputs.prev_version }}" \
-            "${{ steps.prev.outputs.this_version }}"
+            "${{ steps.prev.outputs.this_version }}" || rc=$?
+          if [ "$rc" -eq 75 ]; then
+            echo "classification=environmental" >> "$GITHUB_OUTPUT"
+          elif [ "$rc" -ne 0 ]; then
+            echo "classification=fault" >> "$GITHUB_OUTPUT"
+          else
+            echo "classification=ok" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$rc"
 
   # A red job in a release run is the primary signal, but nobody is guaranteed
   # to be watching Actions at release time — and a silent fail-closed is
@@ -755,7 +786,68 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/river-dev-notify
+
+      # The ENVIRONMENTAL case, and the only one that does not raise the alarm.
+      # Both conditions are required: the publish job succeeded (so the release
+      # is out and nothing is stuck as a draft), AND the canary itself said the
+      # run told us nothing about the updater (exit 75; see the canary step's
+      # comment and EXIT_UNVERIFIED_ENVIRONMENTAL in auto-update-canary.sh).
+      #
+      # WHY THIS BRANCH EXISTS. Everything below it says a node on the previous
+      # release "may not be able to auto-update to this one", which is the #5221
+      # text. Before this split, a runner that could not open a socket to
+      # github.com for a few seconds sent exactly that. The previous release's
+      # binary retries its startup fetch zero times, so the trigger is a routine
+      # network blip on a hosted runner, not a rare event -- and an alarm that
+      # cries #5221 on a blip is one the room learns to scroll past. That is the
+      # same alarm-fatigue failure that let `--disable-auto-update` sit unnoticed
+      # on `framework` for nine days.
+      #
+      # The job is still RED either way. This changes what is SAID, never
+      # whether it is reported.
+      - name: Notify (unverified for environmental reasons, not a fleet problem)
+        # `id:` so `release_canary_wiring_test.sh` can find this step by
+        # something structural. Locating it by a phrase from its own message was
+        # tried first and an ordinary reword of that message immediately broke
+        # the pin -- which is the same "expectation stored as a copy of the
+        # thing it guards" shape this PR is about, one level down.
+        id: notify-environmental
+        if: >
+          needs.attach-to-release.result == 'success' &&
+          needs.auto-update-selfupdate-canary.outputs.classification == 'environmental'
+        uses: ./.github/actions/river-dev-notify
+        with:
+          # Names BOTH environmental causes rather than assuming the network
+          # one. Exit 75 covers two: the previous release's binary could not
+          # reach GitHub (and neither could the runner), or every attempt lost a
+          # port race on this host. An earlier version of this message asserted
+          # the first, so a self-hosted runner with something holding the ports
+          # sent the operator after DNS. The job log's `UNVERIFIED
+          # (ENVIRONMENTAL)` line says which; this says what to do, which is the
+          # same either way.
+          message: "⚠️ ${{ github.ref_name }} published fine, but auto-update for it is **UNVERIFIED** — the self-update canary never reached a verdict, for an environmental reason: either the previous release's binary could not reach GitHub (and neither could the runner) or every attempt hit a port collision on the runner. The job log's `UNVERIFIED (ENVIRONMENTAL)` line says which. The run is not evidence in either direction. Nothing suggests a stranded fleet and no fleet action is indicated, but this release has NOT been shown to be reachable by auto-update: re-run the job to actually verify it. If you are seeing this on consecutive releases, stop treating it as noise — whatever it names, something is persistently stopping the gate from running, the post-publish gate is not working, and nothing has been verified since the last green run. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
+          room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
+          gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}
+
+      # Everything else, unchanged. Written as the NEGATION of the branch above
+      # rather than as its own list of results, so a state neither branch
+      # anticipated (a cancelled job, an empty classification because the step
+      # never ran) lands HERE, in the loud one. A gate's unknown case belongs on
+      # the side that gets read.
+      #
+      # DO NOT CONSOLIDATE THESE TWO STEPS. One step with a conditional message
+      # expression is the obvious tidy and it loses the property: the two
+      # conditions must remain each other's exact complement, which is what a
+      # reviewer can check at a glance and what
+      # `release_canary_wiring_test.sh` asserts by comparing them to each other.
+      # Both steps are located there by `id:`, so a rename fails loudly.
+      - name: Notify (possible auto-update fault)
+        id: notify-fault
+        if: >
+          !(needs.attach-to-release.result == 'success' &&
+          needs.auto-update-selfupdate-canary.outputs.classification == 'environmental')
+        uses: ./.github/actions/river-dev-notify
         with:
           # Deliberately does NOT assert which failure happened. The job can be
           # red because the updater is broken OR because GitHub was unreachable,

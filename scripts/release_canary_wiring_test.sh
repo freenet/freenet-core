@@ -58,11 +58,38 @@ done
 # above the step that runs it, so matching raw text would compare the canary
 # against a sentence and report the gate inverted. A pin that fails on prose is
 # no better than one that passes on prose.
-JOB_BLOCK="$(awk '
-    /^  attach-to-release:[[:space:]]*$/ { inblock = 1; print NR ":" $0; next }
-    inblock && /^  [A-Za-z_.-]+:/        { inblock = 0 }
-    inblock && $0 !~ /^[[:space:]]*#/    { print NR ":" $0 }
-' "$WF")"
+# ONE extraction for every job block in this file, so the comment filter cannot
+# be forgotten at a new call site. It was forgotten at two: `selfupdate_block`
+# (fixed after a mutation of `|| rc=$?` hit the comment quoting it and the pin
+# stayed green) and then `notify_block`, where the consequence was worse --
+# widening the quiet notification's `if:` to `result == 'failure'` while leaving
+# a one-line comment recording the old condition left ALL FOUR suites green,
+# with the reassuring "no fleet action is indicated" message firing on every red
+# Gate B run including a real #5221. Two single-site fixes in a row is what
+# turned this into a function.
+#
+# (That second one was saved only by luck: the comment had to be on ONE line,
+# because the `# ` on a wrapped continuation breaks the whitespace-collapsed
+# match. Nobody designed that.)
+#
+# `--numbered` keeps the original line NUMBERS so ordering comparisons stay
+# meaningful; the others do not need them.
+yaml_job_block() {
+    # yaml_job_block <job-key> [--numbered]
+    local job="$1" numbered="${2:-}"
+    awk -v jobre="^  $job:[[:space:]]*\$" -v numbered="$numbered" '
+        { prefix = (numbered != "" ? NR ":" : "") }
+        $0 ~ jobre                        { inblock = 1; print prefix $0; next }
+        inblock && /^  [A-Za-z_.-]+:/     { inblock = 0 }
+        inblock && $0 !~ /^[[:space:]]*#/ { print prefix $0 }
+    ' "$WF"
+}
+
+# The `attach-to-release:` job block: from its own key to the next top-level
+# job key. Job keys sit at exactly two spaces; everything inside the job is
+# indented further, so this needs no YAML parser and cannot be fooled by a
+# matching string in a comment elsewhere in the file.
+JOB_BLOCK="$(yaml_job_block attach-to-release --numbered)"
 
 if [[ -z "$JOB_BLOCK" ]]; then
     fail "the 'attach-to-release' job no longer exists in cross-compile.yml" \
@@ -286,11 +313,7 @@ fi
 #
 # Whole-file scan, not the attach-to-release block: these are separate
 # top-level jobs.
-notify_block="$(awk '
-    /^  notify-auto-update-canary-failure:[[:space:]]*$/ { inblock = 1; print; next }
-    inblock && /^  [A-Za-z_.-]+:/                        { inblock = 0 }
-    inblock                                              { print }
-' "$WF")"
+notify_block="$(yaml_job_block notify-auto-update-canary-failure)"
 
 if [[ -z "$notify_block" ]]; then
     fail "the 'notify-auto-update-canary-failure' job is gone from cross-compile.yml" \
@@ -343,6 +366,190 @@ else
                 "empty string, so every clause above silently stops matching."
         fi
     done
+
+    # --- 6b. the ENVIRONMENTAL split cannot swallow the real alarm ----------
+    # The notify job now picks between two messages: a quiet one when the
+    # canary classified the run as environmental (it could not reach GitHub, so
+    # it learned nothing), and the loud #5221 one otherwise. Silencing the
+    # channel is now a two-line edit -- widen the quiet branch's condition, or
+    # delete the loud step -- and either would look like tidying.
+    #
+    # Three properties, each of which alone is enough to lose the alarm:
+    #
+    #   (a) the loud message still exists at all;
+    #   (b) the quiet branch requires BOTH that the publish job succeeded and
+    #       that the classification is exactly 'environmental'. Drop the first
+    #       and a release stuck as a DRAFT gets the reassuring message; drop
+    #       the second and everything does;
+    #   (c) the loud branch is the NEGATION of the quiet one rather than its
+    #       own enumeration of results. That is what puts every unanticipated
+    #       state -- a cancelled job, an empty classification because the step
+    #       never ran -- on the side that gets read.
+    if [[ "$notify_block" == *'#5221 failure mode'* ]]; then
+        pass "the notify job still carries the loud #5221 message"
+    else
+        fail "the loud '#5221 failure mode' message is gone from the notify job" \
+            "That text is the only thing that tells the room a node on the previous" \
+            "release may be unable to reach this one. If it was removed to stop" \
+            "false alarms, the fix is the environmental classification, not silence."
+    fi
+
+    quiet_cond="needs.attach-to-release.result == 'success' &&"
+    quiet_cond+=" needs.auto-update-selfupdate-canary.outputs.classification == 'environmental'"
+
+    # PER-STEP, and that is not fussiness. The first version of this scanned the
+    # whole job block for "$quiet_cond", which the LOUD step satisfies all by
+    # itself -- its condition is `!(<quiet_cond>)`, so the quiet condition is a
+    # substring of it. Mutation-tested: replacing the quiet step's `if:` with a
+    # bare `result == 'failure'`, so the reassuring message covers every red
+    # run including a real #5221, left this suite fully GREEN. A pin whose
+    # subject can be satisfied by the thing it is distinguishing from is not a
+    # pin, which is the whole subject of #5303.
+    #
+    # Steps are split on their leading `- name:` / `- uses:` key, so nothing
+    # here depends on step ORDER. How each one is then IDENTIFIED is stated at
+    # the two `step_containing` calls below, and deliberately not restated
+    # here: an earlier version of this comment said "identified by text from
+    # their own message", which the very next commit made false, leaving two
+    # comments fifteen lines apart contradicting each other. A reviewer reading
+    # top-down would have recognised the anti-pattern and reported a defect
+    # already fixed.
+    notify_steps="$(printf '%s\n' "$notify_block" | awk '
+        /^      - (name|uses):/ { n++ }
+        { print n "\t" $0 }
+    ')"
+    step_containing() {
+        # step_containing <needle> -- the whole step chunk holding <needle>,
+        # whitespace-collapsed, or empty if no single step holds it.
+        local needle="$1" n
+        n="$(printf '%s\n' "$notify_steps" | grep -F -- "$needle" | head -1 | cut -f1)"
+        [[ -n "$n" ]] || return 0
+        printf '%s\n' "$notify_steps" | awk -F'\t' -v n="$n" '$1 == n { print $2 }' \
+            | tr -s '[:space:]' ' '
+    }
+
+    # Located by `id:`, not by a phrase from the message. Locating them by
+    # message text was tried and an ordinary reword of the quiet message broke
+    # the pin on the first edit -- the same "expectation stored as a copy"
+    # shape this PR exists to remove. An `id:` is structural and exists to be
+    # referenced; a rename of one still fails here, but loudly and for a reason
+    # the message names.
+    quiet_step="$(step_containing 'id: notify-environmental')"
+    loud_step="$(step_containing 'id: notify-fault')"
+
+    if [[ -z "$quiet_step" ]]; then
+        fail "the environmental (quiet) notification step is gone from the notify job" \
+            "Without it every red Gate B run takes the loud #5221 branch again, so a" \
+            "runner that could not reach github.com tells the room the fleet may be" \
+            "stranded. That is the alarm-fatigue failure this split exists to stop."
+    elif [[ "$quiet_step" == *"$quiet_cond"* && "$quiet_step" != *'!('* ]]; then
+        pass "the quiet step requires a successful publish AND an environmental classification"
+    else
+        fail "the environmental notification's own condition changed" \
+            "Its step must be conditioned on exactly:" \
+            "  $quiet_cond" \
+            "Widened, the reassuring 'nothing to worry about' message starts covering" \
+            "real faults and a release stuck as a DRAFT. Its condition is currently:" \
+            "  $quiet_step"
+    fi
+
+    if [[ -n "$loud_step" && "$loud_step" == *"!($quiet_cond)"* ]]; then
+        pass "the loud step is the exact negation of the quiet one (unknown states stay loud)"
+    else
+        fail "the loud notification is no longer the exact negation of the quiet one" \
+            "Written as its own list of results instead, any state neither branch" \
+            "anticipated -- a cancelled job, an empty classification because the" \
+            "step never ran -- falls through both and nothing is sent at all."
+    fi
+fi
+
+# --- 6c. Gate B's step still classifies, and still re-raises its exit code ---
+# The classification only reaches the notify job because the canary step writes
+# it to GITHUB_OUTPUT and the job re-exports it. Two ways to break that
+# silently: drop the job-level `outputs:` (every clause above reads '' and the
+# loud branch fires for everything, which is merely noisy), or swallow the
+# script's exit code so the job goes GREEN on a failed canary, which is not
+# noisy at all.
+# COMMENT-ONLY LINES ARE DROPPED, exactly as `JOB_BLOCK` drops them for
+# `attach-to-release`, and for the reason this repo keeps rediscovering: a pin
+# that scans raw text is satisfied by PROSE. This block's own comments quote
+# `|| rc=$?` and `exit "$rc"` while explaining why they must stay, so the
+# assertions below would have passed against the explanation after the code
+# was removed. Found by mutation, and only because the mutation hit the comment
+# first and the pin stayed green -- the harness accident that exposed it.
+selfupdate_block="$(yaml_job_block auto-update-selfupdate-canary)"
+
+# shellcheck disable=SC2016  # literal workflow text: the `${{ }}` must not expand
+if [[ "$selfupdate_block" == *'classification: ${{ steps.canary.outputs.classification }}'* ]]; then
+    pass "Gate B's job still exports the 'classification' output"
+else
+    fail "Gate B's job no longer exports 'classification'" \
+        "The notify job reads it to choose between the quiet and the loud message." \
+        "Missing, it evaluates to '' and every run takes the loud #5221 branch."
+fi
+
+# --- 6d. the environmental exit code is the SAME number on both sides -------
+# The canary defines `EXIT_UNVERIFIED_ENVIRONMENTAL` and the workflow tests a
+# LITERAL. They are one contract written in two files, and nothing made them
+# agree. Change the constant and every environmental run silently takes the
+# loud #5221 branch instead of the quiet one -- the direction is safe, which is
+# exactly why it would go unnoticed. Read from the canary rather than restated
+# here, so this test cannot be the thing that is stale.
+canary_env_code="$(sed -n 's/^EXIT_UNVERIFIED_ENVIRONMENTAL=\([0-9]\{1,\}\).*/\1/p' \
+    "$SCRIPT_DIR/auto-update-canary.sh" | head -1)"
+if [[ -z "$canary_env_code" ]]; then
+    fail "could not read EXIT_UNVERIFIED_ENVIRONMENTAL from auto-update-canary.sh" \
+        "Without it this assertion would compare the workflow against an empty" \
+        "string and pass on anything."
+elif [[ "$selfupdate_block" == *"-eq $canary_env_code "* ]]; then
+    pass "the workflow tests the same environmental exit code the canary returns ($canary_env_code)"
+else
+    fail "cross-compile.yml does not test exit $canary_env_code, the canary's EXIT_UNVERIFIED_ENVIRONMENTAL" \
+        "The two are one contract in two files. If they disagree, every" \
+        "environmental run is classified 'fault' and takes the loud #5221" \
+        "branch -- safe, and therefore silent."
+fi
+
+# --- 6e. the step CAPTURES the exit status as well as re-raising it ---------
+# BOTH halves, because pinning only the second leaves the cheaper mutation wide
+# open. Confirmed by mutation: change `|| rc=$?` to `|| true` and `rc` stays 0,
+# `classification` is reported as `ok`, `exit "$rc"` exits 0 -- so Gate B goes
+# GREEN on a genuinely broken updater, the job result is `success`, and the
+# notify job never fires. The `exit "$rc"` pin sees nothing, because that line
+# is untouched.
+#
+# Assertion 3a closes the same neutering route for GATE A only: it scans
+# `$CANARY_STEP`, the preflight invocation inside `attach-to-release`. Gate B is
+# a different top-level job and was never scanned.
+#
+# One directive for the whole compound command: shellcheck rejects a directive
+# in front of an individual `elif` branch (SC1123).
+# shellcheck disable=SC2016  # literal workflow text; `$rc` must not expand
+if [[ "$selfupdate_block" != *'|| rc=$?'* ]]; then
+    fail "Gate B's step no longer captures the canary's exit status into \$rc" \
+        "It must run the canary as '... || rc=\$?' and re-raise at the end." \
+        "Replaced with '|| true' the step exits 0 whatever the canary found:" \
+        "Gate B is green on a broken updater and the notify job never fires," \
+        "because the job result is 'success'. The 'exit \$rc' pin below cannot" \
+        "see this -- that line is left untouched by the mutation."
+elif [[ "$selfupdate_block" != *'exit "$rc"'* ]]; then
+    fail "Gate B's step no longer re-raises the canary's exit status" \
+        "It runs the canary with '|| rc=\$?' so it can classify exit 75. That is" \
+        "only safe while the code is raised again at the end of the step. Without" \
+        "the re-raise the step always exits 0, Gate B is green on a broken" \
+        "updater, and nothing notifies -- the exact silent fail this file exists" \
+        "to prevent, reached by deleting one line."
+else
+    swallowed_b="$(printf '%s\n' "$selfupdate_block" \
+        | grep -cE '\|\|[[:space:]]*(true|:)[[:space:]]*$|set[[:space:]]+\+e')"
+    if [[ "$swallowed_b" -eq 0 ]]; then
+        pass "Gate B's step captures AND re-raises the canary's exit code, and swallows nothing"
+    else
+        fail "Gate B's step swallows an exit status ('|| true', '|| :' or 'set +e')" \
+            "$(printf '%s\n' "$selfupdate_block" | grep -E '\|\|[[:space:]]*(true|:)[[:space:]]*$|set[[:space:]]+\+e')" \
+            "Same route assertion 3a closes for Gate A: the step still runs and" \
+            "still reports, but it can no longer fail."
+    fi
 fi
 
 # --- 7. Gate B's job still exists -------------------------------------------

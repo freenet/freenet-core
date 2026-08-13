@@ -87,7 +87,7 @@ documentation. The source pin then tracks the comment, not the code.
 | `Startup update check complete` | Emitted at `debug!`, so absent from every release binary. The canary's "did the check finish?" assertion could never observe it. |
 | `failed to parse latest version` | Occurs twice in `auto_update.rs`: the production `tracing::warn!` (the format literal `Startup update check: failed to parse latest version '{}'`) and a prose comment inside that file's own `#[cfg(test)] mod tests` (`// WARN failed to parse latest version 'v0.2.121':`). Both are quoted rather than cited by line number on purpose — the first version of this row cited `:1546`/`:1757`, which this very commit's +23 lines had already shifted to `:1569`/`:1780`. A line number in a rule about stale pins rots faster than the thing it describes. Rewording the production line left all 22 assertions green — including `ok - source pin: parse-failure marker` — while a node carrying the #5221 bug then logged check-ran + reworded-warn + check-complete and the canary reported `OK: parsed GitHub's response`. An ordinary log reword deletes the gate, with CI green throughout. |
 | (no marker at all) | The gate had nothing to say WHICH release the node compared against, so its healthy verdict was byte-identical to a silently-wrong comparator's — see the positive-fact rule below. Closed by `MARKER_LATEST_SEEN`. |
-| `triggering auto-update` | A fixed string, so it never matched `freenet.rs:609`'s "triggering IMMEDIATE auto-update". A node that took the urgent path read as one that never decided to update, for as long as that site had existed. Fail-closed, hence unnoticed. Closed by `MARKER_TRIGGERED_RE` plus a count pin. |
+| `triggering auto-update` | A fixed string, so it never matched the urgent site's "triggering IMMEDIATE auto-update" (cited by phrase: the six line numbers this table and the canary once carried were all low by 12 within one release). A node that took the urgent path read as one that never decided to update, for as long as that site had existed. Fail-closed, hence unnoticed. Closed by `MARKER_TRIGGERED_RE` plus a count pin. |
 
 ### The rule
 
@@ -111,7 +111,7 @@ documentation. The source pin then tracks the comment, not the code.
   `api.github.com`): two sources that are allowed to disagree produce failures
   that are not bugs.
 - **Pin the COUNT when a marker is supposed to match a SET of call sites.** A
-  fixed-string `MARKER_TRIGGERED` missed `freenet.rs:609` ("triggering
+  fixed-string `MARKER_TRIGGERED` missed the urgent site ("triggering
   IMMEDIATE auto-update") for as long as that site existed, so a node taking
   the urgent path read as one that never decided to update. It failed CLOSED,
   which is exactly why nobody noticed — **fail-closed is not the same as
@@ -194,6 +194,135 @@ hand-rolling a `split_once`. It:
 **Prefer a cross-file scrape.** A pin that lives in `auto_update.rs` and
 scrapes `update.rs` cannot be satisfied by its own assertion literal at
 all — a structural guarantee rather than a check someone must remember.
+
+### The same class without `include_str!`: an expectation stored as a copy
+
+A pin does not need a sliding anchor to follow its subject. **An expected
+value stored as a plaintext copy of the value it guards is rewritten by
+the same edit that changes the value**, so the pin renames itself and
+stays green. Nothing self-references; the two literals are simply
+identical, and the realistic edit is a sweep over both.
+
+Seen in #5303. `MARKER_LATEST_SEEN_SINCE` names the first published
+release emitting a log marker; rewording the marker requires moving it,
+and nothing prompted anyone (the source pin interpolates the marker, so
+it follows a rename by construction). A freeze was added storing the
+expected marker text as a literal beside the constant. Its own mutation
+test killed it: a reword is performed as a `sed` sweep across the files
+mentioning the marker, that sweep rewrote the frozen expectation too, and
+the suite passed with the constant still stale.
+
+Then the fix's *fix* failed the same way one level up. With the text
+stored base64 the reword went red — but following the failure message's
+own instruction (regenerate the encoded blob) went green again with the
+version constant untouched. Two adjacent assertions are not a pair.
+
+**The rules:**
+
+- **Encode the expectation** (base64, hash, checksum) whenever the value
+  it guards is text a sweep could match. Leave it plaintext only when the
+  realistic wrong edit is a human typing one new value — a version
+  constant qualifies, since bumps touch `Cargo.toml` and the lockfile,
+  not test scripts. Document the asymmetry where you rely on it.
+- **A freeze forces a decision only if the remediation cannot be
+  performed without making that decision.** Freeze values that must move
+  together as ONE blob, so regenerating the expectation is impossible
+  without re-stating both.
+- **Mutation-test the REMEDIATION PATH, not just the regression.** Apply
+  the mutation, then do exactly what your own failure message says, and
+  check whether the suite goes green while the problem remains.
+
+### Load-bearing justifications rot fastest, and their staleness is self-concealing
+
+A systematic sweep of #5303 found eight stale comments. **Seven were not
+descriptions of code — they were justifications**: *"this is the only thing
+keeping X out"*, *"mutation-tested: deleting this left the suite green"*, *"the
+grep returns nothing, so that hazard is not real"*, *"the lifecycle test covers
+this against real boots"*. Every one was false at the head that carried it.
+
+Two properties make this class worse than an ordinary stale comment:
+
+- **They tell the next reader to stop checking.** That is their whole purpose.
+  So the comment most likely to be wrong is the one most likely to suppress the
+  verification that would catch it. One of them — *"the grep returns nothing"* —
+  was the sole stated reason for deleting a real entry from a
+  contributor-facing list. The grep returned two hits.
+- **They rot precisely when the thing they justify is STRENGTHENED.** "This is
+  the only guard" stops being true the moment you add a second guard, which is
+  the good outcome. Three of the seven rotted that way inside four commits.
+
+They also mislead the *careful* reviewer specifically: a comment that outlived
+its code is indistinguishable from the bug it describes, and the careless reader
+never gets that far. One such comment in #5303 ("recorded from the LAST attempt",
+left behind by the commit that replaced last-writer-wins with a latch) cost a
+full review round — the reviewer read the tree rather than the author's report,
+which was the correct instinct, and the tree lied.
+
+**The rule:**
+
+- **A count or a grep result does not belong in prose.** Compute it where it can
+  go red. #5303's `EXIT_UNVERIFIED_ENVIRONMENTAL` pin reads the constant out of
+  the script instead of restating `75`; its shell-assertion counter recomputes
+  "no `*_test.sh` is invisible to this grep" on every CI run instead of carrying
+  the numbers a reviewer had measured by hand. Both replaced sentences that had
+  already gone stale once.
+- **Prefer "the first of two guards" to "the only guard".** State what a check
+  does, not what nothing else does — the second claim is falsified by the next
+  improvement.
+- **When you change code, the nearby comment is part of the change.** Especially
+  when the change makes an old caveat unnecessary: that is when the sentence
+  survives, because nothing forces you to look at it.
+- **When a comment and the code disagree, verify against the code before
+  reporting** — then fix the comment as a defect in its own right.
+- **A defect found at one site is not fixed until you have ENUMERATED every
+  site of that shape, and "enumerate" means grep, not recall.** This appeared
+  four times in one night in #5303, and the fixes were the misses: the
+  comment-stripping filter was applied to one job-block extraction while three
+  siblings went without (twice, in successive commits); the SIGPIPE fix in
+  #5236 corrected two helpers and left four call sites inside the very function
+  those helpers serve; and a false "on all N attempts" claim was corrected in
+  one branch while its sibling twelve lines away kept it. Each time the author
+  had just understood the defect completely, which is exactly when the
+  remaining instances feel like they cannot be there.
+
+  Three of the four were caught only because a MUTATION FAILED TO APPLY —
+  `PATTERN NOT FOUND` with the suite green. **An unapplied mutation is not a
+  pass; it is an unexplained observation**, and here the explanation was always
+  that the string had moved or been half-fixed. Chase it.
+
+  Prefer removing the class over fixing the instances: three extractions became
+  one `yaml_job_block` helper, so a fourth caller cannot forget the filter
+  because there is nothing to forget.
+
+### Relation pins between quantities on different clocks
+
+A pin asserting a fixed relation between two values that change on
+*different schedules* is correct in one phase and wrong in another. It
+looks anchored — the second quantity is one the author cannot influence,
+which is normally the point — but it encodes a phase assumption nobody
+writes down.
+
+#5290 pinned `MARKER_LATEST_SEEN_SINCE >= crate version`, on the premise
+"the marker is new in this tree, so no published release emits it". True
+until that release published; the pin then blocks the *next* release for
+holding the correct value. Reversing it to `<= crate version` is correct
+after publication and wrong during a marker reword, where the right
+constant is crate+1 and the pin goes red for it.
+
+The constant tracks **release history**; the crate version tracks **this
+tree**. No relation asserting they stay in step holds in both phases.
+
+- Ask **"what future state legitimately requires this to move?"** before
+  pinning a relation. If the answer is "a state where the relation is
+  violated", the relation is the wrong pin.
+- Prefer a **freeze on the value**, which is phase-independent and
+  catches strictly more (the empty string, and the most likely wrong
+  value, neither of which a one-sided relation sees).
+- A *loose plausibility bound* is not the same thing and is not refuted
+  by the above: `<= crate + 1` passes during a reword. Note that the
+  claim "it fires on a reword too" was repeated through two reviews
+  before anyone did the arithmetic — **check a refutation before
+  propagating it**, especially one that is a single comparison.
 
 ### Audit
 

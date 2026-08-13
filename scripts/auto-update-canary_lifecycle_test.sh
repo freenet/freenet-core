@@ -556,6 +556,76 @@ else
     fi
 fi
 
+# ---------------------------------------------------------------------------
+# 8. Gate B RETRIES an indeterminate run and does NOT retry a real failure.
+#
+#    THE DANGEROUS HALF IS THE SECOND ONE. Each attempt wipes the tree and boots
+#    a fresh node, so if Gate B retried a genuine detection fault, any fault
+#    that is intermittent -- a race, a timing-dependent parse, a node that
+#    reaches the update path only sometimes -- would eventually produce one
+#    passing attempt and the release would be reported healthy. A flaky pass on
+#    the post-publish gate is strictly worse than no gate: it is a green light
+#    nobody re-examines. That is the disaster this canary exists to prevent,
+#    arriving by way of the canary's own retry loop.
+#
+#    Counted BEHAVIOURALLY, by how many times the node is actually booted,
+#    because that is the property. A source grep for `[ "$rc" -eq 2 ] || break`
+#    would pass just as happily if the surrounding logic stopped reaching it.
+#
+#    cmd_selfupdate downloads and unpacks the previous release before the loop,
+#    so `curl` and `tar` are shadowed by no-op functions -- the script is
+#    SOURCED, so a function definition wins over the external command -- and the
+#    fake node is pre-placed where the extract would have put it.
+boot_count_for() {
+    # boot_count_for <extra-log-line> -- boots Gate B against a fake node that
+    # logs <extra-log-line>, and echoes how many times the node was started.
+    local extra="$1" work counter
+    work="$CANARY_WORKDIR/selfupdate"
+    rm -rf "$work"
+    mkdir -p "$work/bin"
+    counter="$TMPROOT/boots.$$"
+    : > "$counter"
+    make_fake_node "$work/bin/freenet" 0 "$extra"
+    # Count a boot on every invocation that is not `--version`.
+    sed -i "2i if [ \"\${1:-}\" != \"--version\" ]; then echo x >> \"$counter\"; fi" \
+        "$work/bin/freenet"
+    (
+        curl() { :; }
+        tar()  { :; }
+        cmd_selfupdate 0.2.121 0.2.122 >/dev/null 2>&1
+    )
+    grep -c x "$counter" 2>/dev/null || echo 0
+}
+
+SAVED_ATTEMPTS="$CANARY_ATTEMPTS"
+SAVED_SLEEP="$CANARY_RETRY_SLEEP"
+SAVED_OUTCOME="$CANARY_OUTCOME_WAIT_SECS"
+CANARY_ATTEMPTS=2
+CANARY_RETRY_SLEEP=0
+# The fake node writes its lines and exits immediately, so the only thing the
+# outcome poll can wait for here is its own clock. Cut to keep this file inside
+# the Fmt job's 5-minute budget; the REAL bound is exercised by cases 5 and 6,
+# which is where it means something.
+CANARY_OUTCOME_WAIT_SECS=2
+
+boots="$(boot_count_for "WARN freenet::commands::auto_update: Startup update check: failed to fetch latest version: error sending request. Continuing with current binary.")"
+if [[ "$boots" == "2" ]]; then
+    ok "Gate B retries an INDETERMINATE run (2 attempts, node booted twice)"
+else
+    bad "Gate B booted the node $boots time(s) for an indeterminate run, expected 2 (CANARY_ATTEMPTS). Without the retry, one transient blip in a ~40s window decides a release's post-publish verdict -- and the previous release's own startup fetch has no retry either, so the blip is routine."
+fi
+
+boots="$(boot_count_for "$PARSE_FAIL_LINE")"
+if [[ "$boots" == "1" ]]; then
+    ok "Gate B does NOT retry a REAL detection failure (node booted once)"
+else
+    bad "Gate B booted the node $boots time(s) for a genuine #5221 parse failure, expected exactly 1. Retrying a real assertion failure lets an INTERMITTENT fault produce a passing attempt, and Gate B then reports a broken release healthy -- a flaky pass on the post-publish gate, which is worse than no gate at all."
+fi
+
+CANARY_ATTEMPTS="$SAVED_ATTEMPTS"
+CANARY_RETRY_SLEEP="$SAVED_SLEEP"
+CANARY_OUTCOME_WAIT_SECS="$SAVED_OUTCOME"
+
 echo
 if [[ "$FAILURES" -eq 0 ]]; then
     echo "All auto-update-canary lifecycle assertions passed."

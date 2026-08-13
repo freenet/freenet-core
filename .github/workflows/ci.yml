@@ -224,6 +224,16 @@ jobs:
       - name: Self-test auto-update canary lifecycle
         run: bash scripts/auto-update-canary_lifecycle_test.sh
 
+      # Guards the shell-assertion counter further down THIS file. That
+      # alternation has been wrong three times and nothing in the repo
+      # exercised it, so each miss was found by a human noticing a wrong
+      # number. It fails in the rejecting direction: an under-counting lint
+      # turns away a fix: PR that does have a regression test, and the cheapest
+      # response for the author is to reshape a good test until the grep likes
+      # it. The test extracts the live regex rather than copying it.
+      - name: Self-test Rule Lint shell-assertion counter
+        run: bash scripts/rule_lint_shell_assertion_counter_test.sh
+
       # install.sh now sets up a supervised service by default (issue #4073) so
       # new nodes auto-update. The system-vs-user + lingering decision is the
       # load-bearing new logic; these smoke tests pin it without needing real
@@ -234,7 +244,7 @@ jobs:
       # clean when they landed but were not actually in this list, so nothing
       # held them to it. `-x` because the two test scripts `source` the canary.
       - name: Lint install/uninstall scripts (shellcheck)
-        run: shellcheck -x scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh scripts/release_wait_for_binaries_test.sh scripts/release_canary_wiring_test.sh scripts/release.sh
+        run: shellcheck -x scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh scripts/release_wait_for_binaries_test.sh scripts/release_canary_wiring_test.sh scripts/rule_lint_shell_assertion_counter_test.sh scripts/release.sh
       - name: Self-test install.sh service-mode decision
         run: sh scripts/test-install-sh.sh
       - name: Self-test uninstall.sh
@@ -414,30 +424,104 @@ jobs:
 
           if [ "$IS_FIX" -gt 0 ] && [ "$HAS_EXEMPT_LABEL" -eq 0 ]; then
             NEW_TESTS=$(echo "$ALL_ADDED_STRIPPED" | grep -cE "$TEST_ATTR_RE" || true)
-            # Some fixes are to shell tooling (e.g. scripts/release-agent/*.sh),
-            # whose regression tests are shell *_test.sh self-tests run in CI,
-            # not Rust #[test]s. Count added assertion lines (`check ...`) in
-            # added *_test.sh files so such fixes aren't forced to claim
-            # test-exempt. Without this, a genuine shell regression test scores
-            # zero against TEST_ATTR_RE (Rust-only) and the fix is wrongly
-            # rejected — the gap that hid the announce-to-river fix's own test.
-            # `check` is one of several assertion helpers in this repo's shell
-            # self-tests; `auto-update-canary_lifecycle_test.sh` reports through
-            # `ok`/`bad` instead. Matching only `check` made this rule miss a
-            # genuine behavioural regression test (#5290 added a lifecycle case
-            # that reproduces the fault and goes red without the fix) and demand
-            # `test-exempt` for a PR that had exactly the test the rule wants —
-            # the same "gate cannot see its subject" shape the comment above
-            # describes. Match the helpers actually in use.
+            # Some fixes are to shell tooling, whose regression tests are shell
+            # *_test.sh self-tests, not Rust #[test]s. Without this they score
+            # zero against TEST_ATTR_RE and the fix is wrongly rejected — the gap
+            # that hid the announce-to-river fix's own test.
+            #
+            # WHAT THIS RECOGNISES, precisely: the SUCCESS-REPORTING LINE of an
+            # assertion, by prefix. Not assertions. A decorative
+            # `echo "ok - looks fine"` satisfies it, and so did `ok "..."` and a
+            # self-comparing `check "x" "a" "a"` before it was widened. What
+            # stops a decorative test is review and mutation-testing, not this
+            # grep; widening only adds spellings.
+            #
+            # The alternation was widened three times, each time stopping at the
+            # file in front of whoever was editing. It is now derived from an
+            # ENUMERATION of every `*_test.sh` in the repo rather than from the
+            # file at hand: `check` (6 files), `ok`/`bad` (lifecycle), `pass`
+            # (3 files), `expect`
+            # (rule_lint_shell_assertion_counter_test.sh), `echo "ok   - "`
+            # (all sites use that exact separator, so anchoring on it costs
+            # nothing while rejecting `echo "okay, starting"`), and
+            # `echo "PASS [...]"` (release_state_restore_test.sh). Both quote
+            # styles. `expect` is safe as a bare name only because nothing in
+            # `scripts/` drives the TCL `expect(1)`; check that before assuming
+            # it stays safe.
+            #
+            # RE-RUN THE ENUMERATION AFTER ADDING A TEST FILE, not just before
+            # adding a pattern. The commit that introduced
+            # `rule_lint_shell_assertion_counter_test.sh` -- the file whose
+            # whole job is to stop this counter under-counting -- wrote its 26
+            # assertions as bare `expect 1 ...` calls, which scored ZERO. The
+            # blind spot was reintroduced by the fix for it, in the same PR,
+            # and was caught by re-measuring rather than by reading.
+            #
+            # THE BARE-NAME FORMS ABOVE ARE NOT THE WHOLE VOCABULARY, and for a
+            # while this counter behaved as if they were. `[[:space:]]`
+            # immediately after `(check|ok|pass)` requires the helper's name to
+            # END there, so every underscore-suffixed helper scored zero:
+            # `gate_b_arm_case`, `version_ge_case`, `trigger_case`,
+            # `norm_case`, `timeout_guard_case`, `pin_marker`,
+            # `pin_warn_literal`, `check_vs_expected`, `check_call_count`,
+            # `check_fallback`, `test_restores_persisted_value`. Measured
+            # every `*_test.sh` in the repo at the time: the original form saw
+            # roughly three quarters of the assertion call sites and missed the
+            # rest, almost all of them in `auto-update-canary_test.sh`, whose
+            # parameterised cases are written almost entirely in that style. The
+            # patterns added below (a `check_`/`pin_`/`assert_`/`expect_`/`test_`
+            # prefix, a `_case` suffix, and bare `expect`) closed the gap with no
+            # false positives.
+            #
+            # NO EXACT FIGURES HERE ON PURPOSE. Three counts in this comment went
+            # stale inside this very PR, because every commit that adds an
+            # assertion moves them, and a number in a justification is the kind
+            # of sentence that tells the next reader to stop checking.
+            # `rule_lint_shell_assertion_counter_test.sh` RECOMPUTES the property
+            # that actually matters -- that no `*_test.sh` is invisible to this
+            # counter -- on every CI run, and fails naming the files. Definitions do not match either pattern (`foo() {` has no
+            # whitespace where the name ends), so declaring a helper still
+            # scores nothing, which is right.
+            #
+            # KNOWN FALSE NEGATIVES, left in rather than chased. All three are
+            # real in this repo today:
+            #   1. `printf`-style success reporting. An earlier version of this
+            #      comment DELETED this entry, on the stated ground that
+            #      `grep -rnE "printf .*['\"](ok|PASS)"` over scripts/ returned
+            #      nothing. It returns two:
+            #      `scripts/test-install-sh.sh` and `scripts/test-uninstall-sh.sh`,
+            #      both `pass() { printf 'PASS  %s\\n' "$1"; }`. They escape this
+            #      counter only because the diff above is scoped to
+            #      `**/*_test.sh` and those are named `test-*.sh` -- a naming
+            #      accident, not the absence of the convention. The moment
+            #      someone writes that reporter in a `*_test.sh`, it scores zero.
+            #      `rule_lint_shell_assertion_counter_test.sh` now RECOMPUTES
+            #      this rather than trusting the sentence.
+            #   2. An assertion whose only added line is its FAIL branch.
+            #      Deliberate: counting FAIL would let a PR score by adding an
+            #      error message alone.
+            #   3. A new entry in a TABLE an existing assertion loops over.
+            #      `SIGPIPE_SCRIPTS=(...)` in auto-update-canary_test.sh is the
+            #      live instance. Adding a file there genuinely extends what is
+            #      audited, and the added line is a bare string.
+            # The error text below tells the contributor all three.
             NEW_SHELL_TESTS=$(git diff "$BASE"..."$HEAD" -- '**/*_test.sh' \
               | grep -E '^\+' | grep -vF '+++' \
-              | grep -cE '^\+[[:space:]]*(check|ok)[[:space:]]' || true)
+              | grep -cE '^\+[[:space:]]*(check|ok|pass|expect)[[:space:]]|^\+[[:space:]]*echo[[:space:]]+["'"'"'](ok[[:space:]]+-|PASS[[:space:]])|^\+[[:space:]]*(check|pin|assert|expect|test)_[a-z0-9_]*([[:space:]]|$)|^\+[[:space:]]*[a-z_][a-z0-9_]*_case[[:space:]]' || true)
             if [ "$NEW_TESTS" -eq 0 ] && [ "$NEW_SHELL_TESTS" -eq 0 ]; then
               ERRORS="$ERRORS
           ERROR: fix: PR must include at least one new regression test
           Add a test that reproduces the bug (fails without fix, passes with fix).
-          A Rust #[test]/#[tokio::test]/etc. or an added 'check' assertion in a
-          *_test.sh self-test both satisfy this.
+          Either satisfies this:
+            - a Rust #[test] / #[tokio::test] / etc.
+            - an added assertion in a *_test.sh self-test, written with any of the
+              conventions those files use: 'check ...', 'ok ...', 'pass ...',
+              'expect ...', a 'check_'/'pin_'/'assert_'/'expect_'/'test_'-prefixed helper, a
+              '*_case ...' helper, 'echo \"ok   - ...\"' or 'echo \"PASS ...\"'.
+              Known blind spots: an assertion whose only added line is its FAIL
+              branch, and a new entry in a table an existing assertion loops over
+              (e.g. SIGPIPE_SCRIPTS). If you have a real test the counter cannot
+              see, say so on the PR rather than reshaping the test to please this grep.
           If this fix genuinely cannot have a test, add the 'test-exempt' label with a justification comment."
             fi
           fi

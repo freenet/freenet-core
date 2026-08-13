@@ -134,6 +134,26 @@ check "healthy: check ran and completed up-to-date -> pass" 0 "$HEALTHY_UP_TO_DA
 check "broken: #5221 unparseable tag -> fail" 1 "$BROKEN" \
     "could not parse the version GitHub returned"
 
+# BOTH markers in one log, which pins the ORDER of the two branches. The
+# parse-failure check runs BEFORE the fetch-failure check, and that ordering is
+# the FIRST of two things keeping a real #5221 out of the environmental
+# classification
+# Gate B gained this round. Swap the two branches -- an innocent-looking tidy,
+# "infra check before product check" -- and this log returns 2 instead of 1,
+# Gate B treats it as a candidate for the environmental class. The runner probe
+# is the second guard and would usually catch it from there, so this is an
+# ordering hazard rather than a guaranteed false quiet -- but the two together
+# are what make it safe, and a guard that only holds when its sibling also does
+# is worth its own case.
+#
+# Realistic rather than contrived: a node whose startup fetch failed and whose
+# periodic re-poll then returned an unparseable tag logs exactly this, and so
+# does the reverse. Until this case existed no fixture in the suite held both.
+BROKEN_PLUS_FETCH_FAIL="$BROKEN
+2026-08-08T02:05:00.000000Z  WARN freenet::commands::auto_update: Startup update check: failed to fetch latest version: error sending request. Continuing with current binary."
+check "broken: a parse failure OUTRANKS a fetch failure in the same log" 1 \
+    "$BROKEN_PLUS_FETCH_FAIL" "could not parse the version GitHub returned"
+
 # --- THE VACUOUS-PASS CASES -------------------------------------------------
 # Each of these contains NO error line. A one-sided "grep -q 'failed to parse'
 # && fail" assertion passes all of them, which is exactly how a dead updater
@@ -428,6 +448,368 @@ else
     echo "ok   - cmd_selfupdate arms the equality check from its expected-version argument"
 fi
 
+# --- environmental classification: the alarm must not blame the fleet -------
+# `node_could_not_reach_github` is what stops the post-publish Matrix alarm
+# saying "a node on the previous release may not be able to auto-update to this
+# one" because a hosted runner could not open a socket.
+#
+# It is a real risk rather than a tidy-up, and the numbers matter: Gate B's
+# subject is a PUBLISHED binary, whose startup fetch retries ZERO times
+# (`startup_update_check_with_fetcher` warns and returns on the first Err), and
+# `framework` logged that WARN twice on 2026-08-11 -- 17:08:04Z and 00:35:13Z.
+#
+# Both directions, because only one of them is safe to get wrong. Classifying a
+# real fault as environmental would quieten the exact alarm this canary exists
+# to raise, so the negative case is the load-bearing one.
+env_case() {
+    # env_case <description> <expect yes|no> <log-content>
+    local desc="$1" expect="$2" content="$3" dir got
+    dir="$(mktemp -d "$TMPROOT/env.XXXXXX")"
+    printf '%s\n' "$content" > "$dir/freenet.2026-08-08-02.log"
+    if node_could_not_reach_github "$dir"; then got=yes; else got=no; fi
+    if [[ "$got" == "$expect" ]]; then
+        echo "ok   - environmental classification: $desc"
+    else
+        echo "FAIL - environmental classification: $desc (got '$got', expected '$expect')" >&2
+        if [[ "$expect" == no ]]; then
+            echo "       Classifying this as environmental silences the #5221 alarm for a run" >&2
+            echo "       that found a real fault." >&2
+        else
+            echo "       Not classifying it means a runner that could not reach github.com" >&2
+            echo "       tells the dev room the fleet may be stranded." >&2
+        fi
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+env_case "the node's own fetch-failure WARN" yes "$FETCH_FAIL"
+env_case "a real #5221 parse failure is NOT environmental" no "$BROKEN"
+env_case "a healthy run is NOT environmental"              no "$HEALTHY"
+env_case "a truncated run (no outcome logged) is NOT environmental" no "$PENDING"
+env_case "a disabled updater is NOT environmental"         no "$DISABLED"
+
+# --- and the DECISION the classification feeds -------------------------------
+# `node_could_not_reach_github` establishes CANDIDACY for the quiet path;
+# `gate_b_unverified_class` decides. The split exists because the quiet message
+# tells the dev room a red release needs no action, so a single WARN from the
+# node is not enough to earn it: a persistent problem would otherwise report
+# "environmental" release after release, nobody would be alarmed, and we would
+# believe we had a post-publish gate while verifying nothing.
+#
+# The GitHub case therefore demands corroboration from a second observer in the
+# same run -- this runner's own fetch. Stubbed here, so the decision is tested
+# without a network.
+#
+# The real implementation is captured and put back afterwards rather than
+# re-sourcing the script: sourcing it again would run its top-level `mktemp -d`
+# a second time and re-register `trap cleanup EXIT`, leaking the first workdir
+# on every CI run. A stub left installed would be worse -- it would silently
+# weaken any later assertion that reaches it.
+# --- the probe itself, before the decision that consumes it -----------------
+# `runner_can_reach_github` is the corroboration. Every way it can MALFUNCTION
+# used to be indistinguishable from "the network is down", because it went
+# through `resolve_expected_latest`, which collapses a 403, a captive portal, a
+# changed redirect shape and a missing curl all to `return 1`. Read as
+# corroboration, every one of those bought the quiet path.
+#
+# Only connect-class curl exits may now answer "cannot reach". Stubbing `curl`
+# rather than the function, so what is tested is the classification of exit
+# codes and not a restatement of it.
+probe_case() {
+    # probe_case <description> <curl-exit> <expected reachable|unreachable>
+    local desc="$1" curl_rc="$2" expect="$3" got
+    if (
+        curl() { return "$curl_rc"; }
+        runner_can_reach_github
+    ); then got=reachable; else got=unreachable; fi
+    if [[ "$got" == "$expect" ]]; then
+        echo "ok   - probe: $desc"
+    else
+        echo "FAIL - probe: $desc (got '$got', expected '$expect')" >&2
+        if [[ "$expect" == reachable ]]; then
+            echo "       Reading this as 'the network is down' hands the quiet path to a" >&2
+            echo "       probe malfunction, which is the direction that hides things." >&2
+        fi
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+probe_case "curl succeeds"                        0   reachable
+probe_case "could not resolve host (6)"           6   unreachable
+probe_case "failed to connect (7)"                7   unreachable
+probe_case "operation timed out (28)"             28  unreachable
+probe_case "SSL connect error (35)"               35  unreachable
+probe_case "HTTP error, e.g. 403 rate limit (22)" 22  reachable
+probe_case "unsupported protocol / bad URL (1)"   1   reachable
+probe_case "curl not installed (127)"             127 reachable
+
+real_runner_can_reach_github="$(declare -f runner_can_reach_github)"
+if [[ -z "$real_runner_can_reach_github" ]]; then
+    echo "FAIL - runner_can_reach_github is not defined; the corroboration tests would" >&2
+    echo "       stub a function nothing calls and pass vacuously." >&2
+    FAILURES=$((FAILURES + 1))
+fi
+class_case() {
+    # class_case <description> <env-cause> <runner-reachable yes|no> <expected>
+    local desc="$1" cause="$2" reachable="$3" expect="$4" got
+    if [[ "$reachable" == yes ]]; then
+        runner_can_reach_github() { return 0; }
+    else
+        runner_can_reach_github() { return 1; }
+    fi
+    got="$(gate_b_unverified_class "$cause")"
+    if [[ "$got" == "$expect" ]]; then
+        echo "ok   - unverified class: $desc"
+    else
+        echo "FAIL - unverified class: $desc (got '$got', expected '$expect')" >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+class_case "node could not reach GitHub and neither can the runner -> quiet" \
+    github no  environmental
+class_case "node could not reach GitHub but the RUNNER can -> loud" \
+    github yes fault
+class_case "port collision needs no network corroboration -> quiet" \
+    ports  yes environmental
+class_case "port collision, runner offline too -> still quiet" \
+    ports  no  environmental
+class_case "no cause recorded (hung updater) -> loud even with a dead network" \
+    ""     no  fault
+class_case "an unrecognised cause is loud, not quiet" \
+    weather no fault
+eval "$real_runner_can_reach_github"
+
+# --- Gate B END TO END, driven per attempt ----------------------------------
+# Everything above tests a PIECE. This drives the real `cmd_selfupdate` over a
+# scripted sequence of attempts and asserts BOTH the returned exit code and the
+# attempt count, which is the only way several of these properties can be
+# observed at all.
+#
+# WHY, CONCRETELY. Three mutations that break the classifier in the QUIET
+# direction were confirmed to leave the whole suite green before this existed:
+#
+#   1. `[ "$rc" -eq 2 ] && node_could_not_reach_github …` -> `||`, so every
+#      indeterminate becomes environmental. The source pin survives because the
+#      CALL TEXT is still there -- the same defect the round-2
+#      `prev_emits_latest_seen` fix was written to close, reappearing one
+#      function over. A pin that greps for a call cannot see the operator
+#      joining it to anything.
+#   2. `-eq 1` -> `-ne 1` on the corroboration, swapping 75 and 1.
+#   3. deleting the `attempt_cause=""` reset.
+#
+# And the run-level latch -- an unexplained indeterminate on ANY attempt must
+# never be overwritten by a later environmental one -- is a property OF THE
+# SEQUENCE. No single-attempt test can express it.
+#
+# `run_node_until_check` is stubbed rather than booting a node: the sequence is
+# the subject, and a real boot costs seconds per attempt. The lifecycle test
+# covers the same retry property by actually running `run_node_until_check`
+# against a FAKE NODE BINARY -- a real process, real ports, real log files, but
+# not a real node. So the two differ in how much of the harness executes, not in
+# whether the subject is genuine; neither is a live cross-check against a real
+# release. (An earlier version of this claimed "against REAL boots", which
+# overstated the lifecycle test in the direction of "you need not check this".)
+# `curl`/`tar` are shadowed so the
+# download preamble is a no-op. Same shape as
+# `release_wait_for_binaries_test.sh`'s `check_call_count`.
+GATE_B_ATTEMPT=0
+GATE_B_SCRIPT=()
+run_node_until_check_stub() {
+    local work="$2" spec exit_code logvar
+    GATE_B_ATTEMPT=$((GATE_B_ATTEMPT + 1))
+    # Past the end of the script means the loop ran more times than the case
+    # expects; repeat the last entry so the attempt-COUNT assertion is what
+    # reports it, with a number, rather than an unbound-variable abort.
+    if [[ "$GATE_B_ATTEMPT" -le "${#GATE_B_SCRIPT[@]}" ]]; then
+        spec="${GATE_B_SCRIPT[$((GATE_B_ATTEMPT - 1))]}"
+    else
+        spec="${GATE_B_SCRIPT[$((${#GATE_B_SCRIPT[@]} - 1))]}"
+    fi
+    exit_code="${spec%%:*}"
+    logvar="${spec#*:}"
+    NODE_EXIT="$exit_code"
+    mkdir -p "$work/logs"
+    if [[ -n "$logvar" ]]; then
+        printf '%s\n' "${!logvar}" > "$work/logs/freenet.2026-08-08-02.log"
+    fi
+}
+
+real_run_node_until_check="$(declare -f run_node_until_check)"
+if [[ -z "$real_run_node_until_check" ]]; then
+    echo "FAIL - run_node_until_check is not defined; the Gate B driver would stub" >&2
+    echo "       nothing and every case below would pass vacuously." >&2
+    FAILURES=$((FAILURES + 1))
+fi
+
+# THE MESSAGE IS ASSERTED, not just the code. Exit 75 is reached from two
+# branches whose operator-facing text differs, and the quiet Matrix message
+# deliberately points the reader at the job log line as the ONLY thing that says
+# which -- so that line is the disambiguator and it was untested. Measured:
+# deleting the entire `ports)` arm of the message `case` left all four suites
+# green. `check()` in this same file exists for exactly this reason and says so
+# in its own comment; this is that gap reintroduced one function over.
+gate_b_case() {
+    # gate_b_case <desc> <expected-rc> <expected-attempts> <runner-reachable> \
+    #             <expected-message-substring> <spec...>
+    # Each <spec> is "<node-exit>:<fixture-variable-name>" for one attempt.
+    local desc="$1" want_rc="$2" want_attempts="$3" reachable="$4" want_msg="$5"
+    shift 5
+    GATE_B_SCRIPT=("$@")
+    GATE_B_ATTEMPT=0
+    local got_rc got_attempts out err errfile
+    errfile="$(mktemp "$TMPROOT/gateb.XXXXXX")"
+    out="$(
+        CANARY_ATTEMPTS="${#GATE_B_SCRIPT[@]}"
+        CANARY_RETRY_SLEEP=0
+        curl() { :; }
+        tar()  { :; }
+        run_node_until_check() { run_node_until_check_stub "$@"; }
+        if [[ "$reachable" == yes ]]; then
+            runner_can_reach_github() { return 0; }
+        else
+            runner_can_reach_github() { return 1; }
+        fi
+        mkdir -p "$CANARY_WORKDIR/selfupdate/bin"
+        printf '#!/bin/sh\necho "Freenet version: 0.2.121"\n' \
+            > "$CANARY_WORKDIR/selfupdate/bin/freenet"
+        chmod +x "$CANARY_WORKDIR/selfupdate/bin/freenet"
+        cmd_selfupdate 0.2.121 0.2.122 2>"$errfile" >/dev/null
+        printf '%s %s' "$?" "$GATE_B_ATTEMPT"
+    )"
+    got_rc="${out%% *}"
+    got_attempts="${out##* }"
+    err="$(cat "$errfile")"
+    rm -f "$errfile"
+    if [[ "$got_rc" != "$want_rc" || "$got_attempts" != "$want_attempts" ]]; then
+        echo "FAIL - Gate B: $desc" >&2
+        echo "         got exit $got_rc after $got_attempts attempt(s);" >&2
+        echo "         wanted exit $want_rc after $want_attempts" >&2
+        FAILURES=$((FAILURES + 1))
+    elif [[ "$err" != *"$want_msg"* ]]; then
+        echo "FAIL - Gate B: $desc (exit $got_rc correct, but the operator sees the wrong text)" >&2
+        echo "         wanted a message containing: $want_msg" >&2
+        echo "         got: ${err:-<nothing on stderr>}" >&2
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "ok   - Gate B: $desc"
+    fi
+}
+
+# The load-bearing one, and the reason the retry is gated on rc=2. Each attempt
+# wipes the tree and boots a fresh node, so retrying a REAL failure lets any
+# intermittent fault produce one passing attempt, and Gate B then reports a
+# broken release healthy. A flaky pass on the post-publish gate is worse than
+# no gate.
+gate_b_case "a real #5221 failure is never retried" 1 1 no \
+    "could not parse the version GitHub returned" "0:BROKEN" "0:BROKEN"
+gate_b_case "an indeterminate IS retried, then exits 75" 75 2 no \
+    "could not reach GitHub on 2 of 2 attempt(s), and this runner cannot reach it either" \
+    "0:FETCH_FAIL" "0:FETCH_FAIL"
+gate_b_case "a port collision exits 75 without a network probe" 75 2 yes \
+    "every attempt hit a port collision on this host" "43:" "43:"
+# The corroboration: the same node-side symptom, opposite runner state.
+# The COUNT is asserted, not just the phrase. The message used to say "on all
+# $CANARY_ATTEMPTS attempts" unconditionally, which sticky-by-strength made
+# false the moment one attempt was a port collision -- and the original
+# assertion picked a substring that did not span the number, so it passed.
+gate_b_case "node cannot reach GitHub but the runner can -> loud, not 75" 1 2 yes \
+    "could not reach GitHub on 2 of 2 attempt(s), but THIS RUNNER reached" \
+    "0:FETCH_FAIL" "0:FETCH_FAIL"
+# A hung updater must never be quiet.
+gate_b_case "no outcome logged on every attempt -> loud" 1 2 no \
+    "at least one attempt started the update check and never logged an outcome" \
+    "0:PENDING" "0:PENDING"
+# THE LATCH, top tier. An unexplained indeterminate on attempt 1 must survive an
+# environmental attempt 2. Last-writer-wins here returned 75 and told the dev
+# room a hung updater was "not a stranded fleet and needs no fleet action".
+gate_b_case "unexplained THEN environmental stays loud (the latch)" 1 2 no \
+    "at least one attempt started the update check and never logged an outcome" \
+    "0:PENDING" "43:"
+# ...and in the other order, so the latch is not merely "the first attempt wins".
+gate_b_case "environmental THEN unexplained stays loud (the latch)" 1 2 no \
+    "at least one attempt started the update check and never logged an outcome" \
+    "43:" "0:PENDING"
+
+# STICKY BY STRENGTH, one tier down: `github` must never be downgraded to
+# `ports`. Both orderings, because they disagreed. The second was the live bug:
+# the probe never ran, the run exited 75 quiet, and the message claimed every
+# attempt hit a port collision -- which the message assertion is what catches,
+# since the exit code alone is 75 in the correct `ports`-only case too.
+gate_b_case "ports THEN github runs the probe and goes loud" 1 2 yes \
+    "could not reach GitHub on 1 of 2 attempt(s), but THIS RUNNER reached" \
+    "43:" "0:FETCH_FAIL"
+gate_b_case "github THEN ports still runs the probe and goes loud" 1 2 yes \
+    "could not reach GitHub on 1 of 2 attempt(s), but THIS RUNNER reached" \
+    "0:FETCH_FAIL" "43:"
+
+# The QUIET github branch, which the three cases above never reach: they all
+# have the runner UP, so they land on the loud sibling. With the runner DOWN a
+# mixed run is environmental, and that branch printed "in $CANARY_ATTEMPTS
+# attempts" for a further commit after its sibling was fixed -- the same false
+# unanimity, in the branch nobody had a case for. Found because a reviewer's
+# mutation reported PATTERN NOT FOUND, which is why an unapplied mutation is
+# never a pass.
+gate_b_case "ports THEN github with the runner DOWN is quiet, and counts honestly" 75 2 no \
+    "could not reach GitHub on 1 of 2 attempt(s), and this runner cannot reach it either" \
+    "43:" "0:FETCH_FAIL"
+gate_b_case "github THEN ports with the runner DOWN is quiet, and counts honestly" 75 2 no \
+    "could not reach GitHub on 1 of 2 attempt(s), and this runner cannot reach it either" \
+    "0:FETCH_FAIL" "43:"
+
+eval "$real_run_node_until_check"
+
+# Gate B's use of it. Three separate things can each silently undo the split,
+# and the first two fail in the QUIET direction:
+#   - returning 1 instead of the distinct code, so cross-compile.yml cannot
+#     tell the cases apart and every blip fires the #5221 alarm again;
+#   - classifying without consulting the logs (e.g. treating every rc=2 as
+#     environmental), which quietens a genuine no-outcome run;
+#   - dropping the retry loop, so one blip in a ~40s window decides a release.
+# shellcheck disable=SC2016  # literal source text; must not expand
+if [[ "$selfupdate_body" != *'return "$EXIT_UNVERIFIED_ENVIRONMENTAL"'* ]]; then
+    echo "FAIL - cmd_selfupdate no longer returns the distinct environmental exit code." >&2
+    echo "       cross-compile.yml keys the WORDING of its Matrix message off that code." >&2
+    echo "       Without it a runner that could not reach GitHub tells the dev room that a" >&2
+    echo "       node on the previous release may not be able to auto-update -- the #5221" >&2
+    echo "       text -- and an alarm that cries wolf on a network blip stops being read." >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ "$selfupdate_body" != *'node_could_not_reach_github "$work/logs"'* ]]; then
+    echo "FAIL - cmd_selfupdate classifies without consulting the node's logs." >&2
+    echo "       assert_detection_healthy returns 2 for two different situations. Treating" >&2
+    echo "       both as environmental quietens a run where the check started and never" >&2
+    echo "       logged an outcome, which is what a HUNG updater looks like." >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ "$selfupdate_body" != *'saw_unexplained=1'* ]]; then
+    echo "FAIL - cmd_selfupdate no longer latches an UNEXPLAINED indeterminate." >&2
+    echo "       The per-attempt cause is last-writer-wins without it: an attempt that" >&2
+    echo "       started the check and logged no outcome (a hung updater) followed by an" >&2
+    echo "       attempt that lost a port race reports exit 75 and the quiet 'no fleet" >&2
+    echo "       action' message. The behavioural cases above cover both orderings." >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ "$selfupdate_body" != *'gate_b_unverified_class "$env_cause"'* ]]; then
+    echo "FAIL - cmd_selfupdate no longer routes the quiet path through gate_b_unverified_class." >&2
+    echo "       Taking the node's WARN as sufficient on its own restores the silent-skip" >&2
+    echo "       shape: a persistent problem reports 'environmental' release after release," >&2
+    echo "       nobody is alarmed, and the post-publish gate verifies nothing while looking" >&2
+    echo "       maintained. The corroboration probe is what earns the quiet message." >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ "$selfupdate_body" != *'for attempt in $(seq 1 "$CANARY_ATTEMPTS")'* ]]; then
+    echo "FAIL - cmd_selfupdate no longer retries the indeterminate case." >&2
+    echo "       Gate B had no retry at all until this was added: CANARY_ATTEMPTS was read" >&2
+    echo "       only by cmd_preflight, so a single transient blip in a ~40s window decided" >&2
+    echo "       a release's post-publish verdict." >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ "$selfupdate_body" != *'rm -rf "${work:?}/home"'* ]]; then
+    echo "FAIL - cmd_selfupdate does not wipe the node's state between attempts." >&2
+    echo "       It must clear \$work/home and friends but NOT \$work/bin, which holds the" >&2
+    echo "       downloaded previous release -- the SUBJECT of the test, not state. Gate A's" >&2
+    echo "       'rm -rf \${work:?}' would delete the binary and every retry would run" >&2
+    echo "       nothing; keeping \$work/home makes the retry re-read the node's persisted" >&2
+    echo "       GitHub poll cooldown and reproduce the same INDETERMINATE without asking" >&2
+    echo "       GitHub at all. A retry that cannot produce a different answer is not one." >&2
+    FAILURES=$((FAILURES + 1))
+else
+    echo "ok   - cmd_selfupdate retries, classifies from the logs, and keeps \$work/bin"
+fi
+
 # The version gate around it. The observed-latest marker is new in #5236 and
 # Gate B drives the PREVIOUS release, so for one release there is no line to
 # compare; the gate must skip rather than fail. Both halves are pinned, because
@@ -455,6 +837,26 @@ else
     echo "ok   - cmd_selfupdate gates the equality check on prev_emits_latest_seen (un-negated)"
 fi
 
+# ...and that the DECISION reads the constant rather than a literal of its
+# current value. Nothing else covers this: hardcoding `version_at_least "$1"
+# "0.2.125"` inside the function leaves the whole suite green, the freeze
+# included, because the constant is untouched and the freeze has nothing to
+# disagree with. It matters at exactly the moment the constant is supposed to
+# move -- a correct reword bump would then silently not take effect, which is
+# the same shape as the reword hazard the freeze above exists to close.
+# shellcheck disable=SC2016  # literal source text; must not expand
+if [[ "$(declare -f prev_emits_latest_seen)" == *'"$MARKER_LATEST_SEEN_SINCE"'* ]]; then
+    echo "ok   - prev_emits_latest_seen compares against the CONSTANT, not a literal"
+else
+    echo "FAIL - prev_emits_latest_seen no longer reads \$MARKER_LATEST_SEEN_SINCE." >&2
+    echo "       Its body:" >&2
+    declare -f prev_emits_latest_seen | sed 's/^/         /' >&2
+    echo "       A literal threshold here decouples the decision from the constant, so" >&2
+    echo "       moving the constant -- which is exactly what a marker reword requires --" >&2
+    echo "       changes nothing and the whole suite stays green." >&2
+    FAILURES=$((FAILURES + 1))
+fi
+
 # ...and what that gate DECIDES, which the text match above cannot see. An
 # inversion inside the function flips both of these.
 gate_b_arm_case() {
@@ -470,11 +872,31 @@ gate_b_arm_case() {
         FAILURES=$((FAILURES + 1))
     fi
 }
-gate_b_arm_case "$MARKER_LATEST_SEEN_SINCE" yes   # the release the marker lands in
-gate_b_arm_case "0.2.125"                   yes   # every release after it
+gate_b_arm_case "$MARKER_LATEST_SEEN_SINCE" yes   # the first release that emits it
+# Was a literal `0.2.125`, which is the constant's own value and so duplicated
+# the case above rather than covering "after it". The constant is frozen (pinned
+# below), so a later release is a literal one release on.
+gate_b_arm_case "0.2.126"                   yes   # every release after it
 gate_b_arm_case "0.3.0"                     yes
-gate_b_arm_case "0.2.123"                   no    # the one release that must skip
+# BOTH releases below the constant must skip, and both are listed on purpose.
+# With only 0.2.123 here the cases straddled the gap: 0.2.123 no / 0.2.125 yes is
+# satisfied by ANY threshold in {0.2.124, 0.2.125}, so nothing pinned that the
+# decision reads the CONSTANT rather than a literal. Verified vacuity: replacing
+# the body of `prev_emits_latest_seen` with a hardcoded
+# `version_at_least "$1" "0.2.124"` left the entire suite green. 0.2.124 is the
+# case that closes it -- and it is the interesting one anyway, being the release
+# whose tree HAS the marker but which was never published.
+gate_b_arm_case "0.2.124"                   no    # in-tree but never published
+gate_b_arm_case "0.2.123"                   no    # predates the marker entirely
 gate_b_arm_case "0.2.99"                    no    # numeric, not lexical
+
+# Malformed input ARMS the check rather than skipping it. Skipping is the silent
+# direction; arming an unknown binary costs at worst a loud red on a release
+# whose version string was already unreadable. Note this is the OPPOSITE of what
+# `version_at_least` returns for the same input (below) -- deliberately, because
+# the two answer different questions. See the comment on prev_emits_latest_seen.
+gate_b_arm_case "not-a-version"             yes   # unreadable -> assert, don't skip
+gate_b_arm_case ""                          yes
 
 # `version_at_least` decides whether the gate above arms, so it gets its own
 # cases: an off-by-one here silently disarms Gate B's only positive assertion.
@@ -489,13 +911,26 @@ version_ge_case() {
         FAILURES=$((FAILURES + 1))
     fi
 }
-version_ge_case "0.2.124" "0.2.124" yes   # the release the marker lands in
+version_ge_case "0.2.124" "0.2.124" yes   # equal
 version_ge_case "0.2.125" "0.2.124" yes
-version_ge_case "0.2.123" "0.2.124" no    # the one release that must skip
+version_ge_case "0.2.123" "0.2.124" no    # strictly below
 version_ge_case "0.3.0"   "0.2.124" yes
 # Numeric, not lexical: a lexical compare puts 0.2.99 above 0.2.124 and would
 # disarm the gate for every release in between.
 version_ge_case "0.2.99"  "0.2.124" no
+
+# MALFORMED INPUT MUST NOT COMPARE TRUE. The bare `sort -V` form answered TRUE
+# for all three of these -- non-numeric text sorts after digits, and an empty
+# operand loses to anything -- so an unreadable version or an emptied constant
+# passed a comparison that has no answer. Measured on GNU coreutils 9.4 before
+# the guard: cases 1 and 2 below both returned yes.
+version_ge_case "not-a-version" "0.2.125" no
+version_ge_case "0.2.125"       ""        no
+version_ge_case ""              ""        no
+# Rejected rather than ordered, because `sort -V` puts a pre-release ABOVE the
+# release where semver puts it below. This repo cuts no rc tags; accepting a
+# form the comparator gets backwards would be worse than refusing it.
+version_ge_case "0.2.125-rc.1"  "0.2.125" no
 
 # --- no status-consuming pipe into a short-circuiting reader ----------------
 # The defect that produced this rule: `printf '%s' "$logs" | grep -aqF …` under
@@ -729,63 +1164,308 @@ fi
 pin_marker "source pin: #4073 refusal phrase"   "$SRC"    "$MARKER_NOT_TRIGGERED"
 pin_marker "source pin: disabled marker"        "$SRC"    "$MARKER_DISABLED"
 
-# --- the MARKER_LATEST_SEEN_SINCE constant itself ---------------------------
-# Gate B's version gate is now pinned in both directions (the behavioural cases
-# on `prev_emits_latest_seen`, and the un-negated call site), but neither looks
-# at the CONSTANT they compare against. Raising it 0.2.124 -> 0.2.999 left the
+# --- the (marker text, first release that shipped it) PAIR ------------------
+# Gate B's version gate is pinned in both directions (the behavioural cases on
+# `prev_emits_latest_seen`, and the un-negated call site), but neither looks at
+# the CONSTANT they compare against. Raising it 0.2.124 -> 0.2.999 left the
 # whole suite green while permanently disarming Gate B's only positive
 # assertion -- the same silent direction as the `!` inversion, reached by
 # editing a different line.
 #
-# Anchored against the crate version, which the constant cannot influence. The
-# relationship is real rather than arbitrary: the constant names the first
-# release whose binary emits MARKER_LATEST_SEEN, that marker is emitted by THIS
-# source tree (pinned above), and this tree ships as the NEXT release. So the
-# constant must be just ahead of the version in Cargo.toml -- not behind it (the
-# marker is new here, so no already-published release emits it) and not far
-# ahead of it (that is a typo, or a change that has sat unmerged for many
-# releases and needs the value re-confirmed rather than assumed).
+# NO EQUALITY-STYLE RELATION PIN HERE. Two were tried and each was right in one
+# phase and wrong in another. Writing C for the crate version, and noting that a
+# dev tree's C equals the last PUBLISHED release (the bump happens inside the
+# release commit), so a marker reworded today first ships in C+1 and the correct
+# constant during a reword is C+1:
 #
-# The window is a guard against a wrong constant, not a proof of the right one.
-# If a release genuinely slips further than this, update the constant on
-# purpose -- which is the outcome this assertion exists to force.
-CORE_TOML="$SCRIPT_DIR/../crates/core/Cargo.toml"
-SINCE_SKEW_MAX=5
-if [[ ! -f "$CORE_TOML" ]]; then
-    echo "FAIL - cannot check MARKER_LATEST_SEEN_SINCE: $CORE_TOML not found" >&2
+#   constant >= C   (#5290)  rests on "no published release emits the marker
+#                            yet"; true until 0.2.125 published, false one
+#                            second later. Detonates on the next bump.
+#   constant <= C   (first   C+1 <= C is FALSE, so it goes RED for the CORRECT
+#                   attempt) value during a reword, and the value that makes it
+#                            green makes Gate B demand new text from a binary
+#                            emitting the old one.
+#
+# The constant tracks RELEASE HISTORY and C tracks THIS TREE, so a relation
+# asserting they stay in step cannot hold in both phases. That is the reason
+# neither of the above works, and it is a claim about EQUALITY-STYLE relations
+# only.
+#
+# CORRECTION, and it is worth stating because the wrong version of it was
+# repeated through two reviews and into this comment: a LOOSE bound of the form
+# `constant <= C+1` does NOT fire on a reword. C+1 <= C+1 passes. It was
+# described as firing, the reviewer who proposed it withdrew it on that basis,
+# and nobody checked the arithmetic until a later reviewer did. Such a bound is
+# phase-independent and would catch a constant more than one release ahead. It
+# is deliberately NOT added here -- the freeze below already rejects every wrong
+# value, so a second overlapping pin needs its own justification -- but the
+# reason is redundancy, not unsoundness. Do not re-cite the refuted claim.
+#
+# The freeze below is phase-independent and catches strictly more than either
+# relation did: every wrong value, including the empty string and the most
+# likely wrong one (the version being cut). It also cannot be tripped by
+# `version.workspace = true`, which broke the relation pin's Cargo.toml read.
+#
+# WHY THE TWO VALUES ARE ONE BLOB, and why it is encoded. Both properties were
+# forced by mutation, in two rounds:
+#
+#   Plaintext expectation -> a reword is done as a `sed` sweep, the sweep
+#   rewrote the expectation too, suite green. An expectation stored as a copy of
+#   the value it guards follows any rename of that value.
+#
+#   Two adjacent encoded assertions -> the reword went red, but following this
+#   pin's OWN failure message (regenerate the text blob) went green again with
+#   the version constant untouched, because the message never asked about it.
+#   A freeze forces a decision only if the remediation cannot be performed
+#   without making that decision.
+#
+# One blob of both values fixes both: a sweep cannot reach it, and the recipe
+# cannot be run without supplying a version. Mutation-test the REMEDIATION PATH,
+# not just the regression, before trusting any replacement.
+#
+# WHAT IT STILL CANNOT DO, so nobody reads more into a green run than is there:
+# it makes the question unavoidable, it does not verify the answer. Regenerate
+# the blob with the new text and the OLD version and this goes green -- measured.
+# No local check can know which release will ship a given wording, and any
+# relation that tried to infer it is back to the phase problem above. The value
+# here is that the version cannot be left unconsidered, not that it is correct.
+#
+# 0.2.125 is the first release a running node can REACH whose binary emits this
+# text: the marker landed in the 0.2.124 tree, but 0.2.124 was never published
+# (Gate A blocked it, #5290) and a draft does not appear at `/releases/latest`.
+# Ground-truthed by downloading the published v0.2.125 musl asset and finding
+# the string in it.
+#
+# WHAT THIS DOES NOT COVER. `assert_detection_healthy` greps SEVEN markers, and
+# in Gate B every one of them is put to the PREVIOUS release's binary -- the one
+# place in the pipeline where a published binary is asked for text this tree
+# chose. Two are frozen: MARKER_LATEST_SEEN here, MARKER_PARSE_FAIL immediately
+# below. The remaining five are not:
+#
+#   MARKER_DISABLED, MARKER_CHECK_RAN, MARKER_CHECK_COMPLETE,
+#   MARKER_TRIGGERED_RE        -- the four tracked by #5309
+#   MARKER_FETCH_FAIL          -- grepped too, and NOT named in #5309's
+#                                 enumeration (that issue counts five markers
+#                                 and misses this one and MARKER_PARSE_FAIL).
+#                                 It is now the highest-priority member of that
+#                                 set, and the reason CHANGED under this PR.
+#                                 It used to be simply loud: an old binary's
+#                                 fetch failure would stop being classified
+#                                 INDETERMINATE and fall through to the equality
+#                                 check, reporting a missing observed-latest
+#                                 line -- wrong diagnosis, but red. Since Gate B
+#                                 gained the environmental classification the
+#                                 marker is ALSO the input to
+#                                 `node_could_not_reach_github`, so a reword
+#                                 silently disables that classification and
+#                                 sends every network blip back to the loud
+#                                 #5221 alarm: it reinstates precisely the false
+#                                 fleet alarm that change removed, by editing a
+#                                 different line. Still not a silent PASS, which
+#                                 is why it is handed to #5309 rather than
+#                                 frozen here alongside MARKER_PARSE_FAIL.
+#
+# So this class is NOT closed, and neither freeze closes it. The asymmetry that
+# creates it is real rather than an oversight: Gate A runs a binary built from
+# THIS tree, so a reword there is self-consistent, and Gate B is the only place
+# an older binary is read.
+#
+# To change it deliberately, re-state BOTH values:
+#   printf '%s\n%s' '<marker text>' '<first release shipping it>' | base64 | tr -d '\n'
+# (`base64 -w0` is GNU-only and fails on macOS, which is where someone reading
+# this failure is most likely to be.)
+MARKER_PAIR_FROZEN_B64='U3RhcnR1cCB1cGRhdGUgY2hlY2s6IEdpdEh1YiByZXBvcnRzIGxhdGVzdCByZWxlYXNlCjAuMi4xMjU='
+marker_pair_frozen="$(printf '%s' "$MARKER_PAIR_FROZEN_B64" | base64 -d)"
+marker_pair_live="$(printf '%s\n%s' "$MARKER_LATEST_SEEN" "$MARKER_LATEST_SEEN_SINCE")"
+
+if [[ -z "$marker_pair_frozen" ]]; then
+    # A failed decode would leave the expectation empty and make the comparison
+    # vacuous in the quiet direction.
+    echo "FAIL - could not decode MARKER_PAIR_FROZEN_B64; the marker/version freeze is not running" >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ "$marker_pair_live" == "$marker_pair_frozen" ]]; then
+    echo "ok   - (MARKER_LATEST_SEEN, MARKER_LATEST_SEEN_SINCE) frozen as a pair at v$MARKER_LATEST_SEEN_SINCE"
+else
+    echo "FAIL - the frozen (marker text, first release that shipped it) pair changed." >&2
+    echo "         was: '$(printf '%s' "$marker_pair_frozen" | head -1)' @ v$(printf '%s' "$marker_pair_frozen" | tail -1)" >&2
+    echo "         now: '$MARKER_LATEST_SEEN' @ v$MARKER_LATEST_SEEN_SINCE" >&2
+    echo "       These are frozen TOGETHER because they only make sense together." >&2
+    echo "       If the TEXT changed: no published binary emits the new wording yet, so" >&2
+    echo "       MARKER_LATEST_SEEN_SINCE must move to the release that will first SHIP it" >&2
+    echo "       -- normally the NEXT one, since the bump happens inside the release commit." >&2
+    echo "       Leave it and Gate B demands the new wording from a binary that emits the old" >&2
+    echo "       one: a POST-PUBLISH red canary and a Matrix alarm that blames the node." >&2
+    echo "       Nothing else in this suite would have told you -- the source pin interpolates" >&2
+    echo "       \$MARKER_LATEST_SEEN and follows a rename by construction." >&2
+    echo "       If only the VERSION changed: raising it skips Gate B's only positive" >&2
+    echo "       assertion for every release below the new value, silently. Unless you are" >&2
+    echo "       here because of a reword, the fix is to put it back." >&2
+    echo "       Once decided, re-state BOTH:" >&2
+    # printf, not echo: the recipe contains \n sequences that must reach the
+    # reader literally, and `echo`'s handling of those is shell-dependent.
+    # shellcheck disable=SC2016  # the `$(...)` is literal recipe text for the reader
+    printf '         MARKER_PAIR_FROZEN_B64="$(printf %s %s | base64 | tr -d %s)"\n' \
+        "'%s\\n%s'" "'$MARKER_LATEST_SEEN' '<release>'" "'\\n'" >&2
+    FAILURES=$((FAILURES + 1))
+fi
+# --- the #5221 signature text, frozen ---------------------------------------
+# MARKER_PARSE_FAIL is the marker this whole canary was built around: it is the
+# #5221 regression's log signature, and `assert_detection_healthy`'s only
+# NEGATIVE check greps for it.
+#
+# WHY IT NEEDS A FREEZE WHEN IT ALREADY HAS TWO SOURCE PINS. `pin_warn_literal`
+# below interpolates $MARKER_PARSE_FAIL, so it follows a rename BY CONSTRUCTION
+# -- the same defect that left MARKER_LATEST_SEEN's source pin unable to notice
+# a reword. Measured on this branch: a `sed` sweep replacing the text in the
+# three files a developer must touch (auto-update-canary.sh, this file's
+# fixtures, auto_update.rs) leaves ALL assertions green. Sweeping only the first
+# two of those goes red -- which is worse than useless as a guard, because it
+# tells whoever does the incomplete sweep that finishing it is the fix.
+#
+# WHY THIS ONE IS THE DANGEROUS MEMBER OF THE CLASS, and the reason it is frozen
+# ahead of #5309's four. The other markers feed POSITIVE checks, so losing them
+# makes Gate B red against a healthy release: loud, and someone investigates.
+# This one feeds a negative check. Reword it and the grep stops matching the
+# text every ALREADY-PUBLISHED binary emits, so a previous release carrying the
+# live #5221 bug logs check-ran + reworded-warn + check-complete and Gate B
+# reports "OK: parsed GitHub's response". A silent false PASS, on the exact
+# failure this canary exists to catch, on the exact binary Gate B exists to
+# question.
+#
+# WHY NO COMPANION VERSION CONSTANT, i.e. why this is a single value and not the
+# pair above. MARKER_LATEST_SEEN needs MARKER_LATEST_SEEN_SINCE because Gate B
+# SKIPS its positive check for binaries that predate the marker, and that skip
+# needs a version to compare against. There is no skip branch here and no
+# constant to leave stale, so there is no second value a remediation could
+# quietly avoid restating.
+#
+# WHAT TO ACTUALLY DO IF THIS FIRES ON A DELIBERATE REWORD is in the failure
+# message, and it is not "regenerate the blob and move on": no published binary
+# emits the new wording, so re-stating the freeze alone hands Gate B a grep that
+# matches nothing older than the next release.
+MARKER_PARSE_FAIL_FROZEN_B64='U3RhcnR1cCB1cGRhdGUgY2hlY2s6IGZhaWxlZCB0byBwYXJzZQ=='
+# A decode failure must not leave the expectation empty and the comparison
+# vacuous -- the quiet direction, and the one this freeze exists to remove.
+# `printf | base64 -d` reads to EOF and cannot short-circuit, so it is not the
+# `| grep -q` SIGPIPE shape banned elsewhere in this file.
+if ! parse_fail_frozen="$(printf '%s' "$MARKER_PARSE_FAIL_FROZEN_B64" | base64 -d 2>/dev/null)"; then
+    parse_fail_frozen=""
+fi
+if [[ -z "$parse_fail_frozen" ]]; then
+    echo "FAIL - could not decode MARKER_PARSE_FAIL_FROZEN_B64; the #5221 signature freeze is not running" >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ "$MARKER_PARSE_FAIL" == "$parse_fail_frozen" ]]; then
+    echo "ok   - MARKER_PARSE_FAIL (the #5221 signature) frozen against a rename sweep"
+else
+    echo "FAIL - the frozen #5221 signature text changed." >&2
+    echo "         was: '$parse_fail_frozen'" >&2
+    echo "         now: '$MARKER_PARSE_FAIL'" >&2
+    echo "       This marker feeds the canary's only NEGATIVE check, so a reword fails" >&2
+    echo "       SILENTLY and in the passing direction. Gate B greps the PREVIOUS" >&2
+    echo "       release's binary, which emits the OLD text; a grep for the new text" >&2
+    echo "       matches nothing, so a published release carrying the live #5221 bug" >&2
+    echo "       logs check-ran + warn + check-complete and Gate B reports" >&2
+    echo "       \"OK: parsed GitHub's response\". Every already-published binary is" >&2
+    echo "       affected, not just the next one." >&2
+    echo "       Nothing else in this suite would have told you: pin_warn_literal" >&2
+    echo "       interpolates \$MARKER_PARSE_FAIL and follows a rename by construction." >&2
+    echo "       DECIDE THIS BEFORE RE-STATING THE FREEZE -- re-stating it alone is not" >&2
+    echo "       the fix, it just makes the suite agree with the blind spot:" >&2
+    echo "         (a) keep matching the OLD text as well, so Gate B can still see" >&2
+    echo "             #5221 on binaries that are already out there. MARKER_TRIGGERED_RE" >&2
+    echo "             is the precedent for an alternation marker in this file; or" >&2
+    echo "         (b) accept knowingly that Gate B cannot detect #5221 on any release" >&2
+    echo "             published before the new wording ships." >&2
+    echo "       Once decided, re-state it:" >&2
+    # printf, not echo: the recipe must reach the reader literally, and echo's
+    # handling of backslash sequences is shell-dependent. `base64 -w0` is
+    # GNU-only and fails on macOS, which is where someone reading this is most
+    # likely to be -- hence `tr -d '\n'`.
+    # shellcheck disable=SC2016  # the `$(...)` is literal recipe text for the reader
+    printf '         MARKER_PARSE_FAIL_FROZEN_B64="$(printf %s %s | base64 | tr -d %s)"\n' \
+        "'%s'" "'$MARKER_PARSE_FAIL'" "'\\n'" >&2
+    FAILURES=$((FAILURES + 1))
+fi
+
+# --- ...and the BEHAVIOURAL half, which is the one that forces the decision --
+# The freeze above notifies. It cannot force, and the difference is the whole
+# lesson of this file's history, so it is worth being exact about what was
+# measured rather than asserting a property.
+#
+# Reword the marker, then do EXACTLY what the failure message's recipe says and
+# nothing else: suite green, every assertion passing. Then hand the resulting
+# canary a verbatim real v0.2.121 log -- the live #5221 break, the thing Gate B
+# exists to catch on the previous release -- and it answers:
+#
+#     OK: startup update check ran to completion and parsed GitHub's response.
+#     RC=0
+#
+# That is the round-4 shape restated at one remove: "a freeze forces a decision
+# only if the remediation cannot be performed without making that decision," and
+# re-stating a single value can always be performed.
+#
+# So the DETECTOR is asserted against a log line no sweep can rewrite: the
+# historical WARN, base64 here, driven through the real `assert_detection_healthy`
+# rather than compared against a constant. After a reword this stays RED until
+# the canary can actually still read an already-published binary -- which is
+# option (a) in the message above, an alternation over old and new wording. The
+# only way to green it otherwise is to delete this assertion, which is the
+# deliberate, reviewable form of option (b).
+#
+# Scaffolding lines interpolate the LIVE $MARKER_CHECK_RAN on purpose, so this
+# stays a pin on MARKER_PARSE_FAIL alone and does not go red for a reword of a
+# marker #5309 owns. The diagnosis is asserted as well as the exit code: rc=1 is
+# also what "the startup update check never ran" returns, and a pin that cannot
+# tell those apart would pass while reporting the wrong subsystem.
+PARSE_FAIL_HISTORICAL_WARN_B64='MjAyNi0wOC0wOFQwMTo1OTozNi4xMTEwNzNaICBXQVJOIGZyZWVuZXQ6OmNvbW1hbmRzOjphdXRvX3VwZGF0ZTogU3RhcnR1cCB1cGRhdGUgY2hlY2s6IGZhaWxlZCB0byBwYXJzZSBsYXRlc3QgdmVyc2lvbiAndjAuMi4xMjInOiB1bmV4cGVjdGVkIGNoYXJhY3RlciAndicgd2hpbGUgcGFyc2luZyBtYWpvciB2ZXJzaW9uIG51bWJlcg=='
+if ! historical_warn="$(printf '%s' "$PARSE_FAIL_HISTORICAL_WARN_B64" | base64 -d 2>/dev/null)"; then
+    historical_warn=""
+fi
+if [[ -z "$historical_warn" ]]; then
+    echo "FAIL - could not decode PARSE_FAIL_HISTORICAL_WARN_B64; the #5221 detection test is not running" >&2
     FAILURES=$((FAILURES + 1))
 else
-    crate_version="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$CORE_TOML" | head -1)"
-    IFS=. read -r c_maj c_min c_pat <<< "$crate_version"
-    IFS=. read -r s_maj s_min s_pat <<< "$MARKER_LATEST_SEEN_SINCE"
-    if [[ -z "$crate_version" ]]; then
-        echo "FAIL - could not read the crate version from $CORE_TOML" >&2
-        FAILURES=$((FAILURES + 1))
-    elif [[ "$s_maj" != "$c_maj" || "$s_min" != "$c_min" ]]; then
-        echo "FAIL - MARKER_LATEST_SEEN_SINCE ($MARKER_LATEST_SEEN_SINCE) is not on the same" >&2
-        echo "       major.minor as the crate ($crate_version). Gate B skips its positive" >&2
-        echo "       equality check for every release below the constant, so a constant set" >&2
-        echo "       too high leaves the gate permanently vacuous and silent about it." >&2
-        FAILURES=$((FAILURES + 1))
-    elif [[ "$s_pat" -lt "$c_pat" ]]; then
-        echo "FAIL - MARKER_LATEST_SEEN_SINCE ($MARKER_LATEST_SEEN_SINCE) is BELOW the crate" >&2
-        echo "       version ($crate_version). It names the first release that emits" >&2
-        echo "       '$MARKER_LATEST_SEEN', and that marker is new in this tree -- no" >&2
-        echo "       already-published release emits it, so Gate B would demand the line" >&2
-        echo "       from binaries never built to log it." >&2
-        FAILURES=$((FAILURES + 1))
-    elif [[ "$s_pat" -gt $(( c_pat + SINCE_SKEW_MAX )) ]]; then
-        echo "FAIL - MARKER_LATEST_SEEN_SINCE ($MARKER_LATEST_SEEN_SINCE) is more than" >&2
-        echo "       $SINCE_SKEW_MAX patch releases ahead of the crate version ($crate_version)." >&2
-        echo "       Gate B skips its only positive assertion for every release below the" >&2
-        echo "       constant, so an over-high value disarms the gate permanently and" >&2
-        echo "       silently. If the release really has slipped this far, re-confirm the" >&2
-        echo "       value and widen SINCE_SKEW_MAX deliberately." >&2
-        FAILURES=$((FAILURES + 1))
+    historical_dir="$(mktemp -d "$TMPROOT/historical.XXXXXX")"
+    # THREE lines, and the completion line is not padding. `freenet.rs` emits
+    # `Startup update check complete` on every non-triggering outcome, so a real
+    # #5221 log has it, and WITHOUT it this fixture returns 2 (indeterminate)
+    # rather than the 0 the failure message below claims a reworded marker
+    # produces. The assertion goes red either way, but a fixture that fails for
+    # a different reason than its message names is how a pin comes to be
+    # trusted for the wrong thing. Measured: two lines -> rc=2, three -> rc=0.
+    printf '%s\n%s\n%s\n' \
+        "2026-08-08T01:59:35.950835Z  INFO freenet: $MARKER_CHECK_RAN current=\"0.2.121\" jitter_secs=40" \
+        "$historical_warn" \
+        "2026-08-08T01:59:36.200000Z  INFO freenet: $MARKER_CHECK_COMPLETE: staying on the current version current=\"0.2.121\"" \
+        > "$historical_dir/freenet.2026-08-08-01.log"
+    historical_stderr="$(assert_detection_healthy "$historical_dir" 2>&1 >/dev/null)"
+    historical_rc=$?
+    if [[ "$historical_rc" == 1 && "$historical_stderr" == *"could not parse the version GitHub returned"* ]]; then
+        echo "ok   - the canary still detects #5221 in a log an ALREADY-PUBLISHED binary emits"
     else
-        echo "ok   - MARKER_LATEST_SEEN_SINCE ($MARKER_LATEST_SEEN_SINCE) is the next release after the crate version ($crate_version)"
+        echo "FAIL - the canary no longer detects #5221 in the log a published binary emits." >&2
+        echo "         fixture line: $historical_warn" >&2
+        echo "         got exit $historical_rc, wanted 1 with 'could not parse the version GitHub returned'" >&2
+        echo "         stderr: ${historical_stderr:-<none>}" >&2
+        echo "       This is Gate B's subject: it greps the PREVIOUS release's binary, and that" >&2
+        echo "       binary emits the text above no matter what this tree calls the marker." >&2
+        echo "       A canary that cannot match it reports \"OK: parsed GitHub's response\" for a" >&2
+        echo "       release carrying the live #5221 bug -- measured, exit 0." >&2
+        echo "       If you are here after rewording MARKER_PARSE_FAIL: re-stating the frozen" >&2
+        echo "       blob above does NOT fix this, and going green is not the goal. Make the" >&2
+        echo "       detector match the OLD wording as well (MARKER_TRIGGERED_RE is the" >&2
+        echo "       precedent for an alternation), or delete this assertion deliberately and" >&2
+        echo "       say in the commit message that Gate B is now blind to #5221 on every" >&2
+        echo "       release published before the new wording ships." >&2
+        echo "       (Deleting this block IS a way out and nothing stops it: ci.yml's" >&2
+        echo "       removed-tests guard scans crates/core/**/*.rs only, so a deleted" >&2
+        echo "       SHELL assertion is flagged nowhere, and the counter this PR widened" >&2
+        echo "       measures additions rather than deletions. Accepted, and said out" >&2
+        echo "       loud so nobody reads 'the suite went green' as 'the property holds'.)" >&2
+        FAILURES=$((FAILURES + 1))
     fi
 fi
+
 # The parse-failure marker gets a STRONGER pin than pin_marker can give.
 # `failed to parse latest version` appears twice in auto_update.rs: the
 # production warn!, and a comment inside its own `#[cfg(test)] mod tests`
@@ -827,7 +1507,7 @@ pin_marker "source pin: fetch-failure marker"   "$AU_SRC" "$MARKER_FETCH_FAIL"
 # grep tracks prose, and this one carries the gate's only POSITIVE assertion.
 # It must also stay at INFO -- `release_max_level_info` compiles out anything
 # below, so a `debug!` here would delete the equality check from every shipped
-# binary while leaving all 30 assertions green.
+# binary while leaving every assertion in this file green.
 if [[ "$(tr -d '[:space:]' < "$AU_SRC")" == *"tracing::info!(latest=%latest,\"${MARKER_LATEST_SEEN//[[:space:]]/}"* ]]; then
     echo "ok   - source pin: observed-latest marker is emitted at INFO with a latest= field"
 else
@@ -841,7 +1521,8 @@ fi
 
 # --- the trigger-site ENUMERATION -------------------------------------------
 # `MARKER_TRIGGERED_RE` has to match every site that requests an update. It
-# missed the urgent one at :609 for as long as that site has existed, because
+# missed the urgent one ("triggering IMMEDIATE auto-update") for as long as that
+# site has existed, because
 # the marker was a fixed string and the site says "triggering IMMEDIATE
 # auto-update".
 #
@@ -902,7 +1583,7 @@ else
     echo "       $versioned_sends version-detecting trigger sites ('update_tx.send(new_version)')." >&2
     echo "       ($actual_sites regex matches minus $actual_refusals refusals.) If the regex matches FEWER, a" >&2
     echo "       trigger site is worded so the canary cannot see it -- a node that took that path reads as one" >&2
-    echo "       that never decided to update, which is how the urgent site at :609 went unseen. If it matches" >&2
+    echo "       that never decided to update, which is how the urgent site went unseen. If it matches" >&2
     echo "       MORE, the regex is picking up prose. Either way, reconcile MARKER_TRIGGERED_RE with the" >&2
     echo "       enumeration comment in auto-update-canary.sh." >&2
     grep -nE "$MARKER_TRIGGERED_RE" "$SRC" >&2
