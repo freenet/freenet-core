@@ -243,12 +243,45 @@ EXIT_UNVERIFIED_ENVIRONMENTAL=75
 # breaks the local-debugging path this file's header invites, which is exactly
 # when someone is trying to understand a blocked release.
 #
-# Block of 8 with the WS port at +4, so the per-attempt increments below (at
-# most +2, for CANARY_ATTEMPTS=3) can never walk the network port onto this
-# run's own WS port. Both stay overridable; the lifecycle test pins them.
+# Block of 8 with the WS port at +4. Both ports are incremented in LOCKSTEP at
+# the top of each attempt in both gates, so the +4 gap is invariant and the
+# network port can never walk onto this run's own WS port -- for any attempt
+# count. (An earlier version of this comment said "at most +2, for
+# CANARY_ATTEMPTS=3", which was wrong twice over: the increment happens before
+# each run, so it is +N for N attempts, and the hazard it described is
+# unreachable anyway because both ports move together. Gate B now has an attempt
+# loop of its own, so the stale arithmetic described that too.) The block still
+# earns its keep by keeping a run's ports away from a neighbouring run's.
+# Both stay overridable; the lifecycle test pins them.
 CANARY_PORT_BLOCK="${CANARY_PORT_BLOCK:-$(( 39000 + (RANDOM % 320) * 8 ))}"
 CANARY_NETWORK_PORT="${CANARY_NETWORK_PORT:-$CANARY_PORT_BLOCK}"
 CANARY_WS_PORT="${CANARY_WS_PORT:-$(( CANARY_PORT_BLOCK + 4 ))}"
+
+# sanitise_positive_int <value> <fallback> -- echoes <value> if it is a positive
+# integer, otherwise <fallback>.
+#
+# One function for all three budgets below, because the hand-written guard they
+# each carried had the same hole and fixing one instance is how this file's own
+# rules say not to do it. The guard was
+# `case "$v" in ''|*[!0-9]*|0) v=$default ;; esac`, and `00` passes it: it is
+# all digits and is not the literal string `0`. `seq 1 00` is EMPTY, so with
+# `CANARY_ATTEMPTS=00` the retry loop never executes, `rc` is never assigned,
+# and the read after the loop aborts under `set -u` with "rc: unbound variable"
+# -- a shell error where a release verdict should be. `$((10#$v))` folds `00`,
+# `007` and similar to their decimal value so the `-lt 1` test can see it; the
+# digits-only case guard above it is what keeps `10#` itself safe.
+sanitise_positive_int() {
+  local value="$1" fallback="$2"
+  case "$value" in
+    ''|*[!0-9]*) printf '%s' "$fallback"; return ;;
+  esac
+  value=$((10#$value))
+  if [ "$value" -lt 1 ]; then
+    printf '%s' "$fallback"
+  else
+    printf '%s' "$value"
+  fi
+}
 
 # How long to let the node run before giving up on the startup check. The
 # check fires after a 0-60s anti-thundering-herd jitter, so this must clear
@@ -259,9 +292,7 @@ CANARY_TIMEOUT_SECS="${CANARY_TIMEOUT_SECS:-240}"
 # reaches the `$((...))` in the lifecycle guard and, under `set -u`, kills the
 # canary with a shell arithmetic error rather than a canary verdict -- a
 # release-blocking failure whose message says nothing about the release.
-case "$CANARY_TIMEOUT_SECS" in
-  ''|*[!0-9]*|0) CANARY_TIMEOUT_SECS=240 ;;
-esac
+CANARY_TIMEOUT_SECS="$(sanitise_positive_int "$CANARY_TIMEOUT_SECS" 240)"
 
 # Retry budget for the INDETERMINATE (GitHub unreachable) case only. Kept
 # small on purpose: this sits on the release critical path inside a job with a
@@ -272,9 +303,7 @@ CANARY_ATTEMPTS="${CANARY_ATTEMPTS:-2}"
 # A non-numeric or zero override would make the retry loop body never execute
 # and the script report "could not reach GitHub in 0 attempts" -- a blocking
 # failure backed by no attempt at all.
-case "$CANARY_ATTEMPTS" in
-  ''|*[!0-9]*|0) CANARY_ATTEMPTS=2 ;;
-esac
+CANARY_ATTEMPTS="$(sanitise_positive_int "$CANARY_ATTEMPTS" 2)"
 CANARY_RETRY_SLEEP="${CANARY_RETRY_SLEEP:-20}"
 
 # How long to wait, AFTER the "check started" line appears, for the check to
@@ -286,10 +315,7 @@ CANARY_RETRY_SLEEP="${CANARY_RETRY_SLEEP:-20}"
 # within ~10s of that line, and this is 2x that. Below PROBE_CHAIN_TIMEOUT the
 # canary stops the node mid-request and reads the resulting silence as health
 # (#5236).
-CANARY_OUTCOME_WAIT_SECS="${CANARY_OUTCOME_WAIT_SECS:-20}"
-case "$CANARY_OUTCOME_WAIT_SECS" in
-  ''|*[!0-9]*|0) CANARY_OUTCOME_WAIT_SECS=20 ;;
-esac
+CANARY_OUTCOME_WAIT_SECS="$(sanitise_positive_int "${CANARY_OUTCOME_WAIT_SECS:-20}" 20)"
 
 log()  { printf '%s\n' "$*"; }
 fail() { printf '::error::%s\n' "$*" >&2; }
@@ -955,6 +981,17 @@ runner_can_reach_github() {
 # The PORT case needs no probe: another process holding a port says nothing
 # about the network, and demanding a network probe for it would make a
 # collision on a healthy runner take the loud path for no reason.
+#
+# ONE MORE THING THIS CANNOT SEE, and it is why the quiet message says what it
+# says about recurrence. The GitHub branch trusts the node's self-report of WHY
+# its fetch failed, and that same WARN fires for a fetch-side REGRESSION too --
+# a malformed URL, a TLS or user-agent change, a 403 from a rate-limited
+# endpoint (#5102 moved the node off `api.github.com` for exactly that). Such a
+# regression would look environmental on every release, permanently. Gate A
+# narrows it, because it runs the same code path on the binary being shipped, so
+# a regression introduced in THIS tree fails there first. What is left is a
+# regression already published, which is why "if this recurs across consecutive
+# releases it is not the runner" belongs in the message rather than in a comment.
 gate_b_unverified_class() {
   case "$1" in
     ports)
@@ -1152,7 +1189,25 @@ cmd_selfupdate() {
   #
   # The loop also cannot run twice after a decision to update: that path leaves
   # the loop with rc=0.
-  local attempt rc env_cause=""
+  # `saw_unexplained` LATCHES, and `env_cause` alone would not. It records that
+  # some attempt produced an indeterminate the node could not explain -- the
+  # hung-updater shape -- and once that has happened no later attempt may buy
+  # the quiet message.
+  #
+  # Without the latch the flag is last-writer-wins, and the sequence that breaks
+  # it is ordinary rather than contrived: attempt 1 starts the check and logs no
+  # outcome (a real finding), attempt 2 loses a port race (environmental), and
+  # the dev room is told a hung updater on the previous release is "not a
+  # stranded fleet and needs no fleet action". A false quiet on exactly the
+  # class this gate exists to raise, produced by the retry that was added to
+  # reduce false alarms. This file's own rule: a gate's unknown case belongs on
+  # the side that gets read.
+  #
+  # `rc=1` up front so a `CANARY_ATTEMPTS` that somehow yields an empty `seq`
+  # cannot reach the read below unset. Under `set -u` that is an "unbound
+  # variable" abort, which exits 1 and takes the LOUD path -- safe, but the
+  # operator gets a shell error where a verdict should be.
+  local attempt rc=1 env_cause="" attempt_cause="" saw_unexplained=0
   for attempt in $(seq 1 "$CANARY_ATTEMPTS"); do
     log "--- attempt $attempt/$CANARY_ATTEMPTS ---"
     rm -rf "${work:?}/home" "${work:?}/cfg" "${work:?}/data" \
@@ -1171,7 +1226,7 @@ cmd_selfupdate() {
     if [ "$NODE_EXIT" = "$EXIT_CODE_ALREADY_RUNNING" ]; then
       note "INDETERMINATE: the node exited $EXIT_CODE_ALREADY_RUNNING (another instance already holds ports $CANARY_NETWORK_PORT/$CANARY_WS_PORT). A port collision on this host -- another canary run, or a local node -- not an auto-update fault."
       rc=2
-      env_cause=ports
+      attempt_cause=ports
     else
       # The two-sided log assertion first: it LOCALISES the failure. If detection
       # is broken the version check below would also fail, but with a far less
@@ -1184,9 +1239,20 @@ cmd_selfupdate() {
       # because a hung updater produces exactly that. The candidacy is not the
       # verdict -- see `gate_b_unverified_class`, which demands corroboration.
       if [ "$rc" -eq 2 ] && node_could_not_reach_github "$work/logs"; then
-        env_cause=github
+        attempt_cause=github
       else
-        env_cause=""
+        attempt_cause=""
+      fi
+    fi
+
+    # Fold this attempt into the run-level classification. An explained
+    # indeterminate records its cause; an UNEXPLAINED one latches and is never
+    # overwritten (see the note on `saw_unexplained` above).
+    if [ "$rc" -eq 2 ]; then
+      if [ -n "$attempt_cause" ]; then
+        env_cause="$attempt_cause"
+      else
+        saw_unexplained=1
       fi
     fi
 
@@ -1205,6 +1271,13 @@ cmd_selfupdate() {
     # EVERY branch below is a release this gate did NOT verify. They differ only
     # in whether we can say why, and therefore in how loudly to say it -- never
     # in whether the job is red.
+    #
+    # The latch is applied HERE rather than inside the loop so the loop stays a
+    # plain record of what each attempt saw.
+    if [ "$saw_unexplained" -eq 1 ]; then
+      fail "UNVERIFIED: at least one attempt started the update check and never logged an outcome, so the canary could not determine whether v$prev_version reaches v$expected_version. This is NOT evidence that auto-update is broken, and NOT evidence that it works -- but it is also NOT environmental noise, whatever a later attempt ran into: the node did not report a failed GitHub fetch on the attempt that produced this. A hung updater looks exactly like it. Re-run the job."
+      return 1
+    fi
     if [ "$(gate_b_unverified_class "$env_cause")" = "environmental" ]; then
       # Distinct exit code so `cross-compile.yml` can word the Matrix message
       # accordingly: the alarm that says a node "may not be able to auto-update
@@ -1215,7 +1288,7 @@ cmd_selfupdate() {
           fail "UNVERIFIED (ENVIRONMENTAL): every attempt hit a port collision on this host, so Gate B never got to test the updater. v$expected_version has NOT been verified as reachable by a node on v$prev_version -- this run says nothing either way. Another canary run or a local node is holding the ports. Re-run the job; if it recurs, something on this runner is holding them persistently and the gate is not working."
           ;;
         *)
-          fail "UNVERIFIED (ENVIRONMENTAL): v$prev_version could not reach GitHub in $CANARY_ATTEMPTS attempts, and this runner cannot reach it either, so the canary never got to test whether v$prev_version reaches v$expected_version. v$expected_version has NOT been verified as reachable by auto-update -- this run is not evidence in either direction. The node's startup fetch has no retry, so a bad network moment produces exactly this. Re-run the job. If Gate B reports this on consecutive releases, stop reading it as noise: the post-publish gate is not working and nothing has been verified since the last green run."
+          fail "UNVERIFIED (ENVIRONMENTAL): v$prev_version could not reach GitHub in $CANARY_ATTEMPTS attempts, and this runner cannot reach it either, so the canary never got to test whether v$prev_version reaches v$expected_version. v$expected_version has NOT been verified as reachable by auto-update -- this run is not evidence in either direction. The node's startup fetch has no retry, so a bad network moment produces exactly this. Re-run the job. If Gate B reports this on CONSECUTIVE releases it is not the runner: the same WARN is also what a published fetch-side regression logs (a bad URL, a TLS or user-agent change, a rate-limited endpoint), and either way the post-publish gate is not working and nothing has been verified since the last green run."
           ;;
       esac
       return "$EXIT_UNVERIFIED_ENVIRONMENTAL"
@@ -1227,8 +1300,11 @@ cmd_selfupdate() {
       fail "UNVERIFIED: v$prev_version reported it could not reach GitHub on all $CANARY_ATTEMPTS attempts, but THIS RUNNER reached the same endpoint immediately afterwards. So the network is not simply down: the published binary consistently cannot do something this runner can. That may still not be an auto-update fault -- a poll-budget cooldown persisted under the node's HOME is the obvious candidate (#5102) -- but it is not environmental noise, and v$expected_version is NOT verified as reachable. Read the node output above before re-running."
       return 1
     fi
-    # The node never said WHY. A hung updater lands here.
-    fail "UNVERIFIED: the update check produced no verdict in $CANARY_ATTEMPTS attempts (it started and never logged an outcome), so the canary could not determine whether v$prev_version reaches v$expected_version. This is NOT evidence that auto-update is broken, and NOT evidence that it works -- but it is also NOT evidence of a bad network: the node did not report a failed GitHub fetch. Re-run the job."
+    # Unreachable today: every rc=2 either records a cause or sets
+    # `saw_unexplained`, both handled above. Kept because "the classifier grew a
+    # case nobody routed" must not fall out of the function with rc=2 read as a
+    # SUCCESS -- the shape that let #5236 ship.
+    fail "UNVERIFIED: the update check produced no verdict in $CANARY_ATTEMPTS attempts and the canary could not classify why (env_cause='"'"'$env_cause'"'"'). This is a canary bug, not a verdict about v$prev_version. Re-run the job and report this message."
     return 1
   fi
   [ "$rc" -eq 0 ] || return 1

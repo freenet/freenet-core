@@ -456,16 +456,68 @@ else
         "Missing, it evaluates to '' and every run takes the loud #5221 branch."
 fi
 
-# shellcheck disable=SC2016  # literal workflow text: `$rc` is the step's variable
-if [[ "$selfupdate_block" == *'exit "$rc"'* ]]; then
-    pass "Gate B's step re-raises the canary's exit code"
+# --- 6d. the environmental exit code is the SAME number on both sides -------
+# The canary defines `EXIT_UNVERIFIED_ENVIRONMENTAL` and the workflow tests a
+# LITERAL. They are one contract written in two files, and nothing made them
+# agree. Change the constant and every environmental run silently takes the
+# loud #5221 branch instead of the quiet one -- the direction is safe, which is
+# exactly why it would go unnoticed. Read from the canary rather than restated
+# here, so this test cannot be the thing that is stale.
+canary_env_code="$(sed -n 's/^EXIT_UNVERIFIED_ENVIRONMENTAL=\([0-9]\{1,\}\).*/\1/p' \
+    "$SCRIPT_DIR/auto-update-canary.sh" | head -1)"
+if [[ -z "$canary_env_code" ]]; then
+    fail "could not read EXIT_UNVERIFIED_ENVIRONMENTAL from auto-update-canary.sh" \
+        "Without it this assertion would compare the workflow against an empty" \
+        "string and pass on anything."
+elif [[ "$selfupdate_block" == *"-eq $canary_env_code "* ]]; then
+    pass "the workflow tests the same environmental exit code the canary returns ($canary_env_code)"
 else
+    fail "cross-compile.yml does not test exit $canary_env_code, the canary's EXIT_UNVERIFIED_ENVIRONMENTAL" \
+        "The two are one contract in two files. If they disagree, every" \
+        "environmental run is classified 'fault' and takes the loud #5221" \
+        "branch -- safe, and therefore silent."
+fi
+
+# --- 6e. the step CAPTURES the exit status as well as re-raising it ---------
+# BOTH halves, because pinning only the second leaves the cheaper mutation wide
+# open. Confirmed by mutation: change `|| rc=$?` to `|| true` and `rc` stays 0,
+# `classification` is reported as `ok`, `exit "$rc"` exits 0 -- so Gate B goes
+# GREEN on a genuinely broken updater, the job result is `success`, and the
+# notify job never fires. The `exit "$rc"` pin sees nothing, because that line
+# is untouched.
+#
+# Assertion 3a closes the same neutering route for GATE A only: it scans
+# `$CANARY_STEP`, the preflight invocation inside `attach-to-release`. Gate B is
+# a different top-level job and was never scanned.
+#
+# One directive for the whole compound command: shellcheck rejects a directive
+# in front of an individual `elif` branch (SC1123).
+# shellcheck disable=SC2016  # literal workflow text; `$rc` must not expand
+if [[ "$selfupdate_block" != *'|| rc=$?'* ]]; then
+    fail "Gate B's step no longer captures the canary's exit status into \$rc" \
+        "It must run the canary as '... || rc=\$?' and re-raise at the end." \
+        "Replaced with '|| true' the step exits 0 whatever the canary found:" \
+        "Gate B is green on a broken updater and the notify job never fires," \
+        "because the job result is 'success'. The 'exit \$rc' pin below cannot" \
+        "see this -- that line is left untouched by the mutation."
+elif [[ "$selfupdate_block" != *'exit "$rc"'* ]]; then
     fail "Gate B's step no longer re-raises the canary's exit status" \
         "It runs the canary with '|| rc=\$?' so it can classify exit 75. That is" \
         "only safe while the code is raised again at the end of the step. Without" \
         "the re-raise the step always exits 0, Gate B is green on a broken" \
         "updater, and nothing notifies -- the exact silent fail this file exists" \
         "to prevent, reached by deleting one line."
+else
+    swallowed_b="$(printf '%s\n' "$selfupdate_block" \
+        | grep -cE '\|\|[[:space:]]*(true|:)[[:space:]]*$|set[[:space:]]+\+e')"
+    if [[ "$swallowed_b" -eq 0 ]]; then
+        pass "Gate B's step captures AND re-raises the canary's exit code, and swallows nothing"
+    else
+        fail "Gate B's step swallows an exit status ('|| true', '|| :' or 'set +e')" \
+            "$(printf '%s\n' "$selfupdate_block" | grep -E '\|\|[[:space:]]*(true|:)[[:space:]]*$|set[[:space:]]+\+e')" \
+            "Same route assertion 3a closes for Gate A: the step still runs and" \
+            "still reports, but it can no longer fail."
+    fi
 fi
 
 # --- 7. Gate B's job still exists -------------------------------------------

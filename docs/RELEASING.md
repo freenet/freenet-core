@@ -690,6 +690,14 @@ previous binary — `MARKER_DISABLED`, `MARKER_CHECK_RAN`, `MARKER_CHECK_COMPLET
 produce the same false alarm with a less specific message (#5309 tracks the
 first four; it does not name `MARKER_FETCH_FAIL`).
 
+`MARKER_FETCH_FAIL` is the one of those five to check first. It is no longer
+just a marker Gate B greps: it is the input to the environmental classification
+described in case 0 above. Reword it and a previous release's failed fetch stops
+being recognised as environmental, so every network blip goes back to firing the
+loud 🚨 "may not be able to auto-update" message — reinstating the false fleet
+alarm that classification exists to remove, from an edit that looks unrelated
+to it.
+
 `MARKER_PARSE_FAIL` is the one to be most careful with, and it IS frozen
 (`auto-update-canary_test.sh`), because it is the only marker whose reword fails
 in the PASSING direction: it feeds Gate B's negative check, so a grep that stops

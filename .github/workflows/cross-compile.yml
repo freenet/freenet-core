@@ -817,7 +817,15 @@ jobs:
           needs.auto-update-selfupdate-canary.outputs.classification == 'environmental'
         uses: ./.github/actions/river-dev-notify
         with:
-          message: "⚠️ ${{ github.ref_name }} published fine, but auto-update for it is **UNVERIFIED** — the self-update canary never reached a verdict. The previous release's binary could not reach GitHub, and neither could the runner, so the run is not evidence in either direction. Nothing suggests a stranded fleet and no fleet action is indicated, but this release has NOT been shown to be reachable by auto-update: re-run the job to actually verify it. If you are seeing this on consecutive releases, stop treating it as noise — the post-publish gate is not working and nothing has been verified since the last green run. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # Names BOTH environmental causes rather than assuming the network
+          # one. Exit 75 covers two: the previous release's binary could not
+          # reach GitHub (and neither could the runner), or every attempt lost a
+          # port race on this host. An earlier version of this message asserted
+          # the first, so a self-hosted runner with something holding the ports
+          # sent the operator after DNS. The job log's `UNVERIFIED
+          # (ENVIRONMENTAL)` line says which; this says what to do, which is the
+          # same either way.
+          message: "⚠️ ${{ github.ref_name }} published fine, but auto-update for it is **UNVERIFIED** — the self-update canary never reached a verdict, for an environmental reason: either the previous release's binary could not reach GitHub (and neither could the runner) or every attempt hit a port collision on the runner. The job log's `UNVERIFIED (ENVIRONMENTAL)` line says which. The run is not evidence in either direction. Nothing suggests a stranded fleet and no fleet action is indicated, but this release has NOT been shown to be reachable by auto-update: re-run the job to actually verify it. If you are seeing this on consecutive releases, stop treating it as noise — whatever it names, something is persistently stopping the gate from running, the post-publish gate is not working, and nothing has been verified since the last green run. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
           room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
           gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}
@@ -827,6 +835,13 @@ jobs:
       # anticipated (a cancelled job, an empty classification because the step
       # never ran) lands HERE, in the loud one. A gate's unknown case belongs on
       # the side that gets read.
+      #
+      # DO NOT CONSOLIDATE THESE TWO STEPS. One step with a conditional message
+      # expression is the obvious tidy and it loses the property: the two
+      # conditions must remain each other's exact complement, which is what a
+      # reviewer can check at a glance and what
+      # `release_canary_wiring_test.sh` asserts by comparing them to each other.
+      # Both steps are located there by `id:`, so a rename fails loudly.
       - name: Notify (possible auto-update fault)
         id: notify-fault
         if: >

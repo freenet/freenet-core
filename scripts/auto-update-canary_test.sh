@@ -134,6 +134,22 @@ check "healthy: check ran and completed up-to-date -> pass" 0 "$HEALTHY_UP_TO_DA
 check "broken: #5221 unparseable tag -> fail" 1 "$BROKEN" \
     "could not parse the version GitHub returned"
 
+# BOTH markers in one log, which pins the ORDER of the two branches. The
+# parse-failure check runs BEFORE the fetch-failure check, and that ordering is
+# the only thing keeping a real #5221 out of the environmental classification
+# Gate B gained this round. Swap the two branches -- an innocent-looking tidy,
+# "infra check before product check" -- and this log returns 2 instead of 1,
+# Gate B calls it environmental, and the dev room is told "not a stranded
+# fleet" about a log carrying the live #5221 signature.
+#
+# Realistic rather than contrived: a node whose startup fetch failed and whose
+# periodic re-poll then returned an unparseable tag logs exactly this, and so
+# does the reverse. Until this case existed no fixture in the suite held both.
+BROKEN_PLUS_FETCH_FAIL="$BROKEN
+2026-08-08T02:05:00.000000Z  WARN freenet::commands::auto_update: Startup update check: failed to fetch latest version: error sending request. Continuing with current binary."
+check "broken: a parse failure OUTRANKS a fetch failure in the same log" 1 \
+    "$BROKEN_PLUS_FETCH_FAIL" "could not parse the version GitHub returned"
+
 # --- THE VACUOUS-PASS CASES -------------------------------------------------
 # Each of these contains NO error line. A one-sided "grep -q 'failed to parse'
 # && fail" assertion passes all of them, which is exactly how a dead updater
@@ -520,6 +536,128 @@ class_case "an unrecognised cause is loud, not quiet" \
     weather no fault
 eval "$real_runner_can_reach_github"
 
+# --- Gate B END TO END, driven per attempt ----------------------------------
+# Everything above tests a PIECE. This drives the real `cmd_selfupdate` over a
+# scripted sequence of attempts and asserts BOTH the returned exit code and the
+# attempt count, which is the only way several of these properties can be
+# observed at all.
+#
+# WHY, CONCRETELY. Three mutations that break the classifier in the QUIET
+# direction were confirmed to leave the whole suite green before this existed:
+#
+#   1. `[ "$rc" -eq 2 ] && node_could_not_reach_github …` -> `||`, so every
+#      indeterminate becomes environmental. The source pin survives because the
+#      CALL TEXT is still there -- the same defect the round-2
+#      `prev_emits_latest_seen` fix was written to close, reappearing one
+#      function over. A pin that greps for a call cannot see the operator
+#      joining it to anything.
+#   2. `-eq 1` -> `-ne 1` on the corroboration, swapping 75 and 1.
+#   3. deleting the `attempt_cause=""` reset.
+#
+# And the run-level latch -- an unexplained indeterminate on ANY attempt must
+# never be overwritten by a later environmental one -- is a property OF THE
+# SEQUENCE. No single-attempt test can express it.
+#
+# `run_node_until_check` is stubbed rather than booting a node: the sequence is
+# the subject, and a real boot costs seconds per attempt. The lifecycle test
+# covers the same retry property against REAL boots, so the stub cannot quietly
+# diverge from the thing it stands in for. `curl`/`tar` are shadowed so the
+# download preamble is a no-op. Same shape as
+# `release_wait_for_binaries_test.sh`'s `check_call_count`.
+GATE_B_ATTEMPT=0
+GATE_B_SCRIPT=()
+run_node_until_check_stub() {
+    local work="$2" spec exit_code logvar
+    GATE_B_ATTEMPT=$((GATE_B_ATTEMPT + 1))
+    # Past the end of the script means the loop ran more times than the case
+    # expects; repeat the last entry so the attempt-COUNT assertion is what
+    # reports it, with a number, rather than an unbound-variable abort.
+    if [[ "$GATE_B_ATTEMPT" -le "${#GATE_B_SCRIPT[@]}" ]]; then
+        spec="${GATE_B_SCRIPT[$((GATE_B_ATTEMPT - 1))]}"
+    else
+        spec="${GATE_B_SCRIPT[$((${#GATE_B_SCRIPT[@]} - 1))]}"
+    fi
+    exit_code="${spec%%:*}"
+    logvar="${spec#*:}"
+    NODE_EXIT="$exit_code"
+    mkdir -p "$work/logs"
+    if [[ -n "$logvar" ]]; then
+        printf '%s\n' "${!logvar}" > "$work/logs/freenet.2026-08-08-02.log"
+    fi
+}
+
+real_run_node_until_check="$(declare -f run_node_until_check)"
+if [[ -z "$real_run_node_until_check" ]]; then
+    echo "FAIL - run_node_until_check is not defined; the Gate B driver would stub" >&2
+    echo "       nothing and every case below would pass vacuously." >&2
+    FAILURES=$((FAILURES + 1))
+fi
+
+gate_b_case() {
+    # gate_b_case <desc> <expected-rc> <expected-attempts> <runner-reachable> <spec...>
+    # Each <spec> is "<node-exit>:<fixture-variable-name>" for one attempt.
+    local desc="$1" want_rc="$2" want_attempts="$3" reachable="$4"
+    shift 4
+    GATE_B_SCRIPT=("$@")
+    GATE_B_ATTEMPT=0
+    local got_rc got_attempts out
+    out="$(
+        CANARY_ATTEMPTS="${#GATE_B_SCRIPT[@]}"
+        CANARY_RETRY_SLEEP=0
+        curl() { :; }
+        tar()  { :; }
+        run_node_until_check() { run_node_until_check_stub "$@"; }
+        if [[ "$reachable" == yes ]]; then
+            runner_can_reach_github() { return 0; }
+        else
+            runner_can_reach_github() { return 1; }
+        fi
+        mkdir -p "$CANARY_WORKDIR/selfupdate/bin"
+        printf '#!/bin/sh\necho "Freenet version: 0.2.121"\n' \
+            > "$CANARY_WORKDIR/selfupdate/bin/freenet"
+        chmod +x "$CANARY_WORKDIR/selfupdate/bin/freenet"
+        cmd_selfupdate 0.2.121 0.2.122 >/dev/null 2>&1
+        printf '%s %s' "$?" "$GATE_B_ATTEMPT"
+    )"
+    got_rc="${out%% *}"
+    got_attempts="${out##* }"
+    if [[ "$got_rc" == "$want_rc" && "$got_attempts" == "$want_attempts" ]]; then
+        echo "ok   - Gate B: $desc"
+    else
+        echo "FAIL - Gate B: $desc" >&2
+        echo "         got exit $got_rc after $got_attempts attempt(s);" >&2
+        echo "         wanted exit $want_rc after $want_attempts" >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
+# The load-bearing one, and the reason the retry is gated on rc=2. Each attempt
+# wipes the tree and boots a fresh node, so retrying a REAL failure lets any
+# intermittent fault produce one passing attempt, and Gate B then reports a
+# broken release healthy. A flaky pass on the post-publish gate is worse than
+# no gate.
+gate_b_case "a real #5221 failure is never retried" 1 1 no "0:BROKEN" "0:BROKEN"
+gate_b_case "an indeterminate IS retried, then exits 75" 75 2 no \
+    "0:FETCH_FAIL" "0:FETCH_FAIL"
+gate_b_case "a port collision exits 75 without a network probe" 75 2 yes \
+    "43:" "43:"
+# The corroboration: the same node-side symptom, opposite runner state.
+gate_b_case "node cannot reach GitHub but the runner can -> loud, not 75" 1 2 yes \
+    "0:FETCH_FAIL" "0:FETCH_FAIL"
+# A hung updater must never be quiet.
+gate_b_case "no outcome logged on every attempt -> loud" 1 2 no \
+    "0:PENDING" "0:PENDING"
+# THE LATCH. An unexplained indeterminate on attempt 1 must survive an
+# environmental attempt 2. Last-writer-wins here returned 75 and told the dev
+# room a hung updater was "not a stranded fleet and needs no fleet action".
+gate_b_case "unexplained THEN environmental stays loud (the latch)" 1 2 no \
+    "0:PENDING" "43:"
+# ...and in the other order, so the latch is not merely "the first attempt wins".
+gate_b_case "environmental THEN unexplained stays loud (the latch)" 1 2 no \
+    "43:" "0:PENDING"
+
+eval "$real_run_node_until_check"
+
 # Gate B's use of it. Three separate things can each silently undo the split,
 # and the first two fail in the QUIET direction:
 #   - returning 1 instead of the distinct code, so cross-compile.yml cannot
@@ -540,6 +678,13 @@ elif [[ "$selfupdate_body" != *'node_could_not_reach_github "$work/logs"'* ]]; t
     echo "       assert_detection_healthy returns 2 for two different situations. Treating" >&2
     echo "       both as environmental quietens a run where the check started and never" >&2
     echo "       logged an outcome, which is what a HUNG updater looks like." >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ "$selfupdate_body" != *'saw_unexplained=1'* ]]; then
+    echo "FAIL - cmd_selfupdate no longer latches an UNEXPLAINED indeterminate." >&2
+    echo "       The per-attempt cause is last-writer-wins without it: an attempt that" >&2
+    echo "       started the check and logged no outcome (a hung updater) followed by an" >&2
+    echo "       attempt that lost a port race reports exit 75 and the quiet 'no fleet" >&2
+    echo "       action' message. The behavioural cases above cover both orderings." >&2
     FAILURES=$((FAILURES + 1))
 elif [[ "$selfupdate_body" != *'gate_b_unverified_class "$env_cause"'* ]]; then
     echo "FAIL - cmd_selfupdate no longer routes the quiet path through gate_b_unverified_class." >&2
@@ -1004,12 +1149,23 @@ pin_marker "source pin: disabled marker"        "$SRC"    "$MARKER_DISABLED"
 #   MARKER_FETCH_FAIL          -- grepped too, and NOT named in #5309's
 #                                 enumeration (that issue counts five markers
 #                                 and misses this one and MARKER_PARSE_FAIL).
-#                                 Its reword direction is the loud one: an old
-#                                 binary's fetch failure would stop being
-#                                 classified INDETERMINATE and fall through to
-#                                 the equality check, which reports a missing
-#                                 observed-latest line. Wrong diagnosis, but red
-#                                 rather than green.
+#                                 It is now the highest-priority member of that
+#                                 set, and the reason CHANGED under this PR.
+#                                 It used to be simply loud: an old binary's
+#                                 fetch failure would stop being classified
+#                                 INDETERMINATE and fall through to the equality
+#                                 check, reporting a missing observed-latest
+#                                 line -- wrong diagnosis, but red. Since Gate B
+#                                 gained the environmental classification the
+#                                 marker is ALSO the input to
+#                                 `node_could_not_reach_github`, so a reword
+#                                 silently disables that classification and
+#                                 sends every network blip back to the loud
+#                                 #5221 alarm: it reinstates precisely the false
+#                                 fleet alarm that change removed, by editing a
+#                                 different line. Still not a silent PASS, which
+#                                 is why it is handed to #5309 rather than
+#                                 frozen here alongside MARKER_PARSE_FAIL.
 #
 # So this class is NOT closed, and neither freeze closes it. The asymmetry that
 # creates it is real rather than an oversight: Gate A runs a binary built from
@@ -1172,9 +1328,17 @@ if [[ -z "$historical_warn" ]]; then
     FAILURES=$((FAILURES + 1))
 else
     historical_dir="$(mktemp -d "$TMPROOT/historical.XXXXXX")"
-    printf '%s\n%s\n' \
+    # THREE lines, and the completion line is not padding. `freenet.rs` emits
+    # `Startup update check complete` on every non-triggering outcome, so a real
+    # #5221 log has it, and WITHOUT it this fixture returns 2 (indeterminate)
+    # rather than the 0 the failure message below claims a reworded marker
+    # produces. The assertion goes red either way, but a fixture that fails for
+    # a different reason than its message names is how a pin comes to be
+    # trusted for the wrong thing. Measured: two lines -> rc=2, three -> rc=0.
+    printf '%s\n%s\n%s\n' \
         "2026-08-08T01:59:35.950835Z  INFO freenet: $MARKER_CHECK_RAN current=\"0.2.121\" jitter_secs=40" \
         "$historical_warn" \
+        "2026-08-08T01:59:36.200000Z  INFO freenet: $MARKER_CHECK_COMPLETE: staying on the current version current=\"0.2.121\"" \
         > "$historical_dir/freenet.2026-08-08-01.log"
     historical_stderr="$(assert_detection_healthy "$historical_dir" 2>&1 >/dev/null)"
     historical_rc=$?
@@ -1195,6 +1359,11 @@ else
         echo "       precedent for an alternation), or delete this assertion deliberately and" >&2
         echo "       say in the commit message that Gate B is now blind to #5221 on every" >&2
         echo "       release published before the new wording ships." >&2
+        echo "       (Deleting this block IS a way out and nothing stops it: ci.yml's" >&2
+        echo "       removed-tests guard scans crates/core/**/*.rs only, so a deleted" >&2
+        echo "       SHELL assertion is flagged nowhere, and the counter this PR widened" >&2
+        echo "       measures additions rather than deletions. Accepted, and said out" >&2
+        echo "       loud so nobody reads 'the suite went green' as 'the property holds'.)" >&2
         FAILURES=$((FAILURES + 1))
     fi
 fi
