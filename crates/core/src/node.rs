@@ -10161,22 +10161,36 @@ mod tests {
                 // WHAT MAKES THIS TEST PASS, measured rather than assumed. Each
                 // row is 40 runs of this test alone, `--exact`:
                 //
-                //   zero-advance reject + atomic boundary (shipped) . 40 / 0
-                //   zero-advance reject, boundary deleted ........... 40 / 0
+                //   zero-advance reject + atomic boundary (shipped) . 40 /  0
+                //   zero-advance reject, boundary deleted ........... 40 /  0
                 //   atomic boundary, advance check deleted .......... 23 / 17
                 //   neither, but with the id-equality dedup guard
                 //     it replaced (commit 65086ec2) ................. 32 /  8
-                //   pre-PR main ..................................... 40 / 0
+                //                            and, replicated ....... 27 / 13
+                //   pre-PR main ..................................... 40 /  0
+                //                            and, replicated ....... 40 /  0
                 //
-                // Read those carefully, because the obvious story is wrong. It
+                // TREAT THE FAILING RATES AS ORDER-OF-MAGNITUDE ONLY. The two
+                // independent measurements of 65086ec2 (separate sessions,
+                // worktrees and binaries) agree that it flakes badly but differ
+                // by 12 points, 20% vs 33%, most plausibly because this host runs
+                // concurrent test agents. So do not read fine distinctions
+                // between 20%, 33% and 43% -- those intervals overlap with the
+                // noise. The zero rows are the robust ones: 0 failures in 40 is
+                // qualitatively different from 8-17 in 40, and both replications
+                // of `main` agree exactly.
+                //
+                // Read the rows carefully, because the obvious story is wrong. It
                 // is the ZERO-ADVANCE REJECTION in `record_fallback_cursor` that
-                // makes this test green, NOT the atomic boundary. And the
-                // boundary makes the situation WORSE on its own (17/40 failing,
-                // worse than either earlier state) because publishing the origin
-                // makes concurrent racers AGREE, so they now build identical
-                // windows every time -- turning the duplicate charge from
-                // occasional into systematic. The two changes are coupled: the
-                // boundary is what makes the dedup path load-bearing.
+                // makes this test green, NOT the atomic boundary -- the advance
+                // check alone is 0/40, the boundary alone is 17/40. That
+                // distinction survives the noise; a claim that the boundary alone
+                // is WORSE than the guard it replaced would not, so it is not
+                // made. What matters is that publishing the origin makes
+                // concurrent racers AGREE, so they build identical windows every
+                // time, turning the duplicate charge from occasional into
+                // systematic. The two changes are coupled: the boundary is what
+                // makes the dedup path load-bearing.
                 //
                 // So the atomic boundary is NOT justified by this test. It is
                 // justified by (a) not spending a second full window of uplink
