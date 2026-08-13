@@ -429,9 +429,18 @@ jobs:
             # `test-exempt` for a PR that had exactly the test the rule wants —
             # the same "gate cannot see its subject" shape the comment above
             # describes. Match the helpers actually in use.
+            #
+            # Third form, same gap: `auto-update-canary_test.sh` -- the largest
+            # shell self-test in the repo, and the one that guards the release
+            # canary -- has no helper at all. It reports each assertion with a
+            # bare `echo "ok   - ..."` / `echo "FAIL - ..." >&2`, so a PR whose
+            # entire regression test is a new assertion there scored ZERO here
+            # and was told to add a test it had already added. Widening for
+            # `ok` covered the lifecycle file's helper and stopped at the file
+            # next to it. Count the echoed form too.
             NEW_SHELL_TESTS=$(git diff "$BASE"..."$HEAD" -- '**/*_test.sh' \
               | grep -E '^\+' | grep -vF '+++' \
-              | grep -cE '^\+[[:space:]]*(check|ok)[[:space:]]' || true)
+              | grep -cE '^\+[[:space:]]*(check|ok)[[:space:]]|^\+[[:space:]]*echo[[:space:]]+"ok' || true)
             if [ "$NEW_TESTS" -eq 0 ] && [ "$NEW_SHELL_TESTS" -eq 0 ]; then
               ERRORS="$ERRORS
           ERROR: fix: PR must include at least one new regression test
