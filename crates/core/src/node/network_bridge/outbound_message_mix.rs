@@ -383,6 +383,12 @@ const SUMMARIES_WIRE_FORMS: [SummariesWireForm; 2] =
 /// "everyone's sends" and "everyone's receives" are the same traffic counted
 /// twice.
 ///
+/// The field measurement makes this concrete rather than merely structural:
+/// **48.7% of node-minutes send ZERO notifications** (77,327 of 158,708 rollups)
+/// while still receiving them from peers' fan-out, and 41.7% send zero
+/// `change_interests_reply`. So for roughly half the sample a per-node
+/// correction is not merely wrong, it is undefined or zero.
+///
 /// The name is the guard: `FleetSingleEntryTotals` cannot be read as a per-node
 /// quantity. It does not physically stop someone summing one node's records into
 /// it — the collection-taking signature that would needs a rollup-parsing
@@ -752,8 +758,11 @@ struct Window {
     /// instrument land a release ahead of the mechanism it judges (regime rule
     /// 7; 0.2.120 is permanently unattributable for want of exactly this).
     ///
-    /// **This bucket is the FULL-BYTES leg only, and it is ~15%
-    /// not-notification.** Read
+    /// **This bucket is the FULL-BYTES leg only, and it is ~4.6%
+    /// not-notification** — NOT the ~15% merged figure, because
+    /// `ChangeInterestsReply` is 95.3% digest today and so mostly never reaches
+    /// this bucket. Two independent derivations agree on ~4-5% (per-arm census
+    /// projection, and classifying rollups by mean bytes/msg). Read
     /// [`OutboundMix::record_summary_comparison`] before quoting a number off
     /// it — the contamination is measurable but NOT negligible, and it biases
     /// `p` in BOTH directions. Subtract it using
@@ -998,11 +1007,35 @@ impl OutboundMix {
     /// | single-entry `Summaries` sender | msgs, one window | effect on `p` |
     /// |---|---|---|
     /// | `Notification` (the signal) | 3,194,108 | — |
-    /// | `ChangeInterestsReply` | 418,476 (mean 1.000, max 1, 1,284 peers) | either |
-    /// | `SummaryRequestReply` | >=131,153 | **downward** |
-    /// | `Rejection` | 669 | either |
+    /// | `ChangeInterestsReply` | 418,476 (mean 1.000, max 1, 1,284 peers) | either; 95.3% digest so mostly off the full-bytes leg |
+    /// | `SummaryRequestReply` | >=131,153 | **downward** (mostly, not all — see below) |
+    /// | `Rejection` | 669 | **UPWARD** — identical by construction |
     ///
-    /// So **~15% of single-entry observations are not notifications.**
+    /// The signs matter and the census cannot supply them; they come from what
+    /// each emitter means. `Rejection` fires only when a rejected broadcast's
+    /// summary ALREADY matched ours, so it is identical by construction and
+    /// pushes `p` up — it is the one arm whose sign is actually knowable, and at
+    /// 669 messages it is harmless, but it is not "either".
+    ///
+    /// So **~15% of single-entry MESSAGES SENT are not notifications** — note the
+    /// unit: messages, on the send side. Saying "observations" there would import
+    /// the receive-side unit and is the category error this whole section exists
+    /// to prevent.
+    ///
+    /// **Per LEG, which is what actually matters:** `ChangeInterestsReply` is
+    /// **95.3% digest / 4.7% full-bytes**, so the FULL-BYTES leg — the one `p` is
+    /// computed over today — is only **~4.6%** contaminated, essentially
+    /// `request_reply + rejection`. The ~15% is the merged number and applying it
+    /// to the full-bytes leg over-subtracts by roughly 11 points. Two independent
+    /// derivations agree on the ~4-5% figure: projecting the per-arm census, and
+    /// classifying rollups by mean bytes/msg (digest singles ~41 B against
+    /// full-bytes ~9-10 KB).
+    ///
+    /// Scale of what the split buys: **without it the instrument cannot tell a
+    /// true `p` of 99% from 95%** (worst-case bracket ~17 points wide against a
+    /// 4-point decision gap); with it, residual uncertainty is **≈±0.6 points**.
+    /// The leg split is therefore not tidiness — it is the difference between an
+    /// instrument that answers its question and one that does not.
     ///
     /// `ChangeInterestsReply` is single-entry because
     /// `broadcast_change_interests` is called with one contract per gossip, so
@@ -1012,11 +1045,18 @@ impl OutboundMix {
     ///
     /// **The `SummaryRequestReply` term is the dangerous one, and it runs
     /// DOWNWARD.** Bytes are requested only after a digest mismatch, so when
-    /// they arrive they cannot compare equal — such a reply lands in
-    /// `differing` by construction. Single-entry ones therefore inflate `p`'s
-    /// DENOMINATOR only, and at real scale: >=131,153 such messages against a
-    /// fleet `summary_entries_differing` of 559,992 in the same window. A true
-    /// notification-leg `p` of 99% would measure around **95%**.
+    /// they arrive they *almost always* compare unequal — such a reply lands in
+    /// `differing`. Not airtight, and worth stating precisely rather than as a
+    /// law: state can converge between the digest mismatch and the bytes
+    /// arriving, in which case the reply compares equal after all. Single-entry
+    /// ones therefore inflate `p`'s DENOMINATOR predominantly, at real scale: at
+    /// least 131,153 such messages against a fleet `summary_entries_differing`
+    /// of 559,992 in the same window.
+    ///
+    /// (An earlier revision put a figure here — "a true 99% would measure around
+    /// 95%". Removed: that arithmetic silently assumes one comparison per
+    /// message, which is the very conversion the expansion factor makes unknown
+    /// until deployment. It was a point estimate dressed as a consequence.)
     ///
     /// So `p` off this counter is NOT a clean ceiling. It has an upward term
     /// (divergences lost to a dropped round trip, below) and a larger downward
@@ -1059,6 +1099,25 @@ impl OutboundMix {
     /// of these counters is an interval computed with the send-side census, not
     /// a single number — and a build/no-build call for R4b should be made on
     /// that interval.
+    ///
+    /// **The two are NOT independent, so do not add their uncertainties.** The
+    /// dropped-round-trip term above and the request-reply contamination are the
+    /// same phenomenon viewed from opposite ends: the sender counts a reply it
+    /// sent, the receiver never observes it, so a census subtraction
+    /// over-subtracts by exactly that loss rate. Treating them as two separate
+    /// biases overstates the uncertainty structure.
+    ///
+    /// # ROLLOUT: version skew makes the first data the least trustworthy
+    ///
+    /// Only nodes on this build emit either counter. During adoption the
+    /// receive-side singles therefore come largely from senders that are ABSENT
+    /// from the census, so the fleet-closure assumption the whole correction
+    /// rests on is weakest exactly when the first numbers arrive. And the send
+    /// mix genuinely differs by version — #4965 added the digest legs, #5155
+    /// changed `InterestsReply` shape, #5003 changed notification recipients — so
+    /// this is not merely a smaller sample, it is a differently-composed one.
+    /// Compounds the two-release-lag: wait for adoption before trusting the
+    /// share, even though expansion calibrates early.
     pub(crate) fn record_summary_comparison(
         &self,
         contract: &ContractInstanceId,

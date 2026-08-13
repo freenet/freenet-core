@@ -11437,6 +11437,91 @@ mod tests {
                 );
             }
 
+            /// THE TWO PROPERTIES THIS WHOLE INSTRUMENT RESTS ON (#5153 review F4).
+            ///
+            /// `p` is read off single-entry FULL-BYTES `Summaries`, and that is a
+            /// proxy for "this is a notification" only while both of these hold:
+            ///
+            /// 1. A notification ships **full bytes unconditionally** — it must
+            ///    not consult the hash-first version gate. If it did, the
+            ///    pre-R4b full-bytes buckets would silently go quiet AND the
+            ///    claim "a digest single is provably not a notification" would
+            ///    INVERT, with every test still green.
+            /// 2. A notification is **single-entry** — one contract per send. If
+            ///    notifications were ever batched (plausible: coalescing work is
+            ///    already in this tree), they would leave the single-entry
+            ///    population entirely and `p` would silently become the
+            ///    agreement rate of whatever failed to batch.
+            ///
+            /// Both are true today, verified from code and field: the emitter
+            /// calls `full_summaries_message(vec![...], Notification)` with no
+            /// reference to the gate, and the field shows mean 41,642 B/msg with
+            /// entries exactly equal to msgs and **no rollup anywhere reporting
+            /// `max_entries > 1`**. So multi-entry false negatives are impossible
+            /// today rather than merely unobserved.
+            ///
+            /// Neither was pinned. This mirrors
+            /// `summary_request_reply_is_always_full_bytes`, which pins exactly
+            /// this shape for the request-reply arm — and note that
+            /// `no_uninstrumented_full_summaries_construction` does NOT cover it:
+            /// that forces `Summaries` through the instrumented constructor but
+            /// says nothing about a site switching to the digest gate.
+            #[test]
+            fn notification_leg_is_always_full_bytes_and_single_entry() {
+                let src = include_str!("operations/update.rs");
+                let f = src
+                    .find("pub(crate) async fn send_proactive_summary_notification(")
+                    .expect("notification emitter not found — update this pin");
+                // Bound at the next top-level `pub(crate)` item so a sibling's
+                // gate usage cannot satisfy or trip the assertions below.
+                let end = src[f..]
+                    .find("\npub(crate) ")
+                    .map(|off| f + off)
+                    .unwrap_or(src.len());
+                let body = code_only(&src[f..end]);
+
+                assert!(
+                    body.contains("full_summaries_message("),
+                    "the notification leg must build its message through \
+                     full_summaries_message — the instrumented FULL-BYTES \
+                     constructor. Window extraction may also be off; check that \
+                     first."
+                );
+                assert!(
+                    body.contains("SummariesEmitter::Notification"),
+                    "window extraction is off — the notification emitter body \
+                     should tag its own emitter"
+                );
+                // Property 1. Every entry point to the encoding CHOICE, matching
+                // the sibling pin: #5155 split `summaries_reply_for_peer` into
+                // two names, neither a substring of the old one.
+                for banned in [
+                    "summaries_reply_for_peer",
+                    "summary_reply_form",
+                    "summaries_reply_in_form",
+                ] {
+                    assert!(
+                        !body.contains(banned),
+                        "the notification leg now consults `{banned}`, i.e. the \
+                         hash-first version gate. That moves notifications onto \
+                         the digest leg, so the R4b full-bytes single-entry \
+                         buckets go quiet AND `SummaryObservation::SingleEntryDigest`'s \
+                         'not a notification' premise inverts — silently, with \
+                         every other test green (#5153 review F4)"
+                    );
+                }
+                // Property 2. One contract per send. `vec![` with a single
+                // element is the shape; a batched send would collect or extend.
+                assert!(
+                    body.contains("vec![full_entry.clone()]"),
+                    "the notification leg no longer sends exactly one entry. If \
+                     notifications are now batched they leave the single-entry \
+                     population, and `p` becomes the agreement rate of whatever \
+                     failed to batch (#5153 review F4). Re-derive the proxy \
+                     before changing this."
+                );
+            }
+
             /// The `SummaryDigests` arm must NOT record a one-sided observation
             /// (#5153 review F2 — it double-counted).
             ///
