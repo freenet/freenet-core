@@ -274,6 +274,25 @@ which was the correct instinct, and the tree lied.
   survives, because nothing forces you to look at it.
 - **When a comment and the code disagree, verify against the code before
   reporting** — then fix the comment as a defect in its own right.
+- **A defect found at one site is not fixed until you have ENUMERATED every
+  site of that shape, and "enumerate" means grep, not recall.** This appeared
+  four times in one night in #5303, and the fixes were the misses: the
+  comment-stripping filter was applied to one job-block extraction while three
+  siblings went without (twice, in successive commits); the SIGPIPE fix in
+  #5236 corrected two helpers and left four call sites inside the very function
+  those helpers serve; and a false "on all N attempts" claim was corrected in
+  one branch while its sibling twelve lines away kept it. Each time the author
+  had just understood the defect completely, which is exactly when the
+  remaining instances feel like they cannot be there.
+
+  Three of the four were caught only because a MUTATION FAILED TO APPLY —
+  `PATTERN NOT FOUND` with the suite green. **An unapplied mutation is not a
+  pass; it is an unexplained observation**, and here the explanation was always
+  that the string had moved or been half-fixed. Chase it.
+
+  Prefer removing the class over fixing the instances: three extractions became
+  one `yaml_job_block` helper, so a fourth caller cannot forget the filter
+  because there is nothing to forget.
 
 ### Relation pins between quantities on different clocks
 

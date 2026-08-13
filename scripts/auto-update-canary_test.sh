@@ -701,7 +701,7 @@ gate_b_case() {
 gate_b_case "a real #5221 failure is never retried" 1 1 no \
     "could not parse the version GitHub returned" "0:BROKEN" "0:BROKEN"
 gate_b_case "an indeterminate IS retried, then exits 75" 75 2 no \
-    "could not reach GitHub in 2 attempts, and this runner cannot reach it either" \
+    "could not reach GitHub on 2 of 2 attempt(s), and this runner cannot reach it either" \
     "0:FETCH_FAIL" "0:FETCH_FAIL"
 gate_b_case "a port collision exits 75 without a network probe" 75 2 yes \
     "every attempt hit a port collision on this host" "43:" "43:"
@@ -738,6 +738,20 @@ gate_b_case "ports THEN github runs the probe and goes loud" 1 2 yes \
     "43:" "0:FETCH_FAIL"
 gate_b_case "github THEN ports still runs the probe and goes loud" 1 2 yes \
     "could not reach GitHub on 1 of 2 attempt(s), but THIS RUNNER reached" \
+    "0:FETCH_FAIL" "43:"
+
+# The QUIET github branch, which the three cases above never reach: they all
+# have the runner UP, so they land on the loud sibling. With the runner DOWN a
+# mixed run is environmental, and that branch printed "in $CANARY_ATTEMPTS
+# attempts" for a further commit after its sibling was fixed -- the same false
+# unanimity, in the branch nobody had a case for. Found because a reviewer's
+# mutation reported PATTERN NOT FOUND, which is why an unapplied mutation is
+# never a pass.
+gate_b_case "ports THEN github with the runner DOWN is quiet, and counts honestly" 75 2 no \
+    "could not reach GitHub on 1 of 2 attempt(s), and this runner cannot reach it either" \
+    "43:" "0:FETCH_FAIL"
+gate_b_case "github THEN ports with the runner DOWN is quiet, and counts honestly" 75 2 no \
+    "could not reach GitHub on 1 of 2 attempt(s), and this runner cannot reach it either" \
     "0:FETCH_FAIL" "43:"
 
 eval "$real_run_node_until_check"

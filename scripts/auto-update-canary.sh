@@ -1355,15 +1355,23 @@ cmd_selfupdate() {
           fail "UNVERIFIED (ENVIRONMENTAL): every attempt hit a port collision on this host, so Gate B never got to test the updater. v$expected_version has NOT been verified as reachable by a node on v$prev_version -- this run says nothing either way. Another canary run or a local node is holding the ports. Re-run the job; if it recurs, something on this runner is holding them persistently and the gate is not working."
           ;;
         *)
-          fail "UNVERIFIED (ENVIRONMENTAL): v$prev_version could not reach GitHub in $CANARY_ATTEMPTS attempts, and this runner cannot reach it either, so the canary never got to test whether v$prev_version reaches v$expected_version. v$expected_version has NOT been verified as reachable by auto-update -- this run is not evidence in either direction. The node's startup fetch has no retry, so a bad network moment produces exactly this. Re-run the job. If Gate B reports this on CONSECUTIVE releases it is not the runner: the same WARN is also what a published fetch-side regression logs (a bad URL, a TLS or user-agent change, a rate-limited endpoint), and either way the post-publish gate is not working and nothing has been verified since the last green run."
+          fail "UNVERIFIED (ENVIRONMENTAL): v$prev_version could not reach GitHub on $github_attempts of $CANARY_ATTEMPTS attempt(s), and this runner cannot reach it either, so the canary never got to test whether v$prev_version reaches v$expected_version. v$expected_version has NOT been verified as reachable by auto-update -- this run is not evidence in either direction. The node's startup fetch has no retry, so a bad network moment produces exactly this. Re-run the job. If Gate B reports this on CONSECUTIVE releases it is not the runner: the same WARN is also what a published fetch-side regression logs (a bad URL, a TLS or user-agent change, a rate-limited endpoint), and either way the post-publish gate is not working and nothing has been verified since the last green run."
           ;;
       esac
       return "$EXIT_UNVERIFIED_ENVIRONMENTAL"
     fi
     if [ "$env_cause" = "github" ]; then
-      # The node said it could not reach GitHub, on every attempt -- and this
-      # runner reached the same endpoint moments later. Not a blip, so not
+      # The node said it could not reach GitHub on at least one attempt -- and
+      # this runner reached the same endpoint moments later. Not a blip, so not
       # something to reassure anyone about.
+      #
+      # "at least one", not "every": sticky-by-strength promotes `github` over
+      # `ports`, so a mixed run lands here with one github attempt. Both this
+      # branch and its environmental SIBLING above print `$github_attempts`
+      # rather than `$CANARY_ATTEMPTS` for that reason. The sibling was missed
+      # when this one was fixed, and stated the false unanimity for a further
+      # commit -- see the enumeration note in
+      # `.claude/rules/bug-prevention-patterns.md`.
       fail "UNVERIFIED: v$prev_version reported it could not reach GitHub on $github_attempts of $CANARY_ATTEMPTS attempt(s), but THIS RUNNER reached the same endpoint immediately afterwards. So the network is not simply down: the published binary consistently cannot do something this runner can. That may still not be an auto-update fault -- a poll-budget cooldown persisted under the node's HOME is the obvious candidate (#5102) -- but it is not environmental noise, and v$expected_version is NOT verified as reachable. Read the node output above before re-running."
       return 1
     fi
