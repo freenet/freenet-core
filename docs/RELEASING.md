@@ -643,38 +643,60 @@ a tag that no longer exists is worse than the draft.
 
 ### If Gate B fails
 
-**Establish which of three things happened before acting.** They need different
-responses, and the loud alarm text names the worst one.
+**A red Gate B is not by itself a fleet problem, and the Matrix message is not
+enough to tell.** Five distinct outcomes end in a red job; only one of them means
+a node on the previous release genuinely cannot reach this one. **Read the
+`::error::` line in the job log before doing anything** — it names which.
 
-**0. The runner could not reach GitHub, which is NOT a fleet problem and the
-canary now says so itself.** The previous release's binary retries its startup
-fetch zero times, so an ordinary network blip on a hosted runner makes it log
+The wording below is generated from the code, so match on the quoted phrases
+rather than on the shape of the alarm.
+
+| What the log says | Exit | Matrix | What it means | Response |
+|---|---|---|---|---|
+| `UNVERIFIED (ENVIRONMENTAL): … could not reach GitHub … and this runner cannot reach it either` | 75 | ⚠️ quiet | The network was down for both the node and the runner. Nothing learned. | Re-run the job. |
+| `UNVERIFIED (ENVIRONMENTAL): every attempt hit a port collision on this host` | 75 | ⚠️ quiet | Something else on the runner held the ports; the node never started. | Re-run the job. |
+| `UNVERIFIED: … reported it could not reach GitHub … but THIS RUNNER reached the same endpoint immediately afterwards` | 1 | 🚨 loud | The published binary consistently could not do what the runner just did. Most likely its persisted poll-budget cooldown (#5102), possibly a published fetch-side regression. **Not a stranded fleet.** | Read the node output. Re-run; if it recurs across releases it is not the runner. |
+| `UNVERIFIED: at least one attempt started the update check and never logged an outcome` | 1 | 🚨 loud | A hung updater, or the check was cut short. Genuinely unknown. | Re-run. Persisting, treat as a real fault. |
+| Anything naming a specific detection or install failure | 1 | 🚨 loud | The real thing. See case 3. | See case 3. |
+
+**The trap this table exists to remove.** An earlier version of this section said
+a fetch failure always gives exit 75 and the quiet ⚠️, and told the reader that
+if they were looking at the 🚨 text "this is not what happened". That stopped
+being true when the corroboration probe landed: the GitHub cause now *also*
+requires this runner to fail the same fetch, and a hosted runner is normally
+online by probe time. So the common case — the previous release's binary logging
 
 ```
 Startup update check: failed to fetch latest version: error sending request
 for url (.../releases/latest). Continuing with current binary.
 ```
 
-and the run learns nothing about the updater in either direction. Gate B retries
-(`CANARY_ATTEMPTS`, 2 by default), and if every attempt lands the same way it
-exits **75** (`EXIT_UNVERIFIED_ENVIRONMENTAL`, sysexits' EX_TEMPFAIL) with a
-message beginning `UNVERIFIED (ENVIRONMENTAL)`. `cross-compile.yml` keys off
-that code and sends the quiet ⚠️ message instead of the 🚨 one, so if you are
-reading the #5221 text this is not what happened. The job is still red: an
-unverified run is not a passed one. **Response: re-run the job.** Adding a retry
-to the node's own fetch (`crates/core/src/bin/commands/auto_update.rs`) would
-remove the class, but only for releases published after that lands, since Gate B
-always drives an already-published binary.
+on an otherwise healthy runner — produces **exit 1 and the loud 🚨**, and the old
+text sent the reader straight past it into "a real detection failure" and on to
+cutting a fix release for a poll-budget cooldown.
 
-**1. A stale canary constant, which is NOT a fleet problem either.** Gate B's
+**1. Environmental (exit 75, quiet ⚠️).** Two causes, both above. The previous
+release's binary retries its startup fetch zero times, so a single bad moment on
+the network is enough to produce the first. Gate B retries (`CANARY_ATTEMPTS`, 2
+by default) and only reports this if every attempt lands the same way AND this
+runner also cannot reach the endpoint. The job stays red: unverified is not
+verified. Adding a retry to the node's own fetch
+(`crates/core/src/bin/commands/auto_update.rs`) would shrink the class, but only
+for releases published after that lands, since Gate B always drives an
+already-published binary.
+
+If either of these appears on **consecutive** releases, stop treating it as
+noise: nothing has been verified since the last green run, and for the GitHub
+cause a persistent node-side failure that this runner does not share is a
+published fetch-side regression rather than weather.
+
+**2. A stale canary constant, which is NOT a fleet problem either.** Gate B's
 positive-equality check greps the previous release's log for
 `MARKER_LATEST_SEEN` (`scripts/auto-update-canary.sh`), and it arms only from
 `MARKER_LATEST_SEEN_SINCE` onwards. If that marker's TEXT was reworded and the
 constant was not moved to the release that first ships the new wording, Gate B
 demands text the published binary was never built to emit. Auto-update is fine;
-the gate is asking the wrong question. The Matrix alarm still says "a node on
-the previous release may not be able to auto-update", so read the job log rather
-than the alarm.
+the gate is asking the wrong question.
 
 Check first:
 
@@ -692,11 +714,10 @@ first four; it does not name `MARKER_FETCH_FAIL`).
 
 `MARKER_FETCH_FAIL` is the one of those five to check first. It is no longer
 just a marker Gate B greps: it is the input to the environmental classification
-described in case 0 above. Reword it and a previous release's failed fetch stops
-being recognised as environmental, so every network blip goes back to firing the
-loud 🚨 "may not be able to auto-update" message — reinstating the false fleet
-alarm that classification exists to remove, from an edit that looks unrelated
-to it.
+in case 1. Reword it and a previous release's failed fetch stops being
+recognised as environmental at all, so even the genuinely-offline case fires the
+loud 🚨 — reinstating the false fleet alarm that classification exists to
+remove, from an edit that looks unrelated to it.
 
 `MARKER_PARSE_FAIL` is the one to be most careful with, and it IS frozen
 (`auto-update-canary_test.sh`), because it is the only marker whose reword fails
@@ -704,14 +725,14 @@ in the PASSING direction: it feeds Gate B's negative check, so a grep that stops
 matching the text published binaries emit reports `OK: parsed GitHub's response`
 for a release carrying the live #5221 bug.
 
-**2. A real detection or install failure.** The previous release genuinely
+**3. A real detection or install failure.** The previous release genuinely
 cannot reach this one. The release is already public and the fleet will **not**
 converge onto it on its own: ship a fix release, and expect to roll existing
 nodes by hand (`freenet update`) as v0.2.120/v0.2.121 required.
 
-Gate A does not have this failure mode: it runs a binary built from the same
-tree as the canary, so a reword there is self-consistent. Gate B is the only
-place an OLDER binary's log is read.
+Gate A does not have the case-2 failure mode: it runs a binary built from the
+same tree as the canary, so a reword there is self-consistent. Gate B is the
+only place an OLDER binary's log is read.
 
 ## Post-release verification
 

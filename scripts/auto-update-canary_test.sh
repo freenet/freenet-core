@@ -136,11 +136,15 @@ check "broken: #5221 unparseable tag -> fail" 1 "$BROKEN" \
 
 # BOTH markers in one log, which pins the ORDER of the two branches. The
 # parse-failure check runs BEFORE the fetch-failure check, and that ordering is
-# the only thing keeping a real #5221 out of the environmental classification
+# the FIRST of two things keeping a real #5221 out of the environmental
+# classification
 # Gate B gained this round. Swap the two branches -- an innocent-looking tidy,
 # "infra check before product check" -- and this log returns 2 instead of 1,
-# Gate B calls it environmental, and the dev room is told "not a stranded
-# fleet" about a log carrying the live #5221 signature.
+# Gate B treats it as a candidate for the environmental class. The runner probe
+# is the second guard and would usually catch it from there, so this is an
+# ordering hazard rather than a guaranteed false quiet -- but the two together
+# are what make it safe, and a guard that only holds when its sibling also does
+# is worth its own case.
 #
 # Realistic rather than contrived: a node whose startup fetch failed and whose
 # periodic re-poll then returned an unparseable tag logs exactly this, and so
@@ -597,8 +601,13 @@ eval "$real_runner_can_reach_github"
 #
 # `run_node_until_check` is stubbed rather than booting a node: the sequence is
 # the subject, and a real boot costs seconds per attempt. The lifecycle test
-# covers the same retry property against REAL boots, so the stub cannot quietly
-# diverge from the thing it stands in for. `curl`/`tar` are shadowed so the
+# covers the same retry property by actually running `run_node_until_check`
+# against a FAKE NODE BINARY -- a real process, real ports, real log files, but
+# not a real node. So the two differ in how much of the harness executes, not in
+# whether the subject is genuine; neither is a live cross-check against a real
+# release. (An earlier version of this claimed "against REAL boots", which
+# overstated the lifecycle test in the direction of "you need not check this".)
+# `curl`/`tar` are shadowed so the
 # download preamble is a no-op. Same shape as
 # `release_wait_for_binaries_test.sh`'s `check_call_count`.
 GATE_B_ATTEMPT=0
@@ -697,8 +706,12 @@ gate_b_case "an indeterminate IS retried, then exits 75" 75 2 no \
 gate_b_case "a port collision exits 75 without a network probe" 75 2 yes \
     "every attempt hit a port collision on this host" "43:" "43:"
 # The corroboration: the same node-side symptom, opposite runner state.
+# The COUNT is asserted, not just the phrase. The message used to say "on all
+# $CANARY_ATTEMPTS attempts" unconditionally, which sticky-by-strength made
+# false the moment one attempt was a port collision -- and the original
+# assertion picked a substring that did not span the number, so it passed.
 gate_b_case "node cannot reach GitHub but the runner can -> loud, not 75" 1 2 yes \
-    "THIS RUNNER reached the same endpoint immediately afterwards" \
+    "could not reach GitHub on 2 of 2 attempt(s), but THIS RUNNER reached" \
     "0:FETCH_FAIL" "0:FETCH_FAIL"
 # A hung updater must never be quiet.
 gate_b_case "no outcome logged on every attempt -> loud" 1 2 no \
@@ -721,10 +734,10 @@ gate_b_case "environmental THEN unexplained stays loud (the latch)" 1 2 no \
 # attempt hit a port collision -- which the message assertion is what catches,
 # since the exit code alone is 75 in the correct `ports`-only case too.
 gate_b_case "ports THEN github runs the probe and goes loud" 1 2 yes \
-    "THIS RUNNER reached the same endpoint immediately afterwards" \
+    "could not reach GitHub on 1 of 2 attempt(s), but THIS RUNNER reached" \
     "43:" "0:FETCH_FAIL"
 gate_b_case "github THEN ports still runs the probe and goes loud" 1 2 yes \
-    "THIS RUNNER reached the same endpoint immediately afterwards" \
+    "could not reach GitHub on 1 of 2 attempt(s), but THIS RUNNER reached" \
     "0:FETCH_FAIL" "43:"
 
 eval "$real_run_node_until_check"
@@ -1480,7 +1493,7 @@ pin_marker "source pin: fetch-failure marker"   "$AU_SRC" "$MARKER_FETCH_FAIL"
 # grep tracks prose, and this one carries the gate's only POSITIVE assertion.
 # It must also stay at INFO -- `release_max_level_info` compiles out anything
 # below, so a `debug!` here would delete the equality check from every shipped
-# binary while leaving all 30 assertions green.
+# binary while leaving every assertion in this file green.
 if [[ "$(tr -d '[:space:]' < "$AU_SRC")" == *"tracing::info!(latest=%latest,\"${MARKER_LATEST_SEEN//[[:space:]]/}"* ]]; then
     echo "ok   - source pin: observed-latest marker is emitted at INFO with a latest= field"
 else
@@ -1494,7 +1507,8 @@ fi
 
 # --- the trigger-site ENUMERATION -------------------------------------------
 # `MARKER_TRIGGERED_RE` has to match every site that requests an update. It
-# missed the urgent one at :609 for as long as that site has existed, because
+# missed the urgent one ("triggering IMMEDIATE auto-update") for as long as that
+# site has existed, because
 # the marker was a fixed string and the site says "triggering IMMEDIATE
 # auto-update".
 #
@@ -1555,7 +1569,7 @@ else
     echo "       $versioned_sends version-detecting trigger sites ('update_tx.send(new_version)')." >&2
     echo "       ($actual_sites regex matches minus $actual_refusals refusals.) If the regex matches FEWER, a" >&2
     echo "       trigger site is worded so the canary cannot see it -- a node that took that path reads as one" >&2
-    echo "       that never decided to update, which is how the urgent site at :609 went unseen. If it matches" >&2
+    echo "       that never decided to update, which is how the urgent site went unseen. If it matches" >&2
     echo "       MORE, the regex is picking up prose. Either way, reconcile MARKER_TRIGGERED_RE with the" >&2
     echo "       enumeration comment in auto-update-canary.sh." >&2
     grep -nE "$MARKER_TRIGGERED_RE" "$SRC" >&2

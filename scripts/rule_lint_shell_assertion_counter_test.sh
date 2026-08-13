@@ -10,9 +10,15 @@
 # to END there, so EVERY underscore-suffixed helper scored zero --
 # `gate_b_arm_case`, `version_ge_case`, `pin_marker`, `check_vs_expected`,
 # `check_call_count`, `check_fallback`, `test_restores_persisted_value` and
-# more. Measured across all 11 `*_test.sh` files in the repo at the time:
-# 329 assertion call sites, 275 seen, 54 missed, 42 of those in
-# `auto-update-canary_test.sh` alone.
+# more. Measured across every `*_test.sh` in the repo, the original form saw
+# roughly three quarters of the assertion call sites; the great majority of the
+# misses were in `auto-update-canary_test.sh`, which is written almost entirely
+# in that style.
+#
+# Deliberately no exact figures: they moved three times inside the PR that added
+# this file, and a stale number in a justification is the sentence that tells
+# the next reader not to re-measure. The computed checks at the bottom of this
+# file are where the real numbers live, and they fail naming the files.
 #
 # Nothing in the repo exercised the regex, so each of those misses was found by
 # a human noticing a wrong number rather than by CI. The failure direction is
@@ -112,19 +118,20 @@ expect() {
 # Each line is a real one from the file named, with a leading '+' as the diff
 # would present it. Add a row here when a new convention appears; that is the
 # enumeration the ci.yml comment tells you to re-run.
-expect 1 "bare 'check' (7 files)" \
+expect 1 "bare 'check' (most files)" \
     '+check "healthy: check ran, parsed, triggered -> pass" 0 "$HEALTHY"'
 expect 1 "bare 'ok' (lifecycle)" \
     '+ok "the canary refuses a node that never checked"'
 expect 1 "bare 'pass' (3 files)" \
     '+pass "cross-compile.yml still has the pre-flight failure notification job"'
 # THIS file's own convention, and the case that proves the point it makes.
-# When this file was first added, its 26 `expect` calls scored ZERO -- the very
-# under-count it exists to prevent, reintroduced by the fix for it, inside the
-# same PR, and found by re-measuring rather than by reading. Safe as a bare
+# When this file was first added, EVERY ONE of its `expect` calls scored ZERO --
+# the very under-count it exists to prevent, reintroduced by the fix for it,
+# inside the same PR, and found by re-measuring rather than by reading. The
+# computed check at the bottom of this file is what now catches that shape. Safe as a bare
 # name only because nothing in scripts/ drives the TCL `expect(1)`.
 expect 1 "bare 'expect' (this file)" \
-    '+expect 1 "bare check (7 files)" \'
+    '+expect 1 "bare check (most files)" \'
 expect 1 "inline echo \"ok   - ...\"" \
     '+    echo "ok   - MARKER_PARSE_FAIL frozen against a rename sweep"'
 expect 1 "inline echo 'PASS ...' (release_state_restore_test.sh)" \
@@ -175,6 +182,70 @@ expect 0 "echo that merely starts with the letters 'ok'" \
     '+    echo "okay, starting the node"'
 expect 0 "a bare string added to a table (a KNOWN blind spot, documented in ci.yml)" \
     '+    "$SCRIPT_DIR/release.sh"'
+
+# --- COMPUTED, not asserted in prose ----------------------------------------
+# Everything above is a hand-written case. These two are measurements, and they
+# are here because the claims they replace were both WRONG in a comment while
+# the suite was green.
+#
+# The rule they come from: a justification that states a COUNT or a GREP RESULT
+# is the one kind of comment whose staleness actively suppresses the check that
+# would catch it -- it tells the next reader they may stop looking. So compute
+# it where it can go red, and let the prose point here.
+
+# 1. EVERY *_test.sh the counter can see must contain at least one line it
+#    recognises. A file scoring zero means the counter cannot see that file's
+#    convention AT ALL, so a `fix:` PR whose only regression test lives there is
+#    rejected for having no test. This is not hypothetical: when
+#    THIS file was added, its 26 bare `expect` calls scored zero -- the miss it
+#    exists to prevent, in the file written to prevent it, caught by measuring.
+invisible=()
+while IFS= read -r f; do
+    [[ -f "$f" ]] || continue
+    # Same `eval` path as `counter_matches`, so this measures the LIVE pattern
+    # rather than a re-quoted copy of it.
+    if [[ "$(eval "sed 's/^/+/' \"\$f\" | grep -cE $FRAG")" -eq 0 ]]; then
+        invisible+=("$f")
+    fi
+done < <(git -C "$SCRIPT_DIR/.." ls-files '*_test.sh' 2>/dev/null | sed "s|^|$SCRIPT_DIR/../|")
+
+if [[ ${#invisible[@]} -eq 0 ]]; then
+    echo "ok   - every tracked *_test.sh contains at least one assertion the counter sees"
+else
+    echo "FAIL - these *_test.sh files are INVISIBLE to the shell-assertion counter:" >&2
+    for f in "${invisible[@]}"; do echo "         $f" >&2; done
+    echo "       A fix: PR whose only regression test is in one of them scores zero and" >&2
+    echo "       is rejected for having no test. Either the file uses a convention the" >&2
+    echo "       alternation does not know, or it has no assertions at all. Widen the" >&2
+    echo "       alternation in ci.yml -- do not reshape the tests to please the grep." >&2
+    FAILURES=$((FAILURES + 1))
+fi
+
+# 2. The `printf`-style reporter, which ci.yml lists as a known blind spot. That
+#    entry was once DELETED on the stated ground that the grep returned nothing;
+#    it returns two, in `test-*.sh` files the counter's `**/*_test.sh` glob does
+#    not reach. The sentence was wrong and nothing could tell. So: if that
+#    convention ever appears in a file the counter DOES scan, the blind spot has
+#    stopped being theoretical and this fails.
+printf_in_scanned=()
+while IFS= read -r hit; do
+    printf_in_scanned+=("$hit")
+done < <(grep -rnE "printf[[:space:]]+.*['\"](ok|PASS)" \
+    "$SCRIPT_DIR"/*_test.sh "$SCRIPT_DIR"/release-agent/*_test.sh 2>/dev/null || true)
+
+if [[ ${#printf_in_scanned[@]} -eq 0 ]]; then
+    echo "ok   - no printf-style success reporter in any file the counter scans (blind spot still theoretical)"
+else
+    echo "FAIL - a printf-style success reporter now exists in a file the counter SCANS:" >&2
+    for hit in "${printf_in_scanned[@]}"; do echo "         $hit" >&2; done
+    echo "       ci.yml lists this as a known-but-unreached blind spot. It is now" >&2
+    echo "       reached: those assertions score zero. Add a printf pattern to the" >&2
+    echo "       alternation and a MUST-COUNT row above, then update ci.yml's list." >&2
+    echo "       (The two pre-existing hits, scripts/test-install-sh.sh and" >&2
+    echo "       scripts/test-uninstall-sh.sh, are OUT of scope by filename: the diff" >&2
+    echo "       is globbed to '**/*_test.sh' and they are 'test-*.sh'.)" >&2
+    FAILURES=$((FAILURES + 1))
+fi
 
 echo
 if [[ "$FAILURES" -eq 0 ]]; then

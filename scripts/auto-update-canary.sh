@@ -101,18 +101,22 @@ MARKER_FETCH_FAIL='failed to fetch latest version'
 MARKER_DISABLED='Auto-update is DISABLED'
 # freenet.rs -- detection succeeded and an update was requested. There are
 # FIVE such sites and one REFUSAL that shares the phrase:
-#   :524 "Startup check: newer version on GitHub, triggering auto-update"
-#   :609 "Urgent update confirmed on GitHub, triggering immediate auto-update"
-#   :670 "Update confirmed on GitHub after stagger, triggering auto-update"
-#   :751 "Newer version confirmed on GitHub, triggering auto-update"
-#   :873 "Periodic re-poll: newer version on GitHub, triggering auto-update"
-#   :519 "...repeated install failures); not triggering auto-update (#4073)"
+# Cited by PHRASE, never by line number. The six that were here were all low
+# by 12 within one release, and this file's own rules already say a line number
+# in a note about stale pins rots faster than the thing it describes. The
+# phrases are also what the detector actually matches.
+#   "Startup check: newer version on GitHub, triggering auto-update"
+#   "Urgent update confirmed on GitHub, triggering immediate auto-update"
+#   "Update confirmed on GitHub after stagger, triggering auto-update"
+#   "Newer version confirmed on GitHub, triggering auto-update"
+#   "Periodic re-poll: newer version on GitHub, triggering auto-update"
+#   "...repeated install failures); not triggering auto-update (#4073)"  <- the refusal
 # Matching the bare substring counts the refusal as a trigger; anchoring on any
 # ONE site's full phrase misses the others, reporting "did not decide to
 # update" for a node that did. So: match the phrase, subtract the refusal.
 #
-# A REGEX, not a fixed string, and that is the whole point: the urgent site at
-# :609 says "triggering IMMEDIATE auto-update", so the fixed substring
+# A REGEX, not a fixed string, and that is the whole point: the urgent site
+# says "triggering IMMEDIATE auto-update", so the fixed substring
 # `triggering auto-update` did not match it. A node that took the urgent path
 # was reported as never having decided to update. It failed CLOSED (Gate B
 # refuses rather than passes), so nothing broke visibly -- which is precisely
@@ -1241,7 +1245,7 @@ cmd_selfupdate() {
   # cannot reach the read below unset. Under `set -u` that is an "unbound
   # variable" abort, which exits 1 and takes the LOUD path -- safe, but the
   # operator gets a shell error where a verdict should be.
-  local attempt rc=1 env_cause="" attempt_cause="" saw_unexplained=0
+  local attempt rc=1 env_cause="" attempt_cause="" saw_unexplained=0 github_attempts=0
   for attempt in $(seq 1 "$CANARY_ATTEMPTS"); do
     log "--- attempt $attempt/$CANARY_ATTEMPTS ---"
     rm -rf "${work:?}/home" "${work:?}/cfg" "${work:?}/data" \
@@ -1310,7 +1314,7 @@ cmd_selfupdate() {
     if [ "$rc" -eq 2 ]; then
       case "$attempt_cause" in
         '')     saw_unexplained=1 ;;
-        github) env_cause=github ;;
+        github) env_cause=github; github_attempts=$((github_attempts + 1)) ;;
         ports)  [ "$env_cause" = "github" ] || env_cause=ports ;;
         *)      # An unrecognised cause is not quiet-eligible; treat it as
                 # unexplained rather than letting it fall through unrecorded.
@@ -1334,8 +1338,9 @@ cmd_selfupdate() {
     # in whether we can say why, and therefore in how loudly to say it -- never
     # in whether the job is red.
     #
-    # The latch is applied HERE rather than inside the loop so the loop stays a
-    # plain record of what each attempt saw.
+    # The latch is READ here. It is SET inside the loop, by the precedence fold
+    # (an earlier version of this said the loop "stays a plain record of what
+    # each attempt saw", which stopped being true when the fold moved in).
     if [ "$saw_unexplained" -eq 1 ]; then
       fail "UNVERIFIED: at least one attempt started the update check and never logged an outcome, so the canary could not determine whether v$prev_version reaches v$expected_version. This is NOT evidence that auto-update is broken, and NOT evidence that it works -- but it is also NOT environmental noise, whatever a later attempt ran into: the node did not report a failed GitHub fetch on the attempt that produced this. A hung updater looks exactly like it. Re-run the job."
       return 1
@@ -1359,7 +1364,7 @@ cmd_selfupdate() {
       # The node said it could not reach GitHub, on every attempt -- and this
       # runner reached the same endpoint moments later. Not a blip, so not
       # something to reassure anyone about.
-      fail "UNVERIFIED: v$prev_version reported it could not reach GitHub on all $CANARY_ATTEMPTS attempts, but THIS RUNNER reached the same endpoint immediately afterwards. So the network is not simply down: the published binary consistently cannot do something this runner can. That may still not be an auto-update fault -- a poll-budget cooldown persisted under the node's HOME is the obvious candidate (#5102) -- but it is not environmental noise, and v$expected_version is NOT verified as reachable. Read the node output above before re-running."
+      fail "UNVERIFIED: v$prev_version reported it could not reach GitHub on $github_attempts of $CANARY_ATTEMPTS attempt(s), but THIS RUNNER reached the same endpoint immediately afterwards. So the network is not simply down: the published binary consistently cannot do something this runner can. That may still not be an auto-update fault -- a poll-budget cooldown persisted under the node's HOME is the obvious candidate (#5102) -- but it is not environmental noise, and v$expected_version is NOT verified as reachable. Read the node output above before re-running."
       return 1
     fi
     # Unreachable today: every rc=2 either records a cause or sets

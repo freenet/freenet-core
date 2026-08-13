@@ -439,7 +439,7 @@ jobs:
             # The alternation was widened three times, each time stopping at the
             # file in front of whoever was editing. It is now derived from an
             # ENUMERATION of every `*_test.sh` in the repo rather than from the
-            # file at hand: `check` (7 files), `ok`/`bad` (lifecycle), `pass`
+            # file at hand: `check` (6 files), `ok`/`bad` (lifecycle), `pass`
             # (3 files), `expect`
             # (rule_lint_shell_assertion_counter_test.sh), `echo "ok   - "`
             # (all sites use that exact separator, so anchoring on it costs
@@ -465,30 +465,46 @@ jobs:
             # `norm_case`, `timeout_guard_case`, `pin_marker`,
             # `pin_warn_literal`, `check_vs_expected`, `check_call_count`,
             # `check_fallback`, `test_restores_persisted_value`. Measured
-            # across all 12 `*_test.sh` files: 378 assertion call sites, of
-            # which the original form saw 286 and missed 92, of which 53 are in
-            # `auto-update-canary_test.sh` alone, whose parameterised cases are
-            # written almost entirely in that style. The patterns added below
-            # (a `check_`/`pin_`/`assert_`/`expect_`/`test_` prefix, a `_case`
-            # suffix, and bare `expect`) take it to 378 of 378 with zero false
-            # positives, checked line by line against a hand-enumerated ground
-            # truth. Definitions do not match either pattern (`foo() {` has no
+            # every `*_test.sh` in the repo at the time: the original form saw
+            # roughly three quarters of the assertion call sites and missed the
+            # rest, almost all of them in `auto-update-canary_test.sh`, whose
+            # parameterised cases are written almost entirely in that style. The
+            # patterns added below (a `check_`/`pin_`/`assert_`/`expect_`/`test_`
+            # prefix, a `_case` suffix, and bare `expect`) closed the gap with no
+            # false positives.
+            #
+            # NO EXACT FIGURES HERE ON PURPOSE. Three counts in this comment went
+            # stale inside this very PR, because every commit that adds an
+            # assertion moves them, and a number in a justification is the kind
+            # of sentence that tells the next reader to stop checking.
+            # `rule_lint_shell_assertion_counter_test.sh` RECOMPUTES the property
+            # that actually matters -- that no `*_test.sh` is invisible to this
+            # counter -- on every CI run, and fails naming the files. Definitions do not match either pattern (`foo() {` has no
             # whitespace where the name ends), so declaring a helper still
             # scores nothing, which is right.
             #
-            # KNOWN FALSE NEGATIVES, left in rather than chased. Both are real
-            # in this repo today; the `printf`-style reporting this comment used
-            # to cite as the first one is NOT: `grep -rnE "printf .*['\"](ok|PASS)"
-            # over scripts/ returns nothing, so it was a hazard nobody had ever
-            # written, and it has been dropped in favour of the two that exist:
-            #   1. An assertion whose only added line is its FAIL branch.
+            # KNOWN FALSE NEGATIVES, left in rather than chased. All three are
+            # real in this repo today:
+            #   1. `printf`-style success reporting. An earlier version of this
+            #      comment DELETED this entry, on the stated ground that
+            #      `grep -rnE "printf .*['\"](ok|PASS)"` over scripts/ returned
+            #      nothing. It returns two:
+            #      `scripts/test-install-sh.sh` and `scripts/test-uninstall-sh.sh`,
+            #      both `pass() { printf 'PASS  %s\\n' "$1"; }`. They escape this
+            #      counter only because the diff above is scoped to
+            #      `**/*_test.sh` and those are named `test-*.sh` -- a naming
+            #      accident, not the absence of the convention. The moment
+            #      someone writes that reporter in a `*_test.sh`, it scores zero.
+            #      `rule_lint_shell_assertion_counter_test.sh` now RECOMPUTES
+            #      this rather than trusting the sentence.
+            #   2. An assertion whose only added line is its FAIL branch.
             #      Deliberate: counting FAIL would let a PR score by adding an
             #      error message alone.
-            #   2. A new entry in a TABLE an existing assertion loops over.
+            #   3. A new entry in a TABLE an existing assertion loops over.
             #      `SIGPIPE_SCRIPTS=(...)` in auto-update-canary_test.sh is the
             #      live instance. Adding a file there genuinely extends what is
             #      audited, and the added line is a bare string.
-            # The error text below tells the contributor both.
+            # The error text below tells the contributor all three.
             NEW_SHELL_TESTS=$(git diff "$BASE"..."$HEAD" -- '**/*_test.sh' \
               | grep -E '^\+' | grep -vF '+++' \
               | grep -cE '^\+[[:space:]]*(check|ok|pass|expect)[[:space:]]|^\+[[:space:]]*echo[[:space:]]+["'"'"'](ok[[:space:]]+-|PASS[[:space:]])|^\+[[:space:]]*(check|pin|assert|expect|test)_[a-z0-9_]*([[:space:]]|$)|^\+[[:space:]]*[a-z_][a-z0-9_]*_case[[:space:]]' || true)

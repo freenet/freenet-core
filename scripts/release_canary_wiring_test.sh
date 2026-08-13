@@ -406,8 +406,14 @@ else
     # subject can be satisfied by the thing it is distinguishing from is not a
     # pin, which is the whole subject of #5303.
     #
-    # Steps are split on their leading `- name:` / `- uses:` key and identified
-    # by text from their own message, so neither depends on step ORDER.
+    # Steps are split on their leading `- name:` / `- uses:` key, so nothing
+    # here depends on step ORDER. How each one is then IDENTIFIED is stated at
+    # the two `step_containing` calls below, and deliberately not restated
+    # here: an earlier version of this comment said "identified by text from
+    # their own message", which the very next commit made false, leaving two
+    # comments fifteen lines apart contradicting each other. A reviewer reading
+    # top-down would have recognised the anti-pattern and reported a defect
+    # already fixed.
     notify_steps="$(printf '%s\n' "$notify_block" | awk '
         /^      - (name|uses):/ { n++ }
         { print n "\t" $0 }
