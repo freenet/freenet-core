@@ -2894,7 +2894,7 @@ fn classify_summary_digest(
 /// every peer does today, so the cost of guessing wrong is bandwidth, never
 /// convergence.
 ///
-/// # Only the MULTI-ENTRY reply legs use this (#4965 review §2)
+/// # Only the REPLY legs use this (#4965 review §2)
 ///
 /// `ChangeInterestsReply` routes through here. `InterestsReply` no longer
 /// does: #5155 needs the form BEFORE it builds entries, so that it can bound
@@ -2903,8 +2903,20 @@ fn classify_summary_digest(
 /// twice. The encoding decision is identical; only the point at which it is
 /// taken moved.
 ///
-/// The two single-entry legs — `Notification` and `Rejection` — call
-/// [`full_summaries_message`] directly and ship full bytes this release.
+/// The heading said "MULTI-ENTRY reply legs" until 2026-08-12; corrected per
+/// #5153 review F1, because **`ChangeInterestsReply` is single-entry** (one
+/// contract per `broadcast_change_interests` gossip; measured mean 1.000
+/// entries/msg, `max_entries` 1, over 418,476 messages on 1,284 peers). Only
+/// `InterestsReply` is genuinely multi-entry. The distinction is load-bearing
+/// for the R4b agreement-rate instrument, which cannot read the emitter tag and
+/// so uses message length as its proxy: `ChangeInterestsReply` is that proxy's
+/// largest contaminant, and calling it multi-entry is what made the proxy look
+/// clean. See `network_bridge::outbound_message_mix`.
+///
+/// `Notification` and `Rejection` are also single-entry, but call
+/// [`full_summaries_message`] directly and ship full bytes this release — which
+/// is why a single-entry observation on the DIGEST leg cannot be a notification
+/// today.
 ///
 /// The reason is evidential, not technical: the 98.1% agreement rate that
 /// justifies hash-first was measured on a heartbeat-dominated population, and
@@ -3501,6 +3513,21 @@ async fn handle_interest_sync_message(
                 // never both in one message, and sharing one set would let the
                 // first kind silence the second.
                 let mut one_sided_counted: HashSet<ContractInstanceId> = HashSet::new();
+                // R4b instrument (#5153). THIS is the arm that reads `p`
+                // BACKWARD: a proactive summary notification lands here today as
+                // a single-entry FULL-BYTES `Summaries`, and the loop below
+                // already performs exactly the comparison a 21-byte digest would
+                // have made. So classifying by message shape measures the
+                // notification leg's agreement rate on real production traffic
+                // before R4b ships anything — no wire change, no new variant, no
+                // version gate. See `OutboundMix::record_summary_comparison` for
+                // why shape is the only available discriminator (the emitter tag
+                // is `#[serde(skip)]`) and for the measured contamination.
+                //
+                // Computed BEFORE the loop consumes `entries`, on the length of
+                // the message the peer actually sent. Same expression as the
+                // `SummaryDigests` arm's, so the two legs stay comparable.
+                let single_entry = entries.len() == 1;
                 for entry in entries {
                     for contract in op_manager.interest_manager.lookup_by_hash(entry.hash) {
                         if !op_manager.interest_manager.has_local_interest(&contract) {
@@ -3569,6 +3596,8 @@ async fn handle_interest_sync_message(
                                     contract.id(),
                                     ours.as_ref(),
                                     theirs.as_ref(),
+                                    crate::node::network_bridge::outbound_message_mix::
+                                        SummaryObservation::full_bytes(single_entry),
                                     &mut compared_contracts,
                                 );
                                 let delta_verdict = if identical {
@@ -3648,6 +3677,8 @@ async fn handle_interest_sync_message(
                             (None, Some(_)) => {
                                 op_manager.outbound_mix.record_summary_one_sided(
                                     contract.id(),
+                                    crate::node::network_bridge::outbound_message_mix::
+                                        SummaryObservation::full_bytes(single_entry),
                                     &mut one_sided_counted,
                                 );
                                 false
@@ -3821,16 +3852,34 @@ async fn handle_interest_sync_message(
                     let start = crate::config::GlobalRng::random_range(0..entries.len());
                     entries.rotate_left(start);
                 }
-                // #4965 agreement-rate proxy: single-entry messages come
-                // from the state-change-driven send sites (proactive
-                // notification, rejection summary-back) by construction, while
-                // the heartbeat / interest-churn replies are multi-entry. The
-                // emitter tag is non-wire so the receiver cannot read it; this
-                // is the closest available discriminator. Reads `entries.len()`
-                // — the length of the message the peer actually SENT. The
-                // rotation above reorders but never shortens, and the cap
-                // applies to the processing window rather than to this count,
-                // so a capped message is still classified by its true size.
+                // #4965 agreement-rate proxy: the state-change-driven send
+                // sites (proactive notification, rejection summary-back) are
+                // single-entry by construction, and only `InterestsReply` (the
+                // ~5-min heartbeat) is genuinely multi-entry. The emitter tag
+                // is non-wire so the receiver cannot read it; this is the
+                // closest available discriminator.
+                //
+                // It is a CONTAMINATED discriminator, and on THIS arm — the
+                // digest leg — the contamination is the whole population.
+                // `ChangeInterestsReply` is single-entry 100% of the time
+                // (measured mean exactly 1.000, `max_entries` 1, over 418,476
+                // messages on 1,284 peers; corroborated in two further
+                // windows), because `broadcast_change_interests` gossips one
+                // contract per message. It is ALSO version-gated to digests and
+                // the fleet is past the floor, so 95-99% of its sends arrive
+                // here. Meanwhile a notification ships full bytes
+                // unconditionally (`send_proactive_summary_notification`), so a
+                // single-entry observation on the digest leg is churn-leg BY
+                // CONSTRUCTION and is not the R4b population at all — which is
+                // why `SummaryObservation::digest` keeps it in separate buckets
+                // rather than folding it into `*_single`. Do not read this flag
+                // here as "this was a notification"; it is not, today.
+                //
+                // Reads `entries.len()` — the length of the message the peer
+                // actually SENT. The rotation above reorders but never shortens,
+                // and the cap applies to the processing window rather than to
+                // this count, so a capped message is still classified by its
+                // true size.
                 let single_entry = entries.len() == 1;
                 // Dedup on the (hash, digest) PAIR, not on the hash alone.
                 //
@@ -3895,8 +3944,14 @@ async fn handle_interest_sync_message(
                 > = std::collections::HashMap::new();
                 let mut cached_for_hash: Option<u32> = None;
                 let mut compared_contracts: HashSet<ContractInstanceId> = HashSet::new();
-                // See the sibling set in the `Summaries` arm.
-                let mut one_sided_counted: HashSet<ContractInstanceId> = HashSet::new();
+                // No `one_sided_counted` set here, unlike the `Summaries` arm:
+                // this arm no longer records one-sided observations at all
+                // (#5153 review F2 — it double-counted against the full-bytes
+                // reply that follows). Its absence is a nudge, NOT a guard: a
+                // re-added recording could pass `&mut HashSet::new()` as a
+                // temporary and compile fine. The actual guard is the test
+                // `digest_arm_records_no_one_sided_observation`, which fails if
+                // this arm regains a one-sided call.
                 // WIRE-ORDER INDEPENDENCE — the invariant this grouping exists
                 // to establish.
                 //
@@ -4016,6 +4071,15 @@ async fn handle_interest_sync_message(
                                     contract.id(),
                                     ours.as_ref(),
                                     ours.as_ref(),
+                                    // DIGEST leg, deliberately a separate bucket
+                                    // from the full-bytes one: a notification
+                                    // ships full bytes unconditionally today, so
+                                    // a single-entry observation arriving here is
+                                    // churn-leg by construction and is NOT part
+                                    // of the population R4b's `p` is about
+                                    // (#5153 review F1).
+                                    crate::node::network_bridge::outbound_message_mix::
+                                        SummaryObservation::digest(single_entry),
                                     &mut compared_contracts,
                                 );
                                 crate::config::GlobalTestMetrics::record_summary_digest_agreement(
@@ -4084,19 +4148,68 @@ async fn handle_interest_sync_message(
                                 crate::config::GlobalTestMetrics::record_summary_digest_mismatch(
                                     single_entry,
                                 );
-                                // #4965 review S2: separate "we hold nothing,
-                                // they do" from a genuine digest disagreement.
-                                // Only the former sat outside the 98.1%
-                                // denominator, and it is the one costing +2
-                                // messages for bytes the full-bytes path
-                                // shipped immediately (and used to seed our
-                                // peer-summary cache).
-                                if our_summary.is_none() {
-                                    op_manager.outbound_mix.record_summary_one_sided(
-                                        contract.id(),
-                                        &mut one_sided_counted,
-                                    );
-                                }
+                                // R4b instrument (#5153): a genuine digest
+                                // disagreement deliberately does NOT record a
+                                // `summary_entries_differing` here, on either the
+                                // total or the single-entry bucket. It defers to
+                                // the full-bytes `Summaries` reply that the
+                                // `SummaryRequest` below provokes, which observes
+                                // it in the other arm — recording here as well
+                                // would count one divergence twice and inflate
+                                // exactly the denominator `p` is computed
+                                // against. Continuity across R4b is preserved
+                                // rather than lost: the reply carries one entry
+                                // per requested hash, so a single-entry digest
+                                // mismatch produces a single-entry reply and
+                                // classifies the same way on arrival.
+                                //
+                                // ACCEPTED BIAS: if the `SummaryRequest` or its
+                                // reply is DROPPED, this divergence is never
+                                // recorded anywhere, so it pushes `p` UP by the
+                                // loss rate on one round trip. Double-counting
+                                // would be plain wrong arithmetic, so the
+                                // deferral stays.
+                                //
+                                // This is NOT the only bias and `p` is NOT a
+                                // ceiling — an earlier revision of this comment
+                                // said it was. The contamination term runs the
+                                // other way and is larger: a single-entry
+                                // `SummaryRequestReply` is differing by
+                                // construction, so it inflates the denominator.
+                                // See `OutboundMix::record_summary_comparison`
+                                // and `notification_share_bounds` for both terms
+                                // and why `p` must be quoted as an interval.
+                                //
+                                // Also not shape-preserving under hash collision:
+                                // if two locally-known contracts share one 32-bit
+                                // FNV-1a hash, the reply carries TWO entries and
+                                // classifies as `MultiEntry`, so the deferred
+                                // observation reaches no single-entry bucket at
+                                // all. Rare, and it removes rather than
+                                // fabricates, but it is a third small downward
+                                // path on the single-entry counters.
+                                // #5153 review F2 — the one-sided recording that
+                                // used to live here is REMOVED, not moved.
+                                //
+                                // It fired when `our_summary.is_none()` and then
+                                // set `needs_bytes`, so the bytes were requested
+                                // and the full-bytes `Summaries` arm observed the
+                                // SAME contract again on its `(None, Some(_))`
+                                // branch. Two different messages with two
+                                // different per-message dedup sets, so nothing
+                                // suppressed the repeat: one divergence, counted
+                                // twice. That directly contradicted the
+                                // no-double-count property this arm's `differing`
+                                // deferral is built on, and it inflated
+                                // `summary_entries_one_sided_single`, which is
+                                // presented as an R4b cost input.
+                                //
+                                // The full-bytes arm still records it, so nothing
+                                // is lost: `our_summary` is None there too, so
+                                // the reply takes `(None, Some(_))` and counts
+                                // exactly once. One-sided now defers exactly as
+                                // `differing` already did — consistently, rather
+                                // than one of the two.
                                 needs_bytes = true;
                             }
                         }
@@ -4331,11 +4444,20 @@ async fn handle_interest_sync_message(
             if entries.is_empty() {
                 None
             } else {
-                // #5052: also multi-entry and also built by
-                // `summary_if_hosted_or_in_use`, but driven by interest CHURN
-                // rather than the heartbeat clock — a peer joining or dropping
-                // interest, not a periodic tick. Same bytes, a different thing
-                // to fix if it is the large one.
+                // #5052: also built by `summary_if_hosted_or_in_use`, but driven
+                // by interest CHURN rather than the heartbeat clock — a peer
+                // joining or dropping interest, not a periodic tick. A different
+                // thing to fix if it is the large one.
+                //
+                // SINGLE-entry, unlike the `InterestsReply` above — corrected
+                // 2026-08-12 (#5153 review F1), where this said "also
+                // multi-entry". `broadcast_change_interests` gossips one contract
+                // per message, so the `entries` built above carries exactly one:
+                // measured mean 1.000, `max_entries` 1, over 418,476 messages on
+                // 1,284 peers. Load-bearing rather than trivia — the R4b
+                // agreement-rate instrument cannot read the emitter tag and uses
+                // message LENGTH as its proxy for "this was a notification", so
+                // this arm is that proxy's largest contaminant.
                 Some(summaries_reply_for_peer(
                     op_manager,
                     source,
@@ -11068,6 +11190,432 @@ mod tests {
                  identical/differing comparison, or the telemetry that \
                  justifies this change stops being able to measure it"
             );
+        }
+
+        /// The R4b agreement-rate instrument (#5153), driven through the REAL
+        /// receive arm.
+        ///
+        /// R4b would swap the proactive summary notification's full summary
+        /// bytes for a 21-byte digest, and that trade wins or loses entirely on
+        /// `p`, the agreement rate ON THAT LEG. The fleet-wide rate cannot
+        /// answer it: comparisons are per ENTRY, and a notification carries
+        /// 1.000 entries/message against the heartbeat's 222.97, so a 99.73%
+        /// aggregate is essentially the heartbeat's population.
+        ///
+        /// The measurement is possible today only because a notification
+        /// already arrives here as a single-entry FULL-BYTES `Summaries` and
+        /// this arm already performs the comparison a digest would have made.
+        /// These tests live at the handler level rather than on `OutboundMix`
+        /// because a unit test on the counter cannot tell a live discriminator
+        /// from a constant: only driving the real arm can, and what it asserts
+        /// on is the rollup body production telemetry would actually ship.
+        mod r4b_single_entry_instrument {
+            use super::*;
+
+            /// Feed one full-bytes `Summaries` message and return the rollup
+            /// body the node would emit for the window.
+            async fn report(
+                h: &Harness,
+                peer: SocketAddr,
+                entries: Vec<SummaryEntry>,
+            ) -> serde_json::Value {
+                handle_interest_sync_message(
+                    &h.op_manager,
+                    peer,
+                    InterestMessage::Summaries {
+                        emitter: crate::message::SummariesEmitter::Other,
+                        entries,
+                    },
+                )
+                .await;
+                h.op_manager.outbound_mix.rollup_body_for_test()
+            }
+
+            fn count(body: &serde_json::Value, key: &str) -> u64 {
+                body.get(key)
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or_else(|| panic!("rollup body must carry `{key}`"))
+            }
+
+            /// A summary entry for `key` carrying `summary`.
+            fn entry_for(key: &ContractKey, summary: &[u8]) -> SummaryEntry {
+                SummaryEntry {
+                    hash: contract_hash(key),
+                    summary_bytes: Some(summary.to_vec()),
+                }
+            }
+
+            /// A SINGLE-entry message's comparison lands in both the total and
+            /// the single-entry bucket; a MULTI-entry one lands in the total
+            /// only.
+            ///
+            /// The two halves are the whole instrument. Only the second can
+            /// fail if the discriminator is replaced by a constant `true`, and
+            /// only the first if it is replaced by `false` — the realistic
+            /// mutations, since either is one token. Asserting the multi-entry
+            /// message adds EXACTLY nothing to the single bucket (rather than
+            /// merely less) is what stops that bucket from quietly measuring
+            /// something other than message shape.
+            #[tokio::test]
+            async fn message_shape_decides_which_bucket_an_agreement_lands_in() {
+                let ours = vec![4u8; 64];
+                let h = build_harness("r4b-shape", 17300, ours.clone()).await;
+                // A second locally-hosted, summarizable contract, so the
+                // multi-entry message is genuinely multi-CONTRACT rather than a
+                // repeat the per-message dedup would collapse.
+                let second = host_many(&h, 1);
+                let hashes = distinct_hashes(&[h.key, second[0]]);
+                assert_eq!(hashes.len(), 2, "premise: two distinct advertised hashes");
+
+                // SINGLE entry, agreeing.
+                let body = report(&h, h.new_peer, vec![entry_for(&h.key, &ours)]).await;
+                assert_eq!(
+                    count(&body, "summary_entries_identical"),
+                    1,
+                    "premise: the fixture must produce a real two-sided \
+                     agreement, or neither bucket is under test"
+                );
+                assert_eq!(
+                    count(&body, "summary_entries_identical_single"),
+                    1,
+                    "a single-entry `Summaries` IS the notification leg's shape \
+                     — its agreement must reach the single-entry bucket, or \
+                     `p` reads as zero and R4b looks unbuildable"
+                );
+
+                // MULTI entry, both agreeing. Counters are cumulative over the
+                // window, so the deltas are what matter.
+                let body = report(
+                    &h,
+                    h.new_peer,
+                    vec![entry_for(&h.key, &ours), entry_for(&second[0], &ours)],
+                )
+                .await;
+                assert_eq!(
+                    count(&body, "summary_entries_identical"),
+                    3,
+                    "premise: both entries of the multi-entry message must \
+                     resolve to a locally-interested, summarizable contract, \
+                     or the multi-entry case is not actually exercised"
+                );
+                assert_eq!(
+                    count(&body, "summary_entries_identical_single"),
+                    1,
+                    "a MULTI-entry message is heartbeat-shaped and must add \
+                     nothing to the single-entry bucket — a bucket that grows \
+                     here is counting comparisons, not message shape, and `p` \
+                     silently becomes the fleet-wide rate the instrument \
+                     exists because it cannot use"
+                );
+            }
+
+            /// The same split applies to DISAGREEMENT, which is `p`'s
+            /// denominator.
+            ///
+            /// Without it a low single-entry agreement COUNT and a low
+            /// single-entry comparison VOLUME are indistinguishable — the ratio
+            /// would have a numerator and no denominator.
+            #[tokio::test]
+            async fn message_shape_decides_which_bucket_a_disagreement_lands_in() {
+                let ours = vec![4u8; 64];
+                let theirs = vec![9u8; 64];
+                let h = build_harness("r4b-shape-diff", 17310, ours.clone()).await;
+                let second = host_many(&h, 1);
+
+                let body = report(&h, h.new_peer, vec![entry_for(&h.key, &theirs)]).await;
+                assert_eq!(count(&body, "summary_entries_differing"), 1);
+                assert_eq!(
+                    count(&body, "summary_entries_differing_single"),
+                    1,
+                    "the notification leg's disagreements are `p`'s denominator"
+                );
+
+                let body = report(
+                    &h,
+                    h.new_peer,
+                    vec![entry_for(&h.key, &theirs), entry_for(&second[0], &theirs)],
+                )
+                .await;
+                assert_eq!(count(&body, "summary_entries_differing"), 3);
+                assert_eq!(
+                    count(&body, "summary_entries_differing_single"),
+                    1,
+                    "a multi-entry message must add nothing to the \
+                     single-entry denominator"
+                );
+
+                // The per-contract attribution carries the subset too, which is
+                // what separates "a few non-converging contracts" (structural
+                // `p` = 0) from "the leg disagrees in general".
+                let listed = body
+                    .get("summary_differing_contracts")
+                    .and_then(|v| v.as_array())
+                    .expect("summary_differing_contracts must be an array");
+                let mine = listed
+                    .iter()
+                    .find(|e| {
+                        e.get("contract").and_then(|v| v.as_str())
+                            == Some(h.key.id().to_string().as_str())
+                    })
+                    .expect("the diverging contract must be named");
+                assert_eq!(mine.get("count").and_then(|v| v.as_u64()), Some(2));
+                assert_eq!(
+                    mine.get("single_count").and_then(|v| v.as_u64()),
+                    Some(1),
+                    "per-contract attribution must carry the notification-leg \
+                     subset, not just the total"
+                );
+            }
+
+            /// Every `OutboundMix` summary-observation call in this file passes
+            /// the message-shape discriminator, and there are exactly as many
+            /// such call sites as this pin knows about.
+            ///
+            /// The behavioural tests above cover the two-sided sites. They
+            /// cannot reach the ONE-SIDED sites, which need a contract this node
+            /// is interested in but cannot summarize — so a future edit could
+            /// hard-code `false` there and stay green. This pin closes that gap,
+            /// and fails on a NEW call site too, which is the case that would
+            /// otherwise silently under-count.
+            ///
+            /// Two scoping rules make it non-vacuous, and both were needed:
+            ///
+            /// * Comments are stripped (`code_only`) — the prose around these
+            ///   call sites names `single_entry` repeatedly, so a
+            ///   comment-inclusive scan would pass with the argument deleted.
+            /// * The scan stops at the test module — otherwise the needles below
+            ///   match THEMSELVES (string literals survive `code_only`), which
+            ///   is how a self-matching pin comes to count its own text as
+            ///   evidence. Confirmed by observation: the unscoped version found
+            ///   6 sites, not 4.
+            #[test]
+            fn every_summary_observation_passes_the_message_shape() {
+                const TEST_MOD: &str = "\n#[cfg(test)]\nmod tests {";
+                let whole = include_str!("node.rs");
+                let production_end = whole
+                    .find(TEST_MOD)
+                    .expect("the test module anchor must still exist — update this pin");
+                let src = code_only(&whole[..production_end]);
+                let sites: Vec<usize> = [
+                    "outbound_mix.record_summary_comparison(",
+                    "outbound_mix.record_summary_one_sided(",
+                ]
+                .iter()
+                .flat_map(|needle| {
+                    src.match_indices(needle)
+                        .map(|(i, m)| i + m.len())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+                // THREE, not four: the `Summaries` arm's two (comparison +
+                // one-sided) and the `SummaryDigests` arm's one (comparison
+                // only). The digest arm's one-sided recording was REMOVED as a
+                // double count (#5153 review F2), and this count is what will
+                // notice if it comes back — it did notice when the fix landed.
+                assert_eq!(
+                    sites.len(),
+                    3,
+                    "expected 3 summary-observation call sites (two on the \
+                     full-bytes `Summaries` arm, one on `SummaryDigests`); found \
+                     {}. A NEW site must pass the message-shape discriminator \
+                     too, and a new one-sided recording on the digest arm is the \
+                     #5153 F2 double count returning",
+                    sites.len()
+                );
+                let mut full_bytes_legs = 0;
+                let mut digest_legs = 0;
+                for start in sites {
+                    // Bound the window at the call's closing `);` so a match
+                    // cannot come from the NEXT call site's arguments.
+                    let end = src[start..]
+                        .find(");")
+                        .map(|off| start + off)
+                        .expect("a call site must have a closing `);`");
+                    let args = &src[start..end];
+                    assert!(
+                        args.contains("single_entry"),
+                        "a summary-observation call site does not pass the \
+                         message-shape discriminator; its args were: {args}"
+                    );
+                    // The LEG matters as much as the shape: a digest-leg
+                    // observation labelled full-bytes silently merges churn
+                    // traffic into the R4b population (#5153 review F1), and
+                    // both spellings contain `single_entry`, so the assertion
+                    // above cannot tell them apart.
+                    if args.contains("SummaryObservation::full_bytes(") {
+                        full_bytes_legs += 1;
+                    } else if args.contains("SummaryObservation::digest(") {
+                        digest_legs += 1;
+                    } else {
+                        panic!(
+                            "a summary-observation call site names neither leg \
+                             constructor, so which population it lands in is \
+                             unpinned; its args were: {args}"
+                        );
+                    }
+                }
+                assert_eq!(
+                    (full_bytes_legs, digest_legs),
+                    (2, 1),
+                    "expected 2 full-bytes-leg sites and 1 digest-leg site; a \
+                     digest observation recorded as full-bytes would fold \
+                     churn-leg traffic into the notification population `p` is \
+                     computed over"
+                );
+            }
+
+            /// THE TWO PROPERTIES THIS WHOLE INSTRUMENT RESTS ON (#5153 review F4).
+            ///
+            /// `p` is read off single-entry FULL-BYTES `Summaries`, and that is a
+            /// proxy for "this is a notification" only while both of these hold:
+            ///
+            /// 1. A notification ships **full bytes unconditionally** — it must
+            ///    not consult the hash-first version gate. If it did, the
+            ///    pre-R4b full-bytes buckets would silently go quiet AND the
+            ///    claim "a digest single is provably not a notification" would
+            ///    INVERT, with every test still green.
+            /// 2. A notification is **single-entry** — one contract per send. If
+            ///    notifications were ever batched (plausible: coalescing work is
+            ///    already in this tree), they would leave the single-entry
+            ///    population entirely and `p` would silently become the
+            ///    agreement rate of whatever failed to batch.
+            ///
+            /// Both are true today, verified from code and field: the emitter
+            /// calls `full_summaries_message(vec![...], Notification)` with no
+            /// reference to the gate, and the field shows mean 41,642 B/msg with
+            /// entries exactly equal to msgs and **no rollup anywhere reporting
+            /// `max_entries > 1`**. So multi-entry false negatives are impossible
+            /// today rather than merely unobserved.
+            ///
+            /// Neither was pinned. This mirrors
+            /// `summary_request_reply_is_always_full_bytes`, which pins exactly
+            /// this shape for the request-reply arm — and note that
+            /// `no_uninstrumented_full_summaries_construction` does NOT cover it:
+            /// that forces `Summaries` through the instrumented constructor but
+            /// says nothing about a site switching to the digest gate.
+            #[test]
+            fn notification_leg_is_always_full_bytes_and_single_entry() {
+                let src = include_str!("operations/update.rs");
+                let f = src
+                    .find("pub(crate) async fn send_proactive_summary_notification(")
+                    .expect("notification emitter not found — update this pin");
+                // Bound at the next top-level `pub(crate)` item so a sibling's
+                // gate usage cannot satisfy or trip the assertions below.
+                let end = src[f..]
+                    .find("\npub(crate) ")
+                    .map(|off| f + off)
+                    .unwrap_or(src.len());
+                let body = code_only(&src[f..end]);
+
+                assert!(
+                    body.contains("full_summaries_message("),
+                    "the notification leg must build its message through \
+                     full_summaries_message — the instrumented FULL-BYTES \
+                     constructor. Window extraction may also be off; check that \
+                     first."
+                );
+                assert!(
+                    body.contains("SummariesEmitter::Notification"),
+                    "window extraction is off — the notification emitter body \
+                     should tag its own emitter"
+                );
+                // Property 1. Every entry point to the encoding CHOICE, matching
+                // the sibling pin: #5155 split `summaries_reply_for_peer` into
+                // two names, neither a substring of the old one.
+                for banned in [
+                    "summaries_reply_for_peer",
+                    "summary_reply_form",
+                    "summaries_reply_in_form",
+                ] {
+                    assert!(
+                        !body.contains(banned),
+                        "the notification leg now consults `{banned}`, i.e. the \
+                         hash-first version gate. That moves notifications onto \
+                         the digest leg, so the R4b full-bytes single-entry \
+                         buckets go quiet AND `SummaryObservation::SingleEntryDigest`'s \
+                         'not a notification' premise inverts — silently, with \
+                         every other test green (#5153 review F4)"
+                    );
+                }
+                // Property 2. One contract per send. `vec![` with a single
+                // element is the shape; a batched send would collect or extend.
+                assert!(
+                    body.contains("vec![full_entry.clone()]"),
+                    "the notification leg no longer sends exactly one entry. If \
+                     notifications are now batched they leave the single-entry \
+                     population, and `p` becomes the agreement rate of whatever \
+                     failed to batch (#5153 review F4). Re-derive the proxy \
+                     before changing this."
+                );
+            }
+
+            /// The `SummaryDigests` arm must NOT record a one-sided observation
+            /// (#5153 review F2 — it double-counted).
+            ///
+            /// It used to: on a digest mismatch with no local summary it recorded
+            /// one-sided AND set `needs_bytes`, so the full-bytes reply observed
+            /// the same contract again on its `(None, Some(_))` branch. Two
+            /// messages, two per-message dedup sets, nothing suppressing the
+            /// repeat — one divergence counted twice, inflating a field that is
+            /// presented as an R4b cost input.
+            ///
+            /// Pinned at the source because the property is an ABSENCE, and the
+            /// behavioural fixture for it would need a contract this node is
+            /// interested in but cannot summarize. The complementary behavioural
+            /// half lives in `outbound_message_mix`:
+            /// `digest_leg_single_entry_observations_stay_out_of_the_full_bytes_bucket`
+            /// asserts a digest-leg observation reaches no single bucket even if
+            /// one did arrive.
+            ///
+            /// Scoped to production code and comment-stripped for the same two
+            /// reasons as the pin above; the count assertion is what makes it
+            /// non-vacuous, since a needle that matched nothing at all would
+            /// otherwise look like a pass.
+            #[test]
+            fn digest_arm_records_no_one_sided_observation() {
+                const TEST_MOD: &str = "\n#[cfg(test)]\nmod tests {";
+                let whole = include_str!("node.rs");
+                let production_end = whole
+                    .find(TEST_MOD)
+                    .expect("the test module anchor must still exist — update this pin");
+                let src = code_only(&whole[..production_end]);
+
+                let digest_arm = src
+                    .find("InterestMessage::SummaryDigests { entries, .. } => {")
+                    .expect("SummaryDigests arm not found — update this pin");
+                let arm_end = src[digest_arm..]
+                    .find("InterestMessage::SummaryRequest { hashes } => {")
+                    .map(|off| digest_arm + off)
+                    .expect("end of SummaryDigests arm not found — update this pin");
+                let arm = &src[digest_arm..arm_end];
+
+                assert!(
+                    !arm.contains("record_summary_one_sided"),
+                    "the SummaryDigests arm records a one-sided observation \
+                     again. The full-bytes `Summaries` arm ALSO records it once \
+                     the requested bytes arrive, so this counts one divergence \
+                     twice and inflates summary_entries_one_sided(_single) \
+                     (#5153 review F2)"
+                );
+                // Non-vacuity: the arm must still be the arm, and must still
+                // contain the sibling observation the instrument depends on.
+                assert!(
+                    arm.contains("record_summary_comparison"),
+                    "window no longer covers the digest arm's observation site — \
+                     this pin would pass against unrelated text"
+                );
+                // And the full-bytes arm must still be the one that records it,
+                // or the deferral loses the observation entirely.
+                let full_bytes_arm = src
+                    .find("InterestMessage::Summaries { entries, .. } => {")
+                    .expect("Summaries arm not found — update this pin");
+                let full_bytes = &src[full_bytes_arm..digest_arm];
+                assert!(
+                    full_bytes.contains("record_summary_one_sided"),
+                    "nothing records one-sided any more: the digest arm defers to \
+                     the full-bytes arm, so the full-bytes arm must still count it"
+                );
+            }
         }
 
         /// End-to-end wiring for the SHADOW-MODE futile-repair detector

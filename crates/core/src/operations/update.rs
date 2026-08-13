@@ -1121,11 +1121,22 @@ pub(crate) async fn send_proactive_summary_notification(
     // is nothing per-peer to compute.
     //
     // This leg ships FULL BYTES this release. Hash-first (#4965) does NOT
-    // apply here: digest-first rides the two multi-entry reply legs
-    // (`InterestsReply` / `ChangeInterestsReply`) only, and the send site 40
-    // lines below carries the evidential reasoning for why this one was left
-    // out. There is no per-peer encoding choice on this path, and no version
-    // gate is consulted.
+    // apply here: digest-first rides the two REPLY legs (`InterestsReply` /
+    // `ChangeInterestsReply`) only, and the send site 40 lines below carries the
+    // evidential reasoning for why this one was left out. There is no per-peer
+    // encoding choice on this path, and no version gate is consulted.
+    //
+    // The reply legs are not both multi-entry — corrected 2026-08-12 (#5153
+    // review F1). Only `InterestsReply` (the ~5-min heartbeat) is;
+    // `ChangeInterestsReply` is single-entry 100% of the time (measured mean
+    // 1.000, `max_entries` 1, over 418,476 messages on 1,284 peers), because
+    // `broadcast_change_interests` gossips one contract per message. That
+    // matters here because it means message length does NOT separate this
+    // notification leg from the churn reply, which is the proxy the R4b
+    // agreement-rate instrument rests on. See the send site below, whose own
+    // multi-entry claim is tracked separately in #5306 — it is the stated
+    // justification for an already-shipped decision, so it is corrected there
+    // rather than silently here.
     //
     // Worth stating because the opposite is the intuitive guess: this is the
     // send site that fires on every state change to every interested peer, so
