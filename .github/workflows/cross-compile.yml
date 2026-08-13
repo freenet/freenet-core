@@ -806,12 +806,18 @@ jobs:
       # The job is still RED either way. This changes what is SAID, never
       # whether it is reported.
       - name: Notify (unverified for environmental reasons, not a fleet problem)
+        # `id:` so `release_canary_wiring_test.sh` can find this step by
+        # something structural. Locating it by a phrase from its own message was
+        # tried first and an ordinary reword of that message immediately broke
+        # the pin -- which is the same "expectation stored as a copy of the
+        # thing it guards" shape this PR is about, one level down.
+        id: notify-environmental
         if: >
           needs.attach-to-release.result == 'success' &&
           needs.auto-update-selfupdate-canary.outputs.classification == 'environmental'
         uses: ./.github/actions/river-dev-notify
         with:
-          message: "⚠️ ${{ github.ref_name }} published fine, but the auto-update self-update canary could NOT VERIFY it: the previous release's binary could not reach GitHub from the runner, so the run proves nothing about the updater in either direction. This is NOT a stranded fleet and needs no fleet action — re-run the job to get a verdict. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          message: "⚠️ ${{ github.ref_name }} published fine, but auto-update for it is **UNVERIFIED** — the self-update canary never reached a verdict. The previous release's binary could not reach GitHub, and neither could the runner, so the run is not evidence in either direction. Nothing suggests a stranded fleet and no fleet action is indicated, but this release has NOT been shown to be reachable by auto-update: re-run the job to actually verify it. If you are seeing this on consecutive releases, stop treating it as noise — the post-publish gate is not working and nothing has been verified since the last green run. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
           room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
           gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}
@@ -822,6 +828,7 @@ jobs:
       # never ran) lands HERE, in the loud one. A gate's unknown case belongs on
       # the side that gets read.
       - name: Notify (possible auto-update fault)
+        id: notify-fault
         if: >
           !(needs.attach-to-release.result == 'success' &&
           needs.auto-update-selfupdate-canary.outputs.classification == 'environmental')

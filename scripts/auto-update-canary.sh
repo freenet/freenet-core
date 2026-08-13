@@ -914,6 +914,67 @@ resolve_expected_latest() {
   normalise_release_tag "$tag"
 }
 
+# True when THIS RUNNER can reach the release endpoint the node uses.
+#
+# A named one-liner rather than the call inlined, so the decision below can be
+# unit-tested by overriding it. Same reason `prev_emits_latest_seen` exists.
+runner_can_reach_github() {
+  resolve_expected_latest >/dev/null 2>&1
+}
+
+# gate_b_unverified_class <env-cause> -- "environmental" or "fault", for a Gate
+# B run that produced no verdict. Echoes; never exits.
+#
+# WHY A DECISION AND NOT JUST A LOOKUP. The quiet Matrix message says the run
+# tells us nothing and needs no fleet action, so every input that reaches it is
+# a release NOT verified by the gate that exists to verify it. Trusting a single
+# WARN from the node to send us down that path is how a persistent problem
+# becomes a permanent silence: five releases in a row report "environmental",
+# nobody is alarmed, and we believe we have a post-publish gate when we have
+# verified nothing since v0.2.125.
+#
+# So the GitHub case demands corroboration from a second, independent observer
+# in the same run -- this runner's own fetch of the same endpoint. That splits
+# two situations a single WARN cannot:
+#
+#   node failed, runner ALSO cannot reach GitHub -> the network really is bad
+#       right now. Genuinely environmental, quiet, re-run.
+#   node failed on EVERY attempt, runner is fine -> the published binary
+#       consistently cannot do something this runner can, seconds apart. That is
+#       not a blip. It may still not be a fault (a poll-budget cooldown is the
+#       obvious candidate, #5102) but it is not something to reassure anyone
+#       about, so it takes the loud path.
+#
+# THE RESIDUAL WINDOW, stated rather than implied: a condition that persistently
+# breaks the node's fetch AND this runner's probe but NOT the release-asset
+# download would still be quiet every time. Both are github.com and Gate B
+# downloads the previous release's tarball moments earlier -- if that fails the
+# gate has already returned a loud failure -- so a sustained CI-wide outage
+# cannot reach the quiet path at all. What is left is narrow.
+#
+# The PORT case needs no probe: another process holding a port says nothing
+# about the network, and demanding a network probe for it would make a
+# collision on a healthy runner take the loud path for no reason.
+gate_b_unverified_class() {
+  case "$1" in
+    ports)
+      printf 'environmental'
+      ;;
+    github)
+      if runner_can_reach_github; then
+        printf 'fault'
+      else
+        printf 'environmental'
+      fi
+      ;;
+    *)
+      # Includes the empty cause: the check started and never logged an
+      # outcome, which is what a HUNG updater looks like. Never quiet.
+      printf 'fault'
+      ;;
+  esac
+}
+
 # ---------------------------------------------------------------------------
 # Gate A: preflight -- BLOCKS publication.
 #
@@ -1074,11 +1135,24 @@ cmd_selfupdate() {
   # ever asking GitHub. A retry that cannot produce a different answer is not a
   # retry.
   #
-  # Only rc=2 and the port collision loop. Everything else is deterministic:
-  # re-running a node that parsed the wrong version burns release time to
-  # reproduce a fact already established. And the loop can never run twice after
-  # a decision to update, because that path leaves the loop with rc=0.
-  local attempt rc environmental=0
+  # ONLY rc=2 (no verdict) and the port collision loop, and that boundary is the
+  # load-bearing part of this whole block rather than an optimisation.
+  #
+  # A retry over a REAL assertion failure is the disaster this canary exists to
+  # prevent, arriving by way of the canary. Each attempt wipes the tree and boots
+  # a fresh node, so a genuine detection fault that happens to be intermittent --
+  # a race, a timing-dependent parse, a node that reaches the update path only
+  # sometimes -- would eventually produce one passing attempt, and Gate B would
+  # report the release healthy. A flaky pass on the post-publish gate is strictly
+  # worse than no gate: it is a green light nobody re-examines.
+  #
+  # rc=1 therefore breaks IMMEDIATELY, and that is pinned behaviourally in
+  # `auto-update-canary_lifecycle_test.sh` by counting node boots, not by
+  # grepping for this comment.
+  #
+  # The loop also cannot run twice after a decision to update: that path leaves
+  # the loop with rc=0.
+  local attempt rc env_cause=""
   for attempt in $(seq 1 "$CANARY_ATTEMPTS"); do
     log "--- attempt $attempt/$CANARY_ATTEMPTS ---"
     rm -rf "${work:?}/home" "${work:?}/cfg" "${work:?}/data" \
@@ -1097,21 +1171,22 @@ cmd_selfupdate() {
     if [ "$NODE_EXIT" = "$EXIT_CODE_ALREADY_RUNNING" ]; then
       note "INDETERMINATE: the node exited $EXIT_CODE_ALREADY_RUNNING (another instance already holds ports $CANARY_NETWORK_PORT/$CANARY_WS_PORT). A port collision on this host -- another canary run, or a local node -- not an auto-update fault."
       rc=2
-      environmental=1
+      env_cause=ports
     else
       # The two-sided log assertion first: it LOCALISES the failure. If detection
       # is broken the version check below would also fail, but with a far less
       # useful message.
       assert_detection_healthy "$work/logs"
       rc=$?
-      # Which KIND of indeterminate. Only the node saying outright that it could
-      # not reach GitHub counts as environmental. "The check started and never
-      # logged an outcome" stays a real finding: a hung updater produces exactly
-      # that, and calling it environmental would be the quiet direction.
+      # Which KIND of indeterminate, recorded from the LAST attempt. Only the
+      # node saying outright that it could not reach GitHub is a candidate for
+      # the quiet path; "the check started and never logged an outcome" is not,
+      # because a hung updater produces exactly that. The candidacy is not the
+      # verdict -- see `gate_b_unverified_class`, which demands corroboration.
       if [ "$rc" -eq 2 ] && node_could_not_reach_github "$work/logs"; then
-        environmental=1
+        env_cause=github
       else
-        environmental=0
+        env_cause=""
       fi
     fi
 
@@ -1127,18 +1202,33 @@ cmd_selfupdate() {
   done
 
   if [ "$rc" -eq 2 ]; then
-    if [ "$environmental" -eq 1 ]; then
-      # The node told us why, and the reason is not the updater. Distinct exit
-      # code so `cross-compile.yml` can word the Matrix message accordingly:
-      # the alarm that says a node "may not be able to auto-update to this one"
-      # must not fire for a runner that could not open a socket. Still a
-      # non-zero exit and still a red job -- unverified is not verified.
-      fail "UNVERIFIED (ENVIRONMENTAL): v$prev_version could not reach GitHub from this runner in $CANARY_ATTEMPTS attempts, so the canary never got to test whether it reaches v$expected_version. This says NOTHING about auto-update, in either direction: the node's startup fetch has no retry, and a runner that cannot resolve or connect to github.com produces exactly this. Re-run the job. Do NOT read this as a stranded fleet."
+    # EVERY branch below is a release this gate did NOT verify. They differ only
+    # in whether we can say why, and therefore in how loudly to say it -- never
+    # in whether the job is red.
+    if [ "$(gate_b_unverified_class "$env_cause")" = "environmental" ]; then
+      # Distinct exit code so `cross-compile.yml` can word the Matrix message
+      # accordingly: the alarm that says a node "may not be able to auto-update
+      # to this one" must not fire for a runner that could not open a socket.
+      # Still non-zero, still a red job -- unverified is not verified.
+      case "$env_cause" in
+        ports)
+          fail "UNVERIFIED (ENVIRONMENTAL): every attempt hit a port collision on this host, so Gate B never got to test the updater. v$expected_version has NOT been verified as reachable by a node on v$prev_version -- this run says nothing either way. Another canary run or a local node is holding the ports. Re-run the job; if it recurs, something on this runner is holding them persistently and the gate is not working."
+          ;;
+        *)
+          fail "UNVERIFIED (ENVIRONMENTAL): v$prev_version could not reach GitHub in $CANARY_ATTEMPTS attempts, and this runner cannot reach it either, so the canary never got to test whether v$prev_version reaches v$expected_version. v$expected_version has NOT been verified as reachable by auto-update -- this run is not evidence in either direction. The node's startup fetch has no retry, so a bad network moment produces exactly this. Re-run the job. If Gate B reports this on consecutive releases, stop reading it as noise: the post-publish gate is not working and nothing has been verified since the last green run."
+          ;;
+      esac
       return "$EXIT_UNVERIFIED_ENVIRONMENTAL"
     fi
-    # Infrastructure, not a stranded fleet -- but the node never said WHY, so
-    # this keeps the ordinary failure exit. A hung updater lands here.
-    fail "UNVERIFIED: the update check produced no verdict in $CANARY_ATTEMPTS attempts (it started and never logged an outcome), so the canary could not determine whether v$prev_version reaches v$expected_version. This is NOT evidence that auto-update is broken, and NOT evidence that it works. Note that the node did NOT report a failed GitHub fetch, so this is not simply an unreachable runner. Re-run the job."
+    if [ "$env_cause" = "github" ]; then
+      # The node said it could not reach GitHub, on every attempt -- and this
+      # runner reached the same endpoint moments later. Not a blip, so not
+      # something to reassure anyone about.
+      fail "UNVERIFIED: v$prev_version reported it could not reach GitHub on all $CANARY_ATTEMPTS attempts, but THIS RUNNER reached the same endpoint immediately afterwards. So the network is not simply down: the published binary consistently cannot do something this runner can. That may still not be an auto-update fault -- a poll-budget cooldown persisted under the node's HOME is the obvious candidate (#5102) -- but it is not environmental noise, and v$expected_version is NOT verified as reachable. Read the node output above before re-running."
+      return 1
+    fi
+    # The node never said WHY. A hung updater lands here.
+    fail "UNVERIFIED: the update check produced no verdict in $CANARY_ATTEMPTS attempts (it started and never logged an outcome), so the canary could not determine whether v$prev_version reaches v$expected_version. This is NOT evidence that auto-update is broken, and NOT evidence that it works -- but it is also NOT evidence of a bad network: the node did not report a failed GitHub fetch. Re-run the job."
     return 1
   fi
   [ "$rc" -eq 0 ] || return 1

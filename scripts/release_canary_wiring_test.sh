@@ -399,8 +399,14 @@ else
             | tr -s '[:space:]' ' '
     }
 
-    quiet_step="$(step_containing 'could NOT VERIFY')"
-    loud_step="$(step_containing '#5221 failure mode')"
+    # Located by `id:`, not by a phrase from the message. Locating them by
+    # message text was tried and an ordinary reword of the quiet message broke
+    # the pin on the first edit -- the same "expectation stored as a copy"
+    # shape this PR exists to remove. An `id:` is structural and exists to be
+    # referenced; a rename of one still fails here, but loudly and for a reason
+    # the message names.
+    quiet_step="$(step_containing 'id: notify-environmental')"
+    loud_step="$(step_containing 'id: notify-fault')"
 
     if [[ -z "$quiet_step" ]]; then
         fail "the environmental (quiet) notification step is gone from the notify job" \

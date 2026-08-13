@@ -440,13 +440,22 @@ jobs:
             # file in front of whoever was editing. It is now derived from an
             # ENUMERATION of every `*_test.sh` in the repo rather than from the
             # file at hand: `check` (7 files), `ok`/`bad` (lifecycle), `pass`
-            # (3 files), `echo "ok   - "` (all sites use that exact separator,
-            # so anchoring on it costs nothing while rejecting
-            # `echo "okay, starting"`), and `echo "PASS [...]"`
-            # (release_state_restore_test.sh). Both quote styles. Re-run that
-            # enumeration before adding another pattern; adding one because a
-            # file you happen to be editing scores zero is how the first three
-            # went in.
+            # (3 files), `expect`
+            # (rule_lint_shell_assertion_counter_test.sh), `echo "ok   - "`
+            # (all sites use that exact separator, so anchoring on it costs
+            # nothing while rejecting `echo "okay, starting"`), and
+            # `echo "PASS [...]"` (release_state_restore_test.sh). Both quote
+            # styles. `expect` is safe as a bare name only because nothing in
+            # `scripts/` drives the TCL `expect(1)`; check that before assuming
+            # it stays safe.
+            #
+            # RE-RUN THE ENUMERATION AFTER ADDING A TEST FILE, not just before
+            # adding a pattern. The commit that introduced
+            # `rule_lint_shell_assertion_counter_test.sh` -- the file whose
+            # whole job is to stop this counter under-counting -- wrote its 26
+            # assertions as bare `expect 1 ...` calls, which scored ZERO. The
+            # blind spot was reintroduced by the fix for it, in the same PR,
+            # and was caught by re-measuring rather than by reading.
             #
             # THE BARE-NAME FORMS ABOVE ARE NOT THE WHOLE VOCABULARY, and for a
             # while this counter behaved as if they were. `[[:space:]]`
@@ -456,12 +465,12 @@ jobs:
             # `norm_case`, `timeout_guard_case`, `pin_marker`,
             # `pin_warn_literal`, `check_vs_expected`, `check_call_count`,
             # `check_fallback`, `test_restores_persisted_value`. Measured
-            # across all 11 `*_test.sh` files: 329 assertion call sites, of
-            # which the bare-name form saw 275 and missed 54, of which 42 are in
+            # across all 12 `*_test.sh` files: 378 assertion call sites, of
+            # which the original form saw 286 and missed 92, of which 53 are in
             # `auto-update-canary_test.sh` alone, whose parameterised cases are
-            # written almost entirely in that style. The two patterns added
-            # below (a `check_`/`pin_`/`assert_`/`expect_`/`test_` prefix, and
-            # a `_case` suffix) take it to 329 of 329 with zero false
+            # written almost entirely in that style. The patterns added below
+            # (a `check_`/`pin_`/`assert_`/`expect_`/`test_` prefix, a `_case`
+            # suffix, and bare `expect`) take it to 378 of 378 with zero false
             # positives, checked line by line against a hand-enumerated ground
             # truth. Definitions do not match either pattern (`foo() {` has no
             # whitespace where the name ends), so declaring a helper still
@@ -482,7 +491,7 @@ jobs:
             # The error text below tells the contributor both.
             NEW_SHELL_TESTS=$(git diff "$BASE"..."$HEAD" -- '**/*_test.sh' \
               | grep -E '^\+' | grep -vF '+++' \
-              | grep -cE '^\+[[:space:]]*(check|ok|pass)[[:space:]]|^\+[[:space:]]*echo[[:space:]]+["'"'"'](ok[[:space:]]+-|PASS[[:space:]])|^\+[[:space:]]*(check|pin|assert|expect|test)_[a-z0-9_]*([[:space:]]|$)|^\+[[:space:]]*[a-z_][a-z0-9_]*_case[[:space:]]' || true)
+              | grep -cE '^\+[[:space:]]*(check|ok|pass|expect)[[:space:]]|^\+[[:space:]]*echo[[:space:]]+["'"'"'](ok[[:space:]]+-|PASS[[:space:]])|^\+[[:space:]]*(check|pin|assert|expect|test)_[a-z0-9_]*([[:space:]]|$)|^\+[[:space:]]*[a-z_][a-z0-9_]*_case[[:space:]]' || true)
             if [ "$NEW_TESTS" -eq 0 ] && [ "$NEW_SHELL_TESTS" -eq 0 ]; then
               ERRORS="$ERRORS
           ERROR: fix: PR must include at least one new regression test
@@ -491,7 +500,7 @@ jobs:
             - a Rust #[test] / #[tokio::test] / etc.
             - an added assertion in a *_test.sh self-test, written with any of the
               conventions those files use: 'check ...', 'ok ...', 'pass ...',
-              a 'check_'/'pin_'/'assert_'/'expect_'/'test_'-prefixed helper, a
+              'expect ...', a 'check_'/'pin_'/'assert_'/'expect_'/'test_'-prefixed helper, a
               '*_case ...' helper, 'echo \"ok   - ...\"' or 'echo \"PASS ...\"'.
               Known blind spots: an assertion whose only added line is its FAIL
               branch, and a new entry in a table an existing assertion loops over

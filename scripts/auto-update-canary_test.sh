@@ -467,6 +467,59 @@ env_case "a healthy run is NOT environmental"              no "$HEALTHY"
 env_case "a truncated run (no outcome logged) is NOT environmental" no "$PENDING"
 env_case "a disabled updater is NOT environmental"         no "$DISABLED"
 
+# --- and the DECISION the classification feeds -------------------------------
+# `node_could_not_reach_github` establishes CANDIDACY for the quiet path;
+# `gate_b_unverified_class` decides. The split exists because the quiet message
+# tells the dev room a red release needs no action, so a single WARN from the
+# node is not enough to earn it: a persistent problem would otherwise report
+# "environmental" release after release, nobody would be alarmed, and we would
+# believe we had a post-publish gate while verifying nothing.
+#
+# The GitHub case therefore demands corroboration from a second observer in the
+# same run -- this runner's own fetch. Stubbed here, so the decision is tested
+# without a network.
+#
+# The real implementation is captured and put back afterwards rather than
+# re-sourcing the script: sourcing it again would run its top-level `mktemp -d`
+# a second time and re-register `trap cleanup EXIT`, leaking the first workdir
+# on every CI run. A stub left installed would be worse -- it would silently
+# weaken any later assertion that reaches it.
+real_runner_can_reach_github="$(declare -f runner_can_reach_github)"
+if [[ -z "$real_runner_can_reach_github" ]]; then
+    echo "FAIL - runner_can_reach_github is not defined; the corroboration tests would" >&2
+    echo "       stub a function nothing calls and pass vacuously." >&2
+    FAILURES=$((FAILURES + 1))
+fi
+class_case() {
+    # class_case <description> <env-cause> <runner-reachable yes|no> <expected>
+    local desc="$1" cause="$2" reachable="$3" expect="$4" got
+    if [[ "$reachable" == yes ]]; then
+        runner_can_reach_github() { return 0; }
+    else
+        runner_can_reach_github() { return 1; }
+    fi
+    got="$(gate_b_unverified_class "$cause")"
+    if [[ "$got" == "$expect" ]]; then
+        echo "ok   - unverified class: $desc"
+    else
+        echo "FAIL - unverified class: $desc (got '$got', expected '$expect')" >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+class_case "node could not reach GitHub and neither can the runner -> quiet" \
+    github no  environmental
+class_case "node could not reach GitHub but the RUNNER can -> loud" \
+    github yes fault
+class_case "port collision needs no network corroboration -> quiet" \
+    ports  yes environmental
+class_case "port collision, runner offline too -> still quiet" \
+    ports  no  environmental
+class_case "no cause recorded (hung updater) -> loud even with a dead network" \
+    ""     no  fault
+class_case "an unrecognised cause is loud, not quiet" \
+    weather no fault
+eval "$real_runner_can_reach_github"
+
 # Gate B's use of it. Three separate things can each silently undo the split,
 # and the first two fail in the QUIET direction:
 #   - returning 1 instead of the distinct code, so cross-compile.yml cannot
@@ -487,6 +540,13 @@ elif [[ "$selfupdate_body" != *'node_could_not_reach_github "$work/logs"'* ]]; t
     echo "       assert_detection_healthy returns 2 for two different situations. Treating" >&2
     echo "       both as environmental quietens a run where the check started and never" >&2
     echo "       logged an outcome, which is what a HUNG updater looks like." >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ "$selfupdate_body" != *'gate_b_unverified_class "$env_cause"'* ]]; then
+    echo "FAIL - cmd_selfupdate no longer routes the quiet path through gate_b_unverified_class." >&2
+    echo "       Taking the node's WARN as sufficient on its own restores the silent-skip" >&2
+    echo "       shape: a persistent problem reports 'environmental' release after release," >&2
+    echo "       nobody is alarmed, and the post-publish gate verifies nothing while looking" >&2
+    echo "       maintained. The corroboration probe is what earns the quiet message." >&2
     FAILURES=$((FAILURES + 1))
 elif [[ "$selfupdate_body" != *'for attempt in $(seq 1 "$CANARY_ATTEMPTS")'* ]]; then
     echo "FAIL - cmd_selfupdate no longer retries the indeterminate case." >&2

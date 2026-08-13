@@ -118,6 +118,13 @@ expect 1 "bare 'ok' (lifecycle)" \
     '+ok "the canary refuses a node that never checked"'
 expect 1 "bare 'pass' (3 files)" \
     '+pass "cross-compile.yml still has the pre-flight failure notification job"'
+# THIS file's own convention, and the case that proves the point it makes.
+# When this file was first added, its 26 `expect` calls scored ZERO -- the very
+# under-count it exists to prevent, reintroduced by the fix for it, inside the
+# same PR, and found by re-measuring rather than by reading. Safe as a bare
+# name only because nothing in scripts/ drives the TCL `expect(1)`.
+expect 1 "bare 'expect' (this file)" \
+    '+expect 1 "bare check (7 files)" \'
 expect 1 "inline echo \"ok   - ...\"" \
     '+    echo "ok   - MARKER_PARSE_FAIL frozen against a rename sweep"'
 expect 1 "inline echo 'PASS ...' (release_state_restore_test.sh)" \
