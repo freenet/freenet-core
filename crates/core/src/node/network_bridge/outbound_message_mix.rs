@@ -758,15 +758,21 @@ struct Window {
     /// instrument land a release ahead of the mechanism it judges (regime rule
     /// 7; 0.2.120 is permanently unattributable for want of exactly this).
     ///
-    /// **This bucket is the FULL-BYTES leg only, and it is ~4.6%
-    /// not-notification** — NOT the ~15% merged figure, because
-    /// `ChangeInterestsReply` is 95.3% digest today and so mostly never reaches
-    /// this bucket. Two independent derivations agree on ~4-5% (per-arm census
-    /// projection, and classifying rollups by mean bytes/msg). Read
+    /// **This bucket is the FULL-BYTES leg only, and its contamination is
+    /// BRACKETED at 0.07%-12.4% — it is not the ~15% merged figure, and it is
+    /// not a point estimate either.** `ChangeInterestsReply` is 95-99% digest
+    /// today, so it mostly never reaches this bucket. What is established is the
+    /// BOUND, and the bound is what the correction needs: even the pathological
+    /// upper end stays below the merged ~15%, so correcting this bucket with the
+    /// merged number over-subtracts. A central value near ~5% follows only under
+    /// assumptions this counter cannot check, so do not quote one — quoting a
+    /// point estimate where only an interval is supported is the same error class
+    /// this instrument was itself corrected for. Read
     /// [`OutboundMix::record_summary_comparison`] before quoting a number off
     /// it — the contamination is measurable but NOT negligible, and it biases
     /// `p` in BOTH directions. Subtract it using
-    /// [`Window::summaries_single_entry_msgs`].
+    /// [`Window::summaries_single_entry_msgs`], which is the only thing that can
+    /// narrow the bracket.
     summary_entries_identical_single: u64,
     /// The SINGLE-ENTRY subset of [`Window::summary_entries_differing`], full-bytes
     /// leg. The denominator half of `p` — without it a low single-entry agreement
@@ -1023,13 +1029,25 @@ impl OutboundMix {
     /// to prevent.
     ///
     /// **Per LEG, which is what actually matters:** `ChangeInterestsReply` is
-    /// **95.3% digest / 4.7% full-bytes**, so the FULL-BYTES leg — the one `p` is
-    /// computed over today — is only **~4.6%** contaminated, essentially
-    /// `request_reply + rejection`. The ~15% is the merged number and applying it
-    /// to the full-bytes leg over-subtracts by roughly 11 points. Two independent
-    /// derivations agree on the ~4-5% figure: projecting the per-arm census, and
-    /// classifying rollups by mean bytes/msg (digest singles ~41 B against
-    /// full-bytes ~9-10 KB).
+    /// 95-99% digest, so the FULL-BYTES leg — the one `p` is computed over today
+    /// — carries only the residue of it, essentially `request_reply + rejection`.
+    ///
+    /// **That residue is a BRACKET, 0.07%-12.4%, not a point estimate.** Three
+    /// independent measurements agree on the bracket (per-arm census projection;
+    /// classifying rollups by mean bytes/msg, digest singles ~41 B against
+    /// full-bytes ~9-10 KB; and a 6,214-node-minute / 1,132-peer window), and a
+    /// central value lands near ~5% under one window's assumptions — but only
+    /// under those assumptions, so **do not quote the central value.** The claim
+    /// that survives without them is the one the correction actually needs: even
+    /// 12.4% is below the merged ~15%, so applying the merged number to the
+    /// full-bytes leg over-subtracts.
+    ///
+    /// The bracket is wide for a structural reason, and that reason is the
+    /// argument for the census rather than an excuse: **the `request_reply`
+    /// single-entry SHARE that the exact figure depends on is not derivable from
+    /// today's keys at all.** `summaries_single_entry_msgs` is precisely the key
+    /// that makes it derivable, which is why the census exists — a narrower prior
+    /// measurement would not have removed the need for it.
     ///
     /// Scale of what the split buys: **without it the instrument cannot tell a
     /// true `p` of 99% from 95%** (worst-case bracket ~17 points wide against a
@@ -1337,7 +1355,8 @@ fn outbound_mix_json(w: &Window, window_secs: u64) -> serde_json::Value {
     // per-node budget is 10 events/s (`tracing/telemetry.rs`), 3.11% of records
     // already collide with it, and the collector runs at ~88.8 GB/day, so a
     // per-event stream is what got #4940 closed. Five extra integers per
-    // node-minute costs nothing measurable.
+    // node-minute cost nothing measurable — seven now, with the two census keys
+    // added below.
     //
     // Emitted unconditionally including as zeros, same rule as the arms above:
     // "this emitter sent nothing" and "this build does not report it" must not
@@ -1355,7 +1374,8 @@ fn outbound_mix_json(w: &Window, window_secs: u64) -> serde_json::Value {
             w.summaries_max_entries[s].into(),
         );
         // R4b contamination census (#5153 review F1), split by WIRE FORM (review
-        // round 2). 14 integers on a rollup that already carries five per arm —
+        // round 2). 14 integers on a rollup for the five per arm it already
+        // carried, taking each arm to seven —
         // the same cost argument, and it is what makes the receive-side
         // single-entry buckets interpretable rather than merely present.
         //
@@ -2340,6 +2360,28 @@ mod tests {
                 .and_then(|v| v.as_u64()),
             Some(0)
         );
+        // The eight scalars this test did NOT cover (#5153 review round 2). Six are
+        // the R4b counters the build/no-build decision reads, and two
+        // (`summary_entries_one_sided`, the notification pair) were unpinned from
+        // the start. The convention this file states everywhere — a field that
+        // vanishes when zero is invisible to the analysis — was unenforced for
+        // exactly the fields that matter most.
+        for key in [
+            "summary_entries_one_sided",
+            "summary_entries_identical_single",
+            "summary_entries_differing_single",
+            "summary_entries_one_sided_single",
+            "summary_entries_identical_single_digest",
+            "summary_entries_differing_single_digest",
+            "notification_targets_sent",
+            "notification_cohosts_skipped",
+        ] {
+            assert_eq!(
+                body.get(key).and_then(|v| v.as_u64()),
+                Some(0),
+                "an idle window must emit {key} as an explicit zero"
+            );
+        }
         assert_eq!(
             body.get("summary_differing_contracts")
                 .and_then(|v| v.as_array())
@@ -2525,6 +2567,12 @@ mod tests {
         // because in production it is version-gated to DIGESTS and so mostly does
         // NOT reach the full-bytes receive population.
         record_summaries(&mix, SummariesEmitter::ChangeInterestsReply, 1, 400);
+        // TWO digest sends against ONE full-bytes send, deliberately unequal.
+        // With both at 1 the assertions below pass even if the `full_bytes` and
+        // `digests` keys are swapped in `SummariesWireForm::stem`, which is the
+        // exact mistake this leg split exists to prevent — an equal-valued
+        // fixture cannot detect a transposition.
+        record_digests(&mix, SummariesEmitter::ChangeInterestsReply, 1);
         record_digests(&mix, SummariesEmitter::ChangeInterestsReply, 1);
         // InterestsReply is genuinely wide (field: mean ~224). Never counted.
         record_summaries(&mix, SummariesEmitter::InterestsReply, 224, 200);
@@ -2555,9 +2603,10 @@ mod tests {
         );
         assert_eq!(
             dig(SummariesEmitter::ChangeInterestsReply),
-            1,
+            2,
             "its DIGEST sends must land on the digest leg, not folded into \
-             full-bytes — that fold over-subtracts the leg `p` is computed on"
+             full-bytes — that fold over-subtracts the leg `p` is computed on. \
+             Two here against one full-bytes so a key transposition is visible"
         );
         assert_eq!(
             full(SummariesEmitter::InterestsReply),
@@ -2581,7 +2630,7 @@ mod tests {
             ),
             (
                 "interest_sync_summaries_change_interests_reply_digests_single_entry_msgs",
-                1,
+                2,
             ),
             (
                 "interest_sync_summaries_interests_reply_full_bytes_single_entry_msgs",
@@ -2919,7 +2968,7 @@ mod tests {
         }
     }
 
-    /// Every sub-arm's five counters reach the emitted body under their own
+    /// Every sub-arm's seven counters reach the emitted body under their own
     /// keys, and an idle window emits them as explicit zeros.
     ///
     /// The counters were only ever checked on the `Window` struct. A swapped
@@ -2987,7 +3036,20 @@ mod tests {
         let idle = outbound_mix_json(&Window::default(), 60);
         for emitter in SUMMARIES_ARMS {
             let stem = summaries_stem(emitter);
-            for suffix in ["msgs", "bytes", "max_bytes", "entries", "max_entries"] {
+            // SEVEN suffixes, not five: the two R4b census keys are part of every
+            // arm's emitted set (#5153 review round 2). They were absent from both
+            // this loop and the value loop above, so the keys the instrument's
+            // whole correction depends on were the only per-arm keys with no
+            // presence guarantee at all.
+            for suffix in [
+                "msgs",
+                "bytes",
+                "max_bytes",
+                "entries",
+                "max_entries",
+                "full_bytes_single_entry_msgs",
+                "digests_single_entry_msgs",
+            ] {
                 let key = format!("{stem}_{suffix}");
                 assert_eq!(
                     idle.get(&key).and_then(|v| v.as_u64()),
@@ -2996,6 +3058,11 @@ mod tests {
                 );
             }
         }
+        // Presence is all an idle window can check: with every census key at zero,
+        // a `full_bytes`/`digests` transposition is invisible here AND harmless
+        // here. The transposition is caught by
+        // `single_entry_census_is_per_emitter_leg_split_and_excludes_wide_messages`,
+        // whose fixture deliberately sends unequal counts per leg.
     }
 
     /// Emitter-completeness pin: which production files touch
