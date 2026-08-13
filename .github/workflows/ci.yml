@@ -430,14 +430,28 @@ jobs:
             # the same "gate cannot see its subject" shape the comment above
             # describes. Match the helpers actually in use.
             #
-            # Third form, same gap: `auto-update-canary_test.sh` -- the largest
-            # shell self-test in the repo, and the one that guards the release
-            # canary -- has no helper at all. It reports each assertion with a
-            # bare `echo "ok   - ..."` / `echo "FAIL - ..." >&2`, so a PR whose
-            # entire regression test is a new assertion there scored ZERO here
-            # and was told to add a test it had already added. Widening for
-            # `ok` covered the lifecycle file's helper and stopped at the file
-            # next to it. Count the echoed form too.
+            # Third form, same gap: `auto-update-canary_test.sh`. It DOES have a
+            # helper -- `check()` at the top of the file, 12 call sites -- but
+            # that helper takes a log fixture and drives `assert_detection_healthy`,
+            # so it can only express the log-fixture cases. Its other ~49
+            # assertions (source pins, the constant-relation pins, the
+            # trigger-site count) have nothing to fixture, and are written as a
+            # bare `echo "ok   - ..."` / `echo "FAIL - ..." >&2`. A PR whose
+            # entire regression test is one of those scored ZERO here and was
+            # told to add a test it had already added. Widening for `ok` covered
+            # the lifecycle file's helper and stopped at the file next to it.
+            # Count the echoed form too.
+            #
+            # Be honest about what this can and cannot do. It recognises the
+            # SUCCESS-REPORTING LINE of an assertion, by prefix; it has never
+            # recognised assertions. A single `echo "ok - looks fine"` that
+            # tests nothing satisfies it -- but so does `ok "..."` and so does a
+            # self-comparing `check "x" "a" "a"`, both of which the previous
+            # pattern already accepted. Widening does not make the check
+            # decorative; it was already prefix-recognition, and this only adds
+            # the third spelling. What actually stops a decorative test is
+            # review and mutation-testing the pin, not this regex. Prefer
+            # extending an assertion helper over adding a fourth pattern.
             NEW_SHELL_TESTS=$(git diff "$BASE"..."$HEAD" -- '**/*_test.sh' \
               | grep -E '^\+' | grep -vF '+++' \
               | grep -cE '^\+[[:space:]]*(check|ok)[[:space:]]|^\+[[:space:]]*echo[[:space:]]+"ok' || true)
