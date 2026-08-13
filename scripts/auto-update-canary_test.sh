@@ -854,14 +854,28 @@ pin_marker "source pin: disabled marker"        "$SRC"    "$MARKER_DISABLED"
 # Ground-truthed by downloading the published v0.2.125 musl asset and finding
 # the string in it.
 #
-# WHAT THIS DOES NOT COVER: `assert_detection_healthy` greps four other markers
-# against the PREVIOUS release's binary in Gate B -- MARKER_DISABLED,
-# MARKER_CHECK_RAN, MARKER_CHECK_COMPLETE and MARKER_TRIGGERED_RE -- and
-# rewording any of those produces the same post-publish false alarm with a worse
-# message. Only MARKER_LATEST_SEEN is frozen here. The asymmetry is real, not an
-# oversight: Gate A runs a binary built from THIS tree, so a reword there is
-# self-consistent, and Gate B is the only place an older binary is read.
-# Tracked as #5309.
+# WHAT THIS DOES NOT COVER. `assert_detection_healthy` greps SEVEN markers, and
+# in Gate B every one of them is put to the PREVIOUS release's binary -- the one
+# place in the pipeline where a published binary is asked for text this tree
+# chose. Two are frozen: MARKER_LATEST_SEEN here, MARKER_PARSE_FAIL immediately
+# below. The remaining five are not:
+#
+#   MARKER_DISABLED, MARKER_CHECK_RAN, MARKER_CHECK_COMPLETE,
+#   MARKER_TRIGGERED_RE        -- the four tracked by #5309
+#   MARKER_FETCH_FAIL          -- grepped too, and NOT named in #5309's
+#                                 enumeration (that issue counts five markers
+#                                 and misses this one and MARKER_PARSE_FAIL).
+#                                 Its reword direction is the loud one: an old
+#                                 binary's fetch failure would stop being
+#                                 classified INDETERMINATE and fall through to
+#                                 the equality check, which reports a missing
+#                                 observed-latest line. Wrong diagnosis, but red
+#                                 rather than green.
+#
+# So this class is NOT closed, and neither freeze closes it. The asymmetry that
+# creates it is real rather than an oversight: Gate A runs a binary built from
+# THIS tree, so a reword there is self-consistent, and Gate B is the only place
+# an older binary is read.
 #
 # To change it deliberately, re-state BOTH values:
 #   printf '%s\n%s' '<marker text>' '<first release shipping it>' | base64 | tr -d '\n'
@@ -901,6 +915,85 @@ else
         "'%s\\n%s'" "'$MARKER_LATEST_SEEN' '<release>'" "'\\n'" >&2
     FAILURES=$((FAILURES + 1))
 fi
+# --- the #5221 signature text, frozen ---------------------------------------
+# MARKER_PARSE_FAIL is the marker this whole canary was built around: it is the
+# #5221 regression's log signature, and `assert_detection_healthy`'s only
+# NEGATIVE check greps for it.
+#
+# WHY IT NEEDS A FREEZE WHEN IT ALREADY HAS TWO SOURCE PINS. `pin_warn_literal`
+# below interpolates $MARKER_PARSE_FAIL, so it follows a rename BY CONSTRUCTION
+# -- the same defect that left MARKER_LATEST_SEEN's source pin unable to notice
+# a reword. Measured on this branch: a `sed` sweep replacing the text in the
+# three files a developer must touch (auto-update-canary.sh, this file's
+# fixtures, auto_update.rs) leaves ALL assertions green. Sweeping only the first
+# two of those goes red -- which is worse than useless as a guard, because it
+# tells whoever does the incomplete sweep that finishing it is the fix.
+#
+# WHY THIS ONE IS THE DANGEROUS MEMBER OF THE CLASS, and the reason it is frozen
+# ahead of #5309's four. The other markers feed POSITIVE checks, so losing them
+# makes Gate B red against a healthy release: loud, and someone investigates.
+# This one feeds a negative check. Reword it and the grep stops matching the
+# text every ALREADY-PUBLISHED binary emits, so a previous release carrying the
+# live #5221 bug logs check-ran + reworded-warn + check-complete and Gate B
+# reports "OK: parsed GitHub's response". A silent false PASS, on the exact
+# failure this canary exists to catch, on the exact binary Gate B exists to
+# question.
+#
+# WHY NO COMPANION VERSION CONSTANT, i.e. why this is a single value and not the
+# pair above. MARKER_LATEST_SEEN needs MARKER_LATEST_SEEN_SINCE because Gate B
+# SKIPS its positive check for binaries that predate the marker, and that skip
+# needs a version to compare against. There is no skip branch here and no
+# constant to leave stale, so there is no second value a remediation could
+# quietly avoid restating.
+#
+# WHAT TO ACTUALLY DO IF THIS FIRES ON A DELIBERATE REWORD is in the failure
+# message, and it is not "regenerate the blob and move on": no published binary
+# emits the new wording, so re-stating the freeze alone hands Gate B a grep that
+# matches nothing older than the next release.
+MARKER_PARSE_FAIL_FROZEN_B64='U3RhcnR1cCB1cGRhdGUgY2hlY2s6IGZhaWxlZCB0byBwYXJzZQ=='
+# A decode failure must not leave the expectation empty and the comparison
+# vacuous -- the quiet direction, and the one this freeze exists to remove.
+# `printf | base64 -d` reads to EOF and cannot short-circuit, so it is not the
+# `| grep -q` SIGPIPE shape banned elsewhere in this file.
+if ! parse_fail_frozen="$(printf '%s' "$MARKER_PARSE_FAIL_FROZEN_B64" | base64 -d 2>/dev/null)"; then
+    parse_fail_frozen=""
+fi
+if [[ -z "$parse_fail_frozen" ]]; then
+    echo "FAIL - could not decode MARKER_PARSE_FAIL_FROZEN_B64; the #5221 signature freeze is not running" >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ "$MARKER_PARSE_FAIL" == "$parse_fail_frozen" ]]; then
+    echo "ok   - MARKER_PARSE_FAIL (the #5221 signature) frozen against a rename sweep"
+else
+    echo "FAIL - the frozen #5221 signature text changed." >&2
+    echo "         was: '$parse_fail_frozen'" >&2
+    echo "         now: '$MARKER_PARSE_FAIL'" >&2
+    echo "       This marker feeds the canary's only NEGATIVE check, so a reword fails" >&2
+    echo "       SILENTLY and in the passing direction. Gate B greps the PREVIOUS" >&2
+    echo "       release's binary, which emits the OLD text; a grep for the new text" >&2
+    echo "       matches nothing, so a published release carrying the live #5221 bug" >&2
+    echo "       logs check-ran + warn + check-complete and Gate B reports" >&2
+    echo "       \"OK: parsed GitHub's response\". Every already-published binary is" >&2
+    echo "       affected, not just the next one." >&2
+    echo "       Nothing else in this suite would have told you: pin_warn_literal" >&2
+    echo "       interpolates \$MARKER_PARSE_FAIL and follows a rename by construction." >&2
+    echo "       DECIDE THIS BEFORE RE-STATING THE FREEZE -- re-stating it alone is not" >&2
+    echo "       the fix, it just makes the suite agree with the blind spot:" >&2
+    echo "         (a) keep matching the OLD text as well, so Gate B can still see" >&2
+    echo "             #5221 on binaries that are already out there. MARKER_TRIGGERED_RE" >&2
+    echo "             is the precedent for an alternation marker in this file; or" >&2
+    echo "         (b) accept knowingly that Gate B cannot detect #5221 on any release" >&2
+    echo "             published before the new wording ships." >&2
+    echo "       Once decided, re-state it:" >&2
+    # printf, not echo: the recipe must reach the reader literally, and echo's
+    # handling of backslash sequences is shell-dependent. `base64 -w0` is
+    # GNU-only and fails on macOS, which is where someone reading this is most
+    # likely to be -- hence `tr -d '\n'`.
+    # shellcheck disable=SC2016  # the `$(...)` is literal recipe text for the reader
+    printf '         MARKER_PARSE_FAIL_FROZEN_B64="$(printf %s %s | base64 | tr -d %s)"\n' \
+        "'%s'" "'$MARKER_PARSE_FAIL'" "'\\n'" >&2
+    FAILURES=$((FAILURES + 1))
+fi
+
 # The parse-failure marker gets a STRONGER pin than pin_marker can give.
 # `failed to parse latest version` appears twice in auto_update.rs: the
 # production warn!, and a comment inside its own `#[cfg(test)] mod tests`
