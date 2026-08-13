@@ -207,7 +207,13 @@ while IFS= read -r f; do
     if [[ "$(eval "sed 's/^/+/' \"\$f\" | grep -cE $FRAG")" -eq 0 ]]; then
         invisible+=("$f")
     fi
-done < <(git -C "$SCRIPT_DIR/.." ls-files '*_test.sh' 2>/dev/null | sed "s|^|$SCRIPT_DIR/../|")
+    # Filesystem glob, NOT `git ls-files`, and the difference matters: a
+    # contributor adding a test file has not necessarily staged it yet, and that
+    # unstaged file is precisely the one whose convention the counter may not
+    # know. Mutation-tested -- with `git ls-files` an untracked probe file was
+    # invisible to this very check, so the check that exists to find invisible
+    # files could not see the newest one.
+done < <(find "$SCRIPT_DIR" -name '*_test.sh' -type f | sort)
 
 if [[ ${#invisible[@]} -eq 0 ]]; then
     echo "ok   - every tracked *_test.sh contains at least one assertion the counter sees"
