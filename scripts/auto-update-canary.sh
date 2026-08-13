@@ -161,32 +161,41 @@ MARKER_CHECK_COMPLETE='Startup update check complete'
 # the value against the tag GitHub actually published (see
 # CANARY_EXPECTED_LATEST) and fail on a mismatch.
 MARKER_LATEST_SEEN='Startup update check: GitHub reports latest release'
-# The first release whose binary EMITS the line above. It is new in #5236, and
-# Gate B's subject is the PREVIOUS release -- so for exactly one release the
-# binary under test predates the marker and has no observed-latest line to
-# compare. Arming the equality check against it would fail the gate for a line
-# that binary was never built to emit: a release blocked by its predecessor's
-# age. Gate B therefore arms the check only from `prev_version` onwards, which
-# makes this self-retiring -- permanently true from the release AFTER this
-# constant's value.
-#
-# If a Gate B run reports "never logged which release it compared against" for
-# a previous release at or above this version, the marker was REMOVED -- that is
-# a real finding about the node, not a reason to touch this constant.
+# The first PUBLISHED release whose binary emits the exact text above. Gate B's
+# subject is whatever release is currently newest-published, and a binary older
+# than this value has no observed-latest line to compare -- arming the equality
+# check against it would fail the gate for a line that binary was never built to
+# emit. So Gate B arms the check only from this version onwards.
 #
 # 0.2.125, not 0.2.124: the marker landed in the 0.2.124 tree, but that release
 # was never PUBLISHED (Gate A blocked it on the TMPDIR harness bug, #5290) and a
 # draft is invisible to `/releases/latest`. So no release a node can reach emits
 # this line until 0.2.125, and Gate B must not demand it from 0.2.123.
 #
-# FROZEN. This is a fact about release history -- which release first shipped
-# the line -- and release history does not change, so the value must NOT track
-# the version being cut. Raising it to the current release skips Gate B's only
-# positive assertion for that release, and a constant kept level with the crate
-# version disarms the gate on every release while looking maintained.
-# `auto-update-canary_test.sh` pins both halves: the value against this literal,
-# and the constant against the crate version so it can never sit ABOVE it (from
-# where `prev_emits_latest_seen` could never arm at all).
+# WHEN THIS CONSTANT SHOULD AND SHOULD NOT MOVE
+#
+# It is a fact about release history -- which published release first shipped
+# this exact text -- so under ordinary releases it does NOT move. Raising it to
+# the version being cut skips Gate B's only positive assertion for that release,
+# and a constant kept level with the crate version disarms the gate on every
+# release while looking maintained. Do not "refresh" it.
+#
+# But there is one edit where moving it IS correct, and it is easy to miss:
+# REWORDING OR REMOVING THE MARKER. Change the text above and the value below
+# must move to the first release that will SHIP the new text -- normally the
+# NEXT release, since the bump happens inside the release commit. Leave it and
+# Gate B demands the new wording from a published binary that emits the old one,
+# which surfaces as a POST-PUBLISH red canary and a Matrix alarm whose text
+# blames the node ("may not be able to auto-update"). Nothing else in the suite
+# notices: the source pin interpolates $MARKER_LATEST_SEEN, so it follows a
+# rename by construction. `auto-update-canary_test.sh` therefore freezes the
+# marker text and this version TOGETHER, so a reword fails there and forces the
+# author to decide about this line in the same edit.
+#
+# If a Gate B run reports "never logged which release it compared against" for a
+# previous release at or above this version, work out which of the two it is:
+# the marker was REMOVED from the node (a real finding), or the marker was
+# REWORDED and this constant was not moved with it (fix it here).
 MARKER_LATEST_SEEN_SINCE='0.2.125'
 
 MUSL_ASSET='freenet-x86_64-unknown-linux-musl.tar.gz'
@@ -773,11 +782,38 @@ normalise_release_tag() {
   printf '%s' "${1#v}"
 }
 
-# version_at_least <a> <b> -- true when semver <a> is >= <b>.
+# is_dotted_version <s> -- true for a bare dotted numeric version (`0.2.125`).
+#
+# Deliberately narrower than semver: this repo cuts no pre-release or build
+# metadata, `sort -V` orders `0.2.125-rc.1` ABOVE `0.2.125` where semver puts it
+# below, and accepting a form the comparator gets wrong is worse than refusing
+# it. If rc tags are ever cut, fix the comparator before widening this.
+is_dotted_version() {
+  case "$1" in
+    ''|*[!0-9.]*|.*|*.) return 1 ;;
+    *..*)               return 1 ;;
+    *)                  return 0 ;;
+  esac
+}
+
+# version_at_least <a> <b> -- true when dotted version <a> is >= <b>.
 #
 # `sort -V` rather than a field split: it gets 0.2.9 < 0.2.10 right, which a
 # lexical compare does not, and equal inputs land on the last line either way.
+#
+# MALFORMED INPUT IS REFUSED, LOUDLY, and that is not defensive tidying -- the
+# bare comparison answers TRUE for garbage. Measured on GNU coreutils 9.4:
+# `version_at_least "not-a-version" "0.2.125"` is TRUE (non-numeric sorts after
+# digits under `sort -V`), and `version_at_least "0.2.125" ""` is TRUE. So an
+# unreadable version or an emptied constant silently PASSES a comparison it
+# should not even be able to answer. Refusing returns false, so callers must
+# decide what an unanswerable comparison means for them rather than inheriting
+# an accidental yes; `prev_emits_latest_seen` below does exactly that.
 version_at_least() {
+  if ! is_dotted_version "$1" || ! is_dotted_version "$2"; then
+    note "version_at_least: refusing to compare '$1' with '$2' -- not both bare dotted versions. Treating as FALSE; the comparison cannot be answered, and answering it by accident is how a malformed value passes a version gate."
+    return 1
+  fi
   [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]
 }
 
@@ -791,7 +827,19 @@ version_at_least() {
 # inversion. Inverted, Gate B arms against pre-#5236 binaries (a spurious red)
 # and SKIPS for post-#5236 ones, which is the silent direction: its only
 # positive assertion goes permanently vacuous while every release looks fine.
+#
+# An UNUSABLE version arms the check rather than skipping it, which is the
+# opposite of what `version_at_least` returns for the same input and is
+# deliberate. The two functions answer different questions. "Is a >= b" has no
+# answer for garbage, so the comparator refuses. "Should Gate B assert anything"
+# does have one: skipping is the silent direction this whole file exists to
+# remove, and arming against an unknown binary costs at worst a loud red on a
+# release whose version string was already unreadable. Fail toward asserting.
 prev_emits_latest_seen() {
+  if ! is_dotted_version "$1"; then
+    note "could not read the previous release's version from '$1', so whether it predates the observed-latest marker is unknown. ARMING Gate B's positive-equality check anyway: a skip here is silent and permanent, while a spurious red is visible and cheap. Check how the previous release was resolved."
+    return 0
+  fi
   version_at_least "$1" "$MARKER_LATEST_SEEN_SINCE"
 }
 

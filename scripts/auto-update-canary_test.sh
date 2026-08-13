@@ -470,14 +470,31 @@ gate_b_arm_case() {
         FAILURES=$((FAILURES + 1))
     fi
 }
-gate_b_arm_case "$MARKER_LATEST_SEEN_SINCE" yes   # the release the marker lands in
+gate_b_arm_case "$MARKER_LATEST_SEEN_SINCE" yes   # the first release that emits it
 # Was a literal `0.2.125`, which is the constant's own value and so duplicated
 # the case above rather than covering "after it". The constant is frozen (pinned
 # below), so a later release is a literal one release on.
 gate_b_arm_case "0.2.126"                   yes   # every release after it
 gate_b_arm_case "0.3.0"                     yes
-gate_b_arm_case "0.2.123"                   no    # the one release that must skip
+# BOTH releases below the constant must skip, and both are listed on purpose.
+# With only 0.2.123 here the cases straddled the gap: 0.2.123 no / 0.2.125 yes is
+# satisfied by ANY threshold in {0.2.124, 0.2.125}, so nothing pinned that the
+# decision reads the CONSTANT rather than a literal. Verified vacuity: replacing
+# the body of `prev_emits_latest_seen` with a hardcoded
+# `version_at_least "$1" "0.2.124"` left the entire suite green. 0.2.124 is the
+# case that closes it -- and it is the interesting one anyway, being the release
+# whose tree HAS the marker but which was never published.
+gate_b_arm_case "0.2.124"                   no    # in-tree but never published
+gate_b_arm_case "0.2.123"                   no    # predates the marker entirely
 gate_b_arm_case "0.2.99"                    no    # numeric, not lexical
+
+# Malformed input ARMS the check rather than skipping it. Skipping is the silent
+# direction; arming an unknown binary costs at worst a loud red on a release
+# whose version string was already unreadable. Note this is the OPPOSITE of what
+# `version_at_least` returns for the same input (below) -- deliberately, because
+# the two answer different questions. See the comment on prev_emits_latest_seen.
+gate_b_arm_case "not-a-version"             yes   # unreadable -> assert, don't skip
+gate_b_arm_case ""                          yes
 
 # `version_at_least` decides whether the gate above arms, so it gets its own
 # cases: an off-by-one here silently disarms Gate B's only positive assertion.
@@ -492,13 +509,26 @@ version_ge_case() {
         FAILURES=$((FAILURES + 1))
     fi
 }
-version_ge_case "0.2.124" "0.2.124" yes   # the release the marker lands in
+version_ge_case "0.2.124" "0.2.124" yes   # equal
 version_ge_case "0.2.125" "0.2.124" yes
-version_ge_case "0.2.123" "0.2.124" no    # the one release that must skip
+version_ge_case "0.2.123" "0.2.124" no    # strictly below
 version_ge_case "0.3.0"   "0.2.124" yes
 # Numeric, not lexical: a lexical compare puts 0.2.99 above 0.2.124 and would
 # disarm the gate for every release in between.
 version_ge_case "0.2.99"  "0.2.124" no
+
+# MALFORMED INPUT MUST NOT COMPARE TRUE. The bare `sort -V` form answered TRUE
+# for all three of these -- non-numeric text sorts after digits, and an empty
+# operand loses to anything -- so an unreadable version or an emptied constant
+# passed a comparison that has no answer. Measured on GNU coreutils 9.4 before
+# the guard: cases 1 and 2 below both returned yes.
+version_ge_case "not-a-version" "0.2.125" no
+version_ge_case "0.2.125"       ""        no
+version_ge_case ""              ""        no
+# Rejected rather than ordered, because `sort -V` puts a pre-release ABOVE the
+# release where semver puts it below. This repo cuts no rc tags; accepting a
+# form the comparator gets backwards would be worse than refusing it.
+version_ge_case "0.2.125-rc.1"  "0.2.125" no
 
 # --- no status-consuming pipe into a short-circuiting reader ----------------
 # The defect that produced this rule: `printf '%s' "$logs" | grep -aqF …` under
@@ -732,7 +762,7 @@ fi
 pin_marker "source pin: #4073 refusal phrase"   "$SRC"    "$MARKER_NOT_TRIGGERED"
 pin_marker "source pin: disabled marker"        "$SRC"    "$MARKER_DISABLED"
 
-# --- the MARKER_LATEST_SEEN_SINCE constant itself ---------------------------
+# --- the (marker text, first release that shipped it) PAIR ------------------
 # Gate B's version gate is pinned in both directions (the behavioural cases on
 # `prev_emits_latest_seen`, and the un-negated call site), but neither looks at
 # the CONSTANT they compare against. Raising it 0.2.124 -> 0.2.999 left the
@@ -740,83 +770,90 @@ pin_marker "source pin: disabled marker"        "$SRC"    "$MARKER_DISABLED"
 # assertion -- the same silent direction as the `!` inversion, reached by
 # editing a different line.
 #
-# THE RELATION IS `constant <= crate version`, AND IT USED TO BE THE OPPOSITE.
-# The first version of this block asserted the constant was NOT BELOW the crate
-# version. Its premise was stated in its own comment: "the marker is new in this
-# tree, so no already-published release emits it". That premise was true for
-# exactly as long as 0.2.125 was unpublished, and it EXPIRED the moment 0.2.125
-# shipped. The constant is a historical fact and correctly stays at 0.2.125
-# forever, so the old assertion would have gone red on the 0.2.126 bump and
-# blocked a healthy release -- a self-detonating pin, verified by setting the
-# crate version to 0.2.126 and watching it fail.
+# WHY THERE IS NO RELATION PIN HERE, AND MUST NOT BE ONE.
 #
-# The relation worth pinning is the other one, because only one direction is
-# SILENT:
+# Two have been tried and both were wrong, in opposite phases:
 #
-#   constant ABOVE the crate version -- `prev_emits_latest_seen` compares the
-#     PREVIOUS release against it, and the previous release is always below the
-#     crate version, so the gate can never arm. Gate B's only positive assertion
-#     is skipped on every release, indefinitely, and the run still reports
-#     success. This is the dangerous direction and the one asserted below.
+#   `constant >= crate version` (#5290). Premise: "the marker is new in this
+#     tree, so no published release emits it". True until 0.2.125 published,
+#     false one second later. It would have gone red on the 0.2.126 bump and
+#     blocked a healthy release. Self-detonating; verified by setting the crate
+#     version to 0.2.126 and watching it fail.
 #
-#   constant AT or BELOW the crate version -- the check runs (from the release
-#     after the constant onwards). Nothing to catch.
+#   `constant <= crate version` (this PR's first attempt). Correct after
+#     publication, wrong during a marker REWORD. A marker reworded on main first
+#     ships in crate+1, so the CORRECT constant is crate+1 -- which this
+#     assertion calls a failure, while the value that makes it green (constant =
+#     crate) makes Gate B demand the new text from a published binary that emits
+#     the old one: a post-publish red canary and a Matrix alarm blaming the node.
+#     Verified by execution. A `<= crate+1` variant fires on the reword too.
 #
-# Anchored against the crate version, which the constant cannot influence.
-CORE_TOML="$SCRIPT_DIR/../crates/core/Cargo.toml"
-if [[ ! -f "$CORE_TOML" ]]; then
-    echo "FAIL - cannot check MARKER_LATEST_SEEN_SINCE: $CORE_TOML not found" >&2
-    FAILURES=$((FAILURES + 1))
+# The generalisation, and the reason not to try a third: the constant tracks
+# RELEASE HISTORY while the crate version tracks THIS TREE, and no fixed
+# relation between them holds across publication and reword both. A pin on a
+# relation between two quantities that move on different clocks is a pin that
+# will be right in one phase and wrong in another.
+#
+# So the pin is a FREEZE, which is phase-independent, and it covers strictly
+# more: the relation only ever caught "constant strictly above crate version",
+# while the freeze catches every wrong value including the empty string and the
+# most likely wrong one (the version being cut). It also cannot be tripped by
+# `version.workspace = true`, which broke the relation pin's Cargo.toml read.
+#
+# WHY BOTH HALVES ARE FROZEN TOGETHER.
+#
+# The version alone is not enough, and the gap is silent rather than annoying.
+# Reword MARKER_LATEST_SEEN everywhere a developer must touch it -- auto_update.rs,
+# freenet.rs, the canary, and the log fixtures in both test files -- leave the
+# constant alone, and the whole suite passes: verified, zero red. The source pin
+# interpolates $MARKER_LATEST_SEEN so it follows the rename by construction, and
+# nothing else looks at the marker at all. A stale constant is the DEFAULT
+# outcome of a reword, not an escape from a warning, and it surfaces post-publish
+# on the release Matrix channel with text that blames the node.
+#
+# Freezing the PAIR is what closes that: a reword fails HERE, in the same edit,
+# with the version constant named.
+MARKER_LATEST_SEEN_FROZEN='Startup update check: GitHub reports latest release'
+MARKER_LATEST_SEEN_SINCE_FROZEN='0.2.125'
+
+if [[ "$MARKER_LATEST_SEEN" == "$MARKER_LATEST_SEEN_FROZEN" ]]; then
+    echo "ok   - MARKER_LATEST_SEEN still matches the text v$MARKER_LATEST_SEEN_SINCE_FROZEN shipped"
 else
-    crate_version="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$CORE_TOML" | head -1)"
-    if [[ -z "$crate_version" ]]; then
-        echo "FAIL - could not read the crate version from $CORE_TOML" >&2
-        FAILURES=$((FAILURES + 1))
-    elif ! version_at_least "$crate_version" "$MARKER_LATEST_SEEN_SINCE"; then
-        echo "FAIL - MARKER_LATEST_SEEN_SINCE ($MARKER_LATEST_SEEN_SINCE) is ABOVE the crate" >&2
-        echo "       version ($crate_version). Gate B arms its positive-equality check only" >&2
-        echo "       when the PREVIOUS release is >= the constant, and the previous release is" >&2
-        echo "       always below this tree's version -- so a constant set above it can never" >&2
-        echo "       arm. Gate B then skips its only positive assertion on every release," >&2
-        echo "       reports success, and the silently-wrong-comparator hole it exists to" >&2
-        echo "       close is open again." >&2
-        FAILURES=$((FAILURES + 1))
-    else
-        echo "ok   - MARKER_LATEST_SEEN_SINCE ($MARKER_LATEST_SEEN_SINCE) is at or below the crate version ($crate_version), so Gate B's equality check can arm"
-    fi
+    echo "FAIL - the observed-latest MARKER TEXT changed, and MARKER_LATEST_SEEN_SINCE must be" >&2
+    echo "       reconsidered in the same edit." >&2
+    echo "         was: '$MARKER_LATEST_SEEN_FROZEN'" >&2
+    echo "         now: '$MARKER_LATEST_SEEN'" >&2
+    echo "       MARKER_LATEST_SEEN_SINCE names the first PUBLISHED release emitting that text." >&2
+    echo "       Reword it and no published binary emits the new text yet, so the constant must" >&2
+    echo "       move to the release that will first SHIP it -- normally the NEXT one, since the" >&2
+    echo "       bump happens inside the release commit. Leave it and Gate B demands the new" >&2
+    echo "       wording from a binary that emits the old one: a POST-PUBLISH red canary and a" >&2
+    echo "       Matrix alarm whose text blames the node." >&2
+    echo "       Nothing else in this suite would have told you: the source pin interpolates" >&2
+    echo "       \$MARKER_LATEST_SEEN and follows the rename by construction. This assertion is" >&2
+    echo "       the only prompt. Update BOTH frozen values here once you have decided." >&2
+    FAILURES=$((FAILURES + 1))
 fi
 
-# ...and the value itself, which the relation above deliberately does not pin.
-#
-# `constant <= crate version` permits the constant to CREEP FORWARD with each
-# release. That creep passes every assertion in this file and is wrong every
-# time: setting the constant to the version being cut skips Gate B's equality
-# check for that release, so a constant kept level with the crate version
-# disarms the gate on every release while looking maintained.
-#
-# There is exactly one correct value, and it is not a policy choice: 0.2.125 is
-# the first release a running node can REACH whose binary emits
-# MARKER_LATEST_SEEN. The marker landed in the 0.2.124 tree, but 0.2.124 was
-# never published (Gate A blocked it on the #5290 TMPDIR harness bug) and a
-# draft does not appear at `/releases/latest`, so no node ever saw a 0.2.124
-# binary. That makes the constant a statement about release history, not about
-# this tree, and release history does not change -- FREEZE IT.
-#
-# Moving it forward is therefore always a mistake. If the FACT turns out to be
-# wrong (0.2.125 does not emit the line after all), change both the constant and
-# this expectation in the same commit and say why. That deliberate edit is the
-# outcome this assertion exists to force; the accidental bump is what it stops.
-MARKER_LATEST_SEEN_SINCE_FROZEN='0.2.125'
+# ...and the version half. 0.2.125 is the first release a running node can REACH
+# whose binary emits that text: the marker landed in the 0.2.124 tree, but
+# 0.2.124 was never published (Gate A blocked it on the #5290 TMPDIR harness
+# bug) and a draft does not appear at `/releases/latest`, so no node ever saw a
+# 0.2.124 binary. Ground-truthed during review by downloading the published
+# v0.2.125 musl asset and finding the string in it.
 if [[ "$MARKER_LATEST_SEEN_SINCE" == "$MARKER_LATEST_SEEN_SINCE_FROZEN" ]]; then
     echo "ok   - MARKER_LATEST_SEEN_SINCE is frozen at the historical value ($MARKER_LATEST_SEEN_SINCE_FROZEN)"
 else
-    echo "FAIL - MARKER_LATEST_SEEN_SINCE is '$MARKER_LATEST_SEEN_SINCE', expected the frozen" >&2
-    echo "       historical value '$MARKER_LATEST_SEEN_SINCE_FROZEN'. The constant records WHICH" >&2
-    echo "       published release first emitted '$MARKER_LATEST_SEEN'" >&2
-    echo "       -- a fact about release history, which does not change. Raising it skips Gate" >&2
-    echo "       B's positive-equality check for every release below the new value, silently." >&2
-    echo "       If the historical fact is genuinely wrong, change the constant and this" >&2
-    echo "       expectation together, in one commit, with the reason." >&2
+    echo "FAIL - MARKER_LATEST_SEEN_SINCE is '$MARKER_LATEST_SEEN_SINCE', expected '$MARKER_LATEST_SEEN_SINCE_FROZEN'." >&2
+    echo "       It records which PUBLISHED release first emitted the marker text, so under an" >&2
+    echo "       ordinary release it does not move. Raising it to the version being cut skips" >&2
+    echo "       Gate B's only positive assertion for that release, silently, and a constant" >&2
+    echo "       kept level with the crate version disarms the gate on every release while" >&2
+    echo "       looking maintained." >&2
+    echo "       If you got here by RAISING it, the fix is almost certainly to put it back." >&2
+    echo "       There is one edit where moving it is correct -- rewording the marker text --" >&2
+    echo "       and that fails the assertion ABOVE this one, naming the reword. If that" >&2
+    echo "       assertion is green, this is not a reword and the constant should not move." >&2
     FAILURES=$((FAILURES + 1))
 fi
 # The parse-failure marker gets a STRONGER pin than pin_marker can give.

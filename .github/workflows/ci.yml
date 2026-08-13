@@ -430,37 +430,54 @@ jobs:
             # the same "gate cannot see its subject" shape the comment above
             # describes. Match the helpers actually in use.
             #
-            # Third form, same gap: `auto-update-canary_test.sh`. It DOES have a
-            # helper -- `check()` at the top of the file, 12 call sites -- but
-            # that helper takes a log fixture and drives `assert_detection_healthy`,
-            # so it can only express the log-fixture cases. Its other ~49
-            # assertions (source pins, the constant-relation pins, the
-            # trigger-site count) have nothing to fixture, and are written as a
-            # bare `echo "ok   - ..."` / `echo "FAIL - ..." >&2`. A PR whose
-            # entire regression test is one of those scored ZERO here and was
-            # told to add a test it had already added. Widening for `ok` covered
-            # the lifecycle file's helper and stopped at the file next to it.
-            # Count the echoed form too.
+            # Third and fourth forms, same gap. `auto-update-canary_test.sh`
+            # DOES have a helper -- `check()` at the top of the file, 12 call
+            # sites -- but it takes a log fixture and drives
+            # `assert_detection_healthy`, so it can only express the log-fixture
+            # cases; that file's other ~49 assertions (source pins, the frozen
+            # constants, the trigger-site count) have nothing to fixture and are
+            # written as a bare `echo "ok   - ..."`. And four more self-tests
+            # report through `pass` (`release_canary_wiring_test.sh`,
+            # `release_state_restore_test.sh`, and two under `release-agent/`).
+            # A PR whose entire regression test is one of those scored ZERO and
+            # was told to add a test it had already added.
             #
             # Be honest about what this can and cannot do. It recognises the
             # SUCCESS-REPORTING LINE of an assertion, by prefix; it has never
             # recognised assertions. A single `echo "ok - looks fine"` that
             # tests nothing satisfies it -- but so does `ok "..."` and so does a
-            # self-comparing `check "x" "a" "a"`, both of which the previous
-            # pattern already accepted. Widening does not make the check
-            # decorative; it was already prefix-recognition, and this only adds
-            # the third spelling. What actually stops a decorative test is
-            # review and mutation-testing the pin, not this regex. Prefer
-            # extending an assertion helper over adding a fourth pattern.
+            # self-comparing `check "x" "a" "a"`, both of which the pre-existing
+            # pattern already accepted. Widening adds spellings, not a weakness;
+            # what actually stops a decorative test is review and
+            # mutation-testing the pin, not this regex.
+            #
+            # It still has FALSE NEGATIVES, left in deliberately rather than
+            # chased with a fifth pattern: `printf 'ok - ...'` scores zero, and
+            # so does an assertion whose only added line is its `echo "FAIL ..."`
+            # branch. Counting FAIL lines would also let a PR score by adding an
+            # error message alone. The durable fix is one shared assertion helper
+            # across these files, not more regex.
+            #
+            # `["']ok[[:space:]]+-` rather than a bare `"ok`: anchored on the
+            # `ok   - ` separator every one of the ~30 existing sites uses, so
+            # `echo "okay, starting the suite"` and a bare `echo "ok"` no longer
+            # count as regression tests. Both quote styles, since single-quoted
+            # `echo 'ok - ...'` scored zero.
             NEW_SHELL_TESTS=$(git diff "$BASE"..."$HEAD" -- '**/*_test.sh' \
               | grep -E '^\+' | grep -vF '+++' \
-              | grep -cE '^\+[[:space:]]*(check|ok)[[:space:]]|^\+[[:space:]]*echo[[:space:]]+"ok' || true)
+              | grep -cE '^\+[[:space:]]*(check|ok|pass)[[:space:]]|^\+[[:space:]]*echo[[:space:]]+["'"'"']ok[[:space:]]+-' || true)
             if [ "$NEW_TESTS" -eq 0 ] && [ "$NEW_SHELL_TESTS" -eq 0 ]; then
               ERRORS="$ERRORS
           ERROR: fix: PR must include at least one new regression test
           Add a test that reproduces the bug (fails without fix, passes with fix).
-          A Rust #[test]/#[tokio::test]/etc. or an added 'check' assertion in a
-          *_test.sh self-test both satisfy this.
+          Either satisfies this:
+            - a Rust #[test] / #[tokio::test] / etc.
+            - an added assertion in a *_test.sh self-test, written with any of the
+              conventions those files use: 'check ...', 'ok ...', 'pass ...', or
+              'echo \"ok   - ...\"'. Known blind spots: printf-style reporting, and
+              an assertion whose only added line is its FAIL branch. If you have a
+              real test the counter cannot see, say so on the PR rather than
+              reshaping the test to please this grep.
           If this fix genuinely cannot have a test, add the 'test-exempt' label with a justification comment."
             fi
           fi
