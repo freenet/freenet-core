@@ -373,26 +373,58 @@ else
 
     quiet_cond="needs.attach-to-release.result == 'success' &&"
     quiet_cond+=" needs.auto-update-selfupdate-canary.outputs.classification == 'environmental'"
-    # Whitespace-collapsed: the condition is written across two lines in a
-    # folded scalar, and a reflow must not decide whether this is checked.
-    notify_flat="$(printf '%s' "$notify_block" | tr -s '[:space:]' ' ')"
-    if [[ "$notify_flat" == *"$quiet_cond"* ]]; then
-        pass "the quiet branch requires a successful publish AND an environmental classification"
+
+    # PER-STEP, and that is not fussiness. The first version of this scanned the
+    # whole job block for "$quiet_cond", which the LOUD step satisfies all by
+    # itself -- its condition is `!(<quiet_cond>)`, so the quiet condition is a
+    # substring of it. Mutation-tested: replacing the quiet step's `if:` with a
+    # bare `result == 'failure'`, so the reassuring message covers every red
+    # run including a real #5221, left this suite fully GREEN. A pin whose
+    # subject can be satisfied by the thing it is distinguishing from is not a
+    # pin, which is the whole subject of #5303.
+    #
+    # Steps are split on their leading `- name:` / `- uses:` key and identified
+    # by text from their own message, so neither depends on step ORDER.
+    notify_steps="$(printf '%s\n' "$notify_block" | awk '
+        /^      - (name|uses):/ { n++ }
+        { print n "\t" $0 }
+    ')"
+    step_containing() {
+        # step_containing <needle> -- the whole step chunk holding <needle>,
+        # whitespace-collapsed, or empty if no single step holds it.
+        local needle="$1" n
+        n="$(printf '%s\n' "$notify_steps" | grep -F -- "$needle" | head -1 | cut -f1)"
+        [[ -n "$n" ]] || return 0
+        printf '%s\n' "$notify_steps" | awk -F'\t' -v n="$n" '$1 == n { print $2 }' \
+            | tr -s '[:space:]' ' '
+    }
+
+    quiet_step="$(step_containing 'could NOT VERIFY')"
+    loud_step="$(step_containing '#5221 failure mode')"
+
+    if [[ -z "$quiet_step" ]]; then
+        fail "the environmental (quiet) notification step is gone from the notify job" \
+            "Without it every red Gate B run takes the loud #5221 branch again, so a" \
+            "runner that could not reach github.com tells the room the fleet may be" \
+            "stranded. That is the alarm-fatigue failure this split exists to stop."
+    elif [[ "$quiet_step" == *"$quiet_cond"* && "$quiet_step" != *'!('* ]]; then
+        pass "the quiet step requires a successful publish AND an environmental classification"
     else
-        fail "the environmental notification's condition changed" \
-            "Expected it to require both:" \
+        fail "the environmental notification's own condition changed" \
+            "Its step must be conditioned on exactly:" \
             "  $quiet_cond" \
-            "Widened, the quiet 'nothing to worry about' message starts covering" \
-            "real faults and a release stuck as a draft."
+            "Widened, the reassuring 'nothing to worry about' message starts covering" \
+            "real faults and a release stuck as a DRAFT. Its condition is currently:" \
+            "  $quiet_step"
     fi
 
-    if [[ "$notify_flat" == *"!($quiet_cond)"* ]]; then
-        pass "the loud branch is the negation of the quiet one (unknown states stay loud)"
+    if [[ -n "$loud_step" && "$loud_step" == *"!($quiet_cond)"* ]]; then
+        pass "the loud step is the exact negation of the quiet one (unknown states stay loud)"
     else
         fail "the loud notification is no longer the exact negation of the quiet one" \
             "Written as its own list of results instead, any state neither branch" \
-            "anticipated -- a cancelled job, an empty classification -- falls" \
-            "through both and nothing is sent at all."
+            "anticipated -- a cancelled job, an empty classification because the" \
+            "step never ran -- falls through both and nothing is sent at all."
     fi
 fi
 
