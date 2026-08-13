@@ -189,22 +189,53 @@ else
             "text, so an empty extraction would make all of them pass vacuously."
     fi
 
-    # Same two neutering routes assertion 3 covers for the canary. A publish
-    # step that cannot fail is not the problem here -- the problem is a publish
-    # step that runs when the canary DIDN'T pass, which `if:` buys and
-    # `continue-on-error` does not. Pin both anyway: `continue-on-error: true`
-    # here would let a failed upload proceed to the un-draft, publishing a
-    # release whose crates do not exist.
-    PC_OVERRIDE="$(printf '%s\n' "$PUBLISH_CRATES_STEP" \
-        | grep -E '^[0-9]+:        (if|continue-on-error):')"
-    if [[ -z "$PC_OVERRIDE" ]]; then
-        pass "the crates.io publish step has no 'if:' or 'continue-on-error:'"
+    # The step's `if:` is pinned to one exact expression rather than forbidden.
+    #
+    # It needs an `if:` at all because this workflow's `on:` includes
+    # `branches: [main]`, so every push to main runs it. The job's own
+    # `if: startsWith(github.ref, 'refs/tags/v')` already blocks the job there,
+    # but a step that uploads to crates.io should be structurally incapable of
+    # firing off a tag rather than incapable only while that job condition
+    # survives editing. It is also what bounds CARGO_REGISTRY_TOKEN's reach.
+    #
+    # And it needs `success() &&` in front, spelled out. A step `if:` with no
+    # status-check function has `success()` applied implicitly, so the plain
+    # tag test would still require every earlier step -- including Gate A -- to
+    # have passed. Writing it removes the gate's dependence on that implicit
+    # rule; dropping it for `if: always() && startsWith(...)` would publish
+    # after a failed canary, and that one word is the whole difference.
+    #
+    # Exact-match, not "contains no always()", for the reason the un-draft
+    # step's assertion gives: deciding whether an arbitrary expression can
+    # evaluate true after a failed step is not a job for a grep. Any change to
+    # this line is a deliberate edit to a release gate and should update this
+    # expectation on purpose.
+    PC_WANT_IF="        if: \${{ success() && startsWith(github.ref, 'refs/tags/v') }}"
+    PC_GOT_IF="$(printf '%s\n' "$PUBLISH_CRATES_STEP" | grep -E '^[0-9]+:        if:' | cut -d: -f2-)"
+    if [[ "$PC_GOT_IF" == "$PC_WANT_IF" ]]; then
+        pass "the crates.io publish step is gated on success() AND a v* tag ref"
     else
-        fail "the crates.io publish step has acquired an 'if:' or 'continue-on-error:'" \
-            "$(printf '%s\n' "$PC_OVERRIDE")" \
-            "Steps run only after every earlier step succeeded, and that default is" \
-            "what puts this publish downstream of the canary. An 'if:' can override" \
-            "it; 'continue-on-error: true' lets a failed upload reach the un-draft."
+        fail "the crates.io publish step's 'if:' is not the expected gate" \
+            "expected: $PC_WANT_IF" \
+            "got:      ${PC_GOT_IF:-<none>}" \
+            "Without the tag test a push to main can reach a crates.io upload" \
+            "(this workflow runs on 'branches: [main]' too). Without 'success() &&'" \
+            "the step's implicit success() default is being relied on, and any" \
+            "later edit to 'always()' publishes after a failed Gate A."
+    fi
+
+    # `continue-on-error: true` is the other neutering route, and it is not
+    # covered by the exact-match above: it would let a FAILED upload proceed to
+    # the un-draft, publishing a release whose crates do not exist.
+    PC_COE="$(printf '%s\n' "$PUBLISH_CRATES_STEP" \
+        | grep -E '^[0-9]+:        continue-on-error:')"
+    if [[ -z "$PC_COE" ]]; then
+        pass "the crates.io publish step has no 'continue-on-error:'"
+    else
+        fail "the crates.io publish step has acquired a 'continue-on-error:'" \
+            "$(printf '%s\n' "$PC_COE")" \
+            "A failed upload would then reach the un-draft, publishing a release" \
+            "whose crates are not on crates.io."
     fi
 fi
 
@@ -261,10 +292,18 @@ elif ! command -v jq >/dev/null 2>&1; then
 else
     pass "extracted the crates.io publish step's run: block ($(printf '%s\n' "$PC_RUN" | wc -l) lines)"
 
+    # The crates.io answer is per-CRATE, not one fixed body, because the case
+    # that matters most is the asymmetric one: `freenet` uploaded, then `fdev`
+    # failed. A re-run must skip the first and retry only the second. A stub
+    # that answers identically for both cannot express that, and would let a
+    # step that skips or publishes ALL-or-NOTHING pass as if it were
+    # per-crate.
     pc_run_case() {
-        # pc_run_case <desc> <core-version> <tag> <crates.io-body> <want-rc> <want-cargo:yes|no>
-        local desc="$1" core_ver="$2" tag="$3" api_body="$4" want_rc="$5" want_cargo="$6"
-        local work rc got_cargo
+        # pc_run_case <desc> <core-version> <tag> <freenet-body> <fdev-body> <want-rc> <want-published>
+        #   want-published: none | freenet | fdev | both
+        local desc="$1" core_ver="$2" tag="$3" freenet_body="$4" fdev_body="$5"
+        local want_rc="$6" want_published="$7"
+        local work rc got_freenet got_fdev got_published
         work="$(mktemp -d)"
         mkdir -p "$work/crates/core" "$work/crates/fdev" "$work/bin"
         printf '[package]\nname = "freenet"\nversion = "%s"\n' "$core_ver" \
@@ -272,15 +311,24 @@ else
         printf '[package]\nname = "fdev"\nversion = "0.9.9"\n' \
             > "$work/crates/fdev/Cargo.toml"
         : > "$work/cargo.log"
-        # Unquoted heredocs: `$work` and `$api_body` expand, `\$*` and the `\n`
-        # in the format string reach the stub literally.
+        # Unquoted heredocs: `$work` and the bodies expand, while `\$*`, `\$@`
+        # and the `\n` in the format strings reach the stub literally.
         cat > "$work/bin/cargo" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$work/cargo.log"
 EOF
+        # Dispatches on the crate name in the request URL, exactly as the real
+        # endpoint does (\`/api/v1/crates/<name>/<version>\`).
         cat > "$work/bin/curl" <<EOF
 #!/usr/bin/env bash
-printf '%s' '$api_body'
+for arg in "\$@"; do
+  case "\$arg" in
+    */crates/freenet/*) printf '%s' '$freenet_body'; exit 0 ;;
+    */crates/fdev/*)    printf '%s' '$fdev_body';    exit 0 ;;
+  esac
+done
+echo "stub curl: no crate in args: \$*" >&2
+exit 1
 EOF
         printf '#!/usr/bin/env bash\nexit 0\n' > "$work/bin/sleep"
         chmod +x "$work/bin/cargo" "$work/bin/curl" "$work/bin/sleep"
@@ -289,25 +337,28 @@ EOF
         ( cd "$work" && PATH="$work/bin:$PATH" GITHUB_REF="refs/tags/$tag" \
             bash "$work/step.sh" ) > "$work/out" 2>&1
         rc=$?
-        if grep -qF 'publish -p freenet' "$work/cargo.log"; then
-            got_cargo=yes
-        else
-            got_cargo=no
-        fi
+        grep -qF 'publish -p freenet' "$work/cargo.log" && got_freenet=1 || got_freenet=0
+        grep -qF 'publish -p fdev'    "$work/cargo.log" && got_fdev=1    || got_fdev=0
+        case "$got_freenet$got_fdev" in
+            00) got_published=none ;;
+            10) got_published=freenet ;;
+            01) got_published=fdev ;;
+            11) got_published=both ;;
+        esac
 
         local ok=1
         case "$want_rc" in
-            0)      [[ "$rc" -eq 0 ]] || ok=0 ;;
+            0)       [[ "$rc" -eq 0 ]] || ok=0 ;;
             nonzero) [[ "$rc" -ne 0 ]] || ok=0 ;;
         esac
-        [[ "$got_cargo" == "$want_cargo" ]] || ok=0
+        [[ "$got_published" == "$want_published" ]] || ok=0
 
         if [[ "$ok" -eq 1 ]]; then
-            pass "publish step: $desc (rc=$rc, cargo publish called: $got_cargo)"
+            pass "publish step: $desc (rc=$rc, published: $got_published)"
         else
             fail "publish step: $desc" \
-                "expected rc $want_rc and cargo-publish-called=$want_cargo," \
-                "got rc=$rc and cargo-publish-called=$got_cargo" \
+                "expected rc $want_rc and published=$want_published," \
+                "got rc=$rc and published=$got_published" \
                 "--- step output ---" \
                 "$(head -20 "$work/out")"
         fi
@@ -315,25 +366,83 @@ EOF
     }
 
     NOT_ON_CRATES_IO='{"errors":[{"detail":"Not Found"}]}'
-    ON_CRATES_IO='{"version":{"num":"9.9.9"}}'
+    FREENET_ON_CRATES_IO='{"version":{"num":"9.9.9"}}'
+    FDEV_ON_CRATES_IO='{"version":{"num":"0.9.9"}}'
 
     # The guard itself: a tree whose version disagrees with the tag must stop
-    # BEFORE anything reaches crates.io. `cargo publish called: no` is the
-    # load-bearing half -- a refusal that happens after the upload is not one.
+    # BEFORE anything reaches crates.io. `published: none` is the load-bearing
+    # half -- a refusal that happens after the upload is not one.
     pc_run_case "refuses a tree whose version does not match the tag" \
-        "0.0.1" "v9.9.9" "$NOT_ON_CRATES_IO" nonzero no
+        "0.0.1" "v9.9.9" "$NOT_ON_CRATES_IO" "$NOT_ON_CRATES_IO" nonzero none
 
-    # Idempotent re-run (the recovery path the docs point at): the version is
-    # already published, so nothing is uploaded twice and the job proceeds to
-    # the un-draft.
-    pc_run_case "skips a version already on crates.io, and still succeeds" \
-        "9.9.9" "v9.9.9" "$ON_CRATES_IO" 0 no
+    # The normal path. Without this case every other one here is satisfied by a
+    # step that never publishes at all.
+    pc_run_case "publishes both when the tree matches and neither is on crates.io" \
+        "9.9.9" "v9.9.9" "$NOT_ON_CRATES_IO" "$NOT_ON_CRATES_IO" 0 both
 
-    # ...and it is not just refusing everything: on the normal path it really
-    # does publish. Without this case the two above are satisfied by a step
-    # that never publishes at all.
-    pc_run_case "publishes when the tree matches and the version is new" \
-        "9.9.9" "v9.9.9" "$NOT_ON_CRATES_IO" 0 yes
+    # Full re-run after a failure downstream of the upload (a cancelled runner,
+    # a failed un-draft). Nothing is uploaded twice and the job proceeds.
+    pc_run_case "skips both when both are already on crates.io" \
+        "9.9.9" "v9.9.9" "$FREENET_ON_CRATES_IO" "$FDEV_ON_CRATES_IO" 0 none
+
+    # THE case this requirement is about: the publish died between the two
+    # uploads. A re-run must skip freenet -- `cargo publish` would refuse a
+    # duplicate and fail the job, costing another tag -- and retry fdev alone.
+    pc_run_case "re-run after a partial publish retries only the missing crate" \
+        "9.9.9" "v9.9.9" "$FREENET_ON_CRATES_IO" "$NOT_ON_CRATES_IO" 0 fdev
+
+    # ...and the mirror, so the per-crate dispatch is not passing by accident of
+    # the order the step happens to check them in.
+    pc_run_case "re-run publishes freenet alone when only fdev is already up" \
+        "9.9.9" "v9.9.9" "$NOT_ON_CRATES_IO" "$FDEV_ON_CRATES_IO" 0 freenet
+fi
+
+# --- 2b-ter. the crates.io credential is checked EARLY -----------------------
+# Moving the publish to the end of the pipeline created a new way to lose a
+# release: a missing or dead CARGO_REGISTRY_TOKEN is now discovered after the
+# bump PR, the tag, ~30 minutes of cross-compilation and Gate A. That is F3's
+# shape one step further down -- an avoidable cost paid at the most expensive
+# possible moment -- so both entry points check the credential up front.
+TOKEN_CHECK_LINE="$(line_of 'CARGO_REGISTRY_TOKEN not set')"
+if [[ -z "$TOKEN_CHECK_LINE" ]]; then
+    fail "attach-to-release does not check for CARGO_REGISTRY_TOKEN before doing work" \
+        "This job ends in a crates.io upload. A missing credential is" \
+        "deterministic, so it should fail before the artifact download, the" \
+        "signing and the canary -- not after them."
+elif [[ -n "$CANARY_LINE" && "$TOKEN_CHECK_LINE" -gt "$CANARY_LINE" ]]; then
+    fail "attach-to-release checks CARGO_REGISTRY_TOKEN only AFTER the canary (token $TOKEN_CHECK_LINE > canary $CANARY_LINE)" \
+        "The point of the check is to fail fast. After the canary it saves nothing."
+else
+    pass "attach-to-release checks CARGO_REGISTRY_TOKEN before the canary (line $TOKEN_CHECK_LINE)"
+fi
+
+# ...and release.yml checks it in its FIRST job, which is the one that matters:
+# before the bump PR exists there is nothing to unwind.
+RELEASE_YML="$SCRIPT_DIR/../.github/workflows/release.yml"
+if [[ ! -f "$RELEASE_YML" ]]; then
+    fail "release.yml not found at $RELEASE_YML"
+else
+    VALIDATE_JOB="$(awk '
+        /^  validate:[[:space:]]*$/       { inblock = 1; next }
+        inblock && /^  [A-Za-z_.-]+:/     { inblock = 0 }
+        inblock && $0 !~ /^[[:space:]]*#/ { print }
+    ' "$RELEASE_YML")"
+    if [[ -z "$VALIDATE_JOB" ]]; then
+        fail "could not locate release.yml's 'validate' job" \
+            "The credential check below scans it, so an empty extraction would" \
+            "pass vacuously."
+    elif [[ "$VALIDATE_JOB" != *'CARGO_REGISTRY_TOKEN'* ]]; then
+        fail "release.yml's 'validate' job no longer checks CARGO_REGISTRY_TOKEN" \
+            "It is the first job in the pipeline, so a missing credential caught" \
+            "there costs nothing. Caught at the publish instead, it costs the bump" \
+            "PR, the tag and the whole build."
+    elif [[ "$VALIDATE_JOB" != *'exit 1'* ]]; then
+        fail "release.yml's 'validate' job mentions CARGO_REGISTRY_TOKEN but cannot refuse" \
+            "No 'exit 1' in the job. A credential check that only warns does not" \
+            "stop the release from reaching the publish and failing there."
+    else
+        pass "release.yml's 'validate' job checks CARGO_REGISTRY_TOKEN and can refuse"
+    fi
 fi
 
 # --- 2c. release.yml must not publish for real -------------------------------
@@ -344,7 +453,7 @@ fi
 #
 # `--dry-run` is explicitly allowed and deliberately kept there: it is not
 # irreversible and it catches a packaging break before a tag is burned.
-RELEASE_YML="$SCRIPT_DIR/../.github/workflows/release.yml"
+# (RELEASE_YML is set above, by the credential check.)
 if [[ ! -f "$RELEASE_YML" ]]; then
     fail "release.yml not found at $RELEASE_YML"
 else
