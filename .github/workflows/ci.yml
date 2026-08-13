@@ -196,7 +196,10 @@ jobs:
 
       # Pins the WIRING of the blocking pre-flight canary, which is what
       # makes it a gate at all: it must run inside attach-to-release, after
-      # the assets upload and BEFORE `gh release edit --draft=false`, and
+      # the assets upload, BEFORE the crates.io publish (the one irreversible
+      # step, moved here from release.yml so a blocked gate costs a deletable
+      # tag instead of a spent version number), and BEFORE
+      # `gh release edit --draft=false`, and
       # not be disabled in place. Also pins release.sh's ATTACH_JOB_NAME
       # against the job's name in cross-compile.yml -- the driver polls for
       # that string and a rename on either side is otherwise silent.

@@ -253,8 +253,31 @@ jobs:
           LAUNCH_SHA: ${{ github.sha }}
         run: scripts/resolve_release_sha.sh
 
-  publish_crates:
-    name: Publish to crates.io
+  # The crates.io publish itself does NOT happen here. It happens in
+  # cross-compile.yml's `attach-to-release` job, AFTER the blocking auto-update
+  # pre-flight canary (Gate A, #5222) has passed. This job keeps only the
+  # reversible half.
+  #
+  # WHY THE PUBLISH MOVED (#5288 / the 0.2.124 loss). The order used to be
+  # publish-to-crates.io -> tag -> build -> Gate A -> un-draft, so the one step
+  # that can never be undone ran before the gate that decides whether to ship at
+  # all. When Gate A blocked v0.2.124, its crates were already on crates.io and
+  # its GitHub release could only ever stay a draft: the version number was
+  # spent, and 0.2.125 had to be cut in its place. Under the new order a Gate A
+  # block costs a TAG, which is deletable, and a re-run instead of a release.
+  #
+  # What stays here is the DRY RUN, which is not irreversible and which fails
+  # early -- before the tag is pushed and before ~an hour of cross-compilation
+  # and macOS notarization. It catches the packaging class of break (a
+  # `include_str!` path outside the crate, #4240) at the cheapest point.
+  #
+  # freenet only. `cargo publish --dry-run -p fdev` resolves `freenet` from the
+  # REGISTRY (crates/fdev/Cargo.toml carries `version = "0.2.x"` next to the
+  # path dep), so it cannot succeed until this release's freenet is actually
+  # published -- which now happens in cross-compile.yml. Attempting it here
+  # would fail every release for a reason that is not a bug.
+  verify_publishable:
+    name: Verify crates are publishable (dry run)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: [validate, wait_for_pr]
@@ -288,48 +311,24 @@ jobs:
         with:
           toolchain: 1.93.0
 
-      - name: Publish freenet to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      # No CARGO_REGISTRY_TOKEN here on purpose: a dry run does not upload, and
+      # this job must not be able to publish even by accident. The real publish
+      # lives in cross-compile.yml's `attach-to-release`, downstream of Gate A,
+      # and that is the only place the token belongs.
+      - name: Verify freenet packages cleanly (dry run)
         run: |
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            echo "📦 [DRY RUN] Verifying freenet ${{ needs.validate.outputs.version }} can be published to crates.io..."
-            cargo publish -p freenet --dry-run
-            echo "✅ freenet dry-run successful (would publish)"
-          else
-            echo "📦 Publishing freenet ${{ needs.validate.outputs.version }} to crates.io..."
-            cargo publish -p freenet
-            echo "✅ freenet published successfully"
-          fi
-
-      - name: Wait for crates.io propagation
-        if: ${{ !inputs.dry_run }}
-        run: |
-          echo "⏳ Waiting 30s for crates.io to propagate..."
-          sleep 30
-
-      - name: Publish fdev to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            echo "📦 [DRY RUN] Verifying fdev ${{ needs.validate.outputs.fdev_version }} can be published to crates.io..."
-            cargo publish -p fdev --dry-run
-            echo "✅ fdev dry-run successful (would publish)"
-          else
-            echo "📦 Publishing fdev ${{ needs.validate.outputs.fdev_version }} to crates.io..."
-            cargo publish -p fdev
-            echo "✅ fdev published successfully"
-          fi
+          echo "📦 [DRY RUN] Verifying freenet ${{ needs.validate.outputs.version }} can be published to crates.io..."
+          cargo publish -p freenet --dry-run
+          echo "✅ freenet dry-run successful (the real publish runs after Gate A, in cross-compile.yml)"
 
   create_release:
     name: Create GitHub release
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # `wait_for_pr` is in `needs` only to carry `release_sha` through; the
-    # ordering it implies is already enforced via `publish_crates`.
-    needs: [validate, wait_for_pr, publish_crates]
-    if: always() && (needs.publish_crates.result == 'success' || inputs.dry_run)
+    # ordering it implies is already enforced via `verify_publishable`.
+    needs: [validate, wait_for_pr, verify_publishable]
+    if: always() && (needs.verify_publishable.result == 'success' || inputs.dry_run)
     env:
       # The tag MUST land on the same commit that was published to crates.io.
       # `ref: main` here meant the tag could point at a tree nobody validated
@@ -418,7 +417,10 @@ jobs:
             --title "v$VERSION" \
             --notes-file "${{ steps.release_notes.outputs.notes_file }}" \
             --draft
-          echo "✅ Created draft GitHub release v$VERSION (will be published after binaries are attached)"
+          echo "✅ Created draft GitHub release v$VERSION"
+          echo "   cross-compile.yml now: attaches binaries -> runs Gate A -> publishes to"
+          echo "   crates.io -> un-drafts. Nothing irreversible has happened yet; if Gate A"
+          echo "   blocks, delete this tag and re-cut rather than burning the version."
 
       - name: Dry run summary
         if: ${{ inputs.dry_run }}
@@ -440,11 +442,18 @@ jobs:
     steps:
       - name: Release completed
         run: |
-          echo "🎉 Release ${{ needs.validate.outputs.version }} completed!"
+          echo "🎉 Release ${{ needs.validate.outputs.version }} is cut and tagged."
           echo
-          echo "Summary:"
-          echo "  - freenet ${{ needs.validate.outputs.version }} published to crates.io"
-          echo "  - fdev ${{ needs.validate.outputs.fdev_version }} published to crates.io"
-          echo "  - GitHub release created: https://github.com/${{ github.repository }}/releases/tag/v${{ needs.validate.outputs.version }}"
-          echo "  - Cross-compilation workflow will run automatically"
+          echo "Done here:"
+          echo "  - version bump merged, tag v${{ needs.validate.outputs.version }} pushed"
+          echo "  - DRAFT GitHub release created: https://github.com/${{ github.repository }}/releases/tag/v${{ needs.validate.outputs.version }}"
+          echo
+          echo "Still to happen, in cross-compile.yml (triggered by the tag):"
+          echo "  - cross-compile + attach binaries"
+          echo "  - Gate A: auto-update pre-flight on the binary about to ship (BLOCKING)"
+          echo "  - publish freenet ${{ needs.validate.outputs.version }} and fdev ${{ needs.validate.outputs.fdev_version }} to crates.io"
+          echo "  - un-draft the release, which fires the downstream cascade"
+          echo
+          echo "The crates.io publish is deliberately downstream of Gate A: until it runs,"
+          echo "nothing about this release is irreversible."
           echo "  - Binaries will be attached when workflow completes"

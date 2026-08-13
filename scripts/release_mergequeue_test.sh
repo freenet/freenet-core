@@ -6,7 +6,7 @@
 # enforcement enabled between v0.2.92 and v0.2.93) OWNS the merge strategy and
 # rejects an explicit `--squash`, so `gh pr merge` exits non-zero. Under
 # `shell: bash -e` that fails the step, fails the `update_versions` job, and
-# skips the ENTIRE publish cascade (wait_for_pr -> publish_crates -> tag ->
+# skips the ENTIRE publish cascade (wait_for_pr -> verify_publishable -> tag ->
 # gateway update). Net effect: the bump PR is created but nothing publishes.
 #
 # The fix drops `--squash` (the queue applies its configured strategy). This
@@ -60,7 +60,7 @@ check "gh pr merge still enables --auto" \
 # unspecified GITHUB_TOKEN scope `none`, so this job must explicitly opt into
 # Actions read access. Use the job's least-privilege GITHUB_TOKEN rather than a
 # RELEASE_PAT that may not carry the Actions permission.
-WAIT_JOB=$(sed -n '/^  wait_for_pr:/,/^  publish_crates:/p' "$RELEASE_YML")
+WAIT_JOB=$(sed -n '/^  wait_for_pr:/,/^  verify_publishable:/p' "$RELEASE_YML")
 check "wait_for_pr grants Actions read access" \
   "$(grep -qE '^      actions: read$' <<< "$WAIT_JOB" && echo present || echo missing)" "present"
 # The GitHub expression is intentionally matched literally.
@@ -284,7 +284,8 @@ check "queued timeout reports queue position and enqueue time" \
 # ---------------------------------------------------------------------------
 # #5233: the release must be cut from ONE immutable commit.
 #
-# `publish_crates` and `create_release` used to check out `ref: main` and then
+# `verify_publishable` (then named `publish_crates`) and `create_release` used
+# to check out `ref: main` and then
 # `git pull origin main`. Both run AFTER `wait_for_pr`, which blocks ~20 minutes
 # on the merge queue, so any commit that landed on main during that window was
 # silently published and tagged. v0.2.122 shipped an unrelated commit this way.
@@ -295,10 +296,10 @@ VERIFY_SCRIPT="$SCRIPT_DIR/verify_release_checkout.sh"
 
 # Job bodies, bounded to the job. An unbounded grep over the whole file would
 # match a neighbouring job and pass vacuously.
-PUBLISH_JOB=$(sed -n '/^  publish_crates:/,/^  create_release:/p' "$RELEASE_YML")
+PUBLISH_JOB=$(sed -n '/^  verify_publishable:/,/^  create_release:/p' "$RELEASE_YML")
 CREATE_RELEASE_JOB=$(sed -n '/^  create_release:/,/^  summary:/p' "$RELEASE_YML")
 
-check "publish_crates job body was located" \
+check "verify_publishable job body was located" \
   "$([ -n "$PUBLISH_JOB" ] && echo present || echo missing)" "present"
 check "create_release job body was located" \
   "$([ -n "$CREATE_RELEASE_JOB" ] && echo present || echo missing)" "present"
@@ -306,15 +307,15 @@ check "create_release job body was located" \
 # A sed range whose closing anchor is renamed silently runs to EOF, so the
 # job-scoped pins below would start matching neighbouring jobs and pass
 # vacuously. Assert each range actually terminated on its anchor.
-check "publish_crates range is bounded by the next job" \
+check "verify_publishable range is bounded by the next job" \
   "$([ "$(tail -n1 <<< "$PUBLISH_JOB")" = "  create_release:" ] && echo bounded || echo ran-to-eof)" "bounded"
 check "create_release range is bounded by the next job" \
   "$([ "$(tail -n1 <<< "$CREATE_RELEASE_JOB")" = "  summary:" ] && echo bounded || echo ran-to-eof)" "bounded"
 # WAIT_JOB is extracted by the pre-existing merge-queue checks above and needs
-# the same guard: renaming publish_crates silently widens it to EOF, after
+# the same guard: renaming verify_publishable silently widens it to EOF, after
 # which every wait_for_pr pin starts matching text from other jobs.
 check "wait_for_pr range is bounded by the next job" \
-  "$([ "$(tail -n1 <<< "$WAIT_JOB")" = "  publish_crates:" ] && echo bounded || echo ran-to-eof)" "bounded"
+  "$([ "$(tail -n1 <<< "$WAIT_JOB")" = "  verify_publishable:" ] && echo bounded || echo ran-to-eof)" "bounded"
 
 # The bug itself: no job may resolve a moving reference.
 #
@@ -348,13 +349,22 @@ check "wait_for_pr invokes the tested resolver script" \
   "$(grep -qE '^[[:space:]]*run: (bash )?scripts/resolve_release_sha\.sh[[:space:]]*$' <<< "$WAIT_JOB" && echo present || echo missing)" "present"
 
 # Both downstream jobs must consume that SHA and re-check it after checkout.
-# The irreversible act each job must never reach unverified. The regex needles
-# below are intentionally literal shell text, not expansions.
+# The act each job must never reach unverified. The regex needles below are
+# intentionally literal shell text, not expansions.
+#
+# `verify_publishable`'s act is no longer irreversible -- the real crates.io
+# upload moved to cross-compile.yml so it could sit downstream of the blocking
+# pre-flight canary, and what is left here is `cargo publish --dry-run`. The
+# guard stays anyway: a dry run of the WRONG tree reports that a commit nobody
+# is releasing packages cleanly, which is a green signal about the wrong thing.
+# The real upload's equivalent guard (tag vs. crates/core/Cargo.toml, asserted
+# before anything is sent) is pinned in release_canary_wiring_test.sh, which
+# owns the attach-to-release job.
 # shellcheck disable=SC2016
-for job_name in publish_crates create_release; do
+for job_name in verify_publishable create_release; do
     case "$job_name" in
-      publish_crates) JOB_BODY="$PUBLISH_JOB"; IRREVERSIBLE='cargo publish' ;;
-      create_release) JOB_BODY="$CREATE_RELEASE_JOB"; IRREVERSIBLE='git push origin "v\$VERSION"' ;;
+      verify_publishable) JOB_BODY="$PUBLISH_JOB"; IRREVERSIBLE='cargo publish'; ACT='cargo publish (dry run)' ;;
+      create_release) JOB_BODY="$CREATE_RELEASE_JOB"; IRREVERSIBLE='git push origin "v\$VERSION"'; ACT='tag push' ;;
     esac
 
     check "$job_name checks out needs.wait_for_pr.outputs.release_sha" \
@@ -379,9 +389,9 @@ for job_name in publish_crates create_release; do
     CHECKOUT_LINE=$(grep -nE '^[[:space:]]*ref: \$\{\{ needs\.wait_for_pr\.outputs\.release_sha' <<< "$JOB_BODY" | head -1 | cut -d: -f1 || true)
     IRREVERSIBLE_LINE=$(grep -nE "^[^#]*${IRREVERSIBLE}" <<< "$JOB_BODY" | head -1 | cut -d: -f1 || true)
 
-    check "$job_name's irreversible step was located" \
+    check "$job_name's $ACT step was located" \
       "$([ -n "$IRREVERSIBLE_LINE" ] && echo found || echo missing)" "found"
-    check "$job_name verifies BEFORE its irreversible step, not after" \
+    check "$job_name verifies BEFORE its $ACT, not after" \
       "$([ -n "$VERIFY_LINE" ] && [ -n "$IRREVERSIBLE_LINE" ] && [ "$VERIFY_LINE" -lt "$IRREVERSIBLE_LINE" ] && echo before || echo after)" "before"
     check "$job_name verifies AFTER the checkout, not before" \
       "$([ -n "$VERIFY_LINE" ] && [ -n "$CHECKOUT_LINE" ] && [ "$VERIFY_LINE" -gt "$CHECKOUT_LINE" ] && echo after || echo before)" "after"
@@ -389,7 +399,7 @@ done
 
 # create_release can only read the output if wait_for_pr is in its needs.
 check "create_release depends on wait_for_pr so the SHA is in scope" \
-  "$(grep -qE '^    needs: \[validate, wait_for_pr, publish_crates\]$' <<< "$CREATE_RELEASE_JOB" && echo present || echo missing)" "present"
+  "$(grep -qE '^    needs: \[validate, wait_for_pr, verify_publishable\]$' <<< "$CREATE_RELEASE_JOB" && echo present || echo missing)" "present"
 
 # The notes must describe the commit being released, not whatever main is now.
 # The shell variable reference is intentionally matched literally.

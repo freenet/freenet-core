@@ -12,6 +12,14 @@
 # silently-removable-gate shape the canary was introduced to eliminate. A gate
 # whose removal is invisible is not a gate.
 #
+# It also pins the ORDER OF THE IRREVERSIBLE STEP, for the same reason. The
+# crates.io publish moved out of release.yml into this job, between the canary
+# and the un-draft, because a published crate version is the one thing in a
+# release that cannot be taken back: with it upstream of the gate, a Gate A
+# block cost v0.2.124 its version number instead of a re-run. Moving it back --
+# in either file -- restores that, and would otherwise be invisible to every
+# test in this repo. See assertions 2b and 2c.
+#
 # It also pins the two ends of a string that must agree across files:
 # release.sh's ATTACH_JOB_NAME is how the release driver finds this job's
 # status, and nothing else checks that the name still matches. Rename the job
@@ -122,6 +130,141 @@ elif [[ -n "$CANARY_LINE" ]]; then
             "release is public before the updater is ever exercised. The whole" \
             "point of Gate A is that a failure costs a stuck DRAFT, not a" \
             "stranded fleet."
+    fi
+fi
+
+# --- 2b. the crates.io publish sits BETWEEN the canary and the un-draft ------
+# The ordering this pins is the fix for the 0.2.124 loss. The publish used to
+# run in release.yml before the tag existed, so the one irreversible step in a
+# release happened UPSTREAM of the gate that decides whether to ship: when
+# Gate A blocked v0.2.124 its crates were already permanent, the release could
+# only stay a draft, and the version number was spent.
+#
+# Both bounds matter and they fail differently:
+#   above the canary -> back to burning a version number on every gate block;
+#   below the un-draft -> the release goes public before its crates exist, so
+#     `cargo install freenet` fails for whoever reads the announcement first.
+#
+# Ordering is checked by line number because steps in a job run in file order,
+# which is the same mechanism assertion 2 relies on.
+PUBLISH_CRATES_LINE="$(line_of 'cargo publish -p freenet')"
+if [[ -z "$PUBLISH_CRATES_LINE" ]]; then
+    fail "no 'cargo publish -p freenet' in the attach-to-release job" \
+        "The crates.io publish lives here so that it runs AFTER the blocking" \
+        "pre-flight canary. If it has moved back into release.yml (or anywhere" \
+        "upstream of the tag), a Gate A block again costs a permanently-spent" \
+        "crates.io version instead of a deletable tag -- the v0.2.124 loss."
+else
+    pass "the crates.io publish runs in attach-to-release (line $PUBLISH_CRATES_LINE)"
+
+    if [[ -n "$CANARY_LINE" ]]; then
+        if [[ "$CANARY_LINE" -lt "$PUBLISH_CRATES_LINE" ]]; then
+            pass "the canary runs BEFORE the crates.io publish (canary $CANARY_LINE < publish $PUBLISH_CRATES_LINE)"
+        else
+            fail "the crates.io publish runs BEFORE the canary (publish $PUBLISH_CRATES_LINE < canary $CANARY_LINE)" \
+                "The publish is irreversible and the canary is the gate. In this order a" \
+                "Gate A block leaves the crates on crates.io forever and the release" \
+                "unpublishable -- exactly what happened to v0.2.124."
+        fi
+    fi
+
+    if [[ -n "$PUBLISH_LINE" ]]; then
+        if [[ "$PUBLISH_CRATES_LINE" -lt "$PUBLISH_LINE" ]]; then
+            pass "the crates.io publish runs BEFORE '--draft=false' (crates $PUBLISH_CRATES_LINE < un-draft $PUBLISH_LINE)"
+        else
+            fail "the release is un-drafted BEFORE its crates are published (un-draft $PUBLISH_LINE < crates $PUBLISH_CRATES_LINE)" \
+                "The release becomes public, the announcement cascade fires, and" \
+                "'cargo install freenet@<version>' does not work yet. Publish first."
+        fi
+    fi
+
+    PUBLISH_CRATES_STEP="$(step_block "$PUBLISH_CRATES_LINE")"
+    if [[ -z "$PUBLISH_CRATES_STEP" ]]; then
+        # Every assertion below scans this variable, and an empty scan target
+        # makes each of them pass by finding nothing. Fail loudly instead:
+        # `step_block` returning nothing means its `- name:` bounds moved, not
+        # that the step is clean.
+        fail "could not extract the crates.io publish STEP around line $PUBLISH_CRATES_LINE" \
+            "step_block found no enclosing '- name:'. Every check below scans this" \
+            "text, so an empty extraction would make all of them pass vacuously."
+    fi
+
+    # The #5233 guard, in the form this job can express it. release.yml's two
+    # jobs each run verify_release_checkout.sh before their irreversible act,
+    # because they check out a SHA that a moving `main` could have displaced.
+    # Here the ref is the tag, so the equivalent question is whether the tag and
+    # the tree agree -- and it has to be asked BEFORE the upload, because a
+    # crates.io version cannot be replaced once sent. Without it a mis-tagged
+    # tree publishes silently under the wrong version number.
+    PC_STEP_TEXT="$(printf '%s\n' "$PUBLISH_CRATES_STEP" | cut -d: -f2-)"
+    PC_GUARD_LINE="$(printf '%s\n' "$PUBLISH_CRATES_STEP" \
+        | grep -F 'crates/core/Cargo.toml' | head -1 | cut -d: -f1)"
+    if [[ -z "$PC_GUARD_LINE" ]]; then
+        fail "the crates.io publish step does not read crates/core/Cargo.toml" \
+            "It must assert the tag matches the tree's declared version before" \
+            "uploading anything. A crates.io version is permanent, so 'which tree" \
+            "am I publishing' has to be checked, not assumed (#5233 for the same" \
+            "class of bug in release.yml)."
+    elif [[ "$PC_GUARD_LINE" -lt "$(printf '%s\n' "$PUBLISH_CRATES_STEP" | grep -F 'cargo publish -p freenet' | head -1 | cut -d: -f1)" ]]; then
+        pass "the crates.io publish step checks the tag against crates/core/Cargo.toml first"
+    else
+        fail "the crates.io publish step reads crates/core/Cargo.toml only AFTER uploading" \
+            "A guard that runs after the upload verifies nothing -- the version is" \
+            "already permanent."
+    fi
+    # ...and the guard must be able to stop the upload. `exit 1` on mismatch is
+    # what makes it a guard rather than a log line.
+    if [[ "$PC_STEP_TEXT" == *"exit 1"* ]]; then
+        pass "the crates.io publish step's version guard can refuse (exit 1)"
+    else
+        fail "the crates.io publish step's version guard cannot stop the upload" \
+            "No 'exit 1' in the step. A mismatch that only prints is not a guard."
+    fi
+
+    # Same two neutering routes assertion 3 covers for the canary. A publish
+    # step that cannot fail is not the problem here -- the problem is a publish
+    # step that runs when the canary DIDN'T pass, which `if:` buys and
+    # `continue-on-error` does not. Pin both anyway: `continue-on-error: true`
+    # here would let a failed upload proceed to the un-draft, publishing a
+    # release whose crates do not exist.
+    PC_OVERRIDE="$(printf '%s\n' "$PUBLISH_CRATES_STEP" \
+        | grep -E '^[0-9]+:        (if|continue-on-error):')"
+    if [[ -z "$PC_OVERRIDE" ]]; then
+        pass "the crates.io publish step has no 'if:' or 'continue-on-error:'"
+    else
+        fail "the crates.io publish step has acquired an 'if:' or 'continue-on-error:'" \
+            "$(printf '%s\n' "$PC_OVERRIDE")" \
+            "Steps run only after every earlier step succeeded, and that default is" \
+            "what puts this publish downstream of the canary. An 'if:' can override" \
+            "it; 'continue-on-error: true' lets a failed upload reach the un-draft."
+    fi
+fi
+
+# --- 2c. release.yml must not publish for real -------------------------------
+# The other half of the same invariant, and the one a well-meaning revert would
+# reach for: re-adding `cargo publish -p freenet` to release.yml restores the
+# old upstream-of-the-gate order even with everything above still green,
+# because release.yml runs entirely before the tag that triggers this workflow.
+#
+# `--dry-run` is explicitly allowed and deliberately kept there: it is not
+# irreversible and it catches a packaging break before a tag is burned.
+RELEASE_YML="$SCRIPT_DIR/../.github/workflows/release.yml"
+if [[ ! -f "$RELEASE_YML" ]]; then
+    fail "release.yml not found at $RELEASE_YML"
+else
+    # Comment lines dropped for the same reason JOB_BLOCK drops them: this
+    # file's comments discuss the publish at length.
+    REAL_PUBLISH="$(grep -vE '^[[:space:]]*#' "$RELEASE_YML" \
+        | grep -E 'cargo publish' | grep -vE '\-\-dry-run')"
+    if [[ -z "$REAL_PUBLISH" ]]; then
+        pass "release.yml contains no non-dry-run 'cargo publish' (the real one is gated here)"
+    else
+        fail "release.yml runs a real 'cargo publish'" \
+            "$REAL_PUBLISH" \
+            "release.yml runs BEFORE the tag exists, so anything it publishes is" \
+            "upstream of the pre-flight canary. That ordering is what made a Gate A" \
+            "block cost v0.2.124 its version number rather than a re-run. Only" \
+            "'cargo publish --dry-run' belongs there."
     fi
 fi
 

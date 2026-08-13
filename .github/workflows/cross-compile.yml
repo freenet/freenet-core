@@ -380,7 +380,15 @@ jobs:
     # min if it has to retry an unreachable GitHub. At the old budget a retry
     # got the job CANCELLED before the `Publish release` step ran, leaving a
     # permanently stuck draft — the exact failure the retry existed to avoid.
-    timeout-minutes: 25
+    #
+    # Raised again from 25 for the crates.io publish, which moved here from
+    # release.yml so it sits downstream of Gate A. `cargo publish` builds and
+    # verifies each package; release.yml budgeted 20 minutes for the pair. Same
+    # reasoning as the last raise applies with more force now: a cancellation
+    # between the upload and the un-draft leaves a published crate and a draft
+    # release, which is precisely the 0.2.124 state this move exists to make
+    # unreachable. Budget generously.
+    timeout-minutes: 60
     needs: [build-x86_64-linux, build-arm64-linux, build-arm64-macos, build-x86_64-macos, build-x86_64-windows, build-macos-dmg]
     if: startsWith(github.ref, 'refs/tags/v')
 
@@ -616,6 +624,9 @@ jobs:
       #   - the assets exist, so we are testing the real artifact;
       #   - the release is still a DRAFT, so nothing has reached a user yet and
       #     a failure costs us a stuck draft rather than a broken fleet;
+      #   - the crates.io publish is BELOW it (it moved out of release.yml for
+      #     exactly this), so a failure here costs a deletable tag rather than a
+      #     permanently-spent version number;
       #   - it is a `needs`-chained step, not a `release: published` listener,
       #     so it cannot silently stop running if RELEASE_PAT lapses (that
       #     token already suppresses downstream events when unset — see #4118).
@@ -623,11 +634,14 @@ jobs:
       # It adds ~1 minute: the node's startup check fires after a 0-60s jitter
       # and the script returns as soon as it has a verdict.
       #
-      # IF THIS FAILS: the release stays an unpublished draft, which is the
-      # correct fail-closed state. Do NOT un-draft it by hand to "unblock" the
-      # release — the updater in that binary is broken and publishing it
-      # strands the fleet on the previous version. Fix the detection path on
-      # the release branch, then re-run this workflow for the tag.
+      # IF THIS FAILS: the release stays an unpublished draft and NOTHING
+      # irreversible has happened — no crates were uploaded. That is the correct
+      # fail-closed state. Do NOT un-draft it by hand to "unblock" the release:
+      # the updater in that binary is broken and publishing it strands the fleet
+      # on the previous version. Fix the detection path, then either re-run this
+      # workflow for the tag (if the fix is not in the binary) or delete the tag
+      # and re-cut on the corrected commit. Deleting and re-cutting is cheap
+      # here, which is the point; see scripts/RELEASE_RECOVERY.md.
       # ---------------------------------------------------------------------
       # This job downloads artifacts and never checks out the repo, so the
       # canary script is not on disk. Sparse-checkout just that one file into
@@ -651,6 +665,98 @@ jobs:
           tar xzf freenet-x86_64-unknown-linux-musl.tar.gz -C /tmp
           chmod +x /tmp/freenet
           bash _canary/scripts/auto-update-canary.sh preflight /tmp/freenet
+
+      # ---------------------------------------------------------------------
+      # crates.io publish — the IRREVERSIBLE step, deliberately DOWNSTREAM of
+      # Gate A and immediately UPSTREAM of the un-draft.
+      #
+      # It used to run in release.yml, before the tag was even pushed, so the
+      # one action that can never be undone happened before the gate that
+      # decides whether to ship. v0.2.124 is the standing proof: Gate A blocked
+      # it (correctly, as it turned out — on a harness bug, #5290), its crates
+      # were already on crates.io, and a published crate version cannot be
+      # replaced. The release could only ever remain a draft; the version number
+      # was spent and 0.2.125 was cut in its place.
+      #
+      # In this position a Gate A block costs a TAG. `git push --delete origin
+      # vX.Y.Z`, fix, re-tag the corrected commit — a re-run, not a lost
+      # version. That asymmetry is the whole reason for the move: order the
+      # pipeline so the reversible failures happen where the irreversible step
+      # has not run yet.
+      #
+      # Placed BEFORE the un-draft rather than after so the release only becomes
+      # visible once its crates exist. A failure here leaves a draft with assets
+      # and no crates, which is recoverable by re-running this job: the publish
+      # steps below skip a version that is already on crates.io.
+      #
+      # The job otherwise never checks out the repo, and the release assets sit
+      # in the workspace ROOT — `actions/checkout` cleans its target path, so
+      # this must go in a subdirectory for the same reason the canary checkout
+      # does. The default ref for a tag push is the tag, so the tree published
+      # here is exactly the tree the shipped binaries were built from.
+      # ---------------------------------------------------------------------
+      - name: Check out the release source
+        uses: actions/checkout@v7
+        with:
+          path: _src
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - name: Publish crates to crates.io
+        working-directory: _src
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          VERSION="${TAG_NAME#v}"
+
+          # The tag and the tree must agree before anything is uploaded. This is
+          # the same class of guard as release.yml's verify_release_checkout.sh:
+          # a crates.io version is permanent, so "which tree am I publishing"
+          # gets asserted, not assumed.
+          CORE_VERSION="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' crates/core/Cargo.toml | head -1)"
+          FDEV_VERSION="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' crates/fdev/Cargo.toml | head -1)"
+          echo "tag=$TAG_NAME  crates/core=$CORE_VERSION  crates/fdev=$FDEV_VERSION"
+          if [ "$CORE_VERSION" != "$VERSION" ]; then
+            echo "::error::tag $TAG_NAME does not match crates/core/Cargo.toml version '$CORE_VERSION'. Refusing to publish: a crates.io upload cannot be taken back."
+            exit 1
+          fi
+
+          # Already on crates.io? Then this is a re-run of a job that got past
+          # the upload (a failed un-draft, a cancelled runner), and re-uploading
+          # is an error rather than a no-op. `jq` reads a variable via a here-
+          # string, not a pipe: under `set -o pipefail` a short-circuiting
+          # reader makes the producer die 141 and a PRESENT answer read as
+          # ABSENT, which here would mean attempting a duplicate upload.
+          crate_published() {
+            local body
+            body="$(curl -sS -A 'freenet-release-ci' --max-time 30 \
+              --retry 3 --retry-all-errors \
+              "https://crates.io/api/v1/crates/$1/$2" 2>/dev/null)" || return 1
+            jq -e '.version.num? // empty' >/dev/null 2>&1 <<<"$body"
+          }
+
+          if crate_published freenet "$VERSION"; then
+            echo "✅ freenet $VERSION is already on crates.io (re-run); skipping"
+          else
+            echo "📦 Publishing freenet $VERSION to crates.io..."
+            cargo publish -p freenet
+            echo "✅ freenet $VERSION published"
+            echo "⏳ Waiting 30s for crates.io to propagate (fdev resolves freenet from the registry)..."
+            sleep 30
+          fi
+
+          if crate_published fdev "$FDEV_VERSION"; then
+            echo "✅ fdev $FDEV_VERSION is already on crates.io (re-run); skipping"
+          else
+            echo "📦 Publishing fdev $FDEV_VERSION to crates.io..."
+            cargo publish -p fdev
+            echo "✅ fdev $FDEV_VERSION published"
+          fi
 
       - name: Publish release
         env:
@@ -761,7 +867,7 @@ jobs:
           # red because the updater is broken OR because GitHub was unreachable,
           # and a message that overstates ("the fleet is stranded") on a network
           # blip trains people to ignore the channel.
-          message: "\U0001F6A8 RELEASE PRE-FLIGHT did not pass for ${{ github.ref_name }} (publish job: ${{ needs.attach-to-release.result }}, auto-update self-update canary: ${{ needs.auto-update-selfupdate-canary.result }}). Check WHICH step failed before concluding anything: the publish job also does artifact download, checksumming and signing, so a red result here is not by itself an auto-update fault. If the publish job failed, the release is STUCK AS A DRAFT and needs a decision. If the self-update canary failed, a node on the previous release may not be able to auto-update to this one (#5221 failure mode — the fleet would need `freenet update` by hand). ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          message: "\U0001F6A8 RELEASE PRE-FLIGHT did not pass for ${{ github.ref_name }} (publish job: ${{ needs.attach-to-release.result }}, auto-update self-update canary: ${{ needs.auto-update-selfupdate-canary.result }}). Check WHICH step failed before concluding anything: the publish job also does artifact download, checksumming, signing and the crates.io upload, so a red result here is not by itself an auto-update fault. If the publish job failed, the release is STUCK AS A DRAFT and needs a decision — and note that whether the crates.io upload already ran decides the recovery, because it is the one step that cannot be undone (it sits AFTER the pre-flight canary and BEFORE the un-draft; read the job log to see which side of it the failure fell on). If the self-update canary failed, a node on the previous release may not be able to auto-update to this one (#5221 failure mode — the fleet would need `freenet update` by hand). ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
           room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
           gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}
