@@ -2949,7 +2949,7 @@ pub(crate) fn summaries_reply_for_peer(
 /// extreme — a wide set of contracts we do not host, where each entry costs
 /// almost nothing and the byte budget would never bind — not as the number
 /// that governs how fast the rotation turns. Quote the byte budget for that.
-const MAX_FALLBACK_SUMMARIES_PER_REPLY: usize = 64;
+pub(crate) const MAX_FALLBACK_SUMMARIES_PER_REPLY: usize = 64;
 
 /// Byte budget for one full-bytes summary fallback reply (#5155).
 ///
@@ -3434,11 +3434,16 @@ async fn handle_interest_sync_message(
             //   recognised as ground the longer already covered. If the shorter
             //   records first the longer is charged on top of it, over-stating
             //   progress by up to one window.
-            // - A racer that STRADDLES a boundary (it read the old cycle, the
-            //   other took the boundary) overwrites `last_sent` and discards the
-            //   freshly published origin, so its successor resumes from the old
-            //   window instead of the new origin. Safe direction: it costs
-            //   contiguity for one round, never coverage.
+            // - A racer that STRADDLES a boundary (it read the old cycle, another
+            //   reply took the boundary) is NOT in this list any more: its record
+            //   is not well-formed against the new cycle, so it is discarded and
+            //   the freshly published origin survives. It used to overwrite
+            //   `last_sent` and discard that origin, via a first-record exemption
+            //   in `record_fallback_cursor` that no longer exists. The cost is now
+            //   only that the window it already sent is re-sent later, since it
+            //   was never charged. Kept here as a signpost because the imprecision
+            //   was documented for long enough that a reader may come looking for
+            //   it.
             // - Contract CHURN: ids removed from ground already swept while
             //   others are inserted below the cursor let the count reach the set
             //   size with current members never advertised this cycle.
@@ -3452,7 +3457,6 @@ async fn handle_interest_sync_message(
                         &matching,
                         last,
                         entries.len(),
-                        MAX_FALLBACK_SUMMARIES_PER_REPLY,
                     );
                 }
             }
@@ -10170,23 +10174,30 @@ mod tests {
                 //   pre-PR main ..................................... 40 /  0
                 //                            and, replicated ....... 40 /  0
                 //
-                // TREAT THE FAILING RATES AS ORDER-OF-MAGNITUDE ONLY. The two
-                // independent measurements of 65086ec2 (separate sessions,
-                // worktrees and binaries) agree that it flakes badly but differ
-                // by 12 points, 20% vs 33%, most plausibly because this host runs
-                // concurrent test agents. So do not read fine distinctions
-                // between 20%, 33% and 43% -- those intervals overlap with the
-                // noise. The zero rows are the robust ones: 0 failures in 40 is
-                // qualitatively different from 8-17 in 40, and both replications
-                // of `main` agree exactly.
+                // EVERY ROW IS n=40, so read each rate as +/- about 15 points.
+                // The two independent measurements of 65086ec2 (separate
+                // sessions, worktrees and binaries) came out 8/40 and 13/40, and
+                // that spread needs no explanation: z = 1.27, p = 0.20, with
+                // Wilson 95% intervals of [10.5%, 34.8%] and [20.1%, 48.0%]
+                // overlapping across most of their range. It is ordinary sampling
+                // noise at this n, NOT evidence of anything about the machine.
+                //
+                // Which rows are sound follows from the power, and this is why
+                // the table is trustworthy exactly where it is used: separating
+                // 20% from 33% would need n ~ 193, and 33% from 43% n ~ 366, but
+                // separating ~0% from 20% needs only n ~ 35. So the ZERO rows
+                // carry the whole argument at n=40 and the contested rows carry
+                // none of it. Do not read fine distinctions between 20%, 33% and
+                // 43%.
                 //
                 // Read the rows carefully, because the obvious story is wrong. It
                 // is the ZERO-ADVANCE REJECTION in `record_fallback_cursor` that
                 // makes this test green, NOT the atomic boundary -- the advance
-                // check alone is 0/40, the boundary alone is 17/40. That
-                // distinction survives the noise; a claim that the boundary alone
-                // is WORSE than the guard it replaced would not, so it is not
-                // made. What matters is that publishing the origin makes
+                // check alone is 0/40, the boundary alone is 17/40 against main's
+                // 0/40. That 0-versus-17 gap is the one the power analysis above
+                // supports at n=40. A claim that the boundary alone is WORSE than
+                // the id-equality guard it replaced is NOT supported (17/40 vs
+                // 8-13/40 at this n) and is not made. What matters is that publishing the origin makes
                 // concurrent racers AGREE, so they build identical windows every
                 // time, turning the duplicate charge from occasional into
                 // systematic. The two changes are coupled: the boundary is what
