@@ -94,11 +94,19 @@ const TOP_DIFFERING_CONTRACTS_REPORTED: usize = 10;
 /// What a summary comparison's message was shaped like, and which receive arm
 /// saw it — the R4b (#5153) discriminator.
 ///
-/// One enum rather than a `bool` because the two facts are not independent and
-/// the illegal pairing must be unrepresentable: a single-entry observation on
-/// the DIGEST leg is, today, provably **not** notification traffic (a
+/// One enum rather than a `bool` because the two facts are not independent, and
+/// a named variant makes the wrong pairing hard to write by accident rather than
+/// impossible: all three variants are `pub(crate)`, so a call site can still name
+/// `SingleEntryFullBytes` directly on the digest leg. The actual guard against
+/// that is the call-site pin `every_summary_observation_passes_the_message_shape`,
+/// which asserts the leg split (2 full-bytes sites, 1 digest) and goes red on a
+/// directly-named variant. The enum's job is to stop the mistake being invisible;
+/// the pin's job is to stop it shipping.
+///
+/// Why the pairing matters: a single-entry observation on the DIGEST leg is,
+/// today, provably **not** notification traffic (a
 /// notification ships full bytes unconditionally,
-/// `operations/update.rs::send_summary_notification`), so folding it in with the
+/// `operations/update.rs::send_proactive_summary_notification`), so folding it in with the
 /// full-bytes leg would mix two populations under one name. A caller holding a
 /// `bool` cannot express that difference; this type forces it to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,9 +328,173 @@ impl OutboundKind {
 /// today's call sites (the tag is mandatory), but the recorder counts such a
 /// message in the residual rather than dropping it, so the sub-arms sum to the
 /// parent by construction rather than by everyone remembering to.
+/// Which wire form carried a `Summaries`-family message.
+///
+/// The census MUST split on this, not just on emitter and length (#5153 review
+/// round 2). `OutboundClass::classify` folds `InterestMessage::Summaries` and
+/// `InterestMessage::SummaryDigests` into one arm with the same emitter tag,
+/// while the RECEIVE side counts them into separate single-entry buckets. A
+/// leg-blind census therefore charges digest-form sends against the full-bytes
+/// leg — and since `summary_reply_form` returns `Digests` for every peer at or
+/// above the `(0, 2, 116)` floor and the fleet is past it, MOST
+/// `ChangeInterestsReply` traffic is digests and never enters the full-bytes
+/// receive population at all. Correcting the full-bytes leg with a merged
+/// number over-subtracts by roughly 11 points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SummariesWireForm {
+    /// `InterestMessage::Summaries` — full summary bytes per entry.
+    #[default]
+    FullBytes,
+    /// `InterestMessage::SummaryDigests` — 21-byte digests (#4965).
+    Digests,
+}
+
+impl SummariesWireForm {
+    fn index(self) -> usize {
+        match self {
+            Self::FullBytes => 0,
+            Self::Digests => 1,
+        }
+    }
+
+    /// Telemetry key infix. `full_bytes` is spelled out rather than left
+    /// implicit so neither leg reads as the default in a dashboard query.
+    fn stem(self) -> &'static str {
+        match self {
+            Self::FullBytes => "full_bytes",
+            Self::Digests => "digests",
+        }
+    }
+}
+
+const SUMMARIES_WIRE_FORMS: [SummariesWireForm; 2] =
+    [SummariesWireForm::FullBytes, SummariesWireForm::Digests];
+
+/// FLEET-WIDE single-entry totals for one window, and the only supported input
+/// to [`notification_share_bounds`].
+///
+/// This type exists to make one specific mistake impossible to write down. An
+/// earlier revision instructed an analyst, in prose, to measure notification's
+/// share "per node per minute". **That computation is invalid**: the census is
+/// recorded on the SENDER and the comparison buckets on the RECEIVER, so a
+/// node's census describes its own outbound while its buckets describe its
+/// neighbours' outbound. They are disjoint traffic. The correction is only
+/// meaningful summed across the reporting fleet for the same window, where
+/// "everyone's sends" and "everyone's receives" are the same traffic counted
+/// twice.
+///
+/// The name is the guard: `FleetSingleEntryTotals` cannot be read as a per-node
+/// quantity. It does not physically stop someone summing one node's records into
+/// it — the collection-taking signature that would needs a rollup-parsing
+/// harness this crate has no other use for — so that residual is named here
+/// rather than left implicit.
+///
+/// # `request_leg` is EXCLUDED, deliberately
+///
+/// `SummaryRequest` carries bare 32-bit hashes and no summary entries, so it is
+/// never observed as a comparison. Summing all seven census arms would put a
+/// population in the denominator that the numerator structurally cannot contain,
+/// inflating it and understating notification's share. [`Self::from_census`]
+/// drops it; asserted by `census_denominator_excludes_the_request_leg`.
+// DELIBERATELY has no production caller: the node never reads its own rollups
+// back, so this is an executable REFERENCE for the offline analysis, which lives
+// in Python outside this repo. Shipping it as tested code rather than as a
+// rustdoc recipe is the point — an earlier revision expressed the recipe only in
+// prose, got the aggregation level wrong there while the tests beside it computed
+// the right thing, and nothing compared the two. Residual, stated: the divergence
+// risk moves from prose-vs-code to Rust-vs-Python. A named implementation with
+// worked numbers is at least something the Python can be checked against, which
+// prose never was.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FleetSingleEntryTotals {
+    /// Single-entry messages the fleet SENT on the leg being corrected,
+    /// attributed to `Notification`.
+    notification_msgs: u64,
+    /// Same leg, every OTHER summary-bearing emitter — the contamination.
+    other_msgs: u64,
+}
+
+impl FleetSingleEntryTotals {
+    /// Sum one wire form's census across the fleet, excluding the request leg.
+    ///
+    /// `per_arm` is indexed by [`summaries_index`], i.e. the shape of
+    /// `Window::summaries_single_entry_msgs[..][form]` summed over records.
+    #[allow(dead_code)] // see the type-level note: reference impl, no in-tree caller
+    fn from_census(per_arm: [u64; SUMMARIES_ARMS.len()]) -> Self {
+        let mut notification_msgs = 0u64;
+        let mut other_msgs = 0u64;
+        for emitter in SUMMARIES_ARMS {
+            let n = per_arm[summaries_index(emitter)];
+            // Exhaustive on purpose: a new emitter must be classified here
+            // rather than defaulting into either bucket.
+            match emitter {
+                SummariesEmitter::Notification => {
+                    notification_msgs = notification_msgs.saturating_add(n);
+                }
+                // Carries no summary entries, so never a comparison.
+                SummariesEmitter::SummaryRequest => {}
+                SummariesEmitter::InterestsReply
+                | SummariesEmitter::ChangeInterestsReply
+                | SummariesEmitter::Rejection
+                | SummariesEmitter::SummaryRequestReply
+                | SummariesEmitter::Other => {
+                    other_msgs = other_msgs.saturating_add(n);
+                }
+            }
+        }
+        Self {
+            notification_msgs,
+            other_msgs,
+        }
+    }
+}
+
+/// Notification's share of the fleet's single-entry sends on one leg, as an
+/// interval.
+///
+/// Returns `(lower, upper)`. `upper` is the raw share; `lower` charges the whole
+/// contamination against notifications, the worst case for `p`. Quote `p` across
+/// the gap rather than at a point.
+///
+/// **This is not the full correction.** The share is over MESSAGES; the buckets
+/// it corrects count COMPARISONS, and the expansion between them is
+/// emitter-DEPENDENT. A `SummaryRequestReply` exists only because a digest
+/// mismatched, which presupposes the receiver had local interest AND a summary,
+/// so it expands to >= 1 by construction — while a notification can arrive for a
+/// contract the receiver holds no interest in and expand to 0. Notifications
+/// therefore expand to fewer comparisons on average, so applying this share to
+/// the comparison population OVER-subtracts them. That is the same
+/// "differing by construction" property that inflated the denominator, biting a
+/// second time by another mechanism: fixing one does not fix the other.
+///
+/// The expansion factor is **not measurable until this ships** — both sides of
+/// the ratio are counters added here. The first analysis after deployment must
+/// compute `(single-entry comparisons) / (single-entry census messages)`
+/// fleet-wide, record it with its window, and only then quote a bounded `p`. It
+/// calibrates early: both counters come from the same record on the same node,
+/// so any adoption level yields a valid expansion estimate well before `p`
+/// itself is representative.
+#[allow(dead_code)] // see `FleetSingleEntryTotals`: reference impl, no in-tree caller
+fn notification_share_bounds(t: FleetSingleEntryTotals) -> (f64, f64) {
+    let total = t.notification_msgs.saturating_add(t.other_msgs);
+    if total == 0 {
+        // No traffic is not 0% notification, it is no information. (0.0, 1.0)
+        // makes an empty window read as maximally uncertain rather than as
+        // evidence that notifications are absent.
+        return (0.0, 1.0);
+    }
+    let upper = t.notification_msgs as f64 / total as f64;
+    let lower = t.notification_msgs.saturating_sub(t.other_msgs) as f64 / total as f64;
+    (lower, upper)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct SummariesDetail {
     emitter: SummariesEmitter,
+    /// Which wire form carried it — see [`SummariesWireForm`] for why the
+    /// census cannot be read without this.
+    wire_form: SummariesWireForm,
     /// `entries.len()` — how many `SummaryEntry` this one message carried.
     ///
     /// The independent check on the attribution, and the reason it is worth
@@ -439,6 +611,7 @@ impl OutboundClass {
                         kind: OutboundKind::InterestSyncSummaries,
                         summaries: Some(SummariesDetail {
                             emitter: *emitter,
+                            wire_form: SummariesWireForm::FullBytes,
                             entries: entries.len() as u64,
                         }),
                     },
@@ -450,6 +623,7 @@ impl OutboundClass {
                         kind: OutboundKind::InterestSyncSummaries,
                         summaries: Some(SummariesDetail {
                             emitter: *emitter,
+                            wire_form: SummariesWireForm::Digests,
                             entries: entries.len() as u64,
                         }),
                     },
@@ -461,6 +635,12 @@ impl OutboundClass {
                         kind: OutboundKind::InterestSyncSummaries,
                         summaries: Some(SummariesDetail {
                             emitter: SummariesEmitter::SummaryRequest,
+                            // The request leg exists only in the hash-first
+                            // exchange, so `Digests` is the honest label — but it
+                            // carries no summary entries either way and
+                            // `FleetSingleEntryTotals::from_census` excludes it
+                            // from every denominator.
+                            wire_form: SummariesWireForm::Digests,
                             entries: hashes.len() as u64,
                         }),
                     },
@@ -525,18 +705,28 @@ struct Window {
     /// messages per emitter here therefore measures exactly what the receive-side
     /// proxy is unable to separate.
     ///
-    /// Why it is needed, in numbers (one window, 2026-08-12): `notification`
-    /// 3,194,108 single-entry messages, but `change_interests_reply` 418,476
-    /// (mean 1.000, max 1) and `request_reply` at least 131,153 — so **~15% of
-    /// single-entry `Summaries` are not notifications.** An earlier version of
-    /// this instrument documented only `rejection` (669 messages, 0.015%) as the
-    /// contamination, which was the smallest of three by three orders of
-    /// magnitude and left the largest unnamed.
+    /// **Indexed by `[arm][wire form]`, and the wire form is load-bearing.**
+    /// See [`SummariesWireForm`]: a leg-blind census over-subtracts the
+    /// full-bytes leg by roughly 11 points, because most `ChangeInterestsReply`
+    /// goes out as digests today and never reaches the full-bytes receive
+    /// population that `*_single` counts.
     ///
-    /// With this census the analysis can bound `p` instead of asserting it:
-    /// notification's share of the single-entry population is measured per node
-    /// per minute rather than assumed to be ~1.
-    summaries_single_entry_msgs: [u64; SUMMARIES_ARMS.len()],
+    /// Why it is needed, in numbers (one window, 2026-08-12): `notification`
+    /// 3,194,108 single-entry messages, `change_interests_reply` 418,476 (mean
+    /// 1.000, max 1), `request_reply` at least 131,153, `rejection` 669. Merged
+    /// across wire forms that is ~15% not-notification — but the FULL-BYTES leg,
+    /// which is the one `p` is computed over, is contaminated mainly by
+    /// `request_reply` and `rejection`, nearer **4%**. An even earlier version
+    /// documented only `rejection` (0.015%), the smallest of the three.
+    ///
+    /// Those figures come from pre-split telemetry and are therefore themselves
+    /// merged; the whole point of this field is that the deployed version
+    /// measures the split directly instead of estimating it.
+    ///
+    /// How to use it: see
+    /// [`FleetSingleEntryTotals`] — fleet-wide only, as a ratio, and never
+    /// joined per node.
+    summaries_single_entry_msgs: [[u64; SUMMARIES_WIRE_FORMS.len()]; SUMMARIES_ARMS.len()],
     /// InterestSync summary comparisons where both sides held a summary and
     /// the bytes were IDENTICAL. See [`OutboundMix::record_summary_comparison`].
     summary_entries_identical: u64,
@@ -586,7 +776,7 @@ struct Window {
     ///
     /// NOT notification traffic, and that is the point of separating them: a
     /// notification ships full bytes unconditionally today
-    /// (`operations/update.rs::send_summary_notification`), while
+    /// (`operations/update.rs::send_proactive_summary_notification`), while
     /// `ChangeInterestsReply` does route through the version gate — so a
     /// single-entry observation arriving on the digest leg is churn-leg by
     /// construction. Folding these into `*_single` would have bought post-R4b
@@ -598,6 +788,28 @@ struct Window {
     /// visible rather than inferred.
     summary_entries_identical_single_digest: u64,
     /// Digest-leg sibling of [`Window::summary_entries_differing_single`].
+    ///
+    /// # STRUCTURALLY ZERO IN PRODUCTION TODAY — do not compute a rate from it
+    ///
+    /// The digest arm records a comparison in exactly one place, the
+    /// `DigestVerdict::Agree` branch, and it passes byte-identical operands by
+    /// construction; `NeedBytes` deliberately records nothing (the F2 deferral).
+    /// So this counter cannot be incremented by any production path, and
+    /// `identical_single_digest / (identical + differing)_single_digest` reads
+    /// **1.000 forever**. That is not a 100% agreement rate — it is an artefact
+    /// of where the recording sites are, and quoting it as evidence would be the
+    /// overstated-saving failure this instrument exists to avoid.
+    ///
+    /// A NON-ZERO value would mean something specific and worth knowing: either
+    /// the digest arm gained a recording on a disagreeing path, or
+    /// `classify_summary_digest` returned `Agree` for operands that then compared
+    /// unequal — i.e. a digest collision or a summary that changed mid-handler.
+    /// It is emitted for that reason, and because the `NeedBytes` decision is
+    /// revisited at R4b, when notifications move onto this leg and both digest
+    /// counters become the interesting pair.
+    ///
+    /// Only the unit tests drive it, deliberately, by constructing a state
+    /// production cannot reach.
     summary_entries_differing_single_digest: u64,
     /// Comparisons where exactly ONE side held a summary (#4965 review S2).
     ///
@@ -731,8 +943,9 @@ impl OutboundMix {
             // exactly why its proxy needs this to be interpretable. Same branch
             // as the parent update, so it cannot disagree about a message.
             if detail.entries == 1 {
-                w.summaries_single_entry_msgs[s] =
-                    w.summaries_single_entry_msgs[s].saturating_add(1);
+                let f = detail.wire_form.index();
+                w.summaries_single_entry_msgs[s][f] =
+                    w.summaries_single_entry_msgs[s][f].saturating_add(1);
             }
         }
     }
@@ -1082,14 +1295,21 @@ fn outbound_mix_json(w: &Window, window_secs: u64) -> serde_json::Value {
             format!("{stem}_max_entries"),
             w.summaries_max_entries[s].into(),
         );
-        // R4b contamination census (#5153 review F1). Seven more integers on a
-        // rollup that already carries five per arm — the same cost argument, and
-        // it is what makes the receive-side single-entry buckets interpretable
-        // rather than merely present.
-        body.insert(
-            format!("{stem}_single_entry_msgs"),
-            w.summaries_single_entry_msgs[s].into(),
-        );
+        // R4b contamination census (#5153 review F1), split by WIRE FORM (review
+        // round 2). 14 integers on a rollup that already carries five per arm —
+        // the same cost argument, and it is what makes the receive-side
+        // single-entry buckets interpretable rather than merely present.
+        //
+        // The wire-form split is not optional: the receive side counts full-bytes
+        // and digest observations into SEPARATE buckets, so a census merged
+        // across forms cannot correct either one. See `SummariesWireForm`.
+        for form in SUMMARIES_WIRE_FORMS {
+            let f = form.index();
+            body.insert(
+                format!("{stem}_{}_single_entry_msgs", form.stem()),
+                w.summaries_single_entry_msgs[s][f].into(),
+            );
+        }
     }
 
     // #4965 falsifier. Emitted unconditionally (including as a pair of zeros)
@@ -1277,6 +1497,37 @@ mod tests {
             OutboundClass::classify(&summaries_msg(emitter, n, 1)),
             bytes,
         );
+    }
+
+    /// Send `n` entries as the DIGEST wire form under `emitter`.
+    ///
+    /// Needed because `record_summaries` only ever produces
+    /// `InterestMessage::Summaries`, so a census test built on it alone cannot
+    /// distinguish the two legs — which is exactly the gap that let a leg-blind
+    /// census look correct (#5153 review round 2).
+    fn record_digests(mix: &OutboundMix, emitter: SummariesEmitter, n: usize) {
+        let msg = NetMessage::V1(NetMessageV1::InterestSync {
+            message: InterestMessage::SummaryDigests {
+                entries: (0..n)
+                    .map(|i| crate::message::SummaryDigestEntry {
+                        hash: i as u32,
+                        summary_digest: None,
+                    })
+                    .collect(),
+                emitter,
+            },
+        });
+        mix.record_sent(OutboundClass::classify(&msg), 21 * n);
+    }
+
+    /// Send a `SummaryRequest` carrying `n` bare hashes and no summary entries.
+    fn record_request_leg(mix: &OutboundMix, n: usize) {
+        let msg = NetMessage::V1(NetMessageV1::InterestSync {
+            message: InterestMessage::SummaryRequest {
+                hashes: (0..n).map(|i| i as u32).collect(),
+            },
+        });
+        mix.record_sent(OutboundClass::classify(&msg), 4 * n);
     }
 
     /// Taking the window leaves the accumulator empty, so consecutive rollups
@@ -2203,66 +2454,165 @@ mod tests {
     /// counted messages rather than SINGLE-ENTRY messages, the wide arm would be
     /// non-zero and this fails.
     #[test]
-    fn single_entry_census_is_per_emitter_and_excludes_wide_messages() {
+    fn single_entry_census_is_per_emitter_leg_split_and_excludes_wide_messages() {
         let mix = OutboundMix::new();
-        // Notification: single-entry by construction (field: mean 1.000).
-        record_summaries(&mix, SummariesEmitter::Notification, 1, 100);
-        record_summaries(&mix, SummariesEmitter::Notification, 1, 100);
-        record_summaries(&mix, SummariesEmitter::Notification, 1, 100);
-        // ChangeInterestsReply: ALSO single-entry (field: mean 1.000, max 1) —
-        // the contaminant an earlier version of this instrument missed.
+        // Full-bytes leg. Notification is single-entry by construction (field:
+        // mean 1.000) and ships full bytes unconditionally this release.
+        for _ in 0..3 {
+            record_summaries(&mix, SummariesEmitter::Notification, 1, 100);
+        }
+        // ChangeInterestsReply is ALSO single-entry (field: mean 1.000, max 1) —
+        // the contaminant an earlier revision missed. One send on each leg,
+        // because in production it is version-gated to DIGESTS and so mostly does
+        // NOT reach the full-bytes receive population.
         record_summaries(&mix, SummariesEmitter::ChangeInterestsReply, 1, 400);
-        // InterestsReply: genuinely wide (field: mean ~224). Must NOT be counted.
+        record_digests(&mix, SummariesEmitter::ChangeInterestsReply, 1);
+        // InterestsReply is genuinely wide (field: mean ~224). Never counted.
         record_summaries(&mix, SummariesEmitter::InterestsReply, 224, 200);
-        // A request reply can be either; a single-entry one is differing by
-        // construction, which is the downward-bias term.
+        // Rejection: tiny but real, asserted explicitly rather than left to
+        // "structurally covered" — that phrase is what preceded the F1 miss.
+        record_summaries(&mix, SummariesEmitter::Rejection, 1, 800);
+        // Request reply: single-entry ones are differing by construction.
         record_summaries(&mix, SummariesEmitter::SummaryRequestReply, 1, 1600);
         record_summaries(&mix, SummariesEmitter::SummaryRequestReply, 7, 1600);
+        // The REQUEST leg carries bare hashes and no summary entries, so it must
+        // never enter a denominator. Without this send the exclusion asserted by
+        // `census_denominator_excludes_the_request_leg` would be untested here.
+        record_request_leg(&mix, 1);
 
         let w = mix.take_window();
-        let census = |e| w.summaries_single_entry_msgs[summaries_index(e)];
-        assert_eq!(census(SummariesEmitter::Notification), 3);
+        let full = |e| {
+            w.summaries_single_entry_msgs[summaries_index(e)][SummariesWireForm::FullBytes.index()]
+        };
+        let dig = |e| {
+            w.summaries_single_entry_msgs[summaries_index(e)][SummariesWireForm::Digests.index()]
+        };
+
+        assert_eq!(full(SummariesEmitter::Notification), 3);
         assert_eq!(
-            census(SummariesEmitter::ChangeInterestsReply),
+            full(SummariesEmitter::ChangeInterestsReply),
             1,
             "the largest contaminant must be counted, not assumed away"
         );
         assert_eq!(
-            census(SummariesEmitter::InterestsReply),
+            dig(SummariesEmitter::ChangeInterestsReply),
+            1,
+            "its DIGEST sends must land on the digest leg, not folded into \
+             full-bytes — that fold over-subtracts the leg `p` is computed on"
+        );
+        assert_eq!(
+            full(SummariesEmitter::InterestsReply),
             0,
             "a 224-entry message is not single-entry; counting it would make the \
              census meaningless"
         );
-        assert_eq!(
-            census(SummariesEmitter::SummaryRequestReply),
-            1,
-            "one of the two request replies was single-entry"
-        );
-
-        // The decision this feeds: notification's share of the single-entry
-        // population. Computable from the census alone, which is the property
-        // that lets the analysis bound `p` instead of asserting it.
-        let total_single: u64 = SUMMARIES_ARMS.iter().map(|e| census(*e)).sum();
-        assert_eq!(total_single, 5);
-        assert_eq!(census(SummariesEmitter::Notification), 3);
+        assert_eq!(full(SummariesEmitter::Rejection), 1);
+        assert_eq!(full(SummariesEmitter::SummaryRequestReply), 1);
+        assert_eq!(dig(SummariesEmitter::SummaryRequest), 1);
 
         let body = outbound_mix_json(&w, 60);
+        for (key, want) in [
+            (
+                "interest_sync_summaries_notification_full_bytes_single_entry_msgs",
+                3,
+            ),
+            (
+                "interest_sync_summaries_change_interests_reply_full_bytes_single_entry_msgs",
+                1,
+            ),
+            (
+                "interest_sync_summaries_change_interests_reply_digests_single_entry_msgs",
+                1,
+            ),
+            (
+                "interest_sync_summaries_interests_reply_full_bytes_single_entry_msgs",
+                0,
+            ),
+            (
+                "interest_sync_summaries_rejection_full_bytes_single_entry_msgs",
+                1,
+            ),
+        ] {
+            assert_eq!(
+                body.get(key).and_then(|v| v.as_u64()),
+                Some(want),
+                "{key} must reach the rollup with the leg split intact"
+            );
+        }
+    }
+
+    /// The census denominator EXCLUDES the request leg (#5153 review round 2).
+    ///
+    /// `SummaryRequest` carries bare 32-bit hashes and no summary entries, so it
+    /// is never observed as a comparison. Summing all seven arms would put a
+    /// population in the denominator the numerator structurally cannot contain,
+    /// understating notification's share. The fixture deliberately CONTAINS a
+    /// large request-leg count, because an earlier version of the census test
+    /// summed all seven arms while its fixture happened to have none — so it
+    /// could not have exposed the trap it was meant to catch.
+    #[test]
+    fn census_denominator_excludes_the_request_leg() {
+        let mut per_arm = [0u64; SUMMARIES_ARMS.len()];
+        per_arm[summaries_index(SummariesEmitter::Notification)] = 90;
+        per_arm[summaries_index(SummariesEmitter::ChangeInterestsReply)] = 10;
+        per_arm[summaries_index(SummariesEmitter::SummaryRequest)] = 900;
+
+        let totals = FleetSingleEntryTotals::from_census(per_arm);
+        assert_eq!(totals.notification_msgs, 90);
         assert_eq!(
-            body.get("interest_sync_summaries_notification_single_entry_msgs")
-                .and_then(|v| v.as_u64()),
-            Some(3),
-            "the census must reach the rollup under a per-arm key"
+            totals.other_msgs, 10,
+            "the request leg is not contamination either — it is not a \
+             comparison at all"
         );
-        assert_eq!(
-            body.get("interest_sync_summaries_change_interests_reply_single_entry_msgs")
-                .and_then(|v| v.as_u64()),
-            Some(1)
+
+        let (lower, upper) = notification_share_bounds(totals);
+        assert!(
+            (upper - 0.9).abs() < 1e-9,
+            "share must be 90/100, not 90/1000: got {upper}"
         );
-        assert_eq!(
-            body.get("interest_sync_summaries_interests_reply_single_entry_msgs")
-                .and_then(|v| v.as_u64()),
-            Some(0),
-            "emitted as an explicit zero, like every other field here"
+        assert!(
+            (lower - 0.8).abs() < 1e-9,
+            "lower bound charges the contamination to notifications: got {lower}"
+        );
+    }
+
+    /// An empty window is NO INFORMATION, not 0% notification.
+    ///
+    /// A point estimate of 0.0 for an idle window would let a quiet node read as
+    /// evidence that notifications are absent.
+    #[test]
+    fn empty_census_reads_as_maximally_uncertain() {
+        let totals = FleetSingleEntryTotals::from_census([0u64; SUMMARIES_ARMS.len()]);
+        assert_eq!(notification_share_bounds(totals), (0.0, 1.0));
+    }
+
+    /// Worked example on the real measured window (2026-08-12), so the recipe is
+    /// exercised against the numbers it was derived from rather than toy inputs.
+    ///
+    /// These are the MERGED pre-split figures — the deployed census reports the
+    /// legs separately, which is the point — so this pins the arithmetic, not the
+    /// eventual answer.
+    #[test]
+    fn notification_share_worked_example_on_measured_window() {
+        let mut per_arm = [0u64; SUMMARIES_ARMS.len()];
+        per_arm[summaries_index(SummariesEmitter::Notification)] = 3_194_108;
+        per_arm[summaries_index(SummariesEmitter::ChangeInterestsReply)] = 418_476;
+        per_arm[summaries_index(SummariesEmitter::SummaryRequestReply)] = 131_153;
+        per_arm[summaries_index(SummariesEmitter::Rejection)] = 669;
+        // Present in the window and correctly ignored.
+        per_arm[summaries_index(SummariesEmitter::SummaryRequest)] = 130_834;
+
+        let totals = FleetSingleEntryTotals::from_census(per_arm);
+        let (lower, upper) = notification_share_bounds(totals);
+        // ~85.3% of merged single-entry sends are notifications, i.e. ~14.7%
+        // contamination — reproducing the review figure from raw counters.
+        assert!(
+            (0.852..0.854).contains(&upper),
+            "expected ~0.853 notification share, got {upper}"
+        );
+        assert!(
+            (0.705..0.707).contains(&lower),
+            "expected ~0.706 worst case, got {lower}"
         );
     }
 

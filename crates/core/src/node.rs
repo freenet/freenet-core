@@ -3929,10 +3929,11 @@ async fn handle_interest_sync_message(
                 // No `one_sided_counted` set here, unlike the `Summaries` arm:
                 // this arm no longer records one-sided observations at all
                 // (#5153 review F2 — it double-counted against the full-bytes
-                // reply that follows). Its absence is the compiler-checked half
-                // of that fix: re-adding a recording here fails to build until
-                // someone also re-adds the set, which is a prompt to re-read why
-                // it went away.
+                // reply that follows). Its absence is a nudge, NOT a guard: a
+                // re-added recording could pass `&mut HashSet::new()` as a
+                // temporary and compile fine. The actual guard is the test
+                // `digest_arm_records_no_one_sided_observation`, which fails if
+                // this arm regains a one-sided call.
                 // WIRE-ORDER INDEPENDENCE — the invariant this grouping exists
                 // to establish.
                 //
@@ -4144,20 +4145,31 @@ async fn handle_interest_sync_message(
                                 // mismatch produces a single-entry reply and
                                 // classifies the same way on arrival.
                                 //
-                                // ACCEPTED BIAS, and it runs in the dangerous
-                                // direction: if the `SummaryRequest` or its
+                                // ACCEPTED BIAS: if the `SummaryRequest` or its
                                 // reply is DROPPED, this divergence is never
-                                // recorded anywhere. The numerator is untouched
-                                // and the denominator is short, so `p` reads
-                                // HIGH — it is a CEILING, not a floor, by the
+                                // recorded anywhere, so it pushes `p` UP by the
                                 // loss rate on one round trip. Double-counting
-                                // would have erred the safe way (declining a
-                                // mechanism worth building); this errs toward
-                                // building on an agreement rate better than
-                                // reality. Correct arithmetic with a
-                                // known-direction bias still beats a wrong
-                                // number, so this stays — see
-                                // `OutboundMix::record_summary_comparison`.
+                                // would be plain wrong arithmetic, so the
+                                // deferral stays.
+                                //
+                                // This is NOT the only bias and `p` is NOT a
+                                // ceiling — an earlier revision of this comment
+                                // said it was. The contamination term runs the
+                                // other way and is larger: a single-entry
+                                // `SummaryRequestReply` is differing by
+                                // construction, so it inflates the denominator.
+                                // See `OutboundMix::record_summary_comparison`
+                                // and `notification_share_bounds` for both terms
+                                // and why `p` must be quoted as an interval.
+                                //
+                                // Also not shape-preserving under hash collision:
+                                // if two locally-known contracts share one 32-bit
+                                // FNV-1a hash, the reply carries TWO entries and
+                                // classifies as `MultiEntry`, so the deferred
+                                // observation reaches no single-entry bucket at
+                                // all. Rare, and it removes rather than
+                                // fabricates, but it is a third small downward
+                                // path on the single-entry counters.
                                 // #5153 review F2 — the one-sided recording that
                                 // used to live here is REMOVED, not moved.
                                 //
