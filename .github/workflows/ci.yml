@@ -615,12 +615,84 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
-        if: success() || steps.test.conclusion == 'failure'
+        # No `if:` here on purpose. This used to read
+        # `success() || steps.test.conclusion == 'failure'`, intending to save the
+        # cache even when tests failed -- but no step declares `id: test`, so
+        # `steps.test.conclusion` resolved to null and the whole condition
+        # collapsed to `success()`, the step default. A step `if:` also could not
+        # express that intent from HERE regardless, because this step runs BEFORE
+        # the tests; the save happens in this action's post hook.
+        #
+        # If you do want the cache saved after a failing test run, the supported
+        # way is this action's own `cache-on-failure: true` input ("Cache even if
+        # the build fails"), which its post hook honours -- NOT a resurrected
+        # `if:` here, and NOT a separate step.
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # nextest is installed by the maintained action on every platform, NOT by
+      # a hand-rolled download. Worth not undoing: on 2026-08-12 the one-liners
+      # this replaced failed four times across four PRs and BOTH platforms
+      # within ~78 minutes, blocking the merge queue -- `curl: (56) Connection
+      # died` on Linux, `The response ended prematurely` from Invoke-WebRequest
+      # on Windows.
+      #
+      # WHAT THE LINUX SIGNATURE ACTUALLY MEANS. Two earlier versions of this
+      # comment got this wrong in opposite directions, so it is written from the
+      # emitting source rather than from inference. `Connection died, tried 5
+      # times before giving up` has exactly one emission site in libcurl,
+      # `Curl_retry_request()` in lib/transfer.c, and BOTH of its trigger
+      # branches are guarded by `bytecount + headerbytecount == 0` -- ZERO bytes
+      # received, headers included. So it is not a truncated transfer; it is
+      # "nothing arrived at all", from either a reused pooled connection the
+      # peer had already closed (branch 1) or an HTTP/2 REFUSED_STREAM (branch
+      # 2). The "5 times" is `#define CONN_MAX_RETRIES 5`, libcurl-internal, and
+      # unrelated to any `--retry` value.
+      #
+      # WHICH HOST IS AT FAULT IS NOT ESTABLISHED, and this comment deliberately
+      # does not claim one. Branch 2 needs no connection reuse, and get.nexte.st
+      # is served over HTTP/2, so the fault can occur on the redirector leg; it
+      # can equally occur on the shared asset leg
+      # (release-assets.githubusercontent.com), which BOTH the old and new paths
+      # traverse. What can be said is narrower: the new path removes one of the
+      # two hosts where this signature can arise. Do not upgrade that into
+      # "changed hosts, fixed it", and do not invert it into "the redirector was
+      # irrelevant" -- this comment has already been wrong both ways.
+      #
+      # The durable win is what WRAPS the download, and it is exactly the right
+      # response to a zero-bytes-on-connection fault: `retry curl --retry 10`
+      # inside a 10-iteration backoff loop (main.sh), plus a SHA256 checksum
+      # verified against the hash in the action's pinned manifest. NONE of the
+      # seven forms this replaced had any retry flag, and none verified what it
+      # extracted into $CARGO_HOME/bin before the next step executed it. On
+      # Windows the consequence was worst, because a single failure lost a
+      # ~34-minute job.
+      #
+      # `fallback: none` is deliberate: it keeps GITHUB_TOKEN out of the
+      # action's environment (action.yml only populates DEFAULT_GITHUB_TOKEN
+      # when fallback == 'cargo-binstall'). It costs nothing, because the
+      # fallback is unreachable for this tool anyway -- it is entered only when
+      # the manifest lacks the tool or the version/platform, never on a network
+      # or checksum failure, which `bail` under `set -e`.
+      #
+      # timeout-minutes bounds that retry budget: 11 attempts x curl --retry 10
+      # with no --retry-max-time can exceed any job budget here, and would be
+      # reported as a job timeout rather than as a failed download. Measured
+      # install time at this head is 1-2s, and 4s on Windows, so the 5-minute
+      # cap is ~75x headroom rather than a tight bound. (A step killed by
+      # timeout-minutes concludes `failure`, not `cancelled`, so the gates below
+      # skip and the job goes red -- which is the intended outcome. Note
+      # actions/runner#2432: step timeouts may be best-effort on Windows.)
+      #
+      # There are seven of these across ci.yml, playwright-shell.yml and
+      # simulation-nightly.yml; the others point here. See #5296.
       - name: Install nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        uses: taiki-e/install-action@v2
+        id: install-nextest
+        timeout-minutes: 5
+        with:
+          tool: cargo-nextest
+          fallback: none
 
       - name: Build
         env:
@@ -664,7 +736,13 @@ jobs:
             --profile ci -E 'not test(blocked_peers)'
 
       - name: Test blocked-peers (serial)
-        if: ${{ !cancelled() }}
+        # `!cancelled()` deliberately keeps this running after an earlier
+        # TEST failure, so a red test does not hide the rest of the suite.
+        # But it also ran after an INSTALL failure, where it died with
+        # `error: no such command: nextest` -- so the red check named this
+        # step, and a reader saw a plausible test regression instead of a
+        # tool-acquisition problem. Require the install to have succeeded.
+        if: ${{ !cancelled() && steps.install-nextest.conclusion == 'success' }}
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
@@ -677,7 +755,13 @@ jobs:
             -E 'test(blocked_peers)' -j 1
 
       - name: Test ping-types
-        if: ${{ !cancelled() }}
+        # `!cancelled()` deliberately keeps this running after an earlier
+        # TEST failure, so a red test does not hide the rest of the suite.
+        # But it also ran after an INSTALL failure, where it died with
+        # `error: no such command: nextest` -- so the red check named this
+        # step, and a reader saw a plausible test regression instead of a
+        # tool-acquisition problem. Require the install to have succeeded.
+        if: ${{ !cancelled() && steps.install-nextest.conclusion == 'success' }}
         # freenet-ping-types tests need the std feature (default).
         # Run separately since the main step uses --no-default-features.
         run: cargo nextest run -p freenet-ping-types --profile ci
@@ -709,12 +793,30 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
-        if: success() || steps.test.conclusion == 'failure'
+        # No `if:` here on purpose. This used to read
+        # `success() || steps.test.conclusion == 'failure'`, intending to save the
+        # cache even when tests failed -- but no step declares `id: test`, so
+        # `steps.test.conclusion` resolved to null and the whole condition
+        # collapsed to `success()`, the step default. A step `if:` also could not
+        # express that intent from HERE regardless, because this step runs BEFORE
+        # the tests; the save happens in this action's post hook.
+        #
+        # If you do want the cache saved after a failing test run, the supported
+        # way is this action's own `cache-on-failure: true` input ("Cache even if
+        # the build fails"), which its post hook honours -- NOT a resurrected
+        # `if:` here, and NOT a separate step.
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # nextest via the maintained action, not a hand-rolled download.
+      # Rationale at the first of these in ci.yml (test_unit job); see #5296.
       - name: Install nextest
-        run: curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        uses: taiki-e/install-action@v2
+        id: install-nextest
+        timeout-minutes: 5
+        with:
+          tool: cargo-nextest
+          fallback: none
 
       - name: Build freenet bin
         run: cargo build --locked -p freenet --bin freenet
@@ -765,13 +867,15 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # nextest via the maintained action, not a hand-rolled download.
+      # Rationale at the first of these in ci.yml (test_unit job); see #5296.
       - name: Install nextest
-        run: |
-          $tmp = New-TemporaryFile | Rename-Item -NewName { $_ -replace 'tmp$', 'zip' } -PassThru
-          Invoke-WebRequest -OutFile $tmp https://get.nexte.st/latest/windows
-          $outputDir = if ($Env:CARGO_HOME) { Join-Path $Env:CARGO_HOME "bin" } else { "$Env:USERPROFILE\.cargo\bin" }
-          $tmp | Expand-Archive -DestinationPath $outputDir -Force
-          $tmp | Remove-Item
+        uses: taiki-e/install-action@v2
+        id: install-nextest
+        timeout-minutes: 5
+        with:
+          tool: cargo-nextest
+          fallback: none
 
       - name: Build freenet bin
         run: cargo build --locked -p freenet --bin freenet
@@ -837,9 +941,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: steps.skip_check.outputs.skip != 'true'
 
+      # nextest via the maintained action, not a hand-rolled download.
+      # Rationale at the first of these in ci.yml (test_unit job); see #5296.
       - name: Install nextest
+        uses: taiki-e/install-action@v2
+        id: install-nextest
         if: steps.skip_check.outputs.skip != 'true'
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        timeout-minutes: 5
+        with:
+          tool: cargo-nextest
+          fallback: none
 
       # Build the simulation test binaries and fdev up-front in one cargo
       # invocation so they share a single compile of freenet/deps. Then the
@@ -1086,9 +1197,16 @@ jobs:
         if: steps.skip_check.outputs.skip != 'true'
         run: docker pull alpine:latest
 
+      # nextest via the maintained action, not a hand-rolled download.
+      # Rationale at the first of these in ci.yml (test_unit job); see #5296.
       - name: Install nextest
+        uses: taiki-e/install-action@v2
+        id: install-nextest
         if: steps.skip_check.outputs.skip != 'true'
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        timeout-minutes: 5
+        with:
+          tool: cargo-nextest
+          fallback: none
 
       - name: Build
         if: steps.skip_check.outputs.skip != 'true'
