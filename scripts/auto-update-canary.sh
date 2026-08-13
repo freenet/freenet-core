@@ -200,6 +200,13 @@ MARKER_LATEST_SEEN_SINCE='0.2.125'
 
 MUSL_ASSET='freenet-x86_64-unknown-linux-musl.tar.gz'
 RELEASE_BASE='https://github.com/freenet/freenet-core/releases/download'
+# The endpoint the NODE uses for its startup check (the 302 from
+# `/releases/latest`). Named once because two callers must hit exactly the same
+# URL: `resolve_expected_latest`, which reads the tag out of the redirect, and
+# `runner_can_reach_github`, whose whole job is to answer whether the runner can
+# reach the endpoint the node just failed on. Two copies that could drift would
+# make the corroboration compare different things.
+RELEASES_LATEST_URL='https://github.com/freenet/freenet-core/releases/latest'
 
 # The node's exit code for "another instance already holds my WS port"
 # (EXIT_CODE_ALREADY_RUNNING in crates/core/src/bin/freenet.rs). Environmental,
@@ -931,7 +938,7 @@ resolve_expected_latest() {
   # which is all bare `--retry` covers.
   url="$(curl -fsS --max-time 30 --retry 2 --retry-all-errors \
     -o /dev/null -w '%{redirect_url}' \
-    'https://github.com/freenet/freenet-core/releases/latest' 2>/dev/null)" || return 1
+    "$RELEASES_LATEST_URL" 2>/dev/null)" || return 1
   case "$url" in
     */releases/tag/*) tag="${url##*/releases/tag/}" ;;
     *) return 1 ;;
@@ -942,10 +949,37 @@ resolve_expected_latest() {
 
 # True when THIS RUNNER can reach the release endpoint the node uses.
 #
-# A named one-liner rather than the call inlined, so the decision below can be
+# A named function rather than the call inlined, so the decision below can be
 # unit-tested by overriding it. Same reason `prev_emits_latest_seen` exists.
+#
+# IT ASKS CURL DIRECTLY rather than going through `resolve_expected_latest`,
+# and the difference is the whole point. That function collapses every
+# non-answer to `return 1` -- a 403, a captive portal, a changed redirect shape,
+# curl missing from the image -- so "the probe malfunctioned" and "the network
+# is down" become the same value. Read as corroboration, every one of those
+# falls to the QUIET path, which is the direction that hides things.
+#
+# So only the CONNECT-CLASS curl exits count as "cannot reach". Anything else,
+# including success and including an HTTP error, means the runner did reach
+# GitHub and the node's inability to is not explained by the network -- loud.
+# An unusable body is likewise not evidence of an outage. Curl absent (127)
+# lands in the same arm, which is right: a broken harness must not buy silence.
+#
+#   6  could not resolve host      7  failed to connect
+#   28 operation timed out         35 SSL connect error
+#
+# Not a full closure of the class: a transient probe failure coinciding with a
+# genuine node-side fault still yields one quiet run. A PERSISTENT probe break
+# is caught earlier -- Gate A exercises the same path on the shipping binary and
+# blocks -- and the quiet message's own consecutive-releases text covers the
+# rest.
 runner_can_reach_github() {
-  resolve_expected_latest >/dev/null 2>&1
+  local rc=0
+  curl -fsS --max-time 30 -o /dev/null "$RELEASES_LATEST_URL" 2>/dev/null || rc=$?
+  case "$rc" in
+    6|7|28|35) return 1 ;;
+    *)         return 0 ;;
+  esac
 }
 
 # gate_b_unverified_class <env-cause> -- "environmental" or "fault", for a Gate
@@ -1254,15 +1288,34 @@ cmd_selfupdate() {
       fi
     fi
 
-    # Fold this attempt into the run-level classification. An explained
-    # indeterminate records its cause; an UNEXPLAINED one latches and is never
-    # overwritten (see the note on `saw_unexplained` above).
+    # Fold this attempt into the run-level classification, STICKY BY STRENGTH
+    # rather than by recency:
+    #
+    #     unexplained  >  github  >  ports
+    #
+    # `saw_unexplained` is the top tier and is handled separately below. The
+    # same rule has to apply one level down, and the first version of this got
+    # that wrong: `env_cause="$attempt_cause"` unconditionally, so the two
+    # orderings of the same pair of attempts disagreed.
+    #
+    #   ports THEN github  -> env_cause=github -> the runner probe runs -> loud.
+    #   github THEN ports  -> env_cause=ports  -> the probe NEVER RUNS, because
+    #                         a port collision is not probed, so the run exits
+    #                         75 quiet AND claims "every attempt hit a port
+    #                         collision on this host", which is false.
+    #
+    # Reachable at the default two attempts. A recorded `github` must therefore
+    # never be downgraded to `ports`: ports is the weakest cause because it is
+    # the only one that buys the quiet path without any corroboration.
     if [ "$rc" -eq 2 ]; then
-      if [ -n "$attempt_cause" ]; then
-        env_cause="$attempt_cause"
-      else
-        saw_unexplained=1
-      fi
+      case "$attempt_cause" in
+        '')     saw_unexplained=1 ;;
+        github) env_cause=github ;;
+        ports)  [ "$env_cause" = "github" ] || env_cause=ports ;;
+        *)      # An unrecognised cause is not quiet-eligible; treat it as
+                # unexplained rather than letting it fall through unrecorded.
+                saw_unexplained=1 ;;
+      esac
     fi
 
     # Keep the node's own output before the next attempt wipes the tree, or the

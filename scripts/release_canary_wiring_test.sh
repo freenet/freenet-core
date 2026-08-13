@@ -58,11 +58,38 @@ done
 # above the step that runs it, so matching raw text would compare the canary
 # against a sentence and report the gate inverted. A pin that fails on prose is
 # no better than one that passes on prose.
-JOB_BLOCK="$(awk '
-    /^  attach-to-release:[[:space:]]*$/ { inblock = 1; print NR ":" $0; next }
-    inblock && /^  [A-Za-z_.-]+:/        { inblock = 0 }
-    inblock && $0 !~ /^[[:space:]]*#/    { print NR ":" $0 }
-' "$WF")"
+# ONE extraction for every job block in this file, so the comment filter cannot
+# be forgotten at a new call site. It was forgotten at two: `selfupdate_block`
+# (fixed after a mutation of `|| rc=$?` hit the comment quoting it and the pin
+# stayed green) and then `notify_block`, where the consequence was worse --
+# widening the quiet notification's `if:` to `result == 'failure'` while leaving
+# a one-line comment recording the old condition left ALL FOUR suites green,
+# with the reassuring "no fleet action is indicated" message firing on every red
+# Gate B run including a real #5221. Two single-site fixes in a row is what
+# turned this into a function.
+#
+# (That second one was saved only by luck: the comment had to be on ONE line,
+# because the `# ` on a wrapped continuation breaks the whitespace-collapsed
+# match. Nobody designed that.)
+#
+# `--numbered` keeps the original line NUMBERS so ordering comparisons stay
+# meaningful; the others do not need them.
+yaml_job_block() {
+    # yaml_job_block <job-key> [--numbered]
+    local job="$1" numbered="${2:-}"
+    awk -v jobre="^  $job:[[:space:]]*\$" -v numbered="$numbered" '
+        { prefix = (numbered != "" ? NR ":" : "") }
+        $0 ~ jobre                        { inblock = 1; print prefix $0; next }
+        inblock && /^  [A-Za-z_.-]+:/     { inblock = 0 }
+        inblock && $0 !~ /^[[:space:]]*#/ { print prefix $0 }
+    ' "$WF"
+}
+
+# The `attach-to-release:` job block: from its own key to the next top-level
+# job key. Job keys sit at exactly two spaces; everything inside the job is
+# indented further, so this needs no YAML parser and cannot be fooled by a
+# matching string in a comment elsewhere in the file.
+JOB_BLOCK="$(yaml_job_block attach-to-release --numbered)"
 
 if [[ -z "$JOB_BLOCK" ]]; then
     fail "the 'attach-to-release' job no longer exists in cross-compile.yml" \
@@ -286,11 +313,7 @@ fi
 #
 # Whole-file scan, not the attach-to-release block: these are separate
 # top-level jobs.
-notify_block="$(awk '
-    /^  notify-auto-update-canary-failure:[[:space:]]*$/ { inblock = 1; print; next }
-    inblock && /^  [A-Za-z_.-]+:/                        { inblock = 0 }
-    inblock                                              { print }
-' "$WF")"
+notify_block="$(yaml_job_block notify-auto-update-canary-failure)"
 
 if [[ -z "$notify_block" ]]; then
     fail "the 'notify-auto-update-canary-failure' job is gone from cross-compile.yml" \
@@ -448,11 +471,7 @@ fi
 # assertions below would have passed against the explanation after the code
 # was removed. Found by mutation, and only because the mutation hit the comment
 # first and the pin stayed green -- the harness accident that exposed it.
-selfupdate_block="$(awk '
-    /^  auto-update-selfupdate-canary:[[:space:]]*$/ { inblock = 1; print; next }
-    inblock && /^  [A-Za-z_.-]+:/                    { inblock = 0 }
-    inblock && $0 !~ /^[[:space:]]*#/                { print }
-' "$WF")"
+selfupdate_block="$(yaml_job_block auto-update-selfupdate-canary)"
 
 # shellcheck disable=SC2016  # literal workflow text: the `${{ }}` must not expand
 if [[ "$selfupdate_block" == *'classification: ${{ steps.canary.outputs.classification }}'* ]]; then

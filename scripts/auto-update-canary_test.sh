@@ -500,6 +500,43 @@ env_case "a disabled updater is NOT environmental"         no "$DISABLED"
 # a second time and re-register `trap cleanup EXIT`, leaking the first workdir
 # on every CI run. A stub left installed would be worse -- it would silently
 # weaken any later assertion that reaches it.
+# --- the probe itself, before the decision that consumes it -----------------
+# `runner_can_reach_github` is the corroboration. Every way it can MALFUNCTION
+# used to be indistinguishable from "the network is down", because it went
+# through `resolve_expected_latest`, which collapses a 403, a captive portal, a
+# changed redirect shape and a missing curl all to `return 1`. Read as
+# corroboration, every one of those bought the quiet path.
+#
+# Only connect-class curl exits may now answer "cannot reach". Stubbing `curl`
+# rather than the function, so what is tested is the classification of exit
+# codes and not a restatement of it.
+probe_case() {
+    # probe_case <description> <curl-exit> <expected reachable|unreachable>
+    local desc="$1" curl_rc="$2" expect="$3" got
+    if (
+        curl() { return "$curl_rc"; }
+        runner_can_reach_github
+    ); then got=reachable; else got=unreachable; fi
+    if [[ "$got" == "$expect" ]]; then
+        echo "ok   - probe: $desc"
+    else
+        echo "FAIL - probe: $desc (got '$got', expected '$expect')" >&2
+        if [[ "$expect" == reachable ]]; then
+            echo "       Reading this as 'the network is down' hands the quiet path to a" >&2
+            echo "       probe malfunction, which is the direction that hides things." >&2
+        fi
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+probe_case "curl succeeds"                        0   reachable
+probe_case "could not resolve host (6)"           6   unreachable
+probe_case "failed to connect (7)"                7   unreachable
+probe_case "operation timed out (28)"             28  unreachable
+probe_case "SSL connect error (35)"               35  unreachable
+probe_case "HTTP error, e.g. 403 rate limit (22)" 22  reachable
+probe_case "unsupported protocol / bad URL (1)"   1   reachable
+probe_case "curl not installed (127)"             127 reachable
+
 real_runner_can_reach_github="$(declare -f runner_can_reach_github)"
 if [[ -z "$real_runner_can_reach_github" ]]; then
     echo "FAIL - runner_can_reach_github is not defined; the corroboration tests would" >&2
@@ -593,14 +630,23 @@ if [[ -z "$real_run_node_until_check" ]]; then
     FAILURES=$((FAILURES + 1))
 fi
 
+# THE MESSAGE IS ASSERTED, not just the code. Exit 75 is reached from two
+# branches whose operator-facing text differs, and the quiet Matrix message
+# deliberately points the reader at the job log line as the ONLY thing that says
+# which -- so that line is the disambiguator and it was untested. Measured:
+# deleting the entire `ports)` arm of the message `case` left all four suites
+# green. `check()` in this same file exists for exactly this reason and says so
+# in its own comment; this is that gap reintroduced one function over.
 gate_b_case() {
-    # gate_b_case <desc> <expected-rc> <expected-attempts> <runner-reachable> <spec...>
+    # gate_b_case <desc> <expected-rc> <expected-attempts> <runner-reachable> \
+    #             <expected-message-substring> <spec...>
     # Each <spec> is "<node-exit>:<fixture-variable-name>" for one attempt.
-    local desc="$1" want_rc="$2" want_attempts="$3" reachable="$4"
-    shift 4
+    local desc="$1" want_rc="$2" want_attempts="$3" reachable="$4" want_msg="$5"
+    shift 5
     GATE_B_SCRIPT=("$@")
     GATE_B_ATTEMPT=0
-    local got_rc got_attempts out
+    local got_rc got_attempts out err errfile
+    errfile="$(mktemp "$TMPROOT/gateb.XXXXXX")"
     out="$(
         CANARY_ATTEMPTS="${#GATE_B_SCRIPT[@]}"
         CANARY_RETRY_SLEEP=0
@@ -616,18 +662,25 @@ gate_b_case() {
         printf '#!/bin/sh\necho "Freenet version: 0.2.121"\n' \
             > "$CANARY_WORKDIR/selfupdate/bin/freenet"
         chmod +x "$CANARY_WORKDIR/selfupdate/bin/freenet"
-        cmd_selfupdate 0.2.121 0.2.122 >/dev/null 2>&1
+        cmd_selfupdate 0.2.121 0.2.122 2>"$errfile" >/dev/null
         printf '%s %s' "$?" "$GATE_B_ATTEMPT"
     )"
     got_rc="${out%% *}"
     got_attempts="${out##* }"
-    if [[ "$got_rc" == "$want_rc" && "$got_attempts" == "$want_attempts" ]]; then
-        echo "ok   - Gate B: $desc"
-    else
+    err="$(cat "$errfile")"
+    rm -f "$errfile"
+    if [[ "$got_rc" != "$want_rc" || "$got_attempts" != "$want_attempts" ]]; then
         echo "FAIL - Gate B: $desc" >&2
         echo "         got exit $got_rc after $got_attempts attempt(s);" >&2
         echo "         wanted exit $want_rc after $want_attempts" >&2
         FAILURES=$((FAILURES + 1))
+    elif [[ "$err" != *"$want_msg"* ]]; then
+        echo "FAIL - Gate B: $desc (exit $got_rc correct, but the operator sees the wrong text)" >&2
+        echo "         wanted a message containing: $want_msg" >&2
+        echo "         got: ${err:-<nothing on stderr>}" >&2
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "ok   - Gate B: $desc"
     fi
 }
 
@@ -636,25 +689,43 @@ gate_b_case() {
 # intermittent fault produce one passing attempt, and Gate B then reports a
 # broken release healthy. A flaky pass on the post-publish gate is worse than
 # no gate.
-gate_b_case "a real #5221 failure is never retried" 1 1 no "0:BROKEN" "0:BROKEN"
+gate_b_case "a real #5221 failure is never retried" 1 1 no \
+    "could not parse the version GitHub returned" "0:BROKEN" "0:BROKEN"
 gate_b_case "an indeterminate IS retried, then exits 75" 75 2 no \
+    "could not reach GitHub in 2 attempts, and this runner cannot reach it either" \
     "0:FETCH_FAIL" "0:FETCH_FAIL"
 gate_b_case "a port collision exits 75 without a network probe" 75 2 yes \
-    "43:" "43:"
+    "every attempt hit a port collision on this host" "43:" "43:"
 # The corroboration: the same node-side symptom, opposite runner state.
 gate_b_case "node cannot reach GitHub but the runner can -> loud, not 75" 1 2 yes \
+    "THIS RUNNER reached the same endpoint immediately afterwards" \
     "0:FETCH_FAIL" "0:FETCH_FAIL"
 # A hung updater must never be quiet.
 gate_b_case "no outcome logged on every attempt -> loud" 1 2 no \
+    "at least one attempt started the update check and never logged an outcome" \
     "0:PENDING" "0:PENDING"
-# THE LATCH. An unexplained indeterminate on attempt 1 must survive an
+# THE LATCH, top tier. An unexplained indeterminate on attempt 1 must survive an
 # environmental attempt 2. Last-writer-wins here returned 75 and told the dev
 # room a hung updater was "not a stranded fleet and needs no fleet action".
 gate_b_case "unexplained THEN environmental stays loud (the latch)" 1 2 no \
+    "at least one attempt started the update check and never logged an outcome" \
     "0:PENDING" "43:"
 # ...and in the other order, so the latch is not merely "the first attempt wins".
 gate_b_case "environmental THEN unexplained stays loud (the latch)" 1 2 no \
+    "at least one attempt started the update check and never logged an outcome" \
     "43:" "0:PENDING"
+
+# STICKY BY STRENGTH, one tier down: `github` must never be downgraded to
+# `ports`. Both orderings, because they disagreed. The second was the live bug:
+# the probe never ran, the run exited 75 quiet, and the message claimed every
+# attempt hit a port collision -- which the message assertion is what catches,
+# since the exit code alone is 75 in the correct `ports`-only case too.
+gate_b_case "ports THEN github runs the probe and goes loud" 1 2 yes \
+    "THIS RUNNER reached the same endpoint immediately afterwards" \
+    "43:" "0:FETCH_FAIL"
+gate_b_case "github THEN ports still runs the probe and goes loud" 1 2 yes \
+    "THIS RUNNER reached the same endpoint immediately afterwards" \
+    "0:FETCH_FAIL" "43:"
 
 eval "$real_run_node_until_check"
 
