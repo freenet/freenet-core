@@ -279,49 +279,19 @@ async fn test_reconnection_does_not_inflate_client_count() {
 /// Install a thread-local `tracing` subscriber that records every event as a
 /// `"<LEVEL> field=value ..."` string. Returns the captured-message buffer and
 /// the default-subscriber guard (drop it to detach the capture).
+///
+/// The mechanics live in [`crate::util::test_log_capture`] because a
+/// thread-local capture alone is order-dependent: a concurrently-running test
+/// that is the first to reach one of the callsites asserted on here can pin its
+/// process-global `tracing` `Interest` to `never`, and the event then never
+/// arrives (#4927). Every test in this file asserting on captured logs depends
+/// on that helper's fix — do not inline a bare `set_default` capture back here.
 #[cfg(feature = "trace")]
 fn install_log_capture() -> (
     std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     tracing::subscriber::DefaultGuard,
 ) {
-    use std::sync::{Arc, Mutex};
-    use tracing_subscriber::Layer;
-    use tracing_subscriber::layer::SubscriberExt;
-
-    #[derive(Default, Clone)]
-    struct Capture(Arc<Mutex<Vec<String>>>);
-    impl<S: tracing::Subscriber> Layer<S> for Capture {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            struct V(String);
-            impl tracing::field::Visit for V {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    use std::fmt::Write;
-                    // Writing into a String is infallible; ignore the Result.
-                    write!(self.0, " {}={value:?}", field.name()).ok();
-                }
-            }
-            let mut v = V(String::new());
-            event.record(&mut v);
-            self.0
-                .lock()
-                .unwrap()
-                .push(format!("{}{}", event.metadata().level(), v.0));
-        }
-    }
-
-    let capture = Capture::default();
-    let messages = capture.0.clone();
-    let subscriber = tracing_subscriber::registry().with(capture);
-    let guard = tracing::subscriber::set_default(subscriber);
-    (messages, guard)
+    crate::util::test_log_capture::install()
 }
 
 /// Re-scope of #4681 by #5040: an ABSENT subscriber entry must NOT warn.

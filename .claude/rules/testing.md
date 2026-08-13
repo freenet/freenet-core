@@ -118,6 +118,57 @@ Running specific integration test?
   → Use: cargo test -p freenet --test simulation_integration
 ```
 
+### Cross-test interference is invisible to CI — only plain `cargo test` can see it
+
+Every CI job runs `cargo nextest`, which executes each test in its own
+process. That is deliberate and mostly good (see "Running determinism tests"
+below), but it means **no CI job can observe a bug in which one test
+interferes with another through process-global state** — there is no shared
+process for the interference to happen in. `ci.yml` says "process isolation
+handles it (#3051)", which is true of the symptom and false of the coverage:
+it is blindness, not a guard. `AGENTS.md` tells you to run `cargo test` before
+committing, and that is the only runner that can expose this class.
+
+The mechanism generalises past any one library: **any process-global cache
+whose value is decided by whichever thread arrives first** is order-dependent,
+and per-process isolation hides it completely. The instance that motivated
+this entry (#4927, fixed in #5314): `tracing` caches each callsite's
+`Interest` process-globally on first touch, and resolves it against the
+*registering* thread's subscriber, so a test with no subscriber could pin a
+callsite to `never` and blind another test's thread-local log capture to that
+one callsite. Measured: 29 failures in 1000 `cargo test -p freenet --lib
+subscriber_limit_tests` runs across three tests, 0 in 2000 runs after the fix
+— and **unreachable under `cargo nextest` at any repeat count**.
+
+`[profile.ci] retries = 2` in `.config/nextest.toml` is the *smaller* half of
+this gap: it can only launder a failure CI was otherwise able to see.
+
+```
+WHEN adding or changing a test:
+  Ask: could this interact with other tests through process-global state?
+       (a global/static cache, a `set_global_default`, an env var, a
+        singleton registry, an ambient `tracing`/`log` subscriber, a shared
+        temp path)
+
+  → YES: run plain `cargo test` locally at scale (hundreds of runs of a
+         filter that includes the plausible competitors) and say so in the PR.
+         A green nextest CI run has NOT examined it.
+  → Regression test for such a bug: it must control the interfering
+    population, which usually means a child process (re-exec of the test
+    binary filtered to that one test) — in-process, whether the bug can
+    occur at all depends on what else happens to be running. See
+    `crate::util::test_log_capture` for a worked example, including asserting
+    the child actually ran a test so a rename fails closed.
+```
+
+The fix shape for the `tracing` instance is non-obvious enough to record:
+keep **two** permanently-registered dispatchers alive (`tracing_core`'s
+`has_just_one` fast path triggers at `live <= 1`, so one is not enough),
+report `Interest::sometimes()` rather than `always()` so other subscribers'
+per-event filtering is preserved, and do **not** install as the global
+default — that slot belongs to `test_log`, and taking it silently stops
+`RUST_LOG=… cargo test` printing anything.
+
 ## Reference Patterns
 
 **Time injection:**

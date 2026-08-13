@@ -157,6 +157,39 @@ arms, the INFO-level checks on `MARKER_CHECK_COMPLETE` and
 canary still runs, and still runs before `--draft=false` — is pinned by
 `scripts/release_canary_wiring_test.sh`.
 
+## Cross-test interference through process-global state: CI cannot see it
+
+A guard whose two inputs rot from one cause. Every CI job runs `cargo
+nextest`, which runs each test in its own process, so **no CI job can observe
+a bug in which one test interferes with another through process-global
+state** — there is no shared process for it to happen in. Meanwhile
+`AGENTS.md` tells contributors to run plain `cargo test`, the only runner that
+can expose it. `ci.yml`'s "process isolation handles it (#3051)" describes the
+symptom being absent, not the class being checked, and is exactly the sentence
+that stops a reader investigating. `[profile.ci] retries = 2` is the *smaller*
+half of the gap: it can only launder a failure CI was otherwise able to see.
+
+Generalises past any one library: **any process-global cache whose value is
+decided by whichever thread arrives first** is order-dependent, and
+per-process isolation hides it entirely. Instance ([#4927](https://github.com/freenet/freenet-core/issues/4927),
+fixed in #5314): `tracing` caches each callsite's `Interest` process-globally
+on first touch and resolves it against the *registering* thread's subscriber,
+so a test with no subscriber pinned callsites to `never` and blinded another
+test's thread-local log capture to those callsites only. 29 failures in 1000
+`cargo test -p freenet --lib subscriber_limit_tests` runs across three tests,
+0 in 2000 after the fix, and **unreachable under nextest at any repeat
+count**. `test_utils::TestLogger` still has the same hazard: #5315.
+
+Audit question for any new or changed test: *could this interact with other
+tests through global state* (a static cache, `set_global_default`, an env var,
+a singleton registry, a shared temp path)? If so, run plain `cargo test`
+locally at scale and say so in the PR — a green nextest CI run has not
+examined it. Full guidance, including the fix shape that worked (enough
+permanently-registered dispatchers to defeat the `live <= 1` fast path,
+`Interest::sometimes()` not `always()`, never the global default) and why the
+regression test must run in a child process, is in
+[testing.md](testing.md#cross-test-interference-is-invisible-to-ci--only-plain-cargo-test-can-see-it).
+
 ## Self-satisfying `include_str!` source-scrape pins
 
 A source-scrape pin — a test that `include_str!`s its own crate's source
