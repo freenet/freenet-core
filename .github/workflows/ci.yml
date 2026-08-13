@@ -224,6 +224,16 @@ jobs:
       - name: Self-test auto-update canary lifecycle
         run: bash scripts/auto-update-canary_lifecycle_test.sh
 
+      # Guards the shell-assertion counter further down THIS file. That
+      # alternation has been wrong three times and nothing in the repo
+      # exercised it, so each miss was found by a human noticing a wrong
+      # number. It fails in the rejecting direction: an under-counting lint
+      # turns away a fix: PR that does have a regression test, and the cheapest
+      # response for the author is to reshape a good test until the grep likes
+      # it. The test extracts the live regex rather than copying it.
+      - name: Self-test Rule Lint shell-assertion counter
+        run: bash scripts/rule_lint_shell_assertion_counter_test.sh
+
       # install.sh now sets up a supervised service by default (issue #4073) so
       # new nodes auto-update. The system-vs-user + lingering decision is the
       # load-bearing new logic; these smoke tests pin it without needing real
@@ -234,7 +244,7 @@ jobs:
       # clean when they landed but were not actually in this list, so nothing
       # held them to it. `-x` because the two test scripts `source` the canary.
       - name: Lint install/uninstall scripts (shellcheck)
-        run: shellcheck -x scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh scripts/release_wait_for_binaries_test.sh scripts/release_canary_wiring_test.sh scripts/release.sh
+        run: shellcheck -x scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh scripts/release_wait_for_binaries_test.sh scripts/release_canary_wiring_test.sh scripts/rule_lint_shell_assertion_counter_test.sh scripts/release.sh
       - name: Self-test install.sh service-mode decision
         run: sh scripts/test-install-sh.sh
       - name: Self-test uninstall.sh
@@ -428,23 +438,51 @@ jobs:
             #
             # The alternation was widened three times, each time stopping at the
             # file in front of whoever was editing. It is now derived from an
-            # ENUMERATION of every `*_test.sh` under scripts/ rather than from
-            # the file at hand: `check` (4 files), `ok`/`bad` (lifecycle),
-            # `pass` (3 files), `echo "ok   - "` (34 sites, and all 34 use that
-            # exact separator, so anchoring on it costs nothing while rejecting
+            # ENUMERATION of every `*_test.sh` in the repo rather than from the
+            # file at hand: `check` (7 files), `ok`/`bad` (lifecycle), `pass`
+            # (3 files), `echo "ok   - "` (all sites use that exact separator,
+            # so anchoring on it costs nothing while rejecting
             # `echo "okay, starting"`), and `echo "PASS [...]"`
-            # (release_state_restore_test.sh, the last file that still scored
-            # zero). Both quote styles. Re-run that enumeration before adding a
-            # sixth pattern; adding one because a file you happen to be editing
-            # scores zero is how the first three went in.
+            # (release_state_restore_test.sh). Both quote styles. Re-run that
+            # enumeration before adding another pattern; adding one because a
+            # file you happen to be editing scores zero is how the first three
+            # went in.
             #
-            # KNOWN FALSE NEGATIVES, left in rather than chased: `printf`-style
-            # reporting, and an assertion whose only added line is its FAIL
-            # branch (counting FAIL would let a PR score by adding an error
-            # message alone). The error text below tells the contributor both.
+            # THE BARE-NAME FORMS ABOVE ARE NOT THE WHOLE VOCABULARY, and for a
+            # while this counter behaved as if they were. `[[:space:]]`
+            # immediately after `(check|ok|pass)` requires the helper's name to
+            # END there, so every underscore-suffixed helper scored zero:
+            # `gate_b_arm_case`, `version_ge_case`, `trigger_case`,
+            # `norm_case`, `timeout_guard_case`, `pin_marker`,
+            # `pin_warn_literal`, `check_vs_expected`, `check_call_count`,
+            # `check_fallback`, `test_restores_persisted_value`. Measured
+            # across all 11 `*_test.sh` files: 329 assertion call sites, of
+            # which the bare-name form saw 275 and missed 54, of which 42 are in
+            # `auto-update-canary_test.sh` alone, whose parameterised cases are
+            # written almost entirely in that style. The two patterns added
+            # below (a `check_`/`pin_`/`assert_`/`expect_`/`test_` prefix, and
+            # a `_case` suffix) take it to 329 of 329 with zero false
+            # positives, checked line by line against a hand-enumerated ground
+            # truth. Definitions do not match either pattern (`foo() {` has no
+            # whitespace where the name ends), so declaring a helper still
+            # scores nothing, which is right.
+            #
+            # KNOWN FALSE NEGATIVES, left in rather than chased. Both are real
+            # in this repo today; the `printf`-style reporting this comment used
+            # to cite as the first one is NOT: `grep -rnE "printf .*['\"](ok|PASS)"
+            # over scripts/ returns nothing, so it was a hazard nobody had ever
+            # written, and it has been dropped in favour of the two that exist:
+            #   1. An assertion whose only added line is its FAIL branch.
+            #      Deliberate: counting FAIL would let a PR score by adding an
+            #      error message alone.
+            #   2. A new entry in a TABLE an existing assertion loops over.
+            #      `SIGPIPE_SCRIPTS=(...)` in auto-update-canary_test.sh is the
+            #      live instance. Adding a file there genuinely extends what is
+            #      audited, and the added line is a bare string.
+            # The error text below tells the contributor both.
             NEW_SHELL_TESTS=$(git diff "$BASE"..."$HEAD" -- '**/*_test.sh' \
               | grep -E '^\+' | grep -vF '+++' \
-              | grep -cE '^\+[[:space:]]*(check|ok|pass)[[:space:]]|^\+[[:space:]]*echo[[:space:]]+["'"'"'](ok[[:space:]]+-|PASS[[:space:]])' || true)
+              | grep -cE '^\+[[:space:]]*(check|ok|pass)[[:space:]]|^\+[[:space:]]*echo[[:space:]]+["'"'"'](ok[[:space:]]+-|PASS[[:space:]])|^\+[[:space:]]*(check|pin|assert|expect|test)_[a-z0-9_]*([[:space:]]|$)|^\+[[:space:]]*[a-z_][a-z0-9_]*_case[[:space:]]' || true)
             if [ "$NEW_TESTS" -eq 0 ] && [ "$NEW_SHELL_TESTS" -eq 0 ]; then
               ERRORS="$ERRORS
           ERROR: fix: PR must include at least one new regression test
@@ -453,10 +491,12 @@ jobs:
             - a Rust #[test] / #[tokio::test] / etc.
             - an added assertion in a *_test.sh self-test, written with any of the
               conventions those files use: 'check ...', 'ok ...', 'pass ...',
-              'echo \"ok   - ...\"' or 'echo \"PASS ...\"'. Known blind spots:
-              printf-style reporting, and an assertion whose only added line is
-              its FAIL branch. If you have a real test the counter cannot see,
-              say so on the PR rather than reshaping the test to please this grep.
+              a 'check_'/'pin_'/'assert_'/'expect_'/'test_'-prefixed helper, a
+              '*_case ...' helper, 'echo \"ok   - ...\"' or 'echo \"PASS ...\"'.
+              Known blind spots: an assertion whose only added line is its FAIL
+              branch, and a new entry in a table an existing assertion loops over
+              (e.g. SIGPIPE_SCRIPTS). If you have a real test the counter cannot
+              see, say so on the PR rather than reshaping the test to please this grep.
           If this fix genuinely cannot have a test, add the 'test-exempt' label with a justification comment."
             fi
           fi
