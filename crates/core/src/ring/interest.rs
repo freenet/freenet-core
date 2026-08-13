@@ -148,7 +148,7 @@ const RESYNC_THROTTLE_CACHE_SIZE: usize = 4096;
 /// peer to the head of its set every round and starve the tail permanently. The
 /// cap is well above `max_connections`, so that is not the expected regime; the
 /// randomisation is what makes it a slow cycle rather than a silent hole if it
-/// ever is. See [`InterestManager::fallback_window_start`].
+/// ever is. See [`InterestManager::begin_fallback_window`].
 const SUMMARY_FALLBACK_CURSOR_CACHE_SIZE: usize = 4096;
 
 /// Bounds diagnostic correlation state influenced by remote (contract, peer)
@@ -1111,6 +1111,14 @@ pub struct InterestManager<T: TimeSource> {
     /// on. The whole safety argument is a stated upper bound on how long a
     /// divergence can go unnoticed, and under ordinary contract churn an index
     /// cursor degrades that from `ceil(n / limit)` rounds to no bound at all.
+    ///
+    /// Keep the two properties here separate; conflating them is how this file
+    /// previously came to assert something untrue. **Contiguity plus completion**
+    /// is what stops a contract being skipped: one present at a cycle's start is
+    /// covered wherever the origin happens to fall, and randomising the origin
+    /// contributes nothing to that. **Randomisation** earns its place only
+    /// against the fixed-restart and peer-steering failure, and it is weaker now
+    /// than it was — see [`InterestManager::begin_fallback_window`].
     ///
     /// A key resumes after what was actually SENT, so consecutive rounds are
     /// contiguous in id space no matter what happened to the set in between:
@@ -2769,11 +2777,24 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// cycle, so the set was NOT covered in `ceil(len / limit)` rounds. It hit
     /// ~1/limit of cycles regardless of set size.
     ///
-    /// Not a pure read: reaching a boundary DROPS the stale cursor, so the
-    /// entry [`Self::record_fallback_cursor`] writes next starts the new cycle's
-    /// count from zero. Dropping rather than zeroing in place also means a round
-    /// that ends up sending nothing (so never records) draws a fresh boundary
-    /// offset next time instead of silently resuming from the old cycle's id.
+    /// NOT a pure read, and named `begin_` to say so: taking a boundary draws
+    /// the new origin and PUBLISHES the new cycle under the same lock hold.
+    /// Publishing is load-bearing rather than tidy. Two `Interests` from one
+    /// peer are handled as separate tasks (`dispatch.rs`), and each reply awaits
+    /// a storage hit per contract before recording, so two of them routinely
+    /// straddle a boundary. If the boundary only drew and returned, both would
+    /// see no cursor, draw DIFFERENT origins, and send two non-contiguous
+    /// windows whose entry counts were both charged to one cycle — which ran the
+    /// counter ahead of the ground actually covered, tripped the completion test
+    /// early, and left an arc of the set unadvertised. That is #5181's own
+    /// failure class, so it had to be closed here and not documented.
+    /// Republishing means the second racer reads the published cycle and
+    /// resumes contiguously from the same origin.
+    ///
+    /// The empty-set check comes FIRST, before the lock, and is pinned by
+    /// `fallback_window_start_handles_an_empty_shared_set`: both
+    /// `random_range(0..0)` and the predecessor arithmetic below panic at
+    /// `len == 0`.
     ///
     /// A fixed restart at 0 is the failure this codebase has already rejected
     /// twice, for the same reason each time: see the rotations in
@@ -2799,40 +2820,60 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// It only removes the guarantee that the SAME contracts are the ones
     /// covered first every time.
     ///
-    /// The per-cycle count also keeps the peer-steering bound in the second
-    /// bullet above finite. A peer that parks the cursor at the end of the set
-    /// gets one wrapped head window, but each advertised contract it provokes is
-    /// charged to the cycle, so the count crosses `sorted.len()` within a couple
-    /// of rounds and the start is re-randomised. Resuming with a bare
-    /// `start % len` and no count would hand it the head window forever.
+    /// # Anti-steering is WEAKER here than it was before #5181 was fixed
+    ///
+    /// Do not read the second bullet as a property this code provides. It does
+    /// not, and the honest account matters more than the reassuring one.
+    ///
+    /// Before the fix, EVERY round whose resume ran off the end drew a fresh
+    /// random offset. That defeated steering — but only as a side effect of the
+    /// very bug #5181 is about, because it also re-randomised mid-cycle and so
+    /// broke the `ceil(len / limit)` coverage bound. Restoring the bound
+    /// necessarily removes that side effect, so anti-steering has to be provided
+    /// deliberately instead. `advertised_in_cycle` was intended to be that
+    /// replacement and is NOT sufficient: the completion test compares the count
+    /// against `sorted.len()`, and the peer chooses `sorted`. Alternating a
+    /// single-hash `Interests` with a full one makes `len == 1`, trips
+    /// completion, and re-seeds the cycle from an id the peer picked — so the
+    /// count never accumulates and the boundary never recurs. Measured: full
+    /// rounds pinned to one start, with most of the set never advertised.
+    ///
+    /// This is a known, bounded regression, shipped deliberately: the harm is
+    /// almost entirely self-inflicted, since what starves is our advertisement
+    /// of contracts TO THAT PEER, cursors are per-address, and no other peer's
+    /// rotation is affected. The principled fix is positional cycle completion
+    /// (measure the window's progress against the stored origin instead of
+    /// counting entries against a peer-supplied length) and is tracked in #5313;
+    /// it needs an escape hatch so that a peer whose shared set
+    /// legitimately halves does not stop completing cycles forever.
+    /// `varying_shared_set_lets_a_peer_pin_the_window_today` characterises the
+    /// live behaviour so the regression is visible in CI rather than only here.
     ///
     /// `GlobalRng` keeps this deterministic under simulation and test.
-    pub(crate) fn fallback_window_start(&self, peer: SocketAddr, sorted: &[ContractKey]) -> usize {
+    pub(crate) fn begin_fallback_window(&self, peer: SocketAddr, sorted: &[ContractKey]) -> usize {
+        // MUST stay ahead of the lock and of any index arithmetic.
         if sorted.is_empty() {
             return 0;
         }
-        let resume = {
-            let mut cursors = self.summary_fallback_cursor.lock();
-            match cursors.peek(&peer).copied() {
-                // Mid-cycle: continue exactly where the last reply stopped,
-                // wrapping to 0 when it stopped on the highest id.
-                Some(cursor) if cursor.advertised_in_cycle < sorted.len() => {
-                    Some(first_index_after(sorted, &cursor.last_sent) % sorted.len())
-                }
-                // Cycle complete: drop it so the next recorded cursor counts
-                // from zero against the new cycle drawn just below.
-                Some(_) => {
-                    cursors.pop(&peer);
-                    None
-                }
-                // No cursor: a boundary by definition (first reply, our own
-                // restart, LRU eviction, a peer back on a new source port).
-                None => None,
+        let len = sorted.len();
+        let mut cursors = self.summary_fallback_cursor.lock();
+        // Mid-cycle: continue exactly where the last reply stopped, wrapping to
+        // 0 when it stopped on the highest id.
+        if let Some(cursor) = cursors.peek(&peer).copied() {
+            if cursor.advertised_in_cycle < len {
+                return first_index_after(sorted, &cursor.last_sent) % len;
             }
-        };
-        // Drawn outside the cursor lock so the RNG's own lock is never taken
-        // underneath it.
-        resume.unwrap_or_else(|| crate::config::GlobalRng::random_range(0..sorted.len()))
+        }
+        // Boundary: no cursor (first reply, our own restart, LRU eviction, a
+        // peer back on a new source port), or the cycle's count has reached the
+        // size of the set. Draw and publish atomically -- see the rustdoc.
+        //
+        // `GlobalRng` is entirely thread-local (`THREAD_RNG`/`THREAD_SEED` are
+        // `thread_local!`, with only an `AtomicU64` for thread indices), so
+        // drawing under this lock cannot deadlock against it.
+        let origin = crate::config::GlobalRng::random_range(0..len);
+        cursors.put(peer, FallbackCursor::starting_at(sorted, origin));
+        origin
     }
 
     /// Record the contract id of the last entry actually included in `peer`'s
@@ -2845,31 +2886,124 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// same way, so a budget-limited link takes proportionally more rounds to
     /// finish a cycle rather than declaring one finished early.
     ///
-    /// A round that ends on the id already stored is charged NOTHING. That is
-    /// the concurrency case the cursor-advance comment in `node.rs` documents:
-    /// two `Interests` from one peer handled concurrently read the same start,
-    /// build the same window, and record the same last id. They advertised one
-    /// window between them, so charging both would report twice the progress
-    /// actually made and end the cycle with part of the set still unadvertised —
-    /// the same class of hole as #5181, arrived at from the other direction.
+    /// # A record must ADVANCE the cycle, or it is discarded
+    ///
+    /// Replies to one peer are built concurrently and each awaits a storage hit
+    /// per contract before it records, so they can land out of order. Given
+    /// three overlapping rounds, a slow reply carrying an EARLIER window can
+    /// record after a later one: without this check it both charged its entries
+    /// a second time and REWOUND `last_sent`, so the rotation re-sent ground it
+    /// had already covered while the counter said otherwise.
+    ///
+    /// The test is the forward distance from the PREVIOUS position, taken
+    /// modulo the set size, and accepted only when it is at least one position
+    /// and no more than one window (`limit`). Every part of that is load-bearing
+    /// and each alternative has a concrete failure:
+    ///
+    /// - **Circular, not a linear id or index comparison.** A legitimate window
+    ///   wraps past the highest id, so its last entry can sort BELOW the
+    ///   previous one. A linear test rejects it as a rewind.
+    /// - **Relative to the previous position, not to the cycle's origin.** A
+    ///   window that CROSSES the origin necessarily lands a short distance
+    ///   *after* it, so measuring from the origin makes the crossing round look
+    ///   like the largest rewind of the cycle. Rejecting it leaves `last_sent`
+    ///   parked, the next round rebuilds the identical window, and the rotation
+    ///   wedges permanently — strictly worse than the staleness this check
+    ///   exists to stop.
+    /// - **Bounded above by `limit`.** Forward distance alone cannot tell a
+    ///   short hop from a long rewind, since every rewind is also "forward" once
+    ///   you go the long way round. A round advances by at most the window it
+    ///   sent, so anything beyond that is the long way round.
+    /// - **Rejecting zero** subsumes the exact-duplicate case: two racers that
+    ///   built the SAME window record the same id and the second covers no
+    ///   distance. There is deliberately no separate id-equality special case;
+    ///   that was a symptom patch for this same defect.
+    ///
+    /// The FIRST record of a cycle is exempt and is charged unconditionally,
+    /// because `last_sent` then holds the origin's predecessor published by
+    /// [`Self::begin_fallback_window`] rather than anything we sent. Two
+    /// distinct failures need that exemption, and the second is reachable on
+    /// demand:
+    ///
+    /// - A shared set no larger than one window is covered entirely by the
+    ///   first round, which lands back on that predecessor for a distance of
+    ///   zero. Discarding it sticks the counter at zero, so the cycle never
+    ///   completes and the origin is never re-drawn for that peer again.
+    /// - When the drawn origin is 0 the predecessor wraps to the LAST index, so
+    ///   the first round's forward distance is `len - window`, which exceeds
+    ///   `limit` for any set bigger than two windows and reads as a rewind.
+    ///   That is 1-in-`len` of cycles by chance — but a peer steering the start
+    ///   to 0 (see [`Self::begin_fallback_window`]) hits it every cycle.
     pub(crate) fn record_fallback_cursor(
         &self,
         peer: SocketAddr,
+        sorted: &[ContractKey],
         last_sent: ContractInstanceId,
         entries_sent: usize,
+        limit: usize,
     ) {
+        // An empty reply is never recorded in production (the call site is gated
+        // on having included at least one entry). Returning keeps
+        // `advertised_in_cycle == 0` meaning exactly "nothing charged yet this
+        // cycle", which the first-record exemption below relies on.
+        if sorted.is_empty() || entries_sent == 0 {
+            return;
+        }
+        let len = sorted.len();
         let mut cursors = self.summary_fallback_cursor.lock();
-        let advertised_in_cycle = match cursors.peek(&peer) {
-            // Same window again: no new ground covered, so no charge.
-            Some(prev) if prev.last_sent == last_sent => prev.advertised_in_cycle,
-            Some(prev) => prev.advertised_in_cycle.saturating_add(entries_sent),
+        let charged = match cursors.peek(&peer).copied() {
+            // First record of this cycle; see the rustdoc.
+            Some(prev) if prev.advertised_in_cycle == 0 => entries_sent,
+            Some(prev) => {
+                let prev_pos = first_index_after(sorted, &prev.last_sent) % len;
+                let new_pos = first_index_after(sorted, &last_sent) % len;
+                let advance = (new_pos + len - prev_pos) % len;
+                // Why CHURN cannot make a well-formed round trip the upper
+                // bound, which is the obvious worry and worth settling here.
+                //
+                // The window is built and the cursor recorded against the SAME
+                // `matching` snapshot for one reply (see the call site), and the
+                // window is chosen by INDEX in that snapshot starting at
+                // `prev_pos`, with `last_sent` being its k-th entry. So
+                // `new_pos == prev_pos + k` and `advance == entries_sent`
+                // exactly, for any amount of churn since the previous round:
+                // insertions shift `prev_pos` and `new_pos` together. Churn
+                // perturbs WHICH contracts a window covers (see
+                // `advertised_in_cycle`, which is honest that this can under-run
+                // a cycle) but never the distance measured here.
+                //
+                // That derivation depends on both calls receiving the same
+                // snapshot. A refactor that recomputed the shared set between
+                // them would break it, and the symptom would be rejected records
+                // rather than a compile error -- so do not.
+                //
+                // Rejections are in any case transient, never a wedge: the next
+                // round starts at whatever `prev_pos` the stored cursor implies
+                // and its own advance is again exactly its entry count.
+                if advance == 0 || advance > limit {
+                    // Duplicate (zero) or stale (the long way round). Neither
+                    // covers ground this cycle has not already had charged, so
+                    // discard rather than rewind.
+                    //
+                    // The upper bound is what provides the anti-rewind property;
+                    // rejecting zero alone does not. A stale record is forward
+                    // by the long way round -- stored at index 127, a late reply
+                    // ending at 63 over 200 contracts advances 136 -- so without
+                    // the bound it is accepted and rewinds the cursor, which is
+                    // the defect this check exists for.
+                    return;
+                }
+                prev.advertised_in_cycle.saturating_add(entries_sent)
+            }
+            // `begin_fallback_window` always publishes, so this is an LRU
+            // eviction in between. Treat the reply as its own fresh cycle.
             None => entries_sent,
         };
         cursors.put(
             peer,
             FallbackCursor {
                 last_sent,
-                advertised_in_cycle,
+                advertised_in_cycle: charged,
             },
         );
     }
@@ -2878,6 +3012,22 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     #[cfg(test)]
     pub(crate) fn peek_fallback_cursor(&self, peer: SocketAddr) -> Option<FallbackCursor> {
         self.summary_fallback_cursor.lock().peek(&peer).copied()
+    }
+
+    /// Seed `peer`'s cycle so it begins at `origin`, exactly as a boundary
+    /// would, minus the random draw. Shares
+    /// [`FallbackCursor::starting_at`] with production so a test cannot pin a
+    /// cursor shape the boundary never actually publishes.
+    #[cfg(test)]
+    pub(crate) fn seed_fallback_cycle(
+        &self,
+        peer: SocketAddr,
+        sorted: &[ContractKey],
+        origin: usize,
+    ) {
+        self.summary_fallback_cursor
+            .lock()
+            .put(peer, FallbackCursor::starting_at(sorted, origin));
     }
 }
 
@@ -2894,25 +3044,74 @@ impl<T: TimeSource + Sync> InterestManager<T> {
 /// longer covered the set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FallbackCursor {
-    /// Id of the last contract actually SENT to this peer.
+    /// Id of the last contract actually SENT to this peer. Until the cycle's
+    /// first reply is recorded this holds the PREDECESSOR of the origin
+    /// [`InterestManager::begin_fallback_window`] drew, so that
+    /// [`first_index_after`] resolves back to that origin for the next reader.
     pub(crate) last_sent: ContractInstanceId,
     /// Contracts advertised to this peer since the current cycle began. The
     /// cycle is complete once this reaches the size of the shared set.
     ///
-    /// Approximate on purpose, in the safe direction. It is compared against a
-    /// `sorted.len()` the peer can vary between rounds (the set is the
-    /// intersection with the hashes it advertised), and a repeat of the same
-    /// window is not charged, so a cycle can be declared complete after
-    /// slightly more advertising than the set strictly needed. Over-running a
-    /// cycle costs a redundant advertisement; UNDER-running one would leave
-    /// part of the set unadvertised, which is the failure being avoided.
+    /// Zero means exactly "nothing charged yet this cycle" — relied on by
+    /// [`InterestManager::record_fallback_cursor`], and why an empty reply is
+    /// never recorded.
+    ///
+    /// # This is approximate, and NOT only in the safe direction
+    ///
+    /// An earlier version of this comment claimed it errs only towards
+    /// over-running a cycle. That was wrong, and the wrong direction is the one
+    /// that matters: over-running costs a redundant advertisement, while
+    /// UNDER-running ends the cycle with part of the set unadvertised, which is
+    /// #5181's own failure. Known cases where it under-runs:
+    ///
+    /// - **Byte-budget divergence.** Two concurrent replies cut at different
+    ///   lengths carry different last ids, so the shorter one is not recognised
+    ///   as covered ground; if the shorter records first, the longer is charged
+    ///   in full on top of it. Bounded by one window.
+    /// - **Churn.** Contracts removed from the arc already swept while others
+    ///   are inserted below the cursor let the count reach `sorted.len()` with
+    ///   current members never advertised this cycle. An id inserted into
+    ///   already-swept ground is indistinguishable from one that was advertised.
+    /// - **Peer-chosen length.** The count is compared against a `sorted.len()`
+    ///   the peer controls; see [`InterestManager::begin_fallback_window`].
+    ///
+    /// So state the bound carefully, and only where it holds:
+    ///
+    /// - For a set **stable across the cycle**, `ceil(len / limit)` rounds cover
+    ///   it from any origin. That is verified through the real API from every
+    ///   origin, and it is the strongest true statement available today.
+    /// - **Under churn there is NO round bound.** A cycle can end with members
+    ///   unadvertised that were present throughout it. They are picked up in a
+    ///   later cycle, so nothing is starved permanently, but no number of rounds
+    ///   can be promised. Do not write one here without an implementation that
+    ///   earns it — asserting a bound the code does not provide is exactly what
+    ///   #5181 was.
+    ///
+    /// Only per-cycle membership tracking would be exact, at a cost of memory
+    /// per peer per contract. Geometric (positional) completion would make a
+    /// real bound stateable, with a staleness bound of 2 cycles under churn; #5313.
     pub(crate) advertised_in_cycle: usize,
+}
+
+impl FallbackCursor {
+    /// The cursor a cycle beginning at `origin` starts from: nothing charged,
+    /// and `last_sent` set to the origin's PREDECESSOR so that
+    /// [`first_index_after`] resolves back to `origin` for the next reader.
+    ///
+    /// Panics if `sorted` is empty; callers check first.
+    fn starting_at(sorted: &[ContractKey], origin: usize) -> Self {
+        let len = sorted.len();
+        Self {
+            last_sent: *sorted[(origin + len - 1) % len].id(),
+            advertised_in_cycle: 0,
+        }
+    }
 }
 
 /// First index in `sorted` (ascending by contract id, as
 /// [`InterestManager::get_matching_contracts`] returns it) whose id is strictly
 /// greater than `after`. Returns `sorted.len()` when `after` is at or past the
-/// end; [`InterestManager::fallback_window_start`] wraps that back to 0, because
+/// end; [`InterestManager::begin_fallback_window`] wraps that back to 0, because
 /// running off the end is where the rotation's window wraps and NOT by itself a
 /// cycle boundary (#5181 — the boundary is decided by
 /// [`FallbackCursor::advertised_in_cycle`]).
@@ -7367,7 +7566,7 @@ mod tests {
     /// `rotation_window_indices`, which wraps a `len` start back to 0 on its own,
     /// so it cannot see a defect that lives in the resume decision itself — and
     /// it did not. `real_cursor_api_covers_every_contract_from_every_origin`
-    /// drives `fallback_window_start`/`record_fallback_cursor` for that reason;
+    /// drives `begin_fallback_window`/`record_fallback_cursor` for that reason;
     /// `fallback_window_start_randomises_the_cycle_boundary` covers the
     /// boundary behaviour of the production entry point.
     fn rotation_round(
@@ -7394,6 +7593,9 @@ mod tests {
         keys.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
         keys
     }
+
+    /// Mirrors `MAX_FALLBACK_SUMMARIES_PER_REPLY`, which lives in `node.rs`.
+    const LIMIT: usize = 64;
 
     /// The window never exceeds the limit, never exceeds the set, and wraps
     /// past the end rather than returning a short tail.
@@ -7630,38 +7832,186 @@ mod tests {
 
         assert_eq!(mgr.peek_fallback_cursor(peer), None);
 
-        mgr.record_fallback_cursor(peer, *sorted[2].id(), 3);
+        // Seed a cycle beginning at index 1, then charge two rounds against it.
+        mgr.seed_fallback_cycle(peer, &sorted, 1);
+        mgr.record_fallback_cursor(peer, &sorted, *sorted[2].id(), 2, LIMIT);
         assert_eq!(
             mgr.peek_fallback_cursor(peer),
             Some(FallbackCursor {
                 last_sent: *sorted[2].id(),
-                advertised_in_cycle: 3,
+                advertised_in_cycle: 2,
             })
         );
         assert_eq!(
-            mgr.fallback_window_start(peer, &sorted),
+            mgr.begin_fallback_window(peer, &sorted),
             3,
             "mid-cycle the resume point must be exactly after the last id sent"
         );
 
         // Successive rounds accumulate against the SAME cycle.
-        mgr.record_fallback_cursor(peer, *sorted[4].id(), 2);
+        mgr.record_fallback_cursor(peer, &sorted, *sorted[4].id(), 2, LIMIT);
         assert_eq!(
             mgr.peek_fallback_cursor(peer)
                 .map(|c| c.advertised_in_cycle),
-            Some(5),
+            Some(4),
             "entries sent must be charged to the running cycle, not replace it"
         );
-        assert_eq!(mgr.fallback_window_start(peer, &sorted), 5);
+        assert_eq!(mgr.begin_fallback_window(peer, &sorted), 5);
 
         // Cursors are per peer: one peer's progress must not advance another's.
         let other: SocketAddr = "127.0.0.1:9101".parse().unwrap();
-        mgr.record_fallback_cursor(other, *sorted[6].id(), 1);
-        assert_eq!(mgr.fallback_window_start(peer, &sorted), 5);
-        assert_eq!(mgr.fallback_window_start(other, &sorted), 7);
+        mgr.seed_fallback_cycle(other, &sorted, 6);
+        mgr.record_fallback_cursor(other, &sorted, *sorted[6].id(), 1, LIMIT);
+        assert_eq!(mgr.begin_fallback_window(peer, &sorted), 5);
+        assert_eq!(mgr.begin_fallback_window(other, &sorted), 7);
+    }
 
-        // An empty shared set has no valid offset; it must not panic or draw.
-        assert_eq!(mgr.fallback_window_start(peer, &[]), 0);
+    /// An empty shared set must not panic or draw.
+    ///
+    /// Pinned separately because the empty check has to stay AHEAD of both the
+    /// lock and any index arithmetic: `random_range(0..0)` panics, and so does
+    /// the origin-predecessor arithmetic in `FallbackCursor::starting_at`. Now
+    /// that the boundary draws and publishes inside the lock, that prologue is
+    /// the thing a future restructuring is most likely to move.
+    #[test]
+    fn fallback_window_start_handles_an_empty_shared_set() {
+        let (mgr, _clock) = make_manager();
+        let peer: SocketAddr = "127.0.0.1:9102".parse().unwrap();
+
+        assert_eq!(mgr.begin_fallback_window(peer, &[]), 0);
+        assert_eq!(
+            mgr.peek_fallback_cursor(peer),
+            None,
+            "an empty set must not publish a cycle"
+        );
+        // And recording against an empty set is a no-op rather than a panic.
+        let sorted = sorted_keys(0..4);
+        mgr.record_fallback_cursor(peer, &[], *sorted[0].id(), 1, LIMIT);
+        assert_eq!(mgr.peek_fallback_cursor(peer), None);
+    }
+
+    /// A record must move the cycle FORWARD, and "forward" is circular.
+    ///
+    /// Four distinct traps live in this one predicate, each of which was reached
+    /// by an actual implementation attempt. All four are pinned here because a
+    /// coverage assertion alone does not distinguish them.
+    #[test]
+    fn records_must_advance_the_cycle_and_forward_is_circular() {
+        const N: usize = 200;
+        const W: usize = 64;
+        let sorted = sorted_keys(0..N as u32);
+        let pos_of = |i: usize| *sorted[i].id();
+
+        // (1) STALE out-of-order record is discarded, and must not rewind.
+        // A and C advance to 127; B's slow reply carrying 63 lands last.
+        {
+            let (mgr, _clock) = make_manager();
+            let peer: SocketAddr = "127.0.0.1:9710".parse().unwrap();
+            mgr.seed_fallback_cycle(peer, &sorted, 0);
+            mgr.record_fallback_cursor(peer, &sorted, pos_of(63), W, W);
+            mgr.record_fallback_cursor(peer, &sorted, pos_of(127), W, W);
+            assert_eq!(
+                mgr.peek_fallback_cursor(peer)
+                    .map(|c| c.advertised_in_cycle),
+                Some(128)
+            );
+            mgr.record_fallback_cursor(peer, &sorted, pos_of(63), W, W);
+            assert_eq!(
+                mgr.peek_fallback_cursor(peer),
+                Some(FallbackCursor {
+                    last_sent: pos_of(127),
+                    advertised_in_cycle: 128,
+                }),
+                "a stale record must be discarded: charging it double-counts the \
+                 cycle AND rewinding re-sends ground already covered"
+            );
+        }
+
+        // (2) An exact DUPLICATE covers no distance and is charged once. No
+        // id-equality special case is needed for this.
+        {
+            let (mgr, _clock) = make_manager();
+            let peer: SocketAddr = "127.0.0.1:9711".parse().unwrap();
+            mgr.seed_fallback_cycle(peer, &sorted, 0);
+            mgr.record_fallback_cursor(peer, &sorted, pos_of(63), W, W);
+            mgr.record_fallback_cursor(peer, &sorted, pos_of(63), W, W);
+            assert_eq!(
+                mgr.peek_fallback_cursor(peer)
+                    .map(|c| c.advertised_in_cycle),
+                Some(64),
+                "two racers building the same window advertised ONE window"
+            );
+        }
+
+        // (3) A window that CROSSES the cycle origin is forward progress, not a
+        // rewind. Measuring distance from the ORIGIN instead of from the
+        // previous position rejects exactly this record, parks `last_sent`, and
+        // wedges the rotation permanently.
+        {
+            let (mgr, _clock) = make_manager();
+            let peer: SocketAddr = "127.0.0.1:9712".parse().unwrap();
+            mgr.seed_fallback_cycle(peer, &sorted, 0);
+            for end in [63usize, 127, 191] {
+                mgr.record_fallback_cursor(peer, &sorted, pos_of(end), W, W);
+            }
+            // Next window is [192..255] mod 200, ending at index 55 — below the
+            // origin in id order, and only 55 positions past it.
+            mgr.record_fallback_cursor(peer, &sorted, pos_of(55), W, W);
+            assert_eq!(
+                mgr.peek_fallback_cursor(peer),
+                Some(FallbackCursor {
+                    last_sent: pos_of(55),
+                    advertised_in_cycle: 256,
+                }),
+                "the round that wraps past the origin must be charged and must \
+                 advance the cursor, or the rotation wedges re-sending it forever"
+            );
+        }
+
+        // (4) Origin 0: the published predecessor is the LAST index, so the
+        // first window's forward distance is len - W, which exceeds one window
+        // and reads as a rewind. The first-record exemption is what saves it —
+        // and a peer can steer the start to 0 every cycle, so this is not a
+        // 1-in-len curiosity.
+        {
+            let (mgr, _clock) = make_manager();
+            let peer: SocketAddr = "127.0.0.1:9713".parse().unwrap();
+            mgr.seed_fallback_cycle(peer, &sorted, 0);
+            mgr.record_fallback_cursor(peer, &sorted, pos_of(W - 1), W, W);
+            assert_eq!(
+                mgr.peek_fallback_cursor(peer)
+                    .map(|c| c.advertised_in_cycle),
+                Some(W),
+                "the first record of a cycle drawn at origin 0 must be charged; \
+                 rejecting it stalls every cycle a steering peer can force"
+            );
+        }
+
+        // (5) A set no larger than one window is covered by the first round,
+        // which lands back on the origin's predecessor for a distance of zero.
+        // Without the first-record exemption the counter sticks at 0 and the
+        // cycle never completes again.
+        {
+            let (mgr, _clock) = make_manager();
+            let peer: SocketAddr = "127.0.0.1:9714".parse().unwrap();
+            let small = sorted_keys(0..5);
+            let origin = mgr.begin_fallback_window(peer, &small);
+            let last = *small[(origin + small.len() - 1) % small.len()].id();
+            mgr.record_fallback_cursor(peer, &small, last, small.len(), W);
+            let charged = mgr
+                .peek_fallback_cursor(peer)
+                .map(|c| c.advertised_in_cycle)
+                .unwrap();
+            assert_eq!(
+                charged, 5,
+                "a whole-set round must be charged even though it ends where the \
+                 cycle began"
+            );
+            assert!(
+                charged >= small.len(),
+                "and it must therefore complete the cycle"
+            );
+        }
     }
 
     /// At a CYCLE BOUNDARY the start is random, not a fixed 0.
@@ -7691,7 +8041,7 @@ mod tests {
         let mut seen = HashSet::new();
         for i in 0..40u32 {
             let peer: SocketAddr = format!("127.0.0.1:{}", 9200 + i).parse().unwrap();
-            let start = mgr.fallback_window_start(peer, &sorted);
+            let start = mgr.begin_fallback_window(peer, &sorted);
             assert!(start < sorted.len(), "start {start} out of range");
             seen.insert(start);
         }
@@ -7706,8 +8056,9 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:9300".parse().unwrap();
         let mut seen_completed = HashSet::new();
         for _ in 0..40 {
-            mgr.record_fallback_cursor(peer, *sorted[7].id(), sorted.len());
-            seen_completed.insert(mgr.fallback_window_start(peer, &sorted));
+            mgr.seed_fallback_cycle(peer, &sorted, 0);
+            mgr.record_fallback_cursor(peer, &sorted, *sorted[7].id(), sorted.len(), LIMIT);
+            seen_completed.insert(mgr.begin_fallback_window(peer, &sorted));
         }
         assert!(
             seen_completed.iter().all(|s| *s < sorted.len()),
@@ -7719,14 +8070,17 @@ mod tests {
              deterministically after the last id sent — got {seen_completed:?}"
         );
 
-        // Reaching the boundary must also clear the count, or the very next
-        // round would read the new cycle as already finished and re-randomise
-        // again — permanently random, never contiguous.
+        // Taking the boundary must PUBLISH the new cycle (so a concurrent second
+        // reply resumes from the same origin instead of drawing its own) with the
+        // count cleared. If the count survived, the very next round would read
+        // the new cycle as already finished and re-randomise again — permanently
+        // random, never contiguous.
+        let published = mgr
+            .peek_fallback_cursor(peer)
+            .expect("the boundary must publish the new cycle under the same lock");
         assert_eq!(
-            mgr.peek_fallback_cursor(peer),
-            None,
-            "the completed cycle's cursor must be dropped when the boundary is \
-             taken, so the next recorded cursor counts from zero"
+            published.advertised_in_cycle, 0,
+            "the published cycle must start with nothing charged"
         );
     }
 
@@ -7760,17 +8114,18 @@ mod tests {
 
             // Mid-cycle by construction: one entry advertised so far, so the
             // cycle is nowhere near the `len` contracts that would finish it.
-            mgr.record_fallback_cursor(peer, highest, 1);
+            mgr.seed_fallback_cycle(peer, &sorted, len - 1);
+            mgr.record_fallback_cursor(peer, &sorted, highest, 1, LIMIT);
             for read in 0..8 {
                 assert_eq!(
-                    mgr.fallback_window_start(peer, &sorted),
+                    mgr.begin_fallback_window(peer, &sorted),
                     0,
                     "len={len} read={read}: a window ending on the highest id \
                      must wrap to 0 and stay contiguous, not restart the cycle \
                      at a random offset (#5181)"
                 );
             }
-            // Reading a mid-cycle wrap must not consume the cursor.
+            // Reading a mid-cycle wrap must not consume or alter the cursor.
             assert_eq!(
                 mgr.peek_fallback_cursor(peer),
                 Some(FallbackCursor {
@@ -7786,8 +8141,8 @@ mod tests {
     ///
     /// `rotation_covers_every_contract_within_ceil_n_over_limit_rounds` above
     /// exercises the pure helpers with a test-local resume rule, which is why it
-    /// stayed green through #5181: the defect lived in `fallback_window_start`,
-    /// between them. This drives `fallback_window_start` and
+    /// stayed green through #5181: the defect lived in `begin_fallback_window`,
+    /// between them. This drives `begin_fallback_window` and
     /// `record_fallback_cursor` themselves and sweeps all `n` origins rather
     /// than sampling five, so the origins whose rounds land on the last index
     /// (`{8, 72, 136}` for n=200, limit=64 — the ones the flake needed to draw)
@@ -7802,16 +8157,15 @@ mod tests {
             for origin in 0..n {
                 let peer: SocketAddr = format!("127.0.0.1:{}", 9500 + origin).parse().unwrap();
                 let (mgr, _clock) = make_manager();
-                // Force round one to begin at `origin` by seeding the cursor on
-                // its predecessor, mid-cycle with nothing yet charged. For
-                // `origin == 0` the predecessor is the LAST id, so origin 0 is
-                // itself the wrap case — a no-cursor seed would have drawn a
-                // random start and could not pin an origin at all.
-                mgr.record_fallback_cursor(peer, *sorted[(origin + n - 1) % n].id(), 0);
+                // Force round one to begin at `origin`, through the SAME cursor
+                // shape a boundary publishes — so this cannot pin a state
+                // production never produces. `origin == 0` is itself the wrap
+                // case, since the published predecessor is then the last id.
+                mgr.seed_fallback_cycle(peer, &sorted, origin);
 
                 let mut covered: HashSet<ContractInstanceId> = HashSet::new();
                 for round in 0..rounds {
-                    let start = mgr.fallback_window_start(peer, &sorted);
+                    let start = mgr.begin_fallback_window(peer, &sorted);
                     if round == 0 {
                         assert_eq!(
                             start, origin,
@@ -7823,7 +8177,7 @@ mod tests {
                     assert!(!window.is_empty(), "n={n} limit={limit}: empty window");
                     covered.extend(window.iter().map(|i| *sorted[*i].id()));
                     let last = *sorted[*window.last().unwrap()].id();
-                    mgr.record_fallback_cursor(peer, last, window.len());
+                    mgr.record_fallback_cursor(peer, &sorted, last, window.len(), limit);
                 }
 
                 let missed = expected.difference(&covered).count();
@@ -7853,40 +8207,180 @@ mod tests {
     ///
     /// Asserting on BOUNDARIES TAKEN rather than on distinct start values,
     /// because distinct values do not discriminate: the shortcut's single
-    /// first-round draw already produces two of them. A dropped cursor is the
-    /// observable proof a new cycle was begun, and under the shortcut it never
-    /// happens.
+    /// first-round draw already produces two of them.
+    ///
+    /// The boundary is observed as the count being reset to zero, NOT as the
+    /// cursor disappearing. Boundaries now re-publish the new cycle under the
+    /// same lock hold (which is what stops two concurrent replies drawing
+    /// different origins), so `peek()` is always `Some` and a
+    /// dropped-cursor probe would count zero boundaries and fail vacuously.
     #[test]
     fn cycles_end_so_the_start_keeps_being_re_randomised() {
         let (mgr, _clock) = make_manager();
         let peer: SocketAddr = "127.0.0.1:9600".parse().unwrap();
         let sorted = sorted_keys(0..64);
-        const LIMIT: usize = 16;
+        const W: usize = 16;
         const ROUNDS: usize = 20;
 
         let mut boundaries = 0usize;
         let mut starts = Vec::new();
         for _ in 0..ROUNDS {
-            let had_cursor = mgr.peek_fallback_cursor(peer).is_some();
-            let start = mgr.fallback_window_start(peer, &sorted);
-            if had_cursor && mgr.peek_fallback_cursor(peer).is_none() {
+            let charged_before = mgr
+                .peek_fallback_cursor(peer)
+                .map(|c| c.advertised_in_cycle);
+            let start = mgr.begin_fallback_window(peer, &sorted);
+            let charged_after = mgr
+                .peek_fallback_cursor(peer)
+                .map(|c| c.advertised_in_cycle);
+            // A fresh cycle was begun: the count went from "something charged"
+            // to zero.
+            if charged_before.is_some_and(|c| c > 0) && charged_after == Some(0) {
                 boundaries += 1;
             }
             starts.push(start);
-            let window = rotation_window_indices(sorted.len(), start, LIMIT);
+            let window = rotation_window_indices(sorted.len(), start, W);
             let last = *sorted[*window.last().unwrap()].id();
-            mgr.record_fallback_cursor(peer, last, window.len());
+            mgr.record_fallback_cursor(peer, &sorted, last, window.len(), W);
         }
 
         // 20 rounds x 16 entries over a 64-contract set is 5 cycles' worth of
         // advertising, so the boundary must have been reached about 4 times.
-        let expected_min = ROUNDS * LIMIT / sorted.len() - 1;
+        // `saturating_sub` so a future edit that shrinks ROUNDS*W cannot turn
+        // this into an arithmetic panic instead of a clear assertion failure.
+        let expected_min = (ROUNDS * W / sorted.len()).saturating_sub(1);
         assert!(
             boundaries >= expected_min,
             "only {boundaries} cycle boundary/ies in {ROUNDS} rounds (expected \
              at least {expected_min}); starts were {starts:?}. A rotation that \
              never reaches a boundary is a deterministic function of the stored \
              id, which a peer steering `sorted` can pin to the head of the set."
+        );
+    }
+
+    /// Contracts INSERTED between the cursor and the window end, between rounds,
+    /// must not make the round look like a stale long-jump.
+    ///
+    /// The upper bound in `record_fallback_cursor` rejects an advance greater
+    /// than one window, which raises a fair worry: if the index distance at
+    /// record time exceeds the entries actually sent, a legitimate round is
+    /// rejected, the cursor parks, and the rotation wedges the same way the
+    /// origin-0 case did. The derivation says it cannot happen, because the
+    /// window is chosen by index in the same snapshot the record is measured
+    /// against, so the distance IS the entry count. This is that derivation
+    /// under test rather than in a comment — every other test in this area
+    /// passes one fixed `sorted` for every round and so cannot see it.
+    ///
+    /// A wedge is permanent while an over-long cycle is bounded, so where this
+    /// rule is uncertain it must err towards ACCEPTING.
+    #[test]
+    fn churn_inside_the_swept_arc_does_not_look_like_a_stale_record() {
+        let (mgr, _clock) = make_manager();
+        let peer: SocketAddr = "127.0.0.1:9900".parse().unwrap();
+        const W: usize = 8;
+
+        // Round 1 over the original set.
+        let before = sorted_keys((0..40).map(|i| i * 4));
+        mgr.seed_fallback_cycle(peer, &before, 0);
+        let start1 = mgr.begin_fallback_window(peer, &before);
+        let w1 = rotation_window_indices(before.len(), start1, W);
+        let last1 = *before[*w1.last().unwrap()].id();
+        mgr.record_fallback_cursor(peer, &before, last1, w1.len(), W);
+        let charged1 = mgr
+            .peek_fallback_cursor(peer)
+            .map(|c| c.advertised_in_cycle);
+        assert_eq!(charged1, Some(W), "premise: round one charged one window");
+
+        // Now insert contracts INTERLEAVED with the original ids, so many of
+        // them land inside the arc round two is about to sweep. Seeds not
+        // divisible by 4 sort between the originals.
+        let after = sorted_keys((0..40).map(|i| i * 4).chain((0..40).map(|i| i * 4 + 1)));
+        assert!(
+            after.len() > before.len(),
+            "premise: the set grew by insertion"
+        );
+
+        // Round two, production-shaped: the SAME grown snapshot is used to pick
+        // the window and to record it.
+        let start2 = mgr.begin_fallback_window(peer, &after);
+        let w2 = rotation_window_indices(after.len(), start2, W);
+        let last2 = *after[*w2.last().unwrap()].id();
+        mgr.record_fallback_cursor(peer, &after, last2, w2.len(), W);
+
+        let cursor = mgr
+            .peek_fallback_cursor(peer)
+            .expect("cursor must still exist");
+        assert_eq!(
+            cursor.last_sent, last2,
+            "a round whose swept arc gained contracts since the last round must \
+             still ADVANCE the cursor. Rejecting it parks the cursor and the \
+             rotation re-sends the same window forever — a permanent wedge, \
+             where wrongly accepting would only lengthen a cycle."
+        );
+        assert_eq!(
+            cursor.advertised_in_cycle,
+            W + w2.len(),
+            "and it must be charged to the cycle"
+        );
+    }
+
+    /// CHARACTERISATION, not an endorsement: with a shared set the peer VARIES
+    /// between rounds, it can pin the window and starve most of the set.
+    ///
+    /// Every other test that drives the real API passes one fixed `sorted` for
+    /// every round, so none of them can see this. It is the anti-steering
+    /// regression described on `begin_fallback_window`: the completion test
+    /// compares the count against `sorted.len()`, and the peer chooses `sorted`.
+    /// A single-hash `Interests` makes `len == 1`, so the cycle completes
+    /// immediately and is re-seeded from an id the peer picked; the full round
+    /// then resumes from there, every time.
+    ///
+    /// Asserting the live behaviour deliberately, so the regression is visible
+    /// in CI rather than only in prose. **When positional completion lands this
+    /// test must be INVERTED** — the starves-most-of-the-set assertion becomes
+    /// the bug, and #5313 is the place that flips it.
+    #[test]
+    fn varying_shared_set_lets_a_peer_pin_the_window_today() {
+        let (mgr, _clock) = make_manager();
+        let peer: SocketAddr = "127.0.0.1:9800".parse().unwrap();
+        let full = sorted_keys(0..200);
+        const W: usize = 64;
+
+        // The peer's steering choice: one hash, the highest id in the set.
+        let single = vec![full[full.len() - 1].clone()];
+
+        let mut full_starts = Vec::new();
+        let mut advertised: HashSet<ContractInstanceId> = HashSet::new();
+        for _ in 0..20 {
+            // Round A: the peer advertises exactly one hash.
+            let a = mgr.begin_fallback_window(peer, &single);
+            let wa = rotation_window_indices(single.len(), a, W);
+            advertised.extend(wa.iter().map(|i| *single[*i].id()));
+            let last_a = *single[*wa.last().unwrap()].id();
+            mgr.record_fallback_cursor(peer, &single, last_a, wa.len(), W);
+
+            // Round B: the peer advertises everything.
+            let b = mgr.begin_fallback_window(peer, &full);
+            full_starts.push(b);
+            let wb = rotation_window_indices(full.len(), b, W);
+            advertised.extend(wb.iter().map(|i| *full[*i].id()));
+            let last_b = *full[*wb.last().unwrap()].id();
+            mgr.record_fallback_cursor(peer, &full, last_b, wb.len(), W);
+        }
+
+        let distinct: HashSet<usize> = full_starts.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            1,
+            "characterisation: the full-round start is currently pinned by the \
+             peer. If this now varies, anti-steering has been RESTORED — invert \
+             this test rather than relaxing it. starts={full_starts:?}"
+        );
+        assert!(
+            advertised.len() < full.len(),
+            "characterisation: pinning the start starves the rest of the set; \
+             advertised {} of {}",
+            advertised.len(),
+            full.len()
         );
     }
 
@@ -7898,11 +8392,11 @@ mod tests {
     /// under the deterministic simulation harness, which would make any
     /// convergence simulation covering this path silently non-deterministic.
     #[test]
-    fn fallback_window_start_draws_its_offset_from_global_rng() {
+    fn begin_fallback_window_draws_its_offset_from_global_rng() {
         let src = include_str!("interest.rs");
         let at = src
-            .find("pub(crate) fn fallback_window_start(")
-            .expect("fallback_window_start not found");
+            .find("pub(crate) fn begin_fallback_window(")
+            .expect("begin_fallback_window not found");
         let body_end = at + src[at..].find("\n    }\n").expect("body end not found");
         let body = &src[at..body_end];
         assert!(

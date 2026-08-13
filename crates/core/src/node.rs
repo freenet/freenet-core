@@ -3314,7 +3314,7 @@ async fn handle_interest_sync_message(
                 SummaryReplyForm::FullBytes => {
                     let start = op_manager
                         .interest_manager
-                        .fallback_window_start(source, &matching);
+                        .begin_fallback_window(source, &matching);
                     Some(crate::ring::interest::rotation_window_indices(
                         matching.len(),
                         start,
@@ -3408,10 +3408,15 @@ async fn handle_interest_sync_message(
             // past the last id (resume at 0). Deriving that from the resume
             // index alone was #5181.
             //
-            // Two known imprecisions here, both accepted, both costing at most
-            // one cycle of delay for the affected contracts and neither able to
-            // skip one permanently (the window wraps, and a cycle boundary
-            // restarts at a random offset):
+            // Known imprecisions, all accepted, none able to skip a contract
+            // permanently — because the window WRAPS and cycles complete, which
+            // is the property that does that work. (The random origin defends a
+            // different failure, peer steering, and does not contribute to
+            // non-permanence; the two used to be offered jointly here, which is
+            // how the claim ended up wrong.) Several of these make the cycle end
+            // EARLY rather than late, so an arc can go unadvertised for an extra
+            // cycle; `FallbackCursor::advertised_in_cycle` is explicit that this
+            // is not a safe-direction-only approximation:
             //
             // - This advances on send ATTEMPT. The reply is handed to the
             //   connection afterwards and a send failure is only logged, so a
@@ -3421,12 +3426,34 @@ async fn handle_interest_sync_message(
             //   read the same start and build the same window, losing one
             //   round of progress. Reserving the window at read time instead
             //   would trade that for a worse failure: a budget-cut round would
-            //   then skip everything it did not reach.
+            //   then skip everything it did not reach. The duplicate is not
+            //   double-CHARGED (it covers no new distance), but the round is
+            //   still spent.
+            // - Two concurrent replies cut at different lengths by the byte
+            //   budget carry different last ids, so the shorter is not
+            //   recognised as ground the longer already covered. If the shorter
+            //   records first the longer is charged on top of it, over-stating
+            //   progress by up to one window.
+            // - A racer that STRADDLES a boundary (it read the old cycle, the
+            //   other took the boundary) overwrites `last_sent` and discards the
+            //   freshly published origin, so its successor resumes from the old
+            //   window instead of the new origin. Safe direction: it costs
+            //   contiguity for one round, never coverage.
+            // - Contract CHURN: ids removed from ground already swept while
+            //   others are inserted below the cursor let the count reach the set
+            //   size with current members never advertised this cycle.
+            // - The peer chooses `sorted`, so it chooses the length the count is
+            //   compared against; see `begin_fallback_window`'s rustdoc for the
+            //   anti-steering regression this leaves open.
             if form == SummaryReplyForm::FullBytes {
                 if let Some(last) = last_included {
-                    op_manager
-                        .interest_manager
-                        .record_fallback_cursor(source, last, entries.len());
+                    op_manager.interest_manager.record_fallback_cursor(
+                        source,
+                        &matching,
+                        last,
+                        entries.len(),
+                        MAX_FALLBACK_SUMMARIES_PER_REPLY,
+                    );
                 }
             }
 
@@ -9770,14 +9797,14 @@ mod tests {
 
             // Seed the cursor so both rounds are mid-cycle and the starting
             // offset is fixed. Without this the first round would begin at a
-            // random cycle-boundary offset (see `fallback_window_start`).
-            // One entry charged to the cycle, so the 8-contract set is nowhere
-            // near finished and neither round re-randomises.
+            // random cycle-boundary offset (see `begin_fallback_window`).
+            // Seeded through the production boundary shape so the cycle starts
+            // at index 1, leaving the 8-contract set nowhere near finished.
             let mut sorted = keys.clone();
             sorted.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
             h.op_manager
                 .interest_manager
-                .record_fallback_cursor(h.old_peer, *sorted[0].id(), 1);
+                .seed_fallback_cycle(h.old_peer, &sorted, 1);
 
             let mut seen: Vec<u32> = Vec::new();
             for round in 0..2 {
@@ -10047,9 +10074,14 @@ mod tests {
                     .interest_manager
                     .peek_fallback_cursor(h.old_peer)
                     .expect("a fallback reply must leave a cursor");
-                // A duplicated window is charged once, so 3 pairs advance the
-                // cycle by at most 3 x 64 of the 400 shared contracts and the
-                // boundary (which would drop the cursor) is not reached here.
+                // Both racers now resume from the SAME published origin (see
+                // `begin_fallback_window`), so a pair advances the cycle by one
+                // window rather than two: 3 pairs charge ~3 x 64 of the 400
+                // shared contracts and no cycle completes inside this loop.
+                // Before the origin was published atomically, pair 0 drew two
+                // different origins and charged both, which ran the counter
+                // ahead of the ground covered and made this test fail ~20% of
+                // the time.
                 assert!(
                     ids.contains(&cursor.last_sent),
                     "after pair {pair} the cursor is no longer a member of the \
