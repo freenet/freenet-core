@@ -195,6 +195,73 @@ hand-rolling a `split_once`. It:
 scrapes `update.rs` cannot be satisfied by its own assertion literal at
 all — a structural guarantee rather than a check someone must remember.
 
+### The same class without `include_str!`: an expectation stored as a copy
+
+A pin does not need a sliding anchor to follow its subject. **An expected
+value stored as a plaintext copy of the value it guards is rewritten by
+the same edit that changes the value**, so the pin renames itself and
+stays green. Nothing self-references; the two literals are simply
+identical, and the realistic edit is a sweep over both.
+
+Seen in #5303. `MARKER_LATEST_SEEN_SINCE` names the first published
+release emitting a log marker; rewording the marker requires moving it,
+and nothing prompted anyone (the source pin interpolates the marker, so
+it follows a rename by construction). A freeze was added storing the
+expected marker text as a literal beside the constant. Its own mutation
+test killed it: a reword is performed as a `sed` sweep across the files
+mentioning the marker, that sweep rewrote the frozen expectation too, and
+the suite passed with the constant still stale.
+
+Then the fix's *fix* failed the same way one level up. With the text
+stored base64 the reword went red — but following the failure message's
+own instruction (regenerate the encoded blob) went green again with the
+version constant untouched. Two adjacent assertions are not a pair.
+
+**The rules:**
+
+- **Encode the expectation** (base64, hash, checksum) whenever the value
+  it guards is text a sweep could match. Leave it plaintext only when the
+  realistic wrong edit is a human typing one new value — a version
+  constant qualifies, since bumps touch `Cargo.toml` and the lockfile,
+  not test scripts. Document the asymmetry where you rely on it.
+- **A freeze forces a decision only if the remediation cannot be
+  performed without making that decision.** Freeze values that must move
+  together as ONE blob, so regenerating the expectation is impossible
+  without re-stating both.
+- **Mutation-test the REMEDIATION PATH, not just the regression.** Apply
+  the mutation, then do exactly what your own failure message says, and
+  check whether the suite goes green while the problem remains.
+
+### Relation pins between quantities on different clocks
+
+A pin asserting a fixed relation between two values that change on
+*different schedules* is correct in one phase and wrong in another. It
+looks anchored — the second quantity is one the author cannot influence,
+which is normally the point — but it encodes a phase assumption nobody
+writes down.
+
+#5290 pinned `MARKER_LATEST_SEEN_SINCE >= crate version`, on the premise
+"the marker is new in this tree, so no published release emits it". True
+until that release published; the pin then blocks the *next* release for
+holding the correct value. Reversing it to `<= crate version` is correct
+after publication and wrong during a marker reword, where the right
+constant is crate+1 and the pin goes red for it.
+
+The constant tracks **release history**; the crate version tracks **this
+tree**. No relation asserting they stay in step holds in both phases.
+
+- Ask **"what future state legitimately requires this to move?"** before
+  pinning a relation. If the answer is "a state where the relation is
+  violated", the relation is the wrong pin.
+- Prefer a **freeze on the value**, which is phase-independent and
+  catches strictly more (the empty string, and the most likely wrong
+  value, neither of which a one-sided relation sees).
+- A *loose plausibility bound* is not the same thing and is not refuted
+  by the above: `<= crate + 1` passes during a reword. Note that the
+  claim "it fires on a reword too" was repeated through two reviews
+  before anyone did the arithmetic — **check a refutation before
+  propagating it**, especially one that is a single comparison.
+
 ### Audit
 
 Every pin must be mutation-tested when written: apply the exact

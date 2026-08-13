@@ -643,9 +643,40 @@ a tag that no longer exists is worse than the draft.
 
 ### If Gate B fails
 
-The release is already public and the fleet will **not** converge onto it on
-its own. Ship a fix release, and expect to roll existing nodes by hand
-(`freenet update`) as v0.2.120/v0.2.121 required.
+**Establish which of two things happened before acting.** They need opposite
+responses, and the alarm text names the worse one.
+
+**1. A stale canary constant, which is NOT a fleet problem.** Gate B's
+positive-equality check greps the previous release's log for
+`MARKER_LATEST_SEEN` (`scripts/auto-update-canary.sh`), and it arms only from
+`MARKER_LATEST_SEEN_SINCE` onwards. If that marker's TEXT was reworded and the
+constant was not moved to the release that first ships the new wording, Gate B
+demands text the published binary was never built to emit. Auto-update is fine;
+the gate is asking the wrong question. The Matrix alarm still says "a node on
+the previous release may not be able to auto-update", so read the job log rather
+than the alarm.
+
+Check first:
+
+```bash
+grep -n "MARKER_LATEST_SEEN\b\|MARKER_LATEST_SEEN_SINCE" scripts/auto-update-canary.sh
+```
+
+If the marker text was changed in this release's window, fix the constant (the
+test file freezes the two together and explains the choice) rather than shipping
+anything. The same applies to the other markers Gate B greps against the
+previous binary — `MARKER_DISABLED`, `MARKER_CHECK_RAN`, `MARKER_CHECK_COMPLETE`
+and `MARKER_TRIGGERED_RE` — which are not frozen and would produce the same false
+alarm with a less specific message.
+
+**2. A real detection or install failure.** The previous release genuinely
+cannot reach this one. The release is already public and the fleet will **not**
+converge onto it on its own: ship a fix release, and expect to roll existing
+nodes by hand (`freenet update`) as v0.2.120/v0.2.121 required.
+
+Gate A does not have this failure mode: it runs a binary built from the same
+tree as the canary, so a reword there is self-consistent. Gate B is the only
+place an OLDER binary's log is read.
 
 ## Post-release verification
 

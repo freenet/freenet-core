@@ -455,6 +455,26 @@ else
     echo "ok   - cmd_selfupdate gates the equality check on prev_emits_latest_seen (un-negated)"
 fi
 
+# ...and that the DECISION reads the constant rather than a literal of its
+# current value. Nothing else covers this: hardcoding `version_at_least "$1"
+# "0.2.125"` inside the function leaves the whole suite green, the freeze
+# included, because the constant is untouched and the freeze has nothing to
+# disagree with. It matters at exactly the moment the constant is supposed to
+# move -- a correct reword bump would then silently not take effect, which is
+# the same shape as the reword hazard the freeze above exists to close.
+# shellcheck disable=SC2016  # literal source text; must not expand
+if [[ "$(declare -f prev_emits_latest_seen)" == *'"$MARKER_LATEST_SEEN_SINCE"'* ]]; then
+    echo "ok   - prev_emits_latest_seen compares against the CONSTANT, not a literal"
+else
+    echo "FAIL - prev_emits_latest_seen no longer reads \$MARKER_LATEST_SEEN_SINCE." >&2
+    echo "       Its body:" >&2
+    declare -f prev_emits_latest_seen | sed 's/^/         /' >&2
+    echo "       A literal threshold here decouples the decision from the constant, so" >&2
+    echo "       moving the constant -- which is exactly what a marker reword requires --" >&2
+    echo "       changes nothing and the whole suite stays green." >&2
+    FAILURES=$((FAILURES + 1))
+fi
+
 # ...and what that gate DECIDES, which the text match above cannot see. An
 # inversion inside the function flips both of these.
 gate_b_arm_case() {
@@ -770,112 +790,115 @@ pin_marker "source pin: disabled marker"        "$SRC"    "$MARKER_DISABLED"
 # assertion -- the same silent direction as the `!` inversion, reached by
 # editing a different line.
 #
-# WHY THERE IS NO RELATION PIN HERE, AND MUST NOT BE ONE.
+# NO EQUALITY-STYLE RELATION PIN HERE. Two were tried and each was right in one
+# phase and wrong in another. Writing C for the crate version, and noting that a
+# dev tree's C equals the last PUBLISHED release (the bump happens inside the
+# release commit), so a marker reworded today first ships in C+1 and the correct
+# constant during a reword is C+1:
 #
-# Two have been tried and both were wrong, in opposite phases:
+#   constant >= C   (#5290)  rests on "no published release emits the marker
+#                            yet"; true until 0.2.125 published, false one
+#                            second later. Detonates on the next bump.
+#   constant <= C   (first   C+1 <= C is FALSE, so it goes RED for the CORRECT
+#                   attempt) value during a reword, and the value that makes it
+#                            green makes Gate B demand new text from a binary
+#                            emitting the old one.
 #
-#   `constant >= crate version` (#5290). Premise: "the marker is new in this
-#     tree, so no published release emits it". True until 0.2.125 published,
-#     false one second later. It would have gone red on the 0.2.126 bump and
-#     blocked a healthy release. Self-detonating; verified by setting the crate
-#     version to 0.2.126 and watching it fail.
+# The constant tracks RELEASE HISTORY and C tracks THIS TREE, so a relation
+# asserting they stay in step cannot hold in both phases. That is the reason
+# neither of the above works, and it is a claim about EQUALITY-STYLE relations
+# only.
 #
-#   `constant <= crate version` (this PR's first attempt). Correct after
-#     publication, wrong during a marker REWORD. A marker reworded on main first
-#     ships in crate+1, so the CORRECT constant is crate+1 -- which this
-#     assertion calls a failure, while the value that makes it green (constant =
-#     crate) makes Gate B demand the new text from a published binary that emits
-#     the old one: a post-publish red canary and a Matrix alarm blaming the node.
-#     Verified by execution. A `<= crate+1` variant fires on the reword too.
+# CORRECTION, and it is worth stating because the wrong version of it was
+# repeated through two reviews and into this comment: a LOOSE bound of the form
+# `constant <= C+1` does NOT fire on a reword. C+1 <= C+1 passes. It was
+# described as firing, the reviewer who proposed it withdrew it on that basis,
+# and nobody checked the arithmetic until a later reviewer did. Such a bound is
+# phase-independent and would catch a constant more than one release ahead. It
+# is deliberately NOT added here -- the freeze below already rejects every wrong
+# value, so a second overlapping pin needs its own justification -- but the
+# reason is redundancy, not unsoundness. Do not re-cite the refuted claim.
 #
-# The generalisation, and the reason not to try a third: the constant tracks
-# RELEASE HISTORY while the crate version tracks THIS TREE, and no fixed
-# relation between them holds across publication and reword both. A pin on a
-# relation between two quantities that move on different clocks is a pin that
-# will be right in one phase and wrong in another.
-#
-# So the pin is a FREEZE, which is phase-independent, and it covers strictly
-# more: the relation only ever caught "constant strictly above crate version",
-# while the freeze catches every wrong value including the empty string and the
-# most likely wrong one (the version being cut). It also cannot be tripped by
+# The freeze below is phase-independent and catches strictly more than either
+# relation did: every wrong value, including the empty string and the most
+# likely wrong one (the version being cut). It also cannot be tripped by
 # `version.workspace = true`, which broke the relation pin's Cargo.toml read.
 #
-# WHY BOTH HALVES ARE FROZEN TOGETHER.
+# WHY THE TWO VALUES ARE ONE BLOB, and why it is encoded. Both properties were
+# forced by mutation, in two rounds:
 #
-# The version alone is not enough, and the gap is silent rather than annoying.
-# Reword MARKER_LATEST_SEEN everywhere a developer must touch it -- auto_update.rs,
-# freenet.rs, the canary, and the log fixtures in both test files -- leave the
-# constant alone, and the whole suite passes: verified, zero red. The source pin
-# interpolates $MARKER_LATEST_SEEN so it follows the rename by construction, and
-# nothing else looks at the marker at all. A stale constant is the DEFAULT
-# outcome of a reword, not an escape from a warning, and it surfaces post-publish
-# on the release Matrix channel with text that blames the node.
+#   Plaintext expectation -> a reword is done as a `sed` sweep, the sweep
+#   rewrote the expectation too, suite green. An expectation stored as a copy of
+#   the value it guards follows any rename of that value.
 #
-# Freezing the PAIR is what closes that: a reword fails HERE, in the same edit,
-# with the version constant named.
+#   Two adjacent encoded assertions -> the reword went red, but following this
+#   pin's OWN failure message (regenerate the text blob) went green again with
+#   the version constant untouched, because the message never asked about it.
+#   A freeze forces a decision only if the remediation cannot be performed
+#   without making that decision.
 #
-# THE EXPECTED TEXT IS BASE64, AND THAT IS THE WHOLE MECHANISM. The first
-# version of this pin stored the marker as a plain literal, and it did not
-# survive its own mutation test: a reword is performed as a `sed` sweep over the
-# files that mention the marker, that sweep rewrote this expectation along with
-# everything else, and the suite stayed green. Same shape as the source pin this
-# was meant to compensate for -- an expectation textually identical to the value
-# under test follows any rename of it. Encoded, a text sweep cannot reach it.
+# One blob of both values fixes both: a sweep cannot reach it, and the recipe
+# cannot be run without supplying a version. Mutation-test the REMEDIATION PATH,
+# not just the regression, before trusting any replacement.
 #
-# To change it deliberately:  printf '%s' '<new marker text>' | base64 -w0
-MARKER_LATEST_SEEN_FROZEN_B64='U3RhcnR1cCB1cGRhdGUgY2hlY2s6IEdpdEh1YiByZXBvcnRzIGxhdGVzdCByZWxlYXNl'
-MARKER_LATEST_SEEN_FROZEN="$(printf '%s' "$MARKER_LATEST_SEEN_FROZEN_B64" | base64 -d)"
-# The version half stays plain. It is not exposed to the same hazard: the edit
-# that would rewrite it is a repo-wide `sed` on a version string, and version
-# bumps here touch Cargo.toml and the lockfile, not these scripts. The realistic
-# wrong edit is a human raising it on purpose, which a plain comparison catches.
-MARKER_LATEST_SEEN_SINCE_FROZEN='0.2.125'
+# WHAT IT STILL CANNOT DO, so nobody reads more into a green run than is there:
+# it makes the question unavoidable, it does not verify the answer. Regenerate
+# the blob with the new text and the OLD version and this goes green -- measured.
+# No local check can know which release will ship a given wording, and any
+# relation that tried to infer it is back to the phase problem above. The value
+# here is that the version cannot be left unconsidered, not that it is correct.
+#
+# 0.2.125 is the first release a running node can REACH whose binary emits this
+# text: the marker landed in the 0.2.124 tree, but 0.2.124 was never published
+# (Gate A blocked it, #5290) and a draft does not appear at `/releases/latest`.
+# Ground-truthed by downloading the published v0.2.125 musl asset and finding
+# the string in it.
+#
+# WHAT THIS DOES NOT COVER: `assert_detection_healthy` greps four other markers
+# against the PREVIOUS release's binary in Gate B -- MARKER_DISABLED,
+# MARKER_CHECK_RAN, MARKER_CHECK_COMPLETE and MARKER_TRIGGERED_RE -- and
+# rewording any of those produces the same post-publish false alarm with a worse
+# message. Only MARKER_LATEST_SEEN is frozen here. The asymmetry is real, not an
+# oversight: Gate A runs a binary built from THIS tree, so a reword there is
+# self-consistent, and Gate B is the only place an older binary is read.
+# Tracked as a follow-up.
+#
+# To change it deliberately, re-state BOTH values:
+#   printf '%s\n%s' '<marker text>' '<first release shipping it>' | base64 | tr -d '\n'
+# (`base64 -w0` is GNU-only and fails on macOS, which is where someone reading
+# this failure is most likely to be.)
+MARKER_PAIR_FROZEN_B64='U3RhcnR1cCB1cGRhdGUgY2hlY2s6IEdpdEh1YiByZXBvcnRzIGxhdGVzdCByZWxlYXNlCjAuMi4xMjU='
+marker_pair_frozen="$(printf '%s' "$MARKER_PAIR_FROZEN_B64" | base64 -d)"
+marker_pair_live="$(printf '%s\n%s' "$MARKER_LATEST_SEEN" "$MARKER_LATEST_SEEN_SINCE")"
 
-if [[ -z "$MARKER_LATEST_SEEN_FROZEN" ]]; then
-    # `base64 -d` failing would leave the expectation empty and make the
-    # comparison below vacuous in the quiet direction.
-    echo "FAIL - could not decode MARKER_LATEST_SEEN_FROZEN_B64; the marker freeze is not running" >&2
+if [[ -z "$marker_pair_frozen" ]]; then
+    # A failed decode would leave the expectation empty and make the comparison
+    # vacuous in the quiet direction.
+    echo "FAIL - could not decode MARKER_PAIR_FROZEN_B64; the marker/version freeze is not running" >&2
     FAILURES=$((FAILURES + 1))
-elif [[ "$MARKER_LATEST_SEEN" == "$MARKER_LATEST_SEEN_FROZEN" ]]; then
-    echo "ok   - MARKER_LATEST_SEEN still matches the text v$MARKER_LATEST_SEEN_SINCE_FROZEN shipped"
+elif [[ "$marker_pair_live" == "$marker_pair_frozen" ]]; then
+    echo "ok   - (MARKER_LATEST_SEEN, MARKER_LATEST_SEEN_SINCE) frozen as a pair at v$MARKER_LATEST_SEEN_SINCE"
 else
-    echo "FAIL - the observed-latest MARKER TEXT changed, and MARKER_LATEST_SEEN_SINCE must be" >&2
-    echo "       reconsidered in the same edit." >&2
-    echo "         was: '$MARKER_LATEST_SEEN_FROZEN'" >&2
-    echo "         now: '$MARKER_LATEST_SEEN'" >&2
-    echo "       MARKER_LATEST_SEEN_SINCE names the first PUBLISHED release emitting that text." >&2
-    echo "       Reword it and no published binary emits the new text yet, so the constant must" >&2
-    echo "       move to the release that will first SHIP it -- normally the NEXT one, since the" >&2
-    echo "       bump happens inside the release commit. Leave it and Gate B demands the new" >&2
-    echo "       wording from a binary that emits the old one: a POST-PUBLISH red canary and a" >&2
-    echo "       Matrix alarm whose text blames the node." >&2
-    echo "       Nothing else in this suite would have told you: the source pin interpolates" >&2
-    echo "       \$MARKER_LATEST_SEEN and follows the rename by construction. This assertion is" >&2
-    echo "       the only prompt. Once you have decided, update BOTH frozen values here:" >&2
-    echo "         MARKER_LATEST_SEEN_FROZEN_B64=\"\$(printf '%s' '$MARKER_LATEST_SEEN' | base64 -w0)\"" >&2
-    echo "         MARKER_LATEST_SEEN_SINCE_FROZEN=<first release that will SHIP the new text>" >&2
-    FAILURES=$((FAILURES + 1))
-fi
-
-# ...and the version half. 0.2.125 is the first release a running node can REACH
-# whose binary emits that text: the marker landed in the 0.2.124 tree, but
-# 0.2.124 was never published (Gate A blocked it on the #5290 TMPDIR harness
-# bug) and a draft does not appear at `/releases/latest`, so no node ever saw a
-# 0.2.124 binary. Ground-truthed during review by downloading the published
-# v0.2.125 musl asset and finding the string in it.
-if [[ "$MARKER_LATEST_SEEN_SINCE" == "$MARKER_LATEST_SEEN_SINCE_FROZEN" ]]; then
-    echo "ok   - MARKER_LATEST_SEEN_SINCE is frozen at the historical value ($MARKER_LATEST_SEEN_SINCE_FROZEN)"
-else
-    echo "FAIL - MARKER_LATEST_SEEN_SINCE is '$MARKER_LATEST_SEEN_SINCE', expected '$MARKER_LATEST_SEEN_SINCE_FROZEN'." >&2
-    echo "       It records which PUBLISHED release first emitted the marker text, so under an" >&2
-    echo "       ordinary release it does not move. Raising it to the version being cut skips" >&2
-    echo "       Gate B's only positive assertion for that release, silently, and a constant" >&2
-    echo "       kept level with the crate version disarms the gate on every release while" >&2
-    echo "       looking maintained." >&2
-    echo "       If you got here by RAISING it, the fix is almost certainly to put it back." >&2
-    echo "       There is one edit where moving it is correct -- rewording the marker text --" >&2
-    echo "       and that fails the assertion ABOVE this one, naming the reword. If that" >&2
-    echo "       assertion is green, this is not a reword and the constant should not move." >&2
+    echo "FAIL - the frozen (marker text, first release that shipped it) pair changed." >&2
+    echo "         was: '$(printf '%s' "$marker_pair_frozen" | head -1)' @ v$(printf '%s' "$marker_pair_frozen" | tail -1)" >&2
+    echo "         now: '$MARKER_LATEST_SEEN' @ v$MARKER_LATEST_SEEN_SINCE" >&2
+    echo "       These are frozen TOGETHER because they only make sense together." >&2
+    echo "       If the TEXT changed: no published binary emits the new wording yet, so" >&2
+    echo "       MARKER_LATEST_SEEN_SINCE must move to the release that will first SHIP it" >&2
+    echo "       -- normally the NEXT one, since the bump happens inside the release commit." >&2
+    echo "       Leave it and Gate B demands the new wording from a binary that emits the old" >&2
+    echo "       one: a POST-PUBLISH red canary and a Matrix alarm that blames the node." >&2
+    echo "       Nothing else in this suite would have told you -- the source pin interpolates" >&2
+    echo "       \$MARKER_LATEST_SEEN and follows a rename by construction." >&2
+    echo "       If only the VERSION changed: raising it skips Gate B's only positive" >&2
+    echo "       assertion for every release below the new value, silently. Unless you are" >&2
+    echo "       here because of a reword, the fix is to put it back." >&2
+    echo "       Once decided, re-state BOTH:" >&2
+    # printf, not echo: the recipe contains \n sequences that must reach the
+    # reader literally, and `echo`'s handling of those is shell-dependent.
+    # shellcheck disable=SC2016  # the `$(...)` is literal recipe text for the reader
+    printf '         MARKER_PAIR_FROZEN_B64="$(printf %s %s | base64 | tr -d %s)"\n' \
+        "'%s\\n%s'" "'$MARKER_LATEST_SEEN' '<release>'" "'\\n'" >&2
     FAILURES=$((FAILURES + 1))
 fi
 # The parse-failure marker gets a STRONGER pin than pin_marker can give.
