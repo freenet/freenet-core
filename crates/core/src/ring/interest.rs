@@ -8399,7 +8399,7 @@ mod tests {
         const W: usize = 64;
 
         // The peer's steering choice: one hash, the highest id in the set.
-        let single = vec![full[full.len() - 1].clone()];
+        let single = vec![full[full.len() - 1]];
 
         let mut full_starts = Vec::new();
         let mut advertised: HashSet<ContractInstanceId> = HashSet::new();
