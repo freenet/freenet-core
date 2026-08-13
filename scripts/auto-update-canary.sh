@@ -1233,11 +1233,20 @@ cmd_selfupdate() {
       # useful message.
       assert_detection_healthy "$work/logs"
       rc=$?
-      # Which KIND of indeterminate, recorded from the LAST attempt. Only the
-      # node saying outright that it could not reach GitHub is a candidate for
-      # the quiet path; "the check started and never logged an outcome" is not,
-      # because a hung updater produces exactly that. The candidacy is not the
-      # verdict -- see `gate_b_unverified_class`, which demands corroboration.
+      # Which KIND of indeterminate THIS attempt was. Deliberately per-attempt
+      # and NOT the run's answer: the fold below decides that, and it latches.
+      #
+      # (This comment used to read "recorded from the LAST attempt", which was
+      # true of the last-writer-wins version and became false when the latch
+      # landed. A reviewer read the tree, read this line, and correctly
+      # concluded the bug was still present -- from the comment, not the code.
+      # A stale comment on a fixed bug costs a review round.)
+      #
+      # Only the node saying outright that it could not reach GitHub is a
+      # CANDIDATE for the quiet path; "the check started and never logged an
+      # outcome" is not, because a hung updater produces exactly that.
+      # Candidacy is not the verdict -- see `gate_b_unverified_class`, which
+      # demands corroboration on top.
       if [ "$rc" -eq 2 ] && node_could_not_reach_github "$work/logs"; then
         attempt_cause=github
       else
