@@ -189,38 +189,6 @@ else
             "text, so an empty extraction would make all of them pass vacuously."
     fi
 
-    # The #5233 guard, in the form this job can express it. release.yml's two
-    # jobs each run verify_release_checkout.sh before their irreversible act,
-    # because they check out a SHA that a moving `main` could have displaced.
-    # Here the ref is the tag, so the equivalent question is whether the tag and
-    # the tree agree -- and it has to be asked BEFORE the upload, because a
-    # crates.io version cannot be replaced once sent. Without it a mis-tagged
-    # tree publishes silently under the wrong version number.
-    PC_STEP_TEXT="$(printf '%s\n' "$PUBLISH_CRATES_STEP" | cut -d: -f2-)"
-    PC_GUARD_LINE="$(printf '%s\n' "$PUBLISH_CRATES_STEP" \
-        | grep -F 'crates/core/Cargo.toml' | head -1 | cut -d: -f1)"
-    if [[ -z "$PC_GUARD_LINE" ]]; then
-        fail "the crates.io publish step does not read crates/core/Cargo.toml" \
-            "It must assert the tag matches the tree's declared version before" \
-            "uploading anything. A crates.io version is permanent, so 'which tree" \
-            "am I publishing' has to be checked, not assumed (#5233 for the same" \
-            "class of bug in release.yml)."
-    elif [[ "$PC_GUARD_LINE" -lt "$(printf '%s\n' "$PUBLISH_CRATES_STEP" | grep -F 'cargo publish -p freenet' | head -1 | cut -d: -f1)" ]]; then
-        pass "the crates.io publish step checks the tag against crates/core/Cargo.toml first"
-    else
-        fail "the crates.io publish step reads crates/core/Cargo.toml only AFTER uploading" \
-            "A guard that runs after the upload verifies nothing -- the version is" \
-            "already permanent."
-    fi
-    # ...and the guard must be able to stop the upload. `exit 1` on mismatch is
-    # what makes it a guard rather than a log line.
-    if [[ "$PC_STEP_TEXT" == *"exit 1"* ]]; then
-        pass "the crates.io publish step's version guard can refuse (exit 1)"
-    else
-        fail "the crates.io publish step's version guard cannot stop the upload" \
-            "No 'exit 1' in the step. A mismatch that only prints is not a guard."
-    fi
-
     # Same two neutering routes assertion 3 covers for the canary. A publish
     # step that cannot fail is not the problem here -- the problem is a publish
     # step that runs when the canary DIDN'T pass, which `if:` buys and
@@ -238,6 +206,134 @@ else
             "what puts this publish downstream of the canary. An 'if:' can override" \
             "it; 'continue-on-error: true' lets a failed upload reach the un-draft."
     fi
+fi
+
+# --- 2b-bis. the publish step's tree guard, EXECUTED not scraped -------------
+# The #5233 guard in the form this job can express it. release.yml's two jobs
+# run verify_release_checkout.sh before their irreversible act, because they
+# check out a SHA a moving `main` could have displaced. Here the ref is the tag,
+# so the equivalent question is whether the tag and the tree agree -- and it
+# must be asked BEFORE the upload, because a crates.io version cannot be
+# replaced once sent.
+#
+# RUN the step rather than grepping it, and the reason is a mistake made while
+# writing this file. The first version asserted the step contained the text
+# `crates/core/Cargo.toml` above its first `cargo publish`. Mutation-testing it
+# -- replacing the real `sed` read with `CORE_VERSION="$VERSION"`, which
+# compares the tag against itself and can never fail -- left the assertion
+# GREEN, because the step's own `::error::` message mentions the same filename.
+# A scrape satisfied by the error text of the guard it is checking is the
+# `not triggering auto-update` shape again: pinning a line that is talking
+# ABOUT the thing rather than doing it.
+#
+# The step's `run:` is extracted from the YAML and executed against fixture
+# trees with `cargo`, `curl` and `sleep` stubbed, so what is asserted is what it
+# DOES: refuses a mismatched tree without calling cargo, skips a version already
+# on crates.io, and actually publishes otherwise. The third case matters as much
+# as the first -- a guard that refuses everything would satisfy the other two.
+extract_step_run() {
+    # extract_step_run <step name> -- that step's `run:` script, dedented.
+    awk -v want="      - name: $1" '
+        $0 == want                       { instep = 1; next }
+        instep && /^      - name:/       { exit }
+        instep && /^        run: \|/     { inrun = 1; next }
+        inrun {
+            if ($0 !~ /^[[:space:]]*$/ && $0 !~ /^          /) exit
+            sub(/^          /, "")
+            print
+        }
+    ' "$WF"
+}
+
+PC_RUN="$(extract_step_run 'Publish crates to crates.io')"
+if [[ -z "$PC_RUN" || "$PC_RUN" != *'cargo publish -p freenet'* ]]; then
+    # Never a silent skip: every case below would pass on an empty script.
+    fail "could not extract the 'Publish crates to crates.io' step's run: block" \
+        "The behavioural cases below execute it, so an empty or wrong extraction" \
+        "would make all of them pass vacuously. Check the step name and that its" \
+        "body is still a 'run: |' block indented by 10 spaces."
+elif ! command -v jq >/dev/null 2>&1; then
+    # Also never a silent skip. The step itself needs jq at release time, so a
+    # missing jq is a real problem, not a reason to stop checking.
+    fail "jq is not installed, so the publish step's guard cannot be exercised" \
+        "The step uses jq to read crates.io's answer; it would fail at release" \
+        "time too. Install jq."
+else
+    pass "extracted the crates.io publish step's run: block ($(printf '%s\n' "$PC_RUN" | wc -l) lines)"
+
+    pc_run_case() {
+        # pc_run_case <desc> <core-version> <tag> <crates.io-body> <want-rc> <want-cargo:yes|no>
+        local desc="$1" core_ver="$2" tag="$3" api_body="$4" want_rc="$5" want_cargo="$6"
+        local work rc got_cargo
+        work="$(mktemp -d)"
+        mkdir -p "$work/crates/core" "$work/crates/fdev" "$work/bin"
+        printf '[package]\nname = "freenet"\nversion = "%s"\n' "$core_ver" \
+            > "$work/crates/core/Cargo.toml"
+        printf '[package]\nname = "fdev"\nversion = "0.9.9"\n' \
+            > "$work/crates/fdev/Cargo.toml"
+        : > "$work/cargo.log"
+        # Unquoted heredocs: `$work` and `$api_body` expand, `\$*` and the `\n`
+        # in the format string reach the stub literally.
+        cat > "$work/bin/cargo" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$work/cargo.log"
+EOF
+        cat > "$work/bin/curl" <<EOF
+#!/usr/bin/env bash
+printf '%s' '$api_body'
+EOF
+        printf '#!/usr/bin/env bash\nexit 0\n' > "$work/bin/sleep"
+        chmod +x "$work/bin/cargo" "$work/bin/curl" "$work/bin/sleep"
+        printf '%s\n' "$PC_RUN" > "$work/step.sh"
+
+        ( cd "$work" && PATH="$work/bin:$PATH" GITHUB_REF="refs/tags/$tag" \
+            bash "$work/step.sh" ) > "$work/out" 2>&1
+        rc=$?
+        if grep -qF 'publish -p freenet' "$work/cargo.log"; then
+            got_cargo=yes
+        else
+            got_cargo=no
+        fi
+
+        local ok=1
+        case "$want_rc" in
+            0)      [[ "$rc" -eq 0 ]] || ok=0 ;;
+            nonzero) [[ "$rc" -ne 0 ]] || ok=0 ;;
+        esac
+        [[ "$got_cargo" == "$want_cargo" ]] || ok=0
+
+        if [[ "$ok" -eq 1 ]]; then
+            pass "publish step: $desc (rc=$rc, cargo publish called: $got_cargo)"
+        else
+            fail "publish step: $desc" \
+                "expected rc $want_rc and cargo-publish-called=$want_cargo," \
+                "got rc=$rc and cargo-publish-called=$got_cargo" \
+                "--- step output ---" \
+                "$(head -20 "$work/out")"
+        fi
+        rm -rf "$work"
+    }
+
+    NOT_ON_CRATES_IO='{"errors":[{"detail":"Not Found"}]}'
+    ON_CRATES_IO='{"version":{"num":"9.9.9"}}'
+
+    # The guard itself: a tree whose version disagrees with the tag must stop
+    # BEFORE anything reaches crates.io. `cargo publish called: no` is the
+    # load-bearing half -- a refusal that happens after the upload is not one.
+    pc_run_case "refuses a tree whose version does not match the tag" \
+        "0.0.1" "v9.9.9" "$NOT_ON_CRATES_IO" nonzero no
+
+    # Idempotent re-run (the recovery path the docs point at): the version is
+    # already published, so nothing is uploaded twice and the job proceeds to
+    # the un-draft.
+    pc_run_case "skips a version already on crates.io, and still succeeds" \
+        "9.9.9" "v9.9.9" "$ON_CRATES_IO" 0 no
+
+    # ...and it is not just refusing everything: on the normal path it really
+    # does publish. Without this case the two above are satisfied by a step
+    # that never publishes at all.
+    pc_run_case "publishes when the tree matches and the version is new" \
+        "9.9.9" "v9.9.9" "$NOT_ON_CRATES_IO" 0 yes
 fi
 
 # --- 2c. release.yml must not publish for real -------------------------------
