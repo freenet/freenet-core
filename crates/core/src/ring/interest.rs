@@ -1122,9 +1122,17 @@ pub struct InterestManager<T: TimeSource> {
     /// runs both designs over the same removal schedule and shows the index
     /// one missing contracts the key one covers.
     ///
+    /// The entry also carries how many contracts have been advertised to that
+    /// peer SINCE THE CURRENT CYCLE BEGAN, which is what makes a mid-cycle wrap
+    /// distinguishable from a completed cycle. The id alone cannot tell them
+    /// apart: a window that happens to end on the highest id in the set looks
+    /// exactly like a cursor that has run off the end, and treating that as a
+    /// boundary re-randomised the start MID-cycle (#5181), breaking contiguity
+    /// and with it the `ceil(len / limit)` bound above.
+    ///
     /// Only the full-bytes fallback consults this. Digest-capable peers keep
     /// receiving the complete set every round and never touch it.
-    summary_fallback_cursor: Mutex<LruCache<SocketAddr, ContractInstanceId>>,
+    summary_fallback_cursor: Mutex<LruCache<SocketAddr, FallbackCursor>>,
 
     /// Count of concurrently-outstanding queue-full-resync retry tasks (#4862 P1).
     /// Bounds aggregate retry tasks node-wide, independent of the throttle LRU
@@ -2747,16 +2755,31 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// (ascending by contract id).
     ///
     /// Mid-cycle this resumes immediately after the last contract SENT to that
-    /// peer, which is what makes successive windows contiguous in id space
-    /// (see [`first_index_after`]). At a cycle BOUNDARY — no cursor yet, the
-    /// cursor evicted or lost, or the previous window ending on the highest id
-    /// — the next cycle starts at a RANDOM offset rather than at 0.
+    /// peer, WRAPPING to 0 when that contract was the highest id in the set,
+    /// which is what makes successive windows contiguous in id space (see
+    /// [`first_index_after`]). At a cycle BOUNDARY — no cursor yet, the cursor
+    /// evicted or lost, or the cycle's own contract count having reached the
+    /// size of the set — the next cycle starts at a RANDOM offset rather than
+    /// at 0.
+    ///
+    /// The two are told apart by [`FallbackCursor::advertised_in_cycle`], not by
+    /// whether the resume index ran off the end. That distinction is #5181: a
+    /// window ending on the last index is a mid-cycle wrap, and re-randomising
+    /// there restarted the rotation at an arbitrary offset partway through a
+    /// cycle, so the set was NOT covered in `ceil(len / limit)` rounds. It hit
+    /// ~1/limit of cycles regardless of set size.
+    ///
+    /// Not a pure read: reaching a boundary DROPS the stale cursor, so the
+    /// entry [`Self::record_fallback_cursor`] writes next starts the new cycle's
+    /// count from zero. Dropping rather than zeroing in place also means a round
+    /// that ends up sending nothing (so never records) draws a fresh boundary
+    /// offset next time instead of silently resuming from the old cycle's id.
     ///
     /// A fixed restart at 0 is the failure this codebase has already rejected
     /// twice, for the same reason each time: see the rotations in
     /// `emit_stale_peer_syncs` and in the `SummaryDigests` arm, both of which
     /// note that a fixed prefix "would starve the tail on every cycle
-    /// forever". The two ways to land back at a boundary repeatedly are both
+    /// forever". The two ways to keep landing on the head of the set are both
     /// reachable here, and neither needs an attacker:
     ///
     /// - The cursor is in-memory and keyed by address, so it is lost on our
@@ -2767,8 +2790,8 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// - `sorted` is the INTERSECTION with the hash list the peer advertised,
     ///   so the peer influences where the cursor lands. Advertising a single
     ///   high-id contract parks the cursor at the end, and the following full
-    ///   round would restart at 0 — repeat, and everything past the first
-    ///   window is never advertised.
+    ///   round then resumes by wrapping — at 0. Repeat it and, with nothing
+    ///   else in play, everything past the first window is never advertised.
     ///
     /// Randomising the boundary costs nothing in the ordinary case: a cycle
     /// beginning at any offset still advances contiguously and still covers
@@ -2776,43 +2799,123 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// It only removes the guarantee that the SAME contracts are the ones
     /// covered first every time.
     ///
+    /// The per-cycle count also keeps the peer-steering bound in the second
+    /// bullet above finite. A peer that parks the cursor at the end of the set
+    /// gets one wrapped head window, but each advertised contract it provokes is
+    /// charged to the cycle, so the count crosses `sorted.len()` within a couple
+    /// of rounds and the start is re-randomised. Resuming with a bare
+    /// `start % len` and no count would hand it the head window forever.
+    ///
     /// `GlobalRng` keeps this deterministic under simulation and test.
     pub(crate) fn fallback_window_start(&self, peer: SocketAddr, sorted: &[ContractKey]) -> usize {
         if sorted.is_empty() {
             return 0;
         }
-        let after = { self.summary_fallback_cursor.lock().peek(&peer).copied() };
-        let resumed = after.map(|after| first_index_after(sorted, &after));
-        match resumed {
-            // Mid-cycle: continue exactly where the last reply stopped.
-            Some(start) if start < sorted.len() => start,
-            // Cycle boundary (cursor absent, or exhausted past the end).
-            _ => crate::config::GlobalRng::random_range(0..sorted.len()),
-        }
+        let resume = {
+            let mut cursors = self.summary_fallback_cursor.lock();
+            match cursors.peek(&peer).copied() {
+                // Mid-cycle: continue exactly where the last reply stopped,
+                // wrapping to 0 when it stopped on the highest id.
+                Some(cursor) if cursor.advertised_in_cycle < sorted.len() => {
+                    Some(first_index_after(sorted, &cursor.last_sent) % sorted.len())
+                }
+                // Cycle complete: drop it so the next recorded cursor counts
+                // from zero against the new cycle drawn just below.
+                Some(_) => {
+                    cursors.pop(&peer);
+                    None
+                }
+                // No cursor: a boundary by definition (first reply, our own
+                // restart, LRU eviction, a peer back on a new source port).
+                None => None,
+            }
+        };
+        // Drawn outside the cursor lock so the RNG's own lock is never taken
+        // underneath it.
+        resume.unwrap_or_else(|| crate::config::GlobalRng::random_range(0..sorted.len()))
     }
 
     /// Record the contract id of the last entry actually included in `peer`'s
-    /// fallback reply, so the next reply resumes after it.
+    /// fallback reply, so the next reply resumes after it, and charge the
+    /// `entries_sent` it carried to the current cycle.
     ///
     /// Takes what was SENT, not what was selected: the byte budget can cut a
     /// window short, and advancing past entries we dropped would skip them
-    /// until the rotation wrapped all the way round.
-    pub(crate) fn record_fallback_cursor(&self, peer: SocketAddr, last_sent: ContractInstanceId) {
-        self.summary_fallback_cursor.lock().put(peer, last_sent);
+    /// until the rotation wrapped all the way round. The count is charged the
+    /// same way, so a budget-limited link takes proportionally more rounds to
+    /// finish a cycle rather than declaring one finished early.
+    ///
+    /// A round that ends on the id already stored is charged NOTHING. That is
+    /// the concurrency case the cursor-advance comment in `node.rs` documents:
+    /// two `Interests` from one peer handled concurrently read the same start,
+    /// build the same window, and record the same last id. They advertised one
+    /// window between them, so charging both would report twice the progress
+    /// actually made and end the cycle with part of the set still unadvertised —
+    /// the same class of hole as #5181, arrived at from the other direction.
+    pub(crate) fn record_fallback_cursor(
+        &self,
+        peer: SocketAddr,
+        last_sent: ContractInstanceId,
+        entries_sent: usize,
+    ) {
+        let mut cursors = self.summary_fallback_cursor.lock();
+        let advertised_in_cycle = match cursors.peek(&peer) {
+            // Same window again: no new ground covered, so no charge.
+            Some(prev) if prev.last_sent == last_sent => prev.advertised_in_cycle,
+            Some(prev) => prev.advertised_in_cycle.saturating_add(entries_sent),
+            None => entries_sent,
+        };
+        cursors.put(
+            peer,
+            FallbackCursor {
+                last_sent,
+                advertised_in_cycle,
+            },
+        );
     }
 
     /// Test accessor for the stored cursor.
     #[cfg(test)]
-    pub(crate) fn peek_fallback_cursor(&self, peer: SocketAddr) -> Option<ContractInstanceId> {
+    pub(crate) fn peek_fallback_cursor(&self, peer: SocketAddr) -> Option<FallbackCursor> {
         self.summary_fallback_cursor.lock().peek(&peer).copied()
     }
+}
+
+/// Where a peer's full-bytes fallback rotation has got to, and how far into the
+/// current cycle that is.
+///
+/// Both halves are needed. `last_sent` alone makes successive windows contiguous
+/// under contract churn (see [`first_index_after`]), but says nothing about
+/// whether the rotation has been round the whole set yet — a window ending on
+/// the highest id is indistinguishable from a cursor past the end. Counting the
+/// contracts advertised since the cycle began answers that directly, which is
+/// what #5181 needed: without it, a wrap was read as a completed cycle and the
+/// start was re-randomised partway through, so `ceil(len / limit)` rounds no
+/// longer covered the set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FallbackCursor {
+    /// Id of the last contract actually SENT to this peer.
+    pub(crate) last_sent: ContractInstanceId,
+    /// Contracts advertised to this peer since the current cycle began. The
+    /// cycle is complete once this reaches the size of the shared set.
+    ///
+    /// Approximate on purpose, in the safe direction. It is compared against a
+    /// `sorted.len()` the peer can vary between rounds (the set is the
+    /// intersection with the hashes it advertised), and a repeat of the same
+    /// window is not charged, so a cycle can be declared complete after
+    /// slightly more advertising than the set strictly needed. Over-running a
+    /// cycle costs a redundant advertisement; UNDER-running one would leave
+    /// part of the set unadvertised, which is the failure being avoided.
+    pub(crate) advertised_in_cycle: usize,
 }
 
 /// First index in `sorted` (ascending by contract id, as
 /// [`InterestManager::get_matching_contracts`] returns it) whose id is strictly
 /// greater than `after`. Returns `sorted.len()` when `after` is at or past the
-/// end, which [`InterestManager::fallback_window_start`] reads as the end of a
-/// cycle and answers with a fresh random offset.
+/// end; [`InterestManager::fallback_window_start`] wraps that back to 0, because
+/// running off the end is where the rotation's window wraps and NOT by itself a
+/// cycle boundary (#5181 — the boundary is decided by
+/// [`FallbackCursor::advertised_in_cycle`]).
 ///
 /// This is the churn-safe half of the rotation. Because it is a binary search
 /// over ids rather than a stored offset, it behaves correctly when the set
@@ -7257,8 +7360,16 @@ mod tests {
     /// production uses at a cycle boundary. That is deliberate: these tests
     /// pin the WITHIN-cycle contiguity and coverage properties, which must hold
     /// from any starting offset, so the tests below sweep the starts explicitly
-    /// instead of sampling them. `fallback_window_start_randomises_the_cycle_
-    /// boundary` covers the production entry point.
+    /// instead of sampling them.
+    ///
+    /// Note the LIMIT of this helper, learned from #5181: its resume rule is not
+    /// production's. It feeds `first_index_after` straight into
+    /// `rotation_window_indices`, which wraps a `len` start back to 0 on its own,
+    /// so it cannot see a defect that lives in the resume decision itself — and
+    /// it did not. `real_cursor_api_covers_every_contract_from_every_origin`
+    /// drives `fallback_window_start`/`record_fallback_cursor` for that reason;
+    /// `fallback_window_start_randomises_the_cycle_boundary` covers the
+    /// boundary behaviour of the production entry point.
     fn rotation_round(
         sorted: &[ContractKey],
         cursor: Option<ContractInstanceId>,
@@ -7503,8 +7614,8 @@ mod tests {
              rather than stepping over it"
         );
 
-        // Cursor at the end: signals a completed cycle to the caller, which
-        // restarts at a random offset rather than at 0.
+        // Cursor at the end: the window has run off the end of the set. The
+        // caller wraps this to 0; it is NOT by itself a cycle boundary (#5181).
         let beyond = *sorted[7].id();
         assert_eq!(first_index_after(&sorted, &beyond), sorted.len());
     }
@@ -7519,18 +7630,34 @@ mod tests {
 
         assert_eq!(mgr.peek_fallback_cursor(peer), None);
 
-        mgr.record_fallback_cursor(peer, *sorted[2].id());
-        assert_eq!(mgr.peek_fallback_cursor(peer), Some(*sorted[2].id()));
+        mgr.record_fallback_cursor(peer, *sorted[2].id(), 3);
+        assert_eq!(
+            mgr.peek_fallback_cursor(peer),
+            Some(FallbackCursor {
+                last_sent: *sorted[2].id(),
+                advertised_in_cycle: 3,
+            })
+        );
         assert_eq!(
             mgr.fallback_window_start(peer, &sorted),
             3,
             "mid-cycle the resume point must be exactly after the last id sent"
         );
 
+        // Successive rounds accumulate against the SAME cycle.
+        mgr.record_fallback_cursor(peer, *sorted[4].id(), 2);
+        assert_eq!(
+            mgr.peek_fallback_cursor(peer)
+                .map(|c| c.advertised_in_cycle),
+            Some(5),
+            "entries sent must be charged to the running cycle, not replace it"
+        );
+        assert_eq!(mgr.fallback_window_start(peer, &sorted), 5);
+
         // Cursors are per peer: one peer's progress must not advance another's.
         let other: SocketAddr = "127.0.0.1:9101".parse().unwrap();
-        mgr.record_fallback_cursor(other, *sorted[6].id());
-        assert_eq!(mgr.fallback_window_start(peer, &sorted), 3);
+        mgr.record_fallback_cursor(other, *sorted[6].id(), 1);
+        assert_eq!(mgr.fallback_window_start(peer, &sorted), 5);
         assert_eq!(mgr.fallback_window_start(other, &sorted), 7);
 
         // An empty shared set has no valid offset; it must not panic or draw.
@@ -7540,16 +7667,21 @@ mod tests {
     /// At a CYCLE BOUNDARY the start is random, not a fixed 0.
     ///
     /// A boundary is reached with no cursor (first reply, our own restart, LRU
-    /// eviction, a peer reconnecting on a new port) or with a cursor already at
-    /// the highest id. Restarting at 0 every time would re-send the head of the
-    /// set and starve the tail for any peer that keeps returning to a boundary,
-    /// which is the failure `emit_stale_peer_syncs` and the `SummaryDigests`
-    /// arm both already rotate to avoid.
+    /// eviction, a peer reconnecting on a new port) or with a cycle whose own
+    /// contract count has reached the size of the set. Restarting at 0 every
+    /// time would re-send the head of the set and starve the tail for any peer
+    /// that keeps returning to a boundary, which is the failure
+    /// `emit_stale_peer_syncs` and the `SummaryDigests` arm both already rotate
+    /// to avoid.
     ///
     /// The peer influences this: `sorted` is the intersection with the hash
     /// list it advertised, so advertising one high-id contract parks the cursor
     /// at the end. With a fixed restart that alternation pins the window to the
     /// head forever; with a random one it cannot.
+    ///
+    /// Note what is NOT a boundary: a cursor merely sitting on the highest id.
+    /// That is the mid-cycle wrap of #5181, covered by
+    /// `fallback_window_start_wraps_mid_cycle_instead_of_re_randomising`.
     #[test]
     fn fallback_window_start_randomises_the_cycle_boundary() {
         let (mgr, _clock) = make_manager();
@@ -7569,21 +7701,192 @@ mod tests {
              draws over 64 contracts all landed on {seen:?}"
         );
 
-        // Cursor at the highest id: also a boundary, also randomised.
+        // A COMPLETED cycle (the whole set advertised) is also a boundary, and
+        // also randomised.
         let peer: SocketAddr = "127.0.0.1:9300".parse().unwrap();
-        let mut seen_wrapped = HashSet::new();
+        let mut seen_completed = HashSet::new();
         for _ in 0..40 {
-            mgr.record_fallback_cursor(peer, *sorted[sorted.len() - 1].id());
-            seen_wrapped.insert(mgr.fallback_window_start(peer, &sorted));
+            mgr.record_fallback_cursor(peer, *sorted[7].id(), sorted.len());
+            seen_completed.insert(mgr.fallback_window_start(peer, &sorted));
         }
         assert!(
-            seen_wrapped.iter().all(|s| *s < sorted.len()),
-            "wrapped start out of range"
+            seen_completed.iter().all(|s| *s < sorted.len()),
+            "boundary start out of range"
         );
         assert!(
-            seen_wrapped.len() > 1,
-            "a cursor at the end of the set must restart at a random offset, \
-             not deterministically at 0 — got {seen_wrapped:?}"
+            seen_completed.len() > 1,
+            "a completed cycle must restart at a random offset, not \
+             deterministically after the last id sent — got {seen_completed:?}"
+        );
+
+        // Reaching the boundary must also clear the count, or the very next
+        // round would read the new cycle as already finished and re-randomise
+        // again — permanently random, never contiguous.
+        assert_eq!(
+            mgr.peek_fallback_cursor(peer),
+            None,
+            "the completed cycle's cursor must be dropped when the boundary is \
+             taken, so the next recorded cursor counts from zero"
+        );
+    }
+
+    /// #5181: a window that ends on the LAST index is a mid-cycle wrap, so the
+    /// next round resumes at 0 — it must NOT draw a fresh random offset.
+    ///
+    /// This is a production correctness bug that happened to surface as a ~1-in-
+    /// 200 test flake (`fallback_rotation_covers_the_whole_shared_set`). The old
+    /// code derived the boundary from `first_index_after` returning
+    /// `sorted.len()`, which conflates "cursor past the end of the set" with
+    /// "cursor sitting on the highest id in it". Re-randomising there restarts
+    /// the rotation partway through a cycle, so the set is no longer covered in
+    /// `ceil(len / limit)` rounds — the bound #5155's entire cost argument rests
+    /// on. It fired on ~1/limit of cycles, independent of set size.
+    ///
+    /// Constructed directly rather than sampled: the cursor is placed on the
+    /// highest id with the cycle explicitly mid-flight, which is the exact state
+    /// the flake reached by chance. Repeating the read also pins that the answer
+    /// is deterministic — under the old code each call was an independent draw,
+    /// so a false pass would need the system RNG to return 0 on every one of
+    /// these reads across every set size below.
+    #[test]
+    fn fallback_window_start_wraps_mid_cycle_instead_of_re_randomising() {
+        let peer: SocketAddr = "127.0.0.1:9400".parse().unwrap();
+
+        for len in [2usize, 3, 7, 64, 65, 199, 200] {
+            // Fresh manager per size so the cycle count below is exactly 1.
+            let (mgr, _clock) = make_manager();
+            let sorted = sorted_keys(0..len as u32);
+            let highest = *sorted[len - 1].id();
+
+            // Mid-cycle by construction: one entry advertised so far, so the
+            // cycle is nowhere near the `len` contracts that would finish it.
+            mgr.record_fallback_cursor(peer, highest, 1);
+            for read in 0..8 {
+                assert_eq!(
+                    mgr.fallback_window_start(peer, &sorted),
+                    0,
+                    "len={len} read={read}: a window ending on the highest id \
+                     must wrap to 0 and stay contiguous, not restart the cycle \
+                     at a random offset (#5181)"
+                );
+            }
+            // Reading a mid-cycle wrap must not consume the cursor.
+            assert_eq!(
+                mgr.peek_fallback_cursor(peer),
+                Some(FallbackCursor {
+                    last_sent: highest,
+                    advertised_in_cycle: 1,
+                }),
+                "len={len}: a mid-cycle read must leave the cursor alone"
+            );
+        }
+    }
+
+    /// End-to-end coverage through the REAL cursor API, from EVERY origin.
+    ///
+    /// `rotation_covers_every_contract_within_ceil_n_over_limit_rounds` above
+    /// exercises the pure helpers with a test-local resume rule, which is why it
+    /// stayed green through #5181: the defect lived in `fallback_window_start`,
+    /// between them. This drives `fallback_window_start` and
+    /// `record_fallback_cursor` themselves and sweeps all `n` origins rather
+    /// than sampling five, so the origins whose rounds land on the last index
+    /// (`{8, 72, 136}` for n=200, limit=64 — the ones the flake needed to draw)
+    /// are all covered.
+    #[test]
+    fn real_cursor_api_covers_every_contract_from_every_origin() {
+        for (n, limit) in [(200usize, 64usize), (12, 4), (65, 8), (7, 7), (5, 1)] {
+            let sorted = sorted_keys(0..n as u32);
+            let expected: HashSet<ContractInstanceId> = sorted.iter().map(|k| *k.id()).collect();
+            let rounds = n.div_ceil(limit);
+
+            for origin in 0..n {
+                let peer: SocketAddr = format!("127.0.0.1:{}", 9500 + origin).parse().unwrap();
+                let (mgr, _clock) = make_manager();
+                // Force round one to begin at `origin` by seeding the cursor on
+                // its predecessor, mid-cycle with nothing yet charged. For
+                // `origin == 0` the predecessor is the LAST id, so origin 0 is
+                // itself the wrap case — a no-cursor seed would have drawn a
+                // random start and could not pin an origin at all.
+                mgr.record_fallback_cursor(peer, *sorted[(origin + n - 1) % n].id(), 0);
+
+                let mut covered: HashSet<ContractInstanceId> = HashSet::new();
+                for round in 0..rounds {
+                    let start = mgr.fallback_window_start(peer, &sorted);
+                    if round == 0 {
+                        assert_eq!(
+                            start, origin,
+                            "n={n} limit={limit}: premise — round one must begin \
+                             at the seeded origin"
+                        );
+                    }
+                    let window = rotation_window_indices(n, start, limit);
+                    assert!(!window.is_empty(), "n={n} limit={limit}: empty window");
+                    covered.extend(window.iter().map(|i| *sorted[*i].id()));
+                    let last = *sorted[*window.last().unwrap()].id();
+                    mgr.record_fallback_cursor(peer, last, window.len());
+                }
+
+                let missed = expected.difference(&covered).count();
+                assert_eq!(
+                    missed, 0,
+                    "n={n} limit={limit} origin={origin}: {missed} contract(s) \
+                     unadvertised after {rounds} rounds (ceil({n}/{limit})) — \
+                     the rotation lost contiguity mid-cycle (#5181)"
+                );
+            }
+        }
+    }
+
+    /// Cycles must actually END, so the start keeps being re-randomised.
+    ///
+    /// This is the other half of the #5181 fix and the reason it is not the
+    /// two-line `Some(start) => start % sorted.len()`. That shortcut is
+    /// contiguous and would satisfy every coverage assertion above, but it
+    /// re-randomises exactly once ever — on the first reply, before any cursor
+    /// exists. From then on the rotation is a deterministic function of the
+    /// stored id, so a peer that can steer where the cursor lands (it chooses
+    /// `sorted`, which is the intersection with the hashes it advertised) can
+    /// park it at the end of the set and be handed the head window every round,
+    /// starving its own view of the tail. That is the failure the rustdoc's
+    /// second bullet, `emit_stale_peer_syncs`, and the `SummaryDigests` arm all
+    /// rotate to avoid.
+    ///
+    /// Asserting on BOUNDARIES TAKEN rather than on distinct start values,
+    /// because distinct values do not discriminate: the shortcut's single
+    /// first-round draw already produces two of them. A dropped cursor is the
+    /// observable proof a new cycle was begun, and under the shortcut it never
+    /// happens.
+    #[test]
+    fn cycles_end_so_the_start_keeps_being_re_randomised() {
+        let (mgr, _clock) = make_manager();
+        let peer: SocketAddr = "127.0.0.1:9600".parse().unwrap();
+        let sorted = sorted_keys(0..64);
+        const LIMIT: usize = 16;
+        const ROUNDS: usize = 20;
+
+        let mut boundaries = 0usize;
+        let mut starts = Vec::new();
+        for _ in 0..ROUNDS {
+            let had_cursor = mgr.peek_fallback_cursor(peer).is_some();
+            let start = mgr.fallback_window_start(peer, &sorted);
+            if had_cursor && mgr.peek_fallback_cursor(peer).is_none() {
+                boundaries += 1;
+            }
+            starts.push(start);
+            let window = rotation_window_indices(sorted.len(), start, LIMIT);
+            let last = *sorted[*window.last().unwrap()].id();
+            mgr.record_fallback_cursor(peer, last, window.len());
+        }
+
+        // 20 rounds x 16 entries over a 64-contract set is 5 cycles' worth of
+        // advertising, so the boundary must have been reached about 4 times.
+        let expected_min = ROUNDS * LIMIT / sorted.len() - 1;
+        assert!(
+            boundaries >= expected_min,
+            "only {boundaries} cycle boundary/ies in {ROUNDS} rounds (expected \
+             at least {expected_min}); starts were {starts:?}. A rotation that \
+             never reaches a boundary is a deterministic function of the stored \
+             id, which a peer steering `sorted` can pin to the head of the set."
         );
     }
 

@@ -3403,6 +3403,11 @@ async fn handle_interest_sync_message(
             // short of the selected window must not advance past the entries it
             // dropped, or they wait a full cycle instead of coming next.
             //
+            // The entry count goes with it: it is what tells the next round
+            // whether the cycle is finished (re-randomise) or merely wrapped
+            // past the last id (resume at 0). Deriving that from the resume
+            // index alone was #5181.
+            //
             // Two known imprecisions here, both accepted, both costing at most
             // one cycle of delay for the affected contracts and neither able to
             // skip one permanently (the window wraps, and a cycle boundary
@@ -3421,7 +3426,7 @@ async fn handle_interest_sync_message(
                 if let Some(last) = last_included {
                     op_manager
                         .interest_manager
-                        .record_fallback_cursor(source, last);
+                        .record_fallback_cursor(source, last, entries.len());
                 }
             }
 
@@ -9765,14 +9770,14 @@ mod tests {
 
             // Seed the cursor so both rounds are mid-cycle and the starting
             // offset is fixed. Without this the first round would begin at a
-            // random cycle-boundary offset (see `fallback_window_start`) and a
-            // start on the last contract would wrap into a second random draw,
-            // making the "moved on to a different contract" assertion flaky.
+            // random cycle-boundary offset (see `fallback_window_start`).
+            // One entry charged to the cycle, so the 8-contract set is nowhere
+            // near finished and neither round re-randomises.
             let mut sorted = keys.clone();
             sorted.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
             h.op_manager
                 .interest_manager
-                .record_fallback_cursor(h.old_peer, *sorted[0].id());
+                .record_fallback_cursor(h.old_peer, *sorted[0].id(), 1);
 
             let mut seen: Vec<u32> = Vec::new();
             for round in 0..2 {
@@ -10042,8 +10047,11 @@ mod tests {
                     .interest_manager
                     .peek_fallback_cursor(h.old_peer)
                     .expect("a fallback reply must leave a cursor");
+                // A duplicated window is charged once, so 3 pairs advance the
+                // cycle by at most 3 x 64 of the 400 shared contracts and the
+                // boundary (which would drop the cursor) is not reached here.
                 assert!(
-                    ids.contains(&cursor),
+                    ids.contains(&cursor.last_sent),
                     "after pair {pair} the cursor is no longer a member of the \
                      shared set — concurrent writers corrupted the rotation \
                      rather than merely duplicating a window"
