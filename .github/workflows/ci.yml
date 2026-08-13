@@ -618,10 +618,15 @@ jobs:
         # No `if:` here on purpose. This used to read
         # `success() || steps.test.conclusion == 'failure'`, intending to save the
         # cache even when tests failed -- but no step declares `id: test`, so
-        # `steps.test.conclusion` was the empty string and the whole condition
-        # collapsed to `success()`, the default. It was never expressible at this
-        # position anyway: this step runs BEFORE the tests. Do not re-add it; a
-        # post-test cache save would have to be a separate step after them.
+        # `steps.test.conclusion` resolved to null and the whole condition
+        # collapsed to `success()`, the step default. A step `if:` also could not
+        # express that intent from HERE regardless, because this step runs BEFORE
+        # the tests; the save happens in this action's post hook.
+        #
+        # If you do want the cache saved after a failing test run, the supported
+        # way is this action's own `cache-on-failure: true` input ("Cache even if
+        # the build fails"), which its post hook honours -- NOT a resurrected
+        # `if:` here, and NOT a separate step.
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -632,21 +637,36 @@ jobs:
       # died` on Linux, `The response ended prematurely` from Invoke-WebRequest
       # on Windows.
       #
-      # What actually changed, stated carefully because the obvious reading is
-      # wrong: this did NOT move the download off a bad host.
-      # `get.nexte.st/latest/linux` 302s to the same
-      # github.com/nextest-rs/nextest release asset the action's manifest
-      # names, and both then 302 to release-assets.githubusercontent.com. The
-      # only host removed serves a zero-byte redirect, and both observed errors
-      # are body-transfer failures, which by construction occur downstream of
-      # that redirect -- on the asset host BOTH paths use.
+      # WHAT THE LINUX SIGNATURE ACTUALLY MEANS. Two earlier versions of this
+      # comment got this wrong in opposite directions, so it is written from the
+      # emitting source rather than from inference. `Connection died, tried 5
+      # times before giving up` has exactly one emission site in libcurl,
+      # `Curl_retry_request()` in lib/transfer.c, and BOTH of its trigger
+      # branches are guarded by `bytecount + headerbytecount == 0` -- ZERO bytes
+      # received, headers included. So it is not a truncated transfer; it is
+      # "nothing arrived at all", from either a reused pooled connection the
+      # peer had already closed (branch 1) or an HTTP/2 REFUSED_STREAM (branch
+      # 2). The "5 times" is `#define CONN_MAX_RETRIES 5`, libcurl-internal, and
+      # unrelated to any `--retry` value.
       #
-      # The win is what wraps the download: `retry curl --retry 10` inside a
-      # 10-iteration backoff loop (main.sh), and a SHA256 checksum verified
-      # against the hash in the action's pinned manifest. The form this replaced
-      # on Windows had NO retry budget at all, in a ~34-minute job, and none of
-      # the three verified what it extracted into $CARGO_HOME/bin before the
-      # next step executed it.
+      # WHICH HOST IS AT FAULT IS NOT ESTABLISHED, and this comment deliberately
+      # does not claim one. Branch 2 needs no connection reuse, and get.nexte.st
+      # is served over HTTP/2, so the fault can occur on the redirector leg; it
+      # can equally occur on the shared asset leg
+      # (release-assets.githubusercontent.com), which BOTH the old and new paths
+      # traverse. What can be said is narrower: the new path removes one of the
+      # two hosts where this signature can arise. Do not upgrade that into
+      # "changed hosts, fixed it", and do not invert it into "the redirector was
+      # irrelevant" -- this comment has already been wrong both ways.
+      #
+      # The durable win is what WRAPS the download, and it is exactly the right
+      # response to a zero-bytes-on-connection fault: `retry curl --retry 10`
+      # inside a 10-iteration backoff loop (main.sh), plus a SHA256 checksum
+      # verified against the hash in the action's pinned manifest. NONE of the
+      # seven forms this replaced had any retry flag, and none verified what it
+      # extracted into $CARGO_HOME/bin before the next step executed it. On
+      # Windows the consequence was worst, because a single failure lost a
+      # ~34-minute job.
       #
       # `fallback: none` is deliberate: it keeps GITHUB_TOKEN out of the
       # action's environment (action.yml only populates DEFAULT_GITHUB_TOKEN
@@ -657,7 +677,12 @@ jobs:
       #
       # timeout-minutes bounds that retry budget: 11 attempts x curl --retry 10
       # with no --retry-max-time can exceed any job budget here, and would be
-      # reported as a job timeout rather than as a failed download.
+      # reported as a job timeout rather than as a failed download. Measured
+      # install time at this head is 1-2s, and 4s on Windows, so the 5-minute
+      # cap is ~75x headroom rather than a tight bound. (A step killed by
+      # timeout-minutes concludes `failure`, not `cancelled`, so the gates below
+      # skip and the job goes red -- which is the intended outcome. Note
+      # actions/runner#2432: step timeouts may be best-effort on Windows.)
       #
       # There are seven of these across ci.yml, playwright-shell.yml and
       # simulation-nightly.yml; the others point here. See #5296.
@@ -771,10 +796,15 @@ jobs:
         # No `if:` here on purpose. This used to read
         # `success() || steps.test.conclusion == 'failure'`, intending to save the
         # cache even when tests failed -- but no step declares `id: test`, so
-        # `steps.test.conclusion` was the empty string and the whole condition
-        # collapsed to `success()`, the default. It was never expressible at this
-        # position anyway: this step runs BEFORE the tests. Do not re-add it; a
-        # post-test cache save would have to be a separate step after them.
+        # `steps.test.conclusion` resolved to null and the whole condition
+        # collapsed to `success()`, the step default. A step `if:` also could not
+        # express that intent from HERE regardless, because this step runs BEFORE
+        # the tests; the save happens in this action's post hook.
+        #
+        # If you do want the cache saved after a failing test run, the supported
+        # way is this action's own `cache-on-failure: true` input ("Cache even if
+        # the build fails"), which its post hook honours -- NOT a resurrected
+        # `if:` here, and NOT a separate step.
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
