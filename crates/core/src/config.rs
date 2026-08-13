@@ -4506,13 +4506,22 @@ std::thread_local! {
     // always decodes as `Other` — the receiver, which is the only side that can
     // judge agreement, cannot know which send site produced it. Entry count is
     // the best available proxy and needs no wire change: the notification and
-    // rejection emitters are single-entry BY CONSTRUCTION while both reply
-    // emitters are multi-entry (see `outbound_message_mix::SummariesDetail`).
+    // rejection emitters are single-entry BY CONSTRUCTION, and only
+    // `InterestsReply` — the ~5-min heartbeat — is genuinely multi-entry (see
+    // `outbound_message_mix::SummariesDetail`).
     //
-    // Known ambiguity, stated so the number is not over-read: a heartbeat reply
-    // for a peer pair sharing exactly ONE contract is also single-entry, so the
-    // single bucket is "state-change-driven sites PLUS narrow heartbeats", not
-    // a clean partition. It is directional evidence, not attribution.
+    // Known contamination, stated so the number is not over-read, and it is
+    // larger than a heartbeat edge case: `ChangeInterestsReply` is single-entry
+    // 100% of the time (measured mean exactly 1.000, `max_entries` 1, over
+    // 418,476 messages on 1,284 peers), because `broadcast_change_interests`
+    // gossips one contract per message. Corrected 2026-08-12 (#5153 review F1) —
+    // this said "both reply emitters are multi-entry", which is what made the
+    // proxy look clean. A narrow heartbeat (a peer pair sharing exactly ONE
+    // contract) contaminates too, but is the smaller term. So the single bucket
+    // is "state-change-driven sites PLUS interest-churn replies PLUS narrow
+    // heartbeats": directional evidence, not attribution, and the send-side
+    // per-emitter census in `outbound_message_mix` is what makes the
+    // contamination subtractable rather than assumed.
     /// Peak size of the digest arm's per-hash local-summary cache (#4965).
     /// The observable for the RETENTION bound: the cache holds owned summary
     /// clones, so its peak entry count is what decides whether a hostile

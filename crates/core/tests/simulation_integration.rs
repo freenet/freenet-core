@@ -15531,8 +15531,13 @@ fn test_summary_first_put_reverse_delta_converges_originator() {
 // vacuous.
 //
 // NOTE ON WHICH LEG IS EXERCISED: after the #4965 review, digest-first ships on
-// the two MULTI-ENTRY reply legs only (`InterestsReply`, `ChangeInterestsReply`)
-// — `Notification` and `Rejection` stay full-bytes. So the digests observed here
+// the two REPLY legs only (`InterestsReply`, `ChangeInterestsReply`) —
+// `Notification` and `Rejection` stay full-bytes. Only `InterestsReply` is
+// genuinely multi-entry; this comment said "the two MULTI-ENTRY reply legs"
+// until 2026-08-12, corrected per #5153 review F1, because
+// `ChangeInterestsReply` is single-entry 100% of the time (one contract per
+// `broadcast_change_interests` gossip; measured mean 1.000, `max_entries` 1,
+// over 418,476 messages on 1,284 peers). So the digests observed here
 // necessarily come from the connection-time `Interests` -> reply exchange, which
 // is the leg that matters, and NOT from the per-state-change notification.
 // `summaries_reply_for_peer` is the only path that can emit a digest, and only

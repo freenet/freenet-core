@@ -2808,18 +2808,34 @@ mod tests {
     /// that a call site is labelled correctly.
     ///
     /// Byte totals alone cannot catch a mislabelled emitter — they look
-    /// plausible under any labelling. Mean entries per message can: the
-    /// notification and rejection emitters are single-entry by construction,
-    /// both reply emitters are multi-entry, so a reply arm reporting a mean of
-    /// 1.0 (or a notification arm reporting 12) says the attribution is wrong
-    /// even though every byte reconciles.
+    /// plausible under any labelling. Mean entries per message can, but ONLY
+    /// per arm, and the per-arm expectation is not uniform:
+    ///
+    /// | arm | expected mean entries/msg | a wrong reading |
+    /// |---|---|---|
+    /// | `Notification` | exactly 1 | anything above 1 |
+    /// | `Rejection` | exactly 1 | anything above 1 |
+    /// | `ChangeInterestsReply` | **exactly 1** (measured 1.000, max 1) | anything above 1 |
+    /// | `InterestsReply` | ~224, max 2,401 | a mean of 1.0 |
+    ///
+    /// **`ChangeInterestsReply` reporting a mean of 1.0 is CORRECT and says
+    /// nothing is wrong** — corrected 2026-08-12 (#5153 review F1), because the
+    /// rule stated here previously ("both reply emitters are multi-entry, so a
+    /// reply arm reporting a mean of 1.0 says the attribution is wrong") was
+    /// false and would send an operator hunting a mis-attribution that does not
+    /// exist. `broadcast_change_interests` gossips one contract per message, so
+    /// one entry per reply is the design. Only `InterestsReply` at a mean of 1.0,
+    /// or `Notification`/`Rejection`/`ChangeInterestsReply` above 1, is evidence
+    /// of a mislabelled call site.
     #[test]
     fn entry_counts_are_recorded_per_sub_arm() {
         let mix = OutboundMix::new();
         // Two single-entry notifications.
         record_summaries(&mix, SummariesEmitter::Notification, 1, 100);
         record_summaries(&mix, SummariesEmitter::Notification, 1, 110);
-        // Two multi-entry heartbeat replies, 12 and 4 entries.
+        // Two multi-entry HEARTBEAT replies, 12 and 4 entries — `InterestsReply`
+        // is the one genuinely-wide arm. `ChangeInterestsReply` would be
+        // single-entry here, which is why the wide fixture uses this arm.
         record_summaries(&mix, SummariesEmitter::InterestsReply, 12, 12_000);
         record_summaries(&mix, SummariesEmitter::InterestsReply, 4, 4_000);
 

@@ -3852,16 +3852,34 @@ async fn handle_interest_sync_message(
                     let start = crate::config::GlobalRng::random_range(0..entries.len());
                     entries.rotate_left(start);
                 }
-                // #4965 agreement-rate proxy: single-entry messages come
-                // from the state-change-driven send sites (proactive
-                // notification, rejection summary-back) by construction, while
-                // the heartbeat / interest-churn replies are multi-entry. The
-                // emitter tag is non-wire so the receiver cannot read it; this
-                // is the closest available discriminator. Reads `entries.len()`
-                // — the length of the message the peer actually SENT. The
-                // rotation above reorders but never shortens, and the cap
-                // applies to the processing window rather than to this count,
-                // so a capped message is still classified by its true size.
+                // #4965 agreement-rate proxy: the state-change-driven send
+                // sites (proactive notification, rejection summary-back) are
+                // single-entry by construction, and only `InterestsReply` (the
+                // ~5-min heartbeat) is genuinely multi-entry. The emitter tag
+                // is non-wire so the receiver cannot read it; this is the
+                // closest available discriminator.
+                //
+                // It is a CONTAMINATED discriminator, and on THIS arm — the
+                // digest leg — the contamination is the whole population.
+                // `ChangeInterestsReply` is single-entry 100% of the time
+                // (measured mean exactly 1.000, `max_entries` 1, over 418,476
+                // messages on 1,284 peers; corroborated in two further
+                // windows), because `broadcast_change_interests` gossips one
+                // contract per message. It is ALSO version-gated to digests and
+                // the fleet is past the floor, so 95-99% of its sends arrive
+                // here. Meanwhile a notification ships full bytes
+                // unconditionally (`send_proactive_summary_notification`), so a
+                // single-entry observation on the digest leg is churn-leg BY
+                // CONSTRUCTION and is not the R4b population at all — which is
+                // why `SummaryObservation::digest` keeps it in separate buckets
+                // rather than folding it into `*_single`. Do not read this flag
+                // here as "this was a notification"; it is not, today.
+                //
+                // Reads `entries.len()` — the length of the message the peer
+                // actually SENT. The rotation above reorders but never shortens,
+                // and the cap applies to the processing window rather than to
+                // this count, so a capped message is still classified by its
+                // true size.
                 let single_entry = entries.len() == 1;
                 // Dedup on the (hash, digest) PAIR, not on the hash alone.
                 //
@@ -4426,11 +4444,20 @@ async fn handle_interest_sync_message(
             if entries.is_empty() {
                 None
             } else {
-                // #5052: also multi-entry and also built by
-                // `summary_if_hosted_or_in_use`, but driven by interest CHURN
-                // rather than the heartbeat clock — a peer joining or dropping
-                // interest, not a periodic tick. Same bytes, a different thing
-                // to fix if it is the large one.
+                // #5052: also built by `summary_if_hosted_or_in_use`, but driven
+                // by interest CHURN rather than the heartbeat clock — a peer
+                // joining or dropping interest, not a periodic tick. A different
+                // thing to fix if it is the large one.
+                //
+                // SINGLE-entry, unlike the `InterestsReply` above — corrected
+                // 2026-08-12 (#5153 review F1), where this said "also
+                // multi-entry". `broadcast_change_interests` gossips one contract
+                // per message, so the `entries` built above carries exactly one:
+                // measured mean 1.000, `max_entries` 1, over 418,476 messages on
+                // 1,284 peers. Load-bearing rather than trivia — the R4b
+                // agreement-rate instrument cannot read the emitter tag and uses
+                // message LENGTH as its proxy for "this was a notification", so
+                // this arm is that proxy's largest contaminant.
                 Some(summaries_reply_for_peer(
                     op_manager,
                     source,
