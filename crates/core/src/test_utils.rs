@@ -147,6 +147,16 @@ impl TestLogger {
     /// When enabled, logs will be stored in memory and can be queried
     /// using `contains()`, `logs()`, etc.
     ///
+    /// Known hazard, shared with every thread-local capture in this crate: the
+    /// capture installed by [`Self::init`] is thread-local, but `tracing`
+    /// caches each callsite's `Interest` **process-globally** the first time any
+    /// thread reaches it. A concurrently-running test that reaches a callsite
+    /// first, from a thread with no subscriber, can pin it to `never` and this
+    /// capture then silently records nothing from it (#4927). Unit tests inside
+    /// the crate should prefer `crate::util::test_log_capture::install`, which
+    /// keeps callsite interest resolvable; this builder cannot use it because
+    /// `test_utils` is also compiled into non-test builds.
+    ///
     /// # Example
     /// ```ignore
     /// let logger = TestLogger::new().capture_logs().init();
