@@ -8115,11 +8115,22 @@ mod tests {
             );
         }
 
-        // (4) Origin 0: the published predecessor is the LAST index, so the
-        // first window's forward distance is len - W, which exceeds one window
-        // and reads as a rewind. The first-record exemption is what saves it —
-        // and a peer can steer the start to 0 every cycle, so this is not a
-        // 1-in-len curiosity.
+        // (4) Origin 0, the case a peer can steer to every cycle, so worth its
+        // own block even though it turns out to be unremarkable.
+        //
+        // This comment previously claimed the first window's distance was
+        // `len - W`, that this read as a rewind, and that "the first-record
+        // exemption is what saves it". ALL THREE were wrong, and wrong BEFORE the
+        // exemption was deleted rather than orphaned by it. `first_index_after`
+        // returns `len` for the highest id, so the published predecessor resolves
+        // to `prev_pos = len % len = 0` -- the origin itself, which is the whole
+        // point of storing a predecessor. So `advance = W = 64`, which the old
+        // loose bound did not reject either (64 is not > 64), meaning the
+        // exemption was never exercised here at all.
+        //
+        // What this block actually pins is that origin 0 is NOT special: the
+        // wrap in `starting_at` resolves correctly, so the first record is
+        // charged exactly like any other.
         {
             let (mgr, _clock) = make_manager();
             let peer: SocketAddr = "127.0.0.1:9713".parse().unwrap();
@@ -8215,8 +8226,14 @@ mod tests {
 
         // (5) A set no larger than one window is covered by the first round,
         // which lands back on the origin's predecessor for a distance of zero.
-        // Without the first-record exemption the counter sticks at 0 and the
-        // cycle never completes again.
+        //
+        // This described a real dependency on the old code: under the previous
+        // `advance == 0` rejection the counter stuck at 0 and the cycle never
+        // completed again, and the first-record exemption was what avoided it.
+        // Both are gone. `advance != entries_sent % len` accepts this directly,
+        // because a whole-set round has `entries_sent % len == 0` and an advance
+        // of 0. Kept as a pin: it is the FIRST-record form of the whole-set
+        // round, where (5b) above is the mid-cycle form.
         {
             let (mgr, _clock) = make_manager();
             let peer: SocketAddr = "127.0.0.1:9714".parse().unwrap();
@@ -8536,15 +8553,31 @@ mod tests {
             "premise: the cycle is complete, so the next read is a boundary"
         );
 
-        // The boundary is taken and publishes a fresh origin.
-        let fresh_origin = mgr.begin_fallback_window(peer, &sorted);
+        // The boundary is taken and publishes a fresh origin. The origin is drawn
+        // randomly, so it can land on A's own start (1 in `N`) and then nothing
+        // has been straddled. Re-draw until it differs rather than asserting it
+        // does: an `assert_ne!` here would be a ~0.5% false alarm, and shipping a
+        // new flake to close an old one is not a trade this PR should make. The
+        // loop terminates with overwhelming probability -- each attempt is an
+        // independent 1-in-`N` collision -- and `seed_fallback_cycle` re-arms the
+        // completed cycle so every attempt draws afresh.
+        let mut fresh_origin = mgr.begin_fallback_window(peer, &sorted);
+        for _ in 0..64 {
+            if fresh_origin != a_start {
+                break;
+            }
+            mgr.seed_fallback_cycle(peer, &sorted, 0);
+            mgr.record_fallback_cursor(peer, &sorted, *sorted[N - 1].id(), N);
+            fresh_origin = mgr.begin_fallback_window(peer, &sorted);
+        }
         let published = mgr
             .peek_fallback_cursor(peer)
             .expect("a boundary publishes its cycle");
         assert_eq!(published.advertised_in_cycle, 0, "premise: fresh cycle");
         assert_ne!(
             a_start, fresh_origin,
-            "premise: A and the new boundary must differ, or nothing straddled"
+            "premise: 64 draws all collided with A's start, which is a \
+             1-in-{N}^64 event -- the origin is no longer being drawn randomly"
         );
 
         // NOW A records, against the old cycle's window.

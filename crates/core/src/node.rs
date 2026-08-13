@@ -10124,6 +10124,24 @@ mod tests {
                 // has other rare ways to fail). The contiguity form is used
                 // because it does not depend on the answer, not because the bare
                 // form was proven flaky.
+                //
+                // THIS ASSERTION IS DETERMINISTIC IN SHIPPED CODE and needs no
+                // hardening. Under the shipped code there is exactly ONE published
+                // origin, so both racers resume from it and the windows are
+                // identical (or contiguous if serialised) every time.
+                //
+                // Do not be misled by the ~0.75% figure that appears in the
+                // mutation table below, where deleting the atomic boundary leaves
+                // this assertion passing occasionally by chance (1 of 40 runs
+                // observed) -- two independent origins over `matching.len()`
+                // contracts collide identically once in `L`, or adjacently in
+                // either orientation twice more, so ~0.75% predicted. That probability is a property of the MUTATION, not
+                // of shipped code: it exists only because the mutation removed the
+                // mechanism that makes this deterministic. The one genuine
+                // probabilistic assertion in shipped code was the straddle test's
+                // premise in `interest.rs`, at ~0.5%, and that one was hardened
+                // rather than documented -- shipping a new flake to close an old
+                // one is not a trade this PR makes.
                 let idx = |w: &Vec<u32>| -> Vec<usize> {
                     w.iter()
                         .map(|hash| {
@@ -10162,59 +10180,56 @@ mod tests {
                 // window rather than two: 3 pairs charge 3 x 64 of the 400
                 // shared contracts and no cycle completes inside this loop.
                 //
-                // WHAT MAKES THIS TEST PASS, measured rather than assumed. Each
-                // row is 40 runs of this test alone, `--exact`:
+                // WHICH MECHANISMS THIS TEST REQUIRES, measured against THIS
+                // version of the test. Each row is 40 runs, `--exact`:
                 //
                 //   zero-advance reject + atomic boundary (shipped) . 40 /  0
-                //   zero-advance reject, boundary deleted ........... 40 /  0
-                //   atomic boundary, advance check deleted .......... 23 / 17
-                //   neither, but with the id-equality dedup guard
-                //     it replaced (commit 65086ec2) ................. 32 /  8
-                //                            and, replicated ....... 27 / 13
-                //   pre-PR main ..................................... 40 /  0
-                //                            and, replicated ....... 40 /  0
+                //   atomic boundary, advance check deleted .......... 20 / 20
+                //   zero-advance reject, boundary deleted ........... 1 / 39
                 //
-                // EVERY ROW IS n=40, so read each rate as +/- about 15 points.
-                // The two independent measurements of 65086ec2 (separate
-                // sessions, worktrees and binaries) came out 8/40 and 13/40, and
-                // that spread needs no explanation: z = 1.27, p = 0.20, with
-                // Wilson 95% intervals of [10.5%, 34.8%] and [20.1%, 48.0%]
-                // overlapping across most of their range. It is ordinary sampling
-                // noise at this n, NOT evidence of anything about the machine.
+                // NEITHER MECHANISM ALONE PASSES: they are jointly necessary, and
+                // this change must not be partially reverted. The reason is not
+                // that both happen to be needed -- it is that they fail DIFFERENT
+                // assertions, so they defend different properties and neither
+                // substitutes for the other:
                 //
-                // Which rows are sound follows from the power, and this is why
-                // the table is trustworthy exactly where it is used: separating
-                // 20% from 33% would need n ~ 193, and 33% from 43% n ~ 366, but
-                // separating ~0% from 20% needs only n ~ 35. So the ZERO rows
-                // carry the whole argument at n=40 and the contested rows carry
-                // none of it. Do not read fine distinctions between 20%, 33% and
-                // 43%.
+                // - Advance check deleted -> fails the COVERAGE assertion at the
+                //   end of this test (384 of 400 advertised). Duplicate windows
+                //   are charged twice, the counter runs ahead of the ground
+                //   covered, the cycle ends early, and an arc goes unadvertised.
+                //   PROBABILISTIC (~50%): it needs an interleaving that actually
+                //   produces a duplicate.
+                // - Boundary deleted -> fails the PREMISE assertion at pair 0
+                //   (observed `starts: Some(387) and Some(257)`). Each racer draws
+                //   its own origin. NEAR-DETERMINISTIC (39/40): two independent
+                //   draws over 400 contracts satisfy "identical or contiguous"
+                //   only ~0.75% of the time, which is why 1 run passed.
                 //
-                // Read the rows carefully, because the obvious story is wrong. It
-                // is the ZERO-ADVANCE REJECTION in `record_fallback_cursor` that
-                // makes this test green, NOT the atomic boundary -- the advance
-                // check alone is 0/40, the boundary alone is 17/40 against main's
-                // 0/40. That 0-versus-17 gap is the one the power analysis above
-                // supports at n=40. A claim that the boundary alone is WORSE than
-                // the id-equality guard it replaced is NOT supported (17/40 vs
-                // 8-13/40 at this n) and is not made. What matters is that publishing the origin makes
-                // concurrent racers AGREE, so they build identical windows every
-                // time, turning the duplicate charge from occasional into
-                // systematic. The two changes are coupled: the boundary is what
-                // makes the dedup path load-bearing.
+                // Deterministic-versus-probabilistic is the informative part: the
+                // boundary's absence is unconditionally broken, while the record
+                // check's absence needs a race to expose it.
                 //
-                // So the atomic boundary is NOT justified by this test. It is
-                // justified by (a) not spending a second full window of uplink
-                // on a duplicate, which is the cost #5155 exists to bound, (b)
-                // restoring this test's own premise that concurrent replies
-                // produce identical windows, and (c) removing the divergent-origin
-                // over-charge at source instead of relying on divergence
-                // happening to look stale downstream. Defence in depth plus a
-                // bandwidth fix, not the repair for the flake.
+                // PROVENANCE, and it matters. An earlier revision of this comment
+                // carried a row claiming the boundary-deleted case was 40/0, and
+                // drew from it the conclusion that the boundary was not justified
+                // by this test. That row was measured BEFORE the premise assertion
+                // existed, when this test judged only the coverage floor -- and the
+                // floor is EASIER to clear when the premise is false, since
+                // diverging racers cover two windows instead of one. So the number
+                // credited the change with passing a test it actually fails, via
+                // exactly the vacuity the premise assertion was added to stop.
                 //
-                // `main` being 40/0 is what shows the flake was INTRODUCED by
-                // per-cycle entry counting rather than being a pre-existing
-                // wobble in a multi-threaded test.
+                // The rule that cost: diagnosing a false-green mechanism does not
+                // immunise the numbers already collected under it. When you fix an
+                // instrument, the old readings are retaken or discarded, not
+                // annotated. Every row above was re-measured against this version
+                // of the test.
+                //
+                // The separate question of whether the flake was INTRODUCED (`main`
+                // 40/0 versus 65086ec2 8-13/40) cannot share this table: the
+                // premise assertion is part of what this PR adds, so restoring
+                // main's files removes it, and those rows exist only under the
+                // floor-only test. They are in the PR description, kept apart.
                 assert!(
                     ids.contains(&cursor.last_sent),
                     "after pair {pair} the cursor is no longer a member of the \
