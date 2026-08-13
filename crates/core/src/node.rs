@@ -10034,6 +10034,21 @@ mod tests {
             let expected: HashSet<u32> = hashes.iter().copied().collect();
             let ids: HashSet<ContractInstanceId> = keys.iter().map(|k| *k.id()).collect();
 
+            // Position of each contract in `get_matching_contracts` order
+            // (ascending by id), so a reply's window can be checked for
+            // contiguity rather than only for size. `distinct_hashes` has
+            // already asserted the hashes do not collide, so this is 1:1.
+            let shared_len = keys.len();
+            let index_of_hash: std::collections::HashMap<u32, usize> = {
+                let mut by_id = keys.clone();
+                by_id.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+                by_id
+                    .iter()
+                    .enumerate()
+                    .map(|(i, k)| (contract_hash(k), i))
+                    .collect()
+            };
+
             let mut covered: HashSet<u32> = HashSet::new();
             for pair in 0..PAIRS {
                 let spawn_one = || {
@@ -10051,6 +10066,7 @@ mod tests {
                 };
                 let (first, second) = tokio::join!(spawn_one(), spawn_one());
 
+                let mut windows: Vec<Vec<u32>> = Vec::new();
                 for (which, joined) in [("first", first), ("second", second)] {
                     match joined.expect("handler task panicked") {
                         Some(InterestMessage::Summaries { entries, .. }) => {
@@ -10062,10 +10078,73 @@ mod tests {
                             );
                             assert!(summary_bytes_of(&entries) <= 9 * 1024 + h.our_summary.len());
                             covered.extend(entries.iter().map(|e| e.hash));
+                            windows.push(entries.iter().map(|e| e.hash).collect());
                         }
                         other => panic!("pair {pair} {which} reply was {other:?}"),
                     }
                 }
+
+                // ASSERT THE PREMISE, do not infer it — but assert only what is
+                // scheduler-INDEPENDENT.
+                //
+                // This test's header explains that identical windows prove the
+                // overlap happened and different ones prove it did not — then the
+                // assertions below only checked a COVERAGE FLOOR, which is
+                // satisfied either way. Worse, it is satisfied MORE EASILY when
+                // the premise is false: two racers that diverge cover two
+                // windows instead of one, so `covered` grows faster and the
+                // floor is easier to clear.
+                //
+                // That is not hypothetical. Deleting the atomic boundary in
+                // `begin_fallback_window` makes the racers draw different
+                // origins, and this test stayed green over 40 runs — passing
+                // precisely because the race it exists for stopped happening. A
+                // reader running that mutation would reasonably conclude the test
+                // does not guard the code, when in fact the mutation had
+                // destroyed the test's premise. Both readings of "mutation
+                // applied, still green" are real, and only an explicit premise
+                // assertion separates them.
+                //
+                // A bare `windows[0] == windows[1]` is NOT the right assertion,
+                // though: it asserts that the RUNTIME overlapped the pair, which
+                // is not this code's contract to keep. A genuinely serialised
+                // pair legitimately produces the next CONTIGUOUS window instead.
+                // Both shapes are correct; only a third is not — two unrelated
+                // origins, the pre-boundary defect — and that is what is checked
+                // here.
+                //
+                // Empirically the bare form was borderline rather than clearly
+                // broken: 1 failure in 160 runs with it in place, and the failing
+                // run's message was not captured, so it is NOT established that
+                // the assertion was the thing that failed (a fixed-port harness
+                // has other rare ways to fail). The contiguity form is used
+                // because it does not depend on the answer, not because the bare
+                // form was proven flaky.
+                let idx = |w: &Vec<u32>| -> Vec<usize> {
+                    w.iter()
+                        .map(|hash| {
+                            *index_of_hash
+                                .get(hash)
+                                .expect("every advertised hash is in the shared set")
+                        })
+                        .collect()
+                };
+                let (i0, i1) = (idx(&windows[0]), idx(&windows[1]));
+                let follows = |a: &Vec<usize>, b: &Vec<usize>| {
+                    !a.is_empty() && !b.is_empty() && b[0] == (a[a.len() - 1] + 1) % shared_len
+                };
+                assert!(
+                    i0 == i1 || follows(&i0, &i1) || follows(&i1, &i0),
+                    "pair {pair}: the two concurrent replies were neither \
+                     IDENTICAL (they overlapped, resuming from one published \
+                     origin) nor CONTIGUOUS (the scheduler serialised them). Two \
+                     unrelated windows mean each drew its own origin, which \
+                     charges two non-contiguous windows to one cycle — the defect \
+                     the atomic boundary in `begin_fallback_window` exists to \
+                     prevent. starts: {:?} and {:?}",
+                    i0.first(),
+                    i1.first()
+                );
 
                 // The cursor must still name a contract that exists, not a
                 // value torn between the two writers.
@@ -10076,12 +10155,41 @@ mod tests {
                     .expect("a fallback reply must leave a cursor");
                 // Both racers now resume from the SAME published origin (see
                 // `begin_fallback_window`), so a pair advances the cycle by one
-                // window rather than two: 3 pairs charge ~3 x 64 of the 400
+                // window rather than two: 3 pairs charge 3 x 64 of the 400
                 // shared contracts and no cycle completes inside this loop.
-                // Before the origin was published atomically, pair 0 drew two
-                // different origins and charged both, which ran the counter
-                // ahead of the ground covered and made this test fail ~20% of
-                // the time.
+                //
+                // WHAT MAKES THIS TEST PASS, measured rather than assumed. Each
+                // row is 40 runs of this test alone, `--exact`:
+                //
+                //   zero-advance reject + atomic boundary (shipped) . 40 / 0
+                //   zero-advance reject, boundary deleted ........... 40 / 0
+                //   atomic boundary, advance check deleted .......... 23 / 17
+                //   neither, but with the id-equality dedup guard
+                //     it replaced (commit 65086ec2) ................. 32 /  8
+                //   pre-PR main ..................................... 40 / 0
+                //
+                // Read those carefully, because the obvious story is wrong. It
+                // is the ZERO-ADVANCE REJECTION in `record_fallback_cursor` that
+                // makes this test green, NOT the atomic boundary. And the
+                // boundary makes the situation WORSE on its own (17/40 failing,
+                // worse than either earlier state) because publishing the origin
+                // makes concurrent racers AGREE, so they now build identical
+                // windows every time -- turning the duplicate charge from
+                // occasional into systematic. The two changes are coupled: the
+                // boundary is what makes the dedup path load-bearing.
+                //
+                // So the atomic boundary is NOT justified by this test. It is
+                // justified by (a) not spending a second full window of uplink
+                // on a duplicate, which is the cost #5155 exists to bound, (b)
+                // restoring this test's own premise that concurrent replies
+                // produce identical windows, and (c) removing the divergent-origin
+                // over-charge at source instead of relying on divergence
+                // happening to look stale downstream. Defence in depth plus a
+                // bandwidth fix, not the repair for the flake.
+                //
+                // `main` being 40/0 is what shows the flake was INTRODUCED by
+                // per-cycle entry counting rather than being a pre-existing
+                // wobble in a multi-threaded test.
                 assert!(
                     ids.contains(&cursor.last_sent),
                     "after pair {pair} the cursor is no longer a member of the \

@@ -2991,6 +2991,25 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                     // ending at 63 over 200 contracts advances 136 -- so without
                     // the bound it is accepted and rewinds the cursor, which is
                     // the defect this check exists for.
+                    //
+                    // The ZERO half is load-bearing for concurrency and is made
+                    // MORE so by the atomic boundary, not less. Publishing the
+                    // origin means concurrent racers now agree, so they build
+                    // IDENTICAL windows -- which is exactly the duplicate this
+                    // rejects. Measured on
+                    // `concurrent_interests_from_one_peer_cost_at_most_one_round`
+                    // over 40 runs: with the boundary but without this check,
+                    // 17/40 FAIL, worse than with neither. The two changes are
+                    // coupled; do not reason about either alone.
+                    //
+                    // Note also that this check catching DIVERGENT origins (the
+                    // pre-boundary defect) is incidental: it rejects them because
+                    // a large forward distance looks stale, not because it knows
+                    // anything about concurrent boundary draws. An incidental
+                    // guard is fragile -- retuning the distance bound could stop
+                    // catching that with nothing going red -- which is a reason
+                    // to keep BOTH mechanisms rather than treat either as
+                    // redundant.
                     return;
                 }
                 prev.advertised_in_cycle.saturating_add(entries_sent)
@@ -8255,6 +8274,40 @@ mod tests {
              never reaches a boundary is a deterministic function of the stored \
              id, which a peer steering `sorted` can pin to the head of the set."
         );
+    }
+
+    /// A boundary PUBLISHES its origin, so a second reader that arrives before
+    /// any reply has been recorded resumes from the same origin instead of
+    /// drawing its own.
+    ///
+    /// This is the deterministic guard for the atomic-boundary property.
+    /// `concurrent_interests_from_one_peer_cost_at_most_one_round` exercises the
+    /// same thing through a real race, but its verdict depends on the scheduler
+    /// actually overlapping the two replies; this does not depend on a scheduler
+    /// at all, because "two readers with no record in between" is precisely what
+    /// straddling a boundary means.
+    ///
+    /// Deleting the publish makes each reader draw independently, which charged
+    /// two non-contiguous windows to one cycle and ran the counter ahead of the
+    /// ground covered — #5181's failure class.
+    #[test]
+    fn a_published_boundary_makes_a_second_reader_agree_on_the_origin() {
+        let sorted = sorted_keys(0..200);
+        // Repeated because the origin is random: a single trial where the second
+        // reader happened to draw the same offset would pass under the defect.
+        for trial in 0..40u32 {
+            let (mgr, _clock) = make_manager();
+            let peer: SocketAddr = format!("127.0.0.1:{}", 9950 + trial).parse().unwrap();
+            let first = mgr.begin_fallback_window(peer, &sorted);
+            let second = mgr.begin_fallback_window(peer, &sorted);
+            assert_eq!(
+                first, second,
+                "trial {trial}: a second reader arriving before any reply is \
+                 recorded must resume from the origin the boundary published, \
+                 not draw its own — two origins mean two non-contiguous windows \
+                 both charged to one cycle"
+            );
+        }
     }
 
     /// Contracts INSERTED between the cursor and the window end, between rounds,
