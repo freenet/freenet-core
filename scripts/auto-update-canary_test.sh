@@ -994,6 +994,72 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
+# --- ...and the BEHAVIOURAL half, which is the one that forces the decision --
+# The freeze above notifies. It cannot force, and the difference is the whole
+# lesson of this file's history, so it is worth being exact about what was
+# measured rather than asserting a property.
+#
+# Reword the marker, then do EXACTLY what the failure message's recipe says and
+# nothing else: suite green, every assertion passing. Then hand the resulting
+# canary a verbatim real v0.2.121 log -- the live #5221 break, the thing Gate B
+# exists to catch on the previous release -- and it answers:
+#
+#     OK: startup update check ran to completion and parsed GitHub's response.
+#     RC=0
+#
+# That is the round-4 shape restated at one remove: "a freeze forces a decision
+# only if the remediation cannot be performed without making that decision," and
+# re-stating a single value can always be performed.
+#
+# So the DETECTOR is asserted against a log line no sweep can rewrite: the
+# historical WARN, base64 here, driven through the real `assert_detection_healthy`
+# rather than compared against a constant. After a reword this stays RED until
+# the canary can actually still read an already-published binary -- which is
+# option (a) in the message above, an alternation over old and new wording. The
+# only way to green it otherwise is to delete this assertion, which is the
+# deliberate, reviewable form of option (b).
+#
+# Scaffolding lines interpolate the LIVE $MARKER_CHECK_RAN on purpose, so this
+# stays a pin on MARKER_PARSE_FAIL alone and does not go red for a reword of a
+# marker #5309 owns. The diagnosis is asserted as well as the exit code: rc=1 is
+# also what "the startup update check never ran" returns, and a pin that cannot
+# tell those apart would pass while reporting the wrong subsystem.
+PARSE_FAIL_HISTORICAL_WARN_B64='MjAyNi0wOC0wOFQwMTo1OTozNi4xMTEwNzNaICBXQVJOIGZyZWVuZXQ6OmNvbW1hbmRzOjphdXRvX3VwZGF0ZTogU3RhcnR1cCB1cGRhdGUgY2hlY2s6IGZhaWxlZCB0byBwYXJzZSBsYXRlc3QgdmVyc2lvbiAndjAuMi4xMjInOiB1bmV4cGVjdGVkIGNoYXJhY3RlciAndicgd2hpbGUgcGFyc2luZyBtYWpvciB2ZXJzaW9uIG51bWJlcg=='
+if ! historical_warn="$(printf '%s' "$PARSE_FAIL_HISTORICAL_WARN_B64" | base64 -d 2>/dev/null)"; then
+    historical_warn=""
+fi
+if [[ -z "$historical_warn" ]]; then
+    echo "FAIL - could not decode PARSE_FAIL_HISTORICAL_WARN_B64; the #5221 detection test is not running" >&2
+    FAILURES=$((FAILURES + 1))
+else
+    historical_dir="$(mktemp -d "$TMPROOT/historical.XXXXXX")"
+    printf '%s\n%s\n' \
+        "2026-08-08T01:59:35.950835Z  INFO freenet: $MARKER_CHECK_RAN current=\"0.2.121\" jitter_secs=40" \
+        "$historical_warn" \
+        > "$historical_dir/freenet.2026-08-08-01.log"
+    historical_stderr="$(assert_detection_healthy "$historical_dir" 2>&1 >/dev/null)"
+    historical_rc=$?
+    if [[ "$historical_rc" == 1 && "$historical_stderr" == *"could not parse the version GitHub returned"* ]]; then
+        echo "ok   - the canary still detects #5221 in a log an ALREADY-PUBLISHED binary emits"
+    else
+        echo "FAIL - the canary no longer detects #5221 in the log a published binary emits." >&2
+        echo "         fixture line: $historical_warn" >&2
+        echo "         got exit $historical_rc, wanted 1 with 'could not parse the version GitHub returned'" >&2
+        echo "         stderr: ${historical_stderr:-<none>}" >&2
+        echo "       This is Gate B's subject: it greps the PREVIOUS release's binary, and that" >&2
+        echo "       binary emits the text above no matter what this tree calls the marker." >&2
+        echo "       A canary that cannot match it reports \"OK: parsed GitHub's response\" for a" >&2
+        echo "       release carrying the live #5221 bug -- measured, exit 0." >&2
+        echo "       If you are here after rewording MARKER_PARSE_FAIL: re-stating the frozen" >&2
+        echo "       blob above does NOT fix this, and going green is not the goal. Make the" >&2
+        echo "       detector match the OLD wording as well (MARKER_TRIGGERED_RE is the" >&2
+        echo "       precedent for an alternation), or delete this assertion deliberately and" >&2
+        echo "       say in the commit message that Gate B is now blind to #5221 on every" >&2
+        echo "       release published before the new wording ships." >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+fi
+
 # The parse-failure marker gets a STRONGER pin than pin_marker can give.
 # `failed to parse latest version` appears twice in auto_update.rs: the
 # production warn!, and a comment inside its own `#[cfg(test)] mod tests`
