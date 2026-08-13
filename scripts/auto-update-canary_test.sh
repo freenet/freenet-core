@@ -428,6 +428,85 @@ else
     echo "ok   - cmd_selfupdate arms the equality check from its expected-version argument"
 fi
 
+# --- environmental classification: the alarm must not blame the fleet -------
+# `node_could_not_reach_github` is what stops the post-publish Matrix alarm
+# saying "a node on the previous release may not be able to auto-update to this
+# one" because a hosted runner could not open a socket.
+#
+# It is a real risk rather than a tidy-up, and the numbers matter: Gate B's
+# subject is a PUBLISHED binary, whose startup fetch retries ZERO times
+# (`startup_update_check_with_fetcher` warns and returns on the first Err), and
+# `framework` logged that WARN twice on 2026-08-11 -- 17:08:04Z and 00:35:13Z.
+#
+# Both directions, because only one of them is safe to get wrong. Classifying a
+# real fault as environmental would quieten the exact alarm this canary exists
+# to raise, so the negative case is the load-bearing one.
+env_case() {
+    # env_case <description> <expect yes|no> <log-content>
+    local desc="$1" expect="$2" content="$3" dir got
+    dir="$(mktemp -d "$TMPROOT/env.XXXXXX")"
+    printf '%s\n' "$content" > "$dir/freenet.2026-08-08-02.log"
+    if node_could_not_reach_github "$dir"; then got=yes; else got=no; fi
+    if [[ "$got" == "$expect" ]]; then
+        echo "ok   - environmental classification: $desc"
+    else
+        echo "FAIL - environmental classification: $desc (got '$got', expected '$expect')" >&2
+        if [[ "$expect" == no ]]; then
+            echo "       Classifying this as environmental silences the #5221 alarm for a run" >&2
+            echo "       that found a real fault." >&2
+        else
+            echo "       Not classifying it means a runner that could not reach github.com" >&2
+            echo "       tells the dev room the fleet may be stranded." >&2
+        fi
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+env_case "the node's own fetch-failure WARN" yes "$FETCH_FAIL"
+env_case "a real #5221 parse failure is NOT environmental" no "$BROKEN"
+env_case "a healthy run is NOT environmental"              no "$HEALTHY"
+env_case "a truncated run (no outcome logged) is NOT environmental" no "$PENDING"
+env_case "a disabled updater is NOT environmental"         no "$DISABLED"
+
+# Gate B's use of it. Three separate things can each silently undo the split,
+# and the first two fail in the QUIET direction:
+#   - returning 1 instead of the distinct code, so cross-compile.yml cannot
+#     tell the cases apart and every blip fires the #5221 alarm again;
+#   - classifying without consulting the logs (e.g. treating every rc=2 as
+#     environmental), which quietens a genuine no-outcome run;
+#   - dropping the retry loop, so one blip in a ~40s window decides a release.
+# shellcheck disable=SC2016  # literal source text; must not expand
+if [[ "$selfupdate_body" != *'return "$EXIT_UNVERIFIED_ENVIRONMENTAL"'* ]]; then
+    echo "FAIL - cmd_selfupdate no longer returns the distinct environmental exit code." >&2
+    echo "       cross-compile.yml keys the WORDING of its Matrix message off that code." >&2
+    echo "       Without it a runner that could not reach GitHub tells the dev room that a" >&2
+    echo "       node on the previous release may not be able to auto-update -- the #5221" >&2
+    echo "       text -- and an alarm that cries wolf on a network blip stops being read." >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ "$selfupdate_body" != *'node_could_not_reach_github "$work/logs"'* ]]; then
+    echo "FAIL - cmd_selfupdate classifies without consulting the node's logs." >&2
+    echo "       assert_detection_healthy returns 2 for two different situations. Treating" >&2
+    echo "       both as environmental quietens a run where the check started and never" >&2
+    echo "       logged an outcome, which is what a HUNG updater looks like." >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ "$selfupdate_body" != *'for attempt in $(seq 1 "$CANARY_ATTEMPTS")'* ]]; then
+    echo "FAIL - cmd_selfupdate no longer retries the indeterminate case." >&2
+    echo "       Gate B had no retry at all until this was added: CANARY_ATTEMPTS was read" >&2
+    echo "       only by cmd_preflight, so a single transient blip in a ~40s window decided" >&2
+    echo "       a release's post-publish verdict." >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ "$selfupdate_body" != *'rm -rf "${work:?}/home"'* ]]; then
+    echo "FAIL - cmd_selfupdate does not wipe the node's state between attempts." >&2
+    echo "       It must clear \$work/home and friends but NOT \$work/bin, which holds the" >&2
+    echo "       downloaded previous release -- the SUBJECT of the test, not state. Gate A's" >&2
+    echo "       'rm -rf \${work:?}' would delete the binary and every retry would run" >&2
+    echo "       nothing; keeping \$work/home makes the retry re-read the node's persisted" >&2
+    echo "       GitHub poll cooldown and reproduce the same INDETERMINATE without asking" >&2
+    echo "       GitHub at all. A retry that cannot produce a different answer is not one." >&2
+    FAILURES=$((FAILURES + 1))
+else
+    echo "ok   - cmd_selfupdate retries, classifies from the logs, and keeps \$work/bin"
+fi
+
 # The version gate around it. The observed-latest marker is new in #5236 and
 # Gate B drives the PREVIOUS release, so for one release there is no line to
 # compare; the gate must skip rather than fail. Both halves are pinned, because

@@ -206,6 +206,31 @@ RELEASE_BASE='https://github.com/freenet/freenet-core/releases/download'
 # not an updater fault -- see where it is classified in the gate commands.
 EXIT_CODE_ALREADY_RUNNING=43
 
+# THIS SCRIPT's exit code for "the run was environmental; nothing was learned
+# about the updater". Gate B only. `cross-compile.yml` keys the WORDING of its
+# Matrix message off this, so the dev room stops being told the fleet may be
+# stranded because a runner could not reach github.com for four seconds.
+#
+# 75 is sysexits.h's EX_TEMPFAIL, "temporary failure; the user is invited to
+# retry", which is the convention this file already follows with its `exit 64`
+# (EX_USAGE) for bad arguments.
+#
+# DELIBERATELY NOT 43. That is the NODE's exit code for a port collision, and
+# reusing it here would make "the canary exited 43" mean either "another process
+# held the port" or "the node started fine and GitHub was unreachable" --
+# indistinguishable at the one moment someone is reading it under time pressure,
+# on a release. The port collision is one of the two things that produce a 75;
+# it is not what 75 means.
+#
+# The job still goes RED on a 75. Unverified is not verified, and reporting green
+# on a run that proved nothing is the vacuous pass this whole file exists to
+# remove. What changes is only what the alarm SAYS.
+#
+# Gate A deliberately does NOT use this: it BLOCKS, an unverified blocking gate
+# leaves the release stuck as a draft, and a stuck draft always needs a human
+# whatever the cause.
+EXIT_UNVERIFIED_ENVIRONMENTAL=75
+
 # Ports deliberately off the node defaults (31337 / 7509) so a canary run does
 # not collide with a real node on the same host.
 #
@@ -306,6 +331,31 @@ node_check_settled() {
     return 0
   fi
   node_decided_to_update "$logdir"
+}
+
+# True when the node itself said it could not reach GitHub.
+#
+# `assert_detection_healthy` returns 2 for TWO different situations -- this one,
+# and "the check started but never logged an outcome" -- and Gate B needs to
+# tell them apart to word its alarm. It cannot: an exit code is one number, and
+# the function is deliberately pure so it stays fixture-testable. So the caller
+# re-reads the logs through this predicate rather than the function growing an
+# out-parameter.
+#
+# WHY THIS MATTERS, and it is a live risk rather than a tidy-up. The node's
+# startup fetch has NO retry (`startup_update_check_with_fetcher`, one
+# `fetcher().await`, warn and return on Err), and it demonstrably fails: two
+# WARNs on the `framework` laptop on 2026-08-11 alone, 17:08:04Z and 00:35:13Z,
+#     Startup update check: failed to fetch latest version: error sending
+#     request for url (.../releases/latest). Continuing with current binary.
+# Gate B's subject is a PUBLISHED binary, so that no-retry fetch is a property
+# of the thing under test and cannot be fixed from here. Adding one to the node
+# is worth doing and is deliberately out of this file's scope.
+#
+# No pipe, for the SIGPIPE reason documented on `node_decided_to_update`.
+node_could_not_reach_github() {
+  local logdir="$1"
+  grep -aqF "$MARKER_FETCH_FAIL" "$logdir"/freenet.*.log 2>/dev/null
 }
 
 # Fixed-string presence / extraction over the node's log FILES.
@@ -1009,32 +1059,86 @@ cmd_selfupdate() {
     note "NOTE: v$prev_version predates the observed-latest log line (#5236, first emitted by v$MARKER_LATEST_SEEN_SINCE), so Gate B's positive-equality check is SKIPPED. It arms itself once the previous release is v$MARKER_LATEST_SEEN_SINCE or newer; no action needed."
   fi
 
-  run_node_until_check "$work/bin/freenet" "$work"
+  # RETRY the environmental cases, exactly as Gate A does. Gate B had NO retry
+  # at all -- `CANARY_ATTEMPTS` was read only by `cmd_preflight` -- so a single
+  # transient blip in a ~40s window decided a release's post-publish verdict,
+  # and the blip is not hypothetical: the previous release's own startup fetch
+  # has no retry (see `node_could_not_reach_github`).
+  #
+  # `$work/bin` is preserved across attempts and everything else is wiped, which
+  # is the opposite of Gate A's `rm -rf "${work:?}"` and deliberate: the
+  # downloaded previous release is the SUBJECT, not state. State must go, for
+  # Gate A's reason -- the node persists its GitHub poll token-bucket and
+  # rate-limit cooldown under `$work/home`, so an attempt that reuses them
+  # re-reads the same cooldown and reports the identical INDETERMINATE without
+  # ever asking GitHub. A retry that cannot produce a different answer is not a
+  # retry.
+  #
+  # Only rc=2 and the port collision loop. Everything else is deterministic:
+  # re-running a node that parsed the wrong version burns release time to
+  # reproduce a fact already established. And the loop can never run twice after
+  # a decision to update, because that path leaves the loop with rc=0.
+  local attempt rc environmental=0
+  for attempt in $(seq 1 "$CANARY_ATTEMPTS"); do
+    log "--- attempt $attempt/$CANARY_ATTEMPTS ---"
+    rm -rf "${work:?}/home" "${work:?}/cfg" "${work:?}/data" \
+           "${work:?}/logs" "${work:?}/tmp" "${work:?}/cache"
+    # Distinct ports per attempt, as Gate A does, so a collision that caused the
+    # retry cannot cause the next one too.
+    CANARY_NETWORK_PORT=$((CANARY_NETWORK_PORT + 1))
+    CANARY_WS_PORT=$((CANARY_WS_PORT + 1))
+    run_node_until_check "$work/bin/freenet" "$work"
 
-  # Same port-collision classification as Gate A, and for the same reason: the
-  # log assertion below never consults NODE_EXIT, so a 43 reads as an
-  # auto-update fault. Gate B has no retry loop, so this corrects only the
-  # DIAGNOSIS -- but that is the difference between "re-run this job" and
-  # someone hunting a fleet-wide updater break that does not exist.
-  if [ "$NODE_EXIT" = "$EXIT_CODE_ALREADY_RUNNING" ]; then
-    dump_node_evidence "$work"
-    fail "UNVERIFIED: the node exited $EXIT_CODE_ALREADY_RUNNING (another instance already holds ports $CANARY_NETWORK_PORT/$CANARY_WS_PORT), so Gate B never got to test the updater. This is a port collision on this host -- another canary run, or a local node -- NOT an auto-update fault. Re-run the job."
-    return 1
-  fi
+    # Classified BEFORE the log assertion, for the same reason as in Gate A: the
+    # assertion never consults NODE_EXIT, so a node that died on a port
+    # collision without an update-check line reads as "the startup update check
+    # never ran" -- an auto-update fault reported for another process holding a
+    # port.
+    if [ "$NODE_EXIT" = "$EXIT_CODE_ALREADY_RUNNING" ]; then
+      note "INDETERMINATE: the node exited $EXIT_CODE_ALREADY_RUNNING (another instance already holds ports $CANARY_NETWORK_PORT/$CANARY_WS_PORT). A port collision on this host -- another canary run, or a local node -- not an auto-update fault."
+      rc=2
+      environmental=1
+    else
+      # The two-sided log assertion first: it LOCALISES the failure. If detection
+      # is broken the version check below would also fail, but with a far less
+      # useful message.
+      assert_detection_healthy "$work/logs"
+      rc=$?
+      # Which KIND of indeterminate. Only the node saying outright that it could
+      # not reach GitHub counts as environmental. "The check started and never
+      # logged an outcome" stays a real finding: a hung updater produces exactly
+      # that, and calling it environmental would be the quiet direction.
+      if [ "$rc" -eq 2 ] && node_could_not_reach_github "$work/logs"; then
+        environmental=1
+      else
+        environmental=0
+      fi
+    fi
 
-  # The two-sided log assertion first: it LOCALISES the failure. If detection
-  # is broken the version check below would also fail, but with a far less
-  # useful message.
-  assert_detection_healthy "$work/logs"
-  local rc=$?
-  # Keep the node's own output before the EXIT trap deletes the workdir.
-  [ "$rc" -eq 0 ] || dump_node_evidence "$work"
+    # Keep the node's own output before the next attempt wipes the tree, or the
+    # EXIT trap deletes it. Only on a non-zero verdict, so a healthy release
+    # stays quiet.
+    [ "$rc" -eq 0 ] || dump_node_evidence "$work"
+    [ "$rc" -eq 2 ] || break
+    if [ "$attempt" -lt "$CANARY_ATTEMPTS" ]; then
+      log "indeterminate (no verdict from the update check); retrying in ${CANARY_RETRY_SLEEP}s"
+      sleep "$CANARY_RETRY_SLEEP"
+    fi
+  done
+
   if [ "$rc" -eq 2 ]; then
-    # Infrastructure, not a stranded fleet. Still a failure -- reporting green
-    # on an unverified run is the vacuous-pass this canary exists to prevent --
-    # but worded so nobody reads it as "the fleet is broken" and learns to
-    # ignore the alarm.
-    fail "UNVERIFIED: the update check produced no verdict (GitHub unreachable, or it never logged an outcome), so the canary could not determine whether v$prev_version reaches v$expected_version. This is NOT evidence that auto-update is broken, and NOT evidence that it works. Re-run the job."
+    if [ "$environmental" -eq 1 ]; then
+      # The node told us why, and the reason is not the updater. Distinct exit
+      # code so `cross-compile.yml` can word the Matrix message accordingly:
+      # the alarm that says a node "may not be able to auto-update to this one"
+      # must not fire for a runner that could not open a socket. Still a
+      # non-zero exit and still a red job -- unverified is not verified.
+      fail "UNVERIFIED (ENVIRONMENTAL): v$prev_version could not reach GitHub from this runner in $CANARY_ATTEMPTS attempts, so the canary never got to test whether it reaches v$expected_version. This says NOTHING about auto-update, in either direction: the node's startup fetch has no retry, and a runner that cannot resolve or connect to github.com produces exactly this. Re-run the job. Do NOT read this as a stranded fleet."
+      return "$EXIT_UNVERIFIED_ENVIRONMENTAL"
+    fi
+    # Infrastructure, not a stranded fleet -- but the node never said WHY, so
+    # this keeps the ordinary failure exit. A hung updater lands here.
+    fail "UNVERIFIED: the update check produced no verdict in $CANARY_ATTEMPTS attempts (it started and never logged an outcome), so the canary could not determine whether v$prev_version reaches v$expected_version. This is NOT evidence that auto-update is broken, and NOT evidence that it works. Note that the node did NOT report a failed GitHub fetch, so this is not simply an unreachable runner. Re-run the job."
     return 1
   fi
   [ "$rc" -eq 0 ] || return 1

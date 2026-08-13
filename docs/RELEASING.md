@@ -643,10 +643,30 @@ a tag that no longer exists is worse than the draft.
 
 ### If Gate B fails
 
-**Establish which of two things happened before acting.** They need opposite
-responses, and the alarm text names the worse one.
+**Establish which of three things happened before acting.** They need different
+responses, and the loud alarm text names the worst one.
 
-**1. A stale canary constant, which is NOT a fleet problem.** Gate B's
+**0. The runner could not reach GitHub, which is NOT a fleet problem and the
+canary now says so itself.** The previous release's binary retries its startup
+fetch zero times, so an ordinary network blip on a hosted runner makes it log
+
+```
+Startup update check: failed to fetch latest version: error sending request
+for url (.../releases/latest). Continuing with current binary.
+```
+
+and the run learns nothing about the updater in either direction. Gate B retries
+(`CANARY_ATTEMPTS`, 2 by default), and if every attempt lands the same way it
+exits **75** (`EXIT_UNVERIFIED_ENVIRONMENTAL`, sysexits' EX_TEMPFAIL) with a
+message beginning `UNVERIFIED (ENVIRONMENTAL)`. `cross-compile.yml` keys off
+that code and sends the quiet ⚠️ message instead of the 🚨 one, so if you are
+reading the #5221 text this is not what happened. The job is still red: an
+unverified run is not a passed one. **Response: re-run the job.** Adding a retry
+to the node's own fetch (`crates/core/src/bin/commands/auto_update.rs`) would
+remove the class, but only for releases published after that lands, since Gate B
+always drives an already-published binary.
+
+**1. A stale canary constant, which is NOT a fleet problem either.** Gate B's
 positive-equality check greps the previous release's log for
 `MARKER_LATEST_SEEN` (`scripts/auto-update-canary.sh`), and it arms only from
 `MARKER_LATEST_SEEN_SINCE` onwards. If that marker's TEXT was reworded and the
@@ -665,9 +685,16 @@ grep -n "MARKER_LATEST_SEEN\b\|MARKER_LATEST_SEEN_SINCE" scripts/auto-update-can
 If the marker text was changed in this release's window, fix the constant (the
 test file freezes the two together and explains the choice) rather than shipping
 anything. The same applies to the other markers Gate B greps against the
-previous binary — `MARKER_DISABLED`, `MARKER_CHECK_RAN`, `MARKER_CHECK_COMPLETE`
-and `MARKER_TRIGGERED_RE` — which are not frozen and would produce the same false
-alarm with a less specific message (#5309).
+previous binary — `MARKER_DISABLED`, `MARKER_CHECK_RAN`, `MARKER_CHECK_COMPLETE`,
+`MARKER_TRIGGERED_RE` and `MARKER_FETCH_FAIL` — which are not frozen and would
+produce the same false alarm with a less specific message (#5309 tracks the
+first four; it does not name `MARKER_FETCH_FAIL`).
+
+`MARKER_PARSE_FAIL` is the one to be most careful with, and it IS frozen
+(`auto-update-canary_test.sh`), because it is the only marker whose reword fails
+in the PASSING direction: it feeds Gate B's negative check, so a grep that stops
+matching the text published binaries emit reports `OK: parsed GitHub's response`
+for a release carrying the live #5221 bug.
 
 **2. A real detection or install failure.** The previous release genuinely
 cannot reach this one. The release is already public and the fleet will **not**
@@ -694,7 +721,9 @@ verification skill if you have it):
    gateway shows no errors.
 6. The `Auto-update self-update canary` job in the tag's `cross-compile` run
    is green — a node on the previous release reached this one on its own. If
-   it is red, the fleet is stranded; see "Auto-update canary" above.
+   it is red, read the job log before concluding anything: a red job can mean
+   the fleet is stranded OR that the run was environmental (exit 75, quiet ⚠️
+   Matrix message, re-run it). See "If Gate B fails" above.
 
 [PR #4135]: https://github.com/freenet/freenet-core/pull/4135
 [river#241]: https://github.com/freenet/river/issues/241

@@ -343,6 +343,91 @@ else
                 "empty string, so every clause above silently stops matching."
         fi
     done
+
+    # --- 6b. the ENVIRONMENTAL split cannot swallow the real alarm ----------
+    # The notify job now picks between two messages: a quiet one when the
+    # canary classified the run as environmental (it could not reach GitHub, so
+    # it learned nothing), and the loud #5221 one otherwise. Silencing the
+    # channel is now a two-line edit -- widen the quiet branch's condition, or
+    # delete the loud step -- and either would look like tidying.
+    #
+    # Three properties, each of which alone is enough to lose the alarm:
+    #
+    #   (a) the loud message still exists at all;
+    #   (b) the quiet branch requires BOTH that the publish job succeeded and
+    #       that the classification is exactly 'environmental'. Drop the first
+    #       and a release stuck as a DRAFT gets the reassuring message; drop
+    #       the second and everything does;
+    #   (c) the loud branch is the NEGATION of the quiet one rather than its
+    #       own enumeration of results. That is what puts every unanticipated
+    #       state -- a cancelled job, an empty classification because the step
+    #       never ran -- on the side that gets read.
+    if [[ "$notify_block" == *'#5221 failure mode'* ]]; then
+        pass "the notify job still carries the loud #5221 message"
+    else
+        fail "the loud '#5221 failure mode' message is gone from the notify job" \
+            "That text is the only thing that tells the room a node on the previous" \
+            "release may be unable to reach this one. If it was removed to stop" \
+            "false alarms, the fix is the environmental classification, not silence."
+    fi
+
+    quiet_cond="needs.attach-to-release.result == 'success' &&"
+    quiet_cond+=" needs.auto-update-selfupdate-canary.outputs.classification == 'environmental'"
+    # Whitespace-collapsed: the condition is written across two lines in a
+    # folded scalar, and a reflow must not decide whether this is checked.
+    notify_flat="$(printf '%s' "$notify_block" | tr -s '[:space:]' ' ')"
+    if [[ "$notify_flat" == *"$quiet_cond"* ]]; then
+        pass "the quiet branch requires a successful publish AND an environmental classification"
+    else
+        fail "the environmental notification's condition changed" \
+            "Expected it to require both:" \
+            "  $quiet_cond" \
+            "Widened, the quiet 'nothing to worry about' message starts covering" \
+            "real faults and a release stuck as a draft."
+    fi
+
+    if [[ "$notify_flat" == *"!($quiet_cond)"* ]]; then
+        pass "the loud branch is the negation of the quiet one (unknown states stay loud)"
+    else
+        fail "the loud notification is no longer the exact negation of the quiet one" \
+            "Written as its own list of results instead, any state neither branch" \
+            "anticipated -- a cancelled job, an empty classification -- falls" \
+            "through both and nothing is sent at all."
+    fi
+fi
+
+# --- 6c. Gate B's step still classifies, and still re-raises its exit code ---
+# The classification only reaches the notify job because the canary step writes
+# it to GITHUB_OUTPUT and the job re-exports it. Two ways to break that
+# silently: drop the job-level `outputs:` (every clause above reads '' and the
+# loud branch fires for everything, which is merely noisy), or swallow the
+# script's exit code so the job goes GREEN on a failed canary, which is not
+# noisy at all.
+selfupdate_block="$(awk '
+    /^  auto-update-selfupdate-canary:[[:space:]]*$/ { inblock = 1; print; next }
+    inblock && /^  [A-Za-z_.-]+:/                    { inblock = 0 }
+    inblock                                          { print }
+' "$WF")"
+
+# shellcheck disable=SC2016  # literal workflow text: the `${{ }}` must not expand
+if [[ "$selfupdate_block" == *'classification: ${{ steps.canary.outputs.classification }}'* ]]; then
+    pass "Gate B's job still exports the 'classification' output"
+else
+    fail "Gate B's job no longer exports 'classification'" \
+        "The notify job reads it to choose between the quiet and the loud message." \
+        "Missing, it evaluates to '' and every run takes the loud #5221 branch."
+fi
+
+# shellcheck disable=SC2016  # literal workflow text: `$rc` is the step's variable
+if [[ "$selfupdate_block" == *'exit "$rc"'* ]]; then
+    pass "Gate B's step re-raises the canary's exit code"
+else
+    fail "Gate B's step no longer re-raises the canary's exit status" \
+        "It runs the canary with '|| rc=\$?' so it can classify exit 75. That is" \
+        "only safe while the code is raised again at the end of the step. Without" \
+        "the re-raise the step always exits 0, Gate B is green on a broken" \
+        "updater, and nothing notifies -- the exact silent fail this file exists" \
+        "to prevent, reached by deleting one line."
 fi
 
 # --- 7. Gate B's job still exists -------------------------------------------
