@@ -604,7 +604,20 @@ pub enum SummariesEmitter {
     /// residual; folding the two would repeat, one level down, exactly the
     /// conflation this tag exists to undo.
     ///
-    /// **SINGLE-entry, essentially always** — corrected 2026-08-12 (#5153 review
+    /// **SINGLE-entry, essentially always — but by CALLER convention, not by
+    /// construction.** `broadcast_change_interests` takes `added: Vec<ContractKey>`
+    /// and every caller today passes at most one, yet nothing pins that; and the
+    /// reply loop's hash-collision path can yield 2+ entries on a u32 FNV-1a
+    /// collision. So this is an empirical property of the current call sites, and
+    /// it is deliberately left unpinned: the R4b instrument is robust either way
+    /// (a multi-entry reply simply classifies as `MultiEntry` and leaves the
+    /// single-entry population). Contrast the NOTIFICATION leg, whose identical
+    /// structural property IS pinned, by
+    /// `notification_leg_is_always_full_bytes_and_single_entry` — because `p` is
+    /// read off that leg, so drift there corrupts the measurement rather than
+    /// merely shrinking its denominator.
+    ///
+    /// Corrected 2026-08-12 (#5153 review
     /// F1); this said "also multi-entry" and that was measurably false.
     /// `operations::broadcast_change_interests` is called with one contract per
     /// gossip, so the reply built for it carries one entry: mean **1.000**

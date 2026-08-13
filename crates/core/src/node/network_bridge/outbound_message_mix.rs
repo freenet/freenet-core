@@ -115,8 +115,11 @@ pub(crate) enum SummaryObservation {
     /// population R4b's `p` is about.
     MultiEntry,
     /// Single-entry FULL-BYTES `Summaries`. The R4b population — but see
-    /// [`OutboundMix::record_summary_comparison`]: it is ~15% not-notification,
-    /// and the per-arm census is what makes that subtractable.
+    /// [`OutboundMix::record_summary_comparison`]: it is NOT pure notification
+    /// traffic, its contamination is a BRACKET (0.07%-12.4%) rather than a point
+    /// estimate, and the per-arm census is what makes that subtractable. The
+    /// merged ~15% figure describes a different population and must not be
+    /// applied to this one.
     SingleEntryFullBytes,
     /// Single-entry `SummaryDigests`. Counted SEPARATELY and deliberately: it
     /// cannot be notification traffic while notifications ship full bytes, so it
@@ -338,8 +341,10 @@ impl OutboundKind {
 /// leg — and since `summary_reply_form` returns `Digests` for every peer at or
 /// above the `(0, 2, 116)` floor and the fleet is past it, MOST
 /// `ChangeInterestsReply` traffic is digests and never enters the full-bytes
-/// receive population at all. Correcting the full-bytes leg with a merged
-/// number over-subtracts by roughly 11 points.
+/// receive population at all. Correcting the full-bytes leg with the merged
+/// number therefore over-subtracts — by how much is a bracket, not a figure,
+/// since the merged rate is ~15% while the full-bytes leg's own contamination is
+/// only bounded at 0.07%-12.4%.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum SummariesWireForm {
     /// `InterestMessage::Summaries` — full summary bytes per entry.
@@ -713,16 +718,20 @@ struct Window {
     ///
     /// **Indexed by `[arm][wire form]`, and the wire form is load-bearing.**
     /// See [`SummariesWireForm`]: a leg-blind census over-subtracts the
-    /// full-bytes leg by roughly 11 points, because most `ChangeInterestsReply`
-    /// goes out as digests today and never reaches the full-bytes receive
-    /// population that `*_single` counts.
+    /// full-bytes leg, because most `ChangeInterestsReply` goes out as digests
+    /// today and never reaches the full-bytes receive population that `*_single`
+    /// counts. The size of that error is a bracket rather than a figure — see
+    /// below.
     ///
     /// Why it is needed, in numbers (one window, 2026-08-12): `notification`
     /// 3,194,108 single-entry messages, `change_interests_reply` 418,476 (mean
     /// 1.000, max 1), `request_reply` at least 131,153, `rejection` 669. Merged
     /// across wire forms that is ~15% not-notification — but the FULL-BYTES leg,
     /// which is the one `p` is computed over, is contaminated mainly by
-    /// `request_reply` and `rejection`, nearer **4%**. An even earlier version
+    /// `request_reply` and `rejection`, and its rate is only **bounded at
+    /// 0.07%-12.4%**, not measured. Do not quote a central value: the
+    /// `request_reply` single-entry share it would rest on is not derivable from
+    /// today's keys, which is why this census exists. An even earlier version
     /// documented only `rejection` (0.015%), the smallest of the three.
     ///
     /// Those figures come from pre-split telemetry and are therefore themselves
@@ -1108,8 +1117,9 @@ impl OutboundMix {
     /// arithmetic. It is also the same lost-deferred-round-trip fragility R4b's
     /// own design work flagged separately, so it is a coherent known limitation
     /// rather than a surprise. It is expected to be SMALL (it needs a lost
-    /// message) next to the contamination term above, which is structural and
-    /// ~15%.
+    /// message) next to the contamination term above, which is structural rather
+    /// than loss-dependent — merged ~15%, and on this leg bounded at
+    /// 0.07%-12.4%.
     ///
     /// # NET: bound it, do not point-estimate it
     ///
@@ -2118,7 +2128,23 @@ mod tests {
                 &mut HashSet::new(),
             );
         }
+        // One MULTI-entry one-sided record, so the TOTAL (7) differs from the
+        // single-entry SUBSET (6). Without it both keys read 6 and a
+        // `summary_entries_one_sided` / `_one_sided_single` transposition in
+        // `outbound_mix_json` satisfies every assertion here — and this is the
+        // only body-level assertion either key has, so nothing else would catch
+        // it (#5153 review round 5). The identical/differing pairs are already
+        // distinguished by `headline_counters_reach_the_rollup_body_under_the_right_keys`,
+        // whose fixture leaves their single buckets at 0.
+        mix.record_summary_one_sided(&c, SummaryObservation::MultiEntry, &mut HashSet::new());
         let body = outbound_mix_json(&mix.take_window(), 60);
+        assert_eq!(
+            body.get("summary_entries_one_sided")
+                .and_then(|v| v.as_u64()),
+            Some(7),
+            "the one-sided TOTAL must be distinguishable from its single-entry \
+             subset, or the two keys can be transposed undetected"
+        );
         assert_eq!(
             body.get("summary_entries_identical_single")
                 .and_then(|v| v.as_u64()),
@@ -2360,12 +2386,19 @@ mod tests {
                 .and_then(|v| v.as_u64()),
             Some(0)
         );
-        // The eight scalars this test did NOT cover (#5153 review round 2). Six are
-        // the R4b counters the build/no-build decision reads, and two
-        // (`summary_entries_one_sided`, the notification pair) were unpinned from
-        // the start. The convention this file states everywhere — a field that
-        // vanishes when zero is invisible to the analysis — was unenforced for
-        // exactly the fields that matter most.
+        // Eight scalars this test did not previously list. Of these, exactly ONE
+        // — `summary_entries_one_sided` — had no coverage anywhere; the
+        // notification pair is value-asserted by
+        // `notification_recipient_split_is_emitted_even_when_idle`, and the six
+        // R4b counters by `single_entry_counters_reach_the_rollup_body_...`.
+        // The other seven entries here are therefore belt-and-braces, not new
+        // coverage.
+        //
+        // Stated precisely because an earlier version of this comment claimed all
+        // eight were uncovered and that "two were unpinned from the start", which
+        // was false about this file's own history (#5153 review round 5). A
+        // comment about coverage is exactly what the next reviewer trusts instead
+        // of re-deriving, so an overstatement here is worse than no comment.
         for key in [
             "summary_entries_one_sided",
             "summary_entries_identical_single",
@@ -2744,24 +2777,33 @@ mod tests {
             SummaryObservation::SingleEntryDigest,
             &mut HashSet::new(),
         );
-        mix.record_summary_comparison(
-            &c,
-            b"ours",
-            b"theirs",
-            SummaryObservation::SingleEntryDigest,
-            &mut HashSet::new(),
-        );
+        // TWO differing against ONE identical, deliberately unequal. With both
+        // at 1 every assertion below passes even if the two `*_single_digest`
+        // keys are transposed in `outbound_mix_json`, or if the recorder
+        // increments the wrong one — and these are precisely the keys the
+        // notification population MOVES to when R4b ships, so a transposition
+        // would invert `p` on the post-R4b reading with the whole suite green.
+        // An equal-valued fixture cannot see a swap (#5153 review round 5).
+        for _ in 0..2 {
+            mix.record_summary_comparison(
+                &c,
+                b"ours",
+                b"theirs",
+                SummaryObservation::SingleEntryDigest,
+                &mut HashSet::new(),
+            );
+        }
 
         let w = mix.take_window();
         assert_eq!(w.summary_entries_identical, 1, "totals still count it");
-        assert_eq!(w.summary_entries_differing, 1, "totals still count it");
+        assert_eq!(w.summary_entries_differing, 2, "totals still count it");
         assert_eq!(
             w.summary_entries_identical_single, 0,
             "a digest-leg observation is NOT the R4b full-bytes population"
         );
         assert_eq!(w.summary_entries_differing_single, 0);
         assert_eq!(w.summary_entries_identical_single_digest, 1);
-        assert_eq!(w.summary_entries_differing_single_digest, 1);
+        assert_eq!(w.summary_entries_differing_single_digest, 2);
         assert_eq!(
             w.differing_by_contract.get(&c).map(|d| d.single),
             Some(0),
@@ -2774,7 +2816,7 @@ mod tests {
             ("summary_entries_identical_single", 0),
             ("summary_entries_differing_single", 0),
             ("summary_entries_identical_single_digest", 1),
-            ("summary_entries_differing_single_digest", 1),
+            ("summary_entries_differing_single_digest", 2),
         ] {
             assert_eq!(
                 body.get(key).and_then(|v| v.as_u64()),
@@ -3038,9 +3080,21 @@ mod tests {
             let stem = summaries_stem(emitter);
             // SEVEN suffixes, not five: the two R4b census keys are part of every
             // arm's emitted set (#5153 review round 2). They were absent from both
-            // this loop and the value loop above, so the keys the instrument's
-            // whole correction depends on were the only per-arm keys with no
-            // presence guarantee at all.
+            // this loop and the value loop above.
+            //
+            // Precisely: 9 of the 14 census keys had no assertion anywhere; the
+            // other 5 were already value-pinned by
+            // `single_entry_census_is_per_emitter_leg_split_...`. An earlier
+            // version of this comment implied all 14 were unguarded (#5153 review
+            // round 5) — overstating a coverage gap misleads the next reader
+            // exactly as much as understating one.
+            //
+            // NOTE the scope of what this loop guarantees: CENSUS keys and the
+            // five original per-arm keys. It says nothing about `window_secs`,
+            // `total_msgs`, `total_bytes`, or 29 of the 30 per-`OutboundKind`
+            // body keys, none of which have a body-key assertion. That gap is
+            // pre-existing and out of scope here, but do not read this loop as
+            // "every emitted key is pinned".
             for suffix in [
                 "msgs",
                 "bytes",
