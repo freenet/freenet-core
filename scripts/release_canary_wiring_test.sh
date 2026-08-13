@@ -441,10 +441,17 @@ fi
 # loud branch fires for everything, which is merely noisy), or swallow the
 # script's exit code so the job goes GREEN on a failed canary, which is not
 # noisy at all.
+# COMMENT-ONLY LINES ARE DROPPED, exactly as `JOB_BLOCK` drops them for
+# `attach-to-release`, and for the reason this repo keeps rediscovering: a pin
+# that scans raw text is satisfied by PROSE. This block's own comments quote
+# `|| rc=$?` and `exit "$rc"` while explaining why they must stay, so the
+# assertions below would have passed against the explanation after the code
+# was removed. Found by mutation, and only because the mutation hit the comment
+# first and the pin stayed green -- the harness accident that exposed it.
 selfupdate_block="$(awk '
     /^  auto-update-selfupdate-canary:[[:space:]]*$/ { inblock = 1; print; next }
     inblock && /^  [A-Za-z_.-]+:/                    { inblock = 0 }
-    inblock                                          { print }
+    inblock && $0 !~ /^[[:space:]]*#/                { print }
 ' "$WF")"
 
 # shellcheck disable=SC2016  # literal workflow text: the `${{ }}` must not expand
