@@ -861,7 +861,7 @@ pin_marker "source pin: disabled marker"        "$SRC"    "$MARKER_DISABLED"
 # message. Only MARKER_LATEST_SEEN is frozen here. The asymmetry is real, not an
 # oversight: Gate A runs a binary built from THIS tree, so a reword there is
 # self-consistent, and Gate B is the only place an older binary is read.
-# Tracked as a follow-up.
+# Tracked as #5309.
 #
 # To change it deliberately, re-state BOTH values:
 #   printf '%s\n%s' '<marker text>' '<first release shipping it>' | base64 | tr -d '\n'

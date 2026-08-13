@@ -667,7 +667,7 @@ test file freezes the two together and explains the choice) rather than shipping
 anything. The same applies to the other markers Gate B greps against the
 previous binary — `MARKER_DISABLED`, `MARKER_CHECK_RAN`, `MARKER_CHECK_COMPLETE`
 and `MARKER_TRIGGERED_RE` — which are not frozen and would produce the same false
-alarm with a less specific message.
+alarm with a less specific message (#5309).
 
 **2. A real detection or install failure.** The previous release genuinely
 cannot reach this one. The release is already public and the fleet will **not**
