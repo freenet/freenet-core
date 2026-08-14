@@ -31,7 +31,6 @@ use crate::config::Config;
 use crate::message::{QueryResult, Transaction};
 use crate::node::OpManager;
 use crate::wasm_runtime::UserSecretContext;
-use std::num::NonZeroUsize;
 
 pub(crate) struct ClientResponsesReceiver(UnboundedReceiver<(ClientId, RequestId, HostResult)>);
 
@@ -99,22 +98,10 @@ impl ContractHandler for NetworkContractHandler {
     where
         Self: Sized + 'static,
     {
-        // Reserve one logical core for the Tokio event loop and OS scheduling.
-        // WASM execution is CPU-bound, so the pool naturally can't exceed useful parallelism.
-        // Cap at 16 to stay well within the max_blocking_threads limit (default: 2x cores,
-        // clamped to [4, 32]), preventing the executor pool from exhausting the blocking pool.
-        let parallelism = std::thread::available_parallelism()
-            .unwrap_or(NonZeroUsize::new(4).unwrap())
-            .get()
-            .saturating_sub(1)
-            .max(1);
-
-        // Pool size configurable via FREENET_RUNTIME_POOL_SIZE env var (useful for tests)
-        let pool_size = std::env::var("FREENET_RUNTIME_POOL_SIZE")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .and_then(|n| NonZeroUsize::new(n.clamp(1, 16)))
-            .unwrap_or_else(|| NonZeroUsize::new(parallelism.clamp(1, 16)).unwrap());
+        // One shared source (`config::runtime_pool_size`) so the per-worker cache
+        // budgets, which must divide by this to stay within the node's memory
+        // limit, can never disagree with the pool actually created (#5268).
+        let pool_size = crate::config::runtime_pool_size();
 
         tracing::info!(pool_size = %pool_size, "Creating RuntimePool");
 

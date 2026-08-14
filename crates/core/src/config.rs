@@ -4,6 +4,7 @@ use std::{
     future::Future,
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, atomic::AtomicBool},
     time::Duration,
@@ -1744,6 +1745,35 @@ pub struct Config {
 /// Default graceful-shutdown drain window.
 fn default_shutdown_drain_secs() -> u64 {
     30
+}
+
+/// Number of `Executor<Runtime>` workers the `RuntimePool` runs.
+///
+/// Reserve one logical core for the Tokio event loop and OS scheduling. WASM
+/// execution is CPU-bound, so the pool naturally can't exceed useful
+/// parallelism. Capped at 16 to stay well within the max_blocking_threads limit
+/// (see [`default_max_blocking_threads`]), preventing the executor pool from
+/// exhausting the blocking pool. `FREENET_RUNTIME_POOL_SIZE` overrides it
+/// (useful for tests).
+///
+/// This is CPU-derived, and `MemoryMax` does not constrain CPU count — a 20-core
+/// laptop inside a 2 GiB cgroup gets 16 workers. Anything sized PER WORKER must
+/// therefore compose its ceiling against the memory limit rather than assume the
+/// product is affordable (#5268 defect 3), which is why this lives here as one
+/// shared source: `RuntimePool::new` sizes the pool from it and the per-worker
+/// cache budgets divide by it.
+pub(crate) fn runtime_pool_size() -> NonZeroUsize {
+    const MAX_POOL_SIZE: usize = 16;
+    let parallelism = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .saturating_sub(1)
+        .max(1);
+    std::env::var("FREENET_RUNTIME_POOL_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .and_then(|n| NonZeroUsize::new(n.clamp(1, MAX_POOL_SIZE)))
+        .unwrap_or_else(|| NonZeroUsize::new(parallelism.clamp(1, MAX_POOL_SIZE)).unwrap())
 }
 
 /// Default max blocking threads: 2x CPU cores, clamped to 4-32.
