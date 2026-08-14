@@ -280,6 +280,24 @@ pub(crate) fn resident_overhead_budget_for_ram(total_ram: u64) -> u64 {
     )
 }
 
+/// Minimum CONTINUOUS breach duration required before resident-overhead
+/// pressure contributes to the eviction decision (#5325 PR review, Must-Fix
+/// #1): the raw over-budget reading must persist for at least half of this
+/// window (see [`HostingCache::resident_overhead_over_budget`]) — i.e. 150s
+/// at the current value — before eviction acts on it.
+///
+/// Set equal to [`COST_RATE_MIN_WINDOW`] (the #4861 cost-pressure precedent
+/// this mirrors) for a first cut, but declared as its OWN constant rather
+/// than a reference to that one: the two gate conceptually different things
+/// (a per-contract sampled RATE vs. a per-node exact contract COUNT) and
+/// tuning one should not silently retune the other. 300s / 150s-to-arm is
+/// long enough that the 5s periodic sweep (`CLEANUP_INTERVAL`,
+/// `node/op_state_manager.rs`) observes the breach ~30 times before it can
+/// arm, so a single stale/racy read can't trigger it, and short enough that
+/// a genuinely persistent post-upgrade overage still gets addressed within
+/// a few minutes rather than never.
+pub(crate) const RESIDENT_OVERHEAD_SUSTAINED_WINDOW: Duration = Duration::from_secs(300);
+
 /// Default fraction of the disk capacity *available to Freenet* used to size the
 /// aggregate disk budget (#4683): 50%. Sized against `used + free` (capacity the
 /// node can actually reach), NOT a naive live free-space read that shrinks as it
@@ -1008,10 +1026,21 @@ pub struct HostingCache<T: TimeSource> {
     /// that separates still-wanted contracts from stale ones. Measured in
     /// cache-contention units, not wall-clock.
     eviction_floor: f64,
-    /// Monotonic count of contracts evicted because the cache was over budget.
-    /// Only `evict_over_budget` increments it, so it counts budget-triggered
-    /// evictions specifically (not TTL sweeps that found nothing over budget).
-    /// Exposed via [`HostingCache::stats`] for per-node telemetry.
+    /// Monotonic count of contracts evicted because the cache was over
+    /// budget on EITHER axis: the state-byte budget (`current_bytes >
+    /// budget_bytes`) or, since #5325, the count-derived resident-overhead
+    /// estimate (sustained over `resident_overhead_budget_bytes` — see
+    /// [`HostingCache::resident_overhead_over_budget`]). Only
+    /// `evict_over_budget` increments it, so it counts over-budget-triggered
+    /// evictions specifically (not TTL sweeps that found nothing over
+    /// budget, and not [`Self::evict_cost_pressure`]'s zero-demand cost
+    /// evictions, tracked separately by
+    /// [`Self::cost_evictions_total`]). To isolate the resident-overhead-
+    /// driven subset specifically, see
+    /// [`Self::resident_overhead_evictions_total`] (a subset, not disjoint —
+    /// a single eviction can be counted by both when both axes are over
+    /// budget at once). Exposed via [`HostingCache::stats`] for per-node
+    /// telemetry.
     budget_evictions_total: u64,
     /// Monotonic count of over-budget evictions whose victim had `read_count >= 2`
     /// (genuine repeat demand). The #4338 miscalibration signal — see
@@ -1062,6 +1091,20 @@ pub struct HostingCache<T: TimeSource> {
     /// pressure, not just state bytes, is shaping retention. See
     /// [`HostingCacheStats::resident_overhead_evictions_total`].
     resident_overhead_evictions_total: u64,
+    /// Wall-clock timestamp of when the resident-overhead estimate FIRST
+    /// crossed [`Self::resident_overhead_budget_bytes`], continuously (#5325
+    /// PR review, Must-Fix #1). `None` whenever the raw estimate is at or
+    /// under budget. This is what makes resident-overhead pressure a
+    /// SUSTAINED trigger — mirroring the #4861 cost-pressure precedent
+    /// (`.claude/rules/hosting-invariants.md` invariant 3: "a single burst
+    /// never triggers... sustained across at least half the cost window") —
+    /// rather than a bare instantaneous comparison. Without this, a peer
+    /// upgrading straight into a large pre-existing hosted set (framework:
+    /// 1,057 contracts against a 256-contract budget at its 2 GiB cap) would
+    /// shed the bulk of it in the very first post-upgrade sweep, with no
+    /// grace period for organic (state-byte-driven) shrinkage or operator
+    /// notice. See [`Self::resident_overhead_over_budget`].
+    resident_overhead_breach_since: Option<Instant>,
     eviction_victim_counts: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
     eviction_victim_bytes: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
     /// Monotonic hosting-BEGIN counts by [`HostingCause`]. Incremented ONLY by
@@ -1326,6 +1369,7 @@ impl<T: TimeSource> HostingCache<T> {
             cost_evictions_total: 0,
             resident_overhead_budget_bytes: default_resident_overhead_budget_bytes(),
             resident_overhead_evictions_total: 0,
+            resident_overhead_breach_since: None,
             eviction_victim_counts: [[0; STATE_SIZE_BUCKET_COUNT]; 3],
             eviction_victim_bytes: [[0; STATE_SIZE_BUCKET_COUNT]; 3],
             hosting_begins: [0; HostingCause::COUNT],
@@ -1438,7 +1482,19 @@ impl<T: TimeSource> HostingCache<T> {
         // to start from short of ad hoc field measurement. Only logged when
         // eviction actually runs (not on every no-op periodic sweep), so this
         // does not spam logs during normal in-budget operation.
-        tracing::debug!(
+        //
+        // `info!`, NOT `debug!` (PR review Must-Fix #2): this crate builds
+        // with `release_max_level_info` (`crates/core/Cargo.toml`), which
+        // statically strips `debug!`/`trace!` out of release binaries
+        // entirely — a `debug!` here would never appear on a deployed node,
+        // silently reopening the exact observability gap #5325 complained
+        // about. Existing precedent for a real, deployed-visible eviction
+        // signal in this file is `warn!` (e.g. the cost-pressure eviction
+        // line below); `info!` is the right level here since this fires once
+        // per SWEEP (not once per evicted contract), so a chronically
+        // over-budget node logs at most once per periodic-sweep cadence
+        // (`CLEANUP_INTERVAL`, currently 5s), not a line per contract.
+        tracing::info!(
             current_bytes = self.current_bytes,
             budget_bytes = self.budget_bytes,
             contract_count = self.contracts.len(),
@@ -1517,8 +1573,11 @@ impl<T: TimeSource> HostingCache<T> {
             // Captured BEFORE removal: `contracts.len()` (and therefore the
             // resident-overhead estimate) changes once this victim is removed,
             // so whether resident pressure was the reason THIS victim was
-            // shed must be read against the pre-removal count.
+            // shed must be read against the pre-removal count. Same reasoning
+            // for the state-byte axis, captured alongside for the per-victim
+            // log line below.
             let resident_pressure_active = self.resident_overhead_over_budget();
+            let state_byte_pressure_active = self.current_bytes > self.budget_bytes;
             if let Some(entry) = self.contracts.remove(&key) {
                 let was_in_use = local + downstream > 0;
                 self.current_bytes = self.current_bytes.saturating_sub(entry.size_bytes);
@@ -1526,6 +1585,36 @@ impl<T: TimeSource> HostingCache<T> {
                 if resident_pressure_active {
                     self.resident_overhead_evictions_total =
                         self.resident_overhead_evictions_total.saturating_add(1);
+                    // Per-eviction observability for the resident-overhead axis
+                    // specifically (#5325 PR review — Ian's soak-test concern):
+                    // Must-Fix #1 controls HOW FAST evictions happen; this line
+                    // is what lets a human watching the upcoming soak tests
+                    // (nova try.freenet.org + framework) judge WHETHER they were
+                    // the right contracts — spot-check that this axis is
+                    // shedding zero/low-demand contracts, not ones other peers
+                    // or users still depend on. The existing subscriber-primary
+                    // `victim_order` is what actually protects demanded
+                    // contracts; this line is purely so that protection is
+                    // externally verifiable, not just trusted. `info!`, not
+                    // `debug!` — same `release_max_level_info` release-strip
+                    // trap as Must-Fix #2 (see the sweep-entry log above).
+                    let last_genuine_access_secs_ago = entry
+                        .last_genuine_access
+                        .map(|at| now.saturating_duration_since(at).as_secs());
+                    tracing::info!(
+                        contract = %key,
+                        local_subscriptions = local,
+                        downstream_subscribers = downstream,
+                        read_count = entry.read_count,
+                        last_genuine_access_secs_ago,
+                        state_bytes = entry.size_bytes,
+                        state_byte_pressure_also_active = state_byte_pressure_active,
+                        "resident-overhead pressure evicted a contract (#5325) — \
+                         local_subscriptions/downstream_subscribers should be 0 \
+                         and last_genuine_access_secs_ago should be large (or \
+                         absent = never accessed this run) for this to be a \
+                         correct, low-demand victim"
+                    );
                 }
                 self.record_eviction_victim(usize::from(was_in_use), entry.size_bytes);
                 // Field falsifier for the single riskiest new behavior: shedding a
@@ -2158,11 +2247,55 @@ impl<T: TimeSource> HostingCache<T> {
         (self.contracts.len() as u64).saturating_mul(ESTIMATED_RESIDENT_BYTES_PER_CONTRACT)
     }
 
-    /// Whether the count-derived resident-overhead estimate exceeds its
-    /// budget (#5325) — the second half of `evict_over_budget`'s "am I over
-    /// budget" predicate, alongside `current_bytes > budget_bytes`.
-    fn resident_overhead_over_budget(&self) -> bool {
+    /// Raw, instantaneous "is the count-derived estimate over its budget
+    /// right now" reading (#5325) — no debounce. Used only to drive the
+    /// SUSTAINED gate below and to report point-in-time state (the dashboard
+    /// tile, tripwire logging); never used directly to decide whether to
+    /// evict — see [`Self::resident_overhead_over_budget`].
+    fn resident_overhead_raw_over_budget(&self) -> bool {
         self.estimated_resident_overhead_bytes() > self.resident_overhead_budget_bytes
+    }
+
+    /// Whether resident-overhead pressure is SUSTAINED enough to act as an
+    /// eviction trigger (#5325 PR review, Must-Fix #1) — the second half of
+    /// `evict_over_budget`'s "am I over budget" predicate, alongside
+    /// `current_bytes > budget_bytes`.
+    ///
+    /// Mirrors the #4861 cost-pressure precedent
+    /// (`.claude/rules/hosting-invariants.md` invariant 3: "SUSTAINED
+    /// pressure... a single burst never triggers... continuously for at
+    /// least half the cost window") applied to a per-NODE scalar (hosted
+    /// contract count) rather than a per-contract rate: the raw estimate
+    /// must stay continuously over budget for at least
+    /// [`RESIDENT_OVERHEAD_SUSTAINED_WINDOW`]`/2` before this axis
+    /// contributes eviction pressure. `resident_overhead_breach_since`
+    /// records when the CURRENT continuous breach started; it resets to
+    /// `None` the instant the raw estimate dips back to or under budget
+    /// (an eviction bringing the count back down "cures" the breach, exactly
+    /// like the raw check would).
+    ///
+    /// This is a per-node scalar debounce, not a per-contract rate sample
+    /// like the cost axes': there is no "report burst" to filter out
+    /// (`contracts.len()` is exact, not sampled), so the risk this closes is
+    /// different but the same shape — a peer upgrading straight into a large
+    /// pre-existing hosted set gets a grace window (for organic, state-byte-
+    /// driven shrinkage, or operator notice) before this brand-new axis can
+    /// evict anything, instead of reacting on the very first sweep after
+    /// deploy.
+    ///
+    /// `&mut self`: every call site is already inside `evict_over_budget`
+    /// (`&mut self`), so recording the breach timer here — rather than as a
+    /// separate "observe" step some caller could forget — keeps the state
+    /// machine's only writer next to its only reader.
+    fn resident_overhead_over_budget(&mut self) -> bool {
+        let raw = self.resident_overhead_raw_over_budget();
+        if !raw {
+            self.resident_overhead_breach_since = None;
+            return false;
+        }
+        let now = self.time_source.now();
+        let since = *self.resident_overhead_breach_since.get_or_insert(now);
+        now.saturating_duration_since(since) >= RESIDENT_OVERHEAD_SUSTAINED_WINDOW / 2
     }
 
     /// Snapshot the cache's aggregate resource gauges under a single read for
@@ -2291,8 +2424,11 @@ impl<T: TimeSource> HostingCache<T> {
     /// Sweep for evictable contracts when the cache is over budget, at a given
     /// [`MemoryPressure`].
     ///
-    /// Only evicts when `current_bytes > budget_bytes`. Victims are chosen
-    /// subscriber-primary — ascending
+    /// Only evicts when `current_bytes > budget_bytes` OR the count-derived
+    /// resident-overhead estimate has been SUSTAINED over its own budget
+    /// (#5325 — see [`HostingCache::resident_overhead_over_budget`]); the two
+    /// axes feed the SAME decision, not two separate mechanisms. Victims are
+    /// chosen subscriber-primary — ascending
     /// `(local_subscription_count, downstream_subscriber_count, recency_seq, key)` —
     /// with eligibility governed by `pressure`:
     /// - [`MemoryPressure::AtCapacity`] (production): every entry is eligible (no
@@ -4401,13 +4537,28 @@ mod tests {
     fn resident_overhead_pressure_evicts_even_when_state_bytes_are_negligible() {
         // A generous 1 GiB state-byte budget: with 10-byte contracts this
         // axis could hold over 100 million entries and will never bind.
-        let (mut cache, _clock) = make_cache(GIB);
+        let (mut cache, clock) = make_cache(GIB);
         cache.set_resident_overhead_budget_bytes(10 * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT);
 
         for i in 0..15u32 {
             let key = make_key_u32(i);
             cache.record_access(key, 10, AccessType::Put, 1, |_| (0, 0));
         }
+        assert_eq!(
+            cache.stats().contract_count,
+            15,
+            "the sustained gate (#5325 Must-Fix #1) must not act on an \
+             instantaneous breach — nothing evicts yet"
+        );
+
+        // Advance past the sustained-breach requirement and re-trigger via the
+        // PERIODIC sweep (not another insert) — the real post-deploy path.
+        clock.advance_time(RESIDENT_OVERHEAD_SUSTAINED_WINDOW / 2 + Duration::from_secs(1));
+        let evicted = cache.sweep_expired(|_: &ContractKey| (0, 0), MemoryPressure::AtCapacity);
+        assert!(
+            !evicted.is_empty(),
+            "once sustained past the window, the periodic sweep must evict"
+        );
 
         let stats = cache.stats();
         assert_eq!(
@@ -4470,7 +4621,7 @@ mod tests {
     /// oldest (would be first evicted under plain LRU/insertion order).
     #[test]
     fn resident_overhead_pressure_respects_subscriber_primary_ordering() {
-        let (mut cache, _clock) = make_cache(GIB);
+        let (mut cache, clock) = make_cache(GIB);
         cache.set_resident_overhead_budget_bytes(3 * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT);
 
         let subscribed = make_key_u32(999);
@@ -4483,6 +4634,11 @@ mod tests {
             let key = make_key_u32(i);
             cache.record_access(key, 10, AccessType::Put, 1, counts);
         }
+
+        // Sustained gate (#5325 Must-Fix #1): nothing evicts on the
+        // instantaneous breach; advance past the window and re-sweep.
+        clock.advance_time(RESIDENT_OVERHEAD_SUSTAINED_WINDOW / 2 + Duration::from_secs(1));
+        cache.sweep_expired(counts, MemoryPressure::AtCapacity);
 
         assert!(
             cache.get(&subscribed).is_some(),
@@ -4502,7 +4658,7 @@ mod tests {
     /// `sweep_expired`.
     #[test]
     fn resident_overhead_pressure_is_enforced_by_periodic_sweep_after_bulk_load() {
-        let (mut cache, _clock) = make_cache(GIB);
+        let (mut cache, clock) = make_cache(GIB);
         for i in 0..20u32 {
             let key = make_key_u32(i);
             cache.load_persisted_entry(key, 10, AccessType::Get, Duration::from_secs(0), false);
@@ -4515,13 +4671,132 @@ mod tests {
         );
 
         cache.set_resident_overhead_budget_bytes(5 * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT);
+
+        // First sweep after restart: observes the breach (starts the
+        // sustained-breach timer) but must NOT evict yet (#5325 Must-Fix #1)
+        // — this is the exact post-upgrade instant the review flagged as
+        // dangerous without a sustained gate.
+        let first_sweep = cache.sweep_expired(|_: &ContractKey| (0, 0), MemoryPressure::AtCapacity);
+        assert!(
+            first_sweep.is_empty(),
+            "a freshly-observed breach must not evict on the very first \
+             post-restart sweep"
+        );
+        assert_eq!(cache.stats().contract_count, 20);
+
+        // Advance past the sustained window; the NEXT periodic sweep (5s
+        // cadence in production — see CLEANUP_INTERVAL) now acts.
+        clock.advance_time(RESIDENT_OVERHEAD_SUSTAINED_WINDOW / 2 + Duration::from_secs(1));
         let evicted = cache.sweep_expired(|_: &ContractKey| (0, 0), MemoryPressure::AtCapacity);
 
         assert!(
             !evicted.is_empty(),
-            "the periodic sweep must shed down to the resident-overhead budget"
+            "the periodic sweep must shed down to the resident-overhead budget \
+             once the breach has been sustained"
         );
         assert_eq!(cache.stats().contract_count, 5);
+    }
+
+    /// Dedicated regression test for the review's own concrete numbers
+    /// (2 GiB memory limit -> 256-contract resident budget; framework hosts
+    /// 1,057): without the sustained gate, the very first sweep post-deploy
+    /// would shed ~76% of the hosted set in one pass. Confirms that
+    /// specific, previously-verified-dangerous scenario is now throttled.
+    #[test]
+    fn resident_overhead_pressure_does_not_mass_evict_on_first_sweep_at_framework_scale() {
+        let (mut cache, clock) = make_cache(GIB);
+        cache.set_resident_overhead_budget_bytes(resident_overhead_budget_for_ram(2 * GIB));
+        assert_eq!(
+            cache.resident_overhead_budget_bytes(),
+            256 * MIB,
+            "sanity-check the review's own arithmetic: clamp(2GiB/8, ..) = 256MiB"
+        );
+
+        for i in 0..1057u32 {
+            let key = make_key_u32(i);
+            cache.load_persisted_entry(key, 10, AccessType::Get, Duration::from_secs(0), false);
+        }
+        cache.finalize_loading();
+        assert_eq!(cache.stats().contract_count, 1057);
+
+        // The dangerous instant: the very first sweep immediately after
+        // restart/deploy, with zero elapsed sustained time.
+        let first_sweep = cache.sweep_expired(|_: &ContractKey| (0, 0), MemoryPressure::AtCapacity);
+        assert!(
+            first_sweep.is_empty(),
+            "must NOT mass-evict ~76% of the hosted set on the very first \
+             post-deploy sweep — this is exactly what the sustained gate exists \
+             to prevent"
+        );
+        assert_eq!(cache.stats().contract_count, 1057);
+
+        // Confirm the axis is not simply inert: given enough sustained time,
+        // it does eventually shed down to the budget's contract-count
+        // equivalent (256 contracts at 1 MiB/contract).
+        clock.advance_time(RESIDENT_OVERHEAD_SUSTAINED_WINDOW / 2 + Duration::from_secs(1));
+        cache.sweep_expired(|_: &ContractKey| (0, 0), MemoryPressure::AtCapacity);
+        assert_eq!(cache.stats().contract_count, 256);
+    }
+
+    /// PR review Should-Fix #5: both budget axes bound AT ONCE, at DIFFERENT
+    /// contract-count targets (byte budget looser at 6 contracts, resident-
+    /// overhead budget stricter at 5) — proves the compound `&&` stop
+    /// condition, not an early exit once either axis alone clears, AND that
+    /// the SUSTAINED gate applies independently per axis: an unsustained
+    /// resident breach must not block byte-driven eviction (which has no
+    /// sustained gate), and once sustained it must drive ADDITIONAL eviction
+    /// beyond what byte pressure alone already achieved.
+    #[test]
+    fn both_budget_axes_bind_simultaneously() {
+        let (mut cache, clock) = make_cache(60); // byte budget: 6 contracts @ 10 bytes
+        cache.set_resident_overhead_budget_bytes(5 * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT);
+
+        for i in 0..8u32 {
+            let key = make_key_u32(i);
+            cache.load_persisted_entry(key, 10, AccessType::Get, Duration::from_secs(0), false);
+        }
+        cache.finalize_loading();
+        assert_eq!(cache.stats().contract_count, 8);
+
+        // Sweep 1: byte pressure has NO sustained gate, so it acts
+        // immediately; resident pressure is freshly observed this call (not
+        // yet sustained) and must contribute nothing.
+        let sweep1 = cache.sweep_expired(|_: &ContractKey| (0, 0), MemoryPressure::AtCapacity);
+        assert_eq!(sweep1.len(), 2);
+        assert_eq!(
+            cache.stats().contract_count,
+            6,
+            "byte pressure alone (no sustain gate) evicts down to its own \
+             6-contract target"
+        );
+        assert_eq!(
+            cache.stats().resident_overhead_evictions_total,
+            0,
+            "none of sweep 1's evictions were resident-sustained yet"
+        );
+
+        // Sweep 2, after the resident breach has been sustained: byte
+        // pressure is ALREADY satisfied (6 contracts = 60 bytes = budget),
+        // but resident pressure (still over its own 5-contract budget) must
+        // drive exactly ONE more eviction.
+        clock.advance_time(RESIDENT_OVERHEAD_SUSTAINED_WINDOW / 2 + Duration::from_secs(1));
+        let sweep2 = cache.sweep_expired(|_: &ContractKey| (0, 0), MemoryPressure::AtCapacity);
+        assert_eq!(
+            sweep2.len(),
+            1,
+            "exactly one more eviction, driven by the now-sustained resident axis"
+        );
+
+        let stats = cache.stats();
+        assert_eq!(stats.contract_count, 5);
+        assert_eq!(
+            stats.resident_overhead_evictions_total, 1,
+            "exactly the sweep-2 eviction is attributed to sustained resident pressure"
+        );
+        assert_eq!(
+            stats.budget_evictions_total, 3,
+            "3 total evictions across both sweeps (2 byte-driven + 1 resident-driven)"
+        );
     }
 
     // --- Aggregate disk budget sizing (#4683) ---
