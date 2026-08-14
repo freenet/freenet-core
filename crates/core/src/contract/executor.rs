@@ -2120,13 +2120,34 @@ mod tests {
     #[test]
     fn declared_cache_ceiling_names_every_budget() {
         const FULL: &str = include_str!("executor.rs");
-        let body = FULL
-            .split("fn declared_cache_ceiling(memory_limit: usize, pool_size: usize) -> usize {")
-            .nth(1)
-            .expect("declared_cache_ceiling must exist under that exact signature")
-            .split("\n    }")
-            .next()
-            .expect("function body must terminate");
+        // Built by concatenation so this pin's own copy of the anchor is NOT a
+        // verbatim match for it. A scrape whose anchor can match its own source
+        // silently re-scopes to a later occurrence and passes vacuously — the
+        // failure mode `.claude/rules/bug-prevention-patterns.md` records twice
+        // (#5102). The uniqueness assertion below is what makes that fail loudly
+        // instead: if the signature ever appears twice, or not at all, this stops.
+        let anchor = format!(
+            "fn declared_cache_ceiling(memory_limit: usize, {}",
+            "pool_size: usize) -> usize {"
+        );
+        assert_eq!(
+            FULL.matches(&anchor).count(),
+            1,
+            "the scrape anchor must occur EXACTLY once in this file; a second \
+             occurrence would let the pin scope itself to the wrong region"
+        );
+        let after = FULL.split(&anchor).nth(1).expect("anchor just counted");
+        // A method at 4-space indent closes with `\n    }`. Require it, rather
+        // than letting a missing end anchor widen the region to EOF.
+        let body = after
+            .split_once("\n    }")
+            .expect("could not locate the end of declared_cache_ceiling")
+            .0;
+        assert!(
+            !body.contains("\n    fn ") && !body.contains("\n    #[test]"),
+            "the scoped region escaped past declared_cache_ceiling into a \
+             sibling item — this pin would pass vacuously"
+        );
 
         for required in [
             // per-executor, multiplied by the pool
