@@ -1689,6 +1689,22 @@ pub struct HostingSnapshot {
     /// real value — so the panel can distinguish "not yet computed" from a
     /// genuine (if enormous) budget.
     pub disk_budget_bytes: Option<u64>,
+    /// Configured resident-overhead budget (bytes, #5325): the RAM-scaled
+    /// ceiling on `contract_count * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`, a
+    /// pressure axis independent of `budget_bytes`/`used_bytes` (which cover
+    /// contract STATE bytes only, not the per-contract resident bookkeeping
+    /// overhead that scales with count). See
+    /// `.claude/rules/hosting-invariants.md` invariant 3.
+    pub resident_overhead_budget_bytes: u64,
+    /// Current estimated resident-overhead bytes (#5325): `contract_count *
+    /// ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`. Compare against
+    /// `resident_overhead_budget_bytes` the same way `used_bytes` is compared
+    /// against `budget_bytes`.
+    pub estimated_resident_overhead_bytes: u64,
+    /// Monotonic count of evictions where resident-overhead pressure was
+    /// active at decision time (#5325); may overlap with
+    /// `budget_evictions_total`.
+    pub resident_overhead_evictions_total: u64,
 }
 
 /// One hosted contract's demand-driven eviction row for the dashboard.

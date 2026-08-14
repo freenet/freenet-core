@@ -2640,6 +2640,7 @@ mod tests {
             disk_compile_cache_bytes: None,
             disk_total_bytes: None,
             disk_budget_bytes: None,
+            ..Default::default()
         };
         let html = build_hosting_card(&Some(snap));
         assert!(
@@ -2681,6 +2682,7 @@ mod tests {
             disk_compile_cache_bytes: Some(5 * 1024 * 1024),
             disk_total_bytes: Some(125 * 1024 * 1024),
             disk_budget_bytes: Some(500 * 1024 * 1024),
+            ..Default::default()
         };
         let html = build_hosting_card(&Some(snap));
         assert!(
@@ -2707,6 +2709,49 @@ mod tests {
         assert!(
             html.contains("min(RAM budget, disk budget)"),
             "explanatory paragraph must mention the #4702 min(ram, disk) eviction floor — got:\n{html}"
+        );
+    }
+
+    /// #5325 PR review Should-Fix #6: the new "Resident overhead" tile
+    /// (count-derived pressure axis, independent of the RAM used/budget
+    /// tile above) must render the actual snapshot values, not just compile.
+    #[test]
+    fn hosting_card_renders_resident_overhead_tile() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 256 * 1024 * 1024,
+            used_bytes: 1024,
+            contract_count: 1,
+            budget_evictions_total: 0,
+            evictions_of_recently_read_total: 0,
+            contracts: vec![mk_hosted_entry("A", 1.0, false)],
+            resident_overhead_budget_bytes: 100 * 1024 * 1024,
+            estimated_resident_overhead_bytes: 30 * 1024 * 1024,
+            resident_overhead_evictions_total: 7,
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        assert!(
+            html.contains("Resident overhead"),
+            "resident-overhead tile label present — got:\n{html}"
+        );
+        assert!(
+            html.contains("30.0 MB"),
+            "resident-overhead used value — got:\n{html}"
+        );
+        assert!(
+            html.contains("100.0 MB"),
+            "resident-overhead budget value — got:\n{html}"
+        );
+        // Headroom = budget(100) - used(30) = 70 MB.
+        assert!(
+            html.contains("70.0 MB"),
+            "resident-overhead headroom value — got:\n{html}"
+        );
+        assert!(
+            html.contains(">7<"),
+            "resident-overhead eviction counter renders the snapshot value — got:\n{html}"
         );
     }
 

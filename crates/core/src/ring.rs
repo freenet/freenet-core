@@ -4503,6 +4503,9 @@ impl Ring {
             disk_compile_cache_bytes,
             disk_total_bytes,
             disk_budget_bytes,
+            resident_overhead_budget_bytes: stats.resident_overhead_budget_bytes,
+            estimated_resident_overhead_bytes: stats.estimated_resident_overhead_bytes,
+            resident_overhead_evictions_total: stats.resident_overhead_evictions_total,
         }
     }
 
