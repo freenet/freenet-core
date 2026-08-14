@@ -29,8 +29,7 @@ use crate::node::OpManager;
 use crate::operations::get::GetResult;
 use crate::wasm_runtime::{
     ContractRuntimeInterface, ContractStore, DelegateRuntimeInterface, DelegateStore, Runtime,
-    SecretsStore, SharedContractIndex, StateStorage, StateStore, StateStoreError,
-    UserSecretContext,
+    SecretsStore, SharedStores, StateStorage, StateStore, StateStoreError, UserSecretContext,
 };
 use crate::{
     client_events::{ClientId, HostResult},
@@ -1226,11 +1225,18 @@ const SUMMARY_CACHE_RAM_DIVISOR: usize = 64;
 /// a small node — so the count target (coverage) binds, never this floor.
 const SUMMARY_CACHE_MIN_BYTES: usize = 16 * 1024 * 1024;
 
-/// Upper clamp for the summary-cache byte budget (32 MiB). At the ~512 B floor
-/// this holds ~65k small summaries (≈ the count MAX), so coverage still holds at
-/// the count cap for small digests; a large-summary contract instead evicts down
-/// to whatever fits in 32 MiB. Per-executor × up to 16 pool workers → ≤ 512 MiB
-/// aggregate summary-cache RAM.
+/// Upper clamp for the summary-cache byte budget (32 MiB), which binds on a host
+/// with room for it: an unconstrained gateway, or any node whose pool is small
+/// enough that the envelope share is wider. At the ~512 B floor 32 MiB holds
+/// ~65k small summaries (≈ the count MAX), so coverage holds at the count cap for
+/// small digests; a large-summary contract instead evicts down to what fits.
+///
+/// This is a CEILING, not the resolved budget. On a memory-constrained many-core
+/// host `summary_budget_for` composes it down to a share of the node-wide
+/// envelope (#5268 defect 3): a 2 GiB peer with 16 workers resolves to ~5 MiB,
+/// which at the entry floor still holds ~10k small summaries. `pool_size ×
+/// (summary + delta)` is what the node actually commits, and that product is
+/// what `cache_byte_budgets_are_aggregate_safe` bounds.
 const SUMMARY_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 /// Fraction of "memory the node may use" that sizes the per-executor DELTA cache
@@ -1246,18 +1252,17 @@ const DELTA_CACHE_RAM_DIVISOR: usize = 16;
 const DELTA_CACHE_MIN_BYTES: usize = 8 * 1024 * 1024;
 
 /// Upper clamp for the delta-cache byte budget (64 MiB). Matches PR #4794's
-/// ceiling. Per-executor × up to 16 pool workers → ≤ 1 GiB aggregate delta-cache
-/// RAM. Combined with the summary cache (≤ 512 MiB aggregate) and the shared
-/// module cache (RAM/8, absolute max 4 GiB — but the divisor binds well below
-/// that on typical gateways: ~950 MiB on a 7.6 GiB box) the total cache
-/// commitment stays a safe fraction of a production gateway's memory (see
-/// `cache_byte_budgets_are_aggregate_safe`, which models the RAM-scaled budget
-/// rather than the absolute max). NOTE: this budget is PER-EXECUTOR; aggregate RAM is
-/// `pool_size × (summary_budget + delta_budget)`, not a single node-wide figure.
-/// `pool_size` tracks CPU count (core count), so a RAM-scaled per-executor budget
-/// is multiplied by cores: on an exotic high-core/low-RAM box the aggregate is a
-/// larger fraction of that box's RAM; production gateways have modest core counts
-/// and stay safe (asserted by `cache_byte_budgets_are_aggregate_safe`).
+/// ceiling.
+///
+/// Like [`SUMMARY_CACHE_MAX_BYTES`] this is a CEILING, not the resolved budget:
+/// it binds where the node has room for it, and `delta_budget_for` composes it
+/// down to a share of the node-wide envelope otherwise (#5268 defect 3). The
+/// budget is PER-EXECUTOR and `pool_size` tracks CPU COUNT, which `MemoryMax`
+/// does not constrain — multiplying a RAM-scaled per-executor budget by cores is
+/// exactly how a 2 GiB peer ended up declaring 1.5 GiB of summary+delta ceiling.
+/// `cache_byte_budgets_are_aggregate_safe` bounds the product, together with the
+/// module caches, the redb page cache, the Store arenas and the source-byte
+/// caches, on both a 2 GiB peer and a production gateway.
 const DELTA_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Per-executor SUMMARY-cache byte budget, scaled to the memory the node may use
@@ -1345,6 +1350,16 @@ const SUMMARY_CACHE_ENVELOPE_SHARE: (usize, usize) = (1, 3);
 
 /// Delta's share of a worker's envelope slice — the remaining two thirds.
 const DELTA_CACHE_ENVELOPE_SHARE: (usize, usize) = (2, 3);
+
+/// Byte ceiling for each of the two source-WASM caches (`ContractStore`'s and
+/// `DelegateStore`'s), which memoize the raw `.wasm` bytes read off disk.
+///
+/// Node-wide, not per-executor: pool executors share one cache each (see
+/// [`SharedStores`]). Before #5268 each executor built its own, so the node's
+/// real commitment was `pool_size × 10 MiB` per cache — 320 MiB across both at
+/// 16 workers, holding up to 16 copies of the same bytes, and counted by no
+/// budget anywhere.
+pub(crate) const SOURCE_CODE_CACHE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Hard floor for either cache's byte budget once the envelope has been applied.
 ///
@@ -1666,20 +1681,41 @@ where
     pub(crate) fn get_runtime_stores(
         config: &Config,
         db: Storage,
-        shared_contract_index: Option<SharedContractIndex>,
+        shared: Option<SharedStores>,
     ) -> Result<(ContractStore, DelegateStore, SecretsStore), anyhow::Error> {
-        const MAX_SIZE: u64 = 10 * 1024 * 1024;
-
-        let contract_store = match shared_contract_index {
-            Some(index) => ContractStore::new_with_shared_index(
-                config.contracts_dir(),
-                MAX_SIZE,
-                db.clone(),
-                index,
-            )?,
-            None => ContractStore::new(config.contracts_dir(), MAX_SIZE, db.clone())?,
+        let (contract_store, delegate_store) = match shared {
+            // Pool executors: adopt the node's shared indexes AND byte caches, so
+            // one contract/delegate registered anywhere is visible everywhere and
+            // the node holds ONE copy of each WASM blob rather than `pool_size`
+            // copies (#4218 for the index, #5268 for the byte cache).
+            Some(shared) => (
+                ContractStore::new_with_shared(
+                    config.contracts_dir(),
+                    db.clone(),
+                    shared.contract_index,
+                    shared.contract_code,
+                )?,
+                DelegateStore::new_with_shared(
+                    config.delegates_dir(),
+                    db.clone(),
+                    shared.delegate_index,
+                    shared.delegate_code,
+                )?,
+            ),
+            // Standalone / mock executors own their state.
+            None => (
+                ContractStore::new(
+                    config.contracts_dir(),
+                    SOURCE_CODE_CACHE_MAX_BYTES,
+                    db.clone(),
+                )?,
+                DelegateStore::new(
+                    config.delegates_dir(),
+                    SOURCE_CODE_CACHE_MAX_BYTES,
+                    db.clone(),
+                )?,
+            ),
         };
-        let delegate_store = DelegateStore::new(config.delegates_dir(), MAX_SIZE, db.clone())?;
         // Thread the operator-configured per-user secret quota (#4561, P5 of
         // #4381) into the store at construction. `0` = disabled (the default).
         // Every pooled executor passes the SAME limit (same Config), while the
@@ -1983,16 +2019,32 @@ mod tests {
     /// (MAX-clamp safety on a >32 GiB host is guarded separately by
     /// `module_cache::tests::max_clamp_combined_ceiling_is_safe_at_binding_host`.)
     fn declared_cache_ceiling(memory_limit: usize, pool_size: usize) -> usize {
+        // PER-EXECUTOR — multiplied by the pool.
         let summary = summary_budget_for(memory_limit, pool_size);
         let delta = delta_budget_for(memory_limit, pool_size);
+        // One wasmtime Store per executor, each holding retired-instance bytes up
+        // to its arena budget between refreshes. Also per-executor, and added by
+        // this PR — it has to be in the sum it introduced.
+        let arena = crate::wasm_runtime::engine::store_arena_budget_for(memory_limit, pool_size);
+
+        // NODE-WIDE — one of each, shared by every executor.
         let contract_modules = crate::wasm_runtime::budget_for_ram(memory_limit);
         let delegate_modules =
             contract_modules / crate::wasm_runtime::DELEGATE_MODULE_CACHE_BUDGET_DIVISOR;
+        // The two source-WASM byte caches. Node-wide only because #5268 made them
+        // shared; each executor used to build its own, so this term was
+        // `pool_size × 2 × 10 MiB` and counted nowhere.
+        let source_code = 2 * SOURCE_CODE_CACHE_MAX_BYTES as usize;
         #[cfg(feature = "redb")]
         let page_cache = crate::contract::storages::redb::page_cache_size_for(memory_limit);
         #[cfg(not(feature = "redb"))]
         let page_cache = 0;
-        pool_size * (summary + delta) + contract_modules + delegate_modules + page_cache
+
+        pool_size * (summary + delta + arena)
+            + contract_modules
+            + delegate_modules
+            + source_code
+            + page_cache
     }
 
     /// The per-executor byte budgets stay within their documented clamps, and the
@@ -2032,7 +2084,16 @@ mod tests {
         // 7600 MiB, not 7.6 GiB).
         let gateway_limit: usize = 7_600 * 1024 * 1024;
 
-        for (label, limit) in [("2 GiB peer", peer_limit), ("gateway", gateway_limit)] {
+        // A 1 GiB VPS is the smallest limit at which the node's own floors still
+        // leave room; below that the pre-existing 64 MiB module-cache MINIMUM
+        // dominates any budget this PR composes (see the small-host note below).
+        let small_vps: usize = 1024 * 1024 * 1024;
+
+        for (label, limit) in [
+            ("1 GiB VPS", small_vps),
+            ("2 GiB peer", peer_limit),
+            ("gateway", gateway_limit),
+        ] {
             for pool_size in [1, 4, MAX_POOL_SIZE] {
                 let total = declared_cache_ceiling(limit, pool_size);
                 assert!(
@@ -2041,6 +2102,86 @@ mod tests {
                      ceiling, which must stay under half its {limit}-byte limit"
                 );
             }
+        }
+    }
+
+    /// `declared_cache_ceiling` must keep naming EVERY declared ceiling.
+    ///
+    /// The bound it feeds is an inequality, so dropping a term does not
+    /// necessarily break it — at the 2 GiB / 16-worker shape the total sits at
+    /// roughly 45% of the limit, with room to lose a 256 MiB term and still pass.
+    /// That is exactly how the original version of this test came to omit the
+    /// Store arena and the per-executor source-byte caches while its doc comment
+    /// claimed to sum "every declared ceiling" (#5268 review, Must Fix 2).
+    ///
+    /// So pin the composition itself: every budget that consumes node memory has
+    /// to appear in the sum, and a new one is added here at the same time it is
+    /// added there.
+    #[test]
+    fn declared_cache_ceiling_names_every_budget() {
+        const FULL: &str = include_str!("executor.rs");
+        let body = FULL
+            .split("fn declared_cache_ceiling(memory_limit: usize, pool_size: usize) -> usize {")
+            .nth(1)
+            .expect("declared_cache_ceiling must exist under that exact signature")
+            .split("\n    }")
+            .next()
+            .expect("function body must terminate");
+
+        for required in [
+            // per-executor, multiplied by the pool
+            "summary_budget_for",
+            "delta_budget_for",
+            "store_arena_budget_for",
+            // node-wide
+            "budget_for_ram",
+            "DELEGATE_MODULE_CACHE_BUDGET_DIVISOR",
+            "SOURCE_CODE_CACHE_MAX_BYTES",
+            "page_cache_size_for",
+        ] {
+            assert!(
+                body.contains(required),
+                "declared_cache_ceiling must include `{required}` in the aggregate \
+                 it claims to sum; without it the bound passes while measuring less \
+                 than the node actually commits"
+            );
+        }
+        assert!(
+            body.contains("pool_size * (summary + delta + arena)"),
+            "the per-executor terms must be multiplied by the pool size — that \
+             product IS defect 3"
+        );
+    }
+
+    /// Below roughly a 1 GiB limit the aggregate is dominated by floors this PR
+    /// does not own — chiefly the 64 MiB module-cache MINIMUM, which alone is the
+    /// whole budget on a 128 MiB host.
+    ///
+    /// Asserted rather than omitted so the boundary is a stated property instead
+    /// of an untested gap: a future change that lowers those floors should see
+    /// this test and extend the matrix above, and one that RAISES a per-worker
+    /// floor will trip the multiplier bound here.
+    #[test]
+    fn small_host_ceiling_is_dominated_by_floors_this_pr_does_not_own() {
+        let tiny: usize = 128 * 1024 * 1024;
+        let module_floor = crate::wasm_runtime::budget_for_ram(tiny);
+        assert!(
+            module_floor >= tiny / 2,
+            "the module-cache floor ({module_floor}) is already half a {tiny}-byte              host — no composition of the budgets around it can bring the              aggregate under half the limit"
+        );
+
+        // What this PR DOES own on such a host stays proportionate: the
+        // per-worker terms it introduces or composes must not, multiplied by the
+        // pool, exceed the memory limit on their own.
+        for pool_size in [1, 4, 16] {
+            let per_worker = summary_budget_for(tiny, pool_size)
+                + delta_budget_for(tiny, pool_size)
+                + crate::wasm_runtime::engine::store_arena_budget_for(tiny, pool_size);
+            assert!(
+                pool_size * per_worker <= tiny,
+                "per-worker terms at {pool_size} workers total {} bytes, which must                  not exceed the {tiny}-byte limit by themselves",
+                pool_size * per_worker
+            );
         }
     }
 

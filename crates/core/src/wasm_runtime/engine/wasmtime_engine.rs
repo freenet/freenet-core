@@ -317,12 +317,21 @@ const STORE_REFRESH_THRESHOLD: u64 = 500;
 /// for slack while leaving refreshes infrequent enough not to matter.
 const STORE_ARENA_RAM_DIVISOR: usize = 8;
 
-/// Floor for the per-Store arena byte budget (16 MiB).
+/// Floor for the per-Store arena byte budget (4 MiB).
 ///
-/// Low enough to bind hard on a 2 GiB peer with 16 workers (the shape that OOMs
-/// today), high enough that a Store still retires several instances' worth of
-/// linear memory between refreshes rather than refreshing on every call.
-const STORE_ARENA_MIN_BYTES: usize = 16 * 1024 * 1024;
+/// A thrash guard, not a target: at the measured ~3 MiB of linear memory retained
+/// per instance it still lets a Store retire an instance or so between refreshes,
+/// so a refresh never lands on literally every call.
+///
+/// Deliberately small, because it is the term that fights the budget rather than
+/// serving it. `pool_size × this` is a floor on node-wide arena slack that no
+/// memory limit can reduce, so a generous value re-creates in miniature the
+/// defect-3 shape it sits next to (a per-worker constant multiplied by a
+/// CPU-derived count). Where memory is scarce enough for it to bind — below
+/// roughly a 512 MiB limit at 16 workers — more frequent refreshes are the right
+/// trade; above that the RAM-scaled share binds and this is inert (a 2 GiB peer
+/// with 16 workers resolves to 16 MiB from the share, not from here).
+const STORE_ARENA_MIN_BYTES: usize = 4 * 1024 * 1024;
 
 /// Ceiling for the per-Store arena byte budget (256 MiB).
 ///
@@ -360,8 +369,17 @@ const STORE_ARENA_MAX_BYTES: usize = 256 * 1024 * 1024;
 fn store_arena_budget_bytes() -> usize {
     let total_ram =
         crate::wasm_runtime::read_total_ram_bytes().unwrap_or(STORE_ARENA_FALLBACK_TOTAL_RAM_BYTES);
-    let pool_size: usize = crate::config::runtime_pool_size().into();
-    (total_ram / STORE_ARENA_RAM_DIVISOR / pool_size)
+    store_arena_budget_for(total_ram, crate::config::runtime_pool_size().into())
+}
+
+/// Pure sizing math behind [`store_arena_budget_bytes`], split out so
+/// aggregate-commitment tests can ask what a hypothetical host would get instead
+/// of depending on the test machine's own RAM and core count. See
+/// `contract::executor::tests::cache_byte_budgets_are_aggregate_safe`, which has
+/// to include this term: there is one Store per pool worker, so the node-wide
+/// arena slack is `pool_size ×` this.
+pub(crate) fn store_arena_budget_for(total_ram: usize, pool_size: usize) -> usize {
+    (total_ram / STORE_ARENA_RAM_DIVISOR / pool_size.max(1))
         .clamp(STORE_ARENA_MIN_BYTES, STORE_ARENA_MAX_BYTES)
 }
 
@@ -946,7 +964,13 @@ impl WasmEngine for WasmtimeEngine {
 
         if self.instances.is_empty() && (threshold_exceeded || arena_over_budget) {
             // Normal path: all instances dropped and either bound exceeded.
-            tracing::info!(
+            //
+            // `debug!`, not `info!`: with the byte bound this is a routine event
+            // rather than a rare one. On a constrained host (16 MiB arena budget,
+            // ~3 MiB retained per instance) it fires roughly every 5 instances
+            // instead of every 500, which at `info!` would bury the operator log
+            // under a line every few seconds under load.
+            tracing::debug!(
                 lifetime_instances = self.lifetime_instances,
                 retired_instance_bytes = self.retired_instance_bytes,
                 arena_budget_bytes = self.arena_budget_bytes,
@@ -958,13 +982,21 @@ impl WasmEngine for WasmtimeEngine {
                 "Refreshing engine store to reclaim memory"
             );
             self.replace_store();
-        } else if threshold_exceeded && store_expired {
+        } else if (threshold_exceeded || arena_over_budget) && store_expired {
             // Safety net: orphaned instances (leaked without engine cleanup) are
             // preventing is_empty() from being true. After STORE_MAX_AGE, force
-            // a refresh to bound virtual memory growth. The orphaned Instance
-            // handles become invalid but they were already leaked and unusable.
+            // a refresh to bound memory growth. The orphaned Instance handles
+            // become invalid but they were already leaked and unusable.
+            //
+            // This arm takes EITHER bound, like the normal arm above: the leaked
+            // instance is exactly the case `retired_instance_bytes` claims to
+            // cover, and requiring the full 500-instance count here would have
+            // left the arena's resident bytes unbounded on the one path that
+            // reaches this code (#5268 review).
             tracing::warn!(
                 lifetime_instances = self.lifetime_instances,
+                retired_instance_bytes = self.retired_instance_bytes,
+                arena_budget_bytes = self.arena_budget_bytes,
                 orphaned_instances = self.instances.len(),
                 store_age_secs = self.store_created_at.elapsed().as_secs(),
                 "Force-refreshing engine store — orphaned instances preventing normal refresh"
@@ -3643,21 +3675,25 @@ mod tests {
         // Pure sizing math, independent of the test host (see #5268 defect 3 for
         // why the pool size must divide it: it is CPU-derived and MemoryMax does
         // not constrain CPU count).
-        let sized = |total_ram: usize, pool: usize| {
-            (total_ram / STORE_ARENA_RAM_DIVISOR / pool)
-                .clamp(STORE_ARENA_MIN_BYTES, STORE_ARENA_MAX_BYTES)
-        };
+        let sized = store_arena_budget_for;
         let two_gib = 2 * 1024 * 1024 * 1024;
         assert_eq!(
             sized(two_gib, 16),
-            STORE_ARENA_MIN_BYTES,
-            "a 2 GiB cap across 16 workers must land on the floor"
+            two_gib / STORE_ARENA_RAM_DIVISOR / 16,
+            "a 2 GiB cap across 16 workers must resolve from the RAM-scaled \
+             share, with neither clamp binding"
         );
         assert!(
             sized(two_gib, 16) * 16 <= two_gib / 4,
             "node-wide arena slack on a 2 GiB peer must stay a modest fraction \
              of the limit"
         );
+        // The floor binds only where memory is genuinely scarce, and even then
+        // the node-wide slack stays bounded rather than becoming a
+        // per-worker constant times the core count.
+        let tiny = 256 * 1024 * 1024;
+        assert_eq!(sized(tiny, 16), STORE_ARENA_MIN_BYTES);
+        assert!(sized(tiny, 16) * 16 <= tiny / 4);
         // A single-worker 2 GiB peer and a large unconstrained gateway both keep
         // the generous ceiling, so this only bites the constrained many-core case.
         assert_eq!(sized(two_gib, 1), STORE_ARENA_MAX_BYTES);

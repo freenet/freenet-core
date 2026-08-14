@@ -19,6 +19,41 @@ use super::RuntimeResult;
 /// removal on A left a "ghost" instance live on B until B was rebuilt.
 pub type SharedContractIndex = Arc<DashMap<ContractInstanceId, CodeHash>>;
 
+/// Source-WASM byte cache shared across every pool executor's [`ContractStore`].
+///
+/// `moka::sync::Cache` clones are cheap handles onto ONE shared store, so this is
+/// just the cache itself. It has to be shared for the same reason
+/// [`SharedContractIndex`] does, plus a budget reason: each executor used to
+/// build its own 10 MiB cache, so the node's real commitment was
+/// `pool_size × 10 MiB` (160 MiB at 16 workers) holding up to 16 copies of the
+/// same code bytes — uncounted by any budget, and the same
+/// duplicate-by-parameterization shape #5268 is about, one layer down.
+pub type SharedCodeCache = MokaCache<CodeHash, Arc<ContractCode<'static>>>;
+
+/// Build a source-WASM byte cache bounded by `max_size` bytes.
+pub fn new_code_cache(max_size: u64) -> SharedCodeCache {
+    MokaCache::builder()
+        .max_capacity(max_size)
+        .weigher(
+            |key: &CodeHash, value: &Arc<ContractCode<'static>>| -> u32 {
+                // Saturate to u32::MAX on overflow as moka recommends. A contract
+                // WASM module larger than 4 GiB would indicate a bug in upstream
+                // size validation — log it loudly.
+                let len = value.data().len();
+                u32::try_from(len).unwrap_or_else(|_| {
+                    tracing::warn!(
+                        code_hash = %key,
+                        size_bytes = len,
+                        "Contract code exceeds u32::MAX in cache weigher; \
+                         saturating. This should be impossible."
+                    );
+                    u32::MAX
+                })
+            },
+        )
+        .build()
+}
+
 /// Handle contract blob storage on the file system.
 pub struct ContractStore {
     contracts_dir: PathBuf,
@@ -56,6 +91,22 @@ impl ContractStore {
         Self::new_with_shared_index(contracts_dir, max_size, db, Arc::new(DashMap::new()))
     }
 
+    /// [`ContractStore::new_with_shared_index`] plus a caller-owned
+    /// [`SharedCodeCache`], so pool executors share the source-byte cache too.
+    pub fn new_with_shared_index(
+        contracts_dir: PathBuf,
+        max_size: u64,
+        db: Storage,
+        key_to_code_part: SharedContractIndex,
+    ) -> RuntimeResult<Self> {
+        Self::new_with_shared(
+            contracts_dir,
+            db,
+            key_to_code_part,
+            new_code_cache(max_size),
+        )
+    }
+
     /// Like [`ContractStore::new`] but wires in a caller-owned
     /// [`SharedContractIndex`] so every pool executor sees the same live
     /// `ContractInstanceId -> CodeHash` map (#4218).
@@ -65,11 +116,11 @@ impl ContractStore {
     /// replacements pass the SAME already-populated `Arc`, so they inherit the
     /// live map (including instances stored since startup) instead of paying a
     /// redundant ReDb scan and racing the on-disk state.
-    pub fn new_with_shared_index(
+    pub fn new_with_shared(
         contracts_dir: PathBuf,
-        max_size: u64,
         db: Storage,
         key_to_code_part: SharedContractIndex,
+        shared_code_cache: SharedCodeCache,
     ) -> RuntimeResult<Self> {
         std::fs::create_dir_all(&contracts_dir).map_err(|err| {
             tracing::error!("error creating contract dir: {err}");
@@ -109,26 +160,7 @@ impl ContractStore {
         }
 
         Ok(Self {
-            contract_cache: MokaCache::builder()
-                .max_capacity(max_size)
-                .weigher(
-                    |key: &CodeHash, value: &Arc<ContractCode<'static>>| -> u32 {
-                        // Saturate to u32::MAX on overflow as moka recommends.
-                        // A contract WASM module larger than 4 GiB would indicate
-                        // a bug in upstream size validation — log it loudly.
-                        let len = value.data().len();
-                        u32::try_from(len).unwrap_or_else(|_| {
-                            tracing::warn!(
-                                code_hash = %key,
-                                size_bytes = len,
-                                "Contract code exceeds u32::MAX in cache weigher; \
-                                 saturating. This should be impossible."
-                            );
-                            u32::MAX
-                        })
-                    },
-                )
-                .build(),
+            contract_cache: shared_code_cache,
             contracts_dir,
             key_to_code_part,
             db,

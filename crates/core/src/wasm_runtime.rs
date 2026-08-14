@@ -20,9 +20,37 @@ mod tests;
 pub(crate) use contract::{
     ContractRuntimeBridge, ContractRuntimeInterface, ContractStoreBridge, classify_result,
 };
-pub use contract_store::{ContractStore, SharedContractIndex};
+pub use contract_store::{ContractStore, SharedCodeCache, SharedContractIndex};
 pub(crate) use delegate::DelegateRuntimeInterface;
-pub use delegate_store::DelegateStore;
+pub use delegate_store::{DelegateStore, SharedDelegateCodeCache, SharedDelegateIndex};
+
+/// The per-node store state every pool executor's `ContractStore` and
+/// `DelegateStore` share, rather than each building its own.
+///
+/// Bundled instead of passed as four parallel arguments because they must be
+/// adopted together: an executor that shares the index but not the byte cache
+/// (the pre-#5268 shape) silently keeps `pool_size` copies of the same WASM,
+/// and an executor that shares neither cannot see a delegate a sibling
+/// registered. Cloning this is cheap — every field is a handle.
+#[derive(Clone)]
+pub struct SharedStores {
+    pub contract_index: SharedContractIndex,
+    pub contract_code: SharedCodeCache,
+    pub delegate_index: SharedDelegateIndex,
+    pub delegate_code: SharedDelegateCodeCache,
+}
+
+impl SharedStores {
+    /// Build one set of shared handles, each byte cache bounded by `max_size`.
+    pub fn new(max_size: u64) -> Self {
+        Self {
+            contract_index: SharedContractIndex::default(),
+            contract_code: contract_store::new_code_cache(max_size),
+            delegate_index: SharedDelegateIndex::default(),
+            delegate_code: delegate_store::new_code_cache(max_size),
+        }
+    }
+}
 pub(crate) use engine::BackendEngine;
 pub(crate) use error::{ContractError, RuntimeInnerError, RuntimeResult};
 pub use mock_state_storage::MockStateStorage;

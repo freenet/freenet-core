@@ -10,7 +10,7 @@ use std::sync::Arc;
 use super::super::Runtime;
 use super::super::contract::ContractRuntimeInterface;
 use super::super::runtime::RuntimeConfig;
-use super::{TestSetup, get_test_module, setup_test_contract};
+use super::{TestSetup, code_variant, get_test_module, setup_test_contract};
 use freenet_stdlib::prelude::*;
 
 /// Loading a contract populates the cache and the cache stays within its byte
@@ -152,42 +152,6 @@ fn distinct_keys_same_code(
         keys.push(key);
     }
     keys
-}
-
-/// Append a WASM custom section carrying `tag`, yielding a module that is
-/// byte-distinct (so it compiles to its own `Module` with its own code memory)
-/// but semantically identical to `code`.
-///
-/// Custom sections are `id=0` followed by a LEB128 payload length; the payload
-/// is a name (LEB128 length + bytes) plus arbitrary data, and they may appear
-/// after any other section. This is how the eviction test below gets many
-/// genuinely different modules out of one compiled test contract — varying the
-/// PARAMETERS would no longer do it, because that is precisely the duplication
-/// #5268 removed.
-fn code_variant(code: &[u8], tag: &str) -> Vec<u8> {
-    fn leb128(mut value: u32, out: &mut Vec<u8>) {
-        loop {
-            let byte = (value & 0x7f) as u8;
-            value >>= 7;
-            if value == 0 {
-                out.push(byte);
-                return;
-            }
-            out.push(byte | 0x80);
-        }
-    }
-
-    let name = b"freenet-test-variant";
-    let mut payload = Vec::new();
-    leb128(name.len() as u32, &mut payload);
-    payload.extend_from_slice(name);
-    payload.extend_from_slice(tag.as_bytes());
-
-    let mut out = code.to_vec();
-    out.push(0x00); // custom section id
-    leb128(payload.len() as u32, &mut out);
-    out.extend_from_slice(&payload);
-    out
 }
 
 /// Build `count` contracts whose WASM code is genuinely distinct (one custom
@@ -484,6 +448,145 @@ async fn test_compiled_module_size_is_in_expected_range() -> Result<(), Box<dyn 
         (10 * 1024..=16 * 1024 * 1024).contains(&measured),
         "compiled module size {measured} bytes outside expected 10KiB..16MiB range; \
          revisit the module cache budget if the toolchain changed"
+    );
+
+    std::mem::drop(temp_dir);
+    Ok(())
+}
+
+/// Many pool executors, on separate threads, driving DIFFERENT instances of the
+/// SAME code through one shared module cache must end with exactly ONE compiled
+/// module and no lost work.
+///
+/// Keying by code hash makes this the common case rather than a rarity: before
+/// #5268 each parameterization had its own cache key, so concurrent calls for
+/// distinct instances never contended on the same entry at all. Now they all
+/// race the one key, and specifically the double-check-after-compile in
+/// `prepare_contract_call_inner` — the lock is released across the (slow)
+/// Cranelift compile, so several threads can miss, compile, and then race to
+/// insert. That must converge on a single cached entry, not N inserts trading
+/// places or a torn byte total.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_calls_on_one_code_converge_to_one_cached_module()
+-> Result<(), Box<dyn std::error::Error>> {
+    use super::super::{
+        ContractStore, DelegateStore, SecretsStore, SharedContractIndex, contract_store,
+        engine::Engine,
+    };
+    use crate::contract::storages::Storage;
+    use crate::util::tests::get_temp_dir;
+    use std::sync::{Barrier, Mutex};
+
+    const EXECUTORS: usize = 4;
+
+    let code = get_test_module("test_contract_1")?;
+    let temp_dir = get_temp_dir();
+    let db = Storage::new(temp_dir.path()).await?;
+
+    // One index and one source-byte cache, exactly as `RuntimePool` wires them.
+    let index = SharedContractIndex::default();
+    let code_cache = contract_store::new_code_cache(10 * 1024 * 1024);
+
+    // EXECUTORS distinct instances of ONE code, stored once through the shared
+    // index so every executor's store resolves them.
+    let mut seed_store = ContractStore::new_with_shared(
+        temp_dir.path().join("contracts"),
+        db.clone(),
+        index.clone(),
+        code_cache.clone(),
+    )?;
+    let keys = distinct_keys_same_code(&mut seed_store, &code, EXECUTORS);
+    drop(seed_store);
+
+    let config = RuntimeConfig {
+        module_cache_budget_bytes: 512 * 1024 * 1024,
+        ..Default::default()
+    };
+    let shared_modules: super::super::runtime::SharedModuleCache<CodeHash> = Arc::new(Mutex::new(
+        super::super::ModuleCache::new(config.module_cache_budget_bytes),
+    ));
+    let shared_delegate_modules: super::super::runtime::SharedModuleCache<CodeHash> =
+        Arc::new(Mutex::new(super::super::ModuleCache::new(
+            config.module_cache_budget_bytes,
+        )));
+    let backend = Engine::create_backend_engine(&config)?;
+    let delegate_contexts = super::super::new_delegate_context_cache();
+    let delegate_counter = super::super::new_delegate_counter();
+    let inherited_origins = super::super::new_inherited_origins();
+
+    let mut runtimes = Vec::with_capacity(EXECUTORS);
+    for i in 0..EXECUTORS {
+        let contract_store = ContractStore::new_with_shared(
+            temp_dir.path().join("contracts"),
+            db.clone(),
+            index.clone(),
+            code_cache.clone(),
+        )?;
+        let delegate_store = DelegateStore::new(
+            temp_dir.path().join(format!("delegates-{i}")),
+            10_000,
+            db.clone(),
+        )?;
+        let secrets_store = SecretsStore::new(
+            temp_dir.path().join(format!("secrets-{i}")),
+            Default::default(),
+            db.clone(),
+        )?;
+        runtimes.push(Runtime::build_with_shared_module_caches(
+            contract_store,
+            delegate_store,
+            secrets_store,
+            false,
+            shared_modules.clone(),
+            shared_delegate_modules.clone(),
+            delegate_contexts.clone(),
+            delegate_counter.clone(),
+            inherited_origins.clone(),
+            backend.clone(),
+            &config,
+        )?);
+    }
+
+    // Release every thread into its first (guaranteed-miss) call at once, so the
+    // compile-then-insert race is actually exercised rather than serialized by
+    // thread startup.
+    let barrier = Arc::new(Barrier::new(EXECUTORS));
+    let mut handles = Vec::with_capacity(EXECUTORS);
+    for (i, mut runtime) in runtimes.into_iter().enumerate() {
+        let key = keys[i];
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            let params = Parameters::from(format!("param-{i}").into_bytes());
+            let state = WrappedState::new(vec![1, 2, 3, 4]);
+            barrier.wait();
+            // Repeat so later iterations exercise the hit path under the same
+            // contention, not just the cold race.
+            for _ in 0..8 {
+                let result = runtime.validate_state(&key, &params, &state, &Default::default());
+                assert!(
+                    matches!(result, Ok(ValidateResult::Valid)),
+                    "instance {i} must validate through the shared module: {result:?}"
+                );
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("executor thread panicked");
+    }
+
+    let cache = shared_modules.lock().unwrap();
+    assert_eq!(
+        cache.len(),
+        1,
+        "{EXECUTORS} concurrent executors on one code must leave exactly ONE \
+         cached module, got {}",
+        cache.len()
+    );
+    assert!(
+        cache.total_bytes() > 0 && cache.total_bytes() <= cache.budget_bytes(),
+        "byte accounting must survive the insert race: {} bytes against a {} budget",
+        cache.total_bytes(),
+        cache.budget_bytes()
     );
 
     std::mem::drop(temp_dir);

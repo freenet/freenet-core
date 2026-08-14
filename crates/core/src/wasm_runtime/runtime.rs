@@ -55,17 +55,19 @@ pub(crate) type SharedModuleCache<K> = Arc<Mutex<ModuleCache<K, <Engine as WasmE
 /// themselves rather than from the container's self-declared `code` field
 /// (`ContractCode::hash()` returns a stored field; nothing recomputes it on
 /// deserialization — see `ContractStore::verify_contract_identity`).
-/// The catch-all mirrors the code extraction in `prepare_contract_call_inner`,
-/// which is `unimplemented!()` for the same inputs (both stdlib enums are
-/// `#[non_exhaustive]` but each has exactly one variant), so this adds no
-/// reachable panic: a container that trips this one could never have been
-/// compiled and cached in the first place.
-fn wasm_code_hash(contract: &ContractContainer) -> CodeHash {
+/// Returns an error rather than `unimplemented!()` on the catch-all, matching
+/// `ContractStore::store_contract`'s reasoning for the identical situation:
+/// unreachable today (V1 is `ContractWasmAPIVersion`'s only variant), but the
+/// enum is `#[non_exhaustive]`, and this now runs on the common PUT path, so a
+/// future variant would make that panic reachable from ordinary traffic.
+fn wasm_code_hash(contract: &ContractContainer) -> RuntimeResult<CodeHash> {
     match contract {
         ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_v1)) => {
-            CodeHash::from_code(contract_v1.code().data())
+            Ok(CodeHash::from_code(contract_v1.code().data()))
         }
-        ContractContainer::Wasm(_) | _ => unimplemented!(),
+        ContractContainer::Wasm(_) | _ => {
+            Err(anyhow::anyhow!("unsupported contract container version").into())
+        }
     }
 }
 
@@ -495,8 +497,10 @@ pub struct Runtime {
 
     pub(super) secret_store: SecretsStore,
     pub(super) delegate_store: DelegateStore,
-    /// LRU cache of compiled delegate modules (shared across pool executors).
-    pub(super) delegate_modules: SharedModuleCache<DelegateKey>,
+    /// LRU cache of compiled delegate modules (shared across pool executors),
+    /// keyed by the CODE hash rather than the delegate key — see
+    /// [`SharedModuleCache`] and `prepare_delegate_call`.
+    pub(super) delegate_modules: SharedModuleCache<CodeHash>,
     /// Persisted `ctx.write()` bytes per delegate, shared across pool
     /// executors so a prompt round-trip routed to a different `Runtime` still
     /// sees the pending state. See `native_api::DelegateContextCache`.
@@ -767,7 +771,7 @@ impl Runtime {
         secret_store: SecretsStore,
         host_mem: bool,
         contract_modules: SharedModuleCache<CodeHash>,
-        delegate_modules: SharedModuleCache<DelegateKey>,
+        delegate_modules: SharedModuleCache<CodeHash>,
         delegate_contexts: super::native_api::DelegateContextCache,
         created_delegates_count: super::native_api::SharedDelegateCounter,
         inherited_origins: super::native_api::SharedInheritedOrigins,
@@ -993,7 +997,7 @@ impl Runtime {
         // instance index, or — for a caller holding a not-yet-indexed container
         // — from hashing the very bytes we are about to compile.
         let code_hash = match already_fetched {
-            Some(contract) => wasm_code_hash(contract),
+            Some(contract) => wasm_code_hash(contract)?,
             None => self
                 .contract_store
                 .code_hash_from_id(key.id())
@@ -1089,14 +1093,32 @@ impl Runtime {
         key: &DelegateKey,
         req_bytes: usize,
     ) -> RuntimeResult<(RunningInstance, DelegateApiVersion)> {
+        // Same defect and same fix as the contract cache above (#5268):
+        // `prepare_delegate_call` compiles `delegate.code()` alone, but
+        // `DelegateKey`'s identity covers `key = BLAKE3(code_hash ‖ params)`, so
+        // keying by it compiled and retained one copy of identical machine code
+        // per PARAMETER SET — the shape per-user / per-room parameterized
+        // delegates hit hardest. The hash is resolved through this node's own
+        // delegate index for the same trust reason: `key.code_hash()` is
+        // unverified serde data, so a caller could otherwise name a delegate
+        // while choosing which cached module ran for it.
+        let code_hash = self
+            .delegate_store
+            .code_hash_from_key(key)
+            .ok_or_else(|| RuntimeInnerError::DelegateNotFound(key.clone()))?;
         // Lock held only for the lookup + Module clone; always dropped before
         // the compile below (never held across the blocking compile).
-        let cached = self.delegate_modules.lock().unwrap().get(key).cloned();
+        let cached = self
+            .delegate_modules
+            .lock()
+            .unwrap()
+            .get(&code_hash)
+            .cloned();
         let module = if let Some(module) = cached {
-            tracing::debug!(delegate = %key, "Module cache hit");
+            tracing::debug!(delegate = %key, %code_hash, "Module cache hit");
             module
         } else {
-            tracing::info!(delegate = %key, "Module cache miss — compiling");
+            tracing::info!(delegate = %key, %code_hash, "Module cache miss — compiling");
             let delegate = self
                 .delegate_store
                 .fetch_delegate(key, params)
@@ -1107,10 +1129,10 @@ impl Runtime {
             // Re-check cache: the lock was released before compilation, so
             // another executor may have compiled and cached this delegate.
             let mut cache = self.delegate_modules.lock().unwrap();
-            if let Some(existing) = cache.get(key).cloned() {
+            if let Some(existing) = cache.get(&code_hash).cloned() {
                 existing
             } else {
-                cache.insert(key.clone(), module.clone(), compiled_size);
+                cache.insert(code_hash, module.clone(), compiled_size);
                 module
             }
         };

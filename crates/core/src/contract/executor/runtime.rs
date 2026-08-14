@@ -87,8 +87,8 @@ fn byte_multiset_eq(a: &[u8], b: &[u8]) -> bool {
 
 use crate::node::OpManager;
 use crate::wasm_runtime::{
-    BackendEngine, MAX_STATE_SIZE, ModuleCache, RuntimeConfig, SharedContractIndex,
-    SharedModuleCache, UserSecretContext,
+    BackendEngine, MAX_STATE_SIZE, ModuleCache, RuntimeConfig, SharedModuleCache, SharedStores,
+    UserSecretContext,
 };
 
 use dashmap::DashMap;
@@ -439,19 +439,19 @@ impl Executor<Runtime> {
         shared_state_store: StateStore<Storage>,
         op_manager: Option<Arc<OpManager>>,
         contract_modules: SharedModuleCache<CodeHash>,
-        delegate_modules: SharedModuleCache<DelegateKey>,
+        delegate_modules: SharedModuleCache<CodeHash>,
         delegate_contexts: crate::wasm_runtime::DelegateContextCache,
         created_delegates_count: crate::wasm_runtime::SharedDelegateCounter,
         inherited_origins: crate::wasm_runtime::SharedInheritedOrigins,
         shared_backend: Option<BackendEngine>,
-        shared_contract_index: SharedContractIndex,
+        shared_stores: SharedStores,
     ) -> anyhow::Result<Self> {
         let db = shared_state_store.storage();
         // Pool executors all share ONE contract instance index (#4218), so a
         // contract stored / indexed / removed via any executor is visible to
         // every other executor's `ContractStore`.
         let (contract_store, delegate_store, secret_store) =
-            Self::get_runtime_stores(&config, db.clone(), Some(shared_contract_index))?;
+            Self::get_runtime_stores(&config, db.clone(), Some(shared_stores))?;
         // Production RuntimeConfig: opt in to compile offload so a cold-contract
         // Cranelift compile can run on a blocking thread instead of stalling the
         // current worker's other tasks (issue #4441). Whether the offload
