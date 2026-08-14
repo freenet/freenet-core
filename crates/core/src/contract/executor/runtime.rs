@@ -438,7 +438,7 @@ impl Executor<Runtime> {
         config: Arc<Config>,
         shared_state_store: StateStore<Storage>,
         op_manager: Option<Arc<OpManager>>,
-        contract_modules: SharedModuleCache<ContractKey>,
+        contract_modules: SharedModuleCache<CodeHash>,
         delegate_modules: SharedModuleCache<DelegateKey>,
         delegate_contexts: crate::wasm_runtime::DelegateContextCache,
         created_delegates_count: crate::wasm_runtime::SharedDelegateCounter,

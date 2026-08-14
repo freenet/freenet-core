@@ -21,6 +21,69 @@ pub struct PoolHealthStatus {
     pub contracts_in_flight: usize,
 }
 
+/// How long an [`InUseCodeHashes`] snapshot is reused before it is recomputed.
+///
+/// Matches the module cache's own interest-shadow refresh throttle: the split it
+/// feeds is consumed at the 5-minute snapshot cadence and at admission-gate
+/// time, so bounded staleness is harmless, while an unthrottled recompute would
+/// run the O(in-use) scan once per cached entry during an eviction sweep.
+const IN_USE_CODE_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Answers "is any contract this node currently has demand for running this
+/// WASM code?" — the module cache's interest predicate, restated at code-hash
+/// granularity because the cache is keyed by code hash rather than by contract
+/// instance (#5268).
+///
+/// `Ring::contract_in_use` is a per-instance question and the cache no longer
+/// holds instances, so the mapping has to run the other way: enumerate the
+/// in-use instances (a small set — live client subscriptions plus downstream
+/// subscribers) and resolve each through the shared contract index to the code
+/// it runs. The resulting set is memoized for
+/// [`IN_USE_CODE_REFRESH_INTERVAL`] so an eviction sweep over thousands of
+/// cached modules does not re-derive it per entry.
+struct InUseCodeHashes {
+    ring: Arc<crate::ring::Ring>,
+    index: SharedContractIndex,
+    /// `(computed_at, in-use code hashes)`. Real wall-clock `Instant` for the
+    /// same reason the cache's own throttles use one: this rate-limits a
+    /// telemetry/eviction-heuristic recompute, not node behavior.
+    snapshot: Mutex<Option<(Instant, HashSet<CodeHash>)>>,
+}
+
+impl InUseCodeHashes {
+    fn new(ring: Arc<crate::ring::Ring>, index: SharedContractIndex) -> Self {
+        Self {
+            ring,
+            index,
+            snapshot: Mutex::new(None),
+        }
+    }
+
+    fn contains(&self, code: &CodeHash) -> bool {
+        let mut snapshot = match self.snapshot.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let stale = snapshot
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() >= IN_USE_CODE_REFRESH_INTERVAL);
+        if stale {
+            let fresh: HashSet<CodeHash> = self
+                .ring
+                .in_use_contract_ids()
+                .into_iter()
+                .filter_map(|id| self.index.get(&id).map(|entry| *entry.value()))
+                .collect();
+            *snapshot = Some((Instant::now(), fresh));
+        }
+        snapshot
+            .as_ref()
+            .expect("just populated when stale")
+            .1
+            .contains(code)
+    }
+}
+
 /// A pool of executors that enables concurrent contract execution.
 ///
 /// This pool manages multiple `Executor<Runtime>` instances, allowing multiple
@@ -71,8 +134,10 @@ pub struct RuntimePool {
     shared_summaries: SharedSummaries,
     /// Per-client subscription count for O(1) limit enforcement.
     shared_client_counts: SharedClientCounts,
-    /// Shared compiled contract module cache (avoids 16x duplication across pool executors).
-    shared_contract_modules: SharedModuleCache<ContractKey>,
+    /// Shared compiled contract module cache (avoids 16x duplication across pool
+    /// executors), keyed by CODE hash so instances differing only in parameters
+    /// share one compiled module (#5268).
+    shared_contract_modules: SharedModuleCache<CodeHash>,
     /// Shared contract instance index (`ContractInstanceId -> CodeHash`) so a
     /// contract stored / indexed / removed via any executor is visible to all
     /// the others (#4218). Cloned into every executor's `ContractStore` at
@@ -327,18 +392,28 @@ impl RuntimePool {
         // process-global) keeps the gauges per-node. Both caches share one sink;
         // they're routed apart by their `"contract"` / `"delegate"` label.
         let module_cache_metrics = op_manager.ring.module_cache_metrics();
-        // Interest predicate for the CONTRACT cache only: a contract is "of
-        // interest" while `Ring::contract_in_use` holds (a live local client
-        // subscription OR a downstream peer subscriber — deliberately NOT an
-        // upstream-only subscription, which would be unbounded). This drives the
-        // interest-weighted (two-tier) eviction policy AND the always-on shadow
-        // metrics. The delegate cache has no interest concept, so it gets none
-        // and stays pure byte-LRU. Capturing a clone of the `Arc<Ring>` keeps
-        // `wasm_runtime` free of any `ring` dependency. See #4441 / #4534.
-        let ring_for_interest = op_manager.ring.clone();
-        let contract_interest: crate::wasm_runtime::InterestPredicate<ContractKey> =
-            Arc::new(move |key: &ContractKey| ring_for_interest.contract_in_use(key));
-        let shared_contract_modules: SharedModuleCache<ContractKey> =
+        // Pool-owned contract instance index shared by every executor's
+        // `ContractStore` (#4218). The first executor loads it from ReDb; the
+        // rest inherit the same live `Arc`. Created here (before the caches)
+        // because the contract cache's interest predicate resolves instances
+        // through it — see `InUseCodeHashes`.
+        let shared_contract_index: SharedContractIndex = Arc::new(DashMap::new());
+        // Interest predicate for the CONTRACT cache only: code is "of interest"
+        // while some contract running it satisfies `Ring::contract_in_use` (a
+        // live local client subscription OR a downstream peer subscriber —
+        // deliberately NOT an upstream-only subscription, which would be
+        // unbounded). This drives the interest-weighted (two-tier) eviction
+        // policy AND the always-on shadow metrics. The delegate cache has no
+        // interest concept, so it gets none and stays pure byte-LRU. Capturing a
+        // clone of the `Arc<Ring>` keeps `wasm_runtime` free of any `ring`
+        // dependency. See #4441 / #4534 / #5268.
+        let in_use_codes = Arc::new(InUseCodeHashes::new(
+            op_manager.ring.clone(),
+            shared_contract_index.clone(),
+        ));
+        let contract_interest: crate::wasm_runtime::InterestPredicate<CodeHash> =
+            Arc::new(move |code: &CodeHash| in_use_codes.contains(code));
+        let shared_contract_modules: SharedModuleCache<CodeHash> =
             Arc::new(Mutex::new(ModuleCache::with_label_and_interest(
                 contract_cache_budget,
                 "contract",
@@ -403,11 +478,6 @@ impl RuntimePool {
         // All pool executors share this so recovery tracking is consistent.
         let shared_recovery_guard: super::CorruptedStateRecoveryGuard =
             Arc::new(std::sync::Mutex::new(HashSet::new()));
-
-        // Pool-owned contract instance index shared by every executor's
-        // `ContractStore` (#4218). The first executor loads it from ReDb; the
-        // rest inherit the same live `Arc`.
-        let shared_contract_index: SharedContractIndex = Arc::new(DashMap::new());
 
         // Create the first executor to obtain a backend engine, then share it
         // with all subsequent executors. All executors MUST share the same backend

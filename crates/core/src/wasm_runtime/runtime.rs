@@ -39,7 +39,30 @@ use super::ModuleCache;
 ///   *count* cap did (the eviction-recompilation cycle behind issue #4441).
 /// - It bounds the cache's absolute memory footprint regardless of contract
 ///   count, which a count cap could not (1024 large modules ≫ 1024 small ones).
+///
+/// The contract cache is keyed by [`CodeHash`], NOT by `ContractKey`. Compilation
+/// only ever sees the WASM code (`engine.compile(code)`); parameters are written
+/// into linear memory at call time. Keying by `ContractKey` — whose `Hash`/`Eq`
+/// compare `instance = blake3(code_hash ‖ params)` — therefore compiled and
+/// retained one copy of identical machine code per PARAMETER SET: a measured
+/// ~17x duplication on a production gateway (3,746 cached modules for 215
+/// distinct `.wasm` files), which is issue #5268's largest single contributor to
+/// peers being OOM-killed at the shipped 2 GiB `MemoryMax`. The source-bytes
+/// cache one layer down (`ContractStore::contract_cache`) already keys this way.
 pub(crate) type SharedModuleCache<K> = Arc<Mutex<ModuleCache<K, <Engine as WasmEngine>::Module>>>;
+
+/// Content hash of a contract container's WASM code, derived from the bytes
+/// themselves rather than from the container's self-declared `code` field
+/// (`ContractCode::hash()` returns a stored field; nothing recomputes it on
+/// deserialization — see `ContractStore::verify_contract_identity`).
+fn wasm_code_hash(contract: &ContractContainer) -> CodeHash {
+    match contract {
+        ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_v1)) => {
+            CodeHash::from_code(contract_v1.code().data())
+        }
+        ContractContainer::Wasm(_) | _ => unimplemented!(),
+    }
+}
 
 static INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
 
@@ -486,8 +509,10 @@ pub struct Runtime {
 
     /// Local contract storage.
     pub(crate) contract_store: ContractStore,
-    /// LRU cache of compiled contract modules (shared across pool executors).
-    pub(super) contract_modules: SharedModuleCache<ContractKey>,
+    /// LRU cache of compiled contract modules (shared across pool executors),
+    /// keyed by the CODE hash rather than the contract instance — see
+    /// [`SharedModuleCache`] and `prepare_contract_call_inner`.
+    pub(super) contract_modules: SharedModuleCache<CodeHash>,
 
     /// Optional state storage backend for V2 delegate contract access.
     pub(crate) state_store_db: Option<crate::contract::storages::Storage>,
@@ -736,7 +761,7 @@ impl Runtime {
         delegate_store: DelegateStore,
         secret_store: SecretsStore,
         host_mem: bool,
-        contract_modules: SharedModuleCache<ContractKey>,
+        contract_modules: SharedModuleCache<CodeHash>,
         delegate_modules: SharedModuleCache<DelegateKey>,
         delegate_contexts: super::native_api::DelegateContextCache,
         created_delegates_count: super::native_api::SharedDelegateCounter,
@@ -950,15 +975,46 @@ impl Runtime {
         req_bytes: usize,
         already_fetched: Option<&ContractContainer>,
     ) -> RuntimeResult<RunningInstance> {
+        // Resolve the CODE hash this instance runs, which is what the compiled
+        // module is keyed by (issue #5268). Compilation only ever sees the WASM
+        // code — parameters are written into linear memory at call time — so N
+        // instances of one contract share one compiled module.
+        //
+        // The hash must NOT come from `key.code_hash()`: that is an unverified
+        // serde field which `ContractKey`'s `Hash`/`Eq` never consult, so a
+        // caller naming an instance it is entitled to could otherwise choose
+        // WHICH cached module ran for it (the same reasoning as
+        // `ContractStore::fetch_contract`). Instead it comes from the node's own
+        // instance index, or — for a caller holding a not-yet-indexed container
+        // — from hashing the very bytes we are about to compile.
+        let code_hash = match already_fetched {
+            Some(contract) => wasm_code_hash(contract),
+            None => self
+                .contract_store
+                .code_hash_from_id(key.id())
+                .ok_or_else(|| {
+                    tracing::error!(
+                        contract = %key,
+                        phase = "prepare_contract_call_failed",
+                        "Contract not indexed in store during WASM execution"
+                    );
+                    RuntimeInnerError::ContractNotFound(*key)
+                })?,
+        };
         // Check shared cache first. The lock is held only for the duration of
         // the lookup + Module clone (an Arc bump) and is ALWAYS dropped before
         // the compile below — never held across the blocking compile.
-        let cached = self.contract_modules.lock().unwrap().get(key).cloned();
+        let cached = self
+            .contract_modules
+            .lock()
+            .unwrap()
+            .get(&code_hash)
+            .cloned();
         let module = if let Some(module) = cached {
-            tracing::debug!(contract = %key, "Module cache hit");
+            tracing::debug!(contract = %key, %code_hash, "Module cache hit");
             module
         } else {
-            tracing::info!(contract = %key, "Module cache miss — compiling");
+            tracing::info!(contract = %key, %code_hash, "Module cache miss — compiling");
             // Cache miss — obtain the code and compile with the lock released
             // so the (potentially multi-hundred-millisecond) Cranelift compile
             // never blocks other executors waiting on the shared cache. When
@@ -1002,10 +1058,10 @@ impl Runtime {
             // duplicate Cranelift work, but two distinct misses can still race
             // to this insert). Prefer the already-cached clone if present.
             let mut cache = self.contract_modules.lock().unwrap();
-            if let Some(existing) = cache.get(key).cloned() {
+            if let Some(existing) = cache.get(&code_hash).cloned() {
                 existing
             } else {
-                cache.insert(*key, module.clone(), compiled_size);
+                cache.insert(code_hash, module.clone(), compiled_size);
                 module
             }
         };

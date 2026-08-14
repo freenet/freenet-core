@@ -126,9 +126,9 @@ async fn test_module_cache_tiny_budget_still_runs() -> Result<(), Box<dyn std::e
 /// Build `count` distinct `ContractKey`s from the SAME WASM code by varying the
 /// parameters, store/index each in the contract store, and return the keys.
 ///
-/// Each key is a separate cache entry (cache is keyed by the full
-/// `ContractKey`), so loading all of them exercises eviction with real compiled
-/// module sizes without needing many distinct contract source files.
+/// Every key is a distinct contract INSTANCE running byte-identical code, which
+/// is the shape issue #5268 is about: the compiled module is keyed by code hash,
+/// so all `count` instances must share exactly ONE cache entry.
 fn distinct_keys_same_code(
     contract_store: &mut super::super::ContractStore,
     code: &[u8],
@@ -154,6 +154,186 @@ fn distinct_keys_same_code(
     keys
 }
 
+/// Append a WASM custom section carrying `tag`, yielding a module that is
+/// byte-distinct (so it compiles to its own `Module` with its own code memory)
+/// but semantically identical to `code`.
+///
+/// Custom sections are `id=0` followed by a LEB128 payload length; the payload
+/// is a name (LEB128 length + bytes) plus arbitrary data, and they may appear
+/// after any other section. This is how the eviction test below gets many
+/// genuinely different modules out of one compiled test contract — varying the
+/// PARAMETERS would no longer do it, because that is precisely the duplication
+/// #5268 removed.
+fn code_variant(code: &[u8], tag: &str) -> Vec<u8> {
+    fn leb128(mut value: u32, out: &mut Vec<u8>) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                out.push(byte);
+                return;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+
+    let name = b"freenet-test-variant";
+    let mut payload = Vec::new();
+    leb128(name.len() as u32, &mut payload);
+    payload.extend_from_slice(name);
+    payload.extend_from_slice(tag.as_bytes());
+
+    let mut out = code.to_vec();
+    out.push(0x00); // custom section id
+    leb128(payload.len() as u32, &mut out);
+    out.extend_from_slice(&payload);
+    out
+}
+
+/// Build `count` contracts whose WASM code is genuinely distinct (one custom
+/// section apart), store/index each, and return the keys.
+fn distinct_code_keys(
+    contract_store: &mut super::super::ContractStore,
+    code: &[u8],
+    count: usize,
+) -> Vec<ContractKey> {
+    let mut keys = Vec::with_capacity(count);
+    for i in 0..count {
+        let variant = code_variant(code, &format!("variant-{i}"));
+        let wrapped = WrappedContract::new(
+            Arc::new(ContractCode::from(variant)),
+            Parameters::from([].as_ref()).into_owned(),
+        );
+        let key = *wrapped.key();
+        let container = ContractContainer::Wasm(ContractWasmAPIVersion::V1(wrapped));
+        contract_store
+            .store_contract(container)
+            .expect("store distinct-code contract");
+        contract_store
+            .ensure_key_indexed(&key)
+            .expect("index distinct-code key");
+        keys.push(key);
+    }
+    keys
+}
+
+/// REGRESSION (issue #5268): instances of the same code that differ only in
+/// their parameters MUST share ONE compiled module.
+///
+/// Compilation never sees parameters — `engine.compile` is handed
+/// `contract_v1.code().data()` alone and parameters are written into linear
+/// memory at call time — so a cache keyed by `ContractKey` (whose `Hash`/`Eq`
+/// compare `instance = blake3(code_hash ‖ params)`) compiled and retained one
+/// copy of identical machine code per parameter set. Measured on a production
+/// gateway: 3,746 cached modules for 215 distinct `.wasm` files, ~94% of the
+/// module-cache budget wasted, and the largest single contributor to peers
+/// being OOM-killed at the shipped 2 GiB `MemoryMax`.
+///
+/// Before the fix this test sees 8 entries and ~8x the bytes; after it, 1.
+#[tokio::test(flavor = "multi_thread")]
+async fn same_code_different_params_share_one_module() -> Result<(), Box<dyn std::error::Error>> {
+    let code = get_test_module("test_contract_1")?;
+
+    let TestSetup {
+        mut contract_store,
+        delegate_store,
+        secrets_store,
+        temp_dir,
+        ..
+    } = setup_test_contract("test_contract_1").await?;
+
+    let keys = distinct_keys_same_code(&mut contract_store, &code, 8);
+
+    let config = RuntimeConfig {
+        module_cache_budget_bytes: 512 * 1024 * 1024,
+        ..Default::default()
+    };
+    let mut runtime =
+        Runtime::build_with_config(contract_store, delegate_store, secrets_store, false, config)
+            .unwrap();
+
+    let state = WrappedState::new(vec![1, 2, 3, 4]);
+    for (i, key) in keys.iter().enumerate() {
+        let params = Parameters::from(format!("param-{i}").into_bytes());
+        drop(runtime.validate_state(key, &params, &state, &Default::default()));
+    }
+
+    let cache = runtime.contract_modules.lock().unwrap();
+    assert_eq!(
+        cache.len(),
+        1,
+        "8 instances of one contract's code must share ONE compiled module, got {} entries",
+        cache.len()
+    );
+
+    std::mem::drop(temp_dir);
+    Ok(())
+}
+
+/// Distinct instances of the same code must still each RUN correctly: the shared
+/// module is parameter-independent, and the parameters a call is executed with
+/// are the ones passed to that call.
+///
+/// Guards the obvious way to get `same_code_different_params_share_one_module`
+/// to pass wrongly — serving one instance's compiled module while silently
+/// running it with another instance's parameters.
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_module_still_honors_per_instance_parameters()
+-> Result<(), Box<dyn std::error::Error>> {
+    let code = get_test_module("test_contract_1")?;
+
+    let TestSetup {
+        mut contract_store,
+        delegate_store,
+        secrets_store,
+        temp_dir,
+        ..
+    } = setup_test_contract("test_contract_1").await?;
+
+    let keys = distinct_keys_same_code(&mut contract_store, &code, 3);
+
+    let mut runtime = Runtime::build_with_config(
+        contract_store,
+        delegate_store,
+        secrets_store,
+        false,
+        RuntimeConfig::default(),
+    )
+    .unwrap();
+
+    // test-contract-1 returns Valid for a 4-byte state and Invalid otherwise,
+    // independently of parameters — so every instance must agree on both.
+    for (i, key) in keys.iter().enumerate() {
+        let params = Parameters::from(format!("param-{i}").into_bytes());
+        let valid = runtime.validate_state(
+            key,
+            &params,
+            &WrappedState::new(vec![1, 2, 3, 4]),
+            &Default::default(),
+        );
+        assert!(
+            matches!(valid, Ok(ValidateResult::Valid)),
+            "instance {i} must validate its own state through the shared module: {valid:?}"
+        );
+        // test-contract-1 signals a non-4-byte state by returning an
+        // InvalidState error rather than `ValidateResult::Invalid`; either way
+        // it must NOT come back Valid.
+        let invalid = runtime.validate_state(
+            key,
+            &params,
+            &WrappedState::new(vec![1, 2, 3]),
+            &Default::default(),
+        );
+        assert!(
+            !matches!(invalid, Ok(ValidateResult::Valid)),
+            "instance {i} must reject a bad state through the shared module: {invalid:?}"
+        );
+    }
+
+    std::mem::drop(temp_dir);
+    Ok(())
+}
+
 /// REGRESSION (issue #4441): the cache evicts by BYTES, not by a fixed entry
 /// count. Loading many distinct modules under a byte budget that only holds a
 /// few must keep `total_bytes <= budget` and evict the rest — and crucially the
@@ -177,8 +357,10 @@ async fn test_module_cache_evicts_by_bytes_not_count() -> Result<(), Box<dyn std
         ..
     } = setup_test_contract("test_contract_1").await?;
 
-    // Create 8 distinct-param keys over the same code.
-    let keys = distinct_keys_same_code(&mut contract_store, &code, 8);
+    // Create 8 keys over genuinely DISTINCT code. Distinct parameters over one
+    // code would no longer produce 8 cache entries — that duplication is the
+    // #5268 bug — so eviction has to be driven by real distinct modules.
+    let keys = distinct_code_keys(&mut contract_store, &code, 8);
 
     // First, measure one compiled module's size with a generous budget so we
     // can pick a byte budget that holds only ~2 modules.
@@ -195,10 +377,10 @@ async fn test_module_cache_evicts_by_bytes_not_count() -> Result<(), Box<dyn std
     )
     .unwrap();
     let valid_state = WrappedState::new(vec![1, 2, 3, 4]);
-    let params0 = Parameters::from("param-0".as_bytes().to_vec());
+    let params = Parameters::from([].as_ref());
     // We only care that the module compiled and got cached; the validate
     // outcome is irrelevant here, so explicitly discard the must-use result.
-    drop(probe_runtime.validate_state(&keys[0], &params0, &valid_state, &Default::default()));
+    drop(probe_runtime.validate_state(&keys[0], &params, &valid_state, &Default::default()));
     let per_module = {
         let cache = probe_runtime.contract_modules.lock().unwrap();
         assert_eq!(cache.len(), 1);
@@ -215,7 +397,6 @@ async fn test_module_cache_evicts_by_bytes_not_count() -> Result<(), Box<dyn std
 
     // Load all 8 distinct modules.
     for (i, key) in keys.iter().enumerate() {
-        let params = Parameters::from(format!("param-{i}").into_bytes());
         drop(probe_runtime.validate_state(key, &params, &valid_state, &Default::default()));
 
         let cache = probe_runtime.contract_modules.lock().unwrap();

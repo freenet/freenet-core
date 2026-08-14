@@ -3951,6 +3951,12 @@ impl Ring {
         self.hosting_manager.contract_in_use(contract)
     }
 
+    /// Instance ids of every contract [`Self::contract_in_use`] holds for. See
+    /// `HostingManager::in_use_contract_ids`.
+    pub(crate) fn in_use_contract_ids(&self) -> Vec<ContractInstanceId> {
+        self.hosting_manager.in_use_contract_ids()
+    }
+
     /// Single helper for every state-write chokepoint. Does the three
     /// things a chokepoint MUST do, in order:
     ///
