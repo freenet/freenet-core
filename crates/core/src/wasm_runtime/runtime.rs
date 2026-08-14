@@ -55,6 +55,11 @@ pub(crate) type SharedModuleCache<K> = Arc<Mutex<ModuleCache<K, <Engine as WasmE
 /// themselves rather than from the container's self-declared `code` field
 /// (`ContractCode::hash()` returns a stored field; nothing recomputes it on
 /// deserialization — see `ContractStore::verify_contract_identity`).
+/// The catch-all mirrors the code extraction in `prepare_contract_call_inner`,
+/// which is `unimplemented!()` for the same inputs (both stdlib enums are
+/// `#[non_exhaustive]` but each has exactly one variant), so this adds no
+/// reachable panic: a container that trips this one could never have been
+/// compiled and cached in the first place.
 fn wasm_code_hash(contract: &ContractContainer) -> CodeHash {
     match contract {
         ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_v1)) => {
