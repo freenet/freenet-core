@@ -1632,6 +1632,32 @@ impl HostingManager {
         self.has_client_subscriptions(contract.id()) || self.has_downstream_subscribers(contract)
     }
 
+    /// The instance ids of every contract [`contract_in_use`](Self::contract_in_use)
+    /// currently holds true for, i.e. the exact same two demand sources that
+    /// method counts.
+    ///
+    /// Exists because the compiled-module cache is keyed by CODE hash rather
+    /// than by contract instance (#5268), so its interest predicate has to ask
+    /// "is ANY in-use contract running this code?" — a question no per-key
+    /// lookup can answer. Enumerating the (small) in-use set and mapping it
+    /// through the contract store's instance index is far cheaper than scanning
+    /// the whole index. See `RuntimePool`'s `InUseCodeHashes`.
+    pub(crate) fn in_use_contract_ids(&self) -> Vec<ContractInstanceId> {
+        let mut ids: Vec<ContractInstanceId> = self
+            .client_subscriptions
+            .iter()
+            .filter(|entry| !entry.value().is_empty())
+            .map(|entry| *entry.key())
+            .collect();
+        ids.extend(
+            self.downstream_subscribers
+                .iter()
+                .filter(|entry| !entry.value().is_empty())
+                .map(|entry| *entry.key().id()),
+        );
+        ids
+    }
+
     /// The SPLIT genuine-demand counts pinning `contract`:
     /// `(local_client_subscriptions, downstream_subscribers)`. This is the
     /// subscriber-primary eviction key (#4642, Ian's confirmed ordering): the

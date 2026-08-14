@@ -2264,12 +2264,18 @@ where
             // insert/remove) and never reads the interested gauge — we skip it to
             // avoid paying that per-hint cost for nothing (Codex review). The
             // refresh makes the gauge reflect the cache's CURRENT resident hot set
-            // at decision time (no-op before the runtime pool is built). It cannot
+            // as of the last interest-set snapshot (no-op before the runtime pool
+            // is built). Since #5268 that is NOT strictly decision-time fresh: the
+            // cache is keyed by code hash, so its interest predicate answers "is
+            // any in-use contract running this code", and that set is itself
+            // memoized for 10 s (`InUseCodeHashes`). The scan this forces is fresh;
+            // the demand it reads can be up to that window stale. It also cannot
             // see migrations still in-flight (admitted but not yet
             // hosted/compiled), so a tight burst can still overshoot by ~one
             // migration-completion latency before completed migrations push the hot
             // set to the ceiling — a bounded, self-correcting residual, not the
-            // unbounded 10-s-stale window. Uses the GAUGES-ONLY refresher: it must
+            // unbounded 10-s-stale window this refresh was added to close. Uses the
+            // GAUGES-ONLY refresher: it must
             // NOT bump the throttle-sampled would-reclassify counter (a burst would
             // inflate it by hint volume) nor reset that throttle (Codex review).
             if interest_tiered {

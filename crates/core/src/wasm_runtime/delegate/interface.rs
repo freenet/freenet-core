@@ -322,10 +322,22 @@ impl DelegateRuntimeInterface for Runtime {
 
     #[inline]
     fn unregister_delegate(&mut self, key: &DelegateKey) -> RuntimeResult<()> {
-        self.delegate_modules.lock().unwrap().remove(key);
+        let code_hash = self.delegate_store.code_hash_from_key(key);
         // Drop persisted ctx.write() bytes so an unregistered delegate can't
         // hold onto stale state if it's later re-registered.
         self.delegate_contexts.remove(key);
-        self.delegate_store.remove_delegate(key)
+        self.delegate_store.remove_delegate(key)?;
+        // Drop the compiled module only once NO remaining delegate runs that
+        // code. The cache is keyed by code hash now (#5268), so one delegate's
+        // removal must not evict the module its still-registered siblings —
+        // other parameterizations of the same WASM — share. Mirrors the
+        // reference check `remove_delegate` already applies to the `.wasm` blob,
+        // and runs after it so the removed key is out of the index.
+        if let Some(code_hash) = code_hash {
+            if !self.delegate_store.code_still_referenced(&code_hash) {
+                self.delegate_modules.lock().unwrap().remove(&code_hash);
+            }
+        }
+        Ok(())
     }
 }

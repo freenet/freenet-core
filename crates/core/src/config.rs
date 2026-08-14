@@ -4,6 +4,7 @@ use std::{
     future::Future,
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, atomic::AtomicBool},
     time::Duration,
@@ -1744,6 +1745,54 @@ pub struct Config {
 /// Default graceful-shutdown drain window.
 fn default_shutdown_drain_secs() -> u64 {
     30
+}
+
+/// Number of `Executor<Runtime>` workers the `RuntimePool` runs.
+///
+/// Reserve one logical core for the Tokio event loop and OS scheduling. WASM
+/// execution is CPU-bound, so the pool naturally can't exceed useful
+/// parallelism. Capped at 16 to stay well within the max_blocking_threads limit
+/// (see [`default_max_blocking_threads`]), preventing the executor pool from
+/// exhausting the blocking pool. `FREENET_RUNTIME_POOL_SIZE` overrides it
+/// (useful for tests).
+///
+/// This is CPU-derived, and `MemoryMax` does not constrain CPU count — a 20-core
+/// laptop inside a 2 GiB cgroup gets 16 workers. Anything sized PER WORKER must
+/// therefore compose its ceiling against the memory limit rather than assume the
+/// product is affordable (#5268 defect 3), which is why this lives here as one
+/// shared source: `RuntimePool::new` sizes the pool from it and the per-worker
+/// cache budgets divide by it.
+pub(crate) fn runtime_pool_size() -> NonZeroUsize {
+    let cores = std::thread::available_parallelism().map(|n| n.get()).ok();
+    let override_value = std::env::var(RUNTIME_POOL_SIZE_ENV)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok());
+    resolve_pool_size(cores, override_value)
+}
+
+/// Env var overriding [`runtime_pool_size`] (useful for tests).
+const RUNTIME_POOL_SIZE_ENV: &str = "FREENET_RUNTIME_POOL_SIZE";
+
+/// Upper bound on the executor pool, keeping it well within
+/// [`default_max_blocking_threads`].
+const MAX_RUNTIME_POOL_SIZE: usize = 16;
+
+/// Pure clamp math behind [`runtime_pool_size`], split out so its boundaries are
+/// unit-testable without mutating the process-global environment (which would
+/// race every other test in the binary) or depending on the test host's core
+/// count.
+///
+/// `cores` is `None` when the OS cannot report parallelism; `override_value` is
+/// the parsed env var when set.
+fn resolve_pool_size(cores: Option<usize>, override_value: Option<usize>) -> NonZeroUsize {
+    let from_cores = cores
+        .unwrap_or(4)
+        .saturating_sub(1)
+        .clamp(1, MAX_RUNTIME_POOL_SIZE);
+    let resolved = override_value
+        .map(|n| n.clamp(1, MAX_RUNTIME_POOL_SIZE))
+        .unwrap_or(from_cores);
+    NonZeroUsize::new(resolved).expect("clamped to at least 1")
 }
 
 /// Default max blocking threads: 2x CPU cores, clamped to 4-32.
@@ -5233,6 +5282,37 @@ mod tests {
     use crate::transport::TransportKeypair;
 
     use super::*;
+
+    /// The pool size is the multiplier in every per-worker memory budget
+    /// (#5268 defect 3), so its clamp boundaries are load-bearing, not cosmetic:
+    /// the divisor the budgets use and the count the pool actually creates come
+    /// from this one function, and a mismatch between them WAS the defect.
+    ///
+    /// Exercised through the pure `resolve_pool_size` rather than the env-reading
+    /// wrapper: `FREENET_RUNTIME_POOL_SIZE` is process-global, so a test that set
+    /// it would race every other test in the binary.
+    #[test]
+    fn runtime_pool_size_clamps_cores_and_override() {
+        let size = |cores, over| resolve_pool_size(cores, over).get();
+
+        // One core is reserved for the event loop and OS scheduling.
+        assert_eq!(size(Some(20), None), 16, "capped at MAX");
+        assert_eq!(size(Some(17), None), 16, "exactly at MAX after the reserve");
+        assert_eq!(size(Some(8), None), 7);
+        assert_eq!(size(Some(2), None), 1, "vega's shape: 2 cores -> 1 worker");
+        // Never zero, however few cores are reported.
+        assert_eq!(size(Some(1), None), 1);
+        assert_eq!(size(Some(0), None), 1);
+        // Unknown parallelism falls back to a 4-core assumption.
+        assert_eq!(size(None, None), 3);
+
+        // The override wins, and is clamped the same way — a hostile or fat-
+        // fingered value must not multiply the per-worker budgets past MAX.
+        assert_eq!(size(Some(20), Some(1)), 1);
+        assert_eq!(size(Some(2), Some(16)), 16);
+        assert_eq!(size(Some(2), Some(9_999)), 16);
+        assert_eq!(size(Some(20), Some(0)), 1, "zero clamps up, never panics");
+    }
 
     // ---------------------------------------------------------------------
     // #5124 — `config.toml` key convention.
