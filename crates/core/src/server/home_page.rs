@@ -2640,6 +2640,7 @@ mod tests {
             disk_compile_cache_bytes: None,
             disk_total_bytes: None,
             disk_budget_bytes: None,
+            ..Default::default()
         };
         let html = build_hosting_card(&Some(snap));
         assert!(
@@ -2681,6 +2682,7 @@ mod tests {
             disk_compile_cache_bytes: Some(5 * 1024 * 1024),
             disk_total_bytes: Some(125 * 1024 * 1024),
             disk_budget_bytes: Some(500 * 1024 * 1024),
+            ..Default::default()
         };
         let html = build_hosting_card(&Some(snap));
         assert!(

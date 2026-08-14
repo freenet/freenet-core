@@ -164,6 +164,122 @@ pub(crate) fn budget_for_ram(total_ram: u64) -> u64 {
     )
 }
 
+// =============================================================================
+// Resident-overhead (count-derived) budget — freenet/freenet-core#5325
+// =============================================================================
+//
+// `budget_bytes` above bounds hosted contract STATE bytes only (its own doc
+// says so). The dominant REAL per-contract memory cost is resident overhead
+// that has nothing to do with state size — subscription/interest bookkeeping,
+// redb/index entries, and other fixed per-contract structures — and it scales
+// with hosted CONTRACT COUNT, not state bytes. #5324 composed the module
+// cache, the wasmtime Store arena, and the per-executor summary/delta/redb
+// caches against the memory limit; this budget closes the remaining gap by
+// giving the hosting cache's OWN eviction decision a count-derived pressure
+// axis, so a peer hosting many small-state contracts (a real 2026-08-14 case:
+// a framework peer hosting 1,057 contracts under a 2 GiB cgroup cap, with
+// ~1 GB of resident memory unaccounted for by any budget) still gets eviction
+// pressure even though its state-byte usage looks comfortably in budget.
+//
+// This is composed into the SAME `evict_over_budget` decision as the
+// state-byte budget — not a new admission gate, not a new OOM valve, not a
+// hard pin (`.claude/rules/hosting-invariants.md` invariant 3: eviction is
+// ONE demand-ordered decision). `evict_over_budget` becomes "over budget" if
+// EITHER axis is exceeded, and the SAME `victim_order` (subscriber-primary,
+// then GET/PUT recency) picks the victim regardless of which axis triggered
+// the sweep. This mirrors the existing cost-pressure axes (#4861) in spirit —
+// "a new cost dimension weighed by the same decision" — but not in mechanism:
+// cost pressure targets a single OFFENDER whose share of a per-contract-
+// variable-rate axis dominates the node's total, whereas resident overhead is
+// (by this estimate) roughly UNIFORM per contract, so there is no "offender"
+// to single out — the fix is a second ceiling on the SAME over-budget
+// predicate, not a share-of-total test.
+
+/// Estimated resident-memory overhead per hosted contract, in bytes,
+/// independent of contract state size — subscription/interest bookkeeping,
+/// redb/index entries, and other per-contract fixed costs that do not show up
+/// in [`HostingCache::current_bytes`].
+///
+/// Value: 1 MiB. Provenance: the 2026-06-30 profiling referenced by
+/// `.claude/rules/hosting-invariants.md`'s "Byte-only eviction as the sole
+/// signal" anti-pattern row measured ~1 MB resident per hosted contract,
+/// uncorrelated with state bytes (~650 KB/contract there, negligible).
+/// Independently re-confirmed by the #5325 field evidence: a framework peer
+/// hosting 1,057 contracts under a 2 GiB cgroup cap had ~1 GB of resident
+/// memory unaccounted for by any budget (module cache, Store arena,
+/// summary/delta, redb — all now composed against the memory limit by
+/// #5324), i.e. ~950 KiB/contract — consistent with the earlier figure.
+///
+/// This is a coarse, UNIFORM-per-contract estimate, not a measured-per-
+/// contract-type figure — it does not distinguish a contract with heavy
+/// subscription fan-out or a large redb index from a quiet, rarely-touched
+/// one. It can be wrong in either direction: a peer hosting many small,
+/// low-fan-out contracts may have real overhead below this figure (pressure
+/// triggers EARLIER than strictly necessary — a retention cost, not a
+/// correctness one); a peer whose hosted set skews toward heavily-subscribed,
+/// high-index-overhead contracts may have real overhead ABOVE it (pressure
+/// triggers LATER than needed — the dangerous direction, since it under-
+/// protects against OOM). Revisit this constant if field telemetry (the
+/// `resident_overhead_*` [`HostingCacheStats`] fields this change adds) shows
+/// measured overhead diverging from the estimate at scale.
+pub const ESTIMATED_RESIDENT_BYTES_PER_CONTRACT: u64 = 1024 * 1024;
+
+/// Lower clamp for the RAM-scaled resident-overhead budget (128 MiB) —
+/// mirrors [`MIN_DEFAULT_HOSTING_BUDGET_BYTES`], same floor rationale applied
+/// to a different resource (resident bookkeeping bytes rather than on-disk
+/// state bytes).
+pub const MIN_RESIDENT_OVERHEAD_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Upper clamp for the RAM-scaled resident-overhead budget (1 GiB) — mirrors
+/// [`MAX_DEFAULT_HOSTING_BUDGET_BYTES`].
+pub const MAX_RESIDENT_OVERHEAD_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Fraction of total system RAM earmarked for per-contract resident overhead:
+/// 1/8, the SAME fraction [`DEFAULT_HOSTING_BUDGET_RAM_DIVISOR`] earmarks for
+/// contract state bytes.
+///
+/// JUDGMENT CALL: the two budgets are deliberately SEPARATE slices of RAM (a
+/// peer effectively reserves `2 * total_ram / 8` for hosting overall: one
+/// eighth for state bytes, a second eighth for the count-derived
+/// resident-overhead ceiling) rather than one budget divided further. A
+/// hosted contract genuinely costs memory on both axes independently, so
+/// halving one slice to carve out room for the other would just move the OOM
+/// risk from one axis to the other rather than closing the gap this issue is
+/// about. The remaining ~3/4 of RAM covers the module cache, the wasmtime
+/// Store arena, the per-executor summary/delta/redb caches (all composed
+/// against the memory limit by #5324), transport buffers, and the OS/runtime
+/// baseline — see `cache_byte_budgets_are_aggregate_safe` in
+/// `contract/executor.rs` for that composition's own accounting. Reviewers:
+/// this divisor (and whether it should instead shrink as those other budgets
+/// grow) is exactly the kind of calibration call worth pushing back on.
+const RESIDENT_OVERHEAD_BUDGET_RAM_DIVISOR: u64 = 8;
+
+/// Default resident-overhead budget (bytes), scaled to the memory the node
+/// may use — the count-derived analogue of [`default_hosting_budget_bytes`].
+/// `hosted_contract_count * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT` is weighed
+/// against this by [`HostingCache::evict_over_budget`] as an ADDITIONAL
+/// pressure axis alongside the state-byte budget, composed into the SAME
+/// demand-ordered eviction decision (see the module docs above and
+/// `.claude/rules/hosting-invariants.md` invariant 3, "eviction is ONE
+/// demand-ordered decision"). This is NOT a separate admission gate and NOT
+/// a new OOM valve.
+pub fn default_resident_overhead_budget_bytes() -> u64 {
+    let total_ram = read_total_ram_bytes()
+        .map(|v| v as u64)
+        .unwrap_or(FALLBACK_TOTAL_RAM_BYTES);
+    resident_overhead_budget_for_ram(total_ram)
+}
+
+/// Pure clamp math behind [`default_resident_overhead_budget_bytes`], split
+/// out for the same reason [`budget_for_ram`] is: unit-testable without
+/// depending on the test host's real RAM.
+pub(crate) fn resident_overhead_budget_for_ram(total_ram: u64) -> u64 {
+    (total_ram / RESIDENT_OVERHEAD_BUDGET_RAM_DIVISOR).clamp(
+        MIN_RESIDENT_OVERHEAD_BUDGET_BYTES,
+        MAX_RESIDENT_OVERHEAD_BUDGET_BYTES,
+    )
+}
+
 /// Default fraction of the disk capacity *available to Freenet* used to size the
 /// aggregate disk budget (#4683): 50%. Sized against `used + free` (capacity the
 /// node can actually reach), NOT a naive live free-space read that shrinks as it
@@ -332,6 +448,23 @@ pub(crate) struct HostingCacheStats {
     /// means the floors / share threshold are miscalibrated and churning cheap
     /// contracts.
     pub cost_evictions_total: u64,
+    /// Configured resident-overhead budget (bytes, #5325) — the RAM-scaled
+    /// ceiling on `contract_count * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`.
+    /// Compare against [`Self::estimated_resident_overhead_bytes`] the same
+    /// way [`Self::budget_bytes`] is compared against
+    /// [`Self::current_bytes`]: headroom = `1 -
+    /// estimated_resident_overhead_bytes / resident_overhead_budget_bytes`.
+    pub resident_overhead_budget_bytes: u64,
+    /// Current estimated resident-overhead bytes (#5325): `contract_count *
+    /// ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`. The count-derived analogue of
+    /// [`Self::current_bytes`] — unlike that field, this is never persisted
+    /// per-contract state, just `contract_count` times a constant.
+    pub estimated_resident_overhead_bytes: u64,
+    /// Monotonic count of evictions where resident-overhead pressure was
+    /// active at decision time (#5325). See
+    /// [`HostingCache::resident_overhead_evictions_total`] for the exact
+    /// semantics (may overlap with [`Self::budget_evictions_total`]).
+    pub resident_overhead_evictions_total: u64,
     /// Monotonic eviction victims by reason × state-size bucket. Reason order:
     /// byte-budget zero-demand, byte-budget in-use, cost pressure.
     pub eviction_victim_counts: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
@@ -913,6 +1046,22 @@ pub struct HostingCache<T: TimeSource> {
     /// #4861). Only [`Self::evict_cost_pressure`] increments it. See
     /// [`HostingCacheStats::cost_evictions_total`].
     cost_evictions_total: u64,
+    /// RAM-scaled ceiling on `contracts.len() *
+    /// ESTIMATED_RESIDENT_BYTES_PER_CONTRACT` (#5325) — the count-derived
+    /// resident-overhead pressure axis, composed into the same over-budget
+    /// decision as `budget_bytes`. Defaults to
+    /// [`default_resident_overhead_budget_bytes`] at construction;
+    /// test-settable via [`Self::set_resident_overhead_budget_bytes`].
+    resident_overhead_budget_bytes: u64,
+    /// Monotonic count of evictions where resident-overhead pressure
+    /// (`estimated_resident_overhead_bytes() > resident_overhead_budget_bytes`)
+    /// was active at decision time (#5325). May overlap with
+    /// [`Self::budget_evictions_total`] when both axes are simultaneously over
+    /// budget — this is a diagnostic overlay, not a disjoint reason code. The
+    /// field falsifier for this axis: nonzero on a peer means COUNT-driven
+    /// pressure, not just state bytes, is shaping retention. See
+    /// [`HostingCacheStats::resident_overhead_evictions_total`].
+    resident_overhead_evictions_total: u64,
     eviction_victim_counts: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
     eviction_victim_bytes: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
     /// Monotonic hosting-BEGIN counts by [`HostingCause`]. Incremented ONLY by
@@ -1149,6 +1298,18 @@ pub(crate) fn cost_eviction_candidate(
 
 impl<T: TimeSource> HostingCache<T> {
     /// Create a new hosting cache with the given byte budget.
+    ///
+    /// The resident-overhead budget (#5325) is NOT threaded through this
+    /// constructor's signature — deliberately, to avoid churning every one of
+    /// this type's call sites for a first cut. It is resolved internally from
+    /// live RAM via [`default_resident_overhead_budget_bytes`], the same
+    /// `min(host RAM, cgroup limit)` basis `budget_bytes`'s caller uses for
+    /// the state-byte default. Tests that need a specific (typically tiny)
+    /// resident-overhead budget call [`Self::set_resident_overhead_budget_bytes`]
+    /// after construction, mirroring [`Self::set_budget_for_test`]. An
+    /// operator override (e.g. a future `--max-hosting-resident-overhead`)
+    /// would thread through the same way `--max-hosting-storage` does today —
+    /// left as a follow-up unless field data shows the default needs tuning.
     pub fn new(budget_bytes: u64, time_source: T) -> Self {
         Self {
             budget_bytes,
@@ -1163,6 +1324,8 @@ impl<T: TimeSource> HostingCache<T> {
             oom_valve_evictions_total: 0,
             subscribed_evictions_total: 0,
             cost_evictions_total: 0,
+            resident_overhead_budget_bytes: default_resident_overhead_budget_bytes(),
+            resident_overhead_evictions_total: 0,
             eviction_victim_counts: [[0; STATE_SIZE_BUCKET_COUNT]; 3],
             eviction_victim_bytes: [[0; STATE_SIZE_BUCKET_COUNT]; 3],
             hosting_begins: [0; HostingCause::COUNT],
@@ -1259,9 +1422,30 @@ impl<T: TimeSource> HostingCache<T> {
     where
         G: Fn(&ContractKey) -> (usize, usize),
     {
-        if self.current_bytes <= self.budget_bytes {
+        // "Over budget" is true if EITHER the state-byte budget OR the
+        // count-derived resident-overhead estimate (#5325) is exceeded — two
+        // independent axes feeding the SAME eviction decision, not two
+        // separate mechanisms. `resident_overhead_over_budget()` is O(1)
+        // (just `contracts.len()` against a stored budget), so this early
+        // return stays cheap on the common in-budget path.
+        if self.current_bytes <= self.budget_bytes && !self.resident_overhead_over_budget() {
             return Vec::new();
         }
+
+        // Visibility for the axis this run actually triggered on (#5325):
+        // the hosting cache previously logged neither its budget nor its
+        // current usage at any level, so an OOM investigation had no signal
+        // to start from short of ad hoc field measurement. Only logged when
+        // eviction actually runs (not on every no-op periodic sweep), so this
+        // does not spam logs during normal in-budget operation.
+        tracing::debug!(
+            current_bytes = self.current_bytes,
+            budget_bytes = self.budget_bytes,
+            contract_count = self.contracts.len(),
+            estimated_resident_overhead_bytes = self.estimated_resident_overhead_bytes(),
+            resident_overhead_budget_bytes = self.resident_overhead_budget_bytes,
+            "hosting cache over budget; running eviction sweep"
+        );
 
         // Collect eviction-eligible entries with their ordering keys, then evict
         // lowest-priority first until back under budget. O(n log n) per
@@ -1324,13 +1508,25 @@ impl<T: TimeSource> HostingCache<T> {
         let now = self.time_source.now();
         let mut evicted = Vec::new();
         for (key, local, downstream, _seq) in candidates {
-            if self.current_bytes <= self.budget_bytes {
-                break; // back under budget, stop evicting
+            // Stop as soon as BOTH axes clear (#5325): a resident-overhead-only
+            // sweep must keep evicting past the point where state bytes alone
+            // would already look fine, and vice versa.
+            if self.current_bytes <= self.budget_bytes && !self.resident_overhead_over_budget() {
+                break; // back under budget on both axes, stop evicting
             }
+            // Captured BEFORE removal: `contracts.len()` (and therefore the
+            // resident-overhead estimate) changes once this victim is removed,
+            // so whether resident pressure was the reason THIS victim was
+            // shed must be read against the pre-removal count.
+            let resident_pressure_active = self.resident_overhead_over_budget();
             if let Some(entry) = self.contracts.remove(&key) {
                 let was_in_use = local + downstream > 0;
                 self.current_bytes = self.current_bytes.saturating_sub(entry.size_bytes);
                 self.budget_evictions_total = self.budget_evictions_total.saturating_add(1);
+                if resident_pressure_active {
+                    self.resident_overhead_evictions_total =
+                        self.resident_overhead_evictions_total.saturating_add(1);
+                }
                 self.record_eviction_victim(usize::from(was_in_use), entry.size_bytes);
                 // Field falsifier for the single riskiest new behavior: shedding a
                 // subscribed contract. Counted by the captured subscriber split
@@ -1399,7 +1595,7 @@ impl<T: TimeSource> HostingCache<T> {
         // backstop. Not a `debug_assert!`: the "contract larger than budget" corner
         // is legitimate (the old `min_ttl` age-0 gate left the same state silently),
         // so we surface it as a warning rather than panicking debug builds.
-        if self.current_bytes > self.budget_bytes {
+        if self.current_bytes > self.budget_bytes || self.resident_overhead_over_budget() {
             if let Some(protected_key) = protected {
                 if matches!(pressure, MemoryPressure::AtCapacity)
                     && self.contracts.contains_key(protected_key)
@@ -1408,7 +1604,9 @@ impl<T: TimeSource> HostingCache<T> {
                         contract = %protected_key,
                         current_bytes = self.current_bytes,
                         budget_bytes = self.budget_bytes,
-                        over_by = self.current_bytes - self.budget_bytes,
+                        estimated_resident_overhead_bytes = self.estimated_resident_overhead_bytes(),
+                        resident_overhead_budget_bytes = self.resident_overhead_budget_bytes,
+                        over_by = self.current_bytes.saturating_sub(self.budget_bytes),
                         "op-scoped backstop kept an in-flight contract while still over \
                          budget (pathological — a genuine RAM-overflow signal would pierce \
                          this via Overflow)",
@@ -1933,6 +2131,40 @@ impl<T: TimeSource> HostingCache<T> {
         self.budget_bytes = budget_bytes;
     }
 
+    /// Get the resident-overhead budget in bytes (#5325).
+    #[allow(dead_code)] // Public API for introspection
+    pub fn resident_overhead_budget_bytes(&self) -> u64 {
+        self.resident_overhead_budget_bytes
+    }
+
+    /// Overwrite the resident-overhead budget (#5325). Mirrors
+    /// [`Self::set_budget_bytes`]: O(1), does not itself evict — the next
+    /// `evict_over_budget` (on sweep or cache insert) enforces the new value.
+    /// The production default (installed at construction) is
+    /// [`default_resident_overhead_budget_bytes`]; this setter exists for
+    /// tests that need a small, deterministic value instead of whatever the
+    /// test host's live RAM resolves to, and for a future operator override.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn set_resident_overhead_budget_bytes(&mut self, budget_bytes: u64) {
+        self.resident_overhead_budget_bytes = budget_bytes;
+    }
+
+    /// Current estimated resident-overhead bytes (#5325): `contracts.len() *
+    /// ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`. The count-derived analogue of
+    /// [`Self::current_bytes`] — a coarse estimate, not a measured figure (see
+    /// [`ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`]'s doc for provenance and
+    /// error bounds).
+    fn estimated_resident_overhead_bytes(&self) -> u64 {
+        (self.contracts.len() as u64).saturating_mul(ESTIMATED_RESIDENT_BYTES_PER_CONTRACT)
+    }
+
+    /// Whether the count-derived resident-overhead estimate exceeds its
+    /// budget (#5325) — the second half of `evict_over_budget`'s "am I over
+    /// budget" predicate, alongside `current_bytes > budget_bytes`.
+    fn resident_overhead_over_budget(&self) -> bool {
+        self.estimated_resident_overhead_bytes() > self.resident_overhead_budget_bytes
+    }
+
     /// Snapshot the cache's aggregate resource gauges under a single read for
     /// per-node telemetry. See [`HostingCacheStats`].
     pub fn stats(&self) -> HostingCacheStats {
@@ -1970,6 +2202,9 @@ impl<T: TimeSource> HostingCache<T> {
             evicted_unread_total: self.evicted_unread_total,
             evicted_unread_age_secs_sum: self.evicted_unread_age_secs_sum,
             oom_valve_evictions_total: self.oom_valve_evictions_total,
+            resident_overhead_budget_bytes: self.resident_overhead_budget_bytes,
+            estimated_resident_overhead_bytes: self.estimated_resident_overhead_bytes(),
+            resident_overhead_evictions_total: self.resident_overhead_evictions_total,
         }
     }
 
@@ -4115,6 +4350,178 @@ mod tests {
         // give distinct budgets.
         assert_ne!(budget_for_ram(2 * GIB), budget_for_ram(3 * GIB));
         assert_ne!(budget_for_ram(3 * GIB), budget_for_ram(4 * GIB));
+    }
+
+    // --- Resident-overhead (count-derived) budget (#5325) ---
+
+    /// Same clamp behavior as [`budget_for_ram_scales_and_clamps`], for the
+    /// count-derived resident-overhead budget.
+    #[test]
+    fn resident_overhead_budget_for_ram_scales_and_clamps() {
+        assert_eq!(
+            resident_overhead_budget_for_ram(512 * MIB),
+            MIN_RESIDENT_OVERHEAD_BUDGET_BYTES
+        );
+        assert_eq!(
+            resident_overhead_budget_for_ram(GIB),
+            MIN_RESIDENT_OVERHEAD_BUDGET_BYTES
+        );
+        assert_eq!(resident_overhead_budget_for_ram(2 * GIB), 256 * MIB);
+        assert_eq!(resident_overhead_budget_for_ram(4 * GIB), 512 * MIB);
+        assert_eq!(
+            resident_overhead_budget_for_ram(8 * GIB),
+            MAX_RESIDENT_OVERHEAD_BUDGET_BYTES
+        );
+        assert_eq!(
+            resident_overhead_budget_for_ram(128 * GIB),
+            MAX_RESIDENT_OVERHEAD_BUDGET_BYTES
+        );
+    }
+
+    /// A key-maker with a wider seed space than [`make_key`] (`u8`, 256 max):
+    /// the resident-overhead tests below need well over 256 distinct
+    /// contracts to exceed a small resident budget while keeping
+    /// `ESTIMATED_RESIDENT_BYTES_PER_CONTRACT` at a realistic 1 MiB.
+    fn make_key_u32(seed: u32) -> ContractKey {
+        let mut id_bytes = [0u8; 32];
+        id_bytes[..4].copy_from_slice(&seed.to_le_bytes());
+        let mut code_bytes = [0u8; 32];
+        code_bytes[..4].copy_from_slice(&seed.wrapping_add(1).to_le_bytes());
+        ContractKey::from_id_and_code(ContractInstanceId::new(id_bytes), CodeHash::new(code_bytes))
+    }
+
+    /// The core #5325 regression test: a peer hosting many contracts with
+    /// NEGLIGIBLE state bytes each must still come under eviction pressure
+    /// once `hosted_contract_count * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`
+    /// exceeds the resident-overhead budget — even though the state-byte
+    /// budget alone is nowhere close to binding. This is exactly the
+    /// framework-peer shape from the issue: 1,057 contracts, negligible state
+    /// bytes each, ~1 GB of resident overhead no budget accounted for.
+    #[test]
+    fn resident_overhead_pressure_evicts_even_when_state_bytes_are_negligible() {
+        // A generous 1 GiB state-byte budget: with 10-byte contracts this
+        // axis could hold over 100 million entries and will never bind.
+        let (mut cache, _clock) = make_cache(GIB);
+        cache.set_resident_overhead_budget_bytes(10 * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT);
+
+        for i in 0..15u32 {
+            let key = make_key_u32(i);
+            cache.record_access(key, 10, AccessType::Put, 1, |_| (0, 0));
+        }
+
+        let stats = cache.stats();
+        assert_eq!(
+            stats.contract_count, 10,
+            "resident-overhead pressure must cap the hosted set at the budget's \
+             contract-count equivalent even though state bytes are negligible"
+        );
+        assert!(
+            stats.current_bytes < stats.budget_bytes,
+            "the state-byte budget alone would say this cache is nowhere near \
+             over budget (current={}, budget={})",
+            stats.current_bytes,
+            stats.budget_bytes
+        );
+        assert!(
+            stats.resident_overhead_evictions_total > 0,
+            "eviction must be attributable to resident-overhead pressure"
+        );
+        assert_eq!(
+            stats.resident_overhead_evictions_total, stats.budget_evictions_total,
+            "every eviction in this scenario was resident-pressure-driven \
+             (the byte budget never bound)"
+        );
+        assert_eq!(
+            stats.estimated_resident_overhead_bytes,
+            10 * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT
+        );
+    }
+
+    /// Negative/boundary counterpart: resident overhead sitting exactly AT
+    /// the budget must not evict (mirrors
+    /// `evict_cost_pressure_exact_share_boundary_not_shed`'s boundary
+    /// discipline for the cost axes).
+    #[test]
+    fn resident_overhead_at_budget_does_not_evict() {
+        let (mut cache, _clock) = make_cache(GIB);
+        cache.set_resident_overhead_budget_bytes(5 * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT);
+
+        for i in 0..5u32 {
+            let key = make_key_u32(i);
+            cache.record_access(key, 10, AccessType::Put, 1, |_| (0, 0));
+        }
+
+        let stats = cache.stats();
+        assert_eq!(
+            stats.contract_count, 5,
+            "exactly at budget: nothing evicted"
+        );
+        assert_eq!(stats.resident_overhead_evictions_total, 0);
+        assert_eq!(
+            stats.estimated_resident_overhead_bytes,
+            5 * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT
+        );
+    }
+
+    /// Resident-overhead pressure must respect the SAME subscriber-primary
+    /// victim ordering as byte-budget eviction (hosting-invariants invariant
+    /// 3) — a locally-subscribed contract survives while zero-subscriber
+    /// contracts are still eligible, even though it is numerically the
+    /// oldest (would be first evicted under plain LRU/insertion order).
+    #[test]
+    fn resident_overhead_pressure_respects_subscriber_primary_ordering() {
+        let (mut cache, _clock) = make_cache(GIB);
+        cache.set_resident_overhead_budget_bytes(3 * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT);
+
+        let subscribed = make_key_u32(999);
+        let counts = move |k: &ContractKey| if *k == subscribed { (1, 0) } else { (0, 0) };
+
+        // Insert the locally-subscribed contract FIRST (oldest recency) so a
+        // plain recency/LRU policy would evict it before anything else.
+        cache.record_access(subscribed, 10, AccessType::Put, 1, counts);
+        for i in 0..8u32 {
+            let key = make_key_u32(i);
+            cache.record_access(key, 10, AccessType::Put, 1, counts);
+        }
+
+        assert!(
+            cache.get(&subscribed).is_some(),
+            "a locally-subscribed contract must survive resident-overhead \
+             pressure while zero-subscriber contracts are still eligible \
+             (same victim_order as byte-budget eviction)"
+        );
+        assert_eq!(cache.stats().contract_count, 3);
+    }
+
+    /// Resident-overhead pressure must also be enforced by the PERIODIC sweep,
+    /// not only at insertion time — this is the real-world path #5325
+    /// describes: `load_persisted_entry` (bulk startup reload) deliberately
+    /// does NOT evict ("we may be over budget after loading" — see its doc),
+    /// so a peer restarting with more hosted contracts than its
+    /// resident-overhead budget allows sits over budget until the next
+    /// `sweep_expired`.
+    #[test]
+    fn resident_overhead_pressure_is_enforced_by_periodic_sweep_after_bulk_load() {
+        let (mut cache, _clock) = make_cache(GIB);
+        for i in 0..20u32 {
+            let key = make_key_u32(i);
+            cache.load_persisted_entry(key, 10, AccessType::Get, Duration::from_secs(0), false);
+        }
+        cache.finalize_loading();
+        assert_eq!(
+            cache.stats().contract_count,
+            20,
+            "bulk load does not evict, by design"
+        );
+
+        cache.set_resident_overhead_budget_bytes(5 * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT);
+        let evicted = cache.sweep_expired(|_: &ContractKey| (0, 0), MemoryPressure::AtCapacity);
+
+        assert!(
+            !evicted.is_empty(),
+            "the periodic sweep must shed down to the resident-overhead budget"
+        );
+        assert_eq!(cache.stats().contract_count, 5);
     }
 
     // --- Aggregate disk budget sizing (#4683) ---

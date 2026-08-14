@@ -1335,6 +1335,16 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
         _ => MEASURING.to_string(),
     };
 
+    // Resident-overhead tile (#5325): the state-byte budget above bounds
+    // contract STATE bytes only. This tile is the count-derived axis —
+    // `contract_count * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT` — that closes
+    // the gap where many small-state contracts (negligible RAM-used-tile
+    // impact) still exhaust a peer's real resident memory via per-contract
+    // subscription/index bookkeeping.
+    let resident_overhead_headroom = h
+        .resident_overhead_budget_bytes
+        .saturating_sub(h.estimated_resident_overhead_bytes);
+
     format!(
         r##"<div class="card">
             <div class="card-header"><h2>Demand-driven eviction</h2><span class="g-mode g-mode-enforce">piece A</span></div>
@@ -1353,6 +1363,14 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
                     <div class="g-norm" title="{disk_breakdown_title}"><div class="g-norm-label">Disk used</div><div class="g-norm-value">{disk_used}</div></div>
                     <div class="g-norm"><div class="g-norm-label">Disk budget</div><div class="g-norm-value">{disk_budget}</div></div>
                     <div class="g-norm"><div class="g-norm-label">Disk headroom</div><div class="g-norm-value">{disk_headroom}</div></div>
+                </div>
+            </div>
+            <div class="g-verdict-row">
+                <div class="g-norms">
+                    <div class="g-norm" title="Estimated, not measured: contract_count × 1 MiB/contract (#5325). Bounds per-contract resident bookkeeping overhead (subscriptions, redb/index entries) that RAM used/budget above does not count."><div class="g-norm-label">Resident overhead (est.)</div><div class="g-norm-value">{resident_overhead_used}</div></div>
+                    <div class="g-norm"><div class="g-norm-label">Resident overhead budget</div><div class="g-norm-value">{resident_overhead_budget}</div></div>
+                    <div class="g-norm"><div class="g-norm-label">Resident overhead headroom</div><div class="g-norm-value">{resident_overhead_headroom}</div></div>
+                    <div class="g-norm"><div class="g-norm-label">Resident overhead evictions</div><div class="g-norm-value">{resident_overhead_evictions}</div></div>
                 </div>
             </div>
             <div class="table-wrap">
@@ -1374,6 +1392,10 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
         disk_used = disk_used_value,
         disk_budget = disk_budget_value,
         disk_headroom = disk_headroom_value,
+        resident_overhead_used = format_bytes(h.estimated_resident_overhead_bytes),
+        resident_overhead_budget = format_bytes(h.resident_overhead_budget_bytes),
+        resident_overhead_headroom = format_bytes(resident_overhead_headroom),
+        resident_overhead_evictions = h.resident_overhead_evictions_total,
         rows = rows,
         footer = footer,
     )
