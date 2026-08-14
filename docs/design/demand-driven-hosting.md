@@ -35,9 +35,9 @@ The current code is full of `relay` naming (`drive_relay_subscribe`, `relay_subs
 
 ### No authoritative copy
 
-There is no primary, no leader, no authoritative replica. Every copy of a contract's state is equal. Contract state is a **commutative monoid**: updates are merged with an operation that is associative and commutative, so any set of updates applied in any order converges to the same state. Mergeability is a requirement the contract model places on contract authors, not an assumption the network makes and hopes holds.
+There is no primary, no leader, no authoritative replica. Every copy of a contract's state is equal. Contract state is an **idempotent commutative monoid**: updates are merged with an operation that is associative, commutative, and idempotent, so any set of updates applied in any order — including redundant re-application of the same update — converges to the same state. Mergeability is a requirement the contract model places on contract authors, not an assumption the network makes and hopes holds.
 
-**Why no authority?** An authoritative copy would need a fixed home, a way to elect or locate that home, and a way to recover it after the hosting peer churns out. All three are expensive and fragile in a peer-to-peer network with constant membership change. A commutative merge sidesteps the whole problem: correctness no longer depends on *which* copy you talk to or *what order* updates arrive in. Peers near the contract's key location host it more often, but only because requests route toward the key (gravity), not because those peers hold any special status.
+**Why no authority?** An authoritative copy would need a fixed home, a way to elect or locate that home, and a way to recover it after the hosting peer churns out. All three are expensive and fragile in a peer-to-peer network with constant membership change. An idempotent commutative merge sidesteps the whole problem: correctness no longer depends on *which* copy you talk to, *what order* updates arrive in, or *whether* an update is delivered more than once. Peers near the contract's key location host it more often, but only because requests route toward the key (gravity), not because those peers hold any special status.
 
 ### Updates propagate by proximity
 
