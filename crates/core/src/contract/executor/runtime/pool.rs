@@ -77,6 +77,19 @@ impl InUseCodeHashes {
         }
     }
 
+    /// # Lock ordering (do not invert)
+    ///
+    /// This runs as the module cache's interest predicate, so the caller already
+    /// holds the module-cache mutex. Nesting is therefore
+    /// `module cache → this snapshot mutex → the hosting DashMaps` (via
+    /// `in_use_ids`) and the contract-index DashMap.
+    ///
+    /// It is deadlock-free only because nothing on the other three ever reaches
+    /// BACK for the module cache: `Ring::in_use_contract_ids` and the index are
+    /// pure reads that call nothing in `wasm_runtime`. Adding a module-cache
+    /// touch to any hosting path — or calling `contains` while holding a hosting
+    /// lock — would close the cycle, so keep this the innermost consumer, not a
+    /// participant.
     fn contains(&self, code: &CodeHash) -> bool {
         let mut snapshot = match self.snapshot.lock() {
             Ok(guard) => guard,
