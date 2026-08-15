@@ -114,11 +114,27 @@ pub(crate) use hosting::HostingCause;
 /// `config::ConfigArgs::build` so an upgraded node re-derives its hosting budget
 /// instead of keeping the historically-pinned default (#4565).
 pub(crate) use hosting::LEGACY_FLAT_HOSTING_BUDGET_BYTES;
+/// Clamp bound re-exported only for the config-default round-trip test.
+#[cfg(test)]
+pub(crate) use hosting::MAX_DEFAULT_HOSTING_BUDGET_BYTES;
+/// The aggregate hosting-disk budget's own floor — also the wasmtime
+/// compile-cache's configured-budget bound's floor (#5328 review), so this is
+/// a genuine production dependency now, not test-only.
+pub(crate) use hosting::MIN_DEFAULT_HOSTING_BUDGET_BYTES;
 /// Single source of truth for the default hosted-contract-state budget.
 /// `config::default_max_hosting_storage()` resolves to this so the
 /// operator-facing default and the in-code fallback can never drift. The
 /// default is RAM-scaled (capability-relative, A2) rather than a flat constant.
 pub(crate) use hosting::default_hosting_budget_bytes;
+/// The aggregate hosting-disk budget's own pure clamp math. A genuine
+/// production dependency (#5328 review): the wasmtime compile-cache's
+/// configured-budget bound (`wasm_runtime::runtime::bound_by_configured_disk_budget`)
+/// projects what the live aggregate budget will resolve to via this SAME
+/// function, so the compile cache respects an operator-shrunk
+/// `--max-hosting-disk` rather than only physical disk availability. Also
+/// used by the wasmtime disk-cache sizing tests to verify headroom against
+/// the real function rather than a duplicate.
+pub(crate) use hosting::disk_budget_for_clamped;
 /// The hosting budget's pure RAM clamp, re-exported (test-only) so the wasmtime
 /// on-disk compile-cache sizing test can pin that the compile cache never
 /// exceeds the contract-state budget it accelerates.
@@ -137,9 +153,6 @@ pub(crate) use hosting::{DEFAULT_HOSTING_DISK_PCT, DEFAULT_MAX_HOSTING_DISK_BYTE
 /// snapshot, re-exported so `router` sizes its wire arrays from the same
 /// definition the bucketing code uses.
 pub(crate) use hosting::{GENUINE_ACCESS_RECENCY_BUCKETS, READ_COUNT_HIST_BUCKETS};
-/// Clamp bounds re-exported only for the config-default round-trip test.
-#[cfg(test)]
-pub(crate) use hosting::{MAX_DEFAULT_HOSTING_BUDGET_BYTES, MIN_DEFAULT_HOSTING_BUDGET_BYTES};
 /// The aggregate disk-usage tracker's mount-availability probe and directory
 /// walk, re-exported so the wasmtime on-disk compile-cache startup sizing
 /// (`wasm_runtime::runtime::default_wasmtime_cache_size_bytes_for_dir`, #5014)

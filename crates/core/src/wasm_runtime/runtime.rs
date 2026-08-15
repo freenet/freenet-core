@@ -427,11 +427,41 @@ pub(crate) fn wasmtime_cache_size_for_ram(total_ram: u64) -> u64 {
 /// same way") rather than two unrelated fractions.
 const WASMTIME_CACHE_DISK_DIVISOR: u64 = 8;
 
+/// Lower clamp for the compile cache's DISK-side term ONLY (#5328 review) —
+/// deliberately LOWER than [`MIN_WASMTIME_CACHE_SIZE_BYTES`] (the RAM-side
+/// floor, also the aggregate hosting-disk budget's own floor,
+/// `MIN_DEFAULT_HOSTING_BUDGET_BYTES` in `ring/hosting/cache.rs`).
+///
+/// If the disk-side term shared the 128 MiB RAM-side floor, the two floors
+/// would COLLIDE on a genuinely small disk: `wasmtime_cache_size_for_disk`
+/// would floor at 128 MiB at the exact same reachable-disk size
+/// (256 MiB) where the aggregate disk budget ALSO floors at 128 MiB,
+/// leaving EXACTLY ZERO headroom for actual contract state — the compile
+/// cache alone would consume the entire disk-budget floor, on any host with
+/// <= 256 MiB reachable disk. That is a narrower, but still real, residual
+/// instance of the wedge #5014 exists to fix.
+///
+/// Set to `MIN_WASMTIME_CACHE_SIZE_BYTES / 4` (32 MiB) so the two floors'
+/// breakeven points coincide exactly (`32 MiB * WASMTIME_CACHE_DISK_DIVISOR
+/// == 256 MiB == MIN_DEFAULT_HOSTING_BUDGET_BYTES /
+/// DEFAULT_HOSTING_DISK_PCT`), which makes the headroom function
+/// `disk_budget - disk_term` CONTINUOUS and strictly positive across every
+/// reachable-disk size, not just the one worked example in the issue —
+/// verified by `disk_term_never_exceeds_a_quarter_of_the_aggregate_disk_budget_floor`
+/// and `headroom_is_always_positive_across_reachable_disk_sizes` below. 32 MiB
+/// still buys ~40 entries at the measured p90 on-disk artifact size (811 KiB,
+/// see [`MIN_WASMTIME_CACHE_SIZE_BYTES`]'s doc) — reduced from the RAM
+/// floor's ~161, but a host this disk-constrained also hosts far fewer
+/// distinct contracts, so a smaller working set is the right trade rather
+/// than zero state headroom.
+const MIN_WASMTIME_CACHE_SIZE_BYTES_FOR_DISK: u64 = MIN_WASMTIME_CACHE_SIZE_BYTES / 4;
+
 /// Pure clamp math for the compile cache's DISK-side term (#5014), the disk
-/// analogue of [`wasmtime_cache_size_for_ram`]. Same floor/ceiling
-/// (`MIN`/`MAX_WASMTIME_CACHE_SIZE_BYTES`) as the RAM side, so combining the
-/// two with `min()` in [`combine_wasmtime_cache_size`] can never produce a
-/// value outside that shared range.
+/// analogue of [`wasmtime_cache_size_for_ram`]. Same ceiling
+/// (`MAX_WASMTIME_CACHE_SIZE_BYTES`) as the RAM side but its OWN, lower floor
+/// ([`MIN_WASMTIME_CACHE_SIZE_BYTES_FOR_DISK`] — see that constant's doc for
+/// why sharing the RAM-side floor would leave zero state-budget headroom on
+/// a small disk).
 ///
 /// `available_disk_bytes` is deliberately just the free-space reading, NOT
 /// `used + available` the way [`crate::ring::hosting::cache::disk_budget_for_clamped`]
@@ -442,9 +472,15 @@ const WASMTIME_CACHE_DISK_DIVISOR: u64 = 8;
 /// is about to compete with state/wasm writes for that same headroom, and it
 /// needs no pre-seeded "used" figure, which isn't available yet at the point
 /// in startup this sizing runs (see [`default_wasmtime_cache_size_bytes_for_dir`]).
+/// The caller is responsible for making `available_disk_bytes` itself stable
+/// across restarts (folding the cache's OWN current footprint back in) — see
+/// that function's "Why `available_disk_bytes` folds the cache's own size
+/// back in" section; this function only applies the clamp.
 pub(crate) fn wasmtime_cache_size_for_disk(available_disk_bytes: u64) -> u64 {
-    (available_disk_bytes / WASMTIME_CACHE_DISK_DIVISOR)
-        .clamp(MIN_WASMTIME_CACHE_SIZE_BYTES, MAX_WASMTIME_CACHE_SIZE_BYTES)
+    (available_disk_bytes / WASMTIME_CACHE_DISK_DIVISOR).clamp(
+        MIN_WASMTIME_CACHE_SIZE_BYTES_FOR_DISK,
+        MAX_WASMTIME_CACHE_SIZE_BYTES,
+    )
 }
 
 /// Combine the RAM-side and disk-side terms into the compile cache's actual
@@ -479,6 +515,22 @@ pub(crate) fn combine_wasmtime_cache_size(
 /// probe, so it keeps wasmtime's own default location + flat 512 MiB limit,
 /// unchanged.
 ///
+/// # Callers MUST gate this on actually building a new backend engine
+///
+/// This does real filesystem work (a `statvfs` call and, via
+/// [`reconcile_existing_cache_dir`], a full recursive directory walk and
+/// possibly a `remove_dir_all`), so a caller must call it only for the ONE
+/// executor per node that actually builds a fresh `wasmtime::Engine` /
+/// `Cache` (`shared_backend.is_none()` in `from_config_with_shared_modules`
+/// — every other pool worker, and every mid-life
+/// `create_replacement_executor` panic-recovery call, reuses the already-built
+/// shared engine and never reads the value this returns). Calling it
+/// unconditionally would, on a live node, run the reconciliation's
+/// `remove_dir_all` against a directory the shared engine is actively
+/// reading/writing — exactly the kind of already-populated, in-use cache the
+/// reconciliation is meant to only ever touch once, at boot, before anything
+/// is using it (#5328 review).
+///
 /// # Why this needs the directory, not just a number
 ///
 /// Wasmtime applies its soft limit once, at `Cache::new`, with no live
@@ -494,27 +546,155 @@ pub(crate) fn combine_wasmtime_cache_size(
 /// # Immediate relief for an already-oversized cache
 ///
 /// A node upgrading from an older build (or one that just got less disk) can
-/// already have MORE on disk than the limit computed here — wasmtime's own
-/// cleanup only prunes on a ~1h cadence, so waiting for it would leave a
-/// wedged node's admission gate rejecting writes for up to an hour after the
-/// fix that was supposed to relieve it (see
-/// [`reconcile_existing_cache_dir`]). Reconciling here, once, at startup,
-/// gives the fix effect on the very next restart instead.
-pub(crate) fn default_wasmtime_cache_size_bytes_for_dir(dir: &Path) -> u64 {
+/// already have MORE on disk than the limit computed here. Wasmtime's own
+/// cleanup is gated by a marker file compared against a ~1h interval, and
+/// that marker persists across restarts — so a node that hasn't cleaned up
+/// recently often DOES prune promptly on its first post-restart cache write
+/// (#5328 review), not after a fixed wait. But there is no GUARANTEE of
+/// that (a node that restarts often, or restarts shortly after its own
+/// cleanup ran, waits out the rest of the interval either way), and while
+/// waiting the wedge persists. Reconciling here, once, at startup, gives
+/// the fix effect on the very next restart unconditionally, rather than
+/// depending on wasmtime's internal cleanup timing (see
+/// [`reconcile_existing_cache_dir`]).
+///
+/// # Why `available_disk_bytes` folds the cache's own current size back in
+///
+/// A naive `statvfs` read of raw free space makes the computed limit a
+/// function of the cache's OWN current footprint — the cache occupies disk,
+/// so a bigger cache means less "available," means a SMALLER computed limit
+/// next boot, which (if it now reads as an overshoot) triggers
+/// [`reconcile_existing_cache_dir`] to wipe the cache, which makes MORE disk
+/// "available" next boot, computing a LARGER limit, letting the cache regrow
+/// toward it, shrinking "available" again on the boot after that — a
+/// feedback loop that (#5328 review, verified by hand) converges to
+/// wiping-every-other-restart in steady state for an actively-used node,
+/// defeating the entire point of a persistent on-disk compile cache. Adding
+/// the cache's OWN current on-disk size back to the raw `statvfs` reading
+/// makes the basis `raw_free + current_cache_bytes` — the disk capacity
+/// reachable if the cache were empty — which does NOT depend on the cache's
+/// current size, so the computed limit is STABLE across restarts as long as
+/// other disk usage (state, wasm, unrelated files) doesn't change. This
+/// mirrors the SAME `used + available` stability rationale
+/// [`crate::ring::hosting::cache::disk_budget_for_clamped`] already documents
+/// for the aggregate hosting-disk budget.
+///
+/// # Why the operator's configured disk budget also has to bind
+///
+/// Bounding purely by PHYSICAL disk availability closes the accidental case
+/// (a small physical disk) but not the deliberate one: an operator who sets
+/// `--max-hosting-disk` below the disk's physical capacity (e.g. to reserve
+/// room for other services on a large shared disk) still has physical
+/// availability read as large, so the physical term alone would still
+/// resolve to the RAM ceiling — reproducing #5014's wedge against the
+/// operator's OWN configured budget instead of against physical scarcity.
+/// This was the ORIGINAL issue's own suggested direction (reuse
+/// [`crate::ring::hosting::cache::disk_budget_for_clamped`], the exact
+/// function the live aggregate budget uses), not an addition beyond its
+/// scope. See [`bound_by_configured_disk_budget`].
+pub(crate) fn default_wasmtime_cache_size_bytes_for_dir(
+    dir: &Path,
+    hosting_disk_pct: f64,
+    max_hosting_disk: u64,
+) -> u64 {
     let total_ram = super::read_total_ram_bytes()
         .map(|v| v as u64)
         .unwrap_or(WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES);
-    let available_disk_bytes = crate::ring::disk_available_bytes(dir);
-    let limit = combine_wasmtime_cache_size(total_ram, available_disk_bytes);
-    reconcile_existing_cache_dir(dir, limit);
+    // Walk ONCE, share the result between the stabilized availability signal
+    // and the reconciliation threshold check below — no need to re-walk.
+    let current_cache_bytes = crate::ring::disk_directory_size_bytes(dir);
+    let raw_available_disk_bytes = crate::ring::disk_available_bytes(dir);
+    let stabilized_available_disk_bytes =
+        stabilize_available_disk_bytes(raw_available_disk_bytes, current_cache_bytes);
+    let physical_term = combine_wasmtime_cache_size(total_ram, stabilized_available_disk_bytes);
+    let limit = bound_by_configured_disk_budget(
+        physical_term,
+        current_cache_bytes,
+        raw_available_disk_bytes,
+        hosting_disk_pct,
+        max_hosting_disk,
+    );
+    reconcile_existing_cache_dir(dir, current_cache_bytes, limit);
     limit
+}
+
+/// Fraction of the operator's CONFIGURED aggregate disk budget the compile
+/// cache may consume on its own (#5328 review) — 1/4, the SAME fraction
+/// [`MIN_WASMTIME_CACHE_SIZE_BYTES_FOR_DISK`] uses relative to the RAM-side
+/// floor, so the two mechanisms agree at their shared worst case: when the
+/// configured budget is itself at ITS OWN floor
+/// (`MIN_DEFAULT_HOSTING_BUDGET_BYTES` = 128 MiB), a quarter of it is exactly
+/// 32 MiB — [`MIN_WASMTIME_CACHE_SIZE_BYTES_FOR_DISK`]'s own value — so this
+/// term never re-opens the floor-collision headroom gap that constant was
+/// added to close.
+const CONFIGURED_DISK_BUDGET_ALLOWANCE_DIVISOR: u64 = 4;
+
+/// Further bound `physical_term` (already sized from RAM + raw physical disk)
+/// by a fraction of what the AGGREGATE hosting-disk budget will project to,
+/// using the operator's configured `hosting_disk_pct` / `max_hosting_disk`
+/// (#5328 review — see [`default_wasmtime_cache_size_bytes_for_dir`]'s "Why
+/// the operator's configured disk budget also has to bind"). Computed via
+/// the SAME [`crate::ring::hosting::cache::disk_budget_for_clamped`] function
+/// the live aggregate budget uses, fed `(used = current_cache_bytes,
+/// available = raw_available_disk_bytes)` — the same `used + available`
+/// identity [`stabilize_available_disk_bytes`] already relies on, so this
+/// projection is STABLE across restarts for the same reason that function
+/// is (a pure function of total reachable capacity, not of how much the
+/// cache itself currently occupies).
+///
+/// `raw_available_disk_bytes: None` (unreadable signal) skips this bound
+/// entirely — the physical term's own `None`-fallback already applies, and
+/// there is no available/used basis to project a budget from.
+fn bound_by_configured_disk_budget(
+    physical_term: u64,
+    current_cache_bytes: u64,
+    raw_available_disk_bytes: Option<u64>,
+    hosting_disk_pct: f64,
+    max_hosting_disk: u64,
+) -> u64 {
+    let Some(raw_available) = raw_available_disk_bytes else {
+        return physical_term;
+    };
+    let configured_budget = crate::ring::disk_budget_for_clamped(
+        current_cache_bytes,
+        raw_available,
+        hosting_disk_pct,
+        crate::ring::MIN_DEFAULT_HOSTING_BUDGET_BYTES,
+        max_hosting_disk,
+    );
+    physical_term.min(configured_budget / CONFIGURED_DISK_BUDGET_ALLOWANCE_DIVISOR)
+}
+
+/// Fold a directory's own current on-disk size back into a raw free-space
+/// reading, so the result represents "disk reachable if this directory were
+/// empty" rather than "disk free right now" — see
+/// [`default_wasmtime_cache_size_bytes_for_dir`]'s "Why `available_disk_bytes`
+/// folds the cache's own current size back in" doc for the boot-to-boot
+/// oscillation this prevents (#5328 review). `None` (unreadable raw signal)
+/// stays `None` — folding must never turn an untrusted signal into a trusted
+/// one.
+///
+/// Split out as a pure function so the stabilization property is testable
+/// deterministically: a real end-to-end test through actual `statvfs` cannot
+/// reliably distinguish "fixed" from "buggy" on a host with generous free
+/// disk (the oscillation only manifests when the cache's own footprint is a
+/// non-negligible fraction of `available` — a real dev/CI machine's disk is
+/// typically hundreds of GB free, dwarfing even a full 512 MiB cache, so both
+/// versions land on the same ceiling-clamped answer and the test is vacuous).
+fn stabilize_available_disk_bytes(
+    raw_available: Option<u64>,
+    current_cache_bytes: u64,
+) -> Option<u64> {
+    raw_available.map(|raw| raw.saturating_add(current_cache_bytes))
 }
 
 /// If a PRIOR run already left more than `new_soft_limit_bytes` on disk under
 /// `dir` — a RAM-rich host whose disk tightened, an operator who moved to a
 /// smaller disk, or simply a node upgrading from before #5014 narrowed this
 /// limit — clear the directory rather than waiting on wasmtime's own ~1h
-/// internal prune cycle to catch up.
+/// internal prune cycle to catch up. `current_bytes` is the caller's ALREADY
+/// walked measurement (see [`default_wasmtime_cache_size_bytes_for_dir`]) —
+/// this function does no filesystem read of its own beyond the delete.
 ///
 /// This is a pure cache of recompiled-from-WASM artifacts: clearing it is
 /// always safe (worst case, the next distinct contract blob recompiles once
@@ -525,11 +705,10 @@ pub(crate) fn default_wasmtime_cache_size_bytes_for_dir(dir: &Path) -> u64 {
 /// up-to-an-hour wait.
 ///
 /// Best-effort: this is a startup optimization, not a correctness
-/// requirement, so a walk or delete failure is logged and otherwise ignored —
-/// it must never fail node boot, and a directory that fails to clear just
-/// falls back to wasmtime's own prune cycle, the pre-#5014 behavior.
-fn reconcile_existing_cache_dir(dir: &Path, new_soft_limit_bytes: u64) {
-    let current_bytes = crate::ring::disk_directory_size_bytes(dir);
+/// requirement, so a delete failure is logged and otherwise ignored — it must
+/// never fail node boot, and a directory that fails to clear just falls back
+/// to wasmtime's own prune cycle, the pre-#5014 behavior.
+fn reconcile_existing_cache_dir(dir: &Path, current_bytes: u64, new_soft_limit_bytes: u64) {
     if current_bytes <= new_soft_limit_bytes {
         return;
     }
@@ -1493,7 +1672,7 @@ mod wasmtime_disk_cache_sizing_tests {
     fn default_soft_limit_reader_derives_from_ram_and_disk_signals() {
         let src = include_str!("runtime.rs");
         let body = src
-            .split("pub(crate) fn default_wasmtime_cache_size_bytes_for_dir(dir: &Path) -> u64 {")
+            .split("pub(crate) fn default_wasmtime_cache_size_bytes_for_dir(")
             .nth(1)
             .expect("default_wasmtime_cache_size_bytes_for_dir must exist")
             .split("\n}\n")
@@ -1513,6 +1692,12 @@ mod wasmtime_disk_cache_sizing_tests {
             body.contains("combine_wasmtime_cache_size("),
             "the reader must delegate to the pure combiner so the RAM/disk \
              interaction has exactly one implementation"
+        );
+        assert!(
+            body.contains("bound_by_configured_disk_budget("),
+            "the reader must ALSO bound the physical-disk term by the \
+             operator's configured hosting-disk budget — a physical-only \
+             bound leaves an operator-shrunk --max-hosting-disk wedged"
         );
         assert!(
             body.contains("reconcile_existing_cache_dir("),
@@ -1550,9 +1735,11 @@ mod wasmtime_disk_cache_sizing_tests {
 #[cfg(test)]
 mod wasmtime_disk_cache_disk_sizing_tests {
     use super::{
-        MAX_WASMTIME_CACHE_SIZE_BYTES, MIN_WASMTIME_CACHE_SIZE_BYTES, combine_wasmtime_cache_size,
-        default_wasmtime_cache_size_bytes_for_dir, reconcile_existing_cache_dir,
-        wasmtime_cache_size_for_disk, wasmtime_cache_size_for_ram,
+        MAX_WASMTIME_CACHE_SIZE_BYTES, MIN_WASMTIME_CACHE_SIZE_BYTES,
+        WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES, bound_by_configured_disk_budget,
+        combine_wasmtime_cache_size, default_wasmtime_cache_size_bytes_for_dir,
+        reconcile_existing_cache_dir, stabilize_available_disk_bytes, wasmtime_cache_size_for_disk,
+        wasmtime_cache_size_for_ram,
     };
     use std::io::Write;
 
@@ -1567,10 +1754,15 @@ mod wasmtime_disk_cache_disk_sizing_tests {
     /// pass even if the floor were mutated to 0.
     #[test]
     fn disk_term_floor_and_ceiling_bind() {
-        assert_eq!(wasmtime_cache_size_for_disk(0), 128 * MIB);
-        assert_eq!(wasmtime_cache_size_for_disk(1), 128 * MIB);
-        // Exactly at the binding point: 1 GiB / 8 == 128 MiB == the floor.
-        assert_eq!(wasmtime_cache_size_for_disk(GIB), 128 * MIB);
+        // The disk-side floor is 32 MiB — deliberately LOWER than the 128 MiB
+        // RAM-side/aggregate-budget floor, see
+        // `MIN_WASMTIME_CACHE_SIZE_BYTES_FOR_DISK`'s doc (#5328 review).
+        assert_eq!(wasmtime_cache_size_for_disk(0), 32 * MIB);
+        assert_eq!(wasmtime_cache_size_for_disk(1), 32 * MIB);
+        // Exactly at the binding point: 256 MiB / 8 == 32 MiB == the floor.
+        assert_eq!(wasmtime_cache_size_for_disk(256 * MIB), 32 * MIB);
+        // One divisor-step above it the derived value takes over.
+        assert_eq!(wasmtime_cache_size_for_disk(256 * MIB + 8), 32 * MIB + 1);
         // Exactly at the binding point: 4 GiB / 8 == 512 MiB == the ceiling.
         assert_eq!(wasmtime_cache_size_for_disk(4 * GIB), 512 * MIB);
         assert_eq!(wasmtime_cache_size_for_disk(8 * GIB), 512 * MIB);
@@ -1601,8 +1793,13 @@ mod wasmtime_disk_cache_disk_sizing_tests {
             "a disk-tight host (400 MiB free) must get LESS than the RAM-only \
              figure ({ram_only}); got {combined}"
         );
-        // 400 MiB / 8 == 50 MiB, below the floor, so the floor binds.
-        assert_eq!(combined, 128 * MIB);
+        // 400 MiB / 8 == 50 MiB — above the disk-side floor (32 MiB), so the
+        // raw division binds here, not a floor (#5328 review: an earlier
+        // version of this test asserted the value landed exactly on the
+        // shared 128 MiB floor, which mutation-tested green even when the
+        // disk divisor was changed from 8 to 64 — it was pinning the floor,
+        // not the disk term. This value is a genuine division result.)
+        assert_eq!(combined, 50 * MIB);
     }
 
     /// The composition is `min(ram_term, disk_term)` — whichever signal is
@@ -1648,7 +1845,7 @@ mod wasmtime_disk_cache_disk_sizing_tests {
         let mut f = std::fs::File::create(cache_dir.join("big.bin")).unwrap();
         f.write_all(&vec![0u8; 200 * 1024 * 1024]).unwrap(); // 200 MiB
 
-        reconcile_existing_cache_dir(&cache_dir, 128 * MIB);
+        reconcile_existing_cache_dir(&cache_dir, 200 * MIB, 128 * MIB);
 
         assert!(
             !cache_dir.exists(),
@@ -1668,7 +1865,7 @@ mod wasmtime_disk_cache_disk_sizing_tests {
         let mut f = std::fs::File::create(cache_dir.join("small.bin")).unwrap();
         f.write_all(&vec![0u8; 1024]).unwrap(); // 1 KiB
 
-        reconcile_existing_cache_dir(&cache_dir, 128 * MIB);
+        reconcile_existing_cache_dir(&cache_dir, 1024, 128 * MIB);
 
         assert!(
             cache_dir.join("small.bin").exists(),
@@ -1683,7 +1880,7 @@ mod wasmtime_disk_cache_disk_sizing_tests {
     fn reconcile_is_a_no_op_on_a_missing_directory() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist-yet");
-        reconcile_existing_cache_dir(&missing, 128 * MIB); // must not panic
+        reconcile_existing_cache_dir(&missing, 0, 128 * MIB); // must not panic
         assert!(!missing.exists());
     }
 
@@ -1692,14 +1889,334 @@ mod wasmtime_disk_cache_disk_sizing_tests {
     /// must stay within the shared clamp bounds, and it must not panic when
     /// run against a directory that doesn't exist yet (the fresh-node case).
     #[test]
-    fn default_for_dir_stays_within_bounds_on_a_fresh_directory() {
+    fn default_for_dir_stays_within_bounds_when_the_directory_does_not_exist_yet() {
+        // Defensive-only: in production `config.rs` always `create_dir_all`s
+        // this directory before `Executor::from_config_with_shared_modules`
+        // ever runs, so this exact input never reaches this function on a real
+        // node. Kept as a "must not panic, must fall back sanely" guard, not
+        // as a stand-in for the real disk-derived path — see the sibling test
+        // below for that.
         let dir = tempfile::tempdir().unwrap();
-        let cache_dir = dir.path().join("wasmtime-cache");
-        let result = default_wasmtime_cache_size_bytes_for_dir(&cache_dir);
+        let missing = dir.path().join("wasmtime-cache");
+        let result = default_wasmtime_cache_size_bytes_for_dir(
+            &missing,
+            crate::ring::DEFAULT_HOSTING_DISK_PCT,
+            crate::ring::DEFAULT_MAX_HOSTING_DISK_BYTES,
+        );
         assert!(
             (MIN_WASMTIME_CACHE_SIZE_BYTES..=MAX_WASMTIME_CACHE_SIZE_BYTES).contains(&result),
             "result {result} must stay within [{MIN_WASMTIME_CACHE_SIZE_BYTES}, \
              {MAX_WASMTIME_CACHE_SIZE_BYTES}] regardless of this host's real RAM/disk"
+        );
+    }
+
+    /// #5328 review: the fresh-directory test above never actually created the
+    /// directory, so `statvfs` returned ENOENT and it silently exercised the
+    /// SAME `None`-fallback path as `unreadable_disk_signal_falls_back_to_ram_only`
+    /// — never the real `Some(...)` disk-reading path a production node
+    /// actually takes (the cache dir always exists by the time this runs; see
+    /// the sibling test's comment). This test creates the directory first, so
+    /// `disk_available_bytes` succeeds, and cross-checks the live entry
+    /// point's result against the SAME real signals read independently
+    /// (`super::read_total_ram_bytes()`, `crate::ring::disk_available_bytes`)
+    /// and fed through the pure combiner — not a hardcoded expectation, since
+    /// this host's real RAM/disk are unknown to the test. A maximally
+    /// PERMISSIVE configured budget (pct=1.0, max=u64::MAX) is passed so the
+    /// configured-budget bound (#5328 review) cannot additionally constrain
+    /// the result — that mechanism gets its own dedicated test below.
+    #[test]
+    fn default_for_dir_uses_the_real_disk_reading_on_an_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("wasmtime-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let total_ram = crate::wasm_runtime::read_total_ram_bytes()
+            .map(|v| v as u64)
+            .unwrap_or(WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES);
+        let available_disk_bytes = crate::ring::disk_available_bytes(&cache_dir);
+        assert!(
+            available_disk_bytes.is_some(),
+            "statvfs on a directory that genuinely exists must succeed on this \
+             platform — if this fails, the test tempdir setup is wrong, not the \
+             production code"
+        );
+        let expected = combine_wasmtime_cache_size(total_ram, available_disk_bytes);
+
+        assert_eq!(
+            default_wasmtime_cache_size_bytes_for_dir(&cache_dir, 1.0, u64::MAX),
+            expected,
+            "the live entry point must match the pure combiner fed the SAME \
+             real RAM/disk signals — this pins that it actually reads a live \
+             Some(...) disk signal, not silently falling back to RAM-only"
+        );
+    }
+
+    /// #5328 review (rev-skeptical-2 finding): an operator who shrinks
+    /// `--max-hosting-disk` below physical disk capacity must ALSO be
+    /// protected — bounding only by raw physical availability leaves that
+    /// operator permanently wedged against their OWN configured budget. A
+    /// tiny `max_hosting_disk` must pull the result down from what physical
+    /// disk alone would allow, and the result must still respect the
+    /// documented headroom relationship (a quarter of what
+    /// `disk_budget_for_clamped` would compute for the SAME inputs).
+    #[test]
+    fn default_for_dir_is_bounded_by_a_tiny_configured_disk_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("wasmtime-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        // Permissive physical/RAM signals (pct=1.0 isn't physical/RAM — this
+        // is the operator's CONFIGURED knob under test): a tiny
+        // max_hosting_disk must bind regardless of how much physical disk or
+        // RAM this test host actually has.
+        let tiny_max_hosting_disk = 40 * MIB;
+        let result = default_wasmtime_cache_size_bytes_for_dir(
+            &cache_dir,
+            crate::ring::DEFAULT_HOSTING_DISK_PCT,
+            tiny_max_hosting_disk,
+        );
+
+        assert!(
+            result <= tiny_max_hosting_disk,
+            "a compile cache larger than the operator's OWN configured \
+             --max-hosting-disk ({tiny_max_hosting_disk}) defeats the whole \
+             point of the setting; got {result}"
+        );
+    }
+
+    /// #5328 review finding 1 (rev-domain, verified by hand): giving the
+    /// disk-side term the SAME floor as the aggregate hosting-disk budget's
+    /// own floor left EXACTLY ZERO headroom for real contract state on any
+    /// host with <= 256 MiB reachable disk — the compile cache alone would
+    /// consume the entire disk-budget floor, so #5014's wedge would persist
+    /// (narrower, but not closed) for small-disk hosts. This sweeps a wide
+    /// range of reachable-disk sizes and asserts the aggregate disk budget
+    /// (computed via the SAME `disk_budget_for_clamped` the real
+    /// eviction/admission path uses) always leaves STRICTLY positive headroom
+    /// over the compile-cache disk term — mirroring
+    /// `compile_cache_default_never_exceeds_hosting_default`'s sweep shape
+    /// for the RAM axis. `reachable_disk` models `used + available` at the
+    /// moment the disk term is computed (worst case: the compile cache is the
+    /// ONLY consumer, i.e. right after `reconcile_existing_cache_dir` clears
+    /// a stale cache — the scenario most likely to wedge).
+    #[test]
+    fn disk_term_always_leaves_positive_headroom_against_the_aggregate_disk_budget() {
+        for reachable_disk in [
+            0,
+            1,
+            MIB,
+            32 * MIB,
+            64 * MIB,
+            128 * MIB,
+            200 * MIB,
+            255 * MIB,
+            256 * MIB, // the exact breakeven point both floors share
+            257 * MIB,
+            300 * MIB,
+            400 * MIB, // the issue's worked example
+            912 * MIB, // the issue's worked example, post-reconcile
+            GIB,
+            2 * GIB,
+            4 * GIB,
+            8 * GIB,
+            32 * GIB,
+            100 * GIB,
+            u64::MAX,
+        ] {
+            let disk_term = wasmtime_cache_size_for_disk(reachable_disk);
+            let available = reachable_disk.saturating_sub(disk_term);
+            let disk_budget = crate::ring::disk_budget_for_clamped(
+                disk_term,
+                available,
+                crate::ring::DEFAULT_HOSTING_DISK_PCT,
+                crate::ring::MIN_DEFAULT_HOSTING_BUDGET_BYTES,
+                crate::ring::DEFAULT_MAX_HOSTING_DISK_BYTES,
+            );
+            assert!(
+                disk_budget > disk_term,
+                "at reachable_disk={reachable_disk} the compile cache's disk \
+                 term ({disk_term}) must leave POSITIVE headroom under the \
+                 aggregate disk budget ({disk_budget}) for real contract \
+                 state — zero or negative headroom means the compile cache \
+                 alone wedges admission"
+            );
+        }
+    }
+
+    /// #5328 review (rev-skeptical-2 finding): `bound_by_configured_disk_budget`
+    /// must actually bind when the operator's configured budget is the
+    /// tighter constraint, must NOT bind when it's generous (physical term
+    /// wins), and must fall back to the physical term when the disk signal
+    /// is unreadable (no `used + available` basis to project a budget from).
+    #[test]
+    fn bound_by_configured_disk_budget_binds_only_when_tighter() {
+        // Ample physical term (RAM-ceiling-bound), tiny configured budget:
+        // the configured bound must win.
+        let physical_term = 512 * MIB;
+        let tight = bound_by_configured_disk_budget(
+            physical_term,
+            0,              // current_cache_bytes
+            Some(40 * MIB), // raw_available_disk_bytes
+            crate::ring::DEFAULT_HOSTING_DISK_PCT,
+            crate::ring::MIN_DEFAULT_HOSTING_BUDGET_BYTES, // tiny max_hosting_disk
+        );
+        assert!(
+            tight < physical_term,
+            "a tiny configured max_hosting_disk must pull the result below \
+             the physical term; got {tight}"
+        );
+
+        // Generous configured budget: the physical term must win unchanged.
+        let generous = bound_by_configured_disk_budget(
+            physical_term,
+            0,
+            Some(100 * GIB),
+            crate::ring::DEFAULT_HOSTING_DISK_PCT,
+            crate::ring::DEFAULT_MAX_HOSTING_DISK_BYTES,
+        );
+        assert_eq!(
+            generous, physical_term,
+            "a generous configured budget must not tighten the physical term"
+        );
+
+        // Unreadable disk signal: no used+available basis to project a
+        // budget from, so the physical term passes through unchanged.
+        let unreadable = bound_by_configured_disk_budget(
+            physical_term,
+            0,
+            None,
+            crate::ring::DEFAULT_HOSTING_DISK_PCT,
+            crate::ring::MIN_DEFAULT_HOSTING_BUDGET_BYTES,
+        );
+        assert_eq!(
+            unreadable, physical_term,
+            "an unreadable disk signal must fall back to the physical term, \
+             not invent a budget projection from nothing"
+        );
+    }
+
+    /// #5328 review: the configured-budget bound must ALSO leave positive
+    /// headroom against the real aggregate budget, across a sweep of
+    /// operator-configured `max_hosting_disk` values (not just the default) —
+    /// extending `disk_term_always_leaves_positive_headroom_against_the_aggregate_disk_budget`
+    /// to the axis that test doesn't cover.
+    #[test]
+    fn configured_budget_bound_always_leaves_positive_headroom() {
+        for reachable_disk in [0, MIB, 128 * MIB, 256 * MIB, GIB, 100 * GIB] {
+            for max_hosting_disk in [
+                crate::ring::MIN_DEFAULT_HOSTING_BUDGET_BYTES, // operator floors it
+                16 * GIB,
+                crate::ring::DEFAULT_MAX_HOSTING_DISK_BYTES,
+            ] {
+                let physical_term = wasmtime_cache_size_for_disk(reachable_disk);
+                let available = reachable_disk.saturating_sub(physical_term);
+                let bound = bound_by_configured_disk_budget(
+                    physical_term,
+                    physical_term, // current_cache_bytes: conservative, matches `used` below
+                    Some(available),
+                    crate::ring::DEFAULT_HOSTING_DISK_PCT,
+                    max_hosting_disk,
+                );
+                let real_budget = crate::ring::disk_budget_for_clamped(
+                    bound,
+                    available,
+                    crate::ring::DEFAULT_HOSTING_DISK_PCT,
+                    crate::ring::MIN_DEFAULT_HOSTING_BUDGET_BYTES,
+                    max_hosting_disk,
+                );
+                assert!(
+                    real_budget > bound,
+                    "at reachable_disk={reachable_disk}, \
+                     max_hosting_disk={max_hosting_disk}: the configured-budget-\
+                     bound compile cache ({bound}) must leave POSITIVE headroom \
+                     under the real aggregate budget ({real_budget})"
+                );
+            }
+        }
+    }
+
+    /// #5328 review finding 2 (rev-domain, verified by hand): folding the
+    /// directory's own current size back into the raw free-space reading
+    /// must recover "total reachable capacity", independent of how big the
+    /// directory currently is. Deliberately host-independent (small,
+    /// hand-chosen numbers) — see [`stabilize_available_disk_bytes`]'s doc
+    /// for why a real end-to-end test through actual `statvfs` cannot
+    /// reliably distinguish fixed from buggy on a host with generous free
+    /// disk.
+    #[test]
+    fn stabilize_available_disk_bytes_recovers_total_reachable_capacity() {
+        // 400 MiB total; the cache currently occupies 50 MiB of it, so a raw
+        // statvfs read sees only 350 MiB free. Folding the cache's own 50 MiB
+        // back in must recover the full 400 MiB.
+        assert_eq!(
+            stabilize_available_disk_bytes(Some(350 * MIB), 50 * MIB),
+            Some(400 * MIB)
+        );
+        // An empty directory contributes nothing to fold back — a no-op.
+        assert_eq!(
+            stabilize_available_disk_bytes(Some(400 * MIB), 0),
+            Some(400 * MIB)
+        );
+        // An unreadable raw signal must stay unreadable — folding a KNOWN
+        // quantity into an UNKNOWN one must not manufacture a trusted result.
+        assert_eq!(stabilize_available_disk_bytes(None, 50 * MIB), None);
+        // Overflow-safe: saturating, never panics or wraps.
+        assert_eq!(
+            stabilize_available_disk_bytes(Some(u64::MAX), 50 * MIB),
+            Some(u64::MAX)
+        );
+    }
+
+    /// #5328 review finding 2 (rev-domain, verified by hand): a naive
+    /// `statvfs`-only availability reading makes the computed limit a
+    /// function of the cache's OWN current size (bigger cache -> less
+    /// "available" -> smaller next-boot limit -> wipe -> more "available" ->
+    /// bigger limit -> cache regrows -> repeat), which converges to wiping
+    /// the compile cache on roughly every OTHER restart for an actively-used
+    /// node — defeating the entire point of a persistent on-disk cache. This
+    /// simulates two successive "boots" against a FIXED total reachable disk
+    /// (deterministic, no real filesystem involved): boot 1 computes a limit
+    /// against an empty cache; the cache then regrows to fill exactly that
+    /// limit (the worst case — a busy node whose cache regrew to fill its
+    /// budget between restarts, so the raw free-space reading on boot 2 is
+    /// `total - limit1`); boot 2 must compute the SAME limit via
+    /// [`stabilize_available_disk_bytes`]'s fold-back — and the final
+    /// assertion demonstrates, on the SAME numbers, that WITHOUT the
+    /// fold-back the limit would have shrunk (the bug this fixes).
+    #[test]
+    fn folding_the_caches_own_size_back_in_makes_the_limit_stable_across_simulated_restarts() {
+        let total_ram = 100 * GIB; // ample — only the disk term can bind here
+        let total_reachable_disk = 2 * GIB; // fixed total capacity, both boots
+
+        // Boot 1: cache is empty, so raw free space IS the total.
+        let limit1 = combine_wasmtime_cache_size(
+            total_ram,
+            stabilize_available_disk_bytes(Some(total_reachable_disk), 0),
+        );
+
+        // Between boots: cache regrows to fill exactly limit1. Raw free space
+        // on boot 2 is reduced by exactly what the cache now occupies.
+        let raw_available_boot2 = total_reachable_disk - limit1;
+        let limit2 = combine_wasmtime_cache_size(
+            total_ram,
+            stabilize_available_disk_bytes(Some(raw_available_boot2), limit1),
+        );
+
+        assert_eq!(
+            limit1, limit2,
+            "the computed limit must be STABLE across restarts when nothing \
+             other than the cache's own regrowth changed on disk"
+        );
+
+        // Sanity: on these SAME numbers, the fold-back is load-bearing — a
+        // raw (unstabilized) reading on boot 2 computes a SMALLER limit,
+        // which is exactly what would trigger reconcile's wipe.
+        let unstabilized_limit2 = combine_wasmtime_cache_size(total_ram, Some(raw_available_boot2));
+        assert!(
+            unstabilized_limit2 < limit1,
+            "sanity check failed: this scenario no longer demonstrates the \
+             bug the fold-back fixes, so it's not exercising anything — \
+             unstabilized_limit2={unstabilized_limit2}, limit1={limit1}"
         );
     }
 }
