@@ -77,9 +77,29 @@ pub struct RingStatsSnapshot {
     /// may be getting dropped — operators should watch this.
     pub updates_rate_limited: u64,
     /// Total relayed UPDATEs dropped because the limiter's tracking map
-    /// was at capacity (`MAX_TRACKED_PAIRS`). A non-zero value suggests
-    /// identity churn / admission pressure, distinct from per-pair rate.
+    /// was at capacity (`MAX_TRACKED_PAIRS`) and eviction could not free
+    /// a slot. Since #4981 this means the map is full *and* contended;
+    /// ordinary saturation shows up in `updates_capacity_evicted`.
     pub updates_capacity_dropped: u64,
+    /// Total tracked `(sender, contract)` pairs evicted to admit new
+    /// ones at capacity. This is the saturation signal: a busy node
+    /// relaying for more pairs than `MAX_TRACKED_PAIRS` shows this
+    /// climbing while `updates_capacity_dropped` stays flat, and no
+    /// legitimate UPDATE is dropped for it.
+    pub updates_capacity_evicted: u64,
+    /// Total relayed UPDATEs dropped because the sending peer was over
+    /// its budget for introducing brand-new `(sender, contract)` pairs.
+    /// This is the fresh-contract-id churn signal: unlike the counters
+    /// above it never counts a peer's traffic for contracts already
+    /// being tracked, so a non-zero value really does mean one peer is
+    /// presenting unfamiliar contract ids faster than the budget allows.
+    pub updates_sender_budget_dropped: u64,
+    /// Total relayed UPDATEs admitted for a brand-new pair WITHOUT a
+    /// budget check, because the per-sender budget's own map was full.
+    /// Should be zero. A non-zero value means the budget map is
+    /// undersized for this node's peer churn, so those senders are not
+    /// actually being bounded — the safety valve is firing.
+    pub updates_sender_budget_unmetered: u64,
     /// Nearest-neighbor ring lattice completeness (the "is greedy routing's base
     /// lattice present" signal). `lattice_has_successor` / `_predecessor` are
     /// whether this peer currently HOLDS (a side is FILLED with) its

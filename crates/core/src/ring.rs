@@ -654,6 +654,11 @@ impl Ring {
             governance_config,
             time_source.clone(),
         ));
+        // Read before `connection_manager` is moved into the literal.
+        // The UPDATE limiter's per-sender budget is keyed by the
+        // immediate upstream hop, so its map is sized from this node's
+        // OWN connection cap rather than a hardcoded default.
+        let max_connections = connection_manager.max_connections;
         let ring = Ring {
             max_hops_to_live,
             router,
@@ -674,6 +679,7 @@ impl Ring {
             governance,
             update_rate_limiter: Arc::new(update_rate_limit::UpdateRateLimiter::new(
                 time_source.clone(),
+                max_connections,
             )),
             merge_backoff: Arc::new(merge_backoff::MergeBackoff::new(time_source.clone())),
             delta_incompat: Arc::new(delta_incompat::DeltaIncompat::new(time_source.clone())),
