@@ -1263,10 +1263,60 @@ pub(crate) fn read_total_ram_bytes() -> Option<usize> {
             None
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        read_windows_total_phys_bytes()
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         None
     }
+}
+
+/// Physical RAM (bytes) via `GlobalMemoryStatusEx` (#5329). No cgroup-equivalent
+/// notion exists on Windows, so this is the whole story there — unlike the
+/// Linux branch above, there is no separate container-limit source to min
+/// against.
+#[cfg(windows)]
+fn read_windows_total_phys_bytes() -> Option<usize> {
+    use winapi::um::sysinfoapi::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    // SAFETY: `MEMORYSTATUSEX` is a C-repr struct of plain integer fields
+    // (DWORD/DWORDLONG) with no padding-sensitive invariants or pointers —
+    // an all-zero bit pattern is a valid value for every field. We
+    // immediately overwrite `dwLength` below (the only field the API reads
+    // before populating the rest), so this only ever serves as a
+    // stack-owned, correctly-sized out-buffer for the FFI call that follows.
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: `GlobalMemoryStatusEx` is an FFI call that reads system memory
+    // stats into a caller-owned `MEMORYSTATUSEX` buffer. We pass a valid,
+    // correctly-sized, stack-owned out-buffer with `dwLength` set as the API
+    // requires (the call fails with `ERROR_INVALID_PARAMETER` otherwise). It
+    // writes only into that buffer and returns nonzero on success / 0 on
+    // error (checked below); it borrows no memory past the call. No aliasing
+    // or lifetime hazards.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    windows_memory_status_to_ram_bytes(ok, status.ullTotalPhys)
+}
+
+/// Pure `(BOOL, DWORDLONG) -> Option<usize>` conversion behind
+/// [`read_windows_total_phys_bytes`] (#5329 review), split out — like
+/// [`parse_meminfo_total_bytes`] is for the Linux branch — so the actual
+/// decision logic (API-failure handling, the `u64 -> usize` narrowing) is
+/// unit-testable on ANY host, not just a real Windows CI runner. Deliberately
+/// takes plain integers rather than `MEMORYSTATUSEX` itself so it carries no
+/// `#[cfg(windows)]` and no `winapi` dependency, unlike the FFI call above it
+/// — its only real caller is `#[cfg(windows)]`-gated, so it's gated on
+/// `any(windows, test)` here rather than left ungated (dead code on a
+/// non-Windows, non-test build) or gated to `windows` alone (which would
+/// undo the whole point: making it unit-testable on non-Windows CI).
+#[cfg(any(windows, test))]
+fn windows_memory_status_to_ram_bytes(ok: i32, total_phys_bytes: u64) -> Option<usize> {
+    if ok == 0 {
+        return None;
+    }
+    usize::try_from(total_phys_bytes).ok()
 }
 
 /// Parse physical RAM (bytes) from `/proc/meminfo`'s `MemTotal:` line.
@@ -1772,6 +1822,87 @@ mod tests {
         let sample = "MemFree:  100 kB\nMemTotal:       16331752 kB\nBuffers:  1 kB\n";
         assert_eq!(parse_meminfo_total_bytes(sample), Some(16331752 * 1024));
         assert_eq!(parse_meminfo_total_bytes("SwapTotal: 0 kB\n"), None);
+    }
+
+    /// #5329 review: `GlobalMemoryStatusEx`'s `(BOOL, DWORDLONG)` -> RAM-bytes
+    /// decision logic, tested on ANY host (no `#[cfg(windows)]`) — mirrors
+    /// `parse_meminfo_total_reads_kib_as_bytes` above for the Linux branch.
+    /// This is what actually runs on CI today; the `#[cfg(windows)]` test
+    /// below additionally exercises the real FFI call, but only on a real
+    /// Windows runner.
+    #[test]
+    fn windows_memory_status_to_ram_bytes_converts_or_rejects() {
+        // Success: a real-looking 16 GiB reading passes through unchanged.
+        assert_eq!(
+            windows_memory_status_to_ram_bytes(1, 16 * 1024 * 1024 * 1024),
+            Some(16 * 1024 * 1024 * 1024)
+        );
+        // API failure (BOOL == 0, per GlobalMemoryStatusEx's documented
+        // contract): must be None regardless of whatever garbage is in the
+        // out-buffer, not a Some(0) or a stale prior reading.
+        assert_eq!(
+            windows_memory_status_to_ram_bytes(0, 16 * 1024 * 1024 * 1024),
+            None
+        );
+        // A degenerate-but-technically-valid 0-byte reading passes through
+        // as Some(0) rather than being conflated with the failure case above
+        // — the caller's own fallback handles a 0 total_ram identically to
+        // any other implausible value via the downstream clamp floors, so
+        // this function's job is only to distinguish "API said no" from
+        // "API said yes, here's the (possibly odd) number".
+        assert_eq!(windows_memory_status_to_ram_bytes(1, 0), Some(0));
+    }
+
+    /// #5329 regression: on Windows, `read_total_ram_bytes()` used to return
+    /// `None` unconditionally (no branch existed at all), so every RAM-scaled
+    /// budget silently fell back to its floor value regardless of the host's
+    /// real RAM — e.g. a 16 GiB machine landing on the same 128 MiB resident-
+    /// overhead floor as a 512 MiB host, causing fast, spurious eviction.
+    /// `cargo check`/`cargo build` alone cannot catch this class of bug (a
+    /// `cfg`'d branch that compiles but was simply absent is not something a
+    /// compile-only check on a non-Windows host can distinguish from one that
+    /// works) — per `.claude/rules/deployment.md` ("WHEN adding or modifying
+    /// a platform-gated code path"), this needs to run on the real Windows CI
+    /// runner, which is exactly what a `#[cfg(windows)]`-gated `#[test]`
+    /// achieves: it only compiles and executes there.
+    ///
+    /// NOTE: as of this writing, neither Windows CI job
+    /// (`Windows Check` = `cargo check` only; `Windows Service Unit` =
+    /// `cargo build --bin freenet` + a narrow `commands::service` nextest
+    /// filter scoped to the `--bin` target) actually runs the `freenet`
+    /// LIBRARY's `--lib` test target, so THIS SPECIFIC test is not yet
+    /// exercised by CI — it needs either a future CI job that runs
+    /// `-p freenet --lib` on Windows (tracked: #5331), or manual verification
+    /// on a real Windows box. The decision logic this FFI call feeds IS
+    /// covered on every CI run regardless — see
+    /// [`windows_memory_status_to_ram_bytes`] and its platform-independent
+    /// unit test, which is where the actual risk (API-failure handling,
+    /// `u64 -> usize` narrowing) lived; this test additionally covers the FFI
+    /// plumbing itself (correct struct size/zeroing, the real syscall).
+    #[cfg(windows)]
+    #[test]
+    fn read_total_ram_bytes_returns_a_sane_value_on_windows() {
+        let ram = read_total_ram_bytes();
+        assert!(
+            ram.is_some(),
+            "GlobalMemoryStatusEx must succeed on any real Windows host — a \
+             None here means the #5329 regression is back"
+        );
+        let ram = ram.unwrap();
+        // Sanity bounds, not a tight assertion: any real CI runner has at
+        // least 512 MiB and (barring an absurd host) well under 1 TiB. A
+        // value outside this range indicates the FFI call read garbage
+        // (e.g. a missing dwLength, which GlobalMemoryStatusEx would
+        // normally reject outright, but a corrupted struct layout could
+        // still produce a wild number rather than a clean failure).
+        assert!(
+            ram >= 512 * 1024 * 1024,
+            "implausibly small RAM reading: {ram} bytes"
+        );
+        assert!(
+            ram < 1024 * 1024 * 1024 * 1024,
+            "implausibly large RAM reading: {ram} bytes"
+        );
     }
 
     /// `/proc/self/cgroup` parsing resolves the process's OWN cgroup sub-path for
