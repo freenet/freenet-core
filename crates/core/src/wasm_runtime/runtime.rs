@@ -15,6 +15,7 @@ use freenet_stdlib::{
     },
     prelude::*,
 };
+use std::path::Path;
 use std::sync::atomic::AtomicI64;
 use std::sync::{Arc, Mutex};
 
@@ -240,8 +241,9 @@ pub struct RuntimeConfig {
     /// overrides wasmtime's 512 MiB default via
     /// `CacheConfig::with_files_total_size_soft_limit`; `None` keeps the default.
     /// Production resolves it from
-    /// [`default_wasmtime_cache_size_bytes`], which scales it to the memory the
-    /// node may use instead of pinning a flat constant.
+    /// [`default_wasmtime_cache_size_bytes_for_dir`], which scales it to BOTH
+    /// the memory the node may use AND the disk actually free on the cache's
+    /// mount, instead of pinning a flat constant or a RAM-only figure.
     pub wasmtime_cache_size_bytes: Option<u64>,
 }
 
@@ -341,12 +343,15 @@ pub(crate) const MAX_WASMTIME_CACHE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 /// defaults* stay ordered at every host size. Do not restate this as a
 /// system-level invariant.
 ///
-/// Note also that a RAM signal is not the right shape for this cache's real
-/// constraint: the compile cache is charged against the aggregate **disk** budget
-/// (`DiskUsageTracker::total_bytes()` sums state + wasm + compile-cache bytes and
-/// gates `admit_state_write` / `admit_wasm_write`), so a disk-tight but RAM-rich
-/// host is not protected by any RAM-derived bound. Tracked separately in #5014;
-/// this constant narrows the exposure on RAM-poor hosts without closing it.
+/// Note also that a RAM signal ALONE is not the right shape for this cache's
+/// real constraint: the compile cache is charged against the aggregate
+/// **disk** budget (`DiskUsageTracker::total_bytes()` sums state + wasm +
+/// compile-cache bytes and gates `admit_state_write` / `admit_wasm_write`), so
+/// a disk-tight but RAM-rich host is not protected by a RAM-derived bound on
+/// its own. This divisor narrows the exposure on RAM-poor hosts; the disk-tight
+/// case is closed by composing this RAM term with a disk-derived term via
+/// `min()` — see [`combine_wasmtime_cache_size`] / [`wasmtime_cache_size_for_disk`]
+/// (#5014).
 const WASMTIME_CACHE_RAM_DIVISOR: u64 = 8;
 
 /// Fallback "memory the node may use" estimate (1 GiB) when the OS query fails.
@@ -401,22 +406,148 @@ const WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES: u64 = 1024 * 1024 * 1024;
 /// [`default_module_cache_budget_bytes`](super::default_module_cache_budget_bytes)
 /// and overridable via `--module-cache-budget-bytes`). The two are separate
 /// caches with separate budgets; this one has no operator override today (it
-/// never had one — it was a private constant), so this derived default is its
-/// only source.
-pub(crate) fn default_wasmtime_cache_size_bytes() -> u64 {
-    let total_ram = super::read_total_ram_bytes()
-        .map(|v| v as u64)
-        .unwrap_or(WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES);
-    wasmtime_cache_size_for_ram(total_ram)
-}
-
-/// Pure clamp math behind [`default_wasmtime_cache_size_bytes`], split out so the
-/// small-box / large-box / cgroup boundary behavior is unit-testable without
-/// depending on the test host's real RAM. Mirrors the `budget_for_ram` /
-/// `disk_budget_for_clamped` pattern used by the sibling budgets.
+/// never had one — it was a private constant), so this derived default (see
+/// [`default_wasmtime_cache_size_bytes_for_dir`]) is its only source.
+///
+/// # Pure clamp math behind the RAM-side term
+///
+/// Split out so the small-box / large-box / cgroup boundary behavior is
+/// unit-testable without depending on the test host's real RAM. Mirrors the
+/// `budget_for_ram` / `disk_budget_for_clamped` pattern used by the sibling
+/// budgets.
 pub(crate) fn wasmtime_cache_size_for_ram(total_ram: u64) -> u64 {
     (total_ram / WASMTIME_CACHE_RAM_DIVISOR)
         .clamp(MIN_WASMTIME_CACHE_SIZE_BYTES, MAX_WASMTIME_CACHE_SIZE_BYTES)
+}
+
+/// Fraction of the disk space *available* on the compile-cache's mount that
+/// sizes the on-disk compile cache's disk-side term (#5014): 1/8, the SAME
+/// fraction [`WASMTIME_CACHE_RAM_DIVISOR`] applies on the RAM side, so this
+/// stays one story ("an eighth of the resource, floored and ceilinged the
+/// same way") rather than two unrelated fractions.
+const WASMTIME_CACHE_DISK_DIVISOR: u64 = 8;
+
+/// Pure clamp math for the compile cache's DISK-side term (#5014), the disk
+/// analogue of [`wasmtime_cache_size_for_ram`]. Same floor/ceiling
+/// (`MIN`/`MAX_WASMTIME_CACHE_SIZE_BYTES`) as the RAM side, so combining the
+/// two with `min()` in [`combine_wasmtime_cache_size`] can never produce a
+/// value outside that shared range.
+///
+/// `available_disk_bytes` is deliberately just the free-space reading, NOT
+/// `used + available` the way [`crate::ring::hosting::cache::disk_budget_for_clamped`]
+/// sizes the aggregate hosting-disk budget: that basis exists so the OVERALL
+/// budget doesn't shrink as a node fills with its OWN legitimately-admitted
+/// state. Here we want the opposite bias — a fresh `statvfs` read of "what's
+/// free right now" is the more conservative (safer) signal for a cache that
+/// is about to compete with state/wasm writes for that same headroom, and it
+/// needs no pre-seeded "used" figure, which isn't available yet at the point
+/// in startup this sizing runs (see [`default_wasmtime_cache_size_bytes_for_dir`]).
+pub(crate) fn wasmtime_cache_size_for_disk(available_disk_bytes: u64) -> u64 {
+    (available_disk_bytes / WASMTIME_CACHE_DISK_DIVISOR)
+        .clamp(MIN_WASMTIME_CACHE_SIZE_BYTES, MAX_WASMTIME_CACHE_SIZE_BYTES)
+}
+
+/// Combine the RAM-side and disk-side terms into the compile cache's actual
+/// soft limit (#5014): `min(ram_term, disk_term)`, so a disk-tight host is
+/// bounded even when RAM is ample. `available_disk_bytes` is `None` when the
+/// mount's free-space signal could not be read (statvfs failure or an
+/// unsupported platform) — mirrors
+/// [`crate::ring::hosting::disk_usage::available_bytes`]'s own rule that an
+/// unreadable signal must not silently shrink a budget: fall back to the
+/// RAM-only figure (today's shipped behavior) rather than invent a possibly-
+/// wrong tight cap from a signal we don't trust.
+///
+/// Split out from [`default_wasmtime_cache_size_bytes_for_dir`] as pure
+/// function so the RAM/disk interaction (which one binds, the `None`
+/// fallback) is unit-testable without a real host's RAM or a real mount.
+pub(crate) fn combine_wasmtime_cache_size(
+    total_ram: u64,
+    available_disk_bytes: Option<u64>,
+) -> u64 {
+    let ram_term = wasmtime_cache_size_for_ram(total_ram);
+    match available_disk_bytes {
+        Some(available) => ram_term.min(wasmtime_cache_size_for_disk(available)),
+        None => ram_term,
+    }
+}
+
+/// The wasmtime on-disk compile cache's soft limit, bounded by BOTH the
+/// memory the node may use AND the disk space actually free on the cache
+/// directory's mount (#5014). This is the function the production path
+/// (`Executor::from_config_with_shared_modules`) calls; the non-production
+/// `Runtime::build` path never relocates the cache and has no directory to
+/// probe, so it keeps wasmtime's own default location + flat 512 MiB limit,
+/// unchanged.
+///
+/// # Why this needs the directory, not just a number
+///
+/// Wasmtime applies its soft limit once, at `Cache::new`, with no live
+/// re-application path — so this is a start-time-only value, and the
+/// filesystem probe (`statvfs` on `dir`) has to happen HERE, synchronously,
+/// before the engine is built. It cannot go through the aggregate
+/// [`crate::ring::hosting::disk_usage::DiskUsageTracker`] instead: that
+/// tracker is seeded lazily on the first ~60s sweep tick, well after this
+/// function's caller needs an answer, and seeding it here would mean walking
+/// every persisted contract-state row before the node can even build its WASM
+/// engine.
+///
+/// # Immediate relief for an already-oversized cache
+///
+/// A node upgrading from an older build (or one that just got less disk) can
+/// already have MORE on disk than the limit computed here — wasmtime's own
+/// cleanup only prunes on a ~1h cadence, so waiting for it would leave a
+/// wedged node's admission gate rejecting writes for up to an hour after the
+/// fix that was supposed to relieve it (see
+/// [`reconcile_existing_cache_dir`]). Reconciling here, once, at startup,
+/// gives the fix effect on the very next restart instead.
+pub(crate) fn default_wasmtime_cache_size_bytes_for_dir(dir: &Path) -> u64 {
+    let total_ram = super::read_total_ram_bytes()
+        .map(|v| v as u64)
+        .unwrap_or(WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES);
+    let available_disk_bytes = crate::ring::disk_available_bytes(dir);
+    let limit = combine_wasmtime_cache_size(total_ram, available_disk_bytes);
+    reconcile_existing_cache_dir(dir, limit);
+    limit
+}
+
+/// If a PRIOR run already left more than `new_soft_limit_bytes` on disk under
+/// `dir` — a RAM-rich host whose disk tightened, an operator who moved to a
+/// smaller disk, or simply a node upgrading from before #5014 narrowed this
+/// limit — clear the directory rather than waiting on wasmtime's own ~1h
+/// internal prune cycle to catch up.
+///
+/// This is a pure cache of recompiled-from-WASM artifacts: clearing it is
+/// always safe (worst case, the next distinct contract blob recompiles once
+/// instead of hitting the cache) and is the only way to give an
+/// ALREADY-WEDGED node (#5014: the aggregate disk budget's `admit_state_write`
+/// / `admit_wasm_write` rejecting every write because the disk budget counts
+/// the oversized cache) relief on the very next restart, instead of an
+/// up-to-an-hour wait.
+///
+/// Best-effort: this is a startup optimization, not a correctness
+/// requirement, so a walk or delete failure is logged and otherwise ignored —
+/// it must never fail node boot, and a directory that fails to clear just
+/// falls back to wasmtime's own prune cycle, the pre-#5014 behavior.
+fn reconcile_existing_cache_dir(dir: &Path, new_soft_limit_bytes: u64) {
+    let current_bytes = crate::ring::disk_directory_size_bytes(dir);
+    if current_bytes <= new_soft_limit_bytes {
+        return;
+    }
+    tracing::info!(
+        dir = %dir.display(),
+        current_bytes,
+        new_soft_limit_bytes,
+        "wasmtime compile cache exceeds the newly-computed disk-aware soft \
+         limit; clearing it for immediate relief (#5014)"
+    );
+    if let Err(error) = std::fs::remove_dir_all(dir) {
+        tracing::warn!(
+            dir = %dir.display(),
+            %error,
+            "failed to clear oversized wasmtime compile cache; falling back \
+             to wasmtime's own prune cycle"
+        );
+    }
 }
 
 impl Default for RuntimeConfig {
@@ -1187,8 +1318,7 @@ impl super::contract::ContractRuntimeBridge for Runtime {}
 mod wasmtime_disk_cache_sizing_tests {
     use super::{
         MAX_WASMTIME_CACHE_SIZE_BYTES, MIN_WASMTIME_CACHE_SIZE_BYTES,
-        WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES, default_wasmtime_cache_size_bytes,
-        wasmtime_cache_size_for_ram,
+        WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES, wasmtime_cache_size_for_ram,
     };
     use crate::ring::hosting_budget_for_ram;
 
@@ -1350,52 +1480,44 @@ mod wasmtime_disk_cache_sizing_tests {
         );
     }
 
-    /// The live reader applies the pure clamp to the RAM signal rather than
-    /// carrying its own arithmetic.
-    ///
-    /// This is a consistency check, and on a host above the ceiling-binding
-    /// point (>= 4 GiB, i.e. most CI machines) it CANNOT distinguish a reader
-    /// that ignores RAM and returns the ceiling constant — both sides evaluate
-    /// to the ceiling. `default_soft_limit_reader_derives_from_the_ram_signal`
-    /// below covers that host-independently, which is why the previous
-    /// `(MIN..=MAX).contains(&resolved)` assertion was dropped: a function that
-    /// clamps by construction can never fail a containment check, so it tested
-    /// nothing at all.
+    /// Host-independent pin: the live reader (`default_wasmtime_cache_size_bytes_for_dir`,
+    /// #5014) must derive its value from the shared RAM signal AND the disk
+    /// availability signal, delegating to the pure combiner rather than
+    /// carrying its own arithmetic or re-hardcoding a flat constant. This is a
+    /// source-scrape pin (not a live-value comparison) because on a host above
+    /// the ceiling-binding point on BOTH axes a reader that ignores its inputs
+    /// entirely would still coincidentally return the ceiling — see
+    /// `wasmtime_disk_cache_disk_sizing_tests` for the live-value coverage that
+    /// exercises the RAM/disk interaction itself.
     #[test]
-    fn default_soft_limit_matches_the_pure_clamp_of_this_hosts_ram_signal() {
-        let signal = crate::wasm_runtime::read_total_ram_bytes()
-            .map(|v| v as u64)
-            .unwrap_or(WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES);
-        assert_eq!(
-            default_wasmtime_cache_size_bytes(),
-            wasmtime_cache_size_for_ram(signal),
-            "the live reader must apply the pure clamp to the RAM signal"
-        );
-    }
-
-    /// Host-independent pin: the live reader must derive its value from the
-    /// shared RAM signal and delegate to the pure clamp. Fails if a future edit
-    /// re-hardcodes the limit or introduces a second notion of machine size —
-    /// the mutation a runtime assertion cannot catch on a large CI host.
-    #[test]
-    fn default_soft_limit_reader_derives_from_the_ram_signal() {
+    fn default_soft_limit_reader_derives_from_ram_and_disk_signals() {
         let src = include_str!("runtime.rs");
         let body = src
-            .split("pub(crate) fn default_wasmtime_cache_size_bytes() -> u64 {")
+            .split("pub(crate) fn default_wasmtime_cache_size_bytes_for_dir(dir: &Path) -> u64 {")
             .nth(1)
-            .expect("default_wasmtime_cache_size_bytes must exist")
+            .expect("default_wasmtime_cache_size_bytes_for_dir must exist")
             .split("\n}\n")
             .next()
-            .expect("end of default_wasmtime_cache_size_bytes");
+            .expect("end of default_wasmtime_cache_size_bytes_for_dir");
         assert!(
             body.contains("read_total_ram_bytes()"),
             "the reader must consult the shared read_total_ram_bytes() signal, not \
              a second notion of machine size"
         );
         assert!(
-            body.contains("wasmtime_cache_size_for_ram("),
-            "the reader must delegate to the pure clamp so the boundary math has \
-             exactly one implementation"
+            body.contains("disk_available_bytes("),
+            "the reader must consult a real disk-availability signal — a RAM-only \
+             reader is exactly the #5014 defect"
+        );
+        assert!(
+            body.contains("combine_wasmtime_cache_size("),
+            "the reader must delegate to the pure combiner so the RAM/disk \
+             interaction has exactly one implementation"
+        );
+        assert!(
+            body.contains("reconcile_existing_cache_dir("),
+            "the reader must reconcile an already-oversized cache directory, not \
+             just narrow the limit for future growth"
         );
     }
 
@@ -1420,5 +1542,164 @@ mod wasmtime_disk_cache_sizing_tests {
         // only when this test happens to run.
         const _: () = assert!(MIN_WASMTIME_CACHE_SIZE_BYTES < MAX_WASMTIME_CACHE_SIZE_BYTES);
         assert_eq!(MAX_WASMTIME_CACHE_SIZE_BYTES, LEGACY_FLAT_SOFT_LIMIT_BYTES);
+    }
+}
+
+/// #5014: the disk-side term, the RAM/disk composition, and the startup
+/// reconciliation that gives an already-oversized cache immediate relief.
+#[cfg(test)]
+mod wasmtime_disk_cache_disk_sizing_tests {
+    use super::{
+        MAX_WASMTIME_CACHE_SIZE_BYTES, MIN_WASMTIME_CACHE_SIZE_BYTES, combine_wasmtime_cache_size,
+        default_wasmtime_cache_size_bytes_for_dir, reconcile_existing_cache_dir,
+        wasmtime_cache_size_for_disk, wasmtime_cache_size_for_ram,
+    };
+    use std::io::Write;
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+
+    /// Floor/ceiling boundary for the disk-side term, mirroring
+    /// `compile_cache_floor_binds_on_tiny_hosts` /
+    /// `compile_cache_ceiling_binds_on_large_hosts` for the RAM-side term.
+    /// Concrete byte values, not comparisons against the constants — see
+    /// those tests' doc comment for why a self-referential assertion would
+    /// pass even if the floor were mutated to 0.
+    #[test]
+    fn disk_term_floor_and_ceiling_bind() {
+        assert_eq!(wasmtime_cache_size_for_disk(0), 128 * MIB);
+        assert_eq!(wasmtime_cache_size_for_disk(1), 128 * MIB);
+        // Exactly at the binding point: 1 GiB / 8 == 128 MiB == the floor.
+        assert_eq!(wasmtime_cache_size_for_disk(GIB), 128 * MIB);
+        // Exactly at the binding point: 4 GiB / 8 == 512 MiB == the ceiling.
+        assert_eq!(wasmtime_cache_size_for_disk(4 * GIB), 512 * MIB);
+        assert_eq!(wasmtime_cache_size_for_disk(8 * GIB), 512 * MIB);
+        // u64::MAX must clamp, not wrap or panic.
+        assert_eq!(wasmtime_cache_size_for_disk(u64::MAX), 512 * MIB);
+    }
+
+    /// The exact shape from #5014's worked example: a 16 GiB VM (RAM ample —
+    /// the RAM term resolves to the historical 512 MiB ceiling) with only
+    /// 400 MiB free on the data-dir mount. Before this fix, ONLY the RAM term
+    /// existed, so this host got a 512 MiB compile cache while its whole disk
+    /// budget (`clamp(0.5 * (used + available), ...)`) sat far below that —
+    /// wedging `admit_state_write`/`admit_wasm_write` shut. The disk term
+    /// must now pull the combined result down from the RAM ceiling.
+    #[test]
+    fn ram_rich_disk_tight_host_is_bounded_by_the_disk_term() {
+        let ram_only = wasmtime_cache_size_for_ram(16 * GIB);
+        assert_eq!(
+            ram_only,
+            512 * MIB,
+            "16 GiB RAM must hit the RAM-side ceiling"
+        );
+
+        let available_disk = 400 * MIB;
+        let combined = combine_wasmtime_cache_size(16 * GIB, Some(available_disk));
+        assert!(
+            combined < ram_only,
+            "a disk-tight host (400 MiB free) must get LESS than the RAM-only \
+             figure ({ram_only}); got {combined}"
+        );
+        // 400 MiB / 8 == 50 MiB, below the floor, so the floor binds.
+        assert_eq!(combined, 128 * MIB);
+    }
+
+    /// The composition is `min(ram_term, disk_term)` — whichever signal is
+    /// tighter wins, in both directions.
+    #[test]
+    fn combine_takes_the_tighter_of_the_two_terms() {
+        // RAM-poor, disk-rich: the RAM term binds (unchanged from before #5014).
+        assert_eq!(
+            combine_wasmtime_cache_size(2 * GIB, Some(100 * GIB)),
+            wasmtime_cache_size_for_ram(2 * GIB),
+        );
+        // RAM-rich, disk-poor: the disk term binds (the #5014 fix).
+        assert_eq!(
+            combine_wasmtime_cache_size(100 * GIB, Some(2 * GIB)),
+            wasmtime_cache_size_for_disk(2 * GIB),
+        );
+        // Both ample: both clamp to the shared ceiling, so it's a no-op either way.
+        assert_eq!(
+            combine_wasmtime_cache_size(100 * GIB, Some(100 * GIB)),
+            MAX_WASMTIME_CACHE_SIZE_BYTES,
+        );
+    }
+
+    /// An unreadable disk signal (statvfs failure / unsupported platform)
+    /// must NOT invent a possibly-wrong tight cap — it falls back to the
+    /// RAM-only figure, i.e. today's shipped behavior, unchanged.
+    #[test]
+    fn unreadable_disk_signal_falls_back_to_ram_only() {
+        assert_eq!(
+            combine_wasmtime_cache_size(16 * GIB, None),
+            wasmtime_cache_size_for_ram(16 * GIB),
+        );
+    }
+
+    /// A directory already over the newly-computed limit (the "upgrading an
+    /// already-wedged gateway" case) is cleared immediately rather than left
+    /// for wasmtime's own ~1h prune cycle.
+    #[test]
+    fn reconcile_clears_a_directory_already_over_the_new_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("wasmtime-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let mut f = std::fs::File::create(cache_dir.join("big.bin")).unwrap();
+        f.write_all(&vec![0u8; 200 * 1024 * 1024]).unwrap(); // 200 MiB
+
+        reconcile_existing_cache_dir(&cache_dir, 128 * MIB);
+
+        assert!(
+            !cache_dir.exists(),
+            "an over-limit cache directory must be cleared, not left for the \
+             ~1h wasmtime prune cycle to catch up"
+        );
+    }
+
+    /// A directory already AT OR UNDER the limit must be left alone — this is
+    /// a startup optimization for the over-limit case, not an unconditional
+    /// wipe of the compile cache on every boot.
+    #[test]
+    fn reconcile_leaves_a_directory_under_the_limit_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("wasmtime-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let mut f = std::fs::File::create(cache_dir.join("small.bin")).unwrap();
+        f.write_all(&vec![0u8; 1024]).unwrap(); // 1 KiB
+
+        reconcile_existing_cache_dir(&cache_dir, 128 * MIB);
+
+        assert!(
+            cache_dir.join("small.bin").exists(),
+            "a directory already under the limit must not be touched"
+        );
+    }
+
+    /// A missing directory (fresh node, nothing written yet) must be a no-op,
+    /// not a panic or an error — `du_walk`'s own contract for a missing dir is
+    /// "contributes 0", so 0 is never `>` any real limit.
+    #[test]
+    fn reconcile_is_a_no_op_on_a_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist-yet");
+        reconcile_existing_cache_dir(&missing, 128 * MIB); // must not panic
+        assert!(!missing.exists());
+    }
+
+    /// Smoke test for the impure entry point end-to-end against a real
+    /// directory: whatever this host's actual RAM/disk resolve to, the result
+    /// must stay within the shared clamp bounds, and it must not panic when
+    /// run against a directory that doesn't exist yet (the fresh-node case).
+    #[test]
+    fn default_for_dir_stays_within_bounds_on_a_fresh_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("wasmtime-cache");
+        let result = default_wasmtime_cache_size_bytes_for_dir(&cache_dir);
+        assert!(
+            (MIN_WASMTIME_CACHE_SIZE_BYTES..=MAX_WASMTIME_CACHE_SIZE_BYTES).contains(&result),
+            "result {result} must stay within [{MIN_WASMTIME_CACHE_SIZE_BYTES}, \
+             {MAX_WASMTIME_CACHE_SIZE_BYTES}] regardless of this host's real RAM/disk"
+        );
     }
 }

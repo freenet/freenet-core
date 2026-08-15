@@ -9,7 +9,7 @@ use super::{
     ContractExecutor, ContractRequest, ContractResponse, ExecutorError, InitCheckResult,
     RequestError, Response, SLOW_INIT_THRESHOLD, STALE_INIT_THRESHOLD, StateStoreError, now_nanos,
 };
-use crate::wasm_runtime::default_wasmtime_cache_size_bytes;
+use crate::wasm_runtime::default_wasmtime_cache_size_bytes_for_dir;
 pub(crate) use contract_ops::ReclaimOutcome;
 pub use pool::RuntimePool;
 pub(crate) use pool::{ExportAdmission, ExportDone, MAX_CONCURRENT_EXPORTS};
@@ -469,13 +469,17 @@ impl Executor<Runtime> {
             // pin its soft-size limit (#4683) so it lives on the mount whose
             // free space sizes the disk budget and is measurable as freenet's
             // own on-disk usage. `with_directory` requires an absolute path;
-            // the data dir is absolute. The soft limit is derived from the
-            // memory the node may use rather than a flat constant, so a small or
-            // containerized node no longer gets a compile cache larger than the
-            // contract state it accelerates — see
-            // `default_wasmtime_cache_size_bytes`.
+            // the data dir is absolute. The soft limit is bounded by BOTH the
+            // memory the node may use AND the disk actually free on that mount
+            // (#5014), so a small/containerized node no longer gets a compile
+            // cache larger than the contract state it accelerates, AND a
+            // disk-tight-but-RAM-rich host no longer gets a cache the disk
+            // budget can't actually afford — see
+            // `default_wasmtime_cache_size_bytes_for_dir`.
             wasmtime_cache_dir: Some(config.wasmtime_cache_dir()),
-            wasmtime_cache_size_bytes: Some(default_wasmtime_cache_size_bytes()),
+            wasmtime_cache_size_bytes: Some(default_wasmtime_cache_size_bytes_for_dir(
+                &config.wasmtime_cache_dir(),
+            )),
             ..RuntimeConfig::default()
         };
         let mut rt = Runtime::build_with_shared_module_caches(
@@ -1324,18 +1328,22 @@ mod executor_pin_tests {
             "backend engine must be built from the threaded runtime_config"
         );
         // The wasmtime ON-DISK compile cache's soft limit must be derived from
-        // the memory the node may use, never re-hardcoded to a flat constant: a
+        // BOTH the memory the node may use AND the disk actually free on the
+        // cache's mount, never re-hardcoded to a flat constant or RAM alone: a
         // fixed 512 MiB let a 2 GiB-cgroup node keep a compile cache larger than
-        // its entire 256 MiB contract-state budget. Whitespace is collapsed so
-        // the pin survives a rustfmt line-wrap of the field.
+        // its entire 256 MiB contract-state budget (#4683), and a RAM-only figure
+        // left a disk-tight-but-RAM-rich host's admission gate wedged shut by its
+        // own oversized compile cache (#5014). Whitespace is collapsed so the pin
+        // survives a rustfmt line-wrap of the field.
         let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
             collapsed.contains(concat!(
                 "wasmtime_cache_size_bytes: Some(",
-                "default_wasmtime_cache_size_bytes())"
+                "default_wasmtime_cache_size_bytes_for_dir( &config.wasmtime_cache_dir(), ))"
             )),
             "the wasmtime on-disk compile-cache soft limit must come from \
-             default_wasmtime_cache_size_bytes() (node-relative), not a constant"
+             default_wasmtime_cache_size_bytes_for_dir() (RAM- AND disk-relative), \
+             not a constant or a RAM-only figure"
         );
     }
 

@@ -79,7 +79,9 @@ pub(crate) use native_api::{
 #[cfg(test)]
 pub(crate) use native_api::InheritedOriginsEntry;
 pub use runtime::{ContractExecError, Runtime};
-pub(crate) use runtime::{RuntimeConfig, SharedModuleCache, default_wasmtime_cache_size_bytes};
+pub(crate) use runtime::{
+    RuntimeConfig, SharedModuleCache, default_wasmtime_cache_size_bytes_for_dir,
+};
 pub use secrets_store::{
     DEFAULT_LAST_SEEN_DEBOUNCE_SECS, DEFAULT_PER_USER_INACTIVE_TTL_SECS,
     DEFAULT_PER_USER_SECRET_QUOTA_BYTES, ExportSecretEntry, MigrationReport, SecretScope,

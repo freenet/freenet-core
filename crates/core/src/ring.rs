@@ -140,6 +140,12 @@ pub(crate) use hosting::{GENUINE_ACCESS_RECENCY_BUCKETS, READ_COUNT_HIST_BUCKETS
 /// Clamp bounds re-exported only for the config-default round-trip test.
 #[cfg(test)]
 pub(crate) use hosting::{MAX_DEFAULT_HOSTING_BUDGET_BYTES, MIN_DEFAULT_HOSTING_BUDGET_BYTES};
+/// The aggregate disk-usage tracker's mount-availability probe and directory
+/// walk, re-exported so the wasmtime on-disk compile-cache startup sizing
+/// (`wasm_runtime::runtime::default_wasmtime_cache_size_bytes_for_dir`, #5014)
+/// can bound itself by real disk headroom, not just RAM, without duplicating
+/// the `statvfs` FFI call or the walk.
+pub(crate) use hosting::{disk_available_bytes, disk_directory_size_bytes};
 pub mod interest;
 mod live_tx;
 mod location;

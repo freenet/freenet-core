@@ -86,6 +86,12 @@ use dashmap::{DashMap, DashSet};
 use demand::ProximityPrior;
 use disk_usage::DiskUsageTracker;
 pub(crate) use disk_usage::{DiskBudgetExceeded, DiskUsageStats};
+// #5014: the wasmtime on-disk compile-cache startup sizing needs the same
+// mount-availability probe and directory walk this module already uses for
+// the aggregate disk budget, re-exported one level further in `ring.rs`.
+pub(crate) use disk_usage::{
+    available_bytes as disk_available_bytes, du_walk as disk_directory_size_bytes,
+};
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
