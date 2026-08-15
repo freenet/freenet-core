@@ -9,7 +9,7 @@ use super::{
     ContractExecutor, ContractRequest, ContractResponse, ExecutorError, InitCheckResult,
     RequestError, Response, SLOW_INIT_THRESHOLD, STALE_INIT_THRESHOLD, StateStoreError, now_nanos,
 };
-use crate::wasm_runtime::default_wasmtime_cache_size_bytes;
+use crate::wasm_runtime::default_wasmtime_cache_size_bytes_for_dir;
 pub(crate) use contract_ops::ReclaimOutcome;
 pub use pool::RuntimePool;
 pub(crate) use pool::{ExportAdmission, ExportDone, MAX_CONCURRENT_EXPORTS};
@@ -462,6 +462,29 @@ impl Executor<Runtime> {
         // panics in `current_thread` integration tests. The byte budget here
         // also threads into the backend (though the *shared* cache size comes
         // from the caches passed in by RuntimePool::new).
+        // Only probe disk / size the compile-cache soft limit when we're about
+        // to build a NEW backend engine (`shared_backend.is_none()`) — that is
+        // the ONLY branch that reads `wasmtime_cache_dir`/`wasmtime_cache_size_bytes`
+        // (inside `create_backend_engine`, see below). Computing it
+        // unconditionally would run `default_wasmtime_cache_size_bytes_for_dir`'s
+        // startup reconciliation (#5014) for every pool worker AND on every
+        // mid-life `create_replacement_executor` call (panic recovery) — the
+        // latter passes `shared_backend: Some(..)`, so it would run
+        // `reconcile_existing_cache_dir`'s directory walk / possible
+        // `remove_dir_all` against a directory the LIVE, already-in-use shared
+        // engine is actively reading/writing, exactly when the cache is most
+        // likely to be genuinely populated. Gating on `is_none()` makes this
+        // run exactly once per node, only for the executor that actually
+        // builds the engine, matching the doc comment on
+        // `default_wasmtime_cache_size_bytes_for_dir` (#5328 review).
+        let wasmtime_cache_dir = config.wasmtime_cache_dir();
+        let wasmtime_cache_size_bytes = shared_backend.is_none().then(|| {
+            default_wasmtime_cache_size_bytes_for_dir(
+                &wasmtime_cache_dir,
+                config.hosting_disk_pct,
+                config.max_hosting_disk,
+            )
+        });
         let runtime_config = RuntimeConfig {
             offload_compilation: production_offload_compilation(),
             module_cache_budget_bytes: config.module_cache_budget_bytes,
@@ -469,13 +492,15 @@ impl Executor<Runtime> {
             // pin its soft-size limit (#4683) so it lives on the mount whose
             // free space sizes the disk budget and is measurable as freenet's
             // own on-disk usage. `with_directory` requires an absolute path;
-            // the data dir is absolute. The soft limit is derived from the
-            // memory the node may use rather than a flat constant, so a small or
-            // containerized node no longer gets a compile cache larger than the
-            // contract state it accelerates — see
-            // `default_wasmtime_cache_size_bytes`.
-            wasmtime_cache_dir: Some(config.wasmtime_cache_dir()),
-            wasmtime_cache_size_bytes: Some(default_wasmtime_cache_size_bytes()),
+            // the data dir is absolute. The soft limit is bounded by BOTH the
+            // memory the node may use AND the disk actually free on that mount
+            // (#5014), so a small/containerized node no longer gets a compile
+            // cache larger than the contract state it accelerates, AND a
+            // disk-tight-but-RAM-rich host no longer gets a cache the disk
+            // budget can't actually afford — see
+            // `default_wasmtime_cache_size_bytes_for_dir`.
+            wasmtime_cache_dir: Some(wasmtime_cache_dir),
+            wasmtime_cache_size_bytes,
             ..RuntimeConfig::default()
         };
         let mut rt = Runtime::build_with_shared_module_caches(
@@ -1324,18 +1349,49 @@ mod executor_pin_tests {
             "backend engine must be built from the threaded runtime_config"
         );
         // The wasmtime ON-DISK compile cache's soft limit must be derived from
-        // the memory the node may use, never re-hardcoded to a flat constant: a
+        // BOTH the memory the node may use AND the disk actually free on the
+        // cache's mount, never re-hardcoded to a flat constant or RAM alone: a
         // fixed 512 MiB let a 2 GiB-cgroup node keep a compile cache larger than
-        // its entire 256 MiB contract-state budget. Whitespace is collapsed so
-        // the pin survives a rustfmt line-wrap of the field.
+        // its entire 256 MiB contract-state budget (#4683), and a RAM-only figure
+        // left a disk-tight-but-RAM-rich host's admission gate wedged shut by its
+        // own oversized compile cache (#5014). Whitespace is collapsed so the pin
+        // survives a rustfmt line-wrap of the field.
         let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            collapsed.contains(concat!(
-                "wasmtime_cache_size_bytes: Some(",
-                "default_wasmtime_cache_size_bytes())"
-            )),
+            collapsed.contains("default_wasmtime_cache_size_bytes_for_dir( &wasmtime_cache_dir,"),
             "the wasmtime on-disk compile-cache soft limit must come from \
-             default_wasmtime_cache_size_bytes() (node-relative), not a constant"
+             default_wasmtime_cache_size_bytes_for_dir() (RAM- AND disk-relative), \
+             not a constant or a RAM-only figure"
+        );
+        // #5328 review: the operator's configured disk-budget knobs
+        // (`--hosting-disk-pct` / `--max-hosting-disk`) must feed the sizing
+        // call too — a raw-physical-disk-only bound leaves an operator who
+        // shrinks `--max-hosting-disk` below physical capacity permanently
+        // wedged, since the compile cache would still size itself off the
+        // larger physical disk. This is the case the ORIGINAL issue (#5014)
+        // suggested addressing via `disk_budget_for_clamped`.
+        assert!(
+            collapsed.contains("config.hosting_disk_pct, config.max_hosting_disk,"),
+            "the sizing call must be fed the operator's configured \
+             hosting-disk-pct/max-hosting-disk, not just raw physical disk \
+             availability — otherwise an operator-shrunk disk budget below \
+             physical capacity stays permanently wedged"
+        );
+        // #5328 review: that sizing call does real filesystem work — a statvfs
+        // read and, via reconciliation, a directory walk and possibly a
+        // remove_dir_all — so it MUST be gated on `shared_backend.is_none()`
+        // (the one branch that actually builds a fresh engine/Cache). Without
+        // this gate, every pool worker AND every mid-life
+        // `create_replacement_executor` panic-recovery call would re-run it
+        // against a directory the shared, already-in-use engine is actively
+        // reading/writing.
+        assert!(
+            collapsed.contains("shared_backend.is_none().then(|| {"),
+            "the disk-aware compile-cache sizing (and its reconciliation side \
+             effect) must be gated on shared_backend.is_none(), so it runs only \
+             for the executor that actually builds a new backend engine — never \
+             for a pool worker reusing the shared engine or a mid-life \
+             executor replacement"
         );
     }
 

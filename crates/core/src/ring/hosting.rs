@@ -81,11 +81,22 @@ pub(crate) use cache::{DEFAULT_HOSTING_DISK_PCT, DEFAULT_MAX_HOSTING_DISK_BYTES}
 /// snapshot. Re-exported so `router` can size the wire arrays from the single
 /// definition next to the bucketing code.
 pub(crate) use cache::{GENUINE_ACCESS_RECENCY_BUCKETS, READ_COUNT_HIST_BUCKETS};
-use cache::{HostingCache, HostingCacheStats, disk_budget_for_clamped};
+use cache::{HostingCache, HostingCacheStats};
+// Re-exported (not just used internally) so the wasmtime disk-cache sizing
+// tests (#5328 review) can verify headroom against the SAME aggregate
+// hosting-disk budget function this module uses, rather than duplicating its
+// math.
+pub(crate) use cache::disk_budget_for_clamped;
 use dashmap::{DashMap, DashSet};
 use demand::ProximityPrior;
 use disk_usage::DiskUsageTracker;
 pub(crate) use disk_usage::{DiskBudgetExceeded, DiskUsageStats};
+// #5014: the wasmtime on-disk compile-cache startup sizing needs the same
+// mount-availability probe and directory walk this module already uses for
+// the aggregate disk budget, re-exported one level further in `ring.rs`.
+pub(crate) use disk_usage::{
+    available_bytes as disk_available_bytes, du_walk as disk_directory_size_bytes,
+};
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
