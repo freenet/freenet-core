@@ -46,7 +46,22 @@ pub enum ConformanceProperty {
     /// before this property is ever allowed to influence anything on the network.
     /// Until then it is a reporting signal for contract authors.
     DeltaIdempotence,
-    /// Independent deltas in any order, with duplicates, reach the same canonical state.
+    /// Deltas applied in any order reach the same canonical state.
+    ///
+    /// The published `ContractInterface` requirement carries no independence
+    /// qualifier — "the order in which these updates are applied should not affect
+    /// the final state" — so order-dependence is a defect whether or not the deltas
+    /// are causally related, and this checks exactly that.
+    ///
+    /// Worth knowing when reading a finding: the generator pairs deltas as observed,
+    /// which means consecutive ones may be causally sequenced. So a finding here can
+    /// also be read as "this delta encoding carries sequence", which is the same
+    /// defect seen from the other side rather than a separate one.
+    ///
+    /// Re-delivery is deliberately not checked here; that is
+    /// [`ConformanceProperty::DeltaIdempotence`], which is contested and reports at
+    /// a lower severity. Folding it in would accuse a counter-style contract under
+    /// this property's name and severity regardless of that.
     DeltaPermutationInvariance,
     /// A delta against an exact summary of the same state should be empty (#5072).
     SelfDeltaEmpty,

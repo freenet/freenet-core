@@ -1,9 +1,15 @@
 //! Executes one conformance property against one contract.
 //!
-//! Everything here is deterministic given the oracle: the same case run twice on the
-//! same contract produces the same outcome. That is what lets a peer ship a case to
-//! another peer and have it reach the same conclusion independently, and it is what
-//! lets `fdev` reproduce a network finding offline.
+//! The logic here is deterministic given the oracle, which is what lets a peer ship
+//! a case to another peer and have it reach the same conclusion independently, and
+//! what lets `fdev` reproduce a network finding offline.
+//!
+//! The *contract* is not guaranteed to be, and that is the interesting part. A
+//! contract can reach for the host clock, so the same case run twice can genuinely
+//! produce different outputs. [`verify_case`] therefore re-runs any check that was
+//! about to report a violation and requires the same finding, with the same outputs,
+//! before it will accuse anyone — see the note there. If the module were as
+//! deterministic as the first sentence sounds, that machinery would be dead code.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -145,12 +151,41 @@ pub fn verify_case<O: ConformanceOracle + ?Sized>(
             }
             // Disagreed with itself. The contract is nondeterministic, which is its
             // own defect with its own property, and is emphatically not proof of the
-            // law this case was checking.
-            _ => PropertyOutcome::Inconclusive(Inconclusive::NotReproducible),
+            // law this case was checking. Say so under the right name if we can:
+            // reporting nothing at all would turn a real defect into a silent miss.
+            _ => escalate_to_determinism(oracle, case),
         };
     }
 
     first
+}
+
+/// A check that failed once and not again means something outside the inputs moved.
+/// Try to name that directly instead of just declining to answer.
+///
+/// Without this, a contract that varies its merge output between identical calls
+/// escapes entirely: the law it appeared to break does not reproduce, and the
+/// determinism check that would name it correctly repeats back-to-back and can miss
+/// a coarse-grained clock. Reporting `UpdateDeterminism` when it does fire turns a
+/// silent miss into a finding under the right property.
+fn escalate_to_determinism<O: ConformanceOracle + ?Sized>(
+    oracle: &mut O,
+    case: &ConformanceCase,
+) -> PropertyOutcome {
+    if case.states.len() < ConformanceProperty::UpdateDeterminism.state_arity() {
+        return PropertyOutcome::Inconclusive(Inconclusive::NotReproducible);
+    }
+    let determinism = ConformanceCase {
+        property: ConformanceProperty::UpdateDeterminism,
+        states: case.states.clone(),
+        deltas: Vec::new(),
+        summary: None,
+        related: case.related.clone(),
+    };
+    match run(oracle, &determinism) {
+        Ok(outcome @ PropertyOutcome::Violated(_)) => outcome,
+        _ => PropertyOutcome::Inconclusive(Inconclusive::NotReproducible),
+    }
 }
 
 /// Did the second run reproduce the *same* failure, or merely another failure?

@@ -572,6 +572,89 @@ fn a_weak_delta_path_with_a_sound_merge_is_not_a_cycle() {
     ));
 }
 
+/// A failure that does not happen again is not evidence.
+///
+/// Something outside the inputs moved between the two runs — the host clock being
+/// the realistic candidate — and reporting it as a merge-law break would name the
+/// wrong law about a contract that may be fine. Without this test the entire re-run
+/// block in `verify_case` could be deleted and nothing would fail.
+#[test]
+fn a_violation_that_does_not_reproduce_is_not_reported() {
+    // Misbehaves only on its first two merges, then is a well-behaved union
+    // forever. The first run sees last-write-wins; every run after holds.
+    let mut calls = 0u32;
+    let mut fake = Fake::conforming().merging(move |a, b| {
+        calls += 1;
+        if calls <= 2 {
+            Ok(b.to_vec()) // last-write-wins: A,B and B,A disagree
+        } else {
+            Ok(union(a, b))
+        }
+    });
+
+    assert_inconclusive(
+        verify_case(
+            &mut fake,
+            &case(ConformanceProperty::StateCommutativity, &[&[1, 2], &[2, 3]]),
+        ),
+        Inconclusive::NotReproducible,
+    );
+}
+
+/// A contract whose merge output varies between identical calls is a real defect,
+/// but it is a determinism defect. Rather than silently dropping it as
+/// "not reproducible", the finding is re-issued under the property that names it.
+#[test]
+fn a_nondeterministic_merge_is_reported_as_nondeterminism_not_as_a_merge_law_break() {
+    let mut calls = 0u8;
+    let mut fake = Fake::conforming().merging(move |a, b| {
+        calls = calls.wrapping_add(1);
+        let mut out = union(a, b);
+        out.push(calls);
+        Ok(out)
+    });
+
+    assert_violates(
+        verify_case(
+            &mut fake,
+            &case(ConformanceProperty::StateCommutativity, &[&[1, 2], &[2, 3]]),
+        ),
+        ConformanceProperty::UpdateDeterminism,
+    );
+}
+
+/// Intermediate states get the same validity precondition as the inputs. A state the
+/// contract rejects never reaches another peer, so continuing to merge on top of one
+/// reasons about a history that cannot happen — which is how false positives are
+/// manufactured, by this module's own rule.
+///
+/// Without this test, the `require_valid` calls on the associativity intermediates
+/// could be deleted and nothing would fail.
+#[test]
+fn an_intermediate_the_contract_rejects_is_inconclusive() {
+    // Accepts the three inputs, then rejects everything the merge produces.
+    let mut validations = 0u32;
+    let mut fake = Fake::conforming().validating(move |_state| {
+        validations += 1;
+        if validations <= 3 {
+            Ok(ValidateResult::Valid)
+        } else {
+            Ok(ValidateResult::Invalid)
+        }
+    });
+
+    assert_inconclusive(
+        verify_case(
+            &mut fake,
+            &case(
+                ConformanceProperty::StateAssociativity,
+                &[&[1, 2], &[2, 3], &[4]],
+            ),
+        ),
+        Inconclusive::InputNotValid,
+    );
+}
+
 /// A contract that rejects an update it considers unauthorized (the River-style
 /// signature-chain case) returns an error. One rejection is not a merge-law failure.
 #[test]
