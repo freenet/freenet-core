@@ -16,21 +16,28 @@ bump PR merges
                          -> gh release edit --draft=false
 ```
 
-Two consequences for anyone recovering by hand:
+Two consequences for anyone recovering by hand. Both are about ORDER, not about
+never touching these commands — **Step 4 is the sanctioned way to do both by
+hand, and it exists because sometimes you have to.** What is never allowed is
+doing either one *ahead of the gate*.
 
-- **Never create the GitHub release without `--draft`, and never un-draft it
-  yourself.** Gate A only sees a draft; a release created published skips the
-  gate entirely, which is the failure mode issue #5288 was filed for. The
-  workflow's own comment says the same thing: "Do NOT un-draft it by hand."
-  Gate A exists because auto-update was dead fleet-wide for two releases
-  (v0.2.120, v0.2.121) and every other signal stayed green. A broken updater
-  cannot ship its own fix.
+- **Never create the GitHub release without `--draft`, and do not un-draft it
+  yourself until Gate A has passed** (Step 4 shows how to confirm that, and is
+  the one place that un-drafts by hand). Gate A only sees a draft; a release
+  created published skips the gate entirely, which is the failure mode issue
+  #5288 was filed for. The workflow's own comment says the same thing: "Do NOT
+  un-draft it by hand" — meaning to bypass a gate that has not passed. Gate A
+  exists because auto-update was dead fleet-wide for two releases (v0.2.120,
+  v0.2.121) and every other signal stayed green. A broken updater cannot ship
+  its own fix.
 
-- **Never `cargo publish` by hand before Gate A has passed.** The crates.io
+- **Never `cargo publish` by hand before Gate A has passed** — after it has, and
+  only when the workflow cannot do it, Step 4 is the procedure. The crates.io
   upload is the only step in a release that can never be undone. It used to run
   first, which is why v0.2.124 is permanently a draft with its crates already
   published: the gate blocked it, and the version number was already spent. It
-  now runs inside `attach-to-release`, after the gate. Leave it there.
+  now runs inside `attach-to-release`, after the gate. Leave it there unless
+  the workflow itself is broken.
 
 **Which is why a blocked release is usually cheap now.** If Gate A fails, no
 crates were uploaded. Delete the tag, fix, re-cut on the corrected commit:
@@ -41,7 +48,9 @@ git push --delete origin vX.Y.Z
 git tag -d vX.Y.Z
 ```
 
-Check `cargo search freenet --limit 1` first. If the crates for that version
+Check whether that exact version is on crates.io first (see the Quick
+Reference below — `cargo search` answers about the NEWEST version, not
+yours). If the crates for that version
 *are* already on crates.io, the version is spent — do not re-tag it; cut the
 next patch version instead.
 
@@ -53,7 +62,11 @@ gh pr view <PR_NUMBER> --json state,mergedAt
 git tag -l "v*" | tail -5
 gh release list --limit 5
 gh release view vX.Y.Z --json isDraft,assets --jq '{isDraft, assets: [.assets[].name]}'
-cargo search freenet --limit 1
+
+# Is THIS version on crates.io? `cargo search` only ever reports a crate's
+# newest version, and reads the search index, which lags the registry — so it
+# can answer 'no' about a version that is published. Ask for the version.
+curl -sS https://crates.io/api/v1/crates/freenet/0.1.X | jq -e '.version.num' >/dev/null && echo published || echo 'not published'
 
 # Did the gate run, and what did it say?
 gh run list --workflow=cross-compile.yml --branch vX.Y.Z --limit 3
@@ -136,7 +149,20 @@ Then let the workflow finish the job. If it did not start (a lapsed
 against the tag; `attach-to-release` requires a `refs/tags/v*` ref, so the
 `--ref` must be the tag, not a branch:
 
+**Check nothing is already running for this tag first.** `cross-compile.yml`
+sets `cancel-in-progress` for any ref that is not `main`, so dispatching against
+a tag **cancels the in-flight run for that same tag**. The moment you reach for
+this command — "did it start? is it stuck?" — is exactly when a run may be in
+flight, and a cancellation can now land between the two crate publishes, or
+between the publish and the un-draft. Both states are recoverable (Step 4
+re-runs safely, skipping whatever already published), but do not create them for
+no reason.
+
 ```bash
+# Is one already running? If so, watch it instead of dispatching.
+gh run list --repo freenet/freenet-core --workflow=cross-compile.yml \
+  --branch v0.1.X --limit 5 --json databaseId,status,conclusion
+
 gh workflow run cross-compile.yml --repo freenet/freenet-core --ref v0.1.X
 ```
 
@@ -153,7 +179,18 @@ version already on crates.io, so a re-run is safe, and it keeps the publish and
 the un-draft in the right order.
 
 ```bash
-gh run rerun <RUN_ID> --repo freenet/freenet-core --job <ATTACH_JOB_ID>
+REPO=freenet/freenet-core
+TAG=v0.1.X
+
+RUN_ID=$(gh run list --repo "$REPO" --workflow=cross-compile.yml \
+  --branch "$TAG" --limit 1 --json databaseId --jq '.[0].databaseId')
+
+# `--job` wants the job's databaseId, which is NOT the number in the browser
+# URL. Look it up rather than copying it from the address bar.
+JOB_ID=$(gh run view "$RUN_ID" --repo "$REPO" --json jobs \
+  --jq '.jobs[] | select(.name | startswith("Attach binaries")) | .databaseId')
+
+gh run rerun --repo "$REPO" --job "$JOB_ID"
 ```
 
 Only if that path is unavailable, publish by hand — and **check first that
@@ -161,23 +198,64 @@ Gate A actually passed**, because publishing is what makes the version
 permanent:
 
 ```bash
-# Confirm the pre-flight canary passed for this run before doing anything.
-gh run view <RUN_ID> --repo freenet/freenet-core --log \
-  | grep -F 'Gate A' | tail -20
+REPO=freenet/freenet-core
+TAG=v0.1.X
 
+# Find the run for this tag.
+RUN_ID=$(gh run list --repo "$REPO" --workflow=cross-compile.yml \
+  --branch "$TAG" --limit 1 --json databaseId --jq '.[0].databaseId')
+
+# Confirm Gate A actually PASSED, by reading the step's CONCLUSION.
+#
+# Do NOT confirm this by grepping the log for "Gate A". The canary prints
+# "=== Gate A: auto-update pre-flight on the binary about to ship ===" as the
+# FIRST line of cmd_preflight, before it checks anything, so that grep returns
+# the same output whether the gate passed, blocked on a real fault, or gave no
+# verdict at all. It looks like confirmation and confirms nothing — directly
+# above an irreversible publish.
+gh run view "$RUN_ID" --repo "$REPO" --json jobs --jq '
+  .jobs[]
+  | select(.name | startswith("Attach binaries"))
+  | .steps[]
+  | select(.name | startswith("Auto-update pre-flight"))
+  | "\(.name): \(.conclusion)"'
+```
+
+**That must print `success`.** `failure`, `cancelled`, `skipped` — or no line
+at all, which means the step never ran — all mean Gate A did not pass. Stop and
+go to Step 4b. Only continue past this point on `success`:
+
+```bash
 cd ~/code/freenet/freenet-core/main
 git fetch origin
 # Publish from the release commit, not from whatever main is now (see Step 2).
 git checkout "$RELEASE_SHA"
 
-cargo publish -p freenet
-sleep 30                # fdev resolves freenet from the registry
-cargo publish -p fdev
+# Per crate, because a partial publish is the usual reason to be here:
+# RELEASING.md routes "fdev failed but freenet succeeded" to this step, and an
+# unconditional `cargo publish -p freenet` would just error on the crate that
+# already worked. Mirrors what attach-to-release and release.sh both do.
+published() {  # published <crate> <version>
+  local body
+  body="$(curl -sS --max-time 30 "https://crates.io/api/v1/crates/$1/$2")" || return 1
+  jq -e '.version.num? // empty' >/dev/null 2>&1 <<<"$body"
+}
 
-cargo search freenet --limit 1
+published freenet 0.1.X \
+  && echo "freenet 0.1.X already published, skipping" \
+  || { cargo publish -p freenet; sleep 30; }   # fdev resolves freenet from the registry
 
-# ONLY now, and only if Gate A passed, un-draft:
-gh release edit v0.1.X --repo freenet/freenet-core --draft=false
+published fdev 0.Y.Z \
+  && echo "fdev 0.Y.Z already published, skipping" \
+  || cargo publish -p fdev
+
+# Verify both, by exact version. `cargo search` reports only a crate's NEWEST
+# version and reads the search index, which lags the registry — it can say "no"
+# about a version that is published.
+published freenet 0.1.X && published fdev 0.Y.Z && echo "both on crates.io"
+
+# ONLY now, and only if Gate A reported success above, un-draft:
+gh release edit "$TAG" --repo "$REPO" --draft=false
 ```
 
 ### Step 4b: Gate A blocked the release
@@ -193,7 +271,8 @@ release tags, or the run could not prove that it can. Do not un-draft.
 First establish which side of the irreversible step you are on:
 
 ```bash
-cargo search freenet --limit 1     # is this version already on crates.io?
+# Is THIS version already on crates.io? (not `cargo search` — see Quick Reference)
+curl -sS https://crates.io/api/v1/crates/freenet/0.1.X | jq -e '.version.num' >/dev/null && echo published || echo 'not published'
 ```
 
 - **Not published** (the normal case, since the publish runs after the canary):
@@ -365,7 +444,8 @@ After recovery, verify:
 - [ ] PR merged: `gh pr view <NUMBER> --json state`
 - [ ] Tag exists: `git tag -l "v0.1.X"`
 - [ ] GitHub release: `gh release view v0.1.X`
-- [ ] Crates published: `cargo search freenet --limit 1`
+- [ ] Crates published (by exact version, not `cargo search`):
+      `curl -sS https://crates.io/api/v1/crates/freenet/0.1.X | jq -e .version.num`
 - [ ] Local gateway updated: `/usr/local/bin/freenet --version`
 - [ ] Services running: `systemctl status freenet-gateway freenet-peer-01`
 - [ ] Matrix announced: Check #freenet-locutus channel

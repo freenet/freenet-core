@@ -61,7 +61,7 @@ a `::warning::` annotation telling you what to fix.
 | Secret | Used by | Failure mode if missing |
 |---|---|---|
 | `RELEASE_PAT` | release.yml, cross-compile.yml | Bump PR has no CI; `release.published` doesn't auto-fire downstream workflows. The workflows emit a `::warning::` on every run. |
-| `CARGO_REGISTRY_TOKEN` | cross-compile.yml `attach-to-release` | crates.io publish fails, so the release stays a draft. It lives in cross-compile.yml (not release.yml) because the publish is deliberately downstream of Gate A — see "The crates.io publish is downstream of Gate A" below. |
+| `CARGO_REGISTRY_TOKEN` | release.yml `validate` (checks it), cross-compile.yml `attach-to-release` (uses it) | **`validate` fails first**, before the bump PR exists — that is the intended place to find out, and where to look when a release dies immediately. If `validate` is bypassed (a bare tag push, or a manual `cross-compile.yml` dispatch), `attach-to-release` fails after the binaries are uploaded and the release stays a draft. The actual publish lives in cross-compile.yml, not release.yml, because it is deliberately downstream of Gate A — see "The crates.io publish is downstream of Gate A" below. |
 | `MATRIX_HOMESERVER_URL` | release-announce.yml | Matrix job warns + skips (success, no post). |
 | `MATRIX_ACCESS_TOKEN` | release-announce.yml | Matrix job warns + skips. |
 | `RELEASE_AGENT_HMAC_NOVA` | gateway-update.yml, release-announce.yml | nova update + River announce fail (HTTP 401). |
@@ -321,6 +321,41 @@ packaging problem, not a registry one: most often an `include_str!` /
 `include_bytes!` path pointing outside the crate (#4240), which `cargo publish`
 catches and an ordinary `cargo build` does not. Nothing has been uploaded and
 no tag exists yet. Fix it on `main` and re-run the release.
+
+### Known gap: `fdev` has no packaging pre-flight
+
+`verify_publishable` checks **`freenet` only**. `fdev` is not dry-run anywhere in
+the pipeline, so an `fdev`-specific packaging break (the #4240 class) is now
+discovered at the very last and most expensive step: after the tag, ~30-60
+minutes of cross-compilation and macOS notarization, and Gate A.
+
+This is a deliberate, accepted cost, not an oversight — and it is worth being
+explicit that it is the same "fail at the expensive moment" shape this pipeline
+otherwise works to avoid. It is tolerated only because every alternative is
+worse:
+
+- `cargo publish -p fdev --dry-run` **cannot work** before `freenet` is
+  published. `crates/fdev/Cargo.toml` carries
+  `freenet = { path = "../core", version = "X.Y.Z" }`, so packaging `fdev`
+  strips the path and the verification build resolves `freenet` from the
+  registry — at a version that does not exist yet. It would fail every release
+  for a reason that is not a bug.
+- `--no-verify` would let it run, but skips the verification build, which is the
+  step that actually catches the #4240 class. That is a check that cannot fail —
+  the shape this repo keeps having to remove.
+- A `[patch.crates-io]` override pointing `freenet` at the local path would make
+  the dry run resolve. **`.claude/rules/git-workflow.md` explicitly forbids this
+  pattern**, having been burned by it: patches are not inherited by nested
+  workspaces, CI cannot resolve path deps on a fresh checkout, and it leaves a
+  pre-merge cleanup step behind. Not worth it for a pre-flight.
+
+The blast radius is bounded: `freenet` is already published by the time `fdev`
+is attempted, so an `fdev` failure leaves a recoverable partial publish, and an
+`attach-to-release` re-run skips `freenet` and retries `fdev` alone (see the
+section below). If an `fdev` packaging break ever actually happens, the cheapest
+fix is a CI job running `cargo package -p fdev --no-verify` on PRs touching
+`crates/fdev/` — catching manifest and include-path errors, though not
+compile-time ones.
 
 ### `Publish crates to crates.io` failed (in cross-compile.yml)
 

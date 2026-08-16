@@ -404,15 +404,43 @@ detect_tag_state() {
     fi
 }
 
+# Is <crate> <version> already on crates.io?
+#
+# Asks the REGISTRY endpoint for that exact version, NOT `cargo search`.
+# `cargo search` reads the SEARCH index, which lags the registry index, and
+# `--limit 1` only ever reports a crate's newest version. Before the publish
+# moved downstream of Gate A this guard was near-always "no" and the lag did not
+# matter; now the workflow has normally published already, so it is near-always
+# "yes" and the lag decides the answer. A lagging search index would report "no"
+# for a version that IS published, this function's caller would publish, cargo
+# would reject the duplicate, `run_cmd` would exit 1 -- and a fully successful
+# release would show up as a red driver, repeatedly, until the index caught up.
+#
+# Same endpoint and same reasoning as cross-compile.yml's publish step; keep the
+# two in step. `jq` reads a variable via a here-string rather than a pipe:
+# under `set -o pipefail` a short-circuiting reader makes the producer die 141
+# and a PRESENT answer read as ABSENT, which is the very failure being fixed.
+crate_version_on_crates_io() {
+    local body
+    body="$(curl -sS -A 'freenet-release-driver' --max-time 30 \
+        --retry 3 --retry-all-errors \
+        "https://crates.io/api/v1/crates/$1/$2" 2>/dev/null)" || return 1
+    jq -e '.version.num? // empty' >/dev/null 2>&1 <<<"$body"
+}
+
 # Detect if crates are published
 detect_crates_state() {
-    # Check if freenet is published at this version.
-    # `|| true` because the old form ran inside an `if` condition, where errexit
-    # is disabled; a bare assignment is not, so a failing `cargo search` would
-    # otherwise abort the release.
-    local search_out
-    search_out="$(cargo search freenet --limit 1 2>/dev/null || true)"
-    if [[ "$search_out" == *"freenet = \"$VERSION\""* ]]; then
+    # Check if freenet is published at this version, via the REGISTRY endpoint
+    # rather than `cargo search` -- see crate_version_on_crates_io above.
+    #
+    # This sets the CRATES_PUBLISHED resume flag, and the search index's lag
+    # made it wrong in the safe direction: a published version read as
+    # unpublished, so the flag went unset and `publish_crates` ran anyway. That
+    # is now harmless, because `publish_crates` re-checks per crate against the
+    # same endpoint -- but it still printed a misleading resume state, and
+    # leaving one of two sites on the lagging source is how the next reader
+    # concludes the search index is good enough here.
+    if crate_version_on_crates_io freenet "$VERSION"; then
         COMPLETED_STEPS["CRATES_PUBLISHED"]=1
     fi
 }
@@ -1087,9 +1115,7 @@ publish_crates() {
 
     # Check if freenet is already published
     echo -n "  Checking if freenet $VERSION is already published... "
-    local freenet_search
-    freenet_search="$(cargo search freenet --limit 1 2>/dev/null || true)"
-    if [[ "$freenet_search" == *"freenet = \"$VERSION\""* ]]; then
+    if crate_version_on_crates_io freenet "$VERSION"; then
         echo "yes"
         echo "  ✓ freenet $VERSION already published to crates.io"
         freenet_published=true
@@ -1106,9 +1132,7 @@ publish_crates() {
 
     # Check if fdev is already published
     echo -n "  Checking if fdev $FDEV_VERSION is already published... "
-    local fdev_search
-    fdev_search="$(cargo search fdev --limit 1 2>/dev/null || true)"
-    if [[ "$fdev_search" == *"fdev = \"$FDEV_VERSION\""* ]]; then
+    if crate_version_on_crates_io fdev "$FDEV_VERSION"; then
         echo "yes"
         echo "  ✓ fdev $FDEV_VERSION already published to crates.io"
         fdev_published=true

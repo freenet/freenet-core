@@ -381,6 +381,21 @@ jobs:
     # got the job CANCELLED before the `Publish release` step ran, leaving a
     # permanently stuck draft — the exact failure the retry existed to avoid.
     #
+    # NOTE that the timeout is NOT the only cancellation vector, and is not the
+    # likeliest one. This workflow's `concurrency` block sets
+    # `cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}`, which is TRUE
+    # for every `refs/tags/v*` — so a second run for the SAME TAG cancels this
+    # one, wherever it has got to. The documented
+    # `gh workflow run cross-compile.yml --ref vX.Y.Z` asset recovery lands in
+    # that group, and the moment an operator reaches for it ("did it start? is
+    # it stuck?") is precisely when a run may be in flight. Post-move such a
+    # cancellation can land between the two crate publishes, or between the
+    # publish and the un-draft. Both states are recoverable — the publish step
+    # skips whatever already uploaded, and re-running completes the un-draft —
+    # which is why this is a note rather than a redesign, and why
+    # scripts/RELEASE_RECOVERY.md tells operators to check for a running job
+    # before dispatching.
+    #
     # Raised again from 25 for the crates.io publish, which moved here from
     # release.yml so it sits downstream of Gate A. `cargo publish` builds and
     # verifies each package; release.yml budgeted 20 minutes for the pair. Same
@@ -396,27 +411,55 @@ jobs:
       contents: write
 
     steps:
-      # Before anything else in this job, because this job now ends in a
-      # crates.io upload and a missing credential is deterministic: there is no
-      # point downloading 14 artifacts, checksumming, signing and running the
-      # canary to discover it at the last step.
+      # The release source and its toolchain are staged FIRST, before the
+      # artifacts, so that everything `cargo publish` needs is already on disk
+      # by the time the job reaches the window between Gate A and the un-draft.
       #
-      # release.yml's `validate` job does the stronger check (it also asks
-      # crates.io whether the token is accepted) and does it before the bump PR
-      # exists. This one exists for the path where `validate` never ran: a bare
-      # tag push, or the documented `gh workflow run cross-compile.yml --ref
-      # vX.Y.Z` recovery. Presence only, no network call -- deterministic, so
-      # it cannot fail a release for a reason that is not a bug. On that path a
-      # token that is present but DEAD still surfaces at the publish step.
-      - name: Check the crates.io credential is present
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      # That window is the one this PR identifies as dangerous: a cancellation
+      # inside it can leave crates published and the release still a draft. It
+      # should therefore contain the upload and nothing else. Fetching a Rust
+      # toolchain there -- minutes, on a runner with no rust-cache -- would be
+      # adding avoidable minutes to exactly the interval we are trying to keep
+      # short.
+      #
+      # Checking out here is also strictly safer than checking out later.
+      # `actions/checkout` cleans its target path and the release assets live in
+      # the workspace ROOT, which is why this must go in a subdirectory at all;
+      # running before any asset exists removes the hazard rather than working
+      # around it. The default ref for a tag push is the tag, so the tree
+      # published later is exactly the tree the shipped binaries were built from.
+      - name: Check out the release source
+        uses: actions/checkout@v7
+        with:
+          path: _src
+
+      # NOT a pinned toolchain version, and that is the point.
+      # `rust-toolchain.toml` at the repo root pins the channel, its components
+      # and its targets, and rustup's toolchain-file override beats
+      # `rustup default` -- so a `dtolnay/rust-toolchain` step naming a version
+      # here would install that version and then be silently ignored, because
+      # `cargo` runs in `_src` where the toolchain file lives. An earlier draft
+      # of this job pinned 1.93.0 and was defended in the PR description on the
+      # grounds that it matched release.yml's dry run; both were in fact running
+      # 1.94.0 from the toolchain file. A pin that cannot take effect is worse
+      # than no pin: it invites the next editor to "fix" a number that changes
+      # nothing.
+      #
+      # The toolchain file is the single authority for BOTH this publish and
+      # release.yml's `cargo publish --dry-run`, so the two match by
+      # construction rather than by two hand-synchronised numbers. This step
+      # exists only to make rustup materialise it HERE, outside the Gate A
+      # window, instead of on first use inside it.
+      - name: Materialise the release toolchain
+        working-directory: _src
         run: |
-          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
-            echo "::error title=CARGO_REGISTRY_TOKEN not set::This job publishes to crates.io after the pre-flight canary, so without the secret the release cannot complete. Failing now rather than after the canary. Set the CARGO_REGISTRY_TOKEN repo secret and re-run this job."
-            exit 1
-          fi
-          echo "✅ CARGO_REGISTRY_TOKEN is present."
+          set -euo pipefail
+          echo "rust-toolchain.toml governs this publish:"
+          cat rust-toolchain.toml
+          # Any cargo invocation inside _src makes rustup honour the file,
+          # downloading the channel plus its components and targets if absent.
+          cargo --version
+          rustup show active-toolchain
 
       # Linux x86_64
       - name: Download x86_64 Linux freenet binary
@@ -629,6 +672,46 @@ jobs:
             --clobber
           echo "✅ Assets uploaded to draft release $TAG_NAME"
 
+      # The crates.io credential is checked HERE: AFTER the binaries are
+      # uploaded, and immediately before the canary.
+      #
+      # It was originally the job's first step, which was wrong in a way worth
+      # recording, because it inverted this PR's own thesis. This job is the
+      # only path that attaches binaries and un-drafts the release, and neither
+      # of those needs a crates.io token. Failing at step 1 on a missing
+      # credential therefore blocked BINARY DELIVERY -- the reversible half --
+      # on a credential only the irreversible half requires. An operator
+      # re-running this job to re-attach assets to an already-tagged release
+      # (the documented `gh workflow run cross-compile.yml --ref vX.Y.Z`
+      # recovery) would have got a job that died having done nothing, with a
+      # repo-secret rotation as the only remedy. Sharper still: on a re-run
+      # where both crates are ALREADY published, the publish step skips both
+      # and no token is needed at all, yet the step-1 check demanded one.
+      #
+      # Here it keeps the fail-fast value that motivated it -- there is no point
+      # spending the canary's minutes if the publish cannot happen -- while the
+      # assets are already delivered whatever it decides.
+      #
+      # release.yml's `validate` job does the stronger check (it also asks
+      # crates.io whether the token is ACCEPTED) and does it before the bump PR
+      # exists. This one exists for the path where `validate` never ran: a bare
+      # tag push, or that same manual recovery. Presence only, no network call
+      # -- deterministic, so it cannot fail a release for a reason that is not a
+      # bug. A token that is present but DEAD still surfaces at the publish.
+      #
+      # Residual, accepted: a re-run whose crates are already published still
+      # fails here without a token, after delivering the assets. The assets are
+      # the point of that re-run, so the cost is a red job rather than lost work.
+      - name: Check the crates.io credential is present
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error title=CARGO_REGISTRY_TOKEN not set::This job publishes to crates.io after the pre-flight canary, so without the secret the release cannot complete. Failing now rather than after the canary. The binaries above are already uploaded. Set the CARGO_REGISTRY_TOKEN repo secret and re-run this job."
+            exit 1
+          fi
+          echo "✅ CARGO_REGISTRY_TOKEN is present."
+
       # ---------------------------------------------------------------------
       # Gate A of the auto-update canary (#5222) — BLOCKS PUBLICATION.
       #
@@ -717,16 +800,6 @@ jobs:
       # does. The default ref for a tag push is the tag, so the tree published
       # here is exactly the tree the shipped binaries were built from.
       # ---------------------------------------------------------------------
-      - name: Check out the release source
-        uses: actions/checkout@v7
-        with:
-          path: _src
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.93.0
-
       - name: Publish crates to crates.io
         # Tag-gated as well as job-gated. The job's own
         # `if: startsWith(github.ref, 'refs/tags/v')` already blocks this on a

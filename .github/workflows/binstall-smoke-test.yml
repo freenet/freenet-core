@@ -81,15 +81,27 @@ jobs:
       # The crates.io publish used to run FIRST, in release.yml's
       # `publish_crates`, before the tag even existed; it moved into
       # `attach-to-release` so the one irreversible step sits downstream of the
-      # gate (see that job's comments and #5288). That move SHRINKS the window
-      # this guard works around, from the whole ~30 min cross-compile down to
-      # the seconds between the crates.io upload and the un-draft — but it does
-      # not remove it, and it makes the guard MORE meaningful rather than less:
-      # under the new order, "crates.io has the version but the GitHub release
-      # is still a draft" is precisely the stuck state where the publish
-      # succeeded and the un-draft did not. That state must be caught, and the
-      # staleness threshold below is what catches it while still tolerating the
-      # brief legitimate overlap.
+      # gate (see that job's comments and #5288).
+      #
+      # That move CHANGES WHAT THIS JOB CAN SEE, in both directions, and the
+      # losing direction matters more:
+      #
+      #   - It shrinks the false-alarm window, from the whole ~30 min
+      #     cross-compile down to the seconds between the crates.io upload and
+      #     the un-draft. Good, but that was never the point of the check.
+      #
+      #   - It BLINDS this job to the two most likely stuck states. Everything
+      #     here is keyed off the version crates.io reports as latest. Under the
+      #     new order a Gate A block, or a failed publish, leaves crates.io on
+      #     the PREVIOUS version — so this job checks the previous release,
+      #     finds it published with assets, and goes green while a release sits
+      #     stuck in draft. Under the old order crates.io carried the new
+      #     version immediately and the draft was caught after STALE_MIN.
+      #
+      # Coverage is not lost outright: `notify-auto-update-canary-failure` in
+      # cross-compile.yml fires on an `attach-to-release` failure, and that is
+      # now the primary signal for a stuck release. But do not read a green run
+      # here as evidence that no release is stuck.
       #
       # During that overlap crates.io reports the new version as latest while
       # the GitHub release binaries are still a draft binstall can't see, so
@@ -141,8 +153,18 @@ jobs:
           fi
 
           if [ -z "$release_json" ]; then
-            # crates.io has the version but no GitHub release tag exists yet
-            # (the brief gap before the draft release is created).
+            # crates.io has the version but no GitHub release exists at all.
+            #
+            # NOTE: under the post-#5288 ordering this should no longer be
+            # reachable on a normal release. The draft release is created 30-60
+            # minutes BEFORE the crates.io publish, so a version on crates.io
+            # implies its release already existed. Retained deliberately as a
+            # fail-closed branch: it now indicates something genuinely wrong
+            # (a release deleted after publishing, or a hand-publish that never
+            # created a release), which is exactly when a hard error after
+            # STALE_MIN is wanted. The grace period is kept rather than tightened
+            # because the branch is no longer on the normal path, so there is
+            # nothing to gain from failing it faster.
             pub="${{ steps.versions.outputs.freenet_published_at }}"
             pub_epoch=$(date -u -d "$pub" +%s 2>/dev/null || echo 0)
             age_min=$(( (now - pub_epoch) / 60 ))

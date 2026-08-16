@@ -262,6 +262,26 @@ else
     # `continue-on-error: true` is the other neutering route, and it is not
     # covered by the exact-match above: it would let a FAILED upload proceed to
     # the un-draft, publishing a release whose crates do not exist.
+    # ...and it must be a REAL publish. Stated directly as well as being
+    # exercised by the fixtures below, because this is the mutation a reader of
+    # THIS FILE is primed to make: assertion 2c deliberately whitelists
+    # `--dry-run` in release.yml, so "add --dry-run until it stops failing" is a
+    # move the file itself teaches. Here it would mean Gate A runs, nothing is
+    # uploaded, the release un-drafts, the cascade fires, and
+    # `cargo install freenet@X` 404s for everyone who reads the announcement.
+    PC_DRYRUN="$(printf '%s\n' "$PUBLISH_CRATES_STEP" | grep -E 'cargo publish.*--dry-run')"
+    if [[ -z "$PC_DRYRUN" ]]; then
+        pass "the crates.io publish step really publishes (no --dry-run)"
+    else
+        fail "the crates.io publish step has become a DRY RUN" \
+            "$(printf '%s\n' "$PC_DRYRUN")" \
+            "This step is the release's only real crates.io upload. As a dry run the" \
+            "job still goes green, Gate A still passes, and the release still" \
+            "un-drafts -- publishing binaries and firing the announcement cascade for" \
+            "a version that is not on crates.io. release.yml's dry run is the" \
+            "whitelisted one (assertion 2c); this one must never be."
+    fi
+
     PC_COE="$(printf '%s\n' "$PUBLISH_CRATES_STEP" \
         | grep -E '^[0-9]+:        continue-on-error:')"
     if [[ -z "$PC_COE" ]]; then
@@ -372,8 +392,32 @@ EOF
         ( cd "$work" && PATH="$work/bin:$PATH" GITHUB_REF="refs/tags/$tag" \
             bash "$work/step.sh" ) > "$work/out" 2>&1
         rc=$?
-        grep -qF 'publish -p freenet' "$work/cargo.log" && got_freenet=1 || got_freenet=0
-        grep -qF 'publish -p fdev'    "$work/cargo.log" && got_fdev=1    || got_fdev=0
+        # A REAL publish, not merely an invocation mentioning the crate.
+        # `--dry-run` is excluded deliberately: without that exclusion this
+        # classification is satisfied by `cargo publish -p freenet --dry-run`,
+        # so appending `--dry-run` to both invocations left EVERY assertion in
+        # this file green while the pipeline uploaded nothing -- Gate A runs,
+        # nothing publishes, the release un-drafts, the announcement cascade
+        # fires, and `cargo install freenet@X` 404s for everyone who reads it.
+        # That is the split-channel state assertion 3b's comment calls
+        # impossible, reached by adding one flag.
+        #
+        # It is also a flag this very file TEACHES: assertion 2c whitelists
+        # `--dry-run` in release.yml, so "add --dry-run to make it stop
+        # failing" is a move a reader is actively primed to make. A pin whose
+        # subject can be satisfied by the thing it exists to exclude is not a
+        # pin -- the same lesson as #5303, and the same lesson as the tree
+        # guard two blocks below.
+        #
+        # `grep -c` on the file, not `| grep -q`: the pipefail/SIGPIPE hazard
+        # audited by auto-update-canary_test.sh.
+        got_freenet=0; got_fdev=0
+        [[ "$(grep -cE '(^| )publish +-p +freenet( |$)' "$work/cargo.log")" -gt 0 ]] \
+            && [[ "$(grep -cE '(^| )publish +-p +freenet .*--dry-run' "$work/cargo.log")" -eq 0 ]] \
+            && got_freenet=1
+        [[ "$(grep -cE '(^| )publish +-p +fdev( |$)' "$work/cargo.log")" -gt 0 ]] \
+            && [[ "$(grep -cE '(^| )publish +-p +fdev .*--dry-run' "$work/cargo.log")" -eq 0 ]] \
+            && got_fdev=1
         case "$got_freenet$got_fdev" in
             00) got_published=none ;;
             10) got_published=freenet ;;
@@ -448,7 +492,35 @@ elif [[ -n "$CANARY_LINE" && "$TOKEN_CHECK_LINE" -gt "$CANARY_LINE" ]]; then
     fail "attach-to-release checks CARGO_REGISTRY_TOKEN only AFTER the canary (token $TOKEN_CHECK_LINE > canary $CANARY_LINE)" \
         "The point of the check is to fail fast. After the canary it saves nothing."
 else
-    pass "attach-to-release checks CARGO_REGISTRY_TOKEN before the canary (line $TOKEN_CHECK_LINE)"
+    # ...and it must sit AFTER the asset upload, which is the other bound and
+    # the less obvious one.
+    #
+    # This check began as the job's FIRST step, and that coupled BINARY
+    # DELIVERY to a crates.io credential. This job is the only path that
+    # attaches binaries and un-drafts, and neither needs a crates token; an
+    # expired token therefore blocked the reversible half on a credential only
+    # the irreversible half requires -- the exact inversion of this PR's own
+    # argument. The documented `gh workflow run cross-compile.yml --ref vX.Y.Z`
+    # asset-recovery would have died at step 1 having done nothing.
+    #
+    # Both bounds are pinned because they fail in opposite directions: moved
+    # BELOW the canary it stops being a fail-fast, moved ABOVE the upload it
+    # starts blocking work that does not need it.
+    UPLOAD_LINE="$(line_of 'gh release upload')"
+    if [[ -z "$UPLOAD_LINE" ]]; then
+        fail "no 'gh release upload' in the attach-to-release job" \
+            "The credential check is positioned relative to it, so its absence" \
+            "would make the ordering assertion below pass vacuously."
+    elif [[ "$TOKEN_CHECK_LINE" -lt "$UPLOAD_LINE" ]]; then
+        fail "the CARGO_REGISTRY_TOKEN check runs BEFORE the asset upload (token $TOKEN_CHECK_LINE < upload $UPLOAD_LINE)" \
+            "That couples binary delivery to a crates.io credential it does not" \
+            "need. An expired token would block asset attachment and the un-draft," \
+            "and an operator re-running this job purely to re-attach assets would" \
+            "get a job that fails having done nothing -- fixable only by rotating a" \
+            "repo secret. Keep the check between the upload and the canary."
+    else
+        pass "attach-to-release checks CARGO_REGISTRY_TOKEN after the upload and before the canary (upload $UPLOAD_LINE < token $TOKEN_CHECK_LINE < canary $CANARY_LINE)"
+    fi
 fi
 
 # ...and release.yml checks it in its FIRST job, which is the one that matters:
@@ -547,8 +619,30 @@ if [[ -n "$TOKEN_CHECK_LINE" ]]; then
     else
         TOKEN_NEUTERED="$(printf '%s\n' "$TOKEN_STEP" \
             | grep -cE '^[0-9]+:        (continue-on-error:|if:)|\|\|[[:space:]]*(true|:)[[:space:]]*$|set[[:space:]]+\+e')"
-        if [[ "$TOKEN_NEUTERED" -eq 0 ]]; then
-            pass "the CARGO_REGISTRY_TOKEN fail-fast check is not disabled in place"
+        # The step keys are only half of it: the step must still be ABLE to
+        # refuse. Checked FIRST, because it is the mutation that survived.
+        # This assertion previously located the step by its log text
+        # (`CARGO_REGISTRY_TOKEN not set`) and then only scanned for
+        # `continue-on-error:`/`if:`/`|| true`/`set +e` -- so replacing the
+        # step's `exit 1` with `echo "proceeding without it"`, leaving the
+        # `::error title=CARGO_REGISTRY_TOKEN not set::` line the locator greps
+        # untouched, left this file reporting "the fail-fast check is not
+        # disabled in place" about a check that could no longer fail.
+        #
+        # An IDENTITY pin wearing the label of a BEHAVIOUR pin, and the exact
+        # defect already fixed for release.yml's twin in assertion 2b-ter --
+        # fixed there because mutation testing caught it, and left armed at
+        # nothing here because it was not mutated. Enumerate every site of a
+        # shape, including the sites in your own test file.
+        if [[ "$TOKEN_STEP" != *'exit 1'* ]]; then
+            fail "the CARGO_REGISTRY_TOKEN fail-fast check cannot refuse" \
+                "No 'exit 1' in the step. It still logs an ::error:: title, which is" \
+                "what makes this shape dangerous -- the log looks like a blocked" \
+                "release while the job proceeds to the canary and the publish, and" \
+                "fails there instead, after the expensive part this check exists to" \
+                "come before."
+        elif [[ "$TOKEN_NEUTERED" -eq 0 ]]; then
+            pass "the CARGO_REGISTRY_TOKEN fail-fast check can refuse and is not disabled in place"
         else
             fail "the CARGO_REGISTRY_TOKEN fail-fast check can no longer fail the job" \
                 "$(printf '%s\n' "$TOKEN_STEP" | grep -E '^[0-9]+:        (continue-on-error:|if:)|\|\|[[:space:]]*(true|:)[[:space:]]*$|set[[:space:]]+\+e')" \
@@ -622,18 +716,50 @@ if [[ -f "$RELEASE_YML" ]]; then
     fi
 fi
 
-RECOVERY_MD="$SCRIPT_DIR/RELEASE_RECOVERY.md"
-if [[ ! -f "$RECOVERY_MD" ]]; then
-    fail "scripts/RELEASE_RECOVERY.md not found at $RECOVERY_MD" \
-        "It is the documented manual path around the release gate; without it" \
-        "this assertion checks nothing."
-else
+# Every operator-facing doc that documents creating the release, not just the
+# runbook. RELEASING.md's manual-tag section carries its own `gh release create`
+# and was correct but UNPINNED -- the same "one site of the shape covered, its
+# sibling left armed at nothing" gap as the credential assertions above. A
+# reader fixing the runbook has no reason to look in RELEASING.md, and the flag
+# matters identically in both.
+#
+# Each doc declares its own expected count, so deleting invocations fails rather
+# than passing on a smaller set.
+#   scripts/RELEASE_RECOVERY.md : Step 3, and the full-manual section       -> 2
+#   docs/RELEASING.md           : the "tag by hand" recovery section        -> 1
+draft_docs=(
+    "$SCRIPT_DIR/RELEASE_RECOVERY.md:2"
+    "$SCRIPT_DIR/../docs/RELEASING.md:1"
+)
+
+for spec in "${draft_docs[@]}"; do
+    doc="${spec%:*}"
+    want="${spec##*:}"
+    label="$(basename "$doc")"
+
+    if [[ ! -f "$doc" ]]; then
+        fail "$doc not found" \
+            "It documents creating the release by hand; without it this" \
+            "assertion checks nothing."
+        continue
+    fi
+
+    # ANCHORED at the start of the logical command (`^gh release create`), so a
+    # pipeline DIAGRAM line inside a fence is not counted as an invocation --
+    # RELEASING.md has `└─→ gh release create --draft (release exists but
+    # draft)` in its flow diagram. This matters for the FLOOR rather than for
+    # the flag: counting the diagram would let someone delete the one real
+    # invocation and still satisfy a floor of 1, which is exactly the vacuity
+    # the floor exists to prevent.
+    #
     # Logical commands from fenced code blocks only, with `\` continuations
-    # joined so a multi-line invocation is judged as ONE command -- Step 3's
-    # `gh release create` spreads its flags over four lines, and per-LINE
-    # matching would report its `--draft` missing purely for being on a
-    # different line from the verb.
-    RECOVERY_CREATES="$(awk '
+    # joined so a multi-line invocation is judged as ONE command -- the runbook's
+    # Step 3 spreads its flags over four lines, and per-LINE matching would
+    # report its `--draft` missing purely for being on a different line from the
+    # verb. Fencing also keeps PROSE out: both docs now argue for `--draft` at
+    # length, so a whole-file grep would match sentences ABOUT the command and be
+    # satisfied by the paragraph explaining it.
+    creates="$(awk '
         /^```/          { infence = !infence; next }
         !infence        { next }
         {
@@ -645,35 +771,38 @@ else
             acc = ""
         }
         END { if (acc != "") print acc }
-    ' "$RECOVERY_MD" | grep -E 'gh release create')"
+    ' "$doc" | grep -E '^gh release create')"
 
-    if [[ -z "$RECOVERY_CREATES" ]]; then
-        RECOVERY_TOTAL=0
+    if [[ -z "$creates" ]]; then
+        total=0
     else
-        RECOVERY_TOTAL="$(printf '%s\n' "$RECOVERY_CREATES" | wc -l | tr -d ' ')"
+        total="$(printf '%s\n' "$creates" | wc -l | tr -d ' ')"
     fi
-    # `--draft` as its own flag: `--draft=false` must not satisfy it.
-    RECOVERY_UNDRAFTED="$(printf '%s\n' "$RECOVERY_CREATES" \
-        | grep -vE '(^|[[:space:]])--draft([[:space:]]|$)' | grep -E 'gh release create')"
+    # `--draft` as its own flag: `--draft=false` must NOT satisfy it. That is
+    # the un-draft, the thing only the workflow may do once Gate A has passed,
+    # and accepting it here would let the exact inversion this assertion exists
+    # to catch pass as a fix.
+    undrafted="$(printf '%s\n' "$creates" \
+        | grep -vE '(^|[[:space:]])--draft([[:space:]]|$)' | grep -E '^gh release create')"
 
-    if [[ "$RECOVERY_TOTAL" -lt 2 ]]; then
-        fail "RELEASE_RECOVERY.md has $RECOVERY_TOTAL 'gh release create' invocation(s) in code blocks, expected at least 2" \
-            "Step 3 and the full-manual section each have one. A lower count means" \
-            "an invocation was deleted rather than gated -- and with none left this" \
-            "assertion would otherwise report success having checked nothing."
-    elif [[ -z "$RECOVERY_UNDRAFTED" ]]; then
-        pass "all $RECOVERY_TOTAL 'gh release create' invocations in RELEASE_RECOVERY.md pass --draft"
+    if [[ "$total" -lt "$want" ]]; then
+        fail "$label has $total 'gh release create' invocation(s) in code blocks, expected at least $want" \
+            "A lower count means an invocation was deleted rather than gated -- and" \
+            "with none left this assertion would otherwise report success having" \
+            "checked nothing."
+    elif [[ -z "$undrafted" ]]; then
+        pass "all $total 'gh release create' invocations in $label pass --draft"
     else
-        fail "RELEASE_RECOVERY.md documents creating a release WITHOUT --draft" \
-            "$(printf '%s\n' "$RECOVERY_UNDRAFTED")" \
+        fail "$label documents creating a release WITHOUT --draft" \
+            "$(printf '%s\n' "$undrafted")" \
             "An operator following this creates a PUBLISHED release: Gate A never" \
             "sees it, the crates.io publish that lives behind the gate never runs," \
             "and it becomes /releases/latest before any binary is attached. That is" \
             "#5288 -- the documented procedure being the way around the gate. The" \
             "workflow creates its release with --draft for exactly this reason; the" \
-            "manual path must match it."
+            "manual paths must match it."
     fi
-fi
+done
 
 # --- 3. it is not neutered in place -----------------------------------------
 # `continue-on-error: true` leaves the step present, running, and visibly
