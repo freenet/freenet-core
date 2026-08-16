@@ -1026,28 +1026,103 @@ for spec in "${draft_docs[@]}"; do
     fi
 done
 
+# --- shared: LOGICAL LINES ---------------------------------------------------
+# `NNN:text` per logical shell/YAML command, with `\` continuations joined and
+# UNQUOTED trailing comments stripped. Both scanners below use it, because both
+# were defeated by the same two tricks:
+#
+#   * a `\`-continued invocation, so a per-line matcher saw only a fragment
+#     (`cargo \` on one line, `publish` on the next);
+#   * a trailing code comment, so `cargo publish -p freenet  # not a --dry-run`
+#     satisfied a `--dry-run` exclusion, and
+#     `gh release create ...  # dropped --draft here` satisfied a `--draft`
+#     check. Only LEADING `#` lines were being dropped.
+#
+# That second one is one root cause wearing two costumes: "the string appears
+# somewhere on the line" was being read as "the flag is in effect". Stripping
+# comments at the point of extraction fixes both, once.
+#
+# The strip is QUOTE-AWARE -- it cuts at the first `#` that is unquoted and at a
+# word boundary -- so a legitimate `--notes "fixes #5288"` is not truncated. A
+# naive cut would silently shorten real commands and make the scanners miss what
+# came after.
+logical_lines() {
+    awk '
+        function strip_comment(str,   i, c, q, out) {
+            q = ""
+            out = ""
+            for (i = 1; i <= length(str); i++) {
+                c = substr(str, i, 1)
+                if (q == "") {
+                    if (c == "\"" || c == "'"'"'") { q = c }
+                    else if (c == "#" && (i == 1 || substr(str, i - 1, 1) ~ /[[:space:]]/)) { break }
+                } else if (c == q) { q = "" }
+                out = out c
+            }
+            return out
+        }
+        {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            if (acc == "") startln = NR
+            acc = acc (acc == "" ? "" : " ") line
+            if (line ~ /\\$/) { sub(/[[:space:]]*\\$/, "", acc); next }
+            out = strip_comment(acc)
+            sub(/[[:space:]]+$/, "", out)
+            if (out != "") print startln ":" out
+            acc = ""
+        }
+        END {
+            if (acc != "") {
+                out = strip_comment(acc)
+                sub(/[[:space:]]+$/, "", out)
+                if (out != "") print startln ":" out
+            }
+        }
+    ' "$1"
+}
+
+# A real `cargo publish`, tolerant of everything cargo accepts between the two
+# words. `cargo[[:space:]]+publish` demanded adjacency, so `cargo +stable
+# publish` -- and equally `cargo -q publish`, `cargo --offline publish` --
+# walked straight past a scan whose own comment claimed to forbid exactly that
+# step.
+# `^[0-9]+:` because logical_lines emits `NNN:text` -- a bare `^` or
+# `[[:space:]]` boundary never matches a command at the start of its line,
+# since the character before `cargo` is the prefix colon. Caught by the
+# assertion going to zero on a clean tree rather than by review.
+CARGO_PUBLISH_RE='(^[0-9]+:|[[:space:]])cargo([[:space:]]+[-+][^[:space:]]+)*[[:space:]]+publish([[:space:]]|$)'
+
+# Prose mentions inside an echo are not invocations -- ci.yml documents the
+# publish in one, and release.sh prints guidance quoting it. Narrow on purpose:
+# no command separator AND no substitution between the `echo` and the words, so
+# `echo hi; cargo publish` and `echo "$(cargo publish -p freenet)"` both remain
+# visible. The substitution case is not theoretical; it was used to smuggle a
+# real publish past the previous filter.
+ECHO_PROSE_RE='echo[^;|&$`]*cargo([[:space:]]+[-+][^[:space:]]+)*[[:space:]]+publish'
+
+# real_publishes <file> -- `NNN:text` for every non-dry-run cargo publish.
+real_publishes() {
+    logical_lines "$1" \
+        | grep -E "$CARGO_PUBLISH_RE" \
+        | grep -vE -- '--dry-run' \
+        | grep -vE "$ECHO_PROSE_RE"
+}
+
 # --- 2c-ter. the ONLY real `cargo publish` anywhere is the gated one --------
 # The whole-invariant check, and the one whose absence made every assertion
 # above locally true and globally meaningless.
 #
 # This PR's stated invariant is "nothing irreversible may precede the blocking
-# gate". Assertions 2b/2c enforce that in exactly one file and one job: 2b's
-# `line_of` is scoped to `attach-to-release`, and 2c scans only release.yml.
-# Nothing asked whether a real `cargo publish` had appeared ANYWHERE ELSE.
-#
-# Mutation-tested, and it survived with all eight suites green: a
+# gate". Assertions 2b/2c enforce that in exactly one file and one job, so a
 # `Push crates early` step added to `build-macos-dmg` -- an ordinary job that
-# `attach-to-release` merely `needs:`, so strictly earlier -- publishes both
-# crates before Gate A has run, leaving the gated step untouched and every
-# assertion above still true. Six lines reproduce the v0.2.124 loss in the same
-# file this suite claims to protect.
+# `attach-to-release` merely `needs:`, hence strictly earlier -- publishes both
+# crates before Gate A with every assertion still true. Six lines reproduce the
+# v0.2.124 loss in the file this suite claims to protect.
 #
-# So the rule is global, not local: across the entire workflow set, every real
+# So the rule is global: across the entire workflow set, every real
 # (non-`--dry-run`) `cargo publish` must fall INSIDE the gated step's line
 # range. Dry runs are whitelisted wherever they appear -- they upload nothing.
-#
-# Line numbers come from JOB_BLOCK's `--numbered` prefixes, which are original
-# file lines, so they are directly comparable to `grep -n` output on the file.
 if [[ -n "$PUBLISH_CRATES_LINE" && -n "$PUBLISH_CRATES_STEP" ]]; then
     PC_FIRST="$(printf '%s\n' "$PUBLISH_CRATES_STEP" | head -1 | cut -d: -f1)"
     PC_LAST="$(printf '%s\n' "$PUBLISH_CRATES_STEP" | tail -1 | cut -d: -f1)"
@@ -1062,9 +1137,6 @@ if [[ -n "$PUBLISH_CRATES_LINE" && -n "$PUBLISH_CRATES_STEP" ]]; then
         [[ -f "$_wf" ]] || continue
         scanned_files=$((scanned_files + 1))
         _base="$(basename "$_wf")"
-        # Original line numbers preserved: comment lines are dropped by
-        # matching the numbered output, NOT by filtering the file first (which
-        # would renumber everything and make the range test meaningless).
         while IFS= read -r _hit; do
             [[ -z "$_hit" ]] && continue
             _ln="${_hit%%:*}"
@@ -1073,16 +1145,7 @@ if [[ -n "$PUBLISH_CRATES_LINE" && -n "$PUBLISH_CRATES_STEP" ]]; then
             else
                 rogue_publishes+="$_base:$_hit"$'\n'
             fi
-        # The last filter drops PROSE MENTIONS inside an echo -- ci.yml has
-        # `echo "inside crates/core/ so cargo publish bundles them."`, which is
-        # documentation, not an upload. Deliberately narrow: it requires NO
-        # command separator between the `echo` and the words, so
-        # `echo hi; cargo publish -p freenet` is still flagged. A broad
-        # `-v echo` would have been a hiding place.
-        done < <(grep -nE 'cargo[[:space:]]+publish' "$_wf" \
-                    | grep -vE '^[0-9]+:[[:space:]]*#' \
-                    | grep -vE -- '--dry-run' \
-                    | grep -vE 'echo[^;|&]*cargo[[:space:]]+publish')
+        done < <(real_publishes "$_wf")
     done
 
     if [[ "$scanned_files" -eq 0 ]]; then
@@ -1095,9 +1158,7 @@ if [[ -n "$PUBLISH_CRATES_LINE" && -n "$PUBLISH_CRATES_STEP" ]]; then
             "release may upload to crates.io, because it is the only place that runs" \
             "AFTER Gate A. A publish anywhere else -- including in a job that" \
             "attach-to-release merely 'needs:' -- happens BEFORE the gate, which is" \
-            "precisely the ordering that cost v0.2.124 its version number. If this is" \
-            "a dry run, it must say '--dry-run'; if it is real, it does not belong" \
-            "outside that step."
+            "precisely the ordering that cost v0.2.124 its version number."
     elif [[ "$gated_publishes" -lt 2 ]]; then
         fail "only $gated_publishes real 'cargo publish' invocation(s) inside the gated step, expected 2" \
             "The step publishes freenet and fdev. Fewer means one was removed or" \
@@ -1109,102 +1170,93 @@ if [[ -n "$PUBLISH_CRATES_LINE" && -n "$PUBLISH_CRATES_STEP" ]]; then
     fi
 fi
 
-# --- 2c-quater. release.sh's real publish is confined to publish_crates() ---
-# The same question for the manual driver, which the workflow scan above cannot
-# see. release.sh legitimately CAN publish -- it is the fallback for when the
-# workflow path is broken -- but only from `publish_crates()`, which the driver
-# calls after `wait_for_binaries`, i.e. after the gate. A `cargo publish`
-# anywhere else in that file would run at whatever point the driver reached,
-# with no gate between it and the tag.
+# --- 2c-quater. no shell script publishes outside publish_crates() ----------
+# The same question for the scripts, RECURSIVELY. The previous form globbed
+# `"$SCRIPT_DIR"/*.sh`, which is not recursive, so `scripts/release-agent/` --
+# a real release-path directory that CI already runs tests from -- was invisible
+# to it. Wrong file set, same class as the workflow scan being job-scoped.
+#
+# release.sh legitimately CAN publish: it is the fallback for when the workflow
+# path is broken. But only from `publish_crates()`, which the driver calls after
+# `wait_for_binaries`, i.e. after the gate. Every other script: never.
+#
+# `*_test.sh` is excluded because test files stub and log `cargo publish` by
+# design, and because this file's own text would otherwise match itself.
+SH_ROGUE=""
+SH_GATED=0
+SH_SCANNED=0
+PUBLISH_FN_START=""
+PUBLISH_FN_END=""
 if [[ -f "$RELEASE_SH" ]]; then
     PUBLISH_FN_START="$(grep -nE '^publish_crates\(\) \{' "$RELEASE_SH" | head -1 | cut -d: -f1)"
-    if [[ -z "$PUBLISH_FN_START" ]]; then
-        fail "release.sh has no publish_crates() function" \
-            "The containment check below would pass having nothing to contain."
-    else
+    if [[ -n "$PUBLISH_FN_START" ]]; then
         PUBLISH_FN_END="$(awk -v s="$PUBLISH_FN_START" 'NR > s && /^}/ { print NR; exit }' "$RELEASE_SH")"
         [[ -z "$PUBLISH_FN_END" ]] && PUBLISH_FN_END=999999
-        sh_rogue=""
-        sh_gated=0
-        while IFS= read -r _hit; do
-            [[ -z "$_hit" ]] && continue
-            _ln="${_hit%%:*}"
-            if [[ "$_ln" -ge "$PUBLISH_FN_START" && "$_ln" -le "$PUBLISH_FN_END" ]]; then
-                sh_gated=$((sh_gated + 1))
-            else
-                sh_rogue+="$_hit"$'\n'
-            fi
-        # Same narrow echo filter as the workflow scan above: release.sh's
-        # own guidance text quotes `cargo publish` while telling operators NOT
-        # to run it by hand.
-        done < <(grep -nE '(^|[[:space:]])cargo[[:space:]]+publish' "$RELEASE_SH" \
-                    | grep -vE '^[0-9]+:[[:space:]]*#' \
-                    | grep -vE -- '--dry-run' \
-                    | grep -vE 'echo[^;|&]*cargo[[:space:]]+publish')
-        if [[ -n "$sh_rogue" ]]; then
-            fail "release.sh runs a real 'cargo publish' outside publish_crates()" \
-                "$(printf '%s' "$sh_rogue")" \
-                "publish_crates() is called after wait_for_binaries, i.e. after the" \
-                "gate. A publish elsewhere in the driver runs at whatever point the" \
-                "script reached, with nothing between it and the tag."
-        elif [[ "$sh_gated" -lt 2 ]]; then
-            fail "release.sh's publish_crates() has $sh_gated real 'cargo publish' invocation(s), expected 2" \
-                "It is the manual backstop for freenet and fdev. With none, the check" \
-                "above would report success having found nothing."
-        else
-            pass "release.sh's real 'cargo publish' calls are confined to publish_crates() ($sh_gated)"
-        fi
     fi
 fi
 
+while IFS= read -r _sh; do
+    [[ -f "$_sh" ]] || continue
+    case "$(basename "$_sh")" in *_test.sh) continue ;; esac
+    SH_SCANNED=$((SH_SCANNED + 1))
+    _base="$(basename "$_sh")"
+    while IFS= read -r _hit; do
+        [[ -z "$_hit" ]] && continue
+        _ln="${_hit%%:*}"
+        if [[ "$_sh" == "$RELEASE_SH" && -n "$PUBLISH_FN_START" \
+              && "$_ln" -ge "$PUBLISH_FN_START" && "$_ln" -le "$PUBLISH_FN_END" ]]; then
+            SH_GATED=$((SH_GATED + 1))
+        else
+            SH_ROGUE+="$_base:$_hit"$'\n'
+        fi
+    done < <(real_publishes "$_sh")
+done < <(find "$SCRIPT_DIR" -name '*.sh' -type f | sort)
+
+if [[ "$SH_SCANNED" -eq 0 ]]; then
+    fail "found no shell scripts to scan for stray 'cargo publish'" \
+        "The checks below would pass having examined nothing."
+elif [[ -z "$PUBLISH_FN_START" ]]; then
+    fail "release.sh has no publish_crates() function" \
+        "The containment check has nothing to contain."
+elif [[ -n "$SH_ROGUE" ]]; then
+    fail "a shell script runs a real 'cargo publish' outside publish_crates()" \
+        "$(printf '%s' "$SH_ROGUE")" \
+        "publish_crates() is called after wait_for_binaries, i.e. after the gate." \
+        "A publish anywhere else -- another function, another script, a helper in" \
+        "scripts/release-agent/ -- runs at whatever point that code is reached," \
+        "with nothing between it and the tag."
+elif [[ "$SH_GATED" -lt 2 ]]; then
+    fail "release.sh's publish_crates() has $SH_GATED real 'cargo publish' invocation(s), expected 2" \
+        "It is the manual backstop for freenet and fdev. With none, the check" \
+        "above would report success having found nothing." \
+        "(Scanned $SH_SCANNED shell script(s).)"
+else
+    pass "across $SH_SCANNED shell script(s), real 'cargo publish' occurs only in publish_crates() ($SH_GATED)"
+fi
+
 # --- 2e. EVERY executable site that creates a release passes --draft --------
-# The `--draft` invariant enumerated over CODE, not over the three sites it was
-# first written for.
+# The `--draft` invariant enumerated over CODE, not over the sites it was first
+# written for. It was pinned in release.yml and the two markdown runbooks and
+# missed `scripts/release.sh` -- the one that runs on EVERY NORMAL RELEASE
+# rather than only on a bad day.
 #
-# It was pinned in release.yml and in the two markdown runbooks, and missed
-# `scripts/release.sh` -- which is the one that executes on EVERY NORMAL
-# RELEASE rather than only on a bad day. Dropping `--draft` there passed all
-# eight suites. The pins had been written to the shape of the files already in
-# hand instead of to the shape of the invariant, so the human path that runs
-# most often was the one left uncovered.
+# Uses the same `logical_lines`, so a `\`-continued invocation is judged whole
+# and a trailing `# dropped --draft here` comment cannot satisfy the flag check.
+# The file set is RECURSIVE for the same reason as 2c-quater.
 #
-# Scans workflows and shell scripts together, because "which file is it in" is
-# not a property the invariant cares about. Docs are covered by assertion 2d,
-# which needs fence extraction; this one needs none.
-#
-# `*_test.sh` is excluded: this file itself contains the string `gh release
-# create` in its own greps and failure text, and a scan that matches its own
-# source is the self-satisfying shape this suite exists to remove. Test files
-# do not cut releases.
+# Docs are covered by assertion 2d, which needs fence extraction; this needs
+# none. `*_test.sh` is excluded: this file contains `gh release create` in its
+# own greps and failure text, and a scan matching its own source is the
+# self-satisfying shape this suite exists to remove.
 CODE_CREATE_SITES=()
-for _f in "$SCRIPT_DIR"/../.github/workflows/*.yml "$SCRIPT_DIR"/../.github/workflows/*.yaml "$SCRIPT_DIR"/*.sh; do
+for _f in "$SCRIPT_DIR"/../.github/workflows/*.yml "$SCRIPT_DIR"/../.github/workflows/*.yaml; do
+    [[ -f "$_f" ]] && CODE_CREATE_SITES+=("$_f")
+done
+while IFS= read -r _f; do
     [[ -f "$_f" ]] || continue
     case "$(basename "$_f")" in *_test.sh) continue ;; esac
     CODE_CREATE_SITES+=("$_f")
-done
-
-# Logical commands, with `\` continuations joined and the STARTING line number
-# kept. Per-LINE matching does not work here: release.yml spreads its
-# invocation over four lines with `--draft` on the last, so a line-wise check
-# reports the verb line as undrafted -- a false positive that would have to be
-# silenced, and silencing it is how this assertion would end up deleted.
-#
-# Same joining the doc extractor does, for the same reason, over different
-# input.
-_logical_creates() {
-    awk '
-        {
-            line = $0
-            sub(/^[[:space:]]+/, "", line)
-            if (acc == "") startln = NR
-            acc = acc (acc == "" ? "" : " ") line
-            if (line ~ /\\$/) { sub(/[[:space:]]*\\$/, "", acc); next }
-            print startln ":" acc
-            acc = ""
-        }
-        END { if (acc != "") print startln ":" acc }
-    ' "$1"
-}
+done < <(find "$SCRIPT_DIR" -name '*.sh' -type f | sort)
 
 code_creates_total=0
 code_creates_undrafted=""
@@ -1213,27 +1265,14 @@ for _f in "${CODE_CREATE_SITES[@]}"; do
     while IFS= read -r _hit; do
         [[ -z "$_hit" ]] && continue
         code_creates_total=$((code_creates_total + 1))
-        # `--draft` as its own flag; `--draft=false` is the UN-draft and must
-        # NOT satisfy this -- accepting it would let the exact inversion this
-        # assertion catches pass as a fix.
-        #
-        # Shell punctuation is normalised to spaces first. In CODE the flag is
-        # routinely terminated by something other than whitespace --
-        # `... --draft"` inside an echo, `... --draft)` closing a command
-        # substitution -- so a whitespace-bounded test alone reports correct
-        # invocations as undrafted. `=` is deliberately NOT normalised, so
-        # `--draft=false` still fails to match.
-        #
-        # Done with `case`, not a pipe into grep: no subprocess, and it cannot
-        # reintroduce the pipefail/SIGPIPE hazard this repo audits for.
+        # Shell punctuation normalised so `--draft"` and `--draft)` count, while
+        # `=` is left alone so `--draft=false` -- the UN-draft -- still fails.
         _flags=" $(printf '%s' "${_hit#*:}" | tr '"'"'"'"()' '    ') "
         case "$_flags" in
             *" --draft "*) ;;
             *) code_creates_undrafted+="$_base:$_hit"$'\n' ;;
         esac
-    done < <(_logical_creates "$_f" \
-                | grep -E 'gh release create' \
-                | grep -vE '^[0-9]+:[[:space:]]*#')
+    done < <(logical_lines "$_f" | grep -E 'gh release create')
 done
 code_creates_undrafted="$(printf '%s' "$code_creates_undrafted" | grep -vE '^[[:space:]]*$' || true)"
 

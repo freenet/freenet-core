@@ -200,12 +200,36 @@ expect 0 "a bare string added to a table (a KNOWN blind spot, documented in ci.y
 #    THIS file was added, its 26 bare `expect` calls scored zero -- the miss it
 #    exists to prevent, in the file written to prevent it, caught by measuring.
 invisible=()
+unrun=()
+CI_YML="$SCRIPT_DIR/../.github/workflows/ci.yml"
 while IFS= read -r f; do
     [[ -f "$f" ]] || continue
     # Same `eval` path as `counter_matches`, so this measures the LIVE pattern
     # rather than a re-quoted copy of it.
     if [[ "$(eval "sed 's/^/+/' \"\$f\" | grep -cE $FRAG")" -eq 0 ]]; then
         invisible+=("$f")
+    fi
+    # ...AND it must actually be RUN. A test file that no workflow invokes is
+    # scored by the counter above and executed by nothing: it looks like
+    # coverage in a listing and gates nothing at all.
+    #
+    # Not hypothetical, and not caught by inspection either time. It was found
+    # by hand that `release_state_restore_test.sh` had existed and passed for a
+    # long time while ci.yml referenced it only in a COMMENT -- so the v0.2.42
+    # regression it was written for had no running gate behind it. A later
+    # review then confirmed "no other orphans" by inspection, and demonstrated
+    # in the same breath why inspection is not enough: it added a probe test
+    # with a real assertion and no `run:` line, and all suites stayed green.
+    # This loop is what makes that fail closed.
+    #
+    # Matched against `run:` LINES specifically, not the whole file, so a
+    # mention in a comment -- exactly how the orphan hid -- does not count as
+    # being run.
+    if [[ -f "$CI_YML" ]]; then
+        _base="$(basename "$f")"
+        if [[ "$(grep -cE "^[[:space:]]*run:.*$_base" "$CI_YML")" -eq 0 ]]; then
+            unrun+=("$f")
+        fi
     fi
     # Filesystem glob, NOT `git ls-files`, and the difference matters: a
     # contributor adding a test file has not necessarily staged it yet, and that
@@ -214,6 +238,22 @@ while IFS= read -r f; do
     # invisible to this very check, so the check that exists to find invisible
     # files could not see the newest one.
 done < <(find "$SCRIPT_DIR" -name '*_test.sh' -type f | sort)
+
+if [[ ! -f "$CI_YML" ]]; then
+    echo "FAIL - ci.yml not found at $CI_YML; cannot check that test files are run." >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ ${#unrun[@]} -eq 0 ]]; then
+    echo "ok   - every *_test.sh is invoked by a 'run:' line in ci.yml"
+else
+    echo "FAIL - these *_test.sh files are never RUN by ci.yml:" >&2
+    for f in "${unrun[@]}"; do echo "         $f" >&2; done
+    echo "       They are scored by the assertion counter and executed by nothing," >&2
+    echo "       so they look like coverage in a listing while gating nothing. Add a" >&2
+    echo "       'run: bash scripts/<name>' step to the Fmt job in ci.yml. A mention" >&2
+    echo "       in a COMMENT does not count -- that is exactly how the previous" >&2
+    echo "       orphan stayed hidden." >&2
+    FAILURES=$((FAILURES + 1))
+fi
 
 if [[ ${#invisible[@]} -eq 0 ]]; then
     echo "ok   - every tracked *_test.sh contains at least one assertion the counter sees"

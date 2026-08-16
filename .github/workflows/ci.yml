@@ -209,6 +209,17 @@ jobs:
       - name: Self-test release driver resume state
         run: bash scripts/release_state_restore_test.sh
 
+      # BEHAVIOURAL cover for release.sh, as distinct from the source pins in
+      # release_canary_wiring_test.sh. Two mutations defeated those pins while
+      # leaving their text intact: an unreachable fdev branch (the `cargo
+      # publish -p fdev` line still present, so the source scan's floor was
+      # satisfied, while fdev was stranded on EVERY release) and a second
+      # `publish_crates` call in a conditional form before the tag (the bare
+      # call still matching `^publish_crates$`). Both are properties, not
+      # patterns, so both are asserted by running the driver against stubs.
+      - name: Self-test release driver behaviour
+        run: bash scripts/release_driver_test.sh
+
       # Pins the WIRING of the blocking pre-flight canary, which is what
       # makes it a gate at all: it must run inside attach-to-release, after
       # the assets upload, BEFORE the crates.io publish (the one irreversible
