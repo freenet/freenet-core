@@ -11869,6 +11869,13 @@ mod tests {
                 .await;
                 match reply {
                     Some(InterestMessage::Summaries { entries, .. }) => {
+                        // Holds BY FIXTURE, not by the cap — same as the digest
+                        // twin. Since #5338 a reply is bounded at 64 SUMMARIZE
+                        // CALLS and at MAX_SUMMARY_ENTRIES_PER_MESSAGE entries,
+                        // so a reply may legitimately carry more than 64
+                        // entries. Every contract here is hosted, so every entry
+                        // is costed and the summarize budget binds. Do not read
+                        // this as "replies are capped at 64 entries".
                         assert!(entries.len() <= MAX_FALLBACK_SUMMARIES_PER_REPLY);
                         covered.extend(entries.iter().map(|e| e.hash));
                     }
@@ -12797,9 +12804,13 @@ mod tests {
                 });
             }
             assert!(
-                entries.len() < MAX_SUMMARY_COMPARISONS_PER_MESSAGE,
-                "premise: the fixture must stay under the cap so no rotation \
-                 occurs and this test is deterministic"
+                entries.len() < MAX_SUMMARY_ENTRIES_PER_MESSAGE,
+                "premise: the fixture must stay under the ENTRY ceiling so no \
+                 rotation occurs and this test is deterministic. Anchored to the \
+                 ceiling rather than to MAX_SUMMARY_COMPARISONS_PER_MESSAGE \
+                 because since #5338 that is the constant the rotation triggers \
+                 on — the two were the same number before, so the old anchor \
+                 held for the wrong reason"
             );
 
             let reply = handle_interest_sync_message(
