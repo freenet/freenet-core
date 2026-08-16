@@ -46,6 +46,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WF="$SCRIPT_DIR/../.github/workflows/cross-compile.yml"
 RELEASE_SH="$SCRIPT_DIR/release.sh"
+WF_BASENAME="$(basename "$WF")"
 
 FAILURES=0
 
@@ -136,6 +137,51 @@ step_block() {
         | awk -F: -v a="$at" '$1 > a && /^[0-9]+:      - name:/ { print $1; exit }')"
     [[ -z "$end" ]] && end=999999
     printf '%s\n' "$JOB_BLOCK" | awk -F: -v a="$start" -v b="$end" '$1 >= a && $1 < b'
+}
+
+# status_swallowers <text> [allow-rc-capture]
+#
+# Emits every line that lets a command's NON-ZERO exit status be discarded.
+# Empty output means nothing swallows.
+#
+# WHY THIS IS A FUNCTION, AND WHY IT IS NOT ANCHORED AT END OF LINE.
+# The three gate sites (Gate A's canary step, the CARGO_REGISTRY_TOKEN
+# fail-fast, Gate B's step) each had their own copy of
+# `\|\|[[:space:]]*(true|:)[[:space:]]*$`, which recognises exactly two
+# swallows and only at end of line. Everything else walked straight through:
+#
+#     ... auto-update-canary.sh preflight /tmp/freenet || echo "::warning::soft"
+#     ... || exit 0
+#     ... || :; echo done
+#
+# The first of those was mutation-tested against the whole suite and passed
+# 37/37 while Gate A was completely neutered -- next to a comment in this very
+# file calling `|| true` "the likelier of the two neutering routes, and the
+# worse one ... which is exactly why it has to fail loudly here." It did not.
+# An enumeration of known-bad spellings is not a defence; the RULE is that
+# these steps must not consume their command's status AT ALL.
+#
+# So: ANY `||` counts, plus `set +e`, plus a trailing `; true` / `; :`. None of
+# these steps has a legitimate `||` -- verified: the canary step and the token
+# check contain none, and Gate B contains exactly one, its deliberate
+# `|| rc=$?` capture, which is opted in per call site rather than baked in
+# here. A future step that genuinely needs `||` should have to come here and
+# say so, which is the point.
+#
+# Callers pass comment-stripped text (yaml_job_block drops comment lines), so
+# prose discussing `|| true` cannot fire this.
+status_swallowers() {
+    local text="$1" allow_rc="${2:-}"
+    local hits
+    hits="$(printf '%s\n' "$text" \
+        | grep -E '\|\||set[[:space:]]+\+e|;[[:space:]]*(true|:)[[:space:]]*$')"
+    if [[ -n "$allow_rc" ]]; then
+        # Gate B runs the canary as `... || rc=$?` precisely so it can classify
+        # exit 75, and re-raises with `exit "$rc"`. That pairing is asserted
+        # separately; only the capture spelling is exempted here.
+        hits="$(printf '%s\n' "$hits" | grep -vE '\|\|[[:space:]]*rc=\$\?[[:space:]]*$')"
+    fi
+    printf '%s\n' "$hits" | grep -vE '^[[:space:]]*$' || true
 }
 
 # --- 1. the canary step still runs ------------------------------------------
@@ -318,8 +364,30 @@ fi
 # on crates.io, and actually publishes otherwise. The third case matters as much
 # as the first -- a guard that refuses everything would satisfy the other two.
 extract_step_run() {
-    # extract_step_run <step name> -- that step's `run:` script, dedented.
-    awk -v want="      - name: $1" '
+    # extract_step_run <job-key> <step name> -- that step's `run:` script,
+    # dedented, from THAT JOB ONLY.
+    #
+    # The job scoping is not decoration. This function used to awk the whole
+    # file for the first `- name: <step>`, while `line_of` and `step_block`
+    # are scoped to `$JOB_BLOCK` -- so the two could describe DIFFERENT STEPS
+    # and nothing noticed. Mutation-tested: gutting the real tree guard to
+    # `CORE_VERSION="$VERSION"` (which compares the tag against itself and can
+    # never fail) AND adding an `if: false` decoy step named
+    # `Publish crates to crates.io` to an earlier job, carrying the correct
+    # script, left ALL FIVE behavioural cases green -- including "refuses a
+    # tree whose version does not match the tag" -- because they were executing
+    # the decoy. First-in-file won, and first-in-file was not the step being
+    # gated.
+    #
+    # Any extractor in this file that is not scoped to the thing it claims to
+    # describe is the same defect waiting. See the consistency check at the
+    # PC_RUN call site, which asserts the two extractors agree rather than
+    # trusting that they do.
+    local job="$1" name="$2"
+    awk -v jobre="^  $job:[[:space:]]*\$" -v want="      - name: $name" '
+        $0 ~ jobre                       { injob = 1; next }
+        injob && /^  [A-Za-z_.-]+:/      { injob = 0 }
+        !injob                           { next }
         $0 == want                       { instep = 1; next }
         instep && /^      - name:/       { exit }
         instep && /^        run: \|/     { inrun = 1; next }
@@ -331,7 +399,22 @@ extract_step_run() {
     ' "$WF"
 }
 
-PC_RUN="$(extract_step_run 'Publish crates to crates.io')"
+# A step name that occurs more than once in the file is itself the hazard: two
+# extractors can then disagree about which one they describe. Job scoping fixes
+# WHICH step is read; this names the ambiguity so a decoy is reported rather
+# than silently ignored.
+PC_NAME_COUNT="$(grep -cE '^      - name: Publish crates to crates\.io[[:space:]]*$' "$WF")"
+if [[ "$PC_NAME_COUNT" -eq 1 ]]; then
+    pass "the 'Publish crates to crates.io' step name occurs exactly once in $WF_BASENAME"
+else
+    fail "the step name 'Publish crates to crates.io' occurs $PC_NAME_COUNT times" \
+        "Duplicate step names let a job-scoped extractor and an unscoped one" \
+        "describe DIFFERENT steps. A decoy carrying a correct-looking script --" \
+        "even an 'if: false' one that never runs -- can then satisfy the" \
+        "behavioural cases while the step that actually ships is unexamined."
+fi
+
+PC_RUN="$(extract_step_run attach-to-release 'Publish crates to crates.io')"
 if [[ -z "$PC_RUN" || "$PC_RUN" != *'cargo publish -p freenet'* ]]; then
     # Never a silent skip: every case below would pass on an empty script.
     fail "could not extract the 'Publish crates to crates.io' step's run: block" \
@@ -346,6 +429,47 @@ elif ! command -v jq >/dev/null 2>&1; then
         "time too. Install jq."
 else
     pass "extracted the crates.io publish step's run: block ($(printf '%s\n' "$PC_RUN" | wc -l) lines)"
+
+    # The two extractors must describe the SAME step.
+    #
+    # `PUBLISH_CRATES_STEP` (via line_of/step_block) is what the ORDERING and
+    # `if:` assertions judge; `PC_RUN` is what the behavioural cases EXECUTE.
+    # They are found by different mechanisms, so they can drift apart -- and
+    # when they do, this file reports confidently about two different steps:
+    # the gated one is pinned for position while the executed one is some other
+    # step entirely. That is not hypothetical, it is the N4 mutation, and job
+    # scoping alone only closes the instance rather than the class. This asserts
+    # the agreement instead of assuming it.
+    PC_STEP_TEXT="$(printf '%s\n' "$PUBLISH_CRATES_STEP" | sed 's/^[0-9]*://')"
+    pc_missing=0
+    # Blank and COMMENT lines are skipped: `yaml_job_block` strips comment-only
+    # lines when building JOB_BLOCK, while `extract_step_run` reads the raw
+    # file, so the run block's own shell comments are legitimately present in
+    # one side and absent from the other. Comparing them would fail on every
+    # clean tree, which is how a check like this ends up deleted rather than
+    # fixed. The executable lines are the ones that must agree.
+    while IFS= read -r _line; do
+        _stripped="${_line#"${_line%%[![:space:]]*}"}"
+        [[ -z "$_stripped" ]] && continue
+        [[ "$_stripped" == \#* ]] && continue
+        case "$PC_STEP_TEXT" in
+            *"$_line"*) ;;
+            *) pc_missing=$((pc_missing + 1)) ;;
+        esac
+    done <<< "$PC_RUN"
+
+    if [[ "$pc_missing" -eq 0 ]]; then
+        pass "the executed run: block belongs to the same step the ordering assertions pin"
+    else
+        fail "the EXECUTED publish script is not the step the ordering assertions describe" \
+            "$pc_missing line(s) of the extracted run: block do not appear in the" \
+            "job-scoped step at line $PUBLISH_CRATES_LINE." \
+            "The behavioural cases below would be exercising one step while the" \
+            "ordering and 'if:' assertions above pin a different one -- so this file" \
+            "would report a correct, gated, guarded publish while the step that" \
+            "actually ships is neither. Check for a duplicate step name elsewhere in" \
+            "the workflow."
+    fi
 
     # The crates.io answer is per-CRATE, not one fixed body, because the case
     # that matters most is the asymmetric one: `freenet` uploaded, then `fdev`
@@ -481,13 +605,28 @@ fi
 # release: a missing or dead CARGO_REGISTRY_TOKEN is now discovered after the
 # bump PR, the tag, ~30 minutes of cross-compilation and Gate A. That is F3's
 # shape one step further down -- an avoidable cost paid at the most expensive
-# possible moment -- so both entry points check the credential up front.
-TOKEN_CHECK_LINE="$(line_of 'CARGO_REGISTRY_TOKEN not set')"
+# possible moment -- so both entry points check the credential early.
+#
+# "Early" means something DIFFERENT at each entry point, and the difference is
+# the whole point of the two bounds below. release.yml's `validate` checks it
+# genuinely first, before anything exists to unwind. attach-to-release checks it
+# AFTER the asset upload and BEFORE the canary -- deliberately not first,
+# because this job also delivers binaries and un-drafts, neither of which needs
+# a crates.io token.
+# Located by STEP NAME, not by the log text inside it. The log-text locator
+# worked, but the delta added ~30 lines of prose immediately above this step
+# discussing the same token, and `head -1` takes whichever comes first --
+# a growing collision surface for no benefit. A step name is structural.
+TOKEN_CHECK_LINE="$(line_of '^[0-9]+:      - name: Check the crates\.io credential is present')"
 if [[ -z "$TOKEN_CHECK_LINE" ]]; then
-    fail "attach-to-release does not check for CARGO_REGISTRY_TOKEN before doing work" \
-        "This job ends in a crates.io upload. A missing credential is" \
-        "deterministic, so it should fail before the artifact download, the" \
-        "signing and the canary -- not after them."
+    fail "attach-to-release does not check for CARGO_REGISTRY_TOKEN" \
+        "This job ends in a crates.io upload, and a missing credential is" \
+        "deterministic, so it should fail BEFORE THE CANARY -- there is no point" \
+        "spending the canary's minutes if the publish cannot happen." \
+        "Put it AFTER the asset upload, not first: this job also attaches" \
+        "binaries and un-drafts, and neither needs a crates.io token, so a check" \
+        "at step 1 blocks binary delivery on a credential only the publish" \
+        "requires. The two ordering assertions below enforce both bounds."
 elif [[ -n "$CANARY_LINE" && "$TOKEN_CHECK_LINE" -gt "$CANARY_LINE" ]]; then
     fail "attach-to-release checks CARGO_REGISTRY_TOKEN only AFTER the canary (token $TOKEN_CHECK_LINE > canary $CANARY_LINE)" \
         "The point of the check is to fail fast. After the canary it saves nothing."
@@ -553,11 +692,18 @@ else
         # left the assertion GREEN. The pin was reading a neighbour's refusal
         # and reporting it as this one's -- the same shape as scanning a whole
         # job block for text that a different step supplies.
-        VALIDATE_TOKEN_STEP="$(awk '
+        # Extracted from `$VALIDATE_JOB`, NOT by re-awking the whole file.
+        # Found during the N4 sibling sweep: this had the same unscoped shape,
+        # taking the first step in release.yml whose name mentions "crates.io
+        # token" regardless of which job it sits in. Only `validate` has one
+        # today, so it was correct by luck rather than by construction -- and
+        # "correct by luck" is what the N4 decoy turned into a green suite over
+        # a neutered gate.
+        VALIDATE_TOKEN_STEP="$(printf '%s\n' "$VALIDATE_JOB" | awk '
             /^      - name: .*crates\.io token/ { instep = 1; print; next }
             instep && /^      - name: /         { exit }
             instep                              { print }
-        ' "$RELEASE_YML" | grep -vE '^[[:space:]]*#')"
+        ' | grep -vE '^[[:space:]]*#')"
         if [[ -z "$VALIDATE_TOKEN_STEP" ]]; then
             fail "could not locate release.yml's crates.io token-check STEP" \
                 "The refusal check below scans it, so an empty extraction would" \
@@ -617,8 +763,13 @@ if [[ -n "$TOKEN_CHECK_LINE" ]]; then
         fail "could not extract the CARGO_REGISTRY_TOKEN check STEP around line $TOKEN_CHECK_LINE" \
             "The checks below scan this text, so an empty extraction passes vacuously."
     else
-        TOKEN_NEUTERED="$(printf '%s\n' "$TOKEN_STEP" \
-            | grep -cE '^[0-9]+:        (continue-on-error:|if:)|\|\|[[:space:]]*(true|:)[[:space:]]*$|set[[:space:]]+\+e')"
+        # Step keys and shell swallows are separate routes to the same
+        # outcome; both are checked, the shell half via the shared helper.
+        TOKEN_KEYS="$(printf '%s\n' "$TOKEN_STEP" \
+            | grep -E '^[0-9]+:        (continue-on-error:|if:)')"
+        TOKEN_SWALLOW="$(status_swallowers "$TOKEN_STEP")"
+        TOKEN_NEUTERED=0
+        [[ -n "$TOKEN_KEYS$TOKEN_SWALLOW" ]] && TOKEN_NEUTERED=1
         # The step keys are only half of it: the step must still be ABLE to
         # refuse. Checked FIRST, because it is the mutation that survived.
         # This assertion previously located the step by its log text
@@ -645,7 +796,7 @@ if [[ -n "$TOKEN_CHECK_LINE" ]]; then
             pass "the CARGO_REGISTRY_TOKEN fail-fast check can refuse and is not disabled in place"
         else
             fail "the CARGO_REGISTRY_TOKEN fail-fast check can no longer fail the job" \
-                "$(printf '%s\n' "$TOKEN_STEP" | grep -E '^[0-9]+:        (continue-on-error:|if:)|\|\|[[:space:]]*(true|:)[[:space:]]*$|set[[:space:]]+\+e')" \
+                "$TOKEN_KEYS$TOKEN_SWALLOW" \
                 "It still runs and still logs, but the job proceeds without the" \
                 "credential -- so the failure lands at the crates.io publish instead," \
                 "after the tag, ~30 minutes of cross-compilation and Gate A. A" \
@@ -759,31 +910,67 @@ for spec in "${draft_docs[@]}"; do
     # verb. Fencing also keeps PROSE out: both docs now argue for `--draft` at
     # length, so a whole-file grep would match sentences ABOUT the command and be
     # satisfied by the paragraph explaining it.
-    creates="$(awk '
+    logical="$(awk '
         /^```/          { infence = !infence; next }
         !infence        { next }
         {
             line = $0
             sub(/^[[:space:]]+/, "", line)
+            # Drop comment lines outright. The `^gh release create` anchor on
+            # the FLOOR already excludes them, but the floor must not rest on
+            # that anchor alone -- an operator does not copy a comment, and a
+            # commented-out invocation inflating the floor is exactly the
+            # mutation that got through once.
+            if (line ~ /^#/) next
             acc = acc (acc == "" ? "" : " ") line
             if (line ~ /\\$/) { sub(/[[:space:]]*\\$/, "", acc); next }
             print acc
             acc = ""
         }
         END { if (acc != "") print acc }
-    ' "$doc" | grep -E '^gh release create')"
+    ' "$doc")"
 
-    if [[ -z "$creates" ]]; then
+    # TWO matchers over the same logical commands, and they are deliberately
+    # different strengths. Conflating them cost a real hole:
+    #
+    #   FLOOR  -- anchored (`^gh release create`). Counts only line-initial
+    #             invocations, so a pipeline DIAGRAM line inside a fence
+    #             (`└─→ gh release create --draft ...` in RELEASING.md) cannot
+    #             satisfy the floor on its own. Without the anchor, deleting the
+    #             one real invocation still meets a floor of 1.
+    #
+    #   FLAG   -- UNANCHORED (word-boundary only). Every invocation an operator
+    #             could copy must carry `--draft`, wherever the verb sits on the
+    #             line.
+    #
+    # An earlier revision anchored BOTH, to close the diagram-line hole, and in
+    # doing so blinded the FLAG check to any invocation that is not line-initial:
+    # `GH_TOKEN="$PAT" gh release create ...` with no `--draft` passed the whole
+    # suite, which reported "all 2 invocations pass --draft" while silent about
+    # the third it could not see. That is #5288 reintroduced by the fix for a
+    # different hole in the same assertion. Evading prefixes are anything before
+    # the verb on the joined line: an env assignment, `sudo `, `&& `, a `$`
+    # prompt. Leading whitespace is already stripped by the awk, and a `#`
+    # comment correctly matches neither.
+    #
+    # GENERAL LESSON, worth more than this instance: tightening a matcher is a
+    # behaviour change to EVERY input, not just the one that motivated it. When
+    # you narrow a pattern, mutation-test both directions -- what you newly
+    # catch, and what you could already catch.
+    creates_anchored="$(printf '%s\n' "$logical" | grep -E '^gh release create')"
+    creates_any="$(printf '%s\n' "$logical" | grep -E '(^|[[:space:]]|;|&&|\|\|)gh release create')"
+
+    if [[ -z "$creates_anchored" ]]; then
         total=0
     else
-        total="$(printf '%s\n' "$creates" | wc -l | tr -d ' ')"
+        total="$(printf '%s\n' "$creates_anchored" | wc -l | tr -d ' ')"
     fi
     # `--draft` as its own flag: `--draft=false` must NOT satisfy it. That is
     # the un-draft, the thing only the workflow may do once Gate A has passed,
     # and accepting it here would let the exact inversion this assertion exists
     # to catch pass as a fix.
-    undrafted="$(printf '%s\n' "$creates" \
-        | grep -vE '(^|[[:space:]])--draft([[:space:]]|$)' | grep -E '^gh release create')"
+    undrafted="$(printf '%s\n' "$creates_any" \
+        | grep -vE '(^|[[:space:]])--draft([[:space:]]|$)')"
 
     if [[ "$total" -lt "$want" ]]; then
         fail "$label has $total 'gh release create' invocation(s) in code blocks, expected at least $want" \
@@ -803,6 +990,137 @@ for spec in "${draft_docs[@]}"; do
             "manual paths must match it."
     fi
 done
+
+# --- 2c-ter. the ONLY real `cargo publish` anywhere is the gated one --------
+# The whole-invariant check, and the one whose absence made every assertion
+# above locally true and globally meaningless.
+#
+# This PR's stated invariant is "nothing irreversible may precede the blocking
+# gate". Assertions 2b/2c enforce that in exactly one file and one job: 2b's
+# `line_of` is scoped to `attach-to-release`, and 2c scans only release.yml.
+# Nothing asked whether a real `cargo publish` had appeared ANYWHERE ELSE.
+#
+# Mutation-tested, and it survived with all eight suites green: a
+# `Push crates early` step added to `build-macos-dmg` -- an ordinary job that
+# `attach-to-release` merely `needs:`, so strictly earlier -- publishes both
+# crates before Gate A has run, leaving the gated step untouched and every
+# assertion above still true. Six lines reproduce the v0.2.124 loss in the same
+# file this suite claims to protect.
+#
+# So the rule is global, not local: across the entire workflow set, every real
+# (non-`--dry-run`) `cargo publish` must fall INSIDE the gated step's line
+# range. Dry runs are whitelisted wherever they appear -- they upload nothing.
+#
+# Line numbers come from JOB_BLOCK's `--numbered` prefixes, which are original
+# file lines, so they are directly comparable to `grep -n` output on the file.
+if [[ -n "$PUBLISH_CRATES_LINE" && -n "$PUBLISH_CRATES_STEP" ]]; then
+    PC_FIRST="$(printf '%s\n' "$PUBLISH_CRATES_STEP" | head -1 | cut -d: -f1)"
+    PC_LAST="$(printf '%s\n' "$PUBLISH_CRATES_STEP" | tail -1 | cut -d: -f1)"
+    WF_DIR="$SCRIPT_DIR/../.github/workflows"
+    WF_BASE="$(basename "$WF")"
+
+    rogue_publishes=""
+    gated_publishes=0
+    scanned_files=0
+
+    for _wf in "$WF_DIR"/*.yml "$WF_DIR"/*.yaml; do
+        [[ -f "$_wf" ]] || continue
+        scanned_files=$((scanned_files + 1))
+        _base="$(basename "$_wf")"
+        # Original line numbers preserved: comment lines are dropped by
+        # matching the numbered output, NOT by filtering the file first (which
+        # would renumber everything and make the range test meaningless).
+        while IFS= read -r _hit; do
+            [[ -z "$_hit" ]] && continue
+            _ln="${_hit%%:*}"
+            if [[ "$_base" == "$WF_BASE" && "$_ln" -ge "$PC_FIRST" && "$_ln" -le "$PC_LAST" ]]; then
+                gated_publishes=$((gated_publishes + 1))
+            else
+                rogue_publishes+="$_base:$_hit"$'\n'
+            fi
+        # The last filter drops PROSE MENTIONS inside an echo -- ci.yml has
+        # `echo "inside crates/core/ so cargo publish bundles them."`, which is
+        # documentation, not an upload. Deliberately narrow: it requires NO
+        # command separator between the `echo` and the words, so
+        # `echo hi; cargo publish -p freenet` is still flagged. A broad
+        # `-v echo` would have been a hiding place.
+        done < <(grep -nE 'cargo[[:space:]]+publish' "$_wf" \
+                    | grep -vE '^[0-9]+:[[:space:]]*#' \
+                    | grep -vE -- '--dry-run' \
+                    | grep -vE 'echo[^;|&]*cargo[[:space:]]+publish')
+    done
+
+    if [[ "$scanned_files" -eq 0 ]]; then
+        fail "found no workflow files to scan for stray 'cargo publish'" \
+            "Every check below would pass having examined nothing."
+    elif [[ -n "$rogue_publishes" ]]; then
+        fail "a real 'cargo publish' exists OUTSIDE the gated step" \
+            "$(printf '%s' "$rogue_publishes")" \
+            "The gated step (lines $PC_FIRST-$PC_LAST of $WF_BASE) is the only place a" \
+            "release may upload to crates.io, because it is the only place that runs" \
+            "AFTER Gate A. A publish anywhere else -- including in a job that" \
+            "attach-to-release merely 'needs:' -- happens BEFORE the gate, which is" \
+            "precisely the ordering that cost v0.2.124 its version number. If this is" \
+            "a dry run, it must say '--dry-run'; if it is real, it does not belong" \
+            "outside that step."
+    elif [[ "$gated_publishes" -lt 2 ]]; then
+        fail "only $gated_publishes real 'cargo publish' invocation(s) inside the gated step, expected 2" \
+            "The step publishes freenet and fdev. Fewer means one was removed or" \
+            "turned into a dry run -- and with none left, the 'no rogue publishes'" \
+            "check above would report success having found nothing to compare." \
+            "(Scanned $scanned_files workflow file(s).)"
+    else
+        pass "the only real 'cargo publish' in $scanned_files workflow file(s) is the gated one ($gated_publishes invocations, lines $PC_FIRST-$PC_LAST)"
+    fi
+fi
+
+# --- 2c-quater. release.sh's real publish is confined to publish_crates() ---
+# The same question for the manual driver, which the workflow scan above cannot
+# see. release.sh legitimately CAN publish -- it is the fallback for when the
+# workflow path is broken -- but only from `publish_crates()`, which the driver
+# calls after `wait_for_binaries`, i.e. after the gate. A `cargo publish`
+# anywhere else in that file would run at whatever point the driver reached,
+# with no gate between it and the tag.
+if [[ -f "$RELEASE_SH" ]]; then
+    PUBLISH_FN_START="$(grep -nE '^publish_crates\(\) \{' "$RELEASE_SH" | head -1 | cut -d: -f1)"
+    if [[ -z "$PUBLISH_FN_START" ]]; then
+        fail "release.sh has no publish_crates() function" \
+            "The containment check below would pass having nothing to contain."
+    else
+        PUBLISH_FN_END="$(awk -v s="$PUBLISH_FN_START" 'NR > s && /^}/ { print NR; exit }' "$RELEASE_SH")"
+        [[ -z "$PUBLISH_FN_END" ]] && PUBLISH_FN_END=999999
+        sh_rogue=""
+        sh_gated=0
+        while IFS= read -r _hit; do
+            [[ -z "$_hit" ]] && continue
+            _ln="${_hit%%:*}"
+            if [[ "$_ln" -ge "$PUBLISH_FN_START" && "$_ln" -le "$PUBLISH_FN_END" ]]; then
+                sh_gated=$((sh_gated + 1))
+            else
+                sh_rogue+="$_hit"$'\n'
+            fi
+        # Same narrow echo filter as the workflow scan above: release.sh's
+        # own guidance text quotes `cargo publish` while telling operators NOT
+        # to run it by hand.
+        done < <(grep -nE '(^|[[:space:]])cargo[[:space:]]+publish' "$RELEASE_SH" \
+                    | grep -vE '^[0-9]+:[[:space:]]*#' \
+                    | grep -vE -- '--dry-run' \
+                    | grep -vE 'echo[^;|&]*cargo[[:space:]]+publish')
+        if [[ -n "$sh_rogue" ]]; then
+            fail "release.sh runs a real 'cargo publish' outside publish_crates()" \
+                "$(printf '%s' "$sh_rogue")" \
+                "publish_crates() is called after wait_for_binaries, i.e. after the" \
+                "gate. A publish elsewhere in the driver runs at whatever point the" \
+                "script reached, with nothing between it and the tag."
+        elif [[ "$sh_gated" -lt 2 ]]; then
+            fail "release.sh's publish_crates() has $sh_gated real 'cargo publish' invocation(s), expected 2" \
+                "It is the manual backstop for freenet and fdev. With none, the check" \
+                "above would report success having found nothing."
+        else
+            pass "release.sh's real 'cargo publish' calls are confined to publish_crates() ($sh_gated)"
+        fi
+    fi
+fi
 
 # --- 3. it is not neutered in place -----------------------------------------
 # `continue-on-error: true` leaves the step present, running, and visibly
@@ -843,13 +1161,12 @@ if [[ -n "$CANARY_LINE" ]]; then
     # lines, so there is no legitimate use of these to trip over. Comment-only
     # lines were dropped when JOB_BLOCK was built, so a `# || true` in prose
     # cannot fire this.
-    SWALLOWED="$(printf '%s\n' "$CANARY_STEP" \
-        | grep -cE '\|\|[[:space:]]*(true|:)[[:space:]]*$|set[[:space:]]+\+e')"
-    if [[ "$SWALLOWED" -eq 0 ]]; then
+    SWALLOWED="$(status_swallowers "$CANARY_STEP")"
+    if [[ -z "$SWALLOWED" ]]; then
         pass "the canary step's shell does not swallow its own exit status"
     else
-        fail "the canary step swallows its own exit status ('|| true', '|| :' or 'set +e')" \
-            "$(printf '%s\n' "$CANARY_STEP" | grep -E '\|\|[[:space:]]*(true|:)[[:space:]]*$|set[[:space:]]+\+e')" \
+        fail "the canary step swallows its own exit status (any '||', 'set +e' or trailing '; true')" \
+            "$SWALLOWED" \
             "The step still runs, still reports, and still sits before the publish," \
             "but it can no longer fail -- so nothing blocks publication. This is the" \
             "cheapest possible way to disable the gate and the least visible: it looks" \
@@ -945,6 +1262,41 @@ WF_JOB_NAME="$(printf '%s\n' "$JOB_BLOCK" \
     | sed "s/^['\"]//;s/['\"]$//")"
 SH_JOB_NAME="$(sed -n "s/^ATTACH_JOB_NAME=//p" "$RELEASE_SH" | head -1 \
     | sed "s/^['\"]//;s/['\"]$//")"
+
+# ...and the RECOVERY RUNBOOK reads the same two names out of this workflow.
+#
+# The rewritten gate-confirm command selects the job with
+# `startswith("Attach binaries")` and the step with
+# `startswith("Auto-update pre-flight")`. Neither was pinned, which made it a
+# THIRD site of the shape this file exists to close -- and it was added by the
+# commit that argues "one site covered, its sibling left armed" is the gap
+# being closed. Rename either name and the command silently selects nothing.
+#
+# It fails CLOSED (the runbook says "no line at all ... means Gate A did not
+# pass. Stop"), so the risk is a false alarm blocking a good release rather than
+# a publish slipping through -- which is why this is a prefix check rather than
+# an exact-match, matching what the `--jq` actually does.
+RUNBOOK_STEP_NAME="$(printf '%s\n' "$JOB_BLOCK" \
+    | sed -n 's/^[0-9]*:      - name:[[:space:]]*\(Auto-update pre-flight.*\)$/\1/p' | head -1)"
+for _pair in "Attach binaries:${WF_JOB_NAME:-}" "Auto-update pre-flight:${RUNBOOK_STEP_NAME:-}"; do
+    _prefix="${_pair%%:*}"
+    _actual="${_pair#*:}"
+    if [[ -z "$_actual" ]]; then
+        fail "cross-compile.yml has no name starting with '$_prefix'" \
+            "scripts/RELEASE_RECOVERY.md's Gate A confirmation selects it with" \
+            "startswith(\"$_prefix\"). With nothing matching, the documented check" \
+            "prints no output -- which the runbook tells the operator to read as" \
+            "'Gate A did not pass', so a healthy release looks blocked."
+    elif [[ "$_actual" == "$_prefix"* ]]; then
+        pass "RELEASE_RECOVERY.md's startswith(\"$_prefix\") still matches ('$_actual')"
+    else
+        fail "RELEASE_RECOVERY.md selects on a prefix cross-compile.yml no longer has" \
+            "runbook expects a name starting with: '$_prefix'" \
+            "cross-compile.yml has:                 '$_actual'" \
+            "The documented Gate A confirmation would print nothing, which the" \
+            "runbook says to treat as a failed gate. Update both together."
+    fi
+done
 
 if [[ -z "$WF_JOB_NAME" ]]; then
     fail "the attach-to-release job has no 'name:' in cross-compile.yml" \
@@ -1203,13 +1555,14 @@ elif [[ "$selfupdate_block" != *'exit "$rc"'* ]]; then
         "updater, and nothing notifies -- the exact silent fail this file exists" \
         "to prevent, reached by deleting one line."
 else
-    swallowed_b="$(printf '%s\n' "$selfupdate_block" \
-        | grep -cE '\|\|[[:space:]]*(true|:)[[:space:]]*$|set[[:space:]]+\+e')"
-    if [[ "$swallowed_b" -eq 0 ]]; then
+    # `allow-rc-capture`: Gate B's deliberate `|| rc=$?` is exempt, everything
+    # else -- including `|| echo`, `|| exit 0` -- is not.
+    swallowed_b="$(status_swallowers "$selfupdate_block" allow-rc-capture)"
+    if [[ -z "$swallowed_b" ]]; then
         pass "Gate B's step captures AND re-raises the canary's exit code, and swallows nothing"
     else
-        fail "Gate B's step swallows an exit status ('|| true', '|| :' or 'set +e')" \
-            "$(printf '%s\n' "$selfupdate_block" | grep -E '\|\|[[:space:]]*(true|:)[[:space:]]*$|set[[:space:]]+\+e')" \
+        fail "Gate B's step swallows an exit status (any '||' other than '|| rc=\$?', 'set +e', trailing '; true')" \
+            "$swallowed_b" \
             "Same route assertion 3a closes for Gate A: the step still runs and" \
             "still reports, but it can no longer fail."
     fi

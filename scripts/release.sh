@@ -430,17 +430,33 @@ crate_version_on_crates_io() {
 
 # Detect if crates are published
 detect_crates_state() {
-    # Check if freenet is published at this version, via the REGISTRY endpoint
-    # rather than `cargo search` -- see crate_version_on_crates_io above.
+    # BOTH crates, via the REGISTRY endpoint rather than `cargo search` -- see
+    # crate_version_on_crates_io above.
     #
-    # This sets the CRATES_PUBLISHED resume flag, and the search index's lag
-    # made it wrong in the safe direction: a published version read as
-    # unpublished, so the flag went unset and `publish_crates` ran anyway. That
-    # is now harmless, because `publish_crates` re-checks per crate against the
-    # same endpoint -- but it still printed a misleading resume state, and
-    # leaving one of two sites on the lagging source is how the next reader
-    # concludes the search index is good enough here.
-    if crate_version_on_crates_io freenet "$VERSION"; then
+    # The `&&` is load-bearing, and the reason is worth reading before anyone
+    # "simplifies" it back to a single check.
+    #
+    # This sets the CRATES_PUBLISHED resume flag, and `publish_crates` RETURNS
+    # EARLY on that flag -- above its own per-crate logic. So a flag set on
+    # freenet alone makes the fdev branch unreachable, and the driver reports a
+    # successful release having never published fdev. The scenario is one this
+    # repo now documents as expected: `attach-to-release` publishes freenet,
+    # `cargo publish -p fdev` fails (the #4240 class, which docs/RELEASING.md
+    # records as having no pre-flight anywhere), the operator resumes
+    # release.sh, and it declares the crates step already complete.
+    #
+    # This checked freenet only for as long as it used `cargo search`, whose
+    # index lag usually answered "not published" -- so the flag went unset,
+    # publish_crates ran, and its per-crate branch published fdev. The
+    # INACCURACY was the only thing holding that gap shut. Making the check
+    # correct without widening it to both crates would have turned an unlikely
+    # path into the reliable one.
+    #
+    # General form, because this is not the only place it can bite: before
+    # making a check more correct, ask what currently depends on it being
+    # wrong.
+    if crate_version_on_crates_io freenet "$VERSION" \
+       && crate_version_on_crates_io fdev "$FDEV_VERSION"; then
         COMPLETED_STEPS["CRATES_PUBLISHED"]=1
     fi
 }
