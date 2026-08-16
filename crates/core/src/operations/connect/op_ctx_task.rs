@@ -909,12 +909,13 @@ async fn drive_relay_connect(
     }
 
     if let Some(reject_reason) = initial_actions.rejected {
-        // Pass the SPECIFIC cause, never a constant: the two terminus-rejection
-        // log lines are `debug!` (#5335) and `release_max_level_info` compiles
-        // them out of release builds, so this event's reason string is the only
-        // thing distinguishing "no uphill peers available" (a connectivity
-        // condition) from "uphill budget or TTL exhausted" (the amplification
-        // bound working) in production.
+        // Pass the SPECIFIC cause, never a constant: the terminus-rejection log
+        // lines are `debug!` (#5335) and `release_max_level_info` compiles them
+        // out of release builds, so this event's reason string is the only
+        // thing distinguishing the three causes in production — "no uphill
+        // peers available" (connectivity), "uphill budget exhausted" (the
+        // amplification bound), and "TTL exhausted" (reach). See
+        // `RejectReason::as_event_reason`, which owns those strings.
         if let Some(event) = NetEventLog::connect_rejected(
             &incoming_tx,
             &op_manager.ring,
@@ -1092,12 +1093,20 @@ async fn drive_relay_connect(
                     // cause, so a constant here would reintroduce exactly the
                     // conflation #5335 removed from the initial path — and on
                     // live traffic this retry path is roughly half of this
-                    // driver's rejections, so it is not a corner case. Fall
-                    // back to the generic string only when `handle_request`
-                    // produced no cause at all (it returned neither a forward
-                    // nor an accept nor a rejection — e.g. the already-
-                    // forwarded arm), which is a different situation and
-                    // deserves its own wording.
+                    // driver's rejections, so it is not a corner case.
+                    //
+                    // The generic fallback is for the case where
+                    // `handle_request` returned no forward, no accept AND no
+                    // rejection. That is genuinely reachable, but NOT via the
+                    // already-forwarded arm: `forwarded_to.take()` above sets
+                    // it to `None` before the call, and that arm is gated on
+                    // `forwarded_to.is_some()`. The reachable path is
+                    // `accepted_locally == true` — near-terminus acceptance
+                    // accepts while ALSO forwarding, so when that forward is
+                    // later rejected we re-enter here with every terminus arm
+                    // gated off by `!accepted_locally` and nothing set. A
+                    // different situation from a terminus rejection, so it
+                    // keeps its own wording rather than borrowing a cause.
                     let reason = retry
                         .rejected
                         .map(RejectReason::as_event_reason)
@@ -1246,22 +1255,30 @@ async fn drive_relay_connect(
                 } else {
                     // KNOWN GAP (#5335): `retry.rejected` may carry a specific
                     // cause here, and this branch deliberately emits NO
-                    // `connect_rejected` event — so in a release build, where
-                    // this `debug!` is compiled out by `release_max_level_info`,
-                    // that cause is not recorded anywhere.
+                    // `connect_rejected` event. In a release build this
+                    // `debug!` is compiled out by `release_max_level_info`, so
+                    // on this path the cause is recorded NOWHERE — not in a
+                    // log, not in an event, on this node or any other. State
+                    // that plainly rather than implying it is relocated: a
+                    // `ConnectFailed` is handled in exactly one place (the arm
+                    // this branch belongs to) and its outcomes are forward
+                    // downstream, re-route, accept locally, or propagate
+                    // further upstream. At NO hop does it turn into a
+                    // `Rejected` or emit `connect_rejected`, so there is
+                    // nothing upstream that re-records this.
                     //
-                    // Not fixed by emitting `connect_rejected`: the terminal
-                    // outcome here is ConnectFailed PROPAGATION, not a
-                    // rejection. The upstream relay retries on receiving it and
-                    // emits its own rejection if the chain dead-ends, so
-                    // emitting one here would both double-count and make a
-                    // single event name cover two different decisions —
-                    // inflating `connect_rejects_emitted` and breaking its
-                    // comparability across this release boundary. There is no
-                    // existing event variant for "propagated ConnectFailed",
-                    // and adding one is a telemetry schema change beyond the
-                    // scope of #5335. Recorded in the PR rather than silently
-                    // left; revisit if this path is ever sized in production.
+                    // It is nonetheless deliberate, for a reason that survives
+                    // the above: the terminal outcome here is ConnectFailed
+                    // PROPAGATION, which is a different decision from a
+                    // rejection. Folding it into `connect_rejected` would make
+                    // one event name cover two decisions and inflate
+                    // `connect_rejects_emitted` across this release boundary,
+                    // breaking comparability of the counter. No event variant
+                    // exists for "propagated ConnectFailed" and adding one is a
+                    // telemetry schema change beyond the scope of #5335.
+                    //
+                    // So: an accepted, documented loss on this path, not a
+                    // covered case. Revisit if it is ever sized in production.
                     tracing::debug!(
                         tx = %incoming_tx,
                         %upstream_addr,

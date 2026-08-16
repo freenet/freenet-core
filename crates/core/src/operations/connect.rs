@@ -398,11 +398,14 @@ pub(crate) struct AcceptOutcome {
 
 /// Why a relay at terminus could not accept and rejected the request.
 ///
-/// These are diagnostically different conditions and must stay
-/// distinguishable downstream: [`NoUphillPeers`](Self::NoUphillPeers) is a
+/// Three diagnostically different conditions that must stay distinguishable
+/// downstream: [`NoUphillPeers`](Self::NoUphillPeers) is a
 /// topology/connectivity condition (nothing unvisited left to route to),
-/// while [`UphillBudgetOrTtlExhausted`](Self::UphillBudgetOrTtlExhausted) is
-/// the amplification bound working as designed.
+/// [`UphillBudgetExhausted`](Self::UphillBudgetExhausted) is the
+/// amplification bound working as designed, and
+/// [`TtlExhausted`](Self::TtlExhausted) is the request running out of network
+/// reach. The latter two have different remedies, which is why they are
+/// separate variants rather than one.
 ///
 /// Carried *inside* [`RelayActions::rejected`] rather than as a second field
 /// beside a bool, so that a call site cannot consume the fact of a rejection
@@ -4573,6 +4576,19 @@ mod tests {
     /// inside an `impl` — its closing brace is indented, so that anchor would
     /// find the enclosing `impl RelayState` brace and silently widen the
     /// region across every sibling method.
+    ///
+    /// Two properties callers rely on, both worth knowing before reusing it:
+    ///
+    /// - The `handle_request` anchor matches the TRAIT method signature as
+    ///   well as the inherent one, so it resolves by file order rather than
+    ///   uniquely. That is safe here only because a mis-slice fails LOUDLY —
+    ///   the wrong region lacks the asserted literals — rather than passing
+    ///   vacuously. Do not assume a new anchor has that property.
+    /// - It slices from the first `{` AFTER the anchor, which is right for a
+    ///   signature and wrong for a STATEMENT: the first brace then belongs to
+    ///   whatever follows, so the statement's own text is excluded and an
+    ///   assertion about it can never see it. Match statements
+    ///   whitespace-stripped against the file instead.
     fn fn_body<'a>(source: &'a str, signature_prefix: &str) -> &'a str {
         let start = source
             .find(signature_prefix)
@@ -4705,6 +4721,65 @@ mod tests {
             &ConnectForwardEstimator::new(),
             Instant::now(),
         )
+    }
+
+    /// Drive `handle_request` into the case where the uphill budget AND the
+    /// TTL are BOTH spent — the overlap the else-if precedence decides.
+    fn reject_actions_budget_and_ttl_both_exhausted() -> RelayActions {
+        let self_loc = make_peer(4000);
+        let joiner = make_peer(5000);
+        let uphill = make_peer(6000);
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner,
+                ttl: 0,           // reach spent
+                uphill_budget: 0, // budget spent
+                visited: VisitedPeers::default(),
+            },
+            forwarded_to: None,
+            forwarded_at: None,
+            observed_sent: false,
+            accepted_locally: false,
+            response_forwarded: false,
+        };
+        let ctx = TestRelayContext::new(self_loc)
+            .accept(false)
+            .next_hop(None)
+            .uphill_hop(Some(uphill));
+        state.handle_request(
+            &ctx,
+            &HashMap::new(),
+            &mut HashMap::new(),
+            &ConnectForwardEstimator::new(),
+            Instant::now(),
+        )
+    }
+
+    /// #5335: when the uphill budget AND the TTL are both spent, the reported
+    /// cause is BUDGET.
+    ///
+    /// The two single-condition fixtures each isolate one half of the
+    /// `uphill_budget > 0 && ttl >= 2` gate, so neither exercises the overlap
+    /// — swapping the else-if to test TTL first leaves both of them green.
+    /// This pins the documented precedence itself, which is a real decision:
+    /// budget is decremented once per uphill retry while TTL also falls on
+    /// ordinary forwards, so budget is the tighter and more actionable bound
+    /// on this path.
+    #[test]
+    fn budget_is_reported_when_budget_and_ttl_are_both_exhausted() {
+        let both_spent = reject_actions_budget_and_ttl_both_exhausted()
+            .rejected
+            .expect("budget+TTL-exhausted scenario must reject");
+
+        assert_eq!(
+            both_spent,
+            RejectReason::UphillBudgetExhausted,
+            "with BOTH spent the budget is reported, not the TTL — the \
+             else-if checks `uphill_budget == 0` first, deliberately (#5335)"
+        );
+        assert_eq!(both_spent.as_event_reason(), "uphill budget exhausted");
     }
 
     /// #5335: each terminus-rejection cause must reach the structured
@@ -4939,7 +5014,13 @@ mod tests {
     /// - the local `_EVENT_LOG` register is opt-in and off by default on
     ///   network nodes;
     /// - telemetry upload is user-disableable;
-    /// - the enqueue is a `try_send`, so events are dropped on a full channel.
+    /// - the enqueue is a `try_send`, so events are dropped on a full channel;
+    /// - **the event is coarser than the line it replaces.** The `debug!`
+    ///   carries `ttl`, `uphill_budget` and `visited`; `connect_rejected`
+    ///   carries only `desired_location` and a reason string. Splitting
+    ///   budget from TTL in [`RejectReason`] recovers WHICH bound bound, but
+    ///   not the values — and `visited`, the actual dead-end evidence, has no
+    ///   replacement on any path.
     ///
     /// On a node with telemetry disabled, a release build records terminus
     /// rejections nowhere at all. That is judged an acceptable trade for a
