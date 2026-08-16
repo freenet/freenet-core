@@ -1938,11 +1938,18 @@ for _f in "${UA_FILES[@]}"; do
         # uses that form. Accepting only `-A` made this lint report a correct
         # call as broken on its first run -- a false positive is how a lint
         # gets deleted, so the matcher covers both spellings.
-        # An EMPTY User-Agent 403s exactly like a missing one, and the
-        # realistic form is `-A "$UA"` with UA unset -- so `-A ''` and `-A ""`
-        # are treated as missing rather than present. Checking for the flag's
-        # presence alone would accept the one spelling most likely to occur by
-        # accident.
+        # An EMPTY User-Agent 403s exactly like a missing one, so the literal
+        # spellings `-A ''` and `-A ""` are treated as missing rather than
+        # present.
+        #
+        # SCOPE, stated precisely because an earlier version of this comment
+        # overclaimed: this catches those two LITERAL spellings only. The
+        # variable form `-A "$UA"` with UA unset produces the same 403 and is
+        # NOT caught -- it cannot be, by a static scan that does not evaluate
+        # the shell. That exact line was added and this lint accepted it.
+        #
+        # Still worth having (the literal spellings are the ones that get
+        # typed), but do not read it as covering empty UAs in general.
         case "$_hit" in
             *"-A ''"*|*'-A ""'*|*"--user-agent ''"*|*'--user-agent ""'*)
                 UA_MISSING+="$_base:$_hit  [empty User-Agent -- 403s like a missing one]"$'\n' ;;

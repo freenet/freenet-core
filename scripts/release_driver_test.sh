@@ -383,12 +383,28 @@ if [[ -z "$PDR_BARE" ]]; then
     while IFS= read -r _g; do
         [[ -z "$_g" ]] && continue
         _gl="${_g%%:*}"
+        # WINDOW INCLUDES THE GUARD LINE ITSELF (`>= a`, not `> a`), because the
+        # semantically-identical one-liner
+        # `if ! publish_draft_release; then return 1; fi` puts the return ON that
+        # line. Excluding it REJECTED a correct fix -- and a lint that fails on
+        # correct code is one that gets deleted, which is the reasoning applied
+        # to the orphan gate's false-block and now owed to this check.
+        #
+        # MATCHED IN COMMAND POSITION, not as a substring. `*"return 1"*`
+        # accepted `echo "would return 1 here"`, so a guard whose body only
+        # TALKS about returning passed -- at site 2 that took the whole suite
+        # green with the fail-open shape in place, the one spot this file
+        # claimed coverage it did not have. `return` now has to follow
+        # start-of-line, `;`, `then`, `&&`, `||` or `{`.
         _body="$(code_lines "$RELEASE_SH" \
-            | awk -F: -v a="$_gl" '$1 > a && $1 <= a + 4')"
-        case "$_body" in
-            *"return 1"*) ;;
-            *) PDR_BAD_BODY+="line $_gl: guard body does not return nonzero"$'\n' ;;
-        esac
+            | awk -F: -v a="$_gl" '$1 >= a && $1 <= a + 4')"
+        if printf '%s\n' "$_body" \
+            | grep -qE '(^[0-9]+:[[:space:]]*|;[[:space:]]*|then[[:space:]]+|&&[[:space:]]*|\|\|[[:space:]]*|\{[[:space:]]*)return[[:space:]]+[1-9]'
+        then
+            :
+        else
+            PDR_BAD_BODY+="line $_gl: guard body does not return nonzero"$'\n'
+        fi
     done < <(code_lines "$RELEASE_SH" | grep -E 'if ! publish_draft_release; then')
 
     if [[ "$PDR_CALLS" -lt 3 ]]; then

@@ -40,19 +40,31 @@ doing either one *ahead of the gate*.
   the workflow itself is broken.
 
 **Which is why a blocked release is usually cheap now.** If Gate A fails, no
-crates were uploaded. Delete the tag, fix, re-cut on the corrected commit:
+crates were uploaded — so the tag and draft can be deleted and the same version
+re-cut on a corrected commit.
+
+**Confirm that before deleting anything.** If the crates for that version *are*
+already on crates.io the version is spent, and then the tag and draft must be
+LEFT IN PLACE (see `docs/RELEASING.md`, "If Gate A fails") while you cut the
+next patch instead. The check is cheap and the two cases have opposite answers:
+
+```bash
+# 200 = published (version spent: leave the tag and draft, cut the next patch)
+# 404 = not published (re-cuttable: delete and re-cut the same version)
+# The -A is required -- crates.io answers 403 without a descriptive User-Agent,
+# and a body-parsing form reads that 403 as "not published" for every version.
+curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' \
+  --max-time 30 --retry 3 --retry-all-errors \
+  https://crates.io/api/v1/crates/freenet/X.Y.Z
+```
+
+Only on a **404**, delete and re-cut:
 
 ```bash
 gh release delete vX.Y.Z --repo freenet/freenet-core --yes   # it is still a draft
 git push --delete origin vX.Y.Z
 git tag -d vX.Y.Z
 ```
-
-Check whether that exact version is on crates.io first (see the Quick
-Reference below — `cargo search` answers about the NEWEST version, not
-yours). If the crates for that version
-*are* already on crates.io, the version is spent — do not re-tag it; cut the
-next patch version instead.
 
 ## Quick Reference
 
