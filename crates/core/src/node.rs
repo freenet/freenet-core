@@ -10936,8 +10936,8 @@ mod tests {
             );
         }
 
-        /// The receive leg charges its comparison budget for the entries that
-        /// COST a comparison, not for every entry.
+        /// BOTH receive arms charge their comparison budget for the entries
+        /// that COST a comparison, not for every entry.
         ///
         /// This is the half of #5338 the issue did not name, and without it the
         /// send-side fix above delivers nothing. `MAX_SUMMARY_COMPARISONS_PER_MESSAGE`
@@ -10950,90 +10950,366 @@ mod tests {
         /// would summarize 64 contracts to deliver 32, which is what it delivers
         /// today: double the CPU for identical coverage.
         ///
-        /// An entry with no digest is settled by `classify_summary_digest`'s
-        /// `(_, None)` arm without our summary, so it genuinely costs nothing
-        /// here either. The free entries are placed FIRST so that a
-        /// budget-charged-per-entry regression consumes the whole budget on
-        /// them and reaches none of the digests behind.
+        /// An entry carrying no summary is settled without our summary being
+        /// consulted — `classify_summary_digest`'s `(_, None)` arm on the digest
+        /// leg, the `_ => false` staleness arm on the full-bytes one — so it
+        /// genuinely costs nothing here either. The free entries are placed
+        /// FIRST so that a budget-charged-per-entry regression consumes the
+        /// whole budget on them and reaches none of the costed entries behind.
+        ///
+        /// # Why both forms, and why that is not symmetry for its own sake
+        ///
+        /// The two arms carry near-identical logic that was written twice, so
+        /// covering one proves nothing about the other. More to the point, the
+        /// full-bytes arm is the one that fires for any peer below the
+        /// hash-first floor — and since #5238 has never been released, that is
+        /// every deployed peer. It is the live path, not the legacy one.
+        ///
+        /// The per-form observable differs because the arms answer differently:
+        /// a disagreeing digest provokes a `SummaryRequest`, while disagreeing
+        /// BYTES are resolved in place and recorded by `upsert_peer_summary_from`.
+        /// Both are proof that the costed entries were reached at all, which is
+        /// what a per-entry budget would have prevented.
         #[tokio::test]
-        async fn free_digest_entries_do_not_consume_the_receive_budget() {
+        async fn free_entries_do_not_consume_the_receive_budget() {
             use std::sync::atomic::Ordering;
 
-            // Seeded because the pre-fix path rotates by a random offset before
-            // truncating; a regression must fail reproducibly.
-            let _seed = crate::config::GlobalRng::seed_guard(0x5338_5EC0);
-            let h = build_harness("hf-recv-free", 17240, vec![7u8; 64]).await;
+            for (label, port) in [("digests", 17240u16), ("full-bytes", 17260)] {
+                // Seeded because the pre-fix path rotates by a random offset
+                // before truncating; a regression must fail reproducibly.
+                let _seed = crate::config::GlobalRng::seed_guard(0x5338_5EC0);
+                let h = build_harness(&format!("hf-recv-free-{label}"), port, vec![7u8; 64]).await;
+                let keys = host_many(&h, 200);
+                let hashes = distinct_hashes(&keys);
+                let pk = h.peer_key_of(h.new_peer);
+
+                // A belief about the peer that the free entries must clear.
+                // Without it, "processed for free" and "silently dropped" look
+                // identical from the costed-entry observable alone.
+                h.op_manager.interest_manager.upsert_peer_summary_from(
+                    &keys[199],
+                    &pk,
+                    StateSummary::from(vec![4u8; 8]),
+                    crate::ring::interest::SummaryPopulationSource::InterestSummary,
+                );
+
+                // Disagrees with the harness's `vec![7u8; 64]`, so nothing
+                // short-circuits and every costed entry reaches the comparison.
+                let theirs = vec![9u8; 8];
+                let message = if label == "digests" {
+                    let mut entries: Vec<SummaryDigestEntry> = hashes[64..]
+                        .iter()
+                        .map(|&hash| SummaryDigestEntry {
+                            hash,
+                            summary_digest: None,
+                        })
+                        .collect();
+                    entries.extend(hashes[..64].iter().map(|&hash| SummaryDigestEntry {
+                        hash,
+                        summary_digest: Some(summary_digest(&theirs)),
+                    }));
+                    assert_eq!(
+                        entries.len(),
+                        200,
+                        "{label} premise: 136 free entries, then 64 costed ones"
+                    );
+                    InterestMessage::SummaryDigests {
+                        entries,
+                        emitter: crate::message::SummariesEmitter::InterestsReply,
+                    }
+                } else {
+                    let mut entries: Vec<SummaryEntry> = hashes[64..]
+                        .iter()
+                        .map(|&hash| SummaryEntry {
+                            hash,
+                            summary_bytes: None,
+                        })
+                        .collect();
+                    entries.extend(hashes[..64].iter().map(|&hash| SummaryEntry {
+                        hash,
+                        summary_bytes: Some(theirs.clone()),
+                    }));
+                    assert_eq!(
+                        entries.len(),
+                        200,
+                        "{label} premise: 136 free entries, then 64 costed ones"
+                    );
+                    InterestMessage::Summaries {
+                        entries,
+                        emitter: crate::message::SummariesEmitter::InterestsReply,
+                    }
+                };
+
+                let before = h.summary_queries.load(Ordering::Relaxed);
+                let reply = handle_interest_sync_message(&h.op_manager, h.new_peer, message).await;
+                let fetches = h.summary_queries.load(Ordering::Relaxed) - before;
+
+                // Per-form proof that the costed entries were reached.
+                if label == "digests" {
+                    match reply {
+                        Some(InterestMessage::SummaryRequest { hashes: requested }) => {
+                            assert_eq!(
+                                requested.iter().copied().collect::<HashSet<u32>>(),
+                                hashes[..64].iter().copied().collect::<HashSet<u32>>(),
+                                "every digest that disagreed must be followed up. \
+                                 A budget charged per ENTRY is spent on the 136 \
+                                 free ones first and never reaches these at all"
+                            );
+                        }
+                        other => panic!(
+                            "{label}: a message full of disagreeing digests must \
+                             ask for bytes, got {other:?}"
+                        ),
+                    }
+                } else {
+                    assert!(
+                        reply.is_none(),
+                        "{label}: the `Summaries` arm resolves in place and sends \
+                         no reply, got {reply:?}"
+                    );
+                    assert_eq!(
+                        h.op_manager
+                            .interest_manager
+                            .get_peer_interest(&keys[0], &pk)
+                            .and_then(|i| i.summary)
+                            .map(|s| s.as_ref().to_vec()),
+                        Some(theirs.clone()),
+                        "{label}: a costed entry must be compared and its bytes \
+                         cached against the peer. A budget charged per ENTRY is \
+                         spent on the 136 free entries first, so this one is \
+                         never processed and no summary is recorded"
+                    );
+                }
+
+                assert_eq!(
+                    fetches, 64,
+                    "{label}: exactly one summarize per costed entry, and none at \
+                     all for the free ones — the receive budget must bound the \
+                     round trips, not the entry count"
+                );
+                assert_eq!(
+                    h.op_manager
+                        .interest_manager
+                        .get_peer_interest(&keys[199], &pk)
+                        .and_then(|i| i.summary),
+                    None,
+                    "{label}: a free entry still carries its repair — it clears \
+                     our cached belief that the peer holds state. Not charging \
+                     it must not mean discarding it"
+                );
+            }
+        }
+
+        /// A source we hold no connection for gets a reply, and gets no cursor.
+        ///
+        /// `peer_key` is an `Option`, and #5338 made the rotation depend on it.
+        /// The degraded branch is the one the change's safety argument leans on,
+        /// so it is worth exercising rather than asserting: with no stable
+        /// identity there is nothing to rotate against, so the reply draws a
+        /// fresh random offset and records nothing. That is the same degraded
+        /// mode an evicted cursor already gets, and it is acceptable for the
+        /// same reason — a source with no connection entry is also a source
+        /// whose interest this handler declines to register.
+        ///
+        /// The load-bearing assertion is the third one: a fabricated
+        /// address-derived key would make round two resume contiguously after
+        /// round one. It is an inequality because "holds no memory of this
+        /// source" is the property, and pinning which random offset it draws
+        /// would pin `GlobalRng`'s internals rather than the behaviour.
+        ///
+        /// Note which WIRE FORM this path produces, because it is not the one
+        /// you would guess: `summary_reply_form` fails closed on an unknown
+        /// peer version, and a source with no connection entry has no recorded
+        /// version, so an unresolvable source gets FULL BYTES. Asserted rather
+        /// than tolerated — it means this degraded path also spends the
+        /// full-bytes byte budget, which is worth knowing if the fail-closed
+        /// default ever moves.
+        #[tokio::test]
+        async fn an_unresolvable_source_gets_a_reply_but_no_cursor() {
+            let _seed = crate::config::GlobalRng::seed_guard(0x5338_0FFC);
+            let h = build_harness("hf-no-peer-key", 17280, vec![7u8; 64]).await;
             let keys = host_many(&h, 200);
             let hashes = distinct_hashes(&keys);
-            let pk = h.peer_key_of(h.new_peer);
+            let mut sorted = keys.clone();
+            sorted.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
 
-            // A belief about the peer that the free entries must clear. Without
-            // this, "processed" and "silently dropped" look the same from the
-            // request list alone.
-            h.op_manager.interest_manager.upsert_peer_summary_from(
-                &keys[199],
-                &pk,
-                StateSummary::from(vec![4u8; 8]),
-                crate::ring::interest::SummaryPopulationSource::InterestSummary,
+            // Never added to the ring, so `get_peer_key_from_addr` returns None.
+            let stranger: SocketAddr = "127.0.0.1:17289".parse().unwrap();
+            assert!(
+                h.op_manager
+                    .ring
+                    .connection_manager
+                    .get_peer_by_addr(stranger)
+                    .is_none(),
+                "premise: this address must have no connection entry, or the \
+                 test exercises the resolvable path instead"
             );
 
-            let mut entries: Vec<SummaryDigestEntry> = hashes[64..]
-                .iter()
-                .map(|&hash| SummaryDigestEntry {
-                    hash,
-                    summary_digest: None,
-                })
-                .collect();
-            entries.extend(hashes[..64].iter().map(|&hash| SummaryDigestEntry {
-                hash,
-                summary_digest: Some(summary_digest(b"not our summary")),
-            }));
+            // A known peer's cursor, which the stranger must not touch.
+            let known = h.peer_key_of(h.new_peer);
+            h.op_manager
+                .interest_manager
+                .record_summary_cursor(&known, *sorted[5].id());
+
+            // Full bytes, not digests: the version gate fails closed on a
+            // source we have no connection entry for.
+            let full_bytes_hashes = |reply: Option<InterestMessage>| -> Vec<u32> {
+                match reply {
+                    Some(InterestMessage::Summaries { entries, .. }) => {
+                        entries.iter().map(|e| e.hash).collect()
+                    }
+                    other => panic!(
+                        "an unresolvable source has no recorded version, so the \
+                         fail-closed gate must send full bytes, got {other:?}"
+                    ),
+                }
+            };
+
+            let first = full_bytes_hashes(
+                handle_interest_sync_message(
+                    &h.op_manager,
+                    stranger,
+                    InterestMessage::Interests {
+                        hashes: hashes.clone(),
+                    },
+                )
+                .await,
+            );
             assert_eq!(
-                entries.len(),
-                200,
-                "premise: 136 free entries, then 64 costed ones"
+                first.len(),
+                64,
+                "an unresolvable source is still served a full bounded reply — \
+                 degrading the rotation must not degrade the answer"
             );
+
+            let resume = sorted
+                .iter()
+                .position(|k| contract_hash(k) == *first.last().expect("64 entries"))
+                .expect("the last hash sent must be one of ours")
+                + 1;
+            let second = full_bytes_hashes(
+                handle_interest_sync_message(
+                    &h.op_manager,
+                    stranger,
+                    InterestMessage::Interests { hashes },
+                )
+                .await,
+            );
+            let contiguous: Vec<u32> = (0..64)
+                .map(|i| contract_hash(&sorted[(resume + i) % sorted.len()]))
+                .collect();
+            assert_ne!(
+                second, contiguous,
+                "with no peer key there is no cursor to resume from, so round \
+                 two must NOT continue where round one stopped. Fabricating a \
+                 key from the address would make it resume — and would key the \
+                 cursor by address again, which is the defect #5338 fixes"
+            );
+
+            assert_eq!(
+                h.op_manager
+                    .interest_manager
+                    .peek_summary_cursor(&known)
+                    .as_ref(),
+                Some(sorted[5].id()),
+                "and an unresolvable source must not advance — or read — the \
+                 cursor of a peer we DO know"
+            );
+        }
+
+        /// A window with nothing to summarize walks to the entry ceiling and
+        /// stops there, spending no budget at all.
+        ///
+        /// Two properties in one fixture, both otherwise unpinned:
+        ///
+        /// - **The `MAX_SUMMARY_ENTRIES_PER_MESSAGE` ceiling.** Every other test
+        ///   here stops on the summarize budget well before it, so a regression
+        ///   shrinking the ceiling back toward 64 would pass all of them. The
+        ///   4x sizing is the crux of the argument that the send-side fix is not
+        ///   a no-op, and an unpinned constant is an argument with nothing
+        ///   holding it up.
+        /// - **The all-free window.** With no hosted contract anywhere in the
+        ///   set the loop never reaches `summarized >= summarize_cap`, so the
+        ///   ceiling is the ONLY thing that terminates it. Without one it would
+        ///   walk the entire shared set — the unbounded reply #5238 removed.
+        #[tokio::test]
+        async fn an_all_free_window_stops_at_the_entry_ceiling() {
+            use std::sync::atomic::Ordering;
+
+            let h = build_harness("hf-all-free", 17300, vec![7u8; 64]).await;
+            let tracker = h.peer_key_of(h.old_peer);
+
+            // 400 contracts we track and none we host, so every entry is free.
+            // Big-endian index so sorted-by-id order is `j` order.
+            let mut tracked = Vec::with_capacity(400);
+            for j in 0..400u32 {
+                let mut id = [0u8; 32];
+                id[0..4].copy_from_slice(&j.to_be_bytes());
+                id[4] = 0x77;
+                let key = ContractKey::from_id_and_code(
+                    ContractInstanceId::new(id),
+                    CodeHash::new([0xC2; 32]),
+                );
+                h.op_manager.interest_manager.register_peer_interest_from(
+                    &key,
+                    tracker.clone(),
+                    None,
+                    false,
+                    crate::ring::interest::InterestRegistrationSource::Interests,
+                );
+                tracked.push(key);
+            }
+            let hashes = distinct_hashes(&tracked);
+
+            // An id below every contract in the fixture, so the window starts
+            // at index 0 with no random draw.
+            let pk = h.peer_key_of(h.new_peer);
+            h.op_manager
+                .interest_manager
+                .record_summary_cursor(&pk, ContractInstanceId::new([0u8; 32]));
 
             let before = h.summary_queries.load(Ordering::Relaxed);
             let reply = handle_interest_sync_message(
                 &h.op_manager,
                 h.new_peer,
-                InterestMessage::SummaryDigests {
-                    entries,
-                    emitter: crate::message::SummariesEmitter::InterestsReply,
-                },
+                InterestMessage::Interests { hashes },
             )
             .await;
             let fetches = h.summary_queries.load(Ordering::Relaxed) - before;
 
-            match reply {
-                Some(InterestMessage::SummaryRequest { hashes: requested }) => {
-                    assert_eq!(
-                        requested.iter().copied().collect::<HashSet<u32>>(),
-                        hashes[..64].iter().copied().collect::<HashSet<u32>>(),
-                        "every digest that disagreed must be followed up. A \
-                         budget charged per ENTRY is spent on the 136 free ones \
-                         first and never reaches these at all"
-                    );
-                }
-                other => panic!(
-                    "a message full of disagreeing digests must ask for bytes, got {other:?}"
-                ),
-            }
+            let entries = match reply {
+                Some(InterestMessage::SummaryDigests { entries, .. }) => entries,
+                other => panic!("expected a digest reply, got {other:?}"),
+            };
             assert_eq!(
-                fetches, 64,
-                "exactly one summarize per costed entry, and none at all for the \
-                 free ones — the receive budget must bound the round trips, not \
-                 the entry count"
+                fetches, 0,
+                "not one of these contracts is hosted, so the gate declines every \
+                 one of them without a contract-handler round trip"
+            );
+            assert_eq!(
+                entries.len(),
+                256,
+                "the walk must stop at MAX_SUMMARY_ENTRIES_PER_MESSAGE. Nothing \
+                 here charges the summarize budget, so the ceiling is the only \
+                 thing that ends the loop — shrink it and this is the test that \
+                 notices, since every other fixture stops on the budget first"
+            );
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|e| e.summary_digest.is_some())
+                    .count(),
+                0,
+                "premise: an all-free window advertises no summary at all"
             );
             assert_eq!(
                 h.op_manager
                     .interest_manager
-                    .get_peer_interest(&keys[199], &pk)
-                    .and_then(|i| i.summary),
-                None,
-                "a free entry still carries its repair: `PeerHasNoState` clears \
-                 our cached belief. Not charging it must not mean discarding it"
+                    .peek_summary_cursor(&pk)
+                    .as_ref(),
+                Some(tracked[255].id()),
+                "the cursor advances across the whole walked span, so the next \
+                 round resumes at 256 rather than re-walking the same prefix"
             );
         }
 
