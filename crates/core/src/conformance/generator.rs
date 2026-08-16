@@ -141,6 +141,24 @@ fn cases_for(
         ConformanceCase::new(property, states).with_related(corpus.related.clone())
     };
 
+    // Delta generation against an OBSERVED summary, not only a self-summary.
+    //
+    // Handled before the arity match because it is the one property whose useful
+    // cases depend on captured summaries. Without it those summaries are dead weight
+    // in every corpus: the verifier falls back to `summarize(state)`, which only ever
+    // exercises the "peer is exactly up to date" case. The defects that matter live
+    // in `get_state_delta(state, a summary from a peer at a different point)`, which
+    // is the call the network actually makes.
+    if property == ConformanceProperty::DeltaDeterminism {
+        for state in &states {
+            push(build(vec![state.clone()]));
+            for summary in &corpus.summaries {
+                push(build(vec![state.clone()]).with_summary(summary.clone()));
+            }
+        }
+        return cases;
+    }
+
     match property.state_arity() {
         1 if property.delta_arity() == 0 => {
             for state in &states {

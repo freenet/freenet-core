@@ -1253,6 +1253,23 @@ impl Runtime {
         Ok(unsafe { WasmLinearMem::new(ptr, size as u64) })
     }
 
+    /// Compile and instantiate a stored contract without calling any of its exports.
+    ///
+    /// Used by the conformance tooling so that malformed WASM, or a module missing
+    /// the contract ABI, fails at the point the caller says "load this contract"
+    /// rather than surfacing later as an inconclusive check result. The distinction
+    /// matters because "the contract could not be loaded" and "the contract could
+    /// not be judged" look identical to a caller otherwise, and the first should be
+    /// a hard error while the second must never be one.
+    pub(crate) fn compile_check(
+        &mut self,
+        key: &ContractKey,
+        parameters: &Parameters<'_>,
+    ) -> RuntimeResult<()> {
+        let _instance = self.prepare_contract_call(key, parameters, 0)?;
+        Ok(())
+    }
+
     pub(super) fn prepare_contract_call(
         &mut self,
         key: &ContractKey,

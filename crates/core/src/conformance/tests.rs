@@ -18,7 +18,9 @@ use freenet_stdlib::prelude::{
     ContractInstanceId, RelatedContracts, State, UpdateData, UpdateModification, ValidateResult,
 };
 
-use super::evidence::{ConformanceEvidence, EvidenceRejected, MAX_EVIDENCE_INPUT_BYTES};
+use super::evidence::{
+    ConformanceEvidence, EvidenceRejected, MAX_EVIDENCE_INPUT_BYTES, MAX_EVIDENCE_RELATED,
+};
 use super::generator::{Corpus, GeneratorConfig, generate_cases};
 use super::oracle::{ConformanceOracle, OracleError};
 use super::property::{ConformanceProperty, Inconclusive, PropertyOutcome, Severity};
@@ -682,6 +684,39 @@ fn evidence_with_wrong_arity_is_rejected() {
     ));
 }
 
+/// The fourth `check_bounds` branch. Every rejection branch needs its own test:
+/// this is the untrusted front door, and a limit with no test is a limit that can be
+/// silently removed. Related state is the branch an attacker would aim at, because
+/// each entry is a full contract state and the cost is paid before any check runs.
+#[test]
+fn evidence_with_too_many_related_contracts_is_rejected() {
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1]]);
+    let mut evidence = ConformanceEvidence::new(instance(1), vec![], &case, None);
+    evidence.related = (0..=MAX_EVIDENCE_RELATED)
+        .map(|i| (instance(i as u8), vec![i as u8]))
+        .collect();
+    assert!(
+        evidence.related.len() > MAX_EVIDENCE_RELATED,
+        "the fixture must actually exceed the limit or the assertion below is vacuous"
+    );
+    assert!(matches!(
+        evidence.check_bounds(),
+        Err(EvidenceRejected::TooManyRelated { .. })
+    ));
+}
+
+/// The counterpart: exactly at the limit is allowed. Without this, an off-by-one
+/// that rejected every piece of evidence would still pass the test above.
+#[test]
+fn evidence_at_the_related_contract_limit_is_accepted() {
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1]]);
+    let mut evidence = ConformanceEvidence::new(instance(1), vec![], &case, None);
+    evidence.related = (0..MAX_EVIDENCE_RELATED)
+        .map(|i| (instance(i as u8), vec![i as u8]))
+        .collect();
+    assert!(evidence.check_bounds().is_ok());
+}
+
 #[test]
 fn unsupported_schema_is_rejected() {
     let case = case(ConformanceProperty::StateIdempotence, &[&[1]]);
@@ -732,6 +767,39 @@ fn a_tight_case_budget_still_covers_every_law() {
         seen.len(),
         ConformanceProperty::ALL.len(),
         "budget dropped whole properties instead of narrowing each one"
+    );
+}
+
+/// Regression: captured summaries were never used. Every `DeltaDeterminism` case was
+/// state-only, so the verifier fell back to `summarize(state)` and only ever
+/// exercised the "peer is exactly up to date" case. The defects that matter live in
+/// `get_state_delta(state, a summary from a peer at a different point)`, which is the
+/// call the network actually makes, and no generated case reached it.
+#[test]
+fn generated_delta_cases_use_observed_summaries() {
+    let corpus = Corpus {
+        summaries: vec![bytes(&[1]), bytes(&[2, 3])],
+        ..Corpus::from_states(vec![vec![1, 2], vec![2, 3]])
+    };
+    let cases = generate_cases(&corpus, &GeneratorConfig::default());
+
+    let with_summary: Vec<_> = cases
+        .iter()
+        .filter(|c| c.property == ConformanceProperty::DeltaDeterminism && c.summary.is_some())
+        .collect();
+    assert!(
+        !with_summary.is_empty(),
+        "no generated case exercised get_state_delta against an observed summary"
+    );
+    // Both observed summaries should be reachable, not just the first.
+    let used: std::collections::HashSet<Vec<u8>> = with_summary
+        .iter()
+        .map(|c| c.summary.as_ref().unwrap().to_vec())
+        .collect();
+    assert_eq!(
+        used.len(),
+        2,
+        "only some observed summaries were used: {used:?}"
     );
 }
 
@@ -814,5 +882,101 @@ fn a_foreign_file_is_not_mistaken_for_a_bundle() {
     assert!(matches!(
         ReplayBundle::decode(b"definitely not a bundle"),
         Err(BundleError::BadMagic)
+    ));
+    // A file shorter than the header must not index past the end either.
+    assert!(matches!(
+        ReplayBundle::decode(b"FRNT"),
+        Err(BundleError::BadMagic)
+    ));
+    assert!(matches!(
+        ReplayBundle::decode(b""),
+        Err(BundleError::BadMagic)
+    ));
+}
+
+/// A corpus archived by an older build must be refused with a clear reason rather
+/// than deserialized under the wrong field meanings. Silently misreading an archived
+/// corpus would produce findings about a contract from data that never meant what
+/// the reader thinks it means.
+#[test]
+fn a_bundle_from_an_unsupported_schema_is_refused() {
+    use super::bundle::{BUNDLE_SCHEMA_VERSION, BundleError, ReplayBundle};
+    let mut encoded = ReplayBundle::new(vec![0, 1], vec![])
+        .encode()
+        .expect("encode");
+    // Bump the version in the header, leaving the magic intact.
+    let bumped = BUNDLE_SCHEMA_VERSION + 1;
+    encoded[8..10].copy_from_slice(&bumped.to_le_bytes());
+    match ReplayBundle::decode(&encoded) {
+        Err(BundleError::UnsupportedSchema { found, supported }) => {
+            assert_eq!(found, bumped);
+            assert_eq!(supported, BUNDLE_SCHEMA_VERSION);
+        }
+        other => panic!("expected an unsupported-schema refusal, got {other:?}"),
+    }
+}
+
+/// Regression: a bundle exported without embedded code used to record an all-zero
+/// `code_hash`, so it named no contract at all and could be replayed against any
+/// WASM. A run against the wrong contract is worse than no run: findings and clean
+/// results alike look authoritative and mean nothing.
+#[test]
+fn a_bundle_that_names_no_contract_is_refused() {
+    use super::bundle::{BundleError, ReplayBundle};
+    let mut bundle = ReplayBundle::new(vec![1, 2, 3], vec![]);
+    bundle.code = None;
+    bundle.code_hash = None;
+    assert!(matches!(
+        bundle.resolve_code(Some(vec![9, 9, 9])),
+        Err(BundleError::UnidentifiedContract)
+    ));
+}
+
+#[test]
+fn supplied_code_must_match_the_bundle_it_replays() {
+    use super::bundle::{BundleError, ReplayBundle};
+    let mut bundle = ReplayBundle::new(vec![1, 2, 3], vec![]);
+    bundle.code = None; // hash retained: the bundle still names its contract
+
+    assert!(matches!(
+        bundle.resolve_code(Some(vec![4, 5, 6])),
+        Err(BundleError::CodeMismatch { .. })
+    ));
+    // The right code is accepted.
+    assert_eq!(
+        bundle.resolve_code(Some(vec![1, 2, 3])).unwrap(),
+        vec![1, 2, 3]
+    );
+    // And with no code anywhere, the error says so rather than silently proceeding.
+    assert!(matches!(
+        bundle.resolve_code(None),
+        Err(BundleError::MissingCode)
+    ));
+}
+
+#[test]
+fn embedded_bundle_code_is_verified_against_its_own_hash() {
+    use super::bundle::{BundleError, ReplayBundle};
+    let mut bundle = ReplayBundle::new(vec![1, 2, 3], vec![]);
+    // Corrupt the embedded code, leaving the hash intact.
+    bundle.code = Some(vec![1, 2, 4]);
+    assert!(matches!(
+        bundle.resolve_code(None),
+        Err(BundleError::CodeMismatch { .. })
+    ));
+}
+
+/// Right magic and right version, but a corrupt body. This must be a clean error,
+/// not a panic: bundles come from disk and from other machines.
+#[test]
+fn a_corrupt_bundle_body_is_an_error_not_a_panic() {
+    use super::bundle::{BundleError, ReplayBundle};
+    let mut encoded = ReplayBundle::new(vec![0, 1], vec![])
+        .encode()
+        .expect("encode");
+    encoded.truncate(encoded.len() - 1);
+    assert!(matches!(
+        ReplayBundle::decode(&encoded),
+        Err(BundleError::Decode(_))
     ));
 }

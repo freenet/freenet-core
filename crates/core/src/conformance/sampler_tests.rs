@@ -204,7 +204,7 @@ fn transitions_carry_replay_context() {
     let corpus = sampler.corpus();
     assert!(corpus.deltas.iter().any(|d| d.as_ref() == [9, 9]));
 
-    let bundle = sampler.to_bundle(None, vec![]);
+    let bundle = sampler.to_bundle(None, Some([7u8; 32]), vec![]);
     assert_eq!(bundle.transitions.len(), 1);
     assert_eq!(bundle.transitions[0].base_state, base);
     assert_eq!(bundle.transitions[0].result_state, result);
@@ -222,7 +222,7 @@ fn transitions_are_bounded() {
             &state(tag + 1, 16),
         );
     }
-    let bundle = sampler.to_bundle(None, vec![]);
+    let bundle = sampler.to_bundle(None, Some([7u8; 32]), vec![]);
     assert!(bundle.transitions.len() <= config().transitions);
 }
 
@@ -236,8 +236,130 @@ fn a_transition_whose_endpoints_were_refused_is_not_recorded() {
         sampler.observe_transition(&huge, None, None, None, &state(2, 16)),
         Admission::NotSelected
     );
-    let bundle = sampler.to_bundle(None, vec![]);
+    let bundle = sampler.to_bundle(None, Some([7u8; 32]), vec![]);
     assert!(bundle.transitions.is_empty());
+}
+
+/// Regression: transition payloads are contract-controlled and stored inline, and
+/// were once left out of `stored_bytes()` entirely. A contract emitting large deltas
+/// could then hold far more than the advertised ceiling while every count looked
+/// healthy. A budget that measures only part of what it retains is not a budget.
+#[test]
+fn transition_payloads_count_against_the_byte_budget() {
+    // Deliberately generous transition count and payloads, so the uncounted bytes
+    // dominate: under the old accounting these were retained for free.
+    let cfg = SamplerConfig {
+        transitions: 24,
+        max_bytes: 4096,
+        ..config()
+    };
+    let mut sampler = ContractSampler::new(cfg.clone());
+    // Each payload pair is 400 bytes: under the per-item ceiling (so it is admitted),
+    // but 24 of them are 9600 bytes, well over the 4096 budget. If payloads are not
+    // charged, they are retained for free.
+    let payload = vec![7u8; 200];
+    let mut admitted = 0;
+    for tag in 1u8..=60 {
+        if sampler.observe_transition(
+            &state(tag, 16),
+            None,
+            Some(&payload),
+            Some(&payload),
+            &state(tag + 1, 16),
+        ) == Admission::Stored
+        {
+            admitted += 1;
+        }
+    }
+    assert!(
+        admitted > cfg.transitions,
+        "fixture failed: only {admitted} transitions were admitted, so nothing \
+         accumulated and the assertions below prove nothing"
+    );
+
+    // Measured INDEPENDENTLY of `stored_bytes()`. Asserting on `stored_bytes()`
+    // alone would be circular: that function is precisely what was wrong, so the
+    // assertion would have passed against the buggy version. The serialized size is
+    // an outside view of everything the store is actually holding.
+    let actually_held = bincode::serialize(&sampler).expect("serialize").len();
+    assert!(
+        actually_held <= cfg.max_bytes + cfg.max_bytes / 2,
+        "the store really holds {actually_held} bytes against a {} byte budget; \
+         transition payloads are escaping the accounting",
+        cfg.max_bytes
+    );
+    assert!(
+        sampler.stored_bytes() <= cfg.max_bytes,
+        "reported {} bytes over a {} budget",
+        sampler.stored_bytes(),
+        cfg.max_bytes
+    );
+}
+
+#[test]
+fn an_oversized_transition_payload_is_refused() {
+    let mut sampler = ContractSampler::new(config());
+    let huge = vec![7u8; config().max_state_bytes + 1];
+    assert_eq!(
+        sampler.observe_transition(&state(1, 16), None, Some(&huge), None, &state(2, 16)),
+        Admission::TooLarge
+    );
+}
+
+/// Regression: `recent` was a `VecDeque` read back via `as_slices().0`, which after
+/// enough push_back/pop_front cycles returns only PART of the deque — so the newest
+/// observations could silently vanish from the corpus. The comment at the time
+/// claimed "nothing rotates it", which was exactly wrong: push_back plus pop_front
+/// is rotation.
+#[test]
+fn the_recent_stratum_survives_many_rotations() {
+    let mut sampler = ContractSampler::new(config());
+    for tag in 1u8..=200 {
+        sampler.observe_state(&state(tag, 16));
+    }
+    let recent = sampler.members(Stratum::Recent);
+    assert_eq!(
+        recent.len(),
+        config().recent,
+        "recent stratum lost members to deque slicing"
+    );
+    // The most recently observed state must be present, in the corpus as well as in
+    // the stratum — that is the whole point of a "recent" stratum.
+    let corpus = sampler.corpus();
+    assert!(
+        corpus.states.iter().any(|s| s.as_ref()[0] == 200),
+        "the newest observation is missing from the corpus"
+    );
+}
+
+/// Regression: re-observing a state that had aged out of `recent` (but was still
+/// retained by another stratum) took the duplicate path and did nothing, so "recent"
+/// stopped meaning "most recently observed" for exactly the states a peer keeps
+/// seeing — the population that matters most.
+#[test]
+fn reobserving_an_aged_out_state_makes_it_recent_again() {
+    let mut sampler = ContractSampler::new(config());
+    let first = state(1, 16);
+    sampler.observe_state(&first);
+    // Push it out of the recent window (which holds `config().recent` entries).
+    for tag in 2u8..=10 {
+        sampler.observe_state(&state(tag, 16));
+    }
+    let hash = *blake3::hash(&first).as_bytes();
+    assert!(
+        !sampler.members(Stratum::Recent).contains(&hash),
+        "fixture failed: the state never aged out, so the assertion below is vacuous"
+    );
+
+    assert_eq!(sampler.observe_state(&first), Admission::Duplicate);
+    assert!(
+        sampler.members(Stratum::Recent).contains(&hash),
+        "a re-observed state did not return to the recent stratum"
+    );
+    assert!(
+        sampler.members(Stratum::Recent).len() <= config().recent,
+        "reinsertion broke the recent cap"
+    );
 }
 
 // ------------------------------------------------------------------------ restart

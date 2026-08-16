@@ -146,7 +146,7 @@ pub struct ContractSampler {
     /// here by hash, so overlap costs nothing.
     blobs: BTreeMap<StateHash, Vec<u8>>,
     earliest: Vec<StateHash>,
-    recent: VecDeque<StateHash>,
+    recent: Vec<StateHash>,
     reservoir: Vec<StateHash>,
     largest: Vec<StateHash>,
     smallest: Vec<StateHash>,
@@ -165,7 +165,7 @@ impl ContractSampler {
             config,
             blobs: BTreeMap::new(),
             earliest: Vec::new(),
-            recent: VecDeque::new(),
+            recent: Vec::new(),
             reservoir: Vec::new(),
             largest: Vec::new(),
             smallest: Vec::new(),
@@ -180,8 +180,21 @@ impl ContractSampler {
     }
 
     /// Bytes actually held, counting each distinct blob once.
+    ///
+    /// Includes transition payloads. Deltas and summaries are contract-controlled
+    /// buffers stored inline rather than content-addressed, so leaving them out of
+    /// the accounting let a contract with large deltas hold far more than the
+    /// advertised ceiling while every number here still looked healthy — a budget
+    /// that measures only part of what it retains is not a budget.
     pub fn stored_bytes(&self) -> usize {
-        self.blobs.values().map(Vec::len).sum()
+        self.blobs.values().map(Vec::len).sum::<usize>() + self.transition_payload_bytes()
+    }
+
+    fn transition_payload_bytes(&self) -> usize {
+        self.transitions
+            .iter()
+            .map(|t| t.delta.as_ref().map_or(0, Vec::len) + t.summary.as_ref().map_or(0, Vec::len))
+            .sum()
     }
 
     pub fn distinct_states(&self) -> usize {
@@ -202,9 +215,7 @@ impl ContractSampler {
             Stratum::Reservoir => &self.reservoir,
             Stratum::Largest => &self.largest,
             Stratum::Smallest => &self.smallest,
-            // `recent` is a deque for cheap eviction at the front; it is contiguous
-            // in practice because nothing rotates it.
-            Stratum::Recent => self.recent.as_slices().0,
+            Stratum::Recent => &self.recent,
         }
     }
 
@@ -265,6 +276,14 @@ impl ContractSampler {
             return Admission::NotSelected;
         }
 
+        // Deltas and summaries are contract-controlled and stored inline, so they
+        // get the same per-item ceiling as a state. A contract emitting a huge delta
+        // must not be able to buy unbounded retention with it.
+        let payload_bytes = delta.map_or(0, <[u8]>::len) + summary.map_or(0, <[u8]>::len);
+        if payload_bytes > self.config.max_state_bytes {
+            return Admission::TooLarge;
+        }
+
         let record = TransitionRecord {
             base: hash_of(base),
             result: hash_of(result),
@@ -278,6 +297,13 @@ impl ContractSampler {
         self.transitions.push_back(record);
         while self.transitions.len() > self.config.transitions {
             self.transitions.pop_front();
+        }
+        // Transition payloads count against the byte budget, so admitting one can
+        // put the store over it. Shed until it fits, exactly as a state would.
+        while self.stored_bytes() > self.config.max_bytes {
+            if !self.drop_lowest_value() {
+                break;
+            }
         }
         self.collect_garbage();
         Admission::Stored
@@ -337,11 +363,23 @@ impl ContractSampler {
     }
 
     /// Export as a portable replay bundle for offline analysis.
-    pub fn to_bundle(&self, code: Option<Vec<u8>>, parameters: Vec<u8>) -> ReplayBundle {
+    ///
+    /// `code_hash` identifies the WASM this corpus was observed against, and must be
+    /// supplied when `code` is not embedded. Defaulting it to zeroes (the previous
+    /// behaviour) produced a bundle that named no contract at all, so replaying it
+    /// against an arbitrary WASM would silently "check" a corpus that was never
+    /// produced by that contract — findings and clean runs alike would be
+    /// meaningless.
+    pub fn to_bundle(
+        &self,
+        code: Option<Vec<u8>>,
+        code_hash: Option<[u8; 32]>,
+        parameters: Vec<u8>,
+    ) -> ReplayBundle {
         let code_hash = code
             .as_ref()
             .map(|c| *blake3::hash(c).as_bytes())
-            .unwrap_or_default();
+            .or(code_hash);
         let corpus = self.corpus();
         ReplayBundle {
             schema_version: super::bundle::BUNDLE_SCHEMA_VERSION,
@@ -374,10 +412,22 @@ impl ContractSampler {
         })
     }
 
+    /// Move a re-observed state to the newest end of the recent stratum.
+    ///
+    /// A state that aged out of `recent` while staying retained by another stratum
+    /// must be re-inserted, not ignored: otherwise "recent" stops meaning "most
+    /// recently observed" for exactly the states the peer keeps seeing, which is the
+    /// population that matters most.
     fn touch_recent(&mut self, hash: StateHash) {
+        if self.config.recent == 0 {
+            return;
+        }
         if let Some(pos) = self.recent.iter().position(|h| *h == hash) {
             self.recent.remove(pos);
-            self.recent.push_back(hash);
+        }
+        self.recent.push(hash);
+        while self.recent.len() > self.config.recent {
+            self.recent.remove(0);
         }
     }
 
@@ -436,9 +486,9 @@ impl ContractSampler {
         match stratum {
             Stratum::Earliest => self.earliest.push(hash),
             Stratum::Recent => {
-                self.recent.push_back(hash);
+                self.recent.push(hash);
                 while self.recent.len() > self.config.recent {
-                    self.recent.pop_front();
+                    self.recent.remove(0);
                 }
             }
             Stratum::Reservoir => {
@@ -497,7 +547,7 @@ impl ContractSampler {
         // emptied outright — a stratum that has been silently emptied still reports
         // as present and would make coverage telemetry lie.
         if self.recent.len() > 1 {
-            self.recent.pop_front();
+            self.recent.remove(0);
             self.collect_garbage();
             return true;
         }

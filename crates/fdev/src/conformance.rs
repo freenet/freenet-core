@@ -20,12 +20,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::Context;
-use freenet::conformance::bundle::BundleError;
 use freenet::conformance::generator::Corpus;
+use freenet::conformance::verifier::Bytes;
 use freenet::conformance::{
     ConformanceCase, ConformanceEvidence, ConformanceProperty, GeneratorConfig, Inconclusive,
-    OracleBuildError, PropertyOutcome, ReplayBundle, RuntimeOracle, Severity, generate_cases,
-    verify_case,
+    MinimizeConfig, OracleBuildError, PropertyOutcome, ReplayBundle, RuntimeOracle, Severity,
+    generate_cases, minimize, verify_case,
 };
 use freenet_stdlib::prelude::ContractInstanceId;
 use serde::Serialize;
@@ -96,6 +96,22 @@ pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
     }
 
     let cases = generate_cases(&corpus, &generator_config);
+    // A run that checked nothing must not report success. Restricting to a property
+    // whose inputs the corpus cannot supply (commutativity with one state, delta
+    // idempotence with no captured deltas) otherwise prints "0 cases run" and exits
+    // 0, which any automation reads as "this contract passed".
+    if cases.is_empty() {
+        anyhow::bail!(
+            "no cases could be generated from this corpus: {} state(s), {} delta(s), \
+             {} summary/summaries for the selected properties. Nothing was checked, \
+             so this is not a pass — supply more states (commutativity and \
+             reconciliation need at least two), or captured deltas for the \
+             delta properties.",
+            corpus.states.len(),
+            corpus.deltas.len(),
+            corpus.summaries.len(),
+        );
+    }
 
     let mut oracle = RuntimeOracle::standalone(wasm, parameters.clone())
         .await
@@ -111,7 +127,14 @@ pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
         .collect();
 
     let evidence = match &config.evidence_out {
-        Some(dir) => Some(write_evidence(dir, instance, &parameters, &outcomes)?),
+        Some(dir) => Some(write_evidence(
+            dir,
+            instance,
+            &parameters,
+            &outcomes,
+            &mut oracle,
+            &corpus.states,
+        )?),
         None => None,
     };
 
@@ -174,13 +197,22 @@ fn parse_properties(names: &[String]) -> anyhow::Result<Vec<ConformanceProperty>
 /// `--wasm` / `--params` / `--state`.
 fn load_inputs(config: &ConformanceConfig) -> anyhow::Result<(Vec<u8>, Vec<u8>, Corpus)> {
     if let Some(bundle_path) = &config.bundle {
-        let mut bundle = ReplayBundle::read_from(bundle_path)
+        let bundle = ReplayBundle::read_from(bundle_path)
             .with_context(|| format!("reading bundle {}", bundle_path.display()))?;
-        let wasm = match (&config.wasm, bundle.code.take()) {
-            (Some(path), _) => read_file(path)?,
-            (None, Some(code)) => code,
-            (None, None) => return Err(BundleError::MissingCode.into()),
+        // Identity is checked inside the bundle, for both embedded and supplied
+        // code. Replaying a corpus against the wrong contract is worse than not
+        // replaying it: the run looks authoritative and means nothing, whether it
+        // reports findings or a clean bill of health.
+        let supplied = match &config.wasm {
+            Some(path) => Some(read_file(path)?),
+            None => None,
         };
+        let wasm = bundle.resolve_code(supplied).with_context(|| {
+            format!(
+                "resolving contract code for bundle {}",
+                bundle_path.display()
+            )
+        })?;
         let parameters = bundle.parameters.clone();
         let corpus = bundle.to_corpus();
         Ok((wasm, parameters, corpus))
@@ -235,17 +267,40 @@ fn write_evidence(
     instance: ContractInstanceId,
     parameters: &[u8],
     outcomes: &[(ConformanceCase, PropertyOutcome)],
+    oracle: &mut RuntimeOracle,
+    candidates: &[Bytes],
 ) -> anyhow::Result<EvidenceSummary> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating evidence directory {}", dir.display()))?;
 
     let mut written = HashSet::new();
+    let mut oversized = 0usize;
     for (case, outcome) in outcomes {
         if !outcome.is_enforceable_violation() {
             continue;
         }
-        let observed = outcome.violation().cloned();
-        let evidence = ConformanceEvidence::new(instance, parameters.to_vec(), case, observed);
+
+        // Shrink before serializing. A case generated from large states can carry
+        // several MB, well over the evidence size bound, and evidence that every
+        // recipient rejects is not evidence. Shrinking also makes the file a usable
+        // bug report rather than two large blobs that happen to disagree.
+        let (minimized, _) = minimize(oracle, case, candidates, &MinimizeConfig::default());
+        let observed = verify_case(oracle, &minimized).violation().cloned();
+        let evidence =
+            ConformanceEvidence::new(instance, parameters.to_vec(), &minimized, observed);
+
+        // Bounds-check with the same function a receiving peer uses, so this command
+        // cannot report having written evidence that no peer would accept.
+        if let Err(rejected) = evidence.check_bounds() {
+            oversized += 1;
+            eprintln!(
+                "warning: a {} finding could not be reduced to a shippable size ({rejected}); \
+                 no evidence file written for it",
+                minimized.property
+            );
+            continue;
+        }
+
         let id = evidence.id();
         if !written.insert(id) {
             continue;
@@ -260,6 +315,7 @@ fn write_evidence(
     Ok(EvidenceSummary {
         directory: dir.display().to_string(),
         files_written: written.len(),
+        findings_too_large: oversized,
     })
 }
 
@@ -267,6 +323,10 @@ fn write_evidence(
 struct EvidenceSummary {
     directory: String,
     files_written: usize,
+    /// Findings that stayed over the evidence size bound even after shrinking.
+    /// Reported rather than swallowed: they are real findings that simply cannot be
+    /// propagated, and silently writing nothing would look like there were none.
+    findings_too_large: usize,
 }
 
 #[derive(Serialize)]

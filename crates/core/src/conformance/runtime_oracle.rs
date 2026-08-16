@@ -7,12 +7,13 @@
 //! disagree about the same evidence. So this wraps [`crate::wasm_runtime::Runtime`]
 //! directly rather than reimplementing anything.
 
+use std::sync::Arc;
+
 use freenet_stdlib::prelude::{
     ContractCode, ContractContainer, ContractInstanceId, ContractKey, ContractWasmAPIVersion,
     Parameters, RelatedContracts, StateSummary, UpdateData, UpdateModification, ValidateResult,
     WrappedContract, WrappedState,
 };
-use std::sync::Arc;
 
 use super::oracle::{ConformanceOracle, OracleError};
 use crate::wasm_runtime::{
@@ -87,6 +88,14 @@ impl RuntimeOracle {
         )));
         let key = container.key();
         runtime.contract_store.store_contract(container)?;
+
+        // Compile now rather than lazily on the first check. `store_contract` only
+        // verifies that the key matches the bytes, so malformed WASM or a module
+        // missing the contract ABI would otherwise surface as an `Inconclusive`
+        // result much later — and "we could not judge this contract" would be
+        // indistinguishable from "this contract would not load", letting a run
+        // against a broken file report success.
+        runtime.compile_check(&key, &parameters)?;
 
         Ok(Self {
             runtime,

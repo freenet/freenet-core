@@ -39,6 +39,16 @@ pub enum BundleError {
     Decode(String),
     #[error("bundle carries no contract code and none was supplied separately")]
     MissingCode,
+    #[error(
+        "bundle names no contract (code_hash is absent), so the corpus cannot be \
+         tied to any WASM and replaying it would check an unrelated contract"
+    )]
+    UnidentifiedContract,
+    #[error(
+        "contract code does not match the bundle: bundle names blake3:{expected}, \
+         supplied code is blake3:{actual}"
+    )]
+    CodeMismatch { expected: String, actual: String },
 }
 
 /// One observed `base + update -> result` step.
@@ -55,14 +65,33 @@ pub struct Transition {
     pub result_state: Vec<u8>,
 }
 
+/// A portable, self-describing corpus for one contract: its code, its parameters,
+/// and the states, deltas, summaries and transitions observed for it.
+///
+/// This is the unit that moves between a peer and an offline analysis: capture on a
+/// node writes one, `fdev conformance --bundle` reads one, and a bundle archived
+/// today must still replay against a later build. That is why it carries its own
+/// magic and schema version, and why it stays separate from any internal on-disk
+/// sampler format, which is free to change.
+///
+/// Treat a bundle captured from the live network as sensitive: it contains real
+/// application state, including values that are no longer current anywhere else.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayBundle {
+    /// Schema of this bundle. A reader that does not recognise it refuses the file
+    /// rather than guessing at field meanings.
     pub schema_version: u16,
     /// The contract's own WASM. Optional so a bundle can reference a contract by
     /// hash when the code is already available locally and shipping megabytes again
     /// would be wasteful.
     pub code: Option<Vec<u8>>,
-    pub code_hash: [u8; 32],
+    /// Identity of the WASM this corpus was observed against.
+    ///
+    /// `None` means the bundle names no contract, which makes it unsafe to replay: a
+    /// reader supplying its own WASM has no way to tell whether that WASM is the one
+    /// the states came from, and checking a corpus against the wrong contract
+    /// produces findings and clean runs that mean equally little. Readers refuse it.
+    pub code_hash: Option<[u8; 32]>,
     pub parameters: Vec<u8>,
     pub instance: Option<ContractInstanceId>,
     pub states: Vec<Vec<u8>>,
@@ -76,7 +105,7 @@ pub struct ReplayBundle {
 
 impl ReplayBundle {
     pub fn new(code: Vec<u8>, parameters: Vec<u8>) -> Self {
-        let code_hash = *blake3::hash(&code).as_bytes();
+        let code_hash = Some(*blake3::hash(&code).as_bytes());
         Self {
             schema_version: BUNDLE_SCHEMA_VERSION,
             code: Some(code),
@@ -90,6 +119,36 @@ impl ReplayBundle {
             related: Vec::new(),
             note: None,
         }
+    }
+
+    /// Return the contract code to replay this corpus against, verifying identity.
+    ///
+    /// This is the one place that decides "is this the contract these states came
+    /// from", so no caller can forget to ask. Replaying a corpus against the wrong
+    /// WASM is worse than not replaying it: it yields confident-looking findings, or
+    /// a confident-looking clean run, about a contract that never produced any of
+    /// the inputs.
+    ///
+    /// `supplied` is an operator-provided override (`fdev --wasm`), used when the
+    /// bundle carries no embedded code. It is verified against `code_hash` too.
+    pub fn resolve_code(&self, supplied: Option<Vec<u8>>) -> Result<Vec<u8>, BundleError> {
+        let Some(expected) = self.code_hash else {
+            return Err(BundleError::UnidentifiedContract);
+        };
+        // An operator-supplied override wins over embedded code, but is held to the
+        // same identity check.
+        let code = match supplied.or_else(|| self.code.clone()) {
+            Some(code) => code,
+            None => return Err(BundleError::MissingCode),
+        };
+        let actual = *blake3::hash(&code).as_bytes();
+        if actual != expected {
+            return Err(BundleError::CodeMismatch {
+                expected: hex::encode(&expected[..8]),
+                actual: hex::encode(&actual[..8]),
+            });
+        }
+        Ok(code)
     }
 
     pub fn total_bytes(&self) -> usize {
