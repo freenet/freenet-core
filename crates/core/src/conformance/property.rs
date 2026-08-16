@@ -1,0 +1,278 @@
+//! The conformance laws, and the shape of an answer about one of them.
+
+use serde::{Deserialize, Serialize};
+
+/// A single checkable law about a contract's algebra.
+///
+/// `merge(A, B)` is not a distinct contract entry point: it is
+/// `update_state(A, [UpdateData::State(B)])`. A contract that "rejects" B returns A
+/// unchanged, which is why mutual rejection (`merge(A,B) == A`, `merge(B,A) == B`)
+/// shows up here as an ordinary commutativity failure rather than needing a rule of
+/// its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum ConformanceProperty {
+    /// `merge(A, A) == A`
+    StateIdempotence,
+    /// `merge(A, B) == merge(B, A)`
+    StateCommutativity,
+    /// `merge(merge(A, B), C) == merge(A, merge(B, C))`
+    StateAssociativity,
+    /// Every state emitted by `update_state` is itself valid.
+    EmittedStateValidity,
+    /// `update_state` on identical inputs yields identical bytes.
+    UpdateDeterminism,
+    /// `summarize_state` on identical inputs yields identical bytes (#4857 class).
+    SummaryDeterminism,
+    /// `get_state_delta` on identical inputs yields identical bytes.
+    DeltaDeterminism,
+    /// `apply(apply(A, D), D) == apply(A, D)` — at-least-once delivery must be harmless.
+    DeltaIdempotence,
+    /// Independent deltas in any order, with duplicates, reach the same canonical state.
+    DeltaPermutationInvariance,
+    /// A delta against an exact summary of the same state should be empty (#5072).
+    SelfDeltaEmpty,
+    /// A self-delta should not be as large as the state it is a delta against
+    /// (#5072 / #5056).
+    WholeStateSelfDelta,
+    /// Two valid divergent states reconcile, rather than cycling forever (#5153).
+    ReconciliationCycle,
+}
+
+/// How seriously a failed property should be taken.
+///
+/// The split matters because only [`Severity::Violation`] is ever allowed to become
+/// removal evidence. The RFC is explicit that size alone is not a merge-law proof:
+/// a contract whose self-delta is the whole state is wasteful, not unsound, and
+/// deleting it would be deleting a working application over an efficiency
+/// complaint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Severity {
+    /// Breaks a merge law. Eligible (after independent verification) to justify removal.
+    Violation,
+    /// Wasteful or suspicious, but not a proof of non-convergence. Report only.
+    Diagnostic,
+}
+
+impl ConformanceProperty {
+    /// Every property, in a stable order. Used by the generator and by tests that
+    /// assert no property is silently unhandled.
+    pub const ALL: &'static [ConformanceProperty] = &[
+        ConformanceProperty::StateIdempotence,
+        ConformanceProperty::StateCommutativity,
+        ConformanceProperty::StateAssociativity,
+        ConformanceProperty::EmittedStateValidity,
+        ConformanceProperty::UpdateDeterminism,
+        ConformanceProperty::SummaryDeterminism,
+        ConformanceProperty::DeltaDeterminism,
+        ConformanceProperty::DeltaIdempotence,
+        ConformanceProperty::DeltaPermutationInvariance,
+        ConformanceProperty::SelfDeltaEmpty,
+        ConformanceProperty::WholeStateSelfDelta,
+        ConformanceProperty::ReconciliationCycle,
+    ];
+
+    pub fn severity(self) -> Severity {
+        match self {
+            ConformanceProperty::SelfDeltaEmpty | ConformanceProperty::WholeStateSelfDelta => {
+                Severity::Diagnostic
+            }
+            ConformanceProperty::StateIdempotence
+            | ConformanceProperty::StateCommutativity
+            | ConformanceProperty::StateAssociativity
+            | ConformanceProperty::EmittedStateValidity
+            | ConformanceProperty::UpdateDeterminism
+            | ConformanceProperty::SummaryDeterminism
+            | ConformanceProperty::DeltaDeterminism
+            | ConformanceProperty::DeltaIdempotence
+            | ConformanceProperty::DeltaPermutationInvariance
+            | ConformanceProperty::ReconciliationCycle => Severity::Violation,
+        }
+    }
+
+    /// How many distinct input states a case for this property must carry.
+    pub fn state_arity(self) -> usize {
+        match self {
+            ConformanceProperty::StateIdempotence
+            | ConformanceProperty::EmittedStateValidity
+            | ConformanceProperty::SummaryDeterminism
+            | ConformanceProperty::DeltaDeterminism
+            | ConformanceProperty::DeltaIdempotence
+            | ConformanceProperty::DeltaPermutationInvariance
+            | ConformanceProperty::SelfDeltaEmpty
+            | ConformanceProperty::WholeStateSelfDelta => 1,
+            ConformanceProperty::StateCommutativity
+            | ConformanceProperty::UpdateDeterminism
+            | ConformanceProperty::ReconciliationCycle => 2,
+            ConformanceProperty::StateAssociativity => 3,
+        }
+    }
+
+    /// How many deltas a case for this property must carry.
+    pub fn delta_arity(self) -> usize {
+        match self {
+            ConformanceProperty::DeltaIdempotence => 1,
+            ConformanceProperty::DeltaPermutationInvariance => 2,
+            ConformanceProperty::StateIdempotence
+            | ConformanceProperty::StateCommutativity
+            | ConformanceProperty::StateAssociativity
+            | ConformanceProperty::EmittedStateValidity
+            | ConformanceProperty::UpdateDeterminism
+            | ConformanceProperty::SummaryDeterminism
+            | ConformanceProperty::DeltaDeterminism
+            | ConformanceProperty::SelfDeltaEmpty
+            | ConformanceProperty::WholeStateSelfDelta
+            | ConformanceProperty::ReconciliationCycle => 0,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConformanceProperty::StateIdempotence => "state_idempotence",
+            ConformanceProperty::StateCommutativity => "state_commutativity",
+            ConformanceProperty::StateAssociativity => "state_associativity",
+            ConformanceProperty::EmittedStateValidity => "emitted_state_validity",
+            ConformanceProperty::UpdateDeterminism => "update_determinism",
+            ConformanceProperty::SummaryDeterminism => "summary_determinism",
+            ConformanceProperty::DeltaDeterminism => "delta_determinism",
+            ConformanceProperty::DeltaIdempotence => "delta_idempotence",
+            ConformanceProperty::DeltaPermutationInvariance => "delta_permutation_invariance",
+            ConformanceProperty::SelfDeltaEmpty => "self_delta_empty",
+            ConformanceProperty::WholeStateSelfDelta => "whole_state_self_delta",
+            ConformanceProperty::ReconciliationCycle => "reconciliation_cycle",
+        }
+    }
+}
+
+impl std::fmt::Display for ConformanceProperty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A hash and length standing in for a full output.
+///
+/// Evidence carries digests rather than the outputs themselves: recipients recompute
+/// the outputs from the inputs anyway (that is the whole point of shipping evidence
+/// instead of a verdict), so carrying megabytes of observed output would only inflate
+/// the message and widen the DoS surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct OutputDigest {
+    pub len: usize,
+    pub hash: [u8; 32],
+}
+
+impl OutputDigest {
+    pub fn of(bytes: &[u8]) -> Self {
+        Self {
+            len: bytes.len(),
+            hash: *blake3::hash(bytes).as_bytes(),
+        }
+    }
+
+    pub fn short_hash(&self) -> String {
+        hex::encode(&self.hash[..6])
+    }
+}
+
+impl std::fmt::Display for OutputDigest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} bytes, blake3:{}", self.len, self.short_hash())
+    }
+}
+
+/// A reproduced failure: two executions that the law says must agree, and did not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Violation {
+    pub property: ConformanceProperty,
+    pub severity: Severity,
+    /// Digest of the left-hand side of the comparison (e.g. `merge(A, B)`).
+    pub left: OutputDigest,
+    /// Digest of the right-hand side (e.g. `merge(B, A)`).
+    pub right: OutputDigest,
+    /// Human-readable statement of what was compared. Diagnostics only; never parsed.
+    pub detail: String,
+}
+
+impl std::fmt::Display for Violation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: {} (left: {}; right: {})",
+            self.property, self.detail, self.left, self.right
+        )
+    }
+}
+
+/// Why a check could not reach a verdict.
+///
+/// Every variant here is a *refusal to accuse*, and each one corresponds to a
+/// legitimate contract behaviour that an earlier or naiver detector would have
+/// misread as a defect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum Inconclusive {
+    /// The contract does not consider an input state valid, so the laws say nothing
+    /// about it. Feeding a contract states it never would have accepted proves nothing.
+    InputNotValid,
+    /// The contract needs a related contract's state to proceed. Not a defect: the
+    /// River-style authorization chain does this routinely.
+    RelatedRequired,
+    /// The contract returned an error. A single rejection is not a conformance
+    /// failure — contracts are supposed to reject updates they consider illegitimate.
+    ContractError(String),
+    /// `update_state` returned neither a new state nor a related-contract request.
+    NoOutputState,
+    /// Execution hit a fuel, memory or time limit, so we never saw the real answer.
+    ResourceLimit(String),
+    /// Reconciliation was still making progress when the round budget ran out.
+    /// Legitimate multi-round convergence lives here.
+    RoundLimit,
+    /// The case was malformed for the property (wrong arity, missing delta).
+    MalformedCase(String),
+}
+
+impl std::fmt::Display for Inconclusive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Inconclusive::InputNotValid => f.write_str("an input state is not valid"),
+            Inconclusive::RelatedRequired => f.write_str("contract requires related state"),
+            Inconclusive::ContractError(e) => write!(f, "contract error: {e}"),
+            Inconclusive::NoOutputState => f.write_str("update produced no state"),
+            Inconclusive::ResourceLimit(e) => write!(f, "resource limit: {e}"),
+            Inconclusive::RoundLimit => f.write_str("reconciliation round budget exhausted"),
+            Inconclusive::MalformedCase(e) => write!(f, "malformed case: {e}"),
+        }
+    }
+}
+
+/// The result of checking one property against one contract with one set of inputs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PropertyOutcome {
+    /// The law held for these inputs. Says nothing about other inputs.
+    Holds,
+    /// The law was broken, reproducibly, by these inputs.
+    Violated(Violation),
+    /// No verdict. See [`Inconclusive`].
+    Inconclusive(Inconclusive),
+}
+
+impl PropertyOutcome {
+    pub fn is_violation(&self) -> bool {
+        matches!(self, PropertyOutcome::Violated(_))
+    }
+
+    /// A violation severe enough to be eligible as removal evidence.
+    ///
+    /// Diagnostics are excluded here on purpose; see [`Severity`].
+    pub fn is_enforceable_violation(&self) -> bool {
+        matches!(self, PropertyOutcome::Violated(v) if v.severity == Severity::Violation)
+    }
+
+    pub fn violation(&self) -> Option<&Violation> {
+        match self {
+            PropertyOutcome::Violated(v) => Some(v),
+            PropertyOutcome::Holds | PropertyOutcome::Inconclusive(_) => None,
+        }
+    }
+}
