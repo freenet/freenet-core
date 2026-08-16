@@ -37,7 +37,7 @@ use crate::ring::{ConnectionFailureReason, Location, PeerKeyLocation};
 use crate::tracing::NetEventLog;
 
 use super::{
-    ConnectMsg, ConnectRequest, ForwardAttempt, RelayEnv, RelayState,
+    ConnectMsg, ConnectRequest, ForwardAttempt, RejectReason, RelayEnv, RelayState,
     dispatch_expect_connection_from,
 };
 
@@ -1087,12 +1087,24 @@ async fn drive_relay_connect(
                         failed_peer = ?failed_peer,
                         "CONNECT relay: forwarding rejection upstream (no retry peers)"
                     );
-                    if let Some(event) = NetEventLog::connect_rejected(
-                        &incoming_tx,
-                        &op_manager.ring,
-                        dl,
-                        "relay no retry peers available",
-                    ) {
+                    // This `else` is reached by re-running the SAME
+                    // `handle_request` whose terminus arms carry a specific
+                    // cause, so a constant here would reintroduce exactly the
+                    // conflation #5335 removed from the initial path — and on
+                    // live traffic this retry path is roughly half of this
+                    // driver's rejections, so it is not a corner case. Fall
+                    // back to the generic string only when `handle_request`
+                    // produced no cause at all (it returned neither a forward
+                    // nor an accept nor a rejection — e.g. the already-
+                    // forwarded arm), which is a different situation and
+                    // deserves its own wording.
+                    let reason = retry
+                        .rejected
+                        .map(RejectReason::as_event_reason)
+                        .unwrap_or("relay no retry peers available");
+                    if let Some(event) =
+                        NetEventLog::connect_rejected(&incoming_tx, &op_manager.ring, dl, reason)
+                    {
                         op_manager.ring.register_events(Either::Left(event)).await;
                     }
                     let mut ctx = op_manager.op_ctx(incoming_tx);
@@ -1232,10 +1244,29 @@ async fn drive_relay_connect(
                     )
                     .await?;
                 } else {
+                    // KNOWN GAP (#5335): `retry.rejected` may carry a specific
+                    // cause here, and this branch deliberately emits NO
+                    // `connect_rejected` event — so in a release build, where
+                    // this `debug!` is compiled out by `release_max_level_info`,
+                    // that cause is not recorded anywhere.
+                    //
+                    // Not fixed by emitting `connect_rejected`: the terminal
+                    // outcome here is ConnectFailed PROPAGATION, not a
+                    // rejection. The upstream relay retries on receiving it and
+                    // emits its own rejection if the chain dead-ends, so
+                    // emitting one here would both double-count and make a
+                    // single event name cover two different decisions —
+                    // inflating `connect_rejects_emitted` and breaking its
+                    // comparability across this release boundary. There is no
+                    // existing event variant for "propagated ConnectFailed",
+                    // and adding one is a telemetry schema change beyond the
+                    // scope of #5335. Recorded in the PR rather than silently
+                    // left; revisit if this path is ever sized in production.
                     tracing::debug!(
                         tx = %incoming_tx,
                         %upstream_addr,
                         failed_acceptor = %failed_acceptor_addr,
+                        reject_reason = ?retry.rejected,
                         "CONNECT relay: propagating ConnectFailed upstream (no re-route)"
                     );
                     let mut ctx = op_manager.op_ctx(incoming_tx);
