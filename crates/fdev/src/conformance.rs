@@ -342,6 +342,8 @@ fn write_evidence(
 
     let mut written = HashSet::new();
     let mut oversized = 0usize;
+    let mut shrunk_from = 0usize;
+    let mut shrunk_to = 0usize;
     for (case, outcome) in outcomes {
         if !outcome.is_enforceable_violation() {
             continue;
@@ -351,7 +353,9 @@ fn write_evidence(
         // several MB, well over the evidence size bound, and evidence that every
         // recipient rejects is not evidence. Shrinking also makes the file a usable
         // bug report rather than two large blobs that happen to disagree.
-        let (minimized, _) = minimize(oracle, case, candidates, &MinimizeConfig::default());
+        let (minimized, shrink) = minimize(oracle, case, candidates, &MinimizeConfig::default());
+        shrunk_from += shrink.original_bytes;
+        shrunk_to += shrink.final_bytes;
         let observed = verify_case(oracle, &minimized).violation().cloned();
         let evidence =
             ConformanceEvidence::new(instance, parameters.to_vec(), &minimized, observed);
@@ -383,6 +387,8 @@ fn write_evidence(
         directory: dir.display().to_string(),
         files_written: written.len(),
         findings_too_large: oversized,
+        input_bytes_before_shrinking: shrunk_from,
+        input_bytes_after_shrinking: shrunk_to,
     })
 }
 
@@ -394,6 +400,12 @@ struct EvidenceSummary {
     /// Reported rather than swallowed: they are real findings that simply cannot be
     /// propagated, and silently writing nothing would look like there were none.
     findings_too_large: usize,
+    /// Total case input bytes before and after minimisation, summed over the
+    /// findings written. The ratio is the honest measure of whether shrinking is
+    /// earning its keep, and it is what decides whether a finding fits in evidence
+    /// at all.
+    input_bytes_before_shrinking: usize,
+    input_bytes_after_shrinking: usize,
 }
 
 #[derive(Serialize)]
