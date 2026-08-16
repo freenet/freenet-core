@@ -1889,6 +1889,70 @@ else
         "the behavioural harness cannot see because it installs its own stub."
 fi
 
+# --- 2i. every crates.io API call sends a User-Agent -------------------------
+#
+# crates.io answers **403** to a request with no descriptive User-Agent. The 403
+# body is a JSON `errors` object, so `curl -sS` exits 0 and prints nothing to
+# stderr -- `-sS` surfaces transport errors and a 403 is not one. A
+# `| jq -e '.version.num'` form then finds nothing and reports a clean,
+# confident "not published".
+#
+# So a UA-less snippet answers "not published" for EVERY version, published or
+# not, 100% of the time. Verified against the live API: no UA -> 403 -> "not
+# published" for freenet 0.2.123, which is published; with UA -> 200.
+#
+# That is the exact hazard docs/RELEASING.md warns about in prose -- "it can
+# answer 'not published' about a version that IS published ... acting on that
+# means re-tagging a spent version" -- and six doc snippets demonstrated it
+# while describing it. Every CODE path already had the UA right, and
+# binstall-smoke-test.yml even carries the comment "crates.io requires a
+# descriptive User-Agent or it 403s". The knowledge was in the repo and did not
+# travel from the scripts into the prose.
+#
+# Pinned offline: this asserts the flag is present, not that the network agrees.
+# Logical lines, so a `\`-continued invocation whose `-A` sits on another line
+# is judged whole.
+UA_MISSING=""
+UA_TOTAL=0
+for _f in "$SCRIPT_DIR"/../docs/RELEASING.md "$SCRIPT_DIR"/RELEASE_RECOVERY.md \
+          "$SCRIPT_DIR"/release.sh "$SCRIPT_DIR"/../.github/workflows/cross-compile.yml \
+          "$SCRIPT_DIR"/../.github/workflows/release.yml \
+          "$SCRIPT_DIR"/../.github/workflows/binstall-smoke-test.yml; do
+    [[ -f "$_f" ]] || continue
+    _base="$(basename "$_f")"
+    while IFS= read -r _hit; do
+        [[ -z "$_hit" ]] && continue
+        UA_TOTAL=$((UA_TOTAL + 1))
+        # `-H "User-Agent: ..."` is as valid as `-A`; binstall-smoke-test.yml
+        # uses that form. Accepting only `-A` made this lint report a correct
+        # call as broken on its first run -- a false positive is how a lint
+        # gets deleted, so the matcher covers both spellings.
+        case "$_hit" in
+            *" -A "*|*" --user-agent "*|*"User-Agent:"*) ;;
+            *) UA_MISSING+="$_base:$_hit"$'\n' ;;
+        esac
+    done < <(logical_lines "$_f" | grep -F 'crates.io/api/v1/crates' | grep -F 'curl')
+done
+
+if [[ "$UA_TOTAL" -lt 6 ]]; then
+    fail "found only $UA_TOTAL crates.io curl invocation(s) to check, expected at least 6" \
+        "The docs and scripts between them query crates.io in more places than" \
+        "that. A low count means the scan is not seeing them, and the check below" \
+        "would report success having examined almost nothing."
+elif [[ -n "$UA_MISSING" ]]; then
+    fail "a crates.io API call has no User-Agent, so it will 403 and read as 'not published'" \
+        "$(printf '%s' "$UA_MISSING")" \
+        "crates.io returns 403 without a descriptive User-Agent, the 403 body is" \
+        "JSON, and curl exits 0 -- so a body-parsing form reports 'not published'" \
+        "for every version ever released, silently. In the re-cut decision that" \
+        "means re-tagging a spent version, which is the unrecoverable state this" \
+        "whole ordering exists to prevent. Add -A 'freenet-release-driver' (or" \
+        "the CI equivalent), and prefer distinguishing 200 from 404 from UNKNOWN" \
+        "over parsing the body."
+else
+    pass "all $UA_TOTAL crates.io API calls send a User-Agent"
+fi
+
 # --- 3. it is not neutered in place -----------------------------------------
 # `continue-on-error: true` leaves the step present, running, and visibly
 # green-ish in the UI while the job proceeds to publish regardless -- the
