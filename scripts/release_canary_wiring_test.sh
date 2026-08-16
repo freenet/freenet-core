@@ -144,6 +144,19 @@ step_block() {
 # Emits every line that lets a command's NON-ZERO exit status be discarded.
 # Empty output means nothing swallows.
 #
+# THIS IS NOT THE GUARANTEE. Assertion 2g is: it EXECUTES the gate steps with a
+# failing stub canary and asserts the step's own exit status. This function
+# enumerates SPELLINGS, and an enumeration cannot close the class -- it has been
+# beaten four times, by `|| echo`, by `if ! ...; then ...; fi` (no `||` at all,
+# and `if` conditions are errexit-exempt), by `&` backgrounding, and by
+# `set +o errexit` (the long-option spelling this regex still does not match).
+#
+# It is kept because it names the specific route in its failure text and fails
+# in milliseconds, which is genuinely useful when it does fire. But if you are
+# here because a new swallow spelling got through: DO NOT ADD A FIFTH PATTERN.
+# That approach has failed every time. Check that 2g covers the case instead --
+# it should already, because it does not care how the swallow is spelled.
+#
 # WHY THIS IS A FUNCTION, AND WHY IT IS NOT ANCHORED AT END OF LINE.
 # The three gate sites (Gate A's canary step, the CARGO_REGISTRY_TOKEN
 # fail-fast, Gate B's step) each had their own copy of
@@ -1272,6 +1285,202 @@ if [[ -f "$RELEASE_SH" ]]; then
     fi
 fi
 
+# --- 2g. THE GATE STEPS ARE EXECUTED, not pattern-matched -------------------
+#
+# WHY THIS EXISTS, and why the static "does it swallow?" pins below are no
+# longer the guarantee.
+#
+# Those pins enumerate SPELLINGS of "ignore the exit status": `|| true`, then
+# `|| echo`, then any `||`, then `set +e`. Shell has unbounded ways to spell it,
+# so the enumeration lost four times in one day, each time to a spelling nobody
+# had listed:
+#
+#     if ! bash .../auto-update-canary.sh preflight /tmp/freenet; then
+#       echo "::warning::soft-failed"; fi     # no `||` anywhere; `if` is
+#                                             # errexit-exempt and `fi` returns 0
+#     bash .../auto-update-canary.sh preflight /tmp/freenet & echo started
+#     set +o errexit                          # the long-option spelling
+#     rc=0                                    # inserted just above `exit "$rc"`
+#
+# The last one is the proof that no line-existence pin can close this class:
+# assertion 6e requires `|| rc=$?` AND `exit "$rc"`, BOTH of which are still
+# present and correct. The invariant between them is broken by a THIRD line
+# that contains nothing suspicious. A pin that asserts lines EXIST cannot see
+# an invariant that BREAKS BETWEEN them.
+#
+# So the guarantee is behavioural, using the technique this file already proves
+# on the publish step: extract the step's `run:` block, execute it against a
+# stubbed canary, and assert THE STEP'S OWN EXIT STATUS. Every spelling above
+# dies against that, including the next one neither reviewer nor author has
+# thought of, because it stops asking "what does the text look like" and starts
+# asking "does a failing canary fail the step".
+#
+# The static pins are KEPT and are not redundant: `continue-on-error:` and
+# `if: always()` are ACTIONS-level, and executing a `run:` block cannot see
+# them. Execution covers the shell; the static pins cover the step keys.
+# Neither subsumes the other -- do not delete either believing the other
+# covers it.
+#
+# FIDELITY. Actions runs a `run:` block with `bash -e {0}` when the step sets
+# no `shell:` (errexit; pipefail applies only to an explicit `shell: bash`).
+# Neither gate step sets one and this workflow has no `defaults:` block, so the
+# harness uses `bash -e`. That assumption is pinned immediately below -- adding
+# `shell: bash {0}` (no `-e`) would change real behaviour while leaving this
+# harness testing the old semantics and green, which is the N4
+# harness-diverges-from-reality hole in a new place.
+
+for _gate in "attach-to-release:Auto-update pre-flight canary (blocks publish)" \
+             "auto-update-selfupdate-canary:Previous release self-updates to this release"; do
+    _gjob="${_gate%%:*}"
+    _gname="${_gate#*:}"
+    _gblock="$(yaml_job_block "$_gjob" --numbered)"
+    # `--` is load-bearing: the pattern begins with `-`, so without it grep
+    # parses it as options and matches nothing -- which made this pin report
+    # "could not find the step" on a tree where the step was present.
+    _gline="$(printf '%s\n' "$_gblock" | grep -F -- "- name: $_gname" | head -1 | cut -d: -f1)"
+    if [[ -z "$_gline" ]]; then
+        fail "could not find the step '$_gname' in job '$_gjob'" \
+            "The shell-override pin below would pass having examined nothing."
+        continue
+    fi
+    _gstep="$(printf '%s\n' "$_gblock" \
+        | awk -F: -v a="$_gline" '$1 >= a' \
+        | awk -F: 'NR == 1 { print; next } /^[0-9]+:      - name:/ { exit } { print }')"
+    _gshell="$(printf '%s\n' "$_gstep" | grep -E '^[0-9]+:        shell:')"
+    if [[ -z "$_gshell" ]]; then
+        pass "'$_gname' sets no 'shell:', so the harness's 'bash -e' matches Actions' default"
+    else
+        fail "'$_gname' now overrides 'shell:'" \
+            "$(printf '%s\n' "$_gshell")" \
+            "The behavioural harness below runs this block under 'bash -e', which is" \
+            "Actions' default for a step with no 'shell:'. An override changes the" \
+            "real semantics -- 'shell: bash {0}' drops errexit entirely -- while the" \
+            "harness keeps testing the old ones and stays green. Update the harness" \
+            "deliberately, or drop the override."
+    fi
+done
+
+# exec_step_status <job> <step-name> <canary-exit> <substitutions-file> -- runs
+# the step's `run:` block with a stub canary and echoes "<rc>|<classification>".
+#
+# The stub is installed at BOTH paths the two gates invoke (`_canary/scripts/`
+# for Gate A, `scripts/` for Gate B) so one helper serves both.
+exec_step_status() {
+    local job="$1" name="$2" canary_rc="$3" work rc cls
+    local script
+    script="$(extract_step_run "$job" "$name")"
+    if [[ -z "$script" ]]; then
+        echo "EXTRACT-FAILED|"
+        return
+    fi
+    work="$(mktemp -d)"
+    mkdir -p "$work/bin" "$work/scripts" "$work/_canary/scripts"
+
+    # The canary stub: the ONLY thing under test is whether its exit status
+    # reaches the step's exit status.
+    printf '#!/usr/bin/env bash\nexit %s\n' "$canary_rc" > "$work/scripts/auto-update-canary.sh"
+    cp "$work/scripts/auto-update-canary.sh" "$work/_canary/scripts/auto-update-canary.sh"
+    chmod +x "$work/scripts/auto-update-canary.sh" "$work/_canary/scripts/auto-update-canary.sh"
+
+    # Gate A untars and chmods the shipped binary; neither is under test.
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$work/bin/tar"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$work/bin/chmod"
+    chmod +x "$work/bin/tar" "$work/bin/chmod"
+
+    # GitHub expressions do not expand outside Actions. Substitute the ones
+    # these blocks use, then REFUSE if any `${{` survives: an unsubstituted
+    # expression is a bash bad-substitution that exits non-zero on its own,
+    # which would satisfy a "must exit non-zero" case for entirely the wrong
+    # reason. That is the vacuity this whole file keeps having to remove.
+    script="${script//\$\{\{ steps.prev.outputs.prev_version \}\}/0.0.1}"
+    script="${script//\$\{\{ steps.prev.outputs.this_version \}\}/0.0.2}"
+    # shellcheck disable=SC2016  # literal GitHub expression syntax; must not expand
+    if [[ "$script" == *'${{'* ]]; then
+        rm -rf "$work"
+        echo "UNSUBSTITUTED|"
+        return
+    fi
+    printf '%s\n' "$script" > "$work/step.sh"
+
+    : > "$work/gh_output"
+    (
+        cd "$work" || exit 99
+        PATH="$work/bin:$PATH" GITHUB_OUTPUT="$work/gh_output" \
+            bash -e "$work/step.sh"
+    ) > "$work/out" 2>&1
+    rc=$?
+    cls="$(sed -n 's/^classification=//p' "$work/gh_output" | head -1)"
+    rm -rf "$work"
+    echo "$rc|$cls"
+}
+
+# gate_case <desc> <job> <step> <canary-exit> <want-rc-spec> [want-classification]
+#   want-rc-spec: an exact number, or "nonzero"
+gate_case() {
+    local desc="$1" job="$2" step="$3" cexit="$4" want="$5" want_cls="${6:-}"
+    local got rc cls ok=1
+    got="$(exec_step_status "$job" "$step" "$cexit")"
+    rc="${got%%|*}"
+    cls="${got#*|}"
+
+    case "$rc" in
+        EXTRACT-FAILED)
+            fail "gate behaviour: $desc" \
+                "could not extract the step's run: block -- every case would" \
+                "otherwise pass on an empty script."
+            return ;;
+        UNSUBSTITUTED)
+            fail "gate behaviour: $desc" \
+                "the run: block still contains an unexpanded \${{ }} expression." \
+                "Running it would exit non-zero for that reason alone, which would" \
+                "satisfy a 'must fail' case without testing the guard at all." \
+                "Add the substitution to exec_step_status."
+            return ;;
+    esac
+
+    case "$want" in
+        nonzero) [[ "$rc" -ne 0 ]] || ok=0 ;;
+        *)       [[ "$rc" -eq "$want" ]] || ok=0 ;;
+    esac
+    [[ -n "$want_cls" && "$cls" != "$want_cls" ]] && ok=0
+
+    if [[ "$ok" -eq 1 ]]; then
+        pass "gate behaviour: $desc (canary exit $cexit -> step rc=$rc${want_cls:+, classification=$cls})"
+    else
+        local _got_cls_msg="" _want_cls_msg=""
+        if [[ -n "$want_cls" ]]; then
+            _got_cls_msg=" with classification=$cls"
+            _want_cls_msg=" and classification $want_cls"
+        fi
+        fail "gate behaviour: $desc" \
+            "canary stub exited $cexit; step exited $rc$_got_cls_msg" \
+            "expected rc $want$_want_cls_msg" \
+            "A failing canary that does not fail its step is a gate that does not" \
+            "gate: for Gate A the release publishes anyway, for Gate B the job goes" \
+            "green on a broken updater and the notify job never fires."
+    fi
+}
+
+GATE_A_JOB=attach-to-release
+GATE_A_STEP='Auto-update pre-flight canary (blocks publish)'
+GATE_B_JOB=auto-update-selfupdate-canary
+GATE_B_STEP='Previous release self-updates to this release'
+
+# THE case: a failing canary must fail the step. Kills every swallow spelling.
+gate_case "Gate A fails when the canary fails" "$GATE_A_JOB" "$GATE_A_STEP" 1 nonzero
+# The POSITIVE CONTROL. Without it, a step that is simply broken -- or one whose
+# extraction produced nonsense -- satisfies the case above for the wrong reason.
+gate_case "Gate A passes when the canary passes" "$GATE_A_JOB" "$GATE_A_STEP" 0 0
+
+# Gate B additionally owes the notify job a classification, so each case pins
+# the exit status AND the value written to GITHUB_OUTPUT.
+gate_case "Gate B fails, and classifies 'fault', when the canary fails" \
+    "$GATE_B_JOB" "$GATE_B_STEP" 1 nonzero fault
+gate_case "Gate B re-raises exit 75 and classifies 'environmental'" \
+    "$GATE_B_JOB" "$GATE_B_STEP" 75 75 environmental
+gate_case "Gate B passes and classifies 'ok' when the canary passes" \
+    "$GATE_B_JOB" "$GATE_B_STEP" 0 0 ok
+
 # --- 3. it is not neutered in place -----------------------------------------
 # `continue-on-error: true` leaves the step present, running, and visibly
 # green-ish in the UI while the job proceeds to publish regardless -- the
@@ -1295,6 +1504,14 @@ if [[ -n "$CANARY_LINE" ]]; then
     fi
 
     # --- 3a. ...and its shell does not swallow the canary's exit status ------
+    # SECOND LINE OF DEFENCE, not the first. Assertion 2g executes this step
+    # against a failing stub canary and asserts it exits non-zero, which covers
+    # every spelling including the ones this pattern misses. What 2g CANNOT see
+    # is anything above the `run:` block -- `continue-on-error:`, `if: always()`
+    # -- because those are Actions-level and a harness that extracts and runs
+    # the script never encounters them. That is what assertion 3 covers, and
+    # why neither assertion subsumes the other. Do not delete one believing the
+    # other covers it.
     # The step-key checks above are blind to the SHELL. Appending `|| true` to
     # the invocation leaves the step present, before the publish, and without
     # `continue-on-error` -- every assertion here passed under exactly that
@@ -1676,6 +1893,15 @@ else
 fi
 
 # --- 6e. the step CAPTURES the exit status as well as re-raising it ---------
+# SUPERSEDED AS A GUARANTEE by assertion 2g, and the reason is worth keeping.
+# This pin requires that `|| rc=$?` exists AND that `exit "$rc"` exists. Both
+# can be present and correct while the invariant BETWEEN them is broken by a
+# third line -- inserting a bare `rc=0` immediately above the `exit` leaves both
+# needles matching, contains nothing suspicious, and makes Gate B report success
+# on a broken updater with the notify job never firing. A pin that asserts LINES
+# EXIST cannot see an invariant that breaks between them; only executing the
+# step can. 2g does exactly that, and kills the `rc=0` insertion.
+# Kept for its specific, fast diagnostics when a line really is deleted.
 # BOTH halves, because pinning only the second leaves the cheaper mutation wide
 # open. Confirmed by mutation: change `|| rc=$?` to `|| true` and `rc` stays 0,
 # `classification` is reported as `ok`, `exit "$rc"` exits 0 -- so Gate B goes
