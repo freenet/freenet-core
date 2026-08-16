@@ -194,6 +194,21 @@ jobs:
       - name: Self-test release wait_for_binaries gh resilience
         run: bash scripts/release_wait_for_binaries_test.sh
 
+      # Release-driver RESUME state. Two regressions, both of the shape where a
+      # resumed release is wrong in a way the operator cannot see: the v0.2.42
+      # FDEV_VERSION double-bump, and the CRATES_PUBLISHED flag being set on
+      # `freenet` alone (which makes `publish_crates`'s early return skip the
+      # per-crate branch and strand `fdev` after a partial publish, while the
+      # driver reports success).
+      #
+      # NOTE this file EXISTED and PASSED for a long time without ever being
+      # run here -- it was referenced only in a comment further down, so it was
+      # scored by the assertion counter and executed by nothing. A test that
+      # does not run is not a gate, which is the same class of defect as the
+      # assertions it now protects.
+      - name: Self-test release driver resume state
+        run: bash scripts/release_state_restore_test.sh
+
       # Pins the WIRING of the blocking pre-flight canary, which is what
       # makes it a gate at all: it must run inside attach-to-release, after
       # the assets upload, BEFORE the crates.io publish (the one irreversible
