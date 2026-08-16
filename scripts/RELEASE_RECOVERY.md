@@ -368,8 +368,11 @@ git push origin release/vX.Y.Z
 
 **Solution:**
 ```bash
-# Check if already published
-cargo search freenet --limit 1
+# Check if THIS version is already published. Not `cargo search` -- it reports
+# only the NEWEST version and reads the lagging search index (see the Quick
+# Reference); here that would answer about some other version entirely.
+curl -sS https://crates.io/api/v1/crates/freenet/0.1.X \
+  | jq -e '.version.num' >/dev/null && echo published || echo 'not published'
 
 # Verify credentials
 cargo login
@@ -416,6 +419,11 @@ gh run watch "$(gh run list --workflow=cross-compile.yml \
 
 # 6. Verify it got there, rather than assuming
 gh release view v0.1.X --json isDraft --jq '.isDraft'   # must be false
+# `cargo search` is CORRECT here and should not be "fixed": after a successful
+# release the newest published version IS the one just cut, which is exactly
+# what it reports. The rule is `cargo search` may only answer questions about
+# the NEWEST version -- fine here, wrong wherever the question is "is version X
+# published?" (see Step 4b and the Quick Reference).
 cargo search freenet --limit 1
 
 # 7. Deploy locally

@@ -145,7 +145,14 @@ else
 fi
 export FREENET_MIN_COMPATIBLE_VERSION="$MIN_COMPATIBLE"
 
-# Get the most recently published version from crates.io (most authoritative source)
+# Get the most recently published version from crates.io (most authoritative source).
+#
+# `cargo search` is CORRECT here and must not be "fixed" to the registry
+# endpoint: this genuinely wants the NEWEST published version, which is exactly
+# what it reports. The rule is that `cargo search` may only answer questions
+# about the newest version -- fine for this comparison, wrong wherever the
+# question is "is version X published?", which is why
+# crate_version_on_crates_io() below uses the per-version endpoint instead.
 echo -n "Checking latest published version on crates.io... "
 PUBLISHED_VERSION=$(cargo search freenet --limit 1 2>/dev/null | grep "^freenet =" | head -1 | cut -d'"' -f2)
 if [[ -z "$PUBLISHED_VERSION" ]]; then

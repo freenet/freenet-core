@@ -380,9 +380,27 @@ on crates.io, the release could only ever stay a draft, and 0.2.125 had to be
 cut in its place.
 
 Now a Gate A block costs a **tag**, which is deletable. Delete the tag and the
-draft, fix, re-cut on the corrected commit. Check `cargo search freenet` first:
-if the crates for that version really are published, the version is spent and
-you cut the next patch instead.
+draft, fix, re-cut on the corrected commit — but check first whether **that
+exact version** is already on crates.io, because if it is, the version is spent
+and you cut the next patch instead:
+
+```bash
+curl -sS https://crates.io/api/v1/crates/freenet/X.Y.Z \
+  | jq -e '.version.num' >/dev/null && echo published || echo 'not published'
+```
+
+**Not `cargo search`.** This is the one decision where it gives the wrong answer
+in the dangerous direction: it reports only a crate's NEWEST version and reads
+the search index, which lags the registry, so it can answer "not published"
+about a version that IS published — and acting on that means re-tagging a spent
+version, which is the unrecoverable 0.2.124 state this whole ordering exists to
+prevent.
+
+The rule, since `cargo search` is still correct in other places and should not
+be purged: **`cargo search` may only answer questions about the NEWEST
+version.** Asking "is the newest published version X?" is fine (that is what
+`release.sh`'s version-comparison guard does). Asking "is version X published?"
+is not.
 
 `scripts/release_canary_wiring_test.sh` pins this ordering — the publish must
 sit between the canary and the undraft, and `release.yml` must contain no
