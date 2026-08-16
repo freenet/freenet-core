@@ -2967,7 +2967,7 @@ pub(crate) fn summaries_reply_for_peer(
 /// extreme — a wide set of contracts we do not host, where each entry costs
 /// almost nothing and the byte budget would never bind — not as the number
 /// that governs how fast the rotation turns. Quote the byte budget for that.
-const MAX_FALLBACK_SUMMARIES_PER_REPLY: usize = 64;
+pub(crate) const MAX_FALLBACK_SUMMARIES_PER_REPLY: usize = 64;
 
 /// Byte budget for one full-bytes summary fallback reply (#5155).
 ///
@@ -3332,7 +3332,7 @@ async fn handle_interest_sync_message(
                 SummaryReplyForm::FullBytes => {
                     let start = op_manager
                         .interest_manager
-                        .fallback_window_start(source, &matching);
+                        .begin_fallback_window(source, &matching);
                     Some(crate::ring::interest::rotation_window_indices(
                         matching.len(),
                         start,
@@ -3421,10 +3421,20 @@ async fn handle_interest_sync_message(
             // short of the selected window must not advance past the entries it
             // dropped, or they wait a full cycle instead of coming next.
             //
-            // Two known imprecisions here, both accepted, both costing at most
-            // one cycle of delay for the affected contracts and neither able to
-            // skip one permanently (the window wraps, and a cycle boundary
-            // restarts at a random offset):
+            // The entry count goes with it: it is what tells the next round
+            // whether the cycle is finished (re-randomise) or merely wrapped
+            // past the last id (resume at 0). Deriving that from the resume
+            // index alone was #5181.
+            //
+            // Known imprecisions, all accepted, none able to skip a contract
+            // permanently — because the window WRAPS and cycles complete, which
+            // is the property that does that work. (The random origin defends a
+            // different failure, peer steering, and does not contribute to
+            // non-permanence; the two used to be offered jointly here, which is
+            // how the claim ended up wrong.) Several of these make the cycle end
+            // EARLY rather than late, so an arc can go unadvertised for an extra
+            // cycle; `FallbackCursor::advertised_in_cycle` is explicit that this
+            // is not a safe-direction-only approximation:
             //
             // - This advances on send ATTEMPT. The reply is handed to the
             //   connection afterwards and a send failure is only logged, so a
@@ -3434,12 +3444,38 @@ async fn handle_interest_sync_message(
             //   read the same start and build the same window, losing one
             //   round of progress. Reserving the window at read time instead
             //   would trade that for a worse failure: a budget-cut round would
-            //   then skip everything it did not reach.
+            //   then skip everything it did not reach. The duplicate is not
+            //   double-CHARGED (it covers no new distance), but the round is
+            //   still spent.
+            // - Two concurrent replies cut at different lengths by the byte
+            //   budget carry different last ids, so the shorter is not
+            //   recognised as ground the longer already covered. If the shorter
+            //   records first the longer is charged on top of it, over-stating
+            //   progress by up to one window.
+            // - A racer that STRADDLES a boundary (it read the old cycle, another
+            //   reply took the boundary) is NOT in this list any more: its record
+            //   is not well-formed against the new cycle, so it is discarded and
+            //   the freshly published origin survives. It used to overwrite
+            //   `last_sent` and discard that origin, via a first-record exemption
+            //   in `record_fallback_cursor` that no longer exists. The cost is now
+            //   only that the window it already sent is re-sent later, since it
+            //   was never charged. Kept here as a signpost because the imprecision
+            //   was documented for long enough that a reader may come looking for
+            //   it.
+            // - Contract CHURN: ids removed from ground already swept while
+            //   others are inserted below the cursor let the count reach the set
+            //   size with current members never advertised this cycle.
+            // - The peer chooses `sorted`, so it chooses the length the count is
+            //   compared against; see `begin_fallback_window`'s rustdoc for the
+            //   anti-steering regression this leaves open.
             if form == SummaryReplyForm::FullBytes {
                 if let Some(last) = last_included {
-                    op_manager
-                        .interest_manager
-                        .record_fallback_cursor(source, last);
+                    op_manager.interest_manager.record_fallback_cursor(
+                        source,
+                        &matching,
+                        last,
+                        entries.len(),
+                    );
                 }
             }
 
@@ -9893,14 +9929,14 @@ mod tests {
 
             // Seed the cursor so both rounds are mid-cycle and the starting
             // offset is fixed. Without this the first round would begin at a
-            // random cycle-boundary offset (see `fallback_window_start`) and a
-            // start on the last contract would wrap into a second random draw,
-            // making the "moved on to a different contract" assertion flaky.
+            // random cycle-boundary offset (see `begin_fallback_window`).
+            // Seeded through the production boundary shape so the cycle starts
+            // at index 1, leaving the 8-contract set nowhere near finished.
             let mut sorted = keys.clone();
             sorted.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
             h.op_manager
                 .interest_manager
-                .record_fallback_cursor(h.old_peer, *sorted[0].id());
+                .seed_fallback_cycle(h.old_peer, &sorted, 1);
 
             let mut seen: Vec<u32> = Vec::new();
             for round in 0..2 {
@@ -10130,6 +10166,21 @@ mod tests {
             let expected: HashSet<u32> = hashes.iter().copied().collect();
             let ids: HashSet<ContractInstanceId> = keys.iter().map(|k| *k.id()).collect();
 
+            // Position of each contract in `get_matching_contracts` order
+            // (ascending by id), so a reply's window can be checked for
+            // contiguity rather than only for size. `distinct_hashes` has
+            // already asserted the hashes do not collide, so this is 1:1.
+            let shared_len = keys.len();
+            let index_of_hash: std::collections::HashMap<u32, usize> = {
+                let mut by_id = keys.clone();
+                by_id.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+                by_id
+                    .iter()
+                    .enumerate()
+                    .map(|(i, k)| (contract_hash(k), i))
+                    .collect()
+            };
+
             let mut covered: HashSet<u32> = HashSet::new();
             for pair in 0..PAIRS {
                 let spawn_one = || {
@@ -10147,6 +10198,7 @@ mod tests {
                 };
                 let (first, second) = tokio::join!(spawn_one(), spawn_one());
 
+                let mut windows: Vec<Vec<u32>> = Vec::new();
                 for (which, joined) in [("first", first), ("second", second)] {
                     match joined.expect("handler task panicked") {
                         Some(InterestMessage::Summaries { entries, .. }) => {
@@ -10158,10 +10210,91 @@ mod tests {
                             );
                             assert!(summary_bytes_of(&entries) <= 9 * 1024 + h.our_summary.len());
                             covered.extend(entries.iter().map(|e| e.hash));
+                            windows.push(entries.iter().map(|e| e.hash).collect());
                         }
                         other => panic!("pair {pair} {which} reply was {other:?}"),
                     }
                 }
+
+                // ASSERT THE PREMISE, do not infer it — but assert only what is
+                // scheduler-INDEPENDENT.
+                //
+                // This test's header explains that identical windows prove the
+                // overlap happened and different ones prove it did not — then the
+                // assertions below only checked a COVERAGE FLOOR, which is
+                // satisfied either way. Worse, it is satisfied MORE EASILY when
+                // the premise is false: two racers that diverge cover two
+                // windows instead of one, so `covered` grows faster and the
+                // floor is easier to clear.
+                //
+                // That is not hypothetical. Deleting the atomic boundary in
+                // `begin_fallback_window` makes the racers draw different
+                // origins, and this test stayed green over 40 runs — passing
+                // precisely because the race it exists for stopped happening. A
+                // reader running that mutation would reasonably conclude the test
+                // does not guard the code, when in fact the mutation had
+                // destroyed the test's premise. Both readings of "mutation
+                // applied, still green" are real, and only an explicit premise
+                // assertion separates them.
+                //
+                // A bare `windows[0] == windows[1]` is NOT the right assertion,
+                // though: it asserts that the RUNTIME overlapped the pair, which
+                // is not this code's contract to keep. A genuinely serialised
+                // pair legitimately produces the next CONTIGUOUS window instead.
+                // Both shapes are correct; only a third is not — two unrelated
+                // origins, the pre-boundary defect — and that is what is checked
+                // here.
+                //
+                // Empirically the bare form was borderline rather than clearly
+                // broken: 1 failure in 160 runs with it in place, and the failing
+                // run's message was not captured, so it is NOT established that
+                // the assertion was the thing that failed (a fixed-port harness
+                // has other rare ways to fail). The contiguity form is used
+                // because it does not depend on the answer, not because the bare
+                // form was proven flaky.
+                //
+                // THIS ASSERTION IS DETERMINISTIC IN SHIPPED CODE and needs no
+                // hardening. Under the shipped code there is exactly ONE published
+                // origin, so both racers resume from it and the windows are
+                // identical (or contiguous if serialised) every time.
+                //
+                // Do not be misled by the ~0.75% figure that appears in the
+                // mutation table below, where deleting the atomic boundary leaves
+                // this assertion passing occasionally by chance (1 of 40 runs
+                // observed) -- two independent origins over `matching.len()`
+                // contracts collide identically once in `L`, or adjacently in
+                // either orientation twice more, so ~0.75% predicted. That probability is a property of the MUTATION, not
+                // of shipped code: it exists only because the mutation removed the
+                // mechanism that makes this deterministic. The one genuine
+                // probabilistic assertion in shipped code was the straddle test's
+                // premise in `interest.rs`, at ~0.5%, and that one was hardened
+                // rather than documented -- shipping a new flake to close an old
+                // one is not a trade this PR makes.
+                let idx = |w: &Vec<u32>| -> Vec<usize> {
+                    w.iter()
+                        .map(|hash| {
+                            *index_of_hash
+                                .get(hash)
+                                .expect("every advertised hash is in the shared set")
+                        })
+                        .collect()
+                };
+                let (i0, i1) = (idx(&windows[0]), idx(&windows[1]));
+                let follows = |a: &Vec<usize>, b: &Vec<usize>| {
+                    !a.is_empty() && !b.is_empty() && b[0] == (a[a.len() - 1] + 1) % shared_len
+                };
+                assert!(
+                    i0 == i1 || follows(&i0, &i1) || follows(&i1, &i0),
+                    "pair {pair}: the two concurrent replies were neither \
+                     IDENTICAL (they overlapped, resuming from one published \
+                     origin) nor CONTIGUOUS (the scheduler serialised them). Two \
+                     unrelated windows mean each drew its own origin, which \
+                     charges two non-contiguous windows to one cycle — the defect \
+                     the atomic boundary in `begin_fallback_window` exists to \
+                     prevent. starts: {:?} and {:?}",
+                    i0.first(),
+                    i1.first()
+                );
 
                 // The cursor must still name a contract that exists, not a
                 // value torn between the two writers.
@@ -10170,8 +10303,63 @@ mod tests {
                     .interest_manager
                     .peek_fallback_cursor(h.old_peer)
                     .expect("a fallback reply must leave a cursor");
+                // Both racers now resume from the SAME published origin (see
+                // `begin_fallback_window`), so a pair advances the cycle by one
+                // window rather than two: 3 pairs charge 3 x 64 of the 400
+                // shared contracts and no cycle completes inside this loop.
+                //
+                // WHICH MECHANISMS THIS TEST REQUIRES, measured against THIS
+                // version of the test. Each row is 40 runs, `--exact`:
+                //
+                //   zero-advance reject + atomic boundary (shipped) . 40 /  0
+                //   atomic boundary, advance check deleted .......... 20 / 20
+                //   zero-advance reject, boundary deleted ........... 1 / 39
+                //
+                // NEITHER MECHANISM ALONE PASSES: they are jointly necessary, and
+                // this change must not be partially reverted. The reason is not
+                // that both happen to be needed -- it is that they fail DIFFERENT
+                // assertions, so they defend different properties and neither
+                // substitutes for the other:
+                //
+                // - Advance check deleted -> fails the COVERAGE assertion at the
+                //   end of this test (384 of 400 advertised). Duplicate windows
+                //   are charged twice, the counter runs ahead of the ground
+                //   covered, the cycle ends early, and an arc goes unadvertised.
+                //   PROBABILISTIC (~50%): it needs an interleaving that actually
+                //   produces a duplicate.
+                // - Boundary deleted -> fails the PREMISE assertion at pair 0
+                //   (observed `starts: Some(387) and Some(257)`). Each racer draws
+                //   its own origin. NEAR-DETERMINISTIC (39/40): two independent
+                //   draws over 400 contracts satisfy "identical or contiguous"
+                //   only ~0.75% of the time, which is why 1 run passed.
+                //
+                // Deterministic-versus-probabilistic is the informative part: the
+                // boundary's absence is unconditionally broken, while the record
+                // check's absence needs a race to expose it.
+                //
+                // PROVENANCE, and it matters. An earlier revision of this comment
+                // carried a row claiming the boundary-deleted case was 40/0, and
+                // drew from it the conclusion that the boundary was not justified
+                // by this test. That row was measured BEFORE the premise assertion
+                // existed, when this test judged only the coverage floor -- and the
+                // floor is EASIER to clear when the premise is false, since
+                // diverging racers cover two windows instead of one. So the number
+                // credited the change with passing a test it actually fails, via
+                // exactly the vacuity the premise assertion was added to stop.
+                //
+                // The rule that cost: diagnosing a false-green mechanism does not
+                // immunise the numbers already collected under it. When you fix an
+                // instrument, the old readings are retaken or discarded, not
+                // annotated. Every row above was re-measured against this version
+                // of the test.
+                //
+                // The separate question of whether the flake was INTRODUCED (`main`
+                // 40/0 versus 65086ec2 8-13/40) cannot share this table: the
+                // premise assertion is part of what this PR adds, so restoring
+                // main's files removes it, and those rows exist only under the
+                // floor-only test. They are in the PR description, kept apart.
                 assert!(
-                    ids.contains(&cursor),
+                    ids.contains(&cursor.last_sent),
                     "after pair {pair} the cursor is no longer a member of the \
                      shared set — concurrent writers corrupted the rotation \
                      rather than merely duplicating a window"
