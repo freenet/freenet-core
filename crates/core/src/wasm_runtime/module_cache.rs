@@ -1385,39 +1385,40 @@ fn windows_memory_status_to_ram_bytes(raw_bytes: Option<u64>) -> Option<usize> {
 /// obtain without swapping).
 #[cfg(target_os = "macos")]
 fn read_macos_available_bytes() -> Option<usize> {
-    use mach2::kern_return::KERN_SUCCESS;
-    use mach2::mach_host::{host_statistics64, mach_host_self};
-    use mach2::message::mach_msg_type_number_t;
-    use mach2::vm_statistics::{HOST_VM_INFO64, vm_statistics64};
+    // `mach2` (workspace dep pinned at 0.4) does NOT export `mach_host`,
+    // `HOST_VM_INFO64`, or a `vm_statistics64` struct at this version — `libc`
+    // has all three (its own `apple::mach_host_self`/`mach_task_self` doc
+    // comments say "use mach2 instead", which is stale advice for the pinned
+    // version; `host_statistics64`/`task_info` below carry no such notice).
+    use libc::{HOST_VM_INFO64, host_statistics64, kern_return_t, vm_statistics64};
 
     // SAFETY: `vm_statistics64` is a C-repr struct of plain integer fields
     // (natural_t/uint64_t) with no padding-sensitive invariants or
     // pointers — an all-zero bit pattern is a valid value for every field,
-    // entirely overwritten by the FFI call below on success. `mach_host_self`
-    // returns a send right to the host port with no preconditions — safe to
-    // call unconditionally, and it is a borrowed/statically-valid right, not
-    // an owned resource this function needs to deallocate.
+    // entirely overwritten by the FFI call below on success.
     let mut stats: vm_statistics64 = unsafe { std::mem::zeroed() };
-    let mut count = (std::mem::size_of::<vm_statistics64>() / std::mem::size_of::<u32>())
-        as mach_msg_type_number_t;
+    let mut count = libc::HOST_VM_INFO64_COUNT;
     // SAFETY: `host_statistics64` is an FFI call that reads host VM
     // statistics into a caller-owned `vm_statistics64` buffer. We pass a
-    // valid host port (from `mach_host_self` just above), the `HOST_VM_INFO64`
+    // valid host port (`macos_cached_host_port()`, below — a real Mach send
+    // right, acquired once and cached; see its own doc), the `HOST_VM_INFO64`
     // flavor matching the `vm_statistics64` struct we're reading into, a
-    // correctly-sized stack-owned out-buffer, and a correctly-initialized
-    // in/out count matching that buffer's size (the API's documented
-    // contract). It writes only into that buffer, up to `count` natural_t
-    // words, and returns `KERN_SUCCESS` (0) on success (checked below); it
-    // borrows no memory past the call. No aliasing or lifetime hazards.
-    let kr = unsafe {
+    // correctly-sized stack-owned out-buffer (`HOST_VM_INFO64_COUNT`, the
+    // same libc-provided constant the API expects rather than a hand-rolled
+    // `size_of` count), and a correctly-initialized in/out count matching
+    // that buffer's size (the API's documented contract). It writes only
+    // into that buffer, up to `count` natural_t words, and returns
+    // `KERN_SUCCESS` (0) on success (checked below); it borrows no memory
+    // past the call. No aliasing or lifetime hazards.
+    let kr: kern_return_t = unsafe {
         host_statistics64(
-            mach_host_self(),
+            macos_cached_host_port(),
             HOST_VM_INFO64,
             (&mut stats as *mut vm_statistics64).cast(),
             &mut count,
         )
     };
-    if kr != KERN_SUCCESS {
+    if kr != libc::KERN_SUCCESS {
         return None;
     }
     let page_size = macos_page_size_bytes()?;
@@ -1427,6 +1428,27 @@ fn read_macos_available_bytes() -> Option<usize> {
         u64::from(stats.purgeable_count),
         page_size,
     )
+}
+
+/// The Mach host port, acquired via `mach_host_self()` exactly ONCE for the
+/// life of the process and cached (#5333 review, MEDIUM finding). Unlike
+/// `mach_task_self()` — which `libc`'s own binding shows is just a read of a
+/// process-global static the Mach runtime initializes at startup, never a
+/// fresh kernel call — `mach_host_self()` is a real MIG trap that mints a NEW
+/// send right (a distinct `uref` in this process's IPC space) on every call.
+/// Calling it on every 60s sweep tick forever would accumulate one uref per
+/// tick with nothing ever deallocating it, which is reachable in practice:
+/// this is the exact pattern the mature, widely-used `sysinfo` crate avoids
+/// (`sysinfo::unix::apple::system::SystemInner::new`, which acquires the port
+/// once at construction and reuses it for the process's whole lifetime — see
+/// its `src/unix/apple/system.rs`). A `OnceLock` gives the same one-acquisition
+/// guarantee without restructuring this module's stateless-function shape
+/// into a persistent struct.
+#[cfg(target_os = "macos")]
+fn macos_cached_host_port() -> libc::mach_port_t {
+    static HOST_PORT: std::sync::OnceLock<libc::mach_port_t> = std::sync::OnceLock::new();
+    #[allow(deprecated)]
+    *HOST_PORT.get_or_init(|| unsafe { libc::mach_host_self() })
 }
 
 /// Pure arithmetic behind [`read_macos_available_bytes`], split out from the
@@ -1458,39 +1480,44 @@ fn macos_vm_stats_to_available_bytes(
 /// `mem_share` — see `ring::hosting::cache::resident_overhead_budget_for`.
 #[cfg(target_os = "macos")]
 fn read_macos_own_rss_bytes() -> Option<usize> {
-    use mach2::kern_return::KERN_SUCCESS;
-    use mach2::message::mach_msg_type_number_t;
-    use mach2::task::task_info;
-    use mach2::task_info::{MACH_TASK_BASIC_INFO, mach_task_basic_info};
-    use mach2::traps::mach_task_self;
+    // Same `mach2`-does-not-have-this-at-the-pinned-version situation as
+    // `read_macos_available_bytes` above — `libc` has `task_info`,
+    // `MACH_TASK_BASIC_INFO`(_COUNT), and `mach_task_basic_info`.
+    use libc::{MACH_TASK_BASIC_INFO, kern_return_t, mach_task_basic_info, task_info};
 
     // SAFETY: `mach_task_basic_info` is a C-repr struct of plain integer
     // fields with no padding-sensitive invariants or pointers — an all-zero
     // bit pattern is a valid value for every field, entirely overwritten by
-    // the FFI call below on success. `mach_task_self` returns this task's
-    // own (borrowed, statically-valid) port with no preconditions — safe to
-    // call unconditionally.
+    // the FFI call below on success. `mach_task_self()` (unlike
+    // `mach_host_self()`, cached via `macos_cached_host_port()` above) is
+    // safe to call on every tick with no caching of its own: `libc`'s own
+    // binding for it is literally `unsafe fn mach_task_self() -> mach_port_t
+    // { mach_task_self_ }` — a read of a process-global `static` the Mach
+    // runtime initializes once at process startup, not a kernel trap that
+    // mints a new right, so there is nothing here to accumulate.
     let mut info: mach_task_basic_info = unsafe { std::mem::zeroed() };
-    let mut count = (std::mem::size_of::<mach_task_basic_info>() / std::mem::size_of::<u32>())
-        as mach_msg_type_number_t;
+    let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
     // SAFETY: `task_info` is an FFI call that reads this task's basic info
     // into a caller-owned `mach_task_basic_info` buffer. We pass the current
     // task's own port (`mach_task_self`, valid for this process's lifetime),
     // the `MACH_TASK_BASIC_INFO` flavor matching the struct we're reading
-    // into, a correctly-sized stack-owned out-buffer, and a
-    // correctly-initialized in/out count matching that buffer's size. It
-    // writes only into that buffer, up to `count` natural_t words, and
-    // returns `KERN_SUCCESS` (0) on success (checked below); it borrows no
-    // memory past the call. No aliasing or lifetime hazards.
-    let kr = unsafe {
+    // into, a correctly-sized stack-owned out-buffer (`MACH_TASK_BASIC_INFO_COUNT`,
+    // the libc-provided constant matching the API's expected count rather
+    // than a hand-rolled `size_of`), and a correctly-initialized in/out count
+    // matching that buffer's size. It writes only into that buffer, up to
+    // `count` natural_t words, and returns `KERN_SUCCESS` (0) on success
+    // (checked below); it borrows no memory past the call. No aliasing or
+    // lifetime hazards.
+    #[allow(deprecated)]
+    let kr: kern_return_t = unsafe {
         task_info(
-            mach_task_self(),
+            libc::mach_task_self(),
             MACH_TASK_BASIC_INFO,
             (&mut info as *mut mach_task_basic_info).cast(),
             &mut count,
         )
     };
-    if kr != KERN_SUCCESS {
+    if kr != libc::KERN_SUCCESS {
         return None;
     }
     macos_task_info_to_rss_bytes(info.resident_size)

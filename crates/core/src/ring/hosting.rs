@@ -754,6 +754,32 @@ impl HostingManager {
             self.resident_overhead_mem_share_bits
                 .load(Ordering::Relaxed),
         );
+        // #5333 review (skeptical lens, Blocker 2): `own_rss` as read by
+        // `read_own_rss_bytes()` is the WHOLE process's resident memory,
+        // which already includes the very hosting overhead this budget is
+        // meant to bound (`estimated_resident_overhead_bytes()`, the `C` the
+        // eviction predicate compares against). Passing it through
+        // unadjusted made the live-surplus term self-referential: as C grows
+        // by hosting one more contract, `own_rss` grows by (approximately,
+        // per the same 1 MiB/contract calibration) the SAME amount, so the
+        // budget `own_rss + mem_share*available` grows in lockstep with the
+        // cost it is supposed to cap — the axis could never actually bind on
+        // an unconstrained host. Strip `C` out here, before the live signal
+        // reaches the pure formula, so `own_rss` reflects only the process's
+        // NON-hosting-attributable resident memory (base runtime, transport
+        // buffers, other caches) — the genuine "never shrink below this"
+        // floor the mechanism intends, without cancelling out the growth
+        // it's meant to detect.
+        let current_estimated_overhead = self
+            .hosting_cache
+            .read()
+            .estimated_resident_overhead_bytes();
+        let live_signals = live_signals.map(|(own_rss, available)| {
+            (
+                own_rss.saturating_sub(current_estimated_overhead),
+                available,
+            )
+        });
         let budget =
             cache::resident_overhead_budget_for(total_ram, pool_size, live_signals, mem_share);
         self.hosting_cache
@@ -7574,6 +7600,88 @@ mod tests {
             installed, installed_lower_share,
             "changing the configured share must change the installed budget \
              on a shape where the live-surplus term binds"
+        );
+    }
+
+    /// A key-maker with a wider seed space than `make_contract_key` (`u8`,
+    /// 256 max): the resident-overhead test below needs well over 256
+    /// distinct contracts. Mirrors `cache::tests::make_key_u32`.
+    fn make_key_u32(seed: u32) -> ContractKey {
+        let mut id_bytes = [0u8; 32];
+        id_bytes[..4].copy_from_slice(&seed.to_le_bytes());
+        let mut code_bytes = [0u8; 32];
+        code_bytes[..4].copy_from_slice(&seed.wrapping_add(1).to_le_bytes());
+        ContractKey::from_id_and_code(ContractInstanceId::new(id_bytes), CodeHash::new(code_bytes))
+    }
+
+    /// #5333 review (skeptical lens, Blocker 2): the live-surplus term is
+    /// SELF-REFERENTIAL if `own_rss` is passed through unadjusted, because
+    /// `own_rss` already includes the very hosting cost
+    /// (`estimated_resident_overhead_bytes()`, `C`) this budget is compared
+    /// against. Algebraically (`live_term = own_rss + mem_share*available`,
+    /// `own_rss = base_other_rss + C` under the calibration
+    /// `ESTIMATED_RESIDENT_BYTES_PER_CONTRACT` assumes): the eviction
+    /// predicate `C > budget` reduces to `0 > base_other_rss +
+    /// mem_share*available`, which — since every term on the right is
+    /// non-negative — is NEVER true, however large `C` grows or however far
+    /// `available` shrinks. The live-surplus branch could therefore NEVER
+    /// actually bind on an unconstrained host, silently defeating the whole
+    /// OOM-protection purpose of this axis on exactly the case it targets.
+    /// The fix (`recompute_resident_overhead_budget` subtracting the
+    /// cache's current `C` from `own_rss` before calling the pure formula)
+    /// restores a genuine, reachable fixed point.
+    ///
+    /// This test hosts enough contracts to exhaust a small, fixed `available`
+    /// budget, then asserts the axis CAN fire (`cost > installed_budget`) —
+    /// the direct, end-to-end version of "is OOM protection reachable at
+    /// all", not an indirect proxy for it. Reverting the fix makes this test
+    /// fail (mutation-tested): without it, `cost` never exceeds the budget.
+    #[test]
+    fn resident_overhead_budget_can_actually_fire_on_an_unconstrained_host() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+        let total_ram = 64 * GIB; // generous enough the structural term never binds
+        let pool_size = 8;
+        let base_other_rss = 50 * MIB; // non-hosting resident memory, held constant
+        let available0 = 200 * MIB; // small on purpose: cheap to exhaust by hosting
+
+        let manager = HostingManager::new(total_ram);
+        manager.configure_resident_overhead_mem_share(0.125);
+
+        // Host enough contracts that cost alone exceeds `available0` — i.e.
+        // this process has consumed all the memory that was "available",
+        // the scenario genuine OOM protection must catch.
+        for i in 0..300u32 {
+            manager.record_contract_access(
+                make_key_u32(i),
+                1,
+                AccessType::Get,
+                HostingCause::Other,
+            );
+        }
+        let cost =
+            manager.hosting_contracts_count() as u64 * cache::ESTIMATED_RESIDENT_BYTES_PER_CONTRACT;
+        assert!(
+            cost > available0,
+            "test setup: hosted cost ({cost}) must exceed available0 ({available0}) \
+             to exercise the exhausted-available regime"
+        );
+        let own_rss = base_other_rss + cost;
+        let available = available0.saturating_sub(cost); // saturates to 0
+
+        let installed_budget = manager.recompute_resident_overhead_budget(
+            total_ram,
+            pool_size,
+            Some((own_rss, available)),
+        );
+
+        assert!(
+            cost > installed_budget,
+            "cost ({cost}) must exceed the installed budget ({installed_budget}) once \
+             available memory is exhausted by hosting — if it doesn't, the \
+             live-surplus term is self-referential (own_rss not adjusted for the \
+             current hosting cost) and this axis can NEVER actually protect \
+             against OOM on an unconstrained host — the #5333 Blocker 2 regression."
         );
     }
 

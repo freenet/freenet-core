@@ -2074,7 +2074,6 @@ dependencies = [
  "keyring",
  "libc",
  "lru",
- "mach2 0.4.3",
  "moka",
  "muda",
  "notify",
@@ -3943,15 +3942,6 @@ dependencies = [
  "cc",
  "libc",
  "pkg-config",
-]
-
-[[package]]
-name = "mach2"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d640282b302c0bb0a2a8e0233ead9035e3bed871f0b7e81fe4a1ec829765db44"
-dependencies = [
- "libc",
 ]
 
 [[package]]
@@ -7940,7 +7930,7 @@ dependencies = [
  "ittapi",
  "libc",
  "log",
- "mach2 0.6.0",
+ "mach2",
  "memfd",
  "object 0.39.1",
  "once_cell",

@@ -336,14 +336,36 @@ pub fn default_resident_overhead_budget_bytes() -> u64 {
 ///   operator already explicitly made, so there's no "surplus grab" concern
 ///   to bound further.
 /// - **Live-surplus term**: `own_rss + mem_share * available_raw`, only
-///   computed when live signals are present. `own_rss` (already-resident
-///   memory) is NEVER discounted by `mem_share` — the mechanism can never
-///   demand shrinking below what's already resident just because the share
-///   is conservative, only genuine external pressure (available memory
-///   actually dropping) does that. This is what makes an UNCONSTRAINED host
-///   (no `MemoryMax`, e.g. a dedicated gateway) claim only a modest,
-///   Task-Manager-unremarkable default slice of its real surplus, rather
-///   than the ~90% of total RAM the structural term alone would allow.
+///   computed when live signals are present. `own_rss` here is NEVER
+///   discounted by `mem_share` — the mechanism can never demand shrinking
+///   below what's already resident just because the share is conservative,
+///   only genuine external pressure (available memory actually dropping)
+///   does that. This is what makes an UNCONSTRAINED host (no `MemoryMax`,
+///   e.g. a dedicated gateway) claim only a modest, Task-Manager-unremarkable
+///   default slice of its real surplus, rather than the ~90% of total RAM
+///   the structural term alone would allow.
+///
+///   **`own_rss` here MUST already exclude the current estimated
+///   resident-overhead cost** (`HostingCache::estimated_resident_overhead_bytes`
+///   — the `C = contracts.len() * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT` the
+///   eviction predicate compares this budget against). This is a caller
+///   contract, not something this pure function enforces, because the caller
+///   is the only place that has both signals to hand
+///   (`HostingManager::recompute_resident_overhead_budget` reads the cache's
+///   current `C` and pre-subtracts it before calling here). Passing raw,
+///   unadjusted process RSS is a #5333-REVIEW-CAUGHT BUG, not a style
+///   choice: since `own_rss` calibrates almost 1:1 with `C` as hosted
+///   contract count grows (that IS what `ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`
+///   measures), an un-adjusted `own_rss + mem_share*available` grows in
+///   lockstep with `C` itself — the eviction predicate `C > budget` reduces
+///   to `0 > (own_rss - C) + mem_share*available`, which is essentially
+///   never true on any live host, so the live-surplus branch could NEVER
+///   actually bind and the whole OOM-protection purpose of this axis was
+///   silently defeated on exactly the unconstrained-host case it targets.
+///   Subtracting `C` first restores genuine negative feedback: `available`
+///   (system-wide, NOT self-inclusive of this process's own growth) shrinks
+///   as `C` grows, so the predicate converges to a real fixed point instead
+///   of ratcheting upward forever.
 ///
 /// Composing via `min()` — the SAME pattern
 /// `wasm_runtime::runtime::combine_wasmtime_cache_size` uses (#5328) —
@@ -392,6 +414,14 @@ pub(crate) fn resident_overhead_budget_for(
     bound.max(MIN_RESIDENT_OVERHEAD_BUDGET_BYTES)
 }
 
+/// KNOWN LIMITATION (#5334, #5333 review): this budget is recomputed from
+/// LIVE memory signals every 60s sweep tick, so it is a MOVING TARGET —
+/// unlike the SUSTAINED-breach gate below, which damps a single-tick swing
+/// in the raw over-budget READING, nothing here damps a swing in the
+/// THRESHOLD itself (a transient system memory-pressure spike lowering the
+/// budget, then recovering). Deferred pending field telemetry (see #5334)
+/// rather than designing hysteresis speculatively.
+///
 /// Minimum CONTINUOUS breach duration required before resident-overhead
 /// pressure contributes to the eviction decision (#5325 PR review, Must-Fix
 /// #1): the raw over-budget reading must persist for at least half of this
@@ -2355,7 +2385,13 @@ impl<T: TimeSource> HostingCache<T> {
     /// [`Self::current_bytes`] — a coarse estimate, not a measured figure (see
     /// [`ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`]'s doc for provenance and
     /// error bounds).
-    fn estimated_resident_overhead_bytes(&self) -> u64 {
+    ///
+    /// `pub(crate)` (not private) so [`super::HostingManager::
+    /// recompute_resident_overhead_budget`] can read it to strip this
+    /// self-referential term OUT of the live `own_rss` signal before handing
+    /// it to [`resident_overhead_budget_for`] — see that function's "why
+    /// own_rss is pre-adjusted" doc (#5333 review).
+    pub(crate) fn estimated_resident_overhead_bytes(&self) -> u64 {
         (self.contracts.len() as u64).saturating_mul(ESTIMATED_RESIDENT_BYTES_PER_CONTRACT)
     }
 
