@@ -17,7 +17,7 @@
 //! ```
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use freenet::conformance::generator::Corpus;
@@ -77,6 +77,15 @@ pub struct ConformanceConfig {
     /// violation into this directory (created if it does not exist).
     #[arg(long = "evidence-out")]
     pub(crate) evidence_out: Option<PathBuf>,
+
+    /// Save the corpus that was checked as a replay bundle at this path.
+    ///
+    /// Makes a run reproducible by someone else: the bundle carries the contract
+    /// code, its parameters and every state checked, and `--bundle` replays it
+    /// exactly. Useful for attaching a reproducer to a bug report, and for turning a
+    /// one-off finding into a permanent regression corpus.
+    #[arg(long = "bundle-out")]
+    pub(crate) bundle_out: Option<PathBuf>,
 }
 
 pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
@@ -111,6 +120,10 @@ pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
             corpus.deltas.len(),
             corpus.summaries.len(),
         );
+    }
+
+    if let Some(path) = &config.bundle_out {
+        write_bundle(path, &wasm, &parameters, &corpus)?;
     }
 
     let mut oracle = RuntimeOracle::standalone(wasm, parameters.clone())
@@ -149,6 +162,39 @@ pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
     if exit_code(just_outcomes) != 0 {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+/// Save the corpus under check as a replay bundle.
+///
+/// Embeds the contract code, so the bundle names the contract it came from and
+/// `ReplayBundle::resolve_code` can verify identity on the way back in. A bundle
+/// that did not identify its contract could be replayed against an unrelated WASM,
+/// which produces confident-looking results about nothing.
+fn write_bundle(
+    path: &Path,
+    wasm: &[u8],
+    parameters: &[u8],
+    corpus: &Corpus,
+) -> anyhow::Result<()> {
+    let mut bundle = ReplayBundle::new(wasm.to_vec(), parameters.to_vec());
+    bundle.states = corpus.states.iter().map(|s| s.to_vec()).collect();
+    bundle.deltas = corpus.deltas.iter().map(|d| d.to_vec()).collect();
+    bundle.summaries = corpus.summaries.iter().map(|s| s.to_vec()).collect();
+    bundle.note = Some(format!(
+        "captured by fdev conformance {}",
+        env!("CARGO_PKG_VERSION")
+    ));
+    bundle
+        .write_to(path)
+        .with_context(|| format!("writing bundle to {}", path.display()))?;
+    eprintln!(
+        "wrote replay bundle to {} ({} state(s), {} delta(s), {} summary/summaries)",
+        path.display(),
+        bundle.states.len(),
+        bundle.deltas.len(),
+        bundle.summaries.len(),
+    );
     Ok(())
 }
 

@@ -876,6 +876,39 @@ fn bundle_round_trips() {
     assert!(corpus.deltas.iter().any(|d| d.as_ref() == [3]));
 }
 
+/// A bundle must reproduce the exact same corpus it was written from. This is the
+/// property the whole evidence model rests on: if replay produced a different set of
+/// states, a finding reported by one peer would not be reproducible by another, and
+/// "verify it yourself" would be meaningless.
+#[test]
+fn a_bundle_round_trips_to_an_identical_corpus() {
+    use super::bundle::ReplayBundle;
+    let mut bundle = ReplayBundle::new(vec![0, 1, 2, 3], vec![7]);
+    bundle.states = vec![vec![1, 2], vec![2, 3], vec![4]];
+    bundle.deltas = vec![vec![9]];
+    bundle.summaries = vec![vec![1]];
+
+    let decoded = ReplayBundle::decode(&bundle.encode().expect("encode")).expect("decode");
+    let (before, after) = (bundle.to_corpus(), decoded.to_corpus());
+    assert_eq!(before.states, after.states);
+    assert_eq!(before.deltas, after.deltas);
+    assert_eq!(before.summaries, after.summaries);
+
+    // And the same corpus must generate the same cases, or two peers replaying it
+    // would check different things.
+    let config = GeneratorConfig::default();
+    let (a, b) = (
+        generate_cases(&before, &config),
+        generate_cases(&after, &config),
+    );
+    assert_eq!(a.len(), b.len());
+    for (x, y) in a.iter().zip(b.iter()) {
+        assert_eq!(x.property, y.property);
+        assert_eq!(x.states, y.states);
+        assert_eq!(x.summary, y.summary);
+    }
+}
+
 #[test]
 fn a_foreign_file_is_not_mistaken_for_a_bundle() {
     use super::bundle::{BundleError, ReplayBundle};

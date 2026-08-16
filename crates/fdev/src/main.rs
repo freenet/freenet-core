@@ -249,6 +249,7 @@ mod tests {
             properties: Vec::new(),
             json: false,
             evidence_out: None,
+            bundle_out: None,
         }
     }
 
