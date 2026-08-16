@@ -10525,11 +10525,20 @@ mod tests {
             let h = build_harness("hf-change-dedup", 17185, vec![7u8; 64]).await;
             let keys = host_many(&h, 1);
             let hashes = distinct_hashes(&keys);
-            assert_eq!(
-                hashes.len(),
-                1,
-                "premise: fixture hosts exactly one contract"
-            );
+            // NOT "the fixture hosts exactly one contract" — `build_harness`
+            // already hosts and locally-registers its own `h.key` before
+            // `host_many` adds this one, so the node hosts two. What matters is
+            // narrower, and is what this asserts: `host_many(1)` yielded a
+            // single hash, and that hash is the only thing we put in `added`.
+            // `h.key`'s hash is never sent, so the arm never reaches it.
+            //
+            // Near-vacuous by construction (`host_many(1)` returns one key, so
+            // `distinct_hashes` returns one hash barring a self-collision), and
+            // kept as a guard on the FIXTURE rather than on the behaviour: if
+            // someone grows `host_many`'s argument, the expected fetch count
+            // below stops being 1, and this fires first with a clearer reason
+            // than the equality would give.
+            assert_eq!(hashes.len(), 1, "premise: exactly one hash is advertised");
 
             // 500 copies of ONE hash. Pre-dedup this is 500 sequential
             // summarize round trips for a single contract.
@@ -11684,7 +11693,14 @@ mod tests {
         /// sampling must seed.
         #[tokio::test]
         async fn over_cap_digest_message_stays_bounded() {
-            crate::config::GlobalRng::set_seed(0x0496_5CA9);
+            // Guarded, like the two rotation tests. This was the last bare
+            // `set_seed` in the file: it pins THREAD_SEED, THREAD_RNG and
+            // THREAD_INDEX and never cleared them, on the success path as well
+            // as on panic. That is the cross-test-interference class
+            // `.claude/rules/bug-prevention-patterns.md` records from #5314,
+            // which plain `cargo test` can see and `cargo nextest` structurally
+            // cannot.
+            let _seed = crate::config::GlobalRng::seed_guard(0x0496_5CA9);
             let h = build_harness("hf-cap", 17065, vec![5u8; 128]).await;
             let hash = contract_hash(&h.key);
 
