@@ -202,6 +202,13 @@ pub enum ContractExecError {
     /// peers). See `ExecutorError::host_timeout` in `contract/executor.rs`.
     #[error("The operation was queued too long on a saturated execution pool and never ran")]
     SchedulerOverloaded,
+
+    /// The module loaded but does not export the contract entry points.
+    ///
+    /// Distinct from a contract that errors: this is not a contract at all, and the
+    /// difference matters to any caller that treats "could not judge" as benign.
+    #[error("module is not a contract: missing required export(s): {missing}")]
+    MissingContractExports { missing: String },
 }
 
 pub struct RuntimeConfig {
@@ -1261,12 +1268,29 @@ impl Runtime {
     /// matters because "the contract could not be loaded" and "the contract could
     /// not be judged" look identical to a caller otherwise, and the first should be
     /// a hard error while the second must never be one.
+    /// Compiling is not enough on its own: a module can compile and instantiate
+    /// while exporting none of the contract entry points, in which case every later
+    /// call fails and a conformance run reads that as "could not judge this
+    /// contract" instead of "this is not a contract". So the ABI is resolved here
+    /// too.
     pub(crate) fn compile_check(
         &mut self,
         key: &ContractKey,
         parameters: &Parameters<'_>,
     ) -> RuntimeResult<()> {
-        let _instance = self.prepare_contract_call(key, parameters, 0)?;
+        let mut running = self.prepare_contract_call(key, parameters, 0)?;
+        let missing = self.engine.missing_contract_exports_for(&running.handle);
+        // Release the instance explicitly. Dropping `RunningInstance` alone only
+        // clears `MEM_ADDR`; the engine keeps the instance and its memory until the
+        // engine itself is dropped, so every oracle built would otherwise carry a
+        // leaked instance and log the cleanup warning.
+        self.drop_running_instance(&mut running);
+        if !missing.is_empty() {
+            return Err(ContractExecError::MissingContractExports {
+                missing: missing.join(", "),
+            }
+            .into());
+        }
         Ok(())
     }
 

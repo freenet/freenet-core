@@ -264,15 +264,21 @@ impl ContractSampler {
     ) -> Admission {
         let base_admission = self.observe_state(base);
         let result_admission = self.observe_state(result);
-        if let Some(incoming) = incoming_state {
-            self.observe_state(incoming);
-        }
+        let incoming_admission = incoming_state.map(|incoming| self.observe_state(incoming));
 
-        // Only record the step if both endpoints survived admission: a transition
-        // pointing at bytes we did not keep is not replayable, and storing it would
-        // be storing a dangling reference.
+        // Only record the step if EVERY state it references survived admission.
+        //
+        // The incoming state counts. Ignoring its result meant a transition could be
+        // recorded whose `Some(incoming_state)` had been refused or evicted, and
+        // `materialize` then silently turned that into `None` on export — so the
+        // bundle claimed a transition while omitting the full-state update that
+        // caused it, and anyone replaying it would be reasoning about a step that
+        // never happened as described.
         let kept = |a: Admission| matches!(a, Admission::Stored | Admission::Duplicate);
-        if !kept(base_admission) || !kept(result_admission) {
+        if !kept(base_admission)
+            || !kept(result_admission)
+            || incoming_admission.is_some_and(|a| !kept(a))
+        {
             return Admission::NotSelected;
         }
 

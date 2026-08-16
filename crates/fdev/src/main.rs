@@ -54,9 +54,21 @@ const EXIT_RESPONSE_TIMEOUT: i32 = 3;
 /// Map a top-level error to the process exit code. A [`commands::ResponseTimeout`]
 /// (possibly wrapped by `anyhow`) maps to [`EXIT_RESPONSE_TIMEOUT`]; everything
 /// else maps to the generic failure code `1`.
+/// A contract broke a merge law. Distinct from 1 (harness failure) so automation
+/// does not read "could not run the check" as "the contract is unsound".
+const EXIT_CONFORMANCE_VIOLATION: i32 = 4;
+
 fn exit_code_for_error(err: &anyhow::Error) -> i32 {
     if err.downcast_ref::<commands::ResponseTimeout>().is_some() {
         EXIT_RESPONSE_TIMEOUT
+    } else if err
+        .downcast_ref::<conformance::ConformanceViolations>()
+        .is_some()
+    {
+        // A contract that breaks a merge law is a different outcome from a harness
+        // that could not run, and CI needs to tell them apart: the first is a real
+        // result about the contract, the second says nothing about it at all.
+        EXIT_CONFORMANCE_VIOLATION
     } else {
         1
     }

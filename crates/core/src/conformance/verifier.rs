@@ -139,7 +139,7 @@ pub fn verify_case<O: ConformanceOracle + ?Sized>(
         };
         return match (&first, &second) {
             (PropertyOutcome::Violated(a), PropertyOutcome::Violated(b))
-                if a.property == b.property =>
+                if a.property == b.property && reproduced_identically(a, b) =>
             {
                 second
             }
@@ -151,6 +151,36 @@ pub fn verify_case<O: ConformanceOracle + ?Sized>(
     }
 
     first
+}
+
+/// Did the second run reproduce the *same* failure, or merely another failure?
+///
+/// Matching on the property alone is not enough, and getting this wrong makes the
+/// whole re-run pointless for the case it exists to catch: a clock-dependent merge
+/// reports `StateCommutativity` on every run, with different bytes each time, so a
+/// property-only comparison waves it through as reproducible. The outputs have to
+/// match too.
+///
+/// The determinism properties are the deliberate exception. For those, outputs
+/// differing between runs *is* the defect being reported, so demanding that the
+/// digests agree would suppress exactly the finding the check exists to make.
+fn reproduced_identically(first: &Violation, second: &Violation) -> bool {
+    match first.property {
+        ConformanceProperty::UpdateDeterminism
+        | ConformanceProperty::SummaryDeterminism
+        | ConformanceProperty::DeltaDeterminism => true,
+        ConformanceProperty::StateIdempotence
+        | ConformanceProperty::StateCommutativity
+        | ConformanceProperty::StateAssociativity
+        | ConformanceProperty::EmittedStateValidity
+        | ConformanceProperty::DeltaIdempotence
+        | ConformanceProperty::DeltaPermutationInvariance
+        | ConformanceProperty::SelfDeltaEmpty
+        | ConformanceProperty::WholeStateSelfDelta
+        | ConformanceProperty::ReconciliationCycle => {
+            first.left == second.left && first.right == second.right
+        }
+    }
 }
 
 fn run<O: ConformanceOracle + ?Sized>(
@@ -477,8 +507,25 @@ fn reconciliation_cycle<O: ConformanceOracle + ?Sized>(
             .get_state_delta(&left, &right_summary)
             .map_err(inconclusive_from)?;
 
-        let mut next_left = apply_delta_bytes(oracle, &left, &to_left)?;
-        let mut next_right = apply_delta_bytes(oracle, &right, &to_right)?;
+        // Mirror the production size gate, per direction and before applying.
+        //
+        // `ring::interest::gate_delta_size` refuses a delta that is not meaningfully
+        // smaller than the state and sends the whole state instead, so a contract
+        // whose delta encoding is oversized never has that delta applied on the
+        // network at all. Simulating the application anyway can walk the pair into a
+        // repeat — for instance a delta that swaps the two peers' states — and
+        // produce an enforceable cycle finding against a contract whose merge is
+        // sound and which converges in production.
+        let mut next_left = if delta_would_be_refused(&to_left, &left) {
+            merge(oracle, &left, &right)?
+        } else {
+            apply_delta_bytes(oracle, &left, &to_left)?
+        };
+        let mut next_right = if delta_would_be_refused(&to_right, &right) {
+            merge(oracle, &right, &left)?
+        } else {
+            apply_delta_bytes(oracle, &right, &to_right)?
+        };
 
         // Model the protocol's full-state fallback.
         //
@@ -531,6 +578,17 @@ fn reconciliation_cycle<O: ConformanceOracle + ?Sized>(
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(bytes).as_bytes()
+}
+
+/// Would the network refuse to send this delta and ship the whole state instead?
+///
+/// Deliberately conservative relative to `ring::interest::gate_delta_size`: a delta
+/// at least as large as the state it would replace carries no saving, and the
+/// production path treats that case as a full-state send. Erring toward the fallback
+/// only ever makes the simulation converge more readily, which is the safe direction
+/// for a check whose failure mode is accusing a correct contract.
+fn delta_would_be_refused(delta: &[u8], state: &[u8]) -> bool {
+    !delta.is_empty() && delta.len() >= state.len()
 }
 
 fn require_valid<O: ConformanceOracle + ?Sized>(

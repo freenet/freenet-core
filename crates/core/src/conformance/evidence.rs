@@ -164,9 +164,17 @@ impl ConformanceEvidence {
                 limit: MAX_EVIDENCE_RELATED,
             });
         }
+        // EXACT arity, not "at least".
+        //
+        // A minimum-only check lets evidence carry arbitrarily many trailing states.
+        // Empty vectors weigh nothing against the byte budget, so they slip past it,
+        // yet `verify_case` validates every supplied state through WASM — so a
+        // sender could buy unbounded execution for free. It also breaks
+        // deduplication, since varying the padding varies the id while the finding
+        // stays the same.
         let want = self.property.state_arity();
         let want_deltas = self.property.delta_arity();
-        if self.states.len() < want || self.deltas.len() < want_deltas {
+        if self.states.len() != want || self.deltas.len() != want_deltas {
             return Err(EvidenceRejected::Arity {
                 property: self.property,
                 want,

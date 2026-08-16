@@ -159,8 +159,20 @@ pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
     }
 
     let just_outcomes: Vec<&PropertyOutcome> = outcomes.iter().map(|(_, o)| o).collect();
+    let enforceable = just_outcomes
+        .iter()
+        .filter(|o| o.is_enforceable_violation())
+        .count();
     if exit_code(just_outcomes) != 0 {
-        std::process::exit(1);
+        // Return rather than `process::exit`, so every destructor runs. Exiting here
+        // skipped the oracle's `TempDir`, leaving a scratch contract database and
+        // freshly generated secrets on disk after every failing run — and failing
+        // runs are the ones a developer repeats.
+        //
+        // A distinct error type also lets `main` give conformance violations their
+        // own exit code, so CI can tell "this contract breaks a merge law" apart
+        // from "the harness could not run".
+        return Err(ConformanceViolations { count: enforceable }.into());
     }
     Ok(())
 }
@@ -196,6 +208,15 @@ fn write_bundle(
         bundle.summaries.len(),
     );
     Ok(())
+}
+
+/// The contract broke a merge law. Distinct from any harness failure, so a caller
+/// can tell "this contract is unsound" apart from "the check could not run" — a
+/// distinction CI needs and a single exit code cannot express.
+#[derive(Debug, thiserror::Error)]
+#[error("{count} enforceable conformance violation(s) found")]
+pub struct ConformanceViolations {
+    pub count: usize,
 }
 
 /// 0 when no [`PropertyOutcome`] is an enforceable violation, 1 otherwise.

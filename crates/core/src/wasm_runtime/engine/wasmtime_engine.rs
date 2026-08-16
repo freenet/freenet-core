@@ -1377,6 +1377,35 @@ impl WasmtimeEngine {
             .any(|import| import.module() == "freenet_contract_io")
     }
 
+    /// Names of the contract entry points this instance is missing, if any.
+    ///
+    /// A module can compile and instantiate perfectly while exporting none of the
+    /// contract ABI. Every call against it then fails at execution time, which a
+    /// conformance run reads as "could not judge this contract" rather than "this is
+    /// not a contract" — so a run against the wrong file reports success. Resolving
+    /// the names up front turns that into a load error.
+    pub(crate) fn missing_contract_exports_for(
+        &mut self,
+        handle: &InstanceHandle,
+    ) -> Vec<&'static str> {
+        const CONTRACT_ABI: [&str; 4] = [
+            "validate_state",
+            "update_state",
+            "summarize_state",
+            "get_state_delta",
+        ];
+        let Some(store) = self.store.as_mut() else {
+            return Vec::new();
+        };
+        let Some(instance) = self.instances.get(&handle.id) else {
+            return Vec::new();
+        };
+        CONTRACT_ABI
+            .into_iter()
+            .filter(|name| instance.get_export(&mut *store, name).is_none())
+            .collect()
+    }
+
     /// Create a new backend engine that can be shared across multiple Runtime instances.
     pub(crate) fn create_backend_engine(config: &RuntimeConfig) -> Result<Engine, ContractError> {
         let (engine, _, _) = Self::create_engine(config)?;
