@@ -3099,13 +3099,34 @@ const MAX_FALLBACK_SUMMARY_BYTES_PER_REPLY: usize = 9 * 1024;
 ///
 /// - This is the BACKSTOP layer, not the delivery path. A committed update goes
 ///   to every connected advertised co-host immediately via live fan-out, with
-///   no interest check and untouched by this change; the event-driven repairs
+///   no INTEREST check and untouched by this change; the event-driven repairs
 ///   (resend-on-failed-patch, request-full-state-when-too-far-behind) are also
 ///   untouched. Anti-entropy only has to catch a divergence that ALL of those
 ///   missed.
+///
+///   Read "no interest check" narrowly, because live fan-out is not
+///   unconditional. It has a SUMMARY gate — `plan_fanout_send` returns `Skip`
+///   when our cached belief about the peer's summary is byte-equal to ours —
+///   and that gate is fed by the very cache this change warms more slowly. A
+///   MISSING belief is safe in the direction that matters (see the
+///   second-order cost below: it makes us send more, never skip). A WRONG
+///   belief is the case this bullet must not be read as covering: after a lost
+///   stream tail the sender can believe a peer has state it does not have,
+///   nothing is sent, so no delta fails and the ResyncRequest repair cannot
+///   fire either. For a contract that then goes quiet, anti-entropy is the
+///   only correction, and this change stretches that window by roughly 8x.
+///   It stays bounded, and it is confined to quiescent contracts, but it is a
+///   real cost of this change rather than one the delivery path absorbs.
+///   `broadcast_queue.rs` carries the same note where the belief is cached.
 /// - It is far tighter than the cost already accepted on the sibling path:
 ///   [`MAX_FALLBACK_SUMMARY_BYTES_PER_REPLY`] documents cycles on the order of
 ///   ten HOURS for the heaviest full-bytes links, shipped in #5155.
+/// - **The layer being slowed almost never finds anything.** Measured
+///   fleet-wide over ~27,500 node-minutes: 26,457,275 summary comparisons
+///   agreed against 44,305 that differed — 99.83% identical. Anti-entropy is
+///   paying a continuous CPU cost to discover a divergence roughly one time in
+///   six hundred, which is what makes trading its latency for that CPU the
+///   right side of the deal.
 ///
 /// # The second-order cost: the peer-summary cache warms at the same rate
 ///
@@ -3190,6 +3211,22 @@ const MAX_DIGEST_SUMMARIES_PER_REPLY: usize = 64;
 /// long-lived mixed-version population ever becomes normal, and not worth the
 /// machinery for a rollout window.
 const MAX_SUMMARY_COMPARISONS_PER_MESSAGE: usize = MAX_DIGEST_SUMMARIES_PER_REPLY;
+
+/// The `Summaries` receive-leg cap is documented (see its comment above) as
+/// never binding against a peer running #5155 or later, because such a peer
+/// caps its own `InterestsReply` fallback at
+/// [`MAX_FALLBACK_SUMMARIES_PER_REPLY`]. That is a relationship BETWEEN two
+/// independently-motivated constants, not a property of either one: the
+/// fallback cap has its own byte-budget rationale, and raising it alone would
+/// start silently truncating legitimate replies from upgraded peers with no
+/// test failing. The alias above keeps the 64 -> 128 retune this module
+/// actively invites self-consistent; this assertion is what keeps the OTHER
+/// side of the inequality honest.
+const _: () = assert!(
+    MAX_FALLBACK_SUMMARIES_PER_REPLY <= MAX_SUMMARY_COMPARISONS_PER_MESSAGE,
+    "raising MAX_FALLBACK_SUMMARIES_PER_REPLY above MAX_SUMMARY_COMPARISONS_PER_MESSAGE \
+     would make the Summaries receive-leg cap truncate replies from #5155+ peers"
+);
 
 /// Which wire form a multi-entry `Summaries` reply to a peer takes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -4584,7 +4621,41 @@ async fn handle_interest_sync_message(
             // Handle additions - respond with summaries for newly shared contracts
             let mut entries = Vec::new();
             if let Some(ref pk) = peer_key {
+                // #5238: deduplicate the peer-supplied hash list before doing
+                // any work.
+                //
+                // This arm is deliberately NOT windowed — it is driven by
+                // interest churn rather than by a clock, so there is no
+                // guaranteed next round to rotate into and a window could defer
+                // a newly-added interest indefinitely rather than by a bounded
+                // number of heartbeats. That argument is recorded at the arm
+                // below and it still stands.
+                //
+                // It is an argument against ROTATION, not against DEDUP, and
+                // the two are not the same trade. A rotation window can drop a
+                // new interest; a dedup set cannot, because the second and
+                // later copies of a hash carry no information the first did not
+                // already deliver. So dedup is free here in exactly the way a
+                // window is not.
+                //
+                // It is worth doing because bounding the other four loops makes
+                // THIS the cheapest amplification path in the family: `added`
+                // is peer-supplied and uncapped, and every entry costs one
+                // `summary_if_hosted_or_in_use` round trip that re-enters WASM
+                // on a memo miss, sequentially on the handler. Leaving it would
+                // repeat #5155's mistake one level up — bound the paths you
+                // measured and leave the equivalent one you did not.
+                //
+                // Note this bounds work by DISTINCT hash, not by message size.
+                // A peer naming many genuinely-distinct new interests still
+                // costs one round trip each, by design: those are real
+                // additions and dropping them is the failure mode the missing
+                // window is avoiding.
+                let mut seen_added: HashSet<u32> = HashSet::new();
                 for hash in added {
+                    if !seen_added.insert(hash) {
+                        continue;
+                    }
                     // Handle hash collisions - process all matching contracts
                     for contract in op_manager.interest_manager.lookup_by_hash(hash) {
                         // Only process if we have local interest in this contract
@@ -10272,7 +10343,12 @@ mod tests {
         /// reproducible instead of flaky.
         #[tokio::test]
         async fn digest_rotation_covers_the_whole_shared_set() {
-            crate::config::GlobalRng::set_seed(0x5238_D16E);
+            // Guarded rather than bare: `set_seed` also pins THREAD_INDEX to 0,
+            // and `config.rs` asks callers to pair it with `clear_seed`. The
+            // guard does that on unwind too, so a panicking assertion below
+            // cannot leave the seed pinned for whatever runs next on this
+            // thread.
+            let _seed = crate::config::GlobalRng::seed_guard(0x5238_D16E);
             let h = build_harness("hf-digest-rotate", 17150, vec![7u8; 64]).await;
             let keys = host_many(&h, 200);
             let hashes = distinct_hashes(&keys);
@@ -10428,6 +10504,64 @@ mod tests {
             );
         }
 
+        /// `ChangeInterests` deduplicates its peer-supplied hash list.
+        ///
+        /// This arm is deliberately not windowed — it is churn-driven, so a
+        /// window could defer a newly-added interest indefinitely rather than
+        /// by a bounded number of heartbeats. That leaves it as the cheapest
+        /// amplification path in the family once the other four are bounded:
+        /// `added` is peer-supplied and uncapped, and every entry costs a
+        /// `summary_if_hosted_or_in_use` round trip.
+        ///
+        /// Dedup is the part that is free. A window can drop a real new
+        /// interest; a repeated hash carries nothing the first copy did not,
+        /// so collapsing it cannot lose anything. The assertion is therefore
+        /// on REPETITION only — a peer naming many genuinely distinct new
+        /// interests still pays per interest, by design.
+        #[tokio::test]
+        async fn change_interests_deduplicates_repeated_hashes() {
+            use std::sync::atomic::Ordering;
+
+            let h = build_harness("hf-change-dedup", 17185, vec![7u8; 64]).await;
+            let keys = host_many(&h, 1);
+            let hashes = distinct_hashes(&keys);
+            assert_eq!(
+                hashes.len(),
+                1,
+                "premise: fixture hosts exactly one contract"
+            );
+
+            // 500 copies of ONE hash. Pre-dedup this is 500 sequential
+            // summarize round trips for a single contract.
+            let repeats = 500usize;
+            let added: Vec<u32> = std::iter::repeat_n(hashes[0], repeats).collect();
+
+            let before = h.summary_queries.load(Ordering::Relaxed);
+            let _ = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::ChangeInterests {
+                    added,
+                    removed: Vec::new(),
+                },
+            )
+            .await;
+            let fetches = h.summary_queries.load(Ordering::Relaxed) - before;
+
+            assert!(
+                fetches > 0,
+                "premise: the fixture must actually reach the summarize path, \
+                 or the bound below can never fail"
+            );
+            assert!(
+                fetches < repeats,
+                "{repeats} copies of one hash made {fetches} summarize round \
+                 trips. Bounding the other four loops makes this arm the \
+                 cheapest amplification path in the #5238 family, and dedup is \
+                 the one bound here that cannot drop a real new interest"
+            );
+        }
+
         /// The digest path RECORDS a rotation cursor, not just reads one.
         ///
         /// `digest_rotation_covers_the_whole_shared_set` covers this only
@@ -10537,7 +10671,8 @@ mod tests {
         /// run it enough times to land on one of the three bad starts.
         #[tokio::test]
         async fn fallback_rotation_covers_the_whole_shared_set() {
-            crate::config::GlobalRng::set_seed(0x5155_0704);
+            // Guarded — see the sibling rotation test for why.
+            let _seed = crate::config::GlobalRng::seed_guard(0x5155_0704);
             let h = build_harness("hf-bound-rotate", 17140, vec![7u8; 64]).await;
             let keys = host_many(&h, 200);
             let hashes = distinct_hashes(&keys);
@@ -10787,6 +10922,20 @@ mod tests {
         /// peer out of the broadcast set for whatever fell outside, converting
         /// a bandwidth bound into missed updates — a correctness bug wearing a
         /// performance fix's clothes.
+        ///
+        /// This is the most load-bearing test in the change, because
+        /// `INTEREST_TTL` is 20 minutes (4 heartbeats) while the new coverage
+        /// cycle is ~40-75 minutes. Had the registration loop been moved inside
+        /// the window, `sweep_expired_interests` would have started removing
+        /// (contract, peer) pairs in steady state for any peer sharing more
+        /// than 4 x 64 contracts — silent, and fatal to live fan-out.
+        ///
+        /// Be precise about what running BOTH forms buys, because it is easy to
+        /// overstate: there is exactly ONE registration loop today, shared by
+        /// both forms, so any move of it inside the window breaks BOTH cases
+        /// and either alone would catch it. The second case is insurance
+        /// against a FUTURE per-form split of that loop, not additional
+        /// coverage of the code as it stands.
         #[tokio::test]
         async fn bounding_the_reply_does_not_bound_interest_registration() {
             // #5238: run against BOTH wire forms. Under #5155 only the
@@ -11576,14 +11725,34 @@ mod tests {
 
             // The known hash MUST come back, and it must come back alone.
             //
-            // The 2,000 unknowns-plus-one-known shape is what makes this a real
-            // assertion rather than a no-panic smoke test: pair dedup collapses
-            // all 2,000 copies of the known hash to a single pair, so the
-            // reply can name it at most once however the rotation lands, while
-            // the ~6,096 unknown hashes resolve to nothing whatever the peer
-            // does. The known hash is ~25% of the message and the scan takes at
-            // least 64 distinct pairs, so its omission has probability ~1e-8 —
-            // and the seed above makes the outcome deterministic regardless.
+            // The interleaved shape is what makes this a real assertion rather
+            // than a no-panic smoke test. The ~6,096 unknown hashes resolve to
+            // nothing whatever the peer does, so before the known hash was
+            // introduced this arm was unreachable and the bound assertion ran
+            // against an empty set.
+            //
+            // Inclusion is STRUCTURAL, not probabilistic — see the fixture
+            // construction above. The known hash is interleaved at a period
+            // below the 64-distinct-pair scan, so a copy falls inside every
+            // possible window and no rotation offset can miss it. The obvious
+            // alternative, appending the copies as one contiguous block, does
+            // NOT work: pair dedup collapses them to a single pair and the scan
+            // stops after 64 DISTINCT pairs, so a rotation landing anywhere in
+            // the unknowns fills its quota long before reaching the block. That
+            // is a near-certainty rather than a low probability, and it failed
+            // on the first run rather than flaking.
+            //
+            // Pair dedup still does the other half of the work: all copies of
+            // the known hash share one (hash, digest) pair, so the reply can
+            // name it at most once however the rotation lands.
+            //
+            // What this test is NOT: a regression pin for #5238. Under a full
+            // revert to the 4,096 cap the fixture still exceeds it, the known
+            // hash is still found by the same gap argument, and the reply is
+            // still `vec![hash]` — so it passes either way. It is a repair of a
+            // previously VACUOUS test, which is worth having on its own terms,
+            // but the bound on this change is pinned by the five tests that do
+            // fail on a targeted revert. Do not count this one among them.
             match reply {
                 Some(InterestMessage::SummaryRequest { hashes }) => {
                     assert!(
