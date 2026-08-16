@@ -434,21 +434,6 @@ extract_step_run() {
     ' "$WF"
 }
 
-# A step name that occurs more than once in the file is itself the hazard: two
-# extractors can then disagree about which one they describe. Job scoping fixes
-# WHICH step is read; this names the ambiguity so a decoy is reported rather
-# than silently ignored.
-PC_NAME_COUNT="$(grep -cE '^      - name: Publish crates to crates\.io[[:space:]]*$' "$WF")"
-if [[ "$PC_NAME_COUNT" -eq 1 ]]; then
-    pass "the 'Publish crates to crates.io' step name occurs exactly once in $WF_BASENAME"
-else
-    fail "the step name 'Publish crates to crates.io' occurs $PC_NAME_COUNT times" \
-        "Duplicate step names let a job-scoped extractor and an unscoped one" \
-        "describe DIFFERENT steps. A decoy carrying a correct-looking script --" \
-        "even an 'if: false' one that never runs -- can then satisfy the" \
-        "behavioural cases while the step that actually ships is unexamined."
-fi
-
 PC_RUN="$(extract_step_run attach-to-release 'Publish crates to crates.io')"
 if [[ -z "$PC_RUN" || "$PC_RUN" != *'cargo publish -p freenet'* ]]; then
     # Never a silent skip: every case below would pass on an empty script.
@@ -1351,6 +1336,166 @@ if [[ -f "$RELEASE_SH" ]]; then
     fi
 fi
 
+# --- 2h. CRITICAL STEPS: unique name, fixed conditionality, no shell override
+#
+# ONE table for every step this suite reasons about, because fixing this class
+# at one site and not sweeping the siblings has now happened three times.
+#
+# THE ATTACK. Insert a DUPLICATE step with the same `- name:` above the real
+# one, carrying a pristine script, guarded by an `if:` that is never true on a
+# tag push (`github.event_name == 'schedule'`). Then neuter the REAL step.
+# `extract_step_run` takes the first exact name match and `line_of` the first
+# occurrence of the invocation, so every assertion -- including the behavioural
+# harness in 2g -- reads the DECOY while the shipping step goes unexamined.
+# Measured: 54 ok / 0 FAIL with Gate A fully neutered. `if: false` was caught
+# only because assertion 3 matched that literal string; ANY other conditional
+# walked through.
+#
+# The publish step already had a name-count and a run-block consistency check
+# for exactly this reason. The two GATE steps did not. Hence a table rather
+# than a fourth point fix: adding a step here is one line, and forgetting to is
+# the failure mode.
+#
+# Note that duplicate step names are LEGITIMATE across different jobs in this
+# workflow (`Install Rust`, `Upload freenet binary`), so this deliberately does
+# not forbid duplicates in general -- only for the steps whose identity a
+# security assertion depends on.
+#
+# `if-policy`:
+#   none        -- the step must carry NO `if:` at all. Steps run only when
+#                  every earlier step succeeded, and that DEFAULT is the gating
+#                  mechanism; any `if:` can override it. Deliberately stricter
+#                  than "no always()": whether an arbitrary expression can
+#                  evaluate true after a failure is not a judgement for a grep.
+#   exact:<expr> -- the step's `if:` must equal <expr> exactly.
+CRITICAL_STEPS=(
+    # The two checkout steps are here because assertions in this file READ them:
+    # 2g-bis takes `path:` from the canary checkout to compare against Gate A's
+    # invocation, and the publish step's `working-directory: _src` depends on
+    # the source checkout. Found by enumerating every step this suite extracts
+    # rather than by adding the two that were named in a review -- that
+    # fix-the-named-site-only habit is what produced this class three times.
+    "attach-to-release|Check out the release source|none"
+    "attach-to-release|Check out the canary script|none"
+    "attach-to-release|Check the crates.io credential is present|none"
+    "attach-to-release|Upload binaries to release|none"
+    "attach-to-release|Auto-update pre-flight canary (blocks publish)|none"
+    "attach-to-release|Publish crates to crates.io|exact:\${{ success() && startsWith(github.ref, 'refs/tags/v') }}"
+    "attach-to-release|Publish release|none"
+    "auto-update-selfupdate-canary|Previous release self-updates to this release|none"
+)
+
+for _spec in "${CRITICAL_STEPS[@]}"; do
+    _cjob="${_spec%%|*}"
+    _rest="${_spec#*|}"
+    _cname="${_rest%%|*}"
+    _cpol="${_rest##*|}"
+
+    # (1) UNIQUE NAME. This is what kills the decoy.
+    _count="$(grep -cxF "      - name: $_cname" "$WF")"
+    if [[ "$_count" -ne 1 ]]; then
+        fail "the critical step name '$_cname' occurs $_count time(s) in $WF_BASENAME, expected exactly 1" \
+            "Every locator in this file takes the FIRST match, so a duplicate lets a" \
+            "decoy carrying a pristine script satisfy the assertions while the step" \
+            "that actually ships is never examined -- including the behavioural" \
+            "harness. A count of 0 means the step was renamed and this suite is now" \
+            "reasoning about a step that does not exist."
+        continue
+    fi
+
+    _cblock="$(yaml_job_block "$_cjob" --numbered)"
+    # `--` because the pattern begins with `-`; without it grep parses it as
+    # options and silently matches nothing.
+    _cline="$(printf '%s\n' "$_cblock" | grep -F -- "- name: $_cname" | head -1 | cut -d: -f1)"
+    if [[ -z "$_cline" ]]; then
+        fail "critical step '$_cname' is not in job '$_cjob'" \
+            "It exists exactly once in the file but not in the job this suite" \
+            "believes owns it, so every job-scoped assertion about it is reading" \
+            "something else."
+        continue
+    fi
+    _cstep="$(step_block "$_cline")"
+
+    # (2) CONDITIONALITY, per policy.
+    _cif="$(printf '%s\n' "$_cstep" | grep -E '^[0-9]+:        if:' | head -1 | sed 's/^[0-9]*:        if:[[:space:]]*//')"
+    case "$_cpol" in
+        none)
+            if [[ -z "$_cif" ]]; then
+                pass "critical step '$_cname': unique, and unconditional as required"
+            else
+                fail "critical step '$_cname' has acquired an 'if:'" \
+                    "  if: $_cif" \
+                    "Steps run only after every earlier step succeeded, and that default" \
+                    "IS the gate. Any 'if:' can override it -- 'if: always()' is the" \
+                    "obvious one, but so is a schedule/event guard that is simply never" \
+                    "true on a tag push, which is how the decoy attack disables a step" \
+                    "while leaving it present."
+            fi ;;
+        exact:*)
+            _want="${_cpol#exact:}"
+            if [[ "$_cif" == "$_want" ]]; then
+                pass "critical step '$_cname': unique, and gated on the expected expression"
+            else
+                fail "critical step '$_cname' does not carry the expected 'if:'" \
+                    "expected: $_want" \
+                    "got:      ${_cif:-<none>}" \
+                    "Exact-match on purpose: deciding whether an arbitrary expression can" \
+                    "evaluate true after a failed step is not a job for a grep."
+            fi ;;
+    esac
+
+    # (3) NO SHELL OVERRIDE. The behavioural harness in 2g runs these blocks
+    #     under `bash -e`, which is Actions' default only while no `shell:` is
+    #     set. `shell: bash {0}` drops errexit, changing real behaviour while
+    #     the harness keeps testing the old semantics and stays green.
+    _cshell="$(printf '%s\n' "$_cstep" | grep -E '^[0-9]+:        shell:')"
+    if [[ -n "$_cshell" ]]; then
+        fail "critical step '$_cname' overrides 'shell:'" \
+            "$(printf '%s\n' "$_cshell")" \
+            "2g runs this block under 'bash -e', Actions' default for a step with no" \
+            "'shell:'. An override changes the real semantics while the harness keeps" \
+            "testing the old ones. Update the harness deliberately, or drop this."
+    fi
+done
+
+# --- 2h-bis. no `defaults.run.shell` anywhere above these steps -------------
+# The scope level the per-step pin cannot see. Actions honours `defaults.run.shell`
+# at WORKFLOW and JOB level, so a step with no `shell:` of its own can still be
+# run by something other than `bash -e`.
+#
+# This matters most for Gate A specifically: the publish step sets its own
+# `set -euo pipefail`, so it defends itself, but Gate A's entire gating rests on
+# Actions' IMPLICIT `-e`. Setting `defaults.run.shell: bash {0}` plus a trailing
+# `echo` gives a green suite and a defeated gate -- measured `bash -e` rc=1
+# versus `bash` rc=0 on the same script.
+#
+# Pinned as "no defaults: at all" rather than "no shell: inside defaults:",
+# because the safe state today is that the file has none, and pinning the state
+# is more robust than adjudicating which keys are harmless.
+WF_DEFAULTS="$(grep -nE '^defaults:' "$WF")"
+if [[ -n "$WF_DEFAULTS" ]]; then
+    fail "$WF_BASENAME declares a workflow-level 'defaults:' block" \
+        "$WF_DEFAULTS" \
+        "'defaults.run.shell' changes how EVERY step's run: block is executed," \
+        "including Gate A, whose gating rests entirely on Actions' implicit -e." \
+        "The behavioural harness assumes 'bash -e' and would keep passing."
+else
+    pass "$WF_BASENAME declares no workflow-level 'defaults:'"
+fi
+
+for _djob in attach-to-release auto-update-selfupdate-canary; do
+    _dblock="$(yaml_job_block "$_djob")"
+    _djd="$(printf '%s\n' "$_dblock" | grep -E '^    defaults:')"
+    if [[ -n "$_djd" ]]; then
+        fail "job '$_djob' declares a job-level 'defaults:' block" \
+            "$_djd" \
+            "Same hazard as the workflow-level one: it can set run.shell for every" \
+            "step in the job that gates this release."
+    else
+        pass "job '$_djob' declares no job-level 'defaults:'"
+    fi
+done
+
 # --- 2g. THE GATE STEPS ARE EXECUTED, not pattern-matched -------------------
 #
 # WHY THIS EXISTS, and why the static "does it swallow?" pins below are no
@@ -1395,37 +1540,6 @@ fi
 # harness testing the old semantics and green, which is the N4
 # harness-diverges-from-reality hole in a new place.
 
-for _gate in "attach-to-release:Auto-update pre-flight canary (blocks publish)" \
-             "auto-update-selfupdate-canary:Previous release self-updates to this release"; do
-    _gjob="${_gate%%:*}"
-    _gname="${_gate#*:}"
-    _gblock="$(yaml_job_block "$_gjob" --numbered)"
-    # `--` is load-bearing: the pattern begins with `-`, so without it grep
-    # parses it as options and matches nothing -- which made this pin report
-    # "could not find the step" on a tree where the step was present.
-    _gline="$(printf '%s\n' "$_gblock" | grep -F -- "- name: $_gname" | head -1 | cut -d: -f1)"
-    if [[ -z "$_gline" ]]; then
-        fail "could not find the step '$_gname' in job '$_gjob'" \
-            "The shell-override pin below would pass having examined nothing."
-        continue
-    fi
-    _gstep="$(printf '%s\n' "$_gblock" \
-        | awk -F: -v a="$_gline" '$1 >= a' \
-        | awk -F: 'NR == 1 { print; next } /^[0-9]+:      - name:/ { exit } { print }')"
-    _gshell="$(printf '%s\n' "$_gstep" | grep -E '^[0-9]+:        shell:')"
-    if [[ -z "$_gshell" ]]; then
-        pass "'$_gname' sets no 'shell:', so the harness's 'bash -e' matches Actions' default"
-    else
-        fail "'$_gname' now overrides 'shell:'" \
-            "$(printf '%s\n' "$_gshell")" \
-            "The behavioural harness below runs this block under 'bash -e', which is" \
-            "Actions' default for a step with no 'shell:'. An override changes the" \
-            "real semantics -- 'shell: bash {0}' drops errexit entirely -- while the" \
-            "harness keeps testing the old ones and stays green. Update the harness" \
-            "deliberately, or drop the override."
-    fi
-done
-
 # exec_step_status <job> <step-name> <canary-exit> <substitutions-file> -- runs
 # the step's `run:` block with a stub canary and echoes "<rc>|<classification>".
 #
@@ -1440,13 +1554,33 @@ exec_step_status() {
         return
     fi
     work="$(mktemp -d)"
-    mkdir -p "$work/bin" "$work/scripts" "$work/_canary/scripts"
+    mkdir -p "$work/bin"
 
-    # The canary stub: the ONLY thing under test is whether its exit status
-    # reaches the step's exit status.
-    printf '#!/usr/bin/env bash\nexit %s\n' "$canary_rc" > "$work/scripts/auto-update-canary.sh"
-    cp "$work/scripts/auto-update-canary.sh" "$work/_canary/scripts/auto-update-canary.sh"
-    chmod +x "$work/scripts/auto-update-canary.sh" "$work/_canary/scripts/auto-update-canary.sh"
+    # WORKSPACE FIDELITY. The stub is installed at the ONE path this job's
+    # workspace really has, not at both.
+    #
+    # An earlier version mkdir'd `$work/scripts` AND `$work/_canary/scripts` so
+    # a single helper could serve both gates. That made the harness workspace
+    # RICHER than the real one, and a richer environment hides defeats the shell
+    # cannot: `if [ -d scripts ]; then <canary>; fi` is TRUE here and FALSE in
+    # `attach-to-release`, which checks out only into `_canary` (and `_src`).
+    # Measured in a faithful workspace: real rc=0, gate defeated, suite green.
+    # So "it does not care how the swallow is spelled" was true of the SHELL and
+    # not of the ENVIRONMENT.
+    #
+    # It also meant re-pointing Gate A at `scripts/...` -- which would fail every
+    # real release with exit 127 -- stayed green, because the stub was waiting
+    # there too. Assertions 2g-bis and 2g-ter below pin the checkout that makes
+    # the real path exist.
+    local stub_dir
+    case "$job" in
+        attach-to-release)             stub_dir="$work/_canary/scripts" ;;
+        auto-update-selfupdate-canary) stub_dir="$work/scripts" ;;
+        *)                             stub_dir="$work/scripts" ;;
+    esac
+    mkdir -p "$stub_dir"
+    printf '#!/usr/bin/env bash\nexit %s\n' "$canary_rc" > "$stub_dir/auto-update-canary.sh"
+    chmod +x "$stub_dir/auto-update-canary.sh"
 
     # Gate A untars and chmods the shipped binary; neither is under test.
     printf '#!/usr/bin/env bash\nexit 0\n' > "$work/bin/tar"
@@ -1546,6 +1680,50 @@ gate_case "Gate B re-raises exit 75 and classifies 'environmental'" \
     "$GATE_B_JOB" "$GATE_B_STEP" 75 75 environmental
 gate_case "Gate B passes and classifies 'ok' when the canary passes" \
     "$GATE_B_JOB" "$GATE_B_STEP" 0 0 ok
+
+# --- 2g-bis. the canary script is actually PUT where Gate A runs it ---------
+# `attach-to-release` downloads artifacts and never checks out the repo, so the
+# canary script is only on disk because of a sparse-checkout step. Deleting that
+# step left every assertion green while a real Gate A would exit 127 on every
+# release -- the harness cannot see it, because the harness installs the stub
+# itself.
+#
+# So the two ends are pinned against each other: the checkout's `path:` must be
+# the prefix Gate A actually invokes.
+# Scoped to the CANARY CHECKOUT STEP. A bare `path:` grep over the job takes
+# the first artifact-download path instead -- the job has a dozen of them --
+# and then compares the invocation against something unrelated.
+_co_line="$(printf '%s\n' "$JOB_BLOCK" | grep -F -- "- name: Check out the canary script" | head -1 | cut -d: -f1)"
+if [[ -n "$_co_line" ]]; then
+    CHECKOUT_PATH="$(step_block "$_co_line" \
+        | grep -E '^[0-9]+:          path: ' | head -1 | sed 's/.*path:[[:space:]]*//')"
+else
+    CHECKOUT_PATH=""
+fi
+SPARSE="$(printf '%s\n' "$JOB_BLOCK" | grep -E 'sparse-checkout:.*auto-update-canary\.sh')"
+CANARY_INVOKE="$(printf '%s\n' "$JOB_BLOCK" \
+    | grep -E 'auto-update-canary\.sh preflight' | head -1 | sed 's/^[0-9]*://')"
+
+if [[ -z "$SPARSE" ]]; then
+    fail "attach-to-release no longer sparse-checks-out scripts/auto-update-canary.sh" \
+        "This job never checks out the repo otherwise, so the canary script would" \
+        "not be on disk and Gate A would exit 127 on every release. The behavioural" \
+        "harness cannot catch this: it installs its own stub, so the step passes" \
+        "there and fails only in production."
+elif [[ -z "$CHECKOUT_PATH" ]]; then
+    fail "the canary checkout step has no 'path:'" \
+        "Without it actions/checkout cleans the workspace ROOT, destroying the" \
+        "release assets this job just built."
+elif [[ "$CANARY_INVOKE" == *"$CHECKOUT_PATH/scripts/auto-update-canary.sh"* ]]; then
+    pass "Gate A invokes the canary at the path it is checked out to ('$CHECKOUT_PATH')"
+else
+    fail "Gate A invokes the canary from a path it is not checked out to" \
+        "checkout path: $CHECKOUT_PATH" \
+        "invocation:    $CANARY_INVOKE" \
+        "The script is only on disk under the checkout path. Pointing the" \
+        "invocation elsewhere makes Gate A exit 127 on every real release, which" \
+        "the behavioural harness cannot see because it installs its own stub."
+fi
 
 # --- 3. it is not neutered in place -----------------------------------------
 # `continue-on-error: true` leaves the step present, running, and visibly

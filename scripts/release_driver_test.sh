@@ -105,9 +105,20 @@ EOF
             publish_crates
         ) > "$work/out" 2>&1
 
+        # A REAL publish, not merely an invocation mentioning the crate.
+        # `--dry-run` is excluded deliberately: with a plain substring match,
+        # appending `--dry-run` to both invocations left this file reporting
+        # "publishes both" while nothing would ever be uploaded. The property
+        # is claimed as "actually publishes"; without this it is only
+        # "mentions". Same fix, same reason, as the publish-step fixtures in
+        # release_canary_wiring_test.sh.
         got_f=0; got_d=0
-        [[ "$(grep -cF 'publish -p freenet' "$work/cargo.log")" -gt 0 ]] && got_f=1
-        [[ "$(grep -cF 'publish -p fdev'    "$work/cargo.log")" -gt 0 ]] && got_d=1
+        [[ "$(grep -cE '(^| )publish +-p +freenet( |$)' "$work/cargo.log")" -gt 0 ]] \
+            && [[ "$(grep -cE '(^| )publish +-p +freenet .*--dry-run' "$work/cargo.log")" -eq 0 ]] \
+            && got_f=1
+        [[ "$(grep -cE '(^| )publish +-p +fdev( |$)' "$work/cargo.log")" -gt 0 ]] \
+            && [[ "$(grep -cE '(^| )publish +-p +fdev .*--dry-run' "$work/cargo.log")" -eq 0 ]] \
+            && got_d=1
         case "$got_f$got_d" in
             00) got=none ;; 10) got=freenet ;; 01) got=fdev ;; 11) got=both ;;
         esac
@@ -193,11 +204,53 @@ else
                 "and wait_for_binaries blocks until that workflow -- including Gate A --" \
                 "has run. Publishing before either uploads to crates.io before the gate" \
                 "can block, which is what cost v0.2.124 its version number." \
-                "Note this observes the FIRST call, so adding an earlier one in any" \
-                "form -- a conditional, a subshell, a helper -- fails here even when" \
-                "the original bare call is left untouched."
+                "This observes the FIRST call in the MAIN FLOW, so an earlier call there" \
+                "in any form -- conditional, eval, variable, subshell -- fails here even" \
+                "when the original bare call is untouched. Calls from inside a FUNCTION" \
+                "body are covered separately below, because every function is stubbed" \
+                "here and so a call inside one never executes."
         fi
         rm -rf "$work"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 3. no FUNCTION BODY calls publish_crates
+# ---------------------------------------------------------------------------
+# The blind spot of the ordering test above, stated plainly rather than papered
+# over. That test stubs every function to announce itself, so a `publish_crates`
+# call INSIDE `update_versions()` never executes and is never observed -- while
+# the later bare call still satisfies the ordering property. Measured: the
+# driver publishes before the PR, the tag and Gate A, with 5 ok / 0 FAIL.
+#
+# Execution cannot see it (the body never runs) and the ordering property is not
+# violated (the first OBSERVED call is still late), so this one is a source scan
+# by necessity, not by preference. It is narrow and exact: `publish_crates` may
+# be called from the main flow only.
+#
+# Comment lines are stripped so the prose above `publish_crates` in release.sh --
+# which discusses the call at length -- cannot satisfy or trip this.
+LAST_BRACE_FN="$(grep -n '^}' "$RELEASE_SH" | tail -1 | cut -d: -f1)"
+if [[ -z "$LAST_BRACE_FN" ]]; then
+    fail "could not locate the end of release.sh's function definitions" \
+        "The function-body scan below would examine nothing."
+else
+    BODY_CALLS="$(head -n "$LAST_BRACE_FN" "$RELEASE_SH" \
+        | grep -nE '(^|[^#[:alnum:]_])publish_crates([[:space:]]|$|\))' \
+        | grep -vE '^[0-9]+:[[:space:]]*#' \
+        | grep -vE '^[0-9]+:publish_crates\(\) \{' \
+        | grep -vE 'echo[^;|&$`]*publish_crates')"
+    if [[ -z "$BODY_CALLS" ]]; then
+        pass "no function body in release.sh calls publish_crates (only the main flow does)"
+    else
+        fail "a function body in release.sh calls publish_crates" \
+            "$BODY_CALLS" \
+            "The ordering test above stubs every function, so a call from inside one" \
+            "never executes and is never observed -- while the later bare call keeps" \
+            "the ordering property satisfied. A publish reached that way runs at" \
+            "whatever point that function is called, which for update_versions() is" \
+            "before the PR, the tag and Gate A." \
+            "publish_crates belongs in the main flow only."
     fi
 fi
 
