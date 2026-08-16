@@ -3257,6 +3257,23 @@ const MAX_SUMMARY_COMPARISONS_PER_MESSAGE: usize = MAX_DIGEST_SUMMARIES_PER_REPL
 /// enforces it. Lower it on the receive side alone and the send window's
 /// `ceil(n / 64)` tiling silently becomes a random sample at the receiver —
 /// which is the class of "narrower than advertised" defect #5338 is about.
+///
+/// # Mixed versions
+///
+/// A reply may now carry up to 4x the entries it did between #5238 and #5338,
+/// and a peer that predates #5338 does not skip the round trip for the free
+/// ones — so the obvious worry is that this hands an un-upgraded receiver up to
+/// 4x the summarize work. It does not, because there is no such population to
+/// hand it to: #5238 merged after v0.2.127 and has never been released, so
+/// every deployed peer predates BOTH changes and is still being sent the whole
+/// shared set today — hundreds of entries, which is the storm #5238 exists to
+/// stop. Against that baseline a 256-entry ceiling is a large reduction, not an
+/// increase, and the two ship together.
+///
+/// This is a fact about the release, not a property of the design, so re-check
+/// it rather than inherit it: if #5238 ever ships WITHOUT #5338, raising this
+/// ceiling afterwards would be a real regression for the peers running the
+/// version in between.
 const MAX_SUMMARY_ENTRIES_PER_MESSAGE: usize = 4 * MAX_DIGEST_SUMMARIES_PER_REPLY;
 
 /// The send ceiling must not exceed the receive ceiling, or our own replies
