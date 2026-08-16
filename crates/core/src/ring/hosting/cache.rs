@@ -74,7 +74,7 @@ use super::demand::NEUTRAL_DEMAND;
 use crate::ring::interest::PeerKey;
 use crate::tracing::event_kind::{STATE_SIZE_BUCKET_COUNT, state_size_bucket};
 use crate::util::time_source::TimeSource;
-use crate::wasm_runtime::read_total_ram_bytes;
+use crate::wasm_runtime::{read_available_memory_bytes, read_own_rss_bytes, read_total_ram_bytes};
 
 /// Lower clamp for the RAM-scaled default hosting budget (128 MiB).
 ///
@@ -224,60 +224,172 @@ pub(crate) fn budget_for_ram(total_ram: u64) -> u64 {
 /// measured overhead diverging from the estimate at scale.
 pub const ESTIMATED_RESIDENT_BYTES_PER_CONTRACT: u64 = 1024 * 1024;
 
-/// Lower clamp for the RAM-scaled resident-overhead budget (128 MiB) —
-/// mirrors [`MIN_DEFAULT_HOSTING_BUDGET_BYTES`], same floor rationale applied
-/// to a different resource (resident bookkeeping bytes rather than on-disk
-/// state bytes).
+/// Lower clamp for the resident-overhead budget (128 MiB) — mirrors
+/// [`MIN_DEFAULT_HOSTING_BUDGET_BYTES`], same floor rationale applied to a
+/// different resource (resident bookkeeping bytes rather than on-disk state
+/// bytes): even a genuinely tiny host should still be able to host a useful
+/// amount, a minimum-viability guarantee, not a resource cap.
+///
+/// There is deliberately NO independent ceiling (#5333 review, replacing the
+/// #5325 fixed-1/8-of-RAM-with-a-1-GiB-cap design) — see
+/// [`resident_overhead_budget_for`].
 pub const MIN_RESIDENT_OVERHEAD_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
 
-/// Upper clamp for the RAM-scaled resident-overhead budget (1 GiB) — mirrors
-/// [`MAX_DEFAULT_HOSTING_BUDGET_BYTES`].
-pub const MAX_RESIDENT_OVERHEAD_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
-
-/// Fraction of total system RAM earmarked for per-contract resident overhead:
-/// 1/8, the SAME fraction [`DEFAULT_HOSTING_BUDGET_RAM_DIVISOR`] earmarks for
-/// contract state bytes.
+/// Absolute reservation (bytes) for what a node uses REGARDLESS of hosted
+/// contract count or the sizes of the other RAM-scaled caches — the true
+/// OS/tokio-runtime/transport baseline. Deliberately an ABSOLUTE quantity,
+/// not a fraction of total RAM (#5333 review): that baseline cost does not
+/// scale with how much RAM the box has, so a fraction-based reservation
+/// would over-reserve on a large gateway (wasting GiBs of headroom for a
+/// cost that stays roughly fixed) and could under-reserve on a small one if
+/// the true fixed cost is a large share of a tiny RAM budget.
 ///
-/// JUDGMENT CALL: the two budgets are deliberately SEPARATE slices of RAM (a
-/// peer effectively reserves `2 * total_ram / 8` for hosting overall: one
-/// eighth for state bytes, a second eighth for the count-derived
-/// resident-overhead ceiling) rather than one budget divided further. A
-/// hosted contract genuinely costs memory on both axes independently, so
-/// halving one slice to carve out room for the other would just move the OOM
-/// risk from one axis to the other rather than closing the gap this issue is
-/// about. The remaining ~3/4 of RAM covers the module cache, the wasmtime
-/// Store arena, the per-executor summary/delta/redb caches (all composed
-/// against the memory limit by #5324), transport buffers, and the OS/runtime
-/// baseline — see `cache_byte_budgets_are_aggregate_safe` in
-/// `contract/executor.rs` for that composition's own accounting. Reviewers:
-/// this divisor (and whether it should instead shrink as those other budgets
-/// grow) is exactly the kind of calibration call worth pushing back on.
-const RESIDENT_OVERHEAD_BUDGET_RAM_DIVISOR: u64 = 8;
+/// Value: 512 MiB. Provenance: an initial, deliberately conservative
+/// estimate, informed by a live measurement on nova (try.freenet.org,
+/// 125 GiB RAM) — running at ~1.15 GiB RSS while hosting 1,024 contracts
+/// against its OWN prior fixed 1 GiB resident-overhead ceiling (~1024 MiB
+/// attributed at the [`ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`] estimate),
+/// leaving well under 200 MiB observed for every OTHER consumer combined
+/// (declared caches + true baseline) at that specific shape — declared
+/// caches bind to worst-case ceilings that real workloads rarely reach, so
+/// this is not a tight fit to the observation, it is deliberate headroom
+/// against the parts not measured directly. NOT yet validated across a
+/// genuinely memory-constrained peer — to be confirmed or tightened by field
+/// soak testing across nova, framework, and a `MemoryMax`-constrained peer
+/// (#5333) rather than treated as final.
+pub(crate) const BASELINE_MEMORY_RESERVATION_BYTES: u64 = 512 * 1024 * 1024;
 
-/// Default resident-overhead budget (bytes), scaled to the memory the node
-/// may use — the count-derived analogue of [`default_hosting_budget_bytes`].
-/// `hosted_contract_count * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT` is weighed
-/// against this by [`HostingCache::evict_over_budget`] as an ADDITIONAL
-/// pressure axis alongside the state-byte budget, composed into the SAME
-/// demand-ordered eviction decision (see the module docs above and
+/// Default share of genuine LIVE host-wide surplus memory (#5333) the
+/// resident-overhead budget claims by default when live signals are
+/// available — 1/8, matching the divisor already used everywhere else in
+/// this codebase's RAM-scaled defaults (module cache, state-byte hosting
+/// budget, wasmtime compile cache all divide by 8), and independently
+/// benchmarked against qBittorrent's disk-cache "auto" default (also 1/8 of
+/// RAM) — the closest real-world precedent for a background app that
+/// opportunistically uses spare memory without alarming a casual user's Task
+/// Manager. Deliberately more conservative than IPFS/Kubo's resource-manager
+/// ceiling (1/2 of total RAM) or ZFS ARC's default (1/2, with the ZFS
+/// community's own desktop guidance to tune DOWN to 1/4-3/10 for exactly
+/// this optics reason): Freenet's typical install is a casual background
+/// app a user did not explicitly opt into donating resources with, unlike
+/// IPFS/ZFS's more technical audience.
+///
+/// Operator-overridable (a future `--hosting-mem-share`, threaded the same
+/// way `--hosting-disk-pct` is) for the enthusiast/gateway population that
+/// explicitly wants a larger default — the resolution to that side of the
+/// tension, not a reason to raise the default itself. See
+/// [`resident_overhead_budget_for`]'s "live-surplus term" doc for how this
+/// composes with the rest of the formula.
+pub const DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE: f64 = 0.125;
+
+/// Default resident-overhead budget (bytes) — the count-derived analogue of
+/// [`default_hosting_budget_bytes`]. `hosted_contract_count *
+/// ESTIMATED_RESIDENT_BYTES_PER_CONTRACT` is weighed against this by
+/// [`HostingCache::evict_over_budget`] as an ADDITIONAL pressure axis
+/// alongside the state-byte budget, composed into the SAME demand-ordered
+/// eviction decision (see the module docs above and
 /// `.claude/rules/hosting-invariants.md` invariant 3, "eviction is ONE
 /// demand-ordered decision"). This is NOT a separate admission gate and NOT
 /// a new OOM valve.
+///
+/// This is the CONSTRUCTION-TIME default only (used once, by
+/// [`HostingCache::new`], before any config or periodic sweep has run) — the
+/// LIVE value, recomputed from real memory signals on the existing 60s
+/// sweep, is installed by
+/// `super::HostingManager::recompute_resident_overhead_budget`. Both call the
+/// SAME pure [`resident_overhead_budget_for`].
 pub fn default_resident_overhead_budget_bytes() -> u64 {
     let total_ram = read_total_ram_bytes()
         .map(|v| v as u64)
         .unwrap_or(FALLBACK_TOTAL_RAM_BYTES);
-    resident_overhead_budget_for_ram(total_ram)
+    let pool_size = crate::config::runtime_pool_size().get();
+    let live_signals = match (read_own_rss_bytes(), read_available_memory_bytes()) {
+        (Some(rss), Some(avail)) => Some((rss as u64, avail as u64)),
+        _ => None,
+    };
+    resident_overhead_budget_for(
+        total_ram,
+        pool_size,
+        live_signals,
+        DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE,
+    )
 }
 
-/// Pure clamp math behind [`default_resident_overhead_budget_bytes`], split
-/// out for the same reason [`budget_for_ram`] is: unit-testable without
-/// depending on the test host's real RAM.
-pub(crate) fn resident_overhead_budget_for_ram(total_ram: u64) -> u64 {
-    (total_ram / RESIDENT_OVERHEAD_BUDGET_RAM_DIVISOR).clamp(
-        MIN_RESIDENT_OVERHEAD_BUDGET_BYTES,
-        MAX_RESIDENT_OVERHEAD_BUDGET_BYTES,
-    )
+/// Pure composition math behind [`default_resident_overhead_budget_bytes`]
+/// and `super::HostingManager::recompute_resident_overhead_budget`, split out
+/// for the same reason [`budget_for_ram`] is: unit-testable across a wide
+/// synthetic `(total_ram, pool_size, live_signals, mem_share)` range without
+/// depending on the test host's real RAM, core count, or `/proc` contents.
+///
+/// `min()` of two INDEPENDENTLY-scaled terms (#5333 review, replacing the
+/// #5325 fixed-1/8-of-RAM-with-a-1-GiB-cap design, and a prior single-term
+/// residual formula this session that turned out to conflate two different
+/// bases — see below):
+///
+/// - **Structural residual**: `total_ram minus baseline minus
+///   declared_cache_ceiling minus state_byte_budget`. Consistent with how
+///   every OTHER RAM-scaled budget in this codebase (module cache, arena,
+///   summary/delta, redb, state budget) is sized — all directly off
+///   `total_ram`, not off any notion of "surplus". This term ALONE is what a
+///   tightly `MemoryMax`-constrained peer (e.g. the shipped 2 GiB default)
+///   gets, unchanged from before this revision — a real allocation the
+///   operator already explicitly made, so there's no "surplus grab" concern
+///   to bound further.
+/// - **Live-surplus term**: `own_rss + mem_share * available_raw`, only
+///   computed when live signals are present. `own_rss` (already-resident
+///   memory) is NEVER discounted by `mem_share` — the mechanism can never
+///   demand shrinking below what's already resident just because the share
+///   is conservative, only genuine external pressure (available memory
+///   actually dropping) does that. This is what makes an UNCONSTRAINED host
+///   (no `MemoryMax`, e.g. a dedicated gateway) claim only a modest,
+///   Task-Manager-unremarkable default slice of its real surplus, rather
+///   than the ~90% of total RAM the structural term alone would allow.
+///
+/// Composing via `min()` — the SAME pattern
+/// `wasm_runtime::runtime::combine_wasmtime_cache_size` uses (#5328) —
+/// rather than applying `mem_share` to the whole basis is what avoids a
+/// scale mismatch: `declared_cache_ceiling` and `state_byte_budget` scale
+/// with `total_ram` via their OWN independent divisors, completely
+/// unrelated to `mem_share`, so subtracting them from a `mem_share`-shrunk
+/// basis directly (an earlier, incorrect version of this formula) could
+/// floor the result below the OLD fixed-1-GiB cap on a large host — the
+/// opposite of the intended fix. Composing two independently-scaled
+/// candidates and taking the tighter one is correct on both regimes: a
+/// dedicated large host without a `MemoryMax` limit converges on the
+/// live-surplus term as its own independent, honestly-sized estimate,
+/// while a tightly capped peer converges on the structural term
+/// unaffected by `mem_share`.
+pub(crate) fn resident_overhead_budget_for(
+    total_ram: u64,
+    pool_size: usize,
+    live_signals: Option<(u64, u64)>,
+    mem_share: f64,
+) -> u64 {
+    let declared_ceiling =
+        crate::contract::declared_cache_ceiling(total_ram as usize, pool_size) as u64;
+    let state_byte_budget = budget_for_ram(total_ram);
+    let structural_residual = total_ram
+        .saturating_sub(BASELINE_MEMORY_RESERVATION_BYTES)
+        .saturating_sub(declared_ceiling)
+        .saturating_sub(state_byte_budget);
+
+    let bound = match live_signals {
+        Some((own_rss, available_raw)) => {
+            // A non-finite or negative share is meaningless — collapse to 0
+            // (never NaN-propagate into the budget), mirroring
+            // `disk_budget_for_clamped`'s identical `pct` handling.
+            let mem_share = if mem_share.is_finite() {
+                mem_share.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let claimed_surplus = (available_raw as f64 * mem_share) as u64;
+            structural_residual.min(own_rss.saturating_add(claimed_surplus))
+        }
+        None => structural_residual,
+    };
+
+    bound.max(MIN_RESIDENT_OVERHEAD_BUDGET_BYTES)
 }
 
 /// Minimum CONTINUOUS breach duration required before resident-overhead
@@ -4488,30 +4600,306 @@ mod tests {
         assert_ne!(budget_for_ram(3 * GIB), budget_for_ram(4 * GIB));
     }
 
-    // --- Resident-overhead (count-derived) budget (#5325) ---
+    // --- Resident-overhead (count-derived) budget (#5325, residual composition #5333) ---
 
-    /// Same clamp behavior as [`budget_for_ram_scales_and_clamps`], for the
-    /// count-derived resident-overhead budget.
+    /// Hand-computed sanity check of the composition arithmetic at one
+    /// concrete, realistic shape (matches the shipped 2 GiB `MemoryMax`
+    /// default, 4-worker pool) — independent of the sweep below, so a bug
+    /// that happens to preserve the sweep's weaker invariants (floor, sum
+    /// <= total_ram) but breaks the actual formula still has a chance of
+    /// being caught by an exact expected value.
     #[test]
-    fn resident_overhead_budget_for_ram_scales_and_clamps() {
+    fn resident_overhead_budget_for_matches_hand_computed_composition_at_2gib() {
+        let total_ram = 2 * GIB;
+        let pool_size = 4;
+        let declared =
+            crate::contract::declared_cache_ceiling(total_ram as usize, pool_size) as u64;
+        let state_budget = budget_for_ram(total_ram);
+        let expected = total_ram
+            .saturating_sub(BASELINE_MEMORY_RESERVATION_BYTES)
+            .saturating_sub(declared)
+            .saturating_sub(state_budget)
+            .max(MIN_RESIDENT_OVERHEAD_BUDGET_BYTES);
         assert_eq!(
-            resident_overhead_budget_for_ram(512 * MIB),
-            MIN_RESIDENT_OVERHEAD_BUDGET_BYTES
+            resident_overhead_budget_for(
+                total_ram,
+                pool_size,
+                None,
+                DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE
+            ),
+            expected
+        );
+        // The composition must actually be doing something at this shape —
+        // not just falling straight through to the floor, which would let
+        // any of the subtractions silently drop out without failing.
+        assert!(
+            expected > MIN_RESIDENT_OVERHEAD_BUDGET_BYTES,
+            "test shape must exercise the non-floor-bound branch; got exactly the \
+             floor ({expected}), which would make this test unable to catch a \
+             dropped term"
+        );
+    }
+
+    /// A tiny host (well below what the baseline reservation alone needs)
+    /// must floor at [`MIN_RESIDENT_OVERHEAD_BUDGET_BYTES`], not saturate to
+    /// zero or panic.
+    #[test]
+    fn resident_overhead_budget_for_floors_on_tiny_hosts() {
+        for total_ram in [0, 1, MIB, 128 * MIB] {
+            assert_eq!(
+                resident_overhead_budget_for(
+                    total_ram,
+                    1,
+                    None,
+                    DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE
+                ),
+                MIN_RESIDENT_OVERHEAD_BUDGET_BYTES,
+                "at total_ram={total_ram}: must floor, not saturate to 0"
+            );
+        }
+    }
+
+    /// #5333 regression: the OLD design capped EVERY host with >= 8 GiB RAM
+    /// at exactly 1 GiB (~1024 contracts at the
+    /// [`ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`] estimate), inherited from an
+    /// unrelated legacy constant with no principled basis for that specific
+    /// number (see [`BASELINE_MEMORY_RESERVATION_BYTES`]'s doc). The NEW
+    /// residual composition must give a RAM-rich host substantially MORE
+    /// than that once its actually-idle capacity is accounted for — nova's
+    /// real shape (125 GiB RAM, 15-worker pool: 16 cores - 1) is live
+    /// evidence this cap was real: nova was hosting EXACTLY 1024 contracts,
+    /// pinned at the old ceiling, when this was investigated.
+    #[test]
+    fn resident_overhead_budget_scales_past_the_old_fixed_ceiling_on_ram_rich_hosts() {
+        let old_fixed_ceiling = 1024 * MIB;
+        let nova_budget =
+            resident_overhead_budget_for(125 * GIB, 15, None, DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE);
+        assert!(
+            nova_budget > old_fixed_ceiling,
+            "a 125 GiB host must get MORE than the old fixed 1 GiB ceiling; got {nova_budget}"
+        );
+        assert!(
+            nova_budget / ESTIMATED_RESIDENT_BYTES_PER_CONTRACT > 1024,
+            "must exceed the old ~1024-contract cap in contract-count terms too"
+        );
+    }
+
+    /// #5333: hand-computed sanity check of the live-signals `min()`
+    /// composition on an UNCONSTRAINED shape (nova's real numbers: 125 GiB
+    /// total RAM, 15-worker pool, ~1.2 GiB own RSS, ~98 GiB available) — the
+    /// live-surplus term (`own_rss + mem_share * available`) must be the
+    /// binding term, strictly smaller than the structural residual, so the
+    /// result equals the live term exactly rather than the much larger
+    /// structural bound. This is the scenario the #5333 UX concern is about:
+    /// an idle-but-RAM-rich host must NOT claim unbounded surplus memory.
+    #[test]
+    fn resident_overhead_budget_unconstrained_peer_is_bounded_by_live_surplus_term() {
+        let total_ram = 125 * GIB;
+        let pool_size = 15;
+        let own_rss = 1_200 * MIB; // ~1.2 GiB, nova's real resident size
+        let available = 98 * GIB; // ~98 GiB, nova's real free+available memory
+        let mem_share = DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE;
+
+        let declared =
+            crate::contract::declared_cache_ceiling(total_ram as usize, pool_size) as u64;
+        let state_budget = budget_for_ram(total_ram);
+        let structural_residual = total_ram
+            .saturating_sub(BASELINE_MEMORY_RESERVATION_BYTES)
+            .saturating_sub(declared)
+            .saturating_sub(state_budget);
+        let live_term = own_rss + (available as f64 * mem_share) as u64;
+
+        assert!(
+            live_term < structural_residual,
+            "test shape must exercise the live-term-binds branch: live_term \
+             ({live_term}) must be strictly less than structural_residual \
+             ({structural_residual}), or this test can't distinguish the two \
+             terms"
+        );
+
+        let actual = resident_overhead_budget_for(
+            total_ram,
+            pool_size,
+            Some((own_rss, available)),
+            mem_share,
         );
         assert_eq!(
-            resident_overhead_budget_for_ram(GIB),
-            MIN_RESIDENT_OVERHEAD_BUDGET_BYTES
+            actual, live_term,
+            "on an unconstrained RAM-rich host the live-surplus term must bind, \
+             not the structural residual"
         );
-        assert_eq!(resident_overhead_budget_for_ram(2 * GIB), 256 * MIB);
-        assert_eq!(resident_overhead_budget_for_ram(4 * GIB), 512 * MIB);
+    }
+
+    /// #5333: on a tightly `MemoryMax`-constrained peer (shipped 2 GiB
+    /// default), the structural residual is already smaller than any
+    /// realistic live-surplus term, so `mem_share` must have NO effect on the
+    /// result — a cgroup-capped peer is unaffected by the live-memory policy
+    /// knob. Uses a deliberately generous live-signal shape (as if the host
+    /// had abundant free memory) to prove the structural cap still wins.
+    #[test]
+    fn resident_overhead_budget_tightly_capped_peer_is_unaffected_by_mem_share() {
+        let total_ram = 2 * GIB;
+        let pool_size = 4;
+        // A generous live-signal shape: as if this process were using almost
+        // nothing and the HOST had 64 GiB free — realistic when a 2 GiB
+        // `MemoryMax` cgroup runs on a much larger physical box.
+        let own_rss = 64 * MIB;
+        let available = 64 * GIB;
+        let mem_share = DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE;
+
+        let unconstrained = resident_overhead_budget_for(total_ram, pool_size, None, mem_share);
+        let live_bounded = resident_overhead_budget_for(
+            total_ram,
+            pool_size,
+            Some((own_rss, available)),
+            mem_share,
+        );
+
         assert_eq!(
-            resident_overhead_budget_for_ram(8 * GIB),
-            MAX_RESIDENT_OVERHEAD_BUDGET_BYTES
+            unconstrained, live_bounded,
+            "a tightly cgroup-constrained peer's budget must be identical whether \
+             or not live signals are available — the structural residual, not \
+             mem_share, must bind"
         );
+    }
+
+    /// #5333: `own_rss` must never be discounted by `mem_share` — even with
+    /// `mem_share = 0.0` (an operator opting out of claiming ANY additional
+    /// surplus), the live-surplus term still credits the process's own
+    /// current resident size, so the budget does not collapse below what the
+    /// process is already using (as long as the structural residual allows
+    /// it).
+    #[test]
+    fn resident_overhead_budget_own_rss_survives_zero_mem_share() {
+        let total_ram = 64 * GIB;
+        let pool_size = 8;
+        let own_rss = 4 * GIB;
+        let available = 32 * GIB;
+
+        let budget =
+            resident_overhead_budget_for(total_ram, pool_size, Some((own_rss, available)), 0.0);
+
+        let declared =
+            crate::contract::declared_cache_ceiling(total_ram as usize, pool_size) as u64;
+        let state_budget = budget_for_ram(total_ram);
+        let structural_residual = total_ram
+            .saturating_sub(BASELINE_MEMORY_RESERVATION_BYTES)
+            .saturating_sub(declared)
+            .saturating_sub(state_budget);
+        assert!(
+            own_rss < structural_residual,
+            "test shape must keep own_rss under the structural cap, or this \
+             test can't distinguish 'floored at own_rss' from 'floored at the \
+             structural residual'"
+        );
+
         assert_eq!(
-            resident_overhead_budget_for_ram(128 * GIB),
-            MAX_RESIDENT_OVERHEAD_BUDGET_BYTES
+            budget, own_rss,
+            "mem_share=0.0 must still credit own_rss verbatim, not zero it out"
         );
+    }
+
+    /// #5333: an out-of-range `mem_share` (negative, > 1.0, NaN) must be
+    /// clamped/sanitized rather than panicking or producing a nonsensical
+    /// (e.g. negative or larger-than-structural) budget.
+    #[test]
+    fn resident_overhead_budget_sanitizes_out_of_range_mem_share() {
+        let total_ram = 64 * GIB;
+        let pool_size = 8;
+        let own_rss = GIB;
+        let available = 32 * GIB;
+
+        for bad_share in [-1.0, 2.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let budget = resident_overhead_budget_for(
+                total_ram,
+                pool_size,
+                Some((own_rss, available)),
+                bad_share,
+            );
+            assert!(
+                budget >= MIN_RESIDENT_OVERHEAD_BUDGET_BYTES,
+                "mem_share={bad_share}: must still floor, not panic or underflow"
+            );
+            assert!(
+                budget <= total_ram,
+                "mem_share={bad_share}: must never exceed total_ram"
+            );
+        }
+    }
+
+    /// #5333: the residual composition must (a) never drop below the floor,
+    /// and (b) whenever it is NOT floor-bound, the four terms it composes
+    /// (baseline + declared_cache_ceiling + state_byte_budget +
+    /// resident_overhead_budget_for) must sum to AT MOST total_ram — the
+    /// residual formula can never claim more than what subtracting the
+    /// other three terms from total_ram actually leaves, by construction.
+    /// Swept from a genuinely minimal peer up through a very large future
+    /// gateway, at every pool_size the real config can resolve to, so this
+    /// stands in for "minimal memory situation" / "maximal memory
+    /// situation" deterministically — the real-hardware validation is the
+    /// #5333 soak tests on nova, framework, and a memory-constrained peer.
+    #[test]
+    fn resident_overhead_budget_composition_never_exceeds_total_ram_and_never_drops_below_floor() {
+        for total_ram in [
+            0,
+            1,
+            MIB,
+            128 * MIB,
+            256 * MIB,
+            512 * MIB,
+            GIB,
+            2 * GIB, // shipped MemoryMax default
+            4 * GIB,
+            8 * GIB,
+            16 * GIB,
+            32 * GIB,
+            60 * GIB, // framework's real RAM
+            64 * GIB,
+            125 * GIB, // nova's real RAM
+            256 * GIB,
+            1024 * GIB, // 1 TiB — an absurdly large future gateway
+            u64::MAX,
+        ] {
+            for pool_size in [1usize, 4, 16] {
+                let resident = resident_overhead_budget_for(
+                    total_ram,
+                    pool_size,
+                    None,
+                    DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE,
+                );
+                assert!(
+                    resident >= MIN_RESIDENT_OVERHEAD_BUDGET_BYTES,
+                    "at total_ram={total_ram}, pool_size={pool_size}: resident-overhead \
+                     budget {resident} must never drop below the floor"
+                );
+
+                let declared =
+                    crate::contract::declared_cache_ceiling(total_ram as usize, pool_size) as u64;
+                let state_budget = budget_for_ram(total_ram);
+                let composed_total = BASELINE_MEMORY_RESERVATION_BYTES
+                    .saturating_add(declared)
+                    .saturating_add(state_budget)
+                    .saturating_add(resident);
+
+                // When the residual was NOT floor-bound, the four terms sum
+                // to AT MOST total_ram — that is the whole point of deriving
+                // it as a residual. When it WAS floor-bound (a genuinely
+                // tiny host), the floor is a deliberate viability guarantee
+                // that can legitimately push the sum over total_ram — the
+                // SAME trade-off MIN_DEFAULT_HOSTING_BUDGET_BYTES's floor
+                // already makes, not a new one this composition introduces.
+                let floor_bound = resident == MIN_RESIDENT_OVERHEAD_BUDGET_BYTES;
+                if !floor_bound {
+                    assert!(
+                        composed_total <= total_ram,
+                        "at total_ram={total_ram}, pool_size={pool_size}: composed total \
+                         ({composed_total} = baseline {BASELINE_MEMORY_RESERVATION_BYTES} + \
+                         declared {declared} + state {state_budget} + resident {resident}) \
+                         must not exceed total_ram when NOT floor-bound"
+                    );
+                }
+            }
+        }
     }
 
     /// A key-maker with a wider seed space than [`make_key`] (`u8`, 256 max):
@@ -4698,19 +5086,18 @@ mod tests {
     }
 
     /// Dedicated regression test for the review's own concrete numbers
-    /// (2 GiB memory limit -> 256-contract resident budget; framework hosts
-    /// 1,057): without the sustained gate, the very first sweep post-deploy
-    /// would shed ~76% of the hosted set in one pass. Confirms that
-    /// specific, previously-verified-dangerous scenario is now throttled.
+    /// (256 MiB resident budget; framework hosts 1,057 contracts, ~1 GiB
+    /// attributed overhead): without the sustained gate, the very first
+    /// sweep post-deploy would shed ~76% of the hosted set in one pass.
+    /// Confirms that specific, previously-verified-dangerous scenario is now
+    /// throttled. The 256 MiB figure is a direct fixture value (the field
+    /// scenario this test pins), not derived from
+    /// [`resident_overhead_budget_for`] — that function's own composition is
+    /// covered by its dedicated tests below (#5333).
     #[test]
     fn resident_overhead_pressure_does_not_mass_evict_on_first_sweep_at_framework_scale() {
         let (mut cache, clock) = make_cache(GIB);
-        cache.set_resident_overhead_budget_bytes(resident_overhead_budget_for_ram(2 * GIB));
-        assert_eq!(
-            cache.resident_overhead_budget_bytes(),
-            256 * MIB,
-            "sanity-check the review's own arithmetic: clamp(2GiB/8, ..) = 256MiB"
-        );
+        cache.set_resident_overhead_budget_bytes(256 * MIB);
 
         for i in 0..1057u32 {
             let key = make_key_u32(i);

@@ -150,7 +150,7 @@ tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
-winapi = { workspace = true, features = ["shellapi", "sysinfoapi", "wincon", "winuser", "synchapi", "handleapi", "errhandlingapi", "winerror", "winnt", "minwindef"] }
+winapi = { workspace = true, features = ["shellapi", "sysinfoapi", "wincon", "winuser", "synchapi", "handleapi", "errhandlingapi", "winerror", "winnt", "minwindef", "psapi", "processthreadsapi"] }
 serde = { workspace = true }
 zip = { workspace = true }
 tray-icon = { workspace = true }
@@ -163,6 +163,15 @@ winreg = { workspace = true }
 tray-icon = { workspace = true }
 muda = { workspace = true }
 tao = { workspace = true }
+# Live memory-pressure signals for the resident-overhead hosting budget
+# (#5333) — `host_statistics64` (system-wide available memory) and
+# `task_info` (this process's own resident size). A maintained,
+# purpose-built crate rather than hand-rolled Mach FFI: getting the
+# struct layouts / flavor constants exactly right without a way to
+# smoke-test locally in this session is exactly the kind of mistake a
+# vetted crate avoids. Real macOS CI (`macos_unit`, ci.yml) compiles and
+# runs this on every PR.
+mach2 = { workspace = true }
 
 [dev-dependencies]
 arbitrary = { workspace = true }

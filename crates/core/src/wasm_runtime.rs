@@ -57,8 +57,9 @@ pub use mock_state_storage::MockStateStorage;
 pub use module_cache::default_module_cache_budget_bytes;
 pub(crate) use module_cache::{
     DELEGATE_MODULE_CACHE_BUDGET_DIVISOR, InterestPredicate, ModuleCache, ModuleCacheMetrics,
-    contract_cache_interested_occupancy_pct, contract_cache_occupancy_pct, interest_tiered_enabled,
-    migration_admission_recovered_now, read_total_ram_bytes,
+    budget_for_ram, contract_cache_interested_occupancy_pct, contract_cache_occupancy_pct,
+    interest_tiered_enabled, migration_admission_recovered_now, read_available_memory_bytes,
+    read_own_rss_bytes, read_total_ram_bytes,
 };
 // Clamp bounds are referenced only by the config-default round-trip test, which
 // asserts the resolved default lands within [MIN, MAX] without hardcoding the
@@ -66,7 +67,7 @@ pub(crate) use module_cache::{
 // the re-export isn't an unused import under `-D warnings` in release.
 #[cfg(test)]
 pub(crate) use module_cache::{
-    MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES, MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES, budget_for_ram,
+    MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES, MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES,
 };
 pub(crate) use native_api::{
     DELEGATE_SUBSCRIPTIONS, DelegateContextCache, SharedDelegateCounter, SharedInheritedOrigins,

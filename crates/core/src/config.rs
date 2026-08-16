@@ -134,6 +134,18 @@ pub struct ConfigArgs {
     #[arg(long, env = "MAX_HOSTING_DISK")]
     pub max_hosting_disk: Option<u64>,
 
+    /// Fraction (0.0-1.0) of LIVE host-wide surplus memory (this process's own
+    /// resident size plus currently-available system memory) the resident-
+    /// overhead (count-derived) eviction budget may claim, on top of its own
+    /// RSS (#5333). Bounds how aggressively an otherwise-idle host grows its
+    /// hosted-contract count so the process does not visibly dominate a
+    /// user's Task Manager even when the OS reports abundant free memory.
+    /// Does not shrink the budget below the host's already-declared static
+    /// caches. Default: 0.125 (1/8, matching qBittorrent's disk-cache "auto"
+    /// default and this codebase's own pre-existing `/8` convention).
+    #[arg(long, env = "HOSTING_MEM_SHARE")]
+    pub hosting_mem_share: Option<f64>,
+
     /// Per-user secret-storage quota in bytes for HOSTED mode (#4561, P5 of
     /// #4381). Bounds a single hosted user's (one `userToken`) TOTAL on-disk
     /// footprint under their `users/<user_id>/` tree, summed across every
@@ -295,6 +307,7 @@ impl Default for ConfigArgs {
             max_hosting_storage: None,
             hosting_disk_pct: None,
             max_hosting_disk: None,
+            hosting_mem_share: None,
             per_user_secret_quota_bytes: None,
             per_user_inactive_ttl_secs: None,
             inactive_user_sweep_interval_secs: None,
@@ -904,6 +917,7 @@ impl ConfigArgs {
             // these are new fields, so a plain get_or_insert is correct.
             self.hosting_disk_pct.get_or_insert(cfg.hosting_disk_pct);
             self.max_hosting_disk.get_or_insert(cfg.max_hosting_disk);
+            self.hosting_mem_share.get_or_insert(cfg.hosting_mem_share);
             // #4968. `cfg.enable_event_log` is itself an Option, so an older
             // config.toml with no such key merges as `None` and leaves the
             // mode-dependent default intact rather than pinning `false`.
@@ -1430,6 +1444,9 @@ impl ConfigArgs {
             max_hosting_disk: self
                 .max_hosting_disk
                 .unwrap_or(crate::ring::DEFAULT_MAX_HOSTING_DISK_BYTES),
+            hosting_mem_share: self
+                .hosting_mem_share
+                .unwrap_or(crate::ring::DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE),
             per_user_secret_quota_bytes: self
                 .per_user_secret_quota_bytes
                 .unwrap_or(crate::wasm_runtime::DEFAULT_PER_USER_SECRET_QUOTA_BYTES as u64),
@@ -1637,6 +1654,12 @@ pub struct Config {
     /// operator override survives a flag-less restart.
     #[serde(default = "default_max_hosting_disk", rename = "max-hosting-disk")]
     pub max_hosting_disk: u64,
+    /// Fraction (0.0-1.0) of LIVE host-wide surplus memory the resident-
+    /// overhead (count-derived) eviction budget may claim on top of its own
+    /// RSS (#5333). Default 0.125 (1/8). Persisted so an operator override
+    /// survives a flag-less restart.
+    #[serde(default = "default_hosting_mem_share", rename = "hosting-mem-share")]
+    pub hosting_mem_share: f64,
     /// Per-user secret-storage quota in bytes for hosted mode (#4561, P5 of
     /// #4381). Bounds a single hosted user's TOTAL on-disk footprint (active
     /// secret-value blobs + the `.keys` enumeration registry) under their
@@ -1826,6 +1849,14 @@ fn default_hosting_disk_pct() -> f64 {
 /// [`crate::ring::DEFAULT_MAX_HOSTING_DISK_BYTES`] (32 GiB).
 fn default_max_hosting_disk() -> u64 {
     crate::ring::DEFAULT_MAX_HOSTING_DISK_BYTES
+}
+
+/// Default fraction of live host-wide surplus memory the resident-overhead
+/// eviction budget may claim (#5333): resolves to
+/// [`crate::ring::DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE`] (0.125), the single
+/// source of truth shared with the sizing math.
+fn default_hosting_mem_share() -> f64 {
+    crate::ring::DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE
 }
 
 /// `skip_serializing_if` predicate for [`Config::max_hosting_storage`]: true
@@ -7503,6 +7534,7 @@ shutdown-drain-secs = 42
             max_hosting_storage: None,
             hosting_disk_pct: None,
             max_hosting_disk: None,
+            hosting_mem_share: None,
             per_user_secret_quota_bytes: None,
             per_user_inactive_ttl_secs: None,
             inactive_user_sweep_interval_secs: None,
@@ -7652,6 +7684,7 @@ shutdown-drain-secs = 42
             max_hosting_storage: 123_456_789,
             hosting_disk_pct: 0.37,
             max_hosting_disk: 9_876_543_210,
+            hosting_mem_share: 0.21,
             per_user_secret_quota_bytes: 7_654_321,
             per_user_inactive_ttl_secs: 1_234_567,
             inactive_user_sweep_interval_secs: 7_200,
@@ -7715,6 +7748,7 @@ shutdown-drain-secs = 42
             max_hosting_storage,
             hosting_disk_pct,
             max_hosting_disk,
+            hosting_mem_share,
             per_user_secret_quota_bytes,
             per_user_inactive_ttl_secs,
             inactive_user_sweep_interval_secs,
@@ -7742,6 +7776,10 @@ shutdown-drain-secs = 42
         );
         assert_eq!(hosting_disk_pct, seed.hosting_disk_pct, "hosting_disk_pct");
         assert_eq!(max_hosting_disk, seed.max_hosting_disk, "max_hosting_disk");
+        assert_eq!(
+            hosting_mem_share, seed.hosting_mem_share,
+            "hosting_mem_share"
+        );
         assert_eq!(
             per_user_secret_quota_bytes, seed.per_user_secret_quota_bytes,
             "per_user_secret_quota_bytes"

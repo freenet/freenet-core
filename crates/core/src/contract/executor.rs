@@ -1332,6 +1332,54 @@ pub(crate) fn delta_budget_for(total_ram: usize, pool_size: usize) -> usize {
     compose_against_envelope(ram_scaled, DELTA_CACHE_ENVELOPE_SHARE, total_ram, pool_size)
 }
 
+/// Sum of every cache ceiling a node with `memory_limit` bytes and `pool_size`
+/// workers declares: the per-executor summary, delta, and Store-arena caches
+/// times the pool, plus the single shared contract and delegate module caches,
+/// the shared source-WASM byte caches, and the redb page cache.
+///
+/// Module ceilings are sized to the RAM the host actually has, NOT the
+/// absolute MAX clamp: the 4 GiB module-cache MAX only binds above 32 GiB of
+/// RAM, so using it would model an impossible cache on a smaller box. (MAX-clamp
+/// safety on a >32 GiB host is guarded separately by
+/// `module_cache::tests::max_clamp_combined_ceiling_is_safe_at_binding_host`.)
+///
+/// Promoted from a `#[cfg(test)]`-only helper (originally written purely to
+/// verify [`cache_byte_budgets_are_aggregate_safe`] below) to a real
+/// production function (#5333 review): the resident-overhead hosting budget
+/// (`ring::hosting::cache::resident_overhead_budget_for`) needs the SAME
+/// real figure — what every OTHER memory consumer has already declared — to
+/// derive its own budget as a residual rather than an independently-clamped
+/// guess. Using this one function in both places means the aggregate-safety
+/// test now checks the ACTUAL formula the resident-overhead budget composes
+/// against, not a second, potentially-drifting re-derivation of it.
+pub(crate) fn declared_cache_ceiling(memory_limit: usize, pool_size: usize) -> usize {
+    // PER-EXECUTOR — multiplied by the pool.
+    let summary = summary_budget_for(memory_limit, pool_size);
+    let delta = delta_budget_for(memory_limit, pool_size);
+    // One wasmtime Store per executor, each holding retired-instance bytes up
+    // to its arena budget between refreshes.
+    let arena = crate::wasm_runtime::engine::store_arena_budget_for(memory_limit, pool_size);
+
+    // NODE-WIDE — one of each, shared by every executor.
+    let contract_modules = crate::wasm_runtime::budget_for_ram(memory_limit);
+    let delegate_modules =
+        contract_modules / crate::wasm_runtime::DELEGATE_MODULE_CACHE_BUDGET_DIVISOR;
+    // The two source-WASM byte caches. Node-wide because #5268 made them
+    // shared; each executor used to build its own, so this term was
+    // `pool_size × 2 × 10 MiB` and counted nowhere.
+    let source_code = 2 * SOURCE_CODE_CACHE_MAX_BYTES as usize;
+    #[cfg(feature = "redb")]
+    let page_cache = crate::contract::storages::redb::page_cache_size_for(memory_limit);
+    #[cfg(not(feature = "redb"))]
+    let page_cache = 0;
+
+    pool_size * (summary + delta + arena)
+        + contract_modules
+        + delegate_modules
+        + source_code
+        + page_cache
+}
+
 /// Fallback total-RAM estimate (1 GiB) when the OS query fails — mirrors the
 /// module cache's `FALLBACK_TOTAL_RAM_BYTES`, yielding a mid-range budget.
 const SUMMARY_CACHE_FALLBACK_TOTAL_RAM_BYTES: usize = 1024 * 1024 * 1024;
@@ -2008,45 +2056,6 @@ mod tests {
         }
     }
 
-    /// Sum of every cache ceiling a node with `memory_limit` bytes and
-    /// `pool_size` workers declares: the per-executor summary and delta caches
-    /// times the pool, plus the single shared contract and delegate module
-    /// caches, plus the redb page cache.
-    ///
-    /// Module ceilings are sized to the RAM the host actually has, NOT the
-    /// absolute MAX clamp: the 4 GiB module-cache MAX only binds above 32 GiB of
-    /// RAM, so using it would model an impossible cache on a smaller box.
-    /// (MAX-clamp safety on a >32 GiB host is guarded separately by
-    /// `module_cache::tests::max_clamp_combined_ceiling_is_safe_at_binding_host`.)
-    fn declared_cache_ceiling(memory_limit: usize, pool_size: usize) -> usize {
-        // PER-EXECUTOR — multiplied by the pool.
-        let summary = summary_budget_for(memory_limit, pool_size);
-        let delta = delta_budget_for(memory_limit, pool_size);
-        // One wasmtime Store per executor, each holding retired-instance bytes up
-        // to its arena budget between refreshes. Also per-executor, and added by
-        // this PR — it has to be in the sum it introduced.
-        let arena = crate::wasm_runtime::engine::store_arena_budget_for(memory_limit, pool_size);
-
-        // NODE-WIDE — one of each, shared by every executor.
-        let contract_modules = crate::wasm_runtime::budget_for_ram(memory_limit);
-        let delegate_modules =
-            contract_modules / crate::wasm_runtime::DELEGATE_MODULE_CACHE_BUDGET_DIVISOR;
-        // The two source-WASM byte caches. Node-wide only because #5268 made them
-        // shared; each executor used to build its own, so this term was
-        // `pool_size × 2 × 10 MiB` and counted nowhere.
-        let source_code = 2 * SOURCE_CODE_CACHE_MAX_BYTES as usize;
-        #[cfg(feature = "redb")]
-        let page_cache = crate::contract::storages::redb::page_cache_size_for(memory_limit);
-        #[cfg(not(feature = "redb"))]
-        let page_cache = 0;
-
-        pool_size * (summary + delta + arena)
-            + contract_modules
-            + delegate_modules
-            + source_code
-            + page_cache
-    }
-
     /// The per-executor byte budgets stay within their documented clamps, and the
     /// aggregate of EVERY declared cache ceiling stays a safe fraction of the
     /// node's memory — on a production gateway AND on a peer running under the
@@ -2137,14 +2146,16 @@ mod tests {
              occurrence would let the pin scope itself to the wrong region"
         );
         let after = FULL.split(&anchor).nth(1).expect("anchor just counted");
-        // A method at 4-space indent closes with `\n    }`. Require it, rather
-        // than letting a missing end anchor widen the region to EOF.
+        // `declared_cache_ceiling` is a top-level (0-indent) function — #5333
+        // promoted it out of `mod tests` into production code — so it closes
+        // with `\n}` at column 0, not a nested method's `\n    }`. Require it,
+        // rather than letting a missing end anchor widen the region to EOF.
         let body = after
-            .split_once("\n    }")
+            .split_once("\n}")
             .expect("could not locate the end of declared_cache_ceiling")
             .0;
         assert!(
-            !body.contains("\n    fn ") && !body.contains("\n    #[test]"),
+            !body.contains("\npub") && !body.contains("\nfn ") && !body.contains("\nconst "),
             "the scoped region escaped past declared_cache_ceiling into a \
              sibling item — this pin would pass vacuously"
         );

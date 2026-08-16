@@ -76,7 +76,9 @@ pub(crate) use cache::{COST_RATE_MIN_WINDOW, CostAxisPressure, build_cost_axes};
 /// Aggregate disk-budget sizing defaults + pure clamp math (#4683). Re-exported
 /// so `config` can resolve the persisted `hosting-disk-pct` / `max-hosting-disk`
 /// defaults and `ring`/`HostingManager` can size the eviction floor.
-pub(crate) use cache::{DEFAULT_HOSTING_DISK_PCT, DEFAULT_MAX_HOSTING_DISK_BYTES};
+pub(crate) use cache::{
+    DEFAULT_HOSTING_DISK_PCT, DEFAULT_MAX_HOSTING_DISK_BYTES, DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE,
+};
 /// Widths of the two hosted-set demand-signal histograms exported on the router
 /// snapshot. Re-exported so `router` can size the wire arrays from the single
 /// definition next to the bucketing code.
@@ -525,6 +527,15 @@ pub(crate) struct HostingManager {
     /// installs a real value (the tracker is also unseeded before then, so the
     /// gate is a no-op regardless).
     disk_budget_bytes: AtomicU64,
+
+    /// Default share of genuine LIVE host-wide surplus memory the
+    /// resident-overhead budget is willing to claim by default (#5333) —
+    /// the RAM-axis analogue of `disk_pct_bits` above. Defaults to
+    /// [`cache::DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE`]; overridden from config
+    /// at startup via [`Self::configure_resident_overhead_mem_share`]. Stored
+    /// as bits so it lives in an `AtomicU64` (the recompute reads it off the
+    /// sweep task without a lock).
+    resident_overhead_mem_share_bits: AtomicU64,
 }
 
 impl HostingManager {
@@ -572,6 +583,9 @@ impl HostingManager {
             disk_pct_bits: AtomicU64::new(DEFAULT_HOSTING_DISK_PCT.to_bits()),
             max_hosting_disk_bytes: AtomicU64::new(DEFAULT_MAX_HOSTING_DISK_BYTES),
             disk_budget_bytes: AtomicU64::new(u64::MAX),
+            resident_overhead_mem_share_bits: AtomicU64::new(
+                DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE.to_bits(),
+            ),
         }
     }
 
@@ -703,6 +717,49 @@ impl HostingManager {
         // OUTSIDE any lock before this call.
         self.hosting_cache.write().set_budget_bytes(effective);
         Some(effective)
+    }
+
+    /// Install the operator-configured resident-overhead sizing knob (#5333):
+    /// the default share of genuine live host-wide surplus memory the
+    /// resident-overhead budget is willing to claim, mirroring
+    /// [`Self::configure_disk_budget`] for the disk axis. Called once at
+    /// startup (the config is only reachable there). If never called, the
+    /// default set in the ctor applies.
+    pub(crate) fn configure_resident_overhead_mem_share(&self, mem_share: f64) {
+        self.resident_overhead_mem_share_bits
+            .store(mem_share.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Recompute the resident-overhead hosting budget from LIVE memory
+    /// signals and install it via
+    /// [`HostingCache::set_resident_overhead_budget_bytes`] (#5333). Run on
+    /// the SAME 60s sweep as [`Self::recompute_effective_budget`], mirroring
+    /// its shape: the (cheap — a couple of `/proc` reads, no directory walk)
+    /// signal sampling happens here, and only the O(1)
+    /// `set_resident_overhead_budget_bytes` touches the cache lock.
+    ///
+    /// `total_ram`/`pool_size`/`live_signals` are injected as parameters —
+    /// same determinism seam [`Self::recompute_effective_budget`] uses for
+    /// `available` — so tests can drive this without depending on the test
+    /// host's real RAM, core count, or `/proc` contents.
+    ///
+    /// Returns the budget it installed (for telemetry/tests).
+    pub(crate) fn recompute_resident_overhead_budget(
+        &self,
+        total_ram: u64,
+        pool_size: usize,
+        live_signals: Option<(u64, u64)>,
+    ) -> u64 {
+        let mem_share = f64::from_bits(
+            self.resident_overhead_mem_share_bits
+                .load(Ordering::Relaxed),
+        );
+        let budget =
+            cache::resident_overhead_budget_for(total_ram, pool_size, live_signals, mem_share);
+        self.hosting_cache
+            .write()
+            .set_resident_overhead_budget_bytes(budget);
+        budget
     }
 
     /// Pre-write admission gate for a state write (#4683, live since #4702): reject the write
