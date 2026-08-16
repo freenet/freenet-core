@@ -3212,6 +3212,45 @@ const MAX_DIGEST_SUMMARIES_PER_REPLY: usize = 64;
 /// machinery for a rollout window.
 const MAX_SUMMARY_COMPARISONS_PER_MESSAGE: usize = MAX_DIGEST_SUMMARIES_PER_REPLY;
 
+/// Absolute ceiling on the number of ENTRIES one periodic summary exchange
+/// carries or processes, in either wire form (#5338).
+///
+/// Distinct from [`MAX_DIGEST_SUMMARIES_PER_REPLY`] /
+/// [`MAX_SUMMARY_COMPARISONS_PER_MESSAGE`], which bound the expensive thing (a
+/// `summary_if_hosted_or_in_use` call). Since #5338 an entry that costs no such
+/// call is not charged against those, so they no longer bound the entry count
+/// on their own and something else has to: entries still cost wire bytes on the
+/// way out and a `lookup_by_hash` plus a `clear_peer_summary` on the way in.
+///
+/// **Why it is 4x rather than 1x.** At 1x this ceiling would bind before the
+/// summarize budget did and the #5338 fix would be a no-op — a reply would
+/// still stop at 64 entries however few of them were hosted. 4x lets the window
+/// walk past a shared set that is up to 75% not-hosted-by-us and still fill all
+/// 64 summarize slots with contracts we can actually advertise. A digest entry
+/// is 21 bytes, so 256 of them is ~5.4 KB, comfortably inside the 9 KiB the
+/// full-bytes path already spends per reply
+/// ([`MAX_FALLBACK_SUMMARY_BYTES_PER_REPLY`]).
+///
+/// **It is deliberately the same number on both legs.** The receive leg
+/// truncates an over-ceiling message (random offset, as its siblings do), so a
+/// sender that respects this ceiling is never truncated by a receiver that
+/// enforces it. Lower it on the receive side alone and the send window's
+/// `ceil(n / 64)` tiling silently becomes a random sample at the receiver —
+/// which is the class of "narrower than advertised" defect #5338 is about.
+const MAX_SUMMARY_ENTRIES_PER_MESSAGE: usize = 4 * MAX_DIGEST_SUMMARIES_PER_REPLY;
+
+/// The send ceiling must not exceed the receive ceiling, or our own replies
+/// would be truncated by an upgraded peer — see
+/// [`MAX_SUMMARY_ENTRIES_PER_MESSAGE`]. Trivially true while one constant
+/// serves both; the assertion is here so that splitting it into two later
+/// cannot silently invert the inequality.
+const _: () = assert!(
+    MAX_SUMMARY_ENTRIES_PER_MESSAGE >= MAX_DIGEST_SUMMARIES_PER_REPLY
+        && MAX_SUMMARY_ENTRIES_PER_MESSAGE >= MAX_FALLBACK_SUMMARIES_PER_REPLY,
+    "the per-message entry ceiling must leave room for a full summarize budget, \
+     or the budget can never be spent"
+);
+
 /// The `Summaries` receive-leg cap is documented (see its comment above) as
 /// never binding against a peer running #5155 or later, because such a peer
 /// caps its own `InterestsReply` fallback at
@@ -3529,15 +3568,49 @@ async fn handle_interest_sync_message(
             // call to produce, and that call is what stormed. Only the LIMIT
             // differs by form, and only the full-bytes path additionally
             // charges a byte budget on top (see the loop below).
-            let entry_cap = match form {
+            //
+            // #5338: the cap counts entries that COST a summarize call, and the
+            // window is walked up to `MAX_SUMMARY_ENTRIES_PER_MESSAGE`
+            // candidate positions to fill it. `matching` comes from
+            // `contract_hash_index`, which peer interest registrations populate
+            // as well as our own hosting, so it contains contracts we track but
+            // do NOT host; those return `None` through the in-memory gate
+            // without any contract-handler round trip. Charging them a slot
+            // spent a CPU budget on entries that cost no CPU, so convergence
+            // latency for the contracts we can actually advertise scaled with
+            // `|matching|` while the cost being bounded scaled only with the
+            // hosted subset.
+            let summarize_cap = match form {
                 SummaryReplyForm::Digests => MAX_DIGEST_SUMMARIES_PER_REPLY,
                 SummaryReplyForm::FullBytes => MAX_FALLBACK_SUMMARIES_PER_REPLY,
             };
+            // #5338: keyed by the peer's stable transport key, not by the
+            // address it happens to be reaching us from. Without a resolvable
+            // key there is no identity to rotate against, so the reply takes a
+            // fresh random offset and records nothing — the same degraded mode
+            // an evicted cursor gets, and it only arises for a source we have
+            // no connection entry for, which is also a source whose interest we
+            // do not register above.
             let window = {
-                let start = op_manager
-                    .interest_manager
-                    .summary_window_start(source, &matching);
-                crate::ring::interest::rotation_window_indices(matching.len(), start, entry_cap)
+                let start = peer_key.as_ref().map_or_else(
+                    || {
+                        if matching.is_empty() {
+                            0
+                        } else {
+                            crate::config::GlobalRng::random_range(0..matching.len())
+                        }
+                    },
+                    |pk| {
+                        op_manager
+                            .interest_manager
+                            .summary_window_start(pk, &matching)
+                    },
+                );
+                crate::ring::interest::rotation_window_indices(
+                    matching.len(),
+                    start,
+                    MAX_SUMMARY_ENTRIES_PER_MESSAGE,
+                )
             };
 
             // Register/refresh peer interest for EVERY shared contract, not just
@@ -3582,10 +3655,22 @@ async fn handle_interest_sync_message(
             }
 
             // Build the summaries this reply carries, in rotation order.
-            let mut entries = Vec::with_capacity(window.len());
+            let mut entries = Vec::with_capacity(window.len().min(summarize_cap));
             let mut summary_bytes_used = 0usize;
             let mut last_included: Option<ContractInstanceId> = None;
+            // Entries that cost a `summary_if_hosted_or_in_use` round trip.
+            // This — not `entries.len()` — is what the cap bounds (#5338).
+            let mut summarized = 0usize;
             for &index in &window {
+                // Checked BEFORE the entry rather than after, so the loop stops
+                // on the round trip that would breach the budget instead of
+                // making it first. A free entry never trips it, which is the
+                // whole point; free entries trailing the last charged one are
+                // simply not reached, keeping the message no larger than the
+                // budget needs it to be.
+                if summarized >= summarize_cap {
+                    break;
+                }
                 let contract = matching[index];
                 // #5155 byte budget. The check is RETROSPECTIVE — it asks
                 // whether the budget is already spent, not whether this entry
@@ -3609,9 +3694,16 @@ async fn handle_interest_sync_message(
                 // nothing to advertise and their pointless GetSummaryQuery
                 // round-trips were the dominant #4473 storm. See
                 // `summary_if_hosted_or_in_use`.
-                let summary = summary_if_hosted_or_in_use(op_manager, &contract).await;
-                summary_bytes_used += summary.as_ref().map_or(0, |s| s.as_ref().len());
-                entries.push(SummaryEntry::from_summary(hash, summary.as_ref()));
+                let probe = summary_if_hosted_or_in_use(op_manager, &contract).await;
+                // Charged from the PROBE's own report of what it did, never
+                // re-derived from whether a summary came back: a round trip
+                // that ran and returned nothing cost exactly as much as one
+                // that returned bytes, and must be charged.
+                if probe.summarized {
+                    summarized += 1;
+                }
+                summary_bytes_used += probe.summary.as_ref().map_or(0, |s| s.as_ref().len());
+                entries.push(SummaryEntry::from_summary(hash, probe.summary.as_ref()));
                 last_included = Some(*contract.id());
             }
 
@@ -3636,10 +3728,13 @@ async fn handle_interest_sync_message(
             //
             // #5238: recorded for BOTH forms now. Under #5155 only the
             // full-bytes path rotated, so only it had a cursor to advance.
-            if let Some(last) = last_included {
-                op_manager
-                    .interest_manager
-                    .record_summary_cursor(source, last);
+            //
+            // #5338: recorded against the peer's KEY. Keying this by address
+            // discarded the cursor whenever a NATed peer resumed on a new
+            // source port, which sent that peer's rotation back to a random
+            // offset every reconnect.
+            if let (Some(pk), Some(last)) = (peer_key.as_ref(), last_included) {
+                op_manager.interest_manager.record_summary_cursor(pk, last);
             }
 
             if entries.is_empty() {
@@ -3750,13 +3845,35 @@ async fn handle_interest_sync_message(
                 // at `MAX_SUMMARY_COMPARISONS_PER_MESSAGE`. Random offset
                 // rather than a prefix, for the tail-starvation reason the
                 // sibling arms document.
+                //
+                // #5338: the ENTRY ceiling and the SUMMARIZE budget are two
+                // different numbers now, for the reason the `SummaryDigests`
+                // arm states at length — an entry carrying no summary bytes
+                // reaches the `_ => false` staleness arm and a
+                // `clear_peer_summary` without our summary being needed, so it
+                // costs no round trip and must not be charged one.
                 let mut entries = entries;
-                if entries.len() > MAX_SUMMARY_COMPARISONS_PER_MESSAGE {
+                if entries.len() > MAX_SUMMARY_ENTRIES_PER_MESSAGE {
                     let start = crate::config::GlobalRng::random_range(0..entries.len());
                     entries.rotate_left(start);
-                    entries.truncate(MAX_SUMMARY_COMPARISONS_PER_MESSAGE);
+                    entries.truncate(MAX_SUMMARY_ENTRIES_PER_MESSAGE);
                 }
+                // Charged per ENTRY rather than per contract, as the pre-#5338
+                // cap was: a hash collision makes one entry fetch for several
+                // contracts, so this is the same slight under-count it always
+                // had, bounded by the collision rate rather than by anything a
+                // peer chooses.
+                let mut charged = 0usize;
                 for entry in entries {
+                    let costs_a_summarize = entry.summary_bytes.is_some();
+                    if costs_a_summarize {
+                        if charged >= MAX_SUMMARY_COMPARISONS_PER_MESSAGE {
+                            // See the sibling arm: free entries past the budget
+                            // still carry their repair and still cost nothing.
+                            continue;
+                        }
+                        charged += 1;
+                    }
                     for contract in op_manager.interest_manager.lookup_by_hash(entry.hash) {
                         if !op_manager.interest_manager.has_local_interest(&contract) {
                             continue;
@@ -3769,7 +3886,20 @@ async fn handle_interest_sync_message(
                         // has nothing to advertise and no subscriber whose stale
                         // copy we'd heal: `our_summary` is None → not stale → no
                         // SyncStateToPeer, while the loop round-trip is avoided.
-                        let our_summary = summary_if_hosted_or_in_use(op_manager, &contract).await;
+                        //
+                        // #5338: skipped outright when the peer sent no summary
+                        // bytes — the comparison below cannot reach a two-sided
+                        // arm, so our summary could only ever have been
+                        // discarded. `emit_confirmed` (simulation only) keeps
+                        // paying it so the convergence checker sees what it did
+                        // before.
+                        let our_summary = if costs_a_summarize || emit_confirmed {
+                            summary_if_hosted_or_in_use(op_manager, &contract)
+                                .await
+                                .summary
+                        } else {
+                            None
+                        };
 
                         if emit_confirmed {
                             if let Some(ref summary) = our_summary {
@@ -4091,10 +4221,24 @@ async fn handle_interest_sync_message(
                 // hundreds of them. This is the receiving half of the same
                 // storm the send-side window closes; both legs of one
                 // round-trip pay it independently.
+                //
+                // #5338: the ceiling that bounds the ENTRY count is now
+                // `MAX_SUMMARY_ENTRIES_PER_MESSAGE`, and
+                // `MAX_SUMMARY_COMPARISONS_PER_MESSAGE` bounds only the
+                // entries that cost us a summarize (below). An entry whose
+                // digest is `None` is settled by
+                // `classify_summary_digest`'s `(_, None)` arm without
+                // consulting our summary at all, so it costs no round trip
+                // and charging it one was bounding the wrong thing —
+                // symmetrically with the send leg, whose replies since #5338
+                // may carry free entries past the summarize budget. Sized to
+                // match the send ceiling exactly, so an upgraded peer's reply
+                // is never truncated here.
                 let mut entries = entries;
-                if entries.len() > MAX_SUMMARY_COMPARISONS_PER_MESSAGE {
+                if entries.len() > MAX_SUMMARY_ENTRIES_PER_MESSAGE {
                     let start = crate::config::GlobalRng::random_range(0..entries.len());
                     entries.rotate_left(start);
+                    entries.truncate(MAX_SUMMARY_ENTRIES_PER_MESSAGE);
                 }
                 // #4965 agreement-rate proxy: the state-change-driven send
                 // sites (proactive notification, rejection summary-back) are
@@ -4223,15 +4367,31 @@ async fn handle_interest_sync_message(
                 // them, it removes the ordering freedom they were being asked to
                 // absorb.
                 let mut bounded: Vec<crate::message::SummaryDigestEntry> = Vec::new();
+                // Distinct PAIRS that cost a summarize, matching what is
+                // actually paid for — counting distinct hashes would no longer
+                // bound the work now that several pairs can share a hash, and
+                // counting ENTRIES would charge the free ones (#5338).
+                let mut charged = 0usize;
                 for entry in entries {
-                    // The cap counts distinct PAIRS, matching what is actually
-                    // processed — counting distinct hashes would no longer
-                    // bound the work now that several pairs can share a hash.
-                    if seen_pairs.len() >= MAX_SUMMARY_COMPARISONS_PER_MESSAGE {
-                        break;
+                    // Whether this entry can make us summarize, decided from
+                    // the entry itself: an absent digest is settled by
+                    // `classify_summary_digest` without our summary, so the
+                    // fetch below is skipped for it. That makes this an upper
+                    // bound on the round trips — never an under-count, which is
+                    // the direction a budget has to err in.
+                    let costs_a_summarize = entry.summary_digest.is_some();
+                    if costs_a_summarize && charged >= MAX_SUMMARY_COMPARISONS_PER_MESSAGE {
+                        // `continue`, not `break`: the free entries after this
+                        // point still cost nothing and still carry a real
+                        // repair (`clear_peer_summary`), so dropping them would
+                        // discard information for no saving.
+                        continue;
                     }
                     if !seen_pairs.insert((entry.hash, entry.summary_digest)) {
                         continue;
+                    }
+                    if costs_a_summarize {
+                        charged += 1;
                     }
                     bounded.push(entry);
                 }
@@ -4282,17 +4442,33 @@ async fn handle_interest_sync_message(
                         // value cannot change while this handler runs, and
                         // re-fetching per pair is the amplification the pair
                         // dedup would otherwise open.
-                        if !local_summaries.contains_key(contract.id()) {
-                            let fetched = summary_if_hosted_or_in_use(op_manager, &contract).await;
-                            local_summaries.insert(*contract.id(), fetched);
-                            crate::config::GlobalTestMetrics::note_summary_cache_size(
-                                local_summaries.len(),
-                            );
-                        }
-                        let our_summary = local_summaries
-                            .get(contract.id())
-                            .expect("just inserted")
-                            .clone();
+                        //
+                        // #5338: skipped entirely when the peer advertised no
+                        // digest. `classify_summary_digest` settles `(_, None)`
+                        // as `PeerHasNoState` whatever our summary is, so the
+                        // round trip could not change the verdict — it was pure
+                        // cost, and it is what made a free entry expensive for
+                        // the RECEIVER even though it was free for the sender.
+                        // `emit_confirmed` (simulation only) still pays it, so
+                        // the convergence checker keeps seeing our state hash
+                        // for these contracts exactly as before.
+                        let needs_our_summary = entry.summary_digest.is_some() || emit_confirmed;
+                        let our_summary = if needs_our_summary {
+                            if !local_summaries.contains_key(contract.id()) {
+                                let fetched =
+                                    summary_if_hosted_or_in_use(op_manager, &contract).await;
+                                local_summaries.insert(*contract.id(), fetched.summary);
+                                crate::config::GlobalTestMetrics::note_summary_cache_size(
+                                    local_summaries.len(),
+                                );
+                            }
+                            local_summaries
+                                .get(contract.id())
+                                .expect("just inserted")
+                                .clone()
+                        } else {
+                            None
+                        };
 
                         if emit_confirmed {
                             if let Some(ref summary) = our_summary {
@@ -4576,7 +4752,9 @@ async fn handle_interest_sync_message(
             let mut entries = Vec::with_capacity(matching.len());
             for contract in matching {
                 let hash = contract_hash(&contract);
-                let summary = summary_if_hosted_or_in_use(op_manager, &contract).await;
+                let summary = summary_if_hosted_or_in_use(op_manager, &contract)
+                    .await
+                    .summary;
                 entries.push(SummaryEntry::from_summary(hash, summary.as_ref()));
             }
 
@@ -4734,7 +4912,9 @@ async fn handle_interest_sync_message(
                         // that is the residual of this family; bounding it
                         // needs a mechanism that cannot drop a new interest,
                         // not the rotation the periodic arms use.
-                        let summary = summary_if_hosted_or_in_use(op_manager, &contract).await;
+                        let summary = summary_if_hosted_or_in_use(op_manager, &contract)
+                            .await
+                            .summary;
                         entries.push(SummaryEntry::from_summary(hash, summary.as_ref()));
                     }
                 }
@@ -5275,14 +5455,45 @@ async fn get_contract_summary(
 async fn summary_if_hosted_or_in_use(
     op_manager: &Arc<OpManager>,
     key: &freenet_stdlib::prelude::ContractKey,
-) -> Option<freenet_stdlib::prelude::StateSummary<'static>> {
+) -> SummaryProbe {
     if op_manager.ring.should_summarize_or_broadcast(key) {
         // Periodic interest-sync summarize: best-effort background work, so it
         // yields the contract loop to client/relay traffic (#4534 / #4473).
-        get_contract_summary(op_manager, key, crate::contract::Priority::Background).await
+        SummaryProbe {
+            summary: get_contract_summary(op_manager, key, crate::contract::Priority::Background)
+                .await,
+            summarized: true,
+        }
     } else {
-        None
+        SummaryProbe {
+            summary: None,
+            summarized: false,
+        }
     }
+}
+
+/// What one [`summary_if_hosted_or_in_use`] call produced, together with
+/// whether it actually paid for it.
+///
+/// The two are reported together on purpose (#5338). The rotation window exists
+/// to bound the number of contract-handler round trips a reply makes, so its
+/// budget must be charged by the code that decides whether to make one — not
+/// re-derived by the caller from `summary.is_none()`, which conflates "the gate
+/// declined, nothing was spent" with "the round trip ran and came back empty".
+/// See the "metric describing a filtering decision" entry in
+/// `.claude/rules/bug-prevention-patterns.md` for the general shape and the
+/// three wrong counts it produced last time.
+///
+/// The gate itself is not literally free — `contract_state_present` is a cheap
+/// synchronous point lookup on the state store — but it makes no
+/// contract-handler round trip and runs no WASM, which is the cost the budget
+/// is sized against.
+struct SummaryProbe {
+    /// Our summary. Absent when the gate declined OR when the round trip ran
+    /// and produced nothing; `summarized` is what tells those apart.
+    summary: Option<freenet_stdlib::prelude::StateSummary<'static>>,
+    /// Whether the contract-handler round trip actually ran.
+    summarized: bool,
 }
 
 /// Get the PeerKey for a socket address.
@@ -10193,7 +10404,7 @@ mod tests {
             sorted.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
             h.op_manager
                 .interest_manager
-                .record_summary_cursor(h.old_peer, *sorted[0].id());
+                .record_summary_cursor(&h.peer_key_of(h.old_peer), *sorted[0].id());
 
             let mut seen: Vec<u32> = Vec::new();
             for round in 0..2 {
@@ -10359,7 +10570,7 @@ mod tests {
             sorted.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
             h.op_manager
                 .interest_manager
-                .record_summary_cursor(h.new_peer, *sorted[0].id());
+                .record_summary_cursor(&h.peer_key_of(h.new_peer), *sorted[0].id());
 
             let mut covered: HashSet<u32> = HashSet::new();
             for round in 0..rounds {
@@ -10391,6 +10602,373 @@ mod tests {
                 expected.len()
             );
             assert_eq!(covered, expected);
+        }
+
+        // ===== #5338: the window is as wide as it is advertised to be =====
+
+        /// Hashes carried by a `SummaryDigests` reply, in wire order.
+        fn digest_hashes(reply: Option<InterestMessage>) -> Vec<u32> {
+            match reply {
+                Some(InterestMessage::SummaryDigests { entries, .. }) => {
+                    entries.iter().map(|e| e.hash).collect()
+                }
+                other => panic!("expected a digest reply, got {other:?}"),
+            }
+        }
+
+        /// A peer that resumes on a NEW SOURCE PORT keeps its place in the
+        /// rotation.
+        ///
+        /// The cursor was keyed by `SocketAddr` until #5338, so a NATed peer
+        /// reconnecting on a fresh port lost it outright — no LRU pressure
+        /// needed. A missing cursor is not a missing optimisation: it re-draws a
+        /// RANDOM offset (deliberately, as anti-starvation), which turns the
+        /// advertised contiguous `ceil(n / 64)` tiling into coupon-collector,
+        /// roughly 90 minutes rather than 40 at n = 450. The population that hit
+        /// hardest was the frequently-reconnecting NATed peer #5238 was measured
+        /// on, so the headline convergence number was least accurate exactly
+        /// where it was validated.
+        ///
+        /// The assertion is on the EXACT window both rounds carry, not merely
+        /// that round 2 differs from round 1: a random re-draw agrees with the
+        /// contiguous answer 1 time in 200 here, and "not equal to the previous
+        /// window" would pass under the bug on all the other 199.
+        #[tokio::test]
+        async fn summary_window_cursor_follows_the_peer_not_its_address() {
+            // Seeded so that a regression's random re-draw is reproducible
+            // rather than flaky-red; the fix's own path never draws at all.
+            let _seed = crate::config::GlobalRng::seed_guard(0x5338_ADD8);
+            let h = build_harness("hf-cursor-identity", 17200, vec![7u8; 64]).await;
+            let keys = host_many(&h, 200);
+            let hashes = distinct_hashes(&keys);
+            let mut sorted = keys.clone();
+            sorted.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+            let expected = |range: std::ops::Range<usize>| -> Vec<u32> {
+                sorted[range].iter().map(contract_hash).collect()
+            };
+
+            // Fix the first round's start at index 1, so both rounds are
+            // mid-cycle and the tiling is exact (see
+            // `digest_rotation_covers_the_whole_shared_set` for why a boundary
+            // round would re-draw legitimately).
+            let pk = h.peer_key_of(h.new_peer);
+            h.op_manager
+                .interest_manager
+                .record_summary_cursor(&pk, *sorted[0].id());
+
+            let first = digest_hashes(
+                handle_interest_sync_message(
+                    &h.op_manager,
+                    h.new_peer,
+                    InterestMessage::Interests {
+                        hashes: hashes.clone(),
+                    },
+                )
+                .await,
+            );
+            assert_eq!(
+                first,
+                expected(1..65),
+                "premise: the first round must tile contiguously from the \
+                 seeded cursor, or the second round's expectation is meaningless"
+            );
+
+            // The SAME peer reappears on a different source port. Public key
+            // unchanged — that is what makes it the same peer — and the
+            // previous address is left registered because the harness has no
+            // disconnect hook; the reply is built for whichever address the
+            // request arrives on, which is the whole point.
+            let resumed_addr: SocketAddr = "127.0.0.1:17209".parse().unwrap();
+            assert!(
+                h.op_manager.ring.connection_manager.add_connection(
+                    crate::ring::Location::new(0.42),
+                    resumed_addr,
+                    pk.0.clone(),
+                    false,
+                ),
+                "the reconnecting peer must be admitted to the ring"
+            );
+            h.op_manager.ring.connection_manager.record_remote_version(
+                resumed_addr,
+                Some(crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION),
+            );
+            assert_eq!(
+                h.peer_key_of(resumed_addr),
+                pk,
+                "premise: the new address must resolve to the SAME peer key, or \
+                 this test is about two different peers and proves nothing"
+            );
+
+            let second = digest_hashes(
+                handle_interest_sync_message(
+                    &h.op_manager,
+                    resumed_addr,
+                    InterestMessage::Interests { hashes },
+                )
+                .await,
+            );
+            assert_eq!(
+                second,
+                expected(65..129),
+                "the rotation must resume where the previous reply to this PEER \
+                 stopped. Keying the cursor by address instead loses it on every \
+                 reconnect and restarts the cycle at a random offset"
+            );
+            assert_eq!(
+                h.op_manager
+                    .interest_manager
+                    .peek_summary_cursor(&pk)
+                    .as_ref(),
+                Some(sorted[128].id()),
+                "and the advanced cursor must be stored against the peer, not \
+                 against the address it happened to arrive from"
+            );
+        }
+
+        /// Contracts we track but do NOT host must not consume slots of the
+        /// summarize budget — and must still be advertised.
+        ///
+        /// `matching` comes from `contract_hash_index`, which peer interest
+        /// registrations populate as well as our own hosting, so it contains
+        /// contracts we track and cannot summarize. Those return `None` through
+        /// the in-memory gate with no contract-handler round trip, yet the build
+        /// loop charged them a slot of a budget that exists to bound exactly
+        /// that round trip. Convergence latency for the contracts we CAN
+        /// advertise therefore scaled with `|matching|` while the cost being
+        /// bounded scaled only with the hosted subset.
+        ///
+        /// # What each assertion rules out
+        ///
+        /// The fixture alternates hosted and tracked-only contracts in id order,
+        /// so a slot-charging regression halves the hosted coverage. Three
+        /// independent observables are pinned, because no one of them
+        /// distinguishes the two ways this can go wrong:
+        ///
+        /// - `fetches` — the budget is still spent in full, and still only 64.
+        ///   Goes to 32 if free entries are charged again.
+        /// - the `Some` entries — the advertised set is the whole hosted
+        ///   subset, not half of it.
+        /// - the `None` entries — the free entries are still SENT. They drive
+        ///   `clear_peer_summary` through `DigestVerdict::PeerHasNoState`, so
+        ///   "don't charge it" must not become "don't send it"; that regression
+        ///   would leave `fetches` at 64 and only this assertion would notice.
+        #[tokio::test]
+        async fn non_hosted_entries_do_not_consume_summarize_slots() {
+            use std::sync::atomic::Ordering;
+
+            let h = build_harness("hf-free-entries", 17220, vec![7u8; 64]).await;
+            let tracker = h.peer_key_of(h.old_peer);
+
+            // Big-endian index in the leading bytes, so sorted-by-id order is
+            // exactly `j` order and the interleave is a property of the fixture
+            // rather than of how the ids happen to hash.
+            let mut all = Vec::with_capacity(128);
+            let mut hosted = Vec::new();
+            let mut tracked = Vec::new();
+            for j in 0..128u32 {
+                let mut id = [0u8; 32];
+                id[0..4].copy_from_slice(&j.to_be_bytes());
+                id[4] = 0x99;
+                let key = ContractKey::from_id_and_code(
+                    ContractInstanceId::new(id),
+                    CodeHash::new([0xC1; 32]),
+                );
+                if j % 2 == 0 {
+                    let _ = h.op_manager.ring.host_contract(
+                        key,
+                        128,
+                        crate::ring::AccessType::Put,
+                        crate::ring::HostingCause::Other,
+                    );
+                    h.op_manager.interest_manager.register_local_hosting(&key);
+                    hosted.push(key);
+                } else {
+                    // Indexed by a DIFFERENT peer's interest and never hosted
+                    // here: the exact shape the build loop was charging for.
+                    h.op_manager.interest_manager.register_peer_interest_from(
+                        &key,
+                        tracker.clone(),
+                        None,
+                        false,
+                        crate::ring::interest::InterestRegistrationSource::Interests,
+                    );
+                    tracked.push(key);
+                }
+                all.push(key);
+            }
+            let hashes = distinct_hashes(&all);
+            assert_eq!((hosted.len(), tracked.len()), (64, 64));
+
+            // An id below every contract in the fixture, so the window starts
+            // at index 0 with no random draw.
+            let pk = h.peer_key_of(h.new_peer);
+            h.op_manager
+                .interest_manager
+                .record_summary_cursor(&pk, ContractInstanceId::new([0u8; 32]));
+
+            let before = h.summary_queries.load(Ordering::Relaxed);
+            let reply = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::Interests { hashes },
+            )
+            .await;
+            let fetches = h.summary_queries.load(Ordering::Relaxed) - before;
+
+            let entries = match reply {
+                Some(InterestMessage::SummaryDigests { entries, .. }) => entries,
+                other => panic!("expected a digest reply, got {other:?}"),
+            };
+            let advertised: Vec<u32> = entries
+                .iter()
+                .filter(|e| e.summary_digest.is_some())
+                .map(|e| e.hash)
+                .collect();
+            let free: Vec<u32> = entries
+                .iter()
+                .filter(|e| e.summary_digest.is_none())
+                .map(|e| e.hash)
+                .collect();
+
+            assert_eq!(
+                fetches, 64,
+                "the reply must spend its whole 64-call budget on contracts it \
+                 can actually summarize; charging the tracked-only contracts a \
+                 slot leaves half the budget buying nothing"
+            );
+            assert_eq!(
+                advertised,
+                hosted.iter().map(contract_hash).collect::<Vec<u32>>(),
+                "one round must advertise all 64 hosted contracts, in id order"
+            );
+            assert_eq!(
+                free,
+                tracked[..63]
+                    .iter()
+                    .map(contract_hash)
+                    .collect::<Vec<u32>>(),
+                "the tracked-only contracts encountered on the way must still be \
+                 SENT — they are what clears a peer's stale belief that we hold \
+                 state (`DigestVerdict::PeerHasNoState`). Not charging them a \
+                 slot must not turn into not sending them"
+            );
+            assert_eq!(
+                entries.len(),
+                127,
+                "64 charged entries plus the 63 free ones interleaved between \
+                 them; the loop stops on the 64th charged entry rather than \
+                 running on to collect free entries nobody asked for"
+            );
+            assert_eq!(
+                h.op_manager
+                    .interest_manager
+                    .peek_summary_cursor(&pk)
+                    .as_ref(),
+                Some(hosted[63].id()),
+                "the cursor advances to the last entry SENT, so the next round \
+                 resumes after it"
+            );
+        }
+
+        /// The receive leg charges its comparison budget for the entries that
+        /// COST a comparison, not for every entry.
+        ///
+        /// This is the half of #5338 the issue did not name, and without it the
+        /// send-side fix above delivers nothing. `MAX_SUMMARY_COMPARISONS_PER_MESSAGE`
+        /// used to cap the number of ENTRIES a message could contribute, so a
+        /// reply carrying 64 charged entries plus free ones would be randomly
+        /// truncated back to 64 entries by the receiver — the free entries would
+        /// crowd out the very digests the sender spent its CPU budget producing,
+        /// and the send window's contiguous tiling would arrive as a random
+        /// sample. In the worst case (half the shared set not hosted) the sender
+        /// would summarize 64 contracts to deliver 32, which is what it delivers
+        /// today: double the CPU for identical coverage.
+        ///
+        /// An entry with no digest is settled by `classify_summary_digest`'s
+        /// `(_, None)` arm without our summary, so it genuinely costs nothing
+        /// here either. The free entries are placed FIRST so that a
+        /// budget-charged-per-entry regression consumes the whole budget on
+        /// them and reaches none of the digests behind.
+        #[tokio::test]
+        async fn free_digest_entries_do_not_consume_the_receive_budget() {
+            use std::sync::atomic::Ordering;
+
+            // Seeded because the pre-fix path rotates by a random offset before
+            // truncating; a regression must fail reproducibly.
+            let _seed = crate::config::GlobalRng::seed_guard(0x5338_5EC0);
+            let h = build_harness("hf-recv-free", 17240, vec![7u8; 64]).await;
+            let keys = host_many(&h, 200);
+            let hashes = distinct_hashes(&keys);
+            let pk = h.peer_key_of(h.new_peer);
+
+            // A belief about the peer that the free entries must clear. Without
+            // this, "processed" and "silently dropped" look the same from the
+            // request list alone.
+            h.op_manager.interest_manager.upsert_peer_summary_from(
+                &keys[199],
+                &pk,
+                StateSummary::from(vec![4u8; 8]),
+                crate::ring::interest::SummaryPopulationSource::InterestSummary,
+            );
+
+            let mut entries: Vec<SummaryDigestEntry> = hashes[64..]
+                .iter()
+                .map(|&hash| SummaryDigestEntry {
+                    hash,
+                    summary_digest: None,
+                })
+                .collect();
+            entries.extend(hashes[..64].iter().map(|&hash| SummaryDigestEntry {
+                hash,
+                summary_digest: Some(summary_digest(b"not our summary")),
+            }));
+            assert_eq!(
+                entries.len(),
+                200,
+                "premise: 136 free entries, then 64 costed ones"
+            );
+
+            let before = h.summary_queries.load(Ordering::Relaxed);
+            let reply = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::SummaryDigests {
+                    entries,
+                    emitter: crate::message::SummariesEmitter::InterestsReply,
+                },
+            )
+            .await;
+            let fetches = h.summary_queries.load(Ordering::Relaxed) - before;
+
+            match reply {
+                Some(InterestMessage::SummaryRequest { hashes: requested }) => {
+                    assert_eq!(
+                        requested.iter().copied().collect::<HashSet<u32>>(),
+                        hashes[..64].iter().copied().collect::<HashSet<u32>>(),
+                        "every digest that disagreed must be followed up. A \
+                         budget charged per ENTRY is spent on the 136 free ones \
+                         first and never reaches these at all"
+                    );
+                }
+                other => panic!(
+                    "a message full of disagreeing digests must ask for bytes, got {other:?}"
+                ),
+            }
+            assert_eq!(
+                fetches, 64,
+                "exactly one summarize per costed entry, and none at all for the \
+                 free ones — the receive budget must bound the round trips, not \
+                 the entry count"
+            );
+            assert_eq!(
+                h.op_manager
+                    .interest_manager
+                    .get_peer_interest(&keys[199], &pk)
+                    .and_then(|i| i.summary),
+                None,
+                "a free entry still carries its repair: `PeerHasNoState` clears \
+                 our cached belief. Not charging it must not mean discarding it"
+            );
         }
 
         /// The RECEIVING leg is bounded independently of the sending one.
@@ -10599,7 +11177,7 @@ mod tests {
             assert!(
                 h.op_manager
                     .interest_manager
-                    .peek_summary_cursor(h.new_peer)
+                    .peek_summary_cursor(&h.peer_key_of(h.new_peer))
                     .is_none(),
                 "premise: no cursor before the first reply"
             );
@@ -10614,7 +11192,7 @@ mod tests {
             assert!(
                 h.op_manager
                     .interest_manager
-                    .peek_summary_cursor(h.new_peer)
+                    .peek_summary_cursor(&h.peer_key_of(h.new_peer))
                     .is_some(),
                 "a digest reply must record where it stopped, or the next round \
                  re-draws at random and the ceil(n / cap) coverage bound is lost \
@@ -10704,7 +11282,7 @@ mod tests {
             sorted.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
             h.op_manager
                 .interest_manager
-                .record_summary_cursor(h.old_peer, *sorted[0].id());
+                .record_summary_cursor(&h.peer_key_of(h.old_peer), *sorted[0].id());
 
             let mut covered: HashSet<u32> = HashSet::new();
             for round in 0..rounds {
@@ -10890,7 +11468,7 @@ mod tests {
                 let cursor = h
                     .op_manager
                     .interest_manager
-                    .peek_summary_cursor(h.old_peer)
+                    .peek_summary_cursor(&h.peer_key_of(h.old_peer))
                     .expect("a fallback reply must leave a cursor");
                 assert!(
                     ids.contains(&cursor),

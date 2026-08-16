@@ -136,8 +136,8 @@ const RESYNC_THROTTLE_CACHE_SIZE: usize = 4096;
 
 /// Bound on the number of peers tracked by the periodic summary rotation
 /// cursor (#5155; every peer since #5238, not just the full-bytes minority).
-/// Keyed by remote socket address, so it MUST be bounded — see the
-/// per-key-collection rule in `.claude/rules/code-style.md`.
+/// Keyed by remote peer, so it MUST be bounded — see the per-key-collection
+/// rule in `.claude/rules/code-style.md`.
 ///
 /// Eviction costs a peer its place in the cycle, not coverage: a forgotten
 /// cursor restarts that peer's rotation at a random offset, so the contracts
@@ -157,6 +157,13 @@ const RESYNC_THROTTLE_CACHE_SIZE: usize = 4096;
 /// is no longer as large as the original margin suggested, so re-check it
 /// against `max_connections` rather than against this paragraph if either
 /// moves.
+///
+/// #5338 re-keyed the cache from [`SocketAddr`] to [`PeerKey`], which makes
+/// this bound the number of tracked PEERS rather than the number of tracked
+/// ADDRESSES. A NATed peer that reconnects on a new source port used to
+/// consume a fresh slot each time (and abandon its old one to age out), so the
+/// occupancy was churn-driven; it is now one slot per peer for as long as that
+/// peer keeps its key.
 const SUMMARY_WINDOW_CURSOR_CACHE_SIZE: usize = 4096;
 
 /// Bounds diagnostic correlation state influenced by remote (contract, peer)
@@ -1105,7 +1112,20 @@ pub struct InterestManager<T: TimeSource> {
     resync_request_throttle: Mutex<LruCache<(ContractKey, SocketAddr), Instant>>,
 
     /// Rotation cursor for the bounded periodic summary reply (#5155, extended
-    /// to the digest form by #5238), keyed by the peer's socket address.
+    /// to the digest form by #5238), keyed by the peer's stable transport
+    /// public key.
+    ///
+    /// KEYED BY [`PeerKey`], NOT BY [`SocketAddr`] (#5338). The address is not
+    /// the peer's identity — a NATed peer that resumes on a new source port is
+    /// the same peer with the same hosted set, and keying by address threw its
+    /// cursor away on every reconnect. That is not a lost optimisation: with no
+    /// cursor, [`Self::summary_window_start`] re-draws a RANDOM offset, so
+    /// coverage degrades from a contiguous `ceil(n / limit)` tiling to
+    /// coupon-collector — about `(n / limit) * H_(n / limit)` rounds, ~90
+    /// minutes rather than ~40 at n = 450 and the 5-minute heartbeat. The
+    /// population it hit hardest was the frequently-reconnecting NATed peer
+    /// #5238 was measured on, i.e. the convergence figure was least accurate
+    /// exactly where it was validated.
     ///
     /// Holds the contract id of the LAST entry included in that peer's previous
     /// reply — a KEY, not an index. That distinction is what preserves
@@ -1135,7 +1155,7 @@ pub struct InterestManager<T: TimeSource> {
     /// and never touched it — and #5238 ended that, because the cost the window
     /// really bounds is the per-entry summarize call, which the digest form
     /// pays in full.
-    summary_window_cursor: Mutex<LruCache<SocketAddr, ContractInstanceId>>,
+    summary_window_cursor: Mutex<LruCache<PeerKey, ContractInstanceId>>,
 
     /// Count of concurrently-outstanding queue-full-resync retry tasks (#4862 P1).
     /// Bounds aggregate retry tasks node-wide, independent of the throttle LRU
@@ -2779,11 +2799,12 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// forever". The two ways to land back at a boundary repeatedly are both
     /// reachable here, and neither needs an attacker:
     ///
-    /// - The cursor is in-memory and keyed by address, so it is lost on our
-    ///   own restart, on LRU eviction, and whenever a peer reconnects from a
-    ///   new source port. A peer that reconnects more often than one cycle
+    /// - The cursor is in-memory, so it is lost on our own restart and on LRU
+    ///   eviction. A peer whose cursor is dropped more often than one cycle
     ///   completes would, with a fixed restart, only ever be told about the
-    ///   head of the set.
+    ///   head of the set. (Reconnection from a new source port used to be a
+    ///   third way in — the cache was keyed by address — and is not one since
+    ///   #5338; see [`Self::summary_window_cursor`].)
     /// - `sorted` is the INTERSECTION with the hash list the peer advertised,
     ///   so the peer influences where the cursor lands. Advertising a single
     ///   high-id contract parks the cursor at the end, and the following full
@@ -2797,11 +2818,11 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// covered first every time.
     ///
     /// `GlobalRng` keeps this deterministic under simulation and test.
-    pub(crate) fn summary_window_start(&self, peer: SocketAddr, sorted: &[ContractKey]) -> usize {
+    pub(crate) fn summary_window_start(&self, peer: &PeerKey, sorted: &[ContractKey]) -> usize {
         if sorted.is_empty() {
             return 0;
         }
-        let after = { self.summary_window_cursor.lock().peek(&peer).copied() };
+        let after = { self.summary_window_cursor.lock().peek(peer).copied() };
         let resumed = after.map(|after| first_index_after(sorted, &after));
         match resumed {
             // Mid-cycle: continue exactly where the last reply stopped.
@@ -2817,14 +2838,16 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// Takes what was SENT, not what was selected: the byte budget can cut a
     /// window short, and advancing past entries we dropped would skip them
     /// until the rotation wrapped all the way round.
-    pub(crate) fn record_summary_cursor(&self, peer: SocketAddr, last_sent: ContractInstanceId) {
-        self.summary_window_cursor.lock().put(peer, last_sent);
+    pub(crate) fn record_summary_cursor(&self, peer: &PeerKey, last_sent: ContractInstanceId) {
+        self.summary_window_cursor
+            .lock()
+            .put(peer.clone(), last_sent);
     }
 
     /// Test accessor for the stored cursor.
     #[cfg(test)]
-    pub(crate) fn peek_summary_cursor(&self, peer: SocketAddr) -> Option<ContractInstanceId> {
-        self.summary_window_cursor.lock().peek(&peer).copied()
+    pub(crate) fn peek_summary_cursor(&self, peer: &PeerKey) -> Option<ContractInstanceId> {
+        self.summary_window_cursor.lock().peek(peer).copied()
     }
 }
 
@@ -7534,27 +7557,27 @@ mod tests {
     #[test]
     fn summary_cursor_round_trips_and_resumes_mid_cycle() {
         let (mgr, _clock) = make_manager();
-        let peer: SocketAddr = "127.0.0.1:9100".parse().unwrap();
+        let peer = make_peer_key(1);
         let sorted = sorted_keys(0..8);
 
-        assert_eq!(mgr.peek_summary_cursor(peer), None);
+        assert_eq!(mgr.peek_summary_cursor(&peer), None);
 
-        mgr.record_summary_cursor(peer, *sorted[2].id());
-        assert_eq!(mgr.peek_summary_cursor(peer), Some(*sorted[2].id()));
+        mgr.record_summary_cursor(&peer, *sorted[2].id());
+        assert_eq!(mgr.peek_summary_cursor(&peer), Some(*sorted[2].id()));
         assert_eq!(
-            mgr.summary_window_start(peer, &sorted),
+            mgr.summary_window_start(&peer, &sorted),
             3,
             "mid-cycle the resume point must be exactly after the last id sent"
         );
 
         // Cursors are per peer: one peer's progress must not advance another's.
-        let other: SocketAddr = "127.0.0.1:9101".parse().unwrap();
-        mgr.record_summary_cursor(other, *sorted[6].id());
-        assert_eq!(mgr.summary_window_start(peer, &sorted), 3);
-        assert_eq!(mgr.summary_window_start(other, &sorted), 7);
+        let other = make_peer_key(2);
+        mgr.record_summary_cursor(&other, *sorted[6].id());
+        assert_eq!(mgr.summary_window_start(&peer, &sorted), 3);
+        assert_eq!(mgr.summary_window_start(&other, &sorted), 7);
 
         // An empty shared set has no valid offset; it must not panic or draw.
-        assert_eq!(mgr.summary_window_start(peer, &[]), 0);
+        assert_eq!(mgr.summary_window_start(&peer, &[]), 0);
     }
 
     /// At a CYCLE BOUNDARY the start is random, not a fixed 0.
@@ -7578,8 +7601,8 @@ mod tests {
         // No cursor: many draws, all in range, and not all the same value.
         let mut seen = HashSet::new();
         for i in 0..40u32 {
-            let peer: SocketAddr = format!("127.0.0.1:{}", 9200 + i).parse().unwrap();
-            let start = mgr.summary_window_start(peer, &sorted);
+            let peer = make_unique_peer_key(9200 + i);
+            let start = mgr.summary_window_start(&peer, &sorted);
             assert!(start < sorted.len(), "start {start} out of range");
             seen.insert(start);
         }
@@ -7590,11 +7613,11 @@ mod tests {
         );
 
         // Cursor at the highest id: also a boundary, also randomised.
-        let peer: SocketAddr = "127.0.0.1:9300".parse().unwrap();
+        let peer = make_unique_peer_key(9300);
         let mut seen_wrapped = HashSet::new();
         for _ in 0..40 {
-            mgr.record_summary_cursor(peer, *sorted[sorted.len() - 1].id());
-            seen_wrapped.insert(mgr.summary_window_start(peer, &sorted));
+            mgr.record_summary_cursor(&peer, *sorted[sorted.len() - 1].id());
+            seen_wrapped.insert(mgr.summary_window_start(&peer, &sorted));
         }
         assert!(
             seen_wrapped.iter().all(|s| *s < sorted.len()),
