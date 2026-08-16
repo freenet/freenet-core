@@ -10643,19 +10643,21 @@ mod tests {
             let hashes = distinct_hashes(&keys);
             let mut sorted = keys.clone();
             sorted.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
-            let expected = |range: std::ops::Range<usize>| -> Vec<u32> {
-                sorted[range].iter().map(contract_hash).collect()
+            // 64 hashes from `start`, WRAPPING — `rotation_window_indices`
+            // wraps, and a window that runs off the end mid-cycle is ordinary.
+            let expected_from = |start: usize| -> Vec<u32> {
+                (0..64)
+                    .map(|i| contract_hash(&sorted[(start + i) % sorted.len()]))
+                    .collect()
             };
 
-            // Fix the first round's start at index 1, so both rounds are
-            // mid-cycle and the tiling is exact (see
-            // `digest_rotation_covers_the_whole_shared_set` for why a boundary
-            // round would re-draw legitimately).
+            // The first round is driven through the handler rather than by
+            // seeding the cursor directly, so that the SECOND round's assertion
+            // is the one a regression trips. Seeding via
+            // `record_summary_cursor` would make a re-keyed cursor miss on
+            // round one too, and the test would then fail on its own premise
+            // without ever exercising the reconnect.
             let pk = h.peer_key_of(h.new_peer);
-            h.op_manager
-                .interest_manager
-                .record_summary_cursor(&pk, *sorted[0].id());
-
             let first = digest_hashes(
                 handle_interest_sync_message(
                     &h.op_manager,
@@ -10667,10 +10669,24 @@ mod tests {
                 .await,
             );
             assert_eq!(
-                first,
-                expected(1..65),
-                "premise: the first round must tile contiguously from the \
-                 seeded cursor, or the second round's expectation is meaningless"
+                first.len(),
+                64,
+                "premise: the first round must fill the whole entry cap"
+            );
+            // Where the second round MUST resume: immediately after the last id
+            // the first one sent. Derived from what round one actually did, so
+            // it is an exact expectation without depending on which offset the
+            // cycle-boundary draw picked.
+            let resume = sorted
+                .iter()
+                .position(|k| contract_hash(k) == *first.last().expect("64 entries"))
+                .expect("the last hash sent must be one of ours")
+                + 1;
+            assert!(
+                resume < sorted.len(),
+                "premise: round one must not end on the highest id (resume=\
+                 {resume}), or round two is at a CYCLE BOUNDARY and re-draws a \
+                 random offset legitimately, proving nothing about the cursor"
             );
 
             // The SAME peer reappears on a different source port. Public key
@@ -10709,7 +10725,7 @@ mod tests {
             );
             assert_eq!(
                 second,
-                expected(65..129),
+                expected_from(resume),
                 "the rotation must resume where the previous reply to this PEER \
                  stopped. Keying the cursor by address instead loses it on every \
                  reconnect and restarts the cycle at a random offset"
@@ -10719,7 +10735,7 @@ mod tests {
                     .interest_manager
                     .peek_summary_cursor(&pk)
                     .as_ref(),
-                Some(sorted[128].id()),
+                Some(sorted[(resume + 63) % sorted.len()].id()),
                 "and the advanced cursor must be stored against the peer, not \
                  against the address it happened to arrive from"
             );
