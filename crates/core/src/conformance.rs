@@ -30,6 +30,7 @@
 //! - [`generator`] — turns a corpus of observed states into cases to check.
 //! - [`minimize`] — shrinks a failing case to the smallest witness that still fails,
 //!   so evidence fits its size bound and reads as a usable bug report.
+//! - [`capture`] — operator-enabled recording of real contract traffic for replay.
 //! - [`sampler`] — the bounded, restart-safe store of states a peer observed.
 //! - [`focus`] — which contracts a peer watches, and when it moves on.
 //! - [`policy`] — what a peer is permitted to do about a finding. Deletion is the
@@ -80,6 +81,7 @@
 //! merges straddle an expiry boundary and be accused of breaking commutativity.
 
 pub mod bundle;
+pub mod capture;
 pub mod evidence;
 pub mod focus;
 pub mod generator;
@@ -99,6 +101,7 @@ mod tests;
 mod wasm_tests;
 
 pub use bundle::ReplayBundle;
+pub use capture::{CaptureHandle, Observation};
 pub use evidence::{ConformanceEvidence, EvidenceId, EvidenceRejected};
 pub use focus::FocusSelector;
 pub use generator::{GeneratorConfig, generate_cases};

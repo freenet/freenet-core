@@ -1549,6 +1549,42 @@ where
         };
         let new_state = WrappedState::new(new_state.into_bytes());
 
+        // Conformance capture (RFC #5320), off unless an operator sets
+        // FREENET_CONFORMANCE_CAPTURE_DIR. This is the seam where the base state,
+        // the update that was applied and the resulting state are all in hand,
+        // which is exactly the transition an offline replay needs.
+        //
+        // Cost when disabled is one atomic load. When enabled it is a `try_send` on
+        // a bounded channel that drops rather than waits, so a slow writer can never
+        // stall a merge — capture losing observations is always preferable to
+        // synchronization queueing behind it.
+        if let Some(capture) = crate::conformance::capture::global() {
+            let (incoming_state, delta) = updates.iter().fold((None, None), |acc, update| {
+                match update {
+                    UpdateData::State(state) => (Some(state.as_ref().to_vec()), acc.1),
+                    UpdateData::Delta(delta) => (acc.0, Some(delta.as_ref().to_vec())),
+                    UpdateData::StateAndDelta { state, delta } => {
+                        (Some(state.as_ref().to_vec()), Some(delta.as_ref().to_vec()))
+                    }
+                    // Related-contract payloads describe a different contract's
+                    // state, so they are not part of this transition.
+                    UpdateData::RelatedState { .. }
+                    | UpdateData::RelatedDelta { .. }
+                    | UpdateData::RelatedStateAndDelta { .. }
+                    | _ => acc,
+                }
+            });
+            capture.observe(crate::conformance::capture::Observation {
+                contract: *key.id(),
+                code_hash: crate::conformance::capture::code_hash_of(key),
+                parameters: parameters.as_ref().to_vec(),
+                base_state: current_state.as_ref().to_vec(),
+                incoming_state,
+                delta,
+                result_state: new_state.as_ref().to_vec(),
+            });
+        }
+
         if new_state.as_ref() == current_state.as_ref() {
             tracing::debug!(
                 contract = %key,
