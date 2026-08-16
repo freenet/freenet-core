@@ -148,7 +148,9 @@ pub use hosting::{AccessType, RecordAccessResult};
 /// Aggregate disk-budget defaults (#4683). `config` resolves the persisted
 /// `hosting-disk-pct` / `max-hosting-disk` defaults from these so the operator-
 /// facing defaults and the in-code sizing math share one source of truth.
-pub(crate) use hosting::{DEFAULT_HOSTING_DISK_PCT, DEFAULT_MAX_HOSTING_DISK_BYTES};
+pub(crate) use hosting::{
+    DEFAULT_HOSTING_DISK_PCT, DEFAULT_MAX_HOSTING_DISK_BYTES, DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE,
+};
 /// Widths of the two hosted-set demand-signal histograms carried on the router
 /// snapshot, re-exported so `router` sizes its wire arrays from the same
 /// definition the bucketing code uses.
@@ -3264,6 +3266,33 @@ impl Ring {
                 .disk_available_bytes()
                 .unwrap_or(u64::MAX);
             ring.hosting_manager.recompute_effective_budget(available);
+
+            // Resident-overhead (count-derived) budget (#5325, live-basis #5333):
+            // recomputed every tick so it tracks LIVE memory pressure rather than
+            // being fixed at startup — a peer that grows busy (or a `MemoryMax`
+            // cgroup that gets tightened externally) re-derives a smaller budget
+            // on the next tick, and one that goes idle re-derives a larger one.
+            // All three reads are cheap (a `/proc` parse or a single syscall on
+            // every platform), so unlike the disk-usage walk above these run
+            // inline rather than on a blocking thread.
+            // 1 GiB fallback mirrors `cache::FALLBACK_TOTAL_RAM_BYTES` (private to
+            // that module) for the rare case the RAM read itself fails.
+            let total_ram = crate::wasm_runtime::read_total_ram_bytes()
+                .map(|v| v as u64)
+                .unwrap_or(1024 * 1024 * 1024);
+            let pool_size = crate::config::runtime_pool_size().get();
+            let live_signals = match (
+                crate::wasm_runtime::read_own_rss_bytes(),
+                crate::wasm_runtime::read_available_memory_bytes(),
+            ) {
+                (Some(rss), Some(avail)) => Some((rss as u64, avail as u64)),
+                _ => None,
+            };
+            ring.hosting_manager.recompute_resident_overhead_budget(
+                total_ram,
+                pool_size,
+                live_signals,
+            );
         }
     }
 
@@ -3463,6 +3492,14 @@ impl Ring {
         // config is only reachable here). The 60s sweep's recompute reads them.
         self.hosting_manager
             .configure_disk_budget(hosting_disk_pct, max_hosting_disk);
+    }
+
+    /// Install the operator-configurable share of live host-wide surplus
+    /// memory the resident-overhead (count-derived) eviction budget may claim
+    /// (#5333). Called once at startup; the 60s sweep's recompute reads it.
+    pub fn configure_resident_overhead_mem_share(&self, mem_share: f64) {
+        self.hosting_manager
+            .configure_resident_overhead_mem_share(mem_share);
     }
 
     /// Drop the ring's clones of the redb `Storage` handle (hosting metadata +

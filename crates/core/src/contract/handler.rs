@@ -120,6 +120,10 @@ impl ContractHandler for NetworkContractHandler {
             config.hosting_disk_pct,
             config.max_hosting_disk,
         );
+        // Resident-overhead (count-derived) budget's live-surplus share (#5333).
+        op_manager
+            .ring
+            .configure_resident_overhead_mem_share(config.hosting_mem_share);
         // Hydrate broken-invariants flags from the same backing store so a
         // node that previously detected a non-idempotent contract doesn't
         // re-engage its broadcast storm after restart.
