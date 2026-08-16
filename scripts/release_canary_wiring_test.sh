@@ -1323,6 +1323,31 @@ if [[ -f "$RELEASE_SH" ]]; then
         grep -nE "(^$1\$|^if ! $1;|^$1 \|\||^[[:space:]]+$1\$)" "$RELEASE_SH" \
             | head -1 | cut -d: -f1
     }
+    # AMBIGUITY MUST FAIL LOUDLY, not resolve to whichever call comes first.
+    #
+    # Widening `_line_of_call` from `^name$` to also match an indented call was
+    # necessary once `wait_for_binaries` moved inside a guard -- but it also made
+    # `publish_crates` resolvable to a call nested in that guard. While the
+    # fallback still called it, `head -1` took the nested one, and deleting the
+    # real main-flow call left this pin GREEN while reporting the fallback's line
+    # number as though it were the ordered publish. A reader checking the message
+    # would have been misled by a number that was confidently wrong.
+    #
+    # The design change removed that particular collision -- the fallback no
+    # longer publishes, so there is exactly one call again -- but the widened
+    # regex remains, so the collision is one edit away from returning. Counting
+    # is the fix: more than one call site and this refuses to report an ordering
+    # at all, rather than silently picking one.
+    RS_PUBLISH_COUNT="$(grep -cE '^[[:space:]]*publish_crates[[:space:]]*$' "$RELEASE_SH")"
+    if [[ "$RS_PUBLISH_COUNT" -ne 1 ]]; then
+        fail "release.sh has $RS_PUBLISH_COUNT 'publish_crates' call sites, expected exactly 1" \
+            "This assertion reports a LINE NUMBER for 'the publish', and with more" \
+            "than one call it would report whichever comes first -- which is how a" \
+            "deleted main-flow call once left this pin green while naming a nested" \
+            "call's line as the ordered publish. If a second call site is genuinely" \
+            "wanted, decide here which one this ordering is about." \
+            "$(grep -nE '^[[:space:]]*publish_crates[[:space:]]*$' "$RELEASE_SH")"
+    fi
     RS_PUBLISH="$(_line_of_call publish_crates)"
     RS_CREATE="$(_line_of_call create_github_release)"
     RS_WAIT="$(_line_of_call wait_for_binaries)"

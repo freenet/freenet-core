@@ -217,75 +217,119 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3. the publish fallback is REACHABLE when the workflow path is broken
+# 3. the driver REFUSES to publish when the workflow path failed
 # ---------------------------------------------------------------------------
-# The ordering assertion above compares the POSITION of the calls. This asserts
-# that the later one actually RUNS, which a line-number comparison structurally
-# cannot express -- and did not: `publish_crates` sat textually after
-# `wait_for_binaries` and was unreachable in the exact scenario its own comment
-# says it exists for.
+# THIS ASSERTION WAS PREVIOUSLY THE EXACT OPPOSITE, and the inversion is the
+# most important thing in this file.
 #
-# `release.sh` runs under `set -euo pipefail`, and `wait_for_binaries` was
-# called BARE. It returns nonzero on five paths -- timeout, attach job failed,
-# attach succeeded but binaries missing, no run found, and draft state unknown --
-# so on every one of them the script aborted before reaching the fallback. Its
-# comment claims it is the backstop for when "the workflow path is broken"; it
-# was disarmed by precisely the conditions that mean the workflow path is
-# broken.
+# It asserted that `publish_crates` still RUNS when `wait_for_binaries` fails,
+# on the reasoning that the fallback was a harmless confirmation and a backstop
+# for a `CARGO_REGISTRY_TOKEN` that never reached CI. Walking the five failure
+# paths shows publishing is wrong on four of them:
 #
-# Stubbing `wait_for_binaries` to fail is the whole test. If the fallback is
-# guarded it still runs; if the call is bare, `set -e` kills the script first.
+#   no workflow run found        Gate A never ran        -> publish ungated
+#   attach job never reported    Gate A state unknown    -> publish ungated
+#   attach conclusion != success Gate A REJECTED it      -> publish what it blocked
+#   timeout                      Gate A undecided        -> pre-empt the gate
+#   assets missing, attach OK    Gate A passed           -> the only safe one
+#
+# `publish_crates` consults only the resume flag, DRY_RUN and crates.io
+# presence -- never the gate's verdict. And on the rejected path the crate is
+# genuinely absent (cross-compile.yml runs the canary before its publish step),
+# so the already-published check says "no" and the upload really happens.
+#
+# The backstop justification was also unachievable: the credential check runs
+# BEFORE the canary in cross-compile.yml, so a missing token cannot reach this
+# branch -- and here missing-token and canary-rejected are indistinguishable,
+# both arriving as the same non-success conclusion.
+#
+# The general lesson, and it is why this file now asserts the opposite: the
+# fallback was DEAD (bare call under `set -e`) and making it live removed the
+# accident that was preventing an unsafe publish. Before making dead code
+# reachable, ask what its being dead was protecting.
 if [[ -z "${MAIN_FLOW:-}" || -z "${FN_NAMES:-}" ]]; then
-    fail "main flow not extracted; the reachability case cannot run" \
+    fail "main flow not extracted; the refusal case cannot run" \
         "It would otherwise report success having executed nothing."
 else
-    reach_work="$(mktemp -d)"
-    {
-        while IFS= read -r fn; do
-            [[ -z "$fn" ]] && continue
-            if [[ "$fn" == "wait_for_binaries" ]]; then
-                # The failure mode under test: the workflow path is broken.
-                printf '%s() { echo "CALL:%s"; return 1; }\n' "$fn" "$fn"
-            else
-                printf '%s() { echo "CALL:%s"; }\n' "$fn" "$fn"
-            fi
-        done <<< "$FN_NAMES"
-        printf 'VERSION=9.9.9\nFDEV_VERSION=0.9.9\nSTATE_FILE=/dev/null\n'
-        printf 'PROJECT_ROOT=/nonexistent\n'
-        # `set -e` ONLY, deliberately, and NOT `set -euo pipefail`.
-        #
-        # errexit is the mechanism under test: a bare `wait_for_binaries`
-        # aborting the script is what makes the fallback unreachable. `-u` is
-        # not, and including it made this harness abort on `PROJECT_ROOT`
-        # -- a variable defined in the part of release.sh above the extracted
-        # main-flow region -- BEFORE reaching the code under test. The case then
-        # reported RED for a reason having nothing to do with reachability,
-        # which is a vacuous failure: right verdict, wrong cause, and it would
-        # have gone green again on any change that happened to define that
-        # variable. Caught by reading the harness's stderr instead of trusting
-        # the red.
-        printf 'set -e\n'
-        printf '%s\n' "$MAIN_FLOW"
-    } > "$reach_work/flow.sh"
+    refuse_case() {  # refuse_case <desc> <wfb-rc> <want-publish: yes|no> <want-exit: zero|nonzero>
+        local desc="$1" wfb_rc="$2" want_pub="$3" want_exit="$4"
+        local work rc got_pub got_exit
+        work="$(mktemp -d)"
+        {
+            while IFS= read -r fn; do
+                [[ -z "$fn" ]] && continue
+                if [[ "$fn" == "wait_for_binaries" ]]; then
+                    printf '%s() { echo "CALL:%s"; return %s; }\n' "$fn" "$fn" "$wfb_rc"
+                else
+                    printf '%s() { echo "CALL:%s"; }\n' "$fn" "$fn"
+                fi
+            done <<< "$FN_NAMES"
+            printf 'VERSION=9.9.9\nFDEV_VERSION=0.9.9\nSTATE_FILE=/dev/null\n'
+            printf 'PROJECT_ROOT=/nonexistent\n'
+            # `set -e` only; errexit is the mechanism, `-u` would abort on
+            # variables the extraction did not carry.
+            printf 'set -e\n'
+            printf '%s\n' "$MAIN_FLOW"
+        } > "$work/flow.sh"
 
-    REACH_ORDER="$(bash "$reach_work/flow.sh" 2>/dev/null | sed -n 's/^CALL://p')"
-    if printf '%s\n' "$REACH_ORDER" | grep -qxF publish_crates; then
-        pass "publish_crates still runs when wait_for_binaries fails (fallback is reachable)"
+        bash "$work/flow.sh" > "$work/out" 2>&1
+        rc=$?
+        if grep -qxF 'CALL:publish_crates' "$work/out"; then got_pub=yes; else got_pub=no; fi
+        if [[ "$rc" -eq 0 ]]; then got_exit=zero; else got_exit=nonzero; fi
+
+        if [[ "$got_pub" == "$want_pub" && "$got_exit" == "$want_exit" ]]; then
+            pass "driver: $desc (published=$got_pub, exit=$got_exit)"
+        else
+            fail "driver: $desc" \
+                "wait_for_binaries returned $wfb_rc" \
+                "expected published=$want_pub exit=$want_exit; got published=$got_pub exit=$got_exit" \
+                "Publishing on a failed workflow path uploads a version Gate A never" \
+                "passed -- on four of the five failure paths, including the one where" \
+                "the canary REJECTED the binary. That permanently spends the version" \
+                "number. The branch must refuse and print the recovery procedure." \
+                "--- output ---" \
+                "$(head -20 "$work/out")"
+        fi
+        rm -rf "$work"
+    }
+
+    # THE property: a failed workflow path must NOT publish, and must fail loudly.
+    refuse_case "refuses to publish when wait_for_binaries fails" 1 no nonzero
+    # The control, so the case above cannot be satisfied by a driver that never
+    # publishes at all.
+    refuse_case "still publishes on the success path" 0 yes zero
+fi
+
+# --- 3b. every publish_draft_release call site is guarded -------------------
+# A source scan, by necessity. Case 4 below drives the REAL `wait_for_binaries`
+# but only reaches its FIRST `publish_draft_release` call site -- the
+# "binaries already available" branch. The second is inside the polling loop and
+# would need a stubbed `gh`, a run id and several poll iterations to reach;
+# mutation-testing confirmed the behavioural case does not cover it (reverting
+# that site alone stayed green).
+#
+# Rather than leave the sibling unprotected -- the exact fix-the-named-site-only
+# habit this PR keeps finding -- both sites are pinned structurally: a call to
+# `publish_draft_release` must be guarded, never bare, because bare calls have
+# their failure swallowed when `wait_for_binaries` is invoked from an `if !`
+# condition.
+PDR_BARE="$(grep -nE '^[[:space:]]*publish_draft_release[[:space:]]*$' "$RELEASE_SH")"
+if [[ -z "$PDR_BARE" ]]; then
+    PDR_CALLS="$(grep -cE 'publish_draft_release' "$RELEASE_SH")"
+    if [[ "$PDR_CALLS" -lt 3 ]]; then
+        fail "expected publish_draft_release's definition plus at least 2 call sites, found $PDR_CALLS references" \
+            "The bare-call scan above would pass having nothing to examine."
     else
-        fail "the crates.io fallback is UNREACHABLE when the workflow path is broken" \
-            "Stubbed wait_for_binaries to return 1; observed calls:" \
-            "  $(printf '%s\n' "$REACH_ORDER" | tr '\n' ' ')" \
-            "publish_crates never ran. release.sh runs under 'set -euo pipefail'," \
-            "so a bare 'wait_for_binaries' aborts the script on any of its five" \
-            "nonzero returns -- timeout, attach job failed, binaries missing, no run" \
-            "found, draft state unknown. Every one of those IS 'the workflow path is" \
-            "broken', which is the case publish_crates' own comment claims it covers." \
-            "Guard the call ('if ! wait_for_binaries; then publish_crates; exit 1; fi')" \
-            "or correct the comment to state the real reachability. Do not rely on" \
-            "the ordering assertion above: it compares line numbers and passes while" \
-            "the call is dead."
+        pass "no bare 'publish_draft_release' call; every site propagates its refusal"
     fi
-    rm -rf "$reach_work"
+else
+    fail "publish_draft_release is called BARE, so its refusal can be swallowed" \
+        "$PDR_BARE" \
+        "Bash suspends errexit for the whole dynamic extent of a command in an" \
+        "'if !' condition, including the callee's body. wait_for_binaries is called" \
+        "that way, so a bare failing call here falls through to the adjacent" \
+        "'return 0' and reports SUCCESS for an unpublished draft." \
+        "Use 'if ! publish_draft_release; then return 1; fi'."
 fi
 
 # ---------------------------------------------------------------------------

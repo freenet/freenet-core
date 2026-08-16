@@ -1127,8 +1127,11 @@ See commit history for detailed changes.
 # release_canary_wiring_test.sh -- that one compares line numbers and passed
 # throughout the period this was dead.
 #
-# MUST be called AFTER wait_for_binaries. Calling it earlier reinstates exactly
-# the ordering described above.
+# MUST be called AFTER wait_for_binaries, and ONLY on its success path. Calling
+# it earlier reinstates the ordering described above; calling it on the FAILURE
+# path publishes a version Gate A never passed, because this function checks
+# only the resume flag, DRY_RUN and crates.io presence -- never the gate's
+# verdict. The main flow refuses instead; see the comment at that call site.
 publish_crates() {
     echo "Confirming crates.io publish (normally already done by cross-compile.yml):"
 
@@ -1814,15 +1817,65 @@ create_github_release
 # second call was dead. release_driver_test.sh now stubs `wait_for_binaries` to
 # fail and asserts `publish_crates` still runs.
 #
-# `exit 1` after it, so a broken workflow path still fails the driver loudly --
-# the confirmation runs, the release is still reported as unsuccessful.
+# REFUSES TO PUBLISH. This branch does NOT call publish_crates, and that is the
+# whole point of it.
+#
+# An earlier revision called publish_crates here, on the theory that it was a
+# harmless confirmation and a backstop for a CARGO_REGISTRY_TOKEN that never
+# reached CI. Both halves were wrong.
+#
+# WHY IT IS UNSAFE. `wait_for_binaries` returns nonzero on five paths, and
+# publishing is wrong on four of them:
+#
+#   no workflow run found        -- Gate A never ran        -> would publish ungated
+#   attach job never reported    -- Gate A state unknown    -> would publish ungated
+#   attach conclusion != success -- Gate A REJECTED it      -> would publish what
+#                                                              the gate blocked
+#   timeout                      -- Gate A undecided        -> would pre-empt it
+#   assets missing, attach OK    -- Gate A passed           -> the only safe one
+#
+# `publish_crates` consults exactly three things: the resume flag, DRY_RUN, and
+# whether the version is already on crates.io. It never looks at the attach
+# job's conclusion, the canary, or the draft state. And on the rejected path the
+# crate is genuinely ABSENT -- cross-compile.yml runs the canary (:772) before
+# its publish step (:803), so a rejected binary means nothing was uploaded --
+# which is precisely when the already-published check says "no" and the fallback
+# really does upload it. Four of five paths publish a version Gate A never
+# passed, including the one where it actively rejected the binary.
+#
+# WHY THE STATED JUSTIFICATION WAS UNACHIEVABLE. The missing-token case cannot
+# reach here: cross-compile.yml checks the credential at step :705, BEFORE the
+# canary at :772, so a missing token fails the job before the gate ever runs.
+# And at this call site missing-token and canary-rejected are INDISTINGUISHABLE
+# -- both arrive as the same `conclusion != success` on the same job. One would
+# warrant publishing; the other is the unrecoverable spent-version state. A
+# branch that cannot tell them apart must not publish.
+#
+# The deeper lesson, and it is the same one recorded on `detect_crates_state`
+# above: this fallback was previously DEAD, because `wait_for_binaries` was
+# called bare under `set -e`. Making it reachable removed the accident that was
+# preventing an unsafe publish. Before making dead code live, ask what its being
+# dead was protecting.
+#
+# Precedent for refusing rather than guessing: `publish_draft_release` already
+# refuses on anything other than `completed:success`, for the same reason.
 if ! wait_for_binaries; then
     echo
-    echo "⚠️  wait_for_binaries failed. Running the crates.io confirmation anyway:"
-    echo "   it is a no-op if the workflow already published, and the backstop if"
-    echo "   CARGO_REGISTRY_TOKEN never reached CI. Then failing, because the"
-    echo "   release did not complete."
-    publish_crates
+    echo "❌ The cross-compile workflow did not complete successfully." >&2
+    echo >&2
+    echo "   NOT publishing to crates.io from here, deliberately. This point is" >&2
+    echo "   reached when Gate A never ran, its verdict is unknown, it timed out," >&2
+    echo "   or it REJECTED the binary -- and this branch cannot tell those apart." >&2
+    echo "   Publishing on any of them uploads a version the blocking auto-update" >&2
+    echo "   pre-flight canary never passed, which permanently spends the version" >&2
+    echo "   number (the v0.2.124 state)." >&2
+    echo >&2
+    echo "   Find out WHY first:" >&2
+    echo "     gh run list --repo freenet/freenet-core --workflow=cross-compile.yml \\" >&2
+    echo "       --branch \"v$VERSION\" --limit 3" >&2
+    echo >&2
+    echo "   Then follow scripts/RELEASE_RECOVERY.md -- Step 4 if Gate A passed and" >&2
+    echo "   only the crates publish is missing, Step 4b if Gate A blocked it." >&2
     exit 1
 fi
 

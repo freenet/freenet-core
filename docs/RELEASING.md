@@ -385,8 +385,14 @@ exact version** is already on crates.io, because if it is, the version is spent
 and you cut the next patch instead:
 
 ```bash
-curl -sS https://crates.io/api/v1/crates/freenet/X.Y.Z \
-  | jq -e '.version.num' >/dev/null && echo published || echo 'not published'
+# 200 = published, 404 = not published. ANY other code is UNKNOWN, not "no".
+# The -A is load-bearing: crates.io answers 403 without a descriptive
+# User-Agent, and because 403 has a JSON body, a `| jq -e '.version.num'` form
+# exits 0 and prints "not published" for EVERY version -- silently turning this
+# check into the exact hazard described below.
+curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' \
+  --max-time 30 --retry 3 --retry-all-errors \
+  https://crates.io/api/v1/crates/freenet/X.Y.Z
 ```
 
 **Not `cargo search`.** This is the one decision where it gives the wrong answer

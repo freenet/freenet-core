@@ -66,7 +66,14 @@ gh release view vX.Y.Z --json isDraft,assets --jq '{isDraft, assets: [.assets[].
 # Is THIS version on crates.io? `cargo search` only ever reports a crate's
 # newest version, and reads the search index, which lags the registry — so it
 # can answer 'no' about a version that is published. Ask for the version.
-curl -sS https://crates.io/api/v1/crates/freenet/0.1.X | jq -e '.version.num' >/dev/null && echo published || echo 'not published'
+# 200 = published, 404 = not published. ANY other code is UNKNOWN, not "no" --
+# notably 403, which is what crates.io returns when the request carries no
+# descriptive User-Agent. Do not drop the -A: without it this returns 403 for
+# every version, and a body-parsing form reads that as "not published" while
+# curl exits 0 and prints nothing.
+curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' \
+  --max-time 30 --retry 3 --retry-all-errors \
+  https://crates.io/api/v1/crates/freenet/0.1.X
 
 # Did the gate run, and what did it say?
 gh run list --workflow=cross-compile.yml --branch vX.Y.Z --limit 3
@@ -235,24 +242,44 @@ git checkout "$RELEASE_SHA"
 # RELEASING.md routes "fdev failed but freenet succeeded" to this step, and an
 # unconditional `cargo publish -p freenet` would just error on the crate that
 # already worked. Mirrors what attach-to-release and release.sh both do.
-published() {  # published <crate> <version>
-  local body
-  body="$(curl -sS --max-time 30 "https://crates.io/api/v1/crates/$1/$2")" || return 1
-  jq -e '.version.num? // empty' >/dev/null 2>&1 <<<"$body"
+# published <crate> <version>
+#   returns 0 = published, 1 = genuinely absent, 2 = UNKNOWN (do not act)
+#
+# The `-A` is load-bearing: crates.io answers 403 to a request with no
+# descriptive User-Agent, and 403 has a JSON body, so a body-parsing form exits
+# 0 and reports "not published" for every version ever released. Distinguishing
+# 404 from every other status is what stops an outage or a rate-limit reading as
+# "not published" too.
+published() {
+  local code
+  code="$(curl -sS -o /dev/null -w '%{http_code}' -A 'freenet-release-driver' \
+      --max-time 30 --retry 3 --retry-all-errors \
+      "https://crates.io/api/v1/crates/$1/$2")" || return 2
+  case "$code" in
+    200) return 0 ;;
+    404) return 1 ;;
+    *) echo "crates.io answered HTTP $code for $1 $2 -- UNKNOWN, not 'absent'" >&2; return 2 ;;
+  esac
 }
 
-published freenet 0.1.X \
-  && echo "freenet 0.1.X already published, skipping" \
-  || { cargo publish -p freenet; sleep 30; }   # fdev resolves freenet from the registry
+# Note the explicit `-eq 1`: only a genuine 404 means "go ahead and publish".
+# `|| publish` would treat UNKNOWN (2) as absent and upload on an outage.
+published freenet 0.1.X; case $? in
+  0) echo "freenet 0.1.X already published, skipping" ;;
+  1) cargo publish -p freenet; sleep 30 ;;   # fdev resolves freenet from the registry
+  *) echo "STOP: could not determine whether freenet 0.1.X is published"; exit 1 ;;
+esac
 
-published fdev 0.Y.Z \
-  && echo "fdev 0.Y.Z already published, skipping" \
-  || cargo publish -p fdev
+published fdev 0.Y.Z; case $? in
+  0) echo "fdev 0.Y.Z already published, skipping" ;;
+  1) cargo publish -p fdev ;;
+  *) echo "STOP: could not determine whether fdev 0.Y.Z is published"; exit 1 ;;
+esac
 
 # Verify both, by exact version. `cargo search` reports only a crate's NEWEST
 # version and reads the search index, which lags the registry — it can say "no"
 # about a version that is published.
-published freenet 0.1.X && published fdev 0.Y.Z && echo "both on crates.io"
+published freenet 0.1.X && published fdev 0.Y.Z && echo "both on crates.io"   # 0 = published
 
 # ONLY now, and only if Gate A reported success above, un-draft:
 gh release edit "$TAG" --repo "$REPO" --draft=false
@@ -272,7 +299,14 @@ First establish which side of the irreversible step you are on:
 
 ```bash
 # Is THIS version already on crates.io? (not `cargo search` — see Quick Reference)
-curl -sS https://crates.io/api/v1/crates/freenet/0.1.X | jq -e '.version.num' >/dev/null && echo published || echo 'not published'
+# 200 = published, 404 = not published. ANY other code is UNKNOWN, not "no" --
+# notably 403, which is what crates.io returns when the request carries no
+# descriptive User-Agent. Do not drop the -A: without it this returns 403 for
+# every version, and a body-parsing form reads that as "not published" while
+# curl exits 0 and prints nothing.
+curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' \
+  --max-time 30 --retry 3 --retry-all-errors \
+  https://crates.io/api/v1/crates/freenet/0.1.X
 ```
 
 - **Not published** (the normal case, since the publish runs after the canary):
@@ -371,8 +405,14 @@ git push origin release/vX.Y.Z
 # Check if THIS version is already published. Not `cargo search` -- it reports
 # only the NEWEST version and reads the lagging search index (see the Quick
 # Reference); here that would answer about some other version entirely.
-curl -sS https://crates.io/api/v1/crates/freenet/0.1.X \
-  | jq -e '.version.num' >/dev/null && echo published || echo 'not published'
+# 200 = published, 404 = not published. ANY other code is UNKNOWN, not "no" --
+# notably 403, which is what crates.io returns when the request carries no
+# descriptive User-Agent. Do not drop the -A: without it this returns 403 for
+# every version, and a body-parsing form reads that as "not published" while
+# curl exits 0 and prints nothing.
+curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' \
+  --max-time 30 --retry 3 --retry-all-errors \
+  https://crates.io/api/v1/crates/freenet/0.1.X
 
 # Verify credentials
 cargo login
@@ -453,7 +493,8 @@ After recovery, verify:
 - [ ] Tag exists: `git tag -l "v0.1.X"`
 - [ ] GitHub release: `gh release view v0.1.X`
 - [ ] Crates published (by exact version, not `cargo search`):
-      `curl -sS https://crates.io/api/v1/crates/freenet/0.1.X | jq -e .version.num`
+      `curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' https://crates.io/api/v1/crates/freenet/0.1.X`
+      (expect `200`; a `403` means the User-Agent was dropped, not that it is unpublished)
 - [ ] Local gateway updated: `/usr/local/bin/freenet --version`
 - [ ] Services running: `systemctl status freenet-gateway freenet-peer-01`
 - [ ] Matrix announced: Check #freenet-locutus channel
