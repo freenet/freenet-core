@@ -48,6 +48,47 @@ fail() {
 }
 pass() { echo "ok   - $1"; }
 
+# code_lines <file> -- `NNN:code` per line, with UNQUOTED trailing comments
+# stripped and comment-only lines dropped.
+#
+# EVERY source scan in this file goes through this. Two did not, and one of them
+# was defeated by exactly the trick this exists to stop: appending
+# `  # bare, refusal swallowed` to a bare `publish_draft_release` call left the
+# whole suite green, including the line "no bare 'publish_draft_release' call;
+# every site propagates its refusal" -- which was then vacuously false while the
+# fail-open shape it exists to catch sat in the file.
+#
+# release_canary_wiring_test.sh already had a `logical_lines` helper built for
+# this failure mode, used by its gh-release and User-Agent scans. This file's
+# scans did not use one. That is the fixed-one-site-left-the-sibling-armed
+# pattern again, this time against a helper already written for the job -- so
+# the helper is duplicated here deliberately (these suites are independently
+# runnable and neither sources the other) and every scan is routed through it.
+#
+# QUOTE-AWARE, so `--notes "fixes #5288"` is not truncated: a naive cut would
+# silently shorten real commands and make the scans miss what came after.
+code_lines() {
+    awk '
+        function strip_comment(str,   i, c, q, out) {
+            q = ""; out = ""
+            for (i = 1; i <= length(str); i++) {
+                c = substr(str, i, 1)
+                if (q == "") {
+                    if (c == "\"" || c == "'"'"'") { q = c }
+                    else if (c == "#" && (i == 1 || substr(str, i - 1, 1) ~ /[[:space:]]/)) { break }
+                } else if (c == q) { q = "" }
+                out = out c
+            }
+            return out
+        }
+        {
+            out = strip_comment($0)
+            sub(/[[:space:]]+$/, "", out)
+            if (out !~ /^[[:space:]]*$/) print NR ":" out
+        }
+    ' "$1"
+}
+
 if [[ ! -f "$RELEASE_SH" ]]; then
     echo "FAIL: $RELEASE_SH not found" >&2
     exit 1
@@ -313,14 +354,49 @@ fi
 # `publish_draft_release` must be guarded, never bare, because bare calls have
 # their failure swallowed when `wait_for_binaries` is invoked from an `if !`
 # condition.
-PDR_BARE="$(grep -nE '^[[:space:]]*publish_draft_release[[:space:]]*$' "$RELEASE_SH")"
+PDR_BARE="$(code_lines "$RELEASE_SH" | grep -E '^[0-9]+:[[:space:]]*publish_draft_release[[:space:]]*$')"
 if [[ -z "$PDR_BARE" ]]; then
-    PDR_CALLS="$(grep -cE 'publish_draft_release' "$RELEASE_SH")"
+    PDR_CALLS="$(code_lines "$RELEASE_SH" | grep -cE 'publish_draft_release')"
+    # Each guard must also RETURN NONZERO. "Guarded" is syntax; "propagates" is
+    # the property, and they are not the same: changing a guard's body from
+    # `return 1` to an `echo` leaves the call guarded, the refusal swallowed,
+    # and a syntax-only scan green. That mutation IS caught at site 1 by the
+    # behavioural case below; this closes it at site 2, which the behavioural
+    # case cannot reach (it lives in the polling loop, past a stubbed `gh`, a
+    # run id and several iterations).
+    #
+    # So the two sites are protected UNEQUALLY and that is stated rather than
+    # glossed: site 1 behaviourally, site 2 by syntax plus this shape check.
+    # "Pinned structurally" was a stronger claim than the earlier scan
+    # delivered.
+    PDR_GUARDS="$(code_lines "$RELEASE_SH" | grep -cE 'if ! publish_draft_release; then')"
+    PDR_BAD_BODY=""
+    while IFS= read -r _g; do
+        [[ -z "$_g" ]] && continue
+        _gl="${_g%%:*}"
+        _body="$(code_lines "$RELEASE_SH" \
+            | awk -F: -v a="$_gl" '$1 > a && $1 <= a + 4')"
+        case "$_body" in
+            *"return 1"*) ;;
+            *) PDR_BAD_BODY+="line $_gl: guard body does not return nonzero"$'\n' ;;
+        esac
+    done < <(code_lines "$RELEASE_SH" | grep -E 'if ! publish_draft_release; then')
+
     if [[ "$PDR_CALLS" -lt 3 ]]; then
         fail "expected publish_draft_release's definition plus at least 2 call sites, found $PDR_CALLS references" \
             "The bare-call scan above would pass having nothing to examine."
+    elif [[ "$PDR_GUARDS" -lt 2 ]]; then
+        fail "expected 2 guarded publish_draft_release call sites, found $PDR_GUARDS" \
+            "Both call sites must be guarded; a bare one has its refusal swallowed."
+    elif [[ -n "$PDR_BAD_BODY" ]]; then
+        fail "a publish_draft_release guard does not propagate the refusal" \
+            "$(printf '%s' "$PDR_BAD_BODY")" \
+            "The call being guarded is not enough -- the guard body must return" \
+            "nonzero. An 'echo' there leaves wait_for_binaries reporting success" \
+            "for an unpublished draft, which is the failure this guard exists to" \
+            "prevent."
     else
-        pass "no bare 'publish_draft_release' call; every site propagates its refusal"
+        pass "both publish_draft_release call sites are guarded AND return nonzero"
     fi
 else
     fail "publish_draft_release is called BARE, so its refusal can be swallowed" \
@@ -432,9 +508,13 @@ if [[ -z "$LAST_BRACE_FN" ]]; then
     fail "could not locate the end of release.sh's function definitions" \
         "The function-body scan below would examine nothing."
 else
-    BODY_CALLS="$(head -n "$LAST_BRACE_FN" "$RELEASE_SH" \
-        | grep -nE '(^|[^#[:alnum:]_])publish_crates([[:space:]]|$|\))' \
-        | grep -vE '^[0-9]+:[[:space:]]*#' \
+    # Also via code_lines. It only stripped FULL-LINE comments before, so a
+    # trailing `# ... publish_crates ...` in prose would have false-positived --
+    # the opposite direction from the bare-call scan's hole, and the direction
+    # that gets a check deleted for crying wolf.
+    BODY_CALLS="$(code_lines "$RELEASE_SH" \
+        | awk -F: -v last="$LAST_BRACE_FN" '$1 <= last' \
+        | grep -E '(^[0-9]+:|[^#[:alnum:]_])publish_crates([[:space:]]|$|\))' \
         | grep -vE '^[0-9]+:publish_crates\(\) \{' \
         | grep -vE 'echo[^;|&$`]*publish_crates')"
     if [[ -z "$BODY_CALLS" ]]; then

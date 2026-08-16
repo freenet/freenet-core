@@ -279,7 +279,17 @@ esac
 # Verify both, by exact version. `cargo search` reports only a crate's NEWEST
 # version and reads the search index, which lags the registry — it can say "no"
 # about a version that is published.
-published freenet 0.1.X && published fdev 0.Y.Z && echo "both on crates.io"   # 0 = published
+# Explicit, not `&&`: `published` is TRI-state and `&&` treats UNKNOWN (2) the
+# same as absent (1), re-conflating the two states this helper exists to
+# separate -- in the step whose whole job is verifying the publish landed.
+for c in "freenet 0.1.X" "fdev 0.Y.Z"; do
+  # shellcheck disable=SC2086
+  published $c; case $? in
+    0) echo "$c: on crates.io" ;;
+    1) echo "$c: NOT on crates.io -- the publish did not land" ;;
+    *) echo "$c: UNKNOWN -- crates.io did not give a usable answer; re-check before acting" ;;
+  esac
+done
 
 # ONLY now, and only if Gate A reported success above, un-draft:
 gh release edit "$TAG" --repo "$REPO" --draft=false

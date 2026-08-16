@@ -1914,11 +1914,22 @@ fi
 # is judged whole.
 UA_MISSING=""
 UA_TOTAL=0
-for _f in "$SCRIPT_DIR"/../docs/RELEASING.md "$SCRIPT_DIR"/RELEASE_RECOVERY.md \
-          "$SCRIPT_DIR"/release.sh "$SCRIPT_DIR"/../.github/workflows/cross-compile.yml \
-          "$SCRIPT_DIR"/../.github/workflows/release.yml \
-          "$SCRIPT_DIR"/../.github/workflows/binstall-smoke-test.yml; do
+# File set DERIVED, not enumerated. The previous form hardcoded six paths, so a
+# UA-less crates.io curl added to gateway-update.yml -- a release-pipeline
+# workflow -- would have left this green at "all N send a User-Agent". Same
+# wrong-set class as the non-recursive script glob earlier in this file.
+UA_FILES=()
+while IFS= read -r _f; do UA_FILES+=("$_f"); done < <(
+    find "$SCRIPT_DIR/.." -type f \( -name '*.yml' -o -name '*.yaml' -o -name '*.sh' -o -name '*.md' \) \
+        -not -path '*/.git/*' -not -path '*/target/*' 2>/dev/null | sort
+)
+for _f in "${UA_FILES[@]}"; do
     [[ -f "$_f" ]] || continue
+    # `*_test.sh` excluded: this file's own scan line contains the literals
+    # `crates.io/api/v1/crates` and `curl`, so scanning itself flags itself --
+    # the self-match shape this suite exists to remove, produced by widening the
+    # file set. Test files are not release machinery.
+    case "$(basename "$_f")" in *_test.sh) continue ;; esac
     _base="$(basename "$_f")"
     while IFS= read -r _hit; do
         [[ -z "$_hit" ]] && continue
@@ -1927,7 +1938,14 @@ for _f in "$SCRIPT_DIR"/../docs/RELEASING.md "$SCRIPT_DIR"/RELEASE_RECOVERY.md \
         # uses that form. Accepting only `-A` made this lint report a correct
         # call as broken on its first run -- a false positive is how a lint
         # gets deleted, so the matcher covers both spellings.
+        # An EMPTY User-Agent 403s exactly like a missing one, and the
+        # realistic form is `-A "$UA"` with UA unset -- so `-A ''` and `-A ""`
+        # are treated as missing rather than present. Checking for the flag's
+        # presence alone would accept the one spelling most likely to occur by
+        # accident.
         case "$_hit" in
+            *"-A ''"*|*'-A ""'*|*"--user-agent ''"*|*'--user-agent ""'*)
+                UA_MISSING+="$_base:$_hit  [empty User-Agent -- 403s like a missing one]"$'\n' ;;
             *" -A "*|*" --user-agent "*|*"User-Agent:"*) ;;
             *) UA_MISSING+="$_base:$_hit"$'\n' ;;
         esac

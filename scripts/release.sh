@@ -1110,21 +1110,35 @@ See commit history for detailed changes.
 # un-draft, and the tag push this script performs is what triggers it.
 #
 # So by the time `wait_for_binaries` returns, the workflow has normally already
-# published both crates and the checks below simply confirm it -- which is worth
-# keeping rather than deleting: this is the manual driver, used when the
-# workflow path is broken, and a `CARGO_REGISTRY_TOKEN` that never reached CI
-# would otherwise leave a released version with no crates and nothing to say so.
-# It stays a real publish for that case.
+# published both crates and the checks below simply confirm it.
 #
-# REACHABILITY, stated because an earlier version of this comment claimed a
-# capability the script did not have. `wait_for_binaries` returns nonzero on
-# five paths and this script runs under `set -e`, so while it was called bare
-# this function was UNREACHABLE on every one of them -- i.e. exactly when the
-# claim above is meant to apply. The call site is now guarded (`if !
-# wait_for_binaries; then publish_crates; exit 1; fi`), which is what makes the
-# sentence above true. Pinned by the reachability case in
-# release_driver_test.sh, NOT by the ordering assertion in
-# release_canary_wiring_test.sh -- that one compares line numbers and passed
+# IT RUNS ONLY ON THE SUCCESS PATH. It is NOT a fallback for a broken workflow
+# and must not be made into one.
+#
+# Two earlier versions of this comment claimed otherwise -- that it "stays a
+# real publish" for a `CARGO_REGISTRY_TOKEN` that never reached CI, and that
+# the call site was `if ! wait_for_binaries; then publish_crates; exit 1; fi`.
+# Both are false, and the second is the shape a maintainer would restore from
+# reading them, so they are corrected rather than merely appended to.
+#
+# WHY IT MUST NOT RUN ON FAILURE. `wait_for_binaries` fails on five paths, and
+# publishing is wrong on four: no run found and attach-never-reported both mean
+# Gate A never ran; a non-success conclusion means it REJECTED the binary; a
+# timeout means it is still undecided. Only "assets missing after a successful
+# attach" is safe. This function checks the resume flag, DRY_RUN and crates.io
+# presence -- never the gate's verdict -- and on the rejected path the crate is
+# genuinely absent, so the already-published check says "no" and it really does
+# upload.
+#
+# The token justification was also unachievable: cross-compile.yml checks the
+# credential BEFORE running the canary, so a missing token fails the job before
+# the gate; and at the call site a missing token and a canary rejection arrive
+# as the same non-success conclusion, indistinguishable.
+#
+# PINNED BY the refusal case in release_driver_test.sh -- which asserts this
+# function does NOT run when wait_for_binaries fails, the exact opposite of what
+# an earlier reachability case asserted -- NOT by the ordering assertion in
+# release_canary_wiring_test.sh, which compares line numbers and stayed green
 # throughout the period this was dead.
 #
 # MUST be called AFTER wait_for_binaries, and ONLY on its success path. Calling
@@ -1814,8 +1828,10 @@ create_github_release
 #
 # The ordering pin in release_canary_wiring_test.sh could not see this: it
 # compares the LINE NUMBERS of the two calls, which were correct while the
-# second call was dead. release_driver_test.sh now stubs `wait_for_binaries` to
-# fail and asserts `publish_crates` still runs.
+# second call was dead. release_driver_test.sh drives it behaviourally instead
+# -- and asserts that `publish_crates` does NOT run when `wait_for_binaries`
+# fails. An earlier version of that case asserted the opposite, which is the
+# unsafe property; see the refusal branch below and the note on publish_crates.
 #
 # REFUSES TO PUBLISH. This branch does NOT call publish_crates, and that is the
 # whole point of it.
