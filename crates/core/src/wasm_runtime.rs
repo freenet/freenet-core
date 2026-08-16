@@ -15,7 +15,7 @@ mod secrets_store;
 pub(crate) mod simulation_runtime;
 mod state_store;
 #[cfg(all(test, feature = "wasmtime-backend"))]
-mod tests;
+pub(crate) mod tests;
 
 pub(crate) use contract::{
     ContractRuntimeBridge, ContractRuntimeInterface, ContractStoreBridge, classify_result,

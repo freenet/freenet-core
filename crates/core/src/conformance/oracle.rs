@@ -88,10 +88,18 @@ pub trait ConformanceOracle {
 
     /// Drop any cached WASM instance so the next call starts from a fresh one.
     ///
-    /// Determinism checks want this: state that leaks between calls inside one
-    /// instance (a lazily-built index, a cached iteration order) is precisely the
-    /// #4857 class of bug, and it is invisible if every repeat reuses the same
-    /// instance. Implementations that cannot cheaply do this may leave the default
-    /// no-op; the determinism check then only covers within-instance nondeterminism.
+    /// The default is a no-op, and for the production runtime that is correct:
+    /// measured on this runtime, each contract call gets a fresh instance from a
+    /// cached *module*, so nothing leaks between calls to reset. It follows that a
+    /// contract cannot be nondeterministic across calls from its own internal state
+    /// alone — a pure function of `(parameters, state)` has nothing to vary on. The
+    /// determinism checks are therefore aimed at **host-provided** nondeterminism,
+    /// of which the clock (`freenet_stdlib::time::now`) is the realistic instance,
+    /// and which is exactly the #4857 class.
+    ///
+    /// The hook stays because a fake oracle can and does carry state between calls,
+    /// and because a future runtime that pools instances would make within-instance
+    /// leakage reachable again. If that happens, this is where it gets handled, and
+    /// the determinism checks start covering a second class of bug for free.
     fn reset_instance(&mut self) {}
 }

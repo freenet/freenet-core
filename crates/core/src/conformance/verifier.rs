@@ -165,11 +165,17 @@ fn run<O: ConformanceOracle + ?Sized>(
         }
 
         ConformanceProperty::EmittedStateValidity => {
-            // Merging a valid state with itself must emit a state the contract still
-            // accepts. A contract that produces states it would reject cannot
-            // converge: the next peer to receive that state drops it.
-            let a = &case.states[0];
-            let merged = merge(oracle, a, a)?;
+            // Merging two valid states must emit a state the contract still accepts.
+            // A contract that produces states it would reject cannot converge: the
+            // next peer to receive that state drops it.
+            //
+            // Two distinct states rather than a self-merge, because a self-merge is
+            // already covered by StateIdempotence (if merge(A,A) == A and A is valid,
+            // the result is trivially valid). The interesting failures happen when
+            // combining different states produces something that breaks the
+            // contract's own invariant, e.g. a union that exceeds a size cap.
+            let (a, b) = (&case.states[0], &case.states[1]);
+            let merged = merge(oracle, a, b)?;
             match oracle
                 .validate_state(&merged, &case.related)
                 .map_err(inconclusive_from)?

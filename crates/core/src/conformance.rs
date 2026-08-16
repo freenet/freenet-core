@@ -22,6 +22,31 @@
 //! - [`evidence`] — the self-contained, bounded reproducer that travels between peers.
 //! - [`bundle`] — the offline replay corpus format.
 //! - [`generator`] — turns a corpus of observed states into cases to check.
+//! - [`minimize`] — shrinks a failing case to the smallest witness that still fails,
+//!   so evidence fits its size bound and reads as a usable bug report.
+//! - [`sampler`] — the bounded, restart-safe store of states a peer observed.
+//! - [`focus`] — which contracts a peer watches, and when it moves on.
+//! - [`policy`] — what a peer is permitted to do about a finding. Deletion is the
+//!   last step of the RFC's deployment plan, and this is where that ordering is
+//!   enforced and tested rather than merely intended.
+//!
+//! # Relationship to the existing probe
+//!
+//! `contract::executor::runtime::executor_impl::maybe_probe_idempotency` already
+//! samples one merge in 32 and checks re-apply idempotence. Two differences matter.
+//!
+//! It compares with `byte_multiset_eq` rather than byte equality, because states
+//! were not guaranteed to have a canonical encoding, so a strict comparison would
+//! have flagged contracts that merely reordered their own output. The RFC makes
+//! canonical serialization an explicit platform requirement, which is what lets this
+//! module compare exact bytes and therefore say something much stronger.
+//!
+//! It also checks exactly one law. Commutativity, associativity and reconciliation
+//! are where the measured production damage actually came from (#5153), and a
+//! re-apply probe cannot see any of them.
+//!
+//! This module does not replace or disable that probe. Nothing here is wired into
+//! the node yet.
 //!
 //! # The bias toward `Inconclusive`
 //!
@@ -37,21 +62,33 @@
 
 pub mod bundle;
 pub mod evidence;
+pub mod focus;
 pub mod generator;
+pub mod minimize;
 pub mod oracle;
+pub mod policy;
 pub mod property;
 pub mod runtime_oracle;
+pub mod sampler;
 pub mod verifier;
 
 #[cfg(test)]
+mod sampler_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wasm_tests;
 
 pub use bundle::ReplayBundle;
 pub use evidence::{ConformanceEvidence, EvidenceId, EvidenceRejected};
+pub use focus::FocusSelector;
 pub use generator::{GeneratorConfig, generate_cases};
+pub use minimize::{MinimizeConfig, MinimizeReport, minimize};
 pub use oracle::{ConformanceOracle, OracleError, OracleErrorKind};
+pub use policy::{ConformanceAction, EnforcementMode, decide};
 pub use property::{
     ConformanceProperty, Inconclusive, OutputDigest, PropertyOutcome, Severity, Violation,
 };
-pub use runtime_oracle::RuntimeOracle;
+pub use runtime_oracle::{OracleBuildError, RuntimeOracle};
+pub use sampler::{Admission, ContractSampler, SamplerConfig, Stratum};
 pub use verifier::{ConformanceCase, verify_case};

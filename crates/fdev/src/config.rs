@@ -75,6 +75,12 @@ pub enum SubCommand {
         #[clap(subcommand)]
         command: crate::website::WebsiteCommand,
     },
+    /// Check a contract against the conformance laws (RFC #5320): merge
+    /// commutativity/associativity/idempotence, delta idempotence, and more.
+    ///
+    /// Runs the *same* verifier the network runs (`freenet::conformance`), so
+    /// a finding here means the same thing it would mean on the network.
+    Conformance(crate::conformance::ConformanceConfig),
 }
 
 impl SubCommand {

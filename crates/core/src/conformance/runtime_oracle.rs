@@ -24,6 +24,22 @@ use crate::wasm_runtime::{
 const STANDALONE_CONTRACT_STORE_BYTES: u64 = 1024 * 1024 * 1024;
 const STANDALONE_DELEGATE_STORE_BYTES: u64 = 10_000_000;
 
+/// Why an oracle could not be built.
+///
+/// A concrete type rather than a boxed error because callers — `fdev`, tests, and
+/// eventually the node — need to tell "this WASM is not loadable" apart from "this
+/// machine could not make a temp directory". Only the first is a statement about
+/// the contract.
+#[derive(Debug, thiserror::Error)]
+pub enum OracleBuildError {
+    #[error("could not create scratch directory for the conformance runtime: {0}")]
+    Scratch(#[from] std::io::Error),
+    #[error("could not open the scratch storage backend: {0}")]
+    Storage(String),
+    #[error("could not build the contract runtime: {0}")]
+    Runtime(#[from] RuntimeContractError),
+}
+
 /// A single contract, pinned to its code and parameters, executable on demand.
 pub struct RuntimeOracle {
     runtime: Runtime,
@@ -39,12 +55,11 @@ impl RuntimeOracle {
     ///
     /// This is the `fdev` path and the offline-replay path: no node, no hosted
     /// state, nothing that outlives the check.
-    pub async fn standalone(
-        wasm: Vec<u8>,
-        parameters: Vec<u8>,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn standalone(wasm: Vec<u8>, parameters: Vec<u8>) -> Result<Self, OracleBuildError> {
         let scratch = tempfile::TempDir::new()?;
-        let db = crate::contract::storages::Storage::new(scratch.path()).await?;
+        let db = crate::contract::storages::Storage::new(scratch.path())
+            .await
+            .map_err(|e| OracleBuildError::Storage(e.to_string()))?;
         let contract_store = ContractStore::new(
             scratch.path().join("contract"),
             STANDALONE_CONTRACT_STORE_BYTES,

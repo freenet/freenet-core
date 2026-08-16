@@ -118,7 +118,14 @@ impl ConformanceOracle for Fake {
             current = match update {
                 UpdateData::State(incoming) => (self.merge)(&current, incoming.as_ref())?,
                 UpdateData::Delta(delta) => (self.apply)(&current, delta.as_ref())?,
-                other => {
+                // `UpdateData` is `#[non_exhaustive]` in freenet-stdlib, so a
+                // wildcard is unavoidable, but the known variants are named so a
+                // new one shows up here rather than silently joining the catch-all.
+                other @ (UpdateData::StateAndDelta { .. }
+                | UpdateData::RelatedState { .. }
+                | UpdateData::RelatedDelta { .. }
+                | UpdateData::RelatedStateAndDelta { .. })
+                | other => {
                     return Err(OracleError::runtime(format!(
                         "fake contract does not handle {other:?}"
                     )));
@@ -164,7 +171,9 @@ fn case(property: ConformanceProperty, states: &[&[u8]]) -> ConformanceCase {
 fn assert_violates(outcome: PropertyOutcome, property: ConformanceProperty) {
     match outcome {
         PropertyOutcome::Violated(v) => assert_eq!(v.property, property, "wrong property flagged"),
-        other => panic!("expected a {property} violation, got {other:?}"),
+        other @ (PropertyOutcome::Holds | PropertyOutcome::Inconclusive(_)) => {
+            panic!("expected a {property} violation, got {other:?}")
+        }
     }
 }
 
@@ -177,7 +186,9 @@ fn assert_holds(outcome: PropertyOutcome) {
 fn assert_inconclusive(outcome: PropertyOutcome, expected: Inconclusive) {
     match outcome {
         PropertyOutcome::Inconclusive(reason) => assert_eq!(reason, expected),
-        other => panic!("expected inconclusive ({expected}), got {other:?}"),
+        other @ (PropertyOutcome::Holds | PropertyOutcome::Violated(_)) => {
+            panic!("expected inconclusive ({expected}), got {other:?}")
+        }
     }
 }
 
@@ -204,7 +215,7 @@ fn conforming_contract_satisfies_every_state_law() {
     ));
     assert_holds(verify_case(
         &mut fake,
-        &case(ConformanceProperty::EmittedStateValidity, &[a]),
+        &case(ConformanceProperty::EmittedStateValidity, &[a, b]),
     ));
     assert_holds(verify_case(
         &mut fake,
@@ -436,7 +447,10 @@ fn emitted_state_the_contract_would_reject_is_caught() {
     assert_violates(
         verify_case(
             &mut fake,
-            &case(ConformanceProperty::EmittedStateValidity, &[&[1, 2]]),
+            &case(
+                ConformanceProperty::EmittedStateValidity,
+                &[&[1, 2], &[3, 4]],
+            ),
         ),
         ConformanceProperty::EmittedStateValidity,
     );
@@ -550,7 +564,11 @@ fn resource_exhaustion_is_inconclusive() {
         &case(ConformanceProperty::StateCommutativity, &[&[1, 2], &[2, 3]]),
     ) {
         PropertyOutcome::Inconclusive(Inconclusive::ResourceLimit(_)) => {}
-        other => panic!("expected a resource-limit inconclusive, got {other:?}"),
+        other @ (PropertyOutcome::Holds
+        | PropertyOutcome::Violated(_)
+        | PropertyOutcome::Inconclusive(_)) => {
+            panic!("expected a resource-limit inconclusive, got {other:?}")
+        }
     }
 }
 
@@ -562,7 +580,11 @@ fn a_case_with_too_few_states_is_malformed_not_a_violation() {
         &case(ConformanceProperty::StateAssociativity, &[&[1], &[2]]),
     ) {
         PropertyOutcome::Inconclusive(Inconclusive::MalformedCase(_)) => {}
-        other => panic!("expected malformed-case, got {other:?}"),
+        other @ (PropertyOutcome::Holds
+        | PropertyOutcome::Violated(_)
+        | PropertyOutcome::Inconclusive(_)) => {
+            panic!("expected malformed-case, got {other:?}")
+        }
     }
 }
 

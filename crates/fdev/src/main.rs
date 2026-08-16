@@ -6,6 +6,7 @@ use freenet_stdlib::client_api::ClientRequest;
 mod build;
 mod commands;
 mod config;
+mod conformance;
 mod diagnostics;
 mod inspect;
 pub(crate) mod network_metrics_server;
@@ -61,10 +62,35 @@ fn exit_code_for_error(err: &anyhow::Error) -> i32 {
     }
 }
 
+/// Default logging level for `fdev`'s subcommands, gated per-subcommand.
+///
+/// `fdev` is normally a debug build, and `init_tracer`'s default filter is
+/// `DEBUG` in that case (see `crates/core/src/tracing/tracer.rs`). `fdev
+/// conformance` makes one WASM call per case — hundreds on a real corpus —
+/// so the runtime's own per-call `DEBUG` logging (e.g. "Module cache hit")
+/// drowns the report under that default. Quiet it to `INFO` by default.
+/// `RUST_LOG`, when the user set one, always wins over the level passed
+/// here: `EnvFilter::from_env_lossy()` inside `init_tracer` reads the env
+/// var first and ignores the default entirely when it is present, so this
+/// only takes effect when nothing was set. Every other subcommand is
+/// unaffected (`None`, i.e. `init_tracer`'s own default).
+fn conformance_log_level(
+    sub_command: &SubCommand,
+    rust_log_is_set: bool,
+) -> Option<tracing::level_filters::LevelFilter> {
+    if matches!(sub_command, SubCommand::Conformance(_)) && !rust_log_is_set {
+        Some(tracing::level_filters::LevelFilter::INFO)
+    } else {
+        None
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let config = Config::parse();
     if !config.sub_command.is_child() {
-        freenet::config::set_logger(None, None, config.additional.paths.log_dir.as_deref());
+        let log_level =
+            conformance_log_level(&config.sub_command, std::env::var("RUST_LOG").is_ok());
+        freenet::config::set_logger(log_level, None, config.additional.paths.log_dir.as_deref());
     }
 
     // Test subcommand uses Turmoil which requires running outside of any tokio runtime
@@ -124,6 +150,9 @@ fn main() -> anyhow::Result<()> {
             }
             SubCommand::VerifyState(verify_config) => {
                 verify_state::verify_state(verify_config).await
+            }
+            SubCommand::Conformance(conformance_config) => {
+                conformance::conformance(conformance_config).await
             }
             SubCommand::Website { command } => match command {
                 website::WebsiteCommand::Init { name } => website::init(name),
@@ -208,5 +237,45 @@ mod tests {
     fn other_errors_map_to_generic_failure_code() {
         let err = anyhow::anyhow!("boom");
         assert_eq!(exit_code_for_error(&err), 1);
+    }
+
+    fn empty_conformance_config() -> crate::conformance::ConformanceConfig {
+        crate::conformance::ConformanceConfig {
+            wasm: None,
+            params: None,
+            states: Vec::new(),
+            bundle: None,
+            max_cases: None,
+            properties: Vec::new(),
+            json: false,
+            evidence_out: None,
+        }
+    }
+
+    /// The bug this guards: without a quieter default, a debug build's
+    /// `DEBUG` filter drowns every conformance report in per-call WASM
+    /// runtime logging.
+    #[test]
+    fn conformance_quiets_default_log_level_when_rust_log_unset() {
+        let sub = super::SubCommand::Conformance(empty_conformance_config());
+        assert_eq!(
+            super::conformance_log_level(&sub, false),
+            Some(tracing::level_filters::LevelFilter::INFO)
+        );
+    }
+
+    /// An explicit `RUST_LOG` from the user must always win.
+    #[test]
+    fn conformance_defers_to_explicit_rust_log() {
+        let sub = super::SubCommand::Conformance(empty_conformance_config());
+        assert_eq!(super::conformance_log_level(&sub, true), None);
+    }
+
+    /// This is `conformance`-specific quieting, not a change to fdev's
+    /// global logging default: every other subcommand is unaffected.
+    #[test]
+    fn other_subcommands_keep_the_default_log_level() {
+        let sub = super::SubCommand::Query {};
+        assert_eq!(super::conformance_log_level(&sub, false), None);
     }
 }

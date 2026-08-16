@@ -27,6 +27,24 @@ pub enum ConformanceProperty {
     /// `get_state_delta` on identical inputs yields identical bytes.
     DeltaDeterminism,
     /// `apply(apply(A, D), D) == apply(A, D)` — at-least-once delivery must be harmless.
+    ///
+    /// **This property is contested, and the disagreement is not resolved here.**
+    /// The existing sampled probe in
+    /// `contract::executor::runtime::executor_impl::maybe_probe_idempotency`
+    /// deliberately exempts delta inputs, on the stated grounds that
+    /// operation-based CRDTs (counters, append-logs) legitimately break byte
+    /// equality on re-apply: an "increment by 1" delta yields `S+1` then `S+2`.
+    /// The RFC takes the opposite position, and explicitly requires delta
+    /// idempotence, because Freenet delivery is at-least-once — under which a
+    /// contract that double-counts a redelivered increment is not a valid CmRDT,
+    /// it is a contract that will silently corrupt its own state.
+    ///
+    /// The RFC is the newer and more specific document, so the check exists. But
+    /// whether any deployed first-party contract actually relies on non-idempotent
+    /// deltas is an empirical question that cannot be settled by reading code, and
+    /// it must be answered by running `fdev conformance` against deployed WASM
+    /// before this property is ever allowed to influence anything on the network.
+    /// Until then it is a reporting signal for contract authors.
     DeltaIdempotence,
     /// Independent deltas in any order, with duplicates, reach the same canonical state.
     DeltaPermutationInvariance,
@@ -94,7 +112,6 @@ impl ConformanceProperty {
     pub fn state_arity(self) -> usize {
         match self {
             ConformanceProperty::StateIdempotence
-            | ConformanceProperty::EmittedStateValidity
             | ConformanceProperty::SummaryDeterminism
             | ConformanceProperty::DeltaDeterminism
             | ConformanceProperty::DeltaIdempotence
@@ -102,6 +119,7 @@ impl ConformanceProperty {
             | ConformanceProperty::SelfDeltaEmpty
             | ConformanceProperty::WholeStateSelfDelta => 1,
             ConformanceProperty::StateCommutativity
+            | ConformanceProperty::EmittedStateValidity
             | ConformanceProperty::UpdateDeterminism
             | ConformanceProperty::ReconciliationCycle => 2,
             ConformanceProperty::StateAssociativity => 3,
