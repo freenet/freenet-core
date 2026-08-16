@@ -1302,8 +1302,26 @@ fi
 # Matched on bare top-level calls (`^name$`), which is how release.sh's main
 # flow invokes them -- definitions are `name() {` and so cannot collide.
 if [[ -f "$RELEASE_SH" ]]; then
+    # Matches the call in any of the forms the main flow uses -- bare on its own
+    # line, or inside an `if !` / `||` guard.
+    #
+    # It was `^name$` only, which broke the moment `wait_for_binaries` was
+    # correctly guarded: the ordering pin reported "could not locate" on a
+    # CORRECT change. That direction is the tolerable one (it failed closed
+    # rather than passing vacuously), but it is worth noticing WHY it happened.
+    #
+    # This assertion compares LINE NUMBERS. It cannot express whether a call is
+    # reachable, and it demonstrated exactly that: throughout the period
+    # `publish_crates` was unreachable under `set -e`, this pin was green,
+    # because the line numbers were in the right order the whole time. The
+    # guarantee is the reachability case in release_driver_test.sh, which stubs
+    # `wait_for_binaries` to fail and asserts `publish_crates` still runs.
+    #
+    # This is kept as cheap, specific, fast-failing signal about textual
+    # position -- not as the ordering guarantee. Do not re-read it as one.
     _line_of_call() {
-        grep -nE "^$1\$" "$RELEASE_SH" | head -1 | cut -d: -f1
+        grep -nE "(^$1\$|^if ! $1;|^$1 \|\||^[[:space:]]+$1\$)" "$RELEASE_SH" \
+            | head -1 | cut -d: -f1
     }
     RS_PUBLISH="$(_line_of_call publish_crates)"
     RS_CREATE="$(_line_of_call create_github_release)"
@@ -1434,7 +1452,17 @@ done
 while IFS= read -r _m; do
     _pat="$(printf '%s' "$_m" | sed -E "s/^line_of '(.*)'$/\1/")"
     [[ -z "$_pat" ]] && continue
-    _l="$(printf '%s\n' "$JOB_BLOCK" | grep -E "$_pat" | head -1 | cut -d: -f1)"
+    # The scrape matches its OWN source -- the literal `line_of '[^']+'` in the
+    # grep above yields the fragment `[^`, and sed expressions elsewhere yield
+    # `(.*)` and `<pattern>`. Those are dropped later by the validate-against-
+    # real-step-names step, so they never caused a false failure, but `[^` is
+    # not a valid regex and grep was writing "Invalid regular expression" to
+    # stderr on every run. Stray errors on a passing suite are how a real one
+    # gets overlooked, so unusable patterns are skipped here rather than left to
+    # complain.
+    printf 'x\n' | grep -E "$_pat" >/dev/null 2>&1
+    [[ "$?" -gt 1 ]] && continue
+    _l="$(printf '%s\n' "$JOB_BLOCK" | grep -E "$_pat" 2>/dev/null | head -1 | cut -d: -f1)"
     [[ -z "$_l" ]] && continue
     _first="$(step_block "$_l" | head -1)"
     # Only when the enclosing block really starts at a `- name:` line. A

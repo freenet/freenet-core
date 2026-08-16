@@ -1116,6 +1116,17 @@ See commit history for detailed changes.
 # would otherwise leave a released version with no crates and nothing to say so.
 # It stays a real publish for that case.
 #
+# REACHABILITY, stated because an earlier version of this comment claimed a
+# capability the script did not have. `wait_for_binaries` returns nonzero on
+# five paths and this script runs under `set -e`, so while it was called bare
+# this function was UNREACHABLE on every one of them -- i.e. exactly when the
+# claim above is meant to apply. The call site is now guarded (`if !
+# wait_for_binaries; then publish_crates; exit 1; fi`), which is what makes the
+# sentence above true. Pinned by the reachability case in
+# release_driver_test.sh, NOT by the ordering assertion in
+# release_canary_wiring_test.sh -- that one compares line numbers and passed
+# throughout the period this was dead.
+#
 # MUST be called AFTER wait_for_binaries. Calling it earlier reinstates exactly
 # the ordering described above.
 publish_crates() {
@@ -1753,7 +1764,32 @@ check_prerequisites
 update_versions
 create_release_pr
 create_github_release
-wait_for_binaries
+# GUARDED, not bare, and that is the whole point of the `if`.
+#
+# This script runs under `set -euo pipefail`, and `wait_for_binaries` returns
+# nonzero on five paths: timeout, attach job failed, attach succeeded but
+# binaries missing, no run found, and draft state unknown. Called bare, every
+# one of those aborted the script HERE -- so `publish_crates` below, whose own
+# comment calls it the backstop for when "the workflow path is broken", was
+# unreachable in precisely the cases where the workflow path is broken.
+#
+# The ordering pin in release_canary_wiring_test.sh could not see this: it
+# compares the LINE NUMBERS of the two calls, which were correct while the
+# second call was dead. release_driver_test.sh now stubs `wait_for_binaries` to
+# fail and asserts `publish_crates` still runs.
+#
+# `exit 1` after it, so a broken workflow path still fails the driver loudly --
+# the confirmation runs, the release is still reported as unsuccessful.
+if ! wait_for_binaries; then
+    echo
+    echo "⚠️  wait_for_binaries failed. Running the crates.io confirmation anyway:"
+    echo "   it is a no-op if the workflow already published, and the backstop if"
+    echo "   CARGO_REGISTRY_TOKEN never reached CI. Then failing, because the"
+    echo "   release did not complete."
+    publish_crates
+    exit 1
+fi
+
 # AFTER wait_for_binaries, not before create_github_release. The crates.io
 # publish is the one irreversible step in a release, and it now sits downstream
 # of the blocking pre-flight canary (in cross-compile.yml, which the tag push

@@ -162,6 +162,8 @@ if [[ -z "$LAST_BRACE" ]]; then
     fail "could not find the end of the last function definition in release.sh" \
         "The main-flow extraction below depends on it."
 else
+    # Exported to the reachability case below, which reuses the same extraction
+    # rather than re-deriving it (two extractions of one thing drift apart).
     MAIN_FLOW="$(tail -n "+$((LAST_BRACE + 1))" "$RELEASE_SH")"
     FN_NAMES="$(grep -oE '^[a-z_][a-z_0-9]*\(\) \{' "$RELEASE_SH" | sed 's/() {//')"
     if [[ -z "$MAIN_FLOW" || -z "$FN_NAMES" ]]; then
@@ -215,7 +217,79 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3. no FUNCTION BODY calls publish_crates
+# 3. the publish fallback is REACHABLE when the workflow path is broken
+# ---------------------------------------------------------------------------
+# The ordering assertion above compares the POSITION of the calls. This asserts
+# that the later one actually RUNS, which a line-number comparison structurally
+# cannot express -- and did not: `publish_crates` sat textually after
+# `wait_for_binaries` and was unreachable in the exact scenario its own comment
+# says it exists for.
+#
+# `release.sh` runs under `set -euo pipefail`, and `wait_for_binaries` was
+# called BARE. It returns nonzero on five paths -- timeout, attach job failed,
+# attach succeeded but binaries missing, no run found, and draft state unknown --
+# so on every one of them the script aborted before reaching the fallback. Its
+# comment claims it is the backstop for when "the workflow path is broken"; it
+# was disarmed by precisely the conditions that mean the workflow path is
+# broken.
+#
+# Stubbing `wait_for_binaries` to fail is the whole test. If the fallback is
+# guarded it still runs; if the call is bare, `set -e` kills the script first.
+if [[ -z "${MAIN_FLOW:-}" || -z "${FN_NAMES:-}" ]]; then
+    fail "main flow not extracted; the reachability case cannot run" \
+        "It would otherwise report success having executed nothing."
+else
+    reach_work="$(mktemp -d)"
+    {
+        while IFS= read -r fn; do
+            [[ -z "$fn" ]] && continue
+            if [[ "$fn" == "wait_for_binaries" ]]; then
+                # The failure mode under test: the workflow path is broken.
+                printf '%s() { echo "CALL:%s"; return 1; }\n' "$fn" "$fn"
+            else
+                printf '%s() { echo "CALL:%s"; }\n' "$fn" "$fn"
+            fi
+        done <<< "$FN_NAMES"
+        printf 'VERSION=9.9.9\nFDEV_VERSION=0.9.9\nSTATE_FILE=/dev/null\n'
+        printf 'PROJECT_ROOT=/nonexistent\n'
+        # `set -e` ONLY, deliberately, and NOT `set -euo pipefail`.
+        #
+        # errexit is the mechanism under test: a bare `wait_for_binaries`
+        # aborting the script is what makes the fallback unreachable. `-u` is
+        # not, and including it made this harness abort on `PROJECT_ROOT`
+        # -- a variable defined in the part of release.sh above the extracted
+        # main-flow region -- BEFORE reaching the code under test. The case then
+        # reported RED for a reason having nothing to do with reachability,
+        # which is a vacuous failure: right verdict, wrong cause, and it would
+        # have gone green again on any change that happened to define that
+        # variable. Caught by reading the harness's stderr instead of trusting
+        # the red.
+        printf 'set -e\n'
+        printf '%s\n' "$MAIN_FLOW"
+    } > "$reach_work/flow.sh"
+
+    REACH_ORDER="$(bash "$reach_work/flow.sh" 2>/dev/null | sed -n 's/^CALL://p')"
+    if printf '%s\n' "$REACH_ORDER" | grep -qxF publish_crates; then
+        pass "publish_crates still runs when wait_for_binaries fails (fallback is reachable)"
+    else
+        fail "the crates.io fallback is UNREACHABLE when the workflow path is broken" \
+            "Stubbed wait_for_binaries to return 1; observed calls:" \
+            "  $(printf '%s\n' "$REACH_ORDER" | tr '\n' ' ')" \
+            "publish_crates never ran. release.sh runs under 'set -euo pipefail'," \
+            "so a bare 'wait_for_binaries' aborts the script on any of its five" \
+            "nonzero returns -- timeout, attach job failed, binaries missing, no run" \
+            "found, draft state unknown. Every one of those IS 'the workflow path is" \
+            "broken', which is the case publish_crates' own comment claims it covers." \
+            "Guard the call ('if ! wait_for_binaries; then publish_crates; exit 1; fi')" \
+            "or correct the comment to state the real reachability. Do not rely on" \
+            "the ordering assertion above: it compares line numbers and passes while" \
+            "the call is dead."
+    fi
+    rm -rf "$reach_work"
+fi
+
+# ---------------------------------------------------------------------------
+# 4. no FUNCTION BODY calls publish_crates
 # ---------------------------------------------------------------------------
 # The blind spot of the ordering test above, stated plainly rather than papered
 # over. That test stubs every function to announce itself, so a `publish_crates`
