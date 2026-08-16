@@ -396,6 +396,46 @@ pub(crate) struct AcceptOutcome {
     pub joiner: PeerKeyLocation,
 }
 
+/// Why a relay at terminus could not accept and rejected the request.
+///
+/// These are diagnostically different conditions and must stay
+/// distinguishable downstream: [`NoUphillPeers`](Self::NoUphillPeers) is a
+/// topology/connectivity condition (nothing unvisited left to route to),
+/// while [`UphillBudgetOrTtlExhausted`](Self::UphillBudgetOrTtlExhausted) is
+/// the amplification bound working as designed.
+///
+/// Carried *inside* [`RelayActions::rejected`] rather than as a second field
+/// beside a bool, so that a call site cannot consume the fact of a rejection
+/// without also getting its cause. That is the same reasoning as
+/// [`AcceptOutcome`] (#3838): paired fields which are only meaningful
+/// together drift apart at different call sites, and the type system should
+/// forbid it rather than a comment asking callers to remember.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RejectReason {
+    /// At terminus, cannot accept, and `select_uphill_hop` found no
+    /// unvisited strictly-uphill candidate.
+    NoUphillPeers,
+    /// At terminus, cannot accept, and the uphill budget or TTL is spent.
+    UphillBudgetOrTtlExhausted,
+}
+
+impl RejectReason {
+    /// Stable reason string for the `connect_rejected` telemetry event.
+    ///
+    /// This is the ONLY thing that distinguishes the two causes in a release
+    /// build: the corresponding log lines are `debug!` (#5335) and
+    /// `release_max_level_info` compiles them out entirely, so a constant
+    /// reason string here would erase the distinction in production. Keep
+    /// the two strings distinct, and keep them aligned with the log message
+    /// wording so a log and an event about one rejection agree.
+    pub(crate) fn as_event_reason(self) -> &'static str {
+        match self {
+            Self::NoUphillPeers => "no uphill peers available",
+            Self::UphillBudgetOrTtlExhausted => "uphill budget or TTL exhausted",
+        }
+    }
+}
+
 /// Result of processing a request at a relay.
 #[derive(Debug, Default)]
 pub(crate) struct RelayActions {
@@ -405,9 +445,11 @@ pub(crate) struct RelayActions {
     pub accept: Option<AcceptOutcome>,
     pub forward: Option<(PeerKeyLocation, ConnectRequest)>,
     pub observed_address: Option<(PeerKeyLocation, SocketAddr)>,
-    /// True when at terminus, cannot accept, and has no routing options.
-    /// Signals that an explicit Rejected message should be sent back.
-    pub rejected: bool,
+    /// `Some` exactly when at terminus, cannot accept, and there are no
+    /// routing options — signalling that an explicit Rejected message should
+    /// be sent back. The payload is *why*, so the cause travels with the
+    /// decision instead of in a parallel field. See [`RejectReason`].
+    pub rejected: Option<RejectReason>,
 }
 
 #[derive(Debug, Clone)]
@@ -758,7 +800,7 @@ impl RelayState {
                         visited = ?self.request.visited,
                         "connect: at terminus, cannot accept, no uphill peers available — rejecting"
                     );
-                    actions.rejected = true;
+                    actions.rejected = Some(RejectReason::NoUphillPeers);
                 }
             } else {
                 // debug!, not info!: exhausting the uphill budget or TTL is the
@@ -771,7 +813,7 @@ impl RelayState {
                     visited = ?self.request.visited,
                     "connect: at terminus, cannot accept, uphill budget or TTL exhausted — rejecting"
                 );
-                actions.rejected = true;
+                actions.rejected = Some(RejectReason::UphillBudgetOrTtlExhausted);
             }
         } else if is_terminus && self.forwarded_to.is_some() {
             tracing::debug!(
@@ -3516,7 +3558,11 @@ mod tests {
             actions.forward.is_none(),
             "should not forward uphill when budget is exhausted"
         );
-        assert!(actions.rejected, "should reject when budget is exhausted");
+        assert_eq!(
+            actions.rejected,
+            Some(RejectReason::UphillBudgetOrTtlExhausted),
+            "should reject with the budget-exhausted cause when budget is exhausted"
+        );
     }
 
     // NOTE: A test for joiner_known = None was considered, but this edge case cannot
@@ -3707,7 +3753,11 @@ mod tests {
             Instant::now(),
         );
 
-        assert!(actions.rejected, "should reject when no uphill peers");
+        assert_eq!(
+            actions.rejected,
+            Some(RejectReason::NoUphillPeers),
+            "should reject with the no-uphill-peers cause"
+        );
         assert!(actions.accept.is_none());
         assert!(actions.forward.is_none());
     }
@@ -3745,7 +3795,11 @@ mod tests {
             Instant::now(),
         );
 
-        assert!(actions.rejected, "should reject when TTL exhausted");
+        assert_eq!(
+            actions.rejected,
+            Some(RejectReason::UphillBudgetOrTtlExhausted),
+            "should reject with the budget-or-TTL cause when TTL is exhausted"
+        );
         assert!(actions.accept.is_none());
         assert!(actions.forward.is_none());
     }
@@ -3786,7 +3840,10 @@ mod tests {
             Instant::now(),
         );
 
-        assert!(!actions.rejected, "should not reject when uphill available");
+        assert!(
+            actions.rejected.is_none(),
+            "should not reject when uphill available"
+        );
         assert!(actions.forward.is_some(), "should forward uphill");
         assert!(actions.accept.is_none());
         assert!(
@@ -3915,9 +3972,10 @@ mod tests {
             &estimator,
             Instant::now(),
         );
-        assert!(
+        assert_eq!(
             retry_actions.rejected,
-            "should reject when no uphill peers on retry"
+            Some(RejectReason::NoUphillPeers),
+            "should reject with the no-uphill-peers cause on retry"
         );
         assert!(retry_actions.forward.is_none());
         assert!(retry_actions.accept.is_none());
@@ -4474,7 +4532,7 @@ mod tests {
     fn fn_body<'a>(source: &'a str, signature_prefix: &str) -> &'a str {
         let start = source
             .find(signature_prefix)
-            .unwrap_or_else(|| panic!("{signature_prefix} not found in connect.rs"));
+            .unwrap_or_else(|| panic!("anchor not found in scraped source: {signature_prefix}"));
         // Refuse an anchor that landed inside this test module: from there the
         // scraped region could only contain the pin's own literals, so every
         // assertion below would pass without reading production code.
@@ -4508,6 +4566,148 @@ mod tests {
             i += 1;
         }
         panic!("unbalanced braces while scanning {signature_prefix}");
+    }
+
+    /// Drive `handle_request` into the "no unvisited uphill candidate"
+    /// rejection and return the resulting actions.
+    fn reject_actions_no_uphill_peers() -> RelayActions {
+        let self_loc = make_peer(4000);
+        let joiner = make_peer(5000);
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner,
+                ttl: 3,
+                visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
+            },
+            forwarded_to: None,
+            forwarded_at: None,
+            observed_sent: false,
+            accepted_locally: false,
+            response_forwarded: false,
+        };
+        let ctx = TestRelayContext::new(self_loc)
+            .accept(false)
+            .uphill_hop(None);
+        state.handle_request(
+            &ctx,
+            &HashMap::new(),
+            &mut HashMap::new(),
+            &ConnectForwardEstimator::new(),
+            Instant::now(),
+        )
+    }
+
+    /// Drive `handle_request` into the "uphill budget / TTL spent" rejection
+    /// and return the resulting actions.
+    fn reject_actions_budget_or_ttl_exhausted() -> RelayActions {
+        let self_loc = make_peer(4000);
+        let joiner = make_peer(5000);
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner,
+                ttl: 0, // TTL exhausted
+                visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
+            },
+            forwarded_to: None,
+            forwarded_at: None,
+            observed_sent: false,
+            accepted_locally: false,
+            response_forwarded: false,
+        };
+        let ctx = TestRelayContext::new(self_loc).accept(false);
+        state.handle_request(
+            &ctx,
+            &HashMap::new(),
+            &mut HashMap::new(),
+            &ConnectForwardEstimator::new(),
+            Instant::now(),
+        )
+    }
+
+    /// #5335: each terminus-rejection cause must reach the structured
+    /// `connect_rejected` event under its OWN distinct reason string.
+    ///
+    /// This is what makes the log downgrade lossless rather than a trade.
+    /// The two causes are diagnostically different — "no uphill peers
+    /// available" is a topology/connectivity condition, "uphill budget or TTL
+    /// exhausted" is the amplification bound working as designed — and once
+    /// the log lines are `debug!` (compiled out of release builds by
+    /// `release_max_level_info`) this event's reason is the ONLY thing that
+    /// tells them apart in production. Before this, both arrived as the
+    /// constant `"rejected by handle_request"`.
+    ///
+    /// Asserts the specific mapping, not merely that the two differ: a test
+    /// that only checked `a != b` would stay green if the two arms of
+    /// `as_event_reason` were swapped.
+    #[test]
+    fn each_terminus_rejection_cause_reaches_the_event_with_its_own_reason() {
+        let no_uphill = reject_actions_no_uphill_peers()
+            .rejected
+            .expect("no-uphill-candidate scenario must reject");
+        let budget_spent = reject_actions_budget_or_ttl_exhausted()
+            .rejected
+            .expect("budget/TTL-exhausted scenario must reject");
+
+        assert_eq!(no_uphill, RejectReason::NoUphillPeers);
+        assert_eq!(budget_spent, RejectReason::UphillBudgetOrTtlExhausted);
+
+        assert_eq!(
+            no_uphill.as_event_reason(),
+            "no uphill peers available",
+            "the no-uphill-candidate cause must carry its own event reason"
+        );
+        assert_eq!(
+            budget_spent.as_event_reason(),
+            "uphill budget or TTL exhausted",
+            "the budget/TTL cause must carry its own event reason"
+        );
+        assert_ne!(
+            no_uphill.as_event_reason(),
+            budget_spent.as_event_reason(),
+            "the two causes must remain distinguishable in telemetry"
+        );
+    }
+
+    /// #5335: the CONNECT relay driver must pass the carried cause to
+    /// `NetEventLog::connect_rejected`, never a constant.
+    ///
+    /// The behavioural test above proves `handle_request` produces the right
+    /// `RejectReason`; this proves the driver actually forwards it into the
+    /// event, which is the step that would silently undo the whole point.
+    /// Reaching the real emit requires a live `OpManager` and ring, so this
+    /// is a source scrape — but a CROSS-FILE one (it lives in `connect.rs`
+    /// and reads `connect/op_ctx_task.rs`), so it structurally cannot be
+    /// satisfied by its own assertion literals.
+    #[test]
+    fn relay_driver_passes_the_specific_reject_cause_to_the_event() {
+        const DRIVER_SOURCE: &str = include_str!("connect/op_ctx_task.rs");
+        let branch = fn_body(
+            DRIVER_SOURCE,
+            "if let Some(reject_reason) = initial_actions.rejected",
+        );
+
+        assert!(
+            branch.contains("NetEventLog::connect_rejected("),
+            "the rejected branch must still emit the structured event"
+        );
+        assert!(
+            branch.contains("reject_reason.as_event_reason()"),
+            "the rejected branch must pass the CARRIED cause to \
+             connect_rejected (#5335) — a constant reason string erases the \
+             difference between 'no uphill peers available' and 'uphill \
+             budget or TTL exhausted' in release builds, where the \
+             corresponding debug! log lines are compiled out entirely"
+        );
+        assert!(
+            !branch.contains("\"rejected by handle_request\""),
+            "the constant reason string must not come back (#5335)"
+        );
     }
 
     /// #5335: the two terminus-rejection arms of `RelayState::handle_request`

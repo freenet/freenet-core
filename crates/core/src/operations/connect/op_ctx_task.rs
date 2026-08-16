@@ -908,12 +908,18 @@ async fn drive_relay_connect(
         .await?;
     }
 
-    if initial_actions.rejected {
+    if let Some(reject_reason) = initial_actions.rejected {
+        // Pass the SPECIFIC cause, never a constant: the two terminus-rejection
+        // log lines are `debug!` (#5335) and `release_max_level_info` compiles
+        // them out of release builds, so this event's reason string is the only
+        // thing distinguishing "no uphill peers available" (a connectivity
+        // condition) from "uphill budget or TTL exhausted" (the amplification
+        // bound working) in production.
         if let Some(event) = NetEventLog::connect_rejected(
             &incoming_tx,
             &op_manager.ring,
             state.request.desired_location,
-            "rejected by handle_request",
+            reject_reason.as_event_reason(),
         ) {
             op_manager.ring.register_events(Either::Left(event)).await;
         }
