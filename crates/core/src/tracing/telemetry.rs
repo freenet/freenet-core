@@ -808,6 +808,15 @@ impl NetEventRegister for TelemetryReporter {
                 // consumes the per-event stream (topology / rejection panels).
                 // Retiring here (skip the two variants) would make net telemetry
                 // volume NEGATIVE.
+                //
+                // BEFORE retiring connect_rejected, read #5335. The terminus-
+                // rejection log lines in operations/connect.rs are `debug!`,
+                // which `release_max_level_info` compiles out of release
+                // builds, so this per-event stream's `reason` field is now the
+                // ONLY thing that distinguishes those causes in production.
+                // The snapshot counters have no reason dimension, so retiring
+                // the per-event stream without adding one would silently
+                // delete that signal entirely rather than relocate it.
                 match event_type.as_str() {
                     "connect_connected" => {
                         crate::node::network_status::record_connect_accept_emitted()
