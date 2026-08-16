@@ -3265,9 +3265,37 @@ const MAX_SUMMARY_COMPARISONS_PER_MESSAGE: usize = MAX_DIGEST_SUMMARIES_PER_REPL
 ///   at all and summarizes every entry it is sent (see the mixed-version note
 ///   below), so the ceiling is the whole of its per-message cost.
 ///
+/// # The adversarial case, in numbers
+///
+/// State it explicitly, because this ceiling is the ONLY thing bounding it and
+/// the honest case above is not the one that decides the value.
+///
+/// A hostile or broken peer's message is truncated to this ceiling, so the
+/// worst FULLY-PROCESSED message is 128 entries. Of those:
+///
+/// - **Summarize round trips: at most 64, unchanged by #5338.**
+///   [`MAX_SUMMARY_COMPARISONS_PER_MESSAGE`] still caps them, and free entries
+///   cannot consume that budget because they make no call. (The full-bytes arm
+///   charges per ENTRY, so a hash collision can still make one entry fetch for
+///   several contracts — a pre-existing property, noted at that loop.)
+/// - **`clear_peer_summary` calls: at most 128, up from 64.** A message of
+///   nothing but free entries reaches the summarize budget never, so every one
+///   of them is processed. That is the 2x, and it is a 2x on the lever
+///   described above; at 4x it would have been 256.
+///
+/// **`break` instead of `continue` past the budget would not help**, which is
+/// worth recording so the next reader does not reach for it as the cheap fix. A
+/// message of pure free entries never reaches the budget at all, so the `break`
+/// would never fire and the count would be identical. Charging free entries
+/// against the budget would bound it — and would also delete the fix. Lowering
+/// the ceiling is the only lever that moves this number, which is the second
+/// reason it is 2x rather than 4x.
+///
 /// The benefit above 2x is speculative — nobody has measured the not-hosted
-/// fraction of a real shared set — while the cost above 2x is concrete. Raise
-/// it when there IS a measurement, which is a one-line change that
+/// fraction of a real shared set — while the cost above 2x is concrete and
+/// lands on a number #5153 is actively measuring. Raise it when there IS a
+/// measurement (#5168's entries-per-reply distribution is the natural one),
+/// which is a one-line change that
 /// `an_all_free_window_stops_at_the_entry_ceiling` will notice.
 ///
 /// A digest entry is 21 bytes, so 128 of them is ~2.7 KB, well inside the 9 KiB
