@@ -1385,6 +1385,117 @@ CRITICAL_STEPS=(
     "auto-update-selfupdate-canary|Previous release self-updates to this release|none"
 )
 
+# --- 2h-pre. the table is DERIVED-CHECKED, not merely declared -------------
+#
+# THE GAP THIS CLOSES, which is the table's own version of the orphan test.
+# `CRITICAL_STEPS` is a hand-written list. Add a step that this suite extracts
+# -- or convert an existing check to extract one -- and forget to list it here,
+# and that step silently has no uniqueness, conditionality or shell-override
+# protection while every suite stays green. Present, plausible, covered by
+# nothing, with the listing looking complete.
+#
+# So the set is DERIVED from this file's own source and compared against the
+# table. The enumeration was done by hand once (which is how
+# `Check out the canary script` was found); doing it mechanically is what stops
+# the next one being missed.
+#
+# Three extraction mechanisms are scraped, because those are the three this
+# file uses to reach a step:
+#   * `extract_step_run <job> '<name>'`   -- names the step directly
+#   * `GATE_A_STEP=` / `GATE_B_STEP=`     -- names passed through a variable
+#   * `line_of '<pattern>'`               -- finds a LINE, which is then handed
+#                                            to `step_block`; the enclosing
+#                                            step's name is resolved here
+#
+# DELIBERATELY OUT OF SCOPE, stated so the omission is a decision: the notify
+# job's steps, which `step_containing` locates by `id:`. A duplicate `id:`
+# within a job is a workflow syntax error, so the decoy attack is structurally
+# impossible there, and their conditions are already pinned exactly by 6b.
+_self="${BASH_SOURCE[0]}"
+declare -a _derived=()
+
+# (1) explicit `extract_step_run <literal job> '<literal name>'`
+while IFS= read -r _m; do
+    [[ -z "$_m" ]] && continue
+    _dj="$(printf '%s' "$_m" | sed -E "s/^extract_step_run ([A-Za-z0-9_-]+) '.*'$/\1/")"
+    _dn="$(printf '%s' "$_m" | sed -E "s/^extract_step_run [A-Za-z0-9_-]+ '(.*)'$/\1/")"
+    [[ -n "$_dn" ]] && _derived+=("$_dj|$_dn")
+done < <(grep -oE "extract_step_run [A-Za-z0-9_-]+ '[^']+'" "$_self")
+
+# (2) step names carried through the GATE_*_STEP variables
+for _v in "GATE_A_STEP|attach-to-release" "GATE_B_STEP|auto-update-selfupdate-canary"; do
+    _vn="${_v%%|*}"; _vj="${_v#*|}"
+    _dn="$(grep -oE "^${_vn}='[^']+'" "$_self" | head -1 | sed -E "s/^${_vn}='(.*)'$/\1/")"
+    [[ -n "$_dn" ]] && _derived+=("$_vj|$_dn")
+done
+
+# (3) `line_of '<pattern>'` -- resolve the pattern to its enclosing step name.
+#     `line_of` is scoped to $JOB_BLOCK, so every hit is in attach-to-release.
+while IFS= read -r _m; do
+    _pat="$(printf '%s' "$_m" | sed -E "s/^line_of '(.*)'$/\1/")"
+    [[ -z "$_pat" ]] && continue
+    _l="$(printf '%s\n' "$JOB_BLOCK" | grep -E "$_pat" | head -1 | cut -d: -f1)"
+    [[ -z "$_l" ]] && continue
+    _first="$(step_block "$_l" | head -1)"
+    # Only when the enclosing block really starts at a `- name:` line. A
+    # pattern that resolves to the job header (or to a line with no enclosing
+    # step) otherwise yields a junk "name" and this check reports a gap that is
+    # an artifact of its own scrape -- which is how a derived check loses its
+    # credibility and gets deleted.
+    # Extract-and-require-non-empty rather than a `=~` pre-test. A bash regex
+    # with backslash-escaped spaces is fragile enough that it silently matched
+    # NOTHING here, so `line_of`-located steps were never derived at all and
+    # this check quietly covered only half the surface it claims. Mutation
+    # found it: adding a `line_of` for an untabled step stayed green.
+    _sn="$(printf '%s' "$_first" | sed -nE 's/^[0-9]+:      - name: (.*)$/\1/p')"
+    [[ -n "$_sn" ]] && _derived+=("attach-to-release|$_sn")
+done < <(grep -oE "line_of '[^']+'" "$_self")
+
+# (4) literal `- name: X` strings used as locators (the checkout steps)
+while IFS= read -r _m; do
+    _sn="$(printf '%s' "$_m" | sed -E 's/^"- name: (.*)"$/\1/')"
+    [[ -n "$_sn" ]] && _derived+=("attach-to-release|$_sn")
+done < <(grep -oE '"- name: [^"]+"' "$_self")
+
+# Every candidate must be a REAL step name in the workflow. This is what makes
+# the scrape trustworthy: regex fragments and sed expressions picked up from
+# this file's own source (`(.*)`, `[^`, `$_cname`) are not step names, and
+# reporting them as uncovered steps would be noise that trains the next reader
+# to ignore this assertion.
+_validated=()
+for _d in "${_derived[@]}"; do
+    _dn="${_d#*|}"
+    [[ "$(grep -cxF "      - name: $_dn" "$WF")" -gt 0 ]] && _validated+=("$_d")
+done
+_derived=("${_validated[@]}")
+
+_missing=""
+for _d in "${_derived[@]}"; do
+    _found=0
+    for _spec in "${CRITICAL_STEPS[@]}"; do
+        [[ "${_spec%|*}" == "$_d" ]] && _found=1 && break
+    done
+    [[ "$_found" -eq 0 ]] && [[ "$_missing" != *"$_d"* ]] && _missing+="  $_d"$'\n'
+done
+
+if [[ ${#_derived[@]} -eq 0 ]]; then
+    fail "derived NO extracted steps from this file's own source" \
+        "The scrape found nothing, so the comparison below cannot fail and the" \
+        "table is unchecked. Either the extraction helpers were renamed or the" \
+        "scrape patterns are stale -- fix the scrape, do not delete this."
+elif [[ -n "$_missing" ]]; then
+    fail "a step is EXTRACTED by this suite but missing from CRITICAL_STEPS" \
+        "$(printf '%s' "$_missing")" \
+        "Any step this file locates can be shadowed by a duplicate-name decoy," \
+        "so it needs the uniqueness, conditionality and shell-override checks the" \
+        "table applies. Add it to CRITICAL_STEPS with its if-policy ('none', or" \
+        "'exact:<expr>'). This check exists because the table is hand-written and" \
+        "a step added without listing it would be protected by nothing while every" \
+        "suite stayed green -- the orphan-test shape, one level up."
+else
+    pass "every step this suite extracts (${#_derived[@]} references) is covered by CRITICAL_STEPS"
+fi
+
 for _spec in "${CRITICAL_STEPS[@]}"; do
     _cjob="${_spec%%|*}"
     _rest="${_spec#*|}"
