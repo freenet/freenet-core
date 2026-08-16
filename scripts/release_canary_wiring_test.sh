@@ -1971,6 +1971,80 @@ else
     pass "all $UA_TOTAL crates.io API calls send a User-Agent"
 fi
 
+# --- 2j. the wait_for_binaries failure enumeration exists in ONE place -------
+#
+# A comment pin, deliberately, because on this PR the comments ARE part of the
+# deliverable and this specific list has been wrong four times.
+#
+# `wait_for_binaries` fails on six modes. That list was restated in three
+# places, and all three copies drifted: two in release.sh undercounted in
+# OPPOSITE directions while both claiming "five paths", and a third in
+# release_driver_test.sh -- the file release.sh points a reader at as the
+# behavioural pin -- kept the old five-row table, so following that pointer
+# landed on the wrong count.
+#
+# None of it broke an assertion, which is exactly why it drifted unnoticed: no
+# test depended on the number, so nothing objected. The failure mode is a
+# maintainer reading a stale list and reasoning from it -- and a stale
+# enumeration is already on record here as what hid the round-7 bug.
+#
+# So: the canonical table lives in release.sh's refusal branch, every other site
+# refers to it, and this fails if a second multi-row copy appears anywhere. A
+# file mentioning one or two members in prose is fine; three or more is a
+# restated table.
+# realpath, because `find "$SCRIPT_DIR/.."` emits `.../../scripts/release.sh`
+# while $RELEASE_SH is the direct path -- a string compare never matched, so the
+# canonical file was scanned as though it were a copy and the check reported
+# "0 of 5 rows" on a correct tree. A pin that fires on the healthy state is one
+# that gets deleted.
+CANON_FILE="$(realpath "$RELEASE_SH" 2>/dev/null || echo "$RELEASE_SH")"
+CANON_ROWS=(
+    "Gate A never ran"
+    "Gate A state unknown"
+    "Gate A REJECTED"
+    "Gate A undecided"
+    "Gate A passed"
+)
+
+enum_copies=""
+canon_hits=0
+while IFS= read -r _f; do
+    [[ -f "$_f" ]] || continue
+    _n=0
+    for _row in "${CANON_ROWS[@]}"; do
+        [[ "$(grep -cF -- "$_row" "$_f")" -gt 0 ]] && _n=$((_n + 1))
+    done
+    # `*_test.sh` excluded: CANON_ROWS above literally contains all five
+    # phrases, so this pin flags ITSELF otherwise. Third self-match of the day
+    # from widening a file set -- the pattern is that any scan whose needles are
+    # spelled out in its own source must exclude the files that hold needles.
+    case "$(basename "$_f")" in *_test.sh) continue ;; esac
+    _fr="$(realpath "$_f" 2>/dev/null || echo "$_f")"
+    if [[ "$_fr" == "$CANON_FILE" ]]; then
+        canon_hits="$_n"
+    elif [[ "$_n" -ge 3 ]]; then
+        enum_copies+="$(basename "$_f"): contains $_n of the ${#CANON_ROWS[@]} enumeration rows"$'\n'
+    fi
+done < <(find "$SCRIPT_DIR/.." -type f \( -name '*.sh' -o -name '*.md' -o -name '*.yml' \) \
+            -not -path '*/.git/*' -not -path '*/target/*' 2>/dev/null | sort)
+
+if [[ "$canon_hits" -lt "${#CANON_ROWS[@]}" ]]; then
+    fail "release.sh's canonical failure enumeration is incomplete ($canon_hits of ${#CANON_ROWS[@]} rows)" \
+        "Every other site refers to this table instead of restating it, so if it" \
+        "is trimmed those references point at something that no longer says what" \
+        "they claim. Rows expected: ${CANON_ROWS[*]}"
+elif [[ -n "$enum_copies" ]]; then
+    fail "the wait_for_binaries failure enumeration has been restated outside release.sh" \
+        "$(printf '%s' "$enum_copies")" \
+        "Three copies of this list existed and all three disagreed -- two" \
+        "undercounting in opposite directions, the third in the very file" \
+        "release.sh cites as the behavioural pin. No assertion depended on the" \
+        "count, which is why nobody noticed. Refer to release.sh's table rather" \
+        "than repeating it; naming one or two modes in prose is fine."
+else
+    pass "the wait_for_binaries failure enumeration exists only in release.sh (${canon_hits} rows)"
+fi
+
 # --- 3. it is not neutered in place -----------------------------------------
 # `continue-on-error: true` leaves the step present, running, and visibly
 # green-ish in the UI while the job proceeds to publish regardless -- the

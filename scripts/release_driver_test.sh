@@ -265,14 +265,23 @@ fi
 #
 # It asserted that `publish_crates` still RUNS when `wait_for_binaries` fails,
 # on the reasoning that the fallback was a harmless confirmation and a backstop
-# for a `CARGO_REGISTRY_TOKEN` that never reached CI. Walking the five failure
-# paths shows publishing is wrong on four of them:
+# for a `CARGO_REGISTRY_TOKEN` that never reached CI. Walking the failure modes
+# shows publishing is wrong on all but one of them.
 #
-#   no workflow run found        Gate A never ran        -> publish ungated
-#   attach job never reported    Gate A state unknown    -> publish ungated
-#   attach conclusion != success Gate A REJECTED it      -> publish what it blocked
-#   timeout                      Gate A undecided        -> pre-empt the gate
-#   assets missing, attach OK    Gate A passed           -> the only safe one
+# THE ENUMERATION LIVES IN ONE PLACE: the refusal branch in `scripts/release.sh`,
+# which lists every mode with its Gate A implication. This comment deliberately
+# does NOT restate it.
+#
+# It used to. That copy said "five failure paths" and listed five rows, omitting
+# the refusal inherited from `publish_draft_release` -- the exact sixth member,
+# and the exact undercount already corrected twice in release.sh. Three copies
+# of one list produced three different versions of it, and this one sat in the
+# file that release.sh points a reader at as the behavioural pin, so following
+# that pointer landed you on the wrong count.
+#
+# The assertions below never depended on the number, which is why it drifted
+# unnoticed. Restating a list is how copies diverge; the fix is to stop having
+# copies, not to keep fixing them.
 #
 # `publish_crates` consults only the resume flag, DRY_RUN and crates.io
 # presence -- never the gate's verdict. And on the rejected path the crate is
@@ -325,7 +334,7 @@ else
                 "wait_for_binaries returned $wfb_rc" \
                 "expected published=$want_pub exit=$want_exit; got published=$got_pub exit=$got_exit" \
                 "Publishing on a failed workflow path uploads a version Gate A never" \
-                "passed -- on four of the five failure paths, including the one where" \
+                "passed -- on every failure mode except one, including the one where" \
                 "the canary REJECTED the binary. That permanently spends the version" \
                 "number. The branch must refuse and print the recovery procedure." \
                 "--- output ---" \

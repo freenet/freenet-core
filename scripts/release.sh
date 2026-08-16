@@ -1914,8 +1914,10 @@ if ! wait_for_binaries; then
     echo "❌ The cross-compile workflow did not complete successfully." >&2
     echo >&2
     echo "   NOT publishing to crates.io from here, deliberately. This point is" >&2
-    echo "   reached when Gate A never ran, its verdict is unknown, it timed out," >&2
-    echo "   or it REJECTED the binary -- and this branch cannot tell those apart." >&2
+    echo "   reached for any of six reasons -- Gate A never ran, its verdict is" >&2
+    echo "   unknown, it timed out, it REJECTED the binary, the draft-publish step" >&2
+    echo "   refused, or the assets are missing though Gate A passed -- and this" >&2
+    echo "   branch cannot tell them apart. Only the last is safe to publish on." >&2
     echo "   Publishing on any of them uploads a version the blocking auto-update" >&2
     echo "   pre-flight canary never passed, which permanently spends the version" >&2
     echo "   number (the v0.2.124 state)." >&2
