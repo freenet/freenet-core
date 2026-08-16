@@ -1122,6 +1122,156 @@ if [[ -f "$RELEASE_SH" ]]; then
     fi
 fi
 
+# --- 2e. EVERY executable site that creates a release passes --draft --------
+# The `--draft` invariant enumerated over CODE, not over the three sites it was
+# first written for.
+#
+# It was pinned in release.yml and in the two markdown runbooks, and missed
+# `scripts/release.sh` -- which is the one that executes on EVERY NORMAL
+# RELEASE rather than only on a bad day. Dropping `--draft` there passed all
+# eight suites. The pins had been written to the shape of the files already in
+# hand instead of to the shape of the invariant, so the human path that runs
+# most often was the one left uncovered.
+#
+# Scans workflows and shell scripts together, because "which file is it in" is
+# not a property the invariant cares about. Docs are covered by assertion 2d,
+# which needs fence extraction; this one needs none.
+#
+# `*_test.sh` is excluded: this file itself contains the string `gh release
+# create` in its own greps and failure text, and a scan that matches its own
+# source is the self-satisfying shape this suite exists to remove. Test files
+# do not cut releases.
+CODE_CREATE_SITES=()
+for _f in "$SCRIPT_DIR"/../.github/workflows/*.yml "$SCRIPT_DIR"/../.github/workflows/*.yaml "$SCRIPT_DIR"/*.sh; do
+    [[ -f "$_f" ]] || continue
+    case "$(basename "$_f")" in *_test.sh) continue ;; esac
+    CODE_CREATE_SITES+=("$_f")
+done
+
+# Logical commands, with `\` continuations joined and the STARTING line number
+# kept. Per-LINE matching does not work here: release.yml spreads its
+# invocation over four lines with `--draft` on the last, so a line-wise check
+# reports the verb line as undrafted -- a false positive that would have to be
+# silenced, and silencing it is how this assertion would end up deleted.
+#
+# Same joining the doc extractor does, for the same reason, over different
+# input.
+_logical_creates() {
+    awk '
+        {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            if (acc == "") startln = NR
+            acc = acc (acc == "" ? "" : " ") line
+            if (line ~ /\\$/) { sub(/[[:space:]]*\\$/, "", acc); next }
+            print startln ":" acc
+            acc = ""
+        }
+        END { if (acc != "") print startln ":" acc }
+    ' "$1"
+}
+
+code_creates_total=0
+code_creates_undrafted=""
+for _f in "${CODE_CREATE_SITES[@]}"; do
+    _base="$(basename "$_f")"
+    while IFS= read -r _hit; do
+        [[ -z "$_hit" ]] && continue
+        code_creates_total=$((code_creates_total + 1))
+        # `--draft` as its own flag; `--draft=false` is the UN-draft and must
+        # NOT satisfy this -- accepting it would let the exact inversion this
+        # assertion catches pass as a fix.
+        #
+        # Shell punctuation is normalised to spaces first. In CODE the flag is
+        # routinely terminated by something other than whitespace --
+        # `... --draft"` inside an echo, `... --draft)` closing a command
+        # substitution -- so a whitespace-bounded test alone reports correct
+        # invocations as undrafted. `=` is deliberately NOT normalised, so
+        # `--draft=false` still fails to match.
+        #
+        # Done with `case`, not a pipe into grep: no subprocess, and it cannot
+        # reintroduce the pipefail/SIGPIPE hazard this repo audits for.
+        _flags=" $(printf '%s' "${_hit#*:}" | tr '"'"'"'"()' '    ') "
+        case "$_flags" in
+            *" --draft "*) ;;
+            *) code_creates_undrafted+="$_base:$_hit"$'\n' ;;
+        esac
+    done < <(_logical_creates "$_f" \
+                | grep -E 'gh release create' \
+                | grep -vE '^[0-9]+:[[:space:]]*#')
+done
+code_creates_undrafted="$(printf '%s' "$code_creates_undrafted" | grep -vE '^[[:space:]]*$' || true)"
+
+if [[ "$code_creates_total" -lt 2 ]]; then
+    fail "only $code_creates_total 'gh release create' invocation(s) found in workflows + scripts, expected at least 2" \
+        "release.yml creates the draft on the automated path and release.sh creates" \
+        "it on the manual one. Fewer means one was removed -- and with none, the" \
+        "--draft check below would report success having examined nothing."
+elif [[ -z "$code_creates_undrafted" ]]; then
+    pass "all $code_creates_total 'gh release create' invocations in workflows + scripts pass --draft"
+else
+    fail "an executable path creates a GitHub release WITHOUT --draft" \
+        "$(printf '%s' "$code_creates_undrafted")" \
+        "A release created published is a release Gate A never sees: it becomes" \
+        "/releases/latest before any binary is attached, the release.published" \
+        "cascade fires immediately, and the gated crates.io publish never runs." \
+        "This is #5288 in code rather than in documentation, and release.sh's copy" \
+        "runs on every normal release, not only during a recovery."
+fi
+
+# --- 2f. release.sh publishes AFTER the gate, not before --------------------
+# The second invariant, enumerated over the human path.
+#
+# `scripts/release.sh` holds its own copy of the ordering this whole PR is
+# about, and moving its `publish_crates` call back above `create_github_release`
+# reproduces the v0.2.124 loss on the manual path with every suite green. The
+# line directly above that call says "Moving it back up is what cost v0.2.124
+# its version number" -- a comment asserting the invariant, with nothing
+# enforcing it. A comment is not a gate.
+#
+# The tag push that triggers cross-compile.yml (and therefore Gate A) happens
+# inside `create_github_release`, and `wait_for_binaries` is what blocks until
+# that workflow has run. So `publish_crates` must come after BOTH: after the
+# first because otherwise it publishes before the gate exists, and after the
+# second because otherwise it publishes while the gate is still running.
+#
+# Matched on bare top-level calls (`^name$`), which is how release.sh's main
+# flow invokes them -- definitions are `name() {` and so cannot collide.
+if [[ -f "$RELEASE_SH" ]]; then
+    _line_of_call() {
+        grep -nE "^$1\$" "$RELEASE_SH" | head -1 | cut -d: -f1
+    }
+    RS_PUBLISH="$(_line_of_call publish_crates)"
+    RS_CREATE="$(_line_of_call create_github_release)"
+    RS_WAIT="$(_line_of_call wait_for_binaries)"
+
+    if [[ -z "$RS_PUBLISH" || -z "$RS_CREATE" || -z "$RS_WAIT" ]]; then
+        fail "could not locate release.sh's main-flow calls" \
+            "publish_crates=${RS_PUBLISH:-<none>} create_github_release=${RS_CREATE:-<none>} wait_for_binaries=${RS_WAIT:-<none>}" \
+            "The ordering assertions below compare these line numbers, so a missing" \
+            "one would make them pass vacuously. If the driver was restructured," \
+            "re-establish the ordering guarantee here rather than deleting this."
+    else
+        _rs_bad=""
+        [[ "$RS_PUBLISH" -lt "$RS_CREATE" ]] && \
+            _rs_bad+="publish_crates ($RS_PUBLISH) runs BEFORE create_github_release ($RS_CREATE)"$'\n'
+        [[ "$RS_PUBLISH" -lt "$RS_WAIT" ]] && \
+            _rs_bad+="publish_crates ($RS_PUBLISH) runs BEFORE wait_for_binaries ($RS_WAIT)"$'\n'
+        if [[ -z "$_rs_bad" ]]; then
+            pass "release.sh publishes after the tag and the gate (create $RS_CREATE < wait $RS_WAIT < publish $RS_PUBLISH)"
+        else
+            fail "release.sh's crates.io publish runs BEFORE the gate" \
+                "$(printf '%s' "$_rs_bad")" \
+                "create_github_release pushes the tag that triggers cross-compile.yml," \
+                "and wait_for_binaries blocks until that workflow -- including Gate A --" \
+                "has run. A publish above either one uploads to crates.io before the" \
+                "gate can block, which is exactly the ordering that cost v0.2.124 its" \
+                "version number. This is the same invariant the workflow assertions" \
+                "above enforce, on the path a human drives."
+        fi
+    fi
+fi
+
 # --- 3. it is not neutered in place -----------------------------------------
 # `continue-on-error: true` leaves the step present, running, and visibly
 # green-ish in the UI while the job proceeds to publish regardless -- the
