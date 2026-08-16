@@ -7552,7 +7552,12 @@ mod tests {
     /// survives the `f64` <-> `AtomicU64`-bits round trip, and (c)
     /// `recompute_resident_overhead_budget` installs exactly what the pure
     /// `cache::resident_overhead_budget_for` formula would compute for the
-    /// same inputs — the two must never drift apart.
+    /// same inputs — true here because the cache is EMPTY (no hosted
+    /// contracts, so the manager's `own_rss` pre-adjustment, see the pure
+    /// formula's own doc, is a no-op). With a non-empty cache the two
+    /// intentionally diverge — see
+    /// `resident_overhead_budget_can_actually_fire_on_an_unconstrained_host`
+    /// for that case.
     #[test]
     fn configure_and_recompute_resident_overhead_installs_the_pure_formula_result() {
         const GIB: u64 = 1024 * 1024 * 1024;
