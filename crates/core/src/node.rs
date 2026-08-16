@@ -5527,10 +5527,17 @@ async fn summary_if_hosted_or_in_use(
 /// `.claude/rules/bug-prevention-patterns.md` for the general shape and the
 /// three wrong counts it produced last time.
 ///
-/// The gate itself is not literally free — `contract_state_present` is a cheap
-/// synchronous point lookup on the state store — but it makes no
-/// contract-handler round trip and runs no WASM, which is the cost the budget
-/// is sized against.
+/// For the population this matters for — a contract we track only because a
+/// peer registered interest in it — the gate really is pure in-memory work:
+/// `should_summarize_or_broadcast` is
+/// `(is_hosting_contract || contract_in_use) && contract_state_present`, and
+/// `&&` short-circuits, so a contract that is neither hosted nor in use never
+/// reaches the state-store lookup at all. It costs two map reads.
+///
+/// The one declining class that DOES pay a state-store point lookup is the
+/// hosted-or-in-use contract with no stored state — the #4610 phantom — which
+/// is a small population by construction and still makes no contract-handler
+/// round trip and runs no WASM, which is the cost the budget is sized against.
 struct SummaryProbe {
     /// Our summary. Absent when the gate declined OR when the round trip ran
     /// and produced nothing; `summarized` is what tells those apart.
