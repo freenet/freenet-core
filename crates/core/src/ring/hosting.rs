@@ -2495,6 +2495,12 @@ impl HostingManager {
         self.hosting_cache.read().budget_bytes()
     }
 
+    /// Get the installed resident-overhead (count-derived) budget (#5333).
+    #[cfg(test)]
+    pub(crate) fn resident_overhead_budget_bytes(&self) -> u64 {
+        self.hosting_cache.read().resident_overhead_budget_bytes()
+    }
+
     /// Snapshot the hosting cache's aggregate resource gauges (budget, current
     /// bytes, contract count, budget-triggered eviction count) under a single
     /// read lock, for the per-node `RouterSnapshot` telemetry (A2).
@@ -7510,6 +7516,65 @@ mod tests {
         );
         assert_eq!(manager.recompute_effective_budget(0), None);
         assert_eq!(manager.hosting_budget_bytes(), GIB);
+    }
+
+    /// #5333: end-to-end wiring test for the resident-overhead budget's live
+    /// recompute path — mirrors `recompute_installs_min_of_ram_and_disk`
+    /// above for the disk axis. Verifies (a) the ctor installs the
+    /// CONSTRUCTION-TIME default via `default_resident_overhead_budget_bytes`
+    /// before any config/recompute runs, (b) `configure_resident_overhead_mem_share`
+    /// survives the `f64` <-> `AtomicU64`-bits round trip, and (c)
+    /// `recompute_resident_overhead_budget` installs exactly what the pure
+    /// `cache::resident_overhead_budget_for` formula would compute for the
+    /// same inputs — the two must never drift apart.
+    #[test]
+    fn configure_and_recompute_resident_overhead_installs_the_pure_formula_result() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let manager = HostingManager::new(4 * GIB);
+
+        // Ctor default: whatever the live host's own real signals produce —
+        // just assert it's floored sanely, not a specific value (this test
+        // host's real RAM is unknown/irrelevant here).
+        assert!(
+            manager.resident_overhead_budget_bytes() >= cache::MIN_RESIDENT_OVERHEAD_BUDGET_BYTES
+        );
+
+        // A non-default share, to prove the configured value (not the
+        // DEFAULT) is what the recompute actually uses.
+        let mem_share = 0.3;
+        manager.configure_resident_overhead_mem_share(mem_share);
+
+        let total_ram = 64 * GIB;
+        let pool_size = 8;
+        let live_signals = Some((2 * GIB, 40 * GIB));
+        let installed =
+            manager.recompute_resident_overhead_budget(total_ram, pool_size, live_signals);
+
+        let expected =
+            cache::resident_overhead_budget_for(total_ram, pool_size, live_signals, mem_share);
+        assert_eq!(
+            installed, expected,
+            "the manager's recompute must install exactly what the pure formula \
+             computes for the same (total_ram, pool_size, live_signals, mem_share)"
+        );
+        assert_eq!(
+            manager.resident_overhead_budget_bytes(),
+            expected,
+            "the installed value must actually be readable back off the cache"
+        );
+
+        // A DIFFERENT share on the same inputs must (for this shape, where
+        // the live-surplus term binds) install a DIFFERENT budget — proves
+        // configure_resident_overhead_mem_share actually reaches the
+        // recompute rather than being silently ignored.
+        manager.configure_resident_overhead_mem_share(0.05);
+        let installed_lower_share =
+            manager.recompute_resident_overhead_budget(total_ram, pool_size, live_signals);
+        assert_ne!(
+            installed, installed_lower_share,
+            "changing the configured share must change the installed budget \
+             on a shape where the live-surplus term binds"
+        );
     }
 
     /// The recompute takes only the O(1) `set_budget_bytes` cache write lock, so

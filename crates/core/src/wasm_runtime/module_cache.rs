@@ -1421,9 +1421,31 @@ fn read_macos_available_bytes() -> Option<usize> {
         return None;
     }
     let page_size = macos_page_size_bytes()?;
-    let reclaimable_pages = u64::from(stats.free_count)
-        + u64::from(stats.inactive_count)
-        + u64::from(stats.purgeable_count);
+    macos_vm_stats_to_available_bytes(
+        u64::from(stats.free_count),
+        u64::from(stats.inactive_count),
+        u64::from(stats.purgeable_count),
+        page_size,
+    )
+}
+
+/// Pure arithmetic behind [`read_macos_available_bytes`], split out from the
+/// `host_statistics64` FFI call so it is unit-testable on every CI platform
+/// (mirroring [`windows_memory_status_to_ram_bytes`]'s split for the same
+/// reason — the FFI call itself only compiles and runs on a real macOS
+/// host/CI runner, but the arithmetic on its output can be exercised
+/// everywhere). `checked_mul` + `try_from` guard against overflow on an
+/// implausible page count rather than panicking or silently wrapping.
+#[cfg(any(target_os = "macos", test))]
+fn macos_vm_stats_to_available_bytes(
+    free_count: u64,
+    inactive_count: u64,
+    purgeable_count: u64,
+    page_size: u64,
+) -> Option<usize> {
+    let reclaimable_pages = free_count
+        .saturating_add(inactive_count)
+        .saturating_add(purgeable_count);
     reclaimable_pages
         .checked_mul(page_size)
         .and_then(|b| usize::try_from(b).ok())
@@ -1471,7 +1493,15 @@ fn read_macos_own_rss_bytes() -> Option<usize> {
     if kr != KERN_SUCCESS {
         return None;
     }
-    usize::try_from(info.resident_size).ok()
+    macos_task_info_to_rss_bytes(info.resident_size)
+}
+
+/// Pure narrowing behind [`read_macos_own_rss_bytes`], split out for the same
+/// reason as [`macos_vm_stats_to_available_bytes`] — testable on every CI
+/// platform even though the `task_info` FFI call itself only runs on macOS.
+#[cfg(any(target_os = "macos", test))]
+fn macos_task_info_to_rss_bytes(resident_size: u64) -> Option<usize> {
+    usize::try_from(resident_size).ok()
 }
 
 /// Host page size (bytes) via `sysconf(_SC_PAGESIZE)` — the same POSIX call
@@ -2190,6 +2220,99 @@ mod tests {
             ram < 1024 * 1024 * 1024 * 1024,
             "implausibly large RAM reading: {ram} bytes"
         );
+    }
+
+    /// #5333: same rationale and same CI-coverage caveat as
+    /// [`read_total_ram_bytes_returns_a_sane_value_on_windows`] above — this
+    /// compiles and runs ONLY on a real Windows host (tracked by #5331, which
+    /// as of this PR also covers `read_windows_avail_phys_bytes`/
+    /// `read_windows_own_rss_bytes` since neither Windows CI job runs the
+    /// library's `--lib` test target). `GetProcessMemoryInfo`'s own working
+    /// set can legitimately exceed available RAM on a heavily swapped host,
+    /// so this only sanity-checks the low end and that the call succeeds at
+    /// all — a `None` here means the FFI plumbing itself (not just the pure
+    /// narrowing already covered by `windows_memory_status_to_ram_bytes`'s
+    /// platform-independent unit test) is broken.
+    #[cfg(windows)]
+    #[test]
+    fn read_windows_avail_and_own_rss_return_sane_values_on_windows() {
+        let avail = read_windows_avail_phys_bytes();
+        assert!(
+            avail.is_some(),
+            "GlobalMemoryStatusEx must succeed on any real Windows host"
+        );
+        // A CI runner always has SOME available memory; a `0` reading would
+        // indicate the FFI call read garbage rather than a genuine value.
+        assert!(
+            avail.unwrap() > 0,
+            "implausible zero available-memory reading"
+        );
+
+        let rss = read_windows_own_rss_bytes();
+        assert!(
+            rss.is_some(),
+            "GetProcessMemoryInfo must succeed for the calling process's own handle"
+        );
+        assert!(rss.unwrap() > 0, "implausible zero own-RSS reading");
+    }
+
+    /// Pure arithmetic, testable on every platform even though the real
+    /// `host_statistics64` FFI call only compiles on macOS.
+    #[test]
+    fn macos_vm_stats_to_available_bytes_sums_reclaimable_categories() {
+        // 100 free + 50 inactive + 25 purgeable pages, 4 KiB pages.
+        assert_eq!(
+            macos_vm_stats_to_available_bytes(100, 50, 25, 4096),
+            Some(175 * 4096)
+        );
+    }
+
+    #[test]
+    fn macos_vm_stats_to_available_bytes_rejects_overflow() {
+        assert_eq!(
+            macos_vm_stats_to_available_bytes(u64::MAX, u64::MAX, u64::MAX, u64::MAX),
+            None,
+            "an implausible page count must fail closed (None), not wrap"
+        );
+    }
+
+    #[test]
+    fn macos_task_info_to_rss_bytes_narrows_or_rejects() {
+        assert_eq!(macos_task_info_to_rss_bytes(0), Some(0));
+        assert_eq!(
+            macos_task_info_to_rss_bytes(4 * 1024 * 1024 * 1024),
+            Some(4 * 1024 * 1024 * 1024)
+        );
+    }
+
+    /// #5333: same rationale as the Windows FFI smoke test above — compiles
+    /// and runs ONLY on a real macOS host. Neither macOS CI job
+    /// (`macos_check` = `cargo check` only; `macos_unit` = narrow
+    /// `commands::service` nextest filter scoped to the `--bin freenet`
+    /// target) runs the library's `--lib` test target, so this needs a
+    /// future CI job extending #5331's fix to macOS, or manual verification
+    /// on a real Mac. The pure arithmetic above IS covered on every CI run;
+    /// this additionally covers the FFI plumbing itself (struct layout,
+    /// mach port validity, the real syscalls).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn read_macos_available_and_own_rss_return_sane_values_on_macos() {
+        let avail = read_macos_available_bytes();
+        assert!(
+            avail.is_some(),
+            "host_statistics64 must succeed on any real macOS host"
+        );
+        assert!(
+            avail.unwrap() > 0,
+            "implausible zero available-memory reading"
+        );
+
+        let rss = read_macos_own_rss_bytes();
+        assert!(
+            rss.is_some(),
+            "task_info must succeed for the calling process's own task port"
+        );
+        assert!(rss.unwrap() > 0, "implausible zero own-RSS reading");
     }
 
     /// `/proc/self/cgroup` parsing resolves the process's OWN cgroup sub-path for
