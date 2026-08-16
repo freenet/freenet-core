@@ -643,6 +643,29 @@ fn evidence_id_separates_instances_and_parameters() {
     );
 }
 
+/// Related state lives in a `HashMap` on the way in, whose iteration order differs
+/// between peers and between runs. If that order reached the hash, the same
+/// reproducer would get different ids on different peers, deduplication would fail
+/// open, and one finding would circulate once per discoverer.
+#[test]
+fn evidence_id_does_not_depend_on_related_contract_ordering() {
+    let case = case(ConformanceProperty::StateIdempotence, &[&[1]]);
+    let mut forward = ConformanceEvidence::new(instance(1), vec![], &case, None);
+    forward.related = vec![
+        (instance(3), vec![3]),
+        (instance(1), vec![1]),
+        (instance(2), vec![2]),
+    ];
+    let mut reversed = forward.clone();
+    reversed.related.reverse();
+
+    assert_ne!(
+        forward.related, reversed.related,
+        "fixture failed: the two orderings are identical, so this proves nothing"
+    );
+    assert_eq!(forward.id(), reversed.id());
+}
+
 /// Length-prefixing matters: without it, `["ab"]` and `["a", "b"]` would hash the
 /// same and two different reproducers would collide into one id.
 #[test]

@@ -357,6 +357,32 @@ fn run<O: ConformanceOracle + ?Sized>(
 /// what actually happens on the wire: the peers do not take turns. Convergence ends
 /// the check; an exactly-repeated state pair is a proven cycle; running out of
 /// rounds while still moving is inconclusive.
+///
+/// # Why a repeated pair is proof, and the two assumptions it rests on
+///
+/// The simulation is deterministic and carries no state between rounds, so the next
+/// round is a pure function of the current `(left, right)` pair. Revisiting a pair
+/// therefore means the process has entered a loop it can never leave, which is why
+/// this is reported as a violation rather than as "slow". Legitimate multi-round
+/// convergence never trips it: each round moves to a pair not seen before, and
+/// running out of rounds is [`Inconclusive::RoundLimit`].
+///
+/// That argument depends on two things, and both are worth stating because a finding
+/// from this check is the most model-dependent one this module produces:
+///
+/// 1. **The contract is deterministic.** If `summarize_state` or `get_state_delta`
+///    varies between identical calls — a contract stamping the host clock into its
+///    summary, say — then a repeated pair no longer implies a loop, and the finding
+///    would be real but mislabelled: the defect is the nondeterminism, which
+///    [`ConformanceProperty::SummaryDeterminism`] names directly. Such a contract
+///    genuinely cannot converge either way, so this never accuses a *correct*
+///    contract, but the property named may be the wrong one.
+/// 2. **This exchange resembles the protocol's.** Peers are modelled as exchanging
+///    simultaneously, each computing its delta against the other's pre-round summary.
+///    A protocol that reconciles by some other schedule could in principle converge
+///    where this model loops. Shadow mode is where that assumption gets tested
+///    against real traffic, and it is a reason to treat early findings from this
+///    check with more suspicion than the direct algebraic ones.
 fn reconciliation_cycle<O: ConformanceOracle + ?Sized>(
     oracle: &mut O,
     a: &Bytes,
