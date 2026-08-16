@@ -3325,11 +3325,27 @@ const MAX_SUMMARY_COMPARISONS_PER_MESSAGE: usize = MAX_DIGEST_SUMMARIES_PER_REPL
 ///   the free ones on receipt. For that population this ceiling is an INCREASE,
 ///   up to 2x, in the number of summarize round trips one reply can cost it.
 ///
-/// That second bullet is a real if modest regression for a shrinking
-/// population, and it is the honest reason the ceiling is 2x rather than 4x. It
-/// cannot be avoided by version-gating the ceiling: the entries that make a
-/// reply exceed 64 are precisely the free ones, and dropping them for old peers
-/// would drop their `PeerHasNoState` repairs with them.
+/// That second bullet is a real regression for that population, and it is the
+/// honest reason the ceiling is 2x rather than 4x.
+///
+/// **It COULD be version-gated away, and is not.** An earlier revision claimed
+/// gating was impossible because the entries pushing a reply past 64 are
+/// precisely the free ones, so withholding them would withhold their
+/// `PeerHasNoState` repairs. That reasoning is measured against the NEW
+/// behaviour and is wrong against the shipped one: v0.2.127's full-bytes window
+/// counts ENTRIES, not costed entries, so such a peer already receives 64
+/// entries of which some are free today. Gating `FullBytes` back to
+/// [`MAX_FALLBACK_SUMMARIES_PER_REPLY`] would restore exactly today's behaviour
+/// for it and drop no repair it currently gets.
+///
+/// So this is a judgement rather than an impossibility, and the judgement is:
+/// one uniform ceiling, because a version-conditional bound adds a second thing
+/// to reason about in code whose invariants have already needed correcting
+/// twice, and because the size of the affected population is **unmeasured** —
+/// `hash_first_declined_pre_floor` and `hash_first_declined_unknown_version` in
+/// `connection_manager.rs` would answer it. If that measurement ever shows the
+/// pre-floor population is not negligible, gate it; do not assume it is small
+/// because this comment is short.
 const MAX_SUMMARY_ENTRIES_PER_MESSAGE: usize = 2 * MAX_DIGEST_SUMMARIES_PER_REPLY;
 
 /// The send ceiling must not exceed the receive ceiling, or our own replies
@@ -3754,7 +3770,10 @@ async fn handle_interest_sync_message(
             }
 
             // Build the summaries this reply carries, in rotation order.
-            let mut entries = Vec::with_capacity(window.len().min(summarize_cap));
+            // Sized to the WINDOW, not the summarize budget: the vec holds the
+            // free entries too, so `summarize_cap` would under-reserve by up to
+            // the ceiling and reallocate mid-reply (#5338 review D).
+            let mut entries = Vec::with_capacity(window.len());
             let mut summary_bytes_used = 0usize;
             let mut last_included: Option<ContractInstanceId> = None;
             // Entries that cost a `summary_if_hosted_or_in_use` round trip.
@@ -3989,10 +4008,10 @@ async fn handle_interest_sync_message(
                         // #5338: skipped outright when the peer sent no summary
                         // bytes — the comparison below cannot reach a two-sided
                         // arm, so our summary could only ever have been
-                        // discarded. `emit_confirmed` (simulation only) keeps
-                        // paying it so the convergence checker sees what it did
-                        // before.
-                        let our_summary = if costs_a_summarize || emit_confirmed {
+                        // discarded. Simulation takes the same path; see the
+                        // `SummaryDigests` twin for why the `emit_confirmed`
+                        // exception that used to sit here was removed.
+                        let our_summary = if costs_a_summarize {
                             summary_if_hosted_or_in_use(op_manager, &contract)
                                 .await
                                 .summary
@@ -4362,11 +4381,13 @@ async fn handle_interest_sync_message(
                 // rather than folding it into `*_single`. Do not read this flag
                 // here as "this was a notification"; it is not, today.
                 //
-                // Reads `entries.len()` — the length of the message the peer
-                // actually SENT. The rotation above reorders but never shortens,
-                // and the cap applies to the processing window rather than to
-                // this count, so a capped message is still classified by its
-                // true size.
+                // Reads `entries.len()` AFTER the ceiling above, which since
+                // #5338 both reorders and truncates. For any message at or under
+                // the ceiling — every message from a peer running this release —
+                // that is the length the peer actually sent. An over-ceiling
+                // message is classified by the truncated length instead, which
+                // only affects the `single_entry` flag, and a message long
+                // enough to be truncated is not single-entry either way.
                 let single_entry = entries.len() == 1;
                 // Dedup on the (hash, digest) PAIR, not on the hash alone.
                 //
@@ -4548,10 +4569,19 @@ async fn handle_interest_sync_message(
                         // round trip could not change the verdict — it was pure
                         // cost, and it is what made a free entry expensive for
                         // the RECEIVER even though it was free for the sender.
-                        // `emit_confirmed` (simulation only) still pays it, so
-                        // the convergence checker keeps seeing our state hash
-                        // for these contracts exactly as before.
-                        let needs_our_summary = entry.summary_digest.is_some() || emit_confirmed;
+                        // Simulation takes the SAME path (#5338 review): an
+                        // earlier revision kept the fetch under `emit_confirmed`
+                        // so the convergence checker's `StateConfirmed` events
+                        // were unchanged. That made the bound above true in
+                        // production and false under the flag, which is worse
+                        // than it sounds — it means a simulation can neither
+                        // exercise this branch nor measure the cost this change
+                        // is about, and a future sim regression on summarize
+                        // count would read high. Nothing consumes those events
+                        // (checked: both readers are determinism traces, and
+                        // `state_verifier` ignores the variant), so agreeing is
+                        // free.
+                        let needs_our_summary = entry.summary_digest.is_some();
                         let our_summary = if needs_our_summary {
                             if !local_summaries.contains_key(contract.id()) {
                                 let fetched =
@@ -10699,6 +10729,13 @@ mod tests {
                 .await;
                 match reply {
                     Some(InterestMessage::SummaryDigests { entries, .. }) => {
+                        // Holds BY FIXTURE, not by the cap: since #5338 a reply
+                        // is bounded at 64 SUMMARIZE CALLS and at
+                        // MAX_SUMMARY_ENTRIES_PER_MESSAGE entries, so a reply may
+                        // legitimately carry more than 64 entries. Every contract
+                        // here is hosted, so every entry is costed and the
+                        // summarize budget is what binds. Do not read this as
+                        // "replies are capped at 64 entries".
                         assert!(entries.len() <= MAX_DIGEST_SUMMARIES_PER_REPLY);
                         covered.extend(entries.iter().map(|e| e.hash));
                     }
@@ -10750,8 +10787,12 @@ mod tests {
         /// window" would pass under the bug on all the other 199.
         #[tokio::test]
         async fn summary_window_cursor_follows_the_peer_not_its_address() {
-            // Seeded so that a regression's random re-draw is reproducible
-            // rather than flaky-red; the fix's own path never draws at all.
+            // Seeded because BOTH paths draw here: round one has no cursor, so
+            // it takes the cycle-boundary arm and draws an offset, and a
+            // regression's re-draw on round two must be reproducible rather than
+            // flaky-red. (An earlier comment claimed the fixed path never draws,
+            // which was wrong — the fix changes WHICH rounds draw, not whether
+            // any does.)
             let _seed = crate::config::GlobalRng::seed_guard(0x5338_ADD8);
             let h = build_harness("hf-cursor-identity", 17200, vec![7u8; 64]).await;
             let keys = host_many(&h, 200);
@@ -11178,32 +11219,36 @@ mod tests {
             }
         }
 
-        /// The simulation-only `emit_confirmed` path still summarizes for a free
-        /// entry, where production now does not. Pinned deliberately.
+        /// Simulation and production take the SAME path through the free-entry
+        /// skip — the receive budget bounds round trips unconditionally, not
+        /// just when a test flag is off.
         ///
-        /// #5338 stops both receive arms fetching our summary for an entry that
-        /// carries none, because the verdict cannot depend on it. `emit_confirmed`
-        /// (`SimulationIdleTimeout::is_enabled`, off in production) is the one
-        /// exception: it keeps the fetch so the convergence checker's
-        /// `StateConfirmed` events stay exactly what they were before this
-        /// change. Losing them was the alternative, and dropping data from the
-        /// checker to buy symmetry in a path the checker cannot see is the worse
-        /// trade.
+        /// An earlier revision of #5338 kept the fetch alive under
+        /// `emit_confirmed` (`SimulationIdleTimeout`, off in production) so the
+        /// convergence checker's `StateConfirmed` events would be unchanged.
+        /// Three independent reviews landed on that exception, and they were
+        /// right: it made the bound the rustdoc asserts true in production and
+        /// false under the flag, by up to the entry ceiling. The costs were not
+        /// symmetric either. A simulation could neither exercise the production
+        /// branch nor measure the summarize cost this change is about, so a
+        /// future sim regression on that cost would have read high — the
+        /// instrument would have been miscalibrated in exactly the dimension
+        /// the change is judged on.
         ///
-        /// **What that costs, stated rather than left to be discovered: no
-        /// simulation test can ever exercise the production branch here.** With
-        /// the flag on, the skip does not happen; with it off, the checker has
-        /// no events. So the simulation suite is structurally blind to this
-        /// branch, and these unit tests are the ONLY coverage it has. That is
-        /// the "the environment cannot produce the fault" shape — a test can be
-        /// perfectly written and still never fail because the harness it runs in
-        /// cannot reach the code.
+        /// Aligning them turned out to be free. Nothing consumes
+        /// `StateConfirmed`: its two readers are determinism traces, which
+        /// compare runs of the same build against each other and so are
+        /// unaffected by dropping an event symmetrically, and
+        /// `state_verifier`'s detector lists the variant explicitly to ignore
+        /// it. No test in the tree filters on it. That was checked rather than
+        /// assumed — the assumption that the checker needed those events is
+        /// what kept the exception alive for two rounds of review.
         ///
-        /// If the divergence is ever removed, delete this test with it rather
-        /// than relaxing it — a pin that no longer describes the code is worse
-        /// than no pin.
+        /// The free entries whose confirmation is lost are those a peer reports
+        /// no state for, which are not part of that contract's convergence set
+        /// anyway. Costed entries still confirm exactly as before.
         #[tokio::test]
-        async fn emit_confirmed_keeps_the_free_entry_summarize_production_skips() {
+        async fn the_free_entry_skip_is_the_same_in_simulation_and_production() {
             use std::sync::atomic::Ordering;
 
             /// Restores the thread-local flag even if an assertion panics, so a
@@ -11272,12 +11317,11 @@ mod tests {
                      ours, so the call is pure cost"
                 );
                 assert_eq!(
-                    simulated, 64,
-                    "{label}: with the simulation flag on, the fetch is kept so \
-                     the convergence checker still sees a StateConfirmed for each \
-                     of these contracts. If this drops to 0 the divergence has \
-                     been removed — which is fine, but then the checker has lost \
-                     those events and somebody should have decided that on purpose"
+                    simulated, 0,
+                    "{label}: and neither must simulation. If this is non-zero, \
+                     the telemetry exception is back and the receive budget no \
+                     longer bounds round trips under the flag — which silently \
+                     miscalibrates every simulation measurement of summarize cost"
                 );
             }
         }
