@@ -3168,26 +3168,46 @@ const MAX_FALLBACK_SUMMARY_BYTES_PER_REPLY: usize = 9 * 1024;
 /// distribution to read.
 const MAX_DIGEST_SUMMARIES_PER_REPLY: usize = 64;
 
-/// Maximum number of digest entries one inbound `SummaryDigests` message may
-/// COMPARE against local state (#5238).
+/// Maximum number of inbound entries one `SummaryDigests` (or `Summaries`)
+/// message may COMPARE against local state (#5238), where "compare" means the
+/// entries that cost us a `summary_if_hosted_or_in_use` call.
 ///
 /// The digest exchange has two summarize-heavy legs, not one, and they are
 /// independent: the sender pays [`MAX_DIGEST_SUMMARIES_PER_REPLY`] calls to
-/// build the message, and the receiver pays one call per entry to compute its
-/// OWN summary for the comparison. Bounding only the send side would move half
-/// the storm rather than remove it, and would leave the receiver exposed to any
-/// peer that has not upgraded (or is not honest) sending a full set.
+/// build the message, and the receiver pays one call per COSTED entry to
+/// compute its OWN summary for the comparison. Bounding only the send side
+/// would move half the storm rather than remove it, and would leave the
+/// receiver exposed to any peer that has not upgraded (or is not honest)
+/// sending a full set.
+///
+/// # It bounds CALLS, not entries (#5338)
+///
+/// An entry advertising no summary — `summary_digest: None`, or
+/// `summary_bytes: None` on the full-bytes twin — is settled without our
+/// summary being consulted at all (`classify_summary_digest`'s `(_, None)` arm;
+/// the `_ => false` staleness arm on the twin), so the receiver skips the round
+/// trip and does not charge it. Entry COUNT is bounded separately, by
+/// [`MAX_SUMMARY_ENTRIES_PER_MESSAGE`].
+///
+/// Until #5338 this cap counted entries, which was the same number because the
+/// send leg charged its own budget the same way. Once the send leg stopped
+/// charging free entries its replies could exceed 64 entries, and an
+/// entry-counting receiver would have truncated them back — discarding a random
+/// subset of the digests the sender spent its whole budget producing, and
+/// turning the send window's contiguous tiling into a random sample at the
+/// receiver. The two legs charge on the same basis so that cannot happen.
 ///
 /// Equal to [`MAX_DIGEST_SUMMARIES_PER_REPLY`] on purpose: a sender running
-/// this release never emits more than that, so between two upgraded peers this
-/// cap never truncates and the two legs cover exactly the same contracts each
-/// round. It binds only on a message from a peer that predates this change.
+/// this release never COSTS us more than that, so between two upgraded peers
+/// this cap never truncates and the two legs cover exactly the same contracts
+/// each round. It binds only on a message from a peer that predates this
+/// change.
 ///
 /// This REPLACES [`MAX_SUMMARY_HASHES_PER_MESSAGE`] (4096) as the WORK bound on
 /// this arm. That constant is unchanged and still bounds the `SummaryRequest`
 /// input, where it remains the right anti-abuse ceiling.
 ///
-/// Over-cap messages are still processed from a random offset (the existing
+/// Over-ceiling messages are still processed from a random offset (the existing
 /// `rotate_left`), so truncating never starves the tail of a set the sender
 /// happens to emit in contract-id order.
 ///
@@ -3261,6 +3281,12 @@ const _: () = assert!(
 /// test failing. The alias above keeps the 64 -> 128 retune this module
 /// actively invites self-consistent; this assertion is what keeps the OTHER
 /// side of the inequality honest.
+///
+/// Since #5338 both sides of this inequality count SUMMARIZE CALLS rather than
+/// entries, so what it now forbids is an upgraded sender costing an upgraded
+/// receiver more comparisons than the receiver will make. The entry-count
+/// analogue is asserted separately, on
+/// [`MAX_SUMMARY_ENTRIES_PER_MESSAGE`].
 const _: () = assert!(
     MAX_FALLBACK_SUMMARIES_PER_REPLY <= MAX_SUMMARY_COMPARISONS_PER_MESSAGE,
     "raising MAX_FALLBACK_SUMMARIES_PER_REPLY above MAX_SUMMARY_COMPARISONS_PER_MESSAGE \

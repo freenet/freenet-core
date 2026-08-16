@@ -2890,7 +2890,13 @@ pub(crate) fn first_index_after(sorted: &[ContractKey], after: &ContractInstance
 /// the real cycle length is set by bytes rather than by entry count whenever
 /// summaries are large. See `MAX_FALLBACK_SUMMARY_BYTES_PER_REPLY` for the
 /// honest bound; do not quote `ceil(len / limit)` as the cycle time without
-/// checking which of the two limits binds.
+/// checking which of the limits binds.
+///
+/// Since #5338 `limit` is the per-message ENTRY CEILING rather than the
+/// summarize budget, and the caller stops early on the budget — so this is now
+/// the widest span a round may walk, not the span it will use. The cycle time
+/// for the contracts that cost a summarize is `ceil(hosted / budget)`; the
+/// cycle time for the whole shared set is what this function's `limit` bounds.
 pub(crate) fn rotation_window_indices(len: usize, start: usize, limit: usize) -> Vec<usize> {
     if len == 0 || limit == 0 {
         return Vec::new();
