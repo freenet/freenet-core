@@ -522,9 +522,19 @@ impl ContractSampler {
     /// Free space for `incoming` bytes, or report that we cannot.
     ///
     /// Eviction follows the sampling policy rather than a generic LRU: the recent
-    /// stratum is the one designed to churn, so it gives ground first, and the
-    /// earliest stratum is never touched because its whole purpose is to hold on to
-    /// history that nothing else will preserve.
+    /// stratum is the one designed to churn, so it gives ground first, then
+    /// transitions, then the reservoir. The size-ranked and earliest strata give
+    /// ground last, because they hold what nothing else preserves.
+    ///
+    /// But they DO give ground. An earlier version exempted `earliest`, `largest` and
+    /// `smallest` entirely, which wedged the store permanently under its own default
+    /// config: with `max_state_bytes` at 1 MiB and `max_bytes` at 4 MiB, a contract
+    /// whose first few observed states are each near 1 MiB fills those three strata
+    /// with blobs nothing may evict, and every later admission — of any size — then
+    /// fails forever, because the only evictable pools hold nothing but duplicate
+    /// references to the same pinned blobs. The store would stop learning, silently,
+    /// with no error, for exactly the large-state contracts this mechanism exists to
+    /// examine. Each stratum keeps at least one member so none is emptied outright.
     fn make_room_for(&mut self, incoming: usize) -> bool {
         if incoming > self.config.max_bytes {
             return false;
@@ -557,6 +567,27 @@ impl ContractSampler {
         }
         if self.reservoir.len() > 1 {
             self.reservoir.pop();
+            self.collect_garbage();
+            return true;
+        }
+        // Last resort: the size-ranked strata, largest first, since one huge blob is
+        // what usually caused the pressure. Without this the store can wedge forever
+        // (see the note on `make_room_for`).
+        if self.largest.len() > 1 {
+            self.largest.pop();
+            self.collect_garbage();
+            return true;
+        }
+        if self.smallest.len() > 1 {
+            self.smallest.pop();
+            self.collect_garbage();
+            return true;
+        }
+        // And finally the earliest stratum, which is the most valuable and so goes
+        // last. Dropping its newest member keeps the oldest observation, which is the
+        // one nothing else in the store preserves.
+        if self.earliest.len() > 1 {
+            self.earliest.pop();
             self.collect_garbage();
             return true;
         }

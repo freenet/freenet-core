@@ -95,6 +95,15 @@ impl ConformanceProperty {
             ConformanceProperty::SelfDeltaEmpty | ConformanceProperty::WholeStateSelfDelta => {
                 Severity::Diagnostic
             }
+            // Diagnostic until the empirical question is settled, because that is
+            // what this property's own documentation already promises. Saying "a
+            // reporting signal, not allowed to influence anything on the network
+            // until measured against deployed WASM" while handing it the same
+            // enforcement weight as commutativity would make the comment a wish
+            // rather than a rule — and it is exactly the kind of gap that closes
+            // itself the day someone enables enforcement for the settled properties
+            // and this one rides along unnoticed.
+            ConformanceProperty::DeltaIdempotence => Severity::Diagnostic,
             ConformanceProperty::StateIdempotence
             | ConformanceProperty::StateCommutativity
             | ConformanceProperty::StateAssociativity
@@ -102,7 +111,6 @@ impl ConformanceProperty {
             | ConformanceProperty::UpdateDeterminism
             | ConformanceProperty::SummaryDeterminism
             | ConformanceProperty::DeltaDeterminism
-            | ConformanceProperty::DeltaIdempotence
             | ConformanceProperty::DeltaPermutationInvariance
             | ConformanceProperty::ReconciliationCycle => Severity::Violation,
         }
@@ -248,6 +256,13 @@ pub enum Inconclusive {
     RoundLimit,
     /// The case was malformed for the property (wrong arity, missing delta).
     MalformedCase(String),
+    /// The check failed once and then did not fail the same way again.
+    ///
+    /// Something outside the inputs moved between the two runs — the host clock is
+    /// the realistic candidate. That is a defect of its own kind, but it is not
+    /// evidence about the law this case was checking, and reporting it as such would
+    /// name the wrong property and the wrong severity.
+    NotReproducible,
 }
 
 impl std::fmt::Display for Inconclusive {
@@ -260,6 +275,9 @@ impl std::fmt::Display for Inconclusive {
             Inconclusive::ResourceLimit(e) => write!(f, "resource limit: {e}"),
             Inconclusive::RoundLimit => f.write_str("reconciliation round budget exhausted"),
             Inconclusive::MalformedCase(e) => write!(f, "malformed case: {e}"),
+            Inconclusive::NotReproducible => {
+                f.write_str("the finding did not reproduce on a second run")
+            }
         }
     }
 }

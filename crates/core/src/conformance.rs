@@ -9,8 +9,14 @@
 //!
 //! This module is the *single* implementation of what "conformance" means. The
 //! offline `fdev conformance` harness and (later) the node-side checker both call
-//! [`verify_case`], so there is no way for the developer-facing answer and the
-//! network-facing answer to drift apart.
+//! [`verify_case`], so the developer-facing answer and the network-facing answer
+//! cannot disagree.
+//!
+//! That is a property of who calls what, not something the type system enforces:
+//! [`Violation`]'s fields are public, so a future node-side integration could in
+//! principle construct one directly instead of going through [`verify_case`]. Today
+//! nothing does, and nothing should — a second construction site is the exact shape
+//! the drift would take.
 //!
 //! # Structure
 //!
@@ -57,8 +63,21 @@
 //! mechanism ever shipped for this class of problem (#4295) had a 100% false-positive
 //! rate in production, and a violation here is eventually meant to justify deleting a
 //! contract. A missed violation costs bandwidth. A false violation deletes a working
-//! application. The asymmetry is not close, so anything short of "both sides ran to
-//! completion and the canonical bytes differ" is inconclusive.
+//! application. The asymmetry is not close.
+//!
+//! For the eight byte-comparison laws — the merge laws and the determinism checks —
+//! that means anything short of "both sides ran to completion and the canonical
+//! bytes differ" is inconclusive. Three properties reach a verdict another way and
+//! are worth naming rather than glossing: [`ConformanceProperty::EmittedStateValidity`]
+//! fires on the contract's own `Invalid` verdict, the two self-delta checks fire on a
+//! size threshold (and are [`Severity::Diagnostic`], so they can never justify
+//! removal), and [`ConformanceProperty::ReconciliationCycle`] fires on a repeated
+//! state pair across simulated rounds.
+//!
+//! A violation is also required to reproduce: [`verify_case`] re-runs any failing
+//! check and downgrades to [`Inconclusive::NotReproducible`] if the second run
+//! disagrees. A contract that prunes against the host clock can otherwise have two
+//! merges straddle an expiry boundary and be accused of breaking commutativity.
 
 pub mod bundle;
 pub mod evidence;

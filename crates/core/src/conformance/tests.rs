@@ -281,11 +281,19 @@ fn mutual_rejection_fails_commutativity() {
     );
 }
 
-/// The same contract also proves non-convergence directly: the two peers exchange
-/// deltas forever and neither ever moves.
+/// The same contract also proves non-convergence directly: the two peers exchange,
+/// and neither ever moves.
+///
+/// Both the merge and the delta apply must refuse, because the simulation models
+/// the protocol's full-state fallback. A contract whose delta path is weak but whose
+/// *merge* is sound converges the moment the states are exchanged whole, and is
+/// correctly NOT a cycle — that distinction is the whole point of modelling the
+/// fallback, and it is what stops a coarse summary from being called a defect.
 #[test]
 fn mutual_rejection_is_a_reconciliation_cycle() {
-    let mut fake = Fake::conforming().applying(|a, _d| Ok(a.to_vec()));
+    let mut fake = Fake::conforming()
+        .merging(|a, _b| Ok(a.to_vec()))
+        .applying(|a, _d| Ok(a.to_vec()));
     assert_violates(
         verify_case(
             &mut fake,
@@ -302,11 +310,20 @@ fn mutual_rejection_is_a_reconciliation_cycle() {
 
 #[test]
 fn non_idempotent_merge_is_caught() {
-    // Merging a state with itself grows it: the classic counter-appended-per-merge
-    // shape. At-least-once delivery makes this diverge on redelivery alone.
+    // Grows on EVERY re-apply and never settles, which is what genuine
+    // non-idempotence looks like: under at-least-once delivery, redelivering the
+    // same state keeps mutating it.
+    //
+    // Appending a constant marker would not do — that stabilizes after one step and
+    // is indistinguishable from a contract canonicalizing a raw stored state, which
+    // is legitimate and must not be flagged. The length-derived byte keeps changing.
     let mut fake = Fake::conforming().merging(|a, b| {
-        let mut out = union(a, b);
-        out.push(0xff);
+        // Concatenate rather than union: a set union would dedup the growth marker
+        // away and the state would settle after one step, which is the legitimate
+        // canonicalization shape, not this one.
+        let mut out = a.to_vec();
+        out.extend_from_slice(b);
+        out.push(out.len() as u8);
         Ok(out)
     });
     assert_violates(
@@ -507,6 +524,54 @@ fn multi_round_convergence_is_not_a_cycle() {
     ));
 }
 
+/// A canonicalizing contract rewrites a non-canonical stored state once and then
+/// settles. That first change is real and is NOT a defect.
+///
+/// This is the shape the repo already documents on
+/// `executor_impl::probe_identical_input_idempotency`: the PUT install path stores
+/// the client's raw bytes without running `update_state`, so a peer can be holding a
+/// state its own contract has never normalized. A single-apply idempotence check
+/// flags every such contract, which is why that probe iterates to a fixpoint and why
+/// this one does too.
+#[test]
+fn a_canonicalizing_contract_is_not_flagged() {
+    // Sorts and dedups whatever it is given, then is stable forever after.
+    let mut fake = Fake::conforming()
+        .merging(|a, b| Ok(union(a, b)))
+        .validating(|_| Ok(ValidateResult::Valid));
+
+    // A raw, non-canonical stored state: unsorted with a duplicate.
+    let raw: &[u8] = &[3, 1, 3, 2];
+    assert_holds(verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateIdempotence, &[raw]),
+    ));
+}
+
+/// A contract whose delta path cannot express a particular divergence, but whose
+/// merge is sound, converges in production and must not be called a cycle.
+///
+/// A coarse version clock under concurrent writes, or a compact/probabilistic
+/// digest, legitimately yields an empty delta in both directions. A delta-only
+/// simulation sees the pair repeat unchanged and calls that a proven cycle on the
+/// very first round. The real protocol escalates to a full-state send instead, which
+/// is why the simulation models that fallback.
+#[test]
+fn a_weak_delta_path_with_a_sound_merge_is_not_a_cycle() {
+    let mut fake = Fake::conforming()
+        // Summaries collide, so neither side ever believes it has anything to send.
+        .summarizing(|_| Ok(vec![0]))
+        .deltaing(|_state, _summary| Ok(Vec::new()));
+
+    assert_holds(verify_case(
+        &mut fake,
+        &case(
+            ConformanceProperty::ReconciliationCycle,
+            &[&[1, 2], &[3, 4]],
+        ),
+    ));
+}
+
 /// A contract that rejects an update it considers unauthorized (the River-style
 /// signature-chain case) returns an error. One rejection is not a merge-law failure.
 #[test]
@@ -572,6 +637,88 @@ fn resource_exhaustion_is_inconclusive() {
             panic!("expected a resource-limit inconclusive, got {other:?}")
         }
     }
+}
+
+/// A delta that is order-invariant but NOT re-delivery-safe: summing into a running
+/// total. This is the CmRDT counter shape the whole delta-idempotence disagreement
+/// is about, and no other fixture produces it — every other delta fake is either
+/// both order-invariant and idempotent (union) or neither (append).
+///
+/// Two things are asserted: the idempotence check fires, and it is a Diagnostic, so
+/// a counter-style contract cannot be removed for it while the question is open.
+#[test]
+fn a_commutative_but_non_idempotent_delta_is_a_diagnostic_not_a_violation() {
+    let sum = |a: &[u8], d: &[u8]| -> Vec<u8> {
+        let total: u32 =
+            a.iter().map(|b| *b as u32).sum::<u32>() + d.iter().map(|b| *b as u32).sum::<u32>();
+        vec![(total % 251) as u8]
+    };
+    let mut fake = Fake::conforming()
+        .applying(move |a, d| Ok(sum(a, d)))
+        .validating(|state| {
+            if state.len() == 1 {
+                Ok(ValidateResult::Valid)
+            } else {
+                Ok(ValidateResult::Invalid)
+            }
+        });
+
+    let outcome = verify_case(
+        &mut fake,
+        &case(ConformanceProperty::DeltaIdempotence, &[&[10]]).with_deltas(vec![bytes(&[5])]),
+    );
+    assert_violates(outcome.clone(), ConformanceProperty::DeltaIdempotence);
+    assert_eq!(outcome.violation().unwrap().severity, Severity::Diagnostic);
+    assert!(
+        !outcome.is_enforceable_violation(),
+        "a counter-style delta must not be removal-eligible while the question of \
+         whether any deployed contract relies on it is unanswered"
+    );
+
+    // And the ordering property, which IS enforceable, must stay clean for it —
+    // summing is order-invariant. If this fired, downgrading DeltaIdempotence would
+    // have bought nothing, because the same contract would still be accused.
+    let mut fake = Fake::conforming()
+        .applying(move |a, d| Ok(sum(a, d)))
+        .validating(|state| {
+            if state.len() == 1 {
+                Ok(ValidateResult::Valid)
+            } else {
+                Ok(ValidateResult::Invalid)
+            }
+        });
+    assert_holds(verify_case(
+        &mut fake,
+        &case(ConformanceProperty::DeltaPermutationInvariance, &[&[10]])
+            .with_deltas(vec![bytes(&[5]), bytes(&[7])]),
+    ));
+}
+
+/// `EmittedStateValidity` has its own `RequestRelated` arm, distinct from the shared
+/// input-validation helper. It too could have been deleted with nothing failing.
+#[test]
+fn emitted_state_needing_related_context_is_inconclusive() {
+    // Valid on the way in, but asks for related context when handed the merge result.
+    let mut seen = 0u32;
+    let mut fake = Fake::conforming().validating(move |_state| {
+        seen += 1;
+        // The two input states validate; the emitted state is the third call.
+        if seen <= 2 {
+            Ok(ValidateResult::Valid)
+        } else {
+            Ok(ValidateResult::RequestRelated(vec![]))
+        }
+    });
+    assert_inconclusive(
+        verify_case(
+            &mut fake,
+            &case(
+                ConformanceProperty::EmittedStateValidity,
+                &[&[1, 2], &[2, 3]],
+            ),
+        ),
+        Inconclusive::RelatedRequired,
+    );
 }
 
 #[test]

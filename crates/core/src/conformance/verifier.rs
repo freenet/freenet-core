@@ -29,6 +29,14 @@ pub const MAX_RECONCILIATION_ROUNDS: usize = 16;
 /// How many times to repeat a call when checking determinism.
 pub const DETERMINISM_REPEATS: usize = 3;
 
+/// How many times `merge(A, A)` may change the state before the state is judged
+/// never to settle.
+///
+/// Matches `IDENTITY_PROBE_MAX_APPLIES` in the executor's own probe, which arrived
+/// at the same number for the same reason: a canonicalizing contract legitimately
+/// rewrites a non-canonical stored state once and then stabilizes.
+pub const MAX_CANONICALIZATION_APPLIES: usize = 3;
+
 /// One property plus the exact inputs to check it with.
 ///
 /// Cases are the unit of work everywhere: the generator produces them, the verifier
@@ -107,10 +115,42 @@ pub fn verify_case<O: ConformanceOracle + ?Sized>(
     oracle: &mut O,
     case: &ConformanceCase,
 ) -> PropertyOutcome {
-    match run(oracle, case) {
+    let first = match run(oracle, case) {
         Ok(outcome) => outcome,
-        Err(reason) => PropertyOutcome::Inconclusive(reason),
+        Err(reason) => return PropertyOutcome::Inconclusive(reason),
+    };
+
+    // A violation must reproduce before it is reported.
+    //
+    // Nothing here is free of the clock. A contract that prunes expired entries
+    // against `time::now()` — the shape of the in-tree ping contract, with a
+    // five-second TTL — can have two merges milliseconds apart straddle an expiry
+    // boundary, and the two sides then genuinely differ for a reason that has
+    // nothing to do with commutativity. Reported once, that is an accusation of
+    // breaking a merge law, aimed at the wrong law and at a contract that is fine.
+    //
+    // Re-running costs one extra execution and only on the path that was about to
+    // accuse someone. A defect that is actually algebraic reproduces every time; a
+    // straddled deadline does not.
+    if first.is_violation() {
+        let second = match run(oracle, case) {
+            Ok(outcome) => outcome,
+            Err(reason) => return PropertyOutcome::Inconclusive(reason),
+        };
+        return match (&first, &second) {
+            (PropertyOutcome::Violated(a), PropertyOutcome::Violated(b))
+                if a.property == b.property =>
+            {
+                second
+            }
+            // Disagreed with itself. The contract is nondeterministic, which is its
+            // own defect with its own property, and is emphatically not proof of the
+            // law this case was checking.
+            _ => PropertyOutcome::Inconclusive(Inconclusive::NotReproducible),
+        };
     }
+
+    first
 }
 
 fn run<O: ConformanceOracle + ?Sized>(
@@ -128,13 +168,38 @@ fn run<O: ConformanceOracle + ?Sized>(
 
     match case.property {
         ConformanceProperty::StateIdempotence => {
+            // Iterate to a fixpoint rather than demanding `merge(A, A) == A` on the
+            // first try.
+            //
+            // A correct CANONICALIZING contract fails a single-apply check for a
+            // reason that is not a defect: the PUT install path stores the client's
+            // raw bytes without ever running `update_state`, so the state a peer
+            // holds may not be canonical yet, and the first merge rewrites it into
+            // canonical form. That first change is real. What matters is whether it
+            // then STABILIZES. The in-tree probe already learned this the hard way
+            // and iterates for exactly this reason — see the rustdoc on
+            // `executor_impl::probe_identical_input_idempotency`, which says
+            // flagging on the first change alone "would false-flag every such
+            // contract".
+            //
+            // So a violation here means the state never settles: every re-apply
+            // changes it again, which is genuine non-idempotence and does diverge
+            // under at-least-once delivery.
             let a = &case.states[0];
-            let merged = merge(oracle, a, a)?;
-            Ok(compare(
+            let mut current = a.to_vec();
+            for _ in 0..MAX_CANONICALIZATION_APPLIES {
+                let merged = merge(oracle, &current, &current)?;
+                if merged == current {
+                    return Ok(PropertyOutcome::Holds);
+                }
+                current = merged;
+            }
+            Ok(violation(
                 case.property,
-                &merged,
+                &current,
                 a,
-                "merge(A, A) must equal A",
+                "merge(A, A) never reached a fixpoint: the state changes on every \
+                 re-apply, so redelivery of the same state keeps mutating it",
             ))
         }
 
@@ -153,8 +218,15 @@ fn run<O: ConformanceOracle + ?Sized>(
         ConformanceProperty::StateAssociativity => {
             let (a, b, c) = (&case.states[0], &case.states[1], &case.states[2]);
             let ab = merge(oracle, a, b)?;
-            let ab_c = merge(oracle, &ab, c)?;
             let bc = merge(oracle, b, c)?;
+            // The intermediates get the same validity precondition as the inputs.
+            // This function's own rule is that checking laws against states a
+            // contract would never accept manufactures false positives, and an
+            // intermediate the contract rejects is exactly such a state: the real
+            // network drops it, so no peer ever merges on top of it.
+            require_valid(oracle, &ab, &case.related)?;
+            require_valid(oracle, &bc, &case.related)?;
+            let ab_c = merge(oracle, &ab, c)?;
             let a_bc = merge(oracle, a, &bc)?;
             Ok(compare(
                 case.property,
@@ -277,26 +349,23 @@ fn run<O: ConformanceOracle + ?Sized>(
         ConformanceProperty::DeltaPermutationInvariance => {
             let a = &case.states[0];
             let (d1, d2) = (&case.deltas[0], &case.deltas[1]);
+            // Ordering only. Re-delivery is deliberately NOT checked here.
+            //
+            // This property is `Severity::Violation`; delta idempotence is contested
+            // and therefore `Severity::Diagnostic`. Re-applying D1 a third time here
+            // would be a delta-idempotence check wearing an ordering check's name and
+            // severity, so downgrading `DeltaIdempotence` would not actually spare a
+            // counter-style contract — it would still be accused, under a property
+            // whose description says nothing about re-delivery. One law per property.
             let a_then_d1 = apply_delta(oracle, a, d1)?;
             let forward = apply_delta(oracle, &a_then_d1, d2)?;
             let a_then_d2 = apply_delta(oracle, a, d2)?;
             let reverse = apply_delta(oracle, &a_then_d2, d1)?;
-            if forward != reverse {
-                return Ok(violation(
-                    case.property,
-                    &forward,
-                    &reverse,
-                    "applying independent deltas in a different order reached a different state",
-                ));
-            }
-            // Duplicates are a separate failure mode from ordering: at-least-once
-            // delivery means a peer may legitimately see D1 twice around D2.
-            let duplicated = apply_delta(oracle, &forward, d1)?;
             Ok(compare(
                 case.property,
                 &forward,
-                &duplicated,
-                "re-delivering an already-applied delta changed the state",
+                &reverse,
+                "applying independent deltas in a different order reached a different state",
             ))
         }
 
@@ -346,7 +415,7 @@ fn run<O: ConformanceOracle + ?Sized>(
         }
 
         ConformanceProperty::ReconciliationCycle => {
-            reconciliation_cycle(oracle, &case.states[0], &case.states[1])
+            reconciliation_cycle(oracle, &case.states[0], &case.states[1], &case.related)
         }
     }
 }
@@ -387,6 +456,7 @@ fn reconciliation_cycle<O: ConformanceOracle + ?Sized>(
     oracle: &mut O,
     a: &Bytes,
     b: &Bytes,
+    related: &RelatedContracts<'static>,
 ) -> Result<PropertyOutcome, Inconclusive> {
     let mut left = a.to_vec();
     let mut right = b.to_vec();
@@ -407,8 +477,35 @@ fn reconciliation_cycle<O: ConformanceOracle + ?Sized>(
             .get_state_delta(&left, &right_summary)
             .map_err(inconclusive_from)?;
 
-        let next_left = apply_delta_bytes(oracle, &left, &to_left)?;
-        let next_right = apply_delta_bytes(oracle, &right, &to_right)?;
+        let mut next_left = apply_delta_bytes(oracle, &left, &to_left)?;
+        let mut next_right = apply_delta_bytes(oracle, &right, &to_right)?;
+
+        // Model the protocol's full-state fallback.
+        //
+        // Without this the check accuses correct contracts. A summary that cannot
+        // express a particular divergence — a coarse version clock under concurrent
+        // writes, a compact or probabilistic digest — yields an empty delta in both
+        // directions, the pair repeats unchanged, and a delta-only simulation calls
+        // that a proven cycle on the very first round. The real protocol does not
+        // give up there: when the delta path cannot carry the difference it sends the
+        // whole state instead (`ring::interest::gate_delta_size` refuses a
+        // state-sized delta and hands back a full-state send). A full-state send is
+        // just `update_state(local, [State(remote)])`.
+        //
+        // Modelling it is what separates the two cases that otherwise look identical
+        // here: a contract with a weak delta path converges once the states are
+        // exchanged whole, while genuine mutual rejection (#5153) still refuses to
+        // move, because refusing is what it does with any input.
+        if next_left == left && next_right == right {
+            next_left = merge(oracle, &left, &right)?;
+            next_right = merge(oracle, &right, &left)?;
+        }
+
+        // A state the contract would reject never reaches another peer: the real
+        // network drops it. Continuing to iterate on one would be reasoning about a
+        // history that cannot happen.
+        require_valid(oracle, &next_left, related)?;
+        require_valid(oracle, &next_right, related)?;
 
         left = next_left;
         right = next_right;
@@ -498,6 +595,13 @@ fn apply_updates<O: ConformanceOracle + ?Sized>(
     match modification.new_state {
         Some(state) => Ok(state.into_bytes()),
         None if modification.requires_dependencies() => Err(Inconclusive::RelatedRequired),
+        // No state and no related-contract request. `UpdateModification` is
+        // `#[non_exhaustive]` with only `valid()` and `requires()` as constructors,
+        // so safe Rust cannot build this shape and no unit test here constructs it.
+        // It is still reachable in production: the runtime deserializes whatever the
+        // guest emitted, and a malformed or hostile contract can serialize exactly
+        // this. Inconclusive rather than a violation, because it says the contract
+        // answered nothing, not that a law was broken.
         None => Err(Inconclusive::NoOutputState),
     }
 }

@@ -296,6 +296,67 @@ fn transition_payloads_count_against_the_byte_budget() {
     );
 }
 
+/// Regression: the store could wedge permanently and stop learning, silently.
+///
+/// `earliest`, `largest` and `smallest` were exempt from eviction. Under the shape
+/// of the production defaults — a per-state ceiling that is a large fraction of the
+/// total budget — a contract whose first few observed states are big fills those
+/// strata with unevictable blobs, and every later admission fails forever, because
+/// the only evictable pools hold nothing but duplicate references to the same
+/// pinned bytes. No error, no signal, and it happens to exactly the large-state
+/// contracts this mechanism exists to examine.
+///
+/// The existing tests missed it because their config makes
+/// `earliest + largest + smallest` incapable of reaching `max_bytes`.
+#[test]
+fn a_run_of_large_early_states_does_not_wedge_the_store() {
+    // Deliberately production-shaped: one state can be a quarter of the budget.
+    let cfg = SamplerConfig {
+        earliest: 4,
+        recent: 8,
+        reservoir: 8,
+        largest: 4,
+        smallest: 4,
+        transitions: 8,
+        max_bytes: 4096,
+        max_state_bytes: 1024,
+        seed: 7,
+    };
+    let mut sampler = ContractSampler::new(cfg.clone());
+
+    // Big states first, which is what fills the unevictable strata.
+    for tag in 1u8..=8 {
+        sampler.observe_state(&state(tag, 1000));
+    }
+    // Then small ones, which must still be admitted.
+    let mut admitted_after = 0;
+    for tag in 100u8..=140 {
+        if sampler.observe_state(&state(tag, 8)) == Admission::Stored {
+            admitted_after += 1;
+        }
+    }
+
+    assert!(
+        admitted_after > 0,
+        "the store wedged: {} large states filled it and nothing could be admitted \
+         afterwards, so it stops learning for the life of the contract",
+        8
+    );
+    assert!(
+        sampler.stored_bytes() <= cfg.max_bytes,
+        "budget exceeded while unwedging: {} > {}",
+        sampler.stored_bytes(),
+        cfg.max_bytes
+    );
+    // The most recent observation must be reachable, which is the practical test of
+    // "still learning" rather than merely "accepted something".
+    let corpus = sampler.corpus();
+    assert!(
+        corpus.states.iter().any(|s| s.as_ref()[0] == 140),
+        "the newest observation never made it into the corpus"
+    );
+}
+
 #[test]
 fn an_oversized_transition_payload_is_refused() {
     let mut sampler = ContractSampler::new(config());
