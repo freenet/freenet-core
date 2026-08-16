@@ -3189,6 +3189,28 @@ const MAX_DIGEST_SUMMARIES_PER_REPLY: usize = 64;
 /// trip and does not charge it. Entry COUNT is bounded separately, by
 /// [`MAX_SUMMARY_ENTRIES_PER_MESSAGE`].
 ///
+/// # One exception, and it is deliberate: `SimulationIdleTimeout`
+///
+/// Under that flag (`emit_confirmed`, off in production, on for every
+/// direct-runner simulation) both receive arms fetch our summary for free
+/// entries too, so the round trips are bounded by
+/// [`MAX_SUMMARY_ENTRIES_PER_MESSAGE`] rather than by this constant — up to 2x.
+/// Bounded, not unbounded, but a different bound, so **a simulation's
+/// receive-leg summarize count reads high and cannot be used to measure this
+/// path's CPU cost.** Do not size a future cap from a simulation number without
+/// subtracting the telemetry probes.
+///
+/// The exception is not an oversight and removing it is not a cleanup. The
+/// `StateConfirmed` events those fetches produce feed the convergence checker
+/// via `EventKind::stored_state_hash()`; without them a peer's recorded state
+/// hash goes stale or the peer drops out of the check's per-contract map
+/// entirely, which takes the contract below the two-peer threshold and skips it
+/// SILENTLY. Trading a suite that can pass vacuously for an accurate CPU
+/// number in a measurement nobody is currently taking is the wrong way round.
+/// #5338 made that trade once, on a consumer search for the literal variant
+/// name — the consumption goes through a generic accessor, so the name does not
+/// appear at the consumers and the search came back empty.
+///
 /// Until #5338 this cap counted entries, which was the same number because the
 /// send leg charged its own budget the same way. Once the send leg stopped
 /// charging free entries its replies could exceed 64 entries, and an
@@ -4008,10 +4030,13 @@ async fn handle_interest_sync_message(
                         // #5338: skipped outright when the peer sent no summary
                         // bytes — the comparison below cannot reach a two-sided
                         // arm, so our summary could only ever have been
-                        // discarded. Simulation takes the same path; see the
-                        // `SummaryDigests` twin for why the `emit_confirmed`
-                        // exception that used to sit here was removed.
-                        let our_summary = if costs_a_summarize {
+                        // discarded. `emit_confirmed` (simulation only) keeps
+                        // paying it so the convergence checker still receives a
+                        // `StateConfirmed` for these contracts — see the
+                        // `SummaryDigests` twin for the consumer chain, the
+                        // vacuous-pass failure mode it prevents, and why a
+                        // search for the variant name wrongly reports it unused.
+                        let our_summary = if costs_a_summarize || emit_confirmed {
                             summary_if_hosted_or_in_use(op_manager, &contract)
                                 .await
                                 .summary
@@ -4569,19 +4594,34 @@ async fn handle_interest_sync_message(
                         // round trip could not change the verdict — it was pure
                         // cost, and it is what made a free entry expensive for
                         // the RECEIVER even though it was free for the sender.
-                        // Simulation takes the SAME path (#5338 review): an
-                        // earlier revision kept the fetch under `emit_confirmed`
-                        // so the convergence checker's `StateConfirmed` events
-                        // were unchanged. That made the bound above true in
-                        // production and false under the flag, which is worse
-                        // than it sounds — it means a simulation can neither
-                        // exercise this branch nor measure the cost this change
-                        // is about, and a future sim regression on summarize
-                        // count would read high. Nothing consumes those events
-                        // (checked: both readers are determinism traces, and
-                        // `state_verifier` ignores the variant), so agreeing is
-                        // free.
-                        let needs_our_summary = entry.summary_digest.is_some();
+                        // `emit_confirmed` (SIMULATION ONLY) keeps paying it,
+                        // and that exception is load-bearing rather than
+                        // decorative. `StateConfirmed` feeds the convergence
+                        // checker through `EventKind::stored_state_hash()`,
+                        // which `SimNetwork::check_convergence` and
+                        // `check_convergence_from_logs` fold into a
+                        // per-(peer, contract) latest-state map, and the direct
+                        // runner enables this flag for EVERY simulation. Drop
+                        // the exception and a peer's recorded hash goes stale
+                        // (false divergence, flaky red) or the peer leaves
+                        // `contract_states` entirely, taking the contract below
+                        // the two-peer threshold the check needs — which skips
+                        // it silently and passes VACUOUSLY. That second failure
+                        // mode is why this stays: it makes the suite report
+                        // success while checking less.
+                        //
+                        // #5338 removed this exception once, on a search for the
+                        // literal `StateConfirmed` at the consumers. The
+                        // consumption is through a generic accessor, so the
+                        // string does not appear there and the search found
+                        // nothing. Trace `stored_state_hash()`, not the variant
+                        // name, before concluding this is unused.
+                        //
+                        // The cost is stated at
+                        // `MAX_SUMMARY_COMPARISONS_PER_MESSAGE`: under this flag
+                        // the receive leg's round trips are bounded by
+                        // `MAX_SUMMARY_ENTRIES_PER_MESSAGE` instead.
+                        let needs_our_summary = entry.summary_digest.is_some() || emit_confirmed;
                         let our_summary = if needs_our_summary {
                             if !local_summaries.contains_key(contract.id()) {
                                 let fetched =
@@ -11219,36 +11259,47 @@ mod tests {
             }
         }
 
-        /// Simulation and production take the SAME path through the free-entry
-        /// skip — the receive budget bounds round trips unconditionally, not
-        /// just when a test flag is off.
+        /// The simulation-only `emit_confirmed` path still summarizes for a free
+        /// entry, where production does not. Pinned deliberately, in both
+        /// directions, because each half protects something different.
         ///
-        /// An earlier revision of #5338 kept the fetch alive under
-        /// `emit_confirmed` (`SimulationIdleTimeout`, off in production) so the
-        /// convergence checker's `StateConfirmed` events would be unchanged.
-        /// Three independent reviews landed on that exception, and they were
-        /// right: it made the bound the rustdoc asserts true in production and
-        /// false under the flag, by up to the entry ceiling. The costs were not
-        /// symmetric either. A simulation could neither exercise the production
-        /// branch nor measure the summarize cost this change is about, so a
-        /// future sim regression on that cost would have read high — the
-        /// instrument would have been miscalibrated in exactly the dimension
-        /// the change is judged on.
+        /// **Why production must skip.** The verdict for an entry carrying no
+        /// summary cannot depend on ours, so the round trip is pure cost — the
+        /// whole point of #5338's receive half.
         ///
-        /// Aligning them turned out to be free. Nothing consumes
-        /// `StateConfirmed`: its two readers are determinism traces, which
-        /// compare runs of the same build against each other and so are
-        /// unaffected by dropping an event symmetrically, and
-        /// `state_verifier`'s detector lists the variant explicitly to ignore
-        /// it. No test in the tree filters on it. That was checked rather than
-        /// assumed — the assumption that the checker needed those events is
-        /// what kept the exception alive for two rounds of review.
+        /// **Why simulation must NOT skip.** The `StateConfirmed` events these
+        /// fetches produce are consumed, and a search for the variant name at
+        /// the consumers will tell you they are not. The chain is:
+        /// `EventKind::stored_state_hash()` returns the hash for this variant;
+        /// `SimNetwork::check_convergence` and `check_convergence_from_logs`
+        /// fold it with `contract_key()` into a per-(peer, contract) latest-hash
+        /// map; several `simulation_integration` assertions read the same
+        /// accessor directly; and `StateVerifier::build_histories` admits the
+        /// event through `contract_key()`. The direct runner calls
+        /// `SimulationIdleTimeout::enable()` for EVERY simulation, so this is
+        /// not a corner.
         ///
-        /// The free entries whose confirmation is lost are those a peer reports
-        /// no state for, which are not part of that contract's convergence set
-        /// anyway. Costed entries still confirm exactly as before.
+        /// Removing it fails in both directions. A peer's last recorded hash
+        /// goes stale, which reads as divergence that is not there (flaky red);
+        /// or the peer leaves `contract_states` for that contract, dropping it
+        /// below the two-peer threshold the check requires, so the contract is
+        /// skipped without comment and the suite **passes vacuously**. The
+        /// second is the one that matters — a green signal that has quietly
+        /// stopped checking.
+        ///
+        /// #5338 removed this exception once and had to put it back. The
+        /// reasoning was "nothing reads `StateConfirmed`", from a grep for that
+        /// string across the consumers; the consumption is through a generic
+        /// accessor, so the string is not there to find. If you are about to
+        /// delete this test because the divergence looks untidy, trace
+        /// `stored_state_hash()` first.
+        ///
+        /// The cost is real and is recorded at
+        /// `MAX_SUMMARY_COMPARISONS_PER_MESSAGE`: under the flag the receive
+        /// leg's round trips are bounded by `MAX_SUMMARY_ENTRIES_PER_MESSAGE`
+        /// instead, so a simulation's summarize count reads high.
         #[tokio::test]
-        async fn the_free_entry_skip_is_the_same_in_simulation_and_production() {
+        async fn emit_confirmed_keeps_the_free_entry_summarize_production_skips() {
             use std::sync::atomic::Ordering;
 
             /// Restores the thread-local flag even if an assertion panics, so a
@@ -11317,11 +11368,12 @@ mod tests {
                      ours, so the call is pure cost"
                 );
                 assert_eq!(
-                    simulated, 0,
-                    "{label}: and neither must simulation. If this is non-zero, \
-                     the telemetry exception is back and the receive budget no \
-                     longer bounds round trips under the flag — which silently \
-                     miscalibrates every simulation measurement of summarize cost"
+                    simulated, 64,
+                    "{label}: and simulation must still make it. These fetches are \
+                     what produce the StateConfirmed events the convergence \
+                     checker folds into its per-peer state map; without them a \
+                     contract can fall below the two-peer threshold and be \
+                     skipped silently, so the suite passes while checking less"
                 );
             }
         }
