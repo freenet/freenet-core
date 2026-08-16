@@ -427,6 +427,28 @@ detect_tag_state() {
 # two in step. `jq` reads a variable via a here-string rather than a pipe:
 # under `set -o pipefail` a short-circuiting reader makes the producer die 141
 # and a PRESENT answer read as ABSENT, which is the very failure being fixed.
+# DEFERRED, deliberately: this is two-state (present / not-present) while
+# `RELEASE_RECOVERY.md`'s `published()` helper is three-state (200 / 404 /
+# UNKNOWN). A 403, 429 or 5xx therefore reads here as "not published".
+#
+# Left as-is for now because the direction is FAIL-CLOSED and the docs' is not.
+# A false "absent" here makes the caller attempt a duplicate upload, which
+# crates.io rejects, which fails the step loudly and leaves the release a draft.
+# The dangerous inverse -- a false "present" causing a publish to be skipped --
+# needs a genuine 200 body and is unreachable. An operator acting on a false
+# "not published" in the docs, by contrast, re-tags a spent version, which is
+# irreversible; that is why the stricter form was applied there first.
+#
+# It is also protected in practice by the User-Agent lint in
+# release_canary_wiring_test.sh: the realistic way to get a non-200/404 here is
+# a missing or empty UA, and that is now pinned across every crates.io call site
+# in the repo.
+#
+# Worth doing properly, and the tri-state helper to copy already exists. Not
+# done in this PR because the matching change in cross-compile.yml's publish
+# step would require rewriting the behavioural fixtures that stub `curl` with
+# response BODIES, and adding an unverified surface late is a worse trade than
+# a documented fail-closed gap.
 crate_version_on_crates_io() {
     local body
     body="$(curl -sS -A 'freenet-release-driver' --max-time 30 \
@@ -1121,11 +1143,12 @@ See commit history for detailed changes.
 # Both are false, and the second is the shape a maintainer would restore from
 # reading them, so they are corrected rather than merely appended to.
 #
-# WHY IT MUST NOT RUN ON FAILURE. `wait_for_binaries` fails on five paths, and
-# publishing is wrong on four: no run found and attach-never-reported both mean
-# Gate A never ran; a non-success conclusion means it REJECTED the binary; a
-# timeout means it is still undecided. Only "assets missing after a successful
-# attach" is safe. This function checks the resume flag, DRY_RUN and crates.io
+# WHY IT MUST NOT RUN ON FAILURE. `wait_for_binaries` fails on six modes, only
+# one of which ("assets missing after a successful attach") leaves Gate A known
+# to have passed. The canonical enumeration, with each mode's Gate A
+# implication, lives at the refusal branch in the main flow -- deliberately in
+# ONE place, because the previous two copies of it drifted apart and both
+# undercounted. This function checks the resume flag, DRY_RUN and crates.io
 # presence -- never the gate's verdict -- and on the rejected path the crate is
 # genuinely absent, so the already-published check says "no" and it really does
 # upload.
@@ -1810,12 +1833,10 @@ create_github_release
 # GUARDED, not bare, and that is the whole point of the `if`.
 #
 # This script runs under `set -euo pipefail`, and `wait_for_binaries` fails on
-# timeout, attach job failed, attach succeeded but binaries missing, no run
-# found, and on a refusal inherited from `publish_draft_release` (draft state
-# unknown, or still-a-draft with the Gate A canary not concluded). Called bare,
-# every one of those aborted the script HERE -- so `publish_crates` below, whose
-# own comment calls it the backstop for when "the workflow path is broken", was
-# unreachable in precisely the cases where the workflow path is broken.
+# six modes (enumerated once, at the refusal branch below). Called bare, every
+# one of those aborted the script HERE -- so `publish_crates`, whose own comment
+# called it the backstop for when "the workflow path is broken", was unreachable
+# in precisely the cases where the workflow path is broken.
 #
 # NOTE the last item, and how it is phrased. An earlier version of this comment
 # enumerated "five paths" and listed only explicit `return 1` statements inside
@@ -1840,15 +1861,28 @@ create_github_release
 # harmless confirmation and a backstop for a CARGO_REGISTRY_TOKEN that never
 # reached CI. Both halves were wrong.
 #
-# WHY IT IS UNSAFE. `wait_for_binaries` returns nonzero on five paths, and
-# publishing is wrong on four of them:
+# WHY IT IS UNSAFE. THIS IS THE CANONICAL ENUMERATION of how
+# `wait_for_binaries` can fail; anywhere else that needs it refers here rather
+# than restating it. Six modes, and publishing is wrong on five:
 #
-#   no workflow run found        -- Gate A never ran        -> would publish ungated
-#   attach job never reported    -- Gate A state unknown    -> would publish ungated
-#   attach conclusion != success -- Gate A REJECTED it      -> would publish what
-#                                                              the gate blocked
-#   timeout                      -- Gate A undecided        -> would pre-empt it
-#   assets missing, attach OK    -- Gate A passed           -> the only safe one
+#   no workflow run found         -- Gate A never ran       -> publish ungated
+#   attach job never reported     -- Gate A state unknown   -> publish ungated
+#   attach conclusion != success  -- Gate A REJECTED it     -> publish what the
+#                                                              gate blocked
+#   timeout                       -- Gate A undecided       -> pre-empt the gate
+#   refusal from publish_draft_release
+#                                 -- draft state unknown,
+#                                    or canary not concluded
+#                                                           -> publish ungated
+#   assets missing, attach OK     -- Gate A passed          -> the only safe one
+#
+# The sixth is the one two earlier versions of these comments left out, in
+# opposite places, while both claiming "five paths" -- the inherited refusal.
+# It is not an explicit `return 1` in this function's own body, so an
+# enumeration written by reading `return` statements misses it. That is exactly
+# the mistake recorded below as having hidden the round-7 bug, and it recurred
+# HERE, in the comment describing it, twice, with different members each time.
+# Restating a list is how the copies drift; hence one canonical copy.
 #
 # `publish_crates` consults exactly three things: the resume flag, DRY_RUN, and
 # whether the version is already on crates.io. It never looks at the attach
@@ -1856,7 +1890,7 @@ create_github_release
 # crate is genuinely ABSENT -- cross-compile.yml runs the canary (:772) before
 # its publish step (:803), so a rejected binary means nothing was uploaded --
 # which is precisely when the already-published check says "no" and the fallback
-# really does upload it. Four of five paths publish a version Gate A never
+# really does upload it. Five of the six modes publish a version Gate A never
 # passed, including the one where it actively rejected the binary.
 #
 # WHY THE STATED JUSTIFICATION WAS UNACHIEVABLE. The missing-token case cannot

@@ -687,13 +687,35 @@ strands every node on the previous version and the fix cannot be delivered
 automatically. (`scripts/release.sh` will also refuse to publish while the
 cross-compile run is unfinished or failed, for the same reason.)
 
-**Know the state you are in first.** `release.yml` publishes to crates.io
-*before* it pushes the tag, so at this point `freenet`/`fdev` vX.Y.Z are
-already live on crates.io with no published GitHub release. That is a real
-split state: `cargo binstall freenet` will 404 until it is resolved, and the
-nightly `binstall-smoke-test` will go red. crates.io versions cannot be
-un-published, so **do not delete the tag** — a yanked-looking crate pointing at
-a tag that no longer exists is worse than the draft.
+**Know the state you are in first — and this section described the OLD ordering
+until the publish moved.** `release.yml` no longer publishes to crates.io at
+all; it only dry-runs. The real upload happens in `cross-compile.yml`'s
+`attach-to-release`, **after** Gate A. So when Gate A blocks, the canary has run
+and the publish step has not: **nothing was uploaded, and the version is not
+spent.**
+
+That is the whole point of the reorder. A Gate A block costs a **tag**, which is
+deletable — see "The crates.io publish is downstream of Gate A" above, and
+`scripts/RELEASE_RECOVERY.md` Step 4b.
+
+Confirm it rather than assuming, because the recovery differs completely:
+
+```bash
+# 200 = published (version spent), 404 = not published (re-cuttable).
+# The -A is required: crates.io answers 403 without a descriptive User-Agent,
+# and a body-parsing form reads that 403 as "not published" for every version.
+curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' \
+  --max-time 30 --retry 3 --retry-all-errors \
+  https://crates.io/api/v1/crates/freenet/X.Y.Z
+```
+
+- **404 — the normal case after a Gate A block.** Nothing irreversible has
+  happened. Delete the tag and the draft, fix, and re-cut the SAME version on
+  the corrected commit.
+- **200 — the version really is spent.** Only reachable if the publish step ran
+  and something later failed. Do not re-tag it; cut the next patch instead, and
+  note that `cargo binstall freenet` will 404 and the nightly
+  `binstall-smoke-test` will go red until a published release exists.
 
 1. Read the job log. It distinguishes a genuine parse failure from `UNVERIFIED`
    (GitHub was unreachable) or a port collision (exit 43, another node or
@@ -714,10 +736,17 @@ a tag that no longer exists is worse than the draft.
    artifacts persist, so `attach-to-release` re-runs on its own and publishes
    if the canary passes.
 3. **If the updater is genuinely broken**, fix the detection path
-   (`crates/core/src/bin/commands/auto_update.rs`) and cut the next patch
-   release. Leave vX.Y.Z's tag and draft in place; publish the draft only if
-   you have decided the broken updater is acceptable, knowing the fleet will
-   not auto-update off it.
+   (`crates/core/src/bin/commands/auto_update.rs`). Then, per the check above:
+
+   - **crates absent (404, the normal case)** — delete the tag and the draft and
+     re-cut the SAME version on the corrected commit. Nothing was published, so
+     the version number is not spent, and burning one here would be conceding
+     the loss this ordering exists to prevent.
+   - **crates present (200)** — the version is spent; cut the next patch and
+     leave vX.Y.Z's tag and draft in place.
+
+   Publish the draft only if you have decided the broken updater is acceptable,
+   knowing the fleet will not auto-update off it.
 4. To reproduce locally, run the canary against a **clean release build**:
 
    ```bash
