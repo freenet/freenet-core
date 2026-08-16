@@ -194,9 +194,38 @@ jobs:
       - name: Self-test release wait_for_binaries gh resilience
         run: bash scripts/release_wait_for_binaries_test.sh
 
+      # Release-driver RESUME state. Two regressions, both of the shape where a
+      # resumed release is wrong in a way the operator cannot see: the v0.2.42
+      # FDEV_VERSION double-bump, and the CRATES_PUBLISHED flag being set on
+      # `freenet` alone (which makes `publish_crates`'s early return skip the
+      # per-crate branch and strand `fdev` after a partial publish, while the
+      # driver reports success).
+      #
+      # NOTE this file EXISTED and PASSED for a long time without ever being
+      # run here -- it was referenced only in a comment further down, so it was
+      # scored by the assertion counter and executed by nothing. A test that
+      # does not run is not a gate, which is the same class of defect as the
+      # assertions it now protects.
+      - name: Self-test release driver resume state
+        run: bash scripts/release_state_restore_test.sh
+
+      # BEHAVIOURAL cover for release.sh, as distinct from the source pins in
+      # release_canary_wiring_test.sh. Two mutations defeated those pins while
+      # leaving their text intact: an unreachable fdev branch (the `cargo
+      # publish -p fdev` line still present, so the source scan's floor was
+      # satisfied, while fdev was stranded on EVERY release) and a second
+      # `publish_crates` call in a conditional form before the tag (the bare
+      # call still matching `^publish_crates$`). Both are properties, not
+      # patterns, so both are asserted by running the driver against stubs.
+      - name: Self-test release driver behaviour
+        run: bash scripts/release_driver_test.sh
+
       # Pins the WIRING of the blocking pre-flight canary, which is what
       # makes it a gate at all: it must run inside attach-to-release, after
-      # the assets upload and BEFORE `gh release edit --draft=false`, and
+      # the assets upload, BEFORE the crates.io publish (the one irreversible
+      # step, moved here from release.yml so a blocked gate costs a deletable
+      # tag instead of a spent version number), and BEFORE
+      # `gh release edit --draft=false`, and
       # not be disabled in place. Also pins release.sh's ATTACH_JOB_NAME
       # against the job's name in cross-compile.yml -- the driver polls for
       # that string and a rename on either side is otherwise silent.

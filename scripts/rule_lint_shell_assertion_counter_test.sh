@@ -200,12 +200,98 @@ expect 0 "a bare string added to a table (a KNOWN blind spot, documented in ci.y
 #    THIS file was added, its 26 bare `expect` calls scored zero -- the miss it
 #    exists to prevent, in the file written to prevent it, caught by measuring.
 invisible=()
+unrun=()
+CI_YML="$SCRIPT_DIR/../.github/workflows/ci.yml"
+# The Fmt job specifically: it runs on every PR, so a test invoked there is
+# genuinely gating. A test invoked from a job that only runs on
+# `workflow_dispatch` is not, and scoping here is what makes that distinction.
+FMT_JOB=""
+if [[ -f "$CI_YML" ]]; then
+    # Located by DISPLAY NAME (`name: Fmt`), then read to the next top-level job
+    # key. The job KEY is `fmt_check`, which is not guessable from the name --
+    # and guessing it wrong is why an earlier version of this found nothing and
+    # (correctly) failed rather than passing over an empty body.
+    #
+    # The display name is what the branch-protection ruleset requires, so it is
+    # the stable identifier of "the job that must pass".
+    FMT_JOB="$(awk '
+        /^  [A-Za-z_.-]+:[[:space:]]*$/ { if (inblock) exit; key = 1; buf = $0; next }
+        key && /^    name: Fmt[[:space:]]*$/ { inblock = 1; print buf; print; key = 0; next }
+        inblock { print }
+        { key = 0 }
+    ' "$CI_YML")"
+fi
+
 while IFS= read -r f; do
     [[ -f "$f" ]] || continue
     # Same `eval` path as `counter_matches`, so this measures the LIVE pattern
     # rather than a re-quoted copy of it.
     if [[ "$(eval "sed 's/^/+/' \"\$f\" | grep -cE $FRAG")" -eq 0 ]]; then
         invisible+=("$f")
+    fi
+    # ...AND it must actually be RUN. A test file that no workflow invokes is
+    # scored by the counter above and executed by nothing: it looks like
+    # coverage in a listing and gates nothing at all.
+    #
+    # Not hypothetical, and not caught by inspection either time. It was found
+    # by hand that `release_state_restore_test.sh` had existed and passed for a
+    # long time while ci.yml referenced it only in a COMMENT -- so the v0.2.42
+    # regression it was written for had no running gate behind it. A later
+    # review then confirmed "no other orphans" by inspection, and demonstrated
+    # in the same breath why inspection is not enough: it added a probe test
+    # with a real assertion and no `run:` line, and all suites stayed green.
+    # This loop is what makes that fail closed.
+    #
+    # Matched against `run:` LINES specifically, not the whole file, so a
+    # mention in a comment -- exactly how the orphan hid -- does not count as
+    # being run.
+    if [[ -n "$FMT_JOB" ]]; then
+        _base="$(basename "$f")"
+        # Scanned inside the Fmt JOB only, and over the job's whole body rather
+        # than `run:` LINES.
+        #
+        # Both halves are corrections to a gate that was wrong in BOTH
+        # directions:
+        #
+        #   FALSE-SATISFIED four ways -- a step carrying `if: false`, a step in a
+        #   job that only runs on workflow_dispatch, the filename inside an
+        #   `echo`, and a path under a directory that does not exist. Scoping to
+        #   the Fmt job (which runs on every PR) kills the first two; requiring
+        #   a real `bash <path>` invocation kills the third; checking the path
+        #   exists kills the fourth.
+        #
+        #   FALSE-BLOCKING -- a multi-line `run: |` block went RED, because the
+        #   invocation is not on the `run:` line itself. That is worse than the
+        #   hole: a gate that rejects legitimate usage gets deleted. Scanning
+        #   the job body rather than `run:` lines fixes it.
+        # Split into STEPS, so the step carrying the invocation can be checked
+        # for a conditional. Scanning the job body alone accepted an
+        # `if: false` step -- present, never executed, and counted as coverage.
+        # Any `if:` disqualifies: a step that is conditional is not guaranteed
+        # to run on every PR, which is the whole property being asserted. If a
+        # conditional is ever genuinely wanted, that is a deliberate edit here.
+        if [[ "$(printf '%s\n' "$FMT_JOB" \
+                  | grep -vE '^[[:space:]]*#' \
+                  | awk -v needle="$_base" '
+                        /^      - (name|uses|run):/ { n++ }
+                        { step[n] = step[n] "\n" $0 }
+                        END {
+                            for (i = 1; i <= n; i++) {
+                                # Trailing boundary is load-bearing: without it
+                                # `echo "would run bash scripts/x_test.sh"`
+                                # matches, because the closing quote sits where
+                                # the boundary should be. The explicit echo test
+                                # is belt to that braces.
+                                if (step[i] ~ ("bash[[:space:]]+[^[:space:]]*" needle "([[:space:]]|$)") \
+                                    && step[i] !~ ("echo[^;|&$]*bash[[:space:]]+[^[:space:]]*" needle) \
+                                    && step[i] !~ /\n[[:space:]]+if:/) {
+                                    print "RUNS"
+                                }
+                            }
+                        }' \
+                  | grep -c RUNS)" -eq 0 ]]; then
+            unrun+=("$f")
+        fi
     fi
     # Filesystem glob, NOT `git ls-files`, and the difference matters: a
     # contributor adding a test file has not necessarily staged it yet, and that
@@ -214,6 +300,29 @@ while IFS= read -r f; do
     # invisible to this very check, so the check that exists to find invisible
     # files could not see the newest one.
 done < <(find "$SCRIPT_DIR" -name '*_test.sh' -type f | sort)
+
+if [[ ! -f "$CI_YML" ]]; then
+    echo "FAIL - ci.yml not found at $CI_YML; cannot check that test files are run." >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ -z "$FMT_JOB" ]]; then
+    echo "FAIL - could not locate ci.yml's Fmt job; the run-check examined nothing." >&2
+    echo "       This must fail rather than skip: an empty job body would report" >&2
+    echo "       every test file as run." >&2
+    FAILURES=$((FAILURES + 1))
+elif [[ ${#unrun[@]} -eq 0 ]]; then
+    echo "ok   - every *_test.sh is invoked by 'bash <path>' in ci.yml's Fmt job"
+else
+    echo "FAIL - these *_test.sh files are never RUN by ci.yml:" >&2
+    for f in "${unrun[@]}"; do echo "         $f" >&2; done
+    echo "       They are scored by the assertion counter and executed by nothing," >&2
+    echo "       so they look like coverage in a listing while gating nothing. Add a" >&2
+    echo "       'run: bash scripts/<name>' step to the Fmt job in ci.yml." >&2
+    echo "       Checked as a real 'bash <path>' invocation inside the Fmt JOB, so:" >&2
+    echo "       a mention in a comment does not count, nor inside an echo, nor a" >&2
+    echo "       step in a job that only runs on workflow_dispatch. A multi-line" >&2
+    echo "       'run: |' block DOES count." >&2
+    FAILURES=$((FAILURES + 1))
+fi
 
 if [[ ${#invisible[@]} -eq 0 ]]; then
     echo "ok   - every tracked *_test.sh contains at least one assertion the counter sees"

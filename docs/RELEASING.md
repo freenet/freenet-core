@@ -35,12 +35,15 @@ explicit — they're not auto-decidable from commit history.
 Within ~30–60 minutes you should see:
 
 1. The `Release` workflow's `validate` → `update_versions` → `wait_for_pr` →
-   `publish_crates` → `create_release` jobs complete.
+   `verify_publishable` → `create_release` jobs complete.
 2. An auto-created bump PR titled `build: release X.Y.Z` that merges itself.
-3. `freenet` and `fdev` published to crates.io.
-4. A `vX.Y.Z` git tag pushed, which triggers `Build and Cross-Compile`.
-5. Cross-compile builds Linux musl + macOS (Intel + arm64) + Windows + signed
-   DMG, attaches all 14 artifacts to the draft release, then undrafts it.
+3. A `vX.Y.Z` git tag pushed and a **draft** GitHub release created, which
+   triggers `Build and Cross-Compile`.
+4. Cross-compile builds Linux musl + macOS (Intel + arm64) + Windows + signed
+   DMG and attaches all 14 artifacts to the draft release.
+5. Still inside that job, in this order: **Gate A** (the blocking auto-update
+   pre-flight, see "Release gates" below) → `freenet` and `fdev` published to
+   crates.io → undraft.
 6. The undraft fires `release.published` → `Gateway Update` and
    `Release Announcements` both auto-trigger.
 7. nova and vega gateways converge to the new version (verified by the
@@ -58,7 +61,7 @@ a `::warning::` annotation telling you what to fix.
 | Secret | Used by | Failure mode if missing |
 |---|---|---|
 | `RELEASE_PAT` | release.yml, cross-compile.yml | Bump PR has no CI; `release.published` doesn't auto-fire downstream workflows. The workflows emit a `::warning::` on every run. |
-| `CARGO_REGISTRY_TOKEN` | release.yml `publish_crates` | crates.io publish fails. |
+| `CARGO_REGISTRY_TOKEN` | release.yml `validate` (checks it), cross-compile.yml `attach-to-release` (uses it) | **`validate` fails first**, before the bump PR exists — that is the intended place to find out, and where to look when a release dies immediately. If `validate` is bypassed (a bare tag push, or a manual `cross-compile.yml` dispatch), `attach-to-release` fails after the binaries are uploaded and the release stays a draft. The actual publish lives in cross-compile.yml, not release.yml, because it is deliberately downstream of Gate A — see "The crates.io publish is downstream of Gate A" below. |
 | `MATRIX_HOMESERVER_URL` | release-announce.yml | Matrix job warns + skips (success, no post). |
 | `MATRIX_ACCESS_TOKEN` | release-announce.yml | Matrix job warns + skips. |
 | `RELEASE_AGENT_HMAC_NOVA` | gateway-update.yml, release-announce.yml | nova update + River announce fail (HTTP 401). |
@@ -254,9 +257,9 @@ gh workflow run release.yml
     └─→ release.yml: wait_for_pr
             └─→ resolves the bump PR's merge commit -> RELEASE_SHA
                 (everything below checks out that exact commit; see #5233)
-    └─→ release.yml: publish_crates
-            └─→ cargo publish freenet
-            └─→ cargo publish fdev
+    └─→ release.yml: verify_publishable
+            └─→ cargo publish -p freenet --dry-run   (packaging check only —
+                nothing is uploaded here; see the section below)
     └─→ release.yml: create_release
             └─→ git tag -a vX.Y.Z; git push
                     └─→ tag push triggers cross-compile.yml
@@ -264,6 +267,9 @@ gh workflow run release.yml
     cross-compile.yml: matrix builds + DMG sign/notarize
     cross-compile.yml: attach-to-release
             └─→ uploads 14 artifacts
+            └─→ Gate A: auto-update pre-flight   ← BLOCKING
+            └─→ cargo publish freenet            ← IRREVERSIBLE, and the first
+            └─→ cargo publish fdev                 irreversible step in the run
             └─→ gh release edit --draft=false  ← uses RELEASE_PAT
                     └─→ fires release.published event
                             └─→ gateway-update.yml fires
@@ -306,18 +312,106 @@ gh run rerun --failed <RUN_ID> --repo freenet/freenet-core
 ```
 
 The re-run picks up where it left off — `wait_for_pr` will see the merged
-state and proceed to `publish_crates`.
+state and proceed to `verify_publishable`.
 
-### `publish_crates` failed
+### `verify_publishable` failed
+
+This job only runs `cargo publish -p freenet --dry-run`, so a failure here is a
+packaging problem, not a registry one: most often an `include_str!` /
+`include_bytes!` path pointing outside the crate (#4240), which `cargo publish`
+catches and an ordinary `cargo build` does not. Nothing has been uploaded and
+no tag exists yet. Fix it on `main` and re-run the release.
+
+### Known gap: `fdev` has no packaging pre-flight
+
+`verify_publishable` checks **`freenet` only**. `fdev` is not dry-run anywhere in
+the pipeline, so an `fdev`-specific packaging break (the #4240 class) is now
+discovered at the very last and most expensive step: after the tag, ~30-60
+minutes of cross-compilation and macOS notarization, and Gate A.
+
+This is a deliberate, accepted cost, not an oversight — and it is worth being
+explicit that it is the same "fail at the expensive moment" shape this pipeline
+otherwise works to avoid. It is tolerated only because every alternative is
+worse:
+
+- `cargo publish -p fdev --dry-run` **cannot work** before `freenet` is
+  published. `crates/fdev/Cargo.toml` carries
+  `freenet = { path = "../core", version = "X.Y.Z" }`, so packaging `fdev`
+  strips the path and the verification build resolves `freenet` from the
+  registry — at a version that does not exist yet. It would fail every release
+  for a reason that is not a bug.
+- `--no-verify` would let it run, but skips the verification build, which is the
+  step that actually catches the #4240 class. That is a check that cannot fail —
+  the shape this repo keeps having to remove.
+- A `[patch.crates-io]` override pointing `freenet` at the local path would make
+  the dry run resolve. **`.claude/rules/git-workflow.md` explicitly forbids this
+  pattern**, having been burned by it: patches are not inherited by nested
+  workspaces, CI cannot resolve path deps on a fresh checkout, and it leaves a
+  pre-merge cleanup step behind. Not worth it for a pre-flight.
+
+The blast radius is bounded: `freenet` is already published by the time `fdev`
+is attempted, so an `fdev` failure leaves a recoverable partial publish, and an
+`attach-to-release` re-run skips `freenet` and retries `fdev` alone (see the
+section below). If an `fdev` packaging break ever actually happens, the cheapest
+fix is a CI job running `cargo package -p fdev --no-verify` on PRs touching
+`crates/fdev/` — catching manifest and include-path errors, though not
+compile-time ones.
+
+### `Publish crates to crates.io` failed (in cross-compile.yml)
 
 If it failed with "please provide a non-empty token" or similar, the
-`CARGO_REGISTRY_TOKEN` secret is missing or invalid. Update the secret,
-then `gh run rerun --failed`.
+`CARGO_REGISTRY_TOKEN` secret is missing or invalid. Update the secret, then
+re-run the `attach-to-release` job: the step skips any version already on
+crates.io, so a re-run is safe and keeps the publish ahead of the undraft.
 
 If a single crate failed mid-publish (e.g. `fdev` failed but `freenet`
-succeeded), `cargo publish -p fdev` from a checkout of the **release commit**
-(see below — not from whatever `main` is now), then manually move forward to
-tag + draft release as below.
+succeeded), the same re-run handles it — `freenet` is skipped as already
+published and `fdev` is retried. Publishing by hand is a last resort; see
+`scripts/RELEASE_RECOVERY.md` Step 4, and un-draft only after confirming
+Gate A passed.
+
+### The crates.io publish is downstream of Gate A
+
+This is deliberate and it is the fix for the 0.2.124 loss. The publish used to
+run in `release.yml`, before the tag was even pushed, so the one step in a
+release that can never be undone happened before the gate that decides whether
+to ship at all. When Gate A blocked v0.2.124 its crates were already permanent
+on crates.io, the release could only ever stay a draft, and 0.2.125 had to be
+cut in its place.
+
+Now a Gate A block costs a **tag**, which is deletable. Delete the tag and the
+draft, fix, re-cut on the corrected commit — but check first whether **that
+exact version** is already on crates.io, because if it is, the version is spent
+and you cut the next patch instead:
+
+```bash
+# 200 = published, 404 = not published. ANY other code is UNKNOWN, not "no".
+# The -A is load-bearing: crates.io answers 403 without a descriptive
+# User-Agent, and because 403 has a JSON body, a `| jq -e '.version.num'` form
+# exits 0 and prints "not published" for EVERY version -- silently turning this
+# check into the exact hazard described below.
+curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' \
+  --max-time 30 --retry 3 --retry-all-errors \
+  https://crates.io/api/v1/crates/freenet/X.Y.Z
+```
+
+**Not `cargo search`.** This is the one decision where it gives the wrong answer
+in the dangerous direction: it reports only a crate's NEWEST version and reads
+the search index, which lags the registry, so it can answer "not published"
+about a version that IS published — and acting on that means re-tagging a spent
+version, which is the unrecoverable 0.2.124 state this whole ordering exists to
+prevent.
+
+The rule, since `cargo search` is still correct in other places and should not
+be purged: **`cargo search` may only answer questions about the NEWEST
+version.** Asking "is the newest published version X?" is fine (that is what
+`release.sh`'s version-comparison guard does). Asking "is version X published?"
+is not.
+
+`scripts/release_canary_wiring_test.sh` pins this ordering — the publish must
+sit between the canary and the undraft, and `release.yml` must contain no
+non-dry-run `cargo publish` — because moving it back would otherwise be
+invisible to every test in the repo.
 
 ### `create_release` failed
 
@@ -465,10 +559,11 @@ Every signal we had was one-sided — the release built, published, installed an
 ran. Two gates now close that, both driven by `scripts/auto-update-canary.sh`:
 
 **Gate A — pre-flight, BLOCKING** (`attach-to-release` job in
-`cross-compile.yml`, between asset upload and un-draft). Boots the binary that
-is about to ship and requires its updater to read GitHub's current release tag.
-Runs while the release is still a draft, so a failure costs a stuck draft
-rather than a stranded fleet. Adds about a minute.
+`cross-compile.yml`, between asset upload and the crates.io publish). Boots the
+binary that is about to ship and requires its updater to read GitHub's current
+release tag. Runs while the release is still a draft and before anything has
+been uploaded to crates.io, so a failure costs a deletable tag rather than a
+stranded fleet or a spent version number. Adds about a minute.
 
 **Gate B — self-update, post-publish** (`auto-update-selfupdate-canary` job).
 Takes the *previous* release and requires it to detect this one, exit 42, and
@@ -637,13 +732,35 @@ strands every node on the previous version and the fix cannot be delivered
 automatically. (`scripts/release.sh` will also refuse to publish while the
 cross-compile run is unfinished or failed, for the same reason.)
 
-**Know the state you are in first.** `release.yml` publishes to crates.io
-*before* it pushes the tag, so at this point `freenet`/`fdev` vX.Y.Z are
-already live on crates.io with no published GitHub release. That is a real
-split state: `cargo binstall freenet` will 404 until it is resolved, and the
-nightly `binstall-smoke-test` will go red. crates.io versions cannot be
-un-published, so **do not delete the tag** — a yanked-looking crate pointing at
-a tag that no longer exists is worse than the draft.
+**Know the state you are in first — and this section described the OLD ordering
+until the publish moved.** `release.yml` no longer publishes to crates.io at
+all; it only dry-runs. The real upload happens in `cross-compile.yml`'s
+`attach-to-release`, **after** Gate A. So when Gate A blocks, the canary has run
+and the publish step has not: **nothing was uploaded, and the version is not
+spent.**
+
+That is the whole point of the reorder. A Gate A block costs a **tag**, which is
+deletable — see "The crates.io publish is downstream of Gate A" above, and
+`scripts/RELEASE_RECOVERY.md` Step 4b.
+
+Confirm it rather than assuming, because the recovery differs completely:
+
+```bash
+# 200 = published (version spent), 404 = not published (re-cuttable).
+# The -A is required: crates.io answers 403 without a descriptive User-Agent,
+# and a body-parsing form reads that 403 as "not published" for every version.
+curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' \
+  --max-time 30 --retry 3 --retry-all-errors \
+  https://crates.io/api/v1/crates/freenet/X.Y.Z
+```
+
+- **404 — the normal case after a Gate A block.** Nothing irreversible has
+  happened. Delete the tag and the draft, fix, and re-cut the SAME version on
+  the corrected commit.
+- **200 — the version really is spent.** Only reachable if the publish step ran
+  and something later failed. Do not re-tag it; cut the next patch instead, and
+  note that `cargo binstall freenet` will 404 and the nightly
+  `binstall-smoke-test` will go red until a published release exists.
 
 1. Read the job log. It distinguishes a genuine parse failure from `UNVERIFIED`
    (GitHub was unreachable) or a port collision (exit 43, another node or
@@ -664,10 +781,17 @@ a tag that no longer exists is worse than the draft.
    artifacts persist, so `attach-to-release` re-runs on its own and publishes
    if the canary passes.
 3. **If the updater is genuinely broken**, fix the detection path
-   (`crates/core/src/bin/commands/auto_update.rs`) and cut the next patch
-   release. Leave vX.Y.Z's tag and draft in place; publish the draft only if
-   you have decided the broken updater is acceptable, knowing the fleet will
-   not auto-update off it.
+   (`crates/core/src/bin/commands/auto_update.rs`). Then, per the check above:
+
+   - **crates absent (404, the normal case)** — delete the tag and the draft and
+     re-cut the SAME version on the corrected commit. Nothing was published, so
+     the version number is not spent, and burning one here would be conceding
+     the loss this ordering exists to prevent.
+   - **crates present (200)** — the version is spent; cut the next patch and
+     leave vX.Y.Z's tag and draft in place.
+
+   Publish the draft only if you have decided the broken updater is acceptable,
+   knowing the fleet will not auto-update off it.
 4. To reproduce locally, run the canary against a **clean release build**:
 
    ```bash

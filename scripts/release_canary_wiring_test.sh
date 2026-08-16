@@ -12,6 +12,22 @@
 # silently-removable-gate shape the canary was introduced to eliminate. A gate
 # whose removal is invisible is not a gate.
 #
+# It also pins the ORDER OF THE IRREVERSIBLE STEP, for the same reason. The
+# crates.io publish moved out of release.yml into this job, between the canary
+# and the un-draft, because a published crate version is the one thing in a
+# release that cannot be taken back: with it upstream of the gate, a Gate A
+# block cost v0.2.124 its version number instead of a re-run. Moving it back --
+# in either file -- restores that, and would otherwise be invisible to every
+# test in this repo. See assertions 2b and 2c.
+#
+# And it pins the RECOVERY RUNBOOK, which is the other route around the gate:
+# scripts/RELEASE_RECOVERY.md tells a human what to do when a release has
+# already gone wrong, and its `gh release create` invocations lacked `--draft`
+# (#5288). A release created published is a release Gate A never sees. Pinning
+# the workflow while leaving the documented manual path ungated protects the
+# machine and not the human, and the human is the one acting under pressure.
+# See assertion 2d.
+#
 # It also pins the two ends of a string that must agree across files:
 # release.sh's ATTACH_JOB_NAME is how the release driver finds this job's
 # status, and nothing else checks that the name still matches. Rename the job
@@ -30,6 +46,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WF="$SCRIPT_DIR/../.github/workflows/cross-compile.yml"
 RELEASE_SH="$SCRIPT_DIR/release.sh"
+WF_BASENAME="$(basename "$WF")"
 
 FAILURES=0
 
@@ -122,6 +139,86 @@ step_block() {
     printf '%s\n' "$JOB_BLOCK" | awk -F: -v a="$start" -v b="$end" '$1 >= a && $1 < b'
 }
 
+# status_swallowers <text> [allow-rc-capture]
+#
+# Emits every line that lets a command's NON-ZERO exit status be discarded.
+# Empty output means nothing swallows.
+#
+# THIS IS NOT THE GUARANTEE. Assertion 2g is: it EXECUTES the gate steps with a
+# failing stub canary and asserts the step's own exit status. This function
+# enumerates SPELLINGS, and an enumeration cannot close the class -- it has been
+# beaten four times, by `|| echo`, by `if ! ...; then ...; fi` (no `||` at all,
+# and `if` conditions are errexit-exempt), by `&` backgrounding, and by
+# `set +o errexit` (the long-option spelling this regex still does not match).
+#
+# It is kept because it names the specific route in its failure text and fails
+# in milliseconds, which is genuinely useful when it does fire. But if you are
+# here because a new swallow spelling got through: DO NOT ADD A FIFTH PATTERN.
+# That approach has failed every time. Check that 2g covers the case instead --
+# it should already, because it does not care how the swallow is spelled.
+#
+# WORKED EXAMPLE, so this is a decision rather than an oversight:
+# `set +o errexit` is the long-option spelling of `set +e` and this regex does
+# NOT match it. That is deliberate, and it is left unmatched on purpose.
+#
+# Measured under Actions' real `bash -e {0}` rather than reasoned about:
+#
+#     set +o errexit; <canary>                  -> exit 1   gate HOLDS
+#     set +o errexit; <canary>; echo done       -> exit 0   gate DEFEATED
+#     <canary>; exit 0                          -> exit 1   gate HOLDS
+#     { <canary>; }; true                       -> exit 1   gate HOLDS
+#     if ! <canary>; then echo warn; fi         -> exit 0   gate DEFEATED
+#     <canary> &; echo started                  -> exit 0   gate DEFEATED
+#
+# So disabling errexit is harmless on its own -- the canary is the last command
+# and its status becomes the script's -- and dangerous only combined with a
+# trailing zero-status command. Three of the six spellings above do not defeat
+# the gate at all, and a regex cannot tell which is which, because the
+# difference is not in the text of any one line. 2g catches all three that DO
+# defeat it and correctly stays green on the three that do not. Adding
+# `\+o[[:space:]]+errexit` here would flag a harmless line while still missing
+# the combinations, which is the treadmill in miniature.
+#
+# WHY THIS IS A FUNCTION, AND WHY IT IS NOT ANCHORED AT END OF LINE.
+# The three gate sites (Gate A's canary step, the CARGO_REGISTRY_TOKEN
+# fail-fast, Gate B's step) each had their own copy of
+# `\|\|[[:space:]]*(true|:)[[:space:]]*$`, which recognises exactly two
+# swallows and only at end of line. Everything else walked straight through:
+#
+#     ... auto-update-canary.sh preflight /tmp/freenet || echo "::warning::soft"
+#     ... || exit 0
+#     ... || :; echo done
+#
+# The first of those was mutation-tested against the whole suite and passed
+# 37/37 while Gate A was completely neutered -- next to a comment in this very
+# file calling `|| true` "the likelier of the two neutering routes, and the
+# worse one ... which is exactly why it has to fail loudly here." It did not.
+# An enumeration of known-bad spellings is not a defence; the RULE is that
+# these steps must not consume their command's status AT ALL.
+#
+# So: ANY `||` counts, plus `set +e`, plus a trailing `; true` / `; :`. None of
+# these steps has a legitimate `||` -- verified: the canary step and the token
+# check contain none, and Gate B contains exactly one, its deliberate
+# `|| rc=$?` capture, which is opted in per call site rather than baked in
+# here. A future step that genuinely needs `||` should have to come here and
+# say so, which is the point.
+#
+# Callers pass comment-stripped text (yaml_job_block drops comment lines), so
+# prose discussing `|| true` cannot fire this.
+status_swallowers() {
+    local text="$1" allow_rc="${2:-}"
+    local hits
+    hits="$(printf '%s\n' "$text" \
+        | grep -E '\|\||set[[:space:]]+\+e|;[[:space:]]*(true|:)[[:space:]]*$')"
+    if [[ -n "$allow_rc" ]]; then
+        # Gate B runs the canary as `... || rc=$?` precisely so it can classify
+        # exit 75, and re-raises with `exit "$rc"`. That pairing is asserted
+        # separately; only the capture spelling is exempted here.
+        hits="$(printf '%s\n' "$hits" | grep -vE '\|\|[[:space:]]*rc=\$\?[[:space:]]*$')"
+    fi
+    printf '%s\n' "$hits" | grep -vE '^[[:space:]]*$' || true
+}
+
 # --- 1. the canary step still runs ------------------------------------------
 CANARY_LINE="$(line_of 'auto-update-canary\.sh preflight')"
 if [[ -n "$CANARY_LINE" ]]; then
@@ -152,6 +249,1809 @@ elif [[ -n "$CANARY_LINE" ]]; then
     fi
 fi
 
+# --- 2b. the crates.io publish sits BETWEEN the canary and the un-draft ------
+# The ordering this pins is the fix for the 0.2.124 loss. The publish used to
+# run in release.yml before the tag existed, so the one irreversible step in a
+# release happened UPSTREAM of the gate that decides whether to ship: when
+# Gate A blocked v0.2.124 its crates were already permanent, the release could
+# only stay a draft, and the version number was spent.
+#
+# Both bounds matter and they fail differently:
+#   above the canary -> back to burning a version number on every gate block;
+#   below the un-draft -> the release goes public before its crates exist, so
+#     `cargo install freenet` fails for whoever reads the announcement first.
+#
+# Ordering is checked by line number because steps in a job run in file order,
+# which is the same mechanism assertion 2 relies on.
+PUBLISH_CRATES_LINE="$(line_of 'cargo publish -p freenet')"
+if [[ -z "$PUBLISH_CRATES_LINE" ]]; then
+    fail "no 'cargo publish -p freenet' in the attach-to-release job" \
+        "The crates.io publish lives here so that it runs AFTER the blocking" \
+        "pre-flight canary. If it has moved back into release.yml (or anywhere" \
+        "upstream of the tag), a Gate A block again costs a permanently-spent" \
+        "crates.io version instead of a deletable tag -- the v0.2.124 loss."
+else
+    pass "the crates.io publish runs in attach-to-release (line $PUBLISH_CRATES_LINE)"
+
+    if [[ -n "$CANARY_LINE" ]]; then
+        if [[ "$CANARY_LINE" -lt "$PUBLISH_CRATES_LINE" ]]; then
+            pass "the canary runs BEFORE the crates.io publish (canary $CANARY_LINE < publish $PUBLISH_CRATES_LINE)"
+        else
+            fail "the crates.io publish runs BEFORE the canary (publish $PUBLISH_CRATES_LINE < canary $CANARY_LINE)" \
+                "The publish is irreversible and the canary is the gate. In this order a" \
+                "Gate A block leaves the crates on crates.io forever and the release" \
+                "unpublishable -- exactly what happened to v0.2.124."
+        fi
+    fi
+
+    if [[ -n "$PUBLISH_LINE" ]]; then
+        if [[ "$PUBLISH_CRATES_LINE" -lt "$PUBLISH_LINE" ]]; then
+            pass "the crates.io publish runs BEFORE '--draft=false' (crates $PUBLISH_CRATES_LINE < un-draft $PUBLISH_LINE)"
+        else
+            fail "the release is un-drafted BEFORE its crates are published (un-draft $PUBLISH_LINE < crates $PUBLISH_CRATES_LINE)" \
+                "The release becomes public, the announcement cascade fires, and" \
+                "'cargo install freenet@<version>' does not work yet. Publish first."
+        fi
+    fi
+
+    PUBLISH_CRATES_STEP="$(step_block "$PUBLISH_CRATES_LINE")"
+    if [[ -z "$PUBLISH_CRATES_STEP" ]]; then
+        # Every assertion below scans this variable, and an empty scan target
+        # makes each of them pass by finding nothing. Fail loudly instead:
+        # `step_block` returning nothing means its `- name:` bounds moved, not
+        # that the step is clean.
+        fail "could not extract the crates.io publish STEP around line $PUBLISH_CRATES_LINE" \
+            "step_block found no enclosing '- name:'. Every check below scans this" \
+            "text, so an empty extraction would make all of them pass vacuously."
+    fi
+
+    # The step's `if:` is pinned to one exact expression rather than forbidden.
+    #
+    # It needs an `if:` at all because this workflow's `on:` includes
+    # `branches: [main]`, so every push to main runs it. The job's own
+    # `if: startsWith(github.ref, 'refs/tags/v')` already blocks the job there,
+    # but a step that uploads to crates.io should be structurally incapable of
+    # firing off a tag rather than incapable only while that job condition
+    # survives editing. It is also what bounds CARGO_REGISTRY_TOKEN's reach.
+    #
+    # And it needs `success() &&` in front, spelled out. A step `if:` with no
+    # status-check function has `success()` applied implicitly, so the plain
+    # tag test would still require every earlier step -- including Gate A -- to
+    # have passed. Writing it removes the gate's dependence on that implicit
+    # rule; dropping it for `if: always() && startsWith(...)` would publish
+    # after a failed canary, and that one word is the whole difference.
+    #
+    # Exact-match, not "contains no always()", for the reason the un-draft
+    # step's assertion gives: deciding whether an arbitrary expression can
+    # evaluate true after a failed step is not a job for a grep. Any change to
+    # this line is a deliberate edit to a release gate and should update this
+    # expectation on purpose.
+    PC_WANT_IF="        if: \${{ success() && startsWith(github.ref, 'refs/tags/v') }}"
+    PC_GOT_IF="$(printf '%s\n' "$PUBLISH_CRATES_STEP" | grep -E '^[0-9]+:        if:' | cut -d: -f2-)"
+    if [[ "$PC_GOT_IF" == "$PC_WANT_IF" ]]; then
+        pass "the crates.io publish step is gated on success() AND a v* tag ref"
+    else
+        fail "the crates.io publish step's 'if:' is not the expected gate" \
+            "expected: $PC_WANT_IF" \
+            "got:      ${PC_GOT_IF:-<none>}" \
+            "Without the tag test a push to main can reach a crates.io upload" \
+            "(this workflow runs on 'branches: [main]' too). Without 'success() &&'" \
+            "the step's implicit success() default is being relied on, and any" \
+            "later edit to 'always()' publishes after a failed Gate A."
+    fi
+
+    # `continue-on-error: true` is the other neutering route, and it is not
+    # covered by the exact-match above: it would let a FAILED upload proceed to
+    # the un-draft, publishing a release whose crates do not exist.
+    # ...and it must be a REAL publish. Stated directly as well as being
+    # exercised by the fixtures below, because this is the mutation a reader of
+    # THIS FILE is primed to make: assertion 2c deliberately whitelists
+    # `--dry-run` in release.yml, so "add --dry-run until it stops failing" is a
+    # move the file itself teaches. Here it would mean Gate A runs, nothing is
+    # uploaded, the release un-drafts, the cascade fires, and
+    # `cargo install freenet@X` 404s for everyone who reads the announcement.
+    PC_DRYRUN="$(printf '%s\n' "$PUBLISH_CRATES_STEP" | grep -E 'cargo publish.*--dry-run')"
+    if [[ -z "$PC_DRYRUN" ]]; then
+        pass "the crates.io publish step really publishes (no --dry-run)"
+    else
+        fail "the crates.io publish step has become a DRY RUN" \
+            "$(printf '%s\n' "$PC_DRYRUN")" \
+            "This step is the release's only real crates.io upload. As a dry run the" \
+            "job still goes green, Gate A still passes, and the release still" \
+            "un-drafts -- publishing binaries and firing the announcement cascade for" \
+            "a version that is not on crates.io. release.yml's dry run is the" \
+            "whitelisted one (assertion 2c); this one must never be."
+    fi
+
+    PC_COE="$(printf '%s\n' "$PUBLISH_CRATES_STEP" \
+        | grep -E '^[0-9]+:        continue-on-error:')"
+    if [[ -z "$PC_COE" ]]; then
+        pass "the crates.io publish step has no 'continue-on-error:'"
+    else
+        fail "the crates.io publish step has acquired a 'continue-on-error:'" \
+            "$(printf '%s\n' "$PC_COE")" \
+            "A failed upload would then reach the un-draft, publishing a release" \
+            "whose crates are not on crates.io."
+    fi
+fi
+
+# --- 2b-bis. the publish step's tree guard, EXECUTED not scraped -------------
+# The #5233 guard in the form this job can express it. release.yml's two jobs
+# run verify_release_checkout.sh before their irreversible act, because they
+# check out a SHA a moving `main` could have displaced. Here the ref is the tag,
+# so the equivalent question is whether the tag and the tree agree -- and it
+# must be asked BEFORE the upload, because a crates.io version cannot be
+# replaced once sent.
+#
+# RUN the step rather than grepping it, and the reason is a mistake made while
+# writing this file. The first version asserted the step contained the text
+# `crates/core/Cargo.toml` above its first `cargo publish`. Mutation-testing it
+# -- replacing the real `sed` read with `CORE_VERSION="$VERSION"`, which
+# compares the tag against itself and can never fail -- left the assertion
+# GREEN, because the step's own `::error::` message mentions the same filename.
+# A scrape satisfied by the error text of the guard it is checking is the
+# `not triggering auto-update` shape again: pinning a line that is talking
+# ABOUT the thing rather than doing it.
+#
+# The step's `run:` is extracted from the YAML and executed against fixture
+# trees with `cargo`, `curl` and `sleep` stubbed, so what is asserted is what it
+# DOES: refuses a mismatched tree without calling cargo, skips a version already
+# on crates.io, and actually publishes otherwise. The third case matters as much
+# as the first -- a guard that refuses everything would satisfy the other two.
+extract_step_run() {
+    # extract_step_run <job-key> <step name> -- that step's `run:` script,
+    # dedented, from THAT JOB ONLY.
+    #
+    # The job scoping is not decoration. This function used to awk the whole
+    # file for the first `- name: <step>`, while `line_of` and `step_block`
+    # are scoped to `$JOB_BLOCK` -- so the two could describe DIFFERENT STEPS
+    # and nothing noticed. Mutation-tested: gutting the real tree guard to
+    # `CORE_VERSION="$VERSION"` (which compares the tag against itself and can
+    # never fail) AND adding an `if: false` decoy step named
+    # `Publish crates to crates.io` to an earlier job, carrying the correct
+    # script, left ALL FIVE behavioural cases green -- including "refuses a
+    # tree whose version does not match the tag" -- because they were executing
+    # the decoy. First-in-file won, and first-in-file was not the step being
+    # gated.
+    #
+    # Any extractor in this file that is not scoped to the thing it claims to
+    # describe is the same defect waiting. See the consistency check at the
+    # PC_RUN call site, which asserts the two extractors agree rather than
+    # trusting that they do.
+    local job="$1" name="$2"
+    awk -v jobre="^  $job:[[:space:]]*\$" -v want="      - name: $name" '
+        $0 ~ jobre                       { injob = 1; next }
+        injob && /^  [A-Za-z_.-]+:/      { injob = 0 }
+        !injob                           { next }
+        $0 == want                       { instep = 1; next }
+        instep && /^      - name:/       { exit }
+        instep && /^        run: \|/     { inrun = 1; next }
+        inrun {
+            if ($0 !~ /^[[:space:]]*$/ && $0 !~ /^          /) exit
+            sub(/^          /, "")
+            print
+        }
+    ' "$WF"
+}
+
+PC_RUN="$(extract_step_run attach-to-release 'Publish crates to crates.io')"
+if [[ -z "$PC_RUN" || "$PC_RUN" != *'cargo publish -p freenet'* ]]; then
+    # Never a silent skip: every case below would pass on an empty script.
+    fail "could not extract the 'Publish crates to crates.io' step's run: block" \
+        "The behavioural cases below execute it, so an empty or wrong extraction" \
+        "would make all of them pass vacuously. Check the step name and that its" \
+        "body is still a 'run: |' block indented by 10 spaces."
+elif ! command -v jq >/dev/null 2>&1; then
+    # Also never a silent skip. The step itself needs jq at release time, so a
+    # missing jq is a real problem, not a reason to stop checking.
+    fail "jq is not installed, so the publish step's guard cannot be exercised" \
+        "The step uses jq to read crates.io's answer; it would fail at release" \
+        "time too. Install jq."
+else
+    pass "extracted the crates.io publish step's run: block ($(printf '%s\n' "$PC_RUN" | wc -l) lines)"
+
+    # The two extractors must describe the SAME step.
+    #
+    # `PUBLISH_CRATES_STEP` (via line_of/step_block) is what the ORDERING and
+    # `if:` assertions judge; `PC_RUN` is what the behavioural cases EXECUTE.
+    # They are found by different mechanisms, so they can drift apart -- and
+    # when they do, this file reports confidently about two different steps:
+    # the gated one is pinned for position while the executed one is some other
+    # step entirely. That is not hypothetical, it is the N4 mutation, and job
+    # scoping alone only closes the instance rather than the class. This asserts
+    # the agreement instead of assuming it.
+    PC_STEP_TEXT="$(printf '%s\n' "$PUBLISH_CRATES_STEP" | sed 's/^[0-9]*://')"
+    pc_missing=0
+    # Blank and COMMENT lines are skipped: `yaml_job_block` strips comment-only
+    # lines when building JOB_BLOCK, while `extract_step_run` reads the raw
+    # file, so the run block's own shell comments are legitimately present in
+    # one side and absent from the other. Comparing them would fail on every
+    # clean tree, which is how a check like this ends up deleted rather than
+    # fixed. The executable lines are the ones that must agree.
+    while IFS= read -r _line; do
+        _stripped="${_line#"${_line%%[![:space:]]*}"}"
+        [[ -z "$_stripped" ]] && continue
+        [[ "$_stripped" == \#* ]] && continue
+        case "$PC_STEP_TEXT" in
+            *"$_line"*) ;;
+            *) pc_missing=$((pc_missing + 1)) ;;
+        esac
+    done <<< "$PC_RUN"
+
+    if [[ "$pc_missing" -eq 0 ]]; then
+        pass "the executed run: block belongs to the same step the ordering assertions pin"
+    else
+        fail "the EXECUTED publish script is not the step the ordering assertions describe" \
+            "$pc_missing line(s) of the extracted run: block do not appear in the" \
+            "job-scoped step at line $PUBLISH_CRATES_LINE." \
+            "The behavioural cases below would be exercising one step while the" \
+            "ordering and 'if:' assertions above pin a different one -- so this file" \
+            "would report a correct, gated, guarded publish while the step that" \
+            "actually ships is neither. Check for a duplicate step name elsewhere in" \
+            "the workflow."
+    fi
+
+    # The crates.io answer is per-CRATE, not one fixed body, because the case
+    # that matters most is the asymmetric one: `freenet` uploaded, then `fdev`
+    # failed. A re-run must skip the first and retry only the second. A stub
+    # that answers identically for both cannot express that, and would let a
+    # step that skips or publishes ALL-or-NOTHING pass as if it were
+    # per-crate.
+    pc_run_case() {
+        # pc_run_case <desc> <core-version> <tag> <freenet-body> <fdev-body> <want-rc> <want-published>
+        #   want-published: none | freenet | fdev | both
+        local desc="$1" core_ver="$2" tag="$3" freenet_body="$4" fdev_body="$5"
+        local want_rc="$6" want_published="$7"
+        local work rc got_freenet got_fdev got_published
+        work="$(mktemp -d)"
+        mkdir -p "$work/crates/core" "$work/crates/fdev" "$work/bin"
+        printf '[package]\nname = "freenet"\nversion = "%s"\n' "$core_ver" \
+            > "$work/crates/core/Cargo.toml"
+        printf '[package]\nname = "fdev"\nversion = "0.9.9"\n' \
+            > "$work/crates/fdev/Cargo.toml"
+        : > "$work/cargo.log"
+        # Unquoted heredocs: `$work` and the bodies expand, while `\$*`, `\$@`
+        # and the `\n` in the format strings reach the stub literally.
+        cat > "$work/bin/cargo" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$work/cargo.log"
+EOF
+        # Dispatches on the crate name in the request URL, exactly as the real
+        # endpoint does (\`/api/v1/crates/<name>/<version>\`).
+        cat > "$work/bin/curl" <<EOF
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  case "\$arg" in
+    */crates/freenet/*) printf '%s' '$freenet_body'; exit 0 ;;
+    */crates/fdev/*)    printf '%s' '$fdev_body';    exit 0 ;;
+  esac
+done
+echo "stub curl: no crate in args: \$*" >&2
+exit 1
+EOF
+        printf '#!/usr/bin/env bash\nexit 0\n' > "$work/bin/sleep"
+        chmod +x "$work/bin/cargo" "$work/bin/curl" "$work/bin/sleep"
+        printf '%s\n' "$PC_RUN" > "$work/step.sh"
+
+        ( cd "$work" && PATH="$work/bin:$PATH" GITHUB_REF="refs/tags/$tag" \
+            bash "$work/step.sh" ) > "$work/out" 2>&1
+        rc=$?
+        # A REAL publish, not merely an invocation mentioning the crate.
+        # `--dry-run` is excluded deliberately: without that exclusion this
+        # classification is satisfied by `cargo publish -p freenet --dry-run`,
+        # so appending `--dry-run` to both invocations left EVERY assertion in
+        # this file green while the pipeline uploaded nothing -- Gate A runs,
+        # nothing publishes, the release un-drafts, the announcement cascade
+        # fires, and `cargo install freenet@X` 404s for everyone who reads it.
+        # That is the split-channel state assertion 3b's comment calls
+        # impossible, reached by adding one flag.
+        #
+        # It is also a flag this very file TEACHES: assertion 2c whitelists
+        # `--dry-run` in release.yml, so "add --dry-run to make it stop
+        # failing" is a move a reader is actively primed to make. A pin whose
+        # subject can be satisfied by the thing it exists to exclude is not a
+        # pin -- the same lesson as #5303, and the same lesson as the tree
+        # guard two blocks below.
+        #
+        # `grep -c` on the file, not `| grep -q`: the pipefail/SIGPIPE hazard
+        # audited by auto-update-canary_test.sh.
+        got_freenet=0; got_fdev=0
+        [[ "$(grep -cE '(^| )publish +-p +freenet( |$)' "$work/cargo.log")" -gt 0 ]] \
+            && [[ "$(grep -cE '(^| )publish +-p +freenet .*--dry-run' "$work/cargo.log")" -eq 0 ]] \
+            && got_freenet=1
+        [[ "$(grep -cE '(^| )publish +-p +fdev( |$)' "$work/cargo.log")" -gt 0 ]] \
+            && [[ "$(grep -cE '(^| )publish +-p +fdev .*--dry-run' "$work/cargo.log")" -eq 0 ]] \
+            && got_fdev=1
+        case "$got_freenet$got_fdev" in
+            00) got_published=none ;;
+            10) got_published=freenet ;;
+            01) got_published=fdev ;;
+            11) got_published=both ;;
+        esac
+
+        local ok=1
+        case "$want_rc" in
+            0)       [[ "$rc" -eq 0 ]] || ok=0 ;;
+            nonzero) [[ "$rc" -ne 0 ]] || ok=0 ;;
+        esac
+        [[ "$got_published" == "$want_published" ]] || ok=0
+
+        if [[ "$ok" -eq 1 ]]; then
+            pass "publish step: $desc (rc=$rc, published: $got_published)"
+        else
+            fail "publish step: $desc" \
+                "expected rc $want_rc and published=$want_published," \
+                "got rc=$rc and published=$got_published" \
+                "--- step output ---" \
+                "$(head -20 "$work/out")"
+        fi
+        rm -rf "$work"
+    }
+
+    NOT_ON_CRATES_IO='{"errors":[{"detail":"Not Found"}]}'
+    FREENET_ON_CRATES_IO='{"version":{"num":"9.9.9"}}'
+    FDEV_ON_CRATES_IO='{"version":{"num":"0.9.9"}}'
+
+    # The guard itself: a tree whose version disagrees with the tag must stop
+    # BEFORE anything reaches crates.io. `published: none` is the load-bearing
+    # half -- a refusal that happens after the upload is not one.
+    pc_run_case "refuses a tree whose version does not match the tag" \
+        "0.0.1" "v9.9.9" "$NOT_ON_CRATES_IO" "$NOT_ON_CRATES_IO" nonzero none
+
+    # The normal path. Without this case every other one here is satisfied by a
+    # step that never publishes at all.
+    pc_run_case "publishes both when the tree matches and neither is on crates.io" \
+        "9.9.9" "v9.9.9" "$NOT_ON_CRATES_IO" "$NOT_ON_CRATES_IO" 0 both
+
+    # Full re-run after a failure downstream of the upload (a cancelled runner,
+    # a failed un-draft). Nothing is uploaded twice and the job proceeds.
+    pc_run_case "skips both when both are already on crates.io" \
+        "9.9.9" "v9.9.9" "$FREENET_ON_CRATES_IO" "$FDEV_ON_CRATES_IO" 0 none
+
+    # THE case this requirement is about: the publish died between the two
+    # uploads. A re-run must skip freenet -- `cargo publish` would refuse a
+    # duplicate and fail the job, costing another tag -- and retry fdev alone.
+    pc_run_case "re-run after a partial publish retries only the missing crate" \
+        "9.9.9" "v9.9.9" "$FREENET_ON_CRATES_IO" "$NOT_ON_CRATES_IO" 0 fdev
+
+    # ...and the mirror, so the per-crate dispatch is not passing by accident of
+    # the order the step happens to check them in.
+    pc_run_case "re-run publishes freenet alone when only fdev is already up" \
+        "9.9.9" "v9.9.9" "$NOT_ON_CRATES_IO" "$FDEV_ON_CRATES_IO" 0 freenet
+fi
+
+# --- 2b-ter. the crates.io credential is checked EARLY -----------------------
+# Moving the publish to the end of the pipeline created a new way to lose a
+# release: a missing or dead CARGO_REGISTRY_TOKEN is now discovered after the
+# bump PR, the tag, ~30 minutes of cross-compilation and Gate A. That is F3's
+# shape one step further down -- an avoidable cost paid at the most expensive
+# possible moment -- so both entry points check the credential early.
+#
+# "Early" means something DIFFERENT at each entry point, and the difference is
+# the whole point of the two bounds below. release.yml's `validate` checks it
+# genuinely first, before anything exists to unwind. attach-to-release checks it
+# AFTER the asset upload and BEFORE the canary -- deliberately not first,
+# because this job also delivers binaries and un-drafts, neither of which needs
+# a crates.io token.
+# Located by STEP NAME, not by the log text inside it. The log-text locator
+# worked, but the delta added ~30 lines of prose immediately above this step
+# discussing the same token, and `head -1` takes whichever comes first --
+# a growing collision surface for no benefit. A step name is structural.
+TOKEN_CHECK_LINE="$(line_of '^[0-9]+:      - name: Check the crates\.io credential is present')"
+if [[ -z "$TOKEN_CHECK_LINE" ]]; then
+    fail "attach-to-release does not check for CARGO_REGISTRY_TOKEN" \
+        "This job ends in a crates.io upload, and a missing credential is" \
+        "deterministic, so it should fail BEFORE THE CANARY -- there is no point" \
+        "spending the canary's minutes if the publish cannot happen." \
+        "Put it AFTER the asset upload, not first: this job also attaches" \
+        "binaries and un-drafts, and neither needs a crates.io token, so a check" \
+        "at step 1 blocks binary delivery on a credential only the publish" \
+        "requires. The two ordering assertions below enforce both bounds."
+elif [[ -n "$CANARY_LINE" && "$TOKEN_CHECK_LINE" -gt "$CANARY_LINE" ]]; then
+    fail "attach-to-release checks CARGO_REGISTRY_TOKEN only AFTER the canary (token $TOKEN_CHECK_LINE > canary $CANARY_LINE)" \
+        "The point of the check is to fail fast. After the canary it saves nothing."
+else
+    # ...and it must sit AFTER the asset upload, which is the other bound and
+    # the less obvious one.
+    #
+    # This check began as the job's FIRST step, and that coupled BINARY
+    # DELIVERY to a crates.io credential. This job is the only path that
+    # attaches binaries and un-drafts, and neither needs a crates token; an
+    # expired token therefore blocked the reversible half on a credential only
+    # the irreversible half requires -- the exact inversion of this PR's own
+    # argument. The documented `gh workflow run cross-compile.yml --ref vX.Y.Z`
+    # asset-recovery would have died at step 1 having done nothing.
+    #
+    # Both bounds are pinned because they fail in opposite directions: moved
+    # BELOW the canary it stops being a fail-fast, moved ABOVE the upload it
+    # starts blocking work that does not need it.
+    UPLOAD_LINE="$(line_of 'gh release upload')"
+    if [[ -z "$UPLOAD_LINE" ]]; then
+        fail "no 'gh release upload' in the attach-to-release job" \
+            "The credential check is positioned relative to it, so its absence" \
+            "would make the ordering assertion below pass vacuously."
+    elif [[ "$TOKEN_CHECK_LINE" -lt "$UPLOAD_LINE" ]]; then
+        fail "the CARGO_REGISTRY_TOKEN check runs BEFORE the asset upload (token $TOKEN_CHECK_LINE < upload $UPLOAD_LINE)" \
+            "That couples binary delivery to a crates.io credential it does not" \
+            "need. An expired token would block asset attachment and the un-draft," \
+            "and an operator re-running this job purely to re-attach assets would" \
+            "get a job that fails having done nothing -- fixable only by rotating a" \
+            "repo secret. Keep the check between the upload and the canary."
+    else
+        pass "attach-to-release checks CARGO_REGISTRY_TOKEN after the upload and before the canary (upload $UPLOAD_LINE < token $TOKEN_CHECK_LINE < canary $CANARY_LINE)"
+    fi
+fi
+
+# ...and release.yml checks it in its FIRST job, which is the one that matters:
+# before the bump PR exists there is nothing to unwind.
+RELEASE_YML="$SCRIPT_DIR/../.github/workflows/release.yml"
+if [[ ! -f "$RELEASE_YML" ]]; then
+    fail "release.yml not found at $RELEASE_YML"
+else
+    VALIDATE_JOB="$(awk '
+        /^  validate:[[:space:]]*$/       { inblock = 1; next }
+        inblock && /^  [A-Za-z_.-]+:/     { inblock = 0 }
+        inblock && $0 !~ /^[[:space:]]*#/ { print }
+    ' "$RELEASE_YML")"
+    if [[ -z "$VALIDATE_JOB" ]]; then
+        fail "could not locate release.yml's 'validate' job" \
+            "The credential check below scans it, so an empty extraction would" \
+            "pass vacuously."
+    elif [[ "$VALIDATE_JOB" != *'CARGO_REGISTRY_TOKEN'* ]]; then
+        fail "release.yml's 'validate' job no longer checks CARGO_REGISTRY_TOKEN" \
+            "It is the first job in the pipeline, so a missing credential caught" \
+            "there costs nothing. Caught at the publish instead, it costs the bump" \
+            "PR, the tag and the whole build."
+    else
+        # Scoped to the credential-check STEP, not to the whole job, and that
+        # narrowing is not fussiness -- it is a mutation this pin previously
+        # SURVIVED. The `validate` job contains other `exit 1`s (the version
+        # format check, the crates.io auto-bump resolution), so a job-wide scan
+        # for `exit 1` is satisfied by those: replacing the credential check's
+        # own `exit 1` with `true`, turning a blocking check into a warning,
+        # left the assertion GREEN. The pin was reading a neighbour's refusal
+        # and reporting it as this one's -- the same shape as scanning a whole
+        # job block for text that a different step supplies.
+        # Extracted from `$VALIDATE_JOB`, NOT by re-awking the whole file.
+        # Found during the N4 sibling sweep: this had the same unscoped shape,
+        # taking the first step in release.yml whose name mentions "crates.io
+        # token" regardless of which job it sits in. Only `validate` has one
+        # today, so it was correct by luck rather than by construction -- and
+        # "correct by luck" is what the N4 decoy turned into a green suite over
+        # a neutered gate.
+        VALIDATE_TOKEN_STEP="$(printf '%s\n' "$VALIDATE_JOB" | awk '
+            /^      - name: .*crates\.io token/ { instep = 1; print; next }
+            instep && /^      - name: /         { exit }
+            instep                              { print }
+        ' | grep -vE '^[[:space:]]*#')"
+        if [[ -z "$VALIDATE_TOKEN_STEP" ]]; then
+            fail "could not locate release.yml's crates.io token-check STEP" \
+                "The refusal check below scans it, so an empty extraction would" \
+                "pass vacuously. Expected a step whose name mentions 'crates.io token'."
+        elif [[ "$VALIDATE_TOKEN_STEP" != *'exit 1'* ]]; then
+            fail "release.yml's crates.io token check cannot refuse" \
+                "No 'exit 1' in that STEP. A credential check that only warns does" \
+                "not stop the release: it proceeds to the tag, the full build and" \
+                "Gate A, and fails at the publish -- which is the expensive moment" \
+                "this check exists to come before. Note the job has other 'exit 1's;" \
+                "this deliberately does not count them."
+        else
+            pass "release.yml's crates.io token check is present in 'validate' and can refuse"
+        fi
+    fi
+fi
+
+# --- 2c. release.yml must not publish for real -------------------------------
+# The other half of the same invariant, and the one a well-meaning revert would
+# reach for: re-adding `cargo publish -p freenet` to release.yml restores the
+# old upstream-of-the-gate order even with everything above still green,
+# because release.yml runs entirely before the tag that triggers this workflow.
+#
+# `--dry-run` is explicitly allowed and deliberately kept there: it is not
+# irreversible and it catches a packaging break before a tag is burned.
+# (RELEASE_YML is set above, by the credential check.)
+if [[ ! -f "$RELEASE_YML" ]]; then
+    fail "release.yml not found at $RELEASE_YML"
+else
+    # Comment lines dropped for the same reason JOB_BLOCK drops them: this
+    # file's comments discuss the publish at length.
+    REAL_PUBLISH="$(grep -vE '^[[:space:]]*#' "$RELEASE_YML" \
+        | grep -E 'cargo publish' | grep -vE '\-\-dry-run')"
+    if [[ -z "$REAL_PUBLISH" ]]; then
+        pass "release.yml contains no non-dry-run 'cargo publish' (the real one is gated here)"
+    else
+        fail "release.yml runs a real 'cargo publish'" \
+            "$REAL_PUBLISH" \
+            "release.yml runs BEFORE the tag exists, so anything it publishes is" \
+            "upstream of the pre-flight canary. That ordering is what made a Gate A" \
+            "block cost v0.2.124 its version number rather than a re-run. Only" \
+            "'cargo publish --dry-run' belongs there."
+    fi
+fi
+
+# --- 2c-bis. the fail-fast credential check can still FAIL -------------------
+# 2b-ter pins that the check EXISTS and sits before the canary. Neither pins
+# that it can still refuse. `continue-on-error: true` on it, or an `if:` that
+# stops it running, leaves a step that looks like a fail-fast, logs like a
+# fail-fast, and lets the release proceed to discover the missing credential
+# after the tag and the full build -- which is the entire cost this step was
+# added to avoid. Same neutering route assertion 3 closes for the canary; a
+# check that cannot fail is not a check.
+if [[ -n "$TOKEN_CHECK_LINE" ]]; then
+    TOKEN_STEP="$(step_block "$TOKEN_CHECK_LINE")"
+    if [[ -z "$TOKEN_STEP" ]]; then
+        fail "could not extract the CARGO_REGISTRY_TOKEN check STEP around line $TOKEN_CHECK_LINE" \
+            "The checks below scan this text, so an empty extraction passes vacuously."
+    else
+        # Step keys and shell swallows are separate routes to the same
+        # outcome; both are checked, the shell half via the shared helper.
+        TOKEN_KEYS="$(printf '%s\n' "$TOKEN_STEP" \
+            | grep -E '^[0-9]+:        (continue-on-error:|if:)')"
+        TOKEN_SWALLOW="$(status_swallowers "$TOKEN_STEP")"
+        TOKEN_NEUTERED=0
+        [[ -n "$TOKEN_KEYS$TOKEN_SWALLOW" ]] && TOKEN_NEUTERED=1
+        # The step keys are only half of it: the step must still be ABLE to
+        # refuse. Checked FIRST, because it is the mutation that survived.
+        # This assertion previously located the step by its log text
+        # (`CARGO_REGISTRY_TOKEN not set`) and then only scanned for
+        # `continue-on-error:`/`if:`/`|| true`/`set +e` -- so replacing the
+        # step's `exit 1` with `echo "proceeding without it"`, leaving the
+        # `::error title=CARGO_REGISTRY_TOKEN not set::` line the locator greps
+        # untouched, left this file reporting "the fail-fast check is not
+        # disabled in place" about a check that could no longer fail.
+        #
+        # An IDENTITY pin wearing the label of a BEHAVIOUR pin, and the exact
+        # defect already fixed for release.yml's twin in assertion 2b-ter --
+        # fixed there because mutation testing caught it, and left armed at
+        # nothing here because it was not mutated. Enumerate every site of a
+        # shape, including the sites in your own test file.
+        if [[ "$TOKEN_STEP" != *'exit 1'* ]]; then
+            fail "the CARGO_REGISTRY_TOKEN fail-fast check cannot refuse" \
+                "No 'exit 1' in the step. It still logs an ::error:: title, which is" \
+                "what makes this shape dangerous -- the log looks like a blocked" \
+                "release while the job proceeds to the canary and the publish, and" \
+                "fails there instead, after the expensive part this check exists to" \
+                "come before."
+        elif [[ "$TOKEN_NEUTERED" -eq 0 ]]; then
+            pass "the CARGO_REGISTRY_TOKEN fail-fast check can refuse and is not disabled in place"
+        else
+            fail "the CARGO_REGISTRY_TOKEN fail-fast check can no longer fail the job" \
+                "$TOKEN_KEYS$TOKEN_SWALLOW" \
+                "It still runs and still logs, but the job proceeds without the" \
+                "credential -- so the failure lands at the crates.io publish instead," \
+                "after the tag, ~30 minutes of cross-compilation and Gate A. A" \
+                "fail-fast that does not fail saves nothing."
+        fi
+    fi
+fi
+
+# --- 2d. the RECOVERY RUNBOOK routes through the gate, not around it ---------
+# The other route past Gate A, and the one that matters most, because it is the
+# path a HUMAN takes when a release has already gone wrong (#5288).
+# scripts/RELEASE_RECOVERY.md's `gh release create` invocations carried no
+# `--draft`, so anyone following the documented recovery published a release the
+# gate never sees -- and made it `/releases/latest` before any asset existed.
+# Pinning the workflow and leaving the documented manual path ungated protects
+# the machine and not the operator, who is the one acting under time pressure.
+#
+# Two traps this file family has been caught by, both avoided deliberately:
+#
+#   PROSE. The runbook now ARGUES for `--draft` at length, so a naive grep for
+#   `gh release create` matches sentences ABOUT the command and a grep for
+#   `--draft` is satisfied by the paragraph explaining it. Only fenced CODE
+#   BLOCKS are scanned, so what is checked is what an operator would COPY.
+#
+#   VACUITY. Presence alone would pass if every invocation were deleted, so the
+#   COUNT is asserted against a floor: the runbook has two `gh release create`
+#   sites (Step 3, and step 4 of the full-manual section) and both must exist
+#   and both must carry `--draft`. Fewer than two means one was removed rather
+#   than fixed, and this fails rather than reporting success on an empty set.
+#
+# `--draft=false` is deliberately NOT accepted: that is the UN-draft, the thing
+# only the workflow may do after Gate A has passed. Matching it here would let
+# the exact inversion this assertion exists to catch pass as a fix.
+# First the AUTOMATED twin of the same defect, which nothing pinned either.
+# release.yml creates the release with `--draft` and cross-compile.yml un-drafts
+# it after Gate A; drop that one flag and the release is born published, the
+# gate never sees it, and the `release.published` cascade fires before a single
+# binary is attached. Identical consequence to the runbook defect below, in the
+# path that runs on every release rather than only on a bad day -- so it is
+# pinned in the same place, next to its sibling, rather than left to be
+# discovered the same way.
+# (RELEASE_YML is set above, by the credential check.)
+if [[ -f "$RELEASE_YML" ]]; then
+    RY_CREATE="$(grep -vE '^[[:space:]]*#' "$RELEASE_YML" \
+        | tr '\n' '\r' | sed 's/\\\r[[:space:]]*/ /g' | tr '\r' '\n' \
+        | grep -E 'gh release create')"
+    # NOT `| grep -q`: under `pipefail` the producer's SIGPIPE becomes the
+    # pipeline's status, so a needle that IS present can read as ABSENT once the
+    # producer outruns the pipe buffer. auto-update-canary_test.sh audits this
+    # file for exactly that shape. Take the non-matching SET and test it for
+    # emptiness instead, as assertion 2d does below.
+    RY_UNDRAFTED="$(printf '%s\n' "$RY_CREATE" \
+        | grep -vE '(^|[[:space:]])--draft([[:space:]]|$)')"
+    if [[ -z "$RY_CREATE" ]]; then
+        fail "release.yml no longer creates a GitHub release" \
+            "The draft it creates is what cross-compile.yml attaches binaries to," \
+            "gates behind Gate A and un-drafts. Without it there is nothing to gate."
+    elif [[ -n "$RY_UNDRAFTED" ]]; then
+        fail "release.yml creates the GitHub release WITHOUT --draft" \
+            "$(printf '%s\n' "$RY_UNDRAFTED")" \
+            "A release created published is a release Gate A never sees: it becomes" \
+            "/releases/latest before any binary is attached, the downstream" \
+            "release.published cascade fires immediately, and the crates.io publish" \
+            "that lives behind the gate never runs. The whole pipeline order depends" \
+            "on this one flag."
+    else
+        pass "release.yml creates the GitHub release with --draft"
+    fi
+fi
+
+# Every operator-facing doc that documents creating the release, not just the
+# runbook. RELEASING.md's manual-tag section carries its own `gh release create`
+# and was correct but UNPINNED -- the same "one site of the shape covered, its
+# sibling left armed at nothing" gap as the credential assertions above. A
+# reader fixing the runbook has no reason to look in RELEASING.md, and the flag
+# matters identically in both.
+#
+# Each doc declares its own expected count, so deleting invocations fails rather
+# than passing on a smaller set.
+#   scripts/RELEASE_RECOVERY.md : Step 3, and the full-manual section       -> 2
+#   docs/RELEASING.md           : the "tag by hand" recovery section        -> 1
+draft_docs=(
+    "$SCRIPT_DIR/RELEASE_RECOVERY.md:2"
+    "$SCRIPT_DIR/../docs/RELEASING.md:1"
+)
+
+for spec in "${draft_docs[@]}"; do
+    doc="${spec%:*}"
+    want="${spec##*:}"
+    label="$(basename "$doc")"
+
+    if [[ ! -f "$doc" ]]; then
+        fail "$doc not found" \
+            "It documents creating the release by hand; without it this" \
+            "assertion checks nothing."
+        continue
+    fi
+
+    # ANCHORED at the start of the logical command (`^gh release create`), so a
+    # pipeline DIAGRAM line inside a fence is not counted as an invocation --
+    # RELEASING.md has `└─→ gh release create --draft (release exists but
+    # draft)` in its flow diagram. This matters for the FLOOR rather than for
+    # the flag: counting the diagram would let someone delete the one real
+    # invocation and still satisfy a floor of 1, which is exactly the vacuity
+    # the floor exists to prevent.
+    #
+    # Logical commands from fenced code blocks only, with `\` continuations
+    # joined so a multi-line invocation is judged as ONE command -- the runbook's
+    # Step 3 spreads its flags over four lines, and per-LINE matching would
+    # report its `--draft` missing purely for being on a different line from the
+    # verb. Fencing also keeps PROSE out: both docs now argue for `--draft` at
+    # length, so a whole-file grep would match sentences ABOUT the command and be
+    # satisfied by the paragraph explaining it.
+    logical="$(awk '
+        /^```/          { infence = !infence; next }
+        !infence        { next }
+        {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            # Drop comment lines outright. The `^gh release create` anchor on
+            # the FLOOR already excludes them, but the floor must not rest on
+            # that anchor alone -- an operator does not copy a comment, and a
+            # commented-out invocation inflating the floor is exactly the
+            # mutation that got through once.
+            if (line ~ /^#/) next
+            acc = acc (acc == "" ? "" : " ") line
+            if (line ~ /\\$/) { sub(/[[:space:]]*\\$/, "", acc); next }
+            print acc
+            acc = ""
+        }
+        END { if (acc != "") print acc }
+    ' "$doc")"
+
+    # TWO matchers over the same logical commands, and they are deliberately
+    # different strengths. Conflating them cost a real hole:
+    #
+    #   FLOOR  -- anchored (`^gh release create`). Counts only line-initial
+    #             invocations, so a pipeline DIAGRAM line inside a fence
+    #             (`└─→ gh release create --draft ...` in RELEASING.md) cannot
+    #             satisfy the floor on its own. Without the anchor, deleting the
+    #             one real invocation still meets a floor of 1.
+    #
+    #   FLAG   -- UNANCHORED (word-boundary only). Every invocation an operator
+    #             could copy must carry `--draft`, wherever the verb sits on the
+    #             line.
+    #
+    # An earlier revision anchored BOTH, to close the diagram-line hole, and in
+    # doing so blinded the FLAG check to any invocation that is not line-initial:
+    # `GH_TOKEN="$PAT" gh release create ...` with no `--draft` passed the whole
+    # suite, which reported "all 2 invocations pass --draft" while silent about
+    # the third it could not see. That is #5288 reintroduced by the fix for a
+    # different hole in the same assertion. Evading prefixes are anything before
+    # the verb on the joined line: an env assignment, `sudo `, `&& `, a `$`
+    # prompt. Leading whitespace is already stripped by the awk, and a `#`
+    # comment correctly matches neither.
+    #
+    # GENERAL LESSON, worth more than this instance: tightening a matcher is a
+    # behaviour change to EVERY input, not just the one that motivated it. When
+    # you narrow a pattern, mutation-test both directions -- what you newly
+    # catch, and what you could already catch.
+    creates_anchored="$(printf '%s\n' "$logical" | grep -E '^gh release create')"
+    creates_any="$(printf '%s\n' "$logical" | grep -E '(^|[[:space:]]|;|&&|\|\|)gh release create')"
+
+    if [[ -z "$creates_anchored" ]]; then
+        total=0
+    else
+        total="$(printf '%s\n' "$creates_anchored" | wc -l | tr -d ' ')"
+    fi
+    # `--draft` as its own flag: `--draft=false` must NOT satisfy it. That is
+    # the un-draft, the thing only the workflow may do once Gate A has passed,
+    # and accepting it here would let the exact inversion this assertion exists
+    # to catch pass as a fix.
+    undrafted="$(printf '%s\n' "$creates_any" \
+        | grep -vE '(^|[[:space:]])--draft([[:space:]]|$)')"
+
+    if [[ "$total" -lt "$want" ]]; then
+        fail "$label has $total 'gh release create' invocation(s) in code blocks, expected at least $want" \
+            "A lower count means an invocation was deleted rather than gated -- and" \
+            "with none left this assertion would otherwise report success having" \
+            "checked nothing."
+    elif [[ -z "$undrafted" ]]; then
+        pass "all $total 'gh release create' invocations in $label pass --draft"
+    else
+        fail "$label documents creating a release WITHOUT --draft" \
+            "$(printf '%s\n' "$undrafted")" \
+            "An operator following this creates a PUBLISHED release: Gate A never" \
+            "sees it, the crates.io publish that lives behind the gate never runs," \
+            "and it becomes /releases/latest before any binary is attached. That is" \
+            "#5288 -- the documented procedure being the way around the gate. The" \
+            "workflow creates its release with --draft for exactly this reason; the" \
+            "manual paths must match it."
+    fi
+done
+
+# --- shared: LOGICAL LINES ---------------------------------------------------
+# `NNN:text` per logical shell/YAML command, with `\` continuations joined and
+# UNQUOTED trailing comments stripped. Both scanners below use it, because both
+# were defeated by the same two tricks:
+#
+#   * a `\`-continued invocation, so a per-line matcher saw only a fragment
+#     (`cargo \` on one line, `publish` on the next);
+#   * a trailing code comment, so `cargo publish -p freenet  # not a --dry-run`
+#     satisfied a `--dry-run` exclusion, and
+#     `gh release create ...  # dropped --draft here` satisfied a `--draft`
+#     check. Only LEADING `#` lines were being dropped.
+#
+# That second one is one root cause wearing two costumes: "the string appears
+# somewhere on the line" was being read as "the flag is in effect". Stripping
+# comments at the point of extraction fixes both, once.
+#
+# The strip is QUOTE-AWARE -- it cuts at the first `#` that is unquoted and at a
+# word boundary -- so a legitimate `--notes "fixes #5288"` is not truncated. A
+# naive cut would silently shorten real commands and make the scanners miss what
+# came after.
+logical_lines() {
+    awk '
+        function strip_comment(str,   i, c, q, out) {
+            q = ""
+            out = ""
+            for (i = 1; i <= length(str); i++) {
+                c = substr(str, i, 1)
+                if (q == "") {
+                    if (c == "\"" || c == "'"'"'") { q = c }
+                    else if (c == "#" && (i == 1 || substr(str, i - 1, 1) ~ /[[:space:]]/)) { break }
+                } else if (c == q) { q = "" }
+                out = out c
+            }
+            return out
+        }
+        {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            if (acc == "") startln = NR
+            acc = acc (acc == "" ? "" : " ") line
+            if (line ~ /\\$/) { sub(/[[:space:]]*\\$/, "", acc); next }
+            out = strip_comment(acc)
+            sub(/[[:space:]]+$/, "", out)
+            if (out != "") print startln ":" out
+            acc = ""
+        }
+        END {
+            if (acc != "") {
+                out = strip_comment(acc)
+                sub(/[[:space:]]+$/, "", out)
+                if (out != "") print startln ":" out
+            }
+        }
+    ' "$1"
+}
+
+# A real `cargo publish`, tolerant of everything cargo accepts between the two
+# words. `cargo[[:space:]]+publish` demanded adjacency, so `cargo +stable
+# publish` -- and equally `cargo -q publish`, `cargo --offline publish` --
+# walked straight past a scan whose own comment claimed to forbid exactly that
+# step.
+# `^[0-9]+:` because logical_lines emits `NNN:text` -- a bare `^` or
+# `[[:space:]]` boundary never matches a command at the start of its line,
+# since the character before `cargo` is the prefix colon. Caught by the
+# assertion going to zero on a clean tree rather than by review.
+# The leading boundary is "any character that cannot be part of a command word"
+# rather than whitespace. Whitespace alone missed `echo "$(cargo publish ...)"`,
+# where the character before `cargo` is `(` -- a command substitution smuggling a
+# real publish past the scan. Excluding alnum/_/./- still refuses to match
+# `mycargo publish`.
+CARGO_PUBLISH_RE='(^[0-9]+:|[^[:alnum:]_./-])cargo([[:space:]]+[-+][^[:space:]]+)*[[:space:]]+publish([[:space:]]|$)'
+
+# Prose mentions inside an echo are not invocations -- ci.yml documents the
+# publish in one, and release.sh prints guidance quoting it. Narrow on purpose:
+# no command separator AND no substitution between the `echo` and the words, so
+# `echo hi; cargo publish` and `echo "$(cargo publish -p freenet)"` both remain
+# visible. The substitution case is not theoretical; it was used to smuggle a
+# real publish past the previous filter.
+ECHO_PROSE_RE='echo[^;|&$`]*cargo([[:space:]]+[-+][^[:space:]]+)*[[:space:]]+publish'
+
+# real_publishes <file> -- `NNN:text` for every non-dry-run cargo publish.
+real_publishes() {
+    logical_lines "$1" \
+        | grep -E "$CARGO_PUBLISH_RE" \
+        | grep -vE -- '--dry-run' \
+        | grep -vE "$ECHO_PROSE_RE"
+}
+
+# --- 2c-ter. the ONLY real `cargo publish` anywhere is the gated one --------
+# The whole-invariant check, and the one whose absence made every assertion
+# above locally true and globally meaningless.
+#
+# This PR's stated invariant is "nothing irreversible may precede the blocking
+# gate". Assertions 2b/2c enforce that in exactly one file and one job, so a
+# `Push crates early` step added to `build-macos-dmg` -- an ordinary job that
+# `attach-to-release` merely `needs:`, hence strictly earlier -- publishes both
+# crates before Gate A with every assertion still true. Six lines reproduce the
+# v0.2.124 loss in the file this suite claims to protect.
+#
+# So the rule is global: across the entire workflow set, every real
+# (non-`--dry-run`) `cargo publish` must fall INSIDE the gated step's line
+# range. Dry runs are whitelisted wherever they appear -- they upload nothing.
+if [[ -n "$PUBLISH_CRATES_LINE" && -n "$PUBLISH_CRATES_STEP" ]]; then
+    PC_FIRST="$(printf '%s\n' "$PUBLISH_CRATES_STEP" | head -1 | cut -d: -f1)"
+    PC_LAST="$(printf '%s\n' "$PUBLISH_CRATES_STEP" | tail -1 | cut -d: -f1)"
+    WF_DIR="$SCRIPT_DIR/../.github/workflows"
+    WF_BASE="$(basename "$WF")"
+
+    rogue_publishes=""
+    gated_publishes=0
+    scanned_files=0
+
+    for _wf in "$WF_DIR"/*.yml "$WF_DIR"/*.yaml; do
+        [[ -f "$_wf" ]] || continue
+        scanned_files=$((scanned_files + 1))
+        _base="$(basename "$_wf")"
+        while IFS= read -r _hit; do
+            [[ -z "$_hit" ]] && continue
+            _ln="${_hit%%:*}"
+            if [[ "$_base" == "$WF_BASE" && "$_ln" -ge "$PC_FIRST" && "$_ln" -le "$PC_LAST" ]]; then
+                gated_publishes=$((gated_publishes + 1))
+            else
+                rogue_publishes+="$_base:$_hit"$'\n'
+            fi
+        done < <(real_publishes "$_wf")
+    done
+
+    if [[ "$scanned_files" -eq 0 ]]; then
+        fail "found no workflow files to scan for stray 'cargo publish'" \
+            "Every check below would pass having examined nothing."
+    elif [[ -n "$rogue_publishes" ]]; then
+        fail "a real 'cargo publish' exists OUTSIDE the gated step" \
+            "$(printf '%s' "$rogue_publishes")" \
+            "The gated step (lines $PC_FIRST-$PC_LAST of $WF_BASE) is the only place a" \
+            "release may upload to crates.io, because it is the only place that runs" \
+            "AFTER Gate A. A publish anywhere else -- including in a job that" \
+            "attach-to-release merely 'needs:' -- happens BEFORE the gate, which is" \
+            "precisely the ordering that cost v0.2.124 its version number."
+    elif [[ "$gated_publishes" -lt 2 ]]; then
+        fail "only $gated_publishes real 'cargo publish' invocation(s) inside the gated step, expected 2" \
+            "The step publishes freenet and fdev. Fewer means one was removed or" \
+            "turned into a dry run -- and with none left, the 'no rogue publishes'" \
+            "check above would report success having found nothing to compare." \
+            "(Scanned $scanned_files workflow file(s).)"
+    else
+        pass "the only real 'cargo publish' in $scanned_files workflow file(s) is the gated one ($gated_publishes invocations, lines $PC_FIRST-$PC_LAST)"
+    fi
+fi
+
+# --- 2c-quater. no shell script publishes outside publish_crates() ----------
+# The same question for the scripts, RECURSIVELY. The previous form globbed
+# `"$SCRIPT_DIR"/*.sh`, which is not recursive, so `scripts/release-agent/` --
+# a real release-path directory that CI already runs tests from -- was invisible
+# to it. Wrong file set, same class as the workflow scan being job-scoped.
+#
+# release.sh legitimately CAN publish: it is the fallback for when the workflow
+# path is broken. But only from `publish_crates()`, which the driver calls after
+# `wait_for_binaries`, i.e. after the gate. Every other script: never.
+#
+# `*_test.sh` is excluded because test files stub and log `cargo publish` by
+# design, and because this file's own text would otherwise match itself.
+SH_ROGUE=""
+SH_GATED=0
+SH_SCANNED=0
+PUBLISH_FN_START=""
+PUBLISH_FN_END=""
+if [[ -f "$RELEASE_SH" ]]; then
+    PUBLISH_FN_START="$(grep -nE '^publish_crates\(\) \{' "$RELEASE_SH" | head -1 | cut -d: -f1)"
+    if [[ -n "$PUBLISH_FN_START" ]]; then
+        PUBLISH_FN_END="$(awk -v s="$PUBLISH_FN_START" 'NR > s && /^}/ { print NR; exit }' "$RELEASE_SH")"
+        [[ -z "$PUBLISH_FN_END" ]] && PUBLISH_FN_END=999999
+    fi
+fi
+
+while IFS= read -r _sh; do
+    [[ -f "$_sh" ]] || continue
+    case "$(basename "$_sh")" in *_test.sh) continue ;; esac
+    SH_SCANNED=$((SH_SCANNED + 1))
+    _base="$(basename "$_sh")"
+    while IFS= read -r _hit; do
+        [[ -z "$_hit" ]] && continue
+        _ln="${_hit%%:*}"
+        if [[ "$_sh" == "$RELEASE_SH" && -n "$PUBLISH_FN_START" \
+              && "$_ln" -ge "$PUBLISH_FN_START" && "$_ln" -le "$PUBLISH_FN_END" ]]; then
+            SH_GATED=$((SH_GATED + 1))
+        else
+            SH_ROGUE+="$_base:$_hit"$'\n'
+        fi
+    done < <(real_publishes "$_sh")
+done < <(find "$SCRIPT_DIR" -name '*.sh' -type f | sort)
+
+if [[ "$SH_SCANNED" -eq 0 ]]; then
+    fail "found no shell scripts to scan for stray 'cargo publish'" \
+        "The checks below would pass having examined nothing."
+elif [[ -z "$PUBLISH_FN_START" ]]; then
+    fail "release.sh has no publish_crates() function" \
+        "The containment check has nothing to contain."
+elif [[ -n "$SH_ROGUE" ]]; then
+    fail "a shell script runs a real 'cargo publish' outside publish_crates()" \
+        "$(printf '%s' "$SH_ROGUE")" \
+        "publish_crates() is called after wait_for_binaries, i.e. after the gate." \
+        "A publish anywhere else -- another function, another script, a helper in" \
+        "scripts/release-agent/ -- runs at whatever point that code is reached," \
+        "with nothing between it and the tag."
+elif [[ "$SH_GATED" -lt 2 ]]; then
+    fail "release.sh's publish_crates() has $SH_GATED real 'cargo publish' invocation(s), expected 2" \
+        "It is the manual backstop for freenet and fdev. With none, the check" \
+        "above would report success having found nothing." \
+        "(Scanned $SH_SCANNED shell script(s).)"
+else
+    pass "across $SH_SCANNED shell script(s), real 'cargo publish' occurs only in publish_crates() ($SH_GATED)"
+fi
+
+# --- 2e. EVERY executable site that creates a release passes --draft --------
+# The `--draft` invariant enumerated over CODE, not over the sites it was first
+# written for. It was pinned in release.yml and the two markdown runbooks and
+# missed `scripts/release.sh` -- the one that runs on EVERY NORMAL RELEASE
+# rather than only on a bad day.
+#
+# Uses the same `logical_lines`, so a `\`-continued invocation is judged whole
+# and a trailing `# dropped --draft here` comment cannot satisfy the flag check.
+# The file set is RECURSIVE for the same reason as 2c-quater.
+#
+# Docs are covered by assertion 2d, which needs fence extraction; this needs
+# none. `*_test.sh` is excluded: this file contains `gh release create` in its
+# own greps and failure text, and a scan matching its own source is the
+# self-satisfying shape this suite exists to remove.
+CODE_CREATE_SITES=()
+for _f in "$SCRIPT_DIR"/../.github/workflows/*.yml "$SCRIPT_DIR"/../.github/workflows/*.yaml; do
+    [[ -f "$_f" ]] && CODE_CREATE_SITES+=("$_f")
+done
+while IFS= read -r _f; do
+    [[ -f "$_f" ]] || continue
+    case "$(basename "$_f")" in *_test.sh) continue ;; esac
+    CODE_CREATE_SITES+=("$_f")
+done < <(find "$SCRIPT_DIR" -name '*.sh' -type f | sort)
+
+code_creates_total=0
+code_creates_undrafted=""
+for _f in "${CODE_CREATE_SITES[@]}"; do
+    _base="$(basename "$_f")"
+    while IFS= read -r _hit; do
+        [[ -z "$_hit" ]] && continue
+        code_creates_total=$((code_creates_total + 1))
+        # Shell punctuation normalised so `--draft"` and `--draft)` count, while
+        # `=` is left alone so `--draft=false` -- the UN-draft -- still fails.
+        _flags=" $(printf '%s' "${_hit#*:}" | tr '"'"'"'"()' '    ') "
+        case "$_flags" in
+            *" --draft "*) ;;
+            *) code_creates_undrafted+="$_base:$_hit"$'\n' ;;
+        esac
+    done < <(logical_lines "$_f" | grep -E 'gh release create')
+done
+code_creates_undrafted="$(printf '%s' "$code_creates_undrafted" | grep -vE '^[[:space:]]*$' || true)"
+
+if [[ "$code_creates_total" -lt 2 ]]; then
+    fail "only $code_creates_total 'gh release create' invocation(s) found in workflows + scripts, expected at least 2" \
+        "release.yml creates the draft on the automated path and release.sh creates" \
+        "it on the manual one. Fewer means one was removed -- and with none, the" \
+        "--draft check below would report success having examined nothing."
+elif [[ -z "$code_creates_undrafted" ]]; then
+    pass "all $code_creates_total 'gh release create' invocations in workflows + scripts pass --draft"
+else
+    fail "an executable path creates a GitHub release WITHOUT --draft" \
+        "$(printf '%s' "$code_creates_undrafted")" \
+        "A release created published is a release Gate A never sees: it becomes" \
+        "/releases/latest before any binary is attached, the release.published" \
+        "cascade fires immediately, and the gated crates.io publish never runs." \
+        "This is #5288 in code rather than in documentation, and release.sh's copy" \
+        "runs on every normal release, not only during a recovery."
+fi
+
+# --- 2f. release.sh publishes AFTER the gate, not before --------------------
+# The second invariant, enumerated over the human path.
+#
+# `scripts/release.sh` holds its own copy of the ordering this whole PR is
+# about, and moving its `publish_crates` call back above `create_github_release`
+# reproduces the v0.2.124 loss on the manual path with every suite green. The
+# line directly above that call says "Moving it back up is what cost v0.2.124
+# its version number" -- a comment asserting the invariant, with nothing
+# enforcing it. A comment is not a gate.
+#
+# The tag push that triggers cross-compile.yml (and therefore Gate A) happens
+# inside `create_github_release`, and `wait_for_binaries` is what blocks until
+# that workflow has run. So `publish_crates` must come after BOTH: after the
+# first because otherwise it publishes before the gate exists, and after the
+# second because otherwise it publishes while the gate is still running.
+#
+# Matched on bare top-level calls (`^name$`), which is how release.sh's main
+# flow invokes them -- definitions are `name() {` and so cannot collide.
+if [[ -f "$RELEASE_SH" ]]; then
+    # Matches the call in any of the forms the main flow uses -- bare on its own
+    # line, or inside an `if !` / `||` guard.
+    #
+    # It was `^name$` only, which broke the moment `wait_for_binaries` was
+    # correctly guarded: the ordering pin reported "could not locate" on a
+    # CORRECT change. That direction is the tolerable one (it failed closed
+    # rather than passing vacuously), but it is worth noticing WHY it happened.
+    #
+    # This assertion compares LINE NUMBERS. It cannot express whether a call is
+    # reachable, and it demonstrated exactly that: throughout the period
+    # `publish_crates` was unreachable under `set -e`, this pin was green,
+    # because the line numbers were in the right order the whole time. The
+    # guarantee is the reachability case in release_driver_test.sh, which stubs
+    # `wait_for_binaries` to fail and asserts `publish_crates` still runs.
+    #
+    # This is kept as cheap, specific, fast-failing signal about textual
+    # position -- not as the ordering guarantee. Do not re-read it as one.
+    _line_of_call() {
+        grep -nE "(^$1\$|^if ! $1;|^$1 \|\||^[[:space:]]+$1\$)" "$RELEASE_SH" \
+            | head -1 | cut -d: -f1
+    }
+    # AMBIGUITY MUST FAIL LOUDLY, not resolve to whichever call comes first.
+    #
+    # Widening `_line_of_call` from `^name$` to also match an indented call was
+    # necessary once `wait_for_binaries` moved inside a guard -- but it also made
+    # `publish_crates` resolvable to a call nested in that guard. While the
+    # fallback still called it, `head -1` took the nested one, and deleting the
+    # real main-flow call left this pin GREEN while reporting the fallback's line
+    # number as though it were the ordered publish. A reader checking the message
+    # would have been misled by a number that was confidently wrong.
+    #
+    # The design change removed that particular collision -- the fallback no
+    # longer publishes, so there is exactly one call again -- but the widened
+    # regex remains, so the collision is one edit away from returning. Counting
+    # is the fix: more than one call site and this refuses to report an ordering
+    # at all, rather than silently picking one.
+    RS_PUBLISH_COUNT="$(grep -cE '^[[:space:]]*publish_crates[[:space:]]*$' "$RELEASE_SH")"
+    if [[ "$RS_PUBLISH_COUNT" -ne 1 ]]; then
+        fail "release.sh has $RS_PUBLISH_COUNT 'publish_crates' call sites, expected exactly 1" \
+            "This assertion reports a LINE NUMBER for 'the publish', and with more" \
+            "than one call it would report whichever comes first -- which is how a" \
+            "deleted main-flow call once left this pin green while naming a nested" \
+            "call's line as the ordered publish. If a second call site is genuinely" \
+            "wanted, decide here which one this ordering is about." \
+            "$(grep -nE '^[[:space:]]*publish_crates[[:space:]]*$' "$RELEASE_SH")"
+    fi
+    RS_PUBLISH="$(_line_of_call publish_crates)"
+    RS_CREATE="$(_line_of_call create_github_release)"
+    RS_WAIT="$(_line_of_call wait_for_binaries)"
+
+    if [[ -z "$RS_PUBLISH" || -z "$RS_CREATE" || -z "$RS_WAIT" ]]; then
+        fail "could not locate release.sh's main-flow calls" \
+            "publish_crates=${RS_PUBLISH:-<none>} create_github_release=${RS_CREATE:-<none>} wait_for_binaries=${RS_WAIT:-<none>}" \
+            "The ordering assertions below compare these line numbers, so a missing" \
+            "one would make them pass vacuously. If the driver was restructured," \
+            "re-establish the ordering guarantee here rather than deleting this."
+    else
+        _rs_bad=""
+        [[ "$RS_PUBLISH" -lt "$RS_CREATE" ]] && \
+            _rs_bad+="publish_crates ($RS_PUBLISH) runs BEFORE create_github_release ($RS_CREATE)"$'\n'
+        [[ "$RS_PUBLISH" -lt "$RS_WAIT" ]] && \
+            _rs_bad+="publish_crates ($RS_PUBLISH) runs BEFORE wait_for_binaries ($RS_WAIT)"$'\n'
+        if [[ -z "$_rs_bad" ]]; then
+            pass "release.sh publishes after the tag and the gate (create $RS_CREATE < wait $RS_WAIT < publish $RS_PUBLISH)"
+        else
+            fail "release.sh's crates.io publish runs BEFORE the gate" \
+                "$(printf '%s' "$_rs_bad")" \
+                "create_github_release pushes the tag that triggers cross-compile.yml," \
+                "and wait_for_binaries blocks until that workflow -- including Gate A --" \
+                "has run. A publish above either one uploads to crates.io before the" \
+                "gate can block, which is exactly the ordering that cost v0.2.124 its" \
+                "version number. This is the same invariant the workflow assertions" \
+                "above enforce, on the path a human drives."
+        fi
+    fi
+fi
+
+# --- 2h. CRITICAL STEPS: unique name, fixed conditionality, no shell override
+#
+# ONE table for every step this suite reasons about, because fixing this class
+# at one site and not sweeping the siblings has now happened three times.
+#
+# THE ATTACK. Insert a DUPLICATE step with the same `- name:` above the real
+# one, carrying a pristine script, guarded by an `if:` that is never true on a
+# tag push (`github.event_name == 'schedule'`). Then neuter the REAL step.
+# `extract_step_run` takes the first exact name match and `line_of` the first
+# occurrence of the invocation, so every assertion -- including the behavioural
+# harness in 2g -- reads the DECOY while the shipping step goes unexamined.
+# Measured: 54 ok / 0 FAIL with Gate A fully neutered. `if: false` was caught
+# only because assertion 3 matched that literal string; ANY other conditional
+# walked through.
+#
+# The publish step already had a name-count and a run-block consistency check
+# for exactly this reason. The two GATE steps did not. Hence a table rather
+# than a fourth point fix: adding a step here is one line, and forgetting to is
+# the failure mode.
+#
+# Note that duplicate step names are LEGITIMATE across different jobs in this
+# workflow (`Install Rust`, `Upload freenet binary`), so this deliberately does
+# not forbid duplicates in general -- only for the steps whose identity a
+# security assertion depends on.
+#
+# `if-policy`:
+#   none        -- the step must carry NO `if:` at all. Steps run only when
+#                  every earlier step succeeded, and that DEFAULT is the gating
+#                  mechanism; any `if:` can override it. Deliberately stricter
+#                  than "no always()": whether an arbitrary expression can
+#                  evaluate true after a failure is not a judgement for a grep.
+#   exact:<expr> -- the step's `if:` must equal <expr> exactly.
+CRITICAL_STEPS=(
+    # The two checkout steps are here because assertions in this file READ them:
+    # 2g-bis takes `path:` from the canary checkout to compare against Gate A's
+    # invocation, and the publish step's `working-directory: _src` depends on
+    # the source checkout. Found by enumerating every step this suite extracts
+    # rather than by adding the two that were named in a review -- that
+    # fix-the-named-site-only habit is what produced this class three times.
+    "attach-to-release|Check out the release source|none"
+    "attach-to-release|Check out the canary script|none"
+    "attach-to-release|Check the crates.io credential is present|none"
+    "attach-to-release|Upload binaries to release|none"
+    "attach-to-release|Auto-update pre-flight canary (blocks publish)|none"
+    "attach-to-release|Publish crates to crates.io|exact:\${{ success() && startsWith(github.ref, 'refs/tags/v') }}"
+    "attach-to-release|Publish release|none"
+    "auto-update-selfupdate-canary|Previous release self-updates to this release|none"
+)
+
+# --- 2h-pre. the table is DERIVED-CHECKED, not merely declared -------------
+#
+# THE GAP THIS CLOSES, which is the table's own version of the orphan test.
+# `CRITICAL_STEPS` is a hand-written list. Add a step that this suite extracts
+# -- or convert an existing check to extract one -- and forget to list it here,
+# and that step silently has no uniqueness, conditionality or shell-override
+# protection while every suite stays green. Present, plausible, covered by
+# nothing, with the listing looking complete.
+#
+# So the set is DERIVED from this file's own source and compared against the
+# table. The enumeration was done by hand once (which is how
+# `Check out the canary script` was found); doing it mechanically is what stops
+# the next one being missed.
+#
+# Three extraction mechanisms are scraped, because those are the three this
+# file uses to reach a step:
+#   * `extract_step_run <job> '<name>'`   -- names the step directly
+#   * `GATE_A_STEP=` / `GATE_B_STEP=`     -- names passed through a variable
+#   * `line_of '<pattern>'`               -- finds a LINE, which is then handed
+#                                            to `step_block`; the enclosing
+#                                            step's name is resolved here
+#
+# DELIBERATELY OUT OF SCOPE, stated so the omission is a decision: the notify
+# job's steps, which `step_containing` locates by `id:`. A duplicate `id:`
+# within a job is a workflow syntax error, so the decoy attack is structurally
+# impossible there, and their conditions are already pinned exactly by 6b.
+_self="${BASH_SOURCE[0]}"
+declare -a _derived=()
+
+# (1) explicit `extract_step_run <literal job> '<literal name>'`
+while IFS= read -r _m; do
+    [[ -z "$_m" ]] && continue
+    _dj="$(printf '%s' "$_m" | sed -E "s/^extract_step_run ([A-Za-z0-9_-]+) '.*'$/\1/")"
+    _dn="$(printf '%s' "$_m" | sed -E "s/^extract_step_run [A-Za-z0-9_-]+ '(.*)'$/\1/")"
+    [[ -n "$_dn" ]] && _derived+=("$_dj|$_dn")
+done < <(grep -oE "extract_step_run [A-Za-z0-9_-]+ '[^']+'" "$_self")
+
+# (2) step names carried through the GATE_*_STEP variables
+for _v in "GATE_A_STEP|attach-to-release" "GATE_B_STEP|auto-update-selfupdate-canary"; do
+    _vn="${_v%%|*}"; _vj="${_v#*|}"
+    _dn="$(grep -oE "^${_vn}='[^']+'" "$_self" | head -1 | sed -E "s/^${_vn}='(.*)'$/\1/")"
+    [[ -n "$_dn" ]] && _derived+=("$_vj|$_dn")
+done
+
+# (3) `line_of '<pattern>'` -- resolve the pattern to its enclosing step name.
+#     `line_of` is scoped to $JOB_BLOCK, so every hit is in attach-to-release.
+while IFS= read -r _m; do
+    _pat="$(printf '%s' "$_m" | sed -E "s/^line_of '(.*)'$/\1/")"
+    [[ -z "$_pat" ]] && continue
+    # The scrape matches its OWN source -- the literal `line_of '[^']+'` in the
+    # grep above yields the fragment `[^`, and sed expressions elsewhere yield
+    # `(.*)` and `<pattern>`. Those are dropped later by the validate-against-
+    # real-step-names step, so they never caused a false failure, but `[^` is
+    # not a valid regex and grep was writing "Invalid regular expression" to
+    # stderr on every run. Stray errors on a passing suite are how a real one
+    # gets overlooked, so unusable patterns are skipped here rather than left to
+    # complain.
+    printf 'x\n' | grep -E "$_pat" >/dev/null 2>&1
+    [[ "$?" -gt 1 ]] && continue
+    _l="$(printf '%s\n' "$JOB_BLOCK" | grep -E "$_pat" 2>/dev/null | head -1 | cut -d: -f1)"
+    [[ -z "$_l" ]] && continue
+    _first="$(step_block "$_l" | head -1)"
+    # Only when the enclosing block really starts at a `- name:` line. A
+    # pattern that resolves to the job header (or to a line with no enclosing
+    # step) otherwise yields a junk "name" and this check reports a gap that is
+    # an artifact of its own scrape -- which is how a derived check loses its
+    # credibility and gets deleted.
+    # Extract-and-require-non-empty rather than a `=~` pre-test. A bash regex
+    # with backslash-escaped spaces is fragile enough that it silently matched
+    # NOTHING here, so `line_of`-located steps were never derived at all and
+    # this check quietly covered only half the surface it claims. Mutation
+    # found it: adding a `line_of` for an untabled step stayed green.
+    _sn="$(printf '%s' "$_first" | sed -nE 's/^[0-9]+:      - name: (.*)$/\1/p')"
+    [[ -n "$_sn" ]] && _derived+=("attach-to-release|$_sn")
+done < <(grep -oE "line_of '[^']+'" "$_self")
+
+# (4) literal `- name: X` strings used as locators (the checkout steps)
+while IFS= read -r _m; do
+    _sn="$(printf '%s' "$_m" | sed -E 's/^"- name: (.*)"$/\1/')"
+    [[ -n "$_sn" ]] && _derived+=("attach-to-release|$_sn")
+done < <(grep -oE '"- name: [^"]+"' "$_self")
+
+# Every candidate must be a REAL step name in the workflow. This is what makes
+# the scrape trustworthy: regex fragments and sed expressions picked up from
+# this file's own source (`(.*)`, `[^`, `$_cname`) are not step names, and
+# reporting them as uncovered steps would be noise that trains the next reader
+# to ignore this assertion.
+_validated=()
+for _d in "${_derived[@]}"; do
+    _dn="${_d#*|}"
+    [[ "$(grep -cxF "      - name: $_dn" "$WF")" -gt 0 ]] && _validated+=("$_d")
+done
+_derived=("${_validated[@]}")
+
+_missing=""
+for _d in "${_derived[@]}"; do
+    _found=0
+    for _spec in "${CRITICAL_STEPS[@]}"; do
+        [[ "${_spec%|*}" == "$_d" ]] && _found=1 && break
+    done
+    [[ "$_found" -eq 0 ]] && [[ "$_missing" != *"$_d"* ]] && _missing+="  $_d"$'\n'
+done
+
+if [[ ${#_derived[@]} -eq 0 ]]; then
+    fail "derived NO extracted steps from this file's own source" \
+        "The scrape found nothing, so the comparison below cannot fail and the" \
+        "table is unchecked. Either the extraction helpers were renamed or the" \
+        "scrape patterns are stale -- fix the scrape, do not delete this."
+elif [[ -n "$_missing" ]]; then
+    fail "a step is EXTRACTED by this suite but missing from CRITICAL_STEPS" \
+        "$(printf '%s' "$_missing")" \
+        "Any step this file locates can be shadowed by a duplicate-name decoy," \
+        "so it needs the uniqueness, conditionality and shell-override checks the" \
+        "table applies. Add it to CRITICAL_STEPS with its if-policy ('none', or" \
+        "'exact:<expr>'). This check exists because the table is hand-written and" \
+        "a step added without listing it would be protected by nothing while every" \
+        "suite stayed green -- the orphan-test shape, one level up."
+else
+    pass "every step this suite extracts (${#_derived[@]} references) is covered by CRITICAL_STEPS"
+fi
+
+for _spec in "${CRITICAL_STEPS[@]}"; do
+    _cjob="${_spec%%|*}"
+    _rest="${_spec#*|}"
+    _cname="${_rest%%|*}"
+    _cpol="${_rest##*|}"
+
+    # (1) UNIQUE NAME. This is what kills the decoy.
+    _count="$(grep -cxF "      - name: $_cname" "$WF")"
+    if [[ "$_count" -ne 1 ]]; then
+        fail "the critical step name '$_cname' occurs $_count time(s) in $WF_BASENAME, expected exactly 1" \
+            "Every locator in this file takes the FIRST match, so a duplicate lets a" \
+            "decoy carrying a pristine script satisfy the assertions while the step" \
+            "that actually ships is never examined -- including the behavioural" \
+            "harness. A count of 0 means the step was renamed and this suite is now" \
+            "reasoning about a step that does not exist."
+        continue
+    fi
+
+    _cblock="$(yaml_job_block "$_cjob" --numbered)"
+    # `--` because the pattern begins with `-`; without it grep parses it as
+    # options and silently matches nothing.
+    _cline="$(printf '%s\n' "$_cblock" | grep -F -- "- name: $_cname" | head -1 | cut -d: -f1)"
+    if [[ -z "$_cline" ]]; then
+        fail "critical step '$_cname' is not in job '$_cjob'" \
+            "It exists exactly once in the file but not in the job this suite" \
+            "believes owns it, so every job-scoped assertion about it is reading" \
+            "something else."
+        continue
+    fi
+    _cstep="$(step_block "$_cline")"
+
+    # (2) CONDITIONALITY, per policy.
+    _cif="$(printf '%s\n' "$_cstep" | grep -E '^[0-9]+:        if:' | head -1 | sed 's/^[0-9]*:        if:[[:space:]]*//')"
+    case "$_cpol" in
+        none)
+            if [[ -z "$_cif" ]]; then
+                pass "critical step '$_cname': unique, and unconditional as required"
+            else
+                fail "critical step '$_cname' has acquired an 'if:'" \
+                    "  if: $_cif" \
+                    "Steps run only after every earlier step succeeded, and that default" \
+                    "IS the gate. Any 'if:' can override it -- 'if: always()' is the" \
+                    "obvious one, but so is a schedule/event guard that is simply never" \
+                    "true on a tag push, which is how the decoy attack disables a step" \
+                    "while leaving it present."
+            fi ;;
+        exact:*)
+            _want="${_cpol#exact:}"
+            if [[ "$_cif" == "$_want" ]]; then
+                pass "critical step '$_cname': unique, and gated on the expected expression"
+            else
+                fail "critical step '$_cname' does not carry the expected 'if:'" \
+                    "expected: $_want" \
+                    "got:      ${_cif:-<none>}" \
+                    "Exact-match on purpose: deciding whether an arbitrary expression can" \
+                    "evaluate true after a failed step is not a job for a grep."
+            fi ;;
+    esac
+
+    # (3) NO SHELL OVERRIDE. The behavioural harness in 2g runs these blocks
+    #     under `bash -e`, which is Actions' default only while no `shell:` is
+    #     set. `shell: bash {0}` drops errexit, changing real behaviour while
+    #     the harness keeps testing the old semantics and stays green.
+    _cshell="$(printf '%s\n' "$_cstep" | grep -E '^[0-9]+:        shell:')"
+    if [[ -n "$_cshell" ]]; then
+        fail "critical step '$_cname' overrides 'shell:'" \
+            "$(printf '%s\n' "$_cshell")" \
+            "2g runs this block under 'bash -e', Actions' default for a step with no" \
+            "'shell:'. An override changes the real semantics while the harness keeps" \
+            "testing the old ones. Update the harness deliberately, or drop this."
+    fi
+done
+
+# --- 2h-bis. no `defaults.run.shell` anywhere above these steps -------------
+# The scope level the per-step pin cannot see. Actions honours `defaults.run.shell`
+# at WORKFLOW and JOB level, so a step with no `shell:` of its own can still be
+# run by something other than `bash -e`.
+#
+# This matters most for Gate A specifically: the publish step sets its own
+# `set -euo pipefail`, so it defends itself, but Gate A's entire gating rests on
+# Actions' IMPLICIT `-e`. Setting `defaults.run.shell: bash {0}` plus a trailing
+# `echo` gives a green suite and a defeated gate -- measured `bash -e` rc=1
+# versus `bash` rc=0 on the same script.
+#
+# Pinned as "no defaults: at all" rather than "no shell: inside defaults:",
+# because the safe state today is that the file has none, and pinning the state
+# is more robust than adjudicating which keys are harmless.
+WF_DEFAULTS="$(grep -nE '^defaults:' "$WF")"
+if [[ -n "$WF_DEFAULTS" ]]; then
+    fail "$WF_BASENAME declares a workflow-level 'defaults:' block" \
+        "$WF_DEFAULTS" \
+        "'defaults.run.shell' changes how EVERY step's run: block is executed," \
+        "including Gate A, whose gating rests entirely on Actions' implicit -e." \
+        "The behavioural harness assumes 'bash -e' and would keep passing."
+else
+    pass "$WF_BASENAME declares no workflow-level 'defaults:'"
+fi
+
+for _djob in attach-to-release auto-update-selfupdate-canary; do
+    _dblock="$(yaml_job_block "$_djob")"
+    _djd="$(printf '%s\n' "$_dblock" | grep -E '^    defaults:')"
+    if [[ -n "$_djd" ]]; then
+        fail "job '$_djob' declares a job-level 'defaults:' block" \
+            "$_djd" \
+            "Same hazard as the workflow-level one: it can set run.shell for every" \
+            "step in the job that gates this release."
+    else
+        pass "job '$_djob' declares no job-level 'defaults:'"
+    fi
+done
+
+# --- 2g. THE GATE STEPS ARE EXECUTED, not pattern-matched -------------------
+#
+# WHY THIS EXISTS, and why the static "does it swallow?" pins below are no
+# longer the guarantee.
+#
+# Those pins enumerate SPELLINGS of "ignore the exit status": `|| true`, then
+# `|| echo`, then any `||`, then `set +e`. Shell has unbounded ways to spell it,
+# so the enumeration lost four times in one day, each time to a spelling nobody
+# had listed:
+#
+#     if ! bash .../auto-update-canary.sh preflight /tmp/freenet; then
+#       echo "::warning::soft-failed"; fi     # no `||` anywhere; `if` is
+#                                             # errexit-exempt and `fi` returns 0
+#     bash .../auto-update-canary.sh preflight /tmp/freenet & echo started
+#     set +o errexit                          # the long-option spelling
+#     rc=0                                    # inserted just above `exit "$rc"`
+#
+# The last one is the proof that no line-existence pin can close this class:
+# assertion 6e requires `|| rc=$?` AND `exit "$rc"`, BOTH of which are still
+# present and correct. The invariant between them is broken by a THIRD line
+# that contains nothing suspicious. A pin that asserts lines EXIST cannot see
+# an invariant that BREAKS BETWEEN them.
+#
+# So the guarantee is behavioural, using the technique this file already proves
+# on the publish step: extract the step's `run:` block, execute it against a
+# stubbed canary, and assert THE STEP'S OWN EXIT STATUS. Every spelling above
+# dies against that, including the next one neither reviewer nor author has
+# thought of, because it stops asking "what does the text look like" and starts
+# asking "does a failing canary fail the step".
+#
+# The static pins are KEPT and are not redundant: `continue-on-error:` and
+# `if: always()` are ACTIONS-level, and executing a `run:` block cannot see
+# them. Execution covers the shell; the static pins cover the step keys.
+# Neither subsumes the other -- do not delete either believing the other
+# covers it.
+#
+# FIDELITY. Actions runs a `run:` block with `bash -e {0}` when the step sets
+# no `shell:` (errexit; pipefail applies only to an explicit `shell: bash`).
+# Neither gate step sets one and this workflow has no `defaults:` block, so the
+# harness uses `bash -e`. That assumption is pinned immediately below -- adding
+# `shell: bash {0}` (no `-e`) would change real behaviour while leaving this
+# harness testing the old semantics and green, which is the N4
+# harness-diverges-from-reality hole in a new place.
+
+# exec_step_status <job> <step-name> <canary-exit> <substitutions-file> -- runs
+# the step's `run:` block with a stub canary and echoes "<rc>|<classification>".
+#
+# The stub is installed at BOTH paths the two gates invoke (`_canary/scripts/`
+# for Gate A, `scripts/` for Gate B) so one helper serves both.
+exec_step_status() {
+    local job="$1" name="$2" canary_rc="$3" work rc cls
+    local script
+    script="$(extract_step_run "$job" "$name")"
+    if [[ -z "$script" ]]; then
+        echo "EXTRACT-FAILED|"
+        return
+    fi
+    work="$(mktemp -d)"
+    mkdir -p "$work/bin"
+
+    # WORKSPACE FIDELITY. The stub is installed at the ONE path this job's
+    # workspace really has, not at both.
+    #
+    # An earlier version mkdir'd `$work/scripts` AND `$work/_canary/scripts` so
+    # a single helper could serve both gates. That made the harness workspace
+    # RICHER than the real one, and a richer environment hides defeats the shell
+    # cannot: `if [ -d scripts ]; then <canary>; fi` is TRUE here and FALSE in
+    # `attach-to-release`, which checks out only into `_canary` (and `_src`).
+    # Measured in a faithful workspace: real rc=0, gate defeated, suite green.
+    # So "it does not care how the swallow is spelled" was true of the SHELL and
+    # not of the ENVIRONMENT.
+    #
+    # It also meant re-pointing Gate A at `scripts/...` -- which would fail every
+    # real release with exit 127 -- stayed green, because the stub was waiting
+    # there too. Assertions 2g-bis and 2g-ter below pin the checkout that makes
+    # the real path exist.
+    local stub_dir
+    case "$job" in
+        attach-to-release)             stub_dir="$work/_canary/scripts" ;;
+        auto-update-selfupdate-canary) stub_dir="$work/scripts" ;;
+        *)                             stub_dir="$work/scripts" ;;
+    esac
+    mkdir -p "$stub_dir"
+    printf '#!/usr/bin/env bash\nexit %s\n' "$canary_rc" > "$stub_dir/auto-update-canary.sh"
+    chmod +x "$stub_dir/auto-update-canary.sh"
+
+    # Gate A untars and chmods the shipped binary; neither is under test.
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$work/bin/tar"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$work/bin/chmod"
+    chmod +x "$work/bin/tar" "$work/bin/chmod"
+
+    # GitHub expressions do not expand outside Actions. Substitute the ones
+    # these blocks use, then REFUSE if any `${{` survives: an unsubstituted
+    # expression is a bash bad-substitution that exits non-zero on its own,
+    # which would satisfy a "must exit non-zero" case for entirely the wrong
+    # reason. That is the vacuity this whole file keeps having to remove.
+    script="${script//\$\{\{ steps.prev.outputs.prev_version \}\}/0.0.1}"
+    script="${script//\$\{\{ steps.prev.outputs.this_version \}\}/0.0.2}"
+    # shellcheck disable=SC2016  # literal GitHub expression syntax; must not expand
+    if [[ "$script" == *'${{'* ]]; then
+        rm -rf "$work"
+        echo "UNSUBSTITUTED|"
+        return
+    fi
+    printf '%s\n' "$script" > "$work/step.sh"
+
+    : > "$work/gh_output"
+    (
+        cd "$work" || exit 99
+        PATH="$work/bin:$PATH" GITHUB_OUTPUT="$work/gh_output" \
+            bash -e "$work/step.sh"
+    ) > "$work/out" 2>&1
+    rc=$?
+    cls="$(sed -n 's/^classification=//p' "$work/gh_output" | head -1)"
+    rm -rf "$work"
+    echo "$rc|$cls"
+}
+
+# gate_case <desc> <job> <step> <canary-exit> <want-rc-spec> [want-classification]
+#   want-rc-spec: an exact number, or "nonzero"
+gate_case() {
+    local desc="$1" job="$2" step="$3" cexit="$4" want="$5" want_cls="${6:-}"
+    local got rc cls ok=1
+    got="$(exec_step_status "$job" "$step" "$cexit")"
+    rc="${got%%|*}"
+    cls="${got#*|}"
+
+    case "$rc" in
+        EXTRACT-FAILED)
+            fail "gate behaviour: $desc" \
+                "could not extract the step's run: block -- every case would" \
+                "otherwise pass on an empty script."
+            return ;;
+        UNSUBSTITUTED)
+            fail "gate behaviour: $desc" \
+                "the run: block still contains an unexpanded \${{ }} expression." \
+                "Running it would exit non-zero for that reason alone, which would" \
+                "satisfy a 'must fail' case without testing the guard at all." \
+                "Add the substitution to exec_step_status."
+            return ;;
+    esac
+
+    case "$want" in
+        nonzero) [[ "$rc" -ne 0 ]] || ok=0 ;;
+        *)       [[ "$rc" -eq "$want" ]] || ok=0 ;;
+    esac
+    [[ -n "$want_cls" && "$cls" != "$want_cls" ]] && ok=0
+
+    if [[ "$ok" -eq 1 ]]; then
+        pass "gate behaviour: $desc (canary exit $cexit -> step rc=$rc${want_cls:+, classification=$cls})"
+    else
+        local _got_cls_msg="" _want_cls_msg=""
+        if [[ -n "$want_cls" ]]; then
+            _got_cls_msg=" with classification=$cls"
+            _want_cls_msg=" and classification $want_cls"
+        fi
+        fail "gate behaviour: $desc" \
+            "canary stub exited $cexit; step exited $rc$_got_cls_msg" \
+            "expected rc $want$_want_cls_msg" \
+            "A failing canary that does not fail its step is a gate that does not" \
+            "gate: for Gate A the release publishes anyway, for Gate B the job goes" \
+            "green on a broken updater and the notify job never fires."
+    fi
+}
+
+GATE_A_JOB=attach-to-release
+GATE_A_STEP='Auto-update pre-flight canary (blocks publish)'
+GATE_B_JOB=auto-update-selfupdate-canary
+GATE_B_STEP='Previous release self-updates to this release'
+
+# THE case: a failing canary must fail the step. Kills every swallow spelling.
+gate_case "Gate A fails when the canary fails" "$GATE_A_JOB" "$GATE_A_STEP" 1 nonzero
+# The POSITIVE CONTROL. Without it, a step that is simply broken -- or one whose
+# extraction produced nonsense -- satisfies the case above for the wrong reason.
+gate_case "Gate A passes when the canary passes" "$GATE_A_JOB" "$GATE_A_STEP" 0 0
+
+# Gate B additionally owes the notify job a classification, so each case pins
+# the exit status AND the value written to GITHUB_OUTPUT.
+gate_case "Gate B fails, and classifies 'fault', when the canary fails" \
+    "$GATE_B_JOB" "$GATE_B_STEP" 1 nonzero fault
+gate_case "Gate B re-raises exit 75 and classifies 'environmental'" \
+    "$GATE_B_JOB" "$GATE_B_STEP" 75 75 environmental
+gate_case "Gate B passes and classifies 'ok' when the canary passes" \
+    "$GATE_B_JOB" "$GATE_B_STEP" 0 0 ok
+
+# --- 2g-bis. the canary script is actually PUT where Gate A runs it ---------
+# `attach-to-release` downloads artifacts and never checks out the repo, so the
+# canary script is only on disk because of a sparse-checkout step. Deleting that
+# step left every assertion green while a real Gate A would exit 127 on every
+# release -- the harness cannot see it, because the harness installs the stub
+# itself.
+#
+# So the two ends are pinned against each other: the checkout's `path:` must be
+# the prefix Gate A actually invokes.
+# Scoped to the CANARY CHECKOUT STEP. A bare `path:` grep over the job takes
+# the first artifact-download path instead -- the job has a dozen of them --
+# and then compares the invocation against something unrelated.
+_co_line="$(printf '%s\n' "$JOB_BLOCK" | grep -F -- "- name: Check out the canary script" | head -1 | cut -d: -f1)"
+if [[ -n "$_co_line" ]]; then
+    CHECKOUT_PATH="$(step_block "$_co_line" \
+        | grep -E '^[0-9]+:          path: ' | head -1 | sed 's/.*path:[[:space:]]*//')"
+else
+    CHECKOUT_PATH=""
+fi
+SPARSE="$(printf '%s\n' "$JOB_BLOCK" | grep -E 'sparse-checkout:.*auto-update-canary\.sh')"
+CANARY_INVOKE="$(printf '%s\n' "$JOB_BLOCK" \
+    | grep -E 'auto-update-canary\.sh preflight' | head -1 | sed 's/^[0-9]*://')"
+
+if [[ -z "$SPARSE" ]]; then
+    fail "attach-to-release no longer sparse-checks-out scripts/auto-update-canary.sh" \
+        "This job never checks out the repo otherwise, so the canary script would" \
+        "not be on disk and Gate A would exit 127 on every release. The behavioural" \
+        "harness cannot catch this: it installs its own stub, so the step passes" \
+        "there and fails only in production."
+elif [[ -z "$CHECKOUT_PATH" ]]; then
+    fail "the canary checkout step has no 'path:'" \
+        "Without it actions/checkout cleans the workspace ROOT, destroying the" \
+        "release assets this job just built."
+elif [[ "$CANARY_INVOKE" == *"$CHECKOUT_PATH/scripts/auto-update-canary.sh"* ]]; then
+    pass "Gate A invokes the canary at the path it is checked out to ('$CHECKOUT_PATH')"
+else
+    fail "Gate A invokes the canary from a path it is not checked out to" \
+        "checkout path: $CHECKOUT_PATH" \
+        "invocation:    $CANARY_INVOKE" \
+        "The script is only on disk under the checkout path. Pointing the" \
+        "invocation elsewhere makes Gate A exit 127 on every real release, which" \
+        "the behavioural harness cannot see because it installs its own stub."
+fi
+
+# --- 2i. every crates.io API call sends a User-Agent -------------------------
+#
+# crates.io answers **403** to a request with no descriptive User-Agent. The 403
+# body is a JSON `errors` object, so `curl -sS` exits 0 and prints nothing to
+# stderr -- `-sS` surfaces transport errors and a 403 is not one. A
+# `| jq -e '.version.num'` form then finds nothing and reports a clean,
+# confident "not published".
+#
+# So a UA-less snippet answers "not published" for EVERY version, published or
+# not, 100% of the time. Verified against the live API: no UA -> 403 -> "not
+# published" for freenet 0.2.123, which is published; with UA -> 200.
+#
+# That is the exact hazard docs/RELEASING.md warns about in prose -- "it can
+# answer 'not published' about a version that IS published ... acting on that
+# means re-tagging a spent version" -- and six doc snippets demonstrated it
+# while describing it. Every CODE path already had the UA right, and
+# binstall-smoke-test.yml even carries the comment "crates.io requires a
+# descriptive User-Agent or it 403s". The knowledge was in the repo and did not
+# travel from the scripts into the prose.
+#
+# Pinned offline: this asserts the flag is present, not that the network agrees.
+# Logical lines, so a `\`-continued invocation whose `-A` sits on another line
+# is judged whole.
+UA_MISSING=""
+UA_TOTAL=0
+# File set DERIVED, not enumerated. The previous form hardcoded six paths, so a
+# UA-less crates.io curl added to gateway-update.yml -- a release-pipeline
+# workflow -- would have left this green at "all N send a User-Agent". Same
+# wrong-set class as the non-recursive script glob earlier in this file.
+UA_FILES=()
+while IFS= read -r _f; do UA_FILES+=("$_f"); done < <(
+    find "$SCRIPT_DIR/.." -type f \( -name '*.yml' -o -name '*.yaml' -o -name '*.sh' -o -name '*.md' \) \
+        -not -path '*/.git/*' -not -path '*/target/*' 2>/dev/null | sort
+)
+for _f in "${UA_FILES[@]}"; do
+    [[ -f "$_f" ]] || continue
+    # `*_test.sh` excluded: this file's own scan line contains the literals
+    # `crates.io/api/v1/crates` and `curl`, so scanning itself flags itself --
+    # the self-match shape this suite exists to remove, produced by widening the
+    # file set. Test files are not release machinery.
+    case "$(basename "$_f")" in *_test.sh) continue ;; esac
+    _base="$(basename "$_f")"
+    while IFS= read -r _hit; do
+        [[ -z "$_hit" ]] && continue
+        UA_TOTAL=$((UA_TOTAL + 1))
+        # `-H "User-Agent: ..."` is as valid as `-A`; binstall-smoke-test.yml
+        # uses that form. Accepting only `-A` made this lint report a correct
+        # call as broken on its first run -- a false positive is how a lint
+        # gets deleted, so the matcher covers both spellings.
+        # An EMPTY User-Agent 403s exactly like a missing one, so the literal
+        # spellings `-A ''` and `-A ""` are treated as missing rather than
+        # present.
+        #
+        # SCOPE, stated precisely because an earlier version of this comment
+        # overclaimed: this catches those two LITERAL spellings only. The
+        # variable form `-A "$UA"` with UA unset produces the same 403 and is
+        # NOT caught -- it cannot be, by a static scan that does not evaluate
+        # the shell. That exact line was added and this lint accepted it.
+        #
+        # Still worth having (the literal spellings are the ones that get
+        # typed), but do not read it as covering empty UAs in general.
+        case "$_hit" in
+            *"-A ''"*|*'-A ""'*|*"--user-agent ''"*|*'--user-agent ""'*)
+                UA_MISSING+="$_base:$_hit  [empty User-Agent -- 403s like a missing one]"$'\n' ;;
+            *" -A "*|*" --user-agent "*|*"User-Agent:"*) ;;
+            *) UA_MISSING+="$_base:$_hit"$'\n' ;;
+        esac
+    done < <(logical_lines "$_f" | grep -F 'crates.io/api/v1/crates' | grep -F 'curl')
+done
+
+if [[ "$UA_TOTAL" -lt 6 ]]; then
+    fail "found only $UA_TOTAL crates.io curl invocation(s) to check, expected at least 6" \
+        "The docs and scripts between them query crates.io in more places than" \
+        "that. A low count means the scan is not seeing them, and the check below" \
+        "would report success having examined almost nothing."
+elif [[ -n "$UA_MISSING" ]]; then
+    fail "a crates.io API call has no User-Agent, so it will 403 and read as 'not published'" \
+        "$(printf '%s' "$UA_MISSING")" \
+        "crates.io returns 403 without a descriptive User-Agent, the 403 body is" \
+        "JSON, and curl exits 0 -- so a body-parsing form reports 'not published'" \
+        "for every version ever released, silently. In the re-cut decision that" \
+        "means re-tagging a spent version, which is the unrecoverable state this" \
+        "whole ordering exists to prevent. Add -A 'freenet-release-driver' (or" \
+        "the CI equivalent), and prefer distinguishing 200 from 404 from UNKNOWN" \
+        "over parsing the body."
+else
+    pass "all $UA_TOTAL crates.io API calls send a User-Agent"
+fi
+
+# --- 2j. the wait_for_binaries failure enumeration exists in ONE place -------
+#
+# A comment pin, deliberately, because on this PR the comments ARE part of the
+# deliverable and this specific list has been wrong four times.
+#
+# `wait_for_binaries` fails on six modes. That list was restated in three
+# places, and all three copies drifted: two in release.sh undercounted in
+# OPPOSITE directions while both claiming "five paths", and a third in
+# release_driver_test.sh -- the file release.sh points a reader at as the
+# behavioural pin -- kept the old five-row table, so following that pointer
+# landed on the wrong count.
+#
+# None of it broke an assertion, which is exactly why it drifted unnoticed: no
+# test depended on the number, so nothing objected. The failure mode is a
+# maintainer reading a stale list and reasoning from it -- and a stale
+# enumeration is already on record here as what hid the round-7 bug.
+#
+# So: the canonical table lives in release.sh's refusal branch, every other site
+# refers to it, and this fails if a second multi-row copy appears anywhere. A
+# file mentioning one or two members in prose is fine; three or more is a
+# restated table.
+# realpath, because `find "$SCRIPT_DIR/.."` emits `.../../scripts/release.sh`
+# while $RELEASE_SH is the direct path -- a string compare never matched, so the
+# canonical file was scanned as though it were a copy and the check reported
+# "0 of 5 rows" on a correct tree. A pin that fires on the healthy state is one
+# that gets deleted.
+CANON_FILE="$(realpath "$RELEASE_SH" 2>/dev/null || echo "$RELEASE_SH")"
+CANON_ROWS=(
+    "Gate A never ran"
+    "Gate A state unknown"
+    "Gate A REJECTED"
+    "Gate A undecided"
+    "Gate A passed"
+)
+
+enum_copies=""
+canon_hits=0
+while IFS= read -r _f; do
+    [[ -f "$_f" ]] || continue
+    _n=0
+    for _row in "${CANON_ROWS[@]}"; do
+        [[ "$(grep -cF -- "$_row" "$_f")" -gt 0 ]] && _n=$((_n + 1))
+    done
+    # `*_test.sh` excluded: CANON_ROWS above literally contains all five
+    # phrases, so this pin flags ITSELF otherwise. Third self-match of the day
+    # from widening a file set -- the pattern is that any scan whose needles are
+    # spelled out in its own source must exclude the files that hold needles.
+    case "$(basename "$_f")" in *_test.sh) continue ;; esac
+    _fr="$(realpath "$_f" 2>/dev/null || echo "$_f")"
+    if [[ "$_fr" == "$CANON_FILE" ]]; then
+        canon_hits="$_n"
+    elif [[ "$_n" -ge 3 ]]; then
+        enum_copies+="$(basename "$_f"): contains $_n of the ${#CANON_ROWS[@]} enumeration rows"$'\n'
+    fi
+done < <(find "$SCRIPT_DIR/.." -type f \( -name '*.sh' -o -name '*.md' -o -name '*.yml' \) \
+            -not -path '*/.git/*' -not -path '*/target/*' 2>/dev/null | sort)
+
+if [[ "$canon_hits" -lt "${#CANON_ROWS[@]}" ]]; then
+    fail "release.sh's canonical failure enumeration is incomplete ($canon_hits of ${#CANON_ROWS[@]} rows)" \
+        "Every other site refers to this table instead of restating it, so if it" \
+        "is trimmed those references point at something that no longer says what" \
+        "they claim. Rows expected: ${CANON_ROWS[*]}"
+elif [[ -n "$enum_copies" ]]; then
+    fail "the wait_for_binaries failure enumeration has been restated outside release.sh" \
+        "$(printf '%s' "$enum_copies")" \
+        "Three copies of this list existed and all three disagreed -- two" \
+        "undercounting in opposite directions, the third in the very file" \
+        "release.sh cites as the behavioural pin. No assertion depended on the" \
+        "count, which is why nobody noticed. Refer to release.sh's table rather" \
+        "than repeating it; naming one or two modes in prose is fine."
+else
+    pass "the wait_for_binaries failure enumeration exists only in release.sh (${canon_hits} rows)"
+fi
+
 # --- 3. it is not neutered in place -----------------------------------------
 # `continue-on-error: true` leaves the step present, running, and visibly
 # green-ish in the UI while the job proceeds to publish regardless -- the
@@ -175,6 +2075,14 @@ if [[ -n "$CANARY_LINE" ]]; then
     fi
 
     # --- 3a. ...and its shell does not swallow the canary's exit status ------
+    # SECOND LINE OF DEFENCE, not the first. Assertion 2g executes this step
+    # against a failing stub canary and asserts it exits non-zero, which covers
+    # every spelling including the ones this pattern misses. What 2g CANNOT see
+    # is anything above the `run:` block -- `continue-on-error:`, `if: always()`
+    # -- because those are Actions-level and a harness that extracts and runs
+    # the script never encounters them. That is what assertion 3 covers, and
+    # why neither assertion subsumes the other. Do not delete one believing the
+    # other covers it.
     # The step-key checks above are blind to the SHELL. Appending `|| true` to
     # the invocation leaves the step present, before the publish, and without
     # `continue-on-error` -- every assertion here passed under exactly that
@@ -191,13 +2099,12 @@ if [[ -n "$CANARY_LINE" ]]; then
     # lines, so there is no legitimate use of these to trip over. Comment-only
     # lines were dropped when JOB_BLOCK was built, so a `# || true` in prose
     # cannot fire this.
-    SWALLOWED="$(printf '%s\n' "$CANARY_STEP" \
-        | grep -cE '\|\|[[:space:]]*(true|:)[[:space:]]*$|set[[:space:]]+\+e')"
-    if [[ "$SWALLOWED" -eq 0 ]]; then
+    SWALLOWED="$(status_swallowers "$CANARY_STEP")"
+    if [[ -z "$SWALLOWED" ]]; then
         pass "the canary step's shell does not swallow its own exit status"
     else
-        fail "the canary step swallows its own exit status ('|| true', '|| :' or 'set +e')" \
-            "$(printf '%s\n' "$CANARY_STEP" | grep -E '\|\|[[:space:]]*(true|:)[[:space:]]*$|set[[:space:]]+\+e')" \
+        fail "the canary step swallows its own exit status (any '||', 'set +e' or trailing '; true')" \
+            "$SWALLOWED" \
             "The step still runs, still reports, and still sits before the publish," \
             "but it can no longer fail -- so nothing blocks publication. This is the" \
             "cheapest possible way to disable the gate and the least visible: it looks" \
@@ -219,6 +2126,17 @@ fi
 # Steps default to running only if every earlier step in the job succeeded, and
 # that default IS the gate. The publish step has no `if:` today, and this pins
 # that state rather than trying to judge which conditionals are safe.
+#
+# That same default now carries a SECOND invariant, since the crates.io upload
+# moved into this job above the un-draft: a failed `cargo publish` must also
+# stop the un-draft. Give this step `if: always()` and a release whose crates
+# never uploaded is published anyway, which splits the two distribution
+# channels -- `freenet update` and the direct downloads serve the new version
+# while `cargo install freenet` silently still serves the previous one. The
+# correct state after a failed publish is the one the default produces: a draft
+# with its assets attached and no crates, consistent and recoverable by hand
+# (scripts/RELEASE_RECOVERY.md step 4). Both invariants rest on this one
+# absent `if:`, which is why it is pinned here rather than restated twice.
 #
 # Deliberately stricter than "no always()/failure()/cancelled()". Whether an
 # expression can evaluate true after a failed step is not something a grep
@@ -282,6 +2200,41 @@ WF_JOB_NAME="$(printf '%s\n' "$JOB_BLOCK" \
     | sed "s/^['\"]//;s/['\"]$//")"
 SH_JOB_NAME="$(sed -n "s/^ATTACH_JOB_NAME=//p" "$RELEASE_SH" | head -1 \
     | sed "s/^['\"]//;s/['\"]$//")"
+
+# ...and the RECOVERY RUNBOOK reads the same two names out of this workflow.
+#
+# The rewritten gate-confirm command selects the job with
+# `startswith("Attach binaries")` and the step with
+# `startswith("Auto-update pre-flight")`. Neither was pinned, which made it a
+# THIRD site of the shape this file exists to close -- and it was added by the
+# commit that argues "one site covered, its sibling left armed" is the gap
+# being closed. Rename either name and the command silently selects nothing.
+#
+# It fails CLOSED (the runbook says "no line at all ... means Gate A did not
+# pass. Stop"), so the risk is a false alarm blocking a good release rather than
+# a publish slipping through -- which is why this is a prefix check rather than
+# an exact-match, matching what the `--jq` actually does.
+RUNBOOK_STEP_NAME="$(printf '%s\n' "$JOB_BLOCK" \
+    | sed -n 's/^[0-9]*:      - name:[[:space:]]*\(Auto-update pre-flight.*\)$/\1/p' | head -1)"
+for _pair in "Attach binaries:${WF_JOB_NAME:-}" "Auto-update pre-flight:${RUNBOOK_STEP_NAME:-}"; do
+    _prefix="${_pair%%:*}"
+    _actual="${_pair#*:}"
+    if [[ -z "$_actual" ]]; then
+        fail "cross-compile.yml has no name starting with '$_prefix'" \
+            "scripts/RELEASE_RECOVERY.md's Gate A confirmation selects it with" \
+            "startswith(\"$_prefix\"). With nothing matching, the documented check" \
+            "prints no output -- which the runbook tells the operator to read as" \
+            "'Gate A did not pass', so a healthy release looks blocked."
+    elif [[ "$_actual" == "$_prefix"* ]]; then
+        pass "RELEASE_RECOVERY.md's startswith(\"$_prefix\") still matches ('$_actual')"
+    else
+        fail "RELEASE_RECOVERY.md selects on a prefix cross-compile.yml no longer has" \
+            "runbook expects a name starting with: '$_prefix'" \
+            "cross-compile.yml has:                 '$_actual'" \
+            "The documented Gate A confirmation would print nothing, which the" \
+            "runbook says to treat as a failed gate. Update both together."
+    fi
+done
 
 if [[ -z "$WF_JOB_NAME" ]]; then
     fail "the attach-to-release job has no 'name:' in cross-compile.yml" \
@@ -511,6 +2464,15 @@ else
 fi
 
 # --- 6e. the step CAPTURES the exit status as well as re-raising it ---------
+# SUPERSEDED AS A GUARANTEE by assertion 2g, and the reason is worth keeping.
+# This pin requires that `|| rc=$?` exists AND that `exit "$rc"` exists. Both
+# can be present and correct while the invariant BETWEEN them is broken by a
+# third line -- inserting a bare `rc=0` immediately above the `exit` leaves both
+# needles matching, contains nothing suspicious, and makes Gate B report success
+# on a broken updater with the notify job never firing. A pin that asserts LINES
+# EXIST cannot see an invariant that breaks between them; only executing the
+# step can. 2g does exactly that, and kills the `rc=0` insertion.
+# Kept for its specific, fast diagnostics when a line really is deleted.
 # BOTH halves, because pinning only the second leaves the cheaper mutation wide
 # open. Confirmed by mutation: change `|| rc=$?` to `|| true` and `rc` stays 0,
 # `classification` is reported as `ok`, `exit "$rc"` exits 0 -- so Gate B goes
@@ -540,13 +2502,14 @@ elif [[ "$selfupdate_block" != *'exit "$rc"'* ]]; then
         "updater, and nothing notifies -- the exact silent fail this file exists" \
         "to prevent, reached by deleting one line."
 else
-    swallowed_b="$(printf '%s\n' "$selfupdate_block" \
-        | grep -cE '\|\|[[:space:]]*(true|:)[[:space:]]*$|set[[:space:]]+\+e')"
-    if [[ "$swallowed_b" -eq 0 ]]; then
+    # `allow-rc-capture`: Gate B's deliberate `|| rc=$?` is exempt, everything
+    # else -- including `|| echo`, `|| exit 0` -- is not.
+    swallowed_b="$(status_swallowers "$selfupdate_block" allow-rc-capture)"
+    if [[ -z "$swallowed_b" ]]; then
         pass "Gate B's step captures AND re-raises the canary's exit code, and swallows nothing"
     else
-        fail "Gate B's step swallows an exit status ('|| true', '|| :' or 'set +e')" \
-            "$(printf '%s\n' "$selfupdate_block" | grep -E '\|\|[[:space:]]*(true|:)[[:space:]]*$|set[[:space:]]+\+e')" \
+        fail "Gate B's step swallows an exit status (any '||' other than '|| rc=\$?', 'set +e', trailing '; true')" \
+            "$swallowed_b" \
             "Same route assertion 3a closes for Gate A: the step still runs and" \
             "still reports, but it can no longer fail."
     fi
