@@ -509,34 +509,78 @@ caught by Gate B one release later, when that binary becomes the previous one.
 Gate B is also post-publish and non-blocking, so even then it reports rather
 than stops.
 
-**Gate A cannot see a wrong COMPARISON of correct values.** Since #5236 it
-checks the version the node says it observed (`latest=`) against the tag
+**Gate A checks the COMPARISON in one direction only.** Since #5236 it checks
+the version the node says it observed (`latest=`) against the tag
 `releases/latest` actually resolves to, so a fetch or normaliser that returns
-the wrong string is caught. The comparison that follows it is not covered.
-Mutate `compare_versions_for_startup`'s `latest_ver > current_ver`
-(`crates/core/src/bin/commands/auto_update.rs`) to `<` and Gate A stays green:
-the fetch is right, the parse is right, the observed value is right, and every
-marker the gate reads is exactly what a healthy run produces.
+the wrong string is caught. Since #5340 it also asserts WHICH decision the
+updater reached, which closes the half of the comparison Gate A is able to
+exercise.
 
-This is structural, not something the gate is failing to do properly. Gate A's
-subject is by construction NEWER than `releases/latest` — the release it
-belongs to is still a draft — so there is no newer release for it to find and
-"decided not to update" is the correct outcome of a healthy run. A gate whose
-input can only produce one answer cannot distinguish comparators by their
-answer.
+The half it closes. Gate A's subject is by construction NEWER than
+`releases/latest` — the release it belongs to is still a draft — so a healthy
+updater must find nothing newer and stay put. Anything else is a defect, and
+the obvious reading of the failure is the wrong way round: inverting
+`compare_versions_for_startup`'s `latest_ver > current_ver`
+(`crates/core/src/bin/commands/auto_update.rs`) does not make the node quietly
+do nothing. `latest < current` is TRUE for a Gate A run, so the node returns the
+OLDER release, requests an update to it, and exits 42 — a self-downgrade, and a
+supervisor loop that repeats it on every restart. Gate A used to report green on
+that, because a trigger was one of the outcomes `assert_detection_healthy`
+accepts. It now blocks on it, from two independent observers: a trigger line
+appearing in the log, and `NODE_EXIT` being 42. (A healthy run has neither.)
 
-Worth being precise about the direction, because the obvious reading is the
-wrong way round: inverting that operator does not make the node quietly do
-nothing. `latest < current` is TRUE for a Gate A run, so the node returns the
-OLDER release and requests an update to it — a self-downgrade. Gate A reports
-green on it, because a trigger is one of the outcomes it accepts. (Gate A's
-verdict comes only from `assert_detection_healthy`; it does not assert that
-the shipping binary declined to update. Adding that assertion would close this
-particular hole, at the cost of failing any release cut from a branch whose
-version is genuinely below `releases/latest` — a hotfix on an older line. It
-has not been added.)
+The two are independent in the way that matters, and the exit-code observer is
+what covers the log check's blind spot rather than merely duplicating it. If a
+trigger site's wording drifts out of `MARKER_TRIGGERED_RE`, or the line is
+dropped, the node logs no matched trigger *and* no completion line either —
+`freenet.rs` returns as soon as it sends — so the log assertion can only report
+INDETERMINATE. The exit-code observer is therefore evaluated whenever the log
+assertion has not already found a definite fault, not only when it passed;
+gating it on "passed" made it unreachable on exactly that input, which an
+external review pass caught and reproduced.
 
-What does cover the comparison is the Rust unit tests on
+The second observer is qualified — 42 is also `FATAL_LISTENER_EXIT_CODE`
+(`crates/core/src/node/p2p_impl.rs`), which a healthy binary emits when its
+network event listener dies or redb is poisoned, and the canary does not opt
+into the distinct code 45. So an exit 42 whose node output carries one of those
+`CRITICAL:` lines is classified environmental and retried rather than blocking
+the release. (A healthy Gate A run ends at 143 — the canary SIGTERMs a node that
+is still going — so a 42 at all means the node exited on its own.)
+
+Gate A also blocks a `is_version_pinned_bad` / `is_version_install_gated` gate
+(`crates/core/src/bin/commands/rollback.rs`) that matches when it should not:
+the canary node has a fresh isolated HOME with no crash-loop pin and no
+install-failure history, so that refusal has nothing it could legitimately
+match, and a node that refuses every release it is offered is stranded as
+thoroughly as one that cannot parse the tag. That check is worth having and is
+close to unreachable on the normal path, which is not a contradiction — the node
+only reaches the #4073 branch from inside
+`if let Some(new_version) = startup_update_check(…)`, so entering it during a
+draft-release run already requires an inverted comparator, and the trigger check
+above would catch that first. Where it earns its keep is the older-binary arm
+and Gate B.
+
+The half it does not close, and cannot. A comparator that answers "nothing
+newer" when something newer DOES exist is invisible on the normal path, because
+on the normal path nothing newer exists. Gate A only asserts that direction when
+it is genuinely running an older binary, which it detects by comparing the
+shipping binary's `--version` against the resolved latest tag; it says which arm
+it took in the job log. That arm is narrow, and narrower than it first looks:
+`cross-compile.yml` sparse-checks-out the canary script at the tag it is gating,
+so re-running an *older* release's workflow runs that tag's copy of the script,
+which predates this check entirely. What is left is a hotfix branch cut on an
+older line and tagged after a newer release has published, a re-run of a tag cut
+after #5340 landed, and a manual `preflight` run. The conditional exists to stop
+a blocking gate from failing those for being right, not because they are common.
+
+If the two versions cannot be compared at all, Gate A skips the decision check
+and the exit-code check with it, and emits a `::warning::` annotation saying so.
+That is the one input that returns Gate A to its pre-#5340 strength while still
+reporting green, so the `--version` output format is source-pinned in
+`auto-update-canary_test.sh` — a change to it fails there rather than widening
+that arm quietly.
+
+What does cover the comparison in both directions is the Rust unit tests on
 `compare_versions_for_startup` (same file, `mod tests`), which assert both
 directions and the equal case. Gate B covers it end-to-end for real, but only
 for the PREVIOUS release's binary.
@@ -579,9 +623,10 @@ job log before concluding anything about auto-update. Closing this needs a
 runtime test with a stubbed release archive; it is a known gap, deliberately
 deferred, not an oversight.
 
-Net: the installer half of a shipping binary has no blocking gate, and neither
-does its comparison logic. Treat a green Gate A as "this binary can still fetch
-and read new release tags", not as "auto-update works".
+Net: the installer half of a shipping binary has no blocking gate, and its
+comparison logic is gated in one direction only. Treat a green Gate A as "this
+binary can still fetch and read new release tags, and did not ask to be
+replaced by an older one", not as "auto-update works".
 
 ### If Gate A fails
 

@@ -96,8 +96,16 @@ export CANARY_EXPECTED_LATEST=0.2.121
 # outcome line. It models the only variable a real node has here: how long
 # GitHub takes to answer. Production bounds that at PROBE_CHAIN_TIMEOUT (10s),
 # and the whole of case 5 is a value inside that bound.
+# `stderr-line` (arg 6) models an `eprintln!` rather than a `tracing` event, and
+# the distinction is the whole reason it exists: the node's two fatal-abort
+# CRITICAL lines are `eprintln!`, so they land in `node.out` (via the subshell's
+# `2>&1` in run_node_until_check) and NEVER in the log dir. The exit-42
+# classification reads them from there, and until this parameter existed that
+# premise was asserted only by inspection -- every behavioural case wrote
+# `node.out` itself through the stub.
 make_fake_node() {
     local path="$1" exit_code="$2" extra="$3" linger="${4:-0}" delay="${5:-0}"
+    local stderr_line="${6:-}"
     cat > "$path" <<FAKE
 #!/usr/bin/env bash
 if [ "\${1:-}" = "--version" ]; then
@@ -117,6 +125,13 @@ echo "2026-08-08T02:00:00.000000Z  $CHECK_LINE" >> "\$logdir/freenet.2026-08-08-
 if [ -n "$extra" ]; then
     sleep $delay
     echo "2026-08-08T02:00:00.100000Z  $extra" >> "\$logdir/freenet.2026-08-08-02.log"
+fi
+if [ -n "$stderr_line" ]; then
+    # To STDERR, exactly as the node's eprintln! does. run_node_until_check
+    # redirects the node's stdout AND stderr into node.out; if that redirect were
+    # ever split or dropped, this line would stop arriving and the fatal-abort
+    # classification would silently turn every environmental 42 into a hard block.
+    echo "$stderr_line" >&2
 fi
 sleep $linger
 exit $exit_code
@@ -188,6 +203,61 @@ elif [[ "$WRONG_OUT" == *"compared against the WRONG release"* ]]; then
     ok "cmd_preflight fails a node that compared against the wrong release, with the right diagnosis"
 else
     bad "cmd_preflight failed the wrong-release node but with the wrong diagnosis: $WRONG_OUT"
+fi
+
+# ---------------------------------------------------------------------------
+# 2c. Exit 42 is OVERLOADED, and the discrimination must work through the REAL
+#     harness -- not just through a stub that writes node.out itself.
+#
+#     `FATAL_LISTENER_EXIT_CODE` is also 42 (crates/core/src/node/p2p_impl.rs),
+#     and both of its producers `eprintln!` a CRITICAL line before exiting. The
+#     canary treats "42 + CRITICAL" as environmental (retryable) and "42 without
+#     it" as a real downgrade bug, so the whole distinction rests on a premise
+#     nothing was testing: that the node's STDERR reaches `node.out`.
+#
+#     auto-update-canary_test.sh cannot test that. Its stub writes node.out
+#     directly, so it asserts the classification while ASSUMING the plumbing --
+#     the same shape as the retry-attempts gap found in review, and as the #5271
+#     fixture that wrapped a real log string in a type the system cannot emit:
+#     the assertion was fine, the fixture could not produce the fault.
+#
+#     Here the fake node writes the line to fd 2 and the REAL run_node_until_check
+#     captures it. A refactor that splits node stderr into its own file, or drops
+#     the `2>&1`, turns every environmental 42 into a hard block on a healthy
+#     release -- and would leave the other suite entirely green.
+#
+#     CANARY_ATTEMPTS is 1 here, so the environmental verdict exhausts the budget
+#     and the gate returns non-zero; what is asserted is the DIAGNOSIS, which is
+#     what differs between the two branches.
+# ---------------------------------------------------------------------------
+FAKE_FATAL42="$TMPROOT/fake-fatal-abort-42"
+make_fake_node "$FAKE_FATAL42" 42 "$LATEST_SEEN_LINE
+2026-08-08T02:00:00.200000Z  $COMPLETE_LINE" 0 0 \
+    "CRITICAL: Network event listener exited (fatal): transport error: connection reset by peer"
+FATAL42_OUT="$(cmd_preflight "$FAKE_FATAL42" 2>&1)"
+FATAL42_RC=$?
+if [ "$FATAL42_RC" -eq 0 ]; then
+    bad "cmd_preflight returned OK for a node that exited 42 -- the exit-code observer is not running at all"
+elif [[ "$FATAL42_OUT" == *"CRITICAL fatal abort"* ]]; then
+    ok "a fatal-abort CRITICAL on the node's STDERR reaches node.out and is classified environmental (real harness)"
+else
+    bad "cmd_preflight blocked on exit 42 without seeing the fatal-abort CRITICAL the node printed to stderr. Either run_node_until_check no longer captures the node's stderr into node.out, or the marker drifted -- every environmental 42 is now a hard block on a HEALTHY release, blaming compare_versions_for_startup. Got: $FATAL42_OUT"
+fi
+
+# ...and the discriminating twin, through the same real harness: exit 42 with NO
+# CRITICAL line is a genuine downgrade bug and must be named as one. Without this
+# the case above is satisfied by a classifier that calls everything environmental.
+FAKE_BARE42="$TMPROOT/fake-bare-exit-42"
+make_fake_node "$FAKE_BARE42" 42 "$LATEST_SEEN_LINE
+2026-08-08T02:00:00.200000Z  $COMPLETE_LINE" 0 0
+BARE42_OUT="$(cmd_preflight "$FAKE_BARE42" 2>&1)"
+BARE42_RC=$?
+if [ "$BARE42_RC" -eq 0 ]; then
+    bad "cmd_preflight returned OK for a node that exited 42 with a clean log and no fatal-abort line -- that is a self-downgrade request and must block"
+elif [[ "$BARE42_OUT" == *"downgrade-and-restart loop"* ]]; then
+    ok "exit 42 with no fatal-abort line is blocked as a self-downgrade (real harness)"
+else
+    bad "cmd_preflight blocked the bare exit-42 node but with the wrong diagnosis; got: $BARE42_OUT"
 fi
 
 # ---------------------------------------------------------------------------
