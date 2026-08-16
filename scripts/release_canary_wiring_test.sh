@@ -157,6 +157,28 @@ step_block() {
 # That approach has failed every time. Check that 2g covers the case instead --
 # it should already, because it does not care how the swallow is spelled.
 #
+# WORKED EXAMPLE, so this is a decision rather than an oversight:
+# `set +o errexit` is the long-option spelling of `set +e` and this regex does
+# NOT match it. That is deliberate, and it is left unmatched on purpose.
+#
+# Measured under Actions' real `bash -e {0}` rather than reasoned about:
+#
+#     set +o errexit; <canary>                  -> exit 1   gate HOLDS
+#     set +o errexit; <canary>; echo done       -> exit 0   gate DEFEATED
+#     <canary>; exit 0                          -> exit 1   gate HOLDS
+#     { <canary>; }; true                       -> exit 1   gate HOLDS
+#     if ! <canary>; then echo warn; fi         -> exit 0   gate DEFEATED
+#     <canary> &; echo started                  -> exit 0   gate DEFEATED
+#
+# So disabling errexit is harmless on its own -- the canary is the last command
+# and its status becomes the script's -- and dangerous only combined with a
+# trailing zero-status command. Three of the six spellings above do not defeat
+# the gate at all, and a regex cannot tell which is which, because the
+# difference is not in the text of any one line. 2g catches all three that DO
+# defeat it and correctly stays green on the three that do not. Adding
+# `\+o[[:space:]]+errexit` here would flag a harmless line while still missing
+# the combinations, which is the treadmill in miniature.
+#
 # WHY THIS IS A FUNCTION, AND WHY IT IS NOT ANCHORED AT END OF LINE.
 # The three gate sites (Gate A's canary step, the CARGO_REGISTRY_TOKEN
 # fail-fast, Gate B's step) each had their own copy of
