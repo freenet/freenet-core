@@ -3176,3 +3176,78 @@ mod full_state_version_gate_pins {
         );
     }
 }
+
+/// Source-scrape pins for the conformance capture hook (RFC #5320).
+///
+/// Capture sits on the merge path, which is the hottest path a contract touches.
+/// Two properties keep it safe to run on a live node, and neither is visible from
+/// the capture module's own tests, because both are facts about the CALL SITE:
+///
+/// 1. it observes where the transition actually is, inside `attempt_state_update`;
+/// 2. it never blocks the executor.
+///
+/// A refactor that "tidied" the `observe` call into an `await`, or moved it to a
+/// path that cannot see the base state, would leave every capture-module test green
+/// while making the node liable to stall behind a diagnostic writer. That is the
+/// #4145 / #4466 shape, and `.claude/rules/channel-safety.md` exists because it has
+/// happened repeatedly.
+#[cfg(test)]
+mod conformance_capture_pins {
+    /// Slice `attempt_state_update`'s body, from its signature to the next
+    /// function's. A missing anchor panics rather than silently widening the region
+    /// to the rest of the file, which is how a source pin quietly stops testing
+    /// anything (see the `include_str!` note in
+    /// `.claude/rules/bug-prevention-patterns.md`).
+    fn attempt_state_update_body() -> &'static str {
+        let src = include_str!("executor_impl.rs");
+        let start = src
+            .find("    pub(super) async fn attempt_state_update(")
+            .expect("attempt_state_update not found");
+        let after = &src[start..];
+        let end = after
+            .find("    async fn maybe_probe_idempotency(")
+            .expect("maybe_probe_idempotency no longer follows attempt_state_update");
+        &after[..end]
+    }
+
+    /// Capture must read the transition from the merge path itself. Recording it
+    /// anywhere else means recording something other than what the contract did.
+    #[test]
+    fn capture_observes_from_the_merge_path() {
+        let body = attempt_state_update_body();
+        assert!(
+            body.contains("capture.observe("),
+            "conformance capture is no longer invoked from attempt_state_update, so \
+             captured corpora would no longer reflect the merges the node performs"
+        );
+        for field in ["base_state:", "result_state:", "incoming_state,"] {
+            assert!(
+                body.contains(field),
+                "capture no longer records `{field}` from the merge path; a replay \
+                 bundle missing part of the transition cannot reproduce it"
+            );
+        }
+    }
+
+    /// The executor must never wait on capture. A slow or stuck writer would
+    /// otherwise stall contract synchronization, which is the one thing this path
+    /// is required never to do.
+    #[test]
+    fn capture_never_awaits_on_the_merge_path() {
+        let body = attempt_state_update_body();
+        let hook_start = body
+            .find("if let Some(capture) =")
+            .expect("capture hook not found in attempt_state_update");
+        let rest = &body[hook_start..];
+        let hook_end = rest
+            .find("\n        }")
+            .expect("capture hook block not delimited as expected");
+        let hook = &rest[..hook_end];
+        assert!(
+            !hook.contains(".await"),
+            "the conformance capture hook awaits on the merge path. It must not: a \
+             slow or stuck writer would then stall contract synchronization. Use \
+             `try_send` and drop on full, per .claude/rules/channel-safety.md"
+        );
+    }
+}
