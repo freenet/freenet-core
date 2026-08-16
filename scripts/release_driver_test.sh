@@ -289,7 +289,86 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 4. no FUNCTION BODY calls publish_crates
+# 4. wait_for_binaries propagates a refusal INHERITED from publish_draft_release
+# ---------------------------------------------------------------------------
+# Runs the REAL `wait_for_binaries` -- not a stub -- with only
+# `publish_draft_release` replaced. Case 2 above cannot express this: it stubs
+# every function including `wait_for_binaries` itself, so the real body never
+# executes. That harness is scoped to main-flow reachability and does exactly
+# what it claims; this is the interaction it structurally cannot see, and the
+# two are kept separate rather than one being stretched to cover both.
+#
+# WHAT BROKE, and why it was invisible. Guarding the main-flow call as
+# `if ! wait_for_binaries` fixed an unreachable fallback -- and re-armed a worse
+# bug, because bash suspends errexit for the entire DYNAMIC EXTENT of a command
+# in an `if`/`!` condition, including the whole body of the callee. Inside
+# `wait_for_binaries`, `publish_draft_release` was called BARE and immediately
+# followed by `return 0`. So its two deliberate refusals -- draft state unknown,
+# and still-a-draft with the Gate A canary not concluded -- stopped aborting,
+# fell through to that `return 0`, and `wait_for_binaries` reported SUCCESS.
+# The driver then published crates, updated gateways and announced to Matrix and
+# River, for a release still sitting as an unpublished draft, possibly one the
+# blocking canary had rejected.
+#
+# Fail-CLOSED became fail-OPEN, which is strictly worse than the bug the guard
+# fixed. `publish_draft_release`'s own comments name that outcome twice as the
+# thing its `return 1`s exist to prevent; those returns had become `return 0`.
+#
+# NOTE ON THE TEST SHAPE: each mode is invoked as a TOP-LEVEL `if !` statement.
+# Wrapping the call in `|| echo` (or any other errexit-suspending context) makes
+# both modes behave identically and the test vacuous -- the same suspension
+# being tested would be doing the confounding.
+WFB_FN="$(awk '/^wait_for_binaries\(\) \{/,/^\}/' "$RELEASE_SH")"
+if [[ -z "$WFB_FN" ]] || [[ "$WFB_FN" != *"publish_draft_release"* ]]; then
+    fail "could not extract wait_for_binaries() from release.sh" \
+        "The cases below run it, so an empty extraction would pass vacuously."
+else
+    inherit_case() {  # inherit_case <desc> <publish_draft_release-rc> <want: fires|passes>
+        local desc="$1" pdr_rc="$2" want="$3" work rc got
+        work="$(mktemp -d)"
+        {
+            printf 'set -e\n'
+            printf 'DRY_RUN=false\n'
+            # Return 0 so the real function reaches its publish_draft_release
+            # call on the "binaries already available" path.
+            printf 'verify_required_binaries() { return 0; }\n'
+            printf 'publish_draft_release() { echo "PDR:%s"; return %s; }\n' "$pdr_rc" "$pdr_rc"
+            printf '%s\n' "$WFB_FN"
+            # TOP-LEVEL guard, mirroring the real main flow. Not `|| ...`.
+            printf 'if ! wait_for_binaries; then echo "GUARD_FIRED"; exit 7; fi\n'
+            printf 'echo "NO_GUARD"\nexit 0\n'
+        } > "$work/t.sh"
+
+        bash "$work/t.sh" > "$work/out" 2>&1
+        rc=$?
+        if [[ "$rc" -eq 7 ]]; then got=fires; else got=passes; fi
+
+        if [[ "$got" == "$want" ]]; then
+            pass "wait_for_binaries: publish_draft_release returns $pdr_rc -> guard $got ($desc)"
+        else
+            fail "wait_for_binaries: $desc" \
+                "publish_draft_release returned $pdr_rc; expected the guard to $want, it $got (exit $rc)" \
+                "--- output ---" \
+                "$(head -20 "$work/out")" \
+                "A refusal from publish_draft_release MUST reach the caller. Swallowed," \
+                "wait_for_binaries reports success for an unpublished draft and the" \
+                "driver announces a release that never shipped. Guard the inner call" \
+                "('if ! publish_draft_release; then return 1; fi'); a bare call is" \
+                "not enough, because errexit is suspended for the whole callee when" \
+                "wait_for_binaries is itself invoked from an 'if !' condition."
+        fi
+        rm -rf "$work"
+    }
+
+    # THE regression: the refusal must propagate.
+    inherit_case "refusal propagates to the caller" 1 fires
+    # The control, so the case above cannot be satisfied by a function that
+    # always fails.
+    inherit_case "success is not turned into a failure" 0 passes
+fi
+
+# ---------------------------------------------------------------------------
+# 5. no FUNCTION BODY calls publish_crates
 # ---------------------------------------------------------------------------
 # The blind spot of the ordering test above, stated plainly rather than papered
 # over. That test stubs every function to announce itself, so a `publish_crates`

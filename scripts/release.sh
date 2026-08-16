@@ -1483,7 +1483,27 @@ wait_for_binaries() {
     # Check if all required binaries are already available
     if verify_required_binaries "${REQUIRED_BINARIES[@]}"; then
         echo "  ✓ All required platform binaries already available"
-        publish_draft_release
+        # GUARDED, not bare. `publish_draft_release` returns 1 on two deliberate
+        # refusals -- draft state unknown, and still-a-draft with the Gate A
+        # canary not concluded -- and those must reach the caller.
+        #
+        # Bare, they did not. The call site in the main flow is now
+        # `if ! wait_for_binaries`, and bash suspends errexit for the entire
+        # DYNAMIC EXTENT of a command in an `if`/`!` condition, which includes
+        # the whole body of the called function. So a bare failing call here no
+        # longer aborted: control fell through to the `return 0` below,
+        # `wait_for_binaries` reported SUCCESS, and the driver went on to
+        # publish crates, update gateways and announce -- for a release still
+        # sitting as an unpublished draft, possibly one the blocking canary had
+        # rejected. Verified empirically, both call conventions.
+        #
+        # That is a FAIL-OPEN regression, strictly worse than the fail-closed
+        # bug the guard was added to fix. `return 1` inside the `if` is
+        # unaffected by errexit suspension, so this restores the refusal under
+        # either convention.
+        if ! publish_draft_release; then
+            return 1
+        fi
         return 0
     fi
 
@@ -1566,7 +1586,13 @@ wait_for_binaries() {
                 sleep 5  # Brief delay for asset upload
                 if verify_required_binaries "${REQUIRED_BINARIES[@]}"; then
                     echo "  ✓ All required platform binaries attached"
-                    publish_draft_release
+                    # Guarded for the same reason as the other call site above:
+                    # bare, its refusal is swallowed when `wait_for_binaries` is
+                    # itself called from an `if !` condition, and the adjacent
+                    # `return 0` then reports success for an unpublished draft.
+                    if ! publish_draft_release; then
+                        return 1
+                    fi
                     return 0
                 else
                     echo "  ✗ Attach job succeeded but some required binaries are missing"
@@ -1766,12 +1792,22 @@ create_release_pr
 create_github_release
 # GUARDED, not bare, and that is the whole point of the `if`.
 #
-# This script runs under `set -euo pipefail`, and `wait_for_binaries` returns
-# nonzero on five paths: timeout, attach job failed, attach succeeded but
-# binaries missing, no run found, and draft state unknown. Called bare, every
-# one of those aborted the script HERE -- so `publish_crates` below, whose own
-# comment calls it the backstop for when "the workflow path is broken", was
+# This script runs under `set -euo pipefail`, and `wait_for_binaries` fails on
+# timeout, attach job failed, attach succeeded but binaries missing, no run
+# found, and on a refusal inherited from `publish_draft_release` (draft state
+# unknown, or still-a-draft with the Gate A canary not concluded). Called bare,
+# every one of those aborted the script HERE -- so `publish_crates` below, whose
+# own comment calls it the backstop for when "the workflow path is broken", was
 # unreachable in precisely the cases where the workflow path is broken.
+#
+# NOTE the last item, and how it is phrased. An earlier version of this comment
+# enumerated "five paths" and listed only explicit `return 1` statements inside
+# `wait_for_binaries` itself. That enumeration is what hid the bug this guard
+# introduced: it counted RETURN STATEMENTS rather than WAYS THE FUNCTION CAN
+# FAIL, and so did not name failure INHERITED FROM A BARE CALLEE -- which is
+# the one path errexit suspension breaks. It also mis-attributed "draft state
+# unknown", which is `publish_draft_release`'s return, not this function's.
+# Both inner call sites are now guarded so the refusal propagates regardless.
 #
 # The ordering pin in release_canary_wiring_test.sh could not see this: it
 # compares the LINE NUMBERS of the two calls, which were correct while the
