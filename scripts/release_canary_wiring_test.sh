@@ -1091,7 +1091,12 @@ logical_lines() {
 # `[[:space:]]` boundary never matches a command at the start of its line,
 # since the character before `cargo` is the prefix colon. Caught by the
 # assertion going to zero on a clean tree rather than by review.
-CARGO_PUBLISH_RE='(^[0-9]+:|[[:space:]])cargo([[:space:]]+[-+][^[:space:]]+)*[[:space:]]+publish([[:space:]]|$)'
+# The leading boundary is "any character that cannot be part of a command word"
+# rather than whitespace. Whitespace alone missed `echo "$(cargo publish ...)"`,
+# where the character before `cargo` is `(` -- a command substitution smuggling a
+# real publish past the scan. Excluding alnum/_/./- still refuses to match
+# `mycargo publish`.
+CARGO_PUBLISH_RE='(^[0-9]+:|[^[:alnum:]_./-])cargo([[:space:]]+[-+][^[:space:]]+)*[[:space:]]+publish([[:space:]]|$)'
 
 # Prose mentions inside an echo are not invocations -- ci.yml documents the
 # publish in one, and release.sh prints guidance quoting it. Narrow on purpose:
