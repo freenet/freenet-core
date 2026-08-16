@@ -10553,12 +10553,24 @@ mod tests {
                 "premise: the fixture must actually reach the summarize path, \
                  or the bound below can never fail"
             );
-            assert!(
-                fetches < repeats,
+            // Pin the EXACT value, not `< repeats`. The fixture hosts one
+            // contract and `lookup_by_hash` resolves the single hash to it, so
+            // correct dedup collapses the loop to exactly one round trip.
+            //
+            // `< repeats` was the first form and it is far too weak to be worth
+            // having: an INVERTED condition (`if seen_added.insert(hash)`,
+            // skipping only the FIRST occurrence) processes the other 499 and
+            // still passes, as does any batched dedup collapsing to repeats/K.
+            // That mutation removes ~1 round trip out of 500 — a dedup that is
+            // essentially entirely broken — and only an equality assertion
+            // separates it from the fix.
+            assert_eq!(
+                fetches, 1,
                 "{repeats} copies of one hash made {fetches} summarize round \
-                 trips. Bounding the other four loops makes this arm the \
-                 cheapest amplification path in the #5238 family, and dedup is \
-                 the one bound here that cannot drop a real new interest"
+                 trips, expected exactly 1. Bounding the other four loops makes \
+                 this arm the cheapest amplification path in the #5238 family, \
+                 and dedup is the one bound here that cannot drop a real new \
+                 interest"
             );
         }
 
