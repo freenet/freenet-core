@@ -3379,9 +3379,29 @@ fn record_delivery_to_interest<T: crate::util::time_source::TimeSource + Sync>(
     // receiver ACK), so on the streaming path a lost stream tail could leave the
     // peer without the state and the cached summary momentarily wrong. Two
     // backstops bound that window: the periodic InterestSync summary exchange
-    // (~5 min, node.rs) re-reconciles what each peer actually has, and a delta
-    // that fails to apply at the receiver triggers a ResyncRequest that clears
-    // the sender's cached summary (node.rs ~2119). The streaming `Delivered`
+    // re-reconciles what each peer actually has, and a delta that fails to
+    // apply at the receiver triggers a ResyncRequest that clears the sender's
+    // cached summary (node.rs ~2119).
+    //
+    // #5238 CHANGED THE FIRST NUMBER, and it is the backstop that matters for
+    // this specific case. This comment used to say "~5 min", which was the
+    // heartbeat interval, because the exchange re-examined every shared
+    // contract on every heartbeat. It is now a bounded rotating window of
+    // `MAX_DIGEST_SUMMARIES_PER_REPLY` contracts per reply, so a GIVEN contract
+    // is re-examined every `ceil(shared / 64)` heartbeats — on the order of 40
+    // minutes at the shared-set sizes measured in the field, not 5.
+    //
+    // The second backstop cannot cover the gap, which is why the number is
+    // worth stating here rather than only at the cap. It fires on a delta that
+    // FAILS TO APPLY; in the case this paragraph is about nothing is sent at
+    // all, because `plan_fanout_send` returns `Skip` on a byte-equal cached
+    // belief, so no delta exists to fail. After a lost stream tail on a
+    // contract that then goes quiet, the sender holds V2, the peer holds V1,
+    // the sender believes the peer holds V2, and anti-entropy is the only
+    // correction. Any later UPDATE to that contract does get sent (our summary
+    // then differs from the cached one), so the exposure is confined to
+    // quiescent contracts — but for those the window grew by roughly 8x.
+    // The streaming `Delivered`
     // signal is sender-side completion, so the rare tail-loss case is corrected
     // by those backstops rather than by an end-to-end ack here. Caching lets the
     // NEXT broadcast to this peer be a small delta instead of full state.

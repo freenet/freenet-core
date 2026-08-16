@@ -2404,9 +2404,22 @@ fn stale_sync_emit_budget(stale_contracts_len: usize) -> usize {
     stale_contracts_len.min(MAX_STALE_SYNCS_PER_SUMMARIES)
 }
 
-/// Per-message cap on how many DISTINCT contract hashes the hash-first
-/// handlers will process — both the `SummaryDigests` entries we examine and
-/// the `SummaryRequest` hashes we answer (#4965).
+/// Per-message cap on how many DISTINCT contract hashes a `SummaryRequest`
+/// may name (#4965).
+///
+/// # Scope, after #5238
+///
+/// This constant used to govern the `SummaryDigests` window and the
+/// `SummaryRequest` answer as well. It no longer does: the WORK bound on both
+/// moved to [`MAX_SUMMARY_COMPARISONS_PER_MESSAGE`], which is two orders of
+/// magnitude smaller, because the reasoning recorded below — that per-entry
+/// work is a cheap DashMap get — was wrong about the receive side, and being
+/// wrong about it in exactly this way is what produced the #5238 storm.
+///
+/// What is left here is the INPUT filter on `SummaryRequest`'s hash list, where
+/// the constant is still doing its original job: stopping a peer naming an
+/// arbitrarily long list. The two are now independently tunable, which the
+/// paragraph at the end of this comment used to say they were not.
 ///
 /// A digest entry costs the SENDER ~20 bytes and can cost the RECEIVER a
 /// `summary_if_hosted_or_in_use` round trip, which is an amplification ratio
@@ -2415,12 +2428,12 @@ fn stale_sync_emit_budget(stale_contracts_len: usize) -> usize {
 /// DISTINCT hash: a peer repeating one hash is deduplicated before any work,
 /// so repetition buys nothing.
 ///
-/// Over-cap contracts are not dropped permanently — the ~5-min interest
-/// heartbeat re-advertises them, and the `SummaryDigests` arm rotates its
-/// starting offset when the cap binds (the same random-rotation starvation
-/// argument [`MAX_STALE_SYNCS_PER_SUMMARIES`] makes, which matters here for
-/// the same reason: `get_matching_contracts` sorts by contract id, so a fixed
-/// prefix would starve the tail forever).
+/// Over-cap hashes are not dropped permanently — the interest heartbeat
+/// re-advertises them, though since #5238 that takes `ceil(n / 64)` rounds
+/// rather than the next one. The starvation argument
+/// [`MAX_STALE_SYNCS_PER_SUMMARIES`] makes still applies wherever a cap binds
+/// on this path: `get_matching_contracts` sorts by contract id, so a fixed
+/// prefix would starve the tail forever, and every capped site here rotates.
 ///
 /// # Why 4096, measured rather than guessed
 ///
@@ -2449,17 +2462,24 @@ fn stale_sync_emit_budget(stale_contracts_len: usize) -> usize {
 ///
 /// # What the cap is, and is not
 ///
-/// It is a **backstop, not the operative bound.** The sender's entry count is
-/// naturally bounded by its own tracked set (`get_matching_contracts` iterates
-/// the responder's hash index), and the expensive receive-side work is bounded
-/// the same way: `lookup_by_hash` can only resolve contracts WE already track,
-/// so a peer cannot make us summarize something we do not have. What this cap
-/// actually bounds is a per-entry DashMap-get loop — cheap, which is why a
-/// generous value costs nothing.
+/// It is a **backstop, not the operative bound**, and the argument for that
+/// used to run: `lookup_by_hash` can only resolve contracts WE already track,
+/// so a peer cannot make us summarize something we do not have, and what the
+/// cap really bounds is a per-entry DashMap-get loop — cheap, so a generous
+/// value costs nothing.
 ///
-/// There is no send-side chunking at this value; all three uses are
-/// receive-side (the `SummaryDigests` window and the `SummaryRequest` answer),
-/// so the constant moves them together and cannot be raised on one side only.
+/// **The last step of that is what #5238 disproved.** "A peer cannot make us
+/// summarize something we do not have" bounds WHICH contracts, not HOW MANY,
+/// and on a peer hosting 933 contracts the honest heartbeat is itself hundreds
+/// of entries. The per-entry work is a contract-handler round trip that
+/// re-enters WASM on a cache miss, not a DashMap get. Left in place because it
+/// is the reasoning error, and a future editor is better served by seeing it
+/// than by seeing a corrected version that looks like nobody ever got it wrong.
+///
+/// Its one remaining use is the `SummaryRequest` input slice, and there the
+/// original reasoning does hold: a long hash list really is only a
+/// `get_matching_contracts` filter, and the summarize loop that follows it is
+/// separately bounded by [`MAX_SUMMARY_COMPARISONS_PER_MESSAGE`].
 const MAX_SUMMARY_HASHES_PER_MESSAGE: usize = 4096;
 
 /// Per-`Summaries`-message cap on semantic-staleness probes — the WASM
@@ -3029,14 +3049,195 @@ const MAX_FALLBACK_SUMMARIES_PER_REPLY: usize = 64;
 /// zero.
 const MAX_FALLBACK_SUMMARY_BYTES_PER_REPLY: usize = 9 * 1024;
 
+/// Maximum number of contract summaries one periodic `Interests` reply computes
+/// on the hash-first DIGEST path (#5238).
+///
+/// #5155 bounded the full-bytes fallback and deliberately left this path alone,
+/// on the reasoning that digests are cheap to SEND. They are — 21 bytes each.
+/// But an entry of either form costs one `summary_if_hosted_or_in_use` call to
+/// PRODUCE, and that call is a contract-handler round trip that re-enters WASM
+/// whenever the memoised state-hash misses. Bounding bytes never bounded that,
+/// so once digest-capability became the common case (#5066 merged 2026-07-31,
+/// floor 0.2.116) the periodic heartbeat was left looping over the WHOLE shared
+/// interest set, on every message, in both directions.
+///
+/// That produced the third `summarize_contract_state` storm in the family
+/// (#4473 -> #4610 -> #5238): a real NATed peer hosting 933 contracts over 18
+/// connections sustained ~54 calls/sec against the 30/sec per-callsite log
+/// limiter, resuming within seconds of every restart. It is NOT a
+/// phantom-hosting recurrence — every call in that loop is a correctly-gated
+/// summarize of a genuinely hosted contract (`should_summarize_or_broadcast`
+/// holds), and the `Contract state not found in store` WARN that was #4610's
+/// signature does not appear. The defect is that nothing bounded HOW MANY.
+///
+/// # Where 64 comes from
+///
+/// The cost bounded here is CPU, so it is sized against a CPU budget rather
+/// than a message size. Per heartbeat and per peer we pay two summarize-heavy
+/// legs: the reply we build here, and the peer's reply that we compare against
+/// our own state in the `SummaryDigests` arm (bounded by
+/// [`MAX_SUMMARY_COMPARISONS_PER_MESSAGE`]). So
+///
+/// ```text
+/// summarize calls/sec ~= 2 x cap x connected_peers / INTEREST_HEARTBEAT_INTERVAL
+/// ```
+///
+/// At 64 and the observed 18 connections that is ~7.7/sec — about a quarter of
+/// the 30/sec per-callsite limiter these storms are measured against, and an
+/// ~7x reduction from the measured 54/sec. It is also the same number as
+/// [`MAX_FALLBACK_SUMMARIES_PER_REPLY`], which restores the property #5155's
+/// split lost: one periodic reply costs the same whichever wire form it takes.
+///
+/// # What it costs in convergence
+///
+/// A stable shared set of `n` contracts is covered in `ceil(n / 64)` heartbeats
+/// (the window rotates and wraps — see `rotation_window_indices`). At the
+/// ~450-contract shared sets implied by the field measurement that is 8 rounds,
+/// or **~40 minutes** for the anti-entropy backstop to come back round to a
+/// given contract, against 5 minutes before. Two reasons that is affordable,
+/// and one caveat:
+///
+/// - This is the BACKSTOP layer, not the delivery path. A committed update goes
+///   to every connected advertised co-host immediately via live fan-out, with
+///   no INTEREST check and untouched by this change; the event-driven repairs
+///   (resend-on-failed-patch, request-full-state-when-too-far-behind) are also
+///   untouched. Anti-entropy only has to catch a divergence that ALL of those
+///   missed.
+///
+///   Read "no interest check" narrowly, because live fan-out is not
+///   unconditional. It has a SUMMARY gate — `plan_fanout_send` returns `Skip`
+///   when our cached belief about the peer's summary is byte-equal to ours —
+///   and that gate is fed by the very cache this change warms more slowly. A
+///   MISSING belief is safe in the direction that matters (see the
+///   second-order cost below: it makes us send more, never skip). A WRONG
+///   belief is the case this bullet must not be read as covering: after a lost
+///   stream tail the sender can believe a peer has state it does not have,
+///   nothing is sent, so no delta fails and the ResyncRequest repair cannot
+///   fire either. For a contract that then goes quiet, anti-entropy is the
+///   only correction, and this change stretches that window by roughly 8x.
+///   It stays bounded, and it is confined to quiescent contracts, but it is a
+///   real cost of this change rather than one the delivery path absorbs.
+///   `broadcast_queue.rs` carries the same note where the belief is cached.
+/// - It is far tighter than the cost already accepted on the sibling path:
+///   [`MAX_FALLBACK_SUMMARY_BYTES_PER_REPLY`] documents cycles on the order of
+///   ten HOURS for the heaviest full-bytes links, shipped in #5155.
+/// - **The layer being slowed almost never finds anything.** Measured
+///   fleet-wide over ~27,500 node-minutes: 26,457,275 summary comparisons
+///   agreed against 44,305 that differed — 99.83% identical. Anti-entropy is
+///   paying a continuous CPU cost to discover a divergence roughly one time in
+///   six hundred, which is what makes trading its latency for that CPU the
+///   right side of the deal.
+///
+/// # The second-order cost: the peer-summary cache warms at the same rate
+///
+/// Not obvious, and it lands on the majority of links rather than the minority
+/// #5155's equivalent did, so it is stated here rather than left to be
+/// discovered. `SummaryPopulationSource::DigestAgreement` is the only thing
+/// that seeds our cached belief about a peer's summary for a QUIESCENT contract
+/// on a digest link, and it now fires for at most 64 contracts per heartbeat.
+/// The broadcast path sends a delta only to a peer whose summary we hold, so
+/// for up to `ceil(n / 64)` heartbeats after a connection forms, the first
+/// update to a not-yet-covered contract ships FULL STATE instead of a delta.
+///
+/// Two things bound it. The direction is safe — a missing cached summary makes
+/// us send more, never skip — so no update is lost. And `Delivery` seeds the
+/// cache after any successful send, so only the FIRST update per
+/// (contract, peer) pays, and #5153 found 57.5% of cold-start sends fire before
+/// any heartbeat could have helped anyway. It is a bytes-for-bytes trade
+/// against a CPU saving, not purely a latency one.
+///
+/// # The caveat, and the retune candidate
+///
+/// This is a per-REPLY cap, so the per-NODE rate still scales with connection
+/// count. A 200-connection gateway sharing 64+ contracts with every peer would
+/// model to ~85 calls/sec even at this cap. Capping is monotone — it can only
+/// lower what a reply computes, never raise it — so no peer is made worse off,
+/// but an aggregate node-wide budget is a real remaining gap. Sizing one needs
+/// the entries-per-reply distribution (#5168), not another fleet average; see
+/// [`MAX_FALLBACK_SUMMARIES_PER_REPLY`] for how retuning off a mean went wrong
+/// last time.
+///
+/// **128 is the obvious retune candidate and was deliberately not taken here.**
+/// It models to ~15.4 calls/sec at 18 connections, still half the limiter, and
+/// it would halve both the convergence latency and the cache-warm latency
+/// above. The reason to ship 64 first is that the node this was measured on is
+/// pinned at its 2 GB cgroup cap right now, so the larger margin is worth more
+/// than the latency; and that the equality with
+/// [`MAX_FALLBACK_SUMMARIES_PER_REPLY`] is a symmetry argument, not a budget
+/// one, so it should not by itself hold the value down once #5168 gives a
+/// distribution to read.
+const MAX_DIGEST_SUMMARIES_PER_REPLY: usize = 64;
+
+/// Maximum number of digest entries one inbound `SummaryDigests` message may
+/// COMPARE against local state (#5238).
+///
+/// The digest exchange has two summarize-heavy legs, not one, and they are
+/// independent: the sender pays [`MAX_DIGEST_SUMMARIES_PER_REPLY`] calls to
+/// build the message, and the receiver pays one call per entry to compute its
+/// OWN summary for the comparison. Bounding only the send side would move half
+/// the storm rather than remove it, and would leave the receiver exposed to any
+/// peer that has not upgraded (or is not honest) sending a full set.
+///
+/// Equal to [`MAX_DIGEST_SUMMARIES_PER_REPLY`] on purpose: a sender running
+/// this release never emits more than that, so between two upgraded peers this
+/// cap never truncates and the two legs cover exactly the same contracts each
+/// round. It binds only on a message from a peer that predates this change.
+///
+/// This REPLACES [`MAX_SUMMARY_HASHES_PER_MESSAGE`] (4096) as the WORK bound on
+/// this arm. That constant is unchanged and still bounds the `SummaryRequest`
+/// input, where it remains the right anti-abuse ceiling.
+///
+/// Over-cap messages are still processed from a random offset (the existing
+/// `rotate_left`), so truncating never starves the tail of a set the sender
+/// happens to emit in contract-id order.
+///
+/// # What truncation costs, when it binds
+///
+/// The random offset is a fresh uniform draw each round rather than the
+/// id-keyed cursor the send side uses, so coverage of an over-cap sender's set
+/// is coupon-collector rather than `ceil(n / 64)`: about `(n / 64) * H_n`
+/// rounds, ~43 rounds (a few hours) for n = 450, against 8. That is worth
+/// knowing and is NOT the same guarantee the send side gives.
+///
+/// It is nevertheless the right trade, for a reason specific to who can reach
+/// it. Only a pre-#5238 sender emits an over-cap message, so this binds during
+/// a rollout and then stops. In that window the degraded direction is only "we
+/// notice that IT is stale"; the old peer's own view is repaired by our SEND
+/// leg, which is cursor-rotated and covers in `ceil(n / 64)`, and which the old
+/// peer compares in full because it has no cap. So the un-upgraded peer
+/// converges on the normal schedule and only our detection of its staleness is
+/// a slower random walk. Giving this leg a cursor too would need the truncated
+/// set sorted and a second cursor cache keyed the same way; worth doing if a
+/// long-lived mixed-version population ever becomes normal, and not worth the
+/// machinery for a rollout window.
+const MAX_SUMMARY_COMPARISONS_PER_MESSAGE: usize = MAX_DIGEST_SUMMARIES_PER_REPLY;
+
+/// The `Summaries` receive-leg cap is documented (see its comment above) as
+/// never binding against a peer running #5155 or later, because such a peer
+/// caps its own `InterestsReply` fallback at
+/// [`MAX_FALLBACK_SUMMARIES_PER_REPLY`]. That is a relationship BETWEEN two
+/// independently-motivated constants, not a property of either one: the
+/// fallback cap has its own byte-budget rationale, and raising it alone would
+/// start silently truncating legitimate replies from upgraded peers with no
+/// test failing. The alias above keeps the 64 -> 128 retune this module
+/// actively invites self-consistent; this assertion is what keeps the OTHER
+/// side of the inequality honest.
+const _: () = assert!(
+    MAX_FALLBACK_SUMMARIES_PER_REPLY <= MAX_SUMMARY_COMPARISONS_PER_MESSAGE,
+    "raising MAX_FALLBACK_SUMMARIES_PER_REPLY above MAX_SUMMARY_COMPARISONS_PER_MESSAGE \
+     would make the Summaries receive-leg cap truncate replies from #5155+ peers"
+);
+
 /// Which wire form a multi-entry `Summaries` reply to a peer takes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SummaryReplyForm {
-    /// Peer is at or above the hash-first floor: 21-byte digests, whole shared
-    /// set every round. Unchanged by #5155.
+    /// Peer is at or above the hash-first floor: 21-byte digests, bounded and
+    /// rotated by entry COUNT (#5238 — #5155 left this form unbounded because
+    /// it was bounding bytes, and digests are 21 bytes each; what stormed was
+    /// the summarize call each entry costs to produce).
     Digests,
     /// Peer is pre-floor, or its version is unknown: full summary bytes,
-    /// bounded and rotated (#5155).
+    /// bounded and rotated by entry count AND by bytes (#5155).
     FullBytes,
 }
 
@@ -3307,38 +3508,36 @@ async fn handle_interest_sync_message(
 
             // #5155: resolve the wire form BEFORE building anything, and take
             // exactly one reading of the version gate (see
-            // `summary_reply_form`). A digest-capable peer keeps getting the
-            // whole shared set every round; only the full-bytes fallback is
-            // bounded, because only it pays per-contract summary bytes.
+            // `summary_reply_form`). The form still decides the ENCODING and
+            // whether a byte budget applies; since #5238 it no longer decides
+            // WHETHER the reply is bounded — both forms are.
             let form = summary_reply_form(op_manager, source);
 
-            // Positions in `matching` whose summaries this reply carries, in the
-            // order they are charged against the byte budget.
+            // Positions in `matching` whose summaries this reply carries, in
+            // the order they are charged against the caps.
             //
-            // `None` means every contract in the set's own order: the digest
-            // path, unchanged, and deliberately WITHOUT materialising an
-            // identity permutation — that would put an allocation the size of
-            // the shared set on the hot path this change claims not to touch.
+            // A bounded window that rotates from where the last reply to this
+            // peer stopped, so successive rounds cover the whole set instead of
+            // re-sending the same prefix forever. The resume point is derived
+            // from the last contract id SENT rather than a stored index, which
+            // is what makes it survive contracts being added and removed
+            // between rounds — see `first_index_after`.
             //
-            // `Some(window)` is the full-bytes fallback: a bounded window that
-            // rotates from where the last reply to this peer stopped, so
-            // successive rounds cover the whole set instead of re-sending the
-            // same prefix forever. The resume point is derived from the last
-            // contract id SENT rather than a stored index, which is what makes
-            // it survive contracts being added and removed between rounds — see
-            // `first_index_after`.
-            let window: Option<Vec<usize>> = match form {
-                SummaryReplyForm::Digests => None,
-                SummaryReplyForm::FullBytes => {
-                    let start = op_manager
-                        .interest_manager
-                        .fallback_window_start(source, &matching);
-                    Some(crate::ring::interest::rotation_window_indices(
-                        matching.len(),
-                        start,
-                        MAX_FALLBACK_SUMMARIES_PER_REPLY,
-                    ))
-                }
+            // #5238: the digest path is windowed too. #5155 left it whole
+            // because it was bounding BYTES and a digest is 21 of them, but
+            // every entry of either form costs one `summary_if_hosted_or_in_use`
+            // call to produce, and that call is what stormed. Only the LIMIT
+            // differs by form, and only the full-bytes path additionally
+            // charges a byte budget on top (see the loop below).
+            let entry_cap = match form {
+                SummaryReplyForm::Digests => MAX_DIGEST_SUMMARIES_PER_REPLY,
+                SummaryReplyForm::FullBytes => MAX_FALLBACK_SUMMARIES_PER_REPLY,
+            };
+            let window = {
+                let start = op_manager
+                    .interest_manager
+                    .summary_window_start(source, &matching);
+                crate::ring::interest::rotation_window_indices(matching.len(), start, entry_cap)
             };
 
             // Register/refresh peer interest for EVERY shared contract, not just
@@ -3383,12 +3582,11 @@ async fn handle_interest_sync_message(
             }
 
             // Build the summaries this reply carries, in rotation order.
-            let reply_len = window.as_ref().map_or(matching.len(), |w| w.len());
-            let mut entries = Vec::with_capacity(reply_len);
+            let mut entries = Vec::with_capacity(window.len());
             let mut summary_bytes_used = 0usize;
             let mut last_included: Option<ContractInstanceId> = None;
-            for pos in 0..reply_len {
-                let contract = matching[window.as_ref().map_or(pos, |w| w[pos])];
+            for &index in &window {
+                let contract = matching[index];
                 // #5155 byte budget. The check is RETROSPECTIVE — it asks
                 // whether the budget is already spent, not whether this entry
                 // would breach it — which is what guarantees the first entry
@@ -3435,12 +3633,13 @@ async fn handle_interest_sync_message(
             //   round of progress. Reserving the window at read time instead
             //   would trade that for a worse failure: a budget-cut round would
             //   then skip everything it did not reach.
-            if form == SummaryReplyForm::FullBytes {
-                if let Some(last) = last_included {
-                    op_manager
-                        .interest_manager
-                        .record_fallback_cursor(source, last);
-                }
+            //
+            // #5238: recorded for BOTH forms now. Under #5155 only the
+            // full-bytes path rotated, so only it had a cursor to advance.
+            if let Some(last) = last_included {
+                op_manager
+                    .interest_manager
+                    .record_summary_cursor(source, last);
             }
 
             if entries.is_empty() {
@@ -3530,10 +3729,33 @@ async fn handle_interest_sync_message(
                 // why shape is the only available discriminator (the emitter tag
                 // is `#[serde(skip)]`) and for the measured contamination.
                 //
-                // Computed BEFORE the loop consumes `entries`, on the length of
-                // the message the peer actually sent. Same expression as the
-                // `SummaryDigests` arm's, so the two legs stay comparable.
+                // Computed BEFORE the loop consumes `entries`, and before the
+                // #5238 truncation below, so it classifies the length of the
+                // message the peer actually sent rather than the windowed
+                // remainder. Same expression as the `SummaryDigests` arm's, so
+                // the two legs stay comparable.
                 let single_entry = entries.len() == 1;
+
+                // #5238: bound this leg too. It is the full-bytes twin of the
+                // `SummaryDigests` arm and pays the same per-entry summarize
+                // cost, with neither that arm's per-message memo nor its pair
+                // dedup, so it was the cheapest remaining path in the family
+                // once the other three were bounded — the same argument the
+                // `SummaryRequest` arm records.
+                //
+                // It never binds on a peer running #5155 or later: an
+                // `InterestsReply` fallback is capped at
+                // `MAX_FALLBACK_SUMMARIES_PER_REPLY` entries and a
+                // `SummaryRequestReply` answers a request we ourselves capped
+                // at `MAX_SUMMARY_COMPARISONS_PER_MESSAGE`. Random offset
+                // rather than a prefix, for the tail-starvation reason the
+                // sibling arms document.
+                let mut entries = entries;
+                if entries.len() > MAX_SUMMARY_COMPARISONS_PER_MESSAGE {
+                    let start = crate::config::GlobalRng::random_range(0..entries.len());
+                    entries.rotate_left(start);
+                    entries.truncate(MAX_SUMMARY_COMPARISONS_PER_MESSAGE);
+                }
                 for entry in entries {
                     for contract in op_manager.interest_manager.lookup_by_hash(entry.hash) {
                         if !op_manager.interest_manager.has_local_interest(&contract) {
@@ -3822,8 +4044,16 @@ async fn handle_interest_sync_message(
             // therefore costs one extra round trip (sub-second) against a
             // ~5-min heartbeat, and is never silently dropped. If the request
             // or its answer IS lost, the contract simply stays diverged until
-            // the next heartbeat re-advertises it — the same outcome a lost
+            // a later heartbeat re-advertises it — the same outcome a lost
             // `Summaries` has today, not a new failure mode.
+            //
+            // #5238 made "a later heartbeat" materially later: the reply is
+            // windowed, so re-advertisement takes up to `ceil(shared / 64)`
+            // rounds rather than the very next one — on the order of an hour
+            // for a peer sharing the whole of a 933-contract hosted set,
+            // against 5 minutes before. Still bounded, still not a new failure
+            // mode, but this sentence used to lean on a latency it no longer
+            // has, so read it with that number rather than the old one.
             //
             // Telemetry note: the #4965 identical/differing counters are
             // recorded on AGREEMENT here and on ARRIVAL of the requested bytes
@@ -3846,15 +4076,23 @@ async fn handle_interest_sync_message(
             // this is a byte copy, not a key operation, and it happens once per
             // InterestSync message.
             if let Some(pk) = peer_key.clone() {
-                // See `MAX_SUMMARY_HASHES_PER_MESSAGE`: entries are
+                // See `MAX_SUMMARY_COMPARISONS_PER_MESSAGE`: entries are
                 // peer-supplied and cheap for the peer to fabricate, so
                 // deduplicate by hash and process a bounded window. The window
                 // starts at a random offset when the cap binds, for the same
                 // starvation reason `emit_stale_peer_syncs` rotates — a
                 // sender's entries arrive in contract-id order, so a fixed
                 // prefix would starve the tail on every cycle forever.
+                //
+                // #5238: this cap was `MAX_SUMMARY_HASHES_PER_MESSAGE` (4096),
+                // which bounds the MESSAGE but not the WORK — each entry costs
+                // a `summary_if_hosted_or_in_use` call below, so a routine
+                // heartbeat from a peer sharing hundreds of contracts ran
+                // hundreds of them. This is the receiving half of the same
+                // storm the send-side window closes; both legs of one
+                // round-trip pay it independently.
                 let mut entries = entries;
-                if entries.len() > MAX_SUMMARY_HASHES_PER_MESSAGE {
+                if entries.len() > MAX_SUMMARY_COMPARISONS_PER_MESSAGE {
                     let start = crate::config::GlobalRng::random_range(0..entries.len());
                     entries.rotate_left(start);
                 }
@@ -3989,7 +4227,7 @@ async fn handle_interest_sync_message(
                     // The cap counts distinct PAIRS, matching what is actually
                     // processed — counting distinct hashes would no longer
                     // bound the work now that several pairs can share a hash.
-                    if seen_pairs.len() >= MAX_SUMMARY_HASHES_PER_MESSAGE {
+                    if seen_pairs.len() >= MAX_SUMMARY_COMPARISONS_PER_MESSAGE {
                         break;
                     }
                     if !seen_pairs.insert((entry.hash, entry.summary_digest)) {
@@ -4308,25 +4546,33 @@ async fn handle_interest_sync_message(
             // already track can be named) and the same
             // `summary_if_hosted_or_in_use` gate. Unlike the `Interests` arm
             // this registers no interest and removes none — a request is not
-            // an interest advertisement. Bounded by
-            // `MAX_SUMMARY_HASHES_PER_MESSAGE` on the input so a peer cannot
-            // name an arbitrarily long hash list.
+            // an interest advertisement. `MAX_SUMMARY_HASHES_PER_MESSAGE`
+            // bounds the input so a peer cannot name an arbitrarily long hash
+            // list.
             //
-            // No separate rate limit, deliberately: a peer that wanted to
-            // force this work could already do so by spamming `Interests`,
-            // which runs the same `get_matching_contracts` +
-            // `summary_if_hosted_or_in_use` loop AND additionally rewrites its
-            // interest registrations. Since #5155 the two loops are no longer
-            // literally identical — the `Interests` arm windows its summary
-            // fetches for full-bytes peers — but the conclusion is unchanged
-            // and now rests on WHO can reach this arm: only a peer that
-            // negotiated digests sends `SummaryRequest`, and a digest-capable
-            // peer still gets the unwindowed loop on `Interests`. So this arm
-            // is still no cheaper to abuse than one that peer already has, and
-            // the summaries themselves are memoized on the state hash, so
-            // repeats do not re-enter WASM.
+            // #5238: this arm now ALSO bounds the summarize loop itself, and
+            // the reason is a consequence of that change rather than a new
+            // policy. The previous justification for leaving it unbounded was
+            // that "a peer could already force the same work by spamming
+            // `Interests`, which runs the same loop" — true while the
+            // `Interests` arm gave a digest-capable peer an unwindowed loop.
+            // Now that BOTH forms of `Interests` are windowed, that arm is
+            // strictly cheaper than this one, so leaving this one unbounded
+            // would leave behind an amplification path easier than the one
+            // being closed. Bounding it costs nothing in practice: a requester
+            // running this release compares at most
+            // `MAX_SUMMARY_COMPARISONS_PER_MESSAGE` entries, so it can never
+            // ask for more hashes than this cap allows, and anything a
+            // pre-upgrade peer asks for beyond it is re-requested from its next
+            // heartbeat's digest comparison. Random offset, not a prefix, for
+            // the tail-starvation reason the sibling arms document.
             let bounded = &hashes[..hashes.len().min(MAX_SUMMARY_HASHES_PER_MESSAGE)];
-            let matching = op_manager.interest_manager.get_matching_contracts(bounded);
+            let mut matching = op_manager.interest_manager.get_matching_contracts(bounded);
+            if matching.len() > MAX_SUMMARY_COMPARISONS_PER_MESSAGE {
+                let start = crate::config::GlobalRng::random_range(0..matching.len());
+                matching.rotate_left(start);
+                matching.truncate(MAX_SUMMARY_COMPARISONS_PER_MESSAGE);
+            }
             let mut entries = Vec::with_capacity(matching.len());
             for contract in matching {
                 let hash = contract_hash(&contract);
@@ -4375,7 +4621,41 @@ async fn handle_interest_sync_message(
             // Handle additions - respond with summaries for newly shared contracts
             let mut entries = Vec::new();
             if let Some(ref pk) = peer_key {
+                // #5238: deduplicate the peer-supplied hash list before doing
+                // any work.
+                //
+                // This arm is deliberately NOT windowed — it is driven by
+                // interest churn rather than by a clock, so there is no
+                // guaranteed next round to rotate into and a window could defer
+                // a newly-added interest indefinitely rather than by a bounded
+                // number of heartbeats. That argument is recorded at the arm
+                // below and it still stands.
+                //
+                // It is an argument against ROTATION, not against DEDUP, and
+                // the two are not the same trade. A rotation window can drop a
+                // new interest; a dedup set cannot, because the second and
+                // later copies of a hash carry no information the first did not
+                // already deliver. So dedup is free here in exactly the way a
+                // window is not.
+                //
+                // It is worth doing because bounding the other four loops makes
+                // THIS the cheapest amplification path in the family: `added`
+                // is peer-supplied and uncapped, and every entry costs one
+                // `summary_if_hosted_or_in_use` round trip that re-enters WASM
+                // on a memo miss, sequentially on the handler. Leaving it would
+                // repeat #5155's mistake one level up — bound the paths you
+                // measured and leave the equivalent one you did not.
+                //
+                // Note this bounds work by DISTINCT hash, not by message size.
+                // A peer naming many genuinely-distinct new interests still
+                // costs one round trip each, by design: those are real
+                // additions and dropping them is the failure mode the missing
+                // window is avoiding.
+                let mut seen_added: HashSet<u32> = HashSet::new();
                 for hash in added {
+                    if !seen_added.insert(hash) {
+                        continue;
+                    }
                     // Handle hash collisions - process all matching contracts
                     for contract in op_manager.interest_manager.lookup_by_hash(hash) {
                         // Only process if we have local interest in this contract
@@ -4441,6 +4721,19 @@ async fn handle_interest_sync_message(
                         // Get our summary to send back — only for contracts we
                         // host or actively serve (see `summary_if_hosted_or_in_use`,
                         // #4473).
+                        //
+                        // #5238 bounded every OTHER summarize loop in this
+                        // handler and deliberately left this one alone, for
+                        // #5155's reason: this arm is driven by interest CHURN,
+                        // not by a clock, so there is no guaranteed next round
+                        // to rotate into and a window here could defer a
+                        // newly-added interest indefinitely rather than by a
+                        // bounded number of heartbeats. Production emits
+                        // `ChangeInterests` on a 0->1 transition, so `added` is
+                        // normally one hash. A peer CAN name many at once, and
+                        // that is the residual of this family; bounding it
+                        // needs a mechanism that cannot drop a new interest,
+                        // not the rotation the periodic arms use.
                         let summary = summary_if_hosted_or_in_use(op_manager, &contract).await;
                         entries.push(SummaryEntry::from_summary(hash, summary.as_ref()));
                     }
@@ -9893,14 +10186,14 @@ mod tests {
 
             // Seed the cursor so both rounds are mid-cycle and the starting
             // offset is fixed. Without this the first round would begin at a
-            // random cycle-boundary offset (see `fallback_window_start`) and a
+            // random cycle-boundary offset (see `summary_window_start`) and a
             // start on the last contract would wrap into a second random draw,
             // making the "moved on to a different contract" assertion flaky.
             let mut sorted = keys.clone();
             sorted.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
             h.op_manager
                 .interest_manager
-                .record_fallback_cursor(h.old_peer, *sorted[0].id());
+                .record_summary_cursor(h.old_peer, *sorted[0].id());
 
             let mut seen: Vec<u32> = Vec::new();
             for round in 0..2 {
@@ -9932,18 +10225,32 @@ mod tests {
             );
         }
 
-        /// Digest-capable peers are completely unaffected: they keep receiving
-        /// every shared contract every round.
+        // ===== #5238: the digest path is bounded by CALLS, not by bytes =====
+
+        /// The digest reply is bounded too, and the observable is the number of
+        /// `GetSummaryQuery` round trips it makes — not the entry count.
         ///
-        /// #5155 bounds only the fallback. If the bound leaked onto the digest
-        /// path it would slow convergence for the 98% of links that are working
-        /// correctly, to save bytes that path was not spending.
+        /// This is the regression test for #5238, and it deliberately asserts
+        /// on the EXPENSIVE operation rather than on the message. #5155 read
+        /// this path as cheap because a digest is 21 bytes; the cost that
+        /// stormed is the `summary_if_hosted_or_in_use` call each entry needs
+        /// to PRODUCE its digest, which is a contract-handler round trip that
+        /// can re-enter WASM. An entry-count assertion alone would stay green
+        /// under a regression that trimmed the reply after summarizing
+        /// everything, which is exactly the shape that costs nothing to write
+        /// and reproduces the storm in full.
+        ///
+        /// The fixture is the field case: 933 hosted contracts on the NATed
+        /// peer in #5238, all shared with one digest-capable neighbour.
         #[tokio::test]
-        async fn digest_peer_still_receives_every_shared_contract() {
-            let h = build_harness("hf-bound-digest", 17130, vec![7u8; 64]).await;
-            let keys = host_many(&h, 200);
+        async fn digest_reply_bounds_the_summarize_calls_not_just_the_entries() {
+            use std::sync::atomic::Ordering;
+
+            let h = build_harness("hf-digest-bound", 17130, vec![7u8; 64]).await;
+            let keys = host_many(&h, 933);
             let hashes = distinct_hashes(&keys);
 
+            let before = h.summary_queries.load(Ordering::Relaxed);
             let reply = handle_interest_sync_message(
                 &h.op_manager,
                 h.new_peer,
@@ -9952,20 +10259,421 @@ mod tests {
                 },
             )
             .await;
+            let fetches = h.summary_queries.load(Ordering::Relaxed) - before;
 
             match reply {
                 Some(InterestMessage::SummaryDigests { entries, .. }) => {
+                    assert!(
+                        !entries.is_empty(),
+                        "the reply must still carry something — a bound that \
+                         sends nothing is not a bound, it is a silent outage"
+                    );
+                    // ABSOLUTE literals, not the constants that produced them:
+                    // an assertion written against its own constant moves with
+                    // any regression to it and can never fail.
+                    assert!(
+                        entries.len() <= 64,
+                        "digest reply carried {} entries against {} shared \
+                         contracts; the intended cap is 64",
+                        entries.len(),
+                        hashes.len()
+                    );
                     assert_eq!(
                         entries.len(),
-                        hashes.len(),
-                        "a hash-first peer must still get the whole shared set \
-                         ({} contracts) in one round, unbounded by \
-                         MAX_FALLBACK_SUMMARIES_PER_REPLY",
-                        hashes.len()
+                        64,
+                        "premise: at 933 shared contracts the entry cap must be \
+                         the binding constraint"
                     );
                 }
                 other => panic!("a hash-first-capable peer must get digests, got {other:?}"),
             }
+
+            assert!(
+                fetches > 0,
+                "premise: the fixture must actually reach the summarize path, \
+                 or the bound below can never fail. Entry count does not cover \
+                 this — entries are pushed with a `None` summary when the gate \
+                 declines, so a gate regression would leave `entries.len()` at \
+                 64 and `fetches` at 0"
+            );
+            assert!(
+                fetches <= 64,
+                "building the digest reply made {fetches} summarize round trips \
+                 against {} shared contracts. This is the #5238 storm: bounding \
+                 the MESSAGE without bounding the LOOP leaves the CPU cost \
+                 exactly where it was, because a digest costs a full summarize \
+                 to produce",
+                hashes.len()
+            );
+        }
+
+        /// Successive digest replies rotate, so the whole shared set is still
+        /// covered — in `ceil(n / cap)` heartbeats instead of one.
+        ///
+        /// This is the convergence half of the bound. A cap without rotation
+        /// would advertise the same 64 contracts to that peer forever and never
+        /// tell it about the rest, converting a CPU fix into permanent silent
+        /// divergence. The cost that IS accepted is latency: at the 5-minute
+        /// heartbeat, a peer sharing 933 contracts takes 15 rounds — about 75
+        /// minutes — for anti-entropy to come back round to a given contract.
+        /// (`MAX_DIGEST_SUMMARIES_PER_REPLY` quotes ~40 minutes for the same
+        /// node: that is the ~450-contract SHARED set implied by the field
+        /// measurement, where 933 is the HOSTED set, i.e. the worst case of a
+        /// peer sharing interest in every contract we hold.) Live fan-out and
+        /// the event-driven repairs are untouched and still carry every update
+        /// anybody actually makes.
+        ///
+        /// # Why the CURSOR is seeded, not just the RNG
+        ///
+        /// `ceil(n / cap)` rounds tile the set exactly only while every round
+        /// is mid-cycle. A round whose window ENDS on the highest id leaves the
+        /// cursor past the end, which `summary_window_start` reads as a cycle
+        /// boundary and answers with a fresh random offset. That is deliberate
+        /// anti-starvation behaviour rather than a bug, but it re-covers ground
+        /// already covered, and the exact-tiling assertion then fails.
+        ///
+        /// At n=200 and cap=64 that happens for 3 of the 200 possible starts,
+        /// so the first version of this test failed about 1% of runs — and
+        /// non-reproducibly, because `GlobalRng` falls back to `rand::rng()`
+        /// when unseeded. It duly failed on the very next full-suite run.
+        /// Seeding the cursor fixes the start at index 1 and removes the
+        /// boundary re-draw from the schedule entirely, so the test pins the
+        /// tiling property itself rather than one lucky seed. The RNG is seeded
+        /// as well, so that any future edit reintroducing a draw stays
+        /// reproducible instead of flaky.
+        #[tokio::test]
+        async fn digest_rotation_covers_the_whole_shared_set() {
+            // Guarded rather than bare: `set_seed` also pins THREAD_INDEX to 0,
+            // and `config.rs` asks callers to pair it with `clear_seed`. The
+            // guard does that on unwind too, so a panicking assertion below
+            // cannot leave the seed pinned for whatever runs next on this
+            // thread.
+            let _seed = crate::config::GlobalRng::seed_guard(0x5238_D16E);
+            let h = build_harness("hf-digest-rotate", 17150, vec![7u8; 64]).await;
+            let keys = host_many(&h, 200);
+            let hashes = distinct_hashes(&keys);
+            let expected: HashSet<u32> = hashes.iter().copied().collect();
+            let rounds = hashes.len().div_ceil(MAX_DIGEST_SUMMARIES_PER_REPLY);
+
+            let mut sorted = keys.clone();
+            sorted.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+            h.op_manager
+                .interest_manager
+                .record_summary_cursor(h.new_peer, *sorted[0].id());
+
+            let mut covered: HashSet<u32> = HashSet::new();
+            for round in 0..rounds {
+                let reply = handle_interest_sync_message(
+                    &h.op_manager,
+                    h.new_peer,
+                    InterestMessage::Interests {
+                        hashes: hashes.clone(),
+                    },
+                )
+                .await;
+                match reply {
+                    Some(InterestMessage::SummaryDigests { entries, .. }) => {
+                        assert!(entries.len() <= MAX_DIGEST_SUMMARIES_PER_REPLY);
+                        covered.extend(entries.iter().map(|e| e.hash));
+                    }
+                    other => panic!("round {round}: expected digests, got {other:?}"),
+                }
+            }
+
+            assert_eq!(
+                covered.len(),
+                expected.len(),
+                "after {rounds} rounds (ceil({}/{MAX_DIGEST_SUMMARIES_PER_REPLY})) \
+                 the digest rotation covered {} of {} shared contracts — the \
+                 window is not advancing, so the cap is starving the tail",
+                hashes.len(),
+                covered.len(),
+                expected.len()
+            );
+            assert_eq!(covered, expected);
+        }
+
+        /// The RECEIVING leg is bounded independently of the sending one.
+        ///
+        /// One heartbeat round-trip pays two summarize-heavy loops, not one:
+        /// the sender computes a summary per entry to build the digests, and
+        /// the receiver computes its OWN summary per entry to compare against
+        /// them. Bounding only the send side would halve the storm and leave
+        /// the other half reachable from any peer that predates this release —
+        /// which, during a rollout, is most of them.
+        ///
+        /// The old bound on this arm was `MAX_SUMMARY_HASHES_PER_MESSAGE`
+        /// (4096), which bounds the message but is far above the point where
+        /// the WORK matters.
+        #[tokio::test]
+        async fn digest_receive_leg_bounds_its_summarize_calls() {
+            use std::sync::atomic::Ordering;
+
+            let h = build_harness("hf-digest-recv-bound", 17160, vec![7u8; 64]).await;
+            let keys = host_many(&h, 933);
+            let hashes = distinct_hashes(&keys);
+
+            // A pre-#5238 sender: one entry per shared contract, no window.
+            // Digests deliberately DISAGREE with ours, so nothing short-
+            // circuits the comparison — this measures the loop, not the
+            // agreement path.
+            let entries: Vec<SummaryDigestEntry> = hashes
+                .iter()
+                .map(|&hash| SummaryDigestEntry {
+                    hash,
+                    summary_digest: Some(summary_digest(b"not our summary")),
+                })
+                .collect();
+
+            let before = h.summary_queries.load(Ordering::Relaxed);
+            let _ = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::SummaryDigests {
+                    entries,
+                    emitter: crate::message::SummariesEmitter::InterestsReply,
+                },
+            )
+            .await;
+            let fetches = h.summary_queries.load(Ordering::Relaxed) - before;
+
+            assert!(
+                fetches > 0,
+                "premise: the fixture must actually reach the summarize path, \
+                 or this test cannot fail"
+            );
+            assert!(
+                fetches <= 64,
+                "comparing an inbound digest message made {fetches} summarize \
+                 round trips against {} entries. The receiving leg is the other \
+                 half of the #5238 storm and needs its own bound — the sender's \
+                 window does not constrain what an un-upgraded peer sends us",
+                hashes.len()
+            );
+        }
+
+        /// The full-bytes `Summaries` receive leg is bounded too.
+        ///
+        /// It is the twin of `digest_receive_leg_bounds_its_summarize_calls`:
+        /// same per-entry summarize cost, different wire form, and this one has
+        /// neither the digest arm's per-message memo nor its pair dedup, so an
+        /// unbounded version is the cheaper of the two to drive.
+        ///
+        /// It cannot bind against a peer running #5155 or later, which is why
+        /// the fixture builds the message by hand rather than provoking one.
+        #[tokio::test]
+        async fn summaries_receive_leg_bounds_its_summarize_calls() {
+            use std::sync::atomic::Ordering;
+
+            let h = build_harness("hf-summaries-recv-bound", 17180, vec![7u8; 64]).await;
+            let keys = host_many(&h, 933);
+            let hashes = distinct_hashes(&keys);
+
+            // Summaries that DISAGREE with ours, so nothing short-circuits.
+            let entries: Vec<SummaryEntry> = hashes
+                .iter()
+                .map(|&hash| {
+                    SummaryEntry::from_summary(hash, Some(&StateSummary::from(vec![9u8; 8])))
+                })
+                .collect();
+
+            let before = h.summary_queries.load(Ordering::Relaxed);
+            let _ = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::Summaries {
+                    entries,
+                    emitter: crate::message::SummariesEmitter::InterestsReply,
+                },
+            )
+            .await;
+            let fetches = h.summary_queries.load(Ordering::Relaxed) - before;
+
+            assert!(
+                fetches > 0,
+                "premise: the fixture must actually reach the summarize path, \
+                 or the bound below can never fail"
+            );
+            assert!(
+                fetches <= 64,
+                "comparing an inbound Summaries message made {fetches} summarize \
+                 round trips against {} entries; this leg has no per-message \
+                 memo, so an unbounded version is the cheapest path in the \
+                 #5238 family",
+                hashes.len()
+            );
+        }
+
+        /// `ChangeInterests` deduplicates its peer-supplied hash list.
+        ///
+        /// This arm is deliberately not windowed — it is churn-driven, so a
+        /// window could defer a newly-added interest indefinitely rather than
+        /// by a bounded number of heartbeats. That leaves it as the cheapest
+        /// amplification path in the family once the other four are bounded:
+        /// `added` is peer-supplied and uncapped, and every entry costs a
+        /// `summary_if_hosted_or_in_use` round trip.
+        ///
+        /// Dedup is the part that is free. A window can drop a real new
+        /// interest; a repeated hash carries nothing the first copy did not,
+        /// so collapsing it cannot lose anything. The assertion is therefore
+        /// on REPETITION only — a peer naming many genuinely distinct new
+        /// interests still pays per interest, by design.
+        #[tokio::test]
+        async fn change_interests_deduplicates_repeated_hashes() {
+            use std::sync::atomic::Ordering;
+
+            let h = build_harness("hf-change-dedup", 17185, vec![7u8; 64]).await;
+            let keys = host_many(&h, 1);
+            let hashes = distinct_hashes(&keys);
+            // NOT "the fixture hosts exactly one contract" — `build_harness`
+            // already hosts and locally-registers its own `h.key` before
+            // `host_many` adds this one, so the node hosts two. What matters is
+            // narrower, and is what this asserts: `host_many(1)` yielded a
+            // single hash, and that hash is the only thing we put in `added`.
+            // `h.key`'s hash is never sent, so the arm never reaches it.
+            //
+            // Near-vacuous by construction (`host_many(1)` returns one key, so
+            // `distinct_hashes` returns one hash barring a self-collision), and
+            // kept as a guard on the FIXTURE rather than on the behaviour: if
+            // someone grows `host_many`'s argument, the expected fetch count
+            // below stops being 1, and this fires first with a clearer reason
+            // than the equality would give.
+            assert_eq!(hashes.len(), 1, "premise: exactly one hash is advertised");
+
+            // 500 copies of ONE hash. Pre-dedup this is 500 sequential
+            // summarize round trips for a single contract.
+            let repeats = 500usize;
+            let added: Vec<u32> = std::iter::repeat_n(hashes[0], repeats).collect();
+
+            let before = h.summary_queries.load(Ordering::Relaxed);
+            let _ = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::ChangeInterests {
+                    added,
+                    removed: Vec::new(),
+                },
+            )
+            .await;
+            let fetches = h.summary_queries.load(Ordering::Relaxed) - before;
+
+            assert!(
+                fetches > 0,
+                "premise: the fixture must actually reach the summarize path, \
+                 or the bound below can never fail"
+            );
+            // Pin the EXACT value, not `< repeats`. The fixture hosts one
+            // contract and `lookup_by_hash` resolves the single hash to it, so
+            // correct dedup collapses the loop to exactly one round trip.
+            //
+            // `< repeats` was the first form and it is far too weak to be worth
+            // having: an INVERTED condition (`if seen_added.insert(hash)`,
+            // skipping only the FIRST occurrence) processes the other 499 and
+            // still passes, as does any batched dedup collapsing to repeats/K.
+            // That mutation removes ~1 round trip out of 500 — a dedup that is
+            // essentially entirely broken — and only an equality assertion
+            // separates it from the fix.
+            assert_eq!(
+                fetches, 1,
+                "{repeats} copies of one hash made {fetches} summarize round \
+                 trips, expected exactly 1. Bounding the other four loops makes \
+                 this arm the cheapest amplification path in the #5238 family, \
+                 and dedup is the one bound here that cannot drop a real new \
+                 interest"
+            );
+        }
+
+        /// The digest path RECORDS a rotation cursor, not just reads one.
+        ///
+        /// `digest_rotation_covers_the_whole_shared_set` covers this only
+        /// indirectly, through the coverage it produces. Asserting the cursor
+        /// directly is what the full-bytes sibling already does, and it is the
+        /// single line that distinguishes "the window advances" from "the
+        /// window happens to have been drawn differently each round".
+        #[tokio::test]
+        async fn digest_reply_records_the_rotation_cursor() {
+            let h = build_harness("hf-digest-cursor", 17190, vec![7u8; 64]).await;
+            let keys = host_many(&h, 200);
+            let hashes = distinct_hashes(&keys);
+
+            assert!(
+                h.op_manager
+                    .interest_manager
+                    .peek_summary_cursor(h.new_peer)
+                    .is_none(),
+                "premise: no cursor before the first reply"
+            );
+
+            let _ = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::Interests { hashes },
+            )
+            .await;
+
+            assert!(
+                h.op_manager
+                    .interest_manager
+                    .peek_summary_cursor(h.new_peer)
+                    .is_some(),
+                "a digest reply must record where it stopped, or the next round \
+                 re-draws at random and the ceil(n / cap) coverage bound is lost \
+                 — this was `if form == FullBytes` before #5238"
+            );
+        }
+
+        /// The `SummaryRequest` reply is bounded too, because bounding
+        /// `Interests` made this the cheapest remaining amplification path.
+        ///
+        /// The recorded reason for leaving this arm unbounded was that a peer
+        /// could already force the same work by spamming `Interests`, which ran
+        /// the same loop. That was true; it is not any more. With both forms of
+        /// `Interests` windowed, an unbounded reply here would be strictly
+        /// easier to abuse than the loop this change closes.
+        ///
+        /// It costs nothing against an upgraded peer: a requester running this
+        /// release compares at most 64 entries per message, so it cannot ask
+        /// for more hashes than the cap allows.
+        #[tokio::test]
+        async fn summary_request_reply_bounds_its_summarize_calls() {
+            use std::sync::atomic::Ordering;
+
+            let h = build_harness("hf-request-bound", 17170, vec![7u8; 64]).await;
+            let keys = host_many(&h, 933);
+            let hashes = distinct_hashes(&keys);
+
+            let before = h.summary_queries.load(Ordering::Relaxed);
+            let reply = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::SummaryRequest {
+                    hashes: hashes.clone(),
+                },
+            )
+            .await;
+            let fetches = h.summary_queries.load(Ordering::Relaxed) - before;
+
+            match reply {
+                Some(InterestMessage::Summaries { entries, .. }) => {
+                    assert!(
+                        !entries.is_empty(),
+                        "a bounded reply must still answer the request"
+                    );
+                    assert!(entries.len() <= 64, "got {} entries", entries.len());
+                }
+                other => panic!("a SummaryRequest must be answered with full bytes, got {other:?}"),
+            }
+            assert!(
+                fetches > 0,
+                "premise: the fixture must actually reach the summarize path, \
+                 or the bound below can never fail"
+            );
+            assert!(
+                fetches <= 64,
+                "answering a {}-hash SummaryRequest made {fetches} summarize \
+                 round trips; the intended cap is 64",
+                hashes.len()
+            );
         }
 
         /// Successive fallback replies rotate, so the whole shared set is
@@ -9976,13 +10684,27 @@ mod tests {
         /// everything past the first window would never be advertised to that
         /// peer at all, turning a bandwidth fix into permanent silent
         /// divergence.
+        ///
+        /// Cursor-seeded for the reason spelled out on
+        /// `digest_rotation_covers_the_whole_shared_set`: this test carried the
+        /// same ~1% cycle-boundary flake latently since #5155, and it is a
+        /// latent flake rather than an observed one only because nothing had
+        /// run it enough times to land on one of the three bad starts.
         #[tokio::test]
         async fn fallback_rotation_covers_the_whole_shared_set() {
+            // Guarded — see the sibling rotation test for why.
+            let _seed = crate::config::GlobalRng::seed_guard(0x5155_0704);
             let h = build_harness("hf-bound-rotate", 17140, vec![7u8; 64]).await;
             let keys = host_many(&h, 200);
             let hashes = distinct_hashes(&keys);
             let expected: HashSet<u32> = hashes.iter().copied().collect();
             let rounds = hashes.len().div_ceil(MAX_FALLBACK_SUMMARIES_PER_REPLY);
+
+            let mut sorted = keys.clone();
+            sorted.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+            h.op_manager
+                .interest_manager
+                .record_summary_cursor(h.old_peer, *sorted[0].id());
 
             let mut covered: HashSet<u32> = HashSet::new();
             for round in 0..rounds {
@@ -10168,7 +10890,7 @@ mod tests {
                 let cursor = h
                     .op_manager
                     .interest_manager
-                    .peek_fallback_cursor(h.old_peer)
+                    .peek_summary_cursor(h.old_peer)
                     .expect("a fallback reply must leave a cursor");
                 assert!(
                     ids.contains(&cursor),
@@ -10221,48 +10943,82 @@ mod tests {
         /// peer out of the broadcast set for whatever fell outside, converting
         /// a bandwidth bound into missed updates — a correctness bug wearing a
         /// performance fix's clothes.
+        ///
+        /// This is the most load-bearing test in the change, because
+        /// `INTEREST_TTL` is 20 minutes (4 heartbeats) while the new coverage
+        /// cycle is ~40-75 minutes. Had the registration loop been moved inside
+        /// the window, `sweep_expired_interests` would have started removing
+        /// (contract, peer) pairs in steady state for any peer sharing more
+        /// than 4 x 64 contracts — silent, and fatal to live fan-out.
+        ///
+        /// Be precise about what running BOTH forms buys, because it is easy to
+        /// overstate: there is exactly ONE registration loop today, shared by
+        /// both forms, so any move of it inside the window breaks BOTH cases
+        /// and either alone would catch it. The second case is insurance
+        /// against a FUTURE per-form split of that loop, not additional
+        /// coverage of the code as it stands.
         #[tokio::test]
         async fn bounding_the_reply_does_not_bound_interest_registration() {
-            let h = build_harness("hf-bound-interest", 17150, vec![7u8; 64]).await;
-            let keys = host_many(&h, 200);
-            let hashes = distinct_hashes(&keys);
+            // #5238: run against BOTH wire forms. Under #5155 only the
+            // full-bytes reply was windowed, so `old_peer` was the only case
+            // where a contract could be registered-but-unadvertised. Now that
+            // both are windowed the invariant matters for every peer, and a
+            // test that only covers one form would not notice if the
+            // registration loop were moved inside the window for the other.
+            for (label, peer) in [("full-bytes", 17150u16), ("digests", 17151)] {
+                let h =
+                    build_harness(&format!("hf-bound-interest-{label}"), peer, vec![7u8; 64]).await;
+                let target = if label == "digests" {
+                    h.new_peer
+                } else {
+                    h.old_peer
+                };
+                let keys = host_many(&h, 200);
+                let hashes = distinct_hashes(&keys);
 
-            let reply = handle_interest_sync_message(
-                &h.op_manager,
-                h.old_peer,
-                InterestMessage::Interests {
-                    hashes: hashes.clone(),
-                },
-            )
-            .await;
-            let advertised: HashSet<u32> = match reply {
-                Some(InterestMessage::Summaries { ref entries, .. }) => {
-                    entries.iter().map(|e| e.hash).collect()
-                }
-                other => panic!("expected full bytes, got {other:?}"),
-            };
-            assert!(
-                advertised.len() < hashes.len(),
-                "premise: this round must NOT have advertised everything, or \
-                 the test cannot distinguish registered-for-all from \
-                 registered-for-the-window"
-            );
-
-            let pk = h.peer_key_of(h.old_peer);
-            let unadvertised: Vec<&ContractKey> = keys
-                .iter()
-                .filter(|k| !advertised.contains(&contract_hash(k)))
-                .collect();
-            assert!(!unadvertised.is_empty(), "premise: some contract was cut");
-            for key in unadvertised {
+                let reply = handle_interest_sync_message(
+                    &h.op_manager,
+                    target,
+                    InterestMessage::Interests {
+                        hashes: hashes.clone(),
+                    },
+                )
+                .await;
+                let advertised: HashSet<u32> = match reply {
+                    Some(InterestMessage::Summaries { ref entries, .. }) => {
+                        entries.iter().map(|e| e.hash).collect()
+                    }
+                    Some(InterestMessage::SummaryDigests { ref entries, .. }) => {
+                        entries.iter().map(|e| e.hash).collect()
+                    }
+                    other => panic!("{label}: unexpected reply {other:?}"),
+                };
                 assert!(
-                    h.op_manager
-                        .interest_manager
-                        .get_peer_interest(key, &pk)
-                        .is_some(),
-                    "peer interest must be registered for {key} even though \
-                     this round's window did not advertise it"
+                    advertised.len() < hashes.len(),
+                    "{label} premise: this round must NOT have advertised \
+                     everything, or the test cannot distinguish \
+                     registered-for-all from registered-for-the-window"
                 );
+
+                let pk = h.peer_key_of(target);
+                let unadvertised: Vec<&ContractKey> = keys
+                    .iter()
+                    .filter(|k| !advertised.contains(&contract_hash(k)))
+                    .collect();
+                assert!(
+                    !unadvertised.is_empty(),
+                    "{label} premise: some contract was cut"
+                );
+                for key in unadvertised {
+                    assert!(
+                        h.op_manager
+                            .interest_manager
+                            .get_peer_interest(key, &pk)
+                            .is_some(),
+                        "{label}: peer interest must be registered for {key} \
+                         even though this round's window did not advertise it"
+                    );
+                }
             }
         }
 
@@ -10543,7 +11299,7 @@ mod tests {
         /// `summary_if_hosted_or_in_use` runs. That is a contract-handler round
         /// trip, sequential, on the loop the executor needs responsive. With
         /// pair-dedup and no further bound, one message could name a single
-        /// known hash with up to `MAX_SUMMARY_HASHES_PER_MESSAGE` distinct
+        /// known hash with up to `MAX_SUMMARY_COMPARISONS_PER_MESSAGE` distinct
         /// digests and force that many fetches per matching contract.
         ///
         /// Two mechanisms bound it:
@@ -10560,8 +11316,15 @@ mod tests {
         ///
         /// Stated because the obvious reading is wrong. Mutation-tested three
         /// ways: removing the cache alone PASSES, removing the skip alone
-        /// PASSES, removing BOTH fails at 512 fetches. So this test bounds the
-        /// CONJUNCTION, not either mechanism individually.
+        /// PASSES, removing BOTH fails at one fetch per pair. So this test
+        /// bounds the CONJUNCTION, not either mechanism individually.
+        ///
+        /// The fixture was 512 pairs until #5238 lowered the per-message
+        /// comparison cap to 64; it is now sized just under that cap, so the
+        /// cap is still not what this test measures. The amplification factor
+        /// it demonstrates shrank with the fixture, but its discrimination did
+        /// not: removing both mechanisms still yields one fetch per pair
+        /// against an assertion of at most one in total.
         ///
         /// That is not a defect in the test so much as a property of the fix:
         /// each mechanism is independently sufficient for this observable. Only
@@ -10583,17 +11346,18 @@ mod tests {
             let h = build_harness("hf-amp", 17090, vec![5u8; 128]).await;
             let hash = contract_hash(&h.key);
 
-            // 512 distinct fabricated digests, all naming the ONE hash this
+            // 63 distinct fabricated digests, all naming the ONE hash this
             // node tracks. Every one of them is a real, distinct pair, so
             // pair-dedup does not collapse them.
-            let entries: Vec<SummaryDigestEntry> = (0..512u32)
+            let entries: Vec<SummaryDigestEntry> = (0..63u32)
                 .map(|i| SummaryDigestEntry {
                     hash,
                     summary_digest: Some(summary_digest(&i.to_le_bytes())),
                 })
                 .collect();
+            let pairs = entries.len();
             assert!(
-                entries.len() < MAX_SUMMARY_HASHES_PER_MESSAGE,
+                pairs < MAX_SUMMARY_COMPARISONS_PER_MESSAGE,
                 "premise: stay under the cap so the CAP is not what bounds \
                  this — the cache and the skip must be doing the work"
             );
@@ -10611,14 +11375,14 @@ mod tests {
             let fetches = h.summary_queries.load(Ordering::Relaxed) - before;
 
             // One contract matches this hash, so one fetch is the floor. The
-            // bound is what matters: NOT proportional to the 512 pairs.
+            // bound is what matters: NOT proportional to the pair count.
             assert!(
                 fetches <= 1,
-                "512 fabricated digests for one hash caused {fetches} summary \
-                 fetches; the per-message cache should hold it to at most one \
-                 per matching contract. A count near 512 means the cache is \
-                 gone and a peer can monopolize the contract loop with a single \
-                 message."
+                "{pairs} fabricated digests for one hash caused {fetches} \
+                 summary fetches; the per-message cache should hold it to at \
+                 most one per matching contract. A count near {pairs} means the \
+                 cache is gone and a peer can monopolize the contract loop with \
+                 a single message."
             );
 
             // And the divergence is still handled: the hash IS requested.
@@ -10628,8 +11392,8 @@ mod tests {
                         hashes,
                         vec![hash],
                         "the hash must be requested exactly once — bounding the \
-                         work must not cost the request, and must not let 512 \
-                         pairs inflate it either"
+                         work must not cost the request, and must not let \
+                         {pairs} pairs inflate it either"
                     );
                 }
                 other => panic!(
@@ -10756,9 +11520,13 @@ mod tests {
 
             let h = build_harness("hf-interleave", 17110, vec![5u8; 128]).await;
 
-            // 32 hosted contracts, each its own hash.
+            // 21 hosted contracts, each its own hash. Sized so that the three
+            // interleaved rounds below total 63 entries — just under #5238's
+            // 64-entry per-message comparison cap, which must not be what
+            // bounds this test (it was 32 contracts / 96 entries before that
+            // cap existed).
             let mut hashes = Vec::new();
-            for i in 0u8..32 {
+            for i in 0u8..21 {
                 let k = ContractKey::from_id_and_code(
                     ContractInstanceId::new([i.wrapping_add(160); 32]),
                     CodeHash::new([i.wrapping_add(3); 32]),
@@ -10775,7 +11543,7 @@ mod tests {
             hashes.sort_unstable();
             hashes.dedup();
             let n = hashes.len();
-            assert!(n >= 16, "premise: need many distinct hashes, got {n}");
+            assert!(n >= 12, "premise: need many distinct hashes, got {n}");
 
             // Three INTERLEAVED rounds, and the SHAPES matter — this is where
             // a first attempt at this test went wrong. A round of MISMATCHING
@@ -10812,7 +11580,7 @@ mod tests {
                 });
             }
             assert!(
-                entries.len() < MAX_SUMMARY_HASHES_PER_MESSAGE,
+                entries.len() < MAX_SUMMARY_COMPARISONS_PER_MESSAGE,
                 "premise: stay under the cap so the CAP is not what bounds this"
             );
 
@@ -10841,10 +11609,10 @@ mod tests {
         }
 
         /// Repeated hashes must be free: a peer that names the same contract
-        /// 64 times must provoke exactly ONE entry in the request.
+        /// 20 times must provoke exactly ONE entry in the request.
         ///
         /// Entry count is deliberately kept UNDER
-        /// [`MAX_SUMMARY_HASHES_PER_MESSAGE`] so the handler's over-cap
+        /// [`MAX_SUMMARY_COMPARISONS_PER_MESSAGE`] so the handler's over-cap
         /// rotation is the identity and this test is deterministic. The
         /// over-cap behaviour is the sibling test below; separating them is
         /// what lets BOTH have hard assertions.
@@ -10865,17 +11633,20 @@ mod tests {
                     hash,
                     summary_digest: Some(summary_digest(b"divergent")),
                 };
-                64
+                20
             ];
-            // A short tail of unknown hashes, still well under the cap.
-            for i in 0..100u32 {
+            // A short tail of unknown hashes, still under the cap. Sized to 63
+            // entries in total: #5238 lowered the per-message comparison cap to
+            // 64, and going over it would reintroduce exactly the
+            // rotation-dependent flakiness the History note below describes.
+            for i in 0..43u32 {
                 entries.push(SummaryDigestEntry {
                     hash: hash.wrapping_add(i + 1),
                     summary_digest: Some(summary_digest(b"divergent")),
                 });
             }
             assert!(
-                entries.len() < MAX_SUMMARY_HASHES_PER_MESSAGE,
+                entries.len() < MAX_SUMMARY_COMPARISONS_PER_MESSAGE,
                 "premise: the fixture must stay under the cap so no rotation \
                  occurs and this test is deterministic"
             );
@@ -10895,14 +11666,14 @@ mod tests {
                     assert_eq!(
                         hashes.iter().filter(|h| **h == hash).count(),
                         1,
-                        "a hash repeated 64 times must appear in the request \
+                        "a hash repeated 20 times must appear in the request \
                          exactly once — repetition must buy the sender nothing"
                     );
                     assert_eq!(
                         hashes.len(),
                         1,
                         "only the one locally-tracked contract may be \
-                         requested; the 100 unknown hashes resolve to nothing"
+                         requested; the 43 unknown hashes resolve to nothing"
                     );
                 }
                 other => panic!(
@@ -10922,19 +11693,50 @@ mod tests {
         /// sampling must seed.
         #[tokio::test]
         async fn over_cap_digest_message_stays_bounded() {
-            crate::config::GlobalRng::set_seed(0x0496_5CA9);
+            // Guarded, like the two rotation tests. This was the last bare
+            // `set_seed` in the file: it pins THREAD_SEED, THREAD_RNG and
+            // THREAD_INDEX and never cleared them, on the success path as well
+            // as on panic. That is the cross-test-interference class
+            // `.claude/rules/bug-prevention-patterns.md` records from #5314,
+            // which plain `cargo test` can see and `cargo nextest` structurally
+            // cannot.
+            let _seed = crate::config::GlobalRng::seed_guard(0x0496_5CA9);
             let h = build_harness("hf-cap", 17065, vec![5u8; 128]).await;
             let hash = contract_hash(&h.key);
 
+            // #5238: the KNOWN hash is INTERLEAVED through the unknowns, once
+            // every 32 entries, not appended as a block.
+            //
+            // Without a known hash at all, nothing resolves, the
+            // `SummaryRequest` arm below is unreachable and this degenerates
+            // into a no-panic smoke test — tolerable when the cap was 4,096 of
+            // 6,096 entries, much less so now that only 64 are processed.
+            //
+            // Appending it as a block does not work either, and the reason is
+            // worth recording because it is not the obvious probability
+            // argument: pair dedup collapses every copy of the known hash to a
+            // SINGLE pair, so a 2,000-entry block still contributes one, and
+            // the scan stops after 64 DISTINCT pairs. A rotation landing
+            // anywhere in the ~6,000 unknowns therefore fills its quota long
+            // before reaching the block. Measured: it missed outright under the
+            // seeded rotation. Interleaving at a period below the cap puts a
+            // copy inside every possible 64-entry window, so inclusion is
+            // structural rather than probabilistic.
             let mut entries = Vec::new();
             for i in 0..(MAX_SUMMARY_HASHES_PER_MESSAGE as u32 + 2_000) {
                 entries.push(SummaryDigestEntry {
                     hash: hash.wrapping_add(i + 1),
                     summary_digest: Some(summary_digest(b"divergent")),
                 });
+                if i % 32 == 0 {
+                    entries.push(SummaryDigestEntry {
+                        hash,
+                        summary_digest: Some(summary_digest(b"divergent")),
+                    });
+                }
             }
             assert!(
-                entries.len() > MAX_SUMMARY_HASHES_PER_MESSAGE,
+                entries.len() > MAX_SUMMARY_COMPARISONS_PER_MESSAGE,
                 "premise: the fixture must EXCEED the cap, or the bound below \
                  is not being exercised"
             );
@@ -10949,22 +11751,56 @@ mod tests {
             )
             .await;
 
-            // Every hash here is unknown to this node, so nothing resolves and
-            // no request is warranted. The property under test is that an
-            // over-cap message is absorbed without panic and without
-            // manufacturing work: `lookup_by_hash` yields nothing for any of
-            // them, so the peer's 6,096 entries buy it exactly nothing.
+            // The known hash MUST come back, and it must come back alone.
+            //
+            // The interleaved shape is what makes this a real assertion rather
+            // than a no-panic smoke test. The ~6,096 unknown hashes resolve to
+            // nothing whatever the peer does, so before the known hash was
+            // introduced this arm was unreachable and the bound assertion ran
+            // against an empty set.
+            //
+            // Inclusion is STRUCTURAL, not probabilistic — see the fixture
+            // construction above. The known hash is interleaved at a period
+            // below the 64-distinct-pair scan, so a copy falls inside every
+            // possible window and no rotation offset can miss it. The obvious
+            // alternative, appending the copies as one contiguous block, does
+            // NOT work: pair dedup collapses them to a single pair and the scan
+            // stops after 64 DISTINCT pairs, so a rotation landing anywhere in
+            // the unknowns fills its quota long before reaching the block. That
+            // is a near-certainty rather than a low probability, and it failed
+            // on the first run rather than flaking.
+            //
+            // Pair dedup still does the other half of the work: all copies of
+            // the known hash share one (hash, digest) pair, so the reply can
+            // name it at most once however the rotation lands.
+            //
+            // What this test is NOT: a regression pin for #5238. Under a full
+            // revert to the 4,096 cap the fixture still exceeds it, the known
+            // hash is still found by the same gap argument, and the reply is
+            // still `vec![hash]` — so it passes either way. It is a repair of a
+            // previously VACUOUS test, which is worth having on its own terms,
+            // but the bound on this change is pinned by the five tests that do
+            // fail on a targeted revert. Do not count this one among them.
             match reply {
-                None => {}
                 Some(InterestMessage::SummaryRequest { hashes }) => {
                     assert!(
-                        hashes.len() <= MAX_SUMMARY_HASHES_PER_MESSAGE,
+                        hashes.len() <= MAX_SUMMARY_COMPARISONS_PER_MESSAGE,
                         "the request must stay bounded by \
-                         MAX_SUMMARY_HASHES_PER_MESSAGE, got {}",
+                         MAX_SUMMARY_COMPARISONS_PER_MESSAGE, got {}",
                         hashes.len()
                     );
+                    assert_eq!(
+                        hashes,
+                        vec![hash],
+                        "an over-cap message must still answer for the one \
+                         contract this node tracks, and must not let 6,096 \
+                         unknown hashes inflate the reply"
+                    );
                 }
-                other => panic!("unexpected reply {other:?}"),
+                other => panic!(
+                    "the known hash must provoke a bounded SummaryRequest; got \
+                     {other:?}"
+                ),
             }
         }
 
