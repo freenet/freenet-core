@@ -743,7 +743,15 @@ impl RelayState {
                     self.request.uphill_budget = self.request.uphill_budget.saturating_sub(1);
                     actions.forward = Some((peer, fwd_req));
                 } else {
-                    tracing::info!(
+                    // debug!, not info!: reaching terminus with no unvisited
+                    // uphill candidate is a routine, expected outcome of ring
+                    // routing, not an anomaly — it fires 25-65 times/minute as
+                    // standing baseline on a moderately busy peer (#5335), and
+                    // the rejection is already carried as structured telemetry
+                    // by `NetEventLog::connect_rejected` at the caller plus the
+                    // aggregate `connect_rejects_emitted` snapshot counter.
+                    // Matches the sibling already-forwarded arm below.
+                    tracing::debug!(
                         target = %self.request.desired_location,
                         ttl = self.request.ttl,
                         uphill_budget = self.request.uphill_budget,
@@ -753,7 +761,10 @@ impl RelayState {
                     actions.rejected = true;
                 }
             } else {
-                tracing::info!(
+                // debug!, not info!: exhausting the uphill budget or TTL is the
+                // amplification bound doing its job, not a fault. Same #5335
+                // rationale as the sibling arm above.
+                tracing::debug!(
                     target = %self.request.desired_location,
                     ttl = self.request.ttl,
                     uphill_budget = self.request.uphill_budget,
@@ -4444,5 +4455,121 @@ mod tests {
             gap_median < 0.05,
             "gap_target median ({gap_median:.4}) should be < 0.05 (Kleinberg-optimal produces short connections)"
         );
+    }
+
+    /// Return just the body of the item whose signature starts with
+    /// `signature_prefix`, bounded by brace depth.
+    ///
+    /// A bare `SOURCE[start..].find(needle)` does not stop at the function's
+    /// closing brace: it matches a *later* occurrence, very often this test
+    /// module's own assertion literal, and the pin then passes vacuously
+    /// under a name saying the case is covered. See AGENTS.md, "WHEN writing
+    /// a source-scrape pin test".
+    ///
+    /// Brace counting rather than the `\n}\n` end anchor used by
+    /// `commands::auto_update`'s helper, because `handle_request` is a method
+    /// inside an `impl` — its closing brace is indented, so that anchor would
+    /// find the enclosing `impl RelayState` brace and silently widen the
+    /// region across every sibling method.
+    fn fn_body<'a>(source: &'a str, signature_prefix: &str) -> &'a str {
+        let start = source
+            .find(signature_prefix)
+            .unwrap_or_else(|| panic!("{signature_prefix} not found in connect.rs"));
+        // Refuse an anchor that landed inside this test module: from there the
+        // scraped region could only contain the pin's own literals, so every
+        // assertion below would pass without reading production code.
+        let tests_at = source
+            .find("\n#[cfg(test)]\nmod ")
+            .map(|i| i + 1)
+            .expect("test module not located — this guard cannot verify anything");
+        assert!(
+            start < tests_at,
+            "`{signature_prefix}` matched inside the test module — this pin \
+             would be scraping its own source and pass vacuously"
+        );
+        let brace = source[start..]
+            .find('{')
+            .unwrap_or_else(|| panic!("{signature_prefix} must have a body"));
+        let body_start = start + brace + 1;
+        let bytes = source.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = body_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[body_start..i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("unbalanced braces while scanning {signature_prefix}");
+    }
+
+    /// #5335: the two terminus-rejection arms of `RelayState::handle_request`
+    /// must log at `debug!`, never `info!`.
+    ///
+    /// Both describe a routine, expected outcome of CONNECT routing — no
+    /// unvisited uphill candidate, or the uphill budget / TTL bound doing its
+    /// job. On a moderately busy peer they fired 25-65 times a minute as
+    /// standing baseline, ~22% of all log lines, drowning genuinely rare
+    /// connect failures at the level meant for things an operator should
+    /// notice by default. Nothing is lost by the downgrade: the rejection is
+    /// still emitted as a structured `NetEventLog::connect_rejected` event by
+    /// the caller in `connect/op_ctx_task.rs`, and aggregated into the
+    /// `connect_rejects_emitted` snapshot counter.
+    ///
+    /// Note `crates/core/Cargo.toml` enables tracing's
+    /// `release_max_level_info`, so `debug!` is compiled out of release
+    /// builds entirely rather than merely filtered — which is the point here,
+    /// but means a future marker anyone greps for must NOT live at this level.
+    #[test]
+    fn terminus_rejection_log_sites_use_debug_not_info() {
+        const SOURCE: &str = include_str!("connect.rs");
+        let body = fn_body(SOURCE, "pub(crate) fn handle_request<C: RelayContext>(");
+
+        // Bracket the scraped region so a mis-slice fails loudly instead of
+        // asserting against the wrong text: the sibling already-forwarded arm
+        // is inside `handle_request`, `impl RelayContext for RelayEnv` is the
+        // next item after it.
+        assert!(
+            body.contains("connect: at terminus but already forwarded"),
+            "scraped the wrong region — handle_request's body must contain the \
+             sibling already-forwarded arm"
+        );
+        assert!(
+            !body.contains("impl RelayContext for RelayEnv"),
+            "scraped region overran handle_request's closing brace"
+        );
+
+        for marker in [
+            "\"connect: at terminus, cannot accept, no uphill peers available",
+            "\"connect: at terminus, cannot accept, uphill budget or TTL exhausted",
+        ] {
+            let occurrences = body.matches(marker).count();
+            assert_eq!(
+                occurrences, 1,
+                "expected exactly one `{marker}...` log site in handle_request, \
+                 found {occurrences}. If the message was deliberately reworded, \
+                 update this pin — do not delete it (#5335)."
+            );
+            let at = body.find(marker).expect("checked by the count above");
+            let macro_start = body[..at]
+                .rfind("tracing::")
+                .expect("the log site must be a `tracing::` macro invocation");
+            let invocation = &body[macro_start..];
+            let found: String = invocation.chars().take(16).collect();
+            assert!(
+                invocation.starts_with("tracing::debug!("),
+                "`{marker}...` must be logged at debug!, not info! (#5335) — it \
+                 is a routine terminus outcome, not an anomaly, and the \
+                 rejection is already carried by NetEventLog::connect_rejected. \
+                 Found `{found}`."
+            );
+        }
     }
 }
