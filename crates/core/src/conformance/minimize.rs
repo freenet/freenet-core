@@ -88,33 +88,85 @@ pub fn minimize<O: ConformanceOracle + ?Sized>(
     ordered.sort_by_key(|c| c.len());
 
     let mut current = case.clone();
+
+    // States first, then deltas.
+    //
+    // Deltas matter as much as states and were once skipped, which quietly defeated
+    // the whole exercise for the delta properties: for a delta-law violation the bulk
+    // of the witness lives in the delta, so a large one could never be shrunk under
+    // the evidence size bound and `check_bounds` simply rejected it. A minimizer that
+    // cannot shrink the thing the finding is about is not minimizing.
     for slot in 0..current.states.len() {
-        for candidate in &ordered {
-            if report.attempts >= config.max_attempts {
-                report.final_bytes = current.input_bytes();
-                return (current, report);
-            }
-            if candidate.len() >= current.states[slot].len() {
-                // Ordered by size, so nothing later in this list is smaller either.
-                break;
-            }
-
-            let mut trial = current.clone();
-            trial.states[slot] = candidate.clone();
-            report.attempts += 1;
-
-            // The trial must fail the SAME law. A trial that fails a different one
-            // is a different finding, and quietly swapping it in would relabel the
-            // evidence as being about something it never demonstrated.
-            if violated_property(oracle, &trial) == Some(property) {
-                current = trial;
-                break;
-            }
+        if !shrink_slot(
+            oracle,
+            &mut current,
+            property,
+            &ordered,
+            config,
+            &mut report,
+            |case, i| &mut case.states[i],
+            slot,
+        ) {
+            break;
+        }
+    }
+    for slot in 0..current.deltas.len() {
+        if !shrink_slot(
+            oracle,
+            &mut current,
+            property,
+            &ordered,
+            config,
+            &mut report,
+            |case, i| &mut case.deltas[i],
+            slot,
+        ) {
+            break;
         }
     }
 
     report.final_bytes = current.input_bytes();
     (current, report)
+}
+
+/// Try to replace one input slot with the smallest candidate that still fails the
+/// same law. Returns false when the attempt budget is spent.
+#[allow(clippy::too_many_arguments)]
+fn shrink_slot<O: ConformanceOracle + ?Sized>(
+    oracle: &mut O,
+    current: &mut ConformanceCase,
+    property: ConformanceProperty,
+    ordered: &[Bytes],
+    config: &MinimizeConfig,
+    report: &mut MinimizeReport,
+    slot_of: impl Fn(&mut ConformanceCase, usize) -> &mut Bytes,
+    slot: usize,
+) -> bool {
+    for candidate in ordered {
+        if report.attempts >= config.max_attempts {
+            return false;
+        }
+        {
+            let existing = slot_of(current, slot);
+            if candidate.len() >= existing.len() {
+                // Ordered by size, so nothing later in this list is smaller either.
+                break;
+            }
+        }
+
+        let mut trial = current.clone();
+        *slot_of(&mut trial, slot) = candidate.clone();
+        report.attempts += 1;
+
+        // The trial must fail the SAME law. A trial that fails a different one is a
+        // different finding, and quietly swapping it in would relabel the evidence as
+        // being about something it never demonstrated.
+        if violated_property(oracle, &trial) == Some(property) {
+            *current = trial;
+            break;
+        }
+    }
+    true
 }
 
 fn violated_property<O: ConformanceOracle + ?Sized>(
@@ -294,6 +346,63 @@ mod tests {
         );
         assert_eq!(minimized.states, original.states);
         assert_eq!(report.final_bytes, report.original_bytes);
+    }
+
+    /// Deltas must shrink too. For a delta-law violation the witness lives mostly in
+    /// the delta, so a minimizer that only touched states left exactly those findings
+    /// over the evidence size bound — where `check_bounds` rejects them and no peer
+    /// ever sees them.
+    #[test]
+    fn a_large_delta_witness_shrinks_too() {
+        // Order-dependent apply: concatenation. Any two distinct deltas witness it.
+        struct Concat;
+        impl ConformanceOracle for Concat {
+            fn validate_state(
+                &mut self,
+                _state: &[u8],
+                _related: &RelatedContracts<'_>,
+            ) -> Result<ValidateResult, OracleError> {
+                Ok(ValidateResult::Valid)
+            }
+            fn update_state(
+                &mut self,
+                state: &[u8],
+                updates: &[UpdateData<'_>],
+            ) -> Result<UpdateModification<'static>, OracleError> {
+                let mut out = state.to_vec();
+                for update in updates {
+                    if let UpdateData::Delta(d) = update {
+                        out.extend_from_slice(d.as_ref());
+                    }
+                }
+                Ok(UpdateModification::valid(State::from(out)))
+            }
+            fn summarize_state(&mut self, state: &[u8]) -> Result<Vec<u8>, OracleError> {
+                Ok(state.to_vec())
+            }
+            fn get_state_delta(
+                &mut self,
+                state: &[u8],
+                _summary: &[u8],
+            ) -> Result<Vec<u8>, OracleError> {
+                Ok(state.to_vec())
+            }
+        }
+
+        let case = ConformanceCase::new(
+            ConformanceProperty::DeltaPermutationInvariance,
+            vec![bytes(4, 1)],
+        )
+        .with_deltas(vec![bytes(4096, 2), bytes(4096, 3)]);
+        let candidates = vec![bytes(2, 7), bytes(2, 8)];
+
+        let (minimized, report) =
+            minimize(&mut Concat, &case, &candidates, &MinimizeConfig::default());
+        assert!(
+            report.final_bytes < report.original_bytes / 2,
+            "the delta witness did not shrink: {report:?}"
+        );
+        assert!(verify_case(&mut Concat, &minimized).is_violation());
     }
 
     #[test]
