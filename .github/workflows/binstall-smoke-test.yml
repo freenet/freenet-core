@@ -73,13 +73,27 @@ jobs:
             fi
           done
 
-      # The release pipeline publishes to crates.io FIRST (release.yml
-      # `publish_crates`), then creates the GitHub release as a *draft*, and
-      # cross-compile.yml attaches the binaries and only un-drafts it at the
-      # very end (`gh release edit --draft=false`) ~30 min later. For that
-      # whole cross-compile window crates.io reports the new version as latest
-      # while the GitHub release binaries are still a draft binstall can't see,
-      # so `cargo binstall` (compile fallback disabled) correctly fails. That is
+      # The release pipeline creates the GitHub release as a *draft*, and
+      # cross-compile.yml attaches the binaries, runs the blocking auto-update
+      # pre-flight canary, publishes to crates.io and only THEN un-drafts it
+      # (`gh release edit --draft=false`) ~30 min later.
+      #
+      # The crates.io publish used to run FIRST, in release.yml's
+      # `publish_crates`, before the tag even existed; it moved into
+      # `attach-to-release` so the one irreversible step sits downstream of the
+      # gate (see that job's comments and #5288). That move SHRINKS the window
+      # this guard works around, from the whole ~30 min cross-compile down to
+      # the seconds between the crates.io upload and the un-draft — but it does
+      # not remove it, and it makes the guard MORE meaningful rather than less:
+      # under the new order, "crates.io has the version but the GitHub release
+      # is still a draft" is precisely the stuck state where the publish
+      # succeeded and the un-draft did not. That state must be caught, and the
+      # staleness threshold below is what catches it while still tolerating the
+      # brief legitimate overlap.
+      #
+      # During that overlap crates.io reports the new version as latest while
+      # the GitHub release binaries are still a draft binstall can't see, so
+      # `cargo binstall` (compile fallback disabled) correctly fails. That is
       # a release *in progress*, not the permanent breakage this smoke test
       # exists to catch (assets that never attached / a release stuck in draft).
       # If the nightly cron happens to run inside that window it hard-fails and
