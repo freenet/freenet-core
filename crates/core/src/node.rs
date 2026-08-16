@@ -3242,13 +3242,36 @@ const MAX_SUMMARY_COMPARISONS_PER_MESSAGE: usize = MAX_DIGEST_SUMMARIES_PER_REPL
 /// on their own and something else has to: entries still cost wire bytes on the
 /// way out and a `lookup_by_hash` plus a `clear_peer_summary` on the way in.
 ///
-/// **Why it is 4x rather than 1x.** At 1x this ceiling would bind before the
+/// **Why it is 2x rather than 1x.** At 1x this ceiling would bind before the
 /// summarize budget did and the #5338 fix would be a no-op — a reply would
-/// still stop at 64 entries however few of them were hosted. 4x lets the window
-/// walk past a shared set that is up to 75% not-hosted-by-us and still fill all
-/// 64 summarize slots with contracts we can actually advertise. A digest entry
-/// is 21 bytes, so 256 of them is ~5.4 KB, comfortably inside the 9 KiB the
-/// full-bytes path already spends per reply
+/// still stop at 64 entries however few of them were hosted. 2x lets the window
+/// walk past a shared set that is up to half not-hosted-by-us and still fill
+/// all 64 summarize slots with contracts we can actually advertise. Past that
+/// point the fix degrades gracefully rather than failing: a set that is 70%
+/// not-hosted still gets ~38 costed entries per round against the ~19 it gets
+/// today.
+///
+/// **Why not 4x**, which was the first value here and buys a fully-filled
+/// budget out to 75% not-hosted. Every entry past the summarize budget is a
+/// free rider on two things worth rationing, and 4x quadruples both where 2x
+/// doubles them:
+///
+/// - On the RECEIVE leg each free entry drives a `clear_peer_summary`, and per
+///   the #4952 note there that turns the peer from a delta target into a
+///   full-state broadcast target for that contract. Full-state broadcast volume
+///   is exactly what #5153 is investigating right now, so this is a lever on a
+///   number somebody is actively trying to bring down.
+/// - A peer below [`HASH_FIRST_SUMMARIES_MIN_VERSION`] has no receive-side cap
+///   at all and summarizes every entry it is sent (see the mixed-version note
+///   below), so the ceiling is the whole of its per-message cost.
+///
+/// The benefit above 2x is speculative — nobody has measured the not-hosted
+/// fraction of a real shared set — while the cost above 2x is concrete. Raise
+/// it when there IS a measurement, which is a one-line change that
+/// `an_all_free_window_stops_at_the_entry_ceiling` will notice.
+///
+/// A digest entry is 21 bytes, so 128 of them is ~2.7 KB, well inside the 9 KiB
+/// the full-bytes path already spends per reply
 /// ([`MAX_FALLBACK_SUMMARY_BYTES_PER_REPLY`]).
 ///
 /// **It is deliberately the same number on both legs.** The receive leg
@@ -3260,21 +3283,26 @@ const MAX_SUMMARY_COMPARISONS_PER_MESSAGE: usize = MAX_DIGEST_SUMMARIES_PER_REPL
 ///
 /// # Mixed versions
 ///
-/// A reply may now carry up to 4x the entries it did between #5238 and #5338,
-/// and a peer that predates #5338 does not skip the round trip for the free
-/// ones — so the obvious worry is that this hands an un-upgraded receiver up to
-/// 4x the summarize work. It does not, because there is no such population to
-/// hand it to: #5238 merged after v0.2.127 and has never been released, so
-/// every deployed peer predates BOTH changes and is still being sent the whole
-/// shared set today — hundreds of entries, which is the storm #5238 exists to
-/// stop. Against that baseline a 256-entry ceiling is a large reduction, not an
-/// increase, and the two ship together.
+/// The two legs have DIFFERENT baselines in the shipped release, and an earlier
+/// version of this comment got that wrong by treating them as one. In
+/// v0.2.127's `Interests` arm the window is `None` for `Digests` and
+/// `Some(MAX_FALLBACK_SUMMARIES_PER_REPLY)` for `FullBytes` (#5164), so:
 ///
-/// This is a fact about the release, not a property of the design, so re-check
-/// it rather than inherit it: if #5238 ever ships WITHOUT #5338, raising this
-/// ceiling afterwards would be a real regression for the peers running the
-/// version in between.
-const MAX_SUMMARY_ENTRIES_PER_MESSAGE: usize = 4 * MAX_DIGEST_SUMMARIES_PER_REPLY;
+/// - **A peer receiving DIGESTS** (at or above [`HASH_FIRST_SUMMARIES_MIN_VERSION`],
+///   which is most of the fleet) is sent the ENTIRE shared set today — hundreds
+///   of entries, the storm #5238 exists to stop. For that population this
+///   ceiling is a large reduction whatever it is set to.
+/// - **A peer receiving FULL BYTES** (below that floor) is already sent at most
+///   `MAX_FALLBACK_SUMMARIES_PER_REPLY` = 64 entries today, and does not skip
+///   the free ones on receipt. For that population this ceiling is an INCREASE,
+///   up to 2x, in the number of summarize round trips one reply can cost it.
+///
+/// That second bullet is a real if modest regression for a shrinking
+/// population, and it is the honest reason the ceiling is 2x rather than 4x. It
+/// cannot be avoided by version-gating the ceiling: the entries that make a
+/// reply exceed 64 are precisely the free ones, and dropping them for old peers
+/// would drop their `PeerHasNoState` repairs with them.
+const MAX_SUMMARY_ENTRIES_PER_MESSAGE: usize = 2 * MAX_DIGEST_SUMMARIES_PER_REPLY;
 
 /// The send ceiling must not exceed the receive ceiling, or our own replies
 /// would be truncated by an upgraded peer — see
@@ -5538,6 +5566,15 @@ async fn summary_if_hosted_or_in_use(
 /// hosted-or-in-use contract with no stored state — the #4610 phantom — which
 /// is a small population by construction and still makes no contract-handler
 /// round trip and runs no WASM, which is the cost the budget is sized against.
+///
+/// This paragraph is load-bearing for anyone retuning
+/// [`MAX_SUMMARY_ENTRIES_PER_MESSAGE`], which is why it is stated precisely
+/// rather than hedged. An earlier version of it claimed the gate was "not
+/// literally free" because of that state-store lookup, without noting the
+/// short-circuit — and a comment that overstates what walking past a free entry
+/// costs is an invitation to tighten the ceiling in order to buy back a cost
+/// that is not there. The costs that ceiling really rations are on the RECEIVE
+/// side and on the wire; see the constant.
 struct SummaryProbe {
     /// Our summary. Absent when the gate declined OR when the round trip ran
     /// and produced nothing; `summarized` is what tells those apart.
@@ -10960,10 +10997,17 @@ mod tests {
         /// # Why both forms, and why that is not symmetry for its own sake
         ///
         /// The two arms carry near-identical logic that was written twice, so
-        /// covering one proves nothing about the other. More to the point, the
-        /// full-bytes arm is the one that fires for any peer below the
-        /// hash-first floor — and since #5238 has never been released, that is
-        /// every deployed peer. It is the live path, not the legacy one.
+        /// covering one proves nothing about the other. And the full-bytes arm
+        /// is not the legacy path its name suggests. It is reached two ways:
+        ///
+        /// - Directly, by any peer below [`HASH_FIRST_SUMMARIES_MIN_VERSION`].
+        /// - **As the second leg of every digest exchange that finds a
+        ///   disagreement**, for every peer at every version: a `SummaryRequest`
+        ///   is answered with a plain `Summaries`, which lands here. The digest
+        ///   arm defers its heal decision to this one by design.
+        ///
+        /// So the arm whose new `costs_a_summarize` branch had no coverage at
+        /// all was the one with the widest live reach in the change.
         ///
         /// The per-form observable differs because the arms answer differently:
         /// a disagreeing digest provokes a `SummaryRequest`, while disagreeing
@@ -10979,7 +11023,13 @@ mod tests {
                 // before truncating; a regression must fail reproducibly.
                 let _seed = crate::config::GlobalRng::seed_guard(0x5338_5EC0);
                 let h = build_harness(&format!("hf-recv-free-{label}"), port, vec![7u8; 64]).await;
-                let keys = host_many(&h, 200);
+                // Exactly MAX_SUMMARY_ENTRIES_PER_MESSAGE entries: 64 free then
+                // 64 costed. Sized to sit ON the ceiling rather than over it,
+                // so the receive leg's over-ceiling truncation is not what this
+                // test measures — a bigger fixture would drop costed entries at
+                // random and the assertions below would be testing the
+                // truncation instead of the budget.
+                let keys = host_many(&h, 128);
                 let hashes = distinct_hashes(&keys);
                 let pk = h.peer_key_of(h.new_peer);
 
@@ -10987,7 +11037,7 @@ mod tests {
                 // Without it, "processed for free" and "silently dropped" look
                 // identical from the costed-entry observable alone.
                 h.op_manager.interest_manager.upsert_peer_summary_from(
-                    &keys[199],
+                    &keys[127],
                     &pk,
                     StateSummary::from(vec![4u8; 8]),
                     crate::ring::interest::SummaryPopulationSource::InterestSummary,
@@ -11010,8 +11060,8 @@ mod tests {
                     }));
                     assert_eq!(
                         entries.len(),
-                        200,
-                        "{label} premise: 136 free entries, then 64 costed ones"
+                        128,
+                        "{label} premise: 64 free entries, then 64 costed ones"
                     );
                     InterestMessage::SummaryDigests {
                         entries,
@@ -11031,8 +11081,8 @@ mod tests {
                     }));
                     assert_eq!(
                         entries.len(),
-                        200,
-                        "{label} premise: 136 free entries, then 64 costed ones"
+                        128,
+                        "{label} premise: 64 free entries, then 64 costed ones"
                     );
                     InterestMessage::Summaries {
                         entries,
@@ -11052,7 +11102,7 @@ mod tests {
                                 requested.iter().copied().collect::<HashSet<u32>>(),
                                 hashes[..64].iter().copied().collect::<HashSet<u32>>(),
                                 "every digest that disagreed must be followed up. \
-                                 A budget charged per ENTRY is spent on the 136 \
+                                 A budget charged per ENTRY is spent on the 64 \
                                  free ones first and never reaches these at all"
                             );
                         }
@@ -11076,7 +11126,7 @@ mod tests {
                         Some(theirs.clone()),
                         "{label}: a costed entry must be compared and its bytes \
                          cached against the peer. A budget charged per ENTRY is \
-                         spent on the 136 free entries first, so this one is \
+                         spent on the 64 free entries first, so this one is \
                          never processed and no summary is recorded"
                     );
                 }
@@ -11090,12 +11140,116 @@ mod tests {
                 assert_eq!(
                     h.op_manager
                         .interest_manager
-                        .get_peer_interest(&keys[199], &pk)
+                        .get_peer_interest(&keys[127], &pk)
                         .and_then(|i| i.summary),
                     None,
                     "{label}: a free entry still carries its repair — it clears \
                      our cached belief that the peer holds state. Not charging \
                      it must not mean discarding it"
+                );
+            }
+        }
+
+        /// The simulation-only `emit_confirmed` path still summarizes for a free
+        /// entry, where production now does not. Pinned deliberately.
+        ///
+        /// #5338 stops both receive arms fetching our summary for an entry that
+        /// carries none, because the verdict cannot depend on it. `emit_confirmed`
+        /// (`SimulationIdleTimeout::is_enabled`, off in production) is the one
+        /// exception: it keeps the fetch so the convergence checker's
+        /// `StateConfirmed` events stay exactly what they were before this
+        /// change. Losing them was the alternative, and dropping data from the
+        /// checker to buy symmetry in a path the checker cannot see is the worse
+        /// trade.
+        ///
+        /// **What that costs, stated rather than left to be discovered: no
+        /// simulation test can ever exercise the production branch here.** With
+        /// the flag on, the skip does not happen; with it off, the checker has
+        /// no events. So the simulation suite is structurally blind to this
+        /// branch, and these unit tests are the ONLY coverage it has. That is
+        /// the "the environment cannot produce the fault" shape — a test can be
+        /// perfectly written and still never fail because the harness it runs in
+        /// cannot reach the code.
+        ///
+        /// If the divergence is ever removed, delete this test with it rather
+        /// than relaxing it — a pin that no longer describes the code is worse
+        /// than no pin.
+        #[tokio::test]
+        async fn emit_confirmed_keeps_the_free_entry_summarize_production_skips() {
+            use std::sync::atomic::Ordering;
+
+            /// Restores the thread-local flag even if an assertion panics, so a
+            /// failure here cannot silently change what the next test on this
+            /// thread observes.
+            struct FlagGuard;
+            impl Drop for FlagGuard {
+                fn drop(&mut self) {
+                    crate::config::SimulationIdleTimeout::disable();
+                }
+            }
+
+            for (label, port) in [("digests", 17320u16), ("full-bytes", 17340)] {
+                let h = build_harness(&format!("hf-emit-conf-{label}"), port, vec![7u8; 64]).await;
+                let keys = host_many(&h, 64);
+                let hashes = distinct_hashes(&keys);
+
+                // Every entry free, so the fetch count is exactly the number of
+                // free-entry summarize calls and nothing else.
+                let message = || {
+                    if label == "digests" {
+                        InterestMessage::SummaryDigests {
+                            entries: hashes
+                                .iter()
+                                .map(|&hash| SummaryDigestEntry {
+                                    hash,
+                                    summary_digest: None,
+                                })
+                                .collect(),
+                            emitter: crate::message::SummariesEmitter::InterestsReply,
+                        }
+                    } else {
+                        InterestMessage::Summaries {
+                            entries: hashes
+                                .iter()
+                                .map(|&hash| SummaryEntry {
+                                    hash,
+                                    summary_bytes: None,
+                                })
+                                .collect(),
+                            emitter: crate::message::SummariesEmitter::InterestsReply,
+                        }
+                    }
+                };
+
+                assert!(
+                    !crate::config::SimulationIdleTimeout::is_enabled(),
+                    "{label} premise: the production path is the default, or the \
+                     two halves of this test measure the same thing"
+                );
+                let before = h.summary_queries.load(Ordering::Relaxed);
+                let _ = handle_interest_sync_message(&h.op_manager, h.new_peer, message()).await;
+                let production = h.summary_queries.load(Ordering::Relaxed) - before;
+
+                let guard = FlagGuard;
+                crate::config::SimulationIdleTimeout::enable();
+                let before = h.summary_queries.load(Ordering::Relaxed);
+                let _ = handle_interest_sync_message(&h.op_manager, h.new_peer, message()).await;
+                let simulated = h.summary_queries.load(Ordering::Relaxed) - before;
+                drop(guard);
+
+                assert_eq!(
+                    production, 0,
+                    "{label}: production must make no summarize round trip for an \
+                     entry that carries no summary — the verdict cannot depend on \
+                     ours, so the call is pure cost"
+                );
+                assert_eq!(
+                    simulated, 64,
+                    "{label}: with the simulation flag on, the fetch is kept so \
+                     the convergence checker still sees a StateConfirmed for each \
+                     of these contracts. If this drops to 0 the divergence has \
+                     been removed — which is fine, but then the checker has lost \
+                     those events and somebody should have decided that on purpose"
                 );
             }
         }
@@ -11225,9 +11379,10 @@ mod tests {
         /// - **The `MAX_SUMMARY_ENTRIES_PER_MESSAGE` ceiling.** Every other test
         ///   here stops on the summarize budget well before it, so a regression
         ///   shrinking the ceiling back toward 64 would pass all of them. The
-        ///   4x sizing is the crux of the argument that the send-side fix is not
-        ///   a no-op, and an unpinned constant is an argument with nothing
-        ///   holding it up.
+        ///   sizing is the crux of the argument that the send-side fix is not
+        ///   a no-op — at 1x the ceiling binds before the budget and the whole
+        ///   change does nothing — and an unpinned constant is an argument with
+        ///   nothing holding it up.
         /// - **The all-free window.** With no hosted contract anywhere in the
         ///   set the loop never reaches `summarized >= summarize_cap`, so the
         ///   ceiling is the ONLY thing that terminates it. Without one it would
@@ -11286,13 +11441,17 @@ mod tests {
                 "not one of these contracts is hosted, so the gate declines every \
                  one of them without a contract-handler round trip"
             );
+            // ABSOLUTE literal, not the constant that produced it: an
+            // assertion written against its own constant moves with any
+            // regression to it and can never fail.
             assert_eq!(
                 entries.len(),
-                256,
-                "the walk must stop at MAX_SUMMARY_ENTRIES_PER_MESSAGE. Nothing \
-                 here charges the summarize budget, so the ceiling is the only \
-                 thing that ends the loop — shrink it and this is the test that \
-                 notices, since every other fixture stops on the budget first"
+                128,
+                "the walk must stop at MAX_SUMMARY_ENTRIES_PER_MESSAGE (2 x 64). \
+                 Nothing here charges the summarize budget, so the ceiling is \
+                 the only thing that ends the loop — change it and this is the \
+                 test that notices, since every other fixture stops on the \
+                 budget first"
             );
             assert_eq!(
                 entries
@@ -11307,7 +11466,7 @@ mod tests {
                     .interest_manager
                     .peek_summary_cursor(&pk)
                     .as_ref(),
-                Some(tracked[255].id()),
+                Some(tracked[127].id()),
                 "the cursor advances across the whole walked span, so the next \
                  round resumes at 256 rather than re-walking the same prefix"
             );
