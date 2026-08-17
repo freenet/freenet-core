@@ -161,7 +161,7 @@ pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
         None => None,
     };
 
-    let report = Report::build(&outcomes, evidence);
+    let report = Report::build(&corpus, &outcomes, evidence);
     if config.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -455,6 +455,16 @@ struct EvidenceSummary {
 
 #[derive(Serialize)]
 struct Report {
+    /// What the cases were drawn FROM.
+    ///
+    /// Without this, a clean run is uninterpretable: "400 cases held" reads the
+    /// same whether those cases came from thirty distinct states or from three.
+    /// The case count measures work done, not coverage, and a corpus of two
+    /// states can fill hundreds of cases by permuting the same pair. A reader
+    /// deciding how much a clean result is worth needs the denominator.
+    corpus_states: usize,
+    corpus_deltas: usize,
+    corpus_summaries: usize,
     cases_run: usize,
     holds: usize,
     violations: usize,
@@ -491,6 +501,7 @@ impl Report {
     /// information; deduplication for the human view happens at print time,
     /// in [`group_findings`].
     fn build(
+        corpus: &Corpus,
         outcomes: &[(ConformanceCase, PropertyOutcome)],
         evidence: Option<EvidenceSummary>,
     ) -> Self {
@@ -542,6 +553,9 @@ impl Report {
         inconclusive_reasons.sort_by(|a, b| b.occurrences.cmp(&a.occurrences));
 
         Report {
+            corpus_states: corpus.states.len(),
+            corpus_deltas: corpus.deltas.len(),
+            corpus_summaries: corpus.summaries.len(),
             cases_run: outcomes.len(),
             holds,
             violations,
@@ -555,6 +569,10 @@ impl Report {
     }
 
     fn print_human(&self) {
+        println!(
+            "conformance: {} state(s), {} delta(s), {} summary/summaries in the corpus",
+            self.corpus_states, self.corpus_deltas, self.corpus_summaries
+        );
         println!(
             "conformance: {} case(s) run \u{2014} {} held, {} violation(s) ({} enforceable, {} diagnostic-only), {} inconclusive",
             self.cases_run,
