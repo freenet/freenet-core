@@ -15,6 +15,23 @@ where
     S: crate::wasm_runtime::StateStorage + Send + Sync + 'static,
     <S as crate::wasm_runtime::StateStorage>::Error: Into<anyhow::Error>,
 {
+    /// This node's contract-exec WASM counters, or `None` for an executor with
+    /// no `OpManager` (unit-test and local-only executors have no `Ring` to
+    /// attribute the work to, and nothing reads the counters there).
+    ///
+    /// Returns a borrow rather than an `Arc` clone so a counter bump on the
+    /// contract-handling loop costs one `Relaxed` `fetch_add` and nothing else —
+    /// see `ring::contract_exec_metrics` for the cost note and for why an
+    /// undifferentiated handler-entry span could not answer the storm question.
+    #[inline]
+    pub(super) fn contract_exec_metrics(
+        &self,
+    ) -> Option<&crate::ring::contract_exec_metrics::ContractExecMetrics> {
+        self.op_manager
+            .as_ref()
+            .map(|om| om.ring.contract_exec_metrics())
+    }
+
     /// Grow the summary/delta caches' COUNT target to cover the node's live
     /// hosted-contract count before a summarize/delta computation, so the
     /// interest-heartbeat's hosted working set stays cached across cycles (no
@@ -1262,10 +1279,24 @@ where
         // secret export) MUST stay read-only w.r.t. contract state, or it could
         // populate the detector against a state a concurrent write has changed.
         if let Some(detector_hash) = self.state_store.cached_state_hash(&key) {
-            if let Some((cached_hash, cached_summary)) = self.summary_cache.get(&key) {
-                if *cached_hash == detector_hash {
-                    return Ok(cached_summary.clone());
+            // Resolve the hit to an owned value BEFORE recording: `LruCache::get`
+            // borrows the executor mutably (it reorders the recency list), so the
+            // counter read cannot overlap it. The clone is the same one the
+            // return did before; it just moves ahead of the borrow's end.
+            let hit = self
+                .summary_cache
+                .get(&key)
+                .and_then(|(hash, summary)| (*hash == detector_hash).then(|| summary.clone()));
+            if let Some(cached_summary) = hit {
+                // Field-visible cache-HIT count. Without this, the only
+                // production signal for this function was a handler-entry span
+                // that fires identically here and on the WASM path below, so
+                // every storm rate ever quoted conflated the two. See
+                // `ring::contract_exec_metrics`.
+                if let Some(m) = self.contract_exec_metrics() {
+                    m.record_summarize_fast_hit();
                 }
+                return Ok(cached_summary);
             }
         }
 
@@ -1291,10 +1322,18 @@ where
         // The summary may already be cached under this exact hash even when the
         // detector was cold (the summary cache is per-executor; the detector is
         // shared). Reuse it to skip the WASM call.
-        if let Some((cached_hash, cached_summary)) = self.summary_cache.get(&key) {
-            if *cached_hash == state_hash {
-                return Ok(cached_summary.clone());
+        let reload_hit = self
+            .summary_cache
+            .get(&key)
+            .and_then(|(hash, summary)| (*hash == state_hash).then(|| summary.clone()));
+        if let Some(cached_summary) = reload_hit {
+            // Reached the slow path (loaded + hashed the state) but still elided
+            // the WASM call. Counted separately from the fast hit so a cold
+            // detector is distinguishable from a cold cache.
+            if let Some(m) = self.contract_exec_metrics() {
+                m.record_summarize_reload_hit();
             }
+            return Ok(cached_summary);
         }
 
         let params = self
@@ -1316,11 +1355,26 @@ where
         // work whose per-heartbeat × per-neighbor multiplication was the storm.
         // Under the working cache it scales with the STATE-CHANGE rate, not with
         // hosted-set size or neighbor overlap — every-hop placement's "summarize
-        // load stays flat vs hosted-set size" invariant. No-op outside a sim (the
-        // record fn reads the sim-only network-name thread-local). This runs on
-        // the contract-handling loop thread, not a spawn_blocking closure, so the
-        // thread-local is set.
+        // load stays flat vs hosted-set size" invariant.
+        //
+        // TWO sinks, deliberately, because they answer to different readers and
+        // neither can serve the other:
+        //   * `ring.contract_exec_metrics()` is the PRODUCTION counter, read on
+        //     the `router_snapshot` cadence. Always live.
+        //   * `topology_registry` is the SIMULATION counter, keyed by peer
+        //     address so `SimNetwork` can aggregate across nodes; it is a no-op
+        //     outside a sim (the record fn reads the sim-only network-name
+        //     thread-local) and its `get_own_addr()` lookup is deliberately kept
+        //     off the hot path by living here on the WASM slow path. This runs on
+        //     the contract-handling loop thread, not a `spawn_blocking` closure,
+        //     so the thread-local is set.
+        // `summarize_wasm_call_records_both_sinks` pins that they cannot drift
+        // apart.
         if let Some(op_manager) = &self.op_manager {
+            op_manager
+                .ring
+                .contract_exec_metrics()
+                .record_summarize_wasm_call();
             if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
                 crate::ring::topology_registry::record_summarize_wasm_call(own_addr);
             }
@@ -1371,8 +1425,17 @@ where
         // contract state.
         if let Some(detector_hash) = self.state_store.cached_state_hash(&key) {
             let cache_key = (key, detector_hash, summary_hash);
-            if let Some(cached_delta) = self.delta_cache.get(&cache_key) {
-                return Ok(cached_delta.clone());
+            // Owned before recording: `LruCache::get` borrows mutably (see the
+            // summarize twin above).
+            let hit = self.delta_cache.get(&cache_key).cloned();
+            if let Some(cached_delta) = hit {
+                // Field-visible cache-HIT count; see the summarize twin above
+                // and `ring::contract_exec_metrics`. This arm runs per-SUBSCRIBER
+                // during broadcast fan-out, so it is the hotter of the two.
+                if let Some(m) = self.contract_exec_metrics() {
+                    m.record_delta_fast_hit();
+                }
+                return Ok(cached_delta);
             }
         }
 
@@ -1395,8 +1458,14 @@ where
         self.state_store.cache_state_hash(key, state_hash);
 
         let cache_key = (key, state_hash, summary_hash);
-        if let Some(cached_delta) = self.delta_cache.get(&cache_key) {
-            return Ok(cached_delta.clone());
+        let reload_hit = self.delta_cache.get(&cache_key).cloned();
+        if let Some(cached_delta) = reload_hit {
+            // Slow path reached (state loaded + hashed) but the WASM call was
+            // still elided; see the summarize twin above.
+            if let Some(m) = self.contract_exec_metrics() {
+                m.record_delta_reload_hit();
+            }
+            return Ok(cached_delta);
         }
 
         let params = self
@@ -1410,6 +1479,13 @@ where
                     cause: "contract parameters not found".into(),
                 })
             })?;
+
+        // The delta twin of the summarize slow-path counter: a true cache miss
+        // that actually runs the contract's WASM `get_state_delta`. Recorded at
+        // the decision, immediately before the call it describes.
+        if let Some(m) = self.contract_exec_metrics() {
+            m.record_delta_wasm_call();
+        }
 
         let delta = self
             .runtime
@@ -2473,6 +2549,28 @@ where
         // through `Arc<DashMap>`, not `&mut self`), and leaves this false.
         let mut local_entry_became_empty = false;
 
+        // Resolved before either fan-out arm takes its `&mut` borrows: both arms
+        // hold two executor maps mutably for the whole loop, so the
+        // `self.contract_exec_metrics()` accessor (which borrows ALL of `self`)
+        // is unusable inside them.
+        //
+        // Deliberately the FIELD, not that accessor and not an `Arc` clone: this
+        // borrows only `self.op_manager`, which is disjoint from
+        // `self.update_notifications`, `self.subscriber_summaries` and
+        // `self.runtime`, so the borrow checker allows it and the cost is a
+        // pointer. An `Arc` clone here would instead charge two atomic RMWs to
+        // every committed update on the zero-local-subscriber path — the
+        // overwhelmingly common one for a contract this node hosts for the
+        // network, which returns below without recording anything.
+        //
+        // Neither delta below has a cache in front of it, so they land on the
+        // `uncached` arm — see `ring::contract_exec_metrics` for why the cached
+        // and uncached WASM totals are separate counters.
+        let exec_metrics = self
+            .op_manager
+            .as_ref()
+            .map(|om| om.ring.contract_exec_metrics());
+
         if let (Some(shared_notifications), Some(shared_summaries)) = (
             self.shared_notifications.as_ref(),
             self.shared_summaries.as_ref(),
@@ -2625,6 +2723,9 @@ where
                         if delta_computations < super::MAX_DELTA_COMPUTATIONS_PER_FANOUT =>
                     {
                         delta_computations += 1;
+                        if let Some(m) = exec_metrics {
+                            m.record_delta_wasm_uncached();
+                        }
                         self.runtime
                             .get_state_delta(&key, params, new_state, summary)
                             .map_err(|err| {
@@ -2804,6 +2905,9 @@ where
                         if delta_computations < super::MAX_DELTA_COMPUTATIONS_PER_FANOUT =>
                     {
                         delta_computations += 1;
+                        if let Some(m) = exec_metrics {
+                            m.record_delta_wasm_uncached();
+                        }
                         self.runtime
                             .get_state_delta(&key, params, new_state, &*summary)
                             .map_err(|err| {
@@ -3137,6 +3241,116 @@ mod full_state_version_gate_pins {
             "recovery ordering must be: validate local ({local_valid_pos}) < \
              keep-local-when-valid ({keep_local_pos}) < recovery ({recovery_pos}) — \
              recovery may only replace state the contract itself calls invalid"
+        );
+    }
+}
+
+/// Source-scrape pin for the contract-exec WASM counters' PRODUCTION liveness.
+///
+/// The failure this guards against already happened once, and is the whole
+/// reason this instrumentation exists: a counter sat on exactly the right line
+/// for a year and was a no-op in the field, because the only sink it wrote to
+/// (`topology_registry`) keys on a thread-local that `SimNetwork` sets and a
+/// production node never does. The simulation asserted the invariant held, the
+/// field suggested it did not, and the counter that would have adjudicated was
+/// switched off precisely where it mattered.
+///
+/// Two sinks now share the site. A runtime test cannot cover both — the unit
+/// fixtures have no bound listener, so `get_own_addr()` returns `None` and the
+/// simulation sink never fires there — so the ordering invariant is pinned from
+/// source instead: the PRODUCTION record must not be nested inside the
+/// `get_own_addr()` guard, which is exactly the shape that would re-create the
+/// original bug.
+#[cfg(test)]
+mod contract_exec_counter_pins {
+    /// Slice `bridged_summarize_contract_state`'s CODE (its signature to the
+    /// next method's signature), with comment lines removed.
+    ///
+    /// Both bounds matter. The slice stops a needle matching a later occurrence
+    /// elsewhere in the file — including this test module's own assertion
+    /// strings, which `include_str!` also pulls in. Dropping comment lines stops
+    /// a needle matching the PROSE that describes the code: the first draft of
+    /// `summarize_wasm_call_records_both_sinks` failed because `get_own_addr()`
+    /// appears in the block comment above the call as well as in the call, and
+    /// the comment came first. A pin that matches its own explanation is not
+    /// pinning anything.
+    fn summarize_body() -> String {
+        let src = include_str!("executor_impl.rs");
+        let start = src
+            .find("pub(in crate::contract::executor) async fn bridged_summarize_contract_state(")
+            .expect("bridged_summarize_contract_state not found");
+        let after = &src[start..];
+        let end = after
+            .find("pub(in crate::contract::executor) async fn bridged_get_contract_state_delta(")
+            .expect("next method after bridged_summarize_contract_state not found");
+        after[..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn summarize_wasm_call_records_both_sinks() {
+        let body = summarize_body();
+
+        let production_pos = body
+            .find(".record_summarize_wasm_call();")
+            .expect("the production ContractExecMetrics counter must be recorded here");
+        let own_addr_pos = body
+            .find("if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr()")
+            .expect("the simulation sink's own-address guard must still be here");
+        let sim_pos = body
+            .find("topology_registry::record_summarize_wasm_call(own_addr)")
+            .expect("the simulation topology_registry sink must still be recorded here");
+
+        assert!(
+            production_pos < own_addr_pos,
+            "the PRODUCTION counter ({production_pos}) must be recorded BEFORE the \
+             get_own_addr() lookup ({own_addr_pos}), i.e. outside its `if let Some` \
+             guard. Nesting it inside would make the production counter conditional \
+             on a lookup that returns None on a node with no bound listener, \
+             recreating the sim-only-counter bug this instrumentation exists to fix."
+        );
+        assert!(
+            own_addr_pos < sim_pos,
+            "the simulation sink ({sim_pos}) still takes its peer address from the \
+             get_own_addr() guard ({own_addr_pos})"
+        );
+    }
+
+    /// The counter must sit on the WASM SLOW path: after both cache-hit early
+    /// returns, and immediately before the `summarize_state` call it describes.
+    /// A counter that drifted above the cache checks would count cache hits as
+    /// WASM work — the exact conflation the handler-entry span already makes,
+    /// and the reason its numbers could not be acted on.
+    #[test]
+    fn summarize_wasm_counter_sits_after_both_cache_hit_returns() {
+        let body = summarize_body();
+
+        let fast_hit_pos = body
+            .find(".record_summarize_fast_hit();")
+            .expect("fast-path cache-hit counter not found");
+        let reload_hit_pos = body
+            .find(".record_summarize_reload_hit();")
+            .expect("reload-path cache-hit counter not found");
+        let wasm_pos = body
+            .find(".record_summarize_wasm_call();")
+            .expect("WASM-call counter not found");
+        let summarize_state_pos = body
+            .find(".summarize_state(&key, &params, &state)")
+            .expect("the WASM summarize_state call not found");
+
+        assert!(
+            fast_hit_pos < reload_hit_pos && reload_hit_pos < wasm_pos,
+            "counter order must follow the path order: fast hit ({fast_hit_pos}) < \
+             reload hit ({reload_hit_pos}) < WASM call ({wasm_pos})"
+        );
+        assert!(
+            wasm_pos < summarize_state_pos,
+            "the WASM counter ({wasm_pos}) must be recorded at the decision, \
+             immediately before the summarize_state call it describes \
+             ({summarize_state_pos})"
         );
     }
 }

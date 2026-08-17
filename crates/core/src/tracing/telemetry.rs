@@ -2725,6 +2725,81 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "network_efficiency_v1".to_string(),
                     serde_json::json!(snapshot.network_efficiency_v1),
                 );
+                // Contract-exec WASM counters: the cache-hit / WASM-miss split
+                // that makes a summarize or delta rate interpretable at all.
+                // Same hand-mirroring footgun as everything else in this block —
+                // a new `RouterSnapshotInfo` field is invisible to the collector
+                // unless added here. Pinned by
+                // `router_snapshot_json_includes_contract_exec_counters`, which
+                // asserts the FULL set so a partially-mirrored addition fails.
+                for (name, value) in [
+                    (
+                        "contract_exec_summarize_fast_hits_total",
+                        snapshot.contract_exec_summarize_fast_hits_total,
+                    ),
+                    (
+                        "contract_exec_summarize_reload_hits_total",
+                        snapshot.contract_exec_summarize_reload_hits_total,
+                    ),
+                    (
+                        "contract_exec_summarize_wasm_calls_total",
+                        snapshot.contract_exec_summarize_wasm_calls_total,
+                    ),
+                    (
+                        "contract_exec_summarize_wasm_uncached_total",
+                        snapshot.contract_exec_summarize_wasm_uncached_total,
+                    ),
+                    (
+                        "contract_exec_delta_fast_hits_total",
+                        snapshot.contract_exec_delta_fast_hits_total,
+                    ),
+                    (
+                        "contract_exec_delta_reload_hits_total",
+                        snapshot.contract_exec_delta_reload_hits_total,
+                    ),
+                    (
+                        "contract_exec_delta_wasm_calls_total",
+                        snapshot.contract_exec_delta_wasm_calls_total,
+                    ),
+                    (
+                        "contract_exec_delta_wasm_uncached_total",
+                        snapshot.contract_exec_delta_wasm_uncached_total,
+                    ),
+                    (
+                        "contract_exec_summarize_fast_hits_last_snapshot",
+                        snapshot.contract_exec_summarize_fast_hits_last_snapshot,
+                    ),
+                    (
+                        "contract_exec_summarize_reload_hits_last_snapshot",
+                        snapshot.contract_exec_summarize_reload_hits_last_snapshot,
+                    ),
+                    (
+                        "contract_exec_summarize_wasm_calls_last_snapshot",
+                        snapshot.contract_exec_summarize_wasm_calls_last_snapshot,
+                    ),
+                    (
+                        "contract_exec_summarize_wasm_uncached_last_snapshot",
+                        snapshot.contract_exec_summarize_wasm_uncached_last_snapshot,
+                    ),
+                    (
+                        "contract_exec_delta_fast_hits_last_snapshot",
+                        snapshot.contract_exec_delta_fast_hits_last_snapshot,
+                    ),
+                    (
+                        "contract_exec_delta_reload_hits_last_snapshot",
+                        snapshot.contract_exec_delta_reload_hits_last_snapshot,
+                    ),
+                    (
+                        "contract_exec_delta_wasm_calls_last_snapshot",
+                        snapshot.contract_exec_delta_wasm_calls_last_snapshot,
+                    ),
+                    (
+                        "contract_exec_delta_wasm_uncached_last_snapshot",
+                        snapshot.contract_exec_delta_wasm_uncached_last_snapshot,
+                    ),
+                ] {
+                    obj.insert(name.to_string(), serde_json::json!(value));
+                }
                 obj.insert(
                     "hosted_contracts_count".to_string(),
                     serde_json::json!(snapshot.hosted_contracts_count),
@@ -4177,6 +4252,64 @@ mod tests {
             ("broadcast_stream_attempts_total", 37),
             ("broadcast_stream_failures_total", 41),
             ("broadcast_stream_failures_last_snapshot", 43),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// The contract-exec WASM counters must reach the hand-mirrored OTLP body.
+    ///
+    /// These are the fields that make a summarize/delta rate interpretable —
+    /// without them, the only production signal is a handler-entry span that
+    /// counts cache hits and WASM invocations identically, which is how five
+    /// consecutive storm fixes were sized against an undifferentiated number.
+    /// Losing one to the hand-mirroring footgun would re-blind us in exactly the
+    /// way this change exists to fix, so the assertion covers the FULL set: a
+    /// partially-mirrored addition fails here rather than shipping half-visible.
+    ///
+    /// Every value below is DISTINCT, so a copy-paste slip that mirrors one
+    /// field's value under another field's key fails too — an all-`Some(1)`
+    /// fixture would pass under that mutation.
+    #[test]
+    fn router_snapshot_json_includes_contract_exec_counters() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.contract_exec_summarize_fast_hits_total = Some(101);
+        info.contract_exec_summarize_reload_hits_total = Some(102);
+        info.contract_exec_summarize_wasm_calls_total = Some(103);
+        info.contract_exec_summarize_wasm_uncached_total = Some(104);
+        info.contract_exec_delta_fast_hits_total = Some(105);
+        info.contract_exec_delta_reload_hits_total = Some(106);
+        info.contract_exec_delta_wasm_calls_total = Some(107);
+        info.contract_exec_delta_wasm_uncached_total = Some(108);
+        info.contract_exec_summarize_fast_hits_last_snapshot = Some(109);
+        info.contract_exec_summarize_reload_hits_last_snapshot = Some(110);
+        info.contract_exec_summarize_wasm_calls_last_snapshot = Some(111);
+        info.contract_exec_summarize_wasm_uncached_last_snapshot = Some(112);
+        info.contract_exec_delta_fast_hits_last_snapshot = Some(113);
+        info.contract_exec_delta_reload_hits_last_snapshot = Some(114);
+        info.contract_exec_delta_wasm_calls_last_snapshot = Some(115);
+        info.contract_exec_delta_wasm_uncached_last_snapshot = Some(116);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("contract_exec_summarize_fast_hits_total", 101),
+            ("contract_exec_summarize_reload_hits_total", 102),
+            ("contract_exec_summarize_wasm_calls_total", 103),
+            ("contract_exec_summarize_wasm_uncached_total", 104),
+            ("contract_exec_delta_fast_hits_total", 105),
+            ("contract_exec_delta_reload_hits_total", 106),
+            ("contract_exec_delta_wasm_calls_total", 107),
+            ("contract_exec_delta_wasm_uncached_total", 108),
+            ("contract_exec_summarize_fast_hits_last_snapshot", 109),
+            ("contract_exec_summarize_reload_hits_last_snapshot", 110),
+            ("contract_exec_summarize_wasm_calls_last_snapshot", 111),
+            ("contract_exec_summarize_wasm_uncached_last_snapshot", 112),
+            ("contract_exec_delta_fast_hits_last_snapshot", 113),
+            ("contract_exec_delta_reload_hits_last_snapshot", 114),
+            ("contract_exec_delta_wasm_calls_last_snapshot", 115),
+            ("contract_exec_delta_wasm_uncached_last_snapshot", 116),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
