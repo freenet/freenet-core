@@ -226,6 +226,18 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
         ),
         ConformanceProperty::StateIdempotence,
     );
+    // Associativity breaks too, which the mode's documentation claims and this
+    // asserts rather than leaving in prose. Needs three states by definition.
+    assert_violates(
+        verify_case(
+            &mut never_settles,
+            &ConformanceCase::new(
+                ConformanceProperty::StateAssociativity,
+                vec![bytes(&[1, 2]), bytes(&[2, 3]), bytes(&[5, 6])],
+            ),
+        ),
+        ConformanceProperty::StateAssociativity,
+    );
     // Commutativity still HOLDS for this arm: the rewrite is applied to a union, and
     // a union is symmetric. Asserting it keeps the mode's description honest rather
     // than leaving a reader to redo the algebra — the same self-check the
