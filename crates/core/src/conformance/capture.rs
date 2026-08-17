@@ -637,6 +637,7 @@ mod tests {
             incoming_state: Some(vec![2, 3]),
             delta: None,
             result_state: vec![1, 2, 3],
+            related: Vec::new(),
         }
     }
 
@@ -769,6 +770,88 @@ mod tests {
             handle.dropped() >= 4,
             "the refusals should be counted, saw {}",
             handle.dropped()
+        );
+    }
+
+    /// Related-contract state survives capture and comes back out of the bundle.
+    ///
+    /// A contract whose `validate_state` depends on another contract cannot be
+    /// checked at all without that state: the verifier reaches no verdict and says
+    /// `RelatedRequired`. That is honest, and it applies to a whole class of contract
+    /// rather than to an unlucky one, so the capture path has to carry it.
+    #[tokio::test]
+    async fn related_contract_state_is_captured_and_replayable() {
+        let related_id = ContractInstanceId::new([9; 32]);
+        let mut observed = observation();
+        observed.related = vec![(related_id, vec![42, 43])];
+
+        let mut samplers = HashMap::new();
+        record(&mut samplers, observed);
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        write_all(dir.path(), &samplers, 0).await;
+
+        let path = dir
+            .path()
+            .join(format!("{}.bundle", ContractInstanceId::new([1; 32])));
+        let bundle = super::super::bundle::ReplayBundle::read_from(&path).expect("read back");
+        assert_eq!(
+            bundle.related,
+            vec![(related_id, vec![42, 43])],
+            "the bundle must carry the related state the merge referenced"
+        );
+
+        // And it has to arrive where the verifier looks for it, not merely be stored.
+        let corpus = bundle.to_corpus();
+        assert!(
+            corpus.related.states().any(|(id, state)| {
+                *id == related_id && state.as_ref().map(|s| s.as_ref()) == Some(&[42u8, 43][..])
+            }),
+            "related state must reach the corpus as RelatedContracts, or a contract \
+             that needs it still cannot be executed"
+        );
+    }
+
+    /// Related state is bounded, and refuses rather than evicting.
+    ///
+    /// It has its own allowance rather than sharing the sample budget: sharing would
+    /// let a contract with large related state crowd out the very samples the related
+    /// state exists to make checkable.
+    #[tokio::test]
+    async fn related_contract_state_is_bounded() {
+        let mut samplers = HashMap::new();
+
+        // More distinct related contracts than the cap allows.
+        for i in 0..(MAX_RELATED_CONTRACTS + 4) {
+            let mut observed = observation();
+            observed.related = vec![(ContractInstanceId::new([i as u8; 32]), vec![i as u8; 16])];
+            record(&mut samplers, observed);
+        }
+        let tracked = samplers.values().next().expect("one contract tracked");
+        assert!(
+            tracked.related.len() <= MAX_RELATED_CONTRACTS,
+            "related contracts must be capped, held {}",
+            tracked.related.len()
+        );
+
+        // A single oversized related state is refused outright rather than
+        // displacing everything already held.
+        let held_before = tracked.related.len();
+        let mut huge = observation();
+        huge.related = vec![(
+            ContractInstanceId::new([200; 32]),
+            vec![0u8; MAX_RELATED_BYTES + 1],
+        )];
+        record(&mut samplers, huge);
+        let tracked = samplers.values().next().expect("one contract tracked");
+        assert_eq!(
+            tracked.related.len(),
+            held_before,
+            "an oversized related state must be refused, not admitted or swapped in"
+        );
+        assert!(
+            tracked.related.values().map(Vec::len).sum::<usize>() <= MAX_RELATED_BYTES,
+            "the related-state allowance must hold"
         );
     }
 
