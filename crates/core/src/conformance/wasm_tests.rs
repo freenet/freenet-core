@@ -25,6 +25,8 @@ const NON_IDEMPOTENT_DELTA: u8 = 3;
 const NONDETERMINISTIC_SUMMARY: u8 = 4;
 const CAPPED_SET: u8 = 5;
 const NEVER_SETTLES: u8 = 6;
+const REQUIRES_RELATED: u8 = 7;
+const RELATED_ID: [u8; 32] = [7; 32];
 
 fn bytes(values: &[u8]) -> Bytes {
     Arc::from(values)
@@ -255,6 +257,46 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
         "this mode should break idempotence and associativity only; a commutativity \
          finding means the arm no longer isolates what its documentation claims: \
          {commutativity_still_holds:?}"
+    );
+
+    // ------------------------------------------- mode 7: needs related state
+    //
+    // Why capturing related-contract state matters: without it the verifier reaches
+    // no verdict at all for this class of contract, which is honest and useless.
+    // Measured against a live capture, three of 32 contracts were in exactly this
+    // position, one across sixty cases.
+    let mut needs_related = RuntimeOracle::standalone(wasm.clone(), vec![REQUIRES_RELATED]).await?;
+    let case = ConformanceCase::new(
+        ConformanceProperty::StateCommutativity,
+        vec![bytes(&[1, 2]), bytes(&[2, 3])],
+    );
+    match verify_case(&mut needs_related, &case) {
+        PropertyOutcome::Inconclusive(reason) => assert_eq!(
+            reason,
+            crate::conformance::property::Inconclusive::RelatedRequired,
+            "a contract asking for related state must be declined, never accused"
+        ),
+        other @ (PropertyOutcome::Holds | PropertyOutcome::Violated(_)) => {
+            panic!("expected RelatedRequired without the related state, got {other:?}")
+        }
+    }
+
+    // Supply it and the same case decides. The merge conforms, so the verdict is
+    // Holds; the point is that there is a verdict at all.
+    let mut supplied = std::collections::HashMap::new();
+    supplied.insert(
+        freenet_stdlib::prelude::ContractInstanceId::new(RELATED_ID),
+        Some(freenet_stdlib::prelude::State::from(vec![1u8, 2])),
+    );
+    let with_related = ConformanceCase::new(
+        ConformanceProperty::StateCommutativity,
+        vec![bytes(&[1, 2]), bytes(&[2, 3])],
+    )
+    .with_related(freenet_stdlib::prelude::RelatedContracts::from(supplied));
+    assert_eq!(
+        verify_case(&mut needs_related, &with_related),
+        PropertyOutcome::Holds,
+        "with the related state supplied the contract must become judgeable"
     );
 
     // ---------------------------------- same code, different params, different instance

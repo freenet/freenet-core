@@ -21,6 +21,11 @@
 //!                                no-op, which at-least-once delivery makes fatal.
 //!   4 NONDETERMINISTIC_SUMMARY — summarize_state depends on something other than
 //!                                the state: real wall-clock time, the #4857 class.
+//!   6 REQUIRES_RELATED         — validate_state cannot decide without another
+//!                                contract's state and asks for it. The merge itself
+//!                                conforms. Proves the verifier declines rather than
+//!                                accuses when the state is missing, and reaches a
+//!                                real verdict once it is supplied.
 //!   5 CAPPED_SET               — merge caps the collection at N entries, evicting
 //!                                by something other than the merge's own ordering.
 //!                                Commutative and idempotent; only a three-state
@@ -65,6 +70,11 @@ const NON_IDEMPOTENT_DELTA: u8 = 3;
 const NONDETERMINISTIC_SUMMARY: u8 = 4;
 const CAPPED_SET: u8 = 5;
 const NEVER_SETTLES: u8 = 6;
+const REQUIRES_RELATED: u8 = 7;
+
+/// The contract [`REQUIRES_RELATED`] insists on knowing about, as a fixed id so a
+/// test can supply its state without deriving anything.
+const RELATED_ID: [u8; 32] = [7; 32];
 
 /// How many entries [`CAPPED_SET`] keeps. Small so a three-state case overflows it.
 const CAP: usize = 3;
@@ -181,10 +191,24 @@ fn apply_delta(m: u8, current: &[u8], delta: &[u8]) -> Vec<u8> {
 #[contract]
 impl ContractInterface for Contract {
     fn validate_state(
-        _parameters: Parameters<'static>,
+        parameters: Parameters<'static>,
         state: State<'static>,
-        _related: RelatedContracts<'static>,
+        related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, ContractError> {
+        // Mode 6 cannot decide alone: it needs another contract's state, as a
+        // contract enforcing an authorization or membership relation does. Asking is
+        // the honest answer, and it is what makes the contract unjudgeable until the
+        // capture path carries that state.
+        if mode(&parameters) == REQUIRES_RELATED {
+            let wanted = ContractInstanceId::new(RELATED_ID);
+            let supplied = related
+                .states()
+                .any(|(id, state)| *id == wanted && state.is_some());
+            if !supplied {
+                return Ok(ValidateResult::RequestRelated(vec![wanted]));
+            }
+        }
+
         if is_canonical(state.as_ref()) {
             Ok(ValidateResult::Valid)
         } else {
