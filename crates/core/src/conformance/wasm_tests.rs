@@ -24,6 +24,7 @@ const MUTUAL_REJECTION: u8 = 2;
 const NON_IDEMPOTENT_DELTA: u8 = 3;
 const NONDETERMINISTIC_SUMMARY: u8 = 4;
 const CAPPED_SET: u8 = 5;
+const NEVER_SETTLES: u8 = 6;
 
 fn bytes(values: &[u8]) -> Bytes {
     Arc::from(values)
@@ -209,6 +210,52 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
             pairwise.property
         );
     }
+
+    // ------------------------------------------------ mode 6: never settles
+    //
+    // Regression cover for the worst shape found on the live network: a contract
+    // whose merge rewrote its state on every apply, so `merge(A, A)` never reached a
+    // fixpoint. Under at-least-once delivery such a contract can never converge, and
+    // it is covered here by shape rather than by committing the third-party WASM it
+    // was observed in.
+    let mut never_settles = RuntimeOracle::standalone(wasm.clone(), vec![NEVER_SETTLES]).await?;
+    assert_violates(
+        verify_case(
+            &mut never_settles,
+            &ConformanceCase::new(ConformanceProperty::StateIdempotence, vec![bytes(&[1, 2])]),
+        ),
+        ConformanceProperty::StateIdempotence,
+    );
+    // Associativity breaks too, which the mode's documentation claims and this
+    // asserts rather than leaving in prose. Needs three states by definition.
+    assert_violates(
+        verify_case(
+            &mut never_settles,
+            &ConformanceCase::new(
+                ConformanceProperty::StateAssociativity,
+                vec![bytes(&[1, 2]), bytes(&[2, 3]), bytes(&[5, 6])],
+            ),
+        ),
+        ConformanceProperty::StateAssociativity,
+    );
+    // Commutativity still HOLDS for this arm: the rewrite is applied to a union, and
+    // a union is symmetric. Asserting it keeps the mode's description honest rather
+    // than leaving a reader to redo the algebra — the same self-check the
+    // capped-collection mode carries, and the reason review caught the doc claiming
+    // otherwise.
+    let commutativity_still_holds = verify_case(
+        &mut never_settles,
+        &ConformanceCase::new(
+            ConformanceProperty::StateCommutativity,
+            vec![bytes(&[1, 2]), bytes(&[2, 3])],
+        ),
+    );
+    assert!(
+        !commutativity_still_holds.is_violation(),
+        "this mode should break idempotence and associativity only; a commutativity \
+         finding means the arm no longer isolates what its documentation claims: \
+         {commutativity_still_holds:?}"
+    );
 
     // ---------------------------------- same code, different params, different instance
     let a = RuntimeOracle::standalone(wasm.clone(), vec![CONFORMING]).await?;

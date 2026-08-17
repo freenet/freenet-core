@@ -26,6 +26,15 @@
 //!                                Commutative and idempotent; only a three-state
 //!                                case reveals it. The one mode the pairwise laws
 //!                                cannot catch.
+//!   6 NEVER_SETTLES            — merge rewrites the state on every apply, so
+//!                                merge(A, A) never reaches a fixpoint. Idempotence
+//!                                and associativity break; commutativity still HOLDS
+//!                                here, because the rewrite is applied to a union and
+//!                                a union is symmetric. Modelled on a live contract
+//!                                whose states were all a fixed 3488 bytes and whose
+//!                                content changed on every re-apply — that one broke
+//!                                commutativity too, for reasons this arm does not
+//!                                reproduce.
 //!
 //! State is always a canonical byte set: sorted, strictly ascending, no
 //! duplicates. `validate_state` accepts exactly that canonical form.
@@ -55,6 +64,7 @@ const MUTUAL_REJECTION: u8 = 2;
 const NON_IDEMPOTENT_DELTA: u8 = 3;
 const NONDETERMINISTIC_SUMMARY: u8 = 4;
 const CAPPED_SET: u8 = 5;
+const NEVER_SETTLES: u8 = 6;
 
 /// How many entries [`CAPPED_SET`] keeps. Small so a three-state case overflows it.
 const CAP: usize = 3;
@@ -85,6 +95,35 @@ fn merge_state(m: u8, current: &[u8], incoming: &[u8]) -> Vec<u8> {
     match m {
         LAST_WRITE_WINS => incoming.to_vec(),
         MUTUAL_REJECTION => current.to_vec(),
+        // Rewrite in place on every apply: same length, different content, and no
+        // fixpoint. Deterministic, so it is not mistaken for nondeterminism — the
+        // shape seen in the wild, where a contract that keeps a derived field
+        // (a running digest, a sequence number) recomputes it on every merge.
+        //
+        // At-least-once delivery makes this fatal rather than untidy: the same state
+        // redelivered mutates the result again, so the peer never stops producing
+        // "new" state to gossip and can never agree with anyone.
+        //
+        // Adding one is a bijection on the byte alphabet, so the rotation can never
+        // collapse two entries into one and the state never settles — EXCEPT for the
+        // two sets that are invariant under a 256-cycle: the empty set (returned
+        // early below) and the full 0..=255 alphabet. Neither is reachable from the
+        // small states this fixture is driven with, but anyone reusing this arm with
+        // a generated corpus should know the second one exists.
+        NEVER_SETTLES => {
+            let mut out = union(current, incoming);
+            if out.is_empty() {
+                return out;
+            }
+            // Rotate the byte values within the set's own alphabet, keeping the
+            // state canonical (sorted, deduplicated) and the same length, so the
+            // change cannot be dismissed as a serialization artifact.
+            let rotated: Vec<u8> = out.iter().map(|b| b.wrapping_add(1)).collect();
+            out = rotated;
+            out.sort_unstable();
+            out.dedup();
+            out
+        }
         // Union, then evict down to CAP entries.
         //
         // This is the "cap the collection at N" rule real applications write, and
