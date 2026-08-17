@@ -436,6 +436,33 @@ fn nondeterministic_summary_is_caught() {
 }
 
 #[test]
+fn nondeterministic_delta_is_caught() {
+    // Sibling of `nondeterministic_summary_is_caught`, and the one property whose
+    // violation branch nothing else reaches: every other test that mentions
+    // `DeltaDeterminism` feeds it a conforming contract and asserts it holds, which
+    // would pass just as happily with the check deleted.
+    //
+    // A delta that varies across identical calls is worse than a varying summary,
+    // because the recipient applies it: two peers asking the same holder for the
+    // same difference get different answers and diverge without either side seeing
+    // an error.
+    let mut counter = 0u8;
+    let mut fake = Fake::conforming().deltaing(move |state, _summary| {
+        counter = counter.wrapping_add(1);
+        let mut out = state.to_vec();
+        out.push(counter);
+        Ok(out)
+    });
+    assert_violates(
+        verify_case(
+            &mut fake,
+            &case(ConformanceProperty::DeltaDeterminism, &[&[1, 2]]),
+        ),
+        ConformanceProperty::DeltaDeterminism,
+    );
+}
+
+#[test]
 fn nondeterministic_update_is_caught() {
     let mut counter = 0u8;
     let mut fake = Fake::conforming().merging(move |a, b| {
