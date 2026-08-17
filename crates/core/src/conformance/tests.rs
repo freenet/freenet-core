@@ -1076,6 +1076,65 @@ fn generator_is_deterministic() {
 /// emitted every commutativity case before its first associativity case, a corpus
 /// large enough to hit the budget would quietly stop checking associativity —
 /// and nothing would say so.
+/// The false positive found on the live network, kept as a permanent case.
+///
+/// A delta is `get_state_delta(sender_state, recipient_summary)`, so two deltas
+/// observed against DIFFERENT bases can be causally sequenced: the later one computed
+/// from a state that already contains the earlier one's effect. Permuting those asks
+/// what happens in a situation the protocol never produces, and the answer is not a
+/// property of the contract.
+///
+/// This is not hypothetical. Replaying a live capture reported a
+/// `DeltaPermutationInvariance` violation against a real contract, and it came from
+/// exactly such a pair; the finding did not survive once pairing was restricted to a
+/// shared base. RFC #5320 requires every false positive to become a permanent
+/// regression case, and this is that case — without it, reverting the rule would
+/// silently restore the accusation, because every other test supplies deltas that
+/// share a base or none at all.
+#[test]
+fn deltas_observed_against_different_bases_are_never_paired() {
+    let base_one: Bytes = Arc::from([1u8, 2].as_slice());
+    let base_two: Bytes = Arc::from([3u8, 4].as_slice());
+
+    let corpus = Corpus {
+        deltas: vec![Arc::from([9u8].as_slice()), Arc::from([7u8].as_slice())],
+        // Same two deltas, but each seen against a different state.
+        delta_bases: vec![Some(base_one), Some(base_two)],
+        ..Corpus::from_states(vec![vec![1, 2], vec![3, 4]])
+    };
+
+    let cases = generate_cases(&corpus, &GeneratorConfig::default());
+    let permutation_cases = cases
+        .iter()
+        .filter(|c| c.property == ConformanceProperty::DeltaPermutationInvariance)
+        .count();
+
+    assert_eq!(
+        permutation_cases, 0,
+        "deltas seen against different bases must not be paired: they may be causally \
+         sequenced, and permuting them accuses contracts of an order-dependence the \
+         network never exercises"
+    );
+
+    // And the guard must not be so blunt that it stops the check working at all:
+    // the same deltas sharing a base ARE a legitimate pair.
+    let shared: Bytes = Arc::from([1u8, 2].as_slice());
+    let paired = Corpus {
+        deltas: vec![Arc::from([9u8].as_slice()), Arc::from([7u8].as_slice())],
+        delta_bases: vec![Some(shared.clone()), Some(shared)],
+        ..Corpus::from_states(vec![vec![1, 2], vec![3, 4]])
+    };
+    let paired_cases = generate_cases(&paired, &GeneratorConfig::default())
+        .iter()
+        .filter(|c| c.property == ConformanceProperty::DeltaPermutationInvariance)
+        .count();
+    assert!(
+        paired_cases > 0,
+        "deltas sharing a base are the genuine concurrent-update case and must still \
+         be checked, or the fix has simply disabled the property"
+    );
+}
+
 #[test]
 fn a_tight_case_budget_still_covers_every_law() {
     let states: Vec<Vec<u8>> = (1u8..=12).map(|i| vec![i]).collect();

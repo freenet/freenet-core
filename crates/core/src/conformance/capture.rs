@@ -454,7 +454,11 @@ fn reload(dir: &Path) -> HashMap<ContractInstanceId, TrackedContract> {
             TrackedContract {
                 sampler,
                 code_hash,
-                related: bundle.related.iter().cloned().collect(),
+                related: {
+                    let mut restored = HashMap::new();
+                    admit_related(&mut restored, &bundle.related);
+                    restored
+                },
                 parameters: bundle.parameters,
                 // Not persisted in the bundle: this counts what THIS process
                 // refused, and a reloaded corpus has no refusals of its own yet.
@@ -483,25 +487,7 @@ fn record(samplers: &mut HashMap<ContractInstanceId, TrackedContract>, observati
             related: HashMap::new(),
         });
 
-    // Keep the newest state per related contract, within a bounded allowance. Both
-    // bounds refuse rather than evict: a contract that references a hundred others
-    // should not be able to churn this map, and the states already retained are more
-    // useful than an arbitrary newcomer.
-    for (instance, state) in &observation.related {
-        if state.len() > MAX_RELATED_BYTES {
-            continue;
-        }
-        let known = tracked.related.contains_key(instance);
-        if !known && tracked.related.len() >= MAX_RELATED_CONTRACTS {
-            continue;
-        }
-        let held: usize = tracked.related.values().map(Vec::len).sum();
-        let replacing = tracked.related.get(instance).map_or(0, Vec::len);
-        if held - replacing + state.len() > MAX_RELATED_BYTES {
-            continue;
-        }
-        tracked.related.insert(*instance, state.clone());
-    }
+    admit_related(&mut tracked.related, &observation.related);
 
     let admission = tracked.sampler.observe_transition(
         &observation.base_state,
@@ -512,6 +498,42 @@ fn record(samplers: &mut HashMap<ContractInstanceId, TrackedContract>, observati
     );
     if matches!(admission, Admission::TooLarge) {
         tracked.refused_too_large += 1;
+    }
+}
+
+/// Admit related-contract states into a tracked contract, within the allowance.
+///
+/// Shared by `record` and `reload` on purpose. Everything else a reload restores goes
+/// back through the sampler's own admission checks, so it is self-correcting: a
+/// bundle written under looser limits is trimmed to what the current build allows.
+/// Related state was the one field that skipped that and was collected raw, so a
+/// bundle from a looser build — or an edited one, since nothing bounds the vector on
+/// disk — loaded straight past today's limits. One function, called from both paths,
+/// is what stops the two rules drifting again.
+///
+/// Both bounds refuse rather than evict: a contract referencing a hundred others must
+/// not be able to churn this map, and states already retained are more useful than an
+/// arbitrary newcomer.
+fn admit_related(
+    held: &mut HashMap<ContractInstanceId, Vec<u8>>,
+    offered: &[(ContractInstanceId, Vec<u8>)],
+) {
+    for (instance, state) in offered {
+        if state.len() > MAX_RELATED_BYTES {
+            continue;
+        }
+        if !held.contains_key(instance) && held.len() >= MAX_RELATED_CONTRACTS {
+            continue;
+        }
+        let total: usize = held.values().map(Vec::len).sum();
+        // Subtracting what this entry already holds cannot underflow: `replacing` is
+        // non-zero only when the instance is already a key, in which case its length
+        // is part of `total`.
+        let replacing = held.get(instance).map_or(0, Vec::len);
+        if total - replacing + state.len() > MAX_RELATED_BYTES {
+            continue;
+        }
+        held.insert(*instance, state.clone());
     }
 }
 
@@ -809,6 +831,48 @@ mod tests {
             }),
             "related state must reach the corpus as RelatedContracts, or a contract \
              that needs it still cannot be executed"
+        );
+    }
+
+    /// A bundle on disk cannot smuggle more related state than today's bounds allow.
+    ///
+    /// Everything else a reload restores goes back through the sampler's admission
+    /// checks, so it is self-correcting: a corpus written by a build with looser
+    /// limits is trimmed to what this build permits. Related state was the one field
+    /// collected raw, and nothing bounds that vector on disk, so a bundle from a
+    /// looser build — or an edited one — loaded straight past the current limits.
+    #[tokio::test]
+    async fn a_reloaded_bundle_cannot_exceed_the_related_bounds() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let instance = ContractInstanceId::new([1; 32]);
+
+        // Hand-build a bundle carrying far more related state than the bounds allow,
+        // as a looser build or an edit would produce.
+        let mut bundle = super::super::bundle::ReplayBundle::new(vec![9, 9], vec![3]);
+        bundle.instance = Some(instance);
+        bundle.states = vec![vec![1, 2], vec![2, 3]];
+        bundle.related = (0..(MAX_RELATED_CONTRACTS + 6))
+            .map(|i| (ContractInstanceId::new([i as u8; 32]), vec![i as u8; 32]))
+            .collect();
+        bundle
+            .write_to(&dir.path().join(format!("{instance}.bundle")))
+            .expect("write bundle");
+
+        let samplers = reload(dir.path());
+        let tracked = samplers
+            .values()
+            .next()
+            .expect("the bundle should have been reloaded");
+
+        assert!(
+            tracked.related.len() <= MAX_RELATED_CONTRACTS,
+            "reload admitted {} related contracts, over the cap of {}",
+            tracked.related.len(),
+            MAX_RELATED_CONTRACTS
+        );
+        assert!(
+            tracked.related.values().map(Vec::len).sum::<usize>() <= MAX_RELATED_BYTES,
+            "reload admitted more related bytes than the allowance"
         );
     }
 

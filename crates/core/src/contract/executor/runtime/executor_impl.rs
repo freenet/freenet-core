@@ -1559,65 +1559,94 @@ where
         // stall a merge — capture losing observations is always preferable to
         // synchronization queueing behind it.
         if let Some(capture) = crate::conformance::capture::global() {
-            let (incoming_state, delta) = updates.iter().fold((None, None), |acc, update| {
-                match update {
-                    UpdateData::State(state) => (Some(state.as_ref().to_vec()), acc.1),
-                    UpdateData::Delta(delta) => (acc.0, Some(delta.as_ref().to_vec())),
-                    UpdateData::StateAndDelta { state, delta } => {
-                        (Some(state.as_ref().to_vec()), Some(delta.as_ref().to_vec()))
-                    }
-                    // Related-contract payloads describe a different contract's
-                    // state, so they are not part of THIS transition — but they are
-                    // context the contract needs to execute at all, and are collected
-                    // separately below.
-                    UpdateData::RelatedState { .. }
-                    | UpdateData::RelatedDelta { .. }
-                    | UpdateData::RelatedStateAndDelta { .. }
-                    | _ => acc,
-                }
-            });
-            // Related-contract state, kept so a contract whose `validate_state`
-            // depends on another contract can be replayed at all. Without it the
-            // verifier reaches no verdict for that whole class of contract.
+            // Measure first, copy later.
             //
-            // Only full states are useful here: a related DELTA cannot be applied
-            // without the state it is relative to, which this peer may not have.
-            let related: Vec<(ContractInstanceId, Vec<u8>)> = updates
-                .iter()
-                .filter_map(|update| match update {
-                    UpdateData::RelatedState { related_to, state }
-                    | UpdateData::RelatedStateAndDelta {
-                        related_to, state, ..
-                    } => Some((*related_to, state.as_ref().to_vec())),
-                    UpdateData::State(_)
-                    | UpdateData::Delta(_)
-                    | UpdateData::StateAndDelta { .. }
-                    | UpdateData::RelatedDelta { .. }
-                    | _ => None,
-                })
-                .collect();
-            // `observe_with` secures a queue slot BEFORE the closure runs, so the
-            // copies below are paid for only when there is somewhere to put them.
-            // Building the observation first would make the drop path the most
-            // expensive path, on the merge path, exactly under the load that causes
-            // drops.
-            // Size the observation from the slices already in hand, so the byte
-            // budget is enforced before a single byte is copied.
+            // Everything below this point that costs an allocation happens inside the
+            // `observe_with` closure, which runs only after a queue slot and byte
+            // budget are secured. An earlier version computed the incoming state,
+            // delta and related payloads BEFORE the budget check and then claimed in
+            // a comment that no byte was copied before it — which was false for
+            // exactly the three largest fields, and worst for related state, since
+            // that carries another contract's whole state. Under sustained load with
+            // a full queue, that made the drop path pay full allocate-and-copy on the
+            // merge path, which is the cost this ordering exists to avoid.
+            let mut incoming_len = 0usize;
+            let mut delta_len = 0usize;
+            let mut related_len = 0usize;
+            for update in updates {
+                match update {
+                    UpdateData::State(state) => incoming_len = state.as_ref().len(),
+                    UpdateData::Delta(delta) => delta_len = delta.as_ref().len(),
+                    UpdateData::StateAndDelta { state, delta } => {
+                        incoming_len = state.as_ref().len();
+                        delta_len = delta.as_ref().len();
+                    }
+                    UpdateData::RelatedState { state, .. }
+                    | UpdateData::RelatedStateAndDelta { state, .. } => {
+                        related_len += state.as_ref().len();
+                    }
+                    UpdateData::RelatedDelta { .. } => {}
+                    // `UpdateData` is `#[non_exhaustive]`. A future variant carrying
+                    // related state would be missed here and in the closure below;
+                    // both sites are marked so the pair is updated together.
+                    // AUDIT: new Related* variant -> update both match sites.
+                    _ => {}
+                }
+            }
+
             let size_hint = parameters.as_ref().len()
                 + current_state.as_ref().len()
                 + new_state.as_ref().len()
-                + incoming_state.as_ref().map_or(0, Vec::len)
-                + delta.as_ref().map_or(0, Vec::len)
-                + related.iter().map(|(_, state)| state.len()).sum::<usize>();
-            capture.observe_with(size_hint, || crate::conformance::capture::Observation {
-                contract: *key.id(),
-                code_hash: crate::conformance::capture::code_hash_of(key),
-                parameters: parameters.as_ref().to_vec(),
-                base_state: current_state.as_ref().to_vec(),
-                incoming_state,
-                delta,
-                result_state: new_state.as_ref().to_vec(),
-                related,
+                + incoming_len
+                + delta_len
+                + related_len;
+
+            capture.observe_with(size_hint, || {
+                let (incoming_state, delta) = updates.iter().fold((None, None), |acc, update| {
+                    match update {
+                        UpdateData::State(state) => (Some(state.as_ref().to_vec()), acc.1),
+                        UpdateData::Delta(delta) => (acc.0, Some(delta.as_ref().to_vec())),
+                        UpdateData::StateAndDelta { state, delta } => {
+                            (Some(state.as_ref().to_vec()), Some(delta.as_ref().to_vec()))
+                        }
+                        // Related payloads are not part of THIS transition; they are
+                        // collected separately below as the context the contract needs
+                        // to execute at all.
+                        UpdateData::RelatedState { .. }
+                        | UpdateData::RelatedDelta { .. }
+                        | UpdateData::RelatedStateAndDelta { .. }
+                        | _ => acc,
+                    }
+                });
+
+                // Only full states: a related DELTA cannot be applied without the
+                // state it is relative to, which this peer may not hold.
+                // AUDIT: new Related* variant -> update both match sites.
+                let related: Vec<(ContractInstanceId, Vec<u8>)> = updates
+                    .iter()
+                    .filter_map(|update| match update {
+                        UpdateData::RelatedState { related_to, state }
+                        | UpdateData::RelatedStateAndDelta {
+                            related_to, state, ..
+                        } => Some((*related_to, state.as_ref().to_vec())),
+                        UpdateData::State(_)
+                        | UpdateData::Delta(_)
+                        | UpdateData::StateAndDelta { .. }
+                        | UpdateData::RelatedDelta { .. }
+                        | _ => None,
+                    })
+                    .collect();
+
+                crate::conformance::capture::Observation {
+                    contract: *key.id(),
+                    code_hash: crate::conformance::capture::code_hash_of(key),
+                    parameters: parameters.as_ref().to_vec(),
+                    base_state: current_state.as_ref().to_vec(),
+                    incoming_state,
+                    delta,
+                    result_state: new_state.as_ref().to_vec(),
+                    related,
+                }
             });
         }
 
