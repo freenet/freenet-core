@@ -90,10 +90,25 @@ fn conformance_log_level(
     sub_command: &SubCommand,
     rust_log_is_set: bool,
 ) -> Option<tracing::level_filters::LevelFilter> {
-    if matches!(sub_command, SubCommand::Conformance(_)) && !rust_log_is_set {
-        Some(tracing::level_filters::LevelFilter::INFO)
+    let SubCommand::Conformance(config) = sub_command else {
+        return None;
+    };
+    if rust_log_is_set {
+        return None;
+    }
+    if config.json {
+        // `--json` writes the report to stdout, and so does the logger. Anything
+        // the logger emits therefore lands in the middle of the document and the
+        // output stops being parseable, which is the entire point of the flag.
+        // Silence is right rather than merely quieter: one WARN corrupts the
+        // document as thoroughly as a hundred, and the node emits several routine
+        // ones while building its scratch runtime.
+        //
+        // Nothing that matters is lost: a genuine failure returns an error, which
+        // goes to stderr and is carried by the exit code.
+        Some(tracing::level_filters::LevelFilter::OFF)
     } else {
-        None
+        Some(tracing::level_filters::LevelFilter::INFO)
     }
 }
 
@@ -275,6 +290,25 @@ mod tests {
         assert_eq!(
             super::conformance_log_level(&sub, false),
             Some(tracing::level_filters::LevelFilter::INFO)
+        );
+    }
+
+    /// `--json` must produce a parseable document, and the logger writes to the
+    /// same stdout the report does.
+    ///
+    /// Found the hard way: piping a real `--json` run into `jq` failed with
+    /// "Invalid numeric literal at line 1, column 4", because the node's INFO
+    /// lines had landed on top of the document. The earlier INFO default fixed
+    /// readability for a human and left the machine-readable mode broken.
+    #[test]
+    fn conformance_silences_logging_entirely_for_json_output() {
+        let mut config = empty_conformance_config();
+        config.json = true;
+        let sub = super::SubCommand::Conformance(config);
+        assert_eq!(
+            super::conformance_log_level(&sub, false),
+            Some(tracing::level_filters::LevelFilter::OFF),
+            "any log line at all would corrupt the JSON document"
         );
     }
 
