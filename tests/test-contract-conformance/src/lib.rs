@@ -21,6 +21,11 @@
 //!                                no-op, which at-least-once delivery makes fatal.
 //!   4 NONDETERMINISTIC_SUMMARY — summarize_state depends on something other than
 //!                                the state: real wall-clock time, the #4857 class.
+//!   5 CAPPED_SET               — merge caps the collection at N entries, evicting
+//!                                by something other than the merge's own ordering.
+//!                                Commutative and idempotent; only a three-state
+//!                                case reveals it. The one mode the pairwise laws
+//!                                cannot catch.
 //!
 //! State is always a canonical byte set: sorted, strictly ascending, no
 //! duplicates. `validate_state` accepts exactly that canonical form.
