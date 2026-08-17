@@ -17,6 +17,20 @@ use super::verifier::{Bytes, ConformanceCase};
 pub struct Corpus {
     pub states: Vec<Bytes>,
     pub deltas: Vec<Bytes>,
+    /// The state each delta was observed being applied to, where that is known.
+    ///
+    /// Parallel to `deltas`; shorter (or empty) means the tail has no known base.
+    /// Provenance is what makes a permutation check meaningful: a delta is computed
+    /// as `get_state_delta(sender_state, recipient_summary)`, so two deltas observed
+    /// against DIFFERENT bases may be causally sequenced — the second computed from a
+    /// state that already contains the first. Permuting those two is a situation the
+    /// protocol never produces, and a "violation" from it would be an artifact of how
+    /// the case was built rather than a defect in the contract.
+    ///
+    /// Two deltas observed against the SAME base were both legitimately applicable to
+    /// that state, which is precisely the concurrent-independent-updates scenario the
+    /// law is about.
+    pub delta_bases: Vec<Option<Bytes>>,
     pub summaries: Vec<Bytes>,
     pub related: RelatedContracts<'static>,
 }
@@ -39,14 +53,41 @@ impl Corpus {
     /// observations is a corpus of two.
     pub fn deduplicated(mut self) -> Self {
         self.states = dedup(self.states);
-        self.deltas = dedup(self.deltas);
+        // Deltas dedup together with their bases, or the two lists drift out of step
+        // and a delta inherits some other delta's provenance — which would put the
+        // confound back while looking like it had been fixed.
+        let (deltas, bases) = dedup_with_bases(self.deltas, self.delta_bases);
+        self.deltas = deltas;
+        self.delta_bases = bases;
         self.summaries = dedup(self.summaries);
         self
+    }
+
+    /// The base `deltas[i]` was observed against, if known.
+    pub fn delta_base(&self, i: usize) -> Option<&Bytes> {
+        self.delta_bases.get(i).and_then(Option::as_ref)
     }
 
     pub fn is_empty(&self) -> bool {
         self.states.is_empty()
     }
+}
+
+/// Deduplicate deltas while keeping each one's base alongside it.
+fn dedup_with_bases(
+    deltas: Vec<Bytes>,
+    bases: Vec<Option<Bytes>>,
+) -> (Vec<Bytes>, Vec<Option<Bytes>>) {
+    let mut seen = std::collections::HashSet::new();
+    let mut kept_deltas = Vec::with_capacity(deltas.len());
+    let mut kept_bases = Vec::with_capacity(deltas.len());
+    for (i, delta) in deltas.into_iter().enumerate() {
+        if seen.insert(*blake3::hash(&delta).as_bytes()) {
+            kept_bases.push(bases.get(i).cloned().flatten());
+            kept_deltas.push(delta);
+        }
+    }
+    (kept_deltas, kept_bases)
 }
 
 fn dedup(items: Vec<Bytes>) -> Vec<Bytes> {
@@ -247,10 +288,30 @@ fn delta_pairs(corpus: &Corpus, arity: usize) -> Vec<Vec<Bytes>> {
     match arity {
         1 => corpus.deltas.iter().map(|d| vec![d.clone()]).collect(),
         2 => {
+            // Only pair deltas observed against the SAME base state.
+            //
+            // Crossing every pair meant pairing deltas that may be causally
+            // sequenced: a delta is computed from its sender's state, so one observed
+            // against a later base can already contain the other's effect, and
+            // applying them in the reverse order is a situation the protocol never
+            // produces. A finding from such a pair says more about how the case was
+            // built than about the contract.
+            //
+            // Deltas with no recorded base are not paired at all. Reporting nothing
+            // is the right answer when the inputs cannot support the question; the
+            // alternative is a finding nobody can act on.
             let mut pairs = Vec::new();
             for (i, a) in corpus.deltas.iter().enumerate() {
-                for b in corpus.deltas.iter().skip(i + 1) {
-                    pairs.push(vec![a.clone(), b.clone()]);
+                let Some(base_a) = corpus.delta_base(i) else {
+                    continue;
+                };
+                for (j, b) in corpus.deltas.iter().enumerate().skip(i + 1) {
+                    let Some(base_b) = corpus.delta_base(j) else {
+                        continue;
+                    };
+                    if base_a == base_b {
+                        pairs.push(vec![a.clone(), b.clone()]);
+                    }
                 }
             }
             pairs

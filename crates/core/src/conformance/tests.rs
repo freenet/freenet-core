@@ -1079,8 +1079,14 @@ fn generator_is_deterministic() {
 #[test]
 fn a_tight_case_budget_still_covers_every_law() {
     let states: Vec<Vec<u8>> = (1u8..=12).map(|i| vec![i]).collect();
+    // Both deltas share a base, so the permutation check has a legitimate pair to
+    // work with. Without provenance the generator declines to pair them at all —
+    // deliberately, since permuting causally-sequenced deltas asks a question the
+    // protocol never poses — and this test would then fail for the right reason.
+    let base: Bytes = Arc::from([1u8].as_slice());
     let corpus = Corpus {
         deltas: vec![Arc::from([9u8].as_slice()), Arc::from([7u8].as_slice())],
+        delta_bases: vec![Some(base.clone()), Some(base)],
         ..Corpus::from_states(states)
     };
     let config = GeneratorConfig {

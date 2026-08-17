@@ -185,6 +185,9 @@ impl ReplayBundle {
             .iter()
             .map(|d| Arc::from(d.as_slice()))
             .collect();
+        // Bundle-level deltas carry no record of what they were applied to, so they
+        // get no base and are never paired for permutation checks.
+        let mut delta_bases: Vec<Option<Bytes>> = vec![None; deltas.len()];
         let mut summaries: Vec<Bytes> = self
             .summaries
             .iter()
@@ -199,6 +202,8 @@ impl ReplayBundle {
             }
             if let Some(delta) = &transition.delta {
                 deltas.push(Arc::from(delta.as_slice()));
+                // A transition records the state this delta was actually applied to.
+                delta_bases.push(Some(Arc::from(transition.base_state.as_slice())));
             }
             if let Some(summary) = &transition.summary {
                 summaries.push(Arc::from(summary.as_slice()));
@@ -217,6 +222,7 @@ impl ReplayBundle {
             .collect::<std::collections::HashMap<_, _>>();
 
         Corpus {
+            delta_bases,
             states,
             deltas,
             summaries,
