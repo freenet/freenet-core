@@ -23,6 +23,7 @@ const LAST_WRITE_WINS: u8 = 1;
 const MUTUAL_REJECTION: u8 = 2;
 const NON_IDEMPOTENT_DELTA: u8 = 3;
 const NONDETERMINISTIC_SUMMARY: u8 = 4;
+const CAPPED_SET: u8 = 5;
 
 fn bytes(values: &[u8]) -> Bytes {
     Arc::from(values)
@@ -135,6 +136,41 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
         verify_case(&mut nondeterministic, &summary_case),
         ConformanceProperty::SummaryDeterminism,
     );
+
+    // ------------------------------------------------- mode 5: capped collection
+    //
+    // The only planted defect that the pairwise laws cannot see. Asserting the
+    // associativity violation alone would not show that: a mode that also broke
+    // commutativity would satisfy that assertion while proving nothing about the
+    // three-state check. So assert the pairwise laws still HOLD here — that is
+    // what makes this a test of associativity specifically.
+    let mut capped = RuntimeOracle::standalone(wasm.clone(), vec![CAPPED_SET]).await?;
+    let associativity_case = ConformanceCase::new(
+        ConformanceProperty::StateAssociativity,
+        vec![bytes(&[1, 2]), bytes(&[3, 4]), bytes(&[5, 6])],
+    );
+    assert_violates(
+        verify_case(&mut capped, &associativity_case),
+        ConformanceProperty::StateAssociativity,
+    );
+    for pairwise in [
+        ConformanceCase::new(
+            ConformanceProperty::StateCommutativity,
+            vec![bytes(&[1, 2]), bytes(&[3, 4])],
+        ),
+        ConformanceCase::new(
+            ConformanceProperty::StateIdempotence,
+            vec![bytes(&[1, 2]), bytes(&[3, 4])],
+        ),
+    ] {
+        let outcome = verify_case(&mut capped, &pairwise);
+        assert!(
+            !outcome.is_violation(),
+            "the capped-collection mode should break associativity ALONE, but {} \
+             also reported a violation: {outcome:?}",
+            pairwise.property
+        );
+    }
 
     // ---------------------------------- same code, different params, different instance
     let a = RuntimeOracle::standalone(wasm.clone(), vec![CONFORMING]).await?;

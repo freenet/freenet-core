@@ -49,6 +49,10 @@ const LAST_WRITE_WINS: u8 = 1;
 const MUTUAL_REJECTION: u8 = 2;
 const NON_IDEMPOTENT_DELTA: u8 = 3;
 const NONDETERMINISTIC_SUMMARY: u8 = 4;
+const CAPPED_SET: u8 = 5;
+
+/// How many entries [`CAPPED_SET`] keeps. Small so a three-state case overflows it.
+const CAP: usize = 3;
 
 struct Contract;
 
@@ -76,6 +80,32 @@ fn merge_state(m: u8, current: &[u8], incoming: &[u8]) -> Vec<u8> {
     match m {
         LAST_WRITE_WINS => incoming.to_vec(),
         MUTUAL_REJECTION => current.to_vec(),
+        // Union, then evict down to CAP entries.
+        //
+        // This is the "cap the collection at N" rule real applications write, and
+        // it is why associativity needs a three-state check of its own rather
+        // than being assumed to follow from the pairwise laws.
+        //
+        // The eviction has to pick its victim from the whole set, not from the
+        // ordering the merge is defined over. Keeping the largest N would be
+        // associative — a discarded entry can never re-enter the top N, so the
+        // order of merging cannot matter. It is when the thing evicted by
+        // (arrival order, a timestamp, a hash) is independent of the merge's own
+        // ordering that dropping an entry early destroys information a different
+        // merge order would have kept. Here the victim's index is derived from
+        // the set's contents, which stands in for that.
+        //
+        // The pairwise laws still hold: the result depends only on the union, so
+        // it is commutative, and a state already at or under the cap merged with
+        // itself is unchanged, so it is idempotent. Only the triple reveals it.
+        CAPPED_SET => {
+            let mut out = union(current, incoming);
+            while out.len() > CAP {
+                let sum: usize = out.iter().map(|b| *b as usize).sum();
+                out.remove(sum % out.len());
+            }
+            out
+        }
         // CONFORMING, NON_IDEMPOTENT_DELTA and NONDETERMINISTIC_SUMMARY all
         // merge full-state inputs conformingly: their defects are scoped to
         // delta application and summarization respectively, so isolating each
