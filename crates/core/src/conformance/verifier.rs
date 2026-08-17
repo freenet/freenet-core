@@ -457,6 +457,13 @@ fn run<O: ConformanceOracle + ?Sized>(
         }
 
         ConformanceProperty::WholeStateSelfDelta => {
+            // An empty state has nothing to save, so `delta.len() < a.len()` would be
+            // `0 < 0` and report a "self-delta is 0 bytes against a 0 byte state"
+            // diagnostic on every contract with an empty initial state. Noise, and
+            // noise in a diagnostic is what makes people stop reading diagnostics.
+            if case.states[0].is_empty() {
+                return Ok(PropertyOutcome::Holds);
+            }
             let a = &case.states[0];
             let summary = oracle.summarize_state(a).map_err(inconclusive_from)?;
             let delta = oracle

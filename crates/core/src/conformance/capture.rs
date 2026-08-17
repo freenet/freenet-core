@@ -177,11 +177,8 @@ pub fn global() -> Option<&'static CaptureHandle> {
 /// Returns `None` when the variable is unset, which is the normal case and the
 /// default for every node that has not been deliberately configured otherwise.
 pub fn start_from_env() -> Option<CaptureHandle> {
-    let dir = std::env::var(CAPTURE_DIR_ENV).ok()?;
-    if dir.trim().is_empty() {
-        return None;
-    }
-    match start(PathBuf::from(dir)) {
+    let dir = capture_dir_from(std::env::var(CAPTURE_DIR_ENV).ok().as_deref())?;
+    match start(dir) {
         Ok(handle) => Some(handle),
         Err(err) => {
             tracing::warn!(
@@ -191,6 +188,21 @@ pub fn start_from_env() -> Option<CaptureHandle> {
             None
         }
     }
+}
+
+/// Decide where to capture, from the raw environment value.
+///
+/// Split out so the decision is testable without mutating process-global
+/// environment state. `set_var` races any concurrent `getenv` anywhere in the
+/// process, and sibling tests in this very module call `TempDir::new()`, which
+/// reads `TMPDIR` — the process-global interference class `.claude/rules/testing.md`
+/// documents, and one that per-process test isolation hides rather than prevents.
+fn capture_dir_from(raw: Option<&str>) -> Option<PathBuf> {
+    let raw = raw?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(raw))
 }
 
 /// Start the capture writer against an explicit directory.
@@ -507,26 +519,27 @@ mod tests {
     /// unset environment, every node in the network starts recording user state.
     #[test]
     fn capture_is_off_when_the_environment_does_not_ask_for_it() {
-        // SAFETY: this test is the only reader or writer of this variable, and it
-        // does not spawn threads, so no other thread can observe the environment
-        // mid-mutation.
-        unsafe {
-            std::env::remove_var(CAPTURE_DIR_ENV);
-        }
-        assert!(start_from_env().is_none());
-
-        // SAFETY: as above.
-        unsafe {
-            std::env::set_var(CAPTURE_DIR_ENV, "   ");
-        }
+        // Tests the decision, not the environment. The previous version called
+        // `set_var`/`remove_var` with a SAFETY note reasoning about this variable
+        // having no other readers — but the hazard is not this variable: `setenv`
+        // races any concurrent `getenv` in the process, and sibling tests here call
+        // `TempDir::new()`, which reads `TMPDIR`.
         assert!(
-            start_from_env().is_none(),
-            "a blank setting must not enable capture"
+            capture_dir_from(None).is_none(),
+            "an unset environment must leave capture off; otherwise every node in \
+             the network starts recording user state"
         );
-        // SAFETY: as above.
-        unsafe {
-            std::env::remove_var(CAPTURE_DIR_ENV);
+        for blank in ["", "   ", "\t\n"] {
+            assert!(
+                capture_dir_from(Some(blank)).is_none(),
+                "a blank setting ({blank:?}) must not enable capture"
+            );
         }
+        assert_eq!(
+            capture_dir_from(Some("/tmp/somewhere")),
+            Some(PathBuf::from("/tmp/somewhere")),
+            "an explicit directory must be honoured, or the knob does nothing"
+        );
     }
 
     /// Bundles must name the contract they came from, or they cannot be replayed

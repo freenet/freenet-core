@@ -76,9 +76,25 @@
 //! state pair across simulated rounds.
 //!
 //! A violation is also required to reproduce: [`verify_case`] re-runs any failing
-//! check and downgrades to [`Inconclusive::NotReproducible`] if the second run
-//! disagrees. A contract that prunes against the host clock can otherwise have two
-//! merges straddle an expiry boundary and be accused of breaking commutativity.
+//! check and, if the second run disagrees, re-reports under
+//! [`ConformanceProperty::UpdateDeterminism`] rather than under the law the first
+//! run suspected — see [`verify_case`] for why silence would be worse.
+//!
+//! Be precise about what that buys, because it is easy to over-read. It stops a
+//! contract being accused of breaking the WRONG law when the real problem is that
+//! its output varies. It does NOT exonerate a clock-reading contract:
+//!
+//! - If the clock asymmetry is REPRODUCIBLE — the in-tree ping contract filters
+//!   expired entries out of the incoming side but not its own, so `merge(A, B)` and
+//!   `merge(B, A)` differ permanently — both runs agree and the finding stands as a
+//!   commutativity violation. That is correct: the merge really is order-dependent.
+//!   The re-run was never going to save it.
+//! - If the clock straddle is a one-off, the second run disagrees and the finding
+//!   becomes `UpdateDeterminism`, which is itself enforceable. So a contract that
+//!   stamps `now()` into merged state is flagged either way; only the name changes.
+//!
+//! The honest summary is that the re-run protects the ACCURACY of the accusation,
+//! not the contract.
 
 pub mod bundle;
 pub mod capture;
