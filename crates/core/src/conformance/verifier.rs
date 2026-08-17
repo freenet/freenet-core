@@ -718,10 +718,52 @@ fn compare(
     detail: &str,
 ) -> PropertyOutcome {
     if left == right {
-        PropertyOutcome::Holds
-    } else {
-        violation(property, left, right, detail)
+        return PropertyOutcome::Holds;
     }
+    // Distinguish a reordering from a genuinely different result.
+    //
+    // Two outputs holding the same bytes in a different order are the signature of
+    // non-canonical serialization — a `HashMap` iterated in insertion order, most
+    // often — rather than of a merge that computed something different. The
+    // distinction matters because the two call for opposite fixes: make the encoding
+    // canonical, versus fix the merge. It is also the shape of the #4295
+    // false-positive class, which is why the executor's in-tree probe compares byte
+    // MULTISETS (`byte_multiset_eq`) rather than exact bytes.
+    //
+    // This still reports a violation. A reordering is a real problem for this
+    // network: peers compare state by hash, so two peers holding the same logical
+    // state in different byte order never recognise each other as converged. But
+    // saying WHICH of the two it is costs one sort of an already-materialised buffer
+    // on a path that is about to report a finding anyway, and an author told
+    // "your merge is not commutative" when the truth is "your encoding is not
+    // canonical" will look in the wrong place.
+    let detail = if is_reordering(left, right) {
+        &format!(
+            "{detail}. NOTE: both results hold exactly the same bytes in a different \
+             order, so the merge agreed on content and the ENCODING is not canonical \
+             (e.g. a HashMap serialized in iteration order). Peers compare state by \
+             hash, so this still prevents convergence, but the fix is a deterministic \
+             encoding rather than a change to the merge"
+        )
+    } else {
+        detail
+    };
+    violation(property, left, right, detail)
+}
+
+/// Whether two differing outputs are permutations of each other.
+///
+/// Sorting copies is affordable here because this runs only on the path that has
+/// already decided to report a finding, never on the common passing path.
+fn is_reordering(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut a = left.to_vec();
+    let mut b = right.to_vec();
+    a.sort_unstable();
+    b.sort_unstable();
+    a == b
 }
 
 fn violation(

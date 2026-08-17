@@ -39,6 +39,44 @@ fn assert_violates(outcome: PropertyOutcome, property: ConformanceProperty) {
     }
 }
 
+/// A module that compiles but is not a contract must fail at LOAD, not later as an
+/// inconclusive check result.
+///
+/// `Runtime::compile_check` exists solely to draw that line, and until this test it
+/// had no coverage of its own: every other test loads the fixture, which exports the
+/// whole ABI, so `missing_contract_exports_for` returned an empty list on every run
+/// and deleting the check entirely would not have failed anything.
+///
+/// The distinction is load-bearing for the rest of the module. "Could not load this
+/// contract" is a hard error the caller must see; "could not judge this contract" is
+/// a routine, benign outcome that must never be treated as a finding. Collapsing the
+/// first into the second would report a broken or non-contract WASM as an ordinary
+/// inconclusive result, which reads as "nothing to worry about here".
+///
+/// The input is the eight-byte WASM header and nothing else: a valid, empty module,
+/// which is the cheapest way to be a module that exports none of what a contract
+/// must export.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_module_that_is_not_a_contract_fails_to_load_rather_than_reading_inconclusive() {
+    // Exports a memory (so it gets past instantiation, which needs one) and none of
+    // the contract entry points, which is what leaves `missing_contract_exports_for`
+    // something to find. A bare eight-byte header would be rejected earlier, for
+    // lacking the memory export, and would never reach the ABI check at all.
+    let not_a_contract = br#"(module (memory (export "memory") 1))"#.to_vec();
+
+    let err = RuntimeOracle::standalone(not_a_contract, vec![])
+        .await
+        .err()
+        .expect("a module exporting no contract entry points must not load");
+
+    let text = err.to_string();
+    assert!(
+        text.contains("not a contract") || text.contains("missing required export"),
+        "the error must say the module is not a contract, so a caller cannot mistake \
+         it for a contract that merely could not be judged; got: {text}"
+    );
+}
+
 /// Proves the whole pipeline against real wasmtime: the verifier's property
 /// logic, [`RuntimeOracle`]'s translation of contract calls, and the streaming
 /// buffer protocol all have to agree for these outcomes to come out right.

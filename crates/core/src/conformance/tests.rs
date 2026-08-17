@@ -436,6 +436,53 @@ fn nondeterministic_summary_is_caught() {
 }
 
 #[test]
+fn a_merge_that_only_reorders_bytes_is_named_as_an_encoding_problem() {
+    // The #4295 false-positive class, and the reason the executor's own in-tree
+    // probe compares byte MULTISETS rather than exact bytes: a contract whose
+    // encoding is not canonical (a HashMap serialized in iteration order) emits the
+    // same logical state in a different byte order depending on merge order.
+    //
+    // It is still reported — peers compare state by hash, so two holding the same
+    // content in different order never see each other as converged — but the fix is
+    // a deterministic encoding, not a change to the merge, and the finding has to
+    // say which or the author looks in the wrong file.
+    //
+    // This test is also what makes the measurement trustworthy: without it, "none of
+    // the live findings were reorderings" could equally mean the check never fires.
+    let mut fake = Fake::conforming().merging(|current, incoming| {
+        // Set union emitted in an order that depends on which side was the base:
+        // same content, different serialization.
+        let mut out: Vec<u8> = current.to_vec();
+        for b in incoming {
+            if !out.contains(b) {
+                out.push(*b);
+            }
+        }
+        Ok(out)
+    });
+
+    let outcome = verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateCommutativity, &[&[1, 2], &[3, 4]]),
+    );
+
+    let violation = match outcome {
+        PropertyOutcome::Violated(v) => v,
+        other => panic!("expected a commutativity violation, got {other:?}"),
+    };
+    assert!(
+        violation.detail.contains("same bytes in a different order"),
+        "a reordering must be named as an encoding problem; got: {}",
+        violation.detail
+    );
+    assert!(
+        violation.detail.contains("canonical"),
+        "the finding should point at the encoding; got: {}",
+        violation.detail
+    );
+}
+
+#[test]
 fn nondeterministic_delta_is_caught() {
     // Sibling of `nondeterministic_summary_is_caught`, and the one property whose
     // violation branch nothing else reaches: every other test that mentions
