@@ -220,6 +220,10 @@ httptest = { workspace = true }
 # Test-only: proves the collector can verify XEdDSA tokens with a stock
 # ed25519 library after Montgomery->Edwards conversion (4.1.3 = xeddsa's).
 curve25519-dalek = "4.1.3"
+# Test-only: `InMemoryMetricExporter`, so the OTel instrument callbacks can be
+# collected and asserted on without a collector. Dev-only on purpose — the
+# `testing` feature must not reach the shipped binary.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 libc = { workspace = true }  # For sendmmsg syscall batching benchmarks
 parking_lot = { workspace = true, features = ["deadlock_detection"] }
 # Used by tests/in_process_restart.rs to directly probe the redb file lock as a

@@ -82,7 +82,9 @@ credentials your collector wants in `OTEL_EXPORTER_OTLP_HEADERS`:
 OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic $(printf 'user:pass' | base64)"
 ```
 
-An `Authorization` header set that way is never overwritten by the node.
+An `Authorization` header set that way is never overwritten by the node — so
+static header auth, the usual way OTLP endpoints are authenticated, already
+works in the default mode without any freenet-specific configuration.
 
 `otel-auth-mode = "freenet"` is for collectors that verify freenet node
 identities. It adds
@@ -131,6 +133,13 @@ Every export batch carries two resource attributes:
 
 Neither contains an address, so a node keeps the same identity across IP
 changes.
+
+Both are exported in **every** auth mode, `disabled` included. `disabled`
+withholds the SIGNATURE, not the identity: it means "do not assert to this
+collector, cryptographically, that this node is who it says it is", not "do
+not say which node this is" — the metrics would be useless without a node id
+to group them by. If you do not want a node identifiable to a collector, do
+not export to that collector.
 
 ## Notes
 
