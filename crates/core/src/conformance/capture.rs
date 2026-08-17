@@ -72,9 +72,14 @@ fn sampler_config_from(raw: Option<&str>) -> SamplerConfig {
         .filter(|bytes| *bytes > 0)
     {
         config.max_bytes = bytes;
-        // A per-state ceiling above the total budget would let one state exclude
-        // everything else, so keep it a fraction of the whole.
-        config.max_state_bytes = config.max_state_bytes.max(bytes / 4);
+        // Track the total in BOTH directions. `max` here was a bug: lowering the
+        // budget below the shipped default left the per-state ceiling above the
+        // whole budget (4 KiB total against a 1 MiB ceiling), and one state was then
+        // free to exclude every other sample — the exact thing the ceiling exists to
+        // prevent. Worse, states were then refused as `NoBudget` rather than
+        // `TooLarge`, so the "retained nothing for this contract" warning named the
+        // wrong cause.
+        config.max_state_bytes = (bytes / 4).max(1);
     }
     config
 }
@@ -117,11 +122,35 @@ pub struct CaptureHandle {
 }
 
 impl CaptureHandle {
-    /// Offer an observation. Never blocks, never fails visibly.
+    /// Offer an observation, building it only if there is somewhere to put it.
+    ///
+    /// The closure is what copies the states out of the executor, and it runs only
+    /// after a queue slot is secured. That ordering is the point: an `Observation`
+    /// owns full copies of the base, incoming and result states, so on a contract
+    /// with 356 KB states it costs about a megabyte of allocate-and-copy to build.
+    /// Building it first and then discovering the queue is full would make the DROP
+    /// path the most expensive path — precisely under the load that causes drops,
+    /// and on the merge path, which is the hottest path a contract touches.
+    ///
+    /// Never blocks, never fails visibly.
+    pub fn observe_with(&self, build: impl FnOnce() -> Observation) {
+        match self.tx.try_reserve() {
+            Ok(permit) => permit.send(build()),
+            Err(_) => {
+                // Queue full or writer gone. Count it and carry on without paying
+                // for the copies: a stalled capture must never become a stalled
+                // merge, and it should not tax one either.
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Offer an already-built observation. Never blocks, never fails visibly.
+    ///
+    /// Prefer [`observe_with`](Self::observe_with) from the merge path, where the
+    /// copies are worth avoiding when the queue is full.
     pub fn observe(&self, observation: Observation) {
         if self.tx.try_send(observation).is_err() {
-            // Queue full or writer gone. Count it and carry on: a stalled capture
-            // must never become a stalled merge.
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -216,13 +245,13 @@ async fn run_writer(dir: PathBuf, mut rx: mpsc::Receiver<Observation>, dropped: 
                 record(&mut samplers, observation);
             }
             _ = flush.tick() => {
-                write_all(&dir, &samplers, dropped.load(Ordering::Relaxed));
+                write_all(&dir, &samplers, dropped.load(Ordering::Relaxed)).await;
             }
         }
     }
 
     // Channel closed: the node is going away. Write what we have.
-    write_all(&dir, &samplers, dropped.load(Ordering::Relaxed));
+    write_all(&dir, &samplers, dropped.load(Ordering::Relaxed)).await;
 }
 
 struct TrackedContract {
@@ -333,7 +362,18 @@ fn record(samplers: &mut HashMap<ContractInstanceId, TrackedContract>, observati
     }
 }
 
-fn write_all(dir: &Path, samplers: &HashMap<ContractInstanceId, TrackedContract>, dropped: u64) {
+/// Flush every tracked contract's bundle.
+///
+/// Async because a flush is real I/O: up to 64 bundles of up to the per-contract
+/// budget each, which was measured at 25 MB on a live capture. Doing that with
+/// `std::fs::write` parked a tokio worker for the duration, and it is exactly
+/// during that stall that the observation queue fills and observations are
+/// dropped — the flush was starving the thing it exists to record.
+async fn write_all(
+    dir: &Path,
+    samplers: &HashMap<ContractInstanceId, TrackedContract>,
+    dropped: u64,
+) {
     for (instance, tracked) in samplers {
         // No embedded code: the WASM lives in the node's contract store and would
         // multiply the size of every bundle. The code hash identifies it, and
@@ -366,9 +406,26 @@ fn write_all(dir: &Path, samplers: &HashMap<ContractInstanceId, TrackedContract>
         }
 
         let path = dir.join(format!("{instance}.bundle"));
-        if let Err(err) = bundle.write_to(&path) {
-            // Capture failing to write must not escalate. Log and move on.
-            tracing::warn!(error = %err, path = %path.display(), "could not write capture bundle");
+        // Encode on this task (pure CPU, no syscall) and hand only the bytes to the
+        // async write, so the syscalls yield rather than parking the worker.
+        match bundle.encode() {
+            Ok(bytes) => {
+                if let Err(err) = tokio::fs::write(&path, bytes).await {
+                    // Capture failing to write must not escalate. Log and move on.
+                    tracing::warn!(
+                        error = %err,
+                        path = %path.display(),
+                        "could not write capture bundle"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    path = %path.display(),
+                    "could not encode capture bundle"
+                );
+            }
         }
     }
 
@@ -475,13 +532,56 @@ mod tests {
     /// Bundles must name the contract they came from, or they cannot be replayed
     /// safely: `resolve_code` refuses a bundle with no code hash precisely so a
     /// corpus can never be checked against an unrelated WASM.
-    #[test]
-    fn a_written_bundle_identifies_its_contract() {
+    /// A full queue must skip the copies, not merely discard them afterwards.
+    ///
+    /// An `Observation` owns full copies of the base, incoming and result states, so
+    /// building one on a contract with large states costs about a megabyte of
+    /// allocate-and-copy. If the queue is checked only after that work, the drop path
+    /// becomes the most expensive path — on the merge path, and exactly under the load
+    /// that causes drops. Counting the builds is the only way to see the difference:
+    /// the observable outcome (dropped counter increments) is identical either way.
+    #[tokio::test]
+    async fn a_full_queue_skips_building_the_observation_entirely() {
+        let (tx, rx) = mpsc::channel(1);
+        let handle = CaptureHandle {
+            tx,
+            dropped: Arc::new(AtomicU64::new(0)),
+        };
+
+        let builds = std::cell::Cell::new(0usize);
+        let build = || {
+            builds.set(builds.get() + 1);
+            observation()
+        };
+
+        // First offer fits the one-slot queue.
+        handle.observe_with(build);
+        assert_eq!(builds.get(), 1, "the first observation should be built");
+        assert_eq!(handle.dropped(), 0);
+
+        // Queue is now full: the closure must not run at all.
+        handle.observe_with(build);
+        assert_eq!(
+            builds.get(),
+            1,
+            "a full queue must not pay for the copies; the closure ran anyway"
+        );
+        assert_eq!(handle.dropped(), 1, "the drop must still be counted");
+
+        drop(rx);
+        // Receiver gone: still no build, still counted.
+        handle.observe_with(build);
+        assert_eq!(builds.get(), 1, "a dead writer must not pay for the copies");
+        assert_eq!(handle.dropped(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_written_bundle_identifies_its_contract() {
         let mut samplers = HashMap::new();
         record(&mut samplers, observation());
 
         let dir = tempfile::TempDir::new().expect("tempdir");
-        write_all(dir.path(), &samplers, 0);
+        write_all(dir.path(), &samplers, 0).await;
 
         let path = dir
             .path()
@@ -505,8 +605,8 @@ mod tests {
     /// constantly and every observation was refused for size. An empty file that
     /// looks like evidence is worse than no file, because it answers a question it
     /// never actually examined.
-    #[test]
-    fn a_contract_whose_states_are_all_oversized_leaves_no_misleading_bundle() {
+    #[tokio::test]
+    async fn a_contract_whose_states_are_all_oversized_leaves_no_misleading_bundle() {
         let mut samplers = HashMap::new();
 
         let mut oversized = observation();
@@ -526,7 +626,7 @@ mod tests {
         );
 
         let dir = tempfile::TempDir::new().expect("tempdir");
-        write_all(dir.path(), &samplers, 0);
+        write_all(dir.path(), &samplers, 0).await;
 
         let path = dir
             .path()
@@ -546,8 +646,8 @@ mod tests {
     /// failure is invisible from outside — the file is still there, still recent,
     /// just thinner. Found by measuring a real capture rather than by any test,
     /// which is why this one exists.
-    #[test]
-    fn a_restart_resumes_from_what_is_already_on_disk() {
+    #[tokio::test]
+    async fn a_restart_resumes_from_what_is_already_on_disk() {
         let dir = tempfile::TempDir::new().expect("tempdir");
 
         // First run: observe several distinct states.
@@ -558,7 +658,7 @@ mod tests {
             obs.result_state = vec![i; 17];
             record(&mut samplers, obs);
         }
-        write_all(dir.path(), &samplers, 0);
+        write_all(dir.path(), &samplers, 0).await;
         let before = samplers
             .values()
             .next()
@@ -650,6 +750,25 @@ mod tests {
             raised.max_state_bytes < raised.max_bytes,
             "a per-state ceiling at or above the whole budget would let one state \
              evict every other sample"
+        );
+
+        // The lowering direction, which an earlier version got backwards: it used
+        // `max`, so a budget below the shipped default left the ceiling ABOVE the
+        // whole budget. One state could then exclude every other sample, and states
+        // were refused as `NoBudget` rather than `TooLarge`, which made the
+        // "retained nothing" warning name the wrong cause.
+        let lowered = sampler_config_from(Some("4096"));
+        assert_eq!(lowered.max_bytes, 4096);
+        assert!(
+            lowered.max_state_bytes < lowered.max_bytes,
+            "lowering the total budget must lower the per-state ceiling with it: \
+             ceiling {} against a total of {}",
+            lowered.max_state_bytes,
+            lowered.max_bytes
+        );
+        assert!(
+            lowered.max_state_bytes >= 1,
+            "the ceiling must never reach zero, which would admit nothing at all"
         );
 
         // Anything unparseable or zero leaves the shipped default in place rather

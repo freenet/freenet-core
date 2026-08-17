@@ -1574,7 +1574,12 @@ where
                     | _ => acc,
                 }
             });
-            capture.observe(crate::conformance::capture::Observation {
+            // `observe_with` secures a queue slot BEFORE the closure runs, so the
+            // copies below are paid for only when there is somewhere to put them.
+            // Building the observation first would make the drop path the most
+            // expensive path, on the merge path, exactly under the load that causes
+            // drops.
+            capture.observe_with(|| crate::conformance::capture::Observation {
                 contract: *key.id(),
                 code_hash: crate::conformance::capture::code_hash_of(key),
                 parameters: parameters.as_ref().to_vec(),
@@ -3216,13 +3221,31 @@ mod conformance_capture_pins {
     fn capture_observes_from_the_merge_path() {
         let body = attempt_state_update_body();
         assert!(
-            body.contains("capture.observe("),
+            body.contains("capture.observe_with("),
             "conformance capture is no longer invoked from attempt_state_update, so \
              captured corpora would no longer reflect the merges the node performs"
         );
-        for field in ["base_state:", "result_state:", "incoming_state,"] {
+
+        // Bound the field check to the `Observation` literal itself.
+        //
+        // Searching the whole function body was vacuous for `incoming_state`: the
+        // name also appears in the `let (incoming_state, delta) = ...` binding that
+        // computes it, so deleting the FIELD left the assertion green while the
+        // bundle silently lost half the transition. This is the failure mode
+        // `AGENTS.md` warns about for source-scrape pins, and it is why the region
+        // has to be bounded to the thing being pinned rather than to its file.
+        let literal = body
+            .split_once("Observation {")
+            .expect("the capture hook no longer constructs an Observation literal")
+            .1;
+        let literal = literal
+            .split_once("});")
+            .expect("could not find the end of the Observation literal")
+            .0;
+
+        for field in ["base_state:", "result_state:", "incoming_state,", "delta,"] {
             assert!(
-                body.contains(field),
+                literal.contains(field),
                 "capture no longer records `{field}` from the merge path; a replay \
                  bundle missing part of the transition cannot reproduce it"
             );
