@@ -105,6 +105,18 @@ const OBSERVATION_QUEUE: usize = 256;
 /// exhaust memory" is no by construction rather than by argument.
 const MAX_QUEUED_BYTES: usize = 8 * 1024 * 1024;
 
+/// Upper bound on related-contract state retained per tracked contract.
+///
+/// Related state gets its OWN allowance rather than sharing the per-contract
+/// sample budget. Sharing would let a contract with large related state crowd out
+/// the very samples the related state exists to make checkable, which is a silly
+/// way to lose. Small, because one recent state per related contract is enough to
+/// execute against — this is context, not a corpus.
+const MAX_RELATED_BYTES: usize = 512 * 1024;
+
+/// Upper bound on distinct related contracts retained per tracked contract.
+const MAX_RELATED_CONTRACTS: usize = 8;
+
 /// Upper bound on contracts sampled concurrently.
 const MAX_TRACKED_CONTRACTS: usize = 64;
 
@@ -138,6 +150,16 @@ pub struct Observation {
     pub incoming_state: Option<Vec<u8>>,
     pub delta: Option<Vec<u8>>,
     pub result_state: Vec<u8>,
+    /// State of other contracts this merge referenced.
+    ///
+    /// A contract whose `validate_state` needs another contract's state cannot be
+    /// checked at all without it: the verifier reports
+    /// [`Inconclusive::RelatedRequired`](super::property::Inconclusive) and reaches
+    /// no verdict. That is honest but useless, and it applies to a whole class of
+    /// contract rather than to an unlucky one. The states arrive alongside the
+    /// update the contract is being asked to apply, so recording them costs a copy
+    /// and no lookup.
+    pub related: Vec<(ContractInstanceId, Vec<u8>)>,
 }
 
 impl Observation {
@@ -148,6 +170,11 @@ impl Observation {
             + self.incoming_state.as_ref().map_or(0, Vec::len)
             + self.delta.as_ref().map_or(0, Vec::len)
             + self.result_state.len()
+            + self
+                .related
+                .iter()
+                .map(|(_, state)| state.len())
+                .sum::<usize>()
     }
 }
 
@@ -367,6 +394,12 @@ struct TrackedContract {
     /// refusing rather than being inferred later from an empty result, because an
     /// empty corpus has several possible causes and they need telling apart.
     refused_too_large: u64,
+    /// Most recent state seen for each related contract this one referenced.
+    ///
+    /// Keyed by instance, so a contract that references the same related contract
+    /// repeatedly keeps one entry rather than a history: the verifier needs one
+    /// state it can execute against, not every state that ever passed through.
+    related: HashMap<ContractInstanceId, Vec<u8>>,
 }
 
 /// Rebuild samplers from the bundles already in the capture directory.
@@ -421,6 +454,7 @@ fn reload(dir: &Path) -> HashMap<ContractInstanceId, TrackedContract> {
             TrackedContract {
                 sampler,
                 code_hash,
+                related: bundle.related.iter().cloned().collect(),
                 parameters: bundle.parameters,
                 // Not persisted in the bundle: this counts what THIS process
                 // refused, and a reloaded corpus has no refusals of its own yet.
@@ -446,7 +480,28 @@ fn record(samplers: &mut HashMap<ContractInstanceId, TrackedContract>, observati
             code_hash: observation.code_hash,
             parameters: observation.parameters.clone(),
             refused_too_large: 0,
+            related: HashMap::new(),
         });
+
+    // Keep the newest state per related contract, within a bounded allowance. Both
+    // bounds refuse rather than evict: a contract that references a hundred others
+    // should not be able to churn this map, and the states already retained are more
+    // useful than an arbitrary newcomer.
+    for (instance, state) in &observation.related {
+        if state.len() > MAX_RELATED_BYTES {
+            continue;
+        }
+        let known = tracked.related.contains_key(instance);
+        if !known && tracked.related.len() >= MAX_RELATED_CONTRACTS {
+            continue;
+        }
+        let held: usize = tracked.related.values().map(Vec::len).sum();
+        let replacing = tracked.related.get(instance).map_or(0, Vec::len);
+        if held - replacing + state.len() > MAX_RELATED_BYTES {
+            continue;
+        }
+        tracked.related.insert(*instance, state.clone());
+    }
 
     let admission = tracked.sampler.observe_transition(
         &observation.base_state,
@@ -483,6 +538,18 @@ async fn write_all(
                 .sampler
                 .to_bundle(None, Some(tracked.code_hash), tracked.parameters.clone());
         bundle.instance = Some(*instance);
+        // Carried so a replay can execute a contract whose validity depends on
+        // another contract. `to_corpus` turns these back into `RelatedContracts`.
+        // Sorted by instance, so a bundle's bytes do not depend on hash iteration
+        // order. The corpus is written repeatedly and compared across runs; a file
+        // that differs only by map ordering wastes everyone's time.
+        let mut related: Vec<(ContractInstanceId, Vec<u8>)> = tracked
+            .related
+            .iter()
+            .map(|(id, state)| (*id, state.clone()))
+            .collect();
+        related.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        bundle.related = related;
         bundle.note = Some(format!(
             "captured by freenet {} ({} observation(s) dropped node-wide)",
             env!("CARGO_PKG_VERSION"),

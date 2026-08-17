@@ -1567,13 +1567,35 @@ where
                         (Some(state.as_ref().to_vec()), Some(delta.as_ref().to_vec()))
                     }
                     // Related-contract payloads describe a different contract's
-                    // state, so they are not part of this transition.
+                    // state, so they are not part of THIS transition — but they are
+                    // context the contract needs to execute at all, and are collected
+                    // separately below.
                     UpdateData::RelatedState { .. }
                     | UpdateData::RelatedDelta { .. }
                     | UpdateData::RelatedStateAndDelta { .. }
                     | _ => acc,
                 }
             });
+            // Related-contract state, kept so a contract whose `validate_state`
+            // depends on another contract can be replayed at all. Without it the
+            // verifier reaches no verdict for that whole class of contract.
+            //
+            // Only full states are useful here: a related DELTA cannot be applied
+            // without the state it is relative to, which this peer may not have.
+            let related: Vec<(ContractInstanceId, Vec<u8>)> = updates
+                .iter()
+                .filter_map(|update| match update {
+                    UpdateData::RelatedState { related_to, state }
+                    | UpdateData::RelatedStateAndDelta {
+                        related_to, state, ..
+                    } => Some((*related_to, state.as_ref().to_vec())),
+                    UpdateData::State(_)
+                    | UpdateData::Delta(_)
+                    | UpdateData::StateAndDelta { .. }
+                    | UpdateData::RelatedDelta { .. }
+                    | _ => None,
+                })
+                .collect();
             // `observe_with` secures a queue slot BEFORE the closure runs, so the
             // copies below are paid for only when there is somewhere to put them.
             // Building the observation first would make the drop path the most
@@ -1585,7 +1607,8 @@ where
                 + current_state.as_ref().len()
                 + new_state.as_ref().len()
                 + incoming_state.as_ref().map_or(0, Vec::len)
-                + delta.as_ref().map_or(0, Vec::len);
+                + delta.as_ref().map_or(0, Vec::len)
+                + related.iter().map(|(_, state)| state.len()).sum::<usize>();
             capture.observe_with(size_hint, || crate::conformance::capture::Observation {
                 contract: *key.id(),
                 code_hash: crate::conformance::capture::code_hash_of(key),
@@ -1594,6 +1617,7 @@ where
                 incoming_state,
                 delta,
                 result_state: new_state.as_ref().to_vec(),
+                related,
             });
         }
 
