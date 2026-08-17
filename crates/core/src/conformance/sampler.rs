@@ -279,6 +279,23 @@ impl ContractSampler {
             || !kept(result_admission)
             || incoming_admission.is_some_and(|a| !kept(a))
         {
+            // Report WHICH refusal this was, rather than flattening every cause
+            // into `NotSelected`. A caller counting refusals cannot otherwise tell
+            // "this contract's states are too big to sample at all" from "the
+            // strata happened to be full", and those call for opposite responses:
+            // raise the ceiling, or nothing. `TooLarge` is documented as "above
+            // `max_state_bytes`", which is precisely this case.
+            if [
+                Some(base_admission),
+                Some(result_admission),
+                incoming_admission,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|a| matches!(a, Admission::TooLarge))
+            {
+                return Admission::TooLarge;
+            }
             return Admission::NotSelected;
         }
 

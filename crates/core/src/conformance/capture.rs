@@ -39,7 +39,7 @@ use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use tokio::sync::mpsc;
 
 use super::bundle::ReplayBundle;
-use super::sampler::{ContractSampler, SamplerConfig};
+use super::sampler::{Admission, ContractSampler, SamplerConfig};
 
 /// Environment variable that switches capture on and says where to write.
 pub const CAPTURE_DIR_ENV: &str = "FREENET_CONFORMANCE_CAPTURE_DIR";
@@ -229,6 +229,17 @@ struct TrackedContract {
     sampler: ContractSampler,
     code_hash: [u8; 32],
     parameters: Vec<u8>,
+    /// Observations the sampler refused because a state exceeded its per-state
+    /// ceiling.
+    ///
+    /// Kept because the alternative is a silent exclusion. A contract whose states
+    /// are all oversized produces a bundle holding nothing, and replaying it says
+    /// only "the corpus is empty" — which reads as "this contract never merged
+    /// anything" when the truth is the opposite: it merged constantly and every
+    /// observation was refused. The count comes from the filter that does the
+    /// refusing rather than being inferred later from an empty result, because an
+    /// empty corpus has several possible causes and they need telling apart.
+    refused_too_large: u64,
 }
 
 /// Rebuild samplers from the bundles already in the capture directory.
@@ -284,6 +295,9 @@ fn reload(dir: &Path) -> HashMap<ContractInstanceId, TrackedContract> {
                 sampler,
                 code_hash,
                 parameters: bundle.parameters,
+                // Not persisted in the bundle: this counts what THIS process
+                // refused, and a reloaded corpus has no refusals of its own yet.
+                refused_too_large: 0,
             },
         );
     }
@@ -304,15 +318,19 @@ fn record(samplers: &mut HashMap<ContractInstanceId, TrackedContract>, observati
             sampler: ContractSampler::new(sampler_config()),
             code_hash: observation.code_hash,
             parameters: observation.parameters.clone(),
+            refused_too_large: 0,
         });
 
-    tracked.sampler.observe_transition(
+    let admission = tracked.sampler.observe_transition(
         &observation.base_state,
         observation.incoming_state.as_deref(),
         observation.delta.as_deref(),
         None,
         &observation.result_state,
     );
+    if matches!(admission, Admission::TooLarge) {
+        tracked.refused_too_large += 1;
+    }
 }
 
 fn write_all(dir: &Path, samplers: &HashMap<ContractInstanceId, TrackedContract>, dropped: u64) {
@@ -332,6 +350,20 @@ fn write_all(dir: &Path, samplers: &HashMap<ContractInstanceId, TrackedContract>
             env!("CARGO_PKG_VERSION"),
             dropped,
         ));
+
+        // A bundle with no states is worse than no bundle: it looks like evidence
+        // and replays as "the corpus is empty", which invites the reader to
+        // conclude the contract was quiet. Say what actually happened instead.
+        if bundle.states.is_empty() {
+            tracing::warn!(
+                contract = %instance,
+                refused_too_large = tracked.refused_too_large,
+                "conformance capture retained nothing for this contract: its states \
+                 exceed the per-state ceiling. Raise \
+                 FREENET_CONFORMANCE_CAPTURE_MAX_BYTES to sample it."
+            );
+            continue;
+        }
 
         let path = dir.join(format!("{instance}.bundle"));
         if let Err(err) = bundle.write_to(&path) {
@@ -461,6 +493,48 @@ mod tests {
         assert!(
             bundle.resolve_code(Some(vec![9, 9])).is_err(),
             "a bundle must refuse code that does not match the contract it recorded"
+        );
+    }
+
+    /// A contract whose states all exceed the per-state ceiling must not leave a
+    /// bundle behind.
+    ///
+    /// Found on a live capture: one contract produced a 200-byte bundle holding no
+    /// states at all, and replaying it reported only "the corpus is empty". That
+    /// reads as "this contract never merged anything", when in fact it merged
+    /// constantly and every observation was refused for size. An empty file that
+    /// looks like evidence is worse than no file, because it answers a question it
+    /// never actually examined.
+    #[test]
+    fn a_contract_whose_states_are_all_oversized_leaves_no_misleading_bundle() {
+        let mut samplers = HashMap::new();
+
+        let mut oversized = observation();
+        let ceiling = SamplerConfig::default().max_state_bytes;
+        oversized.base_state = vec![7; ceiling + 1];
+        oversized.incoming_state = Some(vec![8; ceiling + 1]);
+        oversized.result_state = vec![9; ceiling + 1];
+        record(&mut samplers, oversized);
+
+        assert_eq!(
+            samplers
+                .values()
+                .map(|tracked| tracked.refused_too_large)
+                .sum::<u64>(),
+            1,
+            "the refusal must be counted where it happens, not inferred afterwards"
+        );
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        write_all(dir.path(), &samplers, 0);
+
+        let path = dir
+            .path()
+            .join(format!("{}.bundle", ContractInstanceId::new([1; 32])));
+        assert!(
+            !path.exists(),
+            "a bundle holding no states must not be written: it replays as an \
+             empty corpus and invites the reader to conclude the contract was quiet"
         );
     }
 

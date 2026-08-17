@@ -228,13 +228,18 @@ fn transitions_are_bounded() {
 
 /// A transition pointing at bytes the store refused is not replayable, and keeping
 /// it would leave a dangling reference that looks like usable evidence.
+///
+/// The refusal reports its own cause: this endpoint is over the per-state ceiling,
+/// so the answer is `TooLarge` rather than a generic `NotSelected`. A caller
+/// counting refusals needs to tell "too big to sample at all" apart from "the
+/// strata were full", because only the first is worth acting on.
 #[test]
 fn a_transition_whose_endpoints_were_refused_is_not_recorded() {
     let mut sampler = ContractSampler::new(config());
     let huge = state(1, 5000);
     assert_eq!(
         sampler.observe_transition(&huge, None, None, None, &state(2, 16)),
-        Admission::NotSelected
+        Admission::TooLarge
     );
     let bundle = sampler.to_bundle(None, Some([7u8; 32]), vec![]);
     assert!(bundle.transitions.is_empty());
