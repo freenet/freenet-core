@@ -1579,7 +1579,14 @@ where
             // Building the observation first would make the drop path the most
             // expensive path, on the merge path, exactly under the load that causes
             // drops.
-            capture.observe_with(|| crate::conformance::capture::Observation {
+            // Size the observation from the slices already in hand, so the byte
+            // budget is enforced before a single byte is copied.
+            let size_hint = parameters.as_ref().len()
+                + current_state.as_ref().len()
+                + new_state.as_ref().len()
+                + incoming_state.as_ref().map_or(0, Vec::len)
+                + delta.as_ref().map_or(0, Vec::len);
+            capture.observe_with(size_hint, || crate::conformance::capture::Observation {
                 contract: *key.id(),
                 code_hash: crate::conformance::capture::code_hash_of(key),
                 parameters: parameters.as_ref().to_vec(),

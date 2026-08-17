@@ -558,12 +558,14 @@ fn reconciliation_cycle<O: ConformanceOracle + ?Sized>(
         // repeat — for instance a delta that swaps the two peers' states — and
         // produce an enforceable cycle finding against a contract whose merge is
         // sound and which converges in production.
-        let mut next_left = if delta_would_be_refused(&to_left, &left) {
+        // Gate against the SENDER's state in each direction: `to_left` was computed
+        // from `right`, so `right` is what production would compare it against.
+        let mut next_left = if delta_would_be_refused(&to_left, &right) {
             merge(oracle, &left, &right)?
         } else {
             apply_delta_bytes(oracle, &left, &to_left)?
         };
-        let mut next_right = if delta_would_be_refused(&to_right, &right) {
+        let mut next_right = if delta_would_be_refused(&to_right, &left) {
             merge(oracle, &right, &left)?
         } else {
             apply_delta_bytes(oracle, &right, &to_right)?
@@ -629,8 +631,24 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
 /// production path treats that case as a full-state send. Erring toward the fallback
 /// only ever makes the simulation converge more readily, which is the safe direction
 /// for a check whose failure mode is accusing a correct contract.
-fn delta_would_be_refused(delta: &[u8], state: &[u8]) -> bool {
-    !delta.is_empty() && delta.len() >= state.len()
+/// Whether production would refuse this delta and send the whole state instead.
+///
+/// `sender_state` is the state of the peer COMPUTING the delta, which is what
+/// production compares against (`gate_delta_size`'s `our_state_size`) — not the
+/// recipient's. Getting that backwards is not a rounding error: with asymmetric
+/// state sizes it applies a delta the network would have replaced with a full state,
+/// which can walk the pair into a repeat and manufacture an enforceable
+/// reconciliation-cycle finding against a contract that converges in production. It
+/// can also do the reverse and hide a real one.
+///
+/// The margin is production's, imported rather than approximated, for the same
+/// reason.
+fn delta_would_be_refused(delta: &[u8], sender_state: &[u8]) -> bool {
+    !delta.is_empty()
+        && delta.len()
+            >= sender_state
+                .len()
+                .saturating_add(crate::ring::interest::MIN_FULL_STATE_SAVING_BYTES)
 }
 
 fn require_valid<O: ConformanceOracle + ?Sized>(

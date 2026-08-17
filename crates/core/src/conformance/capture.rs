@@ -33,7 +33,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use tokio::sync::mpsc;
@@ -91,8 +91,36 @@ fn sampler_config_from(raw: Option<&str>) -> SamplerConfig {
 /// growth behind the merge path.
 const OBSERVATION_QUEUE: usize = 256;
 
+/// Upper bound on bytes queued but not yet sampled.
+///
+/// The item cap alone is not a memory bound. Each `Observation` owns full copies of
+/// the base, incoming and result states, so 256 queued observations of a contract
+/// with multi-megabyte states is gigabytes in flight — on a node whose hosted-set
+/// budget is fighting for a fraction of that, and with none of it visible to the
+/// memory accounting. Capture is a diagnostic; it must not be able to OOM the node
+/// it is diagnosing.
+///
+/// 8 MiB holds a useful burst of ordinary states and several of the largest observed
+/// in the wild (~356 KB), while being small enough that the answer to "could capture
+/// exhaust memory" is no by construction rather than by argument.
+const MAX_QUEUED_BYTES: usize = 8 * 1024 * 1024;
+
 /// Upper bound on contracts sampled concurrently.
 const MAX_TRACKED_CONTRACTS: usize = 64;
+
+/// How many observations may accumulate before a flush, regardless of the clock.
+///
+/// The timer alone leaves the whole interval exposed, and worse for a short run:
+/// the writer is a detached task whose handle is dropped, so runtime shutdown aborts
+/// it rather than letting it finish, and the sender lives in a process-wide static so
+/// `recv()` never returns `None` to trigger the closing flush. A node that runs for
+/// less than one interval therefore writes nothing at all.
+///
+/// Bounding by work as well as by time means what is at risk is a known quantity of
+/// observations rather than however many happened to arrive in a minute. This does
+/// not make shutdown safe — it makes the loss small and predictable, which is the
+/// honest fix available without reaching into the node's shutdown path.
+const FLUSH_EVERY_OBSERVATIONS: usize = 32;
 
 /// How often the worker flushes bundles to disk.
 const FLUSH_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
@@ -112,6 +140,17 @@ pub struct Observation {
     pub result_state: Vec<u8>,
 }
 
+impl Observation {
+    /// Bytes this observation owns, for the queue's byte budget.
+    fn queued_bytes(&self) -> usize {
+        self.parameters.len()
+            + self.base_state.len()
+            + self.incoming_state.as_ref().map_or(0, Vec::len)
+            + self.delta.as_ref().map_or(0, Vec::len)
+            + self.result_state.len()
+    }
+}
+
 /// The executor's end of the capture path.
 ///
 /// Cloning is cheap; the executor holds one and does nothing else with it.
@@ -119,6 +158,13 @@ pub struct Observation {
 pub struct CaptureHandle {
     tx: mpsc::Sender<Observation>,
     dropped: Arc<AtomicU64>,
+    /// Bytes admitted to the queue and not yet sampled.
+    ///
+    /// Approximate under concurrency: two threads can both observe room and both
+    /// admit, so the bound can be overshot by one observation per racing thread.
+    /// That is deliberate — the alternative is a lock on the merge path, and the
+    /// overshoot is bounded and small, which is all this needs to be.
+    queued_bytes: Arc<AtomicUsize>,
 }
 
 impl CaptureHandle {
@@ -133,9 +179,25 @@ impl CaptureHandle {
     /// and on the merge path, which is the hottest path a contract touches.
     ///
     /// Never blocks, never fails visibly.
-    pub fn observe_with(&self, build: impl FnOnce() -> Observation) {
+    pub fn observe_with(&self, size_hint: usize, build: impl FnOnce() -> Observation) {
+        // Refuse on bytes BEFORE reserving or copying. `size_hint` is computed from
+        // the executor's own slices, so this decision costs no allocation at all.
+        // A single observation larger than the whole budget can never be admitted;
+        // saying so here keeps one huge contract from starving every other.
+        let queued = self.queued_bytes.load(Ordering::Relaxed);
+        if size_hint > MAX_QUEUED_BYTES || queued.saturating_add(size_hint) > MAX_QUEUED_BYTES {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
         match self.tx.try_reserve() {
-            Ok(permit) => permit.send(build()),
+            Ok(permit) => {
+                let observation = build();
+                // Charge what was actually built, not the estimate.
+                self.queued_bytes
+                    .fetch_add(observation.queued_bytes(), Ordering::Relaxed);
+                permit.send(observation);
+            }
             Err(_) => {
                 // Queue full or writer gone. Count it and carry on without paying
                 // for the copies: a stalled capture must never become a stalled
@@ -150,8 +212,14 @@ impl CaptureHandle {
     /// Prefer [`observe_with`](Self::observe_with) from the merge path, where the
     /// copies are worth avoiding when the queue is full.
     pub fn observe(&self, observation: Observation) {
-        if self.tx.try_send(observation).is_err() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+        let bytes = observation.queued_bytes();
+        match self.tx.try_send(observation) {
+            Ok(()) => {
+                self.queued_bytes.fetch_add(bytes, Ordering::Relaxed);
+            }
+            Err(_) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -218,20 +286,27 @@ pub fn start(dir: PathBuf) -> std::io::Result<CaptureHandle> {
     std::fs::create_dir_all(&dir)?;
     let (tx, rx) = mpsc::channel(OBSERVATION_QUEUE);
     let dropped = Arc::new(AtomicU64::new(0));
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
     let handle = CaptureHandle {
         tx,
         dropped: dropped.clone(),
+        queued_bytes: queued_bytes.clone(),
     };
 
     tracing::info!(
         directory = %dir.display(),
         "conformance capture enabled: recording contract merges for offline replay"
     );
-    tokio::spawn(run_writer(dir, rx, dropped));
+    tokio::spawn(run_writer(dir, rx, dropped, queued_bytes));
     Ok(handle)
 }
 
-async fn run_writer(dir: PathBuf, mut rx: mpsc::Receiver<Observation>, dropped: Arc<AtomicU64>) {
+async fn run_writer(
+    dir: PathBuf,
+    mut rx: mpsc::Receiver<Observation>,
+    dropped: Arc<AtomicU64>,
+    queued_bytes: Arc<AtomicUsize>,
+) {
     // Resume from what is already on disk.
     //
     // Without this a restart silently DESTROYS the corpus: the worker starts with
@@ -247,6 +322,7 @@ async fn run_writer(dir: PathBuf, mut rx: mpsc::Receiver<Observation>, dropped: 
             "conformance capture resumed from existing bundles"
         );
     }
+    let mut since_flush = 0usize;
     let mut flush = tokio::time::interval(FLUSH_EVERY);
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -254,10 +330,20 @@ async fn run_writer(dir: PathBuf, mut rx: mpsc::Receiver<Observation>, dropped: 
         tokio::select! {
             received = rx.recv() => {
                 let Some(observation) = received else { break };
+                // Release the byte credit as the observation leaves the queue, so
+                // the budget measures what is actually in flight rather than
+                // everything ever admitted.
+                queued_bytes.fetch_sub(observation.queued_bytes(), Ordering::Relaxed);
                 record(&mut samplers, observation);
+                since_flush += 1;
+                if since_flush >= FLUSH_EVERY_OBSERVATIONS {
+                    write_all(&dir, &samplers, dropped.load(Ordering::Relaxed)).await;
+                    since_flush = 0;
+                }
             }
             _ = flush.tick() => {
                 write_all(&dir, &samplers, dropped.load(Ordering::Relaxed)).await;
+                since_flush = 0;
             }
         }
     }
@@ -422,7 +508,16 @@ async fn write_all(
         // async write, so the syscalls yield rather than parking the worker.
         match bundle.encode() {
             Ok(bytes) => {
-                if let Err(err) = tokio::fs::write(&path, bytes).await {
+                // Same atomic replacement as `ReplayBundle::write_to`, async: write
+                // beside the bundle and rename over it, so a crash mid-flush leaves
+                // the previous corpus intact rather than a truncated file.
+                let temporary = path.with_extension("bundle.tmp");
+                let write_then_rename = async {
+                    tokio::fs::write(&temporary, bytes).await?;
+                    tokio::fs::rename(&temporary, &path).await
+                };
+                if let Err(err) = write_then_rename.await {
+                    drop(tokio::fs::remove_file(&temporary).await);
                     // Capture failing to write must not escalate. Log and move on.
                     tracing::warn!(
                         error = %err,
@@ -488,6 +583,7 @@ mod tests {
         let handle = CaptureHandle {
             tx,
             dropped: Arc::new(AtomicU64::new(0)),
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
         };
 
         // One fits in the buffer; the rest cannot, and must not block.
@@ -510,6 +606,7 @@ mod tests {
         let handle = CaptureHandle {
             tx,
             dropped: Arc::new(AtomicU64::new(0)),
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
         };
         handle.observe(observation());
         assert_eq!(handle.dropped(), 1);
@@ -545,6 +642,69 @@ mod tests {
     /// Bundles must name the contract they came from, or they cannot be replayed
     /// safely: `resolve_code` refuses a bundle with no code hash precisely so a
     /// corpus can never be checked against an unrelated WASM.
+    /// The queue is bounded by BYTES, not just by item count.
+    ///
+    /// The item cap alone is not a memory bound: 256 queued observations of a
+    /// contract with multi-megabyte states is gigabytes in flight, invisible to the
+    /// node's memory accounting. Capture is a diagnostic and must not be able to OOM
+    /// the node it is diagnosing.
+    ///
+    /// Checked before building, so an over-budget observation costs no allocation
+    /// either — asserted by counting builds, since the drop is otherwise invisible.
+    #[tokio::test]
+    async fn the_queue_refuses_more_bytes_than_its_budget() {
+        // Plenty of item capacity, so any refusal here is the byte budget's doing.
+        let (tx, _rx) = mpsc::channel(64);
+        let handle = CaptureHandle {
+            tx,
+            dropped: Arc::new(AtomicU64::new(0)),
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let builds = std::cell::Cell::new(0usize);
+        let huge = || {
+            builds.set(builds.get() + 1);
+            let mut obs = observation();
+            obs.base_state = vec![0u8; MAX_QUEUED_BYTES + 1];
+            obs
+        };
+
+        // One observation larger than the entire budget can never be admitted, and
+        // must not be built to find that out.
+        handle.observe_with(MAX_QUEUED_BYTES + 1, huge);
+        assert_eq!(
+            builds.get(),
+            0,
+            "an observation bigger than the whole budget must be refused without \
+             being built; otherwise one huge contract pays for itself in full"
+        );
+        assert_eq!(handle.dropped(), 1);
+
+        // Filling the budget with in-range observations must also start refusing,
+        // while item capacity remains.
+        let each = MAX_QUEUED_BYTES / 4;
+        let admitted = std::cell::Cell::new(0usize);
+        for _ in 0..8 {
+            handle.observe_with(each, || {
+                admitted.set(admitted.get() + 1);
+                let mut obs = observation();
+                obs.base_state = vec![0u8; each];
+                obs
+            });
+        }
+        assert!(
+            admitted.get() <= 4,
+            "the byte budget should have stopped admissions at about four of these, \
+             built {} instead",
+            admitted.get()
+        );
+        assert!(
+            handle.dropped() >= 4,
+            "the refusals should be counted, saw {}",
+            handle.dropped()
+        );
+    }
+
     /// A full queue must skip the copies, not merely discard them afterwards.
     ///
     /// An `Observation` owns full copies of the base, incoming and result states, so
@@ -559,6 +719,7 @@ mod tests {
         let handle = CaptureHandle {
             tx,
             dropped: Arc::new(AtomicU64::new(0)),
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
         };
 
         let builds = std::cell::Cell::new(0usize);
@@ -568,12 +729,12 @@ mod tests {
         };
 
         // First offer fits the one-slot queue.
-        handle.observe_with(build);
+        handle.observe_with(observation().queued_bytes(), build);
         assert_eq!(builds.get(), 1, "the first observation should be built");
         assert_eq!(handle.dropped(), 0);
 
         // Queue is now full: the closure must not run at all.
-        handle.observe_with(build);
+        handle.observe_with(observation().queued_bytes(), build);
         assert_eq!(
             builds.get(),
             1,
@@ -583,7 +744,7 @@ mod tests {
 
         drop(rx);
         // Receiver gone: still no build, still counted.
-        handle.observe_with(build);
+        handle.observe_with(observation().queued_bytes(), build);
         assert_eq!(builds.get(), 1, "a dead writer must not pay for the copies");
         assert_eq!(handle.dropped(), 2);
     }

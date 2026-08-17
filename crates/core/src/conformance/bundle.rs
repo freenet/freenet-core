@@ -248,8 +248,25 @@ impl ReplayBundle {
         bincode::deserialize(&bytes[10..]).map_err(|e| BundleError::Decode(e.to_string()))
     }
 
+    /// Write the bundle, replacing any existing one atomically.
+    ///
+    /// A plain `write` truncates the destination before the replacement is durable,
+    /// so a crash or power loss mid-write destroys the accumulated corpus and the
+    /// next startup finds a partial file it cannot read. That is a poor trade for a
+    /// capture whose entire value is that it accumulates over hours: it is written
+    /// repeatedly and read once. Write beside it and rename over it instead, which is
+    /// atomic on the same filesystem, so a reader sees either the old bundle or the
+    /// new one and never a half-written one.
     pub fn write_to(&self, path: &Path) -> Result<(), BundleError> {
-        std::fs::write(path, self.encode()?)?;
+        let bytes = self.encode()?;
+        let temporary = path.with_extension("bundle.tmp");
+        std::fs::write(&temporary, bytes)?;
+        // Best effort: if the rename fails, remove the temporary rather than leaving
+        // litter beside the corpus for the next reader to puzzle over.
+        if let Err(err) = std::fs::rename(&temporary, path) {
+            drop(std::fs::remove_file(&temporary));
+            return Err(err.into());
+        }
         Ok(())
     }
 
