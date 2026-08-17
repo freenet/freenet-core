@@ -11,14 +11,35 @@
       flake-utils,
       ...
     }:
+    let
+      inherit (nixpkgs) lib;
+
+      # `rev` exists only for a clean git source, `dirtyRev` only for a dirty one,
+      # and neither for a tarball, `path:` or non-git source drop — where an
+      # unguarded dereference is a hard eval failure, not a fallback.
+      gitCommitHash =
+        if self ? rev then
+          lib.substring 0 12 self.rev
+        else if self ? dirtyRev then
+          lib.substring 0 12 (lib.removeSuffix "-dirty" self.dirtyRev)
+        else
+          "unknown";
+
+      # Dirty only when nix says so: treating "no VCS metadata" as dirty would
+      # disable auto-update for every source-drop build (see crates/core/build.rs).
+      gitDirty = self ? dirtyRev;
+    in
     {
-      overlays.default = _: pkgs: {
-        freenet = pkgs.callPackage (import ./package.nix) { };
-        freenet-autoupdate = pkgs.writeShellApplication {
+      overlays.default = final: prev: {
+        freenet = final.callPackage (import ./package.nix) {
+          inherit gitCommitHash gitDirty;
+          sourceDateEpoch = toString self.lastModified;
+        };
+        freenet-autoupdate = final.writeShellApplication {
           name = "freenet-autoupdate";
           runtimeInputs = [
-            pkgs.curl
-            pkgs.nix
+            final.curl
+            final.nix
           ];
           text = ''
             # So the node exits 42 for us instead of logging that it will not update.
