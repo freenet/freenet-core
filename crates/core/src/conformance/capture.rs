@@ -44,6 +44,41 @@ use super::sampler::{ContractSampler, SamplerConfig};
 /// Environment variable that switches capture on and says where to write.
 pub const CAPTURE_DIR_ENV: &str = "FREENET_CONFORMANCE_CAPTURE_DIR";
 
+/// Optional per-contract byte budget override for a capture run.
+///
+/// The sampler's default is sized for ordinary state. Measured against the live
+/// River room, whose states are ~356 KB, the default 4 MiB holds barely a dozen
+/// states however long the node runs — so a long collection produces a corpus no
+/// deeper than a short one, and "no violations found" then rests on three or four
+/// states. That is a much weaker statement than the same words applied to a
+/// small-state contract, and the difference is invisible in the output.
+///
+/// This is an operator knob for a deliberate diagnostic run, not a new default:
+/// raising it costs disk and memory on the node doing the capturing.
+pub const CAPTURE_MAX_BYTES_ENV: &str = "FREENET_CONFORMANCE_CAPTURE_MAX_BYTES";
+
+/// Sampler configuration for this capture run.
+fn sampler_config() -> SamplerConfig {
+    sampler_config_from(std::env::var(CAPTURE_MAX_BYTES_ENV).ok().as_deref())
+}
+
+/// Split out from [`sampler_config`] so the parsing is testable without mutating
+/// process-global environment state, which other tests running in the same
+/// process would see.
+fn sampler_config_from(raw: Option<&str>) -> SamplerConfig {
+    let mut config = SamplerConfig::default();
+    if let Some(bytes) = raw
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|bytes| *bytes > 0)
+    {
+        config.max_bytes = bytes;
+        // A per-state ceiling above the total budget would let one state exclude
+        // everything else, so keep it a fraction of the whole.
+        config.max_state_bytes = config.max_state_bytes.max(bytes / 4);
+    }
+    config
+}
+
 /// How many observations may queue before the executor starts dropping them.
 ///
 /// Small on purpose. A deep queue would hide a writer that cannot keep up, and the
@@ -230,7 +265,7 @@ fn reload(dir: &Path) -> HashMap<ContractInstanceId, TrackedContract> {
             break;
         }
 
-        let mut sampler = ContractSampler::new(SamplerConfig::default());
+        let mut sampler = ContractSampler::new(sampler_config());
         for state in &bundle.states {
             sampler.observe_state(state);
         }
@@ -266,7 +301,7 @@ fn record(samplers: &mut HashMap<ContractInstanceId, TrackedContract>, observati
     let tracked = samplers
         .entry(observation.contract)
         .or_insert_with(|| TrackedContract {
-            sampler: ContractSampler::new(SamplerConfig::default()),
+            sampler: ContractSampler::new(sampler_config()),
             code_hash: observation.code_hash,
             parameters: observation.parameters.clone(),
         });
@@ -525,5 +560,32 @@ mod tests {
             record(&mut samplers, obs);
         }
         assert!(samplers.len() <= MAX_TRACKED_CONTRACTS);
+    }
+
+    #[test]
+    fn the_byte_budget_override_is_honoured_and_bad_input_falls_back() {
+        let default = sampler_config_from(None);
+
+        let raised = sampler_config_from(Some(" 33554432 "));
+        assert_eq!(raised.max_bytes, 33_554_432, "override should be applied");
+        assert!(
+            raised.max_state_bytes >= default.max_state_bytes,
+            "raising the total budget must never lower the per-state ceiling"
+        );
+        assert!(
+            raised.max_state_bytes < raised.max_bytes,
+            "a per-state ceiling at or above the whole budget would let one state \
+             evict every other sample"
+        );
+
+        // Anything unparseable or zero leaves the shipped default in place rather
+        // than silently disabling capture, which a `0` budget would do.
+        for bad in ["", "0", "lots", "-1", "4MB"] {
+            assert_eq!(
+                sampler_config_from(Some(bad)).max_bytes,
+                default.max_bytes,
+                "{bad:?} should fall back to the default budget"
+            );
+        }
     }
 }
