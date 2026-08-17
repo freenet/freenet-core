@@ -38,6 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use tokio::sync::mpsc;
 
+use super::bundle::ReplayBundle;
 use super::sampler::{ContractSampler, SamplerConfig};
 
 /// Environment variable that switches capture on and says where to write.
@@ -155,7 +156,21 @@ pub fn start(dir: PathBuf) -> std::io::Result<CaptureHandle> {
 }
 
 async fn run_writer(dir: PathBuf, mut rx: mpsc::Receiver<Observation>, dropped: Arc<AtomicU64>) {
-    let mut samplers: HashMap<ContractInstanceId, TrackedContract> = HashMap::new();
+    // Resume from what is already on disk.
+    //
+    // Without this a restart silently DESTROYS the corpus: the worker starts with
+    // empty samplers and the first flush overwrites each bundle with whatever few
+    // states it has seen since boot. A capture is only interesting because it
+    // accumulates diversity over hours, so losing it on every restart would make a
+    // long collection worth roughly as much as a short one — and it would look
+    // fine, because the file is still there and still recent.
+    let mut samplers = reload(&dir);
+    if !samplers.is_empty() {
+        tracing::info!(
+            contracts = samplers.len(),
+            "conformance capture resumed from existing bundles"
+        );
+    }
     let mut flush = tokio::time::interval(FLUSH_EVERY);
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -179,6 +194,65 @@ struct TrackedContract {
     sampler: ContractSampler,
     code_hash: [u8; 32],
     parameters: Vec<u8>,
+}
+
+/// Rebuild samplers from the bundles already in the capture directory.
+///
+/// Replays each stored transition back through the sampler rather than trying to
+/// restore its internal strata: the bundle is the portable format and does not
+/// carry the sampler's private structure, and re-observing is both simpler and
+/// self-correcting — anything the current configuration would no longer admit is
+/// simply not re-admitted.
+fn reload(dir: &Path) -> HashMap<ContractInstanceId, TrackedContract> {
+    let mut samplers = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return samplers;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("bundle") {
+            continue;
+        }
+        let bundle = match ReplayBundle::read_from(&path) {
+            Ok(bundle) => bundle,
+            Err(err) => {
+                // A corrupt or half-written bundle must not stop the node from
+                // capturing; it just means that contract starts over.
+                tracing::warn!(error = %err, path = %path.display(), "skipping unreadable capture bundle");
+                continue;
+            }
+        };
+        let (Some(instance), Some(code_hash)) = (bundle.instance, bundle.code_hash) else {
+            continue;
+        };
+        if samplers.len() >= MAX_TRACKED_CONTRACTS {
+            break;
+        }
+
+        let mut sampler = ContractSampler::new(SamplerConfig::default());
+        for state in &bundle.states {
+            sampler.observe_state(state);
+        }
+        for transition in &bundle.transitions {
+            sampler.observe_transition(
+                &transition.base_state,
+                transition.incoming_state.as_deref(),
+                transition.delta.as_deref(),
+                transition.summary.as_deref(),
+                &transition.result_state,
+            );
+        }
+        samplers.insert(
+            instance,
+            TrackedContract {
+                sampler,
+                code_hash,
+                parameters: bundle.parameters,
+            },
+        );
+    }
+    samplers
 }
 
 fn record(samplers: &mut HashMap<ContractInstanceId, TrackedContract>, observation: Observation) {
@@ -353,6 +427,91 @@ mod tests {
             bundle.resolve_code(Some(vec![9, 9])).is_err(),
             "a bundle must refuse code that does not match the contract it recorded"
         );
+    }
+
+    /// Regression: a restart must not destroy the corpus.
+    ///
+    /// The worker previously started with empty samplers, so the first flush after
+    /// a restart overwrote each bundle with only what had been seen since boot. A
+    /// capture is worth having because it accumulates diversity over hours, and this
+    /// failure is invisible from outside — the file is still there, still recent,
+    /// just thinner. Found by measuring a real capture rather than by any test,
+    /// which is why this one exists.
+    #[test]
+    fn a_restart_resumes_from_what_is_already_on_disk() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+
+        // First run: observe several distinct states.
+        let mut samplers = HashMap::new();
+        for i in 0..6u8 {
+            let mut obs = observation();
+            obs.base_state = vec![i; 16];
+            obs.result_state = vec![i; 17];
+            record(&mut samplers, obs);
+        }
+        write_all(dir.path(), &samplers, 0);
+        let before = samplers
+            .values()
+            .next()
+            .expect("one contract")
+            .sampler
+            .distinct_states();
+        assert!(before > 1, "fixture did not accumulate anything to lose");
+
+        // Restart: a fresh worker reloading the same directory.
+        let resumed = reload(dir.path());
+        let after = resumed
+            .values()
+            .next()
+            .expect("contract should have been reloaded")
+            .sampler
+            .distinct_states();
+
+        assert_eq!(
+            after, before,
+            "restart lost sampled states: had {before}, resumed with {after}"
+        );
+        assert_eq!(
+            resumed.values().next().unwrap().code_hash,
+            [2; 32],
+            "restart lost the contract identity, so the corpus could no longer be \
+             verified against the WASM it came from"
+        );
+    }
+
+    /// The test above exercises `reload` directly, which is NOT enough on its own:
+    /// the actual bug was that `run_writer` never called it, and reverting that one
+    /// line left the test green. So the wiring is pinned separately.
+    ///
+    /// `run_writer` is a long-lived task driving a channel and a timer, so calling
+    /// it from a unit test would mean orchestrating a shutdown to observe the
+    /// result. A source pin buys the same guarantee for a fraction of the
+    /// complexity, and the thing being guarded is precisely a one-line call site.
+    #[test]
+    fn the_writer_actually_resumes_on_startup() {
+        let src = include_str!("capture.rs");
+        let start = src
+            .find("async fn run_writer(")
+            .expect("run_writer not found");
+        let after = &src[start..];
+        let end = after
+            .find("\nstruct TrackedContract")
+            .expect("run_writer no longer precedes TrackedContract");
+        let body = &after[..end];
+        assert!(
+            body.contains("reload(&dir)"),
+            "run_writer no longer reloads existing bundles on startup, so a node \
+             restart will overwrite each capture with only what it has seen since \
+             boot — silently, because the file is still there and still recent"
+        );
+    }
+
+    /// An unreadable bundle must not stop the node capturing everything else.
+    #[test]
+    fn a_corrupt_bundle_is_skipped_rather_than_fatal() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("junk.bundle"), b"not a bundle at all").expect("write");
+        assert!(reload(dir.path()).is_empty());
     }
 
     /// The number of contracts tracked is bounded, so a node hosting thousands
