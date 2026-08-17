@@ -119,8 +119,24 @@ impl Ping {
         // fix: a peer starting with `padding: None` that merges an update carrying
         // `Some(..)` would never adopt it, so the two would disagree forever on a
         // field neither side is wrong about.
+        // Longer wins; equal lengths are broken by content, NOT left-biased.
+        //
+        // The original compared lengths only, so two paddings of the same length but
+        // different bytes kept whichever side happened to be `self`: merge(A, B) kept
+        // A's bytes and merge(B, A) kept B's, and the two peers then disagreed
+        // forever. That is the same defect this change exists to remove, on a
+        // different field, and the doc comment above claimed commutativity while the
+        // code broke it. Latent rather than live — the only constructor fills a
+        // uniform byte — but the field is public and arbitrary bytes deserialize.
+        //
+        // Comparing content on a tie is a total order over the padding itself, so
+        // both merge orders pick the same winner.
         let replace_padding = match (&self.padding, &other.padding) {
-            (Some(existing), Some(incoming)) => existing.len() < incoming.len(),
+            (Some(existing), Some(incoming)) => match existing.len().cmp(&incoming.len()) {
+                std::cmp::Ordering::Less => true,
+                std::cmp::Ordering::Greater => false,
+                std::cmp::Ordering::Equal => existing < incoming,
+            },
             (None, Some(_)) => true,
             _ => false,
         };
@@ -156,6 +172,12 @@ impl Ping {
         // (`ping_client.rs::record_received`) counts each reported peer as a ping
         // RECEIVED. That would inflate the stats, including reporting a ping from
         // this node itself the first time its own unsorted entries get sorted.
+        //
+        // Note this is not quite what the original did, and is deliberately better:
+        // the original compared list LENGTH after truncation, so once a peer was at
+        // MAX_HISTORY_PER_PEER a genuinely new timestamp that displaced an older one
+        // left the length unchanged and was never counted — a chronic under-count in
+        // exactly the steady state where every peer is at the cap.
         let mut updates = BTreeMap::new();
         for (name, timestamps) in &self.from {
             let had = before.get(name);
@@ -276,6 +298,95 @@ mod tests {
             "merging a smaller padding must not shrink ours, or the two orders \
              disagree"
         );
+    }
+
+    /// Equal-length paddings must resolve the same way whichever side merges.
+    ///
+    /// The length-only comparison kept whichever side happened to be `self`, so two
+    /// peers holding same-length different-content padding disagreed forever — the
+    /// defect this contract is being fixed for, on a different field, while the doc
+    /// comment claimed commutativity. Found by review; the state map's own
+    /// commutativity test cannot catch it, because `Ping` has no `PartialEq` and the
+    /// comparison goes through `Deref` to the timestamp map only.
+    #[test]
+    fn equal_length_padding_resolves_commutatively() {
+        let ttl = Duration::from_secs(30);
+        let mut a = Ping::new();
+        a.padding = Some(vec![0x01; 16]);
+        let mut b = Ping::new();
+        b.padding = Some(vec![0x02; 16]);
+
+        let mut a_then_b = a.clone();
+        a_then_b.merge(b.clone(), ttl);
+        let mut b_then_a = b.clone();
+        b_then_a.merge(a.clone(), ttl);
+
+        assert_eq!(
+            a_then_b.padding, b_then_a.padding,
+            "same-length paddings must resolve identically in both merge orders, or \
+             the two peers never agree on the serialized state"
+        );
+    }
+
+    /// A new timestamp that displaces an older one at capacity is still a ping.
+    ///
+    /// The original compared list length after truncation, so at
+    /// MAX_HISTORY_PER_PEER a genuinely new timestamp left the length unchanged and
+    /// went uncounted — an under-count in exactly the steady state where every peer
+    /// sits at the cap. Pinned because it is the one place the reporting rule
+    /// deliberately differs from what it replaced.
+    #[test]
+    fn updates_reports_a_new_timestamp_that_displaces_one_at_capacity() {
+        // The held entries are all EXPIRED, so they survive only as the
+        // newest-MAX-regardless-of-age set. A fresh arrival then pushes the oldest
+        // past the cap, where being expired means it is dropped — a genuine
+        // displacement with the length unchanged. (With everything inside TTL the
+        // list would simply grow past the cap instead, since the rule keeps older
+        // entries that are still fresh, and nothing would be displaced at all.)
+        let ttl = Duration::from_secs(5);
+        let expired = Utc::now() - Duration::from_secs(600);
+
+        let mut ping = Ping::new();
+        let full: Vec<_> = (0..MAX_HISTORY_PER_PEER)
+            .map(|i| expired + Duration::from_secs(i as u64))
+            .collect();
+        ping.from.insert("Peer".to_string(), full);
+
+        let mut other = Ping::new();
+        other.from.insert("Peer".to_string(), vec![Utc::now()]);
+
+        let updates = ping.merge(other, ttl);
+        assert!(
+            updates.contains_key("Peer"),
+            "a displacing timestamp is a ping received, even though the list length \
+             did not change"
+        );
+        assert_eq!(ping.from["Peer"].len(), MAX_HISTORY_PER_PEER);
+    }
+
+    /// Merging a state with itself changes nothing.
+    ///
+    /// Idempotence is one of the three laws this change is about, and nothing pinned
+    /// it directly.
+    #[test]
+    fn merge_is_idempotent() {
+        let ttl = Duration::from_secs(600);
+        let mut ping = Ping::new();
+        ping.insert("Alice".to_string());
+        ping.insert("Bob".to_string());
+        ping.padding = Some(vec![0xAB; 8]);
+        // One merge first, so the state is already in the canonical form a peer would
+        // actually hold; idempotence on unsorted input would be a weaker claim.
+        ping.merge(Ping::new(), ttl);
+
+        let before = ping.clone();
+        ping.merge(before.clone(), ttl);
+
+        assert_eq!(
+            *ping, *before,
+            "merging a state with itself must not change it"
+        );
+        assert_eq!(ping.padding, before.padding, "nor its padding");
     }
 
     /// A peer named with no timestamps must not become a permanent phantom entry.
