@@ -3609,4 +3609,60 @@ mod tests {
         let vague = GithubRateLimitedError { retry_after: None }.user_message();
         assert!(vague.contains("within the hour"), "{vague}");
     }
+
+    /// [`fn_body`] for a file with no test module. It requires one, to prove the
+    /// anchor did not fall through into the pin's own literals (#5102/#5103);
+    /// `build.rs` is a different file from this one, which gives that by
+    /// construction. The `\n}\n` bound still matters — without it a moved anchor
+    /// matches later in `build.rs` and the assertions pass vacuously.
+    fn build_rs_fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        let at = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("definition not found in build.rs: {signature}"));
+        assert!(
+            at == 0 || src.as_bytes()[at - 1] == b'\n',
+            "`{signature}` is indented; the `\\n}}\\n` end-anchor would overshoot"
+        );
+        let after = &src[at + signature.len()..];
+        let (body, _) = after
+            .split_once("\n}\n")
+            .unwrap_or_else(|| panic!("could not locate end of: {signature}"));
+        body
+    }
+
+    /// `GIT_DIRTY` is the auto-update kill switch (`auto_update_is_disabled` in
+    /// `freenet.rs`), and `FREENET_GIT_IS_DIRTY` is an env binding onto it —
+    /// the one `config.rs` refuses to give `--disable-auto-update`. Both
+    /// regressions pinned here ship a binary that never updates itself: lenient
+    /// truthiness reads `=false` as dirty, and a missing `rerun-if-env-changed`
+    /// leaves a stale `GIT_DIRTY` baked in after the var is unset.
+    #[test]
+    fn build_script_git_dirty_override_cannot_silently_disable_auto_update() {
+        let body = build_rs_fn_body(
+            include_str!("../../../build.rs"),
+            "fn emit_build_metadata() {",
+        );
+
+        assert!(
+            body.contains(r#"Ok("0") | Ok("false") => false"#),
+            "FREENET_GIT_IS_DIRTY=0/false must map to CLEAN; without this arm it \
+             falls through to a truthiness test that reads it as DIRTY"
+        );
+        assert!(
+            body.contains(r#"Ok("1") | Ok("true") => true"#),
+            "FREENET_GIT_IS_DIRTY=1/true must map to DIRTY"
+        );
+        assert!(
+            body.contains("Ok(other) => panic!"),
+            "an unrecognised FREENET_GIT_IS_DIRTY must fail the build, not be guessed"
+        );
+
+        for var in ["FREENET_GIT_IS_DIRTY", "FREENET_GIT_COMMIT_HASH"] {
+            assert!(
+                body.contains(&format!("cargo:rerun-if-env-changed={var}")),
+                "{var} must be a declared rerun trigger, or an unset value leaves \
+                 stale provenance baked in"
+            );
+        }
+    }
 }

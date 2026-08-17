@@ -1,5 +1,5 @@
-use std::process::Command;
 use chrono::TimeZone;
+use std::process::Command;
 
 fn main() {
     // Emit build metadata for startup logging
@@ -110,23 +110,47 @@ fn read_min_compatible_from_cargo_toml() -> Option<String> {
 }
 
 fn emit_build_metadata() {
-    // Git commit hash
-    let git_hash = Command::new("git")
-        .args(["rev-parse", "--short=12", "HEAD"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+    // Git commit hash. FREENET_GIT_COMMIT_HASH supplies it for source drops with
+    // no `.git`; empty means "no override", as for FREENET_GIT_IS_DIRTY below.
+    let git_hash = match std::env::var("FREENET_GIT_COMMIT_HASH") {
+        Ok(v) if !v.trim().is_empty() => {
+            let v = v.trim().to_string();
+            // Validated because an embedded newline in a `cargo:` directive would
+            // emit further directives of the caller's choosing.
+            if v.len() > 40 || !v.chars().all(|c| c.is_ascii_hexdigit()) {
+                panic!("FREENET_GIT_COMMIT_HASH ({v}) must be <= 40 hex characters");
+            }
+            v
+        }
+        _ => Command::new("git")
+            .args(["rev-parse", "--short=12", "HEAD"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown".to_string()),
+    };
     println!("cargo:rustc-env=GIT_COMMIT_HASH={git_hash}");
 
-    // Git dirty flag
-    let git_dirty = Command::new("git")
-        .args(["status", "--porcelain"])
-        .output()
-        .ok()
-        .map(|o| !o.stdout.is_empty())
-        .unwrap_or(false);
+    // Git dirty flag. Parsed strictly: GIT_DIRTY is the auto-update kill switch
+    // (`auto_update_is_disabled` in src/bin/freenet.rs), so a lenient
+    // "any non-empty value is dirty" rule would let FREENET_GIT_IS_DIRTY=false
+    // ship a release binary that never updates itself.
+    let git_dirty = match std::env::var("FREENET_GIT_IS_DIRTY")
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("1") | Ok("true") => true,
+        Ok("0") | Ok("false") => false,
+        Ok("") | Err(_) => Command::new("git")
+            .args(["status", "--porcelain"])
+            .output()
+            .ok()
+            .map(|o| !o.stdout.is_empty())
+            .unwrap_or(false),
+        Ok(other) => panic!("FREENET_GIT_IS_DIRTY ({other}) must be 1, true, 0, false, or empty"),
+    };
     let dirty_suffix = if git_dirty { "-dirty" } else { "" };
     println!("cargo:rustc-env=GIT_DIRTY={dirty_suffix}");
 
@@ -146,6 +170,11 @@ fn emit_build_metadata() {
     let timestamp = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     println!("cargo:rustc-env=BUILD_TIMESTAMP={timestamp}");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    // Required: emitting any rerun-if-* directive makes Cargo honor only the
+    // declared set, so without these an unset var leaves stale provenance —
+    // and a stale GIT_DIRTY disables auto-update.
+    println!("cargo:rerun-if-env-changed=FREENET_GIT_COMMIT_HASH");
+    println!("cargo:rerun-if-env-changed=FREENET_GIT_IS_DIRTY");
 
     // Rebuild if git HEAD changes
     println!("cargo:rerun-if-changed=.git/HEAD");
