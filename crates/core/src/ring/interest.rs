@@ -918,7 +918,13 @@ pub fn summary_digest(summary_bytes: &[u8]) -> SummaryDigest {
 /// delta marginally exceeds its state keeps sending deltas, while the
 /// poisoned-summary population this gate targets (state-sized deltas at
 /// 550-840 KB) still refuses by a wide margin.
-const MIN_FULL_STATE_SAVING_BYTES: usize = 1024;
+/// How much smaller than the full state a delta must be to be worth sending.
+///
+/// `pub(crate)` so the conformance simulation can gate with the SAME margin the
+/// production path uses. A simulation that mirrors the gate approximately decides a
+/// different thing than the network does, and the consequence there is an accusation
+/// against a contract that converges in production.
+pub(crate) const MIN_FULL_STATE_SAVING_BYTES: usize = 1024;
 
 /// Heuristic: would a delta *probably* be efficient compared to sending full
 /// state, judging only by the peer's summary size?

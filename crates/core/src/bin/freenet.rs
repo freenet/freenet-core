@@ -209,6 +209,14 @@ fn auto_update_is_disabled(git_dirty: &str, disable_flag: bool) -> bool {
 async fn run_network(config: Config) -> anyhow::Result<()> {
     tracing::info!("Starting freenet node in network mode");
 
+    // Initialise conformance capture (RFC #5320) here rather than leaving it to the
+    // first merge. It is a no-op unless FREENET_CONFORMANCE_CAPTURE_DIR is set, but
+    // an operator who set it needs to see confirmation at startup: initialising
+    // lazily means the "capture enabled" line only appears once traffic happens to
+    // arrive, so a freshly-joined peer looks identical whether capture is working or
+    // silently misconfigured.
+    let _ = freenet::conformance::capture::global();
+
     // Honor a persistent operator disable (`freenet service disable`, #4690
     // sibling): while the marker is present the node must not run, and must stay
     // down across restarts/reboots. Idle instead of serving so the supervisor

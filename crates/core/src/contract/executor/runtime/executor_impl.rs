@@ -1549,6 +1549,54 @@ where
         };
         let new_state = WrappedState::new(new_state.into_bytes());
 
+        // Conformance capture (RFC #5320), off unless an operator sets
+        // FREENET_CONFORMANCE_CAPTURE_DIR. This is the seam where the base state,
+        // the update that was applied and the resulting state are all in hand,
+        // which is exactly the transition an offline replay needs.
+        //
+        // Cost when disabled is one atomic load. When enabled it is a `try_send` on
+        // a bounded channel that drops rather than waits, so a slow writer can never
+        // stall a merge — capture losing observations is always preferable to
+        // synchronization queueing behind it.
+        if let Some(capture) = crate::conformance::capture::global() {
+            let (incoming_state, delta) = updates.iter().fold((None, None), |acc, update| {
+                match update {
+                    UpdateData::State(state) => (Some(state.as_ref().to_vec()), acc.1),
+                    UpdateData::Delta(delta) => (acc.0, Some(delta.as_ref().to_vec())),
+                    UpdateData::StateAndDelta { state, delta } => {
+                        (Some(state.as_ref().to_vec()), Some(delta.as_ref().to_vec()))
+                    }
+                    // Related-contract payloads describe a different contract's
+                    // state, so they are not part of this transition.
+                    UpdateData::RelatedState { .. }
+                    | UpdateData::RelatedDelta { .. }
+                    | UpdateData::RelatedStateAndDelta { .. }
+                    | _ => acc,
+                }
+            });
+            // `observe_with` secures a queue slot BEFORE the closure runs, so the
+            // copies below are paid for only when there is somewhere to put them.
+            // Building the observation first would make the drop path the most
+            // expensive path, on the merge path, exactly under the load that causes
+            // drops.
+            // Size the observation from the slices already in hand, so the byte
+            // budget is enforced before a single byte is copied.
+            let size_hint = parameters.as_ref().len()
+                + current_state.as_ref().len()
+                + new_state.as_ref().len()
+                + incoming_state.as_ref().map_or(0, Vec::len)
+                + delta.as_ref().map_or(0, Vec::len);
+            capture.observe_with(size_hint, || crate::conformance::capture::Observation {
+                contract: *key.id(),
+                code_hash: crate::conformance::capture::code_hash_of(key),
+                parameters: parameters.as_ref().to_vec(),
+                base_state: current_state.as_ref().to_vec(),
+                incoming_state,
+                delta,
+                result_state: new_state.as_ref().to_vec(),
+            });
+        }
+
         if new_state.as_ref() == current_state.as_ref() {
             tracing::debug!(
                 contract = %key,
@@ -3137,6 +3185,99 @@ mod full_state_version_gate_pins {
             "recovery ordering must be: validate local ({local_valid_pos}) < \
              keep-local-when-valid ({keep_local_pos}) < recovery ({recovery_pos}) — \
              recovery may only replace state the contract itself calls invalid"
+        );
+    }
+}
+
+/// Source-scrape pins for the conformance capture hook (RFC #5320).
+///
+/// Capture sits on the merge path, which is the hottest path a contract touches.
+/// Two properties keep it safe to run on a live node, and neither is visible from
+/// the capture module's own tests, because both are facts about the CALL SITE:
+///
+/// 1. it observes where the transition actually is, inside `attempt_state_update`;
+/// 2. it never blocks the executor.
+///
+/// A refactor that "tidied" the `observe` call into an `await`, or moved it to a
+/// path that cannot see the base state, would leave every capture-module test green
+/// while making the node liable to stall behind a diagnostic writer. That is the
+/// #4145 / #4466 shape, and `.claude/rules/channel-safety.md` exists because it has
+/// happened repeatedly.
+#[cfg(test)]
+mod conformance_capture_pins {
+    /// Slice `attempt_state_update`'s body, from its signature to the next
+    /// function's. A missing anchor panics rather than silently widening the region
+    /// to the rest of the file, which is how a source pin quietly stops testing
+    /// anything (see the `include_str!` note in
+    /// `.claude/rules/bug-prevention-patterns.md`).
+    fn attempt_state_update_body() -> &'static str {
+        let src = include_str!("executor_impl.rs");
+        let start = src
+            .find("    pub(super) async fn attempt_state_update(")
+            .expect("attempt_state_update not found");
+        let after = &src[start..];
+        let end = after
+            .find("    async fn maybe_probe_idempotency(")
+            .expect("maybe_probe_idempotency no longer follows attempt_state_update");
+        &after[..end]
+    }
+
+    /// Capture must read the transition from the merge path itself. Recording it
+    /// anywhere else means recording something other than what the contract did.
+    #[test]
+    fn capture_observes_from_the_merge_path() {
+        let body = attempt_state_update_body();
+        assert!(
+            body.contains("capture.observe_with("),
+            "conformance capture is no longer invoked from attempt_state_update, so \
+             captured corpora would no longer reflect the merges the node performs"
+        );
+
+        // Bound the field check to the `Observation` literal itself.
+        //
+        // Searching the whole function body was vacuous for `incoming_state`: the
+        // name also appears in the `let (incoming_state, delta) = ...` binding that
+        // computes it, so deleting the FIELD left the assertion green while the
+        // bundle silently lost half the transition. This is the failure mode
+        // `AGENTS.md` warns about for source-scrape pins, and it is why the region
+        // has to be bounded to the thing being pinned rather than to its file.
+        let literal = body
+            .split_once("Observation {")
+            .expect("the capture hook no longer constructs an Observation literal")
+            .1;
+        let literal = literal
+            .split_once("});")
+            .expect("could not find the end of the Observation literal")
+            .0;
+
+        for field in ["base_state:", "result_state:", "incoming_state,", "delta,"] {
+            assert!(
+                literal.contains(field),
+                "capture no longer records `{field}` from the merge path; a replay \
+                 bundle missing part of the transition cannot reproduce it"
+            );
+        }
+    }
+
+    /// The executor must never wait on capture. A slow or stuck writer would
+    /// otherwise stall contract synchronization, which is the one thing this path
+    /// is required never to do.
+    #[test]
+    fn capture_never_awaits_on_the_merge_path() {
+        let body = attempt_state_update_body();
+        let hook_start = body
+            .find("if let Some(capture) =")
+            .expect("capture hook not found in attempt_state_update");
+        let rest = &body[hook_start..];
+        let hook_end = rest
+            .find("\n        }")
+            .expect("capture hook block not delimited as expected");
+        let hook = &rest[..hook_end];
+        assert!(
+            !hook.contains(".await"),
+            "the conformance capture hook awaits on the merge path. It must not: a \
+             slow or stuck writer would then stall contract synchronization. Use \
+             `try_send` and drop on full, per .claude/rules/channel-safety.md"
         );
     }
 }
