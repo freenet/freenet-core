@@ -418,7 +418,11 @@ extract_step_run() {
     # describe is the same defect waiting. See the consistency check at the
     # PC_RUN call site, which asserts the two extractors agree rather than
     # trusting that they do.
-    local job="$1" name="$2"
+    #
+    # The optional third argument is the FILE to read, defaulting to `$WF`
+    # (cross-compile.yml) so every existing call site is unchanged. 2b-quater
+    # passes release.yml, because the credential step it executes lives there.
+    local job="$1" name="$2" file="${3:-$WF}"
     awk -v jobre="^  $job:[[:space:]]*\$" -v want="      - name: $name" '
         $0 ~ jobre                       { injob = 1; next }
         injob && /^  [A-Za-z_.-]+:/      { injob = 0 }
@@ -431,7 +435,7 @@ extract_step_run() {
             sub(/^          /, "")
             print
         }
-    ' "$WF"
+    ' "$file"
 }
 
 PC_RUN="$(extract_step_run attach-to-release 'Publish crates to crates.io')"
@@ -737,6 +741,133 @@ else
                 "this deliberately does not count them."
         else
             pass "release.yml's crates.io token check is present in 'validate' and can refuse"
+        fi
+    fi
+fi
+
+# --- 2b-quater. that check is PRESENCE-ONLY, and still REFUSES ---------------
+#
+# The gap this closes is not the probe itself, it is that a BLOCKING GATE
+# SHIPPED WITH NO WAY TO EXERCISE IT. #5342 added a live-validity probe to that
+# step -- `curl` to `https://crates.io/api/v1/me` with the token in an
+# `Authorization` header, 401/403 -> `exit 1` -- and it blocked every release,
+# including the 0.2.128 cut, while 2b-ter and 2c-bis above stayed green. They
+# pin that the step EXISTS and CAN refuse; neither could see that it now
+# refused unconditionally.
+#
+# `/api/v1/me` is a session-COOKIE endpoint that never accepts API tokens.
+# Measured against the live API:
+#
+#   /api/v1/me  with a VALID token   -> HTTP 403
+#   /api/v1/me  with NO auth header  -> HTTP 403
+#   body: {"errors":[{"detail":"this action can only be performed on the
+#          crates.io website"}]}
+#
+# and no other read endpoint discriminates either -- good token vs bad token:
+# /api/v1/me 403/403, /api/v1/me/updates 403/403, /api/v1/me/tokens 403/403,
+# /api/v1/tokens 404/404, /api/v1/me/crates 404/404, /api/private/session
+# 405/405, and /api/v1/crates/freenet/owners 200/200 because it is PUBLIC.
+# That last one is the tempting "fix" and it is the same defect inverted: a
+# gate no input can turn RED, which is worse than one nothing turns green,
+# because it reports a success it never checked.
+#
+# So the invariant is BOTH halves, and they fail in opposite directions:
+#   - re-add a validity probe  -> the release is blocked unconditionally
+#   - drop the refusal         -> a missing secret is discovered at the publish,
+#                                 after the tag, the full build and Gate A.
+#
+# The no-probe half is STATIC and the refusal half is EXECUTED, deliberately.
+# Executing cannot see a re-added probe: a runner with no network gets curl's
+# `000`, which the #5342 code treated as a warning and passed. That is the
+# environment-cannot-fail shape -- an assertion that is fine while the
+# environment cannot produce the fault. Scanning is what actually discriminates
+# here, so the scan runs FIRST and the execution only happens once it has
+# established the step makes no network calls at all.
+if [[ ! -f "$RELEASE_YML" ]]; then
+    fail "release.yml not found at $RELEASE_YML"
+else
+    CRED_RUN="$(extract_step_run validate \
+        'Verify the crates.io token before anything is created' "$RELEASE_YML")"
+    if [[ -z "$CRED_RUN" || "$CRED_RUN" != *'CARGO_REGISTRY_TOKEN'* ]]; then
+        fail "could not extract release.yml's crates.io credential step's run: block" \
+            "Both halves below read and EXECUTE it, so an empty or wrong extraction" \
+            "would make all of them pass vacuously. Expected a step in the 'validate'" \
+            "job named 'Verify the crates.io token before anything is created' whose" \
+            "'run: |' body mentions CARGO_REGISTRY_TOKEN."
+    else
+        # Shell comments dropped before scanning: the step's own prose is
+        # allowed to quote the endpoints (it does, at length, so the next
+        # person does not re-add the probe), and a pin that fails on the
+        # comment explaining it is a pin that gets deleted rather than fixed.
+        # A commented-out probe is also inert, so ignoring it is correct.
+        CRED_CODE="$(printf '%s\n' "$CRED_RUN" | grep -vE '^[[:space:]]*#')"
+        # Scoped to this STEP, never to the job: the `validate` job legitimately
+        # curls crates.io elsewhere (the auto-bump reads the latest published
+        # version), so a job-wide scan would fail on a correct tree.
+        CRED_PROBE="$(printf '%s\n' "$CRED_CODE" \
+            | grep -nE 'curl|wget|https?://|api/v1|/api/')"
+        if [[ -n "$CRED_PROBE" ]]; then
+            fail "release.yml's crates.io credential step probes the network" \
+                "$CRED_PROBE" \
+                "crates.io exposes NO read endpoint that answers differently for a" \
+                "valid and an invalid API token -- see the measurements in the" \
+                "comment above, and in the step itself. A probe is therefore either" \
+                "a gate nothing turns green (#5342 blocked every release with" \
+                "/api/v1/me) or a gate nothing turns red (/crates/<name>/owners is" \
+                "public and answers 200 with no auth at all). Keep it presence-only." \
+                "The cost is accepted and documented: a present-but-dead token now" \
+                "surfaces at the publish instead."
+        else
+            pass "release.yml's crates.io credential step is presence-only (no network probe)"
+
+            # The refusal, EXECUTED. 2b-ter and 2c-bis scan the step for
+            # `exit 1`; neither shows that the exit is REACHED, or reached for
+            # the right input. Running it does, and it is safe to run precisely
+            # because the scan above established it makes no network calls.
+            #
+            # Both spellings of "missing" are exercised. Actions sets the env
+            # var to the EMPTY STRING for an unset secret, which is the case
+            # that matters in production; the fully-unset case is what `set -u`
+            # would abort on if the `${VAR:-}` guard were dropped, and that is
+            # a real regression with a different cause.
+            CRED_EMPTY_OUT="$(CARGO_REGISTRY_TOKEN='' bash -c "$CRED_RUN" 2>&1)"
+            CRED_EMPTY_RC=$?
+            CRED_UNSET_OUT="$(env -u CARGO_REGISTRY_TOKEN bash -c "$CRED_RUN" 2>&1)"
+            CRED_UNSET_RC=$?
+            CRED_OK_OUT="$(CARGO_REGISTRY_TOKEN='cio-not-a-real-token' bash -c "$CRED_RUN" 2>&1)"
+            CRED_OK_RC=$?
+
+            if [[ "$CRED_EMPTY_RC" -eq 0 ]]; then
+                fail "release.yml's credential step ACCEPTS an empty CARGO_REGISTRY_TOKEN" \
+                    "Exit status 0. Output: ${CRED_EMPTY_OUT:-(none)}" \
+                    "An unset repo secret reaches the step as the empty string, so this" \
+                    "is the common real failure. Unrefused, it is discovered at the" \
+                    "crates.io publish -- after the bump PR, the tag, ~30 minutes of" \
+                    "cross-compilation and Gate A. That cost is the whole reason the" \
+                    "check sits in the first job."
+            elif [[ "$CRED_EMPTY_OUT" != *'::error title=CARGO_REGISTRY_TOKEN not set'* ]]; then
+                fail "release.yml's credential step fails on an empty token for the WRONG reason" \
+                    "Exit status $CRED_EMPTY_RC. Output: ${CRED_EMPTY_OUT:-(none)}" \
+                    "It refused, but without the ::error:: annotation naming the missing" \
+                    "secret -- so the non-zero exit is more likely a syntax error in the" \
+                    "step than the intended refusal, and the operator gets no actionable" \
+                    "message in the Actions summary."
+            elif [[ "$CRED_UNSET_RC" -eq 0 ]]; then
+                fail "release.yml's credential step ACCEPTS a fully-unset CARGO_REGISTRY_TOKEN" \
+                    "Exit status 0. Output: ${CRED_UNSET_OUT:-(none)}" \
+                    "Same consequence as the empty case."
+            elif [[ "$CRED_OK_RC" -ne 0 ]]; then
+                fail "release.yml's credential step REFUSES a present token" \
+                    "Exit status $CRED_OK_RC. Output: ${CRED_OK_OUT:-(none)}" \
+                    "The token above is syntactically fine and merely not real, so the" \
+                    "step must accept it: this check cannot tell a live token from a" \
+                    "dead one and must not pretend to. A step that refuses a present" \
+                    "token blocks EVERY release, which is exactly what #5342 shipped." \
+                    "If this started failing after adding a validity check, the check" \
+                    "is the bug."
+            else
+                pass "release.yml's credential step refuses a missing token (empty and unset) and accepts a present one"
+            fi
         fi
     fi
 fi

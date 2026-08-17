@@ -52,23 +52,62 @@ jobs:
       # The crates.io credential is checked HERE, in the first job, because the
       # publish that needs it now runs at the very END of the pipeline -- after
       # the bump PR, the tag, ~30 minutes of cross-compilation and macOS
-      # notarization, and Gate A. Discovering a missing or dead token at that
-      # point costs the whole run and a tag, which is F3's shape reappearing one
-      # step further down. Fail before anything has been created.
+      # notarization, and Gate A. Discovering a missing token at that point
+      # costs the whole run and a tag, which is F3's shape reappearing one step
+      # further down. Fail before anything has been created.
       #
-      # Precedent: cross-compile.yml's `verify-signing-key` job, which likewise
-      # proves a release credential works before a release depends on it.
+      # PRESENCE ONLY. Deliberately no live-validity probe -- do NOT add one.
       #
-      # Two distinct outcomes, deliberately not collapsed:
-      #   missing        -> ERROR. Deterministic, and the release cannot finish.
-      #   present, 401/403 -> ERROR. A dead or wrong-scope token; equally fatal
-      #                     and equally actionable, and a real check rather than
-      #                     mere presence.
-      #   unreachable    -> WARNING only. crates.io being down is infrastructure,
-      #                     and failing a release on it would be a failure that
-      #                     is not a bug -- the same reasoning the canary uses
-      #                     for INDETERMINATE.
-      # The token is never echoed; only the HTTP status is.
+      # #5342 added exactly that: a probe of `https://crates.io/api/v1/me` with
+      # the token in an `Authorization` header, treating 401/403 as "expired,
+      # revoked, or lacks publish scope" and exiting 1. It fired unconditionally
+      # and blocked EVERY release, including the 0.2.128 cut, because
+      # `/api/v1/me` is a session-COOKIE endpoint that never accepts API tokens
+      # at all. Measured directly against crates.io:
+      #
+      #   /api/v1/me  with a VALID token   -> HTTP 403
+      #   /api/v1/me  with NO auth header  -> HTTP 403
+      #   body: {"errors":[{"detail":"this action can only be performed on the
+      #          crates.io website"}]}
+      #
+      # So the probe could not distinguish a good token from a bad one from no
+      # token at all: a gate no input could turn green.
+      #
+      # And there is no replacement endpoint. Every read endpoint on the API was
+      # measured with a valid token ("good") and an invalid one ("bad"):
+      #
+      #   /api/v1/me                     good=403 bad=403
+      #   /api/v1/me/updates             good=403 bad=403
+      #   /api/v1/me/tokens              good=403 bad=403
+      #   /api/v1/tokens                 good=404 bad=404
+      #   /api/v1/me/crates              good=404 bad=404
+      #   /api/v1/crates/freenet/owners  good=200 bad=200   <- PUBLIC endpoint
+      #   /api/private/session           good=405 bad=405
+      #
+      # NONE discriminates. In particular do not "fix" this by switching to
+      # `/api/v1/crates/<crate>/owners`: it answers 200 for an invalid token and
+      # for no auth, which is the same defect inverted -- a gate no input can
+      # turn RED, which is worse, because it reports success it never checked.
+      #
+      # What that costs us, stated plainly: a token that is PRESENT but expired
+      # or wrong-scope is no longer detected here. It surfaces at the publish
+      # step, which under the #5342 ordering is after Gate A and after the full
+      # build -- expensive, and exactly the cost the probe was meant to avoid.
+      # That is a real loss. It is strictly better than a gate that blocks every
+      # release, and until crates.io exposes a token-authenticated read endpoint
+      # there is no third option. `cargo publish` itself is the only operation
+      # that validates the credential, and it is not idempotent, so it cannot be
+      # run as a probe.
+      #
+      # The remaining check is still worth its place: a missing secret is the
+      # common real failure (an unset or rotated-away repo secret), it is
+      # deterministic, and it costs nothing to catch here.
+      #
+      # Sibling, same shape, already correct: cross-compile.yml's "Check the
+      # crates.io credential is present" is presence-only for these reasons.
+      #
+      # Pinned by scripts/release_canary_wiring_test.sh (assertion 2b-quater),
+      # which fails if a validity probe is re-added or the refusal is removed.
       - name: Verify the crates.io token before anything is created
         if: ${{ !inputs.dry_run }}
         env:
@@ -79,25 +118,7 @@ jobs:
             echo "::error title=CARGO_REGISTRY_TOKEN not set::The crates.io publish runs at the END of the release (in cross-compile.yml, after Gate A), so without this secret the release would fail after the tag, the binaries and ~30 minutes of cross-compilation. Set the CARGO_REGISTRY_TOKEN repo secret and re-run. See AGENTS.md and docs/RELEASING.md."
             exit 1
           fi
-          # `/api/v1/me` is read-only and is the cheapest thing that actually
-          # exercises the credential rather than its presence.
-          STATUS="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 \
-            --retry 2 --retry-all-errors \
-            -H "Authorization: $CARGO_REGISTRY_TOKEN" \
-            -A 'freenet-release-ci' \
-            'https://crates.io/api/v1/me' || echo '000')"
-          case "$STATUS" in
-            200)
-              echo "✅ CARGO_REGISTRY_TOKEN is present and accepted by crates.io."
-              ;;
-            401|403)
-              echo "::error title=CARGO_REGISTRY_TOKEN rejected::crates.io answered HTTP $STATUS for this token. It is expired, revoked, or lacks publish scope. The release would fail at the publish step, after the tag and the full build. Rotate the secret and re-run."
-              exit 1
-              ;;
-            *)
-              echo "::warning title=Could not verify CARGO_REGISTRY_TOKEN::crates.io returned HTTP $STATUS, so the token could not be checked. This is NOT evidence that it is bad -- proceeding. If the publish later fails on authentication, this is why."
-              ;;
-          esac
+          echo "✅ CARGO_REGISTRY_TOKEN is present. Its live validity is NOT checked here; see the comment above this step for why crates.io offers no endpoint that could."
 
       - name: Resolve + validate version
         id: validate
