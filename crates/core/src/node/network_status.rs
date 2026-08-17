@@ -111,48 +111,72 @@ pub struct RingStatsSnapshot {
     pub lattice_probe_improvements: u64,
 }
 
-/// Scalar-only view for the OTel metrics callbacks.
+/// The scalars this module owns directly, for the OTel metrics callbacks.
 ///
 /// Deliberately NOT [`get_snapshot`]: that builds per-peer and per-contract
 /// vectors and formats failure HTML, and the SDK has no batch-callback API in
 /// 0.32 — every observable instrument gets its own callback, so the exporter
 /// would pay that cost once per instrument per collection cycle.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct OtelMetricsSnapshot {
+pub(crate) struct OtelStatusScalars {
     pub connection_attempts: u32,
-    pub ring: RingStatsSnapshot,
-    pub fair_queue: crate::contract::FairQueueStats,
-    /// Hosted contracts partitioned by why they are held. Deliberately NOT a
-    /// `RingStatsSnapshot` field: that provider runs on every dashboard HTTP
-    /// request, and this is an O(hosted) walk under the hosting-cache read
-    /// lock. Its own provider keeps the cost on the OTel collection cadence.
-    pub hosting_reasons: crate::ring::HostingReasonStats,
+    pub op_stats: OperationStats,
 }
 
-/// Read the scalars the OTel exporter observes, or `None` before the node has
-/// registered its status (metrics simply report nothing until then).
+/// Read this module's own scalars, or `None` before [`init`] has run.
 ///
-/// Every unavailable source yields `None` for the whole snapshot rather than a
-/// default: an observable instrument that skips a collection cycle exports
-/// nothing, which reads as "not known yet", while a zero is a real datapoint —
+/// One accessor per SOURCE, not one snapshot over all of them. An observable
+/// instrument that skips a collection cycle exports nothing, which reads as
+/// "not known yet", while a zero is a real datapoint —
 /// `freenet.ring.connections = 0` before the ring provider registers is
-/// indistinguishable from a node that has lost every connection.
-pub(crate) fn otel_metrics_snapshot() -> Option<OtelMetricsSnapshot> {
-    let connection_attempts = NETWORK_STATUS.get()?.read().ok()?.connection_attempts;
-    let ring = RING_STATS_PROVIDER
-        .read()
-        .as_ref()
-        .map(|provider| provider())?;
-    let hosting_reasons = HOSTING_REASON_PROVIDER
-        .read()
-        .as_ref()
-        .map(|provider| provider())?;
-    Some(OtelMetricsSnapshot {
-        connection_attempts,
-        ring,
-        fair_queue: crate::contract::fair_queue_stats(),
-        hosting_reasons,
+/// indistinguishable from a node that has lost every connection. But that
+/// decision has to be per-source: an earlier version `?`-chained all of them
+/// into one snapshot, so an unregistered ring provider silently zeroed the
+/// queue metrics too, which do not depend on it at all.
+pub(crate) fn otel_status_scalars() -> Option<OtelStatusScalars> {
+    let status = NETWORK_STATUS.get()?;
+    // Poison tolerance matches the writers in this module, which already keep
+    // going field-by-field. Propagating it instead would make every metric
+    // sourced here vanish permanently, silently, for the process's life.
+    let status = status.read().unwrap_or_else(|poisoned| {
+        POISON_REPORTED.call_once(|| {
+            tracing::warn!(
+                "network status lock is poisoned; metrics continue against \
+                 the last consistent state"
+            )
+        });
+        poisoned.into_inner()
+    });
+    Some(OtelStatusScalars {
+        connection_attempts: status.connection_attempts,
+        op_stats: status.op_stats.clone(),
     })
+}
+
+/// Logged at most once — a poisoned lock stays poisoned, so this would
+/// otherwise fire on every collection cycle forever.
+static POISON_REPORTED: std::sync::Once = std::sync::Once::new();
+
+/// Live ring stats, or `None` before the provider is registered.
+pub(crate) fn otel_ring_stats() -> Option<RingStatsSnapshot> {
+    RING_STATS_PROVIDER
+        .read()
+        .as_ref()
+        .map(|provider| provider())
+}
+
+/// Hosted contracts partitioned by why they are held, or `None` before the
+/// provider is registered.
+///
+/// Its own accessor, read by exactly the two gauges that need it: this is an
+/// O(hosted) walk under the hosting-cache read lock, and folding it into a
+/// shared snapshot ran it once per observable callback — twelve times a cycle
+/// to serve two of them.
+pub(crate) fn otel_hosting_reasons() -> Option<crate::ring::HostingReasonStats> {
+    HOSTING_REASON_PROVIDER
+        .read()
+        .as_ref()
+        .map(|provider| provider())
 }
 
 /// Source of the per-reason hosted-contract breakdown
@@ -574,7 +598,7 @@ pub struct ConnectedPeer {
 }
 
 /// Counters for each operation type: (success, failure).
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct OperationStats {
     pub gets: (u32, u32),
     pub puts: (u32, u32),
@@ -884,15 +908,6 @@ pub fn record_peer_disconnected(addr: SocketAddr) {
 /// Audit: `grep -rn "record_op_result" crates/core/src/operations/`
 /// must show coverage for every op type with a driver.
 pub fn record_op_result(op_type: OpType, success: bool) {
-    crate::tracing::otel::record_op_result(
-        match op_type {
-            OpType::Get => "get",
-            OpType::Put => "put",
-            OpType::Update => "update",
-            OpType::Subscribe => "subscribe",
-        },
-        success,
-    );
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
             let counter = match op_type {

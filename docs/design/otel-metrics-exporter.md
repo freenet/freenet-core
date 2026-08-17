@@ -46,11 +46,11 @@ Registered in `tracing/otel.rs::register_metrics`.
 | `freenet.process.memory.rss` | gauge | — | `node::resource_metrics::rss_bytes` (Linux only) |
 | `freenet.transport.bytes` | counter | `direction` | `cumulative_bytes_{sent,received}` |
 | `freenet.transport.packets` | counter | `direction` | `cumulative_packets_{sent,received}` |
-| `freenet.transport.transfers` | counter | `result` | `record_transfer_{completed,failed}` |
-| `freenet.transport.nat_traversal` | counter | `result` | `record_nat_traversal_*` |
+| `freenet.transport.transfers` | counter | `result` | `cumulative_transfers` |
+| `freenet.transport.nat_traversal` | counter | `result` | `cumulative_nat_traversal` |
 | `freenet.transport.rtt` | histogram | — | `record_rtt_sample` |
 | `freenet.transport.cwnd` | histogram | — | `record_cwnd_sample` |
-| `freenet.operation.results` | counter | `op`, `result` | `network_status::record_op_result` |
+| `freenet.operation.results` | counter | `op`, `result` | `NetworkStatus::op_stats` |
 | `freenet.ring.connections` | gauge | — | `RingStatsSnapshot` |
 | `freenet.node.contracts.hosted` | gauge | `reason` | `HostingReasonStats` |
 | `freenet.node.contracts.hosted.bytes` | gauge | `reason` | `HostingReasonStats` |
@@ -64,8 +64,26 @@ Registered in `tracing/otel.rs::register_metrics`.
 | `freenet.contract.queue.rejected` | counter | `reason` | `FairQueueStats` |
 | `freenet.contract.queue.background_shed` | counter | — | `FairQueueStats` |
 
-Everything but the two histograms and the three synchronous counters is an
-observable callback over state that already existed for the local dashboard.
+Everything but the two histograms is an observable callback over state that
+already existed for the local dashboard.
+
+The two histograms are the ONLY synchronous instruments, and that is a rule
+rather than an accident: a counter is always exported as an observable reading
+the cumulative atomic the measured code already keeps, so there is no second
+call site to forget when a new one is added. A hand-placed `otel::record_*`
+mirror next to an existing `fetch_add` is the failure class of #4009 / #4010,
+where mirrored counters rotted and read zero for months
+(`.claude/rules/bug-prevention-patterns.md`). A histogram gets no such
+treatment because a sum-and-count atomic cannot reconstruct a distribution;
+those two call sites are pinned, bounded to their function, by
+`every_sync_instrument_still_has_its_hot_path_mirror`.
+
+Where a period counter already existed (`transfers_*`, `nat_traversal_*`),
+the observable reads a NEW cumulative counter incremented in the same
+function, not the period one: `take_snapshot` swaps the period counters to
+zero for the legacy telemetry worker, so observing those as counters would
+produce a non-monotonic series on any node running both pipelines. Pinned by
+`cumulative_outcome_counters_survive_a_snapshot_reset`.
 
 ### `reason` on the hosted-contract gauges
 
@@ -81,12 +99,32 @@ emits an un-attributed total — that would double-count under `sum`.
 | `local_client` | a local client (WebSocket/HTTP) holds a subscription |
 | `downstream` | a downstream peer subscribes to us — we relay its updates |
 | `subscribed` | unexpired network subscription, no local or downstream reader |
-| `local_access` | no subscription, but a local client GET/PUT touched it |
+| `local_access` | no subscription, but a local client GET/PUT touched it *recently* |
 | `abandoned` | was in use and no longer is — the eviction-candidate pool |
+| `restored` | reloaded from persisted metadata at startup, untouched since |
 | `routed` | residual: arrived via a routed GET/PUT, no demand signal |
 
 The strings are a metrics contract — collector-side dashboards filter on them,
 so add variants rather than repurpose existing values.
+
+Two of these are easy to get subtly wrong, so they are spelled out:
+
+- `local_access` is gated on the same age window the hosting policy uses
+  (`has_recent_local_client_access`, `SUBSCRIPTION_LEASE_DURATION`), NOT on the
+  sticky `local_client_access` flag, which is set once and never cleared.
+  Classifying on the flag would make the bucket monotonically absorb every
+  contract a client ever touched over a node's uptime, while `routed` drained
+  into it — and would disagree with the policy the gauge exists to describe.
+- `restored` exists because the restore path resets `abandoned_at` to `None`.
+  Without it, a restart silently empties `abandoned` into `routed` and every
+  reloaded contract claims to have arrived through a routed GET/PUT. It is the
+  demand-side view of `HostingCause::StartupRestore`.
+
+`HostingReason` (this table) and `HostingCause` (`host_begin` in the local
+telemetry pipeline) are different questions in different tenses — current
+demand, re-derived every collection, versus provenance frozen at admission.
+A contract admitted as `TransitGet` shows up here as `local_client` the moment
+a local client subscribes. Both rustdocs cross-reference each other.
 
 The breakdown has its own provider (`set_hosting_reason_provider`) rather than
 riding `RingStatsSnapshot`: that provider runs on every dashboard HTTP request,
@@ -205,7 +243,17 @@ The default is `disabled` — no `Authorization` header. Pointing the exporter a
 your own collector must not ship a signed assertion of this node's identity
 somewhere that never asked for one; `freenet` mode is for collectors that
 actually verify these tokens. Either way, an `Authorization` header supplied
-through `OTEL_EXPORTER_OTLP_HEADERS` is never overwritten.
+through `OTEL_EXPORTER_OTLP_HEADERS` is never overwritten — which is how static
+header auth, the only other scheme in common use with OTLP, is configured
+today, and the reason a second built-in auth mode is a separate change rather
+than a blocker for this one.
+
+To be precise about what `disabled` withholds: the SIGNATURE, not the identity.
+`freenet.node.pubkey` / `.fingerprint` are resource attributes on every export
+batch in both modes (`identity_attributes` is called before the auth-mode
+match), because metrics with no node id to group by are not useful. `disabled`
+means "make no cryptographic assertion of this identity to this collector", not
+"conceal which node this is".
 
 ### Endpoint precedence
 
@@ -341,7 +389,11 @@ at in a collector to confirm the pipeline works.
 Not wired. `global::set_meter_provider` holds a reference for the process
 lifetime, and `PeriodicReader` exports every 60s, so at most one partial interval
 is lost at exit. Flushing on the signal path is plumbing this does not need yet;
-the code carries a `NOTE:` comment naming the ceiling and the upgrade path.
+the code carries a `NOTE:` comment naming the ceiling and the upgrade path —
+including the trap on that path: `shutdown()` drops the blocking reqwest client
+and its private tokio runtime, so calling it directly from an async fn panics
+with "Cannot drop a runtime in a context where blocking is not allowed". It has
+to go through `spawn_blocking`, the same hop `build_provider` makes inbound.
 
 ## Wire-up
 
@@ -379,10 +431,24 @@ that check before building anything — `init` is otherwise unreachable under
   collector fails to verify; the header reaches a real socket in `freenet`
   mode, is absent in `disabled` mode, and never replaces an operator-supplied
   `Authorization`.
+- Instruments actually run: `instrument_callbacks_export_named_datapoints`
+  builds a provider over `InMemoryMetricExporter`, registers every instrument
+  against it, collects once, and asserts the exported datapoints by name and by
+  attribute. `init` returns early under `cfg(test)`, so without this no
+  callback, name, unit or attribute is ever executed in CI — and a panic in any
+  callback kills the `PeriodicReader` thread and stops all metrics permanently,
+  with no export-side signal to report it. It deliberately uses a LOCAL
+  provider: neither `global::set_meter_provider` nor the `INSTRUMENTS` OnceLock
+  is touched, both being process-global state that would leak into every other
+  test in the binary under plain `cargo test`.
 - Pins that would otherwise be vacuous: `init` returns a suppression reason
   under `cfg(test)` (deleting the check makes it build a pipeline instead), and
-  a cross-file scrape asserts every hot-path `record_*` mirror still exists in
-  `transport/metrics.rs` / `node/network_status.rs`.
+  a cross-file scrape asserts each histogram's `record_*` mirror still sits
+  inside the function that takes the sample. The scrape is BOUNDED to that
+  function (a `method_body` helper, the indented sibling of `fn_body` in
+  `bin/commands/auto_update.rs`): an unbounded `contains` does not fail when
+  the call MOVES, it matches a later occurrence — typically the pin's own
+  assertion string — and passes vacuously. Mutation-tested when written.
 - Provider construction succeeds inside a tokio runtime against an unreachable
   endpoint (guards the reqwest-blocking-in-async-context concern; export failure
   is asynchronous and must not surface at build time).
@@ -401,6 +467,10 @@ that check before building anything — `init` is otherwise unreachable under
   OTel globals (tracer provider, not meter provider).
 - `reqwest/blocking` gets enabled workspace-wide by feature unification, which
   pulls in a background runtime thread for blocking clients.
+- Six new never-reset `AtomicU64`s on `TransportMetrics` shadow existing period
+  counters. That is the deliberate trade against a hot-path `otel::record_*`
+  mirror at each site: 48 bytes on one process-global struct, in exchange for
+  removing a class of silent drift.
 
 ## Process note
 

@@ -8,7 +8,7 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use opentelemetry::metrics::{Counter, Histogram};
+use opentelemetry::metrics::Histogram;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_http::{Bytes, HttpClient, HttpError, Request, Response};
 use opentelemetry_otlp::{ExporterBuildError, MetricExporter, WithExportConfig, WithHttpConfig};
@@ -433,7 +433,13 @@ pub(crate) fn init(
             // every 60s (OTEL_METRIC_EXPORT_INTERVAL), so at most one partial
             // interval is lost at exit. If that tail ever matters, keep the
             // provider in a OnceLock and call `shutdown()` from the graceful
-            // shutdown path in `bin/freenet.rs`.
+            // shutdown path in `bin/freenet.rs` — but NOT directly from an
+            // async fn: `shutdown` drops the blocking reqwest client and its
+            // private tokio runtime, which panics with "Cannot drop a runtime
+            // in a context where blocking is not allowed". It has to go
+            // through `spawn_blocking` (or a plain thread), the same hop
+            // `build_provider` makes on the way in and this module's two
+            // provider tests make on the way out.
             global::set_meter_provider(provider);
             register_metrics();
             tracing::info!(
@@ -709,12 +715,16 @@ fn build_provider_blocking(
 /// `global::set_meter_provider` would bind to the no-op provider forever, and
 /// when the exporter is disabled the record helpers collapse to one relaxed
 /// atomic load and a branch.
+///
+/// ONLY histograms belong here. Anything that is a monotonic count is exported
+/// as an observable counter reading the cumulative atomic the measured code
+/// already keeps, which cannot drift from the thing it measures; a
+/// hand-maintained mirror call at the same site can, and has (#4009, #4010 —
+/// `.claude/rules/bug-prevention-patterns.md`). A histogram has no such
+/// atomic to read: sum-and-count cannot reconstruct a distribution.
 struct Instruments {
     rtt: Histogram<f64>,
     cwnd: Histogram<u64>,
-    transfers: Counter<u64>,
-    nat_traversal: Counter<u64>,
-    operations: Counter<u64>,
 }
 
 static INSTRUMENTS: OnceLock<Instruments> = OnceLock::new();
@@ -733,53 +743,29 @@ pub(crate) fn record_cwnd(cwnd_bytes: u64) {
     }
 }
 
-/// Record a stream transfer outcome (`completed` / `failed`).
-pub(crate) fn record_transfer(result: &'static str) {
-    if let Some(i) = INSTRUMENTS.get() {
-        i.transfers.add(1, &[KeyValue::new("result", result)]);
-    }
-}
-
-/// Record a NAT traversal outcome (`attempt` / `established` /
-/// `failed_error` / `failed_version`).
-pub(crate) fn record_nat_traversal(result: &'static str) {
-    if let Some(i) = INSTRUMENTS.get() {
-        i.nat_traversal.add(1, &[KeyValue::new("result", result)]);
-    }
-}
-
-/// Record an operation outcome. `op` is one of get/put/update/subscribe.
-///
-/// NOTE: outcome only, no duration histogram — no driver measures its own
-/// elapsed time today, and adding one means threading `TimeSource` through
-/// every `op_ctx_task` (raw `Instant::now()` is banned in this crate). Add the
-/// histogram when someone needs operation latency percentiles.
-pub(crate) fn record_op_result(op: &'static str, success: bool) {
-    if let Some(i) = INSTRUMENTS.get() {
-        i.operations.add(
-            1,
-            &[
-                KeyValue::new("op", op),
-                KeyValue::new("result", if success { "success" } else { "failure" }),
-            ],
-        );
-    }
-}
-
-/// Register the instruments this crate owns.
+/// Register the instruments this crate owns against the process-global meter.
 ///
 /// Must run AFTER `global::set_meter_provider`: `global::meter` binds to
 /// whatever provider is installed at call time.
-///
-/// Observable handles are dropped on purpose — the callback is registered into
-/// the pipeline at `build()` and observed on every collection cycle regardless.
-/// The SDK has no batch-callback API, so each one reads
-/// [`network_status::otel_metrics_snapshot`] independently; that is why the
-/// accessor is a cheap scalar read rather than the dashboard's `get_snapshot`.
 fn register_metrics() {
     let meter = global::meter(METER_NAME);
 
-    let registered = INSTRUMENTS.set(Instruments {
+    if INSTRUMENTS.set(build_instruments(&meter)).is_err() {
+        // A second `init` would leave the sync instruments bound to the first
+        // provider while the observable ones move to the new one — loud rather
+        // than silently half-migrated.
+        tracing::warn!("OTel instruments already registered; keeping the first set");
+    }
+    register_observables(&meter);
+}
+
+/// The synchronous instruments, built against `meter`.
+///
+/// Separate from [`register_metrics`] so a test can build them against its own
+/// provider without setting the `INSTRUMENTS` OnceLock, which is process-global
+/// and would leak into every other test in the binary under plain `cargo test`.
+fn build_instruments(meter: &opentelemetry::metrics::Meter) -> Instruments {
+    Instruments {
         rtt: meter
             .f64_histogram("freenet.transport.rtt")
             .with_unit("ms")
@@ -790,26 +776,23 @@ fn register_metrics() {
             .with_unit("By")
             .with_description("Congestion window samples")
             .build(),
-        transfers: meter
-            .u64_counter("freenet.transport.transfers")
-            .with_description("Stream transfers by outcome")
-            .build(),
-        nat_traversal: meter
-            .u64_counter("freenet.transport.nat_traversal")
-            .with_description("Outbound NAT traversal attempts by outcome")
-            .build(),
-        operations: meter
-            .u64_counter("freenet.operation.results")
-            .with_description("Completed operations by type and outcome")
-            .build(),
-    });
-    if registered.is_err() {
-        // A second `init` would leave the sync instruments bound to the first
-        // provider while the observable ones move to the new one — loud rather
-        // than silently half-migrated.
-        tracing::warn!("OTel instruments already registered; keeping the first set");
     }
+}
 
+/// Register every observable instrument against `meter`.
+///
+/// Observable handles are dropped on purpose — the callback is registered into
+/// the pipeline at `build()` and observed on every collection cycle regardless.
+/// The SDK has no batch-callback API, so each one reads its source
+/// independently; that is why those accessors are cheap scalar reads rather
+/// than the dashboard's `get_snapshot`.
+///
+/// Takes the meter rather than reaching for `global::meter` so
+/// `instrument_callbacks_export_named_datapoints` can drive all of them against
+/// an in-memory exporter. A panic in any callback kills the `PeriodicReader`
+/// thread and stops ALL metrics permanently, and no export-side signal reports
+/// it, so "the callbacks run at all" needs a test.
+fn register_observables(meter: &opentelemetry::metrics::Meter) {
     let _rss = meter
         .u64_observable_gauge("freenet.process.memory.rss")
         .with_unit("By")
@@ -821,9 +804,9 @@ fn register_metrics() {
         })
         .build();
 
-    register_transport_metrics(&meter);
-    register_ring_metrics(&meter);
-    register_queue_metrics(&meter);
+    register_transport_metrics(meter);
+    register_ring_metrics(meter);
+    register_queue_metrics(meter);
 }
 
 /// Wire-level counters, read from the cumulative (never-reset) transport
@@ -865,19 +848,46 @@ fn register_transport_metrics(meter: &opentelemetry::metrics::Meter) {
             observer.observe(received, &[KeyValue::new("direction", "received")]);
         })
         .build();
+
+    let _transfers = meter
+        .u64_observable_counter("freenet.transport.transfers")
+        .with_description("Stream transfers by outcome")
+        .with_callback(|observer| {
+            let (completed, failed) = TRANSPORT_METRICS.cumulative_transfers();
+            observer.observe(completed, &[KeyValue::new("result", "completed")]);
+            observer.observe(failed, &[KeyValue::new("result", "failed")]);
+        })
+        .build();
+
+    let _nat = meter
+        .u64_observable_counter("freenet.transport.nat_traversal")
+        .with_description("Outbound NAT traversal attempts by outcome")
+        .with_callback(|observer| {
+            let (attempt, established, failed_error, failed_version) =
+                TRANSPORT_METRICS.cumulative_nat_traversal();
+            for (result, value) in [
+                ("attempt", attempt),
+                ("established", established),
+                ("failed_error", failed_error),
+                ("failed_version", failed_version),
+            ] {
+                observer.observe(value, &[KeyValue::new("result", result)]);
+            }
+        })
+        .build();
 }
 
 /// Ring / topology state, mirroring the dashboard's connection-status tiles.
 fn register_ring_metrics(meter: &opentelemetry::metrics::Meter) {
-    use crate::node::network_status::otel_metrics_snapshot as snapshot;
+    use crate::node::network_status::{otel_hosting_reasons, otel_ring_stats, otel_status_scalars};
     use crate::ring::HostingReason;
 
     let _connections = meter
         .u64_observable_gauge("freenet.ring.connections")
         .with_description("Active ring connections")
         .with_callback(|observer| {
-            if let Some(s) = snapshot() {
-                observer.observe(s.ring.connection_count as u64, &[]);
+            if let Some(ring) = otel_ring_stats() {
+                observer.observe(ring.connection_count as u64, &[]);
             }
         })
         .build();
@@ -892,10 +902,10 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter) {
             "Contracts currently hosted by this node, partitioned by why each one is held",
         )
         .with_callback(|observer| {
-            if let Some(s) = snapshot() {
+            if let Some(reasons) = otel_hosting_reasons() {
                 for reason in HostingReason::ALL {
                     observer.observe(
-                        s.hosting_reasons.count(reason),
+                        reasons.count(reason),
                         &[KeyValue::new("reason", reason.as_str())],
                     );
                 }
@@ -912,10 +922,10 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter) {
              what the hosting cache's byte budget measures.",
         )
         .with_callback(|observer| {
-            if let Some(s) = snapshot() {
+            if let Some(reasons) = otel_hosting_reasons() {
                 for reason in HostingReason::ALL {
                     observer.observe(
-                        s.hosting_reasons.bytes(reason),
+                        reasons.bytes(reason),
                         &[KeyValue::new("reason", reason.as_str())],
                     );
                 }
@@ -927,8 +937,38 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter) {
         .u64_observable_counter("freenet.connect.attempts")
         .with_description("Connection attempts made since startup")
         .with_callback(|observer| {
-            if let Some(s) = snapshot() {
-                observer.observe(s.connection_attempts as u64, &[]);
+            if let Some(status) = otel_status_scalars() {
+                observer.observe(status.connection_attempts as u64, &[]);
+            }
+        })
+        .build();
+
+    // Read from the dashboard's own cumulative op counters rather than
+    // incremented at `record_op_result`: same instrument, one fewer thing that
+    // can be forgotten at a new call site. `record_op_result` is itself a
+    // manually-mirrored counter with a documented required-call-site list, and
+    // one mirror per fact is the most this can be reduced to.
+    let _operations = meter
+        .u64_observable_counter("freenet.operation.results")
+        .with_description("Completed operations by type and outcome")
+        .with_callback(|observer| {
+            let Some(status) = otel_status_scalars() else {
+                return;
+            };
+            for (op, (success, failure)) in [
+                ("get", status.op_stats.gets),
+                ("put", status.op_stats.puts),
+                ("update", status.op_stats.updates),
+                ("subscribe", status.op_stats.subscribes),
+            ] {
+                observer.observe(
+                    success as u64,
+                    &[KeyValue::new("op", op), KeyValue::new("result", "success")],
+                );
+                observer.observe(
+                    failure as u64,
+                    &[KeyValue::new("op", op), KeyValue::new("result", "failure")],
+                );
             }
         })
         .build();
@@ -940,13 +980,13 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter) {
              Held does not mean tight — compare distances across nodes.",
         )
         .with_callback(|observer| {
-            if let Some(s) = snapshot() {
+            if let Some(ring) = otel_ring_stats() {
                 observer.observe(
-                    s.ring.lattice_has_successor as u64,
+                    ring.lattice_has_successor as u64,
                     &[KeyValue::new("position", "successor")],
                 );
                 observer.observe(
-                    s.ring.lattice_has_predecessor as u64,
+                    ring.lattice_has_predecessor as u64,
                     &[KeyValue::new("position", "predecessor")],
                 );
             }
@@ -957,11 +997,11 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter) {
         .f64_observable_gauge("freenet.ring.lattice.neighbor.distance")
         .with_description("Ring distance to each held lattice edge; absent when unheld")
         .with_callback(|observer| {
-            if let Some(s) = snapshot() {
-                if let Some(d) = s.ring.lattice_successor_distance {
+            if let Some(ring) = otel_ring_stats() {
+                if let Some(d) = ring.lattice_successor_distance {
                     observer.observe(d, &[KeyValue::new("position", "successor")]);
                 }
-                if let Some(d) = s.ring.lattice_predecessor_distance {
+                if let Some(d) = ring.lattice_predecessor_distance {
                     observer.observe(d, &[KeyValue::new("position", "predecessor")]);
                 }
             }
@@ -976,13 +1016,13 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter) {
              it, so the ratio is a convergence gauge, not a success rate.",
         )
         .with_callback(|observer| {
-            if let Some(s) = snapshot() {
+            if let Some(ring) = otel_ring_stats() {
                 observer.observe(
-                    s.ring.lattice_probes_issued,
+                    ring.lattice_probes_issued,
                     &[KeyValue::new("result", "issued")],
                 );
                 observer.observe(
-                    s.ring.lattice_probe_improvements,
+                    ring.lattice_probe_improvements,
                     &[KeyValue::new("result", "improvement")],
                 );
             }
@@ -993,17 +1033,17 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter) {
         .u64_observable_counter("freenet.contract.updates")
         .with_description("Relayed UPDATEs by admission outcome")
         .with_callback(|observer| {
-            if let Some(s) = snapshot() {
+            if let Some(ring) = otel_ring_stats() {
                 observer.observe(
-                    s.ring.updates_accepted,
+                    ring.updates_accepted,
                     &[KeyValue::new("result", "accepted")],
                 );
                 observer.observe(
-                    s.ring.updates_rate_limited,
+                    ring.updates_rate_limited,
                     &[KeyValue::new("result", "rate_limited")],
                 );
                 observer.observe(
-                    s.ring.updates_capacity_dropped,
+                    ring.updates_capacity_dropped,
                     &[KeyValue::new("result", "capacity_dropped")],
                 );
             }
@@ -1012,8 +1052,13 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter) {
 }
 
 /// Executor fair-queue occupancy and admission outcomes.
+///
+/// These read `contract::fair_queue_stats()` directly rather than going
+/// through the node-status snapshot: it is a free function over always-present
+/// statics, so routing it through a snapshot that can be partly unavailable
+/// only creates a way for an unrelated missing provider to zero these.
 fn register_queue_metrics(meter: &opentelemetry::metrics::Meter) {
-    use crate::node::network_status::otel_metrics_snapshot as snapshot;
+    use crate::contract::fair_queue_stats as snapshot;
 
     let _depth = meter
         .u64_observable_gauge("freenet.contract.queue.depth")
@@ -1022,15 +1067,13 @@ fn register_queue_metrics(meter: &opentelemetry::metrics::Meter) {
              double-count under `sum by (queue)` — sum the tiers instead.",
         )
         .with_callback(|observer| {
-            if let Some(s) = snapshot() {
-                let q = &s.fair_queue;
-                for (tier, depth) in [
-                    ("client_local", q.depth_client_local),
-                    ("network_relay", q.depth_network_relay),
-                    ("background", q.depth_background),
-                ] {
-                    observer.observe(depth as u64, &[KeyValue::new("queue", tier)]);
-                }
+            let q = snapshot();
+            for (tier, depth) in [
+                ("client_local", q.depth_client_local),
+                ("network_relay", q.depth_network_relay),
+                ("background", q.depth_background),
+            ] {
+                observer.observe(depth as u64, &[KeyValue::new("queue", tier)]);
             }
         })
         .build();
@@ -1042,11 +1085,7 @@ fn register_queue_metrics(meter: &opentelemetry::metrics::Meter) {
     let _high_water = meter
         .u64_observable_gauge("freenet.contract.queue.depth.high_water")
         .with_description("Highest fair-queue occupancy reached since startup")
-        .with_callback(|observer| {
-            if let Some(s) = snapshot() {
-                observer.observe(s.fair_queue.high_water as u64, &[]);
-            }
-        })
+        .with_callback(|observer| observer.observe(snapshot().high_water as u64, &[]))
         .build();
 
     let _rejected = meter
@@ -1056,27 +1095,22 @@ fn register_queue_metrics(meter: &opentelemetry::metrics::Meter) {
              per_contract is one noisy contract hitting its own cap.",
         )
         .with_callback(|observer| {
-            if let Some(s) = snapshot() {
-                observer.observe(
-                    s.fair_queue.rejected_global_capacity,
-                    &[KeyValue::new("reason", "global_capacity")],
-                );
-                observer.observe(
-                    s.fair_queue.rejected_per_contract,
-                    &[KeyValue::new("reason", "per_contract")],
-                );
-            }
+            let q = snapshot();
+            observer.observe(
+                q.rejected_global_capacity,
+                &[KeyValue::new("reason", "global_capacity")],
+            );
+            observer.observe(
+                q.rejected_per_contract,
+                &[KeyValue::new("reason", "per_contract")],
+            );
         })
         .build();
 
     let _shed = meter
         .u64_observable_counter("freenet.contract.queue.background_shed")
         .with_description("Background events shed to make room for higher-priority work")
-        .with_callback(|observer| {
-            if let Some(s) = snapshot() {
-                observer.observe(s.fair_queue.background_shed, &[]);
-            }
-        })
+        .with_callback(|observer| observer.observe(snapshot().background_shed, &[]))
         .build();
 }
 
@@ -1488,57 +1522,73 @@ mod tests {
         );
     }
 
-    /// Cross-file pin (a same-file scrape can be satisfied by its own literal
-    /// — see .claude/rules/bug-prevention-patterns.md): every hot-path mirror
-    /// that feeds a synchronous instrument must still exist. Delete one and
-    /// its counter reports zero forever with nothing else failing.
+    /// Body of the METHOD whose signature line is `signature`, bounded to that
+    /// method.
     ///
-    /// Ceiling: presence in the file, not in the right function. A mirror
-    /// moved to the wrong call site still passes; a deleted one does not.
+    /// The free-function `fn_body` in `bin/commands/auto_update.rs` refuses
+    /// indented definitions, because its `\n}\n` end-anchor would slice to the
+    /// end of the enclosing `impl`. Every site pinned below is a method, so
+    /// this variant anchors on the matching 4-space-indented `\n    }\n`
+    /// instead. Same reason both exist at all: an unbounded
+    /// `source.contains(call)` does not fail when the call MOVES — it matches
+    /// a later occurrence, typically the pin's own assertion string, and
+    /// passes vacuously (AGENTS.md, #5103).
+    fn method_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        let at = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("definition not found: {signature}"));
+        let tests_at = src
+            .find("\n#[cfg(test)]\nmod ")
+            .map(|i| i + 1)
+            .expect("test module not located — this guard cannot verify anything");
+        assert!(
+            at < tests_at,
+            "`{signature}` matched inside the test module — this pin is \
+             scraping its own source and would pass vacuously"
+        );
+        let after = &src[at + signature.len()..];
+        let (body, _) = after
+            .split_once("\n    }\n")
+            .unwrap_or_else(|| panic!("could not locate end of: {signature}"));
+        assert!(
+            !body.contains("\n#[cfg(test)]\nmod "),
+            "scoped region for `{signature}` escaped into the test module — \
+             this pin would pass vacuously"
+        );
+        body
+    }
+
+    /// Cross-file pin (a same-file scrape can be satisfied by its own literal
+    /// — see .claude/rules/bug-prevention-patterns.md): the two histogram
+    /// mirrors must still sit IN the function that takes the sample. Delete or
+    /// move one and its histogram reports nothing forever with nothing else
+    /// failing.
+    ///
+    /// Only histograms are pinned because only histograms are mirrored: every
+    /// counter this crate exports is an observable reading a cumulative atomic
+    /// the measured code already keeps, so there is no second call site to
+    /// forget. See [`Instruments`].
+    ///
+    /// Mutation-tested when written: moving `record_rtt_ms` out of
+    /// `record_rtt_sample` (into, say, `record_transfer_completed`) fails
+    /// here, where the previous unbounded `source.contains` stayed green.
     #[test]
     fn every_sync_instrument_still_has_its_hot_path_mirror() {
-        for (source, call) in [
+        let source = include_str!("../transport/metrics.rs");
+        for (signature, call) in [
             (
-                include_str!("../transport/metrics.rs"),
-                "crate::tracing::otel::record_rtt_ms(",
-            ),
-            (
-                include_str!("../transport/metrics.rs"),
+                "    pub(crate) fn record_cwnd_sample(&self, cwnd_bytes: u32) {",
                 "crate::tracing::otel::record_cwnd(",
             ),
             (
-                include_str!("../transport/metrics.rs"),
-                "crate::tracing::otel::record_transfer(\"completed\")",
-            ),
-            (
-                include_str!("../transport/metrics.rs"),
-                "crate::tracing::otel::record_transfer(\"failed\")",
-            ),
-            (
-                include_str!("../transport/metrics.rs"),
-                "crate::tracing::otel::record_nat_traversal(\"attempt\")",
-            ),
-            (
-                include_str!("../transport/metrics.rs"),
-                "crate::tracing::otel::record_nat_traversal(\"established\")",
-            ),
-            (
-                include_str!("../transport/metrics.rs"),
-                "crate::tracing::otel::record_nat_traversal(\"failed_error\")",
-            ),
-            (
-                include_str!("../transport/metrics.rs"),
-                "crate::tracing::otel::record_nat_traversal(\"failed_version\")",
-            ),
-            (
-                include_str!("../node/network_status.rs"),
-                "crate::tracing::otel::record_op_result(",
+                "    pub(crate) fn record_rtt_sample(&self, rtt_us: u64) {",
+                "crate::tracing::otel::record_rtt_ms(",
             ),
         ] {
             assert!(
-                source.contains(call),
-                "missing hot-path mirror `{call}`: the instrument it feeds \
-                 would report zero forever"
+                method_body(source, signature).contains(call),
+                "`{signature}` no longer calls `{call}`: the histogram it \
+                 feeds would report nothing forever"
             );
         }
     }
@@ -1682,9 +1732,6 @@ mod tests {
         // rather than a panic or an implicit no-op-provider binding.
         record_rtt_ms(12.5);
         record_cwnd(4096);
-        record_transfer("completed");
-        record_nat_traversal("attempt");
-        record_op_result("get", true);
         assert!(
             INSTRUMENTS.get().is_none(),
             "recording must not lazily bind instruments to the no-op provider"
@@ -1754,6 +1801,136 @@ mod tests {
             endpoint_problem("https://collector.example/v1/metrics"),
             None
         );
+    }
+
+    /// Every observable callback runs, and the instruments carry the names and
+    /// attributes the collector-side dashboards filter on.
+    ///
+    /// This is the only test that executes an instrument at all: `init` returns
+    /// early under `cfg(test)` (see `init_refuses_to_start_from_a_test_process`),
+    /// so without this the twelve callbacks, every instrument name, every unit
+    /// and every attribute are unexecuted in CI. That matters beyond naming — a
+    /// panic in one callback kills the `PeriodicReader` thread and silently
+    /// stops ALL metrics, and `report_export_failure` cannot see it because it
+    /// is an export-side signal.
+    ///
+    /// Deliberately built against a LOCAL provider: neither
+    /// `global::set_meter_provider` nor the `INSTRUMENTS` OnceLock is touched,
+    /// because both are process-global and would leak into every other test in
+    /// this binary under plain `cargo test` (which, unlike nextest, shares one
+    /// process — see .claude/rules/testing.md).
+    #[test]
+    fn instrument_callbacks_export_named_datapoints() {
+        use opentelemetry::metrics::MeterProvider;
+        use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader};
+
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build())
+            .build();
+        let meter = provider.meter(METER_NAME);
+
+        // Same two calls `register_metrics` makes, minus the global bindings.
+        let instruments = build_instruments(&meter);
+        register_observables(&meter);
+        instruments.rtt.record(12.5, &[]);
+        instruments.cwnd.record(4096, &[]);
+
+        provider.force_flush().expect("collection must not fail");
+        let exported = exporter.get_finished_metrics().expect("exported batches");
+
+        let mut seen: Vec<(String, Vec<String>)> = Vec::new();
+        for resource_metric in &exported {
+            for scope in resource_metric.scope_metrics() {
+                for metric in scope.metrics() {
+                    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+                    let render = |kv: &KeyValue| format!("{}={}", kv.key, kv.value.as_str());
+                    // Only the u64 sums and gauges carry attributes this test
+                    // asserts on; the histograms are checked by name alone.
+                    // A wildcard rather than an exhaustive listing so a future
+                    // SDK variant does not break the build here — and if an
+                    // instrument's aggregation ever moves, its attribute
+                    // assertions below fail loudly rather than silently pass.
+                    #[allow(clippy::wildcard_enum_match_arm)]
+                    let attributes: Vec<String> = match metric.data() {
+                        AggregatedMetrics::U64(MetricData::Sum(sum)) => sum
+                            .data_points()
+                            .flat_map(|p| p.attributes())
+                            .map(render)
+                            .collect(),
+                        AggregatedMetrics::U64(MetricData::Gauge(gauge)) => gauge
+                            .data_points()
+                            .flat_map(|p| p.attributes())
+                            .map(render)
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    seen.push((metric.name().to_string(), attributes));
+                }
+            }
+        }
+
+        let names: Vec<&str> = seen.iter().map(|(name, _)| name.as_str()).collect();
+        // The histograms prove the synchronous path exports; the rest prove
+        // each observable callback ran and produced a datapoint.
+        for expected in [
+            "freenet.transport.rtt",
+            "freenet.transport.cwnd",
+            "freenet.transport.bytes",
+            "freenet.transport.packets",
+            "freenet.transport.transfers",
+            "freenet.transport.nat_traversal",
+            "freenet.contract.queue.depth",
+            "freenet.contract.queue.depth.high_water",
+            "freenet.contract.queue.rejected",
+            "freenet.contract.queue.background_shed",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "instrument `{expected}` produced no datapoint; exported: {names:?}"
+            );
+        }
+
+        // ...and by attribute, since a collector-side dashboard filters on
+        // these strings: renaming one silently empties a panel.
+        let attributes_of = |name: &str| {
+            seen.iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, a)| a.clone())
+                .unwrap_or_default()
+        };
+        for (name, attribute) in [
+            ("freenet.transport.bytes", "direction=sent"),
+            ("freenet.transport.bytes", "direction=received"),
+            ("freenet.transport.transfers", "result=completed"),
+            ("freenet.transport.transfers", "result=failed"),
+            ("freenet.transport.nat_traversal", "result=attempt"),
+            ("freenet.transport.nat_traversal", "result=failed_version"),
+            ("freenet.contract.queue.depth", "queue=background"),
+            ("freenet.contract.queue.rejected", "reason=per_contract"),
+        ] {
+            assert!(
+                attributes_of(name).iter().any(|a| a == attribute),
+                "`{name}` is missing attribute `{attribute}`; has {:?}",
+                attributes_of(name)
+            );
+        }
+
+        // NOT asserted here: that the source-gated instruments (ring, hosted,
+        // operations) export NOTHING when their source is unregistered. That
+        // is real behaviour — an observable with no source must skip the cycle
+        // rather than report a zero, because a zero is a real datapoint — but
+        // it cannot be asserted from this process. `NETWORK_STATUS` is a
+        // process-global OnceLock and `RING_STATS_PROVIDER` a global static,
+        // and other tests in this binary set both; under plain `cargo test`
+        // (one process, unlike nextest) the assertion's outcome depends on
+        // test order. What this test does guard about those instruments is
+        // the part that matters: their callbacks RAN, without panicking, which
+        // is what keeps the PeriodicReader thread alive.
+        //
+        // That the queue instruments above export regardless is the visible
+        // half of the same property — one unregistered provider no longer
+        // zeroes unrelated metrics.
     }
 
     #[tokio::test]

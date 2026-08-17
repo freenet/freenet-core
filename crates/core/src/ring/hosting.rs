@@ -83,7 +83,7 @@ pub(crate) use cache::{
 /// snapshot. Re-exported so `router` can size the wire arrays from the single
 /// definition next to the bucketing code.
 pub(crate) use cache::{GENUINE_ACCESS_RECENCY_BUCKETS, READ_COUNT_HIST_BUCKETS};
-use cache::{HostingCache, HostingCacheStats};
+use cache::{HostingCache, HostingCacheStats, ReasonRow};
 // Re-exported (not just used internally) so the wasmtime disk-cache sizing
 // tests (#5328 review) can verify headroom against the SAME aggregate
 // hosting-disk budget function this module uses, rather than duplicating its
@@ -224,7 +224,19 @@ pub(crate) enum PhantomRepair {
     Drop(ContractKey),
 }
 
-/// Why this node is holding a contract it hosts.
+/// Why this node is holding a contract it hosts, RIGHT NOW.
+///
+/// Not to be confused with `HostingCause` (`hosting/cache.rs`), which is the
+/// other half of the same question and answers a different tense: `HostingCause`
+/// is provenance AT ADMISSION, counted once at the branch that begins hosting
+/// and never revised (`host_begin` in `router.rs`), while `HostingReason` is
+/// current DEMAND, re-derived from live subscription state on every collection.
+/// A contract admitted as `TransitGet` becomes `LocalClient` the moment a local
+/// client subscribes; its `HostingCause` stays `TransitGet` forever. The two
+/// deliberately overlap in one place only — [`HostingReason::Restored`] reads
+/// the same "reloaded at startup" provenance `HostingCause::StartupRestore`
+/// counts, because a restored contract genuinely has no current demand signal
+/// to classify by.
 ///
 /// This is a PARTITION, not a set of flags: the classifier in
 /// [`HostingManager::hosted_by_reason`] evaluates the variants in declaration
@@ -251,13 +263,30 @@ pub enum HostingReason {
     /// downstream reads it: hosted on the network's behalf.
     Subscribed,
     /// No subscription of any kind, but a local client GET/PUT touched it
-    /// (`local_client_access`). The read-only / PUT-only local-demand class
-    /// (River UI containers and friends).
+    /// RECENTLY (within `SUBSCRIPTION_LEASE_DURATION`). The read-only /
+    /// PUT-only local-demand class (River UI containers and friends).
+    ///
+    /// Gated on recency, not on the sticky `local_client_access` flag, which is
+    /// set once and never cleared: classifying on the flag would make this
+    /// bucket monotonically absorb every contract a client ever touched over a
+    /// node's uptime, and would disagree with the hosting policy — which
+    /// consults `has_recent_local_client_access` (see `cache.rs`'s
+    /// `local_client_access_age_gate_expires` for a test of the divergence).
     LocalAccess,
     /// Was in use and no longer is (`abandoned_at`) — the eviction candidate
     /// pool. Distinguished from `Routed` because a rising `abandoned` count is
     /// churn, while a rising `routed` count is ordinary transit caching.
     Abandoned,
+    /// Reloaded from persisted hosting metadata at startup and not touched
+    /// since (`!seeded_this_run`), the `HostingCause::StartupRestore` cohort
+    /// viewed from the demand side.
+    ///
+    /// Separate from `Routed` because the restore path resets `abandoned_at`
+    /// to `None` (`cache.rs::load_persisted_entry_with_demand`): without this
+    /// bucket a restart silently empties `abandoned` into `routed`, and every
+    /// restored contract would be reported as having "arrived through a routed
+    /// GET/PUT", which is false. A bulk reload must not read as live demand.
+    Restored,
     /// Residual: arrived through a routed GET/PUT and never acquired any
     /// demand signal.
     Routed,
@@ -265,12 +294,13 @@ pub enum HostingReason {
 
 impl HostingReason {
     /// Every variant, in classifier (and export) order.
-    pub const ALL: [HostingReason; 6] = [
+    pub const ALL: [HostingReason; 7] = [
         HostingReason::LocalClient,
         HostingReason::Downstream,
         HostingReason::Subscribed,
         HostingReason::LocalAccess,
         HostingReason::Abandoned,
+        HostingReason::Restored,
         HostingReason::Routed,
     ];
 
@@ -284,6 +314,7 @@ impl HostingReason {
             HostingReason::Subscribed => "subscribed",
             HostingReason::LocalAccess => "local_access",
             HostingReason::Abandoned => "abandoned",
+            HostingReason::Restored => "restored",
             HostingReason::Routed => "routed",
         }
     }
@@ -1099,7 +1130,14 @@ impl HostingManager {
     /// [`Self::cost_eligibility_stats`] relies on.
     pub(crate) fn hosted_by_reason(&self) -> HostingReasonStats {
         let mut stats = HostingReasonStats::default();
-        self.hosting_cache.read().for_each_reason_row(|key, entry| {
+        self.hosting_cache.read().for_each_reason_row(|row| {
+            let ReasonRow {
+                key,
+                size_bytes,
+                recent_local_client_access,
+                abandoned,
+                seeded_this_run,
+            } = row;
             let (local, downstream) = self.local_and_downstream_counts(key);
             let reason = if local > 0 {
                 HostingReason::LocalClient
@@ -1107,16 +1145,18 @@ impl HostingManager {
                 HostingReason::Downstream
             } else if self.is_subscribed(key) {
                 HostingReason::Subscribed
-            } else if entry.local_client_access {
+            } else if recent_local_client_access {
                 HostingReason::LocalAccess
-            } else if entry.abandoned_at.is_some() {
+            } else if abandoned {
                 HostingReason::Abandoned
+            } else if !seeded_this_run {
+                HostingReason::Restored
             } else {
                 HostingReason::Routed
             };
             let bucket = reason as usize;
             stats.counts[bucket] = stats.counts[bucket].saturating_add(1);
-            stats.bytes[bucket] = stats.bytes[bucket].saturating_add(entry.size_bytes);
+            stats.bytes[bucket] = stats.bytes[bucket].saturating_add(size_bytes);
         });
         stats
     }
@@ -4580,7 +4620,11 @@ mod tests {
     /// `local_client` only, never be counted twice.
     #[test]
     fn hosted_by_reason_partitions_the_hosting_cache() {
-        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(
+            DEFAULT_HOSTING_BUDGET_BYTES,
+            std::sync::Arc::new(clock.clone()),
+        );
 
         // Empty cache: every bucket zero (a real datapoint, not absence).
         let empty = manager.hosted_by_reason();
@@ -4605,7 +4649,7 @@ mod tests {
             (abandoned, 1_600),
             (routed, 3_200),
         ] {
-            manager.record_contract_access(key, size, AccessType::Get);
+            manager.record_contract_access(key, size, AccessType::Get, HostingCause::Other);
         }
 
         // `local_client` ALSO gets a downstream subscriber and a network
@@ -4628,6 +4672,23 @@ mod tests {
 
         // `routed` gets nothing beyond the GET that seeded it.
 
+        // `restored` arrives the way a restart delivers it: reloaded from
+        // persisted metadata, so `abandoned_at` is reset to None and
+        // `seeded_this_run` is false. Without its own bucket this lands in
+        // `routed` and claims to have "arrived through a routed GET/PUT".
+        let restored = make_contract_key(7);
+        {
+            let mut cache = manager.hosting_cache.write();
+            cache.load_persisted_entry(
+                restored,
+                6_400,
+                AccessType::Get,
+                std::time::Duration::from_secs(10),
+                false,
+            );
+            cache.finalize_loading();
+        }
+
         let stats = manager.hosted_by_reason();
         for (reason, size) in [
             (HostingReason::LocalClient, 100),
@@ -4635,6 +4696,7 @@ mod tests {
             (HostingReason::Subscribed, 400),
             (HostingReason::LocalAccess, 800),
             (HostingReason::Abandoned, 1_600),
+            (HostingReason::Restored, 6_400),
             (HostingReason::Routed, 3_200),
         ] {
             assert_eq!(stats.count(reason), 1, "{reason:?} count");
@@ -4647,6 +4709,30 @@ mod tests {
         let cache = manager.hosting_cache_stats();
         assert_eq!(total_count, cache.contract_count, "counts must partition");
         assert_eq!(total_bytes, cache.current_bytes, "bytes must partition");
+
+        // The `local_access` bucket is age-gated on the same window the
+        // hosting policy uses. Classifying on the sticky `local_client_access`
+        // flag instead would hold this contract here for the node's whole
+        // uptime while the policy had long since stopped counting it.
+        clock.advance_time(SUBSCRIPTION_LEASE_DURATION + std::time::Duration::from_secs(1));
+        assert!(
+            !manager.has_recent_local_client_access(&local_access),
+            "the policy signal must have expired, or this assertion proves nothing"
+        );
+        let aged = manager.hosted_by_reason();
+        assert_eq!(
+            aged.count(HostingReason::LocalAccess),
+            0,
+            "a stale local access must leave the local_access bucket"
+        );
+        assert!(
+            aged.count(HostingReason::Routed) > stats.count(HostingReason::Routed),
+            "and fall through to the residual bucket"
+        );
+        // The network subscription's lease expires on the same clock, so the
+        // exact residual count is not pinned here — only that nothing was lost.
+        let aged_total: u64 = HostingReason::ALL.iter().map(|r| aged.count(*r)).sum();
+        assert_eq!(aged_total, cache.contract_count, "still a partition");
     }
 
     /// `is_eviction_eligible` gates the dashboard's "next to evict" badge on the
