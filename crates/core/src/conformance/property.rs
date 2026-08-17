@@ -53,10 +53,19 @@ pub enum ConformanceProperty {
     /// the final state" — so order-dependence is a defect whether or not the deltas
     /// are causally related, and this checks exactly that.
     ///
-    /// Worth knowing when reading a finding: the generator pairs deltas as observed,
-    /// which means consecutive ones may be causally sequenced. So a finding here can
-    /// also be read as "this delta encoding carries sequence", which is the same
-    /// defect seen from the other side rather than a separate one.
+    /// The generator only pairs deltas observed against the SAME base state, which is
+    /// what makes a finding here mean something. A delta is computed as
+    /// `get_state_delta(sender_state, recipient_summary)`, so two deltas observed
+    /// against different bases can be causally sequenced — the later one computed from
+    /// a state that already contains the earlier one's effect — and permuting those
+    /// asks what happens in a situation the protocol never produces. Same-base pairs
+    /// are the genuine concurrent-independent-updates case. Deltas with no recorded
+    /// base are not paired at all.
+    ///
+    /// So a finding here still reads as "this delta encoding carries sequence", and
+    /// that is a real defect on this network rather than an artifact: delivery is
+    /// out-of-order, so a delta that assumes a base will be applied out of order in
+    /// production too.
     ///
     /// Re-delivery is deliberately not checked here; that is
     /// [`ConformanceProperty::DeltaIdempotence`], which is contested and reports at
@@ -69,6 +78,36 @@ pub enum ConformanceProperty {
     /// (#5072 / #5056).
     WholeStateSelfDelta,
     /// Two valid divergent states reconcile, rather than cycling forever (#5153).
+    ///
+    /// # Open decision: is this severity right?
+    ///
+    /// This is the only check here that is not pure algebra. It rests on a MODEL of
+    /// how the protocol reconciles — which side sends what, when the full-state
+    /// fallback triggers, how the delta size gate behaves — so a finding depends on
+    /// that model being faithful, not just on the contract being wrong. Two model
+    /// bugs were found in review already: the delta gate compared against the wrong
+    /// peer's state (fixed), and the full-state fallback may fire where production
+    /// would not, which would HIDE a real divergence rather than invent one.
+    ///
+    /// It is nevertheless `Severity::Violation`, i.e. removal-eligible, because a
+    /// genuine reconciliation loop is exactly the #5153 shape this whole effort
+    /// exists to catch.
+    ///
+    /// Ian's call (2026-08-17) was to leave it removal-eligible and settle the
+    /// question when the active-but-not-enforcing phase is wired, with real shadow
+    /// telemetry rather than a five-contract sample. Do not quietly downgrade it
+    /// before then, and do not let Enforce become reachable without revisiting it.
+    ///
+    /// What would settle it, in either direction:
+    ///
+    /// - Shadow-mode counts of contracts flagged by THIS property and by no other
+    ///   removal-eligible property. On the live corpus that number was zero: every
+    ///   contract it flagged also broke commutativity, mutual rejection included. If
+    ///   shadow keeps it at zero, the property earns nothing at this severity and
+    ///   should drop to `Diagnostic`. If it is the sole finding for real contracts,
+    ///   it is carrying signal the algebraic checks miss and should stay.
+    /// - Any shadow finding from this property that turns out to converge in
+    ///   production is a model bug, and should drop the severity immediately.
     ReconciliationCycle,
 }
 
