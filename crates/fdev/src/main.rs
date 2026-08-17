@@ -257,6 +257,7 @@ mod tests {
             params: None,
             states: Vec::new(),
             bundle: None,
+            contract_store: None,
             max_cases: None,
             properties: Vec::new(),
             json: false,

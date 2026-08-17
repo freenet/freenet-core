@@ -27,7 +27,7 @@ use freenet::conformance::{
     MinimizeConfig, OracleBuildError, PropertyOutcome, ReplayBundle, RuntimeOracle, Severity,
     generate_cases, minimize, verify_case,
 };
-use freenet_stdlib::prelude::ContractInstanceId;
+use freenet_stdlib::prelude::{CodeHash, ContractCode, ContractInstanceId};
 use serde::Serialize;
 
 /// Run the contract conformance verifier (RFC #5320) against a contract's WASM.
@@ -58,6 +58,16 @@ pub struct ConformanceConfig {
     /// instead of building one from `--state`.
     #[arg(long)]
     pub(crate) bundle: Option<PathBuf>,
+
+    /// Directory of contract WASM files to resolve a bundle's code from,
+    /// typically a node's `contracts` data directory.
+    ///
+    /// A capture bundle records which contract it belongs to by code hash and
+    /// deliberately does not embed the WASM, so a corpus of many contracts stays
+    /// small. Without this, replaying such a bundle means finding the matching
+    /// WASM by hand, which is the whole capture-and-replay loop's weakest link.
+    #[arg(long)]
+    pub(crate) contract_store: Option<PathBuf>,
 
     /// Upper bound on how many cases to generate and check. Defaults to the
     /// generator's own default (currently 512).
@@ -260,6 +270,40 @@ fn parse_properties(names: &[String]) -> anyhow::Result<Vec<ConformanceProperty>
         .collect()
 }
 
+/// Find the WASM a bundle names, by looking it up in a node's contract store.
+///
+/// Addresses the store exactly as the node does: the file is named by the code
+/// hash's own encoding, and its contents are a VERSIONED encoding rather than raw
+/// WASM — a version header precedes the code, and only the code is hashed. So
+/// reading the file's bytes directly and hashing them can never match, and that
+/// failure is quiet: it looks exactly like "this node never hosted that
+/// contract". `ContractStore::store_contract` writes the file;
+/// `ContractCode::load_versioned_from_path` is its matching reader.
+fn find_code_in_store(store: &Path, bundle: &ReplayBundle) -> anyhow::Result<Vec<u8>> {
+    let Some(hash) = bundle.code_hash else {
+        anyhow::bail!(
+            "bundle names no contract (no code hash), so no store lookup could \
+             identify the right WASM"
+        );
+    };
+
+    let path = store
+        .join(CodeHash::new(hash).encode())
+        .with_extension("wasm");
+    if !path.exists() {
+        anyhow::bail!(
+            "this node's contract store has no code for the bundle's contract \
+             (looked for {}). A peer only stores contracts it hosts, so a capture \
+             replayed on a different node may need --wasm.",
+            path.display()
+        );
+    }
+
+    let (code, _version) = ContractCode::load_versioned_from_path(&path)
+        .with_context(|| format!("reading contract code from {}", path.display()))?;
+    Ok(code.data().to_vec())
+}
+
 /// Load the WASM, parameters and corpus, either from `--bundle` or from
 /// `--wasm` / `--params` / `--state`.
 fn load_inputs(config: &ConformanceConfig) -> anyhow::Result<(Vec<u8>, Vec<u8>, Corpus)> {
@@ -270,9 +314,10 @@ fn load_inputs(config: &ConformanceConfig) -> anyhow::Result<(Vec<u8>, Vec<u8>, 
         // code. Replaying a corpus against the wrong contract is worse than not
         // replaying it: the run looks authoritative and means nothing, whether it
         // reports findings or a clean bill of health.
-        let supplied = match &config.wasm {
-            Some(path) => Some(read_file(path)?),
-            None => None,
+        let supplied = match (&config.wasm, &config.contract_store) {
+            (Some(path), _) => Some(read_file(path)?),
+            (None, Some(store)) => Some(find_code_in_store(store, &bundle)?),
+            (None, None) => None,
         };
         let wasm = bundle.resolve_code(supplied).with_context(|| {
             format!(
@@ -616,6 +661,53 @@ fn inconclusive_label(reason: &Inconclusive) -> &'static str {
 mod tests {
     use super::*;
     use freenet::conformance::Violation;
+
+    /// A contract store holds a VERSIONED encoding, not raw WASM: a header
+    /// precedes the code. Resolving a bundle against it therefore has two ways to
+    /// fail quietly — addressing the file by the wrong name, and reading its bytes
+    /// without stripping the header — and both look identical to "this node never
+    /// hosted that contract".
+    ///
+    /// So this writes a store entry the way the node writes one and asserts the
+    /// code comes back byte-for-byte. Reading the file raw returns the header too
+    /// and fails here, which is verified by mutation.
+    #[test]
+    fn code_is_resolved_from_a_contract_store_the_way_the_node_writes_it() {
+        let store = tempfile::tempdir().expect("temp dir");
+        // Not valid WASM, and it does not need to be: resolution is addressing
+        // plus decoding, and nothing here compiles the module.
+        let code = b"\0asm-not-really-but-bytes-are-bytes".to_vec();
+
+        let encoded = ContractCode::from(code.clone())
+            .to_bytes_versioned(freenet_stdlib::prelude::APIVersion::Version0_0_1)
+            .expect("encode versioned");
+        let path = store
+            .path()
+            .join(CodeHash::from_code(&code).encode())
+            .with_extension("wasm");
+        std::fs::write(&path, &encoded).expect("write store entry");
+        assert!(
+            encoded.len() > code.len(),
+            "the stored form must carry a header, or this test proves nothing \
+             about stripping one"
+        );
+
+        let bundle = ReplayBundle::new(code.clone(), Vec::new());
+        let resolved = find_code_in_store(store.path(), &bundle).expect("resolve from store");
+        assert_eq!(resolved, code, "resolved code must be the raw WASM");
+
+        // A contract the node never stored must say so rather than return
+        // something wrong: that is the common case when a capture is replayed on
+        // a different peer.
+        let absent = ReplayBundle::new(b"different code entirely".to_vec(), Vec::new());
+        let err = find_code_in_store(store.path(), &absent)
+            .expect_err("a contract absent from the store must not resolve");
+        assert!(
+            err.to_string()
+                .contains("no code for the bundle's contract"),
+            "error should name the miss, got: {err}"
+        );
+    }
 
     /// Every `ConformanceProperty::ALL` variant must round-trip through
     /// `as_str()` -> `parse_properties()`, so a property added later cannot
