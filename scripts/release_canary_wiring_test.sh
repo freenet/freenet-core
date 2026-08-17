@@ -804,8 +804,31 @@ else
         # Scoped to this STEP, never to the job: the `validate` job legitimately
         # curls crates.io elsewhere (the auto-bump reads the latest published
         # version), so a job-wide scan would fail on a correct tree.
-        CRED_PROBE="$(printf '%s\n' "$CRED_CODE" \
-            | grep -nE 'curl|wget|https?://|api/v1|/api/')"
+        #
+        # TWO needle sets against two different texts, because they have
+        # different false-positive profiles.
+        #
+        # The URL-ish needles are applied to a copy with `echo` lines elided.
+        # The step's operator message already says "Set the CARGO_REGISTRY_TOKEN
+        # repo secret", and adding a docs link to it is a plausible, correct
+        # edit -- which against the raw body produced `FAIL ... probes the
+        # network` quoting an `echo`. A pin that makes a false accusation on a
+        # correct edit is the one that gets deleted rather than fixed, which is
+        # the same reasoning that drops comment lines above.
+        #
+        # `curl`/`wget`/`cargo` stay matched on the RAW text, so `echo $(curl
+        # ...)` is still caught: eliding echo lines for those would open the
+        # hole the elision is meant to avoid opening.
+        #
+        # `cargo` is in the set because a probe need not spell a URL at all:
+        # `cargo owner --list freenet` has no curl, no wget and no `api/v1`, and
+        # since `owners` is public it exits 0 for a bogus token, so the executed
+        # half below passes too -- a gate nothing can turn red, re-entering
+        # through a gap in the needles. The step invokes no cargo, so this costs
+        # nothing.
+        CRED_NOECHO="$(printf '%s\n' "$CRED_CODE" | sed 's/^[[:space:]]*echo .*//')"
+        CRED_PROBE="$( { printf '%s\n' "$CRED_NOECHO" | grep -nE 'https?://|api/v1|/api/'
+                         printf '%s\n' "$CRED_CODE"   | grep -nE 'curl|wget|\bcargo\b'; } | sort -u)"
         if [[ -n "$CRED_PROBE" ]]; then
             fail "release.yml's crates.io credential step probes the network" \
                 "$CRED_PROBE" \
@@ -830,11 +853,24 @@ else
             # that matters in production; the fully-unset case is what `set -u`
             # would abort on if the `${VAR:-}` guard were dropped, and that is
             # a real regression with a different cause.
-            CRED_EMPTY_OUT="$(CARGO_REGISTRY_TOKEN='' bash -c "$CRED_RUN" 2>&1)"
+            #
+            # `-e` IS LOAD-BEARING, and its absence was this pin's own instance
+            # of the defect the PR fixes. A step with no `shell:` key runs under
+            # Actions as `bash -e {0}`: `-e` comes from the INVOCATION, and the
+            # body only sets `-uo pipefail`. A plain `bash -c` therefore runs the
+            # step under weaker options than production, so any unguarded
+            # non-zero command -- `printf %s "$CARGO_REGISTRY_TOKEN" | grep -q
+            # "^cio_"` before the final echo is the demonstration -- aborts the
+            # real step and blocks every release while this suite reports all
+            # assertions passed. Measured on that mutated body with a present
+            # token: real shell rc=1, `bash -c` rc=0. Re-running the three cases
+            # below under `-e` on the correct body gives 1, 1, 0 -- identical --
+            # so matching production costs nothing and buys the whole class.
+            CRED_EMPTY_OUT="$(CARGO_REGISTRY_TOKEN='' bash -e -c "$CRED_RUN" 2>&1)"
             CRED_EMPTY_RC=$?
-            CRED_UNSET_OUT="$(env -u CARGO_REGISTRY_TOKEN bash -c "$CRED_RUN" 2>&1)"
+            CRED_UNSET_OUT="$(env -u CARGO_REGISTRY_TOKEN bash -e -c "$CRED_RUN" 2>&1)"
             CRED_UNSET_RC=$?
-            CRED_OK_OUT="$(CARGO_REGISTRY_TOKEN='cio-not-a-real-token' bash -c "$CRED_RUN" 2>&1)"
+            CRED_OK_OUT="$(CARGO_REGISTRY_TOKEN='cio-not-a-real-token' bash -e -c "$CRED_RUN" 2>&1)"
             CRED_OK_RC=$?
 
             if [[ "$CRED_EMPTY_RC" -eq 0 ]]; then
