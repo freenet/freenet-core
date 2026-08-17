@@ -868,8 +868,8 @@ mod tests {
         let params = vec![1, 2, 3];
         let instance_for = |p: Vec<u8>| {
             ContractInstanceId::from_params_and_code(
-                &freenet_stdlib::prelude::Parameters::from(p),
-                &ContractCode::from(code.clone()),
+                freenet_stdlib::prelude::Parameters::from(p),
+                ContractCode::from(code.clone()),
             )
         };
         let case = ConformanceCase::new(
