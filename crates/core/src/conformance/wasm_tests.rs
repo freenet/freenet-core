@@ -226,6 +226,24 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
         ),
         ConformanceProperty::StateIdempotence,
     );
+    // Commutativity still HOLDS for this arm: the rewrite is applied to a union, and
+    // a union is symmetric. Asserting it keeps the mode's description honest rather
+    // than leaving a reader to redo the algebra — the same self-check the
+    // capped-collection mode carries, and the reason review caught the doc claiming
+    // otherwise.
+    let commutativity_still_holds = verify_case(
+        &mut never_settles,
+        &ConformanceCase::new(
+            ConformanceProperty::StateCommutativity,
+            vec![bytes(&[1, 2]), bytes(&[2, 3])],
+        ),
+    );
+    assert!(
+        !commutativity_still_holds.is_violation(),
+        "this mode should break idempotence and associativity only; a commutativity \
+         finding means the arm no longer isolates what its documentation claims: \
+         {commutativity_still_holds:?}"
+    );
 
     // ---------------------------------- same code, different params, different instance
     let a = RuntimeOracle::standalone(wasm.clone(), vec![CONFORMING]).await?;

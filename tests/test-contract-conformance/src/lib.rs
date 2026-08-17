@@ -26,12 +26,15 @@
 //!                                Commutative and idempotent; only a three-state
 //!                                case reveals it. The one mode the pairwise laws
 //!                                cannot catch.
-//!   6 NEVER_SETTLES            — merge rewrites the state in place on every apply,
-//!                                so merge(A, A) never reaches a fixpoint. Observed in
-//!                                the wild: a live contract whose states were all a
-//!                                fixed 3488 bytes and whose content changed on every
-//!                                re-apply, breaking idempotence, commutativity and
-//!                                associativity at once.
+//!   6 NEVER_SETTLES            — merge rewrites the state on every apply, so
+//!                                merge(A, A) never reaches a fixpoint. Idempotence
+//!                                and associativity break; commutativity still HOLDS
+//!                                here, because the rewrite is applied to a union and
+//!                                a union is symmetric. Modelled on a live contract
+//!                                whose states were all a fixed 3488 bytes and whose
+//!                                content changed on every re-apply — that one broke
+//!                                commutativity too, for reasons this arm does not
+//!                                reproduce.
 //!
 //! State is always a canonical byte set: sorted, strictly ascending, no
 //! duplicates. `validate_state` accepts exactly that canonical form.
@@ -100,6 +103,13 @@ fn merge_state(m: u8, current: &[u8], incoming: &[u8]) -> Vec<u8> {
         // At-least-once delivery makes this fatal rather than untidy: the same state
         // redelivered mutates the result again, so the peer never stops producing
         // "new" state to gossip and can never agree with anyone.
+        //
+        // Adding one is a bijection on the byte alphabet, so the rotation can never
+        // collapse two entries into one and the state never settles — EXCEPT for the
+        // two sets that are invariant under a 256-cycle: the empty set (returned
+        // early below) and the full 0..=255 alphabet. Neither is reachable from the
+        // small states this fixture is driven with, but anyone reusing this arm with
+        // a generated corpus should know the second one exists.
         NEVER_SETTLES => {
             let mut out = union(current, incoming);
             if out.is_empty() {
