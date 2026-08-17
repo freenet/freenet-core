@@ -2,6 +2,10 @@
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -9,6 +13,7 @@
       self,
       nixpkgs,
       flake-utils,
+      rust-overlay,
       ...
     }:
     let
@@ -114,13 +119,46 @@
       let
         pkgs = import nixpkgs {
           inherit system;
-          overlays = [ self.overlays.default ];
+          overlays = [
+            rust-overlay.overlays.default
+            self.overlays.default
+          ];
         };
+
+        # The repo's pinned toolchain, not whatever nixpkgs-unstable ships:
+        # clippy and rustfmt only match CI when the compiler version does.
+        toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+        rustPlatform = pkgs.makeRustPlatform {
+          cargo = toolchain;
+          rustc = toolchain;
+        };
+
+        # Applied here rather than in the overlay, so downstream consumers of
+        # the overlay still get a plain-nixpkgs package.
+        freenet = pkgs.freenet.override { inherit rustPlatform; };
       in
       {
         packages = rec {
-          inherit (pkgs) freenet freenet-autoupdate;
+          inherit freenet;
+          inherit (pkgs) freenet-autoupdate;
           default = freenet-autoupdate;
+        };
+        devShells.default = pkgs.mkShell {
+          inputsFrom = [ freenet ];
+          # Not needed by the freenet binary, but release-agent's openssl-sys
+          # fails to build without them, so `cargo clippy --workspace` in this
+          # shell would not compile.
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = [ pkgs.openssl ];
+          packages = [
+            toolchain
+            pkgs.cargo-nextest
+            pkgs.jq
+            pkgs.nixfmt
+            pkgs.pre-commit
+            pkgs.python3
+            pkgs.shellcheck
+          ];
         };
       }
     );
