@@ -24,6 +24,7 @@ const MUTUAL_REJECTION: u8 = 2;
 const NON_IDEMPOTENT_DELTA: u8 = 3;
 const NONDETERMINISTIC_SUMMARY: u8 = 4;
 const CAPPED_SET: u8 = 5;
+const NEVER_SETTLES: u8 = 6;
 
 fn bytes(values: &[u8]) -> Bytes {
     Arc::from(values)
@@ -209,6 +210,22 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
             pairwise.property
         );
     }
+
+    // ------------------------------------------------ mode 6: never settles
+    //
+    // Regression cover for the worst shape found on the live network: a contract
+    // whose merge rewrote its state on every apply, so `merge(A, A)` never reached a
+    // fixpoint. Under at-least-once delivery such a contract can never converge, and
+    // it is covered here by shape rather than by committing the third-party WASM it
+    // was observed in.
+    let mut never_settles = RuntimeOracle::standalone(wasm.clone(), vec![NEVER_SETTLES]).await?;
+    assert_violates(
+        verify_case(
+            &mut never_settles,
+            &ConformanceCase::new(ConformanceProperty::StateIdempotence, vec![bytes(&[1, 2])]),
+        ),
+        ConformanceProperty::StateIdempotence,
+    );
 
     // ---------------------------------- same code, different params, different instance
     let a = RuntimeOracle::standalone(wasm.clone(), vec![CONFORMING]).await?;
