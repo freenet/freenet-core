@@ -468,7 +468,9 @@ fn a_merge_that_only_reorders_bytes_is_named_as_an_encoding_problem() {
 
     let violation = match outcome {
         PropertyOutcome::Violated(v) => v,
-        other => panic!("expected a commutativity violation, got {other:?}"),
+        other @ (PropertyOutcome::Holds | PropertyOutcome::Inconclusive(_)) => {
+            panic!("expected a commutativity violation, got {other:?}")
+        }
     };
     assert!(
         violation.detail.contains("same bytes in a different order"),

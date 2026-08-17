@@ -317,7 +317,13 @@ impl PropertyOutcome {
     ///
     /// Diagnostics are excluded here on purpose; see [`Severity`].
     pub fn is_enforceable_violation(&self) -> bool {
-        matches!(self, PropertyOutcome::Violated(v) if v.severity == Severity::Violation)
+        // Derive the severity from the PROPERTY rather than reading the field the
+        // `Violation` carries. `Violation` is `Deserialize` with public fields and
+        // travels inside evidence, so the field is attacker-influenceable in any
+        // future that feeds wire data here; the property is not. The two agree today
+        // because `verify_case` fills the field from `property.severity()`, so this
+        // costs nothing and removes the trust dependency rather than documenting it.
+        matches!(self, PropertyOutcome::Violated(v) if v.property.severity() == Severity::Violation)
     }
 
     pub fn violation(&self) -> Option<&Violation> {

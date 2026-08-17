@@ -176,6 +176,7 @@ pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
             &outcomes,
             &mut oracle,
             &corpus.states,
+            &corpus.deltas,
         )?),
         None => None,
     };
@@ -542,7 +543,8 @@ fn write_evidence(
     parameters: &[u8],
     outcomes: &[(ConformanceCase, PropertyOutcome)],
     oracle: &mut RuntimeOracle,
-    candidates: &[Bytes],
+    state_candidates: &[Bytes],
+    delta_candidates: &[Bytes],
 ) -> anyhow::Result<EvidenceSummary> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating evidence directory {}", dir.display()))?;
@@ -560,7 +562,13 @@ fn write_evidence(
         // several MB, well over the evidence size bound, and evidence that every
         // recipient rejects is not evidence. Shrinking also makes the file a usable
         // bug report rather than two large blobs that happen to disagree.
-        let (minimized, shrink) = minimize(oracle, case, candidates, &MinimizeConfig::default());
+        let (minimized, shrink) = minimize(
+            oracle,
+            case,
+            state_candidates,
+            delta_candidates,
+            &MinimizeConfig::default(),
+        );
         shrunk_from += shrink.original_bytes;
         shrunk_to += shrink.final_bytes;
         let observed = verify_case(oracle, &minimized).violation().cloned();
@@ -976,10 +984,16 @@ mod tests {
         freenet::conformance::OutputDigest::of(b"x")
     }
 
-    fn violation(severity: Severity) -> Violation {
+    /// Build a violation for a property whose real severity is `severity`.
+    ///
+    /// Takes the property rather than forging the severity field: severity is
+    /// derived from the property now, so a `StateCommutativity` violation labelled
+    /// `Diagnostic` is a pair that cannot occur, and a test built on one was
+    /// really testing that the field is trusted.
+    fn violation_of(property: ConformanceProperty) -> Violation {
         Violation {
-            property: ConformanceProperty::StateCommutativity,
-            severity,
+            property,
+            severity: property.severity(),
             left: digest(),
             right: digest(),
             detail: "test".to_string(),
@@ -991,13 +1005,16 @@ mod tests {
     /// command, only an enforceable `Severity::Violation` finding may.
     #[test]
     fn exit_code_treats_diagnostic_violation_as_success() {
-        let outcome = PropertyOutcome::Violated(violation(Severity::Diagnostic));
+        // DeltaIdempotence is diagnostic-only: contested, and never removal-eligible.
+        let outcome =
+            PropertyOutcome::Violated(violation_of(ConformanceProperty::DeltaIdempotence));
         assert_eq!(exit_code([&outcome]), 0);
     }
 
     #[test]
     fn exit_code_treats_enforceable_violation_as_failure() {
-        let outcome = PropertyOutcome::Violated(violation(Severity::Violation));
+        let outcome =
+            PropertyOutcome::Violated(violation_of(ConformanceProperty::StateCommutativity));
         assert_eq!(exit_code([&outcome]), 1);
     }
 

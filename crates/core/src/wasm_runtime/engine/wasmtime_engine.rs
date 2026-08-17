@@ -1394,11 +1394,17 @@ impl WasmtimeEngine {
             "summarize_state",
             "get_state_delta",
         ];
+        // Fail CLOSED. Returning "nothing missing" when the store or the instance
+        // is absent reports a contract as having the full ABI without having looked,
+        // which is the one answer this function must never give: its whole purpose is
+        // to stop a module that is not a contract being read as a contract that
+        // merely could not be judged. Report the whole ABI as missing instead, so an
+        // unanswerable question surfaces as a refusal rather than as a pass.
         let Some(store) = self.store.as_mut() else {
-            return Vec::new();
+            return CONTRACT_ABI.to_vec();
         };
         let Some(instance) = self.instances.get(&handle.id) else {
-            return Vec::new();
+            return CONTRACT_ABI.to_vec();
         };
         CONTRACT_ABI
             .into_iter()

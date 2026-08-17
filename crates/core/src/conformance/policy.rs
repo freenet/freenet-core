@@ -85,7 +85,11 @@ pub fn decide(mode: EnforcementMode, outcome: &PropertyOutcome) -> ConformanceAc
         }
     };
 
-    match (mode, violation.severity) {
+    // Severity comes from the property, not from the field the `Violation` carries:
+    // the headline invariant here is that a diagnostic never proposes removal in any
+    // mode, and that invariant should not rest on the caller never handing us a
+    // deserialized `Violation`. Same expression, no trust dependency.
+    match (mode, violation.property.severity()) {
         (EnforcementMode::Disabled, _) => ConformanceAction::Nothing,
         // Diagnostics are reports in every mode, enforcement included.
         (_, Severity::Diagnostic) => ConformanceAction::Report(violation),
@@ -107,6 +111,37 @@ mod tests {
             right: OutputDigest::of(b"right"),
             detail: "test".to_string(),
         })
+    }
+
+    /// A `Violation` whose carried severity disagrees with its property must not be
+    /// able to buy itself removal eligibility.
+    ///
+    /// `Violation` is `Deserialize` with public fields and travels inside evidence,
+    /// so in any future that feeds wire data to these functions the field is
+    /// attacker-influenceable while the property is not. The invariant this module
+    /// leads with — a diagnostic never proposes removal in any mode — should hold
+    /// because of what the property IS, not because every caller can be trusted to
+    /// have built the struct honestly.
+    #[test]
+    fn a_forged_severity_cannot_make_a_diagnostic_removable() {
+        // DeltaIdempotence is a diagnostic; claim otherwise in the struct.
+        let forged = PropertyOutcome::Violated(Violation {
+            property: ConformanceProperty::DeltaIdempotence,
+            severity: Severity::Violation,
+            left: OutputDigest::of(b"left"),
+            right: OutputDigest::of(b"right"),
+            detail: "claims to be enforceable".to_string(),
+        });
+
+        assert!(
+            !forged.is_enforceable_violation(),
+            "severity must come from the property, not from the carried field"
+        );
+        assert!(
+            !decide(EnforcementMode::Enforce, &forged).removes(),
+            "a diagnostic property must not be removable even under Enforce, and even \
+             when the struct says otherwise"
+        );
     }
 
     /// The load-bearing test. If a future change makes shadow mode capable of

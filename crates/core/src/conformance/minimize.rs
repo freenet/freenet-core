@@ -66,7 +66,8 @@ pub struct MinimizeReport {
 pub fn minimize<O: ConformanceOracle + ?Sized>(
     oracle: &mut O,
     case: &ConformanceCase,
-    candidates: &[Bytes],
+    state_candidates: &[Bytes],
+    delta_candidates: &[Bytes],
     config: &MinimizeConfig,
 ) -> (ConformanceCase, MinimizeReport) {
     let original_bytes = case.input_bytes();
@@ -84,8 +85,17 @@ pub fn minimize<O: ConformanceOracle + ?Sized>(
 
     // Smallest first, so the first substitution that sticks is the best available
     // rather than merely an improvement.
-    let mut ordered: Vec<Bytes> = candidates.to_vec();
-    ordered.sort_by_key(|c| c.len());
+    //
+    // States and deltas are kept in SEPARATE pools. Sharing one pool meant a delta
+    // slot could be filled with a serialized state — bytes the contract never
+    // produced as a delta — which is exactly the "never invents inputs" promise this
+    // module opens with. A contract whose delta decoder happens to accept state bytes
+    // would then yield a witness demonstrating a law break on an input that cannot
+    // occur, and the evidence would be unfalsifiable rather than merely wrong.
+    let mut ordered_states: Vec<Bytes> = state_candidates.to_vec();
+    ordered_states.sort_by_key(|c| c.len());
+    let mut ordered_deltas: Vec<Bytes> = delta_candidates.to_vec();
+    ordered_deltas.sort_by_key(|c| c.len());
 
     let mut current = case.clone();
 
@@ -101,7 +111,7 @@ pub fn minimize<O: ConformanceOracle + ?Sized>(
             oracle,
             &mut current,
             property,
-            &ordered,
+            &ordered_states,
             config,
             &mut report,
             |case, i| &mut case.states[i],
@@ -115,7 +125,7 @@ pub fn minimize<O: ConformanceOracle + ?Sized>(
             oracle,
             &mut current,
             property,
-            &ordered,
+            &ordered_deltas,
             config,
             &mut report,
             |case, i| &mut case.deltas[i],
@@ -300,6 +310,7 @@ mod tests {
             &mut LastWriteWins,
             &big_case(),
             &candidates,
+            &candidates,
             &MinimizeConfig::default(),
         );
 
@@ -329,6 +340,7 @@ mod tests {
             &mut LastWriteWins,
             &big_case(),
             &candidates,
+            &candidates,
             &MinimizeConfig::default(),
         );
         assert!(verify_case(&mut LastWriteWins, &minimized).is_violation());
@@ -341,6 +353,7 @@ mod tests {
         let (minimized, report) = minimize(
             &mut AlwaysConforming,
             &original,
+            &candidates,
             &candidates,
             &MinimizeConfig::default(),
         );
@@ -396,8 +409,13 @@ mod tests {
         .with_deltas(vec![bytes(4096, 2), bytes(4096, 3)]);
         let candidates = vec![bytes(2, 7), bytes(2, 8)];
 
-        let (minimized, report) =
-            minimize(&mut Concat, &case, &candidates, &MinimizeConfig::default());
+        let (minimized, report) = minimize(
+            &mut Concat,
+            &case,
+            &candidates,
+            &candidates,
+            &MinimizeConfig::default(),
+        );
         assert!(
             report.final_bytes < report.original_bytes / 2,
             "the delta witness did not shrink: {report:?}"
@@ -405,11 +423,96 @@ mod tests {
         assert!(verify_case(&mut Concat, &minimized).is_violation());
     }
 
+    /// Shrinking must never move an observed STATE into a DELTA slot.
+    ///
+    /// This module opens by promising it never invents inputs, because handing a
+    /// contract bytes it never produced is the fastest route to a false positive.
+    /// One shared candidate pool quietly broke that promise: a delta slot could be
+    /// filled with a serialized state. For a contract whose delta decoder happens to
+    /// accept state bytes, the resulting witness demonstrates a law break on an input
+    /// that cannot occur — evidence that is unfalsifiable rather than merely wrong.
+    #[test]
+    fn shrinking_never_puts_a_state_into_a_delta_slot() {
+        // An append-on-delta contract: order-dependent, so
+        // DeltaPermutationInvariance fails and there is a witness to shrink.
+        struct Append;
+        impl ConformanceOracle for Append {
+            fn validate_state(
+                &mut self,
+                _state: &[u8],
+                _related: &RelatedContracts<'_>,
+            ) -> Result<ValidateResult, OracleError> {
+                Ok(ValidateResult::Valid)
+            }
+            fn update_state(
+                &mut self,
+                state: &[u8],
+                updates: &[UpdateData<'_>],
+            ) -> Result<UpdateModification<'static>, OracleError> {
+                let mut out = state.to_vec();
+                for update in updates {
+                    if let UpdateData::Delta(d) = update {
+                        out.extend_from_slice(d.as_ref());
+                    }
+                }
+                Ok(UpdateModification::valid(State::from(out)))
+            }
+            fn summarize_state(&mut self, state: &[u8]) -> Result<Vec<u8>, OracleError> {
+                Ok(state.to_vec())
+            }
+            fn get_state_delta(
+                &mut self,
+                state: &[u8],
+                _summary: &[u8],
+            ) -> Result<Vec<u8>, OracleError> {
+                Ok(state.to_vec())
+            }
+        }
+
+        // Distinct alphabets, so the origin of any surviving byte is unambiguous.
+        let state_pool = vec![bytes(4, 0xAA), bytes(8, 0xAB)];
+        let delta_pool = vec![bytes(4, 0xDD), bytes(8, 0xDE)];
+
+        let case = ConformanceCase::new(
+            ConformanceProperty::DeltaPermutationInvariance,
+            vec![bytes(4096, 1)],
+        )
+        .with_deltas(vec![bytes(4096, 2), bytes(4096, 3)]);
+
+        let (minimized, _) = minimize(
+            &mut Append,
+            &case,
+            &state_pool,
+            &delta_pool,
+            &MinimizeConfig::default(),
+        );
+
+        for (i, delta) in minimized.deltas.iter().enumerate() {
+            assert!(
+                !delta.iter().any(|b| *b == 0xAA || *b == 0xAB),
+                "delta slot {i} contains bytes from the STATE pool, i.e. an input the \
+                 contract never produced as a delta"
+            );
+        }
+        for (i, state) in minimized.states.iter().enumerate() {
+            assert!(
+                !state.iter().any(|b| *b == 0xDD || *b == 0xDE),
+                "state slot {i} contains bytes from the DELTA pool"
+            );
+        }
+    }
+
     #[test]
     fn shrinking_respects_its_attempt_budget() {
         let candidates: Vec<Bytes> = (1u8..100).map(|i| bytes(i as usize, i)).collect();
         let config = MinimizeConfig { max_attempts: 3 };
-        let (_, report) = minimize(&mut LastWriteWins, &big_case(), &candidates, &config);
+        let (_, report) = minimize(
+            &mut LastWriteWins,
+            &big_case(),
+            &candidates,
+            &candidates,
+            &config,
+        );
         assert!(
             report.attempts <= config.max_attempts,
             "shrinking ran {} verifications against a budget of {}",
@@ -431,6 +534,7 @@ mod tests {
         let (minimized, report) = minimize(
             &mut LastWriteWins,
             &original,
+            &candidates,
             &candidates,
             &MinimizeConfig::default(),
         );
