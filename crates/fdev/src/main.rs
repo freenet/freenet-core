@@ -277,6 +277,7 @@ mod tests {
             properties: Vec::new(),
             json: false,
             evidence_out: None,
+            evidence_in: None,
             bundle_out: None,
         }
     }

@@ -102,7 +102,7 @@ mod wasm_tests;
 
 pub use bundle::ReplayBundle;
 pub use capture::{CaptureHandle, Observation};
-pub use evidence::{ConformanceEvidence, EvidenceId, EvidenceRejected};
+pub use evidence::{ConformanceEvidence, EVIDENCE_SCHEMA_VERSION, EvidenceId, EvidenceRejected};
 pub use focus::FocusSelector;
 pub use generator::{GeneratorConfig, generate_cases};
 pub use minimize::{MinimizeConfig, MinimizeReport, minimize};

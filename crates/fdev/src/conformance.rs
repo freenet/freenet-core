@@ -23,9 +23,9 @@ use anyhow::Context;
 use freenet::conformance::generator::Corpus;
 use freenet::conformance::verifier::Bytes;
 use freenet::conformance::{
-    ConformanceCase, ConformanceEvidence, ConformanceProperty, GeneratorConfig, Inconclusive,
-    MinimizeConfig, OracleBuildError, PropertyOutcome, ReplayBundle, RuntimeOracle, Severity,
-    generate_cases, minimize, verify_case,
+    ConformanceCase, ConformanceEvidence, ConformanceProperty, EVIDENCE_SCHEMA_VERSION,
+    GeneratorConfig, Inconclusive, MinimizeConfig, OracleBuildError, PropertyOutcome, ReplayBundle,
+    RuntimeOracle, Severity, generate_cases, minimize, verify_case,
 };
 use freenet_stdlib::prelude::{CodeHash, ContractCode, ContractInstanceId};
 use serde::Serialize;
@@ -88,6 +88,22 @@ pub struct ConformanceConfig {
     #[arg(long = "evidence-out")]
     pub(crate) evidence_out: Option<PathBuf>,
 
+    /// Verify an evidence file someone else produced, instead of checking a
+    /// contract from scratch.
+    ///
+    /// This is the receiving half of the RFC's evidence model, and the half that
+    /// makes the model worth anything: evidence ships INPUTS, never a verdict, and
+    /// the recipient re-executes and reaches its own conclusion. Without a way to
+    /// consume one, a shipped finding has to be taken on trust — which is exactly
+    /// what the design refuses to do.
+    ///
+    /// Needs the contract, via `--wasm` or `--contract-store`. Evidence
+    /// deliberately does not carry code: a peer receiving it already hosts the
+    /// contract, and embedding WASM in every finding would make findings
+    /// expensive to pass around.
+    #[arg(long = "evidence")]
+    pub(crate) evidence_in: Option<PathBuf>,
+
     /// Save the corpus that was checked as a replay bundle at this path.
     ///
     /// Makes a run reproducible by someone else: the bundle carries the contract
@@ -99,6 +115,9 @@ pub struct ConformanceConfig {
 }
 
 pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
+    if let Some(path) = config.evidence_in.clone() {
+        return verify_evidence(&config, &path).await;
+    }
     let properties = parse_properties(&config.properties)?;
     let (wasm, parameters, corpus) = load_inputs(&config)?;
 
@@ -268,6 +287,149 @@ fn parse_properties(names: &[String]) -> anyhow::Result<Vec<ConformanceProperty>
                 })
         })
         .collect()
+}
+
+/// Re-check a finding someone else shipped, and reach an independent conclusion.
+///
+/// The one rule here is that `evidence.observed` is never trusted. It records what
+/// the discovering peer believed and exists for diagnostics only; the verdict this
+/// prints comes from re-executing the inputs locally. A recipient that believed the
+/// sender would let any peer accuse any contract, which is the failure the whole
+/// ship-inputs-not-verdicts design exists to prevent.
+///
+/// Disagreement is therefore a real outcome and is reported as one rather than
+/// being smoothed over: it means either the sender was wrong or the two runtimes
+/// differ, and both are worth knowing.
+async fn verify_evidence(config: &ConformanceConfig, path: &PathBuf) -> anyhow::Result<()> {
+    let bytes = read_file(path)?;
+    let evidence: ConformanceEvidence = bincode::deserialize(&bytes)
+        .with_context(|| format!("decoding evidence {}", path.display()))?;
+
+    // Refuse a schema this build does not know, rather than reading fields that may
+    // have changed meaning. Silently misreading evidence is worse than declining.
+    if evidence.schema_version != EVIDENCE_SCHEMA_VERSION {
+        anyhow::bail!(
+            "evidence uses schema version {}, this build understands {}",
+            evidence.schema_version,
+            EVIDENCE_SCHEMA_VERSION
+        );
+    }
+
+    // Bounds-check with the same function a receiving peer uses, so this command
+    // never accepts evidence the network itself would reject.
+    evidence
+        .check_bounds()
+        .map_err(|rejected| anyhow::anyhow!("evidence is not shippable: {rejected}"))?;
+
+    let code = match (&config.wasm, &config.contract_store) {
+        (Some(wasm), _) => read_file(wasm)?,
+        (None, Some(store)) => find_code_for_instance(store, &evidence)?,
+        (None, None) => anyhow::bail!(
+            "verifying evidence needs the contract it accuses: pass --wasm, or \
+             --contract-store pointing at a node that hosts it"
+        ),
+    };
+
+    let mut oracle = RuntimeOracle::standalone(code, evidence.parameters.clone())
+        .await
+        .map_err(describe_oracle_build_error)?;
+
+    // The contract must be the one the evidence names. Checking this is what stops
+    // a finding being replayed against a different contract and appearing to
+    // confirm or clear it.
+    if oracle.instance_id() != evidence.contract {
+        anyhow::bail!(
+            "the contract supplied is {} but the evidence is about {}",
+            oracle.instance_id(),
+            evidence.contract
+        );
+    }
+
+    let case = evidence.to_case();
+    let outcome = verify_case(&mut oracle, &case);
+
+    println!("evidence {}", evidence.id());
+    println!("  contract : {}", evidence.contract);
+    println!("  property : {}", evidence.property);
+    println!(
+        "  claimed  : {}",
+        match &evidence.observed {
+            Some(v) => format!("{} ({})", v.property, v.detail),
+            None => "nothing recorded by the sender".to_string(),
+        }
+    );
+
+    match &outcome {
+        PropertyOutcome::Violated(v) => {
+            println!(
+                "  verdict  : REPRODUCED \u{2014} {} ({})",
+                v.property, v.detail
+            );
+            if evidence
+                .observed
+                .as_ref()
+                .is_some_and(|o| o.property != v.property)
+            {
+                println!("  note     : a DIFFERENT law broke here than the sender reported");
+            }
+            if v.severity == Severity::Violation {
+                return Err(ConformanceViolations { count: 1 }.into());
+            }
+            Ok(())
+        }
+        PropertyOutcome::Holds => {
+            println!("  verdict  : NOT REPRODUCED \u{2014} the law holds on this runtime");
+            println!(
+                "  note     : the sender's runtime was {:?}; a finding that does not \
+                 reproduce must not be acted on",
+                evidence.runtime
+            );
+            Ok(())
+        }
+        PropertyOutcome::Inconclusive(reason) => {
+            println!("  verdict  : INCONCLUSIVE \u{2014} {reason}");
+            Ok(())
+        }
+    }
+}
+
+/// Find the code an evidence file's contract instance was built from.
+///
+/// Derives each candidate's instance id from (its code, the evidence's parameters)
+/// and keeps the one that matches. That is an identity check rather than a name
+/// lookup: unlike a bundle, evidence carries no code hash to address the store
+/// with, and the same code under different parameters is a different contract whose
+/// findings must never be mixed up with this one's.
+fn find_code_for_instance(store: &Path, evidence: &ConformanceEvidence) -> anyhow::Result<Vec<u8>> {
+    let params = freenet_stdlib::prelude::Parameters::from(evidence.parameters.clone());
+    let mut examined = 0usize;
+
+    for entry in std::fs::read_dir(store)
+        .with_context(|| format!("reading contract store {}", store.display()))?
+    {
+        let path = entry
+            .with_context(|| format!("listing contract store {}", store.display()))?
+            .path();
+        if !path.is_file() || path.extension().is_none_or(|ext| ext != "wasm") {
+            continue;
+        }
+        // Same versioned encoding as any store entry — see `find_code_in_store`.
+        let Ok((code, _version)) = ContractCode::load_versioned_from_path(&path) else {
+            continue;
+        };
+        examined += 1;
+        if ContractInstanceId::from_params_and_code(&params, &code) == evidence.contract {
+            return Ok(code.data().to_vec());
+        }
+    }
+
+    anyhow::bail!(
+        "no contract in {} is instance {} ({} candidate(s) examined). A peer only \
+         stores contracts it hosts, so pass --wasm if this node does not.",
+        store.display(),
+        evidence.contract,
+        examined
+    )
 }
 
 /// Find the WASM a bundle names, by looking it up in a node's contract store.
@@ -679,6 +841,67 @@ fn inconclusive_label(reason: &Inconclusive) -> &'static str {
 mod tests {
     use super::*;
     use freenet::conformance::Violation;
+
+    /// Evidence is resolved by deriving each candidate's instance id, not by name.
+    ///
+    /// The property that matters: the SAME code under DIFFERENT parameters is a
+    /// different contract, and its findings must never be attributed to this one.
+    /// A resolver that stopped at "this store contains the right code" would hand
+    /// back a contract that merges differently, and the re-execution would then
+    /// confirm or clear a finding about something else entirely.
+    #[test]
+    fn evidence_resolves_by_instance_so_parameters_cannot_be_confused() {
+        let store = tempfile::tempdir().expect("temp dir");
+        let code = b"\0asm-stand-in-bytes".to_vec();
+        let encoded = ContractCode::from(code.clone())
+            .to_bytes_versioned(freenet_stdlib::prelude::APIVersion::Version0_0_1)
+            .expect("encode versioned");
+        std::fs::write(
+            store
+                .path()
+                .join(CodeHash::from_code(&code).encode())
+                .with_extension("wasm"),
+            &encoded,
+        )
+        .expect("write store entry");
+
+        let params = vec![1, 2, 3];
+        let instance_for = |p: Vec<u8>| {
+            ContractInstanceId::from_params_and_code(
+                &freenet_stdlib::prelude::Parameters::from(p),
+                &ContractCode::from(code.clone()),
+            )
+        };
+        let case = ConformanceCase::new(
+            ConformanceProperty::StateCommutativity,
+            vec![Bytes::from(vec![1u8]), Bytes::from(vec![2u8])],
+        );
+
+        let right = ConformanceEvidence::new(instance_for(params.clone()), params, &case, None);
+        assert_eq!(
+            find_code_for_instance(store.path(), &right).expect("should resolve"),
+            code,
+            "evidence naming this instance must resolve to its code"
+        );
+
+        // Evidence whose claimed instance does not match its OWN parameters must
+        // not resolve. The instance binds code and parameters together, so this is
+        // the check that stops a forged or corrupted claim being replayed against
+        // whatever code happens to be lying around — the store here holds
+        // byte-identical WASM, and that must still not be enough.
+        //
+        // My first version of this test asserted the wrong thing: it varied the
+        // parameters and the claimed instance together, which is a perfectly
+        // consistent different contract and resolves correctly.
+        let wrong =
+            ConformanceEvidence::new(instance_for(vec![9, 9, 9]), vec![1, 2, 3], &case, None);
+        let err = find_code_for_instance(store.path(), &wrong)
+            .expect_err("a different instance must not resolve to this contract");
+        assert!(
+            err.to_string().contains("is instance"),
+            "error should name the instance it could not find, got: {err}"
+        );
+    }
 
     /// A contract store holds a VERSIONED encoding, not raw WASM: a header
     /// precedes the code. Resolving a bundle against it therefore has two ways to
