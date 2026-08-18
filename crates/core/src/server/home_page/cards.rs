@@ -1347,7 +1347,7 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
 
     format!(
         r##"<div class="card">
-            <div class="card-header"><h2>Demand-driven eviction</h2><span class="g-mode g-mode-enforce">piece A</span></div>
+            <div class="card-header"><h2>Demand-driven eviction</h2></div>
             <p class="empty" style="margin: 0.2rem 0.9rem 0.4rem; font-size: 0.82rem; color: var(--text-muted, #888);">Retention is demand-driven: contracts with the lowest predicted read-demand (keep-score) are evicted first when over budget. Since #4702 the eviction floor is min(RAM budget, disk budget) — either resource running low can trigger eviction.</p>
             <div class="g-verdict-row">
                 <div class="g-norms">
