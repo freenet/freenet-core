@@ -3303,7 +3303,17 @@ mod conformance_capture_pins {
             .expect("could not find the end of the Observation literal")
             .0;
 
-        for field in ["base_state:", "result_state:", "incoming_state,", "delta,"] {
+        // `related,` included deliberately: without it, a refactor that drops the
+        // field or hardcodes an empty vec reverts related-contract capture entirely
+        // while every pin stays green — the same failure this pin's own history
+        // records for `incoming_state`.
+        for field in [
+            "base_state:",
+            "result_state:",
+            "incoming_state,",
+            "delta,",
+            "related,",
+        ] {
             assert!(
                 literal.contains(field),
                 "capture no longer records `{field}` from the merge path; a replay \

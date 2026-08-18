@@ -1072,10 +1072,6 @@ fn generator_is_deterministic() {
     }
 }
 
-/// A case budget must narrow depth, not silently drop whole laws. If the generator
-/// emitted every commutativity case before its first associativity case, a corpus
-/// large enough to hit the budget would quietly stop checking associativity —
-/// and nothing would say so.
 /// The false positive found on the live network, kept as a permanent case.
 ///
 /// A delta is `get_state_delta(sender_state, recipient_summary)`, so two deltas
@@ -1135,6 +1131,10 @@ fn deltas_observed_against_different_bases_are_never_paired() {
     );
 }
 
+/// A case budget must narrow depth, not silently drop whole laws. If the generator
+/// emitted every commutativity case before its first associativity case, a corpus
+/// large enough to hit the budget would quietly stop checking associativity —
+/// and nothing would say so.
 #[test]
 fn a_tight_case_budget_still_covers_every_law() {
     let states: Vec<Vec<u8>> = (1u8..=12).map(|i| vec![i]).collect();

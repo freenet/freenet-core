@@ -399,6 +399,25 @@ struct TrackedContract {
     /// Keyed by instance, so a contract that references the same related contract
     /// repeatedly keeps one entry rather than a history: the verifier needs one
     /// state it can execute against, not every state that ever passed through.
+    ///
+    /// # Accepted risk: this snapshot is not aligned in time with the cases
+    ///
+    /// `to_corpus` attaches whatever related state is held here to EVERY case,
+    /// including transitions sampled hours earlier when the related contract held
+    /// something else. Inputs are pre-validated against it, so most mismatches
+    /// degrade safely to `Inconclusive::InputNotValid` — but `EmittedStateValidity`
+    /// turns a validate-Invalid on the MERGED output into a violation, so a contract
+    /// whose validity couples its own state to the related one could in principle be
+    /// accused over a pairing that never existed on the network.
+    ///
+    /// This is the same temporal-mismatch shape as the delta false positive this work
+    /// already memorialises, where the fix was to give deltas provenance and pair only
+    /// within a shared base. Related state has no such provenance yet: it is
+    /// latest-wins. The honest fix is a per-transition related snapshot in
+    /// `bundle.transitions`; until then this is a known way to be wrong, recorded
+    /// rather than discovered later. It is bounded by needing a contract whose
+    /// validity depends on related state AND a related state that changed between
+    /// capture and replay.
     related: HashMap<ContractInstanceId, Vec<u8>>,
 }
 
@@ -831,6 +850,58 @@ mod tests {
             }),
             "related state must reach the corpus as RelatedContracts, or a contract \
              that needs it still cannot be executed"
+        );
+    }
+
+    /// The TOTAL byte allowance holds, not just the per-entry one.
+    ///
+    /// Review found the total check was deletable with every other test still green:
+    /// the oversized-entry case is caught by the per-entry check, and the count tests
+    /// used states small enough that their sum never approached the limit. Without
+    /// the total, eight entries just under the per-entry bound would hold eight times
+    /// the intended allowance for one contract, and that multiplies by every tracked
+    /// contract.
+    ///
+    /// This also exercises the replacement path, where an existing entry's bytes must
+    /// be discounted from the total rather than double-counted.
+    #[tokio::test]
+    async fn the_total_related_byte_allowance_holds() {
+        let mut samplers = HashMap::new();
+        let chunk = MAX_RELATED_BYTES / 3;
+
+        // Three entries of a third of the allowance each: the third is the one that
+        // must be refused on the TOTAL, since each is individually well within the
+        // per-entry bound.
+        for i in 0..4u8 {
+            let mut observed = observation();
+            observed.related = vec![(ContractInstanceId::new([i; 32]), vec![i; chunk])];
+            record(&mut samplers, observed);
+        }
+
+        let tracked = samplers.values().next().expect("one contract tracked");
+        let held: usize = tracked.related.values().map(Vec::len).sum();
+        assert!(
+            held <= MAX_RELATED_BYTES,
+            "related state totalled {held} bytes against an allowance of {}",
+            MAX_RELATED_BYTES
+        );
+        assert!(
+            tracked.related.len() < 4,
+            "all four entries were admitted, so the total allowance is not binding"
+        );
+
+        // Replacing an existing entry must discount what it already held: offering
+        // the same id again with the same size must not push the total over.
+        let before = tracked.related.len();
+        let mut again = observation();
+        again.related = vec![(ContractInstanceId::new([0; 32]), vec![0; chunk])];
+        record(&mut samplers, again);
+        let tracked = samplers.values().next().expect("one contract tracked");
+        assert_eq!(
+            tracked.related.len(),
+            before,
+            "replacing an entry changed the number held, so its bytes were not \
+             discounted from the total"
         );
     }
 

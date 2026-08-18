@@ -21,11 +21,6 @@
 //!                                no-op, which at-least-once delivery makes fatal.
 //!   4 NONDETERMINISTIC_SUMMARY — summarize_state depends on something other than
 //!                                the state: real wall-clock time, the #4857 class.
-//!   6 REQUIRES_RELATED         — validate_state cannot decide without another
-//!                                contract's state and asks for it. The merge itself
-//!                                conforms. Proves the verifier declines rather than
-//!                                accuses when the state is missing, and reaches a
-//!                                real verdict once it is supplied.
 //!   5 CAPPED_SET               — merge caps the collection at N entries, evicting
 //!                                by something other than the merge's own ordering.
 //!                                Commutative and idempotent; only a three-state
@@ -40,6 +35,11 @@
 //!                                content changed on every re-apply — that one broke
 //!                                commutativity too, for reasons this arm does not
 //!                                reproduce.
+//!   7 REQUIRES_RELATED         — validate_state cannot decide without another
+//!                                contract's state and asks for it. The merge itself
+//!                                conforms. Proves the verifier declines rather than
+//!                                accuses when the state is missing, and reaches a
+//!                                real verdict once it is supplied.
 //!
 //! State is always a canonical byte set: sorted, strictly ascending, no
 //! duplicates. `validate_state` accepts exactly that canonical form.
@@ -195,7 +195,7 @@ impl ContractInterface for Contract {
         state: State<'static>,
         related: RelatedContracts<'static>,
     ) -> Result<ValidateResult, ContractError> {
-        // Mode 6 cannot decide alone: it needs another contract's state, as a
+        // Mode 7 cannot decide alone: it needs another contract's state, as a
         // contract enforcing an authorization or membership relation does. Asking is
         // the honest answer, and it is what makes the contract unjudgeable until the
         // capture path carries that state.
