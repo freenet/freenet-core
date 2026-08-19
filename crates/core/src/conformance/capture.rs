@@ -966,9 +966,29 @@ mod probe_wiring_pins {
         panic!("run_writer's body is not brace-balanced");
     }
 
+    /// `run_writer_body` with whole-line `//` comments removed, so a pin asserts on
+    /// CODE rather than on prose that happens to name the same thing.
+    ///
+    /// This is not hypothetical tidiness. Mutation-testing these pins caught exactly
+    /// that: the one-probe-at-a-time pin passed with the guard deleted, because the
+    /// comment a few lines above the guard quotes `in_flight.is_none()` while
+    /// explaining why it exists. The pin was matching the explanation of the thing it
+    /// was supposed to be guarding. `full_state_version_gate_pins::upsert_code_only`
+    /// in the executor solves the same problem the same way, and its reasoning applies
+    /// here too: stripping only whole-line comments can produce a false FAILURE but
+    /// never a false pass, because a real call's identifier cannot sit on a line whose
+    /// `trim_start()` begins with `//`.
+    fn run_writer_code_only() -> String {
+        run_writer_body()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn the_probe_runs_off_the_async_runtime() {
-        let body = run_writer_body();
+        let body = run_writer_code_only();
         assert!(
             body.contains("spawn_blocking("),
             "the conformance probe no longer runs on a blocking thread. It executes \
@@ -980,7 +1000,7 @@ mod probe_wiring_pins {
 
     #[test]
     fn at_most_one_probe_runs_at_a_time() {
-        let body = run_writer_body();
+        let body = run_writer_code_only();
         assert!(
             body.contains("in_flight.is_none()"),
             "the probe tick arm is no longer guarded on there being no probe in \
