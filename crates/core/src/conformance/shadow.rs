@@ -352,26 +352,55 @@ async fn probe_one(
     let cases = generate_cases(&corpus, &config);
     report.probed += 1;
 
-    let started = Instant::now();
-    for case in cases.iter().take(MAX_CASES_PER_PROBE) {
-        if started.elapsed() >= budget {
-            report.timed_out += 1;
-            break;
-        }
-
-        let outcome = verify_case(&mut oracle, case);
-        report.cases += 1;
-
-        match decide(mode, &outcome) {
-            ConformanceAction::Nothing => {
-                if matches!(outcome, PropertyOutcome::Inconclusive(_)) {
-                    report.inconclusive += 1;
-                }
+    // The WASM runs here, on a blocking thread.
+    //
+    // `.claude/rules/contracts.md` forbids executing contracts on the main async
+    // runtime, and `verify_case` drives synchronous WASM calls. Moving the probe to
+    // another TASK would not help: tasks share the worker threads, and a node sized by
+    // `available_parallelism()` has exactly one on a single-vCPU host, a supported
+    // deployment. Only the CPU-bound loop moves — building the oracle stays async on
+    // the runtime — so nothing here drives a future from a blocking thread.
+    let cases: Vec<_> = cases.into_iter().take(MAX_CASES_PER_PROBE).collect();
+    let instance_copy = *instance;
+    let joined = tokio::task::spawn_blocking(move || {
+        let mut out = ProbeOutcome::default();
+        let started = Instant::now();
+        for case in &cases {
+            if started.elapsed() >= budget {
+                out.timed_out = true;
+                break;
             }
+            let outcome = verify_case(&mut oracle, case);
+            out.cases += 1;
+            out.decisions.push(decide(mode, &outcome));
+            out.inconclusive += usize::from(matches!(outcome, PropertyOutcome::Inconclusive(_)));
+        }
+        out
+    })
+    .await;
+
+    let outcome = match joined {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            // A probe that died is not a finding about the contract.
+            tracing::warn!(%instance, error = %err, "shadow probe thread failed");
+            return;
+        }
+    };
+
+    report.cases += outcome.cases;
+    report.inconclusive += outcome.inconclusive;
+    if outcome.timed_out {
+        report.timed_out += 1;
+    }
+
+    for action in outcome.decisions {
+        match action {
+            ConformanceAction::Nothing => {}
             ConformanceAction::Report(violation) => {
                 report.reported += 1;
                 findings.push(Finding {
-                    contract: *instance,
+                    contract: instance_copy,
                     violation,
                     would_remove: false,
                 });
@@ -379,7 +408,7 @@ async fn probe_one(
             ConformanceAction::WouldRemove(violation) => {
                 report.would_remove += 1;
                 findings.push(Finding {
-                    contract: *instance,
+                    contract: instance_copy,
                     violation,
                     would_remove: true,
                 });
@@ -392,17 +421,26 @@ async fn probe_one(
             ConformanceAction::Remove(violation) => {
                 report.would_remove += 1;
                 findings.push(Finding {
-                    contract: *instance,
+                    contract: instance_copy,
                     violation,
                     would_remove: true,
                 });
             }
         }
-
-        // Yield between cases. Even on its own task a probe is best-effort,
-        // low-priority work, and must not hold a worker while real traffic waits.
-        tokio::task::yield_now().await;
     }
+}
+
+/// What one contract's blocking probe produced, carried back to the async side.
+///
+/// Decisions rather than outcomes: `PropertyOutcome` owns a `Violation`, and moving
+/// the already-made decision keeps the blocking thread from needing anything about how
+/// findings are recorded.
+#[derive(Default)]
+struct ProbeOutcome {
+    cases: usize,
+    inconclusive: usize,
+    timed_out: bool,
+    decisions: Vec<ConformanceAction>,
 }
 
 /// Read this peer's focus salt, creating one if it does not exist.

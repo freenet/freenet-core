@@ -491,22 +491,15 @@ async fn run_writer(
                 } else {
                     let store = contract_store().cloned();
                     let mode = shadow.mode();
-                    // `spawn_blocking`, not `spawn`. `.claude/rules/contracts.md` is
-                    // explicit that contracts must not execute on the main async
-                    // runtime, and a probe is contract execution: `verify_case` drives
-                    // synchronous WASM calls, and building the oracle compiles a
-                    // module. Moving it to another TASK does not help — that task runs
-                    // on the same worker threads, and a node sized by
-                    // `available_parallelism()` has exactly one of them on a
-                    // single-vCPU host, which is a supported deployment. A blocking
-                    // thread is what keeps "conformance never delays synchronization"
-                    // true rather than merely intended.
-                    in_flight = Some(tokio::task::spawn_blocking(move || {
-                        // The probe is async only because building the oracle is;
-                        // driving it here keeps all of its WASM on this thread.
-                        tokio::runtime::Handle::current()
-                            .block_on(crate::conformance::shadow::probe(work, store, mode))
-                    }));
+                    // An ordinary task: `probe` puts its own WASM execution on a
+                    // blocking thread internally (see `shadow::probe_one`). Doing the
+                    // hop there rather than here keeps the async work — building the
+                    // oracle — on the runtime, and avoids driving a future with
+                    // `Handle::block_on` from a blocking thread, which is subtle on a
+                    // current-thread runtime whose driver lives elsewhere.
+                    in_flight = Some(tokio::spawn(crate::conformance::shadow::probe(
+                        work, store, mode,
+                    )));
                 }
             }
             Some(finished) = async {
@@ -986,9 +979,17 @@ mod probe_wiring_pins {
             .join("\n")
     }
 
+    /// The probe's WASM must run on a blocking thread. The hop lives inside
+    /// `shadow::probe_one`, not here, so this pin reads that module rather than
+    /// `run_writer` — a pin that checked the wrong file would be worse than none.
     #[test]
     fn the_probe_runs_off_the_async_runtime() {
-        let body = run_writer_code_only();
+        let src = include_str!("shadow.rs");
+        let body = src
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             body.contains("spawn_blocking("),
             "the conformance probe no longer runs on a blocking thread. It executes \
