@@ -67,33 +67,27 @@ fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Every raw byte the runtime hands back to the driving client, concatenated.
+/// Every byte the runtime hands back to the driving client, as one buffer.
 ///
-/// Two variants reach the client from a delegate hop. `contract.rs` filters only
-/// `SendDelegateMessage` from the target's output; both `ApplicationMessage` and
-/// `ContextUpdated` pass through into the client's `values`. Scanning only the
-/// first would leave the second as an unchecked channel.
+/// Serialises the WHOLE response rather than picking out variants. That is
+/// deliberate: `contract.rs:1036-1039` filters only `SendDelegateMessage` from the
+/// target's output and forwards **everything else** — `ApplicationMessage`,
+/// `ContextUpdated`, `RequestUserInput` and all four contract-request variants,
+/// each of which carries a `context` field that could hold the payload. An
+/// earlier revision enumerated two of those seven and silently missed the rest.
+///
+/// Serialising also means a variant added to `OutboundDelegateMsg` in future is
+/// covered automatically, where a match with a `_ => {}` arm would quietly not be.
 ///
 /// `ContextUpdated` is ORDER-DEPENDENT, which is easy to get wrong when writing a
-/// test for it. Emitted BEFORE a terminal message it is consumed by
+/// mutation for it. Emitted BEFORE a terminal message it is consumed by
 /// `process_outbound` to update the delegate's own stored context
 /// (`wasm_runtime/delegate/execution.rs:393`) and never reaches the client.
 /// Emitted AFTER one it goes out through the drain path (`execution.rs:69-74`)
 /// and does reach the client. Only the second ordering is a leak, and a mutation
 /// written the first way passes while proving nothing.
-///
-/// Concatenating matters too: scanning each message separately misses a payload
-/// split across two messages, since no single one then holds the whole run.
 fn client_visible_bytes(values: &[OutboundDelegateMsg]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for m in values {
-        match m {
-            OutboundDelegateMsg::ApplicationMessage(msg) => out.extend_from_slice(&msg.payload),
-            OutboundDelegateMsg::ContextUpdated(ctx) => out.extend_from_slice(ctx.as_ref()),
-            _ => {}
-        }
-    }
-    out
+    bincode::serialize(values).expect("OutboundDelegateMsg is serializable")
 }
 
 /// Smallest run of secret bytes whose appearance counts as a leak.
