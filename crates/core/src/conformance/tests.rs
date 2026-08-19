@@ -780,6 +780,36 @@ fn states_the_contract_rejects_are_never_evidence() {
     );
 }
 
+/// `EmittedStateValidity` is the one property that turns a validate-Invalid into a
+/// violation, so it is the one that has to be provably gated on the inputs.
+///
+/// This is load-bearing for a claim made in `capture.rs`: that latest-wins related
+/// state cannot produce a false accusation, because every input is validated against
+/// the SAME related state the property then uses, so the only route to a violation is
+/// a contract emitting a state it rejects after accepting both inputs. That argument
+/// is only as good as the pre-validation loop in `verify_case`, and nothing pinned it
+/// for this property.
+///
+/// The fake is arranged so that deleting the gate does not merely change the verdict,
+/// it produces the false accusation itself: the input `[3, 1]` is non-canonical and
+/// the merge emits it back, so an ungated run reports `Violated` against a contract
+/// that was never asked a fair question.
+#[test]
+fn emitted_state_validity_is_gated_on_the_inputs_being_valid() {
+    let mut fake = Fake::conforming().merging(|_a, _b| Ok(vec![3, 1]));
+
+    assert_inconclusive(
+        verify_case(
+            &mut fake,
+            &case(
+                ConformanceProperty::EmittedStateValidity,
+                &[&[3, 1], &[2, 3]],
+            ),
+        ),
+        Inconclusive::InputNotValid,
+    );
+}
+
 /// Running out of fuel means we never saw the answer. It must not read as a defect,
 /// or a contract could be removed for being slow on a busy peer.
 #[test]
@@ -1070,6 +1100,65 @@ fn generator_is_deterministic() {
         assert_eq!(a.property, b.property);
         assert_eq!(a.states, b.states);
     }
+}
+
+/// The false positive found on the live network, kept as a permanent case.
+///
+/// A delta is `get_state_delta(sender_state, recipient_summary)`, so two deltas
+/// observed against DIFFERENT bases can be causally sequenced: the later one computed
+/// from a state that already contains the earlier one's effect. Permuting those asks
+/// what happens in a situation the protocol never produces, and the answer is not a
+/// property of the contract.
+///
+/// This is not hypothetical. Replaying a live capture reported a
+/// `DeltaPermutationInvariance` violation against a real contract, and it came from
+/// exactly such a pair; the finding did not survive once pairing was restricted to a
+/// shared base. RFC #5320 requires every false positive to become a permanent
+/// regression case, and this is that case — without it, reverting the rule would
+/// silently restore the accusation, because every other test supplies deltas that
+/// share a base or none at all.
+#[test]
+fn deltas_observed_against_different_bases_are_never_paired() {
+    let base_one: Bytes = Arc::from([1u8, 2].as_slice());
+    let base_two: Bytes = Arc::from([3u8, 4].as_slice());
+
+    let corpus = Corpus {
+        deltas: vec![Arc::from([9u8].as_slice()), Arc::from([7u8].as_slice())],
+        // Same two deltas, but each seen against a different state.
+        delta_bases: vec![Some(base_one), Some(base_two)],
+        ..Corpus::from_states(vec![vec![1, 2], vec![3, 4]])
+    };
+
+    let cases = generate_cases(&corpus, &GeneratorConfig::default());
+    let permutation_cases = cases
+        .iter()
+        .filter(|c| c.property == ConformanceProperty::DeltaPermutationInvariance)
+        .count();
+
+    assert_eq!(
+        permutation_cases, 0,
+        "deltas seen against different bases must not be paired: they may be causally \
+         sequenced, and permuting them accuses contracts of an order-dependence the \
+         network never exercises"
+    );
+
+    // And the guard must not be so blunt that it stops the check working at all:
+    // the same deltas sharing a base ARE a legitimate pair.
+    let shared: Bytes = Arc::from([1u8, 2].as_slice());
+    let paired = Corpus {
+        deltas: vec![Arc::from([9u8].as_slice()), Arc::from([7u8].as_slice())],
+        delta_bases: vec![Some(shared.clone()), Some(shared)],
+        ..Corpus::from_states(vec![vec![1, 2], vec![3, 4]])
+    };
+    let paired_cases = generate_cases(&paired, &GeneratorConfig::default())
+        .iter()
+        .filter(|c| c.property == ConformanceProperty::DeltaPermutationInvariance)
+        .count();
+    assert!(
+        paired_cases > 0,
+        "deltas sharing a base are the genuine concurrent-update case and must still \
+         be checked, or the fix has simply disabled the property"
+    );
 }
 
 /// A case budget must narrow depth, not silently drop whole laws. If the generator

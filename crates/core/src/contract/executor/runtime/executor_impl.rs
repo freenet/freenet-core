@@ -1559,41 +1559,94 @@ where
         // stall a merge — capture losing observations is always preferable to
         // synchronization queueing behind it.
         if let Some(capture) = crate::conformance::capture::global() {
-            let (incoming_state, delta) = updates.iter().fold((None, None), |acc, update| {
+            // Measure first, copy later.
+            //
+            // Everything below this point that costs an allocation happens inside the
+            // `observe_with` closure, which runs only after a queue slot and byte
+            // budget are secured. An earlier version computed the incoming state,
+            // delta and related payloads BEFORE the budget check and then claimed in
+            // a comment that no byte was copied before it — which was false for
+            // exactly the three largest fields, and worst for related state, since
+            // that carries another contract's whole state. Under sustained load with
+            // a full queue, that made the drop path pay full allocate-and-copy on the
+            // merge path, which is the cost this ordering exists to avoid.
+            let mut incoming_len = 0usize;
+            let mut delta_len = 0usize;
+            let mut related_len = 0usize;
+            for update in updates {
                 match update {
-                    UpdateData::State(state) => (Some(state.as_ref().to_vec()), acc.1),
-                    UpdateData::Delta(delta) => (acc.0, Some(delta.as_ref().to_vec())),
+                    UpdateData::State(state) => incoming_len = state.as_ref().len(),
+                    UpdateData::Delta(delta) => delta_len = delta.as_ref().len(),
                     UpdateData::StateAndDelta { state, delta } => {
-                        (Some(state.as_ref().to_vec()), Some(delta.as_ref().to_vec()))
+                        incoming_len = state.as_ref().len();
+                        delta_len = delta.as_ref().len();
                     }
-                    // Related-contract payloads describe a different contract's
-                    // state, so they are not part of this transition.
-                    UpdateData::RelatedState { .. }
-                    | UpdateData::RelatedDelta { .. }
-                    | UpdateData::RelatedStateAndDelta { .. }
-                    | _ => acc,
+                    UpdateData::RelatedState { state, .. }
+                    | UpdateData::RelatedStateAndDelta { state, .. } => {
+                        related_len += state.as_ref().len();
+                    }
+                    UpdateData::RelatedDelta { .. } => {}
+                    // `UpdateData` is `#[non_exhaustive]`. A future variant carrying
+                    // related state would be missed here and in the closure below;
+                    // both sites are marked so the pair is updated together.
+                    // AUDIT: new Related* variant -> update both match sites.
+                    _ => {}
                 }
-            });
-            // `observe_with` secures a queue slot BEFORE the closure runs, so the
-            // copies below are paid for only when there is somewhere to put them.
-            // Building the observation first would make the drop path the most
-            // expensive path, on the merge path, exactly under the load that causes
-            // drops.
-            // Size the observation from the slices already in hand, so the byte
-            // budget is enforced before a single byte is copied.
+            }
+
             let size_hint = parameters.as_ref().len()
                 + current_state.as_ref().len()
                 + new_state.as_ref().len()
-                + incoming_state.as_ref().map_or(0, Vec::len)
-                + delta.as_ref().map_or(0, Vec::len);
-            capture.observe_with(size_hint, || crate::conformance::capture::Observation {
-                contract: *key.id(),
-                code_hash: crate::conformance::capture::code_hash_of(key),
-                parameters: parameters.as_ref().to_vec(),
-                base_state: current_state.as_ref().to_vec(),
-                incoming_state,
-                delta,
-                result_state: new_state.as_ref().to_vec(),
+                + incoming_len
+                + delta_len
+                + related_len;
+
+            capture.observe_with(size_hint, || {
+                let (incoming_state, delta) = updates.iter().fold((None, None), |acc, update| {
+                    match update {
+                        UpdateData::State(state) => (Some(state.as_ref().to_vec()), acc.1),
+                        UpdateData::Delta(delta) => (acc.0, Some(delta.as_ref().to_vec())),
+                        UpdateData::StateAndDelta { state, delta } => {
+                            (Some(state.as_ref().to_vec()), Some(delta.as_ref().to_vec()))
+                        }
+                        // Related payloads are not part of THIS transition; they are
+                        // collected separately below as the context the contract needs
+                        // to execute at all.
+                        UpdateData::RelatedState { .. }
+                        | UpdateData::RelatedDelta { .. }
+                        | UpdateData::RelatedStateAndDelta { .. }
+                        | _ => acc,
+                    }
+                });
+
+                // Only full states: a related DELTA cannot be applied without the
+                // state it is relative to, which this peer may not hold.
+                // AUDIT: new Related* variant -> update both match sites.
+                let related: Vec<(ContractInstanceId, Vec<u8>)> = updates
+                    .iter()
+                    .filter_map(|update| match update {
+                        UpdateData::RelatedState { related_to, state }
+                        | UpdateData::RelatedStateAndDelta {
+                            related_to, state, ..
+                        } => Some((*related_to, state.as_ref().to_vec())),
+                        UpdateData::State(_)
+                        | UpdateData::Delta(_)
+                        | UpdateData::StateAndDelta { .. }
+                        | UpdateData::RelatedDelta { .. }
+                        | _ => None,
+                    })
+                    .collect();
+
+                crate::conformance::capture::Observation {
+                    contract: *key.id(),
+                    code_hash: crate::conformance::capture::code_hash_of(key),
+                    parameters: parameters.as_ref().to_vec(),
+                    base_state: current_state.as_ref().to_vec(),
+                    incoming_state,
+                    delta,
+                    result_state: new_state.as_ref().to_vec(),
+                    related,
+                }
             });
         }
 
@@ -3250,13 +3303,73 @@ mod conformance_capture_pins {
             .expect("could not find the end of the Observation literal")
             .0;
 
-        for field in ["base_state:", "result_state:", "incoming_state,", "delta,"] {
+        // `related,` included deliberately: without it, a refactor that drops the
+        // field or hardcodes an empty vec reverts related-contract capture entirely
+        // while every pin stays green — the same failure this pin's own history
+        // records for `incoming_state`.
+        for field in [
+            "base_state:",
+            "result_state:",
+            "incoming_state,",
+            "delta,",
+            "related,",
+        ] {
             assert!(
                 literal.contains(field),
                 "capture no longer records `{field}` from the merge path; a replay \
                  bundle missing part of the transition cannot reproduce it"
             );
         }
+    }
+
+    /// Nothing may be copied before the byte budget is checked.
+    ///
+    /// The sampler side of this is already pinned: `observe_with` provably does not
+    /// invoke its builder once the queue or byte budget is exhausted
+    /// (`a_full_queue_skips_building_the_observation_entirely`). What that test cannot
+    /// see is the CALL SITE. An earlier version of this hook computed the incoming
+    /// state, delta and related payloads BEFORE calling `observe_with`, so the copies
+    /// happened unconditionally whenever capture was enabled — queue full or not —
+    /// while the comment above them claimed the opposite. Moving them back would
+    /// restore that bug with every existing test green, including both pins in this
+    /// module, because the `Observation` literal would be unchanged and the hook would
+    /// still not await.
+    ///
+    /// Related state is the reason this matters more since related-contract capture:
+    /// it can carry another contract's entire state, so the drop path would pay the
+    /// largest copy of the three, on the merge path, under exactly the load that
+    /// causes drops.
+    #[test]
+    fn nothing_is_copied_before_the_budget_check() {
+        let body = attempt_state_update_body();
+        let hook_start = body
+            .find("if let Some(capture) =")
+            .expect("capture hook not found in attempt_state_update");
+        let hook = &body[hook_start..];
+        let (before_budget, inside_closure) = hook
+            .split_once("capture.observe_with(")
+            .expect("the capture hook no longer routes through observe_with");
+
+        for alloc in [".to_vec()", ".to_owned()", ".clone()"] {
+            assert!(
+                !before_budget.contains(alloc),
+                "the capture hook calls `{alloc}` before `observe_with`, so the copy \
+                 happens whether or not a queue slot and byte budget are secured. \
+                 Measure lengths from the slices already held, and do every \
+                 allocation inside the `observe_with` closure, which runs only after \
+                 the budget check"
+            );
+        }
+
+        // Guard against passing vacuously: if the copies were deleted outright rather
+        // than moved, the loop above would also be satisfied. Both spellings count,
+        // so a refactor from one to the other does not fail here claiming the copies
+        // are gone — which is what the first version of this guard did.
+        assert!(
+            inside_closure.contains(".to_vec()") || inside_closure.contains(".to_owned()"),
+            "no copies remain inside the `observe_with` closure, so this pin would \
+             pass for a hook that records nothing at all"
+        );
     }
 
     /// The executor must never wait on capture. A slow or stuck writer would

@@ -105,6 +105,18 @@ const OBSERVATION_QUEUE: usize = 256;
 /// exhaust memory" is no by construction rather than by argument.
 const MAX_QUEUED_BYTES: usize = 8 * 1024 * 1024;
 
+/// Upper bound on related-contract state retained per tracked contract.
+///
+/// Related state gets its OWN allowance rather than sharing the per-contract
+/// sample budget. Sharing would let a contract with large related state crowd out
+/// the very samples the related state exists to make checkable, which is a silly
+/// way to lose. Small, because one recent state per related contract is enough to
+/// execute against — this is context, not a corpus.
+const MAX_RELATED_BYTES: usize = 512 * 1024;
+
+/// Upper bound on distinct related contracts retained per tracked contract.
+const MAX_RELATED_CONTRACTS: usize = 8;
+
 /// Upper bound on contracts sampled concurrently.
 const MAX_TRACKED_CONTRACTS: usize = 64;
 
@@ -138,6 +150,16 @@ pub struct Observation {
     pub incoming_state: Option<Vec<u8>>,
     pub delta: Option<Vec<u8>>,
     pub result_state: Vec<u8>,
+    /// State of other contracts this merge referenced.
+    ///
+    /// A contract whose `validate_state` needs another contract's state cannot be
+    /// checked at all without it: the verifier reports
+    /// [`Inconclusive::RelatedRequired`](super::property::Inconclusive) and reaches
+    /// no verdict. That is honest but useless, and it applies to a whole class of
+    /// contract rather than to an unlucky one. The states arrive alongside the
+    /// update the contract is being asked to apply, so recording them costs a copy
+    /// and no lookup.
+    pub related: Vec<(ContractInstanceId, Vec<u8>)>,
 }
 
 impl Observation {
@@ -148,6 +170,11 @@ impl Observation {
             + self.incoming_state.as_ref().map_or(0, Vec::len)
             + self.delta.as_ref().map_or(0, Vec::len)
             + self.result_state.len()
+            + self
+                .related
+                .iter()
+                .map(|(_, state)| state.len())
+                .sum::<usize>()
     }
 }
 
@@ -367,6 +394,38 @@ struct TrackedContract {
     /// refusing rather than being inferred later from an empty result, because an
     /// empty corpus has several possible causes and they need telling apart.
     refused_too_large: u64,
+    /// Most recent state seen for each related contract this one referenced.
+    ///
+    /// Keyed by instance, so a contract that references the same related contract
+    /// repeatedly keeps one entry rather than a history: the verifier needs one
+    /// state it can execute against, not every state that ever passed through.
+    ///
+    /// # Why latest-wins is sound, and what it costs
+    ///
+    /// `to_corpus` attaches whatever related state is held here to EVERY case,
+    /// including transitions sampled hours earlier when the related contract held
+    /// something else. That looks like the temporal-mismatch shape of the delta false
+    /// positive this work memorialises, where the fix was provenance. It is not, and
+    /// the difference is worth stating so nobody re-derives the wrong conclusion:
+    ///
+    /// `verify_case` validates EVERY input state against `case.related` before any
+    /// property runs, and that is the SAME related state the property then uses. So
+    /// the only way to reach a violation is `validate(A, R)` and `validate(B, R)` both
+    /// Valid while `validate(merge(A, B), R)` is Invalid — the contract emitting a
+    /// state it rejects, under a related state it accepted both inputs against. `R`
+    /// was observed on this node, so it is reachable, and related contracts propagate
+    /// independently of this one, so a peer holding `A` can be seeing `R` when `B`
+    /// arrives. A contract that couples its own validity to the related state has that
+    /// coupling enforced in the input check, which degrades to
+    /// `Inconclusive::InputNotValid` rather than accusing. Deltas had no such gate,
+    /// which is precisely why they needed provenance and this does not.
+    ///
+    /// What latest-wins does cost is COVERAGE, not soundness. When the one state held
+    /// here does not validate the inputs, the case reaches no verdict at all. If
+    /// shadow-mode data shows related-dependent contracts sitting at Inconclusive in
+    /// bulk, the cheap answer is to hold the last few distinct related states and let
+    /// the verifier try each, rather than a per-transition snapshot.
+    related: HashMap<ContractInstanceId, Vec<u8>>,
 }
 
 /// Rebuild samplers from the bundles already in the capture directory.
@@ -421,6 +480,11 @@ fn reload(dir: &Path) -> HashMap<ContractInstanceId, TrackedContract> {
             TrackedContract {
                 sampler,
                 code_hash,
+                related: {
+                    let mut restored = HashMap::new();
+                    admit_related(&mut restored, &bundle.related);
+                    restored
+                },
                 parameters: bundle.parameters,
                 // Not persisted in the bundle: this counts what THIS process
                 // refused, and a reloaded corpus has no refusals of its own yet.
@@ -446,7 +510,10 @@ fn record(samplers: &mut HashMap<ContractInstanceId, TrackedContract>, observati
             code_hash: observation.code_hash,
             parameters: observation.parameters.clone(),
             refused_too_large: 0,
+            related: HashMap::new(),
         });
+
+    admit_related(&mut tracked.related, &observation.related);
 
     let admission = tracked.sampler.observe_transition(
         &observation.base_state,
@@ -457,6 +524,42 @@ fn record(samplers: &mut HashMap<ContractInstanceId, TrackedContract>, observati
     );
     if matches!(admission, Admission::TooLarge) {
         tracked.refused_too_large += 1;
+    }
+}
+
+/// Admit related-contract states into a tracked contract, within the allowance.
+///
+/// Shared by `record` and `reload` on purpose. Everything else a reload restores goes
+/// back through the sampler's own admission checks, so it is self-correcting: a
+/// bundle written under looser limits is trimmed to what the current build allows.
+/// Related state was the one field that skipped that and was collected raw, so a
+/// bundle from a looser build — or an edited one, since nothing bounds the vector on
+/// disk — loaded straight past today's limits. One function, called from both paths,
+/// is what stops the two rules drifting again.
+///
+/// Both bounds refuse rather than evict: a contract referencing a hundred others must
+/// not be able to churn this map, and states already retained are more useful than an
+/// arbitrary newcomer.
+fn admit_related(
+    held: &mut HashMap<ContractInstanceId, Vec<u8>>,
+    offered: &[(ContractInstanceId, Vec<u8>)],
+) {
+    for (instance, state) in offered {
+        if state.len() > MAX_RELATED_BYTES {
+            continue;
+        }
+        if !held.contains_key(instance) && held.len() >= MAX_RELATED_CONTRACTS {
+            continue;
+        }
+        let total: usize = held.values().map(Vec::len).sum();
+        // Subtracting what this entry already holds cannot underflow: `replacing` is
+        // non-zero only when the instance is already a key, in which case its length
+        // is part of `total`.
+        let replacing = held.get(instance).map_or(0, Vec::len);
+        if total - replacing + state.len() > MAX_RELATED_BYTES {
+            continue;
+        }
+        held.insert(*instance, state.clone());
     }
 }
 
@@ -483,6 +586,18 @@ async fn write_all(
                 .sampler
                 .to_bundle(None, Some(tracked.code_hash), tracked.parameters.clone());
         bundle.instance = Some(*instance);
+        // Carried so a replay can execute a contract whose validity depends on
+        // another contract. `to_corpus` turns these back into `RelatedContracts`.
+        // Sorted by instance, so a bundle's bytes do not depend on hash iteration
+        // order. The corpus is written repeatedly and compared across runs; a file
+        // that differs only by map ordering wastes everyone's time.
+        let mut related: Vec<(ContractInstanceId, Vec<u8>)> = tracked
+            .related
+            .iter()
+            .map(|(id, state)| (*id, state.clone()))
+            .collect();
+        related.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        bundle.related = related;
         bundle.note = Some(format!(
             "captured by freenet {} ({} observation(s) dropped node-wide)",
             env!("CARGO_PKG_VERSION"),
@@ -570,6 +685,7 @@ mod tests {
             incoming_state: Some(vec![2, 3]),
             delta: None,
             result_state: vec![1, 2, 3],
+            related: Vec::new(),
         }
     }
 
@@ -702,6 +818,182 @@ mod tests {
             handle.dropped() >= 4,
             "the refusals should be counted, saw {}",
             handle.dropped()
+        );
+    }
+
+    /// Related-contract state survives capture and comes back out of the bundle.
+    ///
+    /// A contract whose `validate_state` depends on another contract cannot be
+    /// checked at all without that state: the verifier reaches no verdict and says
+    /// `RelatedRequired`. That is honest, and it applies to a whole class of contract
+    /// rather than to an unlucky one, so the capture path has to carry it.
+    #[tokio::test]
+    async fn related_contract_state_is_captured_and_replayable() {
+        let related_id = ContractInstanceId::new([9; 32]);
+        let mut observed = observation();
+        observed.related = vec![(related_id, vec![42, 43])];
+
+        let mut samplers = HashMap::new();
+        record(&mut samplers, observed);
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        write_all(dir.path(), &samplers, 0).await;
+
+        let path = dir
+            .path()
+            .join(format!("{}.bundle", ContractInstanceId::new([1; 32])));
+        let bundle = super::super::bundle::ReplayBundle::read_from(&path).expect("read back");
+        assert_eq!(
+            bundle.related,
+            vec![(related_id, vec![42, 43])],
+            "the bundle must carry the related state the merge referenced"
+        );
+
+        // And it has to arrive where the verifier looks for it, not merely be stored.
+        let corpus = bundle.to_corpus();
+        assert!(
+            corpus.related.states().any(|(id, state)| {
+                *id == related_id && state.as_ref().map(|s| s.as_ref()) == Some(&[42u8, 43][..])
+            }),
+            "related state must reach the corpus as RelatedContracts, or a contract \
+             that needs it still cannot be executed"
+        );
+    }
+
+    /// The TOTAL byte allowance holds, not just the per-entry one.
+    ///
+    /// Review found the total check was deletable with every other test still green:
+    /// the oversized-entry case is caught by the per-entry check, and the count tests
+    /// used states small enough that their sum never approached the limit. Without
+    /// the total, eight entries just under the per-entry bound would hold eight times
+    /// the intended allowance for one contract, and that multiplies by every tracked
+    /// contract.
+    ///
+    /// This also exercises the replacement path, where an existing entry's bytes must
+    /// be discounted from the total rather than double-counted.
+    #[tokio::test]
+    async fn the_total_related_byte_allowance_holds() {
+        let mut samplers = HashMap::new();
+        let chunk = MAX_RELATED_BYTES / 3;
+
+        // Three entries of a third of the allowance each: the third is the one that
+        // must be refused on the TOTAL, since each is individually well within the
+        // per-entry bound.
+        for i in 0..4u8 {
+            let mut observed = observation();
+            observed.related = vec![(ContractInstanceId::new([i; 32]), vec![i; chunk])];
+            record(&mut samplers, observed);
+        }
+
+        let tracked = samplers.values().next().expect("one contract tracked");
+        let held: usize = tracked.related.values().map(Vec::len).sum();
+        assert!(
+            held <= MAX_RELATED_BYTES,
+            "related state totalled {held} bytes against an allowance of {}",
+            MAX_RELATED_BYTES
+        );
+        assert!(
+            tracked.related.len() < 4,
+            "all four entries were admitted, so the total allowance is not binding"
+        );
+
+        // Replacing an existing entry must discount what it already held: offering
+        // the same id again with the same size must not push the total over.
+        let before = tracked.related.len();
+        let mut again = observation();
+        again.related = vec![(ContractInstanceId::new([0; 32]), vec![0; chunk])];
+        record(&mut samplers, again);
+        let tracked = samplers.values().next().expect("one contract tracked");
+        assert_eq!(
+            tracked.related.len(),
+            before,
+            "replacing an entry changed the number held, so its bytes were not \
+             discounted from the total"
+        );
+    }
+
+    /// A bundle on disk cannot smuggle more related state than today's bounds allow.
+    ///
+    /// Everything else a reload restores goes back through the sampler's admission
+    /// checks, so it is self-correcting: a corpus written by a build with looser
+    /// limits is trimmed to what this build permits. Related state was the one field
+    /// collected raw, and nothing bounds that vector on disk, so a bundle from a
+    /// looser build — or an edited one — loaded straight past the current limits.
+    #[tokio::test]
+    async fn a_reloaded_bundle_cannot_exceed_the_related_bounds() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let instance = ContractInstanceId::new([1; 32]);
+
+        // Hand-build a bundle carrying far more related state than the bounds allow,
+        // as a looser build or an edit would produce.
+        let mut bundle = super::super::bundle::ReplayBundle::new(vec![9, 9], vec![3]);
+        bundle.instance = Some(instance);
+        bundle.states = vec![vec![1, 2], vec![2, 3]];
+        bundle.related = (0..(MAX_RELATED_CONTRACTS + 6))
+            .map(|i| (ContractInstanceId::new([i as u8; 32]), vec![i as u8; 32]))
+            .collect();
+        bundle
+            .write_to(&dir.path().join(format!("{instance}.bundle")))
+            .expect("write bundle");
+
+        let samplers = reload(dir.path());
+        let tracked = samplers
+            .values()
+            .next()
+            .expect("the bundle should have been reloaded");
+
+        assert!(
+            tracked.related.len() <= MAX_RELATED_CONTRACTS,
+            "reload admitted {} related contracts, over the cap of {}",
+            tracked.related.len(),
+            MAX_RELATED_CONTRACTS
+        );
+        assert!(
+            tracked.related.values().map(Vec::len).sum::<usize>() <= MAX_RELATED_BYTES,
+            "reload admitted more related bytes than the allowance"
+        );
+    }
+
+    /// Related state is bounded, and refuses rather than evicting.
+    ///
+    /// It has its own allowance rather than sharing the sample budget: sharing would
+    /// let a contract with large related state crowd out the very samples the related
+    /// state exists to make checkable.
+    #[tokio::test]
+    async fn related_contract_state_is_bounded() {
+        let mut samplers = HashMap::new();
+
+        // More distinct related contracts than the cap allows.
+        for i in 0..(MAX_RELATED_CONTRACTS + 4) {
+            let mut observed = observation();
+            observed.related = vec![(ContractInstanceId::new([i as u8; 32]), vec![i as u8; 16])];
+            record(&mut samplers, observed);
+        }
+        let tracked = samplers.values().next().expect("one contract tracked");
+        assert!(
+            tracked.related.len() <= MAX_RELATED_CONTRACTS,
+            "related contracts must be capped, held {}",
+            tracked.related.len()
+        );
+
+        // A single oversized related state is refused outright rather than
+        // displacing everything already held.
+        let held_before = tracked.related.len();
+        let mut huge = observation();
+        huge.related = vec![(
+            ContractInstanceId::new([200; 32]),
+            vec![0u8; MAX_RELATED_BYTES + 1],
+        )];
+        record(&mut samplers, huge);
+        let tracked = samplers.values().next().expect("one contract tracked");
+        assert_eq!(
+            tracked.related.len(),
+            held_before,
+            "an oversized related state must be refused, not admitted or swapped in"
+        );
+        assert!(
+            tracked.related.values().map(Vec::len).sum::<usize>() <= MAX_RELATED_BYTES,
+            "the related-state allowance must hold"
         );
     }
 
