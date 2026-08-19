@@ -40,6 +40,12 @@ pub enum BundleError {
     #[error("bundle carries no contract code and none was supplied separately")]
     MissingCode,
     #[error(
+        "this node's contract store has no code for the bundle's contract (looked \
+         for {path}). A peer only stores contracts it hosts, so a capture replayed \
+         on a different node may need the WASM supplied directly."
+    )]
+    NotInStore { path: String },
+    #[error(
         "bundle names no contract (code_hash is absent), so the corpus cannot be \
          tied to any WASM and replaying it would check an unrelated contract"
     )]
@@ -119,6 +125,51 @@ impl ReplayBundle {
             related: Vec::new(),
             note: None,
         }
+    }
+
+    /// Resolve this bundle's code from a node's contract store.
+    ///
+    /// A bundle names its contract by hash and deliberately does not embed the WASM,
+    /// so a corpus of many contracts stays small. That makes the store lookup the
+    /// weakest link in the whole capture-and-replay loop, and it has exactly one
+    /// trap, which is why this lives here rather than being written out at each call
+    /// site: **a store file is a versioned encoding**, forty bytes of header followed
+    /// by the code, and only the code is hashed. Reading the file's bytes and hashing
+    /// them can never match, and the failure is silent, because "hash does not match"
+    /// is indistinguishable from "this node never hosted that contract".
+    /// `ContractCode::load_versioned_from_path` is the reader that gets this right.
+    pub fn resolve_code_from_store(&self, store: &Path) -> Result<Vec<u8>, BundleError> {
+        let Some(hash) = self.code_hash else {
+            return Err(BundleError::UnidentifiedContract);
+        };
+        let path = store
+            .join(freenet_stdlib::prelude::CodeHash::new(hash).encode())
+            .with_extension("wasm");
+        if !path.exists() {
+            return Err(BundleError::NotInStore {
+                path: path.display().to_string(),
+            });
+        }
+        let (code, _version) =
+            freenet_stdlib::prelude::ContractCode::load_versioned_from_path(&path)
+                .map_err(|e| BundleError::Decode(e.to_string()))?;
+
+        // Hash-named is not hash-verified. The file is NAMED for the code hash, which
+        // says what the store believed when it wrote it, not what the bytes are now: a
+        // stale, truncated, hand-replaced or partially-written file still has the right
+        // name. Executing it would attribute another contract's behaviour to this one —
+        // a clean run, or worse a violation, recorded against a contract that never
+        // produced any of it. `resolve_code` holds operator-supplied code to exactly
+        // this check; there is no reason a store lookup should be trusted more.
+        let code = code.data().to_vec();
+        let actual = *blake3::hash(&code).as_bytes();
+        if actual != hash {
+            return Err(BundleError::CodeMismatch {
+                expected: hex::encode(&hash[..8]),
+                actual: hex::encode(&actual[..8]),
+            });
+        }
+        Ok(code)
     }
 
     /// Return the contract code to replay this corpus against, verifying identity.
@@ -278,5 +329,62 @@ impl ReplayBundle {
 
     pub fn read_from(path: &Path) -> Result<Self, BundleError> {
         Self::decode(&std::fs::read(path)?)
+    }
+}
+
+#[cfg(test)]
+mod store_identity_tests {
+    use super::*;
+
+    /// A store lookup must verify the bytes, not trust the filename.
+    ///
+    /// The file is NAMED for a code hash, which records what the store believed when
+    /// it wrote it, not what the bytes are now. A stale, truncated, hand-replaced or
+    /// half-written file keeps the right name. Executing it would attribute another
+    /// contract's behaviour to this one — and since shadow mode's whole output is
+    /// "this contract did or did not obey the merge laws", that is a route to
+    /// recording a violation against a contract that produced none of it.
+    ///
+    /// Built by writing real code under the WRONG hash-derived name, which is exactly
+    /// the shape a corrupted or swapped store file takes.
+    #[test]
+    fn a_store_file_whose_bytes_do_not_match_its_name_is_refused() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let real = b"the bytes actually on disk".to_vec();
+        let claimed = *blake3::hash(b"a completely different contract").as_bytes();
+
+        // Versioned encoding: the reader expects a header before the code, so go
+        // through the stdlib writer rather than inventing the layout here.
+        let code = freenet_stdlib::prelude::ContractCode::from(real);
+        let path = dir
+            .path()
+            .join(freenet_stdlib::prelude::CodeHash::new(claimed).encode())
+            .with_extension("wasm");
+        let versioned = code
+            .to_bytes_versioned(freenet_stdlib::prelude::APIVersion::Version0_0_1)
+            .expect("versioned encoding");
+        std::fs::write(&path, versioned).expect("write versioned code");
+
+        let bundle = ReplayBundle {
+            schema_version: BUNDLE_SCHEMA_VERSION,
+            code: None,
+            code_hash: Some(claimed),
+            parameters: Vec::new(),
+            instance: None,
+            states: Vec::new(),
+            deltas: Vec::new(),
+            summaries: Vec::new(),
+            transitions: Vec::new(),
+            related: Vec::new(),
+            note: None,
+        };
+
+        match bundle.resolve_code_from_store(dir.path()) {
+            Err(BundleError::CodeMismatch { .. }) => {}
+            other => panic!(
+                "a store file whose contents do not hash to its name was accepted: \
+                 {other:?}"
+            ),
+        }
     }
 }

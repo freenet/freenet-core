@@ -255,6 +255,65 @@ impl CaptureHandle {
     }
 }
 
+/// Where this node keeps contract WASM, for shadow-mode probing.
+///
+/// Set by the executor, which is the component that knows it, and read by the capture
+/// task, which needs it but is started from a different place at a different time.
+/// A `OnceLock` rather than a constructor argument so neither has to care which of
+/// them runs first: the capture task reads it on every probe tick, so a store
+/// registered after capture started is picked up on the next tick rather than lost.
+///
+/// Absent means shadow mode can select focus contracts but cannot execute them, which
+/// is reported as `skipped_no_code` rather than passing for a clean result.
+///
+/// # Limitation: one store per PROCESS, not per node
+///
+/// A production node is one process with one `Config`, so first-caller-wins is exact.
+/// The DST/SimNetwork harness is not: it runs many simulated peers in one process, and
+/// if shadow mode were ever exercised across more than one of them, every peer after
+/// the first would silently probe against the first peer's contract directory, find
+/// nothing, and report `skipped_no_code` — a clean-looking result that means nothing,
+/// which is precisely the failure class this module's counters exist to expose. That
+/// is not reachable today (registration is skipped entirely unless capture is on, and
+/// capture is a single-peer diagnostic opt-in), but a multi-peer simulation of shadow
+/// mode would need this keyed by node identity rather than held as a bare global.
+static CONTRACT_STORE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Tell the conformance machinery where contract WASM lives. Idempotent; the first
+/// caller wins, and later callers with a different path are ignored rather than
+/// racing.
+pub fn set_contract_store(path: PathBuf) {
+    // Nothing reads this unless capture is enabled, and registering regardless has a
+    // cost that is not obvious: `crates/core` runs many nodes in ONE process (the
+    // SimNetwork/DST harness) and builds many executors over different temp dirs in a
+    // single `cargo test` binary. First-caller-wins would then warn on essentially
+    // every executor after the first, turning a warning meant to catch a real
+    // production misconfiguration into routine noise in exactly the runner where
+    // cross-test interference is visible at all (see `.claude/rules/testing.md`).
+    if global().is_none() {
+        return;
+    }
+    if let Err(rejected) = CONTRACT_STORE.set(path) {
+        // First caller wins. Two callers agreeing is the normal case (several
+        // executors, one Config) and is silent; two callers DISAGREEING would send
+        // every probe to look for WASM in a directory the node does not write to, and
+        // the only symptom would be a rising `skipped_no_code` that reads as "we host
+        // nothing interesting".
+        if CONTRACT_STORE.get() != Some(&rejected) {
+            tracing::warn!(
+                registered = %CONTRACT_STORE.get().map(|p| p.display().to_string()).unwrap_or_default(),
+                rejected = %rejected.display(),
+                "conflicting contract-store paths registered for conformance; probes \
+                 will look in the first one"
+            );
+        }
+    }
+}
+
+pub(crate) fn contract_store() -> Option<&'static PathBuf> {
+    CONTRACT_STORE.get()
+}
+
 static CAPTURE: std::sync::OnceLock<Option<CaptureHandle>> = std::sync::OnceLock::new();
 
 /// The process-wide capture handle, or `None` when capture is off.
@@ -350,6 +409,43 @@ async fn run_writer(
         );
     }
     let mut since_flush = 0usize;
+    // Shadow mode rides the capture task: it already owns the samples, and it is
+    // already off the merge path, which is the property that matters most. The
+    // mode is `default()` — Shadow — and there is deliberately no way to reach
+    // `Enforce` from here.
+    let mut shadow = crate::conformance::shadow::ShadowRunner::new(
+        &dir,
+        crate::conformance::policy::EnforcementMode::default(),
+    );
+    let mut probe = tokio::time::interval(crate::conformance::shadow::PROBE_INTERVAL);
+    // At most one probe at a time, held here so the select loop can decline to start
+    // another while one is running.
+    //
+    // Deliberately not joined or aborted when the channel closes and this task
+    // returns. A detached probe finishes on its own and drops its scratch directory,
+    // and `panic = "abort"` is off so it unwinds and cleans up even if it panics. The
+    // one case that does leak is the node's real shutdown path, which calls
+    // `std::process::exit` and so runs no destructors: a probe in flight at that exact
+    // moment leaves one temp directory behind, with roughly a probe-duration /
+    // PROBE_INTERVAL chance per restart. Left as-is rather than blocking shutdown on
+    // best-effort diagnostic work, which is the wrong trade in the other direction.
+    let mut in_flight: Option<
+        tokio::task::JoinHandle<(
+            crate::conformance::shadow::ShadowReport,
+            Vec<crate::conformance::shadow::Finding>,
+        )>,
+    > = None;
+    // The first tick of a tokio interval fires immediately. Probing a sampler that
+    // has just been reloaded and holds nothing useful wastes a probe and, worse,
+    // reports a clean run for contracts nobody looked at yet.
+    probe.reset();
+    // Same as `flush` below, and it matters MORE here. The probe arm carries an
+    // `if in_flight.is_none()` guard, and a false-guarded select arm is not polled at
+    // all, so a probe that outran its interval would leave ticks queued and, on the
+    // default Burst behaviour, fire them back to back the moment the guard cleared.
+    // Delay makes a missed tick mean "next one is a full interval from now", which is
+    // what a best-effort background job should do.
+    probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut flush = tokio::time::interval(FLUSH_EVERY);
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -372,6 +468,83 @@ async fn run_writer(
                 write_all(&dir, &samplers, dropped.load(Ordering::Relaxed)).await;
                 since_flush = 0;
             }
+            // Only start a probe when none is in flight. A probe that overran its
+            // interval must not have a second one stacked on top of it: that is how a
+            // slow contract turns a bounded background job into unbounded concurrent
+            // WASM execution.
+            _ = probe.tick(), if in_flight.is_none() => {
+                // Selection borrows the samplers and is cheap; probing owns its copies
+                // and is not. Only the cheap half runs here, so the queue keeps
+                // draining while WASM executes on another task.
+                let work = shadow.select(&samplers);
+                if work.is_empty() {
+                    // Still reported. A tick that selected nothing and a tick that
+                    // found nothing are the same shape in a findings-only log, and
+                    // this phase exists to tell those apart — "no violations" from a
+                    // peer that never had a contract to look at is not evidence about
+                    // any contract.
+                    tracing::info!(
+                        epoch = shadow.epoch(),
+                        tracked = samplers.len(),
+                        "conformance shadow tick selected nothing to probe"
+                    );
+                } else {
+                    let store = contract_store().cloned();
+                    let mode = shadow.mode();
+                    // An ordinary task: `probe` puts its own WASM execution on a
+                    // blocking thread internally (see `shadow::probe_one`). Doing the
+                    // hop there rather than here keeps the async work — building the
+                    // oracle — on the runtime, and avoids driving a future with
+                    // `Handle::block_on` from a blocking thread, which is subtle on a
+                    // current-thread runtime whose driver lives elsewhere.
+                    in_flight = Some(tokio::spawn(crate::conformance::shadow::probe(
+                        work, store, mode,
+                    )));
+                }
+            }
+            Some(finished) = async {
+                match in_flight.as_mut() {
+                    Some(handle) => Some(handle.await),
+                    None => None,
+                }
+            }, if in_flight.is_some() => {
+                in_flight = None;
+                let (report, findings) = match finished {
+                    Ok(result) => result,
+                    Err(err) => {
+                        // A panicking probe must not take the capture task with it,
+                        // and must not pass silently either: capture would carry on
+                        // looking healthy while nothing was ever checked.
+                        tracing::warn!(error = %err, "conformance shadow probe failed");
+                        continue;
+                    }
+                };
+                shadow.record(&findings);
+                // Reported even when nothing was checked. A shadow period that finds
+                // nothing and a shadow period that never ran look identical in a
+                // findings-only log, and telling them apart is most of what this
+                // phase is for.
+                tracing::info!(
+                    epoch = shadow.epoch(),
+                    // Reach, not just findings: focus can only select what capture is
+                    // tracking, and that set stops growing at MAX_TRACKED_CONTRACTS
+                    // and never evicts. Without these two numbers, a peer whose
+                    // candidate set froze months ago reports exactly the same shape of
+                    // clean result as one that is genuinely covering the network.
+                    tracked = samplers.len(),
+                    tracking_at_cap = samplers.len() >= MAX_TRACKED_CONTRACTS,
+                    focused = report.focused,
+                    probed = report.probed,
+                    cases = report.cases,
+                    inconclusive = report.inconclusive,
+                    would_remove = report.would_remove,
+                    reported = report.reported,
+                    skipped_no_code = report.skipped_no_code,
+                    skipped_no_samples = report.skipped_no_samples,
+                    timed_out = report.timed_out,
+                    "conformance shadow tick"
+                );
+            }
         }
     }
 
@@ -379,7 +552,7 @@ async fn run_writer(
     write_all(&dir, &samplers, dropped.load(Ordering::Relaxed)).await;
 }
 
-struct TrackedContract {
+pub(crate) struct TrackedContract {
     sampler: ContractSampler,
     code_hash: [u8; 32],
     parameters: Vec<u8>,
@@ -495,7 +668,10 @@ fn reload(dir: &Path) -> HashMap<ContractInstanceId, TrackedContract> {
     samplers
 }
 
-fn record(samplers: &mut HashMap<ContractInstanceId, TrackedContract>, observation: Observation) {
+pub(crate) fn record(
+    samplers: &mut HashMap<ContractInstanceId, TrackedContract>,
+    observation: Observation,
+) {
     if !samplers.contains_key(&observation.contract) && samplers.len() >= MAX_TRACKED_CONTRACTS {
         // Already tracking as many as allowed. Ignoring the newcomer is the bounded
         // choice; the alternative is evicting an accumulated sample, which throws
@@ -563,6 +739,42 @@ fn admit_related(
     }
 }
 
+/// Build the replay bundle for one tracked contract.
+///
+/// Shared by the periodic flush and by shadow-mode probing, which must check exactly
+/// what a later offline replay would check. Two constructions would be two chances to
+/// disagree about what a corpus contains, and the disagreement would be invisible:
+/// both would produce a plausible bundle, and only a finding that reproduced offline
+/// but not in shadow (or the reverse) would reveal it.
+pub(crate) fn bundle_for(
+    instance: ContractInstanceId,
+    tracked: &TrackedContract,
+) -> crate::conformance::bundle::ReplayBundle {
+    // No embedded code: the WASM lives in the node's contract store and would
+    // multiply the size of every bundle. The code hash identifies it, and
+    // `ReplayBundle::resolve_code` verifies whatever is supplied at replay time
+    // against that hash — so a bundle can never be replayed against the wrong
+    // contract even though it does not carry the contract.
+    let mut bundle =
+        tracked
+            .sampler
+            .to_bundle(None, Some(tracked.code_hash), tracked.parameters.clone());
+    bundle.instance = Some(instance);
+    // Carried so a replay can execute a contract whose validity depends on
+    // another contract. `to_corpus` turns these back into `RelatedContracts`.
+    // Sorted by instance, so a bundle's bytes do not depend on hash iteration
+    // order. The corpus is written repeatedly and compared across runs; a file
+    // that differs only by map ordering wastes everyone's time.
+    let mut related: Vec<(ContractInstanceId, Vec<u8>)> = tracked
+        .related
+        .iter()
+        .map(|(id, state)| (*id, state.clone()))
+        .collect();
+    related.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    bundle.related = related;
+    bundle
+}
+
 /// Flush every tracked contract's bundle.
 ///
 /// Async because a flush is real I/O: up to 64 bundles of up to the per-contract
@@ -576,28 +788,7 @@ async fn write_all(
     dropped: u64,
 ) {
     for (instance, tracked) in samplers {
-        // No embedded code: the WASM lives in the node's contract store and would
-        // multiply the size of every bundle. The code hash identifies it, and
-        // `ReplayBundle::resolve_code` verifies whatever is supplied at replay time
-        // against that hash — so a bundle can never be replayed against the wrong
-        // contract even though it does not carry the contract.
-        let mut bundle =
-            tracked
-                .sampler
-                .to_bundle(None, Some(tracked.code_hash), tracked.parameters.clone());
-        bundle.instance = Some(*instance);
-        // Carried so a replay can execute a contract whose validity depends on
-        // another contract. `to_corpus` turns these back into `RelatedContracts`.
-        // Sorted by instance, so a bundle's bytes do not depend on hash iteration
-        // order. The corpus is written repeatedly and compared across runs; a file
-        // that differs only by map ordering wastes everyone's time.
-        let mut related: Vec<(ContractInstanceId, Vec<u8>)> = tracked
-            .related
-            .iter()
-            .map(|(id, state)| (*id, state.clone()))
-            .collect();
-        related.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-        bundle.related = related;
+        let mut bundle = bundle_for(*instance, tracked);
         bundle.note = Some(format!(
             "captured by freenet {} ({} observation(s) dropped node-wide)",
             env!("CARGO_PKG_VERSION"),
@@ -670,6 +861,162 @@ pub fn code_hash_of(key: &ContractKey) -> [u8; 32] {
     let len = out.len().min(bytes.len());
     out[..len].copy_from_slice(&bytes[..len]);
     out
+}
+
+/// The executor must tell conformance where contract WASM lives.
+///
+/// Without that one call every shadow probe resolves no code, so the peer selects
+/// focus contracts, executes nothing, and reports no violations — for the same reason
+/// a peer with no contracts reports none. The counters distinguish it (`skipped_no_code`
+/// rises), but nothing FAILS, so a refactor that drops the registration turns the whole
+/// mechanism off while leaving every test green and the logs superficially healthy.
+///
+/// A source scrape rather than a behavioural test because the alternative is standing
+/// up a full executor to observe a `OnceLock` being set, which would test tokio more
+/// than it tests this.
+#[cfg(test)]
+mod contract_store_registration_pin {
+    /// Slice `get_runtime_stores`' body, from its signature to the next item. A
+    /// missing anchor panics rather than silently widening the region to the rest of
+    /// the file, which is how a source pin quietly stops testing anything.
+    /// Slice `get_runtime_stores`' body by counting braces to its own closing one.
+    ///
+    /// The first version of this ended the region at the next `pub(crate) fn` / `fn`
+    /// signature, which does not match this file: the item after `get_runtime_stores`
+    /// is a plain `pub fn`. So the region ran on for ~350 lines, through several
+    /// unrelated helpers and into `#[cfg(test)] mod tests`. It was not vacuous — the
+    /// symbol occurs once in the file — but it was one added mention away from being
+    /// so, in a comment or an unrelated helper, and the doc claimed a bound it did not
+    /// have. Brace counting has no such dependency on what happens to come next.
+    fn get_runtime_stores_body() -> &'static str {
+        let src = include_str!("../contract/executor.rs");
+        let start = src
+            .find("    pub(crate) fn get_runtime_stores(")
+            .expect("get_runtime_stores not found in executor.rs");
+        let after = &src[start..];
+        let open = after.find('{').expect("get_runtime_stores has no body");
+        let mut depth = 0usize;
+        for (offset, ch) in after[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &after[..open + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("get_runtime_stores' body is not brace-balanced");
+    }
+
+    #[test]
+    fn the_executor_registers_the_contract_store_for_conformance() {
+        let body = get_runtime_stores_body();
+        assert!(
+            body.contains("set_contract_store("),
+            "the executor no longer registers its contract store with conformance, so \
+             every shadow probe will fail to resolve code and the mechanism reports \
+             nothing while looking healthy"
+        );
+    }
+}
+
+/// Source pins on the probe's wiring inside `run_writer`.
+///
+/// These guard two regressions that no behavioural test in this module would catch,
+/// because every shadow test drives `select` / `probe` / `record` directly rather than
+/// through the writer's select loop. Both regressions leave the mechanism working and
+/// every test green, which is the whole reason they are pinned rather than trusted:
+///
+/// 1. `tokio::spawn` instead of `spawn_blocking` puts synchronous WASM execution back
+///    on the async runtime. `.claude/rules/contracts.md` forbids exactly that, and on a
+///    single-vCPU node — sized by `available_parallelism()`, a supported deployment —
+///    there is one worker thread for it to compete with.
+/// 2. Dropping the `in_flight.is_none()` guard lets probes stack, turning a bounded
+///    background job into unbounded concurrent WASM execution.
+///
+/// Stated plainly: these are pins, not behavioural tests. They prove the call site
+/// still says what it should, not that the scheduling behaves.
+#[cfg(test)]
+mod probe_wiring_pins {
+    /// Slice `run_writer`'s body by counting braces to its own closing one, so the
+    /// region cannot silently widen into whatever happens to follow it.
+    fn run_writer_body() -> &'static str {
+        let src = include_str!("capture.rs");
+        let start = src
+            .find("async fn run_writer(")
+            .expect("run_writer not found");
+        let after = &src[start..];
+        let open = after.find('{').expect("run_writer has no body");
+        let mut depth = 0usize;
+        for (offset, ch) in after[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &after[..open + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("run_writer's body is not brace-balanced");
+    }
+
+    /// `run_writer_body` with whole-line `//` comments removed, so a pin asserts on
+    /// CODE rather than on prose that happens to name the same thing.
+    ///
+    /// This is not hypothetical tidiness. Mutation-testing these pins caught exactly
+    /// that: the one-probe-at-a-time pin passed with the guard deleted, because the
+    /// comment a few lines above the guard quotes `in_flight.is_none()` while
+    /// explaining why it exists. The pin was matching the explanation of the thing it
+    /// was supposed to be guarding. `full_state_version_gate_pins::upsert_code_only`
+    /// in the executor solves the same problem the same way, and its reasoning applies
+    /// here too: stripping only whole-line comments can produce a false FAILURE but
+    /// never a false pass, because a real call's identifier cannot sit on a line whose
+    /// `trim_start()` begins with `//`.
+    fn run_writer_code_only() -> String {
+        run_writer_body()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The probe's WASM must run on a blocking thread. The hop lives inside
+    /// `shadow::probe_one`, not here, so this pin reads that module rather than
+    /// `run_writer` — a pin that checked the wrong file would be worse than none.
+    #[test]
+    fn the_probe_runs_off_the_async_runtime() {
+        let src = include_str!("shadow.rs");
+        let body = src
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("spawn_blocking("),
+            "the conformance probe no longer runs on a blocking thread. It executes \
+             contract WASM synchronously, so on the async runtime it competes with \
+             the event loop — and a node sized by available_parallelism() has one \
+             worker thread on a single-vCPU host. See .claude/rules/contracts.md"
+        );
+    }
+
+    #[test]
+    fn at_most_one_probe_runs_at_a_time() {
+        let body = run_writer_code_only();
+        assert!(
+            body.contains("in_flight.is_none()"),
+            "the probe tick arm is no longer guarded on there being no probe in \
+             flight, so a probe that overran its interval would have another stacked \
+             on top of it — unbounded concurrent WASM execution from a job whose \
+             entire justification is that it is bounded"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1169,8 +1516,13 @@ mod tests {
             .find("async fn run_writer(")
             .expect("run_writer not found");
         let after = &src[start..];
+        // Anchored on the name, not on the visibility keyword in front of it: this
+        // pin already broke once because `TrackedContract` gained `pub(crate)`, which
+        // says nothing about what the pin is guarding. It still `expect`s rather than
+        // defaulting, so a genuinely moved anchor fails loudly instead of silently
+        // widening the region to the rest of the file.
         let end = after
-            .find("\nstruct TrackedContract")
+            .find("struct TrackedContract")
             .expect("run_writer no longer precedes TrackedContract");
         let body = &after[..end];
         assert!(

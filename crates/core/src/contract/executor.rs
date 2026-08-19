@@ -1731,6 +1731,12 @@ where
         db: Storage,
         shared: Option<SharedStores>,
     ) -> Result<(ContractStore, DelegateStore, SecretsStore), anyhow::Error> {
+        // Tell the conformance machinery where contract WASM lives. Shadow-mode
+        // probing replays captured samples against the real contract, and the only
+        // component that knows the path is the one building the store. Idempotent and
+        // free when capture is off: nothing reads it unless a probe runs.
+        crate::conformance::capture::set_contract_store(config.contracts_dir());
+
         let (contract_store, delegate_store) = match shared {
             // Pool executors: adopt the node's shared indexes AND byte caches, so
             // one contract/delegate registered anywhere is visible everywhere and

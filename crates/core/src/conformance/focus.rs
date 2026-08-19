@@ -46,6 +46,20 @@ impl FocusSelector {
         }
     }
 
+    /// Resume at a known epoch.
+    ///
+    /// Rotation only means anything if it accumulates. A peer that restarted back to
+    /// epoch zero would re-select the same first focus set every time, so a contract
+    /// author able to cause restarts could hold a peer's attention on whatever epoch
+    /// zero happens to pick — or keep it away from themselves forever.
+    pub fn resuming_at(salt: [u8; 32], max_focus: usize, epoch: u64) -> Self {
+        Self {
+            salt,
+            max_focus: max_focus.max(1),
+            epoch,
+        }
+    }
+
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
