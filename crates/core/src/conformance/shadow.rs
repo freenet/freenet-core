@@ -32,7 +32,7 @@
 //! for the probe to share nothing with the path that does the synchronizing.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use freenet_stdlib::prelude::ContractInstanceId;
@@ -149,23 +149,24 @@ impl ShadowRunner {
     }
 
     /// Run one probe tick over whatever the sampler currently holds.
+    /// Choose this tick's focus contracts and copy out what a probe needs.
     ///
-    /// Takes the samplers by reference and never mutates them: a probe must not be
-    /// able to change what the peer would have captured, or shadow mode would be
-    /// altering the very measurement it exists to take.
-    /// `store` is where contract WASM lives. Passed per-tick rather than held,
-    /// because the runner is built by the capture task and the store path is known to
-    /// the executor: a parameter keeps the two from having to agree on startup order,
-    /// and keeps this testable without a process-global.
-    pub(crate) async fn tick(
+    /// Split from [`probe`] deliberately, and the split is load-bearing rather than
+    /// tidiness. This half borrows the sampler map, so it has to run on the capture
+    /// task, and it is cheap: a hash per candidate plus a bounded copy of the selected
+    /// contracts' samples. The probe half is CPU-bound WASM execution under a
+    /// ten-second-per-contract budget, and running THAT on the capture task would stop
+    /// the task draining its observation queue for as long as it ran — dropping the
+    /// very observations conformance exists to collect, from a mechanism whose stated
+    /// requirement is that it never degrade normal operation. The periodic flush was
+    /// made async for exactly this reason; a probe is the worse case, because it is
+    /// CPU-bound and cannot be yielded away from by awaiting a syscall.
+    pub(crate) fn select(
         &mut self,
         samplers: &HashMap<ContractInstanceId, super::capture::TrackedContract>,
-        store: Option<&Path>,
-    ) -> ShadowReport {
-        let mut report = ShadowReport::default();
-
+    ) -> Vec<(ContractInstanceId, ReplayBundle)> {
         if self.mode == EnforcementMode::Disabled {
-            return report;
+            return Vec::new();
         }
 
         self.ticks = self.ticks.wrapping_add(1);
@@ -175,132 +176,181 @@ impl ShadowRunner {
         }
 
         let candidates: Vec<ContractInstanceId> = samplers.keys().copied().collect();
-        let focus = self.selector.select(&candidates);
-        report.focused = focus.len();
+        self.selector
+            .select(&candidates)
+            .into_iter()
+            .filter_map(|instance| {
+                let tracked = samplers.get(&instance)?;
+                Some((instance, super::capture::bundle_for(instance, tracked)))
+            })
+            .collect()
+    }
 
-        let Some(store) = store else {
-            // No store means no code, and no code means no question was asked. Say so
-            // in the counter rather than returning an empty report that reads as a
-            // clean run.
-            report.skipped_no_code = focus.len();
-            return report;
-        };
+    pub(crate) fn mode(&self) -> EnforcementMode {
+        self.mode
+    }
 
-        for instance in focus {
-            let Some(tracked) = samplers.get(&instance) else {
+    /// Fold a completed probe's findings into this epoch's log.
+    ///
+    /// Kept here rather than in [`probe`] because the dedup state is scoped to the
+    /// epoch, which lives here, and because the probe runs on another task and must
+    /// not need `&mut self` to do its work.
+    pub(crate) fn record(&mut self, findings: &[Finding]) {
+        for finding in findings {
+            // One line per (contract, property) per epoch: a contract that fails the
+            // same law in forty cases is one finding reported forty times, and a log
+            // that says so forty times is harder to read, not more informative.
+            if !self
+                .logged
+                .insert((finding.contract, finding.violation.property))
+            {
                 continue;
-            };
-            let bundle = super::capture::bundle_for(instance, tracked);
-            self.probe_one(&instance, &bundle, store, &mut report).await;
-        }
-
-        report
-    }
-
-    async fn probe_one(
-        &mut self,
-        instance: &ContractInstanceId,
-        bundle: &ReplayBundle,
-        store: &Path,
-        report: &mut ShadowReport,
-    ) {
-        let corpus = bundle.to_corpus();
-        if corpus.is_empty() {
-            report.skipped_no_samples += 1;
-            return;
-        }
-
-        let code = match bundle.resolve_code_from_store(store) {
-            Ok(code) => code,
-            Err(err) => {
-                // Not a finding: this peer failed to ask the question. Counted as
-                // such rather than passed off as a clean result, because a focus
-                // contract we cannot execute looks exactly like a conforming one if
-                // you only count violations.
-                tracing::debug!(%instance, error = %err, "shadow probe has no code for a focus contract");
-                report.skipped_no_code += 1;
-                return;
             }
-        };
-
-        let mut oracle = match RuntimeOracle::standalone(code, bundle.parameters.clone()).await {
-            Ok(oracle) => oracle,
-            Err(err) => {
-                // A contract whose WASM will not load is not a conformance finding.
-                // It is this peer failing to ask the question, and it is counted as
-                // such rather than passed off as a clean result.
-                tracing::debug!(%instance, error = %err, "shadow probe could not build an oracle");
-                report.skipped_no_code += 1;
-                return;
-            }
-        };
-
-        let config = GeneratorConfig {
-            max_cases: MAX_CASES_PER_PROBE,
-            ..Default::default()
-        };
-        let cases = generate_cases(&corpus, &config);
-        report.probed += 1;
-
-        let started = Instant::now();
-        for case in cases.iter().take(MAX_CASES_PER_PROBE) {
-            if started.elapsed() > PROBE_TIME_BUDGET {
-                report.timed_out += 1;
-                break;
-            }
-
-            let outcome = verify_case(&mut oracle, case);
-            report.cases += 1;
-
-            match decide(self.mode, &outcome) {
-                ConformanceAction::Nothing => {
-                    if matches!(outcome, PropertyOutcome::Inconclusive(_)) {
-                        report.inconclusive += 1;
-                    }
-                }
-                ConformanceAction::Report(violation) => {
-                    report.reported += 1;
-                    self.log_once(instance, &violation, false);
-                }
-                ConformanceAction::WouldRemove(violation) => {
-                    report.would_remove += 1;
-                    self.log_once(instance, &violation, true);
-                }
-                // Unreachable while nothing constructs `EnforcementMode::Enforce`,
-                // and deliberately still handled: the point of routing shadow through
-                // the same `decide` enforcement will use is that the two paths cannot
-                // drift. Counting a removal as a would-remove keeps this honest if a
-                // future caller does reach it before the removal path is built.
-                ConformanceAction::Remove(violation) => {
-                    report.would_remove += 1;
-                    self.log_once(instance, &violation, true);
-                }
-            }
-
-            // Give the runtime back to the node between cases. A probe is
-            // best-effort, low-priority work; nothing here is allowed to hold a
-            // worker while real traffic waits.
-            tokio::task::yield_now().await;
+            tracing::info!(
+                contract = %finding.contract,
+                property = ?finding.violation.property,
+                epoch = self.selector.epoch(),
+                would_remove = finding.would_remove,
+                detail = %finding.violation.detail,
+                "conformance shadow finding"
+            );
         }
     }
+}
 
-    fn log_once(
-        &mut self,
-        instance: &ContractInstanceId,
-        violation: &super::property::Violation,
-        would_remove: bool,
-    ) {
-        if !self.logged.insert((*instance, violation.property)) {
+/// One thing a probe found, carried back to the capture task to be logged.
+#[derive(Debug, Clone)]
+pub(crate) struct Finding {
+    pub contract: ContractInstanceId,
+    pub violation: super::property::Violation,
+    pub would_remove: bool,
+}
+
+/// Run one probe over bundles already copied out of the sampler.
+///
+/// A free function over owned inputs, so the capture task can spawn it and carry on
+/// draining its observation queue while it runs. Nothing here borrows the sampler map,
+/// which is also what makes it structurally impossible for a probe to change what the
+/// peer would have captured.
+pub(crate) async fn probe(
+    work: Vec<(ContractInstanceId, ReplayBundle)>,
+    store: Option<PathBuf>,
+    mode: EnforcementMode,
+) -> (ShadowReport, Vec<Finding>) {
+    let mut report = ShadowReport {
+        focused: work.len(),
+        ..ShadowReport::default()
+    };
+    let mut findings = Vec::new();
+
+    let Some(store) = store else {
+        // No store means no code, and no code means no question was asked. Recorded as
+        // a skip rather than returned as an empty report, which would read as a clean
+        // run for contracts nobody could execute.
+        report.skipped_no_code = work.len();
+        return (report, findings);
+    };
+
+    for (instance, bundle) in work {
+        probe_one(&instance, &bundle, &store, mode, &mut report, &mut findings).await;
+    }
+    (report, findings)
+}
+
+async fn probe_one(
+    instance: &ContractInstanceId,
+    bundle: &ReplayBundle,
+    store: &Path,
+    mode: EnforcementMode,
+    report: &mut ShadowReport,
+    findings: &mut Vec<Finding>,
+) {
+    let corpus = bundle.to_corpus();
+    if corpus.is_empty() {
+        report.skipped_no_samples += 1;
+        return;
+    }
+
+    let code = match bundle.resolve_code_from_store(store) {
+        Ok(code) => code,
+        Err(err) => {
+            // Not a finding: this peer failed to ask the question. Counted as such
+            // rather than passed off as a clean result, because a focus contract we
+            // cannot execute looks exactly like a conforming one if you only count
+            // violations.
+            tracing::debug!(%instance, error = %err, "shadow probe has no code for a focus contract");
+            report.skipped_no_code += 1;
             return;
         }
-        tracing::info!(
-            contract = %instance,
-            property = ?violation.property,
-            epoch = self.selector.epoch(),
-            would_remove,
-            detail = %violation.detail,
-            "conformance shadow finding"
-        );
+    };
+
+    let mut oracle = match RuntimeOracle::standalone(code, bundle.parameters.clone()).await {
+        Ok(oracle) => oracle,
+        Err(err) => {
+            // A contract whose WASM will not load is not a conformance finding either.
+            tracing::debug!(%instance, error = %err, "shadow probe could not build an oracle");
+            report.skipped_no_code += 1;
+            return;
+        }
+    };
+
+    let config = GeneratorConfig {
+        max_cases: MAX_CASES_PER_PROBE,
+        ..Default::default()
+    };
+    let cases = generate_cases(&corpus, &config);
+    report.probed += 1;
+
+    let started = Instant::now();
+    for case in cases.iter().take(MAX_CASES_PER_PROBE) {
+        if started.elapsed() > PROBE_TIME_BUDGET {
+            report.timed_out += 1;
+            break;
+        }
+
+        let outcome = verify_case(&mut oracle, case);
+        report.cases += 1;
+
+        match decide(mode, &outcome) {
+            ConformanceAction::Nothing => {
+                if matches!(outcome, PropertyOutcome::Inconclusive(_)) {
+                    report.inconclusive += 1;
+                }
+            }
+            ConformanceAction::Report(violation) => {
+                report.reported += 1;
+                findings.push(Finding {
+                    contract: *instance,
+                    violation,
+                    would_remove: false,
+                });
+            }
+            ConformanceAction::WouldRemove(violation) => {
+                report.would_remove += 1;
+                findings.push(Finding {
+                    contract: *instance,
+                    violation,
+                    would_remove: true,
+                });
+            }
+            // Unreachable while nothing constructs `EnforcementMode::Enforce`, and
+            // deliberately still handled: the point of routing shadow through the same
+            // `decide` enforcement will use is that the two cannot drift. Counting a
+            // removal as a would-remove keeps this honest if a future caller reaches
+            // it before the removal path exists.
+            ConformanceAction::Remove(violation) => {
+                report.would_remove += 1;
+                findings.push(Finding {
+                    contract: *instance,
+                    violation,
+                    would_remove: true,
+                });
+            }
+        }
+
+        // Yield between cases. Even on its own task a probe is best-effort,
+        // low-priority work, and must not hold a worker while real traffic waits.
+        tokio::task::yield_now().await;
     }
 }
 
@@ -361,6 +411,21 @@ fn write_salt(path: &Path, salt: &[u8; 32]) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::conformance::capture::{Observation, TrackedContract, record};
+
+    /// Drive one whole tick the way the capture task does: select on the writer
+    /// side, probe on the other, fold the findings back in. Tests go through this
+    /// rather than calling the halves directly, so they exercise the same sequence
+    /// production uses and a change to that sequence cannot leave them passing.
+    async fn tick(
+        runner: &mut ShadowRunner,
+        samplers: &HashMap<ContractInstanceId, TrackedContract>,
+        store: Option<&Path>,
+    ) -> ShadowReport {
+        let work = runner.select(samplers);
+        let (report, findings) = probe(work, store.map(|p| p.to_path_buf()), runner.mode()).await;
+        runner.record(&findings);
+        report
+    }
 
     fn instance(n: u8) -> ContractInstanceId {
         ContractInstanceId::new([n; 32])
@@ -471,7 +536,7 @@ mod tests {
             &[(vec![1], vec![1, 2]), (vec![2], vec![2, 3])],
         );
 
-        let report = runner.tick(&samplers, None).await;
+        let report = tick(&mut runner, &samplers, None).await;
         assert!(
             report.focused > 0,
             "nothing was selected, so this proves nothing"
@@ -494,7 +559,7 @@ mod tests {
         let mut runner = ShadowRunner::new(dir.path(), EnforcementMode::Disabled);
         let samplers = samplers_for(instance(1), vec![0], [0u8; 32], &[(vec![1], vec![1, 2])]);
         assert_eq!(
-            runner.tick(&samplers, None).await,
+            tick(&mut runner, &samplers, None).await,
             ShadowReport::default(),
             "Disabled mode still selected or skipped contracts"
         );
@@ -508,15 +573,15 @@ mod tests {
         let mut runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
         let samplers = samplers_for(instance(1), vec![0], [0u8; 32], &[(vec![1], vec![1, 2])]);
 
-        for tick in 1..ROTATE_EVERY_TICKS {
-            runner.tick(&samplers, None).await;
+        for nth in 1..ROTATE_EVERY_TICKS {
+            tick(&mut runner, &samplers, None).await;
             assert_eq!(
                 runner.epoch(),
                 0,
-                "focus rotated early, on tick {tick} of {ROTATE_EVERY_TICKS}"
+                "focus rotated early, on tick {nth} of {ROTATE_EVERY_TICKS}"
             );
         }
-        runner.tick(&samplers, None).await;
+        tick(&mut runner, &samplers, None).await;
         assert_eq!(
             runner.epoch(),
             1,
@@ -583,7 +648,7 @@ mod tests {
 
             let dir = tempfile::TempDir::new()?;
             let mut runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
-            let report = runner.tick(&samplers, Some(store_dir.path())).await;
+            let report = tick(&mut runner, &samplers, Some(store_dir.path())).await;
 
             assert_eq!(
                 samplers.len(),

@@ -271,7 +271,21 @@ static CONTRACT_STORE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new()
 /// caller wins, and later callers with a different path are ignored rather than
 /// racing.
 pub fn set_contract_store(path: PathBuf) {
-    let _ = CONTRACT_STORE.set(path);
+    if let Err(rejected) = CONTRACT_STORE.set(path) {
+        // First caller wins. Two callers agreeing is the normal case (several
+        // executors, one Config) and is silent; two callers DISAGREEING would send
+        // every probe to look for WASM in a directory the node does not write to, and
+        // the only symptom would be a rising `skipped_no_code` that reads as "we host
+        // nothing interesting".
+        if CONTRACT_STORE.get() != Some(&rejected) {
+            tracing::warn!(
+                registered = %CONTRACT_STORE.get().map(|p| p.display().to_string()).unwrap_or_default(),
+                rejected = %rejected.display(),
+                "conflicting contract-store paths registered for conformance; probes \
+                 will look in the first one"
+            );
+        }
+    }
 }
 
 pub(crate) fn contract_store() -> Option<&'static PathBuf> {
@@ -382,6 +396,14 @@ async fn run_writer(
         crate::conformance::policy::EnforcementMode::default(),
     );
     let mut probe = tokio::time::interval(crate::conformance::shadow::PROBE_INTERVAL);
+    // At most one probe at a time, held here so the select loop can decline to start
+    // another while one is running.
+    let mut in_flight: Option<
+        tokio::task::JoinHandle<(
+            crate::conformance::shadow::ShadowReport,
+            Vec<crate::conformance::shadow::Finding>,
+        )>,
+    > = None;
     // The first tick of a tokio interval fires immediately. Probing a sampler that
     // has just been reloaded and holds nothing useful wastes a probe and, worse,
     // reports a clean run for contracts nobody looked at yet.
@@ -408,8 +430,52 @@ async fn run_writer(
                 write_all(&dir, &samplers, dropped.load(Ordering::Relaxed)).await;
                 since_flush = 0;
             }
-            _ = probe.tick() => {
-                let report = shadow.tick(&samplers, contract_store().map(|p| p.as_path())).await;
+            // Only start a probe when none is in flight. A probe that overran its
+            // interval must not have a second one stacked on top of it: that is how a
+            // slow contract turns a bounded background job into unbounded concurrent
+            // WASM execution.
+            _ = probe.tick(), if in_flight.is_none() => {
+                // Selection borrows the samplers and is cheap; probing owns its copies
+                // and is not. Only the cheap half runs here, so the queue keeps
+                // draining while WASM executes on another task.
+                let work = shadow.select(&samplers);
+                if work.is_empty() {
+                    // Still reported. A tick that selected nothing and a tick that
+                    // found nothing are the same shape in a findings-only log, and
+                    // this phase exists to tell those apart — "no violations" from a
+                    // peer that never had a contract to look at is not evidence about
+                    // any contract.
+                    tracing::info!(
+                        epoch = shadow.epoch(),
+                        tracked = samplers.len(),
+                        "conformance shadow tick selected nothing to probe"
+                    );
+                } else {
+                    let store = contract_store().cloned();
+                    let mode = shadow.mode();
+                    in_flight = Some(tokio::spawn(
+                        crate::conformance::shadow::probe(work, store, mode),
+                    ));
+                }
+            }
+            Some(finished) = async {
+                match in_flight.as_mut() {
+                    Some(handle) => Some(handle.await),
+                    None => None,
+                }
+            }, if in_flight.is_some() => {
+                in_flight = None;
+                let (report, findings) = match finished {
+                    Ok(result) => result,
+                    Err(err) => {
+                        // A panicking probe must not take the capture task with it,
+                        // and must not pass silently either: capture would carry on
+                        // looking healthy while nothing was ever checked.
+                        tracing::warn!(error = %err, "conformance shadow probe failed");
+                        continue;
+                    }
+                };
+                shadow.record(&findings);
                 // Reported even when nothing was checked. A shadow period that finds
                 // nothing and a shadow period that never ran look identical in a
                 // findings-only log, and telling them apart is most of what this
@@ -744,6 +810,48 @@ pub fn code_hash_of(key: &ContractKey) -> [u8; 32] {
     let len = out.len().min(bytes.len());
     out[..len].copy_from_slice(&bytes[..len]);
     out
+}
+
+/// The executor must tell conformance where contract WASM lives.
+///
+/// Without that one call every shadow probe resolves no code, so the peer selects
+/// focus contracts, executes nothing, and reports no violations — for the same reason
+/// a peer with no contracts reports none. The counters distinguish it (`skipped_no_code`
+/// rises), but nothing FAILS, so a refactor that drops the registration turns the whole
+/// mechanism off while leaving every test green and the logs superficially healthy.
+///
+/// A source scrape rather than a behavioural test because the alternative is standing
+/// up a full executor to observe a `OnceLock` being set, which would test tokio more
+/// than it tests this.
+#[cfg(test)]
+mod contract_store_registration_pin {
+    /// Slice `get_runtime_stores`' body, from its signature to the next item. A
+    /// missing anchor panics rather than silently widening the region to the rest of
+    /// the file, which is how a source pin quietly stops testing anything.
+    fn get_runtime_stores_body() -> &'static str {
+        let src = include_str!("../contract/executor.rs");
+        let start = src
+            .find("    pub(crate) fn get_runtime_stores(")
+            .expect("get_runtime_stores not found in executor.rs");
+        let after = &src[start..];
+        let end = after[1..]
+            .find("\n    pub(crate) fn ")
+            .or_else(|| after[1..].find("\n    pub(crate) async fn "))
+            .or_else(|| after[1..].find("\n    fn "))
+            .expect("could not find the item after get_runtime_stores");
+        &after[..end]
+    }
+
+    #[test]
+    fn the_executor_registers_the_contract_store_for_conformance() {
+        let body = get_runtime_stores_body();
+        assert!(
+            body.contains("set_contract_store("),
+            "the executor no longer registers its contract store with conformance, so \
+             every shadow probe will fail to resolve code and the mechanism reports \
+             nothing while looking healthy"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1243,8 +1351,13 @@ mod tests {
             .find("async fn run_writer(")
             .expect("run_writer not found");
         let after = &src[start..];
+        // Anchored on the name, not on the visibility keyword in front of it: this
+        // pin already broke once because `TrackedContract` gained `pub(crate)`, which
+        // says nothing about what the pin is guarding. It still `expect`s rather than
+        // defaulting, so a genuinely moved anchor fails loudly instead of silently
+        // widening the region to the rest of the file.
         let end = after
-            .find("\nstruct TrackedContract")
+            .find("struct TrackedContract")
             .expect("run_writer no longer precedes TrackedContract");
         let body = &after[..end];
         assert!(
