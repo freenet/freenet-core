@@ -174,6 +174,27 @@ impl ShadowRunner {
     /// Run one probe tick over whatever the sampler currently holds.
     /// Choose this tick's focus contracts and copy out what a probe needs.
     ///
+    /// # Known bound: focus can only reach what capture is already tracking
+    ///
+    /// `capture::record` stops admitting new contracts once it is tracking
+    /// `MAX_TRACKED_CONTRACTS` and never evicts, so the candidate set here freezes at
+    /// the first N contracts that peer ever observed. Rotation then reshuffles a fixed
+    /// set rather than working through the network: contracts first seen after the cap
+    /// are unreachable, and if hosting later drops the code for a frozen id, focus can
+    /// keep selecting it and only raise `skipped_no_code`.
+    ///
+    /// Two consequences worth stating plainly rather than discovering from a flat
+    /// coverage graph. Ordinary churn erodes coverage over time. And an author who can
+    /// get 64 contracts observed early can, in principle, make a peer's focus set
+    /// entirely their own choosing — which does not let them dodge the salt, but does
+    /// let them starve everyone else of attention on that peer.
+    ///
+    /// Not fixed here: the cap and the no-evict rule are capture's, they predate this,
+    /// and changing them changes what a captured corpus means — a design call, not a
+    /// drive-by. Made VISIBLE instead: every tick reports `tracked` and whether the
+    /// sampler is at its cap, so the erosion shows up in the shadow telemetry that
+    /// exists to find exactly this kind of quiet loss of reach.
+    ///
     /// Split from [`probe`] deliberately, and the split is load-bearing rather than
     /// tidiness. This half borrows the sampler map, so it has to run on the capture
     /// task, and it is cheap: a hash per candidate plus a bounded copy of the selected
@@ -316,6 +337,15 @@ async fn probe_one(
     report: &mut ShadowReport,
     findings: &mut Vec<Finding>,
 ) {
+    // Start the clock BEFORE the oracle is built, not after. Loading the code,
+    // constructing the engine and compiling the module all happen first, and for a
+    // cold or large contract that setup can exceed the whole budget on its own. Timing
+    // only the case loop would let a probe blow through its advertised ceiling and
+    // still report `timed_out == 0`, because the few cases that then ran were quick —
+    // a ceiling that reports itself as respected while being exceeded is worse than no
+    // ceiling, since it is the telemetry the next tuning decision would rest on.
+    let started = Instant::now();
+
     let corpus = bundle.to_corpus();
     if corpus.is_empty() {
         report.skipped_no_samples += 1;
@@ -362,11 +392,16 @@ async fn probe_one(
     // the runtime — so nothing here drives a future from a blocking thread.
     let cases: Vec<_> = cases.into_iter().take(MAX_CASES_PER_PROBE).collect();
     let instance_copy = *instance;
+    // Only what setup did not already spend.
+    let Some(remaining) = budget.checked_sub(started.elapsed()) else {
+        report.timed_out += 1;
+        return;
+    };
     let joined = tokio::task::spawn_blocking(move || {
         let mut out = ProbeOutcome::default();
-        let started = Instant::now();
+        let loop_started = Instant::now();
         for case in &cases {
-            if started.elapsed() >= budget {
+            if loop_started.elapsed() >= remaining {
                 out.timed_out = true;
                 break;
             }
@@ -894,7 +929,15 @@ fn load_epoch(dir: &Path) -> u64 {
 /// restart, which is worse but not broken, and it is logged rather than silent.
 fn store_epoch(dir: &Path, epoch: u64) {
     let path = dir.join(EPOCH_FILE);
-    if let Err(err) = std::fs::write(&path, epoch.to_string()) {
+    // Owner-only like the salt beside it. The epoch alone reveals nothing without the
+    // salt, so this is consistency rather than a hole being closed — but a directory
+    // where one of two files that jointly determine focus is protected and the other
+    // is not invites exactly the wrong inference about which parts matter.
+    let written = crate::wasm_runtime::create_owner_only(&path).and_then(|mut file| {
+        use std::io::Write;
+        file.write_all(epoch.to_string().as_bytes())
+    });
+    if let Err(err) = written {
         tracing::warn!(
             path = %path.display(),
             error = %err,

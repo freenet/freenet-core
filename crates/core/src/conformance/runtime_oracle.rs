@@ -75,11 +75,31 @@ impl RuntimeOracle {
         // only to satisfy the runtime's constructor. Pointing it at the scratch
         // directory keeps the freshly-generated keys inside the temp dir, where they
         // die with it.
+        let cache_dir = scratch.path().join("wasm-cache");
+        std::fs::create_dir_all(&cache_dir)?;
         let secrets_dir = scratch.path().join("secrets");
         std::fs::create_dir_all(&secrets_dir)?;
         let secrets = crate::config::Secrets::load_for_secrets_dir(&secrets_dir)?;
         let secrets_store = SecretsStore::new(secrets_dir, secrets, db)?;
-        let mut runtime = Runtime::build(contract_store, delegate_store, secrets_store, false)?;
+        // Build with an explicit config rather than the default, for one reason: the
+        // default leaves `wasmtime_cache_dir: None`, which means wasmtime's own OS
+        // cache location — outside this oracle's scratch directory, outside the node's
+        // disk accounting, and NOT deleted when the scratch dir dies. A long-running
+        // shadow peer rotating through focus contracts would quietly populate a second
+        // persistent compiled-module cache that nothing owns or bounds. Pointing it
+        // into the scratch dir makes the oracle's disk footprint exactly its temp dir,
+        // which is what "throwaway" is supposed to mean.
+        let config = crate::wasm_runtime::RuntimeConfig {
+            wasmtime_cache_dir: Some(cache_dir),
+            ..Default::default()
+        };
+        let mut runtime = Runtime::build_with_config(
+            contract_store,
+            delegate_store,
+            secrets_store,
+            false,
+            config,
+        )?;
 
         let parameters = Parameters::from(parameters);
         let container = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
@@ -95,7 +115,27 @@ impl RuntimeOracle {
         // result much later — and "we could not judge this contract" would be
         // indistinguishable from "this contract would not load", letting a run
         // against a broken file report success.
-        runtime.compile_check(&key, &parameters)?;
+        //
+        // Offloaded, because this is a real Cranelift compile and not I/O. The default
+        // `RuntimeConfig` sets `offload_compilation: false`, so without this hop the
+        // compile runs inline on whatever thread awaits this constructor — and shadow
+        // mode awaits it from a tokio task, on a node whose worker count is
+        // `available_parallelism()`, i.e. one on a supported single-vCPU host. That is
+        // the #4441 whole-node-hang class, reintroduced by a diagnostic feature that
+        // has no business costing real clients latency. `fdev` gets the same treatment
+        // and does not care.
+        let parameters_for_check = parameters.clone();
+        let key_for_check = key;
+        let (mut runtime, compiled) = tokio::task::spawn_blocking(move || {
+            let outcome = runtime.compile_check(&key_for_check, &parameters_for_check);
+            (runtime, outcome)
+        })
+        .await
+        .map_err(|e| OracleBuildError::Storage(format!("compile task failed: {e}")))?;
+        compiled?;
+        // Silence the unused-mut warning the split introduces without loosening the
+        // binding the struct below expects.
+        let _ = &mut runtime;
 
         Ok(Self {
             runtime,

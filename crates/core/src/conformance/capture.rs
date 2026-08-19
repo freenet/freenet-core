@@ -526,6 +526,13 @@ async fn run_writer(
                 // phase is for.
                 tracing::info!(
                     epoch = shadow.epoch(),
+                    // Reach, not just findings: focus can only select what capture is
+                    // tracking, and that set stops growing at MAX_TRACKED_CONTRACTS
+                    // and never evicts. Without these two numbers, a peer whose
+                    // candidate set froze months ago reports exactly the same shape of
+                    // clean result as one that is genuinely covering the network.
+                    tracked = samplers.len(),
+                    tracking_at_cap = samplers.len() >= MAX_TRACKED_CONTRACTS,
                     focused = report.focused,
                     probed = report.probed,
                     cases = report.cases,
