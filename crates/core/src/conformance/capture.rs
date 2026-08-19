@@ -265,12 +265,34 @@ impl CaptureHandle {
 ///
 /// Absent means shadow mode can select focus contracts but cannot execute them, which
 /// is reported as `skipped_no_code` rather than passing for a clean result.
+///
+/// # Limitation: one store per PROCESS, not per node
+///
+/// A production node is one process with one `Config`, so first-caller-wins is exact.
+/// The DST/SimNetwork harness is not: it runs many simulated peers in one process, and
+/// if shadow mode were ever exercised across more than one of them, every peer after
+/// the first would silently probe against the first peer's contract directory, find
+/// nothing, and report `skipped_no_code` — a clean-looking result that means nothing,
+/// which is precisely the failure class this module's counters exist to expose. That
+/// is not reachable today (registration is skipped entirely unless capture is on, and
+/// capture is a single-peer diagnostic opt-in), but a multi-peer simulation of shadow
+/// mode would need this keyed by node identity rather than held as a bare global.
 static CONTRACT_STORE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// Tell the conformance machinery where contract WASM lives. Idempotent; the first
 /// caller wins, and later callers with a different path are ignored rather than
 /// racing.
 pub fn set_contract_store(path: PathBuf) {
+    // Nothing reads this unless capture is enabled, and registering regardless has a
+    // cost that is not obvious: `crates/core` runs many nodes in ONE process (the
+    // SimNetwork/DST harness) and builds many executors over different temp dirs in a
+    // single `cargo test` binary. First-caller-wins would then warn on essentially
+    // every executor after the first, turning a warning meant to catch a real
+    // production misconfiguration into routine noise in exactly the runner where
+    // cross-test interference is visible at all (see `.claude/rules/testing.md`).
+    if global().is_none() {
+        return;
+    }
     if let Err(rejected) = CONTRACT_STORE.set(path) {
         // First caller wins. Two callers agreeing is the normal case (several
         // executors, one Config) and is silent; two callers DISAGREEING would send
@@ -398,6 +420,15 @@ async fn run_writer(
     let mut probe = tokio::time::interval(crate::conformance::shadow::PROBE_INTERVAL);
     // At most one probe at a time, held here so the select loop can decline to start
     // another while one is running.
+    //
+    // Deliberately not joined or aborted when the channel closes and this task
+    // returns. A detached probe finishes on its own and drops its scratch directory,
+    // and `panic = "abort"` is off so it unwinds and cleans up even if it panics. The
+    // one case that does leak is the node's real shutdown path, which calls
+    // `std::process::exit` and so runs no destructors: a probe in flight at that exact
+    // moment leaves one temp directory behind, with roughly a probe-duration /
+    // PROBE_INTERVAL chance per restart. Left as-is rather than blocking shutdown on
+    // best-effort diagnostic work, which is the wrong trade in the other direction.
     let mut in_flight: Option<
         tokio::task::JoinHandle<(
             crate::conformance::shadow::ShadowReport,
@@ -408,6 +439,13 @@ async fn run_writer(
     // has just been reloaded and holds nothing useful wastes a probe and, worse,
     // reports a clean run for contracts nobody looked at yet.
     probe.reset();
+    // Same as `flush` below, and it matters MORE here. The probe arm carries an
+    // `if in_flight.is_none()` guard, and a false-guarded select arm is not polled at
+    // all, so a probe that outran its interval would leave ticks queued and, on the
+    // default Burst behaviour, fire them back to back the moment the guard cleared.
+    // Delay makes a missed tick mean "next one is a full interval from now", which is
+    // what a best-effort background job should do.
+    probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut flush = tokio::time::interval(FLUSH_EVERY);
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -453,9 +491,22 @@ async fn run_writer(
                 } else {
                     let store = contract_store().cloned();
                     let mode = shadow.mode();
-                    in_flight = Some(tokio::spawn(
-                        crate::conformance::shadow::probe(work, store, mode),
-                    ));
+                    // `spawn_blocking`, not `spawn`. `.claude/rules/contracts.md` is
+                    // explicit that contracts must not execute on the main async
+                    // runtime, and a probe is contract execution: `verify_case` drives
+                    // synchronous WASM calls, and building the oracle compiles a
+                    // module. Moving it to another TASK does not help — that task runs
+                    // on the same worker threads, and a node sized by
+                    // `available_parallelism()` has exactly one of them on a
+                    // single-vCPU host, which is a supported deployment. A blocking
+                    // thread is what keeps "conformance never delays synchronization"
+                    // true rather than merely intended.
+                    in_flight = Some(tokio::task::spawn_blocking(move || {
+                        // The probe is async only because building the oracle is;
+                        // driving it here keeps all of its WASM on this thread.
+                        tokio::runtime::Handle::current()
+                            .block_on(crate::conformance::shadow::probe(work, store, mode))
+                    }));
                 }
             }
             Some(finished) = async {
@@ -828,18 +879,36 @@ mod contract_store_registration_pin {
     /// Slice `get_runtime_stores`' body, from its signature to the next item. A
     /// missing anchor panics rather than silently widening the region to the rest of
     /// the file, which is how a source pin quietly stops testing anything.
+    /// Slice `get_runtime_stores`' body by counting braces to its own closing one.
+    ///
+    /// The first version of this ended the region at the next `pub(crate) fn` / `fn`
+    /// signature, which does not match this file: the item after `get_runtime_stores`
+    /// is a plain `pub fn`. So the region ran on for ~350 lines, through several
+    /// unrelated helpers and into `#[cfg(test)] mod tests`. It was not vacuous — the
+    /// symbol occurs once in the file — but it was one added mention away from being
+    /// so, in a comment or an unrelated helper, and the doc claimed a bound it did not
+    /// have. Brace counting has no such dependency on what happens to come next.
     fn get_runtime_stores_body() -> &'static str {
         let src = include_str!("../contract/executor.rs");
         let start = src
             .find("    pub(crate) fn get_runtime_stores(")
             .expect("get_runtime_stores not found in executor.rs");
         let after = &src[start..];
-        let end = after[1..]
-            .find("\n    pub(crate) fn ")
-            .or_else(|| after[1..].find("\n    pub(crate) async fn "))
-            .or_else(|| after[1..].find("\n    fn "))
-            .expect("could not find the item after get_runtime_stores");
-        &after[..end]
+        let open = after.find('{').expect("get_runtime_stores has no body");
+        let mut depth = 0usize;
+        for (offset, ch) in after[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &after[..open + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("get_runtime_stores' body is not brace-balanced");
     }
 
     #[test]
@@ -850,6 +919,74 @@ mod contract_store_registration_pin {
             "the executor no longer registers its contract store with conformance, so \
              every shadow probe will fail to resolve code and the mechanism reports \
              nothing while looking healthy"
+        );
+    }
+}
+
+/// Source pins on the probe's wiring inside `run_writer`.
+///
+/// These guard two regressions that no behavioural test in this module would catch,
+/// because every shadow test drives `select` / `probe` / `record` directly rather than
+/// through the writer's select loop. Both regressions leave the mechanism working and
+/// every test green, which is the whole reason they are pinned rather than trusted:
+///
+/// 1. `tokio::spawn` instead of `spawn_blocking` puts synchronous WASM execution back
+///    on the async runtime. `.claude/rules/contracts.md` forbids exactly that, and on a
+///    single-vCPU node — sized by `available_parallelism()`, a supported deployment —
+///    there is one worker thread for it to compete with.
+/// 2. Dropping the `in_flight.is_none()` guard lets probes stack, turning a bounded
+///    background job into unbounded concurrent WASM execution.
+///
+/// Stated plainly: these are pins, not behavioural tests. They prove the call site
+/// still says what it should, not that the scheduling behaves.
+#[cfg(test)]
+mod probe_wiring_pins {
+    /// Slice `run_writer`'s body by counting braces to its own closing one, so the
+    /// region cannot silently widen into whatever happens to follow it.
+    fn run_writer_body() -> &'static str {
+        let src = include_str!("capture.rs");
+        let start = src
+            .find("async fn run_writer(")
+            .expect("run_writer not found");
+        let after = &src[start..];
+        let open = after.find('{').expect("run_writer has no body");
+        let mut depth = 0usize;
+        for (offset, ch) in after[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &after[..open + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("run_writer's body is not brace-balanced");
+    }
+
+    #[test]
+    fn the_probe_runs_off_the_async_runtime() {
+        let body = run_writer_body();
+        assert!(
+            body.contains("spawn_blocking("),
+            "the conformance probe no longer runs on a blocking thread. It executes \
+             contract WASM synchronously, so on the async runtime it competes with \
+             the event loop — and a node sized by available_parallelism() has one \
+             worker thread on a single-vCPU host. See .claude/rules/contracts.md"
+        );
+    }
+
+    #[test]
+    fn at_most_one_probe_runs_at_a_time() {
+        let body = run_writer_body();
+        assert!(
+            body.contains("in_flight.is_none()"),
+            "the probe tick arm is no longer guarded on there being no probe in \
+             flight, so a probe that overran its interval would have another stacked \
+             on top of it — unbounded concurrent WASM execution from a job whose \
+             entire justification is that it is bounded"
         );
     }
 }

@@ -12,6 +12,12 @@ mod runtime;
 pub mod secret_export;
 pub mod secret_snapshots;
 mod secrets_store;
+// Narrow re-export rather than making `secrets_store` crate-visible: this is the one
+// correct way in this codebase to create a secret file (owner-only AT CREATION, not
+// chmod-ed afterwards), and the conformance focus salt needs it too. Widening the
+// whole module for one helper would expose the secrets store's internals crate-wide
+// for convenience.
+pub(crate) use secrets_store::sweep::create_owner_only;
 pub(crate) mod simulation_runtime;
 mod state_store;
 #[cfg(all(test, feature = "wasmtime-backend"))]

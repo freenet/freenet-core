@@ -82,10 +82,29 @@ const MAX_CASES_PER_PROBE: usize = 64;
 /// Belt to `MAX_CASES_PER_PROBE`'s braces: the case count bounds the work only if
 /// each case is quick, and "quick" depends on a contract we do not control. A
 /// contract that is merely slow rather than infinite would otherwise stretch a tick.
+///
+/// # What this does NOT bound, and why that is acceptable
+///
+/// It is checked BETWEEN cases, so a single long case overshoots it and is only
+/// recorded as `timed_out` once it finishes. The overshoot is bounded but not small:
+/// each WASM call traps at the runtime's epoch deadline (`max_execution_seconds`,
+/// 5s by default), and a reconciliation case drives up to `MAX_RECONCILIATION_ROUNDS`
+/// rounds of them, so a deliberately-slow contract can hold one case for far longer
+/// than ten seconds. It cannot run unbounded.
+///
+/// Two reasons this is left as it is rather than tightened. The probe runs on a
+/// blocking thread, so an overshoot costs CPU rather than event-loop latency, which is
+/// the property that actually matters. And giving probes a shorter per-call deadline
+/// than production would break the RFC's requirement that the local harness use the
+/// production runtime configuration — a probe would then report resource exhaustion
+/// where `fdev` reports a verdict, and the two would stop meaning the same thing.
 const PROBE_TIME_BUDGET: Duration = Duration::from_secs(10);
 
 /// Filename of the per-peer focus salt inside the capture directory.
 const SALT_FILE: &str = "focus-salt";
+
+/// Filename of the persisted focus epoch, beside the salt.
+const EPOCH_FILE: &str = "focus-epoch";
 
 /// What one tick did. Counters only — never contract state, never evidence bytes.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -119,6 +138,8 @@ pub struct ShadowRunner {
     mode: EnforcementMode,
     selector: FocusSelector,
     ticks: u32,
+    /// Capture directory, so a rotation can persist the new epoch beside the salt.
+    dir: PathBuf,
     /// `(contract, property)` pairs already logged this epoch, so a contract that
     /// fails the same law in forty cases produces one line rather than forty. Cleared
     /// on rotation, which is also what makes the log a per-epoch summary rather than
@@ -136,10 +157,12 @@ impl ShadowRunner {
     /// and readable only by the node's own user.
     pub fn new(dir: &Path, mode: EnforcementMode) -> Self {
         let salt = load_or_create_salt(dir);
+        let epoch = load_epoch(dir);
         Self {
             mode,
-            selector: FocusSelector::new(salt, MAX_FOCUS_CONTRACTS),
+            selector: FocusSelector::resuming_at(salt, MAX_FOCUS_CONTRACTS, epoch),
             ticks: 0,
+            dir: dir.to_path_buf(),
             logged: HashSet::new(),
         }
     }
@@ -173,6 +196,7 @@ impl ShadowRunner {
         if self.ticks % ROTATE_EVERY_TICKS == 0 {
             self.selector.rotate();
             self.logged.clear();
+            store_epoch(&self.dir, self.selector.epoch());
         }
 
         let candidates: Vec<ContractInstanceId> = samplers.keys().copied().collect();
@@ -237,6 +261,22 @@ pub(crate) async fn probe(
     store: Option<PathBuf>,
     mode: EnforcementMode,
 ) -> (ShadowReport, Vec<Finding>) {
+    probe_with_budget(work, store, mode, PROBE_TIME_BUDGET).await
+}
+
+/// [`probe`] with an explicit time budget.
+///
+/// Exists because the budget branch is otherwise unreachable from a test: it is
+/// checked between cases against a real elapsed clock, and no fixture contract is
+/// slow enough to trip a ten-second ceiling without making the suite take ten
+/// seconds. Injecting it lets a test prove the check fires and stops the probe,
+/// which is the part that can regress; the constant itself is a tuning choice.
+pub(crate) async fn probe_with_budget(
+    work: Vec<(ContractInstanceId, ReplayBundle)>,
+    store: Option<PathBuf>,
+    mode: EnforcementMode,
+    budget: Duration,
+) -> (ShadowReport, Vec<Finding>) {
     let mut report = ShadowReport {
         focused: work.len(),
         ..ShadowReport::default()
@@ -252,16 +292,27 @@ pub(crate) async fn probe(
     };
 
     for (instance, bundle) in work {
-        probe_one(&instance, &bundle, &store, mode, &mut report, &mut findings).await;
+        probe_one(
+            &instance,
+            &bundle,
+            &store,
+            mode,
+            budget,
+            &mut report,
+            &mut findings,
+        )
+        .await;
     }
     (report, findings)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn probe_one(
     instance: &ContractInstanceId,
     bundle: &ReplayBundle,
     store: &Path,
     mode: EnforcementMode,
+    budget: Duration,
     report: &mut ShadowReport,
     findings: &mut Vec<Finding>,
 ) {
@@ -303,7 +354,7 @@ async fn probe_one(
 
     let started = Instant::now();
     for case in cases.iter().take(MAX_CASES_PER_PROBE) {
-        if started.elapsed() > PROBE_TIME_BUDGET {
+        if started.elapsed() >= budget {
             report.timed_out += 1;
             break;
         }
@@ -364,6 +415,20 @@ fn load_or_create_salt(dir: &Path) -> [u8; 32] {
     let path = dir.join(SALT_FILE);
     if let Ok(bytes) = std::fs::read(&path) {
         if let Ok(salt) = <[u8; 32]>::try_from(bytes.as_slice()) {
+            // Tighten an existing salt that is readable beyond its owner. A file
+            // written by an older build, or copied about, keeps whatever mode it
+            // arrived with, and a secret that is only protected at creation time is
+            // only protected on the run that created it.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    if meta.permissions().mode() & 0o077 != 0 {
+                        let _ =
+                            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                    }
+                }
+            }
             return salt;
         }
         tracing::warn!(
@@ -396,15 +461,16 @@ fn load_or_create_salt(dir: &Path) -> [u8; 32] {
 }
 
 fn write_salt(path: &Path, salt: &[u8; 32]) -> std::io::Result<()> {
-    std::fs::write(path, salt)?;
-    // The salt is what stops a contract author predicting or influencing whether
-    // this peer is watching them. World-readable would defeat it on a shared host.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    // Created owner-only, rather than written and then chmod-ed. The salt is what
+    // stops a contract author predicting or influencing whether this peer is watching
+    // them, and write-then-chmod leaves a window in which it is not yet protected.
+    // The node tightens its umask at startup so that window is closed in practice
+    // today, but this reuses the helper the project already built for secrets rather
+    // than depending on a mitigation that lives somewhere else and could be narrowed.
+    use std::io::Write;
+    let mut file = crate::wasm_runtime::create_owner_only(path)?;
+    file.write_all(salt)?;
+    file.sync_all()
 }
 
 #[cfg(test)]
@@ -589,6 +655,92 @@ mod tests {
         );
     }
 
+    /// The time budget must actually stop a probe, not merely be declared.
+    ///
+    /// This module's own doc says tokio's clock was chosen so a test could prove the
+    /// budget cuts a probe short — and until review pointed it out, no such test
+    /// existed. A zero budget makes the check fire before the first case, which is the
+    /// branch that can regress; the ten-second value itself is a tuning choice, not a
+    /// behaviour.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_time_budget_stops_a_probe() -> Result<(), Box<dyn std::error::Error>> {
+        use freenet_stdlib::prelude::{
+            ContractCode, ContractContainer, ContractWasmAPIVersion, Parameters, WrappedContract,
+        };
+        use std::sync::Arc;
+
+        let wasm = crate::wasm_runtime::tests::get_test_module("test_contract_conformance")?;
+        let code_hash = *blake3::hash(&wasm).as_bytes();
+        let store_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(store_dir.path())?;
+        let db = crate::contract::storages::Storage::new(store_dir.path()).await?;
+        let mut store =
+            crate::wasm_runtime::ContractStore::new(store_dir.path().into(), 10_000_000, db)?;
+
+        let parameters: Parameters<'static> = Parameters::from(vec![0u8]);
+        let contract = WrappedContract::new(Arc::new(ContractCode::from(wasm)), parameters.clone());
+        let id = *contract.key().id();
+        store.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+            contract,
+        )))?;
+
+        let samplers = samplers_for(
+            id,
+            vec![0],
+            code_hash,
+            &[(vec![1], vec![1, 2]), (vec![2], vec![2, 3])],
+        );
+        let dir = tempfile::TempDir::new()?;
+        let mut runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        let work = runner.select(&samplers);
+        assert!(!work.is_empty(), "nothing selected, so this proves nothing");
+
+        let (report, _) = probe_with_budget(
+            work,
+            Some(store_dir.path().to_path_buf()),
+            EnforcementMode::Shadow,
+            Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(
+            report.timed_out, 1,
+            "an exhausted budget did not stop the probe: {report:?}"
+        );
+        assert_eq!(
+            report.cases, 0,
+            "cases ran after the budget was already exhausted: {report:?}"
+        );
+        Ok(())
+    }
+
+    /// Rotation only means anything if it accumulates across restarts.
+    ///
+    /// A peer that reset to epoch zero on every restart would re-select the same first
+    /// focus set forever, so an author able to cause restarts could pin a peer's
+    /// attention — or keep it away from themselves indefinitely.
+    #[tokio::test]
+    async fn the_focus_epoch_survives_a_restart() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let samplers = samplers_for(instance(1), vec![0], [0u8; 32], &[(vec![1], vec![1, 2])]);
+
+        let mut first = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        for _ in 0..ROTATE_EVERY_TICKS {
+            tick(&mut first, &samplers, None).await;
+        }
+        let rotated = first.epoch();
+        assert!(rotated > 0, "the first runner never rotated");
+        drop(first);
+
+        let resumed = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        assert_eq!(
+            resumed.epoch(),
+            rotated,
+            "a restart lost the focus epoch, so rotation restarts from zero every time \
+             the node bounces"
+        );
+    }
+
     /// The end-to-end proof: a real contract with a real defect, resolved from a real
     /// contract store, driven through focus selection and the probe loop, comes out as
     /// `would_remove` — and a conforming contract through the identical path does not.
@@ -683,5 +835,33 @@ mod tests {
              positive the whole deployment plan is gated on not happening: {honest:?}"
         );
         Ok(())
+    }
+}
+
+/// Read the persisted focus epoch, defaulting to zero.
+///
+/// A missing or unreadable file is not an error: a first run has no epoch, and a
+/// corrupt one is better restarted from zero than guessed at. Losing it costs
+/// rotation progress, not correctness.
+fn load_epoch(dir: &Path) -> u64 {
+    std::fs::read_to_string(dir.join(EPOCH_FILE))
+        .ok()
+        .and_then(|raw| raw.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Persist the focus epoch beside the salt.
+///
+/// Best-effort, like the salt: a peer that cannot write it reshuffles from zero on
+/// restart, which is worse but not broken, and it is logged rather than silent.
+fn store_epoch(dir: &Path, epoch: u64) {
+    let path = dir.join(EPOCH_FILE);
+    if let Err(err) = std::fs::write(&path, epoch.to_string()) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "could not persist the conformance focus epoch; focus rotation will \
+             restart from zero after a restart"
+        );
     }
 }
