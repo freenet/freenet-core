@@ -497,8 +497,16 @@ fn load_or_create_salt(dir: &Path) -> [u8; 32] {
                 use std::os::unix::fs::PermissionsExt;
                 if let Ok(meta) = std::fs::metadata(&path) {
                     if meta.permissions().mode() & 0o077 != 0 {
-                        let _ =
-                            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                        if let Err(err) =
+                            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                        {
+                            tracing::warn!(
+                                path = %path.display(),
+                                error = %err,
+                                "could not tighten permissions on an existing focus \
+                                 salt; it stays readable beyond its owner"
+                            );
+                        }
                     }
                 }
             }
@@ -544,6 +552,42 @@ fn write_salt(path: &Path, salt: &[u8; 32]) -> std::io::Result<()> {
     let mut file = crate::wasm_runtime::create_owner_only(path)?;
     file.write_all(salt)?;
     file.sync_all()
+}
+
+/// Read the persisted focus epoch, defaulting to zero.
+///
+/// A missing or unreadable file is not an error: a first run has no epoch, and a
+/// corrupt one is better restarted from zero than guessed at. Losing it costs
+/// rotation progress, not correctness.
+fn load_epoch(dir: &Path) -> u64 {
+    std::fs::read_to_string(dir.join(EPOCH_FILE))
+        .ok()
+        .and_then(|raw| raw.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Persist the focus epoch beside the salt.
+///
+/// Best-effort, like the salt: a peer that cannot write it reshuffles from zero on
+/// restart, which is worse but not broken, and it is logged rather than silent.
+fn store_epoch(dir: &Path, epoch: u64) {
+    let path = dir.join(EPOCH_FILE);
+    // Owner-only like the salt beside it. The epoch alone reveals nothing without the
+    // salt, so this is consistency rather than a hole being closed — but a directory
+    // where one of two files that jointly determine focus is protected and the other
+    // is not invites exactly the wrong inference about which parts matter.
+    let written = crate::wasm_runtime::create_owner_only(&path).and_then(|mut file| {
+        use std::io::Write;
+        file.write_all(epoch.to_string().as_bytes())
+    });
+    if let Err(err) = written {
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "could not persist the conformance focus epoch; focus rotation will \
+             restart from zero after a restart"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -908,41 +952,5 @@ mod tests {
              positive the whole deployment plan is gated on not happening: {honest:?}"
         );
         Ok(())
-    }
-}
-
-/// Read the persisted focus epoch, defaulting to zero.
-///
-/// A missing or unreadable file is not an error: a first run has no epoch, and a
-/// corrupt one is better restarted from zero than guessed at. Losing it costs
-/// rotation progress, not correctness.
-fn load_epoch(dir: &Path) -> u64 {
-    std::fs::read_to_string(dir.join(EPOCH_FILE))
-        .ok()
-        .and_then(|raw| raw.trim().parse().ok())
-        .unwrap_or(0)
-}
-
-/// Persist the focus epoch beside the salt.
-///
-/// Best-effort, like the salt: a peer that cannot write it reshuffles from zero on
-/// restart, which is worse but not broken, and it is logged rather than silent.
-fn store_epoch(dir: &Path, epoch: u64) {
-    let path = dir.join(EPOCH_FILE);
-    // Owner-only like the salt beside it. The epoch alone reveals nothing without the
-    // salt, so this is consistency rather than a hole being closed — but a directory
-    // where one of two files that jointly determine focus is protected and the other
-    // is not invites exactly the wrong inference about which parts matter.
-    let written = crate::wasm_runtime::create_owner_only(&path).and_then(|mut file| {
-        use std::io::Write;
-        file.write_all(epoch.to_string().as_bytes())
-    });
-    if let Err(err) = written {
-        tracing::warn!(
-            path = %path.display(),
-            error = %err,
-            "could not persist the conformance focus epoch; focus rotation will \
-             restart from zero after a restart"
-        );
     }
 }
