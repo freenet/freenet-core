@@ -3322,6 +3322,56 @@ mod conformance_capture_pins {
         }
     }
 
+    /// Nothing may be copied before the byte budget is checked.
+    ///
+    /// The sampler side of this is already pinned: `observe_with` provably does not
+    /// invoke its builder once the queue or byte budget is exhausted
+    /// (`a_full_queue_skips_building_the_observation_entirely`). What that test cannot
+    /// see is the CALL SITE. An earlier version of this hook computed the incoming
+    /// state, delta and related payloads BEFORE calling `observe_with`, so the copies
+    /// happened unconditionally whenever capture was enabled — queue full or not —
+    /// while the comment above them claimed the opposite. Moving them back would
+    /// restore that bug with every existing test green, including both pins in this
+    /// module, because the `Observation` literal would be unchanged and the hook would
+    /// still not await.
+    ///
+    /// Related state is the reason this matters more since related-contract capture:
+    /// it can carry another contract's entire state, so the drop path would pay the
+    /// largest copy of the three, on the merge path, under exactly the load that
+    /// causes drops.
+    #[test]
+    fn nothing_is_copied_before_the_budget_check() {
+        let body = attempt_state_update_body();
+        let hook_start = body
+            .find("if let Some(capture) =")
+            .expect("capture hook not found in attempt_state_update");
+        let hook = &body[hook_start..];
+        let (before_budget, inside_closure) = hook
+            .split_once("capture.observe_with(")
+            .expect("the capture hook no longer routes through observe_with");
+
+        for alloc in [".to_vec()", ".to_owned()", ".clone()"] {
+            assert!(
+                !before_budget.contains(alloc),
+                "the capture hook calls `{alloc}` before `observe_with`, so the copy \
+                 happens whether or not a queue slot and byte budget are secured. \
+                 Measure lengths from the slices already held, and do every \
+                 allocation inside the `observe_with` closure, which runs only after \
+                 the budget check"
+            );
+        }
+
+        // Guard against passing vacuously: if the copies were deleted outright rather
+        // than moved, the loop above would also be satisfied. Both spellings count,
+        // so a refactor from one to the other does not fail here claiming the copies
+        // are gone — which is what the first version of this guard did.
+        assert!(
+            inside_closure.contains(".to_vec()") || inside_closure.contains(".to_owned()"),
+            "no copies remain inside the `observe_with` closure, so this pin would \
+             pass for a hook that records nothing at all"
+        );
+    }
+
     /// The executor must never wait on capture. A slow or stuck writer would
     /// otherwise stall contract synchronization, which is the one thing this path
     /// is required never to do.
