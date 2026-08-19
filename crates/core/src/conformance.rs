@@ -107,6 +107,7 @@ pub mod policy;
 pub mod property;
 pub mod runtime_oracle;
 pub mod sampler;
+pub mod shadow;
 pub mod verifier;
 
 #[cfg(test)]

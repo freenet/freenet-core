@@ -40,6 +40,12 @@ pub enum BundleError {
     #[error("bundle carries no contract code and none was supplied separately")]
     MissingCode,
     #[error(
+        "this node's contract store has no code for the bundle's contract (looked \
+         for {path}). A peer only stores contracts it hosts, so a capture replayed \
+         on a different node may need the WASM supplied directly."
+    )]
+    NotInStore { path: String },
+    #[error(
         "bundle names no contract (code_hash is absent), so the corpus cannot be \
          tied to any WASM and replaying it would check an unrelated contract"
     )]
@@ -119,6 +125,35 @@ impl ReplayBundle {
             related: Vec::new(),
             note: None,
         }
+    }
+
+    /// Resolve this bundle's code from a node's contract store.
+    ///
+    /// A bundle names its contract by hash and deliberately does not embed the WASM,
+    /// so a corpus of many contracts stays small. That makes the store lookup the
+    /// weakest link in the whole capture-and-replay loop, and it has exactly one
+    /// trap, which is why this lives here rather than being written out at each call
+    /// site: **a store file is a versioned encoding**, forty bytes of header followed
+    /// by the code, and only the code is hashed. Reading the file's bytes and hashing
+    /// them can never match, and the failure is silent, because "hash does not match"
+    /// is indistinguishable from "this node never hosted that contract".
+    /// `ContractCode::load_versioned_from_path` is the reader that gets this right.
+    pub fn resolve_code_from_store(&self, store: &Path) -> Result<Vec<u8>, BundleError> {
+        let Some(hash) = self.code_hash else {
+            return Err(BundleError::UnidentifiedContract);
+        };
+        let path = store
+            .join(freenet_stdlib::prelude::CodeHash::new(hash).encode())
+            .with_extension("wasm");
+        if !path.exists() {
+            return Err(BundleError::NotInStore {
+                path: path.display().to_string(),
+            });
+        }
+        let (code, _version) =
+            freenet_stdlib::prelude::ContractCode::load_versioned_from_path(&path)
+                .map_err(|e| BundleError::Decode(e.to_string()))?;
+        Ok(code.data().to_vec())
     }
 
     /// Return the contract code to replay this corpus against, verifying identity.

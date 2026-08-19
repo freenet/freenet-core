@@ -1,0 +1,622 @@
+//! Shadow mode: the peer checks contracts it has sampled, and records what it
+//! *would* remove.
+//!
+//! Everything else in this module tree is reachable only from `fdev` and from tests.
+//! `decide` has been fully specified and tested since #5344 and has never once been
+//! called by a running node, which means the mechanism the RFC describes does not yet
+//! exist on the network in any mode — not even the mode that does nothing. This is
+//! the piece that makes it exist: a bounded, opt-in loop that selects focus
+//! contracts, replays the samples already being collected, and writes down the
+//! verdict without acting on it.
+//!
+//! # What this deliberately does NOT do
+//!
+//! No removal, in any configuration reachable from here. No evidence propagation, no
+//! author diagnostics, no network traffic of any kind. Those are the RFC's Phase 4;
+//! this is Phase 3, "single/live peer shadow validation", whose whole job is to prove
+//! that focus selection, sampling and local discovery behave on a real peer before
+//! anything is shipped fleet-wide.
+//!
+//! It also generates no synchronization traffic to manufacture samples. It reads what
+//! capture has already observed from ordinary traffic, which is the RFC's explicit
+//! constraint: the peer is an observer, not a fuzzer.
+//!
+//! # Why probes run on a throwaway runtime
+//!
+//! Each probe builds a [`RuntimeOracle::standalone`], which is its own wasmtime
+//! instance over its own scratch store, rather than borrowing the node's executor.
+//! That costs a temp directory per probe and is worth it twice over: a probe cannot
+//! touch hosted state, and a contract that misbehaves under probing cannot affect the
+//! runtime serving real requests. The RFC's hard requirement is that conformance work
+//! never delays normal contract synchronization; the cheapest way to honour that is
+//! for the probe to share nothing with the path that does the synchronizing.
+
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::time::Duration;
+
+use freenet_stdlib::prelude::ContractInstanceId;
+// tokio's clock rather than `std`: it honours `start_paused`, so a test can prove the
+// time budget cuts a probe short without actually spending ten seconds doing it.
+use tokio::time::Instant;
+
+use super::bundle::ReplayBundle;
+use super::focus::FocusSelector;
+use super::generator::{GeneratorConfig, generate_cases};
+use super::policy::{ConformanceAction, EnforcementMode, decide};
+use super::property::{ConformanceProperty, PropertyOutcome};
+use super::runtime_oracle::RuntimeOracle;
+use super::verifier::verify_case;
+
+/// How many contracts a peer watches at once.
+///
+/// Small on purpose. Watching more is not free — each focus contract is a probe's
+/// worth of WASM execution per tick — and it buys less than it looks like it should,
+/// because coverage across the network comes from every peer watching a *different*
+/// couple of contracts, not from any one peer watching many. Two is the RFC's
+/// "simple independent randomized policy" read literally.
+const MAX_FOCUS_CONTRACTS: usize = 2;
+
+/// How often a probe runs.
+pub const PROBE_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// Ticks before the focus set is reshuffled.
+///
+/// Rotation is what stops a contract that happens to be unlucky today from being the
+/// only thing this peer ever looks at, and what stops an author who somehow learns
+/// they are being watched from staying watched. Eight ticks at fifteen minutes is two
+/// hours, long enough for a sampler to accumulate something worth checking and short
+/// enough that a day covers many contracts.
+const ROTATE_EVERY_TICKS: u32 = 8;
+
+/// Cases checked per contract per tick.
+///
+/// The bound that makes "conformance never delays synchronization" true rather than
+/// hoped for. Each case is a handful of WASM calls under the runtime's own fuel
+/// limit, so this is a bounded number of bounded operations, and the probe yields
+/// between cases.
+const MAX_CASES_PER_PROBE: usize = 64;
+
+/// Wall-clock ceiling for one contract's probe, checked between cases.
+///
+/// Belt to `MAX_CASES_PER_PROBE`'s braces: the case count bounds the work only if
+/// each case is quick, and "quick" depends on a contract we do not control. A
+/// contract that is merely slow rather than infinite would otherwise stretch a tick.
+const PROBE_TIME_BUDGET: Duration = Duration::from_secs(10);
+
+/// Filename of the per-peer focus salt inside the capture directory.
+const SALT_FILE: &str = "focus-salt";
+
+/// What one tick did. Counters only — never contract state, never evidence bytes.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ShadowReport {
+    /// Contracts in focus this tick.
+    pub focused: usize,
+    /// Contracts probed, i.e. focus contracts whose code and samples were both
+    /// usable. The gap between this and `focused` is the reach problem, and it is
+    /// reported rather than inferred: a focus contract whose WASM is missing looks
+    /// exactly like a clean one if you only count findings.
+    pub probed: usize,
+    /// Focus contracts skipped because their code could not be resolved.
+    pub skipped_no_code: usize,
+    /// Focus contracts skipped because the sampler held nothing worth checking.
+    pub skipped_no_samples: usize,
+    /// Cases actually verified.
+    pub cases: usize,
+    /// Outcomes that reached no verdict.
+    pub inconclusive: usize,
+    /// Violations that would have caused a removal, had enforcement been on. The
+    /// number the RFC's Phase 5 gate is judged on.
+    pub would_remove: usize,
+    /// Diagnostic-severity findings, which never propose removal in any mode.
+    pub reported: usize,
+    /// Probes cut short by [`PROBE_TIME_BUDGET`].
+    pub timed_out: usize,
+}
+
+/// The shadow loop's state, owned by the capture writer task.
+pub struct ShadowRunner {
+    mode: EnforcementMode,
+    selector: FocusSelector,
+    ticks: u32,
+    /// `(contract, property)` pairs already logged this epoch, so a contract that
+    /// fails the same law in forty cases produces one line rather than forty. Cleared
+    /// on rotation, which is also what makes the log a per-epoch summary rather than
+    /// an ever-growing set.
+    logged: HashSet<(ContractInstanceId, ConformanceProperty)>,
+}
+
+impl ShadowRunner {
+    /// Build a runner, loading or creating this peer's focus salt under `dir`.
+    ///
+    /// The salt is per-peer and secret. If it were derived from anything public — the
+    /// peer's identity, its address, the contract set — an author could compute which
+    /// peers are watching their contract, and either target those peers with
+    /// well-behaved traffic or simply avoid them. It is therefore random, persisted,
+    /// and readable only by the node's own user.
+    pub fn new(dir: &Path, mode: EnforcementMode) -> Self {
+        let salt = load_or_create_salt(dir);
+        Self {
+            mode,
+            selector: FocusSelector::new(salt, MAX_FOCUS_CONTRACTS),
+            ticks: 0,
+            logged: HashSet::new(),
+        }
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.selector.epoch()
+    }
+
+    /// Run one probe tick over whatever the sampler currently holds.
+    ///
+    /// Takes the samplers by reference and never mutates them: a probe must not be
+    /// able to change what the peer would have captured, or shadow mode would be
+    /// altering the very measurement it exists to take.
+    /// `store` is where contract WASM lives. Passed per-tick rather than held,
+    /// because the runner is built by the capture task and the store path is known to
+    /// the executor: a parameter keeps the two from having to agree on startup order,
+    /// and keeps this testable without a process-global.
+    pub(crate) async fn tick(
+        &mut self,
+        samplers: &HashMap<ContractInstanceId, super::capture::TrackedContract>,
+        store: Option<&Path>,
+    ) -> ShadowReport {
+        let mut report = ShadowReport::default();
+
+        if self.mode == EnforcementMode::Disabled {
+            return report;
+        }
+
+        self.ticks = self.ticks.wrapping_add(1);
+        if self.ticks % ROTATE_EVERY_TICKS == 0 {
+            self.selector.rotate();
+            self.logged.clear();
+        }
+
+        let candidates: Vec<ContractInstanceId> = samplers.keys().copied().collect();
+        let focus = self.selector.select(&candidates);
+        report.focused = focus.len();
+
+        let Some(store) = store else {
+            // No store means no code, and no code means no question was asked. Say so
+            // in the counter rather than returning an empty report that reads as a
+            // clean run.
+            report.skipped_no_code = focus.len();
+            return report;
+        };
+
+        for instance in focus {
+            let Some(tracked) = samplers.get(&instance) else {
+                continue;
+            };
+            let bundle = super::capture::bundle_for(instance, tracked);
+            self.probe_one(&instance, &bundle, store, &mut report).await;
+        }
+
+        report
+    }
+
+    async fn probe_one(
+        &mut self,
+        instance: &ContractInstanceId,
+        bundle: &ReplayBundle,
+        store: &Path,
+        report: &mut ShadowReport,
+    ) {
+        let corpus = bundle.to_corpus();
+        if corpus.is_empty() {
+            report.skipped_no_samples += 1;
+            return;
+        }
+
+        let code = match bundle.resolve_code_from_store(store) {
+            Ok(code) => code,
+            Err(err) => {
+                // Not a finding: this peer failed to ask the question. Counted as
+                // such rather than passed off as a clean result, because a focus
+                // contract we cannot execute looks exactly like a conforming one if
+                // you only count violations.
+                tracing::debug!(%instance, error = %err, "shadow probe has no code for a focus contract");
+                report.skipped_no_code += 1;
+                return;
+            }
+        };
+
+        let mut oracle = match RuntimeOracle::standalone(code, bundle.parameters.clone()).await {
+            Ok(oracle) => oracle,
+            Err(err) => {
+                // A contract whose WASM will not load is not a conformance finding.
+                // It is this peer failing to ask the question, and it is counted as
+                // such rather than passed off as a clean result.
+                tracing::debug!(%instance, error = %err, "shadow probe could not build an oracle");
+                report.skipped_no_code += 1;
+                return;
+            }
+        };
+
+        let config = GeneratorConfig {
+            max_cases: MAX_CASES_PER_PROBE,
+            ..Default::default()
+        };
+        let cases = generate_cases(&corpus, &config);
+        report.probed += 1;
+
+        let started = Instant::now();
+        for case in cases.iter().take(MAX_CASES_PER_PROBE) {
+            if started.elapsed() > PROBE_TIME_BUDGET {
+                report.timed_out += 1;
+                break;
+            }
+
+            let outcome = verify_case(&mut oracle, case);
+            report.cases += 1;
+
+            match decide(self.mode, &outcome) {
+                ConformanceAction::Nothing => {
+                    if matches!(outcome, PropertyOutcome::Inconclusive(_)) {
+                        report.inconclusive += 1;
+                    }
+                }
+                ConformanceAction::Report(violation) => {
+                    report.reported += 1;
+                    self.log_once(instance, &violation, false);
+                }
+                ConformanceAction::WouldRemove(violation) => {
+                    report.would_remove += 1;
+                    self.log_once(instance, &violation, true);
+                }
+                // Unreachable while nothing constructs `EnforcementMode::Enforce`,
+                // and deliberately still handled: the point of routing shadow through
+                // the same `decide` enforcement will use is that the two paths cannot
+                // drift. Counting a removal as a would-remove keeps this honest if a
+                // future caller does reach it before the removal path is built.
+                ConformanceAction::Remove(violation) => {
+                    report.would_remove += 1;
+                    self.log_once(instance, &violation, true);
+                }
+            }
+
+            // Give the runtime back to the node between cases. A probe is
+            // best-effort, low-priority work; nothing here is allowed to hold a
+            // worker while real traffic waits.
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn log_once(
+        &mut self,
+        instance: &ContractInstanceId,
+        violation: &super::property::Violation,
+        would_remove: bool,
+    ) {
+        if !self.logged.insert((*instance, violation.property)) {
+            return;
+        }
+        tracing::info!(
+            contract = %instance,
+            property = ?violation.property,
+            epoch = self.selector.epoch(),
+            would_remove,
+            detail = %violation.detail,
+            "conformance shadow finding"
+        );
+    }
+}
+
+/// Read this peer's focus salt, creating one if it does not exist.
+///
+/// A failure to persist is not fatal: the peer runs with an ephemeral salt and
+/// reshuffles its focus set on restart. That is worse than persisting — a peer that
+/// re-rolls on every restart gives an author a way to keep re-rolling by causing
+/// restarts — but it is much better than refusing to run, and it is logged.
+fn load_or_create_salt(dir: &Path) -> [u8; 32] {
+    let path = dir.join(SALT_FILE);
+    if let Ok(bytes) = std::fs::read(&path) {
+        if let Ok(salt) = <[u8; 32]>::try_from(bytes.as_slice()) {
+            return salt;
+        }
+        tracing::warn!(
+            path = %path.display(),
+            "focus salt file is not 32 bytes; generating a new one"
+        );
+    }
+
+    // OsRng, not `GlobalRng`, and this is the crypto-material exception in
+    // `.claude/rules/code-style.md` rather than an oversight. The salt's entire job is
+    // to be unpredictable to a contract author: anyone who can guess it can compute
+    // which peers are watching their contract and either behave for those peers or
+    // avoid them. `GlobalRng` is seeded for determinism, and a simulation seed is
+    // exactly the kind of thing that leaks into a bug report.
+    // Same `OsRng` the node uses for its own cipher key (`config::secret`), so this
+    // does not introduce a second opinion about where entropy comes from.
+    let mut salt = [0u8; 32];
+    chacha20poly1305::aead::rand_core::RngCore::fill_bytes(
+        &mut chacha20poly1305::aead::OsRng,
+        &mut salt,
+    );
+    if let Err(err) = write_salt(&path, &salt) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "could not persist the conformance focus salt; focus will reshuffle on restart"
+        );
+    }
+    salt
+}
+
+fn write_salt(path: &Path, salt: &[u8; 32]) -> std::io::Result<()> {
+    std::fs::write(path, salt)?;
+    // The salt is what stops a contract author predicting or influencing whether
+    // this peer is watching them. World-readable would defeat it on a shared host.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conformance::capture::{Observation, TrackedContract, record};
+
+    fn instance(n: u8) -> ContractInstanceId {
+        ContractInstanceId::new([n; 32])
+    }
+
+    /// Build a sampler map by pushing observations through the real admission path,
+    /// so a test never asserts against a `TrackedContract` the capture path could not
+    /// actually have produced.
+    fn samplers_for(
+        id: ContractInstanceId,
+        parameters: Vec<u8>,
+        code_hash: [u8; 32],
+        transitions: &[(Vec<u8>, Vec<u8>)],
+    ) -> HashMap<ContractInstanceId, TrackedContract> {
+        let mut samplers = HashMap::new();
+        for (base, result) in transitions {
+            record(
+                &mut samplers,
+                Observation {
+                    contract: id,
+                    code_hash,
+                    parameters: parameters.clone(),
+                    base_state: base.clone(),
+                    incoming_state: Some(result.clone()),
+                    delta: None,
+                    result_state: result.clone(),
+                    related: Vec::new(),
+                },
+            );
+        }
+        samplers
+    }
+
+    /// The salt must survive a restart, or an author gets a fresh roll of the dice
+    /// every time the node bounces — which is a lever they can pull by any means that
+    /// causes a restart.
+    #[test]
+    fn the_focus_salt_persists_across_runners() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let first = load_or_create_salt(dir.path());
+        let second = load_or_create_salt(dir.path());
+        assert_eq!(
+            first, second,
+            "a second runner in the same directory drew a different salt, so focus \
+             reshuffles on every restart"
+        );
+    }
+
+    /// The salt is the whole secret. World-readable on a shared host would hand an
+    /// author the answer to "is this peer watching me".
+    #[cfg(unix)]
+    #[test]
+    fn the_focus_salt_is_not_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let _ = load_or_create_salt(dir.path());
+        let mode = std::fs::metadata(dir.path().join(SALT_FILE))
+            .expect("salt file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the focus salt is readable beyond its owner (mode {mode:o})"
+        );
+    }
+
+    /// Two peers must not agree on who to watch, or the network watches one small
+    /// set of contracts many times over and everything else never.
+    #[test]
+    fn two_peers_draw_different_salts() {
+        let a = tempfile::TempDir::new().expect("tempdir");
+        let b = tempfile::TempDir::new().expect("tempdir");
+        assert_ne!(
+            load_or_create_salt(a.path()),
+            load_or_create_salt(b.path()),
+            "two peers drew the same salt, so focus selection is not per-peer"
+        );
+    }
+
+    /// A truncated or hand-edited salt file must not be adopted as a 32-byte salt.
+    #[test]
+    fn a_short_salt_file_is_replaced_rather_than_used() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join(SALT_FILE), [1u8, 2, 3]).expect("write short salt");
+        let salt = load_or_create_salt(dir.path());
+        assert_ne!(salt, [0u8; 32], "a replacement salt must not be all zeroes");
+        assert_eq!(
+            salt,
+            load_or_create_salt(dir.path()),
+            "the replacement salt was not persisted"
+        );
+    }
+
+    /// Without a contract store there is no code, and without code no question was
+    /// asked. That must show up as a skip, never as an empty report: a shadow period
+    /// that could not execute anything and one that found nothing are the same shape
+    /// in a findings-only log, and telling them apart is most of what this phase is
+    /// for.
+    #[tokio::test]
+    async fn no_contract_store_reports_skips_rather_than_a_clean_run() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        let samplers = samplers_for(
+            instance(1),
+            vec![0],
+            [0u8; 32],
+            &[(vec![1], vec![1, 2]), (vec![2], vec![2, 3])],
+        );
+
+        let report = runner.tick(&samplers, None).await;
+        assert!(
+            report.focused > 0,
+            "nothing was selected, so this proves nothing"
+        );
+        assert_eq!(
+            report.skipped_no_code, report.focused,
+            "focus contracts with no resolvable code were not counted as skipped"
+        );
+        assert_eq!(
+            report.cases, 0,
+            "cases were checked without any contract code"
+        );
+        assert_eq!(report.would_remove, 0);
+    }
+
+    /// `Disabled` means nothing runs at all — not "runs but reports nothing".
+    #[tokio::test]
+    async fn disabled_does_no_work_whatsoever() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = ShadowRunner::new(dir.path(), EnforcementMode::Disabled);
+        let samplers = samplers_for(instance(1), vec![0], [0u8; 32], &[(vec![1], vec![1, 2])]);
+        assert_eq!(
+            runner.tick(&samplers, None).await,
+            ShadowReport::default(),
+            "Disabled mode still selected or skipped contracts"
+        );
+    }
+
+    /// Rotation is what stops one unlucky contract being the only thing this peer
+    /// ever looks at. Asserting the epoch advances on the right tick, and not before.
+    #[tokio::test]
+    async fn focus_rotates_on_schedule_and_not_sooner() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        let samplers = samplers_for(instance(1), vec![0], [0u8; 32], &[(vec![1], vec![1, 2])]);
+
+        for tick in 1..ROTATE_EVERY_TICKS {
+            runner.tick(&samplers, None).await;
+            assert_eq!(
+                runner.epoch(),
+                0,
+                "focus rotated early, on tick {tick} of {ROTATE_EVERY_TICKS}"
+            );
+        }
+        runner.tick(&samplers, None).await;
+        assert_eq!(
+            runner.epoch(),
+            1,
+            "focus did not rotate after {ROTATE_EVERY_TICKS} ticks"
+        );
+    }
+
+    /// The end-to-end proof: a real contract with a real defect, resolved from a real
+    /// contract store, driven through focus selection and the probe loop, comes out as
+    /// `would_remove` — and a conforming contract through the identical path does not.
+    ///
+    /// Both halves are needed. Without the conforming half this test would pass for a
+    /// runner that flagged everything, which is the failure mode that matters most
+    /// here: the RFC's whole deployment plan turns on shadow mode producing few enough
+    /// prospective removals that every one can be understood.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_real_defect_reaches_would_remove_and_a_conforming_contract_does_not()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use freenet_stdlib::prelude::{
+            ContractCode, ContractContainer, ContractWasmAPIVersion, Parameters, WrappedContract,
+        };
+        use std::sync::Arc;
+
+        // Mode 1 of the shared fixture is last-write-wins, which breaks commutativity.
+        // Mode 0 is the honest join-semilattice. Keep in sync with
+        // `tests/test-contract-conformance/src/lib.rs`.
+        const LAST_WRITE_WINS: u8 = 1;
+        const CONFORMING: u8 = 0;
+
+        let wasm = crate::wasm_runtime::tests::get_test_module("test_contract_conformance")?;
+        let code_hash = *blake3::hash(&wasm).as_bytes();
+
+        // A real store, written the way the node writes it. Reading it back is the
+        // step with the versioned-header trap, so the test exercises the real reader
+        // rather than a hand-rolled one.
+        let store_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(store_dir.path())?;
+        let db = crate::contract::storages::Storage::new(store_dir.path()).await?;
+        let mut store =
+            crate::wasm_runtime::ContractStore::new(store_dir.path().into(), 10_000_000, db)?;
+
+        let states = vec![
+            (vec![1u8], vec![1u8, 2]),
+            (vec![2u8], vec![2u8, 3]),
+            (vec![1u8, 2], vec![1u8, 2, 3]),
+            (vec![4u8], vec![4u8, 5]),
+        ];
+
+        let mut outcomes = Vec::new();
+        for mode in [LAST_WRITE_WINS, CONFORMING] {
+            let parameters: Parameters<'static> = Parameters::from(vec![mode]);
+            let contract = WrappedContract::new(
+                Arc::new(ContractCode::from(wasm.clone())),
+                parameters.clone(),
+            );
+            let key = *contract.key();
+            let id = *key.id();
+            store.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+                contract,
+            )))?;
+
+            let samplers = samplers_for(id, vec![mode], code_hash, &states);
+            let before = samplers.len();
+
+            let dir = tempfile::TempDir::new()?;
+            let mut runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+            let report = runner.tick(&samplers, Some(store_dir.path())).await;
+
+            assert_eq!(
+                samplers.len(),
+                before,
+                "a probe changed the sampler set; shadow mode must not alter what the \
+                 peer would have captured"
+            );
+            assert_eq!(
+                report.probed, 1,
+                "mode {mode} was not probed at all (skipped_no_code={}, \
+                 skipped_no_samples={}), so its verdict means nothing",
+                report.skipped_no_code, report.skipped_no_samples
+            );
+            assert!(
+                report.cases > 0,
+                "mode {mode} was probed but no case ran, so nothing was checked"
+            );
+            outcomes.push((mode, report));
+        }
+
+        let broken = &outcomes[0].1;
+        let honest = &outcomes[1].1;
+
+        assert!(
+            broken.would_remove > 0,
+            "a contract that provably breaks commutativity produced no prospective \
+             removal: {broken:?}"
+        );
+        assert_eq!(
+            honest.would_remove, 0,
+            "a conforming contract produced a prospective removal, which is the false \
+             positive the whole deployment plan is gated on not happening: {honest:?}"
+        );
+        Ok(())
+    }
+}

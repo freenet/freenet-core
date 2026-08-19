@@ -255,6 +255,29 @@ impl CaptureHandle {
     }
 }
 
+/// Where this node keeps contract WASM, for shadow-mode probing.
+///
+/// Set by the executor, which is the component that knows it, and read by the capture
+/// task, which needs it but is started from a different place at a different time.
+/// A `OnceLock` rather than a constructor argument so neither has to care which of
+/// them runs first: the capture task reads it on every probe tick, so a store
+/// registered after capture started is picked up on the next tick rather than lost.
+///
+/// Absent means shadow mode can select focus contracts but cannot execute them, which
+/// is reported as `skipped_no_code` rather than passing for a clean result.
+static CONTRACT_STORE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Tell the conformance machinery where contract WASM lives. Idempotent; the first
+/// caller wins, and later callers with a different path are ignored rather than
+/// racing.
+pub fn set_contract_store(path: PathBuf) {
+    let _ = CONTRACT_STORE.set(path);
+}
+
+pub(crate) fn contract_store() -> Option<&'static PathBuf> {
+    CONTRACT_STORE.get()
+}
+
 static CAPTURE: std::sync::OnceLock<Option<CaptureHandle>> = std::sync::OnceLock::new();
 
 /// The process-wide capture handle, or `None` when capture is off.
@@ -350,6 +373,19 @@ async fn run_writer(
         );
     }
     let mut since_flush = 0usize;
+    // Shadow mode rides the capture task: it already owns the samples, and it is
+    // already off the merge path, which is the property that matters most. The
+    // mode is `default()` — Shadow — and there is deliberately no way to reach
+    // `Enforce` from here.
+    let mut shadow = crate::conformance::shadow::ShadowRunner::new(
+        &dir,
+        crate::conformance::policy::EnforcementMode::default(),
+    );
+    let mut probe = tokio::time::interval(crate::conformance::shadow::PROBE_INTERVAL);
+    // The first tick of a tokio interval fires immediately. Probing a sampler that
+    // has just been reloaded and holds nothing useful wastes a probe and, worse,
+    // reports a clean run for contracts nobody looked at yet.
+    probe.reset();
     let mut flush = tokio::time::interval(FLUSH_EVERY);
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -372,6 +408,26 @@ async fn run_writer(
                 write_all(&dir, &samplers, dropped.load(Ordering::Relaxed)).await;
                 since_flush = 0;
             }
+            _ = probe.tick() => {
+                let report = shadow.tick(&samplers, contract_store().map(|p| p.as_path())).await;
+                // Reported even when nothing was checked. A shadow period that finds
+                // nothing and a shadow period that never ran look identical in a
+                // findings-only log, and telling them apart is most of what this
+                // phase is for.
+                tracing::info!(
+                    epoch = shadow.epoch(),
+                    focused = report.focused,
+                    probed = report.probed,
+                    cases = report.cases,
+                    inconclusive = report.inconclusive,
+                    would_remove = report.would_remove,
+                    reported = report.reported,
+                    skipped_no_code = report.skipped_no_code,
+                    skipped_no_samples = report.skipped_no_samples,
+                    timed_out = report.timed_out,
+                    "conformance shadow tick"
+                );
+            }
         }
     }
 
@@ -379,7 +435,7 @@ async fn run_writer(
     write_all(&dir, &samplers, dropped.load(Ordering::Relaxed)).await;
 }
 
-struct TrackedContract {
+pub(crate) struct TrackedContract {
     sampler: ContractSampler,
     code_hash: [u8; 32],
     parameters: Vec<u8>,
@@ -495,7 +551,10 @@ fn reload(dir: &Path) -> HashMap<ContractInstanceId, TrackedContract> {
     samplers
 }
 
-fn record(samplers: &mut HashMap<ContractInstanceId, TrackedContract>, observation: Observation) {
+pub(crate) fn record(
+    samplers: &mut HashMap<ContractInstanceId, TrackedContract>,
+    observation: Observation,
+) {
     if !samplers.contains_key(&observation.contract) && samplers.len() >= MAX_TRACKED_CONTRACTS {
         // Already tracking as many as allowed. Ignoring the newcomer is the bounded
         // choice; the alternative is evicting an accumulated sample, which throws
@@ -563,6 +622,42 @@ fn admit_related(
     }
 }
 
+/// Build the replay bundle for one tracked contract.
+///
+/// Shared by the periodic flush and by shadow-mode probing, which must check exactly
+/// what a later offline replay would check. Two constructions would be two chances to
+/// disagree about what a corpus contains, and the disagreement would be invisible:
+/// both would produce a plausible bundle, and only a finding that reproduced offline
+/// but not in shadow (or the reverse) would reveal it.
+pub(crate) fn bundle_for(
+    instance: ContractInstanceId,
+    tracked: &TrackedContract,
+) -> crate::conformance::bundle::ReplayBundle {
+    // No embedded code: the WASM lives in the node's contract store and would
+    // multiply the size of every bundle. The code hash identifies it, and
+    // `ReplayBundle::resolve_code` verifies whatever is supplied at replay time
+    // against that hash — so a bundle can never be replayed against the wrong
+    // contract even though it does not carry the contract.
+    let mut bundle =
+        tracked
+            .sampler
+            .to_bundle(None, Some(tracked.code_hash), tracked.parameters.clone());
+    bundle.instance = Some(instance);
+    // Carried so a replay can execute a contract whose validity depends on
+    // another contract. `to_corpus` turns these back into `RelatedContracts`.
+    // Sorted by instance, so a bundle's bytes do not depend on hash iteration
+    // order. The corpus is written repeatedly and compared across runs; a file
+    // that differs only by map ordering wastes everyone's time.
+    let mut related: Vec<(ContractInstanceId, Vec<u8>)> = tracked
+        .related
+        .iter()
+        .map(|(id, state)| (*id, state.clone()))
+        .collect();
+    related.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    bundle.related = related;
+    bundle
+}
+
 /// Flush every tracked contract's bundle.
 ///
 /// Async because a flush is real I/O: up to 64 bundles of up to the per-contract
@@ -576,28 +671,7 @@ async fn write_all(
     dropped: u64,
 ) {
     for (instance, tracked) in samplers {
-        // No embedded code: the WASM lives in the node's contract store and would
-        // multiply the size of every bundle. The code hash identifies it, and
-        // `ReplayBundle::resolve_code` verifies whatever is supplied at replay time
-        // against that hash — so a bundle can never be replayed against the wrong
-        // contract even though it does not carry the contract.
-        let mut bundle =
-            tracked
-                .sampler
-                .to_bundle(None, Some(tracked.code_hash), tracked.parameters.clone());
-        bundle.instance = Some(*instance);
-        // Carried so a replay can execute a contract whose validity depends on
-        // another contract. `to_corpus` turns these back into `RelatedContracts`.
-        // Sorted by instance, so a bundle's bytes do not depend on hash iteration
-        // order. The corpus is written repeatedly and compared across runs; a file
-        // that differs only by map ordering wastes everyone's time.
-        let mut related: Vec<(ContractInstanceId, Vec<u8>)> = tracked
-            .related
-            .iter()
-            .map(|(id, state)| (*id, state.clone()))
-            .collect();
-        related.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-        bundle.related = related;
+        let mut bundle = bundle_for(*instance, tracked);
         bundle.note = Some(format!(
             "captured by freenet {} ({} observation(s) dropped node-wide)",
             env!("CARGO_PKG_VERSION"),
