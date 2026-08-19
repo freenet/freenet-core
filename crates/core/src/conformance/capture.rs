@@ -400,24 +400,31 @@ struct TrackedContract {
     /// repeatedly keeps one entry rather than a history: the verifier needs one
     /// state it can execute against, not every state that ever passed through.
     ///
-    /// # Accepted risk: this snapshot is not aligned in time with the cases
+    /// # Why latest-wins is sound, and what it costs
     ///
     /// `to_corpus` attaches whatever related state is held here to EVERY case,
     /// including transitions sampled hours earlier when the related contract held
-    /// something else. Inputs are pre-validated against it, so most mismatches
-    /// degrade safely to `Inconclusive::InputNotValid` — but `EmittedStateValidity`
-    /// turns a validate-Invalid on the MERGED output into a violation, so a contract
-    /// whose validity couples its own state to the related one could in principle be
-    /// accused over a pairing that never existed on the network.
+    /// something else. That looks like the temporal-mismatch shape of the delta false
+    /// positive this work memorialises, where the fix was provenance. It is not, and
+    /// the difference is worth stating so nobody re-derives the wrong conclusion:
     ///
-    /// This is the same temporal-mismatch shape as the delta false positive this work
-    /// already memorialises, where the fix was to give deltas provenance and pair only
-    /// within a shared base. Related state has no such provenance yet: it is
-    /// latest-wins. The honest fix is a per-transition related snapshot in
-    /// `bundle.transitions`; until then this is a known way to be wrong, recorded
-    /// rather than discovered later. It is bounded by needing a contract whose
-    /// validity depends on related state AND a related state that changed between
-    /// capture and replay.
+    /// `verify_case` validates EVERY input state against `case.related` before any
+    /// property runs, and that is the SAME related state the property then uses. So
+    /// the only way to reach a violation is `validate(A, R)` and `validate(B, R)` both
+    /// Valid while `validate(merge(A, B), R)` is Invalid — the contract emitting a
+    /// state it rejects, under a related state it accepted both inputs against. `R`
+    /// was observed on this node, so it is reachable, and related contracts propagate
+    /// independently of this one, so a peer holding `A` can be seeing `R` when `B`
+    /// arrives. A contract that couples its own validity to the related state has that
+    /// coupling enforced in the input check, which degrades to
+    /// `Inconclusive::InputNotValid` rather than accusing. Deltas had no such gate,
+    /// which is precisely why they needed provenance and this does not.
+    ///
+    /// What latest-wins does cost is COVERAGE, not soundness. When the one state held
+    /// here does not validate the inputs, the case reaches no verdict at all. If
+    /// shadow-mode data shows related-dependent contracts sitting at Inconclusive in
+    /// bulk, the cheap answer is to hold the last few distinct related states and let
+    /// the verifier try each, rather than a per-transition snapshot.
     related: HashMap<ContractInstanceId, Vec<u8>>,
 }
 

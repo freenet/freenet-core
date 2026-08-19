@@ -780,6 +780,36 @@ fn states_the_contract_rejects_are_never_evidence() {
     );
 }
 
+/// `EmittedStateValidity` is the one property that turns a validate-Invalid into a
+/// violation, so it is the one that has to be provably gated on the inputs.
+///
+/// This is load-bearing for a claim made in `capture.rs`: that latest-wins related
+/// state cannot produce a false accusation, because every input is validated against
+/// the SAME related state the property then uses, so the only route to a violation is
+/// a contract emitting a state it rejects after accepting both inputs. That argument
+/// is only as good as the pre-validation loop in `verify_case`, and nothing pinned it
+/// for this property.
+///
+/// The fake is arranged so that deleting the gate does not merely change the verdict,
+/// it produces the false accusation itself: the input `[3, 1]` is non-canonical and
+/// the merge emits it back, so an ungated run reports `Violated` against a contract
+/// that was never asked a fair question.
+#[test]
+fn emitted_state_validity_is_gated_on_the_inputs_being_valid() {
+    let mut fake = Fake::conforming().merging(|_a, _b| Ok(vec![3, 1]));
+
+    assert_inconclusive(
+        verify_case(
+            &mut fake,
+            &case(
+                ConformanceProperty::EmittedStateValidity,
+                &[&[3, 1], &[2, 3]],
+            ),
+        ),
+        Inconclusive::InputNotValid,
+    );
+}
+
 /// Running out of fuel means we never saw the answer. It must not read as a defect,
 /// or a contract could be removed for being slow on a busy peer.
 #[test]
