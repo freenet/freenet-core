@@ -60,14 +60,63 @@ enum OutboundAppMessage {
 }
 
 /// Does `haystack` contain `needle` as a contiguous subsequence?
-///
-/// Used to scan RAW returned bytes rather than decoded messages, so a leak is
-/// caught regardless of how the leaking delegate happened to frame it.
 fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || haystack.len() < needle.len() {
         return false;
     }
     haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Every raw byte the runtime hands back to the driving client, concatenated.
+///
+/// Two variants reach the client from a delegate hop. `contract.rs` filters only
+/// `SendDelegateMessage` from the target's output; both `ApplicationMessage` and
+/// `ContextUpdated` pass through into the client's `values`. Scanning only the
+/// first would leave the second as an unchecked channel.
+///
+/// `ContextUpdated` is ORDER-DEPENDENT, which is easy to get wrong when writing a
+/// test for it. Emitted BEFORE a terminal message it is consumed by
+/// `process_outbound` to update the delegate's own stored context
+/// (`wasm_runtime/delegate/execution.rs:393`) and never reaches the client.
+/// Emitted AFTER one it goes out through the drain path (`execution.rs:69-74`)
+/// and does reach the client. Only the second ordering is a leak, and a mutation
+/// written the first way passes while proving nothing.
+///
+/// Concatenating matters too: scanning each message separately misses a payload
+/// split across two messages, since no single one then holds the whole run.
+fn client_visible_bytes(values: &[OutboundDelegateMsg]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for m in values {
+        match m {
+            OutboundDelegateMsg::ApplicationMessage(msg) => out.extend_from_slice(&msg.payload),
+            OutboundDelegateMsg::ContextUpdated(ctx) => out.extend_from_slice(ctx.as_ref()),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Smallest run of secret bytes whose appearance counts as a leak.
+///
+/// Requiring the WHOLE secret would pass a receiver that leaked half of it, so
+/// the check is on any window of this length. The secret below is high-entropy
+/// precisely so a window this size cannot collide with unrelated bytes.
+const LEAK_WINDOW: usize = 8;
+
+/// Does any `LEAK_WINDOW`-sized run of `secret` appear in `haystack`?
+///
+/// LIMIT, stated rather than implied: this catches a secret that is leaked
+/// verbatim, whole or in part, contiguously or split across messages. It CANNOT
+/// catch one that is transformed first (hex, base64, XOR, reversed). No byte
+/// scan can. Ruling that out is the receiving delegate's own responsibility and
+/// this test does not prove it.
+fn leaks_any_window(haystack: &[u8], secret: &[u8]) -> bool {
+    if secret.len() < LEAK_WINDOW {
+        return contains_subsequence(haystack, secret);
+    }
+    secret
+        .windows(LEAK_WINDOW)
+        .any(|w| contains_subsequence(haystack, w))
 }
 
 /// E2E test for delegate-to-delegate messaging over WebSocket.
@@ -307,12 +356,8 @@ async fn test_delegate_to_delegate_messaging_e2e() -> anyhow::Result<()> {
                     // is reachable in the RAW bytes returned to this client. If
                     // this assertion ever fails, the observer below is blind and
                     // step 3's silence proves nothing.
-                    let leaked = values.iter().any(|m| match m {
-                        OutboundDelegateMsg::ApplicationMessage(msg) => {
-                            contains_subsequence(&msg.payload, b"inter-delegate-e2e")
-                        }
-                        _ => false,
-                    });
+                    let leaked =
+                        leaks_any_window(&client_visible_bytes(&values), b"inter-delegate-e2e");
                     assert!(
                         leaked,
                         "NEGATIVE CONTROL FAILED: an echoing receiver's payload did not reach \
@@ -334,7 +379,12 @@ async fn test_delegate_to_delegate_messaging_e2e() -> anyhow::Result<()> {
         // secrets to its successor, the successor stores them via `set_secret`
         // and reports a count only. Nothing carrying the payload may reach the
         // client driving the sender.
-        let secret = b"succession-secret-must-not-leak".to_vec();
+        // High-entropy on purpose: `leaks_any_window` matches on 8-byte runs, so a
+        // low-entropy or ASCII secret could collide with unrelated response bytes
+        // and fail the test for the wrong reason.
+        let secret: Vec<u8> = (0u8..32)
+            .map(|i| i.wrapping_mul(97).wrapping_add(29))
+            .collect();
         {
             let mut deposit = b"SECRET:".to_vec();
             deposit.extend_from_slice(&secret);
@@ -359,16 +409,16 @@ async fn test_delegate_to_delegate_messaging_e2e() -> anyhow::Result<()> {
             let resp = tokio::time::timeout(Duration::from_secs(30), client.recv()).await??;
             match resp {
                 HostResponse::DelegateResponse { values, .. } => {
-                    // THE SECURITY ASSERTION. Scan raw bytes, not decoded
-                    // messages, so a leak is caught however it was framed.
-                    for m in values.iter() {
-                        if let OutboundDelegateMsg::ApplicationMessage(msg) = m {
-                            assert!(
-                                !contains_subsequence(&msg.payload, &secret),
-                                "LEAK: deposited secret bytes reached the driving client"
-                            );
-                        }
-                    }
+                    // THE SECURITY ASSERTION. Scans the CONCATENATION of every
+                    // client-visible payload, for any 8-byte run of the secret —
+                    // so a leak that is partial, or split across two messages, or
+                    // routed through `ContextUpdated` instead, is still caught.
+                    // A transformed leak (hex, XOR, reversed) is NOT caught; see
+                    // `leaks_any_window`.
+                    assert!(
+                        !leaks_any_window(&client_visible_bytes(&values), &secret),
+                        "LEAK: deposited secret bytes reached the driving client"
+                    );
 
                     let stored = values
                         .iter()
