@@ -362,8 +362,9 @@ function restoreTableFilters(focusState) {
          deterministically, once the test stopped racing it.
 
          So gate on visibility instead, which needs no engine cooperation: if
-         the box was already in the viewport, focusing it cannot scroll
-         anywhere. If it is off screen the user is reading rows rather than
+         the box was already FULLY in the viewport, focusing it cannot scroll
+         anywhere. Full containment is required — see isInViewport; a
+         half-visible box is still scrolled into view on focus. If it is off screen the user is reading rows rather than
          typing, and silently stealing focus back to an input they cannot see
          is not the behaviour to want anyway. */
       if (focusState && focusState.id === id && focusState.visible) {
@@ -384,14 +385,40 @@ function restoreTableFilters(focusState) {
   });
 }
 
-/* Is the element within the current viewport? Used to decide whether
-   restoring focus is safe — see the comment at the focus() call. */
+/* Is the element FULLY within the viewport? Used to decide whether restoring
+   focus is safe — see the comment at the focus() call.
+ *
+ * Containment, not intersection, and the difference is the whole point. The
+ * browser scrolls a focused element into view unless it is ENTIRELY visible,
+ * so a box with only its top half on screen still gets scrolled — and WebKit
+ * ignores `preventScroll`, so nothing stops it there. An intersection test
+ * (`bottom > 0 && top < h`) would call that box "visible", let the focus
+ * through, and reintroduce the jump for the partial-visibility band. It would
+ * also make the claim at the focus() call ("focusing it cannot scroll
+ * anywhere") false, which is how the bug would survive review: the comment
+ * would still read as correct.
+ *
+ * The cost of being strict is that a box straddling the viewport edge loses
+ * focus on refresh, which is the same outcome as a box fully off screen and
+ * is the safe direction to err. */
 function isInViewport(el) {
   if (!el || typeof el.getBoundingClientRect !== 'function') return false;
   var r = el.getBoundingClientRect();
   var h = window.innerHeight || document.documentElement.clientHeight;
   var w = window.innerWidth || document.documentElement.clientWidth;
-  return r.bottom > 0 && r.right > 0 && r.top < h && r.left < w;
+  /* One pixel of slack. Sub-pixel layout routinely leaves a box that is
+     visually flush with an edge reporting a fractional overflow — measured
+     `bottom: 700.4` against a 700px viewport for a box the browser itself had
+     just scrolled fully into view. An exact comparison calls that "not
+     contained", drops the focus restore, and the caret is lost for a box the
+     user can see perfectly well. The browsers round too. */
+  var slack = 1;
+  return (
+    r.top >= -slack &&
+    r.left >= -slack &&
+    r.bottom <= h + slack &&
+    r.right <= w + slack
+  );
 }
 
 /* Which filter box had focus, and where the caret was, so the refresh can put

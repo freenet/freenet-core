@@ -118,18 +118,58 @@ async function routeFixture(page: Page, rows: number): Promise<void> {
   await page.route(dashboardUrl!, async (route) => {
     const response = await route.fetch();
     const body = await response.text();
-    const marker = "</main>";
-    const i = body.lastIndexOf(marker);
-    if (i < 0) {
-      throw new Error(
-        "dashboard HTML has no </main> to inject the fixture into",
-      );
+    /* Inject at the TOP of <main>, not the bottom. Everything the node
+       reports — uptime, counters, row counts — changes height between
+       refreshes, so a fixture placed after it SHIFTS by that delta and its
+       rows change viewport position without the viewport having moved at all.
+       Measured 68-121px of drift from this alone, which is indistinguishable
+       from a small real jump. Placing the fixture first removes the confound
+       instead of trying to tolerate it. */
+    /* Search AFTER <body>. The inline <script> in <head> is `dashboard.js`,
+       whose comments discuss the `<main>` swap in prose — so a naive
+       indexOf("<main") finds a COMMENT and injects the fixture into the middle
+       of the script, breaking every selector on the page with an error that
+       says only "element not found". */
+    const bodyStart = body.indexOf("<body");
+    const open = bodyStart < 0 ? -1 : body.indexOf("<main", bodyStart);
+    const openEnd = open < 0 ? -1 : body.indexOf(">", open);
+    if (openEnd < 0) {
+      throw new Error("dashboard HTML has no <main> to inject the fixture into");
     }
+    const at = openEnd + 1;
     await route.fulfill({
       response,
-      body: body.slice(0, i) + html + body.slice(i),
+      body: body.slice(0, at) + html + body.slice(at),
     });
   });
+}
+
+/* Viewport-relative top of a row that is actually RENDERED.
+ *
+ * A row hidden by the collapse reports `top: 0, height: 0`, so anchoring on
+ * one makes the movement assertion compare 0 with 0 and pass unconditionally.
+ * This picks the last visible row and asserts it has real geometry, so the
+ * test fails loudly if the collapse ever hides the anchor rather than quietly
+ * measuring nothing. */
+async function anchorRowTop(page: Page): Promise<number> {
+  const r = await page.evaluate((id) => {
+    const rows = [
+      ...document.querySelectorAll(`table[data-table-id="${id}"] tbody tr`),
+    ] as HTMLElement[];
+    const visible = rows.filter((row) => row.style.display !== "none");
+    const target = visible[visible.length - 1];
+    if (!target) return null;
+    const rect = target.getBoundingClientRect();
+    return { top: rect.top, height: rect.height, count: visible.length };
+  }, FIXTURE_TABLE_ID);
+
+  expect(r, "no visible rows to anchor the viewport assertion on").not.toBeNull();
+  expect(
+    r!.height,
+    "the anchor row has zero height — it is hidden, so measuring its position \
+     proves nothing about the viewport",
+  ).toBeGreaterThan(0);
+  return r!.top;
 }
 
 /** Wait for one auto-refresh, detected by the uptime text changing. */
@@ -197,7 +237,15 @@ test.describe("dashboard long-table filter", () => {
       "the page must actually be scrolled, or this test cannot observe a jump",
     ).toBeGreaterThan(200);
 
-    /* Measure a ROW's position within the viewport, not window.scrollY.
+    /* Measure a VISIBLE row. The collapse hides all but the first 25, and a
+       `display: none` row reports `top: 0, height: 0` — so an earlier version
+       of this test anchored on `tr:nth-child(100)` and asserted
+       `|0 - 0| < 50`, which is true no matter what the viewport did. It caught
+       the focus mutation only through the OTHER assertion below, so the
+       coverage looked real and was not. The helper asserts the anchor has
+       non-zero height, which is what stops that recurring.
+
+       Measure a ROW's position within the viewport, not window.scrollY.
        Raw scrollY is the wrong instrument here: <main> changes height on every
        refresh (uptime, counters, row counts), and browsers apply SCROLL
        ANCHORING to compensate — adjusting scrollY precisely so that what the
@@ -205,13 +253,7 @@ test.describe("dashboard long-table filter", () => {
        88px "jump" for a viewport that did not visually move at all. What the
        user actually cares about, and what this test should pin, is that the
        row under their eyes stays under their eyes. */
-    const rowTopBefore = await page.evaluate(
-      (id) =>
-        document
-          .querySelector(`table[data-table-id="${id}"] tbody tr:nth-child(100)`)!
-          .getBoundingClientRect().top,
-      FIXTURE_TABLE_ID,
-    );
+    const rowTopBefore = await anchorRowTop(page);
 
     expect(
       await waitForRefresh(page),
@@ -219,13 +261,7 @@ test.describe("dashboard long-table filter", () => {
     ).toBe(true);
     await page.waitForTimeout(500);
 
-    const rowTopAfter = await page.evaluate(
-      (id) =>
-        document
-          .querySelector(`table[data-table-id="${id}"] tbody tr:nth-child(100)`)!
-          .getBoundingClientRect().top,
-      FIXTURE_TABLE_ID,
-    );
+    const rowTopAfter = await anchorRowTop(page);
     expect(
       Math.abs(rowTopAfter - rowTopBefore),
       `the row under the reader moved from ${Math.round(rowTopBefore)} to ${Math.round(rowTopAfter)} in the viewport`,
@@ -263,6 +299,70 @@ test.describe("dashboard long-table filter", () => {
     ).toBe(false);
   });
 
+  /* The band between "fully visible" and "fully off screen".
+   *
+   * Both reviewers flagged this independently and they were right: an
+   * INTERSECTION test would call a half-visible box visible, let the focus
+   * through, and the browser would scroll it fully into view — WebKit ignores
+   * `preventScroll`, so nothing stops it. The other two tests cannot see this:
+   * one drives the box fully off screen, the other calls
+   * `scrollIntoViewIfNeeded()` and so drives it fully ON screen. Neither ever
+   * lands in the band where the two definitions disagree, which is exactly
+   * where the bug lived. */
+  test("a half-visible filter box does not pull the viewport on refresh", async ({
+    page,
+  }) => {
+    await routeFixture(page, 150);
+    await page.goto(dashboardUrl!, { waitUntil: "domcontentloaded" });
+
+    const input = page.locator(
+      `.table-filter[data-filter-for="${FIXTURE_TABLE_ID}"] .tf-input`,
+    );
+    await expect(input).toBeAttached();
+    await input.focus();
+    await page.waitForTimeout(400);
+
+    // Park the box straddling the TOP edge: its lower half on screen, its
+    // upper half above it.
+    await input.evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      window.scrollTo(0, window.scrollY + r.top + r.height / 2);
+    });
+    await page.waitForTimeout(200);
+
+    const straddles = await input.evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      const h = window.innerHeight || document.documentElement.clientHeight;
+      return { top: r.top, bottom: r.bottom, h, partial: r.top < 0 && r.bottom > 0 };
+    });
+    expect(
+      straddles.partial,
+      `the box must straddle the viewport edge for this test to mean anything \
+       (top ${Math.round(straddles.top)}, bottom ${Math.round(straddles.bottom)})`,
+    ).toBe(true);
+
+    const before = await anchorRowTop(page);
+    expect(
+      await waitForRefresh(page),
+      "no auto-refresh fired — the assertion below would pass vacuously",
+    ).toBe(true);
+    await page.waitForTimeout(500);
+    const after = await anchorRowTop(page);
+
+    /* A TIGHT threshold, unlike the sibling test's 50px, and the difference is
+       the point. The movement this test guards is bounded by the hidden sliver
+       of a ~28px-tall input: measured 8px in WebKit and 14px in Chromium under
+       an intersection gate. A 50px tolerance swallows it entirely, so the
+       first version of this test passed happily against the very bug it was
+       written for. The fixture is injected at the top of <main> precisely so
+       nothing above it can drift and force a loose threshold here. */
+    expect(
+      Math.abs(after - before),
+      `a half-visible filter box pulled the viewport: the row under the reader \
+       moved from ${Math.round(before)} to ${Math.round(after)}`,
+    ).toBeLessThan(4);
+  });
+
   test("the filter value and caret survive the auto-refresh", async ({
     page,
   }) => {
@@ -287,14 +387,19 @@ test.describe("dashboard long-table filter", () => {
        when the product was doing exactly the right thing. */
     await input.scrollIntoViewIfNeeded();
     await page.waitForTimeout(150);
+    /* Assert the SAME predicate the product uses — full containment with a
+       pixel of slack, not mere intersection. Checking intersection here while
+       the product checks containment is how this test started failing for a
+       reason that had nothing to do with the behaviour under test. */
     const visibleBefore = await input.evaluate((el) => {
       const r = el.getBoundingClientRect();
       const h = window.innerHeight || document.documentElement.clientHeight;
-      return r.bottom > 0 && r.top < h;
+      const w = window.innerWidth || document.documentElement.clientWidth;
+      return r.top >= -1 && r.left >= -1 && r.bottom <= h + 1 && r.right <= w + 1;
     });
     expect(
       visibleBefore,
-      "the filter box must be on screen, or declining to refocus is correct",
+      "the filter box must be FULLY on screen, or declining to refocus is correct",
     ).toBe(true);
 
     expect(
