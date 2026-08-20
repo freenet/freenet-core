@@ -1649,6 +1649,9 @@ mod probe_wiring_pins {
 
 #[cfg(test)]
 mod tests {
+
+    use super::*;
+
     /// The related-state budgets the sampler config in force for tests implies.
     ///
     /// Was a bare `MAX_RELATED_BYTES` constant. It is now derived from the sampler
@@ -1658,8 +1661,6 @@ mod tests {
     fn test_related_budgets() -> (usize, usize) {
         related_budgets(&sampler_config())
     }
-
-    use super::*;
 
     fn instance(n: u8) -> ContractInstanceId {
         ContractInstanceId::new([n; 32])
