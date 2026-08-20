@@ -3018,6 +3018,47 @@ mod tests {
         );
     }
 
+    /// Over budget must render as over budget, not as a clamped 100%.
+    ///
+    /// This state is reachable and important, not an error case: exceeding the
+    /// contract-state budget IS the eviction trigger, and the slot axis sits
+    /// over its ceiling for the whole ~2.5 minute sustained window before
+    /// anything is shed. Clamping the percentage produced "150 of 100 (100%)"
+    /// — a line that contradicts its own detail text and hides how far over
+    /// the node is at exactly the moment that matters.
+    #[test]
+    fn hosting_card_shows_true_percentage_when_over_budget() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 100,
+            used_bytes: 150,
+            contract_count: 1,
+            contracts: vec![mk_hosted_entry("A", true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        assert!(
+            html.contains("150%"),
+            "an over-budget axis must report its true percentage — got:\n{html}"
+        );
+        assert!(
+            !html.contains("(100%)"),
+            "no percentage on the card may be clamped to 100% — the RAM-used \
+             tile had the same clamp and disagreed with the strip — got:\n{html}"
+        );
+        // The RAM-used tile must agree with the strip, not clamp separately.
+        assert!(
+            html.contains("150 B / 100 B (150%)"),
+            "the RAM-used tile must report the true percentage too — got:\n{html}"
+        );
+        // The bar itself is still capped: a fill cannot overflow its track.
+        assert!(
+            html.contains("width: 100.0%"),
+            "the bar width must stay clamped at 100% — got:\n{html}"
+        );
+    }
+
     /// An unconfigured or not-yet-measured budget is not "100% full".
     ///
     /// The disk budget is an `Option` precisely because the tracker is

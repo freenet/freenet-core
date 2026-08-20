@@ -1252,7 +1252,13 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
     }
 
     let budget = h.budget_bytes.max(1);
-    let used_pct = (h.used_bytes as f64 / budget as f64 * 100.0).min(100.0);
+    // NOT clamped to 100%. Over budget is the eviction trigger itself, so it
+    // is a state the operator most needs to see accurately; clamping rendered
+    // "150 B / 100 B (100%)", which contradicts its own numerator and hides
+    // how far over the node is. (Found when the binding strip below started
+    // reporting the true figure and the two disagreed — the clamp here
+    // predates this change.)
+    let used_pct = h.used_bytes as f64 / budget as f64 * 100.0;
     let headroom = h.budget_bytes.saturating_sub(h.used_bytes);
 
     // Which limit is actually closest? The card shows three ceilings, and
@@ -1340,7 +1346,17 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
         .iter()
         .max_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(name, util, detail, note)| {
-            let pct = (util * 100.0).min(100.0);
+            // Over budget is a REAL, reachable state, not an error: exceeding
+            // the contract-state budget is the eviction trigger itself, and
+            // the slot axis sits over its ceiling for the whole ~2.5 min
+            // sustained window before anything is shed. Clamping the
+            // percentage rendered that as "150 of 100 (100%)" — a line that
+            // contradicts itself and hides the breach magnitude at exactly the
+            // moment an operator needs it. So the percentage is unclamped and
+            // only the BAR WIDTH is capped, since a bar cannot overflow its
+            // track.
+            let pct = util * 100.0;
+            let bar_pct = pct.min(100.0);
             // Threshold on the DISPLAYED figure, not the raw one. Colouring
             // from `pct` while printing `{pct:.0}` makes the two disagree at
             // the boundary: 89.6% prints as "90%" but renders amber, and 74.6%
@@ -1358,12 +1374,12 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
                 "var(--text-muted, #888)"
             };
             format!(
-                r#"<div class="hz-binding" title="{note}"><div class="hz-binding-head">Closest limit: <strong>{name}</strong> — {detail} ({shown:.0}%)</div><div class="hz-bar" role="img" aria-label="{name} at {shown:.0} percent of its limit"><span class="hz-bar-fill" style="width: {pct:.1}%; background: {tone};"></span></div></div>"#,
+                r#"<div class="hz-binding" title="{note}"><div class="hz-binding-head">Closest limit: <strong>{name}</strong> — {detail} ({shown:.0}%)</div><div class="hz-bar" role="img" aria-label="{name} at {shown:.0} percent of its limit"><span class="hz-bar-fill" style="width: {bar_pct:.1}%; background: {tone};"></span></div></div>"#,
                 name = html_escape(name),
                 detail = html_escape(detail),
                 note = html_escape(note),
                 shown = shown_pct,
-                pct = pct,
+                bar_pct = bar_pct,
                 tone = tone,
             )
         })
