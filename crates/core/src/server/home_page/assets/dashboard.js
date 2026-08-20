@@ -1,31 +1,79 @@
+/* Theme is a THREE-state setting: an explicit 'light', an explicit 'dark', or
+ * no choice at all — in which case the stylesheet's `prefers-color-scheme`
+ * query follows the operating system.
+ *
+ * It used to be two states. The toggle stored 'light' or removed the key, so
+ * "I want dark" and "I have not chosen" were the same stored value, and the
+ * page was dark for everyone regardless of their OS until they found the sun
+ * icon. Storing 'dark' explicitly is what lets the OS default exist without
+ * overriding someone who deliberately chose dark on a light-mode desktop.
+ *
+ * Applied inline at the top of the file, before first paint, so the page does
+ * not flash the wrong theme on load. */
 (function () {
   try {
-    if (localStorage.getItem('theme') === 'light') {
-      document.documentElement.setAttribute('data-theme', 'light');
+    var pref = localStorage.getItem('theme');
+    if (pref === 'light' || pref === 'dark') {
+      document.documentElement.setAttribute('data-theme', pref);
     }
   } catch (e) {
-    /* localStorage unavailable — default to dark */
+    /* localStorage unavailable — fall through to the OS preference */
   }
 })();
 
-function toggleTheme() {
-  var isLight = document.documentElement.getAttribute('data-theme') === 'light';
-  var icon = document.getElementById('theme-icon');
-  if (isLight) {
-    document.documentElement.removeAttribute('data-theme');
-    if (icon)
-      icon.textContent = '\u2600\uFE0F'; /* sun = click to switch to light */
-    try {
-      localStorage.removeItem('theme');
-    } catch (e) {}
-  } else {
-    document.documentElement.setAttribute('data-theme', 'light');
-    if (icon)
-      icon.textContent = '\uD83C\uDF19'; /* moon = click to switch to dark */
-    try {
-      localStorage.setItem('theme', 'light');
-    } catch (e) {}
+/* theme-resolve:BEGIN
+ *
+ * Resolves the three-state theme setting. Extracted verbatim by
+ * `theme_preference.test.mjs`, so it takes its browser dependencies as
+ * parameters rather than reaching for globals — a substring pin cannot tell
+ * you whether an explicit choice correctly beats the OS in BOTH directions,
+ * which is the part that was previously unrepresentable.
+ *
+ * `attr` is the stamped `data-theme` (null when the operator has chosen
+ * nothing); `prefersLight` is the OS preference. */
+function resolveTheme(attr, prefersLight) {
+  if (attr === 'light' || attr === 'dark') return attr;
+  return prefersLight ? 'light' : 'dark';
+}
+/* theme-resolve:END */
+
+/* What the page is CURRENTLY showing, which is not the same as what was
+ * chosen: with no explicit choice the answer comes from the OS, so reading
+ * the attribute alone would report "dark" for a light-mode user and make the
+ * first toggle click appear to do nothing. */
+function effectiveTheme() {
+  var prefersLight = false;
+  try {
+    prefersLight = !!(
+      window.matchMedia &&
+      window.matchMedia('(prefers-color-scheme: light)').matches
+    );
+  } catch (e) {
+    /* matchMedia unavailable — treat as no OS preference */
   }
+  return resolveTheme(
+    document.documentElement.getAttribute('data-theme'),
+    prefersLight,
+  );
+}
+
+function updateThemeIcon() {
+  var icon = document.getElementById('theme-icon');
+  if (!icon) return;
+  /* The icon shows the theme you would switch TO, not the current one. */
+  icon.textContent =
+    effectiveTheme() === 'light'
+      ? '\uD83C\uDF19' /* moon = click for dark */
+      : '\u2600\uFE0F'; /* sun  = click for light */
+}
+
+function toggleTheme() {
+  var next = effectiveTheme() === 'light' ? 'dark' : 'light';
+  document.documentElement.setAttribute('data-theme', next);
+  try {
+    localStorage.setItem('theme', next);
+  } catch (e) {}
+  updateThemeIcon();
 }
 
 /* ── Toast notifications ── */
@@ -887,10 +935,10 @@ function createRefreshScheduler(deps) {
 /* refresh-scheduler:END */
 
 document.addEventListener('DOMContentLoaded', function () {
-  var icon = document.getElementById('theme-icon');
-  if (icon && document.documentElement.getAttribute('data-theme') === 'light') {
-    icon.textContent = '\uD83C\uDF19'; /* moon = click to switch to dark */
-  }
+  /* Reads the EFFECTIVE theme, not the attribute: with no explicit choice the
+     page follows the OS, and checking the attribute alone showed a sun icon
+     to a light-mode user who was already looking at a light page. */
+  updateThemeIcon();
 
   /* Restore active tab after page load / auto-refresh */
   function restoreTab() {

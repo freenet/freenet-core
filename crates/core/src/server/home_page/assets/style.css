@@ -15,8 +15,26 @@
     'Iosevka', 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'SF Mono',
     monospace;
   --font-sans: 'Space Grotesk', 'DM Sans', system-ui, -apple-system, sans-serif;
+
+  /* Semantic status colours. These were referenced throughout as
+   * `var(--danger, #c0392b)` / `var(--warn, #b8860b)` but never DEFINED, so
+   * every call site silently rendered its hardcoded fallback — the same value
+   * in both themes, and #c0392b is poor contrast on the near-black ground.
+   * Defining them makes the fallbacks dead and lets each theme pick a value
+   * that actually reads against its own background. */
+  --danger: #ff6b6b;
+  --warn: #f0b653;
+  --ok: #34d399;
 }
-/* Light mode overrides */
+/* Light mode overrides.
+ *
+ * Three states, not two. `data-theme` is absent until the operator picks a
+ * theme; only then is it stamped, and it then wins over the OS in BOTH
+ * directions. Previously there was no way to record "I want dark" — the
+ * toggle just removed the attribute — so an explicit dark choice on a
+ * light-mode desktop was indistinguishable from having chosen nothing, and
+ * would have been overridden by the media query below. `[data-theme='dark']`
+ * exists to hold that choice. */
 [data-theme='light'] {
   --bg-primary: #f7f5f2;
   --bg-secondary: #eeebe6;
@@ -26,6 +44,30 @@
   --text-primary: #1a1816;
   --text-secondary: #5c5955;
   --text-muted: #8c8985;
+  /* Darker on a light ground: the dark-theme values wash out on #f7f5f2. */
+  --danger: #b3261e;
+  --warn: #8a5a00;
+  --ok: #1f6b3f;
+}
+
+/* Follow the OS when the operator has expressed no preference. Without this
+ * the dashboard was dark for everyone until they found the sun icon, no
+ * matter what their system was set to. Guarded on `:not([data-theme='dark'])`
+ * so an explicit dark choice survives a light-mode OS. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme='dark']) {
+    --bg-primary: #f7f5f2;
+    --bg-secondary: #eeebe6;
+    --bg-tertiary: #e5e0d9;
+    --bg-panel: rgba(255, 255, 255, 0.88);
+    --border-color: rgba(180, 175, 168, 0.4);
+    --text-primary: #1a1816;
+    --text-secondary: #5c5955;
+    --text-muted: #8c8985;
+    --danger: #b3261e;
+    --warn: #8a5a00;
+    --ok: #1f6b3f;
+  }
 }
 * {
   box-sizing: border-box;
