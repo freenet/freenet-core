@@ -1315,9 +1315,39 @@ table.sortable thead th.sort-desc::after {
   color: var(--text-muted, #8b949e);
 }
 
-/* "next to evict" badge on the front row of the Demand-driven eviction
- * table (the lowest keep-score contract, i.e. the next budget-pressure
- * victim). */
+/* "Closest limit" strip on the Demand-driven eviction card: the card shows
+ * several independent ceilings and this names the one nearest to binding,
+ * because three flat rows of identical tiles gave no clue which mattered. The
+ * fill is coloured only above 75% so the strip is ignorable until it isn't. */
+.hz-binding {
+  margin: 0 0.9rem 0.7rem;
+}
+.hz-binding-head {
+  font-size: 0.82rem;
+  color: var(--text-secondary, #8b949e);
+  margin-bottom: 0.3rem;
+}
+.hz-binding-head strong {
+  color: var(--text-primary, #e6edf3);
+  font-weight: 600;
+}
+.hz-bar {
+  display: block;
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(139, 148, 158, 0.18);
+  overflow: hidden;
+}
+.hz-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  min-width: 2px;
+}
+
+/* "next to evict" badge on the first EVICTION-ELIGIBLE row of the
+ * Demand-driven eviction table — the contract the over-budget sweep would
+ * shed first among those no local client or downstream subscriber pins. */
 .hz-badge {
   display: inline-block;
   margin-left: 0.35rem;

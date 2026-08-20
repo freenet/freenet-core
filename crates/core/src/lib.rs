@@ -7,6 +7,13 @@ pub mod config;
 /// Handling of contracts and delegates functionality.
 mod contract;
 
+/// Contract conformance: the shared verifier and evidence model (RFC #5320).
+///
+/// Public because `fdev conformance` runs the *same* verifier the network does.
+/// A developer-facing check that could disagree with the network-facing one would
+/// be worse than no check at all.
+pub mod conformance;
+
 // Re-export for integration tests (tests/ directory needs pub access)
 #[cfg(any(test, feature = "testing", feature = "redb"))]
 pub use contract::storages;

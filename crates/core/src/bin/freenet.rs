@@ -209,6 +209,14 @@ fn auto_update_is_disabled(git_dirty: &str, disable_flag: bool) -> bool {
 async fn run_network(config: Config) -> anyhow::Result<()> {
     tracing::info!("Starting freenet node in network mode");
 
+    // Initialise conformance capture (RFC #5320) here rather than leaving it to the
+    // first merge. It is a no-op unless FREENET_CONFORMANCE_CAPTURE_DIR is set, but
+    // an operator who set it needs to see confirmation at startup: initialising
+    // lazily means the "capture enabled" line only appears once traffic happens to
+    // arrive, so a freshly-joined peer looks identical whether capture is working or
+    // silently misconfigured.
+    let _ = freenet::conformance::capture::global();
+
     // Honor a persistent operator disable (`freenet service disable`, #4690
     // sibling): while the marker is present the node must not run, and must stay
     // down across restarts/reboots. Idle instead of serving so the supervisor
@@ -540,7 +548,27 @@ async fn run_network_node_with_signals(
                 return;
             }
         }
-        tracing::debug!("Startup update check: no newer version found");
+        // INFO, not `debug!`: release builds set `release_max_level_info`
+        // (crates/core/Cargo.toml), so a `debug!` here is compiled OUT of every
+        // shipped binary. That left the startup check with no observable ENDING
+        // on the outcome it takes most often. "The check finished and decided to
+        // stay put" looked exactly like "the check was killed mid-request", and
+        // the release canary (#5222) cannot pass a binary safely without telling
+        // those apart: absence of a parse error is evidence that parsing worked
+        // only if the check is known to have finished. Without this line Gate A
+        // would wave through a binary carrying the #5221 bug whenever GitHub
+        // answered slowly enough that the canary stopped the node first.
+        //
+        // Reached on EVERY non-triggering outcome -- already up to date, GitHub
+        // unreachable, unparseable tag, #4073 locally-blocked version -- so it
+        // claims only that the check ended. The WARN above it, if any, says why.
+        // Do not reword it into a claim about the version, and do not change the
+        // leading phrase: scripts/auto-update-canary.sh greps for it, and
+        // scripts/auto-update-canary_test.sh pins it against this file.
+        tracing::info!(
+            current = build_info::VERSION,
+            "Startup update check complete: staying on the current version"
+        );
 
         /// Parse our version string into a (major, minor, patch) tuple for comparison.
         fn parse_our_version() -> Option<(u8, u8, u16)> {

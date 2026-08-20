@@ -86,6 +86,8 @@ mod connection_backoff;
 mod connection_manager;
 pub(crate) mod contract_ban_list;
 pub(crate) mod delta_incompat;
+/// Shadow-mode detector for repairs that never converge (see the module docs).
+pub(crate) mod futile_repair;
 pub(crate) use connection_manager::ConnectionManager;
 // Nearest-neighbor ring lattice (successor+predecessor base edges).
 // `nn_lattice_active_for` is the full activation gate — the flag AND the
@@ -105,15 +107,34 @@ pub(crate) use broken_invariants::{BrokenInvariant, BrokenInvariantsTracker};
 /// executor chokepoints so a write that would overflow the aggregate disk
 /// budget is refused before any bytes land.
 pub(crate) use hosting::DiskBudgetExceeded;
+/// Hosting-BEGIN attribution: WHY this peer started hosting a contract. Every
+/// production caller of [`Ring::host_contract`] names one.
+pub(crate) use hosting::HostingCause;
 /// The pre-A2 flat 1 GiB budget, used as the upgrade-migration sentinel in
 /// `config::ConfigArgs::build` so an upgraded node re-derives its hosting budget
 /// instead of keeping the historically-pinned default (#4565).
 pub(crate) use hosting::LEGACY_FLAT_HOSTING_BUDGET_BYTES;
+/// Clamp bound re-exported only for the config-default round-trip test.
+#[cfg(test)]
+pub(crate) use hosting::MAX_DEFAULT_HOSTING_BUDGET_BYTES;
+/// The aggregate hosting-disk budget's own floor — also the wasmtime
+/// compile-cache's configured-budget bound's floor (#5328 review), so this is
+/// a genuine production dependency now, not test-only.
+pub(crate) use hosting::MIN_DEFAULT_HOSTING_BUDGET_BYTES;
 /// Single source of truth for the default hosted-contract-state budget.
 /// `config::default_max_hosting_storage()` resolves to this so the
 /// operator-facing default and the in-code fallback can never drift. The
 /// default is RAM-scaled (capability-relative, A2) rather than a flat constant.
 pub(crate) use hosting::default_hosting_budget_bytes;
+/// The aggregate hosting-disk budget's own pure clamp math. A genuine
+/// production dependency (#5328 review): the wasmtime compile-cache's
+/// configured-budget bound (`wasm_runtime::runtime::bound_by_configured_disk_budget`)
+/// projects what the live aggregate budget will resolve to via this SAME
+/// function, so the compile cache respects an operator-shrunk
+/// `--max-hosting-disk` rather than only physical disk availability. Also
+/// used by the wasmtime disk-cache sizing tests to verify headroom against
+/// the real function rather than a duplicate.
+pub(crate) use hosting::disk_budget_for_clamped;
 /// The hosting budget's pure RAM clamp, re-exported (test-only) so the wasmtime
 /// on-disk compile-cache sizing test can pin that the compile cache never
 /// exceeds the contract-state budget it accelerates.
@@ -127,10 +148,19 @@ pub use hosting::{AccessType, RecordAccessResult};
 /// Aggregate disk-budget defaults (#4683). `config` resolves the persisted
 /// `hosting-disk-pct` / `max-hosting-disk` defaults from these so the operator-
 /// facing defaults and the in-code sizing math share one source of truth.
-pub(crate) use hosting::{DEFAULT_HOSTING_DISK_PCT, DEFAULT_MAX_HOSTING_DISK_BYTES};
-/// Clamp bounds re-exported only for the config-default round-trip test.
-#[cfg(test)]
-pub(crate) use hosting::{MAX_DEFAULT_HOSTING_BUDGET_BYTES, MIN_DEFAULT_HOSTING_BUDGET_BYTES};
+pub(crate) use hosting::{
+    DEFAULT_HOSTING_DISK_PCT, DEFAULT_MAX_HOSTING_DISK_BYTES, DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE,
+};
+/// Widths of the two hosted-set demand-signal histograms carried on the router
+/// snapshot, re-exported so `router` sizes its wire arrays from the same
+/// definition the bucketing code uses.
+pub(crate) use hosting::{GENUINE_ACCESS_RECENCY_BUCKETS, READ_COUNT_HIST_BUCKETS};
+/// The aggregate disk-usage tracker's mount-availability probe and directory
+/// walk, re-exported so the wasmtime on-disk compile-cache startup sizing
+/// (`wasm_runtime::runtime::default_wasmtime_cache_size_bytes_for_dir`, #5014)
+/// can bound itself by real disk headroom, not just RAM, without duplicating
+/// the `statvfs` FFI call or the walk.
+pub(crate) use hosting::{disk_available_bytes, disk_directory_size_bytes};
 pub mod interest;
 mod live_tx;
 mod location;
@@ -691,6 +721,29 @@ impl Ring {
         }
 
         let ring = Arc::new(ring);
+
+        // Conformance focus selects over the contracts this peer HOSTS (RFC #5320),
+        // so the ring - which owns the hosting cache - is what can answer that. A
+        // `Weak` deliberately: this closure is stored in a process-global that
+        // outlives the node, and holding a strong `Arc` there would keep an entire
+        // ring, its background tasks' handles and its caches alive past teardown. A
+        // dead ring reads as "no candidates", which surfaces as `focused=0` rather
+        // than as a stale set. Registration is a no-op unless capture is enabled.
+        {
+            let weak = Arc::downgrade(&ring);
+            crate::conformance::capture::set_hosted_contracts_source(Box::new(move || {
+                weak.upgrade()
+                    .map(|ring| {
+                        ring.hosting_manager
+                            .hosting_contract_keys()
+                            .into_iter()
+                            .map(|key| *key.id())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }));
+        }
+
         let current_span = tracing::Span::current();
         let span = if current_span.is_none() {
             tracing::info_span!("connection_maintenance")
@@ -2089,6 +2142,12 @@ impl Ring {
                 )
             {
                 let lifecycle = op_manager.interest_manager.interest_lifecycle_snapshot();
+                // SHADOW MODE: futile-repair evidence (#nc-merge). Rides the
+                // same fixed-cardinality block for the same reason the rest of
+                // it does — `network_efficiency_v1` is the only family that
+                // bypasses both the node rate limiter and the collector's 5%
+                // sampler, so a rare-but-decisive counter is not sampled away.
+                let futile_repair = op_manager.interest_manager.futile_repair_snapshot();
                 let receiver = op_manager.payload_mix.receiver_apply_stats();
                 let queue = crate::node::BROADCAST_QUEUE_EFFICIENCY_METRICS.snapshot();
                 let state_rejections = crate::contract::state_size_rejection_snapshot();
@@ -2222,6 +2281,16 @@ impl Ring {
                     tel,
                     shadow,
                     eff: telemetry.network_efficiency_delivery,
+                    // Hosting observability (#4642): WHY this peer began hosting
+                    // each contract, and the two demand-signal gauges the
+                    // eviction ranking is built on. `hosting` is the same
+                    // `hosting_cache_stats()` read that feeds `vict_n`/`vict_b`
+                    // above, so all four describe one consistent hosted set.
+                    host_begin: hosting.hosting_begins,
+                    host_reads: hosting.read_count_hist,
+                    host_recency: hosting.genuine_access_recency,
+                    futile: futile_repair.to_row(),
+                    futile_ladder: futile_repair.ladder,
                 });
             }
 
@@ -3220,6 +3289,33 @@ impl Ring {
                 .disk_available_bytes()
                 .unwrap_or(u64::MAX);
             ring.hosting_manager.recompute_effective_budget(available);
+
+            // Resident-overhead (count-derived) budget (#5325, live-basis #5333):
+            // recomputed every tick so it tracks LIVE memory pressure rather than
+            // being fixed at startup — a peer that grows busy (or a `MemoryMax`
+            // cgroup that gets tightened externally) re-derives a smaller budget
+            // on the next tick, and one that goes idle re-derives a larger one.
+            // All three reads are cheap (a `/proc` parse or a single syscall on
+            // every platform), so unlike the disk-usage walk above these run
+            // inline rather than on a blocking thread.
+            // 1 GiB fallback mirrors `cache::FALLBACK_TOTAL_RAM_BYTES` (private to
+            // that module) for the rare case the RAM read itself fails.
+            let total_ram = crate::wasm_runtime::read_total_ram_bytes()
+                .map(|v| v as u64)
+                .unwrap_or(1024 * 1024 * 1024);
+            let pool_size = crate::config::runtime_pool_size().get();
+            let live_signals = match (
+                crate::wasm_runtime::read_own_rss_bytes(),
+                crate::wasm_runtime::read_available_memory_bytes(),
+            ) {
+                (Some(rss), Some(avail)) => Some((rss as u64, avail as u64)),
+                _ => None,
+            };
+            ring.hosting_manager.recompute_resident_overhead_budget(
+                total_ram,
+                pool_size,
+                live_signals,
+            );
         }
     }
 
@@ -3299,22 +3395,33 @@ impl Ring {
     /// Returns a `RecordAccessResult` containing:
     /// - `is_new`: Whether this contract was newly added (vs. refreshed existing)
     /// - `evicted`: Contracts that were evicted to make room
+    ///
+    /// `cause` attributes WHY this peer is (possibly) starting to host: the
+    /// caller is the only code that knows whether this is its own client's
+    /// request, someone else's request in transit, or a sub-op fetch. It feeds
+    /// telemetry only — it changes nothing about what is hosted or evicted.
     pub fn host_contract(
         &self,
         key: ContractKey,
         size_bytes: u64,
         access_type: AccessType,
+        cause: HostingCause,
     ) -> RecordAccessResult {
         self.hosting_manager
-            .record_contract_access(key, size_bytes, access_type)
+            .record_contract_access(key, size_bytes, access_type, cause)
     }
 
     /// Record a GET access to a contract in the hosting cache.
     ///
     /// Returns a `RecordAccessResult` indicating whether this was a new addition
     /// and which contracts were evicted (if any).
-    pub fn record_get_access(&self, key: ContractKey, size_bytes: u64) -> RecordAccessResult {
-        self.host_contract(key, size_bytes, AccessType::Get)
+    pub fn record_get_access(
+        &self,
+        key: ContractKey,
+        size_bytes: u64,
+        cause: HostingCause,
+    ) -> RecordAccessResult {
+        self.host_contract(key, size_bytes, AccessType::Get, cause)
     }
 
     /// Record that a local-client GET was answered from local hosted state
@@ -3408,6 +3515,14 @@ impl Ring {
         // config is only reachable here). The 60s sweep's recompute reads them.
         self.hosting_manager
             .configure_disk_budget(hosting_disk_pct, max_hosting_disk);
+    }
+
+    /// Install the operator-configurable share of live host-wide surplus
+    /// memory the resident-overhead (count-derived) eviction budget may claim
+    /// (#5333). Called once at startup; the 60s sweep's recompute reads it.
+    pub fn configure_resident_overhead_mem_share(&self, mem_share: f64) {
+        self.hosting_manager
+            .configure_resident_overhead_mem_share(mem_share);
     }
 
     /// Drop the ring's clones of the redb `Storage` handle (hosting metadata +
@@ -3915,6 +4030,12 @@ impl Ring {
         self.hosting_manager.contract_in_use(contract)
     }
 
+    /// Instance ids of every contract [`Self::contract_in_use`] holds for. See
+    /// `HostingManager::in_use_contract_ids`.
+    pub(crate) fn in_use_contract_ids(&self) -> Vec<ContractInstanceId> {
+        self.hosting_manager.in_use_contract_ids()
+    }
+
     /// Single helper for every state-write chokepoint. Does the three
     /// things a chokepoint MUST do, in order:
     ///
@@ -4388,12 +4509,18 @@ impl Ring {
     }
 
     /// Snapshot of the demand-driven hosting state for the local-peer
-    /// dashboard (piece A, #4642). Reads the canonical hosting cache — the
-    /// capability-relative RAM budget + per-contract Greedy-Dual keep_score
-    /// that actually governs retention today, replacing the dormant MAD
-    /// governance detector (#4296). No mirror, no cache: the aggregate gauges
-    /// and per-contract rows come straight from the `HostingManager`, so the
-    /// panel can't drift the way a mirrored counter would.
+    /// dashboard (#4642). Reads the canonical hosting cache — the
+    /// capability-relative budget plus the per-contract rows. No mirror, no
+    /// cache: the aggregate gauges and per-contract rows come straight from
+    /// the `HostingManager`, so the panel can't drift the way a mirrored
+    /// counter would.
+    ///
+    /// The demoted telemetry-only estimator (`keep_score` /
+    /// `predicted_demand`) is deliberately NOT carried on these rows: eviction
+    /// does not read it, and rendering it implied a ranking it never governed.
+    /// Real eviction ordering is subscriber-primary (`victim_order`);
+    /// `recency_seq` is the one ranking input available here, and is what the
+    /// cache actually sorts these rows by.
     ///
     /// Per-contract rows are returned in EVICTION order (next victim first).
     /// The renderer bounds how many it displays; the full count is
@@ -4422,10 +4549,9 @@ impl Ring {
                 ns::HostedContractEntry {
                     key_full,
                     key_short,
-                    keep_score: row.keep_score,
-                    predicted_demand: row.predicted_demand,
                     size_bytes: row.size_bytes,
                     read_count: row.read_count,
+                    recency_seq: row.recency_seq,
                     eviction_eligible,
                 }
             })
@@ -4461,6 +4587,10 @@ impl Ring {
             disk_compile_cache_bytes,
             disk_total_bytes,
             disk_budget_bytes,
+            resident_overhead_budget_bytes: stats.resident_overhead_budget_bytes,
+            estimated_resident_overhead_bytes: stats.estimated_resident_overhead_bytes,
+            contract_slot_budget: stats.contract_slot_budget,
+            resident_overhead_evictions_total: stats.resident_overhead_evictions_total,
         }
     }
 
@@ -8301,6 +8431,57 @@ mod instant_now_pin_test {
     }
 }
 
+/// Wiring pin for the shadow-mode futile-repair rows on
+/// `network_efficiency_v1` (`crate::ring::futile_repair`).
+///
+/// The detector's state machine is unit-tested in its own module and its
+/// handler wiring in `node.rs`. What NEITHER can see is the assignment in
+/// `router_snapshot_telemetry` that connects the two: drop it, or feed a row
+/// from the wrong source, and every one of those tests stays green while the
+/// fleet publishes zeros — for a release whose entire purpose is to establish
+/// the detector's real frequency in production. That is the #4009/#4010
+/// manually-mirrored-telemetry footgun, and the snapshot loop is a 30-minute
+/// background cadence inside a fully-built `Ring`, which is why it is pinned by
+/// source scrape rather than executed.
+#[cfg(test)]
+mod futile_repair_wiring_pin {
+    /// Production source only: the needles below appear in this module too, and
+    /// a pin that matches its own source is a pin that can never fail.
+    fn production_source() -> &'static str {
+        const FULL: &str = include_str!("ring.rs");
+        let cutoff = FULL
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("ring.rs must have a top-level #[cfg(test)] mod section");
+        &FULL[..cutoff]
+    }
+
+    #[test]
+    fn network_efficiency_block_is_fed_from_the_futile_repair_snapshot() {
+        let src = production_source();
+        assert!(
+            src.contains(
+                "let futile_repair = op_manager.interest_manager.futile_repair_snapshot();"
+            ),
+            "the futile-repair snapshot is no longer taken in the \
+             router_snapshot block — the detector then collects its counters \
+             and exports nothing, while every test for it still passes"
+        );
+        for (field, source_expr) in [
+            ("futile", "futile_repair.to_row()"),
+            ("futile_ladder", "futile_repair.ladder"),
+        ] {
+            let needle = format!("{field}: {source_expr},");
+            assert!(
+                src.contains(&needle),
+                "`NetworkEfficiencyV1.{field}` must be populated as `{needle}` \
+                 in the router_snapshot block. Dropping it, or feeding it from \
+                 anything else, publishes an empty or wrong series with no \
+                 failing test — #4009/#4010."
+            );
+        }
+    }
+}
+
 /// Pin tests for the periodic hosting-advertisement re-request (#4642 spec step
 /// 1, "Fix 1"): the reliability backstop that heals a dropped on-connect
 /// advertisement exchange or a dropped per-eviction retraction. It is PIGGYBACKED
@@ -8667,6 +8848,48 @@ mod sleep_or_shutdown_tests {
     }
 }
 
+/// Wiring pin for the hosting-observability rows on `network_efficiency_v1`.
+///
+/// The counters themselves are unit-tested in `ring::hosting` (attribution) and
+/// `tracing::telemetry` (serialization). What NEITHER can see is the assignment
+/// in `router_snapshot_telemetry` that connects them: drop it, or feed a row
+/// from the wrong source, and every one of those tests stays green while the
+/// fleet publishes zeros or the wrong series. That is the #4009/#4010
+/// manually-mirrored-telemetry footgun, and the snapshot loop is a 30-minute
+/// background cadence inside a fully-built `Ring`, which is why it is pinned by
+/// source scrape rather than executed.
+#[cfg(test)]
+mod hosting_observability_wiring_pin {
+    /// Production source only: the needles below appear in this module too, and
+    /// a pin that matches its own source is a pin that can never fail.
+    fn production_source() -> &'static str {
+        const FULL: &str = include_str!("ring.rs");
+        let cutoff = FULL
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("ring.rs must have a top-level #[cfg(test)] mod section");
+        &FULL[..cutoff]
+    }
+
+    #[test]
+    fn network_efficiency_block_is_fed_from_the_hosting_cache_stats() {
+        let src = production_source();
+        for (field, source_expr) in [
+            ("host_begin", "hosting.hosting_begins"),
+            ("host_reads", "hosting.read_count_hist"),
+            ("host_recency", "hosting.genuine_access_recency"),
+        ] {
+            let needle = format!("{field}: {source_expr},");
+            assert!(
+                src.contains(&needle),
+                "`NetworkEfficiencyV1.{field}` must be populated as `{needle}` in \
+                 the router_snapshot block. Without this assignment the hosting \
+                 counters are collected and never exported, and every unit test \
+                 for them still passes — the exact failure mode of #4009/#4010."
+            );
+        }
+    }
+}
+
 /// End-to-end seam test for cost-aware eviction (#4861 / #4903 review):
 /// drives the message axis through the REAL production reporter
 /// (`Ring::report_contract_resource_usage` → topology meter) and the REAL
@@ -8740,9 +8963,24 @@ mod cost_pressure_seam_tests {
         let read_hot = seam_key(3);
 
         // Host all three through the production entry point (PUT seeds).
-        let _ = ring.host_contract(junk, 121, crate::ring::AccessType::Put);
-        let _ = ring.host_contract(subscribed, 121, crate::ring::AccessType::Put);
-        let _ = ring.host_contract(read_hot, 121, crate::ring::AccessType::Put);
+        let _ = ring.host_contract(
+            junk,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+        let _ = ring.host_contract(
+            subscribed,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+        let _ = ring.host_contract(
+            read_hot,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
         assert!(ring.is_hosting_contract(&junk), "precondition: hosted");
 
         // Age the PUT-seed recency stamps past the cost window, so only the
@@ -8761,7 +8999,7 @@ mod cost_pressure_seam_tests {
             ),
             crate::ring::hosting::AddSubscriberOutcome::Rejected
         ));
-        let _ = ring.record_get_access(read_hot, 121);
+        let _ = ring.record_get_access(read_hot, 121, crate::ring::HostingCause::Other);
 
         // The FX2j storm profile, reported for ALL THREE contracts through
         // the production reporter: one 58-target fan-out dispatch every 1.6s
@@ -8935,8 +9173,18 @@ mod cost_pressure_seam_tests {
         let junk = seam_key(1);
         let subscribed = seam_key(2);
 
-        let _ = ring.host_contract(junk, 121, crate::ring::AccessType::Put);
-        let _ = ring.host_contract(subscribed, 121, crate::ring::AccessType::Put);
+        let _ = ring.host_contract(
+            junk,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+        let _ = ring.host_contract(
+            subscribed,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
         // Both advertised to co-hosts — the state this fix is about. Set directly
         // (not via `announce_contract_hosted`) so the only `HostingAnnounce` the
         // channel can carry is a retraction.
@@ -9031,7 +9279,12 @@ mod cost_pressure_seam_tests {
 
         // (1) Re-hosted: present in the hosting cache when the reclaim runs.
         let rehosted = seam_key(4);
-        let _ = ring.host_contract(rehosted, 121, crate::ring::AccessType::Put);
+        let _ = ring.host_contract(
+            rehosted,
+            121,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
         op_manager.neighbor_hosting.on_contract_hosted(&rehosted);
 
         // (2) Back in use: absent from the hosting cache, but a downstream

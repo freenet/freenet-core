@@ -303,7 +303,123 @@ const WASM_STACK_SIZE: usize = 8 * 1024 * 1024;
 /// and refresh frequency. With the bounded per-instance reservation
 /// (~256 MiB, see #3986) the per-Store virtual memory budget is ~125 GiB,
 /// well within the address space limits that previously motivated this cap.
+///
+/// This bounds VIRTUAL memory and mapping COUNT only. It does NOT bound the
+/// arena's RESIDENT footprint, which is what OOM-kills a peer — see
+/// [`store_arena_budget_bytes`], the companion byte bound (#5268).
 const STORE_REFRESH_THRESHOLD: u64 = 500;
+
+/// Fraction of the memory the node may use that all Store arenas together may
+/// hold in retired-but-unreclaimed instance memory before refreshing.
+///
+/// The arena is pure slack: every byte in it belongs to an instance that has
+/// already finished. An eighth of the node's memory limit is a generous ceiling
+/// for slack while leaving refreshes infrequent enough not to matter.
+const STORE_ARENA_RAM_DIVISOR: usize = 8;
+
+/// Floor for the per-Store arena byte budget (4 MiB).
+///
+/// A thrash guard, not a target: at the measured ~3 MiB of linear memory retained
+/// per instance it still lets a Store retire an instance or so between refreshes,
+/// so a refresh never lands on literally every call.
+///
+/// Deliberately small, because it is the term that fights the budget rather than
+/// serving it. `pool_size × this` is a floor on node-wide arena slack that no
+/// memory limit can reduce, so a generous value re-creates in miniature the
+/// defect-3 shape it sits next to (a per-worker constant multiplied by a
+/// CPU-derived count). Where memory is scarce enough for it to bind — below
+/// roughly a 512 MiB limit at 16 workers — more frequent refreshes are the right
+/// trade; above that the RAM-scaled share binds and this is inert (a 2 GiB peer
+/// with 16 workers resolves to 16 MiB from the share, not from here).
+const STORE_ARENA_MIN_BYTES: usize = 4 * 1024 * 1024;
+
+/// Ceiling for the per-Store arena byte budget (256 MiB).
+///
+/// On an unconstrained host this is what binds, and it binds BEFORE
+/// [`STORE_REFRESH_THRESHOLD`] does: at the measured ~3 MiB of retained linear
+/// memory per instance it is reached after roughly 85 instances, not 500. That
+/// is the intended outcome — a quarter-gigabyte of memory belonging to instances
+/// that have already finished is enough slack for anyone, and refreshing at 85
+/// rather than 500 costs one extra `Store::new` per ~85 contract calls. The
+/// count threshold stays as the mapping-count backstop
+/// (`vm.max_map_count`), which byte accounting does not measure.
+///
+/// Raising this to ~1.5 GiB WOULD restore the old 500-instance cadence exactly,
+/// and is deliberately not done: the whole point of the byte bound is that an
+/// instance COUNT is the wrong unit for a resident-memory limit.
+const STORE_ARENA_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// Retired-instance bytes ONE Store may accumulate before it is refreshed.
+///
+/// # Why a byte bound is needed at all
+///
+/// wasmtime arena-allocates instances inside a `Store`, so dropping an
+/// `Instance` frees nothing: its linear memory stays resident until the whole
+/// Store is replaced. RSS on a real peer is therefore a SAWTOOTH, not a ramp —
+/// `framework`'s fell 1.46 GiB within one second of a
+/// `Refreshing engine store … lifetime_instances=500` line. Peak height was set
+/// purely by [`STORE_REFRESH_THRESHOLD`], a fixed instance COUNT, so nothing in
+/// the node budgeted the arena's resident bytes; the existing comment budgets
+/// only VIRTUAL memory (~125 GiB, matching nova's `VmSize`). That is why kill
+/// intervals varied so wildly on one node (5.5 h vs 1.1 h): death depended on
+/// where a ramp happened to start. Issue #5268 defect 2.
+///
+/// # Sizing
+///
+/// `clamp(memory_limit / 8 / pool_size, 4 MiB, 256 MiB)`. It is divided by the
+/// pool size because there is one Store PER pool worker (up to 16), so the
+/// node-wide arena slack is the product; the memory limit comes from
+/// [`read_total_ram_bytes`](crate::wasm_runtime::read_total_ram_bytes), which
+/// already resolves `min(MemTotal, cgroup limit)` and so honours the shipped
+/// `MemoryMax=2G`. A 2 GiB peer with 16 workers resolves to 16 MiB per Store
+/// (256 MiB node-wide) from the RAM-scaled share; an unconstrained gateway
+/// saturates at [`STORE_ARENA_MAX_BYTES`].
+///
+/// # When ONE instance is as large as the whole budget
+///
+/// A contract may declare up to `DEFAULT_MAX_MEMORY_PAGES` (256 MiB) of linear
+/// memory, so a single instance can meet or exceed this budget by itself. Then
+/// every call to that contract ends in a Store refresh rather than a periodic
+/// one. That is deliberate, and it is the RIGHT outcome rather than a
+/// degenerate one: the alternative is retaining an arena already at or past the
+/// limit the node is trying not to exceed, which is the OOM this exists to
+/// prevent. Prompt reclamation is what a memory-constrained peer wants.
+///
+/// It is not free, though — a `Store::new` plus epoch re-arm per call — and it
+/// concentrates on exactly the large-contract, memory-constrained peers this
+/// work targets, so [`WasmtimeEngine::note_refresh_cadence`] makes it visible to
+/// an operator (rate-limited) instead of letting it be a silent CPU cost. The
+/// per-refresh work is small next to instantiating a module with tens of MiB of
+/// linear memory in the first place, which is why it is accepted rather than
+/// worked around with a floor scaled to observed instance size: such a floor
+/// would be `N × (up to 256 MiB) × pool_size` of guaranteed slack that no
+/// memory limit could reduce — reintroducing defect 3's shape to avoid a cost
+/// that is a fraction of the call it accompanies.
+fn store_arena_budget_bytes() -> usize {
+    let total_ram =
+        crate::wasm_runtime::read_total_ram_bytes().unwrap_or(STORE_ARENA_FALLBACK_TOTAL_RAM_BYTES);
+    store_arena_budget_for(total_ram, crate::config::runtime_pool_size().into())
+}
+
+/// Pure sizing math behind [`store_arena_budget_bytes`], split out so
+/// aggregate-commitment tests can ask what a hypothetical host would get instead
+/// of depending on the test machine's own RAM and core count. See
+/// `contract::executor::tests::cache_byte_budgets_are_aggregate_safe`, which has
+/// to include this term: there is one Store per pool worker, so the node-wide
+/// arena slack is `pool_size ×` this.
+pub(crate) fn store_arena_budget_for(total_ram: usize, pool_size: usize) -> usize {
+    (total_ram / STORE_ARENA_RAM_DIVISOR / pool_size.max(1))
+        .clamp(STORE_ARENA_MIN_BYTES, STORE_ARENA_MAX_BYTES)
+}
+
+/// Fallback total-RAM estimate (1 GiB) when the OS query fails, mirroring the
+/// module cache's own fallback.
+const STORE_ARENA_FALLBACK_TOTAL_RAM_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Minimum gap between [`WasmtimeEngine::note_refresh_cadence`] warnings, so a
+/// peer running one large contract reports the condition periodically instead of
+/// once per call — which would be the very flood the warning is about.
+const CADENCE_WARN_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Maximum age of a Store before forced refresh, even with live instances.
 ///
@@ -614,6 +730,25 @@ pub(crate) struct WasmtimeEngine {
     /// Instances created in the current Store; reset on `replace_store`.
     /// See [`STORE_REFRESH_THRESHOLD`].
     lifetime_instances: u64,
+    /// Linear-memory bytes belonging to instances that have finished but whose
+    /// allocation the current Store's arena still holds; reset on
+    /// `replace_store`. Measured at `drop_instance` time (memory only grows
+    /// within an instance's life, so the size at drop is its high-water mark)
+    /// and compared against [`Self::arena_budget_bytes`]. See
+    /// [`store_arena_budget_bytes`].
+    ///
+    /// Approximate on purpose: it counts the guest's linear memory, which
+    /// dominates, and misses instances leaked without engine cleanup — those
+    /// stay covered by [`STORE_REFRESH_THRESHOLD`] and [`STORE_MAX_AGE`].
+    retired_instance_bytes: u64,
+    /// Retired-instance bytes this Store may hold before it is refreshed.
+    /// Resolved once per engine from the node's memory limit and pool size.
+    arena_budget_bytes: u64,
+    /// Last time [`Self::note_refresh_cadence`] warned that refreshes are firing
+    /// after a single instance. Real wall-clock `Instant` deliberately: it
+    /// rate-limits an operator log line, not node behavior (same rationale as
+    /// `store_created_at` and the module cache's eviction-warning window).
+    last_cadence_warn: Option<Instant>,
     /// When the current Store was created. Used by [`STORE_MAX_AGE`] fallback.
     store_created_at: Instant,
     /// Production opt-in for offloading a cache-miss compile to a blocking
@@ -731,6 +866,9 @@ impl WasmEngine for WasmtimeEngine {
             max_fuel,
             epoch_deadline_ticks,
             lifetime_instances: 0,
+            retired_instance_bytes: 0,
+            arena_budget_bytes: store_arena_budget_bytes() as u64,
+            last_cadence_warn: None,
             store_created_at: Instant::now(),
             offload_compilation: config.offload_compilation,
         })
@@ -850,26 +988,56 @@ impl WasmEngine for WasmtimeEngine {
     }
 
     fn drop_instance(&mut self, handle: &InstanceHandle) {
+        // Charge this instance's linear memory to the arena BEFORE dropping the
+        // handle: the allocation outlives the instance (it is reclaimed only by
+        // replacing the whole Store), so this is what makes RSS a sawtooth
+        // rather than a ramp. See `retired_instance_bytes` (#5268).
+        self.retired_instance_bytes = self
+            .retired_instance_bytes
+            .saturating_add(self.instance_memory_bytes(handle.id));
         self.instances.remove(&handle.id);
         MEM_ADDR.remove(&handle.id);
 
         let threshold_exceeded = self.lifetime_instances >= STORE_REFRESH_THRESHOLD;
+        let arena_over_budget = self.retired_instance_bytes >= self.arena_budget_bytes;
         let store_expired = self.store_created_at.elapsed() >= STORE_MAX_AGE;
 
-        if self.instances.is_empty() && threshold_exceeded {
-            // Normal path: all instances dropped and threshold exceeded.
-            tracing::info!(
+        if self.instances.is_empty() && (threshold_exceeded || arena_over_budget) {
+            self.note_refresh_cadence(arena_over_budget);
+            // Normal path: all instances dropped and either bound exceeded.
+            //
+            // `debug!`, not `info!`: with the byte bound this is a routine event
+            // rather than a rare one. On a constrained host (16 MiB arena budget,
+            // ~3 MiB retained per instance) it fires roughly every 5 instances
+            // instead of every 500, which at `info!` would bury the operator log
+            // under a line every few seconds under load.
+            tracing::debug!(
                 lifetime_instances = self.lifetime_instances,
-                "Refreshing engine store to reclaim virtual memory"
+                retired_instance_bytes = self.retired_instance_bytes,
+                arena_budget_bytes = self.arena_budget_bytes,
+                reason = if arena_over_budget {
+                    "arena_bytes"
+                } else {
+                    "instance_count"
+                },
+                "Refreshing engine store to reclaim memory"
             );
             self.replace_store();
-        } else if threshold_exceeded && store_expired {
+        } else if (threshold_exceeded || arena_over_budget) && store_expired {
             // Safety net: orphaned instances (leaked without engine cleanup) are
             // preventing is_empty() from being true. After STORE_MAX_AGE, force
-            // a refresh to bound virtual memory growth. The orphaned Instance
-            // handles become invalid but they were already leaked and unusable.
+            // a refresh to bound memory growth. The orphaned Instance handles
+            // become invalid but they were already leaked and unusable.
+            //
+            // This arm takes EITHER bound, like the normal arm above: the leaked
+            // instance is exactly the case `retired_instance_bytes` claims to
+            // cover, and requiring the full 500-instance count here would have
+            // left the arena's resident bytes unbounded on the one path that
+            // reaches this code (#5268 review).
             tracing::warn!(
                 lifetime_instances = self.lifetime_instances,
+                retired_instance_bytes = self.retired_instance_bytes,
+                arena_budget_bytes = self.arena_budget_bytes,
                 orphaned_instances = self.instances.len(),
                 store_age_secs = self.store_created_at.elapsed().as_secs(),
                 "Force-refreshing engine store — orphaned instances preventing normal refresh"
@@ -1209,6 +1377,41 @@ impl WasmtimeEngine {
             .any(|import| import.module() == "freenet_contract_io")
     }
 
+    /// Names of the contract entry points this instance is missing, if any.
+    ///
+    /// A module can compile and instantiate perfectly while exporting none of the
+    /// contract ABI. Every call against it then fails at execution time, which a
+    /// conformance run reads as "could not judge this contract" rather than "this is
+    /// not a contract" — so a run against the wrong file reports success. Resolving
+    /// the names up front turns that into a load error.
+    pub(crate) fn missing_contract_exports_for(
+        &mut self,
+        handle: &InstanceHandle,
+    ) -> Vec<&'static str> {
+        const CONTRACT_ABI: [&str; 4] = [
+            "validate_state",
+            "update_state",
+            "summarize_state",
+            "get_state_delta",
+        ];
+        // Fail CLOSED. Returning "nothing missing" when the store or the instance
+        // is absent reports a contract as having the full ABI without having looked,
+        // which is the one answer this function must never give: its whole purpose is
+        // to stop a module that is not a contract being read as a contract that
+        // merely could not be judged. Report the whole ABI as missing instead, so an
+        // unanswerable question surfaces as a refusal rather than as a pass.
+        let Some(store) = self.store.as_mut() else {
+            return CONTRACT_ABI.to_vec();
+        };
+        let Some(instance) = self.instances.get(&handle.id) else {
+            return CONTRACT_ABI.to_vec();
+        };
+        CONTRACT_ABI
+            .into_iter()
+            .filter(|name| instance.get_export(&mut *store, name).is_none())
+            .collect()
+    }
+
     /// Create a new backend engine that can be shared across multiple Runtime instances.
     pub(crate) fn create_backend_engine(config: &RuntimeConfig) -> Result<Engine, ContractError> {
         let (engine, _, _) = Self::create_engine(config)?;
@@ -1264,6 +1467,9 @@ impl WasmtimeEngine {
             max_fuel,
             epoch_deadline_ticks,
             lifetime_instances: 0,
+            retired_instance_bytes: 0,
+            arena_budget_bytes: store_arena_budget_bytes() as u64,
+            last_cadence_warn: None,
             store_created_at: Instant::now(),
             offload_compilation: config.offload_compilation,
         })
@@ -1509,7 +1715,74 @@ impl WasmtimeEngine {
         self.instances.clear();
         self.store = Some(store);
         self.lifetime_instances = 0;
+        self.retired_instance_bytes = 0;
         self.store_created_at = Instant::now();
+    }
+
+    /// Warn (rate-limited) when the arena bound is firing after a SINGLE
+    /// instance, i.e. one contract's linear memory alone meets or exceeds this
+    /// Store's whole arena budget, so every call to it now ends in a Store
+    /// refresh rather than a periodic one.
+    ///
+    /// Correct behaviour (see [`store_arena_budget_bytes`]) but not free, and it
+    /// lands on exactly the large-contract, memory-constrained peers this work
+    /// targets. Without a signal it would be an invisible CPU cost that looks
+    /// like "the node got slower after the upgrade" with nothing to point at; the
+    /// refresh line itself is `debug!` precisely because it is too frequent to
+    /// read, so the diagnosis has to come from here. `warn!` and rate-limited to
+    /// one line per [`CADENCE_WARN_INTERVAL`], so it is greppable without
+    /// becoming the flood it reports.
+    fn note_refresh_cadence(&mut self, arena_over_budget: bool) {
+        // `lifetime_instances` counts creations in the CURRENT Store and resets
+        // on every replace, so 1 here means this Store served exactly one call.
+        if !arena_over_budget || self.lifetime_instances > 1 {
+            return;
+        }
+        let now = Instant::now();
+        let due = self
+            .last_cadence_warn
+            .is_none_or(|prev| now.duration_since(prev) >= CADENCE_WARN_INTERVAL);
+        if !due {
+            return;
+        }
+        self.last_cadence_warn = Some(now);
+        tracing::warn!(
+            retired_instance_bytes = self.retired_instance_bytes,
+            arena_budget_bytes = self.arena_budget_bytes,
+            "A single contract instance's memory fills this worker's whole WASM \
+             arena budget, so its Store is being replaced on every call. Memory \
+             stays bounded, but each call pays an extra store rebuild. Raise the \
+             node's memory limit (MemoryMax) or lower FREENET_RUNTIME_POOL_SIZE \
+             to give each worker a larger arena budget."
+        );
+    }
+
+    /// Override the arena byte budget so a test can decide which of the two
+    /// refresh bounds is under examination, rather than inheriting the test
+    /// host's RAM and core count. Tests that pin the INSTANCE-COUNT threshold
+    /// set `u64::MAX` (arena bound disarmed); the arena test sets a small value.
+    #[cfg(test)]
+    fn set_arena_budget_for_test(&mut self, bytes: u64) {
+        self.arena_budget_bytes = bytes;
+    }
+
+    /// Current linear-memory size of a live instance, or 0 when it cannot be
+    /// read (already gone, no store, or no `memory` export).
+    ///
+    /// Used to charge a finishing instance's allocation to the Store arena; a
+    /// zero on an unreadable instance only under-counts, and the count/age
+    /// thresholds remain as backstops.
+    fn instance_memory_bytes(&mut self, id: i64) -> u64 {
+        let Some(store) = self.store.as_mut() else {
+            return 0;
+        };
+        let Some(instance) = self.instances.get(&id) else {
+            return 0;
+        };
+        instance
+            .get_memory(&mut *store, "memory")
+            .map(|memory| memory.data_size(&*store) as u64)
+            .unwrap_or(0)
     }
 
     fn compute_max_fuel(config: &RuntimeConfig) -> u64 {
@@ -3432,12 +3705,180 @@ mod tests {
         engine.drop_instance(&handle);
     }
 
+    /// REGRESSION (issue #5268 defect 2): the Store must be refreshed when the
+    /// arena's retained RESIDENT bytes reach the budget, WITHOUT waiting for
+    /// `STORE_REFRESH_THRESHOLD` instance creations.
+    ///
+    /// wasmtime arena-allocates instances, so dropping an `Instance` frees
+    /// nothing until the whole Store is replaced. With the fixed 500-instance
+    /// count as the only bound, peak RSS was set by that count and nothing
+    /// budgeted resident memory: a real peer's RSS fell 1.46 GiB the instant one
+    /// refresh fired, and peers died against the shipped 2 GiB `MemoryMax` long
+    /// before 500 was a sensible number.
+    ///
+    /// Without the byte bound this loop refreshes only at 500, so
+    /// `lifetime_instances` is still counting up when the assertion runs.
+    #[test]
+    fn store_refresh_fires_on_arena_bytes_before_instance_count() {
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        let module = engine.compile(SIMPLE_WASM).unwrap();
+
+        // Charge one instance to learn what the arena actually retains per
+        // instance, then set a budget only a few instances wide.
+        let handle = engine.create_instance(&module, 0, 1024).unwrap();
+        engine.drop_instance(&handle);
+        let per_instance = engine.retired_instance_bytes;
+        assert!(
+            per_instance > 0,
+            "an instance's linear memory must be measurable, else the byte bound \
+             can never fire"
+        );
+        engine.set_arena_budget_for_test(per_instance * 4);
+
+        let mut refreshes = 0;
+        let mut previous = engine.lifetime_instances;
+        // Far fewer creations than STORE_REFRESH_THRESHOLD: any refresh seen
+        // here is attributable to the byte bound alone.
+        let creations = 40;
+        assert!(creations < STORE_REFRESH_THRESHOLD);
+        for i in 1..=creations {
+            let handle = engine.create_instance(&module, i as i64, 1024).unwrap();
+            engine.drop_instance(&handle);
+            if engine.lifetime_instances <= previous {
+                refreshes += 1;
+                assert_eq!(
+                    engine.lifetime_instances, 0,
+                    "a refresh must reset the instance counter"
+                );
+                assert_eq!(
+                    engine.retired_instance_bytes, 0,
+                    "a refresh must reset the arena byte counter"
+                );
+            }
+            previous = engine.lifetime_instances;
+        }
+
+        assert!(
+            refreshes >= 5,
+            "a 4-instance arena budget must refresh repeatedly over {creations} \
+             instances, saw {refreshes}"
+        );
+        assert!(
+            engine.is_healthy(),
+            "engine must stay healthy across byte-budget refreshes"
+        );
+        let handle = engine
+            .create_instance(&module, 999_999, 1024)
+            .expect("should create instance after byte-budget refresh");
+        engine.drop_instance(&handle);
+    }
+
+    /// A single instance whose linear memory alone meets the arena budget must
+    /// keep WORKING — refreshing the Store on every call, with memory bounded and
+    /// no wedge — rather than looping, erroring, or silently growing.
+    ///
+    /// A contract may declare up to `DEFAULT_MAX_MEMORY_PAGES` (256 MiB), and on
+    /// the 2 GiB / 16-worker shape this PR targets the arena budget is 16 MiB, so
+    /// "one instance is the whole budget" is a reachable production case, not a
+    /// contrived one (#5268 review, 5th lens). This pins that it degrades to
+    /// per-call reclamation — the correct trade for a memory-constrained peer —
+    /// instead of misbehaving.
+    #[test]
+    fn instance_larger_than_the_arena_budget_refreshes_every_call_and_keeps_working() {
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        // 160 pages = 10 MiB of linear memory, against a 1 MiB arena budget: one
+        // instance is TEN times the whole budget.
+        let wat = r#"
+        (module
+          (memory (export "memory") 160)
+          (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+            i64.const 0)
+          (func (export "__frnt_set_id") (param i64)))
+        "#;
+        let module = engine.compile(wat.as_bytes()).unwrap();
+        engine.set_arena_budget_for_test(1024 * 1024);
+
+        for i in 0..12 {
+            let handle = engine
+                .create_instance(&module, i as i64, 1024)
+                .unwrap_or_else(|e| panic!("instance {i} must still be creatable: {e}"));
+            assert_eq!(
+                engine.lifetime_instances, 1,
+                "each call starts from a fresh Store, so it is the Store's first \
+                 instance"
+            );
+            engine.drop_instance(&handle);
+            assert_eq!(
+                engine.lifetime_instances, 0,
+                "an instance larger than the budget must trigger a refresh on \
+                 EVERY call"
+            );
+            assert_eq!(
+                engine.retired_instance_bytes, 0,
+                "the refresh must reset the arena accounting, so residue cannot \
+                 accumulate across calls"
+            );
+        }
+
+        assert!(
+            engine.is_healthy(),
+            "the engine must survive per-call store replacement"
+        );
+    }
+
+    /// The arena budget must be derived from the memory the node may use divided
+    /// by the number of Stores (one per pool worker), not from a constant — and
+    /// must land at its floor for the shape that OOMs today: a 2 GiB `MemoryMax`
+    /// on a many-core box.
+    #[test]
+    fn arena_budget_is_memory_derived_and_pool_divided() {
+        let budget = store_arena_budget_bytes();
+        assert!(
+            (STORE_ARENA_MIN_BYTES..=STORE_ARENA_MAX_BYTES).contains(&budget),
+            "arena budget {budget} must stay within \
+             [{STORE_ARENA_MIN_BYTES}, {STORE_ARENA_MAX_BYTES}]"
+        );
+
+        // Pure sizing math, independent of the test host (see #5268 defect 3 for
+        // why the pool size must divide it: it is CPU-derived and MemoryMax does
+        // not constrain CPU count).
+        let sized = store_arena_budget_for;
+        let two_gib = 2 * 1024 * 1024 * 1024;
+        assert_eq!(
+            sized(two_gib, 16),
+            two_gib / STORE_ARENA_RAM_DIVISOR / 16,
+            "a 2 GiB cap across 16 workers must resolve from the RAM-scaled \
+             share, with neither clamp binding"
+        );
+        assert!(
+            sized(two_gib, 16) * 16 <= two_gib / 4,
+            "node-wide arena slack on a 2 GiB peer must stay a modest fraction \
+             of the limit"
+        );
+        // The floor binds only where memory is genuinely scarce, and even then
+        // the node-wide slack stays bounded rather than becoming a
+        // per-worker constant times the core count.
+        let tiny = 256 * 1024 * 1024;
+        assert_eq!(sized(tiny, 16), STORE_ARENA_MIN_BYTES);
+        assert!(sized(tiny, 16) * 16 <= tiny / 4);
+        // A single-worker 2 GiB peer and a large unconstrained gateway both keep
+        // the generous ceiling, so this only bites the constrained many-core case.
+        assert_eq!(sized(two_gib, 1), STORE_ARENA_MAX_BYTES);
+        assert_eq!(sized(125 * 1024 * 1024 * 1024, 16), STORE_ARENA_MAX_BYTES);
+    }
+
     /// Verify that the Store is refreshed after STORE_REFRESH_THRESHOLD instances,
     /// reclaiming virtual memory from wasmtime's arena allocator.
     #[test]
     fn test_store_refresh_reclaims_virtual_memory() {
         let config = RuntimeConfig::default();
         let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        // Pin the arena byte bound OFF: this test examines the
+        // instance-COUNT threshold, which must not depend on the test host's
+        // RAM or core count (#5268).
+        engine.set_arena_budget_for_test(u64::MAX);
         let module = engine.compile(SIMPLE_WASM).unwrap();
 
         // Create and drop exactly STORE_REFRESH_THRESHOLD instances.
@@ -3472,6 +3913,10 @@ mod tests {
     fn test_store_not_refreshed_with_live_instances() {
         let config = RuntimeConfig::default();
         let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        // Pin the arena byte bound OFF: this test examines the
+        // instance-COUNT threshold, which must not depend on the test host's
+        // RAM or core count (#5268).
+        engine.set_arena_budget_for_test(u64::MAX);
         let module = engine.compile(SIMPLE_WASM).unwrap();
 
         // First, burn through most of the threshold with create/drop cycles
@@ -3518,6 +3963,10 @@ mod tests {
     fn test_recover_store_resets_lifetime_instances() {
         let config = RuntimeConfig::default();
         let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        // Pin the arena byte bound OFF: this test examines the
+        // instance-COUNT threshold, which must not depend on the test host's
+        // RAM or core count (#5268).
+        engine.set_arena_budget_for_test(u64::MAX);
         let module = engine.compile(SIMPLE_WASM).unwrap();
 
         // Create some instances to bump the counter
@@ -3552,6 +4001,10 @@ mod tests {
             ..Default::default()
         };
         let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        // Pin the arena byte bound OFF: this test examines the
+        // instance-COUNT threshold, which must not depend on the test host's
+        // RAM or core count (#5268).
+        engine.set_arena_budget_for_test(u64::MAX);
         let module = engine.compile(SIMPLE_WASM).unwrap();
 
         // Create and drop enough instances to trigger refresh
@@ -3624,6 +4077,10 @@ mod tests {
 
         let config = RuntimeConfig::default();
         let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        // Pin the arena byte bound OFF: this test examines the instance-COUNT
+        // threshold, which must not depend on the test host's RAM or core count
+        // (#5268).
+        engine.set_arena_budget_for_test(u64::MAX);
         let module = engine.compile(SIMPLE_WASM).unwrap();
 
         let baseline_maps = count_maps();

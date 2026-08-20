@@ -1519,6 +1519,29 @@ where
             return None;
         }
     };
+    // The OBSERVED half of the check, as distinct from the DECISION.
+    //
+    // Every other line on this path reports what the node decided; none reports
+    // what it was deciding ABOUT. That left the release canary (#5236) able to
+    // assert only the ABSENCE of an error, and absence is satisfied by a
+    // comparator that is silently wrong rather than loudly broken: a
+    // `version_from_tag` that regressed to a constant, or a normaliser that
+    // truncated `0.2.121` to `0.2.12`, still parses, still compares, still
+    // declines to update, and still logs a clean completion. The log was
+    // byte-identical to a healthy one, so Gate A could not tell them apart.
+    //
+    // Emitting the value makes the gate's assertion POSITIVE: the canary
+    // compares this against the tag GitHub actually published and fails on a
+    // mismatch. INFO, not `debug!` -- release builds set
+    // `release_max_level_info`, so a `debug!` here would not exist in the
+    // binary the gate inspects (the mistake that made the completion marker
+    // unobservable in the first place). `scripts/auto-update-canary.sh` greps
+    // for this text and `scripts/auto-update-canary_test.sh` pins it against
+    // this call, so do not reword it without updating both.
+    tracing::info!(
+        latest = %latest,
+        "Startup update check: GitHub reports latest release"
+    );
     compare_versions_for_startup(current_version, &latest)
 }
 
@@ -3120,20 +3143,18 @@ mod tests {
         let got = probe_release_tag_at(&server.url_str("/releases/latest"))
             .await
             .expect("a 403 is a normal outcome, not a transport error");
-        match got {
-            ProbeResult::RateLimited { retry_after } => {
-                let secs = retry_after
-                    .expect("reset header must yield a wait")
-                    .as_secs();
-                // Converted from absolute to delta; allow a second of clock drift
-                // between the header being built and being parsed.
-                assert!(
-                    (1_499..=1_500).contains(&secs),
-                    "expected ~1500s derived from x-ratelimit-reset, got {secs}"
-                );
-            }
-            other => panic!("403 must classify as rate-limited, got {other:?}"),
-        }
+        let ProbeResult::RateLimited { retry_after } = &got else {
+            panic!("403 must classify as rate-limited, got {got:?}");
+        };
+        let secs = retry_after
+            .expect("reset header must yield a wait")
+            .as_secs();
+        // Converted from absolute to delta; allow a second of clock drift
+        // between the header being built and being parsed.
+        assert!(
+            (1_499..=1_500).contains(&secs),
+            "expected ~1500s derived from x-ratelimit-reset, got {secs}"
+        );
     }
 
     #[tokio::test]
@@ -3256,13 +3277,13 @@ mod tests {
                 )),
         );
 
-        match probe_release_tag_at(&server.url_str("/releases/latest"))
+        let got = probe_release_tag_at(&server.url_str("/releases/latest"))
             .await
-            .expect("an off-host redirect must resolve to Unusable, not error")
-        {
-            ProbeResult::Unusable { status, .. } => assert_eq!(status, 301),
-            other => panic!("off-host redirect must not be followed, got {other:?}"),
-        }
+            .expect("an off-host redirect must resolve to Unusable, not error");
+        let ProbeResult::Unusable { status, .. } = &got else {
+            panic!("off-host redirect must not be followed, got {got:?}");
+        };
+        assert_eq!(*status, 301);
     }
 
     #[test]
@@ -3352,14 +3373,14 @@ mod tests {
             .expect("exceeding the deadline is a normal outcome, not an error");
         let elapsed = started.elapsed();
 
-        match got {
-            ProbeResult::Aborted { reason } => assert!(
-                reason.contains("chain deadline"),
-                "hitting the deadline must say so, so an operator can tell it from \
-                 a malformed redirect"
-            ),
-            other => panic!("a chain that never resolves must end Unusable, got {other:?}"),
-        }
+        let ProbeResult::Aborted { reason } = &got else {
+            panic!("a chain that never resolves must end Unusable, got {got:?}");
+        };
+        assert!(
+            reason.contains("chain deadline"),
+            "hitting the deadline must say so, so an operator can tell it from \
+             a malformed redirect"
+        );
         // Generous upper bound: the point is that it stops near the deadline
         // rather than running all 4 hops (800ms+), not that it is precise.
         assert!(
@@ -3423,18 +3444,16 @@ mod tests {
                 .respond_with(status_code(302).append_header("location", "/loop")),
         );
 
-        match probe_release_tag_at(&server.url_str("/loop"))
+        let got = probe_release_tag_at(&server.url_str("/loop"))
             .await
-            .expect("a redirect loop must terminate, not error out")
-        {
-            ProbeResult::Aborted { reason } => {
-                assert!(
-                    reason.contains("redirect limit"),
-                    "giving up on a loop should say so"
-                );
-            }
-            other => panic!("a redirect loop must end Unusable, got {other:?}"),
-        }
+            .expect("a redirect loop must terminate, not error out");
+        let ProbeResult::Aborted { reason } = &got else {
+            panic!("a redirect loop must end Unusable, got {got:?}");
+        };
+        assert!(
+            reason.contains("redirect limit"),
+            "giving up on a loop should say so"
+        );
     }
 
     #[tokio::test]

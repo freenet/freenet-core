@@ -16,6 +16,14 @@
 #     ASC_API_ISSUER_ID   Issuer UUID from App Store Connect
 #
 #   Other optional:
+#     FREENET_ARM64_FDEV_BIN  Path to aarch64-apple-darwin fdev binary.
+#     FREENET_X86_FDEV_BIN    Path to x86_64-apple-darwin fdev binary.
+#                             When BOTH are set, fdev is bundled alongside
+#                             freenet (Contents/MacOS/fdev) so the wrapper's
+#                             first-launch CLI symlink setup (service/
+#                             cli_symlinks.rs) can put both `freenet` and
+#                             `fdev` on PATH. When unset, the bundle ships
+#                             without fdev (fine for a local .app smoke-test).
 #     OUTPUT_DIR          Where to place artifacts (default: dist/macos)
 #     ICON_ICNS           Path to a .icns file (default: generic app icon)
 #     CREATE_DMG          "true" to produce a .dmg; "false" to stop at .app
@@ -83,6 +91,18 @@ echo ">> Building universal binary"
 lipo -create -output "$APP_DIR/Contents/MacOS/freenet-bin" \
     "$FREENET_ARM64_BIN" "$FREENET_X86_BIN"
 chmod +x "$APP_DIR/Contents/MacOS/freenet-bin"
+
+if [[ -n "${FREENET_ARM64_FDEV_BIN:-}" && -n "${FREENET_X86_FDEV_BIN:-}" ]]; then
+    echo ">> Building universal fdev binary"
+    lipo -create -output "$APP_DIR/Contents/MacOS/fdev" \
+        "$FREENET_ARM64_FDEV_BIN" "$FREENET_X86_FDEV_BIN"
+    chmod +x "$APP_DIR/Contents/MacOS/fdev"
+elif [[ -n "${FREENET_ARM64_FDEV_BIN:-}" || -n "${FREENET_X86_FDEV_BIN:-}" ]]; then
+    echo "package-macos.sh: FREENET_ARM64_FDEV_BIN and FREENET_X86_FDEV_BIN must both be set (or both unset)" >&2
+    exit 1
+else
+    echo ">> Skipping fdev (FREENET_ARM64_FDEV_BIN/FREENET_X86_FDEV_BIN not set)"
+fi
 
 echo ">> Writing shell wrapper as CFBundleExecutable"
 # When the user opens Freenet.app, macOS runs Contents/MacOS/Freenet (the

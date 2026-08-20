@@ -182,6 +182,20 @@ State merging rules:
     Note: this invariant is NOT enforced for `UpdateData::Delta` inputs
     (CmRDT-style "increment by X" deltas legitimately violate it) or
     `UpdateData::RelatedState` (a cross-contract hint, not a CRDT op).
+
+    **Contested as of RFC #5320.** That delta exemption is a live
+    disagreement, not settled fact. The RFC requires delta idempotence on
+    the grounds that Freenet delivery is at-least-once with no dedup for
+    delta redelivery, so an "increment by X" delta silently double-applies
+    when redelivered — which makes it unsafe under this transport whatever
+    its standing as a CRDT in the abstract. Issue #4320 §1 makes the same
+    argument independently. The offline verifier
+    (`crate::conformance::ConformanceProperty::DeltaIdempotence`) therefore
+    checks deltas, but reports them at `Severity::Diagnostic` so the check
+    can never justify removing a contract while the question is open.
+    Whether any deployed contract actually relies on the unsafe pattern is
+    empirical and unanswered; `fdev conformance` against deployed WASM is
+    how it gets answered. Do not treat either side as decided until it is.
   - Invalid merges should return error, not panic
 ```
 

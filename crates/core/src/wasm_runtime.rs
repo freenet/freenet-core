@@ -12,25 +12,60 @@ mod runtime;
 pub mod secret_export;
 pub mod secret_snapshots;
 mod secrets_store;
+// Narrow re-export rather than making `secrets_store` crate-visible: this is the one
+// correct way in this codebase to create a secret file (owner-only AT CREATION, not
+// chmod-ed afterwards), and the conformance focus salt needs it too. Widening the
+// whole module for one helper would expose the secrets store's internals crate-wide
+// for convenience.
+pub(crate) use secrets_store::sweep::create_owner_only;
 pub(crate) mod simulation_runtime;
 mod state_store;
 #[cfg(all(test, feature = "wasmtime-backend"))]
-mod tests;
+pub(crate) mod tests;
 
 pub(crate) use contract::{
     ContractRuntimeBridge, ContractRuntimeInterface, ContractStoreBridge, classify_result,
 };
-pub use contract_store::{ContractStore, SharedContractIndex};
+pub use contract_store::{ContractStore, SharedCodeCache, SharedContractIndex};
 pub(crate) use delegate::DelegateRuntimeInterface;
-pub use delegate_store::DelegateStore;
+pub use delegate_store::{DelegateStore, SharedDelegateCodeCache, SharedDelegateIndex};
+
+/// The per-node store state every pool executor's `ContractStore` and
+/// `DelegateStore` share, rather than each building its own.
+///
+/// Bundled instead of passed as four parallel arguments because they must be
+/// adopted together: an executor that shares the index but not the byte cache
+/// (the pre-#5268 shape) silently keeps `pool_size` copies of the same WASM,
+/// and an executor that shares neither cannot see a delegate a sibling
+/// registered. Cloning this is cheap — every field is a handle.
+#[derive(Clone)]
+pub struct SharedStores {
+    pub contract_index: SharedContractIndex,
+    pub contract_code: SharedCodeCache,
+    pub delegate_index: SharedDelegateIndex,
+    pub delegate_code: SharedDelegateCodeCache,
+}
+
+impl SharedStores {
+    /// Build one set of shared handles, each byte cache bounded by `max_size`.
+    pub fn new(max_size: u64) -> Self {
+        Self {
+            contract_index: SharedContractIndex::default(),
+            contract_code: contract_store::new_code_cache(max_size),
+            delegate_index: SharedDelegateIndex::default(),
+            delegate_code: delegate_store::new_code_cache(max_size),
+        }
+    }
+}
 pub(crate) use engine::BackendEngine;
 pub(crate) use error::{ContractError, RuntimeInnerError, RuntimeResult};
 pub use mock_state_storage::MockStateStorage;
 pub use module_cache::default_module_cache_budget_bytes;
 pub(crate) use module_cache::{
     DELEGATE_MODULE_CACHE_BUDGET_DIVISOR, InterestPredicate, ModuleCache, ModuleCacheMetrics,
-    contract_cache_interested_occupancy_pct, contract_cache_occupancy_pct, interest_tiered_enabled,
-    migration_admission_recovered_now, read_total_ram_bytes,
+    budget_for_ram, contract_cache_interested_occupancy_pct, contract_cache_occupancy_pct,
+    interest_tiered_enabled, migration_admission_recovered_now, read_available_memory_bytes,
+    read_own_rss_bytes, read_total_ram_bytes,
 };
 // Clamp bounds are referenced only by the config-default round-trip test, which
 // asserts the resolved default lands within [MIN, MAX] without hardcoding the
@@ -38,7 +73,7 @@ pub(crate) use module_cache::{
 // the re-export isn't an unused import under `-D warnings` in release.
 #[cfg(test)]
 pub(crate) use module_cache::{
-    MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES, MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES, budget_for_ram,
+    MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES, MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES,
 };
 pub(crate) use native_api::{
     DELEGATE_SUBSCRIPTIONS, DelegateContextCache, SharedDelegateCounter, SharedInheritedOrigins,
@@ -51,7 +86,9 @@ pub(crate) use native_api::{
 #[cfg(test)]
 pub(crate) use native_api::InheritedOriginsEntry;
 pub use runtime::{ContractExecError, Runtime};
-pub(crate) use runtime::{RuntimeConfig, SharedModuleCache, default_wasmtime_cache_size_bytes};
+pub(crate) use runtime::{
+    RuntimeConfig, SharedModuleCache, default_wasmtime_cache_size_bytes_for_dir,
+};
 pub use secrets_store::{
     DEFAULT_LAST_SEEN_DEBOUNCE_SECS, DEFAULT_PER_USER_INACTIVE_TTL_SECS,
     DEFAULT_PER_USER_SECRET_QUOTA_BYTES, ExportSecretEntry, MigrationReport, SecretScope,

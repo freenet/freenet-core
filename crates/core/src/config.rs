@@ -4,6 +4,7 @@ use std::{
     future::Future,
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, atomic::AtomicBool},
     time::Duration,
@@ -132,6 +133,18 @@ pub struct ConfigArgs {
     /// on a host with a very large data disk. Default: 32 GiB.
     #[arg(long, env = "MAX_HOSTING_DISK")]
     pub max_hosting_disk: Option<u64>,
+
+    /// Fraction (0.0-1.0) of LIVE host-wide surplus memory (this process's own
+    /// resident size plus currently-available system memory) the resident-
+    /// overhead (count-derived) eviction budget may claim, on top of its own
+    /// RSS (#5333). Bounds how aggressively an otherwise-idle host grows its
+    /// hosted-contract count so the process does not visibly dominate a
+    /// user's Task Manager even when the OS reports abundant free memory.
+    /// Does not shrink the budget below the host's already-declared static
+    /// caches. Default: 0.125 (1/8, matching qBittorrent's disk-cache "auto"
+    /// default and this codebase's own pre-existing `/8` convention).
+    #[arg(long, env = "HOSTING_MEM_SHARE")]
+    pub hosting_mem_share: Option<f64>,
 
     /// Per-user secret-storage quota in bytes for HOSTED mode (#4561, P5 of
     /// #4381). Bounds a single hosted user's (one `userToken`) TOTAL on-disk
@@ -294,6 +307,7 @@ impl Default for ConfigArgs {
             max_hosting_storage: None,
             hosting_disk_pct: None,
             max_hosting_disk: None,
+            hosting_mem_share: None,
             per_user_secret_quota_bytes: None,
             per_user_inactive_ttl_secs: None,
             inactive_user_sweep_interval_secs: None,
@@ -903,6 +917,7 @@ impl ConfigArgs {
             // these are new fields, so a plain get_or_insert is correct.
             self.hosting_disk_pct.get_or_insert(cfg.hosting_disk_pct);
             self.max_hosting_disk.get_or_insert(cfg.max_hosting_disk);
+            self.hosting_mem_share.get_or_insert(cfg.hosting_mem_share);
             // #4968. `cfg.enable_event_log` is itself an Option, so an older
             // config.toml with no such key merges as `None` and leaves the
             // mode-dependent default intact rather than pinning `false`.
@@ -1429,6 +1444,9 @@ impl ConfigArgs {
             max_hosting_disk: self
                 .max_hosting_disk
                 .unwrap_or(crate::ring::DEFAULT_MAX_HOSTING_DISK_BYTES),
+            hosting_mem_share: self
+                .hosting_mem_share
+                .unwrap_or(crate::ring::DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE),
             per_user_secret_quota_bytes: self
                 .per_user_secret_quota_bytes
                 .unwrap_or(crate::wasm_runtime::DEFAULT_PER_USER_SECRET_QUOTA_BYTES as u64),
@@ -1636,6 +1654,12 @@ pub struct Config {
     /// operator override survives a flag-less restart.
     #[serde(default = "default_max_hosting_disk", rename = "max-hosting-disk")]
     pub max_hosting_disk: u64,
+    /// Fraction (0.0-1.0) of LIVE host-wide surplus memory the resident-
+    /// overhead (count-derived) eviction budget may claim on top of its own
+    /// RSS (#5333). Default 0.125 (1/8). Persisted so an operator override
+    /// survives a flag-less restart.
+    #[serde(default = "default_hosting_mem_share", rename = "hosting-mem-share")]
+    pub hosting_mem_share: f64,
     /// Per-user secret-storage quota in bytes for hosted mode (#4561, P5 of
     /// #4381). Bounds a single hosted user's TOTAL on-disk footprint (active
     /// secret-value blobs + the `.keys` enumeration registry) under their
@@ -1746,6 +1770,54 @@ fn default_shutdown_drain_secs() -> u64 {
     30
 }
 
+/// Number of `Executor<Runtime>` workers the `RuntimePool` runs.
+///
+/// Reserve one logical core for the Tokio event loop and OS scheduling. WASM
+/// execution is CPU-bound, so the pool naturally can't exceed useful
+/// parallelism. Capped at 16 to stay well within the max_blocking_threads limit
+/// (see [`default_max_blocking_threads`]), preventing the executor pool from
+/// exhausting the blocking pool. `FREENET_RUNTIME_POOL_SIZE` overrides it
+/// (useful for tests).
+///
+/// This is CPU-derived, and `MemoryMax` does not constrain CPU count — a 20-core
+/// laptop inside a 2 GiB cgroup gets 16 workers. Anything sized PER WORKER must
+/// therefore compose its ceiling against the memory limit rather than assume the
+/// product is affordable (#5268 defect 3), which is why this lives here as one
+/// shared source: `RuntimePool::new` sizes the pool from it and the per-worker
+/// cache budgets divide by it.
+pub(crate) fn runtime_pool_size() -> NonZeroUsize {
+    let cores = std::thread::available_parallelism().map(|n| n.get()).ok();
+    let override_value = std::env::var(RUNTIME_POOL_SIZE_ENV)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok());
+    resolve_pool_size(cores, override_value)
+}
+
+/// Env var overriding [`runtime_pool_size`] (useful for tests).
+const RUNTIME_POOL_SIZE_ENV: &str = "FREENET_RUNTIME_POOL_SIZE";
+
+/// Upper bound on the executor pool, keeping it well within
+/// [`default_max_blocking_threads`].
+const MAX_RUNTIME_POOL_SIZE: usize = 16;
+
+/// Pure clamp math behind [`runtime_pool_size`], split out so its boundaries are
+/// unit-testable without mutating the process-global environment (which would
+/// race every other test in the binary) or depending on the test host's core
+/// count.
+///
+/// `cores` is `None` when the OS cannot report parallelism; `override_value` is
+/// the parsed env var when set.
+fn resolve_pool_size(cores: Option<usize>, override_value: Option<usize>) -> NonZeroUsize {
+    let from_cores = cores
+        .unwrap_or(4)
+        .saturating_sub(1)
+        .clamp(1, MAX_RUNTIME_POOL_SIZE);
+    let resolved = override_value
+        .map(|n| n.clamp(1, MAX_RUNTIME_POOL_SIZE))
+        .unwrap_or(from_cores);
+    NonZeroUsize::new(resolved).expect("clamped to at least 1")
+}
+
 /// Default max blocking threads: 2x CPU cores, clamped to 4-32.
 fn default_max_blocking_threads() -> usize {
     std::thread::available_parallelism()
@@ -1777,6 +1849,14 @@ fn default_hosting_disk_pct() -> f64 {
 /// [`crate::ring::DEFAULT_MAX_HOSTING_DISK_BYTES`] (32 GiB).
 fn default_max_hosting_disk() -> u64 {
     crate::ring::DEFAULT_MAX_HOSTING_DISK_BYTES
+}
+
+/// Default fraction of live host-wide surplus memory the resident-overhead
+/// eviction budget may claim (#5333): resolves to
+/// [`crate::ring::DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE`] (0.125), the single
+/// source of truth shared with the sizing math.
+fn default_hosting_mem_share() -> f64 {
+    crate::ring::DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE
 }
 
 /// `skip_serializing_if` predicate for [`Config::max_hosting_storage`]: true
@@ -2536,7 +2616,8 @@ pub struct WebsocketApiArgs {
 
     /// Additional hostname(s) to accept in the Host header for the local
     /// HTTP/WebSocket API (including the delegate permission-prompt
-    /// endpoints `/permission/pending`, `/permission/events`, and
+    /// endpoints `/permission/pending`, `/permission/events`,
+    /// `/permission/events/ws`, and
     /// `/permission/{nonce}/respond`).
     /// Use when accessing the node via a custom domain (e.g., through a reverse proxy).
     /// Can be specified multiple times. If omitted, only the machine's hostname and
@@ -4505,13 +4586,22 @@ std::thread_local! {
     // always decodes as `Other` — the receiver, which is the only side that can
     // judge agreement, cannot know which send site produced it. Entry count is
     // the best available proxy and needs no wire change: the notification and
-    // rejection emitters are single-entry BY CONSTRUCTION while both reply
-    // emitters are multi-entry (see `outbound_message_mix::SummariesDetail`).
+    // rejection emitters are single-entry BY CONSTRUCTION, and only
+    // `InterestsReply` — the ~5-min heartbeat — is genuinely multi-entry (see
+    // `outbound_message_mix::SummariesDetail`).
     //
-    // Known ambiguity, stated so the number is not over-read: a heartbeat reply
-    // for a peer pair sharing exactly ONE contract is also single-entry, so the
-    // single bucket is "state-change-driven sites PLUS narrow heartbeats", not
-    // a clean partition. It is directional evidence, not attribution.
+    // Known contamination, stated so the number is not over-read, and it is
+    // larger than a heartbeat edge case: `ChangeInterestsReply` is single-entry
+    // 100% of the time (measured mean exactly 1.000, `max_entries` 1, over
+    // 418,476 messages on 1,284 peers), because `broadcast_change_interests`
+    // gossips one contract per message. Corrected 2026-08-12 (#5153 review F1) —
+    // this said "both reply emitters are multi-entry", which is what made the
+    // proxy look clean. A narrow heartbeat (a peer pair sharing exactly ONE
+    // contract) contaminates too, but is the smaller term. So the single bucket
+    // is "state-change-driven sites PLUS interest-churn replies PLUS narrow
+    // heartbeats": directional evidence, not attribution, and the send-side
+    // per-emitter census in `outbound_message_mix` is what makes the
+    // contamination subtractable rather than assumed.
     /// Peak size of the digest arm's per-hash local-summary cache (#4965).
     /// The observable for the RETENTION bound: the cache holds owned summary
     /// clones, so its peak entry count is what decides whether a hostile
@@ -5223,6 +5313,37 @@ mod tests {
     use crate::transport::TransportKeypair;
 
     use super::*;
+
+    /// The pool size is the multiplier in every per-worker memory budget
+    /// (#5268 defect 3), so its clamp boundaries are load-bearing, not cosmetic:
+    /// the divisor the budgets use and the count the pool actually creates come
+    /// from this one function, and a mismatch between them WAS the defect.
+    ///
+    /// Exercised through the pure `resolve_pool_size` rather than the env-reading
+    /// wrapper: `FREENET_RUNTIME_POOL_SIZE` is process-global, so a test that set
+    /// it would race every other test in the binary.
+    #[test]
+    fn runtime_pool_size_clamps_cores_and_override() {
+        let size = |cores, over| resolve_pool_size(cores, over).get();
+
+        // One core is reserved for the event loop and OS scheduling.
+        assert_eq!(size(Some(20), None), 16, "capped at MAX");
+        assert_eq!(size(Some(17), None), 16, "exactly at MAX after the reserve");
+        assert_eq!(size(Some(8), None), 7);
+        assert_eq!(size(Some(2), None), 1, "vega's shape: 2 cores -> 1 worker");
+        // Never zero, however few cores are reported.
+        assert_eq!(size(Some(1), None), 1);
+        assert_eq!(size(Some(0), None), 1);
+        // Unknown parallelism falls back to a 4-core assumption.
+        assert_eq!(size(None, None), 3);
+
+        // The override wins, and is clamped the same way — a hostile or fat-
+        // fingered value must not multiply the per-worker budgets past MAX.
+        assert_eq!(size(Some(20), Some(1)), 1);
+        assert_eq!(size(Some(2), Some(16)), 16);
+        assert_eq!(size(Some(2), Some(9_999)), 16);
+        assert_eq!(size(Some(20), Some(0)), 1, "zero clamps up, never panics");
+    }
 
     // ---------------------------------------------------------------------
     // #5124 — `config.toml` key convention.
@@ -7413,6 +7534,7 @@ shutdown-drain-secs = 42
             max_hosting_storage: None,
             hosting_disk_pct: None,
             max_hosting_disk: None,
+            hosting_mem_share: None,
             per_user_secret_quota_bytes: None,
             per_user_inactive_ttl_secs: None,
             inactive_user_sweep_interval_secs: None,
@@ -7562,6 +7684,7 @@ shutdown-drain-secs = 42
             max_hosting_storage: 123_456_789,
             hosting_disk_pct: 0.37,
             max_hosting_disk: 9_876_543_210,
+            hosting_mem_share: 0.21,
             per_user_secret_quota_bytes: 7_654_321,
             per_user_inactive_ttl_secs: 1_234_567,
             inactive_user_sweep_interval_secs: 7_200,
@@ -7625,6 +7748,7 @@ shutdown-drain-secs = 42
             max_hosting_storage,
             hosting_disk_pct,
             max_hosting_disk,
+            hosting_mem_share,
             per_user_secret_quota_bytes,
             per_user_inactive_ttl_secs,
             inactive_user_sweep_interval_secs,
@@ -7652,6 +7776,10 @@ shutdown-drain-secs = 42
         );
         assert_eq!(hosting_disk_pct, seed.hosting_disk_pct, "hosting_disk_pct");
         assert_eq!(max_hosting_disk, seed.max_hosting_disk, "max_hosting_disk");
+        assert_eq!(
+            hosting_mem_share, seed.hosting_mem_share,
+            "hosting_mem_share"
+        );
         assert_eq!(
             per_user_secret_quota_bytes, seed.per_user_secret_quota_bytes,
             "per_user_secret_quota_bytes"

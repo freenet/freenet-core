@@ -12896,12 +12896,12 @@ fn test_placement_migration_at_scale_renewal_load_stays_bounded() {
         // test could pass with migration silently inert (which would defeat its
         // purpose as migration's scale home).
         let mut migrated: Vec<(usize, usize)> = Vec::new();
-        for ci in 0..NUM_CONTRACTS {
+        for (ci, key) in contract_keys.iter().enumerate() {
             // Non-loaded regular nodes are node_no 2..=num_nodes (node 1 is the
             // loaded host; the loaded node hosting its own seeded contract is not
             // a migration).
             for n in 2..=num_nodes {
-                if result.is_node_hosting(&NodeLabel::node(network_name, n), &contract_keys[ci]) {
+                if result.is_node_hosting(&NodeLabel::node(network_name, n), key) {
                     migrated.push((ci, n));
                 }
             }
@@ -13938,12 +13938,6 @@ fn test_subscription_chain_collapses_on_client_leave() {
 struct PieceEGateMetrics {
     // ---- Findability (wire per-tx, the codebase's own GET-reliability metric) ----
     get_attempts: u64,
-    get_successes: u64,
-    get_not_found: u64,
-    get_failures: u64,
-    get_timeouts: u64,
-    /// Successes whose GET traversed the network (hop_count >= 1).
-    network_successes: u64,
     /// wire successes / attempts, in [0, 1].
     findability_rate: f64,
     // ---- Findability (client-visible: requester ended up holding the state) ----
@@ -13970,9 +13964,6 @@ struct PieceEGateMetrics {
     /// Requesters that ended holding a NON-current state (SERVED STALE) — the
     /// direct #4709 signal.
     requesters_stale: usize,
-    /// requesters_stale / (requesters_fresh + requesters_stale), in [0, 1].
-    /// PRIMARY stale-serve number. `None` if no requester obtained any state.
-    stale_serve_rate: Option<f64>,
     /// Mesh subscribers, and how many ended fresh (invariant-1 positive control).
     subscribers_total: usize,
     subscribers_fresh: usize,
@@ -14038,12 +14029,6 @@ fn compute_piece_e_metrics(
     } else {
         requesters_with_state as f64 / requesters_total as f64
     };
-    let served = requesters_fresh + requesters_stale;
-    let stale_serve_rate = if served == 0 {
-        None
-    } else {
-        Some(requesters_stale as f64 / served as f64)
-    };
 
     // --- Subscription-tree formation ---
     let hosting_nodes = result
@@ -14076,11 +14061,6 @@ fn compute_piece_e_metrics(
 
     PieceEGateMetrics {
         get_attempts,
-        get_successes: summary.successes,
-        get_not_found: summary.not_found,
-        get_failures: summary.failures,
-        get_timeouts: summary.timeouts,
-        network_successes: summary.network_successes,
         findability_rate,
         requesters_total,
         requesters_with_state,
@@ -14092,7 +14072,6 @@ fn compute_piece_e_metrics(
         stale_holders,
         requesters_fresh,
         requesters_stale,
-        stale_serve_rate,
         subscribers_total,
         subscribers_fresh,
     }
@@ -15552,8 +15531,13 @@ fn test_summary_first_put_reverse_delta_converges_originator() {
 // vacuous.
 //
 // NOTE ON WHICH LEG IS EXERCISED: after the #4965 review, digest-first ships on
-// the two MULTI-ENTRY reply legs only (`InterestsReply`, `ChangeInterestsReply`)
-// — `Notification` and `Rejection` stay full-bytes. So the digests observed here
+// the two REPLY legs only (`InterestsReply`, `ChangeInterestsReply`) —
+// `Notification` and `Rejection` stay full-bytes. Only `InterestsReply` is
+// genuinely multi-entry; this comment said "the two MULTI-ENTRY reply legs"
+// until 2026-08-12, corrected per #5153 review F1, because
+// `ChangeInterestsReply` is single-entry 100% of the time (one contract per
+// `broadcast_change_interests` gossip; measured mean 1.000, `max_entries` 1,
+// over 418,476 messages on 1,284 peers). So the digests observed here
 // necessarily come from the connection-time `Interests` -> reply exchange, which
 // is the leg that matters, and NOT from the per-state-change notification.
 // `summaries_reply_for_peer` is the only path that can emit a digest, and only
@@ -16333,14 +16317,14 @@ fn nn_run_put_reach(
     for (label, storage) in result.node_storages.iter() {
         if storage.get_stored_state(&contract_key).is_some() {
             total_holders += 1;
-            for idx in 0..locs.len() {
+            for (idx, &loc) in locs.iter().enumerate() {
                 let matches_label = if idx == 0 {
                     *label == NodeLabel::gateway(&network, 0)
                 } else {
                     *label == NodeLabel::node(&network, idx)
                 };
                 if matches_label {
-                    landing_loc = Some(locs[idx]);
+                    landing_loc = Some(loc);
                 }
             }
         }

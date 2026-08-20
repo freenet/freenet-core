@@ -2482,24 +2482,23 @@ mod tests {
             contract_count: 2,
             budget_evictions_total: 3,
             evictions_of_recently_read_total: 1,
-            // Provider emits rows in eviction order (lowest keep_score first).
+            // Provider emits rows in eviction order (least-recently accessed
+            // first — ascending `recency_seq`).
             contracts: vec![
                 HostedContractEntry {
                     key_full: "VICTIM_FULL".to_string(),
                     key_short: "VICTIM...".to_string(),
-                    keep_score: 0.10,
-                    predicted_demand: 0.0,
                     size_bytes: 1024,
                     read_count: 0,
+                    recency_seq: 0,
                     eviction_eligible: true,
                 },
                 HostedContractEntry {
                     key_full: "HOT_FULL".to_string(),
                     key_short: "HOT...".to_string(),
-                    keep_score: 5.0,
-                    predicted_demand: 4.0,
                     size_bytes: 2048,
                     read_count: 42,
+                    recency_seq: 99,
                     eviction_eligible: false,
                 },
             ],
@@ -2519,13 +2518,13 @@ mod tests {
             html.contains("var(--danger"),
             "recently-read eviction count should be highlighted — got:\n{html}"
         );
-        // The next-to-evict badge attaches to the first (lowest keep_score) row.
+        // The next-to-evict badge attaches to the first eligible row.
         let victim_idx = html.find("VICTIM_FULL").expect("victim row present");
         let hot_idx = html.find("HOT_FULL").expect("hot row present");
         let badge_idx = html.find("next to evict").expect("next-to-evict badge");
         assert!(
             victim_idx < hot_idx,
-            "rows must be in eviction order (lowest keep_score first) — got:\n{html}"
+            "rows must be in eviction order (least-recently accessed first) — got:\n{html}"
         );
         assert!(
             badge_idx > victim_idx && badge_idx < hot_idx,
@@ -2533,19 +2532,208 @@ mod tests {
         );
     }
 
+    /// The eviction table must be ordered by a column it actually displays.
+    ///
+    /// Regression for #4830: the card rendered `Keep-score` and `Demand` — the
+    /// demoted telemetry-only estimator that eviction does not read — while the
+    /// rows arrived sorted by `recency_seq`, which was dropped in the dashboard
+    /// mapping and never shown. The table was therefore sorted by an invisible
+    /// column and labelled as sorted by one that had no effect on the order.
+    ///
+    /// Mutation-checked: re-adding a `Keep-score` header or dropping the
+    /// `Recency` column fails this test.
+    #[test]
+    fn hosting_card_shows_the_column_it_is_sorted_by() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 256 * 1024 * 1024,
+            used_bytes: 64 * 1024 * 1024,
+            contract_count: 2,
+            contracts: vec![
+                mk_hosted_entry_seq("COLD", 0, true),
+                mk_hosted_entry_seq("WARM", 7, false),
+            ],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+
+        assert!(
+            html.contains(">Recency</th>"),
+            "the ordering column must be a visible header — got:\n{html}"
+        );
+        // The dormant estimator must not be presented as a ranking column.
+        assert!(
+            !html.contains(">Keep-score</th>") && !html.contains(">Demand</th>"),
+            "keep-score/demand are telemetry-only and must not be shown as \
+             eviction ranking columns — got:\n{html}"
+        );
+        // `recency_seq == 0` is "not accessed since startup", not a real
+        // sequence number, so it must not render as a bare 0.
+        assert!(
+            html.contains(">never<"),
+            "recency_seq 0 must render as 'never', not 0 — got:\n{html}"
+        );
+        assert!(
+            html.contains(">7<"),
+            "a non-zero recency_seq must render its value — got:\n{html}"
+        );
+        // Displayed order must BE the recency order, not merely be labelled as
+        // it. Without this the test would pass on an arbitrary row order.
+        let cold_idx = html.find("COLD_FULL").expect("cold row present");
+        let warm_idx = html.find("WARM_FULL").expect("warm row present");
+        assert!(
+            cold_idx < warm_idx,
+            "rows must render least-recently-accessed first — got:\n{html}"
+        );
+    }
+
+    /// The card must not carry the "piece A" badge, which was internal epic
+    /// jargon rendered in `.g-mode-enforce` — the Governance card's
+    /// *enforcement* red — so a decorative label wore the alarm colour.
+    ///
+    /// Without this pin, restoring the span leaves the suite green.
+    #[test]
+    fn hosting_card_has_no_piece_a_badge() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 256 * 1024 * 1024,
+            used_bytes: 64 * 1024 * 1024,
+            contract_count: 1,
+            contracts: vec![mk_hosted_entry_seq("A", 0, true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        assert!(
+            !html.contains("piece A"),
+            "the internal epic label must not appear on an operator surface — got:\n{html}"
+        );
+        assert!(
+            !html.contains("g-mode-enforce"),
+            "the eviction card must not borrow the governance enforcement-red \
+             badge style — got:\n{html}"
+        );
+    }
+
+    /// A contract pinned by a local client or downstream subscriber sorts to
+    /// the top of this table when it has never been read, because the
+    /// cache-side sort cannot see subscriber counts — yet the real sweep
+    /// evicts it LAST. Without a marker it is indistinguishable from the most
+    /// evictable row, which is the confusion the "in use" badge exists to
+    /// prevent.
+    #[test]
+    fn hosting_card_marks_pinned_rows_as_in_use() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 256 * 1024 * 1024,
+            used_bytes: 64 * 1024 * 1024,
+            contract_count: 2,
+            contracts: vec![
+                // Never read AND pinned: sorts first, but is not the victim.
+                mk_hosted_entry_seq("PINNED", 0, false),
+                mk_hosted_entry_seq("EVICTABLE", 5, true),
+            ],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        let pinned_idx = html.find("PINNED_FULL").expect("pinned row present");
+        let evictable_idx = html.find("EVICTABLE_FULL").expect("evictable row present");
+        let badge_idx = html.find(">in use<").expect("in-use badge present");
+        assert!(
+            badge_idx > pinned_idx && badge_idx < evictable_idx,
+            "the in-use badge must sit on the pinned row — got:\n{html}"
+        );
+        // Exactly one row is pinned, so exactly one badge.
+        assert_eq!(
+            html.matches(">in use<").count(),
+            1,
+            "only the pinned row may carry the in-use badge — got:\n{html}"
+        );
+    }
+
+    /// The footer must not claim a ranking the card cannot actually show.
+    ///
+    /// Regression for #4830: it read "the N most-evictable … (lowest keep-score
+    /// first)", which was wrong twice over — keep-score does not order the
+    /// sweep, and the cache-side sort covers only the zero-subscriber tier.
+    #[test]
+    fn hosting_card_footer_does_not_claim_keep_score_ordering() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 256 * 1024 * 1024,
+            used_bytes: 64 * 1024 * 1024,
+            // More hosted than rendered, so the footer appears.
+            contract_count: 500,
+            contracts: vec![mk_hosted_entry_seq("A", 0, true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        assert!(
+            html.contains("of 500 hosted contracts"),
+            "footer should report the full hosted count — got:\n{html}"
+        );
+        assert!(
+            !html.to_lowercase().contains("keep-score first"),
+            "footer must not claim keep-score ordering — got:\n{html}"
+        );
+        // The subscriber-tier caveat is the honest part; keep it pinned so a
+        // future copy edit cannot quietly drop it.
+        assert!(
+            html.contains("no subscribers"),
+            "footer must state that this is only the zero-subscriber ordering \
+             — got:\n{html}"
+        );
+        // `recency_seq` is ALSO advanced by `record_abandonment` when a
+        // contract loses its last subscriber, so any copy calling this an
+        // access/read ordering misrepresents a just-abandoned contract.
+        //
+        // This blocklist is ILLUSTRATIVE, NOT EXHAUSTIVE: it catches the
+        // phrasings that actually shipped, but an equivalent rewording
+        // ("accessed at", "time since last read", "recently accessed") would
+        // pass. A green run here is therefore evidence, not proof — if you are
+        // editing this copy, re-check the claim against `record_abandonment`
+        // rather than trusting the test.
+        for banned in [
+            "least-recently accessed",
+            "least-recently read",
+            "last accessed",
+            "last read",
+        ] {
+            assert!(
+                !html.contains(banned),
+                "user-visible copy must not describe eviction recency as an \
+                 access time (found {banned:?}) — abandonment advances it too \
+                 — got:\n{html}"
+            );
+        }
+    }
+
+    fn mk_hosted_entry_seq(
+        key: &str,
+        recency_seq: u64,
+        eviction_eligible: bool,
+    ) -> crate::node::network_status::HostedContractEntry {
+        let mut e = mk_hosted_entry(key, eviction_eligible);
+        e.recency_seq = recency_seq;
+        e
+    }
+
+    /// Ordering is by `recency_seq`; use `mk_hosted_entry_seq` when a test
+    /// cares about the order. This helper leaves it at 0 ("never accessed").
     fn mk_hosted_entry(
         key: &str,
-        keep_score: f64,
         eviction_eligible: bool,
     ) -> crate::node::network_status::HostedContractEntry {
         use crate::node::network_status::HostedContractEntry;
         HostedContractEntry {
             key_full: format!("{key}_FULL"),
             key_short: format!("{key}..."),
-            keep_score,
-            predicted_demand: 0.0,
             size_bytes: 1024,
             read_count: 0,
+            recency_seq: 0,
             eviction_eligible,
         }
     }
@@ -2566,9 +2754,9 @@ mod tests {
             evictions_of_recently_read_total: 0,
             contracts: vec![
                 // Lowest score, but pinned (in use / within TTL) → not eligible.
-                mk_hosted_entry("PINNED", 0.10, false),
+                mk_hosted_entry("PINNED", false),
                 // Higher score, but actually eligible → this is the real victim.
-                mk_hosted_entry("EVICTABLE", 2.0, true),
+                mk_hosted_entry("EVICTABLE", true),
             ],
             ..Default::default()
         };
@@ -2602,10 +2790,7 @@ mod tests {
             contract_count: 2,
             budget_evictions_total: 0,
             evictions_of_recently_read_total: 0,
-            contracts: vec![
-                mk_hosted_entry("A", 0.10, false),
-                mk_hosted_entry("B", 2.0, false),
-            ],
+            contracts: vec![mk_hosted_entry("A", false), mk_hosted_entry("B", false)],
             ..Default::default()
         };
         let html = build_hosting_card(&Some(snap));
@@ -2634,12 +2819,13 @@ mod tests {
             contract_count: 1,
             budget_evictions_total: 0,
             evictions_of_recently_read_total: 0,
-            contracts: vec![mk_hosted_entry("A", 1.0, false)],
+            contracts: vec![mk_hosted_entry("A", false)],
             disk_state_bytes: None,
             disk_wasm_bytes: None,
             disk_compile_cache_bytes: None,
             disk_total_bytes: None,
             disk_budget_bytes: None,
+            ..Default::default()
         };
         let html = build_hosting_card(&Some(snap));
         assert!(
@@ -2675,12 +2861,13 @@ mod tests {
             contract_count: 1,
             budget_evictions_total: 0,
             evictions_of_recently_read_total: 0,
-            contracts: vec![mk_hosted_entry("A", 1.0, false)],
+            contracts: vec![mk_hosted_entry("A", false)],
             disk_state_bytes: Some(100 * 1024 * 1024),
             disk_wasm_bytes: Some(20 * 1024 * 1024),
             disk_compile_cache_bytes: Some(5 * 1024 * 1024),
             disk_total_bytes: Some(125 * 1024 * 1024),
             disk_budget_bytes: Some(500 * 1024 * 1024),
+            ..Default::default()
         };
         let html = build_hosting_card(&Some(snap));
         assert!(
@@ -2704,9 +2891,204 @@ mod tests {
                 && html.contains("Compile cache: 5.0 MB"),
             "per-component breakdown in tooltip — got:\n{html}"
         );
+        // The explanatory paragraph must name the pressures that can actually
+        // trigger a sweep. It used to claim the floor was "min(RAM budget,
+        // disk budget)", and this assertion pinned that wording — which is how
+        // the claim outlived the two axes added since: the count-derived
+        // resident-overhead ceiling (#5325, the one that binds first on a
+        // real low-RAM peer) and cost pressure (#4861). Pin the axes, not the
+        // phrasing, so adding a fifth fails here instead of going unnoticed.
+        for axis in ["state bytes", "disk", "resident-overhead", "update work"] {
+            assert!(
+                html.contains(axis),
+                "explanatory paragraph must name the {axis:?} eviction pressure \
+                 — got:\n{html}"
+            );
+        }
+    }
+
+    /// The count-derived pressure axis (#5325) must render as contract SLOTS,
+    /// not as bytes.
+    ///
+    /// The underlying pair is `contract_count * 1 MiB` against a RAM-scaled
+    /// ceiling, so printing it as "30.0 MB / 100.0 MB" reads as measured
+    /// memory. It is not measured, and what it constrains is a number of
+    /// contracts — a low-RAM peer showed "520.0 MB / 524.0 MB" when the honest
+    /// statement was "520 of 524 contract slots used".
+    #[test]
+    fn hosting_card_renders_slot_axis_as_counts_not_bytes() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 256 * 1024 * 1024,
+            used_bytes: 1024,
+            contract_count: 30,
+            contracts: vec![mk_hosted_entry("A", false)],
+            resident_overhead_budget_bytes: 100 * 1024 * 1024,
+            estimated_resident_overhead_bytes: 30 * 1024 * 1024,
+            contract_slot_budget: 100,
+            resident_overhead_evictions_total: 7,
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
         assert!(
-            html.contains("min(RAM budget, disk budget)"),
-            "explanatory paragraph must mention the #4702 min(ram, disk) eviction floor — got:\n{html}"
+            html.contains("Contract slots used") && html.contains("30 / 100"),
+            "slot axis must render as counts — got:\n{html}"
+        );
+        assert!(
+            html.contains(">70<"),
+            "slots free = budget(100) - used(30) — got:\n{html}"
+        );
+        assert!(
+            html.contains(">7<"),
+            "slot-pressure eviction counter renders the snapshot value — got:\n{html}"
+        );
+        // The byte framing must be gone: it is what made this read as RAM.
+        assert!(
+            !html.contains("Resident overhead (est.)")
+                && !html.contains("Resident overhead budget"),
+            "the byte-denominated resident-overhead tiles must not return — got:\n{html}"
+        );
+    }
+
+    /// The card shows several independent ceilings; it must say which one is
+    /// closest to binding.
+    ///
+    /// Measured on a live low-RAM peer: 34% of the state-byte budget, 1% of
+    /// the disk budget, 99.2% of the contract-slot ceiling. All three rendered
+    /// as identical muted tiles, so the only number that mattered was
+    /// indistinguishable from the two with room to spare.
+    #[test]
+    fn hosting_card_names_the_closest_limit() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            // State bytes: 34% used.
+            budget_bytes: 1000,
+            used_bytes: 340,
+            // Slots: 99% used — this is the binding axis.
+            contract_count: 99,
+            contract_slot_budget: 100,
+            // Disk: 1% used.
+            disk_total_bytes: Some(10),
+            disk_budget_bytes: Some(1000),
+            contracts: vec![mk_hosted_entry("A", true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        assert!(
+            html.contains("Closest limit:") && html.contains("contract slots"),
+            "the binding axis must be named — got:\n{html}"
+        );
+        assert!(
+            html.contains("99 of 100"),
+            "the binding axis detail must show its own units — got:\n{html}"
+        );
+        // At 99% it must be flagged, not left in the same muted grey as an
+        // axis with room to spare.
+        assert!(
+            html.contains("var(--danger"),
+            "a near-full binding axis must be coloured — got:\n{html}"
+        );
+    }
+
+    /// The lowest-utilisation axis must NOT be the one reported.
+    #[test]
+    fn hosting_card_picks_the_highest_utilisation_axis() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            // State bytes 90% — the binding axis here.
+            budget_bytes: 1000,
+            used_bytes: 900,
+            // Slots only 10%.
+            contract_count: 10,
+            contract_slot_budget: 100,
+            contracts: vec![mk_hosted_entry("A", true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        assert!(
+            html.contains("Closest limit:") && html.contains("contract state"),
+            "state bytes at 90% must outrank slots at 10% — got:\n{html}"
+        );
+        assert!(
+            !html.contains("Closest limit: <strong>contract slots"),
+            "the slack axis must not be reported as closest — got:\n{html}"
+        );
+    }
+
+    /// Over budget must render as over budget, not as a clamped 100%.
+    ///
+    /// This state is reachable and important, not an error case: exceeding the
+    /// contract-state budget IS the eviction trigger, and the slot axis sits
+    /// over its ceiling for the whole ~2.5 minute sustained window before
+    /// anything is shed. Clamping the percentage produced "150 of 100 (100%)"
+    /// — a line that contradicts its own detail text and hides how far over
+    /// the node is at exactly the moment that matters.
+    #[test]
+    fn hosting_card_shows_true_percentage_when_over_budget() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 100,
+            used_bytes: 150,
+            contract_count: 1,
+            contracts: vec![mk_hosted_entry("A", true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        assert!(
+            html.contains("150%"),
+            "an over-budget axis must report its true percentage — got:\n{html}"
+        );
+        assert!(
+            !html.contains("(100%)"),
+            "no percentage on the card may be clamped to 100% — the RAM-used \
+             tile had the same clamp and disagreed with the strip — got:\n{html}"
+        );
+        // The RAM-used tile must agree with the strip, not clamp separately.
+        assert!(
+            html.contains("150 B / 100 B (150%)"),
+            "the RAM-used tile must report the true percentage too — got:\n{html}"
+        );
+        // The bar itself is still capped: a fill cannot overflow its track.
+        assert!(
+            html.contains("width: 100.0%"),
+            "the bar width must stay clamped at 100% — got:\n{html}"
+        );
+    }
+
+    /// An unconfigured or not-yet-measured budget is not "100% full".
+    ///
+    /// The disk budget is an `Option` precisely because the tracker is
+    /// unseeded early in a node's life; treating an absent or zero
+    /// denominator as full would report a phantom emergency on every fresh
+    /// start.
+    #[test]
+    fn hosting_card_skips_unconfigured_axes_when_picking_closest_limit() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 1000,
+            used_bytes: 100,
+            contract_count: 5,
+            // A slot budget of 0 means "not configured", NOT "no slots left".
+            contract_slot_budget: 0,
+            // Disk tracker unseeded.
+            disk_total_bytes: None,
+            disk_budget_bytes: None,
+            contracts: vec![mk_hosted_entry("A", true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        assert!(
+            html.contains("Closest limit:") && html.contains("contract state"),
+            "the one configured axis must be reported — got:\n{html}"
+        );
+        assert!(
+            !html.contains("contract slots</strong>"),
+            "an unconfigured axis must not be ranked at all — got:\n{html}"
         );
     }
 

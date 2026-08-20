@@ -298,17 +298,46 @@ impl DelegateRuntimeInterface for Runtime {
         cipher: XChaCha20Poly1305,
         nonce: XNonce,
     ) -> RuntimeResult<()> {
+        let key = delegate.key().clone();
         self.secret_store
-            .register_delegate(delegate.key().clone(), cipher, nonce)?;
-        self.delegate_store.store_delegate(delegate)
+            .register_delegate(key.clone(), cipher, nonce)?;
+        // Roll the cipher registration back if the store refuses, mirroring
+        // `native_api.rs`'s delegate-creation path. `store_delegate` became
+        // fallible for a NEW reason when it started verifying that a delegate's
+        // key is derived from its own code (see
+        // `DelegateStore::verify_delegate_identity`), so without this a refused
+        // registration leaves an entry in `SecretsStore::ciphers` and nothing
+        // durable to show it: the caller sees an error, the delegate is not
+        // stored, and the map has grown. The content is benign — since #4140 the
+        // DEK is HKDF-derived from the node KEK, so the entry is re-derivable and
+        // holds no secret the node did not already have — but `ciphers` is keyed
+        // by a 64-byte value the requester chooses and is not bounded, so a
+        // rejection path that grows it silently is the wrong shape regardless.
+        if let Err(err) = self.delegate_store.store_delegate(delegate) {
+            self.secret_store.remove_delegate_cipher(&key);
+            return Err(err);
+        }
+        Ok(())
     }
 
     #[inline]
     fn unregister_delegate(&mut self, key: &DelegateKey) -> RuntimeResult<()> {
-        self.delegate_modules.lock().unwrap().remove(key);
+        let code_hash = self.delegate_store.code_hash_from_key(key);
         // Drop persisted ctx.write() bytes so an unregistered delegate can't
         // hold onto stale state if it's later re-registered.
         self.delegate_contexts.remove(key);
-        self.delegate_store.remove_delegate(key)
+        self.delegate_store.remove_delegate(key)?;
+        // Drop the compiled module only once NO remaining delegate runs that
+        // code. The cache is keyed by code hash now (#5268), so one delegate's
+        // removal must not evict the module its still-registered siblings —
+        // other parameterizations of the same WASM — share. Mirrors the
+        // reference check `remove_delegate` already applies to the `.wasm` blob,
+        // and runs after it so the removed key is out of the index.
+        if let Some(code_hash) = code_hash {
+            if !self.delegate_store.code_still_referenced(&code_hash) {
+                self.delegate_modules.lock().unwrap().remove(&code_hash);
+            }
+        }
+        Ok(())
     }
 }

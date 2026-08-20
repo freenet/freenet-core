@@ -81,8 +81,15 @@ jobs:
         with:
           node-version: 20
 
+      # nextest via the maintained action, not a hand-rolled download.
+      # Rationale at the first of these in ci.yml (test_unit job); see #5296.
       - name: Install nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        uses: taiki-e/install-action@v2
+        id: install-nextest
+        timeout-minutes: 5
+        with:
+          tool: cargo-nextest
+          fallback: none
 
       # fdev is the publish path the harness shells out to. Build it (and the
       # test's own crate deps) before the test step so the binary is on disk.
