@@ -1394,9 +1394,16 @@ mod tests {
 
     /// Wide mode keeps the old bounded-refusal behaviour: a developer corpus whose
     /// contents depended on eviction order would stop meaning "what this peer saw".
+    ///
+    /// Asserting only that the map stopped at its cap does NOT test this - a map that
+    /// evicts one entry per admission also sits exactly at the cap forever. The first
+    /// version of this test did exactly that and passed under the rollover it was
+    /// written to forbid. What separates the two is WHICH contracts survive: refusal
+    /// keeps the earliest, rollover keeps the latest.
     #[test]
     fn wide_sampling_stops_at_the_cap_rather_than_rolling_over() {
         let mut samplers = HashMap::new();
+        let first = ContractInstanceId::new([0; 32]);
         for i in 0..(MAX_TRACKED_CONTRACTS + 20) {
             let id = ContractInstanceId::new([(i % 251) as u8; 32]);
             record(&mut samplers, &SamplingScope::Wide, observation_for(id));
@@ -1405,6 +1412,16 @@ mod tests {
             samplers.len(),
             MAX_TRACKED_CONTRACTS,
             "wide capture did not stop at its cap"
+        );
+        assert!(
+            samplers.contains_key(&first),
+            "wide capture dropped the earliest contract it saw, so the corpus now \
+             depends on eviction order rather than on what the peer observed"
+        );
+        let last = ContractInstanceId::new([(MAX_TRACKED_CONTRACTS + 19) as u8; 32]);
+        assert!(
+            !samplers.contains_key(&last),
+            "wide capture admitted a contract past its cap"
         );
     }
 
