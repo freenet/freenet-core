@@ -1302,10 +1302,15 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
     //     RESIDENT_OVERHEAD_SUSTAINED_WINDOW, ~2.5 min). A transient spike to
     //     99% here self-resolves without evicting anything, so the strip must
     //     not read as though eviction is imminent.
-    //   - disk: not a sweep condition at all. It acts by clamping the
-    //     contract-state budget (`effective = ram.min(disk_budget)` in
-    //     HostingManager), so disk pressure tightens the first axis rather
-    //     than firing on its own.
+    //   - disk: not a sweep condition at all. Its direct consequence is
+    //     ADMISSION: `admit_state_write` / `admit_state_update` /
+    //     `admit_wasm_write` (disk_usage.rs) reject new growth once the
+    //     projected total exceeds the budget. It can additionally tighten the
+    //     contract-state limit via `effective = ram.min(disk_budget)`, but
+    //     only when the disk budget is the SMALLER of the two — on a typical
+    //     node it is not (measured: 1.0 GB RAM budget against 32.0 GB disk),
+    //     so saying "filling disk tightens the state limit" would be wrong in
+    //     the ordinary case and wrong precisely when writes start failing.
     let mut axes: Vec<(&str, f64, String, &str)> = Vec::new();
     if let Some(u) = axis_utilisation(h.used_bytes, h.budget_bytes) {
         axes.push((
@@ -1325,8 +1330,12 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
                 "disk",
                 u,
                 format!("{} of {}", format_bytes(used), format_bytes(disk_budget)),
-                "Disk does not trigger a sweep by itself: it clamps the contract-state \
-                 budget, so filling it tightens that limit instead.",
+                "Filling this rejects new writes — the disk admission gates refuse \
+                 state and WASM growth once the projected total would exceed the \
+                 budget. It does not by itself trigger an eviction sweep. It can \
+                 also tighten the contract-state limit, but only when the disk \
+                 budget is the smaller of the two, since that limit is \
+                 min(RAM budget, disk budget).",
             ));
         }
     }
