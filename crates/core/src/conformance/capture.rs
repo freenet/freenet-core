@@ -1538,6 +1538,15 @@ mod validation_related_capture_pin {
             .join("\n")
     }
 
+    /// Deliberately NOT pinned: that the call precedes `related_map` being consumed.
+    ///
+    /// The borrow checker already enforces it — moving the call after the conversion
+    /// does not compile, because the map is moved. The only reordering that DOES
+    /// compile clones the map first, which leaves capture working correctly while a
+    /// textual pin fires anyway. A pin whose sole reachable failure is a false positive
+    /// is worse than none: it eventually trips on a legitimate refactor and gets
+    /// deleted wholesale, taking the pin below with it. Established by mutation, not
+    /// assumed.
     #[test]
     fn the_executor_captures_validation_resolved_related_state() {
         let body = code_only();
@@ -1546,23 +1555,6 @@ mod validation_related_capture_pin {
             "the executor no longer hands validation-resolved related state to \
              capture, so contracts whose VALIDITY depends on another contract go back \
              to being unjudgeable — and an unjudgeable contract reads as a clean one"
-        );
-    }
-
-    /// It must be emitted BEFORE the map is consumed, or there is nothing to read.
-    #[test]
-    fn the_capture_call_precedes_the_map_being_consumed() {
-        let body = code_only();
-        let call = body
-            .find("observe_related_with(")
-            .expect("capture call missing; the sibling pin covers that");
-        let consumed = body
-            .find("RelatedContracts::from(related_map)")
-            .expect("related_map is no longer converted; this pin needs rewriting");
-        assert!(
-            call < consumed,
-            "the capture call moved after `related_map` is consumed, so it can only \
-             ever observe an empty map"
         );
     }
 }
