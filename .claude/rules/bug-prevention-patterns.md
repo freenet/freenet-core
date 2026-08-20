@@ -1,6 +1,7 @@
 ---
 paths:
   - "crates/core/src/bin/**"
+  - "crates/core/src/conformance/**"
   - "scripts/**"
 ---
 
@@ -475,3 +476,66 @@ when someone next touches those files, neither investigated here:
 machine) into `grep -q` at five sites. Both would fail in the safe direction —
 reporting a healthy service as unhealthy — which is precisely the direction
 that survives unnoticed.
+
+
+## A refusal that is not counted renders as a clean zero
+
+**Any code path that DISCARDS an input must count the discard.** Three bare
+`continue`s, a throwaway local, or an ignored `Admission` all produce the same
+result: an empty output that is indistinguishable from an output that was never
+needed. The reader cannot tell "this contract had no related state" from "this
+contract's related state was thrown away", and the first reading terminates the
+investigation.
+
+This is the sibling of the *"metric describing a filtering decision, re-derived at
+the call site"* pattern, and the relationship is worth stating because the sibling
+is the more dangerous of the two. A **wrong** count invites suspicion — someone
+notices the number is implausible and digs. An **absent** count renders as a clean
+zero, which nobody investigates. Same defect class, opposite symptom, worse outcome.
+
+### Repeat offender history — three instances in one module, one release
+
+All in `crates/core/src/conformance/capture.rs`, all found within a day of each other:
+
+| Instance | What was discarded | How it presented |
+|---|---|---|
+| `admit_related`'s three refusal paths (#5368) | Related-contract state over the byte or slot budget, via bare `continue` | An empty related map. **Measured: 9 of 54 contracts on a live capture peer reached no verdict on ANY case — 2,474 cases — and nothing in the corpus said why.** 17% of hosted contracts were exempt from conformance checking by construction. |
+| `reload`'s related-state refusals (#5368, found in review) | Same, at reload time under a smaller budget than wrote the corpus | Counted into a throwaway local, then overwritten with zero by the next flush — so the evidence was destroyed by the mechanism meant to record it. |
+| `reload`'s **state** refusals (#5374) | States over the per-state ceiling, via a dropped `Admission` | A warning naming the ceiling as the cause while displaying `refused_too_large=0`. The message contradicts its own counter, and neither is obviously the liar. |
+
+The first was a genuine coverage hole: a contract depending on a large related
+contract became permanently unjudgeable, and an unjudgeable contract reads exactly
+like a clean one. **Depending on related state must not be a way to escape
+conformance checking.**
+
+### The rule
+
+When you write a branch that drops an input:
+
+1. **Count it, under its own reason.** Not one counter for "refused" — separate
+   causes need separate counts, because the remedies differ. `too_large` and
+   `over_budget` are fixed by raising a byte budget; `no_slot` is a compile-time
+   constant that no configuration changes, and telling an operator to re-run with a
+   bigger budget sends them somewhere that cannot help.
+2. **Carry the count into the artefact, not just the log.** Logs rotate; a corpus is
+   replayed months later on another machine. If the only record of "this is
+   incomplete" is a log line, the replay reads as a clean bill of health.
+3. **Make it reach the documented consumer.** `fdev conformance --bundle` dropped
+   `bundle.note` entirely, so the durable record existed and was invisible to the one
+   workflow meant to read it. Check the whole path, not just the write.
+4. **Test it by deleting the counter and asserting the test fails.** A refusal
+   counter is exactly the kind of code that is never exercised by the happy path.
+
+### Audit
+
+```bash
+# Discards with no adjacent counter increment:
+grep -n "continue;" crates/core/src/conformance/*.rs
+# Results whose Admission/outcome is dropped:
+grep -nE "^\s*(sampler|self)\.(observe_state|observe_transition)\(" crates/core/src/conformance/*.rs
+# Counters that exist but may not reach the artefact:
+grep -n "refused" crates/core/src/conformance/capture.rs
+```
+
+Question to ask of any one of them: *if this branch fires a thousand times, what does
+a reader see?* If the answer is "an empty result", the count is missing.
