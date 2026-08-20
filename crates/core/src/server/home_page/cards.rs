@@ -1265,7 +1265,18 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
     //
     // Utilisation is computed per axis and the highest wins. A budget of 0 is
     // "not configured / not yet measured", not "completely full", so those
-    // axes are skipped rather than reported as 100%.
+    // axes are skipped rather than reported as 100%. The disk budget is the
+    // real case: it is an `Option` because the tracker is unseeded early in a
+    // node's life, and ranking an absent denominator as full would report a
+    // phantom emergency on every fresh start.
+    //
+    // For the slot axis this is defensive rather than load-bearing: the
+    // resident-overhead budget is floored at MIN_RESIDENT_OVERHEAD_BUDGET_BYTES
+    // (128 MiB, i.e. 128 slots) by `resident_overhead_budget_for`, so a
+    // production node cannot reach 0 slots. Skipping it is therefore not
+    // masking a genuinely-unhostable node — that state is unreachable, and if
+    // it ever becomes reachable the honest fix is to say so explicitly rather
+    // than to let this branch quietly imply "fine".
     let axis_utilisation = |used: u64, budget: u64| -> Option<f64> {
         (budget > 0).then(|| used as f64 / budget as f64)
     };
