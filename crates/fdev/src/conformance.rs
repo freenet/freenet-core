@@ -489,6 +489,20 @@ fn load_inputs(config: &ConformanceConfig) -> anyhow::Result<(Vec<u8>, Vec<u8>, 
             )
         })?;
         let parameters = bundle.parameters.clone();
+
+        // Print the bundle's own provenance note before replaying it.
+        //
+        // Not decoration. Capture records in this note when it REFUSED related-contract
+        // state, and a corpus missing that state cannot reach a verdict: every case
+        // comes back Inconclusive, the command exits 0, and the run reads as a clean
+        // bill of health for a contract nothing actually judged. Measured on a live
+        // corpus: 9 of 54 contracts produced no verdict on any of 2,474 cases for
+        // exactly this reason, with nothing in the replay output saying so. The note is
+        // the only durable record - node logs rotate long before a corpus is replayed.
+        if let Some(note) = bundle.note.as_deref() {
+            println!("bundle note: {note}");
+        }
+
         let corpus = bundle.to_corpus();
         Ok((wasm, parameters, corpus))
     } else {

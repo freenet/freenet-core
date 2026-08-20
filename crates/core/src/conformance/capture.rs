@@ -128,6 +128,20 @@ const MAX_QUEUED_BYTES: usize = 8 * 1024 * 1024;
 ///
 /// So: the same per-state ceiling and the same per-contract total the sampler uses,
 /// both of which the operator can already raise for a diagnostic run.
+///
+/// # This raises the DEFAULT footprint, not just the override's reach
+///
+/// Worth stating plainly rather than leaving to be discovered. At
+/// `SamplerConfig::default()` the related-state total per tracked contract goes from a
+/// flat 512 KiB to `max_bytes` (4 MiB), and the per-state ceiling from 512 KiB to
+/// `max_state_bytes` (1 MiB) - so a node that sets no environment variable at all still
+/// carries more. Node-wide worst case at `MAX_TRACKED_CONTRACTS` is bounded by
+/// `64 * (max_bytes + max_bytes)`, related state plus samples.
+///
+/// Accepted because capture does not run unless an operator sets
+/// `FREENET_CONFORMANCE_CAPTURE_DIR`, `MAX_RELATED_CONTRACTS` still bounds the count,
+/// and the alternative is what this comment exists to describe: a budget too small to
+/// judge the contracts it was collected for.
 fn related_budgets(config: &SamplerConfig) -> (usize, usize) {
     (config.max_state_bytes, config.max_bytes)
 }
@@ -855,6 +869,7 @@ fn reload(dir: &Path) -> HashMap<ContractInstanceId, TrackedContract> {
         }
         // Read before the struct takes ownership of `sampler`.
         let (max_related_state, max_related_total) = related_budgets(sampler.config());
+        let mut reload_refusals = RelatedRefusals::default();
         samplers.insert(
             instance,
             TrackedContract {
@@ -866,21 +881,29 @@ fn reload(dir: &Path) -> HashMap<ContractInstanceId, TrackedContract> {
                     // wrote the bundle: an operator who raised the budget to make a
                     // contract checkable must not have a corpus written under the old
                     // one silently re-truncated to it.
-                    let mut ignored = RelatedRefusals::default();
                     admit_related(
                         &mut restored,
                         &bundle.related,
-                        &mut ignored,
+                        &mut reload_refusals,
                         max_related_state,
                         max_related_total,
                     );
                     restored
                 },
                 parameters: bundle.parameters,
-                // Not persisted in the bundle: these count what THIS process
-                // refused, and a reloaded corpus has no refusals of its own yet.
+                // Not persisted in the bundle: this counts what THIS process refused,
+                // and a reloaded corpus has none of its own yet.
                 refused_too_large: 0,
-                refused_related: RelatedRefusals::default(),
+                // Related refusals ARE carried, because reload genuinely makes them.
+                //
+                // An earlier version discarded them into a throwaway local, with a
+                // comment claiming "a reloaded corpus has no refusals of its own yet".
+                // That was false on its own terms: reload re-admits under THIS
+                // process's budgets, so a run that captured under a raised budget and
+                // then restarted under the default has its related state trimmed right
+                // here - silently, with the next flush writing "0 refused" over the
+                // evidence. That is the exact invariant this type exists to hold.
+                refused_related: reload_refusals,
             },
         );
     }
@@ -1200,10 +1223,27 @@ async fn write_all(
             if refused.total() == 0 {
                 String::new()
             } else {
-                format!(
-                    " (related state refused: {} too large, {} over budget, {} no slot                      - this corpus may be unable to reach a verdict for this contract;                      raise {})",
-                    refused.too_large, refused.over_budget, refused.no_slot, CAPTURE_MAX_BYTES_ENV,
-                )
+                // Built by concatenation, not a `\`-continued literal: a wrapped
+                // literal bakes its own source indentation into every bundle note a
+                // reader ever sees, and rustfmt does not touch string contents.
+                let mut extra = format!(
+                    " (related state refused: {} too large, {} over budget, {} no slot.",
+                    refused.too_large, refused.over_budget, refused.no_slot,
+                );
+                extra.push_str(" This corpus may be unable to reach a verdict for this contract.");
+                if refused.too_large > 0 || refused.over_budget > 0 {
+                    extra.push_str(&format!(" Raise {CAPTURE_MAX_BYTES_ENV} to capture it."));
+                }
+                if refused.no_slot > 0 {
+                    // Raising the byte budget cannot help here: the slot limit is a
+                    // compile-time constant, so do not send a reader after that knob.
+                    extra.push_str(&format!(
+                        " {} related contract(s) exceeded the {}-contract limit, which no configuration changes.",
+                        refused.no_slot, MAX_RELATED_CONTRACTS,
+                    ));
+                }
+                extra.push(')');
+                extra
             },
         ));
 
@@ -1219,9 +1259,17 @@ async fn write_all(
                 over_budget = refused.over_budget,
                 no_slot = refused.no_slot,
                 related_held = tracked.related.len(),
+                // Only suggest the byte budget when the byte budget is what bound.
+                // `no_slot` is the MAX_RELATED_CONTRACTS limit, a compile-time
+                // constant, and sending an operator to re-run with a bigger budget
+                // that cannot possibly help is worse than saying nothing.
+                remedy = if refused.too_large > 0 || refused.over_budget > 0 {
+                    CAPTURE_MAX_BYTES_ENV
+                } else {
+                    "none: the related-contract COUNT limit bound, which is not configurable"
+                },
                 "conformance capture refused related-contract state; replays of this \
-                 contract may reach no verdict. Raise {} to capture it.",
-                CAPTURE_MAX_BYTES_ENV,
+                 contract may reach no verdict"
             );
         }
 
@@ -1696,6 +1744,53 @@ mod tests {
             kept, expected,
             "reload kept a different set than the ordering promises, so which samples \
              survive a restart depends on filesystem enumeration order"
+        );
+    }
+
+    /// Reload counts the related state IT refuses.
+    ///
+    /// Reload re-admits under the CURRENT process's budgets, so a run that captured
+    /// under a raised budget and then restarted under a smaller one has its related
+    /// state trimmed at reload. An earlier version threw that count away into a
+    /// throwaway local, so the next flush wrote "0 refused" over the evidence - the
+    /// exact silent truncation this counter exists to prevent, in the one path that
+    /// most needs it.
+    #[test]
+    fn reload_reports_related_state_it_had_to_refuse() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let instance = ContractInstanceId::new([3; 32]);
+        let (max_state, _) = related_budgets(&sampler_config());
+
+        // A bundle carrying more related contracts than the slot limit allows, which
+        // binds regardless of how the byte budgets are configured.
+        let mut bundle = super::super::bundle::ReplayBundle::new(vec![9, 9], vec![3]);
+        bundle.instance = Some(instance);
+        bundle.states = vec![vec![1, 2], vec![2, 3]];
+        bundle.related = (0..(MAX_RELATED_CONTRACTS + 4))
+            .map(|i| (ContractInstanceId::new([i as u8; 32]), vec![i as u8; 16]))
+            .collect();
+        assert!(
+            max_state > 16,
+            "fixture states must be individually admissible"
+        );
+        bundle
+            .write_to(&bundle_path(dir.path(), &instance))
+            .expect("write bundle");
+
+        let samplers = reload(dir.path());
+        let tracked = samplers
+            .get(&instance)
+            .expect("bundle should have reloaded");
+
+        assert_eq!(
+            tracked.related.len(),
+            MAX_RELATED_CONTRACTS,
+            "reload did not trim to the slot limit, so nothing was refused"
+        );
+        assert_eq!(
+            tracked.refused_related.no_slot, 4,
+            "reload trimmed related state without counting it, so the next flush will \
+             record a corpus as complete when it is not"
         );
     }
 
@@ -2283,16 +2378,42 @@ mod tests {
     #[tokio::test]
     async fn the_total_related_byte_allowance_holds() {
         let mut samplers = HashMap::new();
-        let chunk = test_related_budgets().1 / 3;
+        let (max_state, max_total) = test_related_budgets();
 
-        // Three entries of a third of the allowance each: the third is the one that
-        // must be refused on the TOTAL, since each is individually well within the
-        // per-entry bound.
-        for i in 0..4u8 {
+        // Each entry sits exactly AT the per-state ceiling, so every one is
+        // individually admissible and only the running total can refuse them.
+        //
+        // This used to divide the TOTAL budget into thirds, which was correct while
+        // one constant served as both caps. Once they became distinct
+        // (`max_state_bytes` is a quarter of `max_bytes`), a third of the total
+        // exceeded the per-state cap, so every entry was refused as `TooLarge`, the
+        // map stayed empty, and the assertions below passed without the total-budget
+        // path ever running.
+        let chunk = max_state;
+        let entries = (max_total / chunk) + 1;
+        assert!(
+            entries >= 2,
+            "fixture needs at least two entries to test a TOTAL bound"
+        );
+        for i in 0..entries {
             let mut observed = observation();
-            observed.related = vec![(ContractInstanceId::new([i; 32]), vec![i; chunk])];
+            observed.related = vec![(ContractInstanceId::new([i as u8; 32]), vec![7u8; chunk])];
             let _evicted = record(&mut samplers, &SamplingScope::Wide, observed);
         }
+
+        let refused = samplers
+            .values()
+            .next()
+            .expect("one contract tracked")
+            .refused_related;
+        assert_eq!(
+            refused.too_large, 0,
+            "entries were refused on the PER-STATE cap, so the total was never tested"
+        );
+        assert!(
+            refused.over_budget > 0,
+            "nothing was refused on the total, so the allowance never bound"
+        );
 
         let tracked = samplers.values().next().expect("one contract tracked");
         let held: usize = tracked.related.values().map(Vec::len).sum();
@@ -2302,8 +2423,8 @@ mod tests {
             test_related_budgets().1
         );
         assert!(
-            tracked.related.len() < 4,
-            "all four entries were admitted, so the total allowance is not binding"
+            tracked.related.len() < entries,
+            "all {entries} entries were admitted, so the total allowance is not binding"
         );
 
         // Replacing an existing entry must discount what it already held: offering
