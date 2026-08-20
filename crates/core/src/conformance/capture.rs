@@ -1649,7 +1649,6 @@ mod probe_wiring_pins {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
 
     /// The related-state budgets the sampler config in force for tests implies.
