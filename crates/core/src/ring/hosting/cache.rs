@@ -1288,14 +1288,16 @@ pub struct HostingCache<T: TimeSource> {
 /// 1. fewest **local client subscriptions** first — a contract THIS node's own
 ///    client is subscribed to is evicted LAST (Ian's confirmed ordering, #4642);
 /// 2. then fewest **downstream subscribers** (forwarded demand);
-/// 3. then least-recent real **GET** (`recency_seq`, a recency tiebreak — NOT a
-///    primary key; subscription-renewal traffic must not refresh it);
+/// 3. then lowest **eviction recency** (`recency_seq`, a tiebreak — NOT a
+///    primary key). That clock is set by a real GET or PUT, and also by
+///    [`HostingCache::record_abandonment`] at subscription termination;
+///    subscription-renewal traffic must not refresh it;
 /// 4. then contract-key bytes as a final deterministic tiebreak.
 ///
 /// The candidate that sorts FIRST under this order is the one evicted first. A
 /// locally-subscribed contract is ordered LAST but NOT absolutely pinned: in the
 /// extreme where every eligible contract carries a local subscription and the
-/// peer is still over budget, the least-recently-read local one IS the victim
+/// peer is still over budget, the lowest-recency local one IS the victim
 /// (accepted last resort — see [`HostingCache::evict_over_budget`] and
 /// hosting-invariants invariant 3).
 ///

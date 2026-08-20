@@ -2688,8 +2688,14 @@ mod tests {
         );
         // `recency_seq` is ALSO advanced by `record_abandonment` when a
         // contract loses its last subscriber, so any copy calling this an
-        // access/read ordering misrepresents a just-abandoned contract. Pin
-        // the invariant (no access-time language), not one phrasing of it.
+        // access/read ordering misrepresents a just-abandoned contract.
+        //
+        // This blocklist is ILLUSTRATIVE, NOT EXHAUSTIVE: it catches the
+        // phrasings that actually shipped, but an equivalent rewording
+        // ("accessed at", "time since last read", "recently accessed") would
+        // pass. A green run here is therefore evidence, not proof — if you are
+        // editing this copy, re-check the claim against `record_abandonment`
+        // rather than trusting the test.
         for banned in [
             "least-recently accessed",
             "least-recently read",
