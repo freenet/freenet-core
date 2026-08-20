@@ -2482,24 +2482,23 @@ mod tests {
             contract_count: 2,
             budget_evictions_total: 3,
             evictions_of_recently_read_total: 1,
-            // Provider emits rows in eviction order (lowest keep_score first).
+            // Provider emits rows in eviction order (least-recently accessed
+            // first — ascending `recency_seq`).
             contracts: vec![
                 HostedContractEntry {
                     key_full: "VICTIM_FULL".to_string(),
                     key_short: "VICTIM...".to_string(),
-                    keep_score: 0.10,
-                    predicted_demand: 0.0,
                     size_bytes: 1024,
                     read_count: 0,
+                    recency_seq: 0,
                     eviction_eligible: true,
                 },
                 HostedContractEntry {
                     key_full: "HOT_FULL".to_string(),
                     key_short: "HOT...".to_string(),
-                    keep_score: 5.0,
-                    predicted_demand: 4.0,
                     size_bytes: 2048,
                     read_count: 42,
+                    recency_seq: 99,
                     eviction_eligible: false,
                 },
             ],
@@ -2519,13 +2518,13 @@ mod tests {
             html.contains("var(--danger"),
             "recently-read eviction count should be highlighted — got:\n{html}"
         );
-        // The next-to-evict badge attaches to the first (lowest keep_score) row.
+        // The next-to-evict badge attaches to the first eligible row.
         let victim_idx = html.find("VICTIM_FULL").expect("victim row present");
         let hot_idx = html.find("HOT_FULL").expect("hot row present");
         let badge_idx = html.find("next to evict").expect("next-to-evict badge");
         assert!(
             victim_idx < hot_idx,
-            "rows must be in eviction order (lowest keep_score first) — got:\n{html}"
+            "rows must be in eviction order (least-recently accessed first) — got:\n{html}"
         );
         assert!(
             badge_idx > victim_idx && badge_idx < hot_idx,
@@ -2533,19 +2532,112 @@ mod tests {
         );
     }
 
+    /// The eviction table must be ordered by a column it actually displays.
+    ///
+    /// Regression for #4830: the card rendered `Keep-score` and `Demand` — the
+    /// demoted telemetry-only estimator that eviction does not read — while the
+    /// rows arrived sorted by `recency_seq`, which was dropped in the dashboard
+    /// mapping and never shown. The table was therefore sorted by an invisible
+    /// column and labelled as sorted by one that had no effect on the order.
+    ///
+    /// Mutation-checked: re-adding a `Keep-score` header or dropping the
+    /// `Recency` column fails this test.
+    #[test]
+    fn hosting_card_shows_the_column_it_is_sorted_by() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 256 * 1024 * 1024,
+            used_bytes: 64 * 1024 * 1024,
+            contract_count: 2,
+            contracts: vec![
+                mk_hosted_entry_seq("COLD", 0, true),
+                mk_hosted_entry_seq("WARM", 7, false),
+            ],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+
+        assert!(
+            html.contains(">Recency</th>"),
+            "the ordering column must be a visible header — got:\n{html}"
+        );
+        // The dormant estimator must not be presented as a ranking column.
+        assert!(
+            !html.contains(">Keep-score</th>") && !html.contains(">Demand</th>"),
+            "keep-score/demand are telemetry-only and must not be shown as \
+             eviction ranking columns — got:\n{html}"
+        );
+        // `recency_seq == 0` is "not accessed since startup", not a real
+        // sequence number, so it must not render as a bare 0.
+        assert!(
+            html.contains(">never<"),
+            "recency_seq 0 must render as 'never', not 0 — got:\n{html}"
+        );
+        assert!(
+            html.contains(">7<"),
+            "a non-zero recency_seq must render its value — got:\n{html}"
+        );
+    }
+
+    /// The footer must not claim a ranking the card cannot actually show.
+    ///
+    /// Regression for #4830: it read "the N most-evictable … (lowest keep-score
+    /// first)", which was wrong twice over — keep-score does not order the
+    /// sweep, and the cache-side sort covers only the zero-subscriber tier.
+    #[test]
+    fn hosting_card_footer_does_not_claim_keep_score_ordering() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 256 * 1024 * 1024,
+            used_bytes: 64 * 1024 * 1024,
+            // More hosted than rendered, so the footer appears.
+            contract_count: 500,
+            contracts: vec![mk_hosted_entry_seq("A", 0, true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        assert!(
+            html.contains("of 500 hosted contracts"),
+            "footer should report the full hosted count — got:\n{html}"
+        );
+        assert!(
+            !html.to_lowercase().contains("keep-score first"),
+            "footer must not claim keep-score ordering — got:\n{html}"
+        );
+        // The subscriber-tier caveat is the honest part; keep it pinned so a
+        // future copy edit cannot quietly drop it.
+        assert!(
+            html.contains("no subscribers"),
+            "footer must state that this is only the zero-subscriber ordering \
+             — got:\n{html}"
+        );
+    }
+
+    fn mk_hosted_entry_seq(
+        key: &str,
+        recency_seq: u64,
+        eviction_eligible: bool,
+    ) -> crate::node::network_status::HostedContractEntry {
+        let mut e = mk_hosted_entry(key, eviction_eligible);
+        e.recency_seq = recency_seq;
+        e
+    }
+
+    /// Ordering is by `recency_seq`; use `mk_hosted_entry_seq` when a test
+    /// cares about the order. This helper leaves it at 0 ("never accessed").
     fn mk_hosted_entry(
         key: &str,
-        keep_score: f64,
         eviction_eligible: bool,
     ) -> crate::node::network_status::HostedContractEntry {
         use crate::node::network_status::HostedContractEntry;
         HostedContractEntry {
             key_full: format!("{key}_FULL"),
             key_short: format!("{key}..."),
-            keep_score,
-            predicted_demand: 0.0,
             size_bytes: 1024,
             read_count: 0,
+            recency_seq: 0,
             eviction_eligible,
         }
     }
@@ -2566,9 +2658,9 @@ mod tests {
             evictions_of_recently_read_total: 0,
             contracts: vec![
                 // Lowest score, but pinned (in use / within TTL) → not eligible.
-                mk_hosted_entry("PINNED", 0.10, false),
+                mk_hosted_entry("PINNED", false),
                 // Higher score, but actually eligible → this is the real victim.
-                mk_hosted_entry("EVICTABLE", 2.0, true),
+                mk_hosted_entry("EVICTABLE", true),
             ],
             ..Default::default()
         };
@@ -2602,10 +2694,7 @@ mod tests {
             contract_count: 2,
             budget_evictions_total: 0,
             evictions_of_recently_read_total: 0,
-            contracts: vec![
-                mk_hosted_entry("A", 0.10, false),
-                mk_hosted_entry("B", 2.0, false),
-            ],
+            contracts: vec![mk_hosted_entry("A", false), mk_hosted_entry("B", false)],
             ..Default::default()
         };
         let html = build_hosting_card(&Some(snap));
@@ -2634,7 +2723,7 @@ mod tests {
             contract_count: 1,
             budget_evictions_total: 0,
             evictions_of_recently_read_total: 0,
-            contracts: vec![mk_hosted_entry("A", 1.0, false)],
+            contracts: vec![mk_hosted_entry("A", false)],
             disk_state_bytes: None,
             disk_wasm_bytes: None,
             disk_compile_cache_bytes: None,
@@ -2676,7 +2765,7 @@ mod tests {
             contract_count: 1,
             budget_evictions_total: 0,
             evictions_of_recently_read_total: 0,
-            contracts: vec![mk_hosted_entry("A", 1.0, false)],
+            contracts: vec![mk_hosted_entry("A", false)],
             disk_state_bytes: Some(100 * 1024 * 1024),
             disk_wasm_bytes: Some(20 * 1024 * 1024),
             disk_compile_cache_bytes: Some(5 * 1024 * 1024),
@@ -2725,7 +2814,7 @@ mod tests {
             contract_count: 1,
             budget_evictions_total: 0,
             evictions_of_recently_read_total: 0,
-            contracts: vec![mk_hosted_entry("A", 1.0, false)],
+            contracts: vec![mk_hosted_entry("A", false)],
             resident_overhead_budget_bytes: 100 * 1024 * 1024,
             estimated_resident_overhead_bytes: 30 * 1024 * 1024,
             resident_overhead_evictions_total: 7,

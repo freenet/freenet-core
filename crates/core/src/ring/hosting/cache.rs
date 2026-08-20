@@ -657,20 +657,29 @@ pub(crate) struct HostingCacheStats {
 
 /// Per-contract Greedy-Dual priority row for the local-peer dashboard.
 ///
-/// This is what actually governs retention today (piece A of the
-/// demand-driven hosting redesign, #4642): the over-budget walk evicts the
-/// lowest `keep_score` first. Surfaced on the dashboard so an operator can
-/// see the live demand-ordered eviction policy — the mechanism that
-/// replaced the dormant MAD governance detector (#4296). Collected under a
+/// A dashboard/telemetry row for one hosted contract. Collected under a
 /// single cache read lock by [`HostingCache::eviction_ordered_scores`].
+///
+/// **`keep_score` and `predicted_demand` do NOT govern retention.** They are
+/// the demoted, telemetry-only Greedy-Dual estimator (see the "Demoted
+/// (telemetry-only) demand machinery" section in this module's docs); eviction
+/// reads neither. Real eviction ordering is [`victim_order`], ascending
+/// `(local_subscription_count, downstream_subscriber_count, recency_seq,
+/// key_bytes)` — of which only `recency_seq` is carried here, because the
+/// subscriber counts are computed transiently during the sweep and the cache
+/// cannot see them. Present the row accordingly: `recency_seq` is the field
+/// that actually explains this row's position.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HostingContractScore {
     pub key: ContractKey,
-    /// Greedy-Dual priority = `eviction_floor + predicted_demand` at the last
-    /// refresh. Lowest evicts first.
-    pub keep_score: f64,
-    /// Stored per-contract read-demand estimate (reads/second).
-    pub predicted_demand: f64,
+    //
+    // `keep_score` / `predicted_demand` deliberately absent from this
+    // projection. `HostedContract` still carries them — they drive the
+    // Greedy-Dual `eviction_floor` ratchet — but nothing consumed the copies
+    // on this row once the dashboard stopped rendering them as an eviction
+    // ranking they never governed (#4830). Re-add only alongside a consumer
+    // that presents them as telemetry.
+    //
     /// Per-contract memory cost (state bytes).
     pub size_bytes: u64,
     /// Read accesses (GET/SUBSCRIBE) observed over this entry's residency.
@@ -2523,8 +2532,6 @@ impl<T: TimeSource> HostingCache<T> {
             .iter()
             .map(|(k, v)| HostingContractScore {
                 key: *k,
-                keep_score: v.keep_score,
-                predicted_demand: v.predicted_demand,
                 size_bytes: v.size_bytes,
                 read_count: v.read_count,
                 recency_seq: v.recency_seq,
@@ -4368,10 +4375,8 @@ mod tests {
         );
         for s in &scores {
             let entry = cache.get(&s.key).expect("scored key is in the cache");
-            assert_eq!(s.keep_score, entry.keep_score);
             assert_eq!(s.size_bytes, entry.size_bytes);
             assert_eq!(s.read_count, entry.read_count);
-            assert_eq!(s.predicted_demand, entry.predicted_demand);
             assert_eq!(s.recency_seq, entry.recency_seq);
         }
     }
