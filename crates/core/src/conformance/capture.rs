@@ -1389,9 +1389,12 @@ mod probe_wiring_pins {
             "focus is no longer computed before the select loop, so a focus-scoped \
              peer records nothing for the first probe interval after every restart"
         );
+        // The ARM, not merely the constant: deleting the select arm leaves
+        // `let mut warmup = interval(HOSTED_SOURCE_WARMUP)` behind, so a pin on the
+        // constant's name passes with the retry gone - confirmed by mutation.
         assert!(
-            body.contains("HOSTED_SOURCE_WARMUP"),
-            "the hosted-source warm-up retry is gone; the startup draw alone runs \
+            body.contains("warmup.tick()"),
+            "the hosted-source warm-up retry arm is gone; the startup draw alone runs \
              before the ring registers its hosted contracts and therefore misses it"
         );
     }
@@ -1509,11 +1512,17 @@ mod tests {
         let mut samplers = HashMap::new();
         let watched = instance(1);
         let _evicted = record(&mut samplers, &focused_on(&[1]), observation_for(watched));
-        let _evicted = record(
-            &mut samplers,
-            &focused_on(&[2]),
-            observation_for(instance(2)),
-        );
+
+        // Traffic MUST keep arriving for the defocused contract. Without it the
+        // not-admitted branch never executes, and a version of `record` that discarded
+        // the entry on defocus would pass this test unchanged - confirmed by mutation.
+        let elsewhere = focused_on(&[2]);
+        for n in 0..4u8 {
+            let mut obs = observation_for(watched);
+            obs.result_state = vec![n, 4, 4];
+            let _evicted = record(&mut samplers, &elsewhere, obs);
+        }
+
         assert!(
             samplers.contains_key(&watched),
             "defocusing a contract discarded its accumulated sample"
