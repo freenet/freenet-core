@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+
+# Add a system user if it doesn't exist
+if ! getent passwd freenet > /dev/null 2>&1; then
+    adduser --system --home /var/lib/freenet freenet
+fi
+
+# Do any stuff that the package manager needs to do.
+#DEBHELPER#
+
+exit 0
