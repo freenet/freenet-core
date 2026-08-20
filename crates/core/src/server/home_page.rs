@@ -2907,46 +2907,188 @@ mod tests {
         }
     }
 
-    /// #5325 PR review Should-Fix #6: the new "Resident overhead" tile
-    /// (count-derived pressure axis, independent of the RAM used/budget
-    /// tile above) must render the actual snapshot values, not just compile.
+    /// The count-derived pressure axis (#5325) must render as contract SLOTS,
+    /// not as bytes.
+    ///
+    /// The underlying pair is `contract_count * 1 MiB` against a RAM-scaled
+    /// ceiling, so printing it as "30.0 MB / 100.0 MB" reads as measured
+    /// memory. It is not measured, and what it constrains is a number of
+    /// contracts — a low-RAM peer showed "520.0 MB / 524.0 MB" when the honest
+    /// statement was "520 of 524 contract slots used".
     #[test]
-    fn hosting_card_renders_resident_overhead_tile() {
+    fn hosting_card_renders_slot_axis_as_counts_not_bytes() {
         use crate::node::network_status::HostingSnapshot;
         let mut snap = base_snapshot();
         snap.hosting = HostingSnapshot {
             budget_bytes: 256 * 1024 * 1024,
             used_bytes: 1024,
-            contract_count: 1,
-            budget_evictions_total: 0,
-            evictions_of_recently_read_total: 0,
+            contract_count: 30,
             contracts: vec![mk_hosted_entry("A", false)],
             resident_overhead_budget_bytes: 100 * 1024 * 1024,
             estimated_resident_overhead_bytes: 30 * 1024 * 1024,
+            contract_slot_budget: 100,
             resident_overhead_evictions_total: 7,
             ..Default::default()
         };
         let html = build_hosting_card(&Some(snap));
         assert!(
-            html.contains("Resident overhead"),
-            "resident-overhead tile label present — got:\n{html}"
+            html.contains("Contract slots used") && html.contains("30 / 100"),
+            "slot axis must render as counts — got:\n{html}"
         );
         assert!(
-            html.contains("30.0 MB"),
-            "resident-overhead used value — got:\n{html}"
-        );
-        assert!(
-            html.contains("100.0 MB"),
-            "resident-overhead budget value — got:\n{html}"
-        );
-        // Headroom = budget(100) - used(30) = 70 MB.
-        assert!(
-            html.contains("70.0 MB"),
-            "resident-overhead headroom value — got:\n{html}"
+            html.contains(">70<"),
+            "slots free = budget(100) - used(30) — got:\n{html}"
         );
         assert!(
             html.contains(">7<"),
-            "resident-overhead eviction counter renders the snapshot value — got:\n{html}"
+            "slot-pressure eviction counter renders the snapshot value — got:\n{html}"
+        );
+        // The byte framing must be gone: it is what made this read as RAM.
+        assert!(
+            !html.contains("Resident overhead (est.)")
+                && !html.contains("Resident overhead budget"),
+            "the byte-denominated resident-overhead tiles must not return — got:\n{html}"
+        );
+    }
+
+    /// The card shows several independent ceilings; it must say which one is
+    /// closest to binding.
+    ///
+    /// Measured on a live low-RAM peer: 34% of the state-byte budget, 1% of
+    /// the disk budget, 99.2% of the contract-slot ceiling. All three rendered
+    /// as identical muted tiles, so the only number that mattered was
+    /// indistinguishable from the two with room to spare.
+    #[test]
+    fn hosting_card_names_the_closest_limit() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            // State bytes: 34% used.
+            budget_bytes: 1000,
+            used_bytes: 340,
+            // Slots: 99% used — this is the binding axis.
+            contract_count: 99,
+            contract_slot_budget: 100,
+            // Disk: 1% used.
+            disk_total_bytes: Some(10),
+            disk_budget_bytes: Some(1000),
+            contracts: vec![mk_hosted_entry("A", true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        assert!(
+            html.contains("Closest limit:") && html.contains("contract slots"),
+            "the binding axis must be named — got:\n{html}"
+        );
+        assert!(
+            html.contains("99 of 100"),
+            "the binding axis detail must show its own units — got:\n{html}"
+        );
+        // At 99% it must be flagged, not left in the same muted grey as an
+        // axis with room to spare.
+        assert!(
+            html.contains("var(--danger"),
+            "a near-full binding axis must be coloured — got:\n{html}"
+        );
+    }
+
+    /// The lowest-utilisation axis must NOT be the one reported.
+    #[test]
+    fn hosting_card_picks_the_highest_utilisation_axis() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            // State bytes 90% — the binding axis here.
+            budget_bytes: 1000,
+            used_bytes: 900,
+            // Slots only 10%.
+            contract_count: 10,
+            contract_slot_budget: 100,
+            contracts: vec![mk_hosted_entry("A", true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        assert!(
+            html.contains("Closest limit:") && html.contains("contract state"),
+            "state bytes at 90% must outrank slots at 10% — got:\n{html}"
+        );
+        assert!(
+            !html.contains("Closest limit: <strong>contract slots"),
+            "the slack axis must not be reported as closest — got:\n{html}"
+        );
+    }
+
+    /// Over budget must render as over budget, not as a clamped 100%.
+    ///
+    /// This state is reachable and important, not an error case: exceeding the
+    /// contract-state budget IS the eviction trigger, and the slot axis sits
+    /// over its ceiling for the whole ~2.5 minute sustained window before
+    /// anything is shed. Clamping the percentage produced "150 of 100 (100%)"
+    /// — a line that contradicts its own detail text and hides how far over
+    /// the node is at exactly the moment that matters.
+    #[test]
+    fn hosting_card_shows_true_percentage_when_over_budget() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 100,
+            used_bytes: 150,
+            contract_count: 1,
+            contracts: vec![mk_hosted_entry("A", true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        assert!(
+            html.contains("150%"),
+            "an over-budget axis must report its true percentage — got:\n{html}"
+        );
+        assert!(
+            !html.contains("(100%)"),
+            "no percentage on the card may be clamped to 100% — the RAM-used \
+             tile had the same clamp and disagreed with the strip — got:\n{html}"
+        );
+        // The RAM-used tile must agree with the strip, not clamp separately.
+        assert!(
+            html.contains("150 B / 100 B (150%)"),
+            "the RAM-used tile must report the true percentage too — got:\n{html}"
+        );
+        // The bar itself is still capped: a fill cannot overflow its track.
+        assert!(
+            html.contains("width: 100.0%"),
+            "the bar width must stay clamped at 100% — got:\n{html}"
+        );
+    }
+
+    /// An unconfigured or not-yet-measured budget is not "100% full".
+    ///
+    /// The disk budget is an `Option` precisely because the tracker is
+    /// unseeded early in a node's life; treating an absent or zero
+    /// denominator as full would report a phantom emergency on every fresh
+    /// start.
+    #[test]
+    fn hosting_card_skips_unconfigured_axes_when_picking_closest_limit() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 1000,
+            used_bytes: 100,
+            contract_count: 5,
+            // A slot budget of 0 means "not configured", NOT "no slots left".
+            contract_slot_budget: 0,
+            // Disk tracker unseeded.
+            disk_total_bytes: None,
+            disk_budget_bytes: None,
+            contracts: vec![mk_hosted_entry("A", true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        assert!(
+            html.contains("Closest limit:") && html.contains("contract state"),
+            "the one configured axis must be reported — got:\n{html}"
+        );
+        assert!(
+            !html.contains("contract slots</strong>"),
+            "an unconfigured axis must not be ranked at all — got:\n{html}"
         );
     }
 

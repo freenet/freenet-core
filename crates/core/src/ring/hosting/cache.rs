@@ -237,6 +237,17 @@ pub const ESTIMATED_RESIDENT_BYTES_PER_CONTRACT: u64 = 1024 * 1024;
 /// [`resident_overhead_budget_for`].
 pub const MIN_RESIDENT_OVERHEAD_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
 
+/// The floor must leave room for at least one contract, or
+/// [`HostingCache::contract_slot_budget`] truncates to 0 slots — and the
+/// dashboard reads a 0 slot budget as "axis not configured" and hides it,
+/// which is precisely backwards for a node that can host nothing.
+///
+/// That the two constants are currently 128 MiB and 1 MiB makes this hold by
+/// a wide margin, but nothing enforced the relationship, so a future revision
+/// of either (a raised per-contract estimate, an operator-settable floor)
+/// could break it silently. Pinned here rather than left to the reader.
+const _: () = assert!(MIN_RESIDENT_OVERHEAD_BUDGET_BYTES >= ESTIMATED_RESIDENT_BYTES_PER_CONTRACT);
+
 /// Absolute reservation (bytes) for what a node uses REGARDLESS of hosted
 /// contract count or the sizes of the other RAM-scaled caches — the true
 /// OS/tokio-runtime/transport baseline. Deliberately an ABSOLUTE quantity,
@@ -622,6 +633,12 @@ pub(crate) struct HostingCacheStats {
     /// [`Self::current_bytes`] — unlike that field, this is never persisted
     /// per-contract state, just `contract_count` times a constant.
     pub estimated_resident_overhead_bytes: u64,
+    /// The resident-overhead budget expressed as the contract COUNT it really
+    /// bounds — see [`HostingCache::contract_slot_budget`]. Carried so the
+    /// dashboard can present the ceiling in the unit it actually constrains
+    /// instead of dividing bytes by a constant it would have to reach across
+    /// modules for.
+    pub contract_slot_budget: u64,
     /// Monotonic count of evictions where resident-overhead pressure was
     /// active at decision time (#5325). See
     /// [`HostingCache::resident_overhead_evictions_total`] for the exact
@@ -2415,6 +2432,21 @@ impl<T: TimeSource> HostingCache<T> {
         (self.contracts.len() as u64).saturating_mul(ESTIMATED_RESIDENT_BYTES_PER_CONTRACT)
     }
 
+    /// The resident-overhead budget expressed as what it actually bounds: a
+    /// maximum number of hosted contracts.
+    ///
+    /// Because the estimate is `contract_count *
+    /// ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`, its budget is not really a
+    /// memory measurement — it is a contract-COUNT ceiling wearing memory
+    /// units. Rendering it as bytes reads to an operator as measured RAM,
+    /// which it is not. Derived here rather than in the renderer so the
+    /// per-contract constant has exactly one reader: a metric that describes a
+    /// limit must come from the code that owns the limit, not from arithmetic
+    /// at the call site (see `.claude/rules/bug-prevention-patterns.md`).
+    pub(crate) fn contract_slot_budget(&self) -> u64 {
+        self.resident_overhead_budget_bytes / ESTIMATED_RESIDENT_BYTES_PER_CONTRACT
+    }
+
     /// Raw, instantaneous "is the count-derived estimate over its budget
     /// right now" reading (#5325) — no debounce. Used only to drive the
     /// SUSTAINED gate below and to report point-in-time state (the dashboard
@@ -2505,6 +2537,7 @@ impl<T: TimeSource> HostingCache<T> {
             oom_valve_evictions_total: self.oom_valve_evictions_total,
             resident_overhead_budget_bytes: self.resident_overhead_budget_bytes,
             estimated_resident_overhead_bytes: self.estimated_resident_overhead_bytes(),
+            contract_slot_budget: self.contract_slot_budget(),
             resident_overhead_evictions_total: self.resident_overhead_evictions_total,
         }
     }
