@@ -227,10 +227,21 @@ function tfSet(key, value) {
  * The text a row is matched against. Extracted by `table_filter.test.mjs`.
  *
  * `textContent` alone is NOT enough and that was a real bug: the contracts
- * table renders a 12-character abbreviated key, while the full key lives in
- * `title` / `data-copy` / `data-sort`. Pasting a real contract key — the
- * obvious thing to do, and what the copy button next to every row puts on the
- * clipboard — matched nothing at all. Fold those attributes in. */
+ * table renders a 12-character abbreviated key, so pasting a real contract key
+ * — the obvious thing to do, and what the copy button beside every row puts on
+ * the clipboard — matched nothing at all.
+ *
+ * The extra text comes from `data-copy` ONLY, and the narrowness is
+ * deliberate. `data-copy` holds the full form of the value the cell
+ * abbreviates, so matching it can only ever surface a row for a reason the
+ * user can see. The two neighbouring attributes both look tempting and are
+ * both wrong: `data-sort` carries raw sort keys that differ from the display
+ * (`data-sort="1048576"` renders as "1.0 MB", `data-sort="{state_rank}"` as a
+ * badge), and `title` carries prose — every contract row has a copy button
+ * titled "Copy contract key", so including it would make the query "key"
+ * match every row in the table. Both would surface rows for reasons invisible
+ * on screen, which is worse than not matching at all: the user cannot tell
+ * why the row is there. */
 function rowSearchText(textContent, attrValues) {
   var parts = [textContent || ''];
   for (var i = 0; i < attrValues.length; i++) {
@@ -279,14 +290,12 @@ function applyTableView(wrap) {
   var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
   var matches = rows.map(function (r) {
     if (q.length === 0) return true;
-    /* Fold in the attributes carrying values the cell text abbreviates —
-       chiefly the full contract key behind a 12-character display form. */
+    /* Fold in the full values the cell text abbreviates. See rowSearchText
+       for why this is data-copy alone and not title or data-sort. */
     var attrs = [];
-    var withAttrs = r.querySelectorAll('[title], [data-copy], [data-sort]');
-    for (var i = 0; i < withAttrs.length; i++) {
-      attrs.push(withAttrs[i].getAttribute('title'));
-      attrs.push(withAttrs[i].getAttribute('data-copy'));
-      attrs.push(withAttrs[i].getAttribute('data-sort'));
+    var withCopy = r.querySelectorAll('[data-copy]');
+    for (var i = 0; i < withCopy.length; i++) {
+      attrs.push(withCopy[i].getAttribute('data-copy'));
     }
     return rowSearchText(r.textContent, attrs).indexOf(q) !== -1;
   });

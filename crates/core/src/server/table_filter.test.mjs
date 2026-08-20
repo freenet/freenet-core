@@ -109,6 +109,30 @@ check(
   'guards against a false positive from naive concatenation',
 );
 
+// The caller decides WHICH attributes to pass, and the narrowness is the
+// point: only `data-copy` may be folded in, because it holds the full form of
+// what the cell displays. Pin that here so a future "search more attributes"
+// change has to argue with a test rather than slip through.
+//
+// Widening to `data-sort` or `title` surfaces rows for reasons invisible on
+// screen: `data-sort="1048576"` renders as "1.0 MB", and every contract row
+// carries a copy button titled "Copy contract key", so `title` would make the
+// query "key" match the entire table.
+const callerSrc = src.slice(src.indexOf('function applyTableView('));
+const callerBody = callerSrc.slice(0, callerSrc.indexOf('\nfunction '));
+for (const attr of ['data-sort', 'title']) {
+  check(
+    `applyTableView does not fold '${attr}' into the searchable text`,
+    callerBody.indexOf(`getAttribute('${attr}')`) === -1,
+    'it holds a value that differs from what the cell displays',
+  );
+}
+check(
+  "applyTableView does fold 'data-copy' in",
+  callerBody.indexOf("getAttribute('data-copy')") !== -1,
+  'this is what makes a full contract key findable',
+);
+
 // --- visibleRowFlags ------------------------------------------------------
 
 const all = (n) => Array.from({ length: n }, () => true);
