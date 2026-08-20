@@ -2686,6 +2686,23 @@ mod tests {
             "footer must state that this is only the zero-subscriber ordering \
              — got:\n{html}"
         );
+        // `recency_seq` is ALSO advanced by `record_abandonment` when a
+        // contract loses its last subscriber, so any copy calling this an
+        // access/read ordering misrepresents a just-abandoned contract. Pin
+        // the invariant (no access-time language), not one phrasing of it.
+        for banned in [
+            "least-recently accessed",
+            "least-recently read",
+            "last accessed",
+            "last read",
+        ] {
+            assert!(
+                !html.contains(banned),
+                "user-visible copy must not describe eviction recency as an \
+                 access time (found {banned:?}) — abandonment advances it too \
+                 — got:\n{html}"
+            );
+        }
     }
 
     fn mk_hosted_entry_seq(

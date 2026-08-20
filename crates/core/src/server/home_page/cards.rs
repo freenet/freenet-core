@@ -1340,7 +1340,7 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
     let shown = (h.contracts.len()).min(MAX_ROWS);
     let footer = if (h.contract_count as usize) > shown {
         format!(
-            r#"<p class="empty" style="margin: 0.4rem 0.9rem 0.6rem; font-size: 0.78rem; color: var(--text-muted, #888);">Showing {shown} of {total} hosted contracts, least-recently accessed first. Contracts with a local client or downstream subscriber outrank recency and are evicted last, but those counts aren't available here — so this is the eviction order only among contracts with no subscribers.</p>"#,
+            r#"<p class="empty" style="margin: 0.4rem 0.9rem 0.6rem; font-size: 0.78rem; color: var(--text-muted, #888);">Showing {shown} of {total} hosted contracts, lowest eviction-recency first. That clock is set by a real GET or PUT and also when a contract loses its last subscriber, so it is not purely a last-read time. Contracts with a local client or downstream subscriber outrank recency and are evicted last, but those counts aren't available here — so this is the eviction order only among contracts with no subscribers.</p>"#,
             shown = shown,
             total = h.contract_count,
         )
@@ -1391,7 +1391,7 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
     format!(
         r##"<div class="card">
             <div class="card-header"><h2>Demand-driven eviction</h2></div>
-            <p class="empty" style="margin: 0.2rem 0.9rem 0.4rem; font-size: 0.82rem; color: var(--text-muted, #888);">Retention is demand-driven. When over budget the node sheds contracts with the fewest subscribers first — a local client subscription outranks a downstream one, and among contracts with neither, the least-recently read or written goes first. Since #4702 the eviction floor is min(RAM budget, disk budget), so either resource running low can trigger a sweep.</p>
+            <p class="empty" style="margin: 0.2rem 0.9rem 0.4rem; font-size: 0.82rem; color: var(--text-muted, #888);">Retention is demand-driven. When over budget the node sheds contracts with the fewest subscribers first — a local client subscription outranks a downstream one, and among contracts with neither, the one with the lowest eviction-recency goes first. Since #4702 the eviction floor is min(RAM budget, disk budget), so either resource running low can trigger a sweep.</p>
             <div class="g-verdict-row">
                 <div class="g-norms">
                     <div class="g-norm"><div class="g-norm-label">RAM used</div><div class="g-norm-value">{used} / {budget} ({pct:.0}%)</div></div>

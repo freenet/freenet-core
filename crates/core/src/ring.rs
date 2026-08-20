@@ -4515,11 +4515,12 @@ impl Ring {
     /// the `HostingManager`, so the panel can't drift the way a mirrored
     /// counter would.
     ///
-    /// Note that the `keep_score` / `predicted_demand` carried on each row are
-    /// the DEMOTED telemetry-only estimator and do not govern retention; real
-    /// eviction ordering is subscriber-primary (`victim_order`). `recency_seq`
-    /// is the one ranking input available here, and is what the cache actually
-    /// sorts these rows by.
+    /// The demoted telemetry-only estimator (`keep_score` /
+    /// `predicted_demand`) is deliberately NOT carried on these rows: eviction
+    /// does not read it, and rendering it implied a ranking it never governed.
+    /// Real eviction ordering is subscriber-primary (`victim_order`);
+    /// `recency_seq` is the one ranking input available here, and is what the
+    /// cache actually sorts these rows by.
     ///
     /// Per-contract rows are returned in EVICTION order (next victim first).
     /// The renderer bounds how many it displays; the full count is

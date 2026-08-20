@@ -46,11 +46,13 @@
 //!
 //! `keep_score`, `eviction_floor`, `predicted_demand` and `record_abandonment`
 //! (the Greedy-Dual + proximity-prior demand estimator, pieces A3/#4650/#4688)
-//! are **retained but no longer drive eviction** — they are kept as the
-//! dashboard/telemetry surface (`predicted_demand` is still trained and
-//! displayed) for telemetry continuity this release, and are scheduled for
-//! deletion in a follow-up once the subscriber-primary policy is field-
-//! validated. Eviction reads NONE of them; it orders by subscriber count and
+//! are **retained but no longer drive eviction**. `predicted_demand` is still
+//! TRAINED, but as of #4830 it is no longer DISPLAYED: the dashboard rendered
+//! it as an eviction ranking it never governed, so it and `keep_score` were
+//! dropped from the dashboard-facing projections. They survive on
+//! `HostedContract` only, driving the `eviction_floor` ratchet, and are
+//! scheduled for deletion in a follow-up once the subscriber-primary policy is
+//! field-validated. Eviction reads NONE of them; it orders by subscriber count and
 //! real GET/PUT recency (see principle 2). `predicted_demand` is still supplied by
 //! the caller (`HostingManager`, which owns the proximity-prior estimator and
 //! the peer's own ring location — see [`super::demand`]) purely so the
@@ -684,10 +686,17 @@ pub(crate) struct HostingContractScore {
     pub size_bytes: u64,
     /// Read accesses (GET/SUBSCRIBE) observed over this entry's residency.
     pub read_count: u32,
-    /// Monotonic access sequence at the entry's most recent real GET or PUT
-    /// (genuine client access) — the eviction recency tiebreak (subscriber-
-    /// primary rework, #4642). The cache orders zero-subscriber eviction
-    /// candidates ascending by this. SUBSCRIBE / renewal traffic does NOT bump it.
+    /// The entry's eviction recency clock — a per-run monotonic sequence, and
+    /// the eviction recency tiebreak (subscriber-primary rework, #4642). The
+    /// cache orders zero-subscriber eviction candidates ascending by this.
+    ///
+    /// Set by a real GET or PUT (genuine client access), and ALSO by
+    /// [`HostingCache::record_abandonment`] when the contract loses its last
+    /// subscriber — a deliberate grace period, so a formerly-subscribed
+    /// contract is not evicted on a stale read accrued while it sat in the
+    /// subscription tier. It is therefore NOT a pure last-access time, and the
+    /// dashboard must not label it as one. SUBSCRIBE / renewal traffic does
+    /// NOT bump it.
     pub recency_seq: u64,
 }
 
@@ -2518,14 +2527,17 @@ impl<T: TimeSource> HostingCache<T> {
     }
 
     /// Per-contract rows for the local dashboard, in the cache-side EVICTION
-    /// order: ascending `(recency_seq, key)` — least-recent real GET/PUT first, the
-    /// same order [`Self::keys_eviction_order`] uses. This reflects the order
+    /// order: ascending `(recency_seq, key)` — least-recent eviction-recency
+    /// first, the same order [`Self::keys_eviction_order`] uses. (That clock is
+    /// set by a real GET/PUT *and* by subscription termination, so it is not a
+    /// pure last-read time — see [`HostingContractScore::recency_seq`].) This reflects the order
     /// among the ZERO-subscriber candidate set the over-budget sweep would evict
     /// under `AtCapacity` (the production pressure); the subscriber-count pin is
     /// applied by the manager via `is_eviction_eligible`, so the front of the
-    /// vec is the next zero-subscriber victim under budget pressure. The rows
-    /// still carry the demoted telemetry score fields (`keep_score`,
-    /// `predicted_demand`) the dashboard renders.
+    /// vec is the next zero-subscriber victim under budget pressure.
+    ///
+    /// Rows carry `size_bytes`, `read_count` and `recency_seq` only — the
+    /// demoted telemetry scores are deliberately not projected here.
     pub(crate) fn eviction_ordered_scores(&self) -> Vec<HostingContractScore> {
         let mut rows: Vec<HostingContractScore> = self
             .contracts

@@ -55,9 +55,9 @@ pub type BanListProvider = Arc<dyn Fn() -> BanListSnapshot + Send + Sync + 'stat
 /// `Ring::dashboard_hosting_snapshot()`, which reads the canonical hosting
 /// cache.
 ///
-/// Retention is governed by the subscriber-primary sweep (`victim_order`),
-/// NOT by the `keep_score` / `predicted_demand` carried on each row — those
-/// are the demoted telemetry-only estimator.
+/// Retention is governed by the subscriber-primary sweep (`victim_order`).
+/// The demoted telemetry-only estimator (`keep_score` / `predicted_demand`)
+/// is deliberately not carried on these rows.
 pub type HostingProvider = Arc<dyn Fn() -> HostingSnapshot + Send + Sync + 'static>;
 
 /// Snapshot of ring-level statistics exposed to the dashboard.
