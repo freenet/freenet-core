@@ -867,6 +867,95 @@ fn inconclusive_label(reason: &Inconclusive) -> &'static str {
     }
 }
 
+/// Source pin on `load_inputs`' output stream.
+///
+/// `--json` promises a machine-readable report, which means stdout must carry ONE JSON
+/// document and nothing else. `load_inputs` runs before the report is emitted, so
+/// anything it prints to stdout lands ahead of that document and breaks every consumer
+/// that parses it — `fdev conformance --bundle x --json | jq` simply fails.
+///
+/// That shipped once: the bundle note was printed with `println!`, and because every
+/// bundle this codebase writes always sets a note, it fired on essentially every
+/// `--bundle` replay. It was caught in review rather than by CI, because verifying it
+/// by hand (running the binary and piping to `jq`, which is how the fix was confirmed)
+/// leaves nothing behind that a later refactor has to keep true.
+///
+/// A pin rather than an integration test: spawning `fdev` against a real bundle needs a
+/// contract store and a WASM runtime, which is a large amount of fixture to guard a
+/// one-token property. This asserts the property at the only place it can regress.
+#[cfg(test)]
+mod stdout_purity_pin {
+    /// Slice `load_inputs`' body by counting braces to its own closing one.
+    ///
+    /// Brace-counting rather than "up to the next `fn`": a region ended on a guessed
+    /// anchor silently widens when the following item is not the shape assumed, and a
+    /// widened region here would swallow the human-report code — which prints to stdout
+    /// legitimately — and pass vacuously.
+    fn load_inputs_body() -> &'static str {
+        let src = include_str!("conformance.rs");
+        let start = src
+            .find("fn load_inputs(")
+            .expect("load_inputs not found in conformance.rs");
+        let after = &src[start..];
+        let open = after.find('{').expect("load_inputs has no body");
+        let mut depth = 0usize;
+        for (offset, ch) in after[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &after[..open + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("load_inputs' body is not brace-balanced");
+    }
+
+    /// Strip whole-line comments, so a comment mentioning `println!` cannot satisfy or
+    /// defeat the assertion. The comment above the `eprintln!` call names both.
+    fn code_only() -> String {
+        load_inputs_body()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// `code_only` with the stderr macros removed.
+    ///
+    /// Needed because `eprintln!` CONTAINS `println!` as a substring - the first
+    /// version of this pin asserted `!body.contains("println!")` and could therefore
+    /// never pass while the correct `eprintln!` call was present. It failed on correct
+    /// code, which is the harmless direction; the same trap the other way is how a pin
+    /// passes vacuously forever.
+    fn stdout_macros_only() -> String {
+        code_only().replace("eprintln!", "").replace("eprint!", "")
+    }
+
+    #[test]
+    fn load_inputs_never_writes_to_stdout() {
+        let body = stdout_macros_only();
+        assert!(
+            !body.contains("println!") && !body.contains("print!("),
+            "load_inputs writes to stdout, which lands ahead of the --json document \
+             and corrupts it for every consumer that parses stdout"
+        );
+    }
+
+    #[test]
+    fn the_bundle_note_still_reaches_the_reader() {
+        let body = code_only();
+        assert!(
+            body.contains("eprintln!"),
+            "the bundle note is no longer surfaced at all; a corpus whose related \
+             state was refused would replay as a clean bill of health"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
