@@ -343,13 +343,31 @@ function restoreTableFilters(focusState) {
     var input = wrap.querySelector('.tf-input');
     if (input) {
       input.value = tfGet(filterKey(id)) || '';
-      /* Restoring the VALUE is not enough. The refresh replaces <main>, which
-         destroys the element the caret was in, so without this the next
-         keystroke after a refresh goes nowhere and the user has to click back
-         into the box — every five seconds, while typing. Put the caret back
-         where it was. */
-      if (focusState && focusState.id === id) {
-        input.focus();
+      /* Restoring the VALUE alone is not enough: the refresh replaces <main>,
+         destroying the element the caret was in, so the next keystroke after a
+         refresh goes nowhere and the user has to click back into the box —
+         every five seconds, while typing. Put focus and the caret back too,
+         but ONLY when the box is on screen.
+
+         Restoring it unconditionally is what made the refresh yank the page:
+         focus() scrolls the element into view, the box sits at the TOP of a
+         card whose table can be thousands of pixels tall, so a user who
+         filtered and then scrolled down to read the matches was thrown back
+         every five seconds. Measured: scrollY 3000 -> 231.
+
+         Suppressing that scroll turned out not to be portable. `preventScroll`
+         is honoured by Chromium and Firefox but not WebKit, and neither a
+         synchronous scroll reassignment nor one on the next animation frame
+         beat WebKit's deferred scroll-into-view — it still landed on 1341,
+         deterministically, once the test stopped racing it.
+
+         So gate on visibility instead, which needs no engine cooperation: if
+         the box was already in the viewport, focusing it cannot scroll
+         anywhere. If it is off screen the user is reading rows rather than
+         typing, and silently stealing focus back to an input they cannot see
+         is not the behaviour to want anyway. */
+      if (focusState && focusState.id === id && focusState.visible) {
+        input.focus({ preventScroll: true });
         try {
           /* Unreachable today and kept deliberately: the control is
              `type="search"` (cards.rs), where setSelectionRange is supported
@@ -366,6 +384,16 @@ function restoreTableFilters(focusState) {
   });
 }
 
+/* Is the element within the current viewport? Used to decide whether
+   restoring focus is safe — see the comment at the focus() call. */
+function isInViewport(el) {
+  if (!el || typeof el.getBoundingClientRect !== 'function') return false;
+  var r = el.getBoundingClientRect();
+  var h = window.innerHeight || document.documentElement.clientHeight;
+  var w = window.innerWidth || document.documentElement.clientWidth;
+  return r.bottom > 0 && r.right > 0 && r.top < h && r.left < w;
+}
+
 /* Which filter box had focus, and where the caret was, so the refresh can put
    it back. Read BEFORE the <main> swap; the element does not survive it. */
 function captureFilterFocus() {
@@ -377,6 +405,13 @@ function captureFilterFocus() {
     id: wrap.getAttribute('data-filter-for'),
     start: el.selectionStart,
     end: el.selectionEnd,
+    /* Measured on the OLD element, before the swap. Measuring the fresh one
+       instead races layout: right after the innerHTML write WebKit
+       intermittently reports an off-screen rect, which suppressed the focus
+       restore on ~3 runs in 10. The old element is also the more faithful
+       question to ask — "could the user see the box they were typing in?" —
+       and the replacement occupies the same position. */
+    visible: isInViewport(el),
   };
 }
 

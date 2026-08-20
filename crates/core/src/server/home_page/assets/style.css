@@ -471,7 +471,13 @@ main {
   font-family: var(--font-mono);
   font-size: 0.72rem;
   color: var(--text-muted);
-  white-space: nowrap;
+  /* Deliberately NOT `nowrap`. This string embeds three row counts, and the
+     tables it describes are unbounded — a peer hosting tens of thousands of
+     contracts renders a longer string than any fixed layout budgeted for.
+     Measured at 320px it currently fits (291px of 320px with four-digit
+     counts), so this is a latent overflow rather than a live one, but a
+     no-wrap rule on unbounded content is exactly what caused the horizontal
+     scrolling this change set out to fix. Let it wrap instead. */
 }
 .tf-toggle {
   font-family: var(--font-mono);
@@ -1272,6 +1278,16 @@ table.sortable thead th.sort-desc::after {
  * because the tablet and desktop widths are close, which is too dense for
  * labels like "CONTRACT-CAP REJECTS". Keep these AFTER the base rule; moving
  * either one is what broke this the first time. */
+/* `.g-verdict-row` is a two-track grid (`minmax(280px, 0.85fr) 2fr`) built for
+ * a verdict box beside a stat grid. Three of the hosting card's rows contain
+ * ONLY the stat grid, which then sits in track 1 and gets 0.85/2.85 of the
+ * width — measured at 280px of a 726px row, with 446px left empty beside it.
+ * At that width `auto-fit` yields two columns, so five tiles wrapped into
+ * three rows with dead space alongside. Let a sole child span both tracks. */
+.g-verdict-row > .g-norms:only-child {
+  grid-column: 1 / -1;
+}
+
 @media (max-width: 768px) {
   .g-norms {
     grid-template-columns: repeat(3, 1fr);
