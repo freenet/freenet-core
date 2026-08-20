@@ -237,6 +237,17 @@ pub const ESTIMATED_RESIDENT_BYTES_PER_CONTRACT: u64 = 1024 * 1024;
 /// [`resident_overhead_budget_for`].
 pub const MIN_RESIDENT_OVERHEAD_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
 
+/// The floor must leave room for at least one contract, or
+/// [`HostingCache::contract_slot_budget`] truncates to 0 slots — and the
+/// dashboard reads a 0 slot budget as "axis not configured" and hides it,
+/// which is precisely backwards for a node that can host nothing.
+///
+/// That the two constants are currently 128 MiB and 1 MiB makes this hold by
+/// a wide margin, but nothing enforced the relationship, so a future revision
+/// of either (a raised per-contract estimate, an operator-settable floor)
+/// could break it silently. Pinned here rather than left to the reader.
+const _: () = assert!(MIN_RESIDENT_OVERHEAD_BUDGET_BYTES >= ESTIMATED_RESIDENT_BYTES_PER_CONTRACT);
+
 /// Absolute reservation (bytes) for what a node uses REGARDLESS of hosted
 /// contract count or the sizes of the other RAM-scaled caches — the true
 /// OS/tokio-runtime/transport baseline. Deliberately an ABSOLUTE quantity,

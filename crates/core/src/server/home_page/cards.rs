@@ -1285,7 +1285,22 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
     let axis_utilisation = |used: u64, budget: u64| -> Option<f64> {
         (budget > 0).then(|| used as f64 / budget as f64)
     };
-    let mut axes: Vec<(&str, f64, String)> = Vec::new();
+    // Each axis carries a note saying what CROSSING it actually does, because
+    // the three are not the same kind of ceiling and "closest limit" alone
+    // would imply they are:
+    //
+    //   - contract state: the sweep's own condition (`current_bytes >
+    //     budget_bytes`), so crossing fires it directly.
+    //   - contract slots: also a sweep condition, but only once the breach has
+    //     been SUSTAINED (`resident_overhead_over_budget` requires half of
+    //     RESIDENT_OVERHEAD_SUSTAINED_WINDOW, ~2.5 min). A transient spike to
+    //     99% here self-resolves without evicting anything, so the strip must
+    //     not read as though eviction is imminent.
+    //   - disk: not a sweep condition at all. It acts by clamping the
+    //     contract-state budget (`effective = ram.min(disk_budget)` in
+    //     HostingManager), so disk pressure tightens the first axis rather
+    //     than firing on its own.
+    let mut axes: Vec<(&str, f64, String, &str)> = Vec::new();
     if let Some(u) = axis_utilisation(h.used_bytes, h.budget_bytes) {
         axes.push((
             "contract state",
@@ -1295,6 +1310,7 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
                 format_bytes(h.used_bytes),
                 format_bytes(h.budget_bytes)
             ),
+            "Crossing this triggers an eviction sweep.",
         ));
     }
     if let (Some(used), Some(disk_budget)) = (h.disk_total_bytes, h.disk_budget_bytes) {
@@ -1303,6 +1319,8 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
                 "disk",
                 u,
                 format!("{} of {}", format_bytes(used), format_bytes(disk_budget)),
+                "Disk does not trigger a sweep by itself: it clamps the contract-state \
+                 budget, so filling it tightens that limit instead.",
             ));
         }
     }
@@ -1311,6 +1329,8 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
             "contract slots",
             u,
             format!("{} of {}", h.contract_count, h.contract_slot_budget),
+            "Crossing this triggers a sweep only if it stays over for a few minutes, \
+             so a brief spike here resolves on its own.",
         ));
     }
     // Cost pressure (#4861) is deliberately absent: it is a sustained-rate
@@ -1319,21 +1339,30 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
     let binding = axes
         .iter()
         .max_by(|a, b| a.1.total_cmp(&b.1))
-        .map(|(name, util, detail)| {
+        .map(|(name, util, detail, note)| {
             let pct = (util * 100.0).min(100.0);
+            // Threshold on the DISPLAYED figure, not the raw one. Colouring
+            // from `pct` while printing `{pct:.0}` makes the two disagree at
+            // the boundary: 89.6% prints as "90%" but renders amber, and 74.6%
+            // prints as "75%" but renders grey. An operator seeing a red 90%
+            // beside an amber 90% has no way to tell them apart, so round
+            // first and threshold on what they can actually read.
+            let shown_pct = pct.round();
             // Colour only near the ceiling: an operator should be able to
             // ignore this strip until it means something.
-            let tone = if pct >= 90.0 {
+            let tone = if shown_pct >= 90.0 {
                 "var(--danger, #c0392b)"
-            } else if pct >= 75.0 {
+            } else if shown_pct >= 75.0 {
                 "var(--warn, #b8860b)"
             } else {
                 "var(--text-muted, #888)"
             };
             format!(
-                r#"<div class="hz-binding"><div class="hz-binding-head">Closest limit: <strong>{name}</strong> — {detail} ({pct:.0}%)</div><div class="hz-bar" role="img" aria-label="{name} at {pct:.0} percent of its limit"><span class="hz-bar-fill" style="width: {pct:.1}%; background: {tone};"></span></div></div>"#,
+                r#"<div class="hz-binding" title="{note}"><div class="hz-binding-head">Closest limit: <strong>{name}</strong> — {detail} ({shown:.0}%)</div><div class="hz-bar" role="img" aria-label="{name} at {shown:.0} percent of its limit"><span class="hz-bar-fill" style="width: {pct:.1}%; background: {tone};"></span></div></div>"#,
                 name = html_escape(name),
                 detail = html_escape(detail),
+                note = html_escape(note),
+                shown = shown_pct,
                 pct = pct,
                 tone = tone,
             )
