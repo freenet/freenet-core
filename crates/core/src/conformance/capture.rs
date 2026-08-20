@@ -1525,21 +1525,29 @@ mod tests {
         );
     }
 
-    /// A restart reloads the SAME contracts every time.
+    /// A restart keeps a NAMED set of contracts, not whatever the filesystem lists first.
     ///
     /// `reload` stops at `MAX_TRACKED_CONTRACTS`, and `read_dir` order is undefined, so
-    /// without a sort which contracts survive a restart is decided by whatever the
-    /// filesystem happens to enumerate first. Every other reload test writes a single
-    /// bundle, so the truncation path they exercise is the one where truncation never
-    /// happens - deleting the sort left all of them green.
+    /// without a sort which contracts survive a restart is decided by enumeration
+    /// order. Every other reload test writes a single bundle, so the truncation path
+    /// they cover is the one where truncation never happens - deleting the sort left
+    /// all of them green.
+    ///
+    /// Asserting "two reloads agree" does NOT test this either, and that version of
+    /// this test was vacuous: `read_dir` is stable across calls within one process even
+    /// though its order is unspecified, so both reloads agreed with the sort deleted.
+    /// What the sort actually guarantees is WHICH set survives - the lexicographically
+    /// smallest filenames - and that holds only by luck under ext4's hash order.
     #[test]
     fn a_restart_reloads_a_deterministic_set_when_there_are_more_bundles_than_slots() {
         let dir = tempfile::TempDir::new().expect("tempdir");
 
         // More bundles than slots, so truncation actually runs.
         let extra = 12usize;
+        let mut written = Vec::new();
         for i in 0..(MAX_TRACKED_CONTRACTS + extra) {
             let instance = ContractInstanceId::new([(i % 251) as u8; 32]);
+            written.push(instance);
             let mut bundle = super::super::bundle::ReplayBundle::new(vec![9, 9], vec![3]);
             bundle.instance = Some(instance);
             bundle.states = vec![vec![1, 2], vec![2, 3]];
@@ -1548,26 +1556,26 @@ mod tests {
                 .expect("write bundle");
         }
 
-        let loaded = |dir: &Path| {
-            let mut ids: Vec<Vec<u8>> = reload(dir)
-                .into_keys()
-                .map(|id| id.as_bytes().to_vec())
-                .collect();
-            ids.sort_unstable();
-            ids
-        };
-        let first = loaded(dir.path());
-        let second = loaded(dir.path());
+        // What the sort promises: the lexicographically smallest bundle filenames.
+        let mut expected: Vec<String> = written.iter().map(|id| format!("{id}.bundle")).collect();
+        expected.sort();
+        expected.truncate(MAX_TRACKED_CONTRACTS);
+
+        let mut kept: Vec<String> = reload(dir.path())
+            .into_keys()
+            .map(|id| format!("{id}.bundle"))
+            .collect();
+        kept.sort();
 
         assert_eq!(
-            first.len(),
+            kept.len(),
             MAX_TRACKED_CONTRACTS,
             "fixture did not exceed the cap, so truncation never ran"
         );
         assert_eq!(
-            first, second,
-            "two reloads of the same directory kept different contracts, so which \
-             samples survive a restart depends on filesystem enumeration order"
+            kept, expected,
+            "reload kept a different set than the ordering promises, so which samples \
+             survive a restart depends on filesystem enumeration order"
         );
     }
 
