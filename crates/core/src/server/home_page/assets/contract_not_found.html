@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Contract Not Found — Freenet</title>
+<style>{CSS}{PEER_CSS}</style><script>{JS}</script>
+</head><body>
+<header>
+    <div class="header-left">
+        <a href="/" class="logo-link"><img src="https://freenet.org/freenet_logo.svg" alt="Freenet" class="logo"></a>
+        <a href="/" class="header-title">FREENET</a>
+        <span class="header-sep">/</span>
+        <span class="header-scope">Contract</span>
+    </div>
+    <div class="header-right">
+        <button class="theme-btn" id="theme-btn" onclick="toggleTheme()" title="Toggle dark/light mode">
+            <span id="theme-icon">☀️</span>
+        </button>
+    </div>
+</header>
+<main>
+    <div class="card"><h2>Contract Not Found</h2>
+    <p class="empty">This node knows nothing about <code class="key-wrap">{key}</code>: no subscription, no hosted copy, and no governance record.</p>
+    <p class="empty" style="margin-top:0.5rem">That is a statement about THIS node only. A contract absent here may be alive and well elsewhere in the network — a node holds what demand routed to it, not a directory.</p>
+    <p style="margin-top:0.75rem"><a href="/" style="color:var(--accent-light);font-family:var(--font-mono);font-size:0.85rem">&larr; Back to dashboard</a></p></div>
+</main></body></html>

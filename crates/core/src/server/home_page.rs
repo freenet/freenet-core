@@ -5,6 +5,7 @@
 
 mod assets;
 mod cards;
+mod contract_detail;
 mod estimator;
 mod favicon;
 mod peer_detail;
@@ -22,6 +23,7 @@ use cards::{
     build_ban_list_card, build_contracts_card, build_governance_card, build_hosting_card,
     build_ops_card, build_peers_card, build_status_card, build_transfer_card,
 };
+use contract_detail::contract_detail_html;
 use favicon::{build_dashboard_title, build_favicon_data_uri};
 use peer_detail::peer_detail_html;
 
@@ -101,6 +103,13 @@ pub(super) async fn homepage() -> impl IntoResponse {
 /// Handler for `GET /peer/{address}` — returns a detail page for a single peer.
 pub(super) async fn peer_detail(Path(address): Path<String>) -> impl IntoResponse {
     Html(peer_detail_html(&address))
+}
+
+/// Per-contract detail page (#5369). Accepts either the full `ContractKey`
+/// encoding or the `ContractInstanceId`, because the dashboard's own cards key
+/// on different ones and an operator pasting either should land somewhere.
+pub(super) async fn contract_detail(Path(key): Path<String>) -> impl IntoResponse {
+    Html(contract_detail_html(&key))
 }
 
 fn homepage_html() -> String {
@@ -193,6 +202,7 @@ mod tests {
         build_peers_card, build_ring_svg, build_status_card, build_transfer_card, format_bytes,
         format_last_evaluated,
     };
+    use super::contract_detail::contract_detail_html_from;
     use super::estimator::{
         RegKind, build_estimator_chart, build_estimator_chart_or_placeholder,
         build_regression_chart, build_reliability_chart, build_renegade_accuracy_panel,
@@ -1939,8 +1949,18 @@ mod tests {
         // must NOT be lost when we add the button — that tooltip is
         // still useful for hover-only users (e.g. read-only screenshots).
         // Likewise, <code>{short}</code> must stay outside the button so
-        // the abbreviated key keeps its monospace styling without a
-        // hover state on the contract text itself.
+        // the abbreviated key keeps its monospace styling.
+        //
+        // Amended for #5369: the <code> is now wrapped in an <a> to the
+        // per-contract detail page, so it no longer DIRECTLY precedes the
+        // button. That is a deliberate reversal of one clause of the
+        // original intent, which asked for no hover state on the contract
+        // text — written when there was nowhere for the key to link TO.
+        // Now there is, and a link on the key is how the page is reached.
+        // What still holds, and is what these assertions protect, is that
+        // <code> stays OUTSIDE the copy button: nesting it would make the
+        // key text a click target for "copy" rather than for "open", and
+        // would put the monospace styling inside a button's hover state.
         use crate::node::network_status::ContractSnapshot;
         let mut snap = base_snapshot();
         snap.open_connections = 1;
@@ -1962,15 +1982,23 @@ mod tests {
             html.contains("<code>DEAD...</code>"),
             "the abbreviated key must stay as a plain <code> sibling of the button, got: {html}"
         );
-        // Lock in the simplified markup: the <code> element is a sibling
-        // of the button, NOT wrapped inside it.
+        // Lock in the markup: the <code> element is a sibling of the
+        // button, NOT wrapped inside it.
         assert!(
             !html.contains("class=\"copy-key\" data-copy=\"DEADBEEF\" title=\"Copy contract key\" aria-label=\"Copy contract key\">⧉</button><code>"),
             "<code> must come BEFORE the copy button"
         );
         assert!(
-            html.contains("</code><button type=\"button\" class=\"copy-key\""),
-            "<code> must directly precede the <button> sibling, got: {html}"
+            html.contains("</code></a><button type=\"button\" class=\"copy-key\""),
+            "<code> must sit inside the detail link and directly precede the \
+             copy button, got: {html}"
+        );
+        // The link must target the detail page with the FULL key, not the
+        // abbreviation — the abbreviation is ambiguous and the page looks up
+        // by full key or instance id.
+        assert!(
+            html.contains("href=\"/contract/DEADBEEF\""),
+            "the key must link to its detail page by full key, got: {html}"
         );
     }
 
@@ -3100,6 +3128,86 @@ mod tests {
     // either survives the 5s `<main>` swap. A green run here is compatible
     // with the feature being completely broken in a browser. The behaviour is
     // covered by driving a real node with Playwright; see the PR.
+
+    // ─── Contract detail page (#5369) ───────────────────────────────────
+
+    /// A key that reaches this page came straight out of a URL path, so it is
+    /// attacker-controlled text rendered into HTML.
+    ///
+    /// The not-found branch is the dangerous one: it echoes the key back
+    /// verbatim to say what was not found, and it is reachable by ANYONE who
+    /// can load the page with any path at all — no node state required. An
+    /// unescaped echo there is a reflected-XSS hole on the operator's own
+    /// dashboard, which is the origin that also serves every locally-hosted
+    /// app.
+    #[test]
+    fn contract_detail_escapes_a_key_from_the_url() {
+        let payload = "<script>alert(1)</script>";
+        let html = contract_detail_html_from(&None, payload);
+        assert!(
+            !html.contains("<script>alert(1)"),
+            "an unescaped key from the URL is reflected XSS — got:\n{html}"
+        );
+        assert!(
+            html.contains("&lt;script&gt;alert(1)"),
+            "the key should still be shown, escaped, so the operator can see \
+             what was not found — got:\n{html}"
+        );
+    }
+
+    /// Absence on this node is not absence from the network, and the page must
+    /// not imply otherwise.
+    ///
+    /// A node holds what demand routed to it; it has no directory and cannot
+    /// know whether a contract exists elsewhere. "Not found" phrased as a
+    /// global fact would be the same class of falsehood as the eviction card
+    /// describing a ranking the code does not implement.
+    #[test]
+    fn contract_not_found_is_scoped_to_this_node() {
+        let html = contract_detail_html_from(&None, "NOSUCHCONTRACTKEY");
+        assert!(
+            html.contains("Contract Not Found"),
+            "expected the not-found page — got:\n{html}"
+        );
+        assert!(
+            html.contains("THIS node"),
+            "the page must scope its claim to this node rather than implying \
+             the contract is absent from the network — got:\n{html}"
+        );
+    }
+
+    /// The hosting panel must NOT imply it is showing the eviction ranking.
+    ///
+    /// Invariant 3 ranks by local subscriptions, then downstream subscribers,
+    /// then recency. Only recency is in the snapshot; the two counts that
+    /// OUTRANK it are computed during the sweep and are unavailable here. A
+    /// panel that showed recency alone, unqualified, would read as "this is
+    /// why the contract is kept" — which is exactly the falsehood PR #5371
+    /// removed from the eviction card, reintroduced on a new page.
+    #[test]
+    fn contract_detail_says_the_eviction_ranking_is_not_shown() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 2;
+        snap.hosting.contracts = vec![crate::node::network_status::HostedContractEntry {
+            key_full: "TESTKEY1".to_string(),
+            key_short: "TESTKEY1".to_string(),
+            size_bytes: 4096,
+            read_count: 3,
+            recency_seq: 42,
+            eviction_eligible: true,
+        }];
+        let html = contract_detail_html_from(&Some(snap), "TESTKEY1");
+        assert!(
+            html.contains("not shown"),
+            "the hosting panel must say the ranking keys are missing — \
+             got:\n{html}"
+        );
+        assert!(
+            html.contains("5372"),
+            "and point at the issue tracking them, so the gap is followable \
+             rather than a dead end — got:\n{html}"
+        );
+    }
 
     /// The Playwright fixture's markup must stay in step with what the server
     /// actually emits.

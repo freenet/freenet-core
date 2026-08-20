@@ -285,6 +285,10 @@ impl HttpClientApi {
                 "/peer/{address}",
                 axum::routing::get(home_page::peer_detail),
             )
+            .route(
+                "/contract/{key}",
+                axum::routing::get(home_page::contract_detail),
+            )
             // Notification service worker, served at the origin root so its
             // default scope (`/`) covers every contract shell page. The shell
             // registers it to show notifications via showNotification() — the
