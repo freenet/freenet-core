@@ -144,10 +144,18 @@ pub struct ShadowReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum CandidateSource {
     /// The contracts the peer hosts. The intended source.
-    #[default]
     Hosted,
     /// The contracts the sampler already holds, used when no hosted source was
     /// registered. Keeps probing alive; does not cover the hosted set.
+    ///
+    /// The DEFAULT, deliberately, and this is load-bearing rather than arbitrary.
+    /// `Hosted` was the default first, which made `FocusTick::default()` assert the
+    /// hosted source was already in use before any draw had happened - and the writer's
+    /// warm-up retry is guarded on `source != Hosted`, so the guard was false from the
+    /// first tick and the retry arm was never once polled. A default must be the claim
+    /// that is safe to be wrong about; "we are on the fallback" costs a retry, while
+    /// "we are on the hosted set" silently cancels the recovery path.
+    #[default]
     SamplerFallback,
 }
 
@@ -176,6 +184,23 @@ pub(crate) fn candidate_pool(
         Some(hosted) => (hosted, CandidateSource::Hosted),
         None => (fallback.to_vec(), CandidateSource::SamplerFallback),
     }
+}
+
+/// Whether the writer should keep retrying its focus draw.
+///
+/// Extracted so the condition can be TESTED. As a bare `tokio::select!` arm guard it
+/// could not be: nothing calls `run_writer`, and a source pin can only see that the arm
+/// is written, never that its guard is permanently false. That is exactly how the first
+/// version shipped - `CandidateSource` defaulted to `Hosted`, so the guard was false
+/// from the first tick and the retry never ran once.
+pub(crate) fn needs_hosted_warmup(
+    wide: bool,
+    last: &FocusTick,
+    attempts: u32,
+    budget: u32,
+) -> bool {
+    // Wide capture ignores focus entirely, so it has nothing to warm up.
+    !wide && last.source != CandidateSource::Hosted && attempts < budget
 }
 
 /// One tick's focus decision, before any samples are gathered for it.
@@ -263,11 +288,15 @@ impl ShadowRunner {
     /// silent, but reinstates exactly the #5366 horizon - so the tick reports which
     /// source it used. `candidates=sampler` means focus has stopped covering the
     /// hosted set, a state that otherwise looks identical to a peer hosting little.
-    pub(crate) fn focus(&self, fallback: &[ContractInstanceId]) -> FocusTick {
+    pub(crate) fn focus(
+        &self,
+        hosted: Option<Vec<ContractInstanceId>>,
+        fallback: &[ContractInstanceId],
+    ) -> FocusTick {
         if self.mode == EnforcementMode::Disabled {
             return FocusTick::default();
         }
-        let (candidates, source) = candidate_pool(super::capture::hosted_contracts(), fallback);
+        let (candidates, source) = candidate_pool(hosted, fallback);
         FocusTick {
             selected: self.selector.select(&candidates),
             candidates: candidates.len(),
@@ -693,11 +722,102 @@ mod tests {
         // No hosted-contract source is registered in unit tests, so focus falls back
         // to the sampler keys - which is exactly the fallback path production reports
         // as `candidate_source=sampler`.
-        let focus = runner.focus(&samplers.keys().copied().collect::<Vec<_>>());
+        let focus = runner.focus(None, &samplers.keys().copied().collect::<Vec<_>>());
         let (work, _awaiting) = runner.select(&focus, samplers);
         let (report, findings) = probe(work, store.map(|p| p.to_path_buf()), runner.mode()).await;
         runner.record(&findings);
         report
+    }
+
+    /// A fresh `FocusTick` must NOT claim the hosted source is already in use.
+    ///
+    /// This is the bug that shipped: `CandidateSource` derived `Default` with `Hosted`
+    /// marked `#[default]`, so `FocusTick::default()` asserted the hosted set was in
+    /// use before any draw had happened. The writer's warm-up retry is guarded on
+    /// `source != Hosted`, so the guard was false from the first tick and the retry arm
+    /// was never polled once - leaving exactly the startup gap it was added to close.
+    #[test]
+    fn a_default_focus_tick_does_not_claim_the_hosted_source() {
+        assert_eq!(
+            FocusTick::default().source,
+            CandidateSource::SamplerFallback,
+            "a focus decision that has not happened yet must not claim the hosted set"
+        );
+    }
+
+    /// The warm-up keeps retrying while focus is still on the fallback.
+    #[test]
+    fn warmup_retries_while_focus_is_still_on_the_fallback() {
+        let fallback = FocusTick {
+            source: CandidateSource::SamplerFallback,
+            ..FocusTick::default()
+        };
+        assert!(
+            needs_hosted_warmup(false, &fallback, 0, 12),
+            "warm-up gave up while focus was still on the sampler fallback"
+        );
+        // And specifically for a DEFAULT tick, which is the state at task start.
+        assert!(
+            needs_hosted_warmup(false, &FocusTick::default(), 0, 12),
+            "warm-up was disabled before the first draw had even happened"
+        );
+    }
+
+    /// It stops for good once a draw reaches the hosted set.
+    #[test]
+    fn warmup_stops_once_focus_reaches_the_hosted_set() {
+        let hosted = FocusTick {
+            source: CandidateSource::Hosted,
+            ..FocusTick::default()
+        };
+        assert!(!needs_hosted_warmup(false, &hosted, 0, 12));
+    }
+
+    /// Wide capture never warms up: it ignores focus entirely.
+    #[test]
+    fn warmup_does_not_run_for_wide_capture() {
+        assert!(!needs_hosted_warmup(true, &FocusTick::default(), 0, 12));
+    }
+
+    /// It gives up rather than ticking forever when no source ever appears.
+    ///
+    /// Reachable, not hypothetical: the node calls `capture::global()` - which spawns
+    /// the writer - before it checks whether the daemon is disabled, and a disabled
+    /// daemon idles indefinitely without ever constructing a `Ring` to register one.
+    #[test]
+    fn warmup_gives_up_after_its_attempt_budget() {
+        assert!(
+            !needs_hosted_warmup(false, &FocusTick::default(), 12, 12),
+            "warm-up would retry forever on a node that never builds a ring"
+        );
+    }
+
+    /// `focus` actually consults the hosted set it is handed.
+    ///
+    /// The wiring, not just `candidate_pool`: hardcoding `None` at the call site would
+    /// silently reinstate #5366 in production, and until `focus` took the lookup as a
+    /// parameter no test could tell the difference.
+    #[tokio::test]
+    async fn focus_selects_from_the_hosted_set_it_is_given() -> anyhow::Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        let hosted: Vec<_> = (10..40u8).map(instance).collect();
+
+        let tick = runner.focus(Some(hosted.clone()), &[instance(1), instance(2)]);
+
+        assert_eq!(tick.source, CandidateSource::Hosted);
+        assert_eq!(tick.candidates, hosted.len());
+        assert!(
+            !tick.selected.is_empty(),
+            "hosted candidates selected nothing"
+        );
+        for picked in &tick.selected {
+            assert!(
+                hosted.contains(picked),
+                "focus selected {picked} which the peer does not host"
+            );
+        }
+        Ok(())
     }
 
     /// The hosted set is preferred, and is reported as such.
@@ -946,7 +1066,7 @@ mod tests {
         );
         let dir = tempfile::TempDir::new()?;
         let runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
-        let focus = runner.focus(&samplers.keys().copied().collect::<Vec<_>>());
+        let focus = runner.focus(None, &samplers.keys().copied().collect::<Vec<_>>());
         let (work, _awaiting) = runner.select(&focus, &samplers);
         assert!(!work.is_empty(), "nothing selected, so this proves nothing");
 

@@ -123,9 +123,19 @@ const MAX_TRACKED_CONTRACTS: usize = 64;
 /// How often to retry drawing focus from the hosted set before it is registered.
 ///
 /// Short, because until it succeeds a focus-scoped peer is sampling against an empty
-/// focus set and therefore recording nothing. Bounded work: the arm switches off for
-/// good as soon as one draw reports [`CandidateSource::Hosted`].
+/// focus set and therefore recording nothing.
 const HOSTED_SOURCE_WARMUP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How many warm-up draws to make before giving up.
+///
+/// The arm normally switches off on its first successful draw, so this only matters
+/// when no hosted source is EVER registered - which is reachable, not hypothetical:
+/// `freenet` calls `capture::global()` (spawning this task) before it checks whether
+/// the daemon is disabled, and a disabled daemon idles forever without ever building a
+/// `Ring`. Without a cap the ticker would fire every five seconds for days, while the
+/// constant above claimed to be self-terminating. A minute of retries is far longer
+/// than node startup needs.
+const HOSTED_SOURCE_WARMUP_ATTEMPTS: u32 = 12;
 
 /// How many observations may accumulate before a flush, regardless of the clock.
 ///
@@ -344,12 +354,13 @@ static HOSTED_CONTRACTS: std::sync::OnceLock<HostedContractsFn> = std::sync::Onc
 
 /// Tell the conformance machinery how to list hosted contracts. First caller wins.
 pub fn set_hosted_contracts_source(source: HostedContractsFn) {
-    // Same reasoning as `set_contract_store`: skip entirely unless capture is on, so
-    // the many-nodes-in-one-process test harness does not produce conflict warnings
-    // for a path nothing reads.
-    if global().is_none() {
-        return;
-    }
+    // Deliberately NOT gated on `global()`, unlike `set_contract_store`. That gate
+    // exists there to keep a conflict WARNING quiet in the many-nodes-in-one-process
+    // test harness; this function logs conflicts at debug, so it buys nothing - and it
+    // costs correctness, because `capture::start` is public: an embedder starting
+    // capture explicitly rather than from the environment would have registration
+    // refused, leaving focus permanently empty and every observation discarded.
+    // Registering when nothing reads it is free.
     if HOSTED_CONTRACTS.set(source).is_err() {
         // Unlike the contract store there is nothing useful to compare - two closures
         // are not comparable - so this cannot distinguish "same ring twice" from "two
@@ -520,21 +531,28 @@ async fn run_writer(
     // would take the ring's hosting-cache read lock on the merge path's queue drain.
     let mut warmup = tokio::time::interval(HOSTED_SOURCE_WARMUP);
     warmup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last_focus = crate::conformance::shadow::FocusTick::default();
+    // Seeded from the real draw below, never left at `Default`. The first version left
+    // it defaulted, and because `CandidateSource` then defaulted to `Hosted` the
+    // warm-up guard read "already on the hosted set" before any draw had happened - so
+    // the retry arm was never polled once and the startup gap it exists to close stayed
+    // wide open. The default is now the pessimistic variant too, but seeding this
+    // correctly is the fix; the default is only the backstop.
+    let mut last_focus;
+    let mut warmup_attempts = 0u32;
     // Focused contracts with no samples yet, carried across the probe so the finished
     // tick can report them rather than silently omitting them from `focused`.
     let mut awaiting_samples = 0usize;
-    let mut scope = if wide_capture_requested() {
+    let wide = wide_capture_requested();
+    let startup_focus = shadow.focus(
+        hosted_contracts(),
+        &samplers.keys().copied().collect::<Vec<_>>(),
+    );
+    let mut scope = if wide {
         SamplingScope::Wide
     } else {
-        SamplingScope::Focused(
-            shadow
-                .focus(&samplers.keys().copied().collect::<Vec<_>>())
-                .selected
-                .into_iter()
-                .collect(),
-        )
+        SamplingScope::Focused(startup_focus.selected.iter().copied().collect())
     };
+    last_focus = startup_focus;
 
     loop {
         tokio::select! {
@@ -569,9 +587,14 @@ async fn run_writer(
             }
             // Disabled the moment focus has actually been drawn from the hosted set.
             // `Wide` never consults focus, so it never needs this either.
-            _ = warmup.tick(), if !matches!(scope, SamplingScope::Wide)
-                && last_focus.source != crate::conformance::shadow::CandidateSource::Hosted => {
-                let focus = shadow.focus(&samplers.keys().copied().collect::<Vec<_>>());
+            _ = warmup.tick(),
+                if crate::conformance::shadow::needs_hosted_warmup(
+                    wide, &last_focus, warmup_attempts, HOSTED_SOURCE_WARMUP_ATTEMPTS) => {
+                warmup_attempts += 1;
+                let focus = shadow.focus(
+                    hosted_contracts(),
+                    &samplers.keys().copied().collect::<Vec<_>>(),
+                );
                 if focus.source == crate::conformance::shadow::CandidateSource::Hosted {
                     tracing::debug!(
                         candidates = focus.candidates,
@@ -595,7 +618,10 @@ async fn run_writer(
                 // and is not. Only the cheap half runs here, so the queue keeps
                 // draining while WASM executes on another task.
                 shadow.advance();
-                let focus = shadow.focus(&samplers.keys().copied().collect::<Vec<_>>());
+                let focus = shadow.focus(
+                    hosted_contracts(),
+                    &samplers.keys().copied().collect::<Vec<_>>(),
+                );
                 // Recomputed every tick so a rotation, or a change in what the peer
                 // hosts, takes effect on sampling immediately rather than at the next
                 // restart. Wide mode ignores focus by definition.
@@ -944,19 +970,28 @@ pub(crate) fn record(
                 evicted = Some(victim);
             }
             None => {
-                // Every tracked contract is in focus and the map is full, so there is
-                // nothing to give up. Unreachable while MAX_FOCUS_CONTRACTS (2) is far
-                // below MAX_TRACKED_CONTRACTS (64), but MAX_FOCUS_CONTRACTS is a
-                // documented operational tunable: raise it without revisiting the cap
-                // and this starts silently discarding exactly the focus-selected
-                // observations the eviction rule exists to protect. Counted rather
-                // than dropped in silence.
-                tracing::warn!(
-                    contract = %observation.contract,
-                    tracked = samplers.len(),
-                    "conformance capture could not make room for a focused contract: \
-                     every tracked contract is in focus"
-                );
+                // Two very different situations reach here, and warning for both says
+                // something false about one of them.
+                //
+                // Wide mode maps to `None` unconditionally: refuse-at-the-cap IS its
+                // design, the steady state of any long developer capture run, and it
+                // has no focus set to speak of. Warning there fires continuously and
+                // calls the newcomer "focused", which it is not.
+                //
+                // Focused mode reaching `None` means every tracked contract is in
+                // focus with the map full. Unreachable while MAX_FOCUS_CONTRACTS (2)
+                // sits far below MAX_TRACKED_CONTRACTS (64) - but that is a documented
+                // operational tunable, and raising it without revisiting the cap would
+                // start discarding exactly the focus-selected observations this
+                // eviction rule exists to protect. That one is worth a warning.
+                if matches!(scope, SamplingScope::Focused(_)) {
+                    tracing::warn!(
+                        contract = %observation.contract,
+                        tracked = samplers.len(),
+                        "conformance capture could not make room for a focused \
+                         contract: every tracked contract is in focus"
+                    );
+                }
                 return None;
             }
         }
@@ -1364,8 +1399,17 @@ mod probe_wiring_pins {
     #[test]
     fn an_evicted_contract_has_its_bundle_removed() {
         let body = run_writer_code_only();
+        // Bound to the EVICTED binding, not merely to `remove_file` appearing
+        // somewhere: the writer already unlinks its own `.tmp` staging file on a failed
+        // write, so a bare substring check passes even if the deletion is aimed at the
+        // wrong contract entirely.
         assert!(
-            body.contains("remove_file"),
+            body.contains("bundle_path(&dir, &evicted)"),
+            "the writer no longer derives the deleted path from the evicted contract, \
+             so eviction either orphans a bundle or deletes the wrong one"
+        );
+        assert!(
+            body.contains("remove_file(&path)"),
             "the writer no longer deletes evicted bundles, so every rotation past the \
              tracking cap orphans a file that nothing will ever clean up"
         );
@@ -1396,6 +1440,27 @@ mod probe_wiring_pins {
             body.contains("warmup.tick()"),
             "the hosted-source warm-up retry arm is gone; the startup draw alone runs \
              before the ring registers its hosted contracts and therefore misses it"
+        );
+    }
+
+    /// A focus contract still warming up must be counted, not dropped from the tick.
+    ///
+    /// `focused` is derived from the probe's work length, so a focus contract with no
+    /// samples yet vanished entirely: two selected with samples for one reported
+    /// `focused=1, skipped_no_samples=0`, which reads as "one contract, fully checked".
+    /// Warm-up is the normal state now that focus draws from the hosted set rather than
+    /// from what was already sampled, so this hid the common case.
+    #[test]
+    fn contracts_awaiting_samples_are_counted_in_the_tick() {
+        let body = run_writer_code_only();
+        assert!(
+            body.contains("report.focused += awaiting_samples"),
+            "focus contracts still awaiting samples no longer count toward `focused`, \
+             so a warming-up focus set reports as a smaller, fully-checked one"
+        );
+        assert!(
+            body.contains("report.skipped_no_samples += awaiting_samples"),
+            "focus contracts still awaiting samples are no longer reported as skipped"
         );
     }
 
@@ -1457,6 +1522,52 @@ mod tests {
         assert!(
             !samplers.contains_key(&instance(2)),
             "an unfocused contract was sampled: sampling is not following focus"
+        );
+    }
+
+    /// A restart reloads the SAME contracts every time.
+    ///
+    /// `reload` stops at `MAX_TRACKED_CONTRACTS`, and `read_dir` order is undefined, so
+    /// without a sort which contracts survive a restart is decided by whatever the
+    /// filesystem happens to enumerate first. Every other reload test writes a single
+    /// bundle, so the truncation path they exercise is the one where truncation never
+    /// happens - deleting the sort left all of them green.
+    #[test]
+    fn a_restart_reloads_a_deterministic_set_when_there_are_more_bundles_than_slots() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+
+        // More bundles than slots, so truncation actually runs.
+        let extra = 12usize;
+        for i in 0..(MAX_TRACKED_CONTRACTS + extra) {
+            let instance = ContractInstanceId::new([(i % 251) as u8; 32]);
+            let mut bundle = super::super::bundle::ReplayBundle::new(vec![9, 9], vec![3]);
+            bundle.instance = Some(instance);
+            bundle.states = vec![vec![1, 2], vec![2, 3]];
+            bundle
+                .write_to(&bundle_path(dir.path(), &instance))
+                .expect("write bundle");
+        }
+
+        let loaded = |dir: &Path| {
+            let mut ids: Vec<Vec<u8>> = reload(dir)
+                .into_keys()
+                .map(|id| id.as_bytes().to_vec())
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+        let first = loaded(dir.path());
+        let second = loaded(dir.path());
+
+        assert_eq!(
+            first.len(),
+            MAX_TRACKED_CONTRACTS,
+            "fixture did not exceed the cap, so truncation never ran"
+        );
+        assert_eq!(
+            first, second,
+            "two reloads of the same directory kept different contracts, so which \
+             samples survive a restart depends on filesystem enumeration order"
         );
     }
 
