@@ -927,23 +927,14 @@ p:last-child {
   }
 
   /* Governance: stack verdict + norms vertically, let table scroll */
-  .g-verdict-row {
-    grid-template-columns: 1fr;
-  }
   .g-verdict {
     min-width: auto;
-  }
-  .g-norms {
-    grid-template-columns: repeat(3, 1fr);
   }
   .app-list li {
     padding: 0.4rem 0;
   }
 }
 @media (max-width: 400px) {
-  .g-norms {
-    grid-template-columns: repeat(2, 1fr);
-  }
   .header-title {
     font-size: 0.9rem;
   }
@@ -1266,6 +1257,30 @@ table.sortable thead th.sort-desc::after {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
   gap: 0.5rem;
+}
+
+/* The narrow-viewport column counts. These already existed — at 768px and
+ * 400px, in the media blocks near the top of this file — and had NEVER once
+ * applied: the unconditional base rule above is later in source order at
+ * equal specificity, so it won at every width. That is not a side note, it is
+ * the ROOT CAUSE of the horizontal-overflow bug this change fixes. The
+ * responsive fix was written, shipped, and silently inert, and the page
+ * scrolled sideways on every phone regardless.
+ *
+ * Re-stated here, after the base rule, so they actually take effect. `auto-fit`
+ * alone cannot express the intent: at 768px it yields five ~130px columns
+ * because the tablet and desktop widths are close, which is too dense for
+ * labels like "CONTRACT-CAP REJECTS". Keep these AFTER the base rule; moving
+ * either one is what broke this the first time. */
+@media (max-width: 768px) {
+  .g-norms {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+@media (max-width: 400px) {
+  .g-norms {
+    grid-template-columns: repeat(2, 1fr);
+  }
 }
 .g-norm {
   background: var(--bg-tertiary);

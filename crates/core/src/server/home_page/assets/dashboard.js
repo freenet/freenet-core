@@ -136,6 +136,26 @@ function handleHeaderClick(th) {
   try {
     sessionStorage.setItem(sortKey(table), idx + ':' + dir);
   } catch (e) {}
+  /* Re-apply the collapse against the NEW order. `applySort` reorders the
+     <tr> elements but never touches `style.display`, and the collapse is a
+     POSITIONAL cut — "the first 25 rows in current order". Without this the
+     display flags stay attached to whichever elements were visible under the
+     PREVIOUS order, so sorting a collapsed table showed an arbitrary
+     leftover subset re-sorted among itself, not the top 25 of the new sort.
+     The count in the status line stayed correct, which is what made it hard
+     to notice: the right number of the wrong rows. */
+  reapplyTableViewFor(table);
+}
+
+/* Find the filter controls governing `table`, if any, and recompute which of
+   its rows are visible. */
+function reapplyTableViewFor(table) {
+  var id = table.getAttribute('data-table-id');
+  if (!id) return;
+  var wrap = document.querySelector(
+    '.table-filter[data-filter-for="' + id + '"]',
+  );
+  if (wrap) applyTableView(wrap);
 }
 
 function restoreSort() {
@@ -150,6 +170,11 @@ function restoreSort() {
     } catch (e) {}
   });
 }
+
+/* Sort restore reorders rows too, so the collapse must be recomputed after it
+   for the same reason as a live header click. `restoreTableFilters` runs
+   after `restoreSort` at both call sites, which covers this — but the
+   ordering between them is load-bearing, so do not reverse it. */
 
 /* ── Long-table filter + collapse ──────────────────────────────────────
    The peers and subscribed-contracts tables are unbounded: a production
@@ -171,6 +196,70 @@ function expandKey(id) {
   return 'expand:' + id;
 }
 
+/* sessionStorage throws in some privacy modes. The existing `sort:` handling
+   swallows that and degrades to "no saved sort", which is harmless. Here it
+   would NOT be: `applyTableView` reads the expand flag back immediately after
+   writing it, so a swallowed write made "Show all" inert — the click appeared
+   to do nothing at all. Mirror every write in memory and read that first, so
+   the controls keep working when persistence does not. */
+var tfMemory = {};
+
+function tfGet(key) {
+  if (Object.prototype.hasOwnProperty.call(tfMemory, key)) return tfMemory[key];
+  try {
+    return sessionStorage.getItem(key);
+  } catch (e) {
+    return null;
+  }
+}
+
+function tfSet(key, value) {
+  tfMemory[key] = value;
+  try {
+    sessionStorage.setItem(key, value);
+  } catch (e) {
+    /* memory copy above is the fallback */
+  }
+}
+
+/* tf-search:BEGIN
+ *
+ * The text a row is matched against. Extracted by `table_filter.test.mjs`.
+ *
+ * `textContent` alone is NOT enough and that was a real bug: the contracts
+ * table renders a 12-character abbreviated key, while the full key lives in
+ * `title` / `data-copy` / `data-sort`. Pasting a real contract key — the
+ * obvious thing to do, and what the copy button next to every row puts on the
+ * clipboard — matched nothing at all. Fold those attributes in. */
+function rowSearchText(textContent, attrValues) {
+  var parts = [textContent || ''];
+  for (var i = 0; i < attrValues.length; i++) {
+    if (attrValues[i]) parts.push(attrValues[i]);
+  }
+  return parts.join(' ').toLowerCase();
+}
+
+/* Decide which row indices are visible. Pure so it can be tested without a
+ * DOM: `matches` is the per-row predicate result in current table order.
+ *
+ * Separated from the DOM application because the collapse is a POSITIONAL cut
+ * over the CURRENT order, which is what made the post-sort bug possible — the
+ * decision and the elements it was baked into could drift apart. */
+function visibleRowFlags(matches, showAll, cap) {
+  var out = [];
+  var shown = 0;
+  for (var i = 0; i < matches.length; i++) {
+    if (!matches[i]) {
+      out.push(false);
+      continue;
+    }
+    shown++;
+    out.push(showAll || shown <= cap);
+  }
+  return out;
+}
+/* tf-search:END */
+
 function applyTableView(wrap) {
   var id = wrap.getAttribute('data-filter-for');
   var table = document.querySelector('table[data-table-id="' + id + '"]');
@@ -182,24 +271,30 @@ function applyTableView(wrap) {
   var toggle = wrap.querySelector('.tf-toggle');
 
   var q = (input && input.value ? input.value : '').trim().toLowerCase();
-  var expanded = false;
-  try {
-    expanded = sessionStorage.getItem(expandKey(id)) === '1';
-  } catch (e) {}
+  var expanded = tfGet(expandKey(id)) === '1';
   /* A query implies "show me everything that matches", so filtering
      overrides the collapse rather than fighting it. */
   var showAll = expanded || q.length > 0;
 
   var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
-  var matched = 0;
-  rows.forEach(function (r) {
-    var hit = q.length === 0 || r.textContent.toLowerCase().indexOf(q) !== -1;
-    if (!hit) {
-      r.style.display = 'none';
-      return;
+  var matches = rows.map(function (r) {
+    if (q.length === 0) return true;
+    /* Fold in the attributes carrying values the cell text abbreviates —
+       chiefly the full contract key behind a 12-character display form. */
+    var attrs = [];
+    var withAttrs = r.querySelectorAll('[title], [data-copy], [data-sort]');
+    for (var i = 0; i < withAttrs.length; i++) {
+      attrs.push(withAttrs[i].getAttribute('title'));
+      attrs.push(withAttrs[i].getAttribute('data-copy'));
+      attrs.push(withAttrs[i].getAttribute('data-sort'));
     }
-    matched++;
-    r.style.display = showAll || matched <= COLLAPSE_ROWS ? '' : 'none';
+    return rowSearchText(r.textContent, attrs).indexOf(q) !== -1;
+  });
+  var flags = visibleRowFlags(matches, showAll, COLLAPSE_ROWS);
+  var matched = 0;
+  rows.forEach(function (r, i) {
+    if (matches[i]) matched++;
+    r.style.display = flags[i] ? '' : 'none';
   });
 
   var total = rows.length;
@@ -207,7 +302,13 @@ function applyTableView(wrap) {
   if (status) {
     if (q.length > 0) {
       status.textContent =
-        'Showing ' + shown + ' of ' + matched + ' matching (' + total + ' total)';
+        'Showing ' +
+        shown +
+        ' of ' +
+        matched +
+        ' matching (' +
+        total +
+        ' total)';
     } else if (showAll) {
       status.textContent = 'Showing all ' + total;
     } else {
@@ -227,28 +328,48 @@ function applyAllTableViews() {
   document.querySelectorAll('.table-filter').forEach(applyTableView);
 }
 
-function restoreTableFilters() {
+function restoreTableFilters(focusState) {
   document.querySelectorAll('.table-filter').forEach(function (wrap) {
     var id = wrap.getAttribute('data-filter-for');
     var input = wrap.querySelector('.tf-input');
     if (input) {
-      try {
-        input.value = sessionStorage.getItem(filterKey(id)) || '';
-      } catch (e) {}
+      input.value = tfGet(filterKey(id)) || '';
+      /* Restoring the VALUE is not enough. The refresh replaces <main>, which
+         destroys the element the caret was in, so without this the next
+         keystroke after a refresh goes nowhere and the user has to click back
+         into the box — every five seconds, while typing. Put the caret back
+         where it was. */
+      if (focusState && focusState.id === id) {
+        input.focus();
+        try {
+          input.setSelectionRange(focusState.start, focusState.end);
+        } catch (e) {
+          /* setSelectionRange is unsupported on some input types */
+        }
+      }
     }
     applyTableView(wrap);
   });
 }
 
+/* Which filter box had focus, and where the caret was, so the refresh can put
+   it back. Read BEFORE the <main> swap; the element does not survive it. */
+function captureFilterFocus() {
+  var el = document.activeElement;
+  if (!el || !el.classList || !el.classList.contains('tf-input')) return null;
+  var wrap = el.closest('.table-filter');
+  if (!wrap) return null;
+  return {
+    id: wrap.getAttribute('data-filter-for'),
+    start: el.selectionStart,
+    end: el.selectionEnd,
+  };
+}
+
 function handleFilterInput(input) {
   var wrap = input.closest('.table-filter');
   if (!wrap) return;
-  try {
-    sessionStorage.setItem(
-      filterKey(wrap.getAttribute('data-filter-for')),
-      input.value
-    );
-  } catch (e) {}
+  tfSet(filterKey(wrap.getAttribute('data-filter-for')), input.value);
   applyTableView(wrap);
 }
 
@@ -256,11 +377,8 @@ function handleFilterToggle(btn) {
   var wrap = btn.closest('.table-filter');
   if (!wrap) return;
   var id = wrap.getAttribute('data-filter-for');
-  var expanded = false;
-  try {
-    expanded = sessionStorage.getItem(expandKey(id)) === '1';
-    sessionStorage.setItem(expandKey(id), expanded ? '0' : '1');
-  } catch (e) {}
+  var expanded = tfGet(expandKey(id)) === '1';
+  tfSet(expandKey(id), expanded ? '0' : '1');
   applyTableView(wrap);
 }
 
@@ -820,6 +938,9 @@ document.addEventListener('DOMContentLoaded', function () {
         var doc = parser.parseFromString(html, 'text/html');
         var newMain = doc.querySelector('main');
         var oldMain = document.querySelector('main');
+        /* Read the caret position BEFORE the innerHTML write on the next line
+           destroys the element holding it. */
+        var focusBeforeSwap = captureFilterFocus();
         if (newMain && oldMain) oldMain.innerHTML = newMain.innerHTML;
         /* Update the tab title (connection state + count, #3509) so a
            backgrounded tab still surfaces the current status at a glance. */
@@ -847,7 +968,7 @@ document.addEventListener('DOMContentLoaded', function () {
            this file. */
         restoreTab();
         restoreSort();
-        restoreTableFilters();
+        restoreTableFilters(focusBeforeSwap);
         /* Re-check the live runtime version so the stale-assets banner
                  appears (or clears) if the serving process changes while the
                  page stays open. The banner's data-asset-version stays anchored
