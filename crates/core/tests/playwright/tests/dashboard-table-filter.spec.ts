@@ -231,6 +231,23 @@ test.describe("dashboard long-table filter", () => {
       `the row under the reader moved from ${Math.round(rowTopBefore)} to ${Math.round(rowTopAfter)} in the viewport`,
     ).toBeLessThan(50);
 
+    /* The fixture must have SURVIVED the refresh, i.e. the route intercept
+       matched the refresh's own request. `dashboard.js` refreshes with
+       `fetch(window.location.href)`, which is the URL routed above — but if
+       that ever diverges (a cache-buster query string, say), the fixture would
+       be absent from the refreshed HTML and this test would be examining an
+       empty page. Assert it explicitly rather than relying on the row lookup
+       below happening to throw. */
+    const fixtureSurvived = await page.evaluate(
+      (id) => !!document.querySelector(`table[data-table-id="${id}"] tbody tr`),
+      FIXTURE_TABLE_ID,
+    );
+    expect(
+      fixtureSurvived,
+      "the fixture vanished on refresh — the route intercept no longer matches \
+       the refresh request, so this test is examining an empty page",
+    ).toBe(true);
+
     // Focus is deliberately NOT restored here, and that is the mechanism the
     // assertion above depends on: the box is off screen, so refocusing it
     // would scroll. The complementary case — box on screen, focus and caret
