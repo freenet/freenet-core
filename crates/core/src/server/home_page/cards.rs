@@ -1227,13 +1227,18 @@ pub fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot
     )
 }
 
-/// Build the demand-driven eviction card (piece A, #4642). Surfaces the
-/// capability-relative RAM budget and the per-contract Greedy-Dual
-/// `keep_score` that ACTUALLY governs retention today — the mechanism that
-/// replaced the dormant MAD `GovernanceManager` (#4296), whose dashboard card
-/// is now hidden on default nodes. Every value comes from
+/// Build the demand-driven eviction card (#4642). Surfaces the
+/// capability-relative budgets and the per-contract rows that the
+/// subscriber-primary eviction sweep orders. Every value comes from
 /// `Ring::dashboard_hosting_snapshot` reading the canonical hosting cache;
 /// nothing is invented at render time. See `.claude/rules/hosting-invariants.md`.
+///
+/// The per-contract table shows `recency_seq`, NOT `keep_score` /
+/// `predicted_demand`. The latter two are the demoted telemetry-only
+/// Greedy-Dual estimator, which eviction does not read; presenting them as the
+/// eviction score described a mechanism retired by the subscriber-primary
+/// rework, and left the table sorted by a column it did not display (#4830).
+/// `recency_seq` is the ordering input the cache actually sorts these rows by.
 ///
 /// Hidden when the node hosts nothing (a fresh/idle node) — the budget still
 /// exists but there's nothing to retain, so the panel would just be noise.
@@ -1262,33 +1267,71 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
         "0".to_string()
     };
 
-    // Per-contract table, bounded. Rows arrive in EVICTION order (lowest
-    // keep-score first); show at most MAX_ROWS. The tile carries the full count.
+    // Per-contract table, bounded. Rows arrive from the cache already sorted
+    // ascending by `(recency_seq, key)` — so `recency_seq` is the column that
+    // explains each row's position, and it is the one shown. `keep_score` and
+    // `predicted_demand` are the DEMOTED telemetry-only estimator: eviction
+    // reads neither, so rendering them here as though they ranked anything
+    // described a mechanism that was retired by the subscriber-primary rework
+    // (#4830). They are gone from this projection entirely — they survive only
+    // on the cache-side `HostedContract`, where they still drive the
+    // Greedy-Dual `eviction_floor` ratchet.
     //
-    // The "next to evict" badge marks the first EVICTION-ELIGIBLE row, not
-    // simply the lowest keep-score row. A contract still in use (a local client /
-    // downstream subscriber) is ordered LAST by the subscriber-primary sweep —
-    // shed only as a last resort when nothing with fewer subscribers is eligible —
-    // so it is not the common-case next victim. `is_eviction_eligible` reflects
-    // that (not in use; there is no longer a `min_ttl` age gate), so the badge
-    // never mislabels a contract the sweep would ordinarily keep. When nothing is
-    // currently eligible (every hosted contract is in use), no row is badged.
+    // Caveat the footer states rather than hides: the cache-side sort is only
+    // the ordering WITHIN the zero-subscriber tier. `victim_order` ranks
+    // local-subscription count and downstream-subscriber count above recency,
+    // and those counts are computed transiently during the sweep — the cache
+    // cannot see them, so they are not available to render.
+    //
+    // The "next to evict" badge marks the first EVICTION-ELIGIBLE row. A
+    // contract still in use (a local client / downstream subscriber) is ordered
+    // LAST by the sweep — shed only as a last resort when nothing with fewer
+    // subscribers is eligible — so it is not the common-case next victim.
+    // `is_eviction_eligible` reflects that (not in use; there is no longer a
+    // `min_ttl` age gate). When nothing is currently eligible (every hosted
+    // contract is in use), no row is badged.
     const MAX_ROWS: usize = 20;
     let next_victim_idx = h.contracts.iter().position(|c| c.eviction_eligible);
     let mut rows = String::new();
     for (i, c) in h.contracts.iter().take(MAX_ROWS).enumerate() {
         let next_badge = if Some(i) == next_victim_idx {
-            r#" <span class="hz-badge hz-next" title="Lowest keep-score among eviction-eligible contracts (not in use) — the over-budget sweep would evict this one first.">next to evict</span>"#
+            r#" <span class="hz-badge hz-next" title="First eviction-eligible contract (not pinned by a local client or downstream subscriber) in the sweep's order — the over-budget sweep would evict this one first.">next to evict</span>"#
         } else {
             ""
         };
+        // `recency_seq` is a per-run monotonic sequence, not a timestamp, and
+        // it is the EVICTION recency clock rather than a pure last-read time:
+        // `record_abandonment` also stamps a fresh seq when a contract loses
+        // its last subscriber, deliberately granting a grace period so a
+        // just-unsubscribed contract is not evicted on a stale read accrued
+        // while it sat in the subscription tier. Labelling this column "last
+        // access" would therefore be wrong. 0 means the clock has not been set
+        // since this process started (including every entry reloaded from disk
+        // at startup), which is why so many rows read "never" after a restart.
+        let recency = if c.recency_seq == 0 {
+            r#"<span style="color: var(--text-muted, #888);">never</span>"#.to_string()
+        } else {
+            c.recency_seq.to_string()
+        };
+        // A contract pinned by a local client or downstream subscriber is
+        // ordered LAST by the real sweep, but the cache-side sort this table
+        // shows cannot see subscriber counts — so a pinned, never-read contract
+        // lands at the top reading "never", looking exactly like the most
+        // evictable row. Mark it, or the ordering caveat in the footer is the
+        // only thing standing between the operator and the wrong conclusion.
+        let pin_badge = if c.eviction_eligible {
+            ""
+        } else {
+            r#" <span class="fresh-pill use-active" title="Pinned by a local client or downstream subscriber. The sweep evicts these last, regardless of this row's position.">in use</span>"#
+        };
         rows.push_str(&format!(
-            r#"<tr><td title="{full}" data-sort="{full}"><code>{short}</code><button type="button" class="copy-key" data-copy="{full}" title="Copy contract key" aria-label="Copy contract key">⧉</button>{next}</td><td class="right" data-sort="{keep:.6}">{keep:.3}</td><td class="right" data-sort="{demand:.6}">{demand:.3}</td><td class="right" data-sort="{size}">{size_fmt}</td><td class="right" data-sort="{reads}">{reads}</td></tr>"#,
+            r#"<tr><td title="{full}" data-sort="{full}"><code>{short}</code><button type="button" class="copy-key" data-copy="{full}" title="Copy contract key" aria-label="Copy contract key">⧉</button>{next}{pin}</td><td class="right" data-sort="{seq}">{recency}</td><td class="right" data-sort="{size}">{size_fmt}</td><td class="right" data-sort="{reads}">{reads}</td></tr>"#,
             full = html_escape(&c.key_full),
             short = html_escape(&c.key_short),
             next = next_badge,
-            keep = c.keep_score,
-            demand = c.predicted_demand,
+            pin = pin_badge,
+            seq = c.recency_seq,
+            recency = recency,
             size = c.size_bytes,
             size_fmt = format_bytes(c.size_bytes),
             reads = c.read_count,
@@ -1297,7 +1340,7 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
     let shown = (h.contracts.len()).min(MAX_ROWS);
     let footer = if (h.contract_count as usize) > shown {
         format!(
-            r#"<p class="empty" style="margin: 0.4rem 0.9rem 0.6rem; font-size: 0.78rem; color: var(--text-muted, #888);">Showing the {shown} most-evictable of {total} hosted contracts (lowest keep-score first).</p>"#,
+            r#"<p class="empty" style="margin: 0.4rem 0.9rem 0.6rem; font-size: 0.78rem; color: var(--text-muted, #888);">Showing {shown} of {total} hosted contracts, lowest eviction-recency first. That clock is set by a real GET or PUT and also when a contract loses its last subscriber, so it is not purely a last-read time. Contracts with a local client or downstream subscriber outrank recency and are evicted last, but those counts aren't available here — so this is the eviction order only among contracts with no subscribers.</p>"#,
             shown = shown,
             total = h.contract_count,
         )
@@ -1347,8 +1390,8 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
 
     format!(
         r##"<div class="card">
-            <div class="card-header"><h2>Demand-driven eviction</h2><span class="g-mode g-mode-enforce">piece A</span></div>
-            <p class="empty" style="margin: 0.2rem 0.9rem 0.4rem; font-size: 0.82rem; color: var(--text-muted, #888);">Retention is demand-driven: contracts with the lowest predicted read-demand (keep-score) are evicted first when over budget. Since #4702 the eviction floor is min(RAM budget, disk budget) — either resource running low can trigger eviction.</p>
+            <div class="card-header"><h2>Demand-driven eviction</h2></div>
+            <p class="empty" style="margin: 0.2rem 0.9rem 0.4rem; font-size: 0.82rem; color: var(--text-muted, #888);">Retention is demand-driven. When over budget the node sheds contracts with the fewest subscribers first — a local client subscription outranks a downstream one, and among contracts with neither, the one with the lowest eviction-recency goes first. A sweep can be triggered by any of several independent pressures: contract state bytes, disk usage, the resident-overhead ceiling that scales with hosted-contract count (#5325), or a single zero-demand contract taking a sustained share of the node's update work (#4861).</p>
             <div class="g-verdict-row">
                 <div class="g-norms">
                     <div class="g-norm"><div class="g-norm-label">RAM used</div><div class="g-norm-value">{used} / {budget} ({pct:.0}%)</div></div>
@@ -1375,7 +1418,7 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
             </div>
             <div class="table-wrap">
                 <table class="sortable" data-table-id="hosting">
-                    <thead><tr><th data-sort-type="text">Contract</th><th class="right" data-sort-type="num">Keep-score</th><th class="right" data-sort-type="num">Demand</th><th class="right" data-sort-type="num">Size</th><th class="right" data-sort-type="num">Reads</th></tr></thead>
+                    <thead><tr><th data-sort-type="text">Contract</th><th class="right" data-sort-type="num" title="The eviction recency clock: a per-run sequence, higher is more recent. Reset by a real GET or PUT, and also when a contract loses its last subscriber — the sweep deliberately gives a just-unsubscribed contract a grace period, so this is NOT purely a last-read time. &quot;never&quot; means the clock has not been set since this node started, which includes everything reloaded from disk at startup. This is the column the eviction sweep orders by among contracts with no subscribers.">Recency</th><th class="right" data-sort-type="num">Size</th><th class="right" data-sort-type="num">Reads</th></tr></thead>
                     <tbody>{rows}</tbody>
                 </table>
             </div>

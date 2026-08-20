@@ -2534,11 +2534,14 @@ impl HostingManager {
         self.hosting_cache.read().stats()
     }
 
-    /// Per-contract Greedy-Dual eviction rows for the local-peer dashboard,
-    /// in eviction order (next victim first). Reads the canonical hosting
-    /// cache under a single lock — this is piece A's live demand-driven
-    /// retention state (#4642), the mechanism that replaced the dormant MAD
-    /// governance detector. See [`HostingContractScore`].
+    /// Per-contract eviction rows for the local-peer dashboard, in the
+    /// cache-side eviction order (ascending `recency_seq`, then key). Reads
+    /// the canonical hosting cache under a single lock.
+    ///
+    /// That order is only the ordering WITHIN the zero-subscriber tier:
+    /// `cache::victim_order` ranks local-subscription and downstream-subscriber
+    /// counts above recency, and those are computed during the sweep rather
+    /// than carried on the row. See [`HostingContractScore`].
     pub(crate) fn dashboard_hosting_scores(&self) -> Vec<HostingContractScore> {
         self.hosting_cache.read().eviction_ordered_scores()
     }

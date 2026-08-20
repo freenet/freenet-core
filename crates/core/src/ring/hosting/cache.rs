@@ -46,11 +46,13 @@
 //!
 //! `keep_score`, `eviction_floor`, `predicted_demand` and `record_abandonment`
 //! (the Greedy-Dual + proximity-prior demand estimator, pieces A3/#4650/#4688)
-//! are **retained but no longer drive eviction** — they are kept as the
-//! dashboard/telemetry surface (`predicted_demand` is still trained and
-//! displayed) for telemetry continuity this release, and are scheduled for
-//! deletion in a follow-up once the subscriber-primary policy is field-
-//! validated. Eviction reads NONE of them; it orders by subscriber count and
+//! are **retained but no longer drive eviction**. `predicted_demand` is still
+//! TRAINED, but as of #4830 it is no longer DISPLAYED: the dashboard rendered
+//! it as an eviction ranking it never governed, so it and `keep_score` were
+//! dropped from the dashboard-facing projections. They survive on
+//! `HostedContract` only, driving the `eviction_floor` ratchet, and are
+//! scheduled for deletion in a follow-up once the subscriber-primary policy is
+//! field-validated. Eviction reads NONE of them; it orders by subscriber count and
 //! real GET/PUT recency (see principle 2). `predicted_demand` is still supplied by
 //! the caller (`HostingManager`, which owns the proximity-prior estimator and
 //! the peer's own ring location — see [`super::demand`]) purely so the
@@ -657,28 +659,44 @@ pub(crate) struct HostingCacheStats {
 
 /// Per-contract Greedy-Dual priority row for the local-peer dashboard.
 ///
-/// This is what actually governs retention today (piece A of the
-/// demand-driven hosting redesign, #4642): the over-budget walk evicts the
-/// lowest `keep_score` first. Surfaced on the dashboard so an operator can
-/// see the live demand-ordered eviction policy — the mechanism that
-/// replaced the dormant MAD governance detector (#4296). Collected under a
+/// A dashboard/telemetry row for one hosted contract. Collected under a
 /// single cache read lock by [`HostingCache::eviction_ordered_scores`].
+///
+/// **`keep_score` and `predicted_demand` do NOT govern retention.** They are
+/// the demoted, telemetry-only Greedy-Dual estimator (see the "Demoted
+/// (telemetry-only) demand machinery" section in this module's docs); eviction
+/// reads neither. Real eviction ordering is [`victim_order`], ascending
+/// `(local_subscription_count, downstream_subscriber_count, recency_seq,
+/// key_bytes)` — of which only `recency_seq` is carried here, because the
+/// subscriber counts are computed transiently during the sweep and the cache
+/// cannot see them. Present the row accordingly: `recency_seq` is the field
+/// that actually explains this row's position.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HostingContractScore {
     pub key: ContractKey,
-    /// Greedy-Dual priority = `eviction_floor + predicted_demand` at the last
-    /// refresh. Lowest evicts first.
-    pub keep_score: f64,
-    /// Stored per-contract read-demand estimate (reads/second).
-    pub predicted_demand: f64,
+    //
+    // `keep_score` / `predicted_demand` deliberately absent from this
+    // projection. `HostedContract` still carries them — they drive the
+    // Greedy-Dual `eviction_floor` ratchet — but nothing consumed the copies
+    // on this row once the dashboard stopped rendering them as an eviction
+    // ranking they never governed (#4830). Re-add only alongside a consumer
+    // that presents them as telemetry.
+    //
     /// Per-contract memory cost (state bytes).
     pub size_bytes: u64,
     /// Read accesses (GET/SUBSCRIBE) observed over this entry's residency.
     pub read_count: u32,
-    /// Monotonic access sequence at the entry's most recent real GET or PUT
-    /// (genuine client access) — the eviction recency tiebreak (subscriber-
-    /// primary rework, #4642). The cache orders zero-subscriber eviction
-    /// candidates ascending by this. SUBSCRIBE / renewal traffic does NOT bump it.
+    /// The entry's eviction recency clock — a per-run monotonic sequence, and
+    /// the eviction recency tiebreak (subscriber-primary rework, #4642). The
+    /// cache orders zero-subscriber eviction candidates ascending by this.
+    ///
+    /// Set by a real GET or PUT (genuine client access), and ALSO by
+    /// [`HostingCache::record_abandonment`] when the contract loses its last
+    /// subscriber — a deliberate grace period, so a formerly-subscribed
+    /// contract is not evicted on a stale read accrued while it sat in the
+    /// subscription tier. It is therefore NOT a pure last-access time, and the
+    /// dashboard must not label it as one. SUBSCRIBE / renewal traffic does
+    /// NOT bump it.
     pub recency_seq: u64,
 }
 
@@ -1270,14 +1288,16 @@ pub struct HostingCache<T: TimeSource> {
 /// 1. fewest **local client subscriptions** first — a contract THIS node's own
 ///    client is subscribed to is evicted LAST (Ian's confirmed ordering, #4642);
 /// 2. then fewest **downstream subscribers** (forwarded demand);
-/// 3. then least-recent real **GET** (`recency_seq`, a recency tiebreak — NOT a
-///    primary key; subscription-renewal traffic must not refresh it);
+/// 3. then lowest **eviction recency** (`recency_seq`, a tiebreak — NOT a
+///    primary key). That clock is set by a real GET or PUT, and also by
+///    [`HostingCache::record_abandonment`] at subscription termination;
+///    subscription-renewal traffic must not refresh it;
 /// 4. then contract-key bytes as a final deterministic tiebreak.
 ///
 /// The candidate that sorts FIRST under this order is the one evicted first. A
 /// locally-subscribed contract is ordered LAST but NOT absolutely pinned: in the
 /// extreme where every eligible contract carries a local subscription and the
-/// peer is still over budget, the least-recently-read local one IS the victim
+/// peer is still over budget, the lowest-recency local one IS the victim
 /// (accepted last resort — see [`HostingCache::evict_over_budget`] and
 /// hosting-invariants invariant 3).
 ///
@@ -2509,22 +2529,23 @@ impl<T: TimeSource> HostingCache<T> {
     }
 
     /// Per-contract rows for the local dashboard, in the cache-side EVICTION
-    /// order: ascending `(recency_seq, key)` — least-recent real GET/PUT first, the
-    /// same order [`Self::keys_eviction_order`] uses. This reflects the order
+    /// order: ascending `(recency_seq, key)` — least-recent eviction-recency
+    /// first, the same order [`Self::keys_eviction_order`] uses. (That clock is
+    /// set by a real GET/PUT *and* by subscription termination, so it is not a
+    /// pure last-read time — see [`HostingContractScore::recency_seq`].) This reflects the order
     /// among the ZERO-subscriber candidate set the over-budget sweep would evict
     /// under `AtCapacity` (the production pressure); the subscriber-count pin is
     /// applied by the manager via `is_eviction_eligible`, so the front of the
-    /// vec is the next zero-subscriber victim under budget pressure. The rows
-    /// still carry the demoted telemetry score fields (`keep_score`,
-    /// `predicted_demand`) the dashboard renders.
+    /// vec is the next zero-subscriber victim under budget pressure.
+    ///
+    /// Rows carry `size_bytes`, `read_count` and `recency_seq` only — the
+    /// demoted telemetry scores are deliberately not projected here.
     pub(crate) fn eviction_ordered_scores(&self) -> Vec<HostingContractScore> {
         let mut rows: Vec<HostingContractScore> = self
             .contracts
             .iter()
             .map(|(k, v)| HostingContractScore {
                 key: *k,
-                keep_score: v.keep_score,
-                predicted_demand: v.predicted_demand,
                 size_bytes: v.size_bytes,
                 read_count: v.read_count,
                 recency_seq: v.recency_seq,
@@ -4368,10 +4389,8 @@ mod tests {
         );
         for s in &scores {
             let entry = cache.get(&s.key).expect("scored key is in the cache");
-            assert_eq!(s.keep_score, entry.keep_score);
             assert_eq!(s.size_bytes, entry.size_bytes);
             assert_eq!(s.read_count, entry.read_count);
-            assert_eq!(s.predicted_demand, entry.predicted_demand);
             assert_eq!(s.recency_seq, entry.recency_seq);
         }
     }

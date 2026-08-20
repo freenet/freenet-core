@@ -4509,12 +4509,18 @@ impl Ring {
     }
 
     /// Snapshot of the demand-driven hosting state for the local-peer
-    /// dashboard (piece A, #4642). Reads the canonical hosting cache — the
-    /// capability-relative RAM budget + per-contract Greedy-Dual keep_score
-    /// that actually governs retention today, replacing the dormant MAD
-    /// governance detector (#4296). No mirror, no cache: the aggregate gauges
-    /// and per-contract rows come straight from the `HostingManager`, so the
-    /// panel can't drift the way a mirrored counter would.
+    /// dashboard (#4642). Reads the canonical hosting cache — the
+    /// capability-relative budget plus the per-contract rows. No mirror, no
+    /// cache: the aggregate gauges and per-contract rows come straight from
+    /// the `HostingManager`, so the panel can't drift the way a mirrored
+    /// counter would.
+    ///
+    /// The demoted telemetry-only estimator (`keep_score` /
+    /// `predicted_demand`) is deliberately NOT carried on these rows: eviction
+    /// does not read it, and rendering it implied a ranking it never governed.
+    /// Real eviction ordering is subscriber-primary (`victim_order`);
+    /// `recency_seq` is the one ranking input available here, and is what the
+    /// cache actually sorts these rows by.
     ///
     /// Per-contract rows are returned in EVICTION order (next victim first).
     /// The renderer bounds how many it displays; the full count is
@@ -4543,10 +4549,9 @@ impl Ring {
                 ns::HostedContractEntry {
                     key_full,
                     key_short,
-                    keep_score: row.keep_score,
-                    predicted_demand: row.predicted_demand,
                     size_bytes: row.size_bytes,
                     read_count: row.read_count,
+                    recency_seq: row.recency_seq,
                     eviction_eligible,
                 }
             })

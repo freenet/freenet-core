@@ -515,10 +515,10 @@ impl NodeP2P {
         super::network_status::set_ban_list_provider(std::sync::Arc::new(move || {
             ban_list_ring.dashboard_ban_list_snapshot()
         }));
-        // Same pattern for the demand-driven hosting snapshot (piece A,
-        // #4642) — dashboard reads the canonical hosting cache (RAM budget +
-        // Greedy-Dual keep_score), the mechanism that actually governs
-        // retention now, replacing the dormant MAD governance detector.
+        // Same pattern for the demand-driven hosting snapshot (#4642) — the
+        // dashboard reads the canonical hosting cache. Retention is governed
+        // by the subscriber-primary sweep (`cache::victim_order`), NOT by the
+        // demoted telemetry-only Greedy-Dual `keep_score`.
         let hosting_ring = self.op_manager.ring.clone();
         super::network_status::set_hosting_provider(std::sync::Arc::new(move || {
             hosting_ring.dashboard_hosting_snapshot()

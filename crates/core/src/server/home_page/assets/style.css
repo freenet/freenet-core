@@ -1315,9 +1315,9 @@ table.sortable thead th.sort-desc::after {
   color: var(--text-muted, #8b949e);
 }
 
-/* "next to evict" badge on the front row of the Demand-driven eviction
- * table (the lowest keep-score contract, i.e. the next budget-pressure
- * victim). */
+/* "next to evict" badge on the first EVICTION-ELIGIBLE row of the
+ * Demand-driven eviction table — the contract the over-budget sweep would
+ * shed first among those no local client or downstream subscriber pins. */
 .hz-badge {
   display: inline-block;
   margin-left: 0.35rem;
