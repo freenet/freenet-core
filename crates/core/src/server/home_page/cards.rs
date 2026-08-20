@@ -1270,13 +1270,18 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
     // node's life, and ranking an absent denominator as full would report a
     // phantom emergency on every fresh start.
     //
-    // For the slot axis this is defensive rather than load-bearing: the
-    // resident-overhead budget is floored at MIN_RESIDENT_OVERHEAD_BUDGET_BYTES
-    // (128 MiB, i.e. 128 slots) by `resident_overhead_budget_for`, so a
-    // production node cannot reach 0 slots. Skipping it is therefore not
-    // masking a genuinely-unhostable node — that state is unreachable, and if
-    // it ever becomes reachable the honest fix is to say so explicitly rather
-    // than to let this branch quietly imply "fine".
+    // For the slot axis this is defensive rather than load-bearing, though the
+    // reason is narrower than "the budget is floored": the SETTER
+    // (`HostingCache::set_resident_overhead_budget_bytes`) does not clamp, but
+    // its only production caller
+    // (`HostingManager::recompute_resident_overhead_budget`) passes the output
+    // of `resident_overhead_budget_for`, which ends in
+    // `.max(MIN_RESIDENT_OVERHEAD_BUDGET_BYTES)` — 128 MiB, i.e. 128 slots.
+    // Every other caller is a test. So 0 slots is unreachable in production
+    // TODAY, by call-site convention rather than by construction; a future
+    // caller that set the budget directly could break that. If a node ever can
+    // reach 0 slots, the honest fix is to say so explicitly rather than let
+    // this branch quietly imply "fine".
     let axis_utilisation = |used: u64, budget: u64| -> Option<f64> {
         (budget > 0).then(|| used as f64 / budget as f64)
     };
