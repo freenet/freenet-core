@@ -2885,10 +2885,20 @@ mod tests {
                 && html.contains("Compile cache: 5.0 MB"),
             "per-component breakdown in tooltip — got:\n{html}"
         );
-        assert!(
-            html.contains("min(RAM budget, disk budget)"),
-            "explanatory paragraph must mention the #4702 min(ram, disk) eviction floor — got:\n{html}"
-        );
+        // The explanatory paragraph must name the pressures that can actually
+        // trigger a sweep. It used to claim the floor was "min(RAM budget,
+        // disk budget)", and this assertion pinned that wording — which is how
+        // the claim outlived the two axes added since: the count-derived
+        // resident-overhead ceiling (#5325, the one that binds first on a
+        // real low-RAM peer) and cost pressure (#4861). Pin the axes, not the
+        // phrasing, so adding a fifth fails here instead of going unnoticed.
+        for axis in ["state bytes", "disk", "resident-overhead", "update work"] {
+            assert!(
+                html.contains(axis),
+                "explanatory paragraph must name the {axis:?} eviction pressure \
+                 — got:\n{html}"
+            );
+        }
     }
 
     /// #5325 PR review Should-Fix #6: the new "Resident overhead" tile

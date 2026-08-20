@@ -1391,7 +1391,7 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
     format!(
         r##"<div class="card">
             <div class="card-header"><h2>Demand-driven eviction</h2></div>
-            <p class="empty" style="margin: 0.2rem 0.9rem 0.4rem; font-size: 0.82rem; color: var(--text-muted, #888);">Retention is demand-driven. When over budget the node sheds contracts with the fewest subscribers first — a local client subscription outranks a downstream one, and among contracts with neither, the one with the lowest eviction-recency goes first. Since #4702 the eviction floor is min(RAM budget, disk budget), so either resource running low can trigger a sweep.</p>
+            <p class="empty" style="margin: 0.2rem 0.9rem 0.4rem; font-size: 0.82rem; color: var(--text-muted, #888);">Retention is demand-driven. When over budget the node sheds contracts with the fewest subscribers first — a local client subscription outranks a downstream one, and among contracts with neither, the one with the lowest eviction-recency goes first. A sweep can be triggered by any of several independent pressures: contract state bytes, disk usage, the resident-overhead ceiling that scales with hosted-contract count (#5325), or a single zero-demand contract taking a sustained share of the node's update work (#4861).</p>
             <div class="g-verdict-row">
                 <div class="g-norms">
                     <div class="g-norm"><div class="g-norm-label">RAM used</div><div class="g-norm-value">{used} / {budget} ({pct:.0}%)</div></div>
