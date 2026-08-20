@@ -1273,8 +1273,9 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
     // `predicted_demand` are the DEMOTED telemetry-only estimator: eviction
     // reads neither, so rendering them here as though they ranked anything
     // described a mechanism that was retired by the subscriber-primary rework
-    // (#4830). They stay in the snapshot for telemetry consumers; the operator
-    // view shows the real ordering input instead.
+    // (#4830). They are gone from this projection entirely — they survive only
+    // on the cache-side `HostedContract`, where they still drive the
+    // Greedy-Dual `eviction_floor` ratchet.
     //
     // Caveat the footer states rather than hides: the cache-side sort is only
     // the ordering WITHIN the zero-subscriber tier. `victim_order` ranks
@@ -1298,10 +1299,15 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
         } else {
             ""
         };
-        // `recency_seq` is a per-run monotonic sequence, not a timestamp: 0
-        // means "not GET/PUT-accessed since this process started" (including
-        // every entry reloaded from disk at startup), which is why so many rows
-        // read "never" on a recently-restarted node.
+        // `recency_seq` is a per-run monotonic sequence, not a timestamp, and
+        // it is the EVICTION recency clock rather than a pure last-read time:
+        // `record_abandonment` also stamps a fresh seq when a contract loses
+        // its last subscriber, deliberately granting a grace period so a
+        // just-unsubscribed contract is not evicted on a stale read accrued
+        // while it sat in the subscription tier. Labelling this column "last
+        // access" would therefore be wrong. 0 means the clock has not been set
+        // since this process started (including every entry reloaded from disk
+        // at startup), which is why so many rows read "never" after a restart.
         let recency = if c.recency_seq == 0 {
             r#"<span style="color: var(--text-muted, #888);">never</span>"#.to_string()
         } else {
@@ -1412,7 +1418,7 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
             </div>
             <div class="table-wrap">
                 <table class="sortable" data-table-id="hosting">
-                    <thead><tr><th data-sort-type="text">Contract</th><th class="right" data-sort-type="num" title="Per-run access sequence at this contract's last real GET or PUT — higher is more recent. &quot;never&quot; means it has not been accessed since this node started, which includes everything reloaded from disk at startup. This is the column the eviction sweep orders by among contracts with no subscribers.">Recency</th><th class="right" data-sort-type="num">Size</th><th class="right" data-sort-type="num">Reads</th></tr></thead>
+                    <thead><tr><th data-sort-type="text">Contract</th><th class="right" data-sort-type="num" title="The eviction recency clock: a per-run sequence, higher is more recent. Reset by a real GET or PUT, and also when a contract loses its last subscriber — the sweep deliberately gives a just-unsubscribed contract a grace period, so this is NOT purely a last-read time. &quot;never&quot; means the clock has not been set since this node started, which includes everything reloaded from disk at startup. This is the column the eviction sweep orders by among contracts with no subscribers.">Recency</th><th class="right" data-sort-type="num">Size</th><th class="right" data-sort-type="num">Reads</th></tr></thead>
                     <tbody>{rows}</tbody>
                 </table>
             </div>

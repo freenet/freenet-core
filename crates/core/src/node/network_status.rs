@@ -1731,13 +1731,19 @@ pub struct HostedContractEntry {
     pub size_bytes: u64,
     /// Read accesses (GET/SUBSCRIBE) observed over this entry's residency.
     pub read_count: u32,
-    /// Monotonic access sequence at this entry's most recent real GET or PUT.
+    /// The entry's eviction recency clock — a per-run monotonic sequence.
+    ///
+    /// Reset by a real GET or PUT, and ALSO by `record_abandonment` when the
+    /// contract loses its last subscriber (a deliberate grace period, so a
+    /// just-unsubscribed contract is not evicted on a stale read accrued while
+    /// it sat in the subscription tier). It is therefore NOT purely a
+    /// last-access time, and must not be labelled as one.
+    ///
     /// This is the field the cache actually sorts these rows by, and the only
     /// real eviction-ranking input available on the dashboard — the subscriber
     /// counts that outrank it are computed transiently during the sweep and
     /// are not carried in the snapshot. Rendered so the table is ordered by a
-    /// column the reader can see; `keep_score` / `predicted_demand` are
-    /// telemetry only and take no part in the ordering.
+    /// column the reader can see.
     pub recency_seq: u64,
     /// Whether the over-budget sweep would actually consider this contract for
     /// eviction: NOT pinned by demand (`contract_in_use`). There is no longer a

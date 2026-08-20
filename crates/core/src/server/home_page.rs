@@ -2588,6 +2588,34 @@ mod tests {
         );
     }
 
+    /// The card must not carry the "piece A" badge, which was internal epic
+    /// jargon rendered in `.g-mode-enforce` — the Governance card's
+    /// *enforcement* red — so a decorative label wore the alarm colour.
+    ///
+    /// Without this pin, restoring the span leaves the suite green.
+    #[test]
+    fn hosting_card_has_no_piece_a_badge() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 256 * 1024 * 1024,
+            used_bytes: 64 * 1024 * 1024,
+            contract_count: 1,
+            contracts: vec![mk_hosted_entry_seq("A", 0, true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        assert!(
+            !html.contains("piece A"),
+            "the internal epic label must not appear on an operator surface — got:\n{html}"
+        );
+        assert!(
+            !html.contains("g-mode-enforce"),
+            "the eviction card must not borrow the governance enforcement-red \
+             badge style — got:\n{html}"
+        );
+    }
+
     /// A contract pinned by a local client or downstream subscriber sorts to
     /// the top of this table when it has never been read, because the
     /// cache-side sort cannot see subscriber counts — yet the real sweep
