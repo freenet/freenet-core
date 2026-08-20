@@ -351,9 +351,14 @@ function restoreTableFilters(focusState) {
       if (focusState && focusState.id === id) {
         input.focus();
         try {
+          /* Unreachable today and kept deliberately: the control is
+             `type="search"` (cards.rs), where setSelectionRange is supported
+             in every engine. It throws on `email` and `number`, so this catch
+             is here only so that changing the input's type stays a cosmetic
+             change rather than one that breaks the refresh. */
           input.setSelectionRange(focusState.start, focusState.end);
         } catch (e) {
-          /* setSelectionRange is unsupported on some input types */
+          /* leave the caret wherever focus() put it */
         }
       }
     }
