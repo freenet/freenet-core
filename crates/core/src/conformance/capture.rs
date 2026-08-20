@@ -314,6 +314,49 @@ pub(crate) fn contract_store() -> Option<&'static PathBuf> {
     CONTRACT_STORE.get()
 }
 
+/// How the peer enumerates the contracts it currently hosts.
+///
+/// The RFC selects focus contracts from *what the peer hosts*, not from what the
+/// sampler happens to have collected. Those are different sets, and the difference is
+/// not cosmetic: a sampler-sourced candidate pool can only ever offer contracts that
+/// already arrived through it, so once it reached its tracking cap the peer became
+/// permanently unable to focus on anything new (#5366 - observed live as
+/// `tracking_at_cap=true` on every tick for hours). Sourcing candidates from the
+/// hosting cache makes the horizon the peer's actual hosted set, and makes sampling a
+/// consequence of focus rather than its precondition.
+///
+/// Registered by the ring, which owns the hosting cache; read by the capture task,
+/// which is started elsewhere. The closure holds a `Weak`, so registering it never
+/// keeps a ring alive past node teardown; a dead ring reads as "no candidates", which
+/// surfaces as `focused=0` rather than as a stale set.
+///
+/// Absent means no source was registered, which is reported per tick rather than
+/// silently falling back - see [`super::shadow::CandidateSource`].
+type HostedContractsFn = Box<dyn Fn() -> Vec<ContractInstanceId> + Send + Sync>;
+static HOSTED_CONTRACTS: std::sync::OnceLock<HostedContractsFn> = std::sync::OnceLock::new();
+
+/// Tell the conformance machinery how to list hosted contracts. First caller wins.
+pub fn set_hosted_contracts_source(source: HostedContractsFn) {
+    // Same reasoning as `set_contract_store`: skip entirely unless capture is on, so
+    // the many-nodes-in-one-process test harness does not produce conflict warnings
+    // for a path nothing reads.
+    if global().is_none() {
+        return;
+    }
+    if HOSTED_CONTRACTS.set(source).is_err() {
+        // Unlike the contract store there is nothing useful to compare - two closures
+        // are not comparable - so this cannot distinguish "same ring twice" from "two
+        // different rings". It is logged at debug because in the one process where it
+        // can happen (the simulation harness) it is expected, and in production a
+        // second ring in one process would have larger problems than this.
+        tracing::debug!("hosted-contract source already registered for conformance");
+    }
+}
+
+pub(crate) fn hosted_contracts() -> Option<Vec<ContractInstanceId>> {
+    HOSTED_CONTRACTS.get().map(|source| source())
+}
+
 static CAPTURE: std::sync::OnceLock<Option<CaptureHandle>> = std::sync::OnceLock::new();
 
 /// The process-wide capture handle, or `None` when capture is off.
@@ -449,6 +492,24 @@ async fn run_writer(
     let mut flush = tokio::time::interval(FLUSH_EVERY);
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // Focus is computed once up front, not left empty until the first probe tick.
+    // Under focus-scoped sampling an empty focus set records NOTHING, so deferring
+    // this would throw away every observation in the first probe interval - and the
+    // interval is fifteen minutes, which on a restarting peer is a real hole in the
+    // corpus rather than a rounding error.
+    let mut last_focus = crate::conformance::shadow::FocusTick::default();
+    let mut scope = if wide_capture_requested() {
+        SamplingScope::Wide
+    } else {
+        SamplingScope::Focused(
+            shadow
+                .focus(&samplers.keys().copied().collect::<Vec<_>>())
+                .selected
+                .into_iter()
+                .collect(),
+        )
+    };
+
     loop {
         tokio::select! {
             received = rx.recv() => {
@@ -457,7 +518,7 @@ async fn run_writer(
                 // the budget measures what is actually in flight rather than
                 // everything ever admitted.
                 queued_bytes.fetch_sub(observation.queued_bytes(), Ordering::Relaxed);
-                record(&mut samplers, observation);
+                record(&mut samplers, &scope, observation);
                 since_flush += 1;
                 if since_flush >= FLUSH_EVERY_OBSERVATIONS {
                     write_all(&dir, &samplers, dropped.load(Ordering::Relaxed)).await;
@@ -476,7 +537,16 @@ async fn run_writer(
                 // Selection borrows the samplers and is cheap; probing owns its copies
                 // and is not. Only the cheap half runs here, so the queue keeps
                 // draining while WASM executes on another task.
-                let work = shadow.select(&samplers);
+                shadow.advance();
+                let focus = shadow.focus(&samplers.keys().copied().collect::<Vec<_>>());
+                // Recomputed every tick so a rotation, or a change in what the peer
+                // hosts, takes effect on sampling immediately rather than at the next
+                // restart. Wide mode ignores focus by definition.
+                if !matches!(scope, SamplingScope::Wide) {
+                    scope = SamplingScope::Focused(focus.selected.iter().copied().collect());
+                }
+                last_focus = focus.clone();
+                let work = shadow.select(&focus, &samplers);
                 if work.is_empty() {
                     // Still reported. A tick that selected nothing and a tick that
                     // found nothing are the same shape in a findings-only log, and
@@ -486,6 +556,10 @@ async fn run_writer(
                     tracing::info!(
                         epoch = shadow.epoch(),
                         tracked = samplers.len(),
+                        candidates = focus.candidates,
+                        candidate_source = focus.source.as_str(),
+                        focused = focus.selected.len(),
+                        scope = scope.as_str(),
                         "conformance shadow tick selected nothing to probe"
                     );
                 } else {
@@ -533,6 +607,15 @@ async fn run_writer(
                     // clean result as one that is genuinely covering the network.
                     tracked = samplers.len(),
                     tracking_at_cap = samplers.len() >= MAX_TRACKED_CONTRACTS,
+                    // Where focus could reach this tick. `candidates` is the size of
+                    // the pool focus chose from; when `candidate_source` is `hosted`
+                    // that is the peer's hosted set, which is the whole point of the
+                    // #5366 fix. A tick reading `candidate_source=sampler` means no
+                    // hosted source was registered and reach has silently narrowed
+                    // back to whatever the sampler already held.
+                    candidates = last_focus.candidates,
+                    candidate_source = last_focus.source.as_str(),
+                    scope = scope.as_str(),
                     focused = report.focused,
                     probed = report.probed,
                     cases = report.cases,
@@ -668,15 +751,103 @@ fn reload(dir: &Path) -> HashMap<ContractInstanceId, TrackedContract> {
     samplers
 }
 
+/// Which contracts the sampler will keep samples for.
+///
+/// The RFC samples the *focus* contracts: "while a contract is in the focus set, the
+/// peer records a bounded, diverse sample of the states and update context it
+/// naturally observes". Sampling everything and then choosing focus from what was
+/// collected is the inversion that produced #5366, and it also makes an ordinary
+/// peer's corpus grow with its traffic rather than with its focus.
+#[derive(Debug, Clone)]
+pub(crate) enum SamplingScope {
+    /// Record only for the contracts currently in focus. The production shape: the
+    /// corpus stays proportional to the focus set, not to what the peer happens to
+    /// route.
+    Focused(std::collections::HashSet<ContractInstanceId>),
+    /// Record for everything observed, up to the tracking cap.
+    ///
+    /// Developer corpus-building only, behind [`CAPTURE_WIDE_ENV`]. This is how the
+    /// corpora that found every violation so far were gathered - offline replay needs
+    /// many contracts from one peer, which is precisely what a production peer should
+    /// not be doing.
+    Wide,
+}
+
+impl SamplingScope {
+    /// Whether this scope admits `contract` as a newly tracked contract.
+    fn admits(&self, contract: &ContractInstanceId) -> bool {
+        match self {
+            SamplingScope::Focused(focus) => focus.contains(contract),
+            SamplingScope::Wide => true,
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            SamplingScope::Focused(_) => "focused",
+            SamplingScope::Wide => "wide",
+        }
+    }
+}
+
+/// Set to `1`/`true` to sample every contract observed rather than only the focus set.
+///
+/// Developer-only. It exists because offline replay - which is what actually found
+/// the deployed violations - needs a broad corpus from a single peer, and a peer
+/// obeying the RFC's focus-scoped sampling will never build one.
+pub const CAPTURE_WIDE_ENV: &str = "FREENET_CONFORMANCE_CAPTURE_WIDE";
+
+fn wide_capture_requested() -> bool {
+    matches!(
+        std::env::var(CAPTURE_WIDE_ENV).ok().as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
 pub(crate) fn record(
     samplers: &mut HashMap<ContractInstanceId, TrackedContract>,
+    scope: &SamplingScope,
     observation: Observation,
 ) {
-    if !samplers.contains_key(&observation.contract) && samplers.len() >= MAX_TRACKED_CONTRACTS {
-        // Already tracking as many as allowed. Ignoring the newcomer is the bounded
-        // choice; the alternative is evicting an accumulated sample, which throws
-        // away the diversity this is collecting.
+    let known = samplers.contains_key(&observation.contract);
+    if !known && !scope.admits(&observation.contract) {
+        // Not in focus, so not sampled. Note this drops observations for a contract
+        // that WAS in focus and has rotated out only for NEW contracts - an existing
+        // entry keeps accumulating until it is evicted, which is the RFC's "may
+        // outlive a focus period for a bounded time so returning to a contract does
+        // not always start from zero".
         return;
+    }
+    if !known && samplers.len() >= MAX_TRACKED_CONTRACTS {
+        // At the tracking cap with a contract that focus has actually selected.
+        //
+        // Refusing here is what caused #5366: the map fills, admission stops, and no
+        // amount of rotation can ever get the current focus contract sampled - the
+        // peer keeps probing whatever it captured first, forever, while reporting
+        // healthy ticks. Under focus-scoped sampling that failure returns in a worse
+        // form, because rotation guarantees the map fills with contracts that are no
+        // longer in focus.
+        //
+        // So evict a contract that is NOT in focus to make room. Deterministic (lowest
+        // id) rather than random so behaviour is reproducible in tests; the sample
+        // being discarded belongs to a contract nothing is looking at.
+        let evictable = match scope {
+            SamplingScope::Focused(focus) => samplers
+                .keys()
+                .filter(|id| !focus.contains(id))
+                .min_by(|a, b| a.as_bytes().cmp(b.as_bytes()))
+                .copied(),
+            // Wide mode has no focus to protect and is a developer path where the cap
+            // is the intended stopping point: a corpus that silently rolled over would
+            // make "what this peer saw" depend on eviction order.
+            SamplingScope::Wide => None,
+        };
+        match evictable {
+            Some(victim) => {
+                samplers.remove(&victim);
+            }
+            None => return,
+        }
     }
 
     let tracked = samplers
@@ -911,6 +1082,71 @@ mod contract_store_registration_pin {
         panic!("get_runtime_stores' body is not brace-balanced");
     }
 
+    /// Slice `Ring::new`'s body by counting braces to its own closing one.
+    ///
+    /// Same discipline as `get_runtime_stores_body` above and for the same reason: a
+    /// region ended at "the next `fn`" silently widens when the following item is not
+    /// the shape the pin assumed, and a widened region can match the pin's own
+    /// assertion text and pass vacuously.
+    fn ring_new_body() -> &'static str {
+        let src = include_str!("../ring.rs");
+        let start = src
+            .find("    pub fn new<ER: NetEventRegister>(")
+            .expect("Ring::new not found in ring.rs");
+        let after = &src[start..];
+        let open = after.find('{').expect("Ring::new has no body");
+        let mut depth = 0usize;
+        for (offset, ch) in after[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &after[..open + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("Ring::new's body is not brace-balanced");
+    }
+
+    /// The ring must register how to enumerate hosted contracts.
+    ///
+    /// Without it, focus falls back to the sampler keys and silently reinstates the
+    /// #5366 horizon: the peer keeps probing, keeps logging clean ticks, and can never
+    /// reach a contract it did not happen to observe early. The fallback is reported
+    /// per tick (`candidate_source=sampler`), but nothing in a unit test would notice
+    /// the registration going away, because no unit test builds a `Ring`.
+    #[test]
+    fn the_ring_registers_its_hosted_contracts_for_conformance() {
+        let body = ring_new_body();
+        assert!(
+            body.contains("set_hosted_contracts_source("),
+            "the ring no longer tells conformance how to list hosted contracts, so \
+             focus selection falls back to whatever the sampler already held (#5366)"
+        );
+    }
+
+    /// The registration must not hold the ring alive.
+    ///
+    /// The closure lives in a process-global that outlives the node. A strong `Arc`
+    /// there would leak an entire ring, its caches and its background-task handles
+    /// past teardown - and in the simulation harness, one per simulated peer.
+    #[test]
+    fn the_hosted_contracts_source_holds_only_a_weak_reference() {
+        let body = ring_new_body();
+        let start = body
+            .find("set_hosted_contracts_source(")
+            .expect("registration missing; the sibling pin covers that");
+        let before = &body[..start];
+        assert!(
+            before.contains("Arc::downgrade(&ring)"),
+            "the hosted-contract source does not downgrade the ring first, so the \
+             process-global closure may be keeping the ring alive after teardown"
+        );
+    }
+
     #[test]
     fn the_executor_registers_the_contract_store_for_conformance() {
         let body = get_runtime_stores_body();
@@ -1022,6 +1258,155 @@ mod probe_wiring_pins {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn instance(n: u8) -> ContractInstanceId {
+        ContractInstanceId::new([n; 32])
+    }
+
+    fn observation_for(contract: ContractInstanceId) -> Observation {
+        Observation {
+            contract,
+            code_hash: [2; 32],
+            parameters: vec![3],
+            base_state: vec![1, 2],
+            incoming_state: Some(vec![2, 3]),
+            delta: None,
+            result_state: vec![1, 2, 3],
+            related: Vec::new(),
+        }
+    }
+
+    fn focused_on(ids: &[u8]) -> SamplingScope {
+        SamplingScope::Focused(ids.iter().copied().map(instance).collect())
+    }
+
+    /// Sampling follows focus: a contract nobody is watching is not recorded.
+    ///
+    /// This is the RFC's shape ("while a contract is in the focus set, the peer
+    /// records a bounded, diverse sample") and it is what keeps an ordinary peer's
+    /// corpus proportional to its focus set rather than to its traffic.
+    #[test]
+    fn focused_sampling_records_only_the_focus_set() {
+        let mut samplers = HashMap::new();
+        let scope = focused_on(&[1]);
+
+        record(&mut samplers, &scope, observation_for(instance(1)));
+        record(&mut samplers, &scope, observation_for(instance(2)));
+
+        assert!(
+            samplers.contains_key(&instance(1)),
+            "the focused contract was not sampled"
+        );
+        assert!(
+            !samplers.contains_key(&instance(2)),
+            "an unfocused contract was sampled: sampling is not following focus"
+        );
+    }
+
+    /// Wide mode is the developer corpus path and deliberately ignores focus.
+    #[test]
+    fn wide_sampling_records_contracts_outside_the_focus_set() {
+        let mut samplers = HashMap::new();
+        record(
+            &mut samplers,
+            &SamplingScope::Wide,
+            observation_for(instance(2)),
+        );
+        assert!(
+            samplers.contains_key(&instance(2)),
+            "wide capture refused a contract, so no corpus can be built"
+        );
+    }
+
+    /// The #5366 regression, in the form focus-scoped sampling would take.
+    ///
+    /// A full tracking map must not be able to lock the CURRENT focus contract out of
+    /// being sampled. Rotation guarantees the map fills with contracts that are no
+    /// longer in focus, so a refuse-the-newcomer rule means that after enough
+    /// rotations a peer probes only what it captured first - forever, while its tick
+    /// lines still read healthy. Room is made by evicting something nothing is
+    /// watching.
+    #[test]
+    fn a_full_map_still_admits_the_contract_focus_selected() {
+        let mut samplers = HashMap::new();
+        // Fill to the cap with contracts that are not in focus.
+        for i in 0..MAX_TRACKED_CONTRACTS {
+            let id = ContractInstanceId::new([(i % 251) as u8; 32]);
+            record(&mut samplers, &SamplingScope::Wide, observation_for(id));
+        }
+        // Distinct ids only, otherwise this fills nothing and proves nothing.
+        assert_eq!(
+            samplers.len(),
+            MAX_TRACKED_CONTRACTS,
+            "fixture did not reach the cap, so the admission path under test never ran"
+        );
+
+        let newcomer = ContractInstanceId::new([255; 32]);
+        assert!(
+            !samplers.contains_key(&newcomer),
+            "fixture already tracked the newcomer"
+        );
+        let scope = SamplingScope::Focused([newcomer].into_iter().collect());
+        record(&mut samplers, &scope, observation_for(newcomer));
+
+        assert!(
+            samplers.contains_key(&newcomer),
+            "a full map locked out the contract focus actually selected (#5366)"
+        );
+        assert!(
+            samplers.len() <= MAX_TRACKED_CONTRACTS,
+            "admission grew the map past its cap: {}",
+            samplers.len()
+        );
+    }
+
+    /// Eviction to make room must never take a contract that IS in focus - that would
+    /// trade one starvation for another, discarding the sample being actively built.
+    #[test]
+    fn making_room_never_evicts_a_focused_contract() {
+        let mut samplers = HashMap::new();
+        for i in 0..MAX_TRACKED_CONTRACTS {
+            let id = ContractInstanceId::new([(i % 251) as u8; 32]);
+            record(&mut samplers, &SamplingScope::Wide, observation_for(id));
+        }
+        assert_eq!(samplers.len(), MAX_TRACKED_CONTRACTS);
+
+        // Focus on one contract already tracked, plus one that is not.
+        let held = *samplers
+            .keys()
+            .min_by(|a, b| a.as_bytes().cmp(b.as_bytes()))
+            .expect("fixture is empty");
+        let newcomer = ContractInstanceId::new([255; 32]);
+        let scope = SamplingScope::Focused([held, newcomer].into_iter().collect());
+
+        record(&mut samplers, &scope, observation_for(newcomer));
+
+        assert!(
+            samplers.contains_key(&held),
+            "eviction took a focused contract - the lowest id is exactly what the \
+             deterministic victim rule would pick if it did not skip focus"
+        );
+        assert!(
+            samplers.contains_key(&newcomer),
+            "newcomer was not admitted"
+        );
+    }
+
+    /// Wide mode keeps the old bounded-refusal behaviour: a developer corpus whose
+    /// contents depended on eviction order would stop meaning "what this peer saw".
+    #[test]
+    fn wide_sampling_stops_at_the_cap_rather_than_rolling_over() {
+        let mut samplers = HashMap::new();
+        for i in 0..(MAX_TRACKED_CONTRACTS + 20) {
+            let id = ContractInstanceId::new([(i % 251) as u8; 32]);
+            record(&mut samplers, &SamplingScope::Wide, observation_for(id));
+        }
+        assert_eq!(
+            samplers.len(),
+            MAX_TRACKED_CONTRACTS,
+            "wide capture did not stop at its cap"
+        );
+    }
 
     fn observation() -> Observation {
         Observation {
@@ -1181,7 +1566,7 @@ mod tests {
         observed.related = vec![(related_id, vec![42, 43])];
 
         let mut samplers = HashMap::new();
-        record(&mut samplers, observed);
+        record(&mut samplers, &SamplingScope::Wide, observed);
 
         let dir = tempfile::TempDir::new().expect("tempdir");
         write_all(dir.path(), &samplers, 0).await;
@@ -1229,7 +1614,7 @@ mod tests {
         for i in 0..4u8 {
             let mut observed = observation();
             observed.related = vec![(ContractInstanceId::new([i; 32]), vec![i; chunk])];
-            record(&mut samplers, observed);
+            record(&mut samplers, &SamplingScope::Wide, observed);
         }
 
         let tracked = samplers.values().next().expect("one contract tracked");
@@ -1249,7 +1634,7 @@ mod tests {
         let before = tracked.related.len();
         let mut again = observation();
         again.related = vec![(ContractInstanceId::new([0; 32]), vec![0; chunk])];
-        record(&mut samplers, again);
+        record(&mut samplers, &SamplingScope::Wide, again);
         let tracked = samplers.values().next().expect("one contract tracked");
         assert_eq!(
             tracked.related.len(),
@@ -1314,7 +1699,7 @@ mod tests {
         for i in 0..(MAX_RELATED_CONTRACTS + 4) {
             let mut observed = observation();
             observed.related = vec![(ContractInstanceId::new([i as u8; 32]), vec![i as u8; 16])];
-            record(&mut samplers, observed);
+            record(&mut samplers, &SamplingScope::Wide, observed);
         }
         let tracked = samplers.values().next().expect("one contract tracked");
         assert!(
@@ -1331,7 +1716,7 @@ mod tests {
             ContractInstanceId::new([200; 32]),
             vec![0u8; MAX_RELATED_BYTES + 1],
         )];
-        record(&mut samplers, huge);
+        record(&mut samplers, &SamplingScope::Wide, huge);
         let tracked = samplers.values().next().expect("one contract tracked");
         assert_eq!(
             tracked.related.len(),
@@ -1391,7 +1776,7 @@ mod tests {
     #[tokio::test]
     async fn a_written_bundle_identifies_its_contract() {
         let mut samplers = HashMap::new();
-        record(&mut samplers, observation());
+        record(&mut samplers, &SamplingScope::Wide, observation());
 
         let dir = tempfile::TempDir::new().expect("tempdir");
         write_all(dir.path(), &samplers, 0).await;
@@ -1427,7 +1812,7 @@ mod tests {
         oversized.base_state = vec![7; ceiling + 1];
         oversized.incoming_state = Some(vec![8; ceiling + 1]);
         oversized.result_state = vec![9; ceiling + 1];
-        record(&mut samplers, oversized);
+        record(&mut samplers, &SamplingScope::Wide, oversized);
 
         assert_eq!(
             samplers
@@ -1469,7 +1854,7 @@ mod tests {
             let mut obs = observation();
             obs.base_state = vec![i; 16];
             obs.result_state = vec![i; 17];
-            record(&mut samplers, obs);
+            record(&mut samplers, &SamplingScope::Wide, obs);
         }
         write_all(dir.path(), &samplers, 0).await;
         let before = samplers
@@ -1549,7 +1934,7 @@ mod tests {
         for i in 0..(MAX_TRACKED_CONTRACTS + 50) {
             let mut obs = observation();
             obs.contract = ContractInstanceId::new([(i % 251) as u8; 32]);
-            record(&mut samplers, obs);
+            record(&mut samplers, &SamplingScope::Wide, obs);
         }
         assert!(samplers.len() <= MAX_TRACKED_CONTRACTS);
     }

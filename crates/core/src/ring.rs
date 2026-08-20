@@ -721,6 +721,29 @@ impl Ring {
         }
 
         let ring = Arc::new(ring);
+
+        // Conformance focus selects over the contracts this peer HOSTS (RFC #5320),
+        // so the ring - which owns the hosting cache - is what can answer that. A
+        // `Weak` deliberately: this closure is stored in a process-global that
+        // outlives the node, and holding a strong `Arc` there would keep an entire
+        // ring, its background tasks' handles and its caches alive past teardown. A
+        // dead ring reads as "no candidates", which surfaces as `focused=0` rather
+        // than as a stale set. Registration is a no-op unless capture is enabled.
+        {
+            let weak = Arc::downgrade(&ring);
+            crate::conformance::capture::set_hosted_contracts_source(Box::new(move || {
+                weak.upgrade()
+                    .map(|ring| {
+                        ring.hosting_manager
+                            .hosting_contract_keys()
+                            .into_iter()
+                            .map(|key| *key.id())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }));
+        }
+
         let current_span = tracing::Span::current();
         let span = if current_span.is_none() {
             tracing::info_span!("connection_maintenance")

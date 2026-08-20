@@ -134,6 +134,43 @@ pub struct ShadowReport {
 }
 
 /// The shadow loop's state, owned by the capture writer task.
+/// Where this tick's focus candidates came from.
+///
+/// Reported on every tick rather than assumed. The two sources have very different
+/// reach - the hosted set is the whole point of #5366's fix, the sampler set is the
+/// horizon that bug created - and a peer degraded to the second one produces tick
+/// lines that are otherwise indistinguishable from a healthy peer hosting few
+/// contracts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum CandidateSource {
+    /// The contracts the peer hosts. The intended source.
+    #[default]
+    Hosted,
+    /// The contracts the sampler already holds, used when no hosted source was
+    /// registered. Keeps probing alive; does not cover the hosted set.
+    SamplerFallback,
+}
+
+impl CandidateSource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            CandidateSource::Hosted => "hosted",
+            CandidateSource::SamplerFallback => "sampler",
+        }
+    }
+}
+
+/// One tick's focus decision, before any samples are gathered for it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FocusTick {
+    /// The contracts to watch this tick.
+    pub selected: Vec<ContractInstanceId>,
+    /// How many contracts were eligible. Distinguishes "this peer hosts almost
+    /// nothing" from "selection is broken".
+    pub candidates: usize,
+    pub source: CandidateSource,
+}
+
 pub struct ShadowRunner {
     mode: EnforcementMode,
     selector: FocusSelector,
@@ -171,62 +208,84 @@ impl ShadowRunner {
         self.selector.epoch()
     }
 
-    /// Run one probe tick over whatever the sampler currently holds.
-    /// Choose this tick's focus contracts and copy out what a probe needs.
+    /// Advance to the next probe tick, rotating the focus set when one is due.
     ///
-    /// # Known bound: focus can only reach what capture is already tracking
-    ///
-    /// `capture::record` stops admitting new contracts once it is tracking
-    /// `MAX_TRACKED_CONTRACTS` and never evicts, so the candidate set here freezes at
-    /// the first N contracts that peer ever observed. Rotation then reshuffles a fixed
-    /// set rather than working through the network: contracts first seen after the cap
-    /// are unreachable, and if hosting later drops the code for a frozen id, focus can
-    /// keep selecting it and only raise `skipped_no_code`.
-    ///
-    /// Two consequences worth stating plainly rather than discovering from a flat
-    /// coverage graph. Ordinary churn erodes coverage over time. And an author who can
-    /// get 64 contracts observed early can, in principle, make a peer's focus set
-    /// entirely their own choosing — which does not let them dodge the salt, but does
-    /// let them starve everyone else of attention on that peer.
-    ///
-    /// Not fixed here: the cap and the no-evict rule are capture's, they predate this,
-    /// and changing them changes what a captured corpus means — a design call, not a
-    /// drive-by. Made VISIBLE instead: every tick reports `tracked` and whether the
-    /// sampler is at its cap, so the erosion shows up in the shadow telemetry that
-    /// exists to find exactly this kind of quiet loss of reach.
-    ///
-    /// Split from [`probe`] deliberately, and the split is load-bearing rather than
-    /// tidiness. This half borrows the sampler map, so it has to run on the capture
-    /// task, and it is cheap: a hash per candidate plus a bounded copy of the selected
-    /// contracts' samples. The probe half is CPU-bound WASM execution under a
-    /// ten-second-per-contract budget, and running THAT on the capture task would stop
-    /// the task draining its observation queue for as long as it ran — dropping the
-    /// very observations conformance exists to collect, from a mechanism whose stated
-    /// requirement is that it never degrade normal operation. The periodic flush was
-    /// made async for exactly this reason; a probe is the worse case, because it is
-    /// CPU-bound and cannot be yielded away from by awaiting a syscall.
-    pub(crate) fn select(
-        &mut self,
-        samplers: &HashMap<ContractInstanceId, super::capture::TrackedContract>,
-    ) -> Vec<(ContractInstanceId, ReplayBundle)> {
-        if self.mode == EnforcementMode::Disabled {
-            return Vec::new();
-        }
-
+    /// Separate from [`focus`](Self::focus) so focus can be computed at startup
+    /// without consuming a tick. Rotation counts probe ticks rather than wall time so
+    /// a peer that was down does not skip epochs it never sampled in.
+    pub(crate) fn advance(&mut self) {
         self.ticks = self.ticks.wrapping_add(1);
         if self.ticks % ROTATE_EVERY_TICKS == 0 {
             self.selector.rotate();
             self.logged.clear();
             store_epoch(&self.dir, self.selector.epoch());
         }
+    }
 
-        let candidates: Vec<ContractInstanceId> = samplers.keys().copied().collect();
-        self.selector
-            .select(&candidates)
-            .into_iter()
+    /// The contracts this peer should be watching right now.
+    ///
+    /// Candidates are the contracts the peer HOSTS, per the RFC: "each peer
+    /// independently selects one or a small bounded number of hosted contracts as
+    /// focus contracts". They are deliberately not the contracts the sampler has
+    /// collected. Sourcing them from the sampler is what caused #5366 - the sampler
+    /// stops admitting new contracts at its tracking cap and never evicts, so the
+    /// candidate pool froze at the first N contracts the peer ever observed and
+    /// rotation reshuffled a fixed set forever. On the live capture peer that showed
+    /// up as `tracking_at_cap=true` on every tick for hours, with focus unable to
+    /// reach anything new no matter how long it ran.
+    ///
+    /// Hosted-sourced focus inverts the dependency: focus decides what to sample,
+    /// rather than sampling deciding what can be focused. A freshly focused contract
+    /// therefore starts with no samples and accumulates them from ordinary traffic,
+    /// which is the intended behaviour and is reported as `skipped_no_samples`, not
+    /// as a failure.
+    ///
+    /// `fallback` is used only when no hosted-contract source has been registered.
+    /// Callers pass the sampler keys, which keeps a peer probing rather than going
+    /// silent, but reinstates exactly the #5366 horizon - so the tick reports which
+    /// source it used. `candidates=sampler` means focus has stopped covering the
+    /// hosted set, a state that otherwise looks identical to a peer hosting little.
+    pub(crate) fn focus(&self, fallback: &[ContractInstanceId]) -> FocusTick {
+        if self.mode == EnforcementMode::Disabled {
+            return FocusTick::default();
+        }
+        let (candidates, source) = match super::capture::hosted_contracts() {
+            Some(hosted) => (hosted, CandidateSource::Hosted),
+            None => (fallback.to_vec(), CandidateSource::SamplerFallback),
+        };
+        FocusTick {
+            selected: self.selector.select(&candidates),
+            candidates: candidates.len(),
+            source,
+        }
+    }
+
+    /// Copy out what a probe needs for the focused contracts.
+    ///
+    /// Split from [`probe`] deliberately, and the split is load-bearing rather than
+    /// tidiness. This half borrows the sampler map, so it has to run on the capture
+    /// task, and it is cheap: a bounded copy of the selected contracts' samples. The
+    /// probe half is CPU-bound WASM execution under a ten-second-per-contract budget,
+    /// and running THAT on the capture task would stop the task draining its
+    /// observation queue for as long as it ran - dropping the very observations
+    /// conformance exists to collect, from a mechanism whose stated requirement is
+    /// that it never degrade normal operation. The periodic flush was made async for
+    /// exactly this reason; a probe is the worse case, because it is CPU-bound and
+    /// cannot be yielded away from by awaiting a syscall.
+    pub(crate) fn select(
+        &self,
+        focus: &FocusTick,
+        samplers: &HashMap<ContractInstanceId, super::capture::TrackedContract>,
+    ) -> Vec<(ContractInstanceId, ReplayBundle)> {
+        if self.mode == EnforcementMode::Disabled {
+            return Vec::new();
+        }
+        focus
+            .selected
+            .iter()
             .filter_map(|instance| {
-                let tracked = samplers.get(&instance)?;
-                Some((instance, super::capture::bundle_for(instance, tracked)))
+                let tracked = samplers.get(instance)?;
+                Some((*instance, super::capture::bundle_for(*instance, tracked)))
             })
             .collect()
     }
@@ -604,7 +663,12 @@ mod tests {
         samplers: &HashMap<ContractInstanceId, TrackedContract>,
         store: Option<&Path>,
     ) -> ShadowReport {
-        let work = runner.select(samplers);
+        runner.advance();
+        // No hosted-contract source is registered in unit tests, so focus falls back
+        // to the sampler keys - which is exactly the fallback path production reports
+        // as `candidate_source=sampler`.
+        let focus = runner.focus(&samplers.keys().copied().collect::<Vec<_>>());
+        let work = runner.select(&focus, samplers);
         let (report, findings) = probe(work, store.map(|p| p.to_path_buf()), runner.mode()).await;
         runner.record(&findings);
         report
@@ -627,6 +691,7 @@ mod tests {
         for (base, result) in transitions {
             record(
                 &mut samplers,
+                &crate::conformance::capture::SamplingScope::Wide,
                 Observation {
                     contract: id,
                     code_hash,
@@ -808,8 +873,9 @@ mod tests {
             &[(vec![1], vec![1, 2]), (vec![2], vec![2, 3])],
         );
         let dir = tempfile::TempDir::new()?;
-        let mut runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
-        let work = runner.select(&samplers);
+        let runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        let focus = runner.focus(&samplers.keys().copied().collect::<Vec<_>>());
+        let work = runner.select(&focus, &samplers);
         assert!(!work.is_empty(), "nothing selected, so this proves nothing");
 
         let (report, _) = probe_with_budget(
