@@ -1307,11 +1307,23 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
         } else {
             c.recency_seq.to_string()
         };
+        // A contract pinned by a local client or downstream subscriber is
+        // ordered LAST by the real sweep, but the cache-side sort this table
+        // shows cannot see subscriber counts — so a pinned, never-read contract
+        // lands at the top reading "never", looking exactly like the most
+        // evictable row. Mark it, or the ordering caveat in the footer is the
+        // only thing standing between the operator and the wrong conclusion.
+        let pin_badge = if c.eviction_eligible {
+            ""
+        } else {
+            r#" <span class="fresh-pill use-active" title="Pinned by a local client or downstream subscriber. The sweep evicts these last, regardless of this row's position.">in use</span>"#
+        };
         rows.push_str(&format!(
-            r#"<tr><td title="{full}" data-sort="{full}"><code>{short}</code><button type="button" class="copy-key" data-copy="{full}" title="Copy contract key" aria-label="Copy contract key">⧉</button>{next}</td><td class="right" data-sort="{seq}">{recency}</td><td class="right" data-sort="{size}">{size_fmt}</td><td class="right" data-sort="{reads}">{reads}</td></tr>"#,
+            r#"<tr><td title="{full}" data-sort="{full}"><code>{short}</code><button type="button" class="copy-key" data-copy="{full}" title="Copy contract key" aria-label="Copy contract key">⧉</button>{next}{pin}</td><td class="right" data-sort="{seq}">{recency}</td><td class="right" data-sort="{size}">{size_fmt}</td><td class="right" data-sort="{reads}">{reads}</td></tr>"#,
             full = html_escape(&c.key_full),
             short = html_escape(&c.key_short),
             next = next_badge,
+            pin = pin_badge,
             seq = c.recency_seq,
             recency = recency,
             size = c.size_bytes,

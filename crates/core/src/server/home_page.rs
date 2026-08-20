@@ -2578,6 +2578,51 @@ mod tests {
             html.contains(">7<"),
             "a non-zero recency_seq must render its value — got:\n{html}"
         );
+        // Displayed order must BE the recency order, not merely be labelled as
+        // it. Without this the test would pass on an arbitrary row order.
+        let cold_idx = html.find("COLD_FULL").expect("cold row present");
+        let warm_idx = html.find("WARM_FULL").expect("warm row present");
+        assert!(
+            cold_idx < warm_idx,
+            "rows must render least-recently-accessed first — got:\n{html}"
+        );
+    }
+
+    /// A contract pinned by a local client or downstream subscriber sorts to
+    /// the top of this table when it has never been read, because the
+    /// cache-side sort cannot see subscriber counts — yet the real sweep
+    /// evicts it LAST. Without a marker it is indistinguishable from the most
+    /// evictable row, which is the confusion the "in use" badge exists to
+    /// prevent.
+    #[test]
+    fn hosting_card_marks_pinned_rows_as_in_use() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 256 * 1024 * 1024,
+            used_bytes: 64 * 1024 * 1024,
+            contract_count: 2,
+            contracts: vec![
+                // Never read AND pinned: sorts first, but is not the victim.
+                mk_hosted_entry_seq("PINNED", 0, false),
+                mk_hosted_entry_seq("EVICTABLE", 5, true),
+            ],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        let pinned_idx = html.find("PINNED_FULL").expect("pinned row present");
+        let evictable_idx = html.find("EVICTABLE_FULL").expect("evictable row present");
+        let badge_idx = html.find(">in use<").expect("in-use badge present");
+        assert!(
+            badge_idx > pinned_idx && badge_idx < evictable_idx,
+            "the in-use badge must sit on the pinned row — got:\n{html}"
+        );
+        // Exactly one row is pinned, so exactly one badge.
+        assert_eq!(
+            html.matches(">in use<").count(),
+            1,
+            "only the pinned row may carry the in-use badge — got:\n{html}"
+        );
     }
 
     /// The footer must not claim a ranking the card cannot actually show.
