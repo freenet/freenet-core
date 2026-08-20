@@ -120,6 +120,13 @@ const MAX_RELATED_CONTRACTS: usize = 8;
 /// Upper bound on contracts sampled concurrently.
 const MAX_TRACKED_CONTRACTS: usize = 64;
 
+/// How often to retry drawing focus from the hosted set before it is registered.
+///
+/// Short, because until it succeeds a focus-scoped peer is sampling against an empty
+/// focus set and therefore recording nothing. Bounded work: the arm switches off for
+/// good as soon as one draw reports [`CandidateSource::Hosted`].
+const HOSTED_SOURCE_WARMUP: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// How many observations may accumulate before a flush, regardless of the clock.
 ///
 /// The timer alone leaves the whole interval exposed, and worse for a short run:
@@ -497,7 +504,26 @@ async fn run_writer(
     // this would throw away every observation in the first probe interval - and the
     // interval is fifteen minutes, which on a restarting peer is a real hole in the
     // corpus rather than a rounding error.
+    //
+    // Computing it here is necessary but NOT sufficient, and the reason is worth
+    // stating because it is the opposite of what it looks like: this task is spawned
+    // BY `global()`, which `set_hosted_contracts_source` calls on its own first line
+    // to decide whether to register at all. So the writer starts one line before the
+    // hosted source is installed, and `set_contract_store` triggers the same thing
+    // earlier still. The startup computation therefore usually runs with no hosted
+    // source, falls back to an empty sampler, and installs an empty focus - exactly
+    // the hole it was added to close. The warm-up ticker below re-runs it until the
+    // source appears, then stops.
+    // Re-runs focus until the hosted source shows up, then never fires again. Cheap
+    // (one `OnceLock` read per tick, and the arm is disabled once satisfied) and
+    // self-terminating, rather than re-deriving focus on every observation - which
+    // would take the ring's hosting-cache read lock on the merge path's queue drain.
+    let mut warmup = tokio::time::interval(HOSTED_SOURCE_WARMUP);
+    warmup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_focus = crate::conformance::shadow::FocusTick::default();
+    // Focused contracts with no samples yet, carried across the probe so the finished
+    // tick can report them rather than silently omitting them from `focused`.
+    let mut awaiting_samples = 0usize;
     let mut scope = if wide_capture_requested() {
         SamplingScope::Wide
     } else {
@@ -518,12 +544,43 @@ async fn run_writer(
                 // the budget measures what is actually in flight rather than
                 // everything ever admitted.
                 queued_bytes.fetch_sub(observation.queued_bytes(), Ordering::Relaxed);
-                record(&mut samplers, &scope, observation);
+                if let Some(evicted) = record(&mut samplers, &scope, observation) {
+                    // Dropping the entry alone orphans the file: eviction fires on
+                    // every rotation once the map is full, so the directory would
+                    // grow without bound and `reload` could resurrect a long-evicted
+                    // contract ahead of the current focus set. Best-effort - a failed
+                    // unlink must never disturb capture, let alone the merge path.
+                    let path = bundle_path(&dir, &evicted);
+                    if let Err(err) = tokio::fs::remove_file(&path).await {
+                        if err.kind() != std::io::ErrorKind::NotFound {
+                            tracing::debug!(
+                                path = %path.display(),
+                                error = %err,
+                                "could not remove an evicted conformance bundle"
+                            );
+                        }
+                    }
+                }
                 since_flush += 1;
                 if since_flush >= FLUSH_EVERY_OBSERVATIONS {
                     write_all(&dir, &samplers, dropped.load(Ordering::Relaxed)).await;
                     since_flush = 0;
                 }
+            }
+            // Disabled the moment focus has actually been drawn from the hosted set.
+            // `Wide` never consults focus, so it never needs this either.
+            _ = warmup.tick(), if !matches!(scope, SamplingScope::Wide)
+                && last_focus.source != crate::conformance::shadow::CandidateSource::Hosted => {
+                let focus = shadow.focus(&samplers.keys().copied().collect::<Vec<_>>());
+                if focus.source == crate::conformance::shadow::CandidateSource::Hosted {
+                    tracing::debug!(
+                        candidates = focus.candidates,
+                        focused = focus.selected.len(),
+                        "conformance capture picked up the hosted-contract source"
+                    );
+                }
+                scope = SamplingScope::Focused(focus.selected.iter().copied().collect());
+                last_focus = focus;
             }
             _ = flush.tick() => {
                 write_all(&dir, &samplers, dropped.load(Ordering::Relaxed)).await;
@@ -546,7 +603,8 @@ async fn run_writer(
                     scope = SamplingScope::Focused(focus.selected.iter().copied().collect());
                 }
                 last_focus = focus.clone();
-                let work = shadow.select(&focus, &samplers);
+                let (work, awaiting) = shadow.select(&focus, &samplers);
+                awaiting_samples = awaiting;
                 if work.is_empty() {
                     // Still reported. A tick that selected nothing and a tick that
                     // found nothing are the same shape in a findings-only log, and
@@ -583,7 +641,7 @@ async fn run_writer(
                 }
             }, if in_flight.is_some() => {
                 in_flight = None;
-                let (report, findings) = match finished {
+                let (mut report, findings) = match finished {
                     Ok(result) => result,
                     Err(err) => {
                         // A panicking probe must not take the capture task with it,
@@ -593,6 +651,11 @@ async fn run_writer(
                         continue;
                     }
                 };
+                // Focus picked these; they simply had nothing to check yet. Counted
+                // in both, so `focused` is the size of the focus set rather than the
+                // size of the subset that happened to have samples.
+                report.focused += awaiting_samples;
+                report.skipped_no_samples += awaiting_samples;
                 shadow.record(&findings);
                 // Reported even when nothing was checked. A shadow period that finds
                 // nothing and a shadow period that never ran look identical in a
@@ -600,11 +663,11 @@ async fn run_writer(
                 // phase is for.
                 tracing::info!(
                     epoch = shadow.epoch(),
-                    // Reach, not just findings: focus can only select what capture is
-                    // tracking, and that set stops growing at MAX_TRACKED_CONTRACTS
-                    // and never evicts. Without these two numbers, a peer whose
-                    // candidate set froze months ago reports exactly the same shape of
-                    // clean result as one that is genuinely covering the network.
+                    // How much sample storage is in use. This used to describe focus
+                    // REACH, because focus selected out of this very map; it no longer
+                    // does (see `candidates` below), and the map now evicts. Kept as a
+                    // storage metric: at the cap, every new focus pick costs an older
+                    // contract's accumulated sample.
                     tracked = samplers.len(),
                     tracking_at_cap = samplers.len() >= MAX_TRACKED_CONTRACTS,
                     // Where focus could reach this tick. `candidates` is the size of
@@ -697,7 +760,16 @@ fn reload(dir: &Path) -> HashMap<ContractInstanceId, TrackedContract> {
         return samplers;
     };
 
-    for entry in entries.flatten() {
+    // Sorted, because this loop stops at MAX_TRACKED_CONTRACTS and `read_dir` order is
+    // undefined. Unsorted, WHICH contracts survive a restart is decided by whatever the
+    // filesystem happens to enumerate first - and with eviction now deleting bundles,
+    // a directory can legitimately hold entries in any order. Sorting does not make the
+    // choice smart (nothing here knows the current focus set), but it makes it
+    // reproducible, so a peer that restarts twice reloads the same corpus twice.
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("bundle") {
             continue;
@@ -804,20 +876,44 @@ fn wide_capture_requested() -> bool {
     )
 }
 
+/// Where a contract's persisted bundle lives. One definition, so an eviction cannot
+/// delete a path the writer never wrote.
+pub(crate) fn bundle_path(dir: &Path, instance: &ContractInstanceId) -> PathBuf {
+    dir.join(format!("{instance}.bundle"))
+}
+
+/// Fold one observation into the sampler map.
+///
+/// Returns the contract evicted to make room, if any. The caller must delete that
+/// contract's persisted bundle: dropping it from this map alone leaves the `.bundle`
+/// file behind forever, and since eviction happens on every rotation once the map is
+/// full, those orphans accumulate without bound - which also lets `reload` resurrect a
+/// long-evicted contract ahead of the current focus set on the next restart.
+#[must_use = "the evicted contract's bundle must be deleted, or it is orphaned on disk"]
 pub(crate) fn record(
     samplers: &mut HashMap<ContractInstanceId, TrackedContract>,
     scope: &SamplingScope,
     observation: Observation,
-) {
+) -> Option<ContractInstanceId> {
     let known = samplers.contains_key(&observation.contract);
-    if !known && !scope.admits(&observation.contract) {
-        // Not in focus, so not sampled. Note this drops observations for a contract
-        // that WAS in focus and has rotated out only for NEW contracts - an existing
-        // entry keeps accumulating until it is evicted, which is the RFC's "may
-        // outlive a focus period for a bounded time so returning to a contract does
-        // not always start from zero".
-        return;
+    if !scope.admits(&observation.contract) {
+        // Not in focus, so not COLLECTED - whether or not it is already tracked.
+        //
+        // The first version of this gated only new admissions (`!known && !admits`),
+        // which let any contract that had ever been focused keep absorbing every
+        // observation it saw, forever. With focus rotating every couple of hours and a
+        // 64-entry map, steady state was 64 contracts collecting rather than the two
+        // in focus - so "sampling follows focus" held for a few days after a clean
+        // deploy and then quietly stopped being true. The RFC's allowance is that a
+        // sample "may outlive a focus period for a BOUNDED time so returning to a
+        // contract does not always start from zero"; that is about RETAINING what was
+        // collected, not about continuing to collect, and there was no bound at all.
+        //
+        // Retention is preserved: an out-of-focus entry stays in the map, and stays on
+        // disk, until eviction needs its slot. It simply stops growing.
+        return None;
     }
+    let mut evicted = None;
     if !known && samplers.len() >= MAX_TRACKED_CONTRACTS {
         // At the tracking cap with a contract that focus has actually selected.
         //
@@ -845,8 +941,24 @@ pub(crate) fn record(
         match evictable {
             Some(victim) => {
                 samplers.remove(&victim);
+                evicted = Some(victim);
             }
-            None => return,
+            None => {
+                // Every tracked contract is in focus and the map is full, so there is
+                // nothing to give up. Unreachable while MAX_FOCUS_CONTRACTS (2) is far
+                // below MAX_TRACKED_CONTRACTS (64), but MAX_FOCUS_CONTRACTS is a
+                // documented operational tunable: raise it without revisiting the cap
+                // and this starts silently discarding exactly the focus-selected
+                // observations the eviction rule exists to protect. Counted rather
+                // than dropped in silence.
+                tracing::warn!(
+                    contract = %observation.contract,
+                    tracked = samplers.len(),
+                    "conformance capture could not make room for a focused contract: \
+                     every tracked contract is in focus"
+                );
+                return None;
+            }
         }
     }
 
@@ -872,6 +984,8 @@ pub(crate) fn record(
     if matches!(admission, Admission::TooLarge) {
         tracked.refused_too_large += 1;
     }
+
+    evicted
 }
 
 /// Admit related-contract states into a tracked contract, within the allowance.
@@ -980,7 +1094,7 @@ async fn write_all(
             continue;
         }
 
-        let path = dir.join(format!("{instance}.bundle"));
+        let path = bundle_path(dir, instance);
         // Encode on this task (pure CPU, no syscall) and hand only the bytes to the
         // async write, so the syscalls yield rather than parking the worker.
         match bundle.encode() {
@@ -1242,6 +1356,46 @@ mod probe_wiring_pins {
         );
     }
 
+    /// The writer must delete an evicted contract's persisted bundle.
+    ///
+    /// `record` returns the victim and is `#[must_use]`, so ignoring it is a compile
+    /// error - but `let _ = ...` silences that, and a refactor reaching for it would
+    /// reintroduce unbounded orphan files with no test failing.
+    #[test]
+    fn an_evicted_contract_has_its_bundle_removed() {
+        let body = run_writer_code_only();
+        assert!(
+            body.contains("remove_file"),
+            "the writer no longer deletes evicted bundles, so every rotation past the \
+             tracking cap orphans a file that nothing will ever clean up"
+        );
+    }
+
+    /// Focus must be drawn before the select loop, and retried until the hosted source
+    /// exists.
+    ///
+    /// Both halves are load-bearing and neither is reachable from a test, because
+    /// nothing calls `run_writer`. Under focus-scoped sampling an empty focus set
+    /// records NOTHING, and this task is spawned BY `global()` from inside
+    /// `set_hosted_contracts_source` - one line before the source is registered - so
+    /// the startup draw alone reliably misses it and the peer records nothing until the
+    /// first probe tick fifteen minutes later.
+    #[test]
+    fn focus_is_drawn_at_startup_and_retried_until_the_hosted_source_arrives() {
+        let body = run_writer_code_only();
+        let loop_start = body.find("loop {").expect("run_writer has no select loop");
+        assert!(
+            body[..loop_start].contains(".focus("),
+            "focus is no longer computed before the select loop, so a focus-scoped \
+             peer records nothing for the first probe interval after every restart"
+        );
+        assert!(
+            body.contains("HOSTED_SOURCE_WARMUP"),
+            "the hosted-source warm-up retry is gone; the startup draw alone runs \
+             before the ring registers its hosted contracts and therefore misses it"
+        );
+    }
+
     #[test]
     fn at_most_one_probe_runs_at_a_time() {
         let body = run_writer_code_only();
@@ -1290,8 +1444,8 @@ mod tests {
         let mut samplers = HashMap::new();
         let scope = focused_on(&[1]);
 
-        record(&mut samplers, &scope, observation_for(instance(1)));
-        record(&mut samplers, &scope, observation_for(instance(2)));
+        let _evicted = record(&mut samplers, &scope, observation_for(instance(1)));
+        let _evicted = record(&mut samplers, &scope, observation_for(instance(2)));
 
         assert!(
             samplers.contains_key(&instance(1)),
@@ -1303,11 +1457,139 @@ mod tests {
         );
     }
 
+    /// Sampling follows focus for contracts ALREADY tracked, not just new ones.
+    ///
+    /// The first version gated only new admissions, so any contract that had ever been
+    /// focused kept absorbing observations forever. With focus rotating every couple of
+    /// hours into a 64-entry map, steady state was 64 contracts collecting rather than
+    /// the two in focus - the narrow behaviour held for a few days after a clean deploy
+    /// and then quietly stopped being true.
+    ///
+    /// Counts `total_seen` rather than distinct states, so the assertion cannot be
+    /// satisfied by deduplication happening to hide a sampler that is still collecting.
+    #[test]
+    fn a_contract_that_leaves_focus_stops_collecting() {
+        let mut samplers = HashMap::new();
+        let watched = instance(1);
+
+        let _evicted = record(&mut samplers, &focused_on(&[1]), observation_for(watched));
+        let before = samplers
+            .get(&watched)
+            .expect("focused contract was not sampled")
+            .sampler
+            .total_seen();
+        assert!(
+            before > 0,
+            "fixture recorded nothing, so this proves nothing"
+        );
+
+        // Rotate it out of focus, then keep sending it traffic with distinct states.
+        let elsewhere = focused_on(&[2]);
+        for n in 0..8u8 {
+            let mut obs = observation_for(watched);
+            obs.result_state = vec![n, 9, 9];
+            let _evicted = record(&mut samplers, &elsewhere, obs);
+        }
+
+        let after = samplers
+            .get(&watched)
+            .expect("an out-of-focus contract must be RETAINED, only not collected")
+            .sampler
+            .total_seen();
+        assert_eq!(
+            before, after,
+            "a contract kept collecting after it left the focus set"
+        );
+    }
+
+    /// Retention survives defocus even though collection stops - the RFC's "may outlive
+    /// a focus period ... so returning to a contract does not always start from zero".
+    #[test]
+    fn a_contract_that_leaves_focus_keeps_what_it_already_collected() {
+        let mut samplers = HashMap::new();
+        let watched = instance(1);
+        let _evicted = record(&mut samplers, &focused_on(&[1]), observation_for(watched));
+        let _evicted = record(
+            &mut samplers,
+            &focused_on(&[2]),
+            observation_for(instance(2)),
+        );
+        assert!(
+            samplers.contains_key(&watched),
+            "defocusing a contract discarded its accumulated sample"
+        );
+    }
+
+    /// Eviction names its victim so the caller can delete the persisted bundle.
+    ///
+    /// Removing the entry alone orphans the file. Eviction fires on every rotation once
+    /// the map is full, so those orphans accumulate without bound - and `reload` can
+    /// then resurrect a long-evicted contract ahead of the current focus set.
+    #[test]
+    fn eviction_reports_the_victim_so_its_bundle_can_be_deleted() {
+        let mut samplers = HashMap::new();
+        for i in 0..MAX_TRACKED_CONTRACTS {
+            let id = ContractInstanceId::new([(i % 251) as u8; 32]);
+            let _evicted = record(&mut samplers, &SamplingScope::Wide, observation_for(id));
+        }
+        assert_eq!(samplers.len(), MAX_TRACKED_CONTRACTS);
+
+        let newcomer = ContractInstanceId::new([255; 32]);
+        let scope = SamplingScope::Focused([newcomer].into_iter().collect());
+        let evicted = record(&mut samplers, &scope, observation_for(newcomer));
+
+        let victim = evicted.expect("eviction happened but reported no victim to clean up");
+        assert!(
+            !samplers.contains_key(&victim),
+            "the reported victim is still tracked"
+        );
+        assert_ne!(
+            victim, newcomer,
+            "eviction reported the newcomer as its own victim"
+        );
+    }
+
+    /// The victim is specifically the LOWEST-id non-focused contract.
+    ///
+    /// Asserting only "a non-focused contract was evicted" does not pin this: the
+    /// earlier tests protected a contract that already sat at the minimum id, so
+    /// swapping `min_by` for `max_by` passed them both.
+    #[test]
+    fn eviction_takes_the_lowest_id_contract_not_in_focus() {
+        let mut samplers = HashMap::new();
+        for i in 0..MAX_TRACKED_CONTRACTS {
+            let id = ContractInstanceId::new([(i % 251) as u8; 32]);
+            let _evicted = record(&mut samplers, &SamplingScope::Wide, observation_for(id));
+        }
+        assert_eq!(samplers.len(), MAX_TRACKED_CONTRACTS);
+
+        // Protect the lowest id, so the expected victim is the SECOND lowest. Under a
+        // max_by rule the victim would be the highest instead.
+        let mut ids: Vec<_> = samplers.keys().copied().collect();
+        ids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let protected = ids[0];
+        let expected_victim = ids[1];
+        let newcomer = ContractInstanceId::new([255; 32]);
+
+        let scope = SamplingScope::Focused([protected, newcomer].into_iter().collect());
+        let evicted = record(&mut samplers, &scope, observation_for(newcomer));
+
+        assert_eq!(
+            evicted,
+            Some(expected_victim),
+            "eviction did not take the lowest-id non-focused contract"
+        );
+        assert!(
+            samplers.contains_key(&protected),
+            "a focused contract was evicted"
+        );
+    }
+
     /// Wide mode is the developer corpus path and deliberately ignores focus.
     #[test]
     fn wide_sampling_records_contracts_outside_the_focus_set() {
         let mut samplers = HashMap::new();
-        record(
+        let _evicted = record(
             &mut samplers,
             &SamplingScope::Wide,
             observation_for(instance(2)),
@@ -1332,7 +1614,7 @@ mod tests {
         // Fill to the cap with contracts that are not in focus.
         for i in 0..MAX_TRACKED_CONTRACTS {
             let id = ContractInstanceId::new([(i % 251) as u8; 32]);
-            record(&mut samplers, &SamplingScope::Wide, observation_for(id));
+            let _evicted = record(&mut samplers, &SamplingScope::Wide, observation_for(id));
         }
         // Distinct ids only, otherwise this fills nothing and proves nothing.
         assert_eq!(
@@ -1347,7 +1629,7 @@ mod tests {
             "fixture already tracked the newcomer"
         );
         let scope = SamplingScope::Focused([newcomer].into_iter().collect());
-        record(&mut samplers, &scope, observation_for(newcomer));
+        let _evicted = record(&mut samplers, &scope, observation_for(newcomer));
 
         assert!(
             samplers.contains_key(&newcomer),
@@ -1367,7 +1649,7 @@ mod tests {
         let mut samplers = HashMap::new();
         for i in 0..MAX_TRACKED_CONTRACTS {
             let id = ContractInstanceId::new([(i % 251) as u8; 32]);
-            record(&mut samplers, &SamplingScope::Wide, observation_for(id));
+            let _evicted = record(&mut samplers, &SamplingScope::Wide, observation_for(id));
         }
         assert_eq!(samplers.len(), MAX_TRACKED_CONTRACTS);
 
@@ -1379,7 +1661,7 @@ mod tests {
         let newcomer = ContractInstanceId::new([255; 32]);
         let scope = SamplingScope::Focused([held, newcomer].into_iter().collect());
 
-        record(&mut samplers, &scope, observation_for(newcomer));
+        let _evicted = record(&mut samplers, &scope, observation_for(newcomer));
 
         assert!(
             samplers.contains_key(&held),
@@ -1406,7 +1688,7 @@ mod tests {
         let first = ContractInstanceId::new([0; 32]);
         for i in 0..(MAX_TRACKED_CONTRACTS + 20) {
             let id = ContractInstanceId::new([(i % 251) as u8; 32]);
-            record(&mut samplers, &SamplingScope::Wide, observation_for(id));
+            let _evicted = record(&mut samplers, &SamplingScope::Wide, observation_for(id));
         }
         assert_eq!(
             samplers.len(),
@@ -1583,7 +1865,7 @@ mod tests {
         observed.related = vec![(related_id, vec![42, 43])];
 
         let mut samplers = HashMap::new();
-        record(&mut samplers, &SamplingScope::Wide, observed);
+        let _evicted = record(&mut samplers, &SamplingScope::Wide, observed);
 
         let dir = tempfile::TempDir::new().expect("tempdir");
         write_all(dir.path(), &samplers, 0).await;
@@ -1631,7 +1913,7 @@ mod tests {
         for i in 0..4u8 {
             let mut observed = observation();
             observed.related = vec![(ContractInstanceId::new([i; 32]), vec![i; chunk])];
-            record(&mut samplers, &SamplingScope::Wide, observed);
+            let _evicted = record(&mut samplers, &SamplingScope::Wide, observed);
         }
 
         let tracked = samplers.values().next().expect("one contract tracked");
@@ -1651,7 +1933,7 @@ mod tests {
         let before = tracked.related.len();
         let mut again = observation();
         again.related = vec![(ContractInstanceId::new([0; 32]), vec![0; chunk])];
-        record(&mut samplers, &SamplingScope::Wide, again);
+        let _evicted = record(&mut samplers, &SamplingScope::Wide, again);
         let tracked = samplers.values().next().expect("one contract tracked");
         assert_eq!(
             tracked.related.len(),
@@ -1716,7 +1998,7 @@ mod tests {
         for i in 0..(MAX_RELATED_CONTRACTS + 4) {
             let mut observed = observation();
             observed.related = vec![(ContractInstanceId::new([i as u8; 32]), vec![i as u8; 16])];
-            record(&mut samplers, &SamplingScope::Wide, observed);
+            let _evicted = record(&mut samplers, &SamplingScope::Wide, observed);
         }
         let tracked = samplers.values().next().expect("one contract tracked");
         assert!(
@@ -1733,7 +2015,7 @@ mod tests {
             ContractInstanceId::new([200; 32]),
             vec![0u8; MAX_RELATED_BYTES + 1],
         )];
-        record(&mut samplers, &SamplingScope::Wide, huge);
+        let _evicted = record(&mut samplers, &SamplingScope::Wide, huge);
         let tracked = samplers.values().next().expect("one contract tracked");
         assert_eq!(
             tracked.related.len(),
@@ -1793,7 +2075,7 @@ mod tests {
     #[tokio::test]
     async fn a_written_bundle_identifies_its_contract() {
         let mut samplers = HashMap::new();
-        record(&mut samplers, &SamplingScope::Wide, observation());
+        let _evicted = record(&mut samplers, &SamplingScope::Wide, observation());
 
         let dir = tempfile::TempDir::new().expect("tempdir");
         write_all(dir.path(), &samplers, 0).await;
@@ -1829,7 +2111,7 @@ mod tests {
         oversized.base_state = vec![7; ceiling + 1];
         oversized.incoming_state = Some(vec![8; ceiling + 1]);
         oversized.result_state = vec![9; ceiling + 1];
-        record(&mut samplers, &SamplingScope::Wide, oversized);
+        let _evicted = record(&mut samplers, &SamplingScope::Wide, oversized);
 
         assert_eq!(
             samplers
@@ -1871,7 +2153,7 @@ mod tests {
             let mut obs = observation();
             obs.base_state = vec![i; 16];
             obs.result_state = vec![i; 17];
-            record(&mut samplers, &SamplingScope::Wide, obs);
+            let _evicted = record(&mut samplers, &SamplingScope::Wide, obs);
         }
         write_all(dir.path(), &samplers, 0).await;
         let before = samplers
@@ -1951,7 +2233,7 @@ mod tests {
         for i in 0..(MAX_TRACKED_CONTRACTS + 50) {
             let mut obs = observation();
             obs.contract = ContractInstanceId::new([(i % 251) as u8; 32]);
-            record(&mut samplers, &SamplingScope::Wide, obs);
+            let _evicted = record(&mut samplers, &SamplingScope::Wide, obs);
         }
         assert!(samplers.len() <= MAX_TRACKED_CONTRACTS);
     }

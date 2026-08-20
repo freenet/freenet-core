@@ -160,6 +160,24 @@ impl CandidateSource {
     }
 }
 
+/// Choose the pool focus selects from, and say where it came from.
+///
+/// Pulled out of [`ShadowRunner::focus`] purely so it can be tested. The hosted branch
+/// is the entire point of #5366's fix, and in-process it is unreachable from a test:
+/// `set_hosted_contracts_source` no-ops unless capture is enabled, and capture reads
+/// its switch from the environment on first touch. Reading the global inside `focus`
+/// therefore made the branch that matters the one branch no test could take - swapping
+/// the two arms passed the whole suite.
+pub(crate) fn candidate_pool(
+    hosted: Option<Vec<ContractInstanceId>>,
+    fallback: &[ContractInstanceId],
+) -> (Vec<ContractInstanceId>, CandidateSource) {
+    match hosted {
+        Some(hosted) => (hosted, CandidateSource::Hosted),
+        None => (fallback.to_vec(), CandidateSource::SamplerFallback),
+    }
+}
+
 /// One tick's focus decision, before any samples are gathered for it.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FocusTick {
@@ -249,10 +267,7 @@ impl ShadowRunner {
         if self.mode == EnforcementMode::Disabled {
             return FocusTick::default();
         }
-        let (candidates, source) = match super::capture::hosted_contracts() {
-            Some(hosted) => (hosted, CandidateSource::Hosted),
-            None => (fallback.to_vec(), CandidateSource::SamplerFallback),
-        };
+        let (candidates, source) = candidate_pool(super::capture::hosted_contracts(), fallback);
         FocusTick {
             selected: self.selector.select(&candidates),
             candidates: candidates.len(),
@@ -272,22 +287,33 @@ impl ShadowRunner {
     /// that it never degrade normal operation. The periodic flush was made async for
     /// exactly this reason; a probe is the worse case, because it is CPU-bound and
     /// cannot be yielded away from by awaiting a syscall.
+    /// Returns the work plus the number of focused contracts that have no samples yet.
+    ///
+    /// That count is not incidental. `ShadowReport::focused` is derived from the work
+    /// length, so a focus contract still warming up simply vanished: a tick that
+    /// selected two contracts and found samples for one reported `focused=1,
+    /// skipped_no_samples=0`, which reads as "one contract, fully checked" rather than
+    /// "half the focus set had nothing to check". Warm-up is the NORMAL state now that
+    /// focus picks from the hosted set rather than from what was already sampled, so
+    /// hiding it would hide the common case.
     pub(crate) fn select(
         &self,
         focus: &FocusTick,
         samplers: &HashMap<ContractInstanceId, super::capture::TrackedContract>,
-    ) -> Vec<(ContractInstanceId, ReplayBundle)> {
+    ) -> (Vec<(ContractInstanceId, ReplayBundle)>, usize) {
         if self.mode == EnforcementMode::Disabled {
-            return Vec::new();
+            return (Vec::new(), 0);
         }
-        focus
+        let work: Vec<_> = focus
             .selected
             .iter()
             .filter_map(|instance| {
                 let tracked = samplers.get(instance)?;
                 Some((*instance, super::capture::bundle_for(*instance, tracked)))
             })
-            .collect()
+            .collect();
+        let awaiting_samples = focus.selected.len().saturating_sub(work.len());
+        (work, awaiting_samples)
     }
 
     pub(crate) fn mode(&self) -> EnforcementMode {
@@ -668,10 +694,56 @@ mod tests {
         // to the sampler keys - which is exactly the fallback path production reports
         // as `candidate_source=sampler`.
         let focus = runner.focus(&samplers.keys().copied().collect::<Vec<_>>());
-        let work = runner.select(&focus, samplers);
+        let (work, _awaiting) = runner.select(&focus, samplers);
         let (report, findings) = probe(work, store.map(|p| p.to_path_buf()), runner.mode()).await;
         runner.record(&findings);
         report
+    }
+
+    /// The hosted set is preferred, and is reported as such.
+    ///
+    /// This branch is the entire point of #5366's fix and was, until `candidate_pool`
+    /// was extracted, the one branch no test could reach: `focus` read a process-global
+    /// that only registers when capture is enabled from the environment, so every test
+    /// took the fallback and swapping the two arms passed the whole suite.
+    #[test]
+    fn candidates_come_from_the_hosted_set_when_one_is_available() {
+        let hosted = vec![instance(7), instance(8), instance(9)];
+        let sampler_keys = vec![instance(1), instance(2)];
+
+        let (pool, source) = candidate_pool(Some(hosted.clone()), &sampler_keys);
+
+        assert_eq!(pool, hosted, "focus did not draw from the hosted set");
+        assert_eq!(source, CandidateSource::Hosted);
+    }
+
+    /// With no hosted source, focus keeps working off the sampler - and says so.
+    ///
+    /// The fallback reinstates exactly the #5366 horizon, so the distinction has to
+    /// reach the logs; a peer degraded to it otherwise looks like one hosting little.
+    #[test]
+    fn candidates_fall_back_to_the_sampler_and_report_it() {
+        let sampler_keys = vec![instance(1), instance(2)];
+
+        let (pool, source) = candidate_pool(None, &sampler_keys);
+
+        assert_eq!(pool, sampler_keys);
+        assert_eq!(source, CandidateSource::SamplerFallback);
+        assert_eq!(source.as_str(), "sampler");
+    }
+
+    /// An empty hosted set is NOT the same as an absent source.
+    ///
+    /// A peer that genuinely hosts nothing must report `hosted` with zero candidates,
+    /// not silently borrow the sampler's contents and claim the fix is working.
+    #[test]
+    fn an_empty_hosted_set_does_not_fall_back_to_the_sampler() {
+        let sampler_keys = vec![instance(1), instance(2)];
+
+        let (pool, source) = candidate_pool(Some(Vec::new()), &sampler_keys);
+
+        assert!(pool.is_empty(), "an empty hosted set borrowed sampler keys");
+        assert_eq!(source, CandidateSource::Hosted);
     }
 
     fn instance(n: u8) -> ContractInstanceId {
@@ -689,7 +761,7 @@ mod tests {
     ) -> HashMap<ContractInstanceId, TrackedContract> {
         let mut samplers = HashMap::new();
         for (base, result) in transitions {
-            record(
+            let _evicted = record(
                 &mut samplers,
                 &crate::conformance::capture::SamplingScope::Wide,
                 Observation {
@@ -875,7 +947,7 @@ mod tests {
         let dir = tempfile::TempDir::new()?;
         let runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
         let focus = runner.focus(&samplers.keys().copied().collect::<Vec<_>>());
-        let work = runner.select(&focus, &samplers);
+        let (work, _awaiting) = runner.select(&focus, &samplers);
         assert!(!work.is_empty(), "nothing selected, so this proves nothing");
 
         let (report, _) = probe_with_budget(
