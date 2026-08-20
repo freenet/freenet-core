@@ -442,6 +442,51 @@ main {
   font-size: 0.8rem;
   margin-top: 0.4rem;
 }
+/* Filter + collapse strip above a long table. Laid out with flex-wrap so it
+ * collapses to two lines on a phone instead of pushing the page sideways —
+ * the failure the `.g-norms` grid above had. */
+.table-filter {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0 0 0.6rem;
+}
+.tf-input {
+  flex: 1 1 12rem;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  padding: 0.35rem 0.6rem;
+}
+.tf-input:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 1px;
+}
+.tf-status {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.tf-toggle {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--accent-light);
+  background: rgba(94, 234, 212, 0.1);
+  border: 1px solid rgba(94, 234, 212, 0.25);
+  border-radius: 5px;
+  padding: 0.3rem 0.6rem;
+  cursor: pointer;
+}
+.tf-toggle:hover {
+  background: rgba(94, 234, 212, 0.18);
+}
+
 .table-wrap {
   overflow-x: auto;
 }
@@ -1131,6 +1176,21 @@ table.sortable thead th.sort-desc::after {
   gap: 0.75rem;
   margin: 0.5rem 0 0.75rem;
 }
+
+/* The first column's hard 280px minimum cannot share a ~318px phone viewport
+ * with a second column: the second gets laid out past the edge and the whole
+ * PAGE scrolls sideways. Collapse to one column below the breakpoint.
+ *
+ * This override MUST sit after the rule above. An identical block placed in
+ * the earlier `max-width: 768px` section had equal specificity and lost the
+ * cascade to the later definition — it computed to `280px 87.64px` at 390px
+ * and changed nothing. Browser validation caught both the original overflow
+ * and this silently-dead fix for it. */
+@media (max-width: 768px) {
+  .g-verdict-row {
+    grid-template-columns: 1fr;
+  }
+}
 .g-verdict {
   background: var(--bg-tertiary);
   border: 1px solid var(--border-color);
@@ -1193,9 +1253,18 @@ table.sortable thead th.sort-desc::after {
   background: #d33682;
 }
 
+/* Stat-tile grid. Was a hard `repeat(5, 1fr)`, which had two consequences:
+ * at 390px it forced five ~73px tiles past the viewport edge and made the
+ * whole PAGE scroll sideways (the tables are innocent — they sit in
+ * `.table-wrap`, which already scrolls internally), and on wide screens a
+ * row of 3 or 4 tiles left a ragged right edge with dead space beside it.
+ *
+ * `auto-fit` with a 130px floor keeps five columns at the 800px main width
+ * (5x130 + 4 gaps = 682 <= ~745 available) while collapsing to two on a
+ * phone, so both fall out of one rule. */
 .g-norms {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
   gap: 0.5rem;
 }
 .g-norm {

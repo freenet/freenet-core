@@ -3092,6 +3092,93 @@ mod tests {
         );
     }
 
+    // ─── Long-table filter controls ────────────────────────────────
+    //
+    // SCOPE WARNING: these tests assert the emitted MARKUP only. They do not
+    // execute `dashboard.js`, have no DOM, and cannot tell you whether the
+    // filter actually filters, whether the collapse collapses, or whether
+    // either survives the 5s `<main>` swap. A green run here is compatible
+    // with the feature being completely broken in a browser. The behaviour is
+    // covered by driving a real node with Playwright; see the PR.
+
+    /// Both long tables must carry filter controls wired to their own table.
+    ///
+    /// The peers table rendered 210 rows on a production gateway — 70% of an
+    /// 11,780px page — with no way to locate a single row.
+    #[test]
+    fn long_tables_render_filter_controls_bound_to_their_table() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 2;
+        snap.peers = vec![sample_peer("10.0.0.1:31337", 0.25)];
+        let peers_html = build_peers_card(&Some(snap));
+        assert!(
+            peers_html.contains(r#"data-filter-for="peers""#),
+            "peers filter must target the peers table — got:\n{peers_html}"
+        );
+        assert!(
+            peers_html.contains(r#"data-table-id="peers""#),
+            "the targeted table id must exist on the page — got:\n{peers_html}"
+        );
+
+        let mut snap2 = base_snapshot();
+        snap2.open_connections = 2;
+        snap2.contracts = vec![crate::node::network_status::ContractSnapshot {
+            key_short: "AAA1...".to_string(),
+            key_full: "AAA123XYZ".to_string(),
+            instance_id: "AAA123XYZ".to_string(),
+            subscribed_secs: 100,
+            last_updated_secs: Some(5),
+            is_receiving_updates: true,
+            in_use: true,
+        }];
+        let contracts_html = build_contracts_card(&Some(snap2));
+        assert!(
+            contracts_html.contains(r#"data-filter-for="contracts""#),
+            "contracts filter must target the contracts table — got:\n{contracts_html}"
+        );
+    }
+
+    /// The controls must be reachable without a mouse and announce changes.
+    ///
+    /// The status line updates as you type, so it needs a live region or a
+    /// screen-reader user gets no feedback that the table changed under them.
+    #[test]
+    fn filter_controls_are_labelled_and_announced() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 1;
+        snap.peers = vec![sample_peer("10.0.0.1:31337", 0.25)];
+        let html = build_peers_card(&Some(snap));
+        assert!(
+            html.contains(r#"aria-label="Filter peers""#),
+            "the input needs an accessible name — got:\n{html}"
+        );
+        assert!(
+            html.contains(r#"aria-live="polite""#),
+            "the row-count status must be announced as it changes — got:\n{html}"
+        );
+        assert!(
+            html.contains(r#"aria-expanded="false""#),
+            "the collapse toggle must expose its state — got:\n{html}"
+        );
+    }
+
+    /// The toggle ships hidden.
+    ///
+    /// It is the JS that decides whether there is anything to collapse; a
+    /// toggle visible before that decision would flash on every refresh, and
+    /// on a small node would offer to expand a table that is already whole.
+    #[test]
+    fn filter_toggle_starts_hidden_for_the_js_to_reveal() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 1;
+        snap.peers = vec![sample_peer("10.0.0.1:31337", 0.25)];
+        let html = build_peers_card(&Some(snap));
+        assert!(
+            html.contains(r#"class="tf-toggle" hidden"#),
+            "the toggle must start hidden — got:\n{html}"
+        );
+    }
+
     // ─── Contract ban-list card (#4302) ────────────────────────────
 
     use crate::node::network_status::{BanListEntry, BanListSnapshot, BanReasonSnapshot};

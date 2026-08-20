@@ -151,6 +151,119 @@ function restoreSort() {
   });
 }
 
+/* ── Long-table filter + collapse ──────────────────────────────────────
+   The peers and subscribed-contracts tables are unbounded: a production
+   gateway rendered 210 peer rows, 70% of an 11,780px page, with no way to
+   find one row among them. Rather than truncate server-side (which would
+   make a filter lie about what it searched), every row is still rendered
+   and the table is COLLAPSED to a readable default here, with the filter
+   searching the full set and auto-expanding while a query is active.
+
+   State lives in sessionStorage for the same reason sort order does: the
+   5s auto-refresh replaces <main> wholesale, so an un-persisted filter
+   would be wiped mid-keystroke — worse than not having one. */
+var COLLAPSE_ROWS = 25;
+
+function filterKey(id) {
+  return 'filter:' + id;
+}
+function expandKey(id) {
+  return 'expand:' + id;
+}
+
+function applyTableView(wrap) {
+  var id = wrap.getAttribute('data-filter-for');
+  var table = document.querySelector('table[data-table-id="' + id + '"]');
+  if (!table) return;
+  var tbody = table.querySelector('tbody');
+  if (!tbody) return;
+  var input = wrap.querySelector('.tf-input');
+  var status = wrap.querySelector('.tf-status');
+  var toggle = wrap.querySelector('.tf-toggle');
+
+  var q = (input && input.value ? input.value : '').trim().toLowerCase();
+  var expanded = false;
+  try {
+    expanded = sessionStorage.getItem(expandKey(id)) === '1';
+  } catch (e) {}
+  /* A query implies "show me everything that matches", so filtering
+     overrides the collapse rather than fighting it. */
+  var showAll = expanded || q.length > 0;
+
+  var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
+  var matched = 0;
+  rows.forEach(function (r) {
+    var hit = q.length === 0 || r.textContent.toLowerCase().indexOf(q) !== -1;
+    if (!hit) {
+      r.style.display = 'none';
+      return;
+    }
+    matched++;
+    r.style.display = showAll || matched <= COLLAPSE_ROWS ? '' : 'none';
+  });
+
+  var total = rows.length;
+  var shown = showAll ? matched : Math.min(matched, COLLAPSE_ROWS);
+  if (status) {
+    if (q.length > 0) {
+      status.textContent =
+        'Showing ' + shown + ' of ' + matched + ' matching (' + total + ' total)';
+    } else if (showAll) {
+      status.textContent = 'Showing all ' + total;
+    } else {
+      status.textContent = 'Showing ' + shown + ' of ' + total;
+    }
+  }
+  if (toggle) {
+    /* While a query is active the collapse is not in force, so offering to
+       toggle it would be a control that does nothing. */
+    toggle.hidden = q.length > 0 || total <= COLLAPSE_ROWS;
+    toggle.textContent = expanded ? 'Show fewer' : 'Show all ' + total;
+    toggle.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+  }
+}
+
+function applyAllTableViews() {
+  document.querySelectorAll('.table-filter').forEach(applyTableView);
+}
+
+function restoreTableFilters() {
+  document.querySelectorAll('.table-filter').forEach(function (wrap) {
+    var id = wrap.getAttribute('data-filter-for');
+    var input = wrap.querySelector('.tf-input');
+    if (input) {
+      try {
+        input.value = sessionStorage.getItem(filterKey(id)) || '';
+      } catch (e) {}
+    }
+    applyTableView(wrap);
+  });
+}
+
+function handleFilterInput(input) {
+  var wrap = input.closest('.table-filter');
+  if (!wrap) return;
+  try {
+    sessionStorage.setItem(
+      filterKey(wrap.getAttribute('data-filter-for')),
+      input.value
+    );
+  } catch (e) {}
+  applyTableView(wrap);
+}
+
+function handleFilterToggle(btn) {
+  var wrap = btn.closest('.table-filter');
+  if (!wrap) return;
+  var id = wrap.getAttribute('data-filter-for');
+  var expanded = false;
+  try {
+    expanded = sessionStorage.getItem(expandKey(id)) === '1';
+    sessionStorage.setItem(expandKey(id), expanded ? '0' : '1');
+  } catch (e) {}
+  applyTableView(wrap);
+}
+
 /* ── Update-available check (GitHub releases, cached 12h) ── */
 function compareSemver(a, b) {
   var pa = String(a)
@@ -599,6 +712,7 @@ document.addEventListener('DOMContentLoaded', function () {
   }
   restoreTab();
   restoreSort();
+  restoreTableFilters();
   checkForUpdate();
   checkVersionMismatch();
 
@@ -634,6 +748,11 @@ document.addEventListener('DOMContentLoaded', function () {
 
   /* Delegated click handler \u2014 survives <main> innerHTML swaps from auto-refresh,
        so we don't need to re-bind after each refresh. */
+  document.addEventListener('input', function (ev) {
+    var tf = ev.target.closest && ev.target.closest('.tf-input');
+    if (tf) handleFilterInput(tf);
+  });
+
   document.addEventListener('click', function (ev) {
     /* The open button is inside <main>, which auto-refresh re-renders, so it
        must be handled via delegation to survive innerHTML swaps. */
@@ -641,6 +760,15 @@ document.addEventListener('DOMContentLoaded', function () {
     if (importOpen) {
       ev.preventDefault();
       openImportModal();
+      return;
+    }
+    /* Same reason as the import button: the filter controls live inside
+       <main> and are destroyed by every auto-refresh, so they are handled
+       by delegation rather than re-bound. */
+    var tfToggle = ev.target.closest && ev.target.closest('.tf-toggle');
+    if (tfToggle) {
+      ev.preventDefault();
+      handleFilterToggle(tfToggle);
       return;
     }
     var copy = ev.target.closest && ev.target.closest('.copy-key');
@@ -711,9 +839,15 @@ document.addEventListener('DOMContentLoaded', function () {
         var oldIcon = document.querySelector('link[rel="icon"]');
         if (newIcon && oldIcon)
           oldIcon.setAttribute('href', newIcon.getAttribute('href'));
-        /* Restore tab selection and table sort after content swap */
+        /* Restore tab selection, table sort and table filters after the
+           content swap. The filter restore is NOT optional here: the swap
+           destroys the input element, so without this the box empties and the
+           table re-expands roughly every five seconds — which browser
+           validation caught and no Rust test could, since they never execute
+           this file. */
         restoreTab();
         restoreSort();
+        restoreTableFilters();
         /* Re-check the live runtime version so the stale-assets banner
                  appears (or clears) if the serving process changes while the
                  page stays open. The banner's data-asset-version stays anchored
