@@ -1703,6 +1703,16 @@ pub struct HostingSnapshot {
     /// `resident_overhead_budget_bytes` the same way `used_bytes` is compared
     /// against `budget_bytes`.
     pub estimated_resident_overhead_bytes: u64,
+    /// The resident-overhead budget expressed as the contract COUNT it really
+    /// bounds (`resident_overhead_budget_bytes / 1 MiB-per-contract`).
+    ///
+    /// The dashboard renders this rather than the byte pair, because the byte
+    /// pair is not a memory measurement: the "used" side is
+    /// `contract_count * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT`, so printing
+    /// it in MB reads to an operator as measured RAM when it is really a
+    /// contract-count ceiling. Derived in `HostingCache::contract_slot_budget`
+    /// so the per-contract constant keeps exactly one reader.
+    pub contract_slot_budget: u64,
     /// Monotonic count of evictions where resident-overhead pressure was
     /// active at decision time (#5325); may overlap with
     /// `budget_evictions_total`.

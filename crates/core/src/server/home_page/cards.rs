@@ -1255,6 +1255,75 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
     let used_pct = (h.used_bytes as f64 / budget as f64 * 100.0).min(100.0);
     let headroom = h.budget_bytes.saturating_sub(h.used_bytes);
 
+    // Which limit is actually closest? The card shows three ceilings, and
+    // before this they were three flat rows of identical tiles with nothing
+    // saying which one binds. On a real low-RAM peer that is not academic: a
+    // measured framework node sat at 34% of its state-byte budget, 1% of its
+    // disk budget, and 99.2% of its contract-slot ceiling — the one number
+    // that mattered, rendered in the same muted grey as the two that had room
+    // to spare.
+    //
+    // Utilisation is computed per axis and the highest wins. A budget of 0 is
+    // "not configured / not yet measured", not "completely full", so those
+    // axes are skipped rather than reported as 100%.
+    let axis_utilisation = |used: u64, budget: u64| -> Option<f64> {
+        (budget > 0).then(|| used as f64 / budget as f64)
+    };
+    let mut axes: Vec<(&str, f64, String)> = Vec::new();
+    if let Some(u) = axis_utilisation(h.used_bytes, h.budget_bytes) {
+        axes.push((
+            "contract state",
+            u,
+            format!(
+                "{} of {}",
+                format_bytes(h.used_bytes),
+                format_bytes(h.budget_bytes)
+            ),
+        ));
+    }
+    if let (Some(used), Some(disk_budget)) = (h.disk_total_bytes, h.disk_budget_bytes) {
+        if let Some(u) = axis_utilisation(used, disk_budget) {
+            axes.push((
+                "disk",
+                u,
+                format!("{} of {}", format_bytes(used), format_bytes(disk_budget)),
+            ));
+        }
+    }
+    if let Some(u) = axis_utilisation(h.contract_count, h.contract_slot_budget) {
+        axes.push((
+            "contract slots",
+            u,
+            format!("{} of {}", h.contract_count, h.contract_slot_budget),
+        ));
+    }
+    // Cost pressure (#4861) is deliberately absent: it is a sustained-rate
+    // condition on a single offending contract, not a utilisation ratio, so it
+    // has no comparable denominator to rank against these three.
+    let binding = axes
+        .iter()
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(name, util, detail)| {
+            let pct = (util * 100.0).min(100.0);
+            // Colour only near the ceiling: an operator should be able to
+            // ignore this strip until it means something.
+            let tone = if pct >= 90.0 {
+                "var(--danger, #c0392b)"
+            } else if pct >= 75.0 {
+                "var(--warn, #b8860b)"
+            } else {
+                "var(--text-muted, #888)"
+            };
+            format!(
+                r#"<div class="hz-binding"><div class="hz-binding-head">Closest limit: <strong>{name}</strong> — {detail} ({pct:.0}%)</div><div class="hz-bar" role="img" aria-label="{name} at {pct:.0} percent of its limit"><span class="hz-bar-fill" style="width: {pct:.1}%; background: {tone};"></span></div></div>"#,
+                name = html_escape(name),
+                detail = html_escape(detail),
+                pct = pct,
+                tone = tone,
+            )
+        })
+        .unwrap_or_default();
+
     // Recently-read evictions are the miscalibration alarm (#4338): evicting a
     // repeatedly-requested contract means the demand estimate is mis-ordering
     // the working set. Color it when non-zero so an operator notices.
@@ -1378,20 +1447,38 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
         _ => MEASURING.to_string(),
     };
 
-    // Resident-overhead tile (#5325): the state-byte budget above bounds
-    // contract STATE bytes only. This tile is the count-derived axis —
-    // `contract_count * ESTIMATED_RESIDENT_BYTES_PER_CONTRACT` — that closes
-    // the gap where many small-state contracts (negligible RAM-used-tile
-    // impact) still exhaust a peer's real resident memory via per-contract
+    // The tile shows slots because that is the unit the ceiling constrains;
+    // the tooltip keeps the RAM derivation available, so an operator who wants
+    // to know WHY the ceiling is where it is can still get there. Estimated,
+    // never measured — say so, since the whole failure this replaces was a
+    // derived count reading as a memory measurement.
+    let slot_tooltip = format!(
+        "A contract-count ceiling, not a memory measurement. Each hosted contract is \
+         charged a flat estimate for per-contract bookkeeping (subscriptions, redb/index \
+         entries) that the contract-state budget does not count, so the RAM-scaled byte \
+         budget behind this (#5325) works out to a maximum number of contracts. \
+         Currently {used} estimated against a {budget} ceiling.",
+        used = format_bytes(h.estimated_resident_overhead_bytes),
+        budget = format_bytes(h.resident_overhead_budget_bytes),
+    );
+
+    // Contract-slot tiles (#5325): the state-byte budget above bounds contract
+    // STATE bytes only. This axis is the count-derived one that closes the gap
+    // where many small-state contracts (negligible impact on the state-byte
+    // tile) still exhaust a peer's real resident memory via per-contract
     // subscription/index bookkeeping.
-    let resident_overhead_headroom = h
-        .resident_overhead_budget_bytes
-        .saturating_sub(h.estimated_resident_overhead_bytes);
+    //
+    // Rendered as SLOTS rather than the underlying bytes. The byte pair was
+    // `contract_count * 1 MiB` against a RAM-scaled ceiling, which prints as
+    // e.g. "520.0 MB / 524.0 MB" and reads as measured memory — it is not
+    // measured, and what it constrains is a number of contracts. The tooltip
+    // keeps the RAM derivation available for anyone who needs it.
 
     format!(
         r##"<div class="card">
             <div class="card-header"><h2>Demand-driven eviction</h2></div>
             <p class="empty" style="margin: 0.2rem 0.9rem 0.4rem; font-size: 0.82rem; color: var(--text-muted, #888);">Retention is demand-driven. When over budget the node sheds contracts with the fewest subscribers first — a local client subscription outranks a downstream one, and among contracts with neither, the one with the lowest eviction-recency goes first. A sweep can be triggered by any of several independent pressures: contract state bytes, disk usage, the resident-overhead ceiling that scales with hosted-contract count (#5325), or a single zero-demand contract taking a sustained share of the node's update work (#4861).</p>
+            {binding}
             <div class="g-verdict-row">
                 <div class="g-norms">
                     <div class="g-norm"><div class="g-norm-label">RAM used</div><div class="g-norm-value">{used} / {budget} ({pct:.0}%)</div></div>
@@ -1410,10 +1497,9 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
             </div>
             <div class="g-verdict-row">
                 <div class="g-norms">
-                    <div class="g-norm" title="Estimated, not measured: contract_count × 1 MiB/contract (#5325). Bounds per-contract resident bookkeeping overhead (subscriptions, redb/index entries) that RAM used/budget above does not count."><div class="g-norm-label">Resident overhead (est.)</div><div class="g-norm-value">{resident_overhead_used}</div></div>
-                    <div class="g-norm"><div class="g-norm-label">Resident overhead budget</div><div class="g-norm-value">{resident_overhead_budget}</div></div>
-                    <div class="g-norm"><div class="g-norm-label">Resident overhead headroom</div><div class="g-norm-value">{resident_overhead_headroom}</div></div>
-                    <div class="g-norm"><div class="g-norm-label">Resident overhead evictions</div><div class="g-norm-value">{resident_overhead_evictions}</div></div>
+                    <div class="g-norm" title="{slot_tooltip}"><div class="g-norm-label">Contract slots used</div><div class="g-norm-value">{slots_used} / {slots_budget}</div></div>
+                    <div class="g-norm"><div class="g-norm-label">Slots free</div><div class="g-norm-value">{slots_free}</div></div>
+                    <div class="g-norm" title="Evictions where the contract-slot ceiling was the active pressure (#5325). May overlap with budget evictions."><div class="g-norm-label">Slot-pressure evictions</div><div class="g-norm-value">{resident_overhead_evictions}</div></div>
                 </div>
             </div>
             <div class="table-wrap">
@@ -1424,6 +1510,7 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
             </div>
             {footer}
         </div>"##,
+        binding = binding,
         used = format_bytes(h.used_bytes),
         budget = format_bytes(h.budget_bytes),
         pct = used_pct,
@@ -1435,9 +1522,10 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
         disk_used = disk_used_value,
         disk_budget = disk_budget_value,
         disk_headroom = disk_headroom_value,
-        resident_overhead_used = format_bytes(h.estimated_resident_overhead_bytes),
-        resident_overhead_budget = format_bytes(h.resident_overhead_budget_bytes),
-        resident_overhead_headroom = format_bytes(resident_overhead_headroom),
+        slot_tooltip = html_escape(&slot_tooltip),
+        slots_used = h.contract_count,
+        slots_budget = h.contract_slot_budget,
+        slots_free = h.contract_slot_budget.saturating_sub(h.contract_count),
         resident_overhead_evictions = h.resident_overhead_evictions_total,
         rows = rows,
         footer = footer,
