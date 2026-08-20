@@ -500,7 +500,15 @@ fn load_inputs(config: &ConformanceConfig) -> anyhow::Result<(Vec<u8>, Vec<u8>, 
         // exactly this reason, with nothing in the replay output saying so. The note is
         // the only durable record - node logs rotate long before a corpus is replayed.
         if let Some(note) = bundle.note.as_deref() {
-            println!("bundle note: {note}");
+            // STDERR deliberately. `--json` writes one JSON document to stdout, and a
+            // plain line ahead of it corrupts the stream for anything parsing it -
+            // `fdev conformance --bundle x --json | jq` would simply fail. `write_bundle`
+            // in this same file already uses `eprintln!` for its status line for
+            // exactly this reason; the first version of this did not follow it.
+            //
+            // Still visible in ordinary terminal use, which is the case that matters:
+            // a reader replaying a corpus needs to see that it may be incomplete.
+            eprintln!("bundle note: {note}");
         }
 
         let corpus = bundle.to_corpus();

@@ -1095,19 +1095,6 @@ pub(crate) fn record(
     evicted
 }
 
-/// Admit related-contract states into a tracked contract, within the allowance.
-///
-/// Shared by `record` and `reload` on purpose. Everything else a reload restores goes
-/// back through the sampler's own admission checks, so it is self-correcting: a
-/// bundle written under looser limits is trimmed to what the current build allows.
-/// Related state was the one field that skipped that and was collected raw, so a
-/// bundle from a looser build — or an edited one, since nothing bounds the vector on
-/// disk — loaded straight past today's limits. One function, called from both paths,
-/// is what stops the two rules drifting again.
-///
-/// Both bounds refuse rather than evict: a contract referencing a hundred others must
-/// not be able to churn this map, and states already retained are more useful than an
-/// arbitrary newcomer.
 /// Related state a contract offered and capture would not keep.
 ///
 /// Counted, never silently dropped. Three `continue`s used to discard related state
@@ -1132,6 +1119,19 @@ impl RelatedRefusals {
     }
 }
 
+/// Admit related-contract states into a tracked contract, within the allowance.
+///
+/// Shared by `record` and `reload` on purpose. Everything else a reload restores goes
+/// back through the sampler's own admission checks, so it is self-correcting: a
+/// bundle written under looser limits is trimmed to what the current build allows.
+/// Related state was the one field that skipped that and was collected raw, so a
+/// bundle from a looser build — or an edited one, since nothing bounds the vector on
+/// disk — loaded straight past today's limits. One function, called from both paths,
+/// is what stops the two rules drifting again.
+///
+/// Both bounds refuse rather than evict: a contract referencing a hundred others must
+/// not be able to churn this map, and states already retained are more useful than an
+/// arbitrary newcomer.
 fn admit_related(
     held: &mut HashMap<ContractInstanceId, Vec<u8>>,
     offered: &[(ContractInstanceId, Vec<u8>)],
@@ -1238,7 +1238,7 @@ async fn write_all(
                     // Raising the byte budget cannot help here: the slot limit is a
                     // compile-time constant, so do not send a reader after that knob.
                     extra.push_str(&format!(
-                        " {} related contract(s) exceeded the {}-contract limit, which no configuration changes.",
+                        " {} related contract(s) exceeded the {}-contract limit, which no configuration can raise.",
                         refused.no_slot, MAX_RELATED_CONTRACTS,
                     ));
                 }
@@ -1263,11 +1263,23 @@ async fn write_all(
                 // `no_slot` is the MAX_RELATED_CONTRACTS limit, a compile-time
                 // constant, and sending an operator to re-run with a bigger budget
                 // that cannot possibly help is worse than saying nothing.
-                remedy = if refused.too_large > 0 || refused.over_budget > 0 {
-                    CAPTURE_MAX_BYTES_ENV
-                } else {
-                    "none: the related-contract COUNT limit bound, which is not configurable"
+                // Must describe BOTH causes when both fired. Collapsing to the byte
+                // budget alone sends an operator to raise it, re-run, and get an
+                // incomplete corpus again with no explanation - and a large, popular
+                // related contract is exactly the case that trips both at once.
+                remedy = match (
+                    refused.too_large > 0 || refused.over_budget > 0,
+                    refused.no_slot > 0,
+                ) {
+                    (true, true) => "raise the byte budget; some refusals are also \
+                                     capped by the related-contract COUNT limit, which \
+                                     is not configurable",
+                    (true, false) => "raise the byte budget",
+                    (false, true) => "none: the related-contract COUNT limit bound, \
+                                      which is not configurable",
+                    (false, false) => "none",
                 },
+                byte_budget_env = CAPTURE_MAX_BYTES_ENV,
                 "conformance capture refused related-contract state; replays of this \
                  contract may reach no verdict"
             );
@@ -1792,6 +1804,52 @@ mod tests {
             "reload trimmed related state without counting it, so the next flush will \
              record a corpus as complete when it is not"
         );
+    }
+
+    /// Each reloaded bundle gets ITS OWN refusal count, not a running total.
+    ///
+    /// The direct regression for the worse bug the first fix could have introduced.
+    /// `reload_refusals` has to be declared inside the per-bundle loop; hoisted above
+    /// it, every contract after the first inherits the earlier contracts' refusals and
+    /// the counter starts lying in the opposite direction - overstating rather than
+    /// hiding, which is worse, because an overstated count sends someone hunting a
+    /// truncation that never happened.
+    ///
+    /// The existing multi-bundle reload test cannot catch this: its bundles carry no
+    /// related state at all, so no bundle refuses anything.
+    #[test]
+    fn each_reloaded_bundle_counts_only_its_own_refusals() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+
+        // Two bundles, each over the slot limit by a DIFFERENT amount, so a shared
+        // counter cannot coincidentally produce the right answer for both.
+        let over_by = [3usize, 5usize];
+        let instances = [
+            ContractInstanceId::new([200; 32]),
+            ContractInstanceId::new([201; 32]),
+        ];
+        for (instance, extra) in instances.iter().zip(over_by) {
+            let mut bundle = super::super::bundle::ReplayBundle::new(vec![9, 9], vec![3]);
+            bundle.instance = Some(*instance);
+            bundle.states = vec![vec![1, 2], vec![2, 3]];
+            bundle.related = (0..(MAX_RELATED_CONTRACTS + extra))
+                .map(|i| (ContractInstanceId::new([i as u8; 32]), vec![i as u8; 16]))
+                .collect();
+            bundle
+                .write_to(&bundle_path(dir.path(), instance))
+                .expect("write bundle");
+        }
+
+        let samplers = reload(dir.path());
+
+        for (instance, extra) in instances.iter().zip(over_by) {
+            let tracked = samplers.get(instance).expect("bundle should have reloaded");
+            assert_eq!(
+                tracked.refused_related.no_slot, extra as u64,
+                "{instance} reported a refusal count that is not its own; a shared \
+                 counter across bundles makes every contract after the first overstate"
+            );
+        }
     }
 
     /// The related budget SCALES with the sampler budget an operator sets.
