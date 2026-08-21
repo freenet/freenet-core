@@ -719,12 +719,20 @@ impl UpdateCommand {
         ) {
             Ok(prepared) => Some(prepared),
             Err(e) => {
-                if !self.quiet {
-                    eprintln!(
-                        "Warning: failed to snapshot known-good binary for crash-loop \
-                             rollback: {e}. Proceeding without rollback protection for this update."
-                    );
-                }
+                // NOT gated on `--quiet` (#5244). This is one of the two states
+                // where #4073's brick-safety machinery is silently OFF: the
+                // update is about to land with no rollback target, so a release
+                // that then crash-loops cannot be reverted. `--quiet` must mean
+                // "be less chatty", never "do not record safety events".
+                // Belt-and-braces alongside the subscriber installed in
+                // `freenet_main`, so this survives a later refactor that drops
+                // the subscriber. Matches `handle_post_stop`'s precedent above.
+                eprintln!(
+                    "Freenet: failed to snapshot the known-good binary for crash-loop \
+                     rollback: {e}. PROCEEDING WITHOUT ROLLBACK PROTECTION for this update — if \
+                     this version crash-loops it will NOT be auto-reverted. Check the \
+                     permissions and free space on the Freenet state directory."
+                );
                 tracing::warn!(error = %e, "Failed to capture known-good rollback binary (#4073)");
                 None
             }
@@ -762,12 +770,15 @@ impl UpdateCommand {
                 &current_exe,
                 &meta,
             ) {
-                if !self.quiet {
-                    eprintln!(
-                        "Warning: installed the update but failed to arm crash-loop rollback \
-                         protection: {e}. If this version crash-loops it will NOT auto-roll-back."
-                    );
-                }
+                // NOT gated on `--quiet` — see the sibling above (#5244).
+                // The update HAS landed and the probation marker is absent, so
+                // the post-stop hook will find nothing to count and this
+                // version can crash-loop indefinitely without being reverted.
+                eprintln!(
+                    "Freenet: installed the update but FAILED TO ARM crash-loop rollback \
+                     protection: {e}. If this version crash-loops it will NOT be auto-reverted. \
+                     Check the permissions and free space on the Freenet state directory."
+                );
                 tracing::warn!(error = %e, "Failed to arm crash-loop rollback probation (#4073)");
             }
         }

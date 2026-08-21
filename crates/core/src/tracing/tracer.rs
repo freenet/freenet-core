@@ -744,6 +744,89 @@ pub fn init_tracer(
     )
 }
 
+/// Install a stderr-only subscriber for a short-lived CLI subcommand.
+///
+/// ## Why this exists (#5244)
+///
+/// `freenet update` ran with **no subscriber at all**: `set_logger` is called
+/// only on the node path (`run_node`), so every `tracing::warn!` / `error!` in
+/// the installer was a no-op. Combined with the supervisor invoking it as
+/// `freenet update --quiet`, sites whose only output was a `warn!` plus a
+/// `!quiet`-gated `eprintln!` were completely silent in production — including
+/// "installed the update but could not arm crash-loop rollback".
+///
+/// ## Why not just call [`set_logger`] here
+///
+/// Two traps, both of which produce a fix that looks done and changes nothing:
+///
+/// 1. Passing a `log_dir` (the natural copy-paste from `run_node`) sets
+///    `use_file_logging`, which routes everything into the rolling log files.
+///    systemd captures stdout/stderr, NOT those files — that asymmetry is the
+///    whole of #5232. Every `warn!` would start "working" and the journal would
+///    stay exactly as blind.
+/// 2. With no log dir, [`init_tracer`] still falls through to stdout unless the
+///    `FREENET_LOG_TO_STDERR` env var happens to be set.
+///
+/// So this is explicit rather than configuration-dependent: **stderr, always**.
+/// Diagnostics belong there, it leaves the command's human-facing `println!`
+/// output on stdout, and systemd records both.
+///
+/// Deliberately minimal: no file appenders, no rate limiters. This is a
+/// process that runs for seconds and exits, and the output it must not lose is
+/// the handful of lines saying a safety mechanism did not engage.
+///
+/// `FREENET_DISABLE_LOGS` is still honoured, and `RUST_LOG` still overrides
+/// `level` via `from_env_lossy`.
+pub fn init_cli_stderr_tracer(level: LevelFilter) -> anyhow::Result<()> {
+    if std::env::var("FREENET_DISABLE_LOGS").is_ok() {
+        return Ok(());
+    }
+    let use_json = std::env::var("FREENET_LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    let filter_layer = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(level.into())
+        .from_env_lossy()
+        .add_directive("moka=off".parse().expect("infallible"))
+        .add_directive("sqlx=error".parse().expect("infallible"));
+
+    // ANSI only for a human at a terminal. journald stores what it is given
+    // byte for byte, so colouring unconditionally would write escape sequences
+    // into the journal — which is the destination this whole function exists to
+    // reach. The file layers in `init_tracer` set `.with_ansi(false)` for the
+    // same reason.
+    let ansi = std::io::stderr().is_terminal();
+
+    use tracing_subscriber::layer::SubscriberExt;
+    let registry = Registry::default().with(filter_layer);
+    // `compact` rather than the `pretty` multi-line format `init_stdout_tracer`
+    // uses: one journal entry per event is far easier to read (and to grep)
+    // than an event split across several.
+    let result = if use_json {
+        tracing::subscriber::set_global_default(
+            registry.with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_ansi(false)
+                    .with_writer(std::io::stderr),
+            ),
+        )
+    } else {
+        tracing::subscriber::set_global_default(
+            registry.with(
+                tracing_subscriber::fmt::layer()
+                    .compact()
+                    .with_ansi(ansi)
+                    .with_writer(std::io::stderr),
+            ),
+        )
+    };
+    // Returned, not `expect`ed. `init_stdout_tracer` panics here, which for a
+    // CLI would turn "a subscriber was already installed" into a failed update
+    // — trading a diagnostics problem for an outage.
+    result.map_err(|e| anyhow::anyhow!("could not install the CLI subscriber: {e}"))
+}
+
 fn init_stdout_tracer(
     _default_filter: LevelFilter,
     to_stderr: bool,

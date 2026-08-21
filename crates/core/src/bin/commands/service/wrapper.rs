@@ -645,8 +645,19 @@ pub(super) fn run_wrapper(version: &str) -> Result<()> {
 /// update subprocess silently fails to start and the wrapper falls into
 /// the exit-42 / update-failed / backoff-relaunch loop documented in
 /// #3934 (which was also the root cause of "Check for Updates" being
-/// broken in #3933). Null stdio is harmless on macOS/Linux because
-/// `--quiet` already suppresses all output.
+/// broken in #3933).
+///
+/// KNOWN GAP (#5244): nulling stderr also discards everything `freenet update`
+/// now reports about brick-safety — the WARN subscriber installed for the
+/// subcommand, and the two unconditional messages saying crash-loop rollback
+/// failed to arm. Under systemd those reach the journal; under this wrapper
+/// (Windows, and the macOS tray path) they go nowhere. `--quiet` no longer
+/// suppresses them, so the previous claim that nulling was harmless because
+/// "--quiet already suppresses all output" is no longer true. Fixing it means
+/// pointing stderr at the wrapper log (`log_wrapper_event`'s file) rather than
+/// at null — the Windows constraint above is about INHERITED invalid handles,
+/// not about needing null specifically — and threading a log dir through all
+/// five call sites.
 ///
 /// `post_stop_exit_code` is `Some(code)` ONLY when this update runs as part of
 /// the node's restart cycle (the node exited `code` and the wrapper is applying
