@@ -536,7 +536,56 @@ TimeoutStopSec=45
 # `freenet update` so #4073 can tell a post-stop restart from a manual update
 # and classify the crash; an OLD binary (e.g. one we rolled back TO) ignores the
 # unknown env var.
-ExecStopPost=-/bin/sh -c 'case "$$EXIT_STATUS" in 0|43) ;; *) {post_stop_env}="$$EXIT_STATUS" {binary} update --quiet ;; esac'
+#
+# A DELIBERATE STOP IS NOT A CRASH (#5227). The leading guard skips the hook when
+# systemd reports the unit's $SERVICE_RESULT as "success" AND $EXIT_CODE as
+# "killed" — i.e. systemd itself considers this a clean stop and the process died
+# from a signal rather than by exiting. Per `man systemd.exec` ($SERVICE_RESULT
+# table) that combination is precisely "killed by HUP/INT/TERM/PIPE under the
+# default disposition", which is what happens when a `systemctl stop` lands
+# BEFORE the node has installed its own SIGTERM handler (it is installed after
+# the redb open and contract-store load, which on a large gateway is not brief).
+# systemd then passes $EXIT_STATUS as the signal NAME "TERM"; the $EXIT_STATUS
+# case below has no arm for names, so it fell through to `*)` and rollback.rs
+# scored a clean stop as a post-update probation crash.
+#
+# The guard is narrow ON PURPOSE. This hook is not only the self-heal — it is
+# also what COUNTS crashes for the #4073 rollback, so an over-broad skip would
+# silently disarm rollback, which is worse than the bug it fixes. Every other
+# $SERVICE_RESULT still reaches `freenet update` and is still counted:
+#   "exit-code"       panic 101, fast-crash 45, early-startup error 1
+#   "signal"          ABRT/KILL etc. NOT sent as part of a stop job
+#   "core-dump"       SEGV, ABRT with a core
+#   "oom-kill"        $EXIT_CODE IS "killed", but the result is not "success"
+#   "timeout"         a stop that hung past TimeoutStopSec and was escalated
+#   "exec-condition"  ExecCondition= failed
+#   "protocol", "start-limit-hit", "resources"
+# ("watchdog" is also unaffected but is UNREACHABLE for these units: neither sets
+# WatchdogSec=. Do not cite it as evidence that the guard is narrow.)
+# The voluntary update exit 42 also still runs the updater: SuccessExitStatus=42
+# does make its $SERVICE_RESULT "success", but its $EXIT_CODE is "exited", not
+# "killed", so the guard does not match. On systemd < 232 $SERVICE_RESULT is unset,
+# the guard can never match, and the unit degrades to exactly the old behaviour.
+#
+# TWO CONSEQUENCES TO KEEP IN MIND BEFORE CHANGING ANYTHING NEARBY:
+#
+# 1. The node must NEVER die by SIGTERM/SIGINT/SIGHUP/SIGPIPE as a way of
+#    reporting a FAULT. systemd cannot tell who sent a signal, so all four are
+#    indistinguishable from an operator's stop and are now uncounted. There is
+#    no such path today (the fatal-listener and redb-poison aborts use
+#    `process::exit`, and Rust's runtime sets SIGPIPE to SIG_IGN). If you add
+#    one — `libc::raise`, restoring the default SIGPIPE disposition, an abort
+#    routed through TERM — that fault becomes permanently invisible to rollback.
+#    Exit with a CODE instead.
+#
+# 2. A release that HANGS in this pre-handler window (rather than crashing) no
+#    longer produces any rollback signal at all: it never exits, so
+#    StartLimitBurst never trips, and an operator's `systemctl stop` is now
+#    (correctly) not counted. That rescue path was an accident of the very
+#    ambiguity that caused #5227 and cannot be kept without reinstating the bug.
+#    Detecting a startup HANG needs a real mechanism — WatchdogSec=, or
+#    installing the signal handler before the heavy startup work — not this hook.
+ExecStopPost=-/bin/sh -c 'case "$$SERVICE_RESULT $$EXIT_CODE" in "success killed") exit 0 ;; esac; case "$$EXIT_STATUS" in 0|43) ;; *) {post_stop_env}="$$EXIT_STATUS" {binary} update --quiet ;; esac'
 # Exit 42 (auto-update) and 43 (another instance) are clean exits, so they are
 # not counted as failures — without this, rapid update cycles (exit 42 →
 # ExecStopPost → restart) could exhaust the burst limit and kill the service.
@@ -694,7 +743,56 @@ TimeoutStopSec=45
 # `freenet update` so #4073 can tell a post-stop restart from a manual update
 # and classify the crash; an OLD binary (e.g. one we rolled back TO) ignores the
 # unknown env var.
-ExecStopPost=-/bin/sh -c 'case "$$EXIT_STATUS" in 0|43) ;; *) {post_stop_env}="$$EXIT_STATUS" {binary} update --quiet ;; esac'
+#
+# A DELIBERATE STOP IS NOT A CRASH (#5227). The leading guard skips the hook when
+# systemd reports the unit's $SERVICE_RESULT as "success" AND $EXIT_CODE as
+# "killed" — i.e. systemd itself considers this a clean stop and the process died
+# from a signal rather than by exiting. Per `man systemd.exec` ($SERVICE_RESULT
+# table) that combination is precisely "killed by HUP/INT/TERM/PIPE under the
+# default disposition", which is what happens when a `systemctl stop` lands
+# BEFORE the node has installed its own SIGTERM handler (it is installed after
+# the redb open and contract-store load, which on a large gateway is not brief).
+# systemd then passes $EXIT_STATUS as the signal NAME "TERM"; the $EXIT_STATUS
+# case below has no arm for names, so it fell through to `*)` and rollback.rs
+# scored a clean stop as a post-update probation crash.
+#
+# The guard is narrow ON PURPOSE. This hook is not only the self-heal — it is
+# also what COUNTS crashes for the #4073 rollback, so an over-broad skip would
+# silently disarm rollback, which is worse than the bug it fixes. Every other
+# $SERVICE_RESULT still reaches `freenet update` and is still counted:
+#   "exit-code"       panic 101, fast-crash 45, early-startup error 1
+#   "signal"          ABRT/KILL etc. NOT sent as part of a stop job
+#   "core-dump"       SEGV, ABRT with a core
+#   "oom-kill"        $EXIT_CODE IS "killed", but the result is not "success"
+#   "timeout"         a stop that hung past TimeoutStopSec and was escalated
+#   "exec-condition"  ExecCondition= failed
+#   "protocol", "start-limit-hit", "resources"
+# ("watchdog" is also unaffected but is UNREACHABLE for these units: neither sets
+# WatchdogSec=. Do not cite it as evidence that the guard is narrow.)
+# The voluntary update exit 42 also still runs the updater: SuccessExitStatus=42
+# does make its $SERVICE_RESULT "success", but its $EXIT_CODE is "exited", not
+# "killed", so the guard does not match. On systemd < 232 $SERVICE_RESULT is unset,
+# the guard can never match, and the unit degrades to exactly the old behaviour.
+#
+# TWO CONSEQUENCES TO KEEP IN MIND BEFORE CHANGING ANYTHING NEARBY:
+#
+# 1. The node must NEVER die by SIGTERM/SIGINT/SIGHUP/SIGPIPE as a way of
+#    reporting a FAULT. systemd cannot tell who sent a signal, so all four are
+#    indistinguishable from an operator's stop and are now uncounted. There is
+#    no such path today (the fatal-listener and redb-poison aborts use
+#    `process::exit`, and Rust's runtime sets SIGPIPE to SIG_IGN). If you add
+#    one — `libc::raise`, restoring the default SIGPIPE disposition, an abort
+#    routed through TERM — that fault becomes permanently invisible to rollback.
+#    Exit with a CODE instead.
+#
+# 2. A release that HANGS in this pre-handler window (rather than crashing) no
+#    longer produces any rollback signal at all: it never exits, so
+#    StartLimitBurst never trips, and an operator's `systemctl stop` is now
+#    (correctly) not counted. That rescue path was an accident of the very
+#    ambiguity that caused #5227 and cannot be kept without reinstating the bug.
+#    Detecting a startup HANG needs a real mechanism — WatchdogSec=, or
+#    installing the signal handler before the heavy startup work — not this hook.
+ExecStopPost=-/bin/sh -c 'case "$$SERVICE_RESULT $$EXIT_CODE" in "success killed") exit 0 ;; esac; case "$$EXIT_STATUS" in 0|43) ;; *) {post_stop_env}="$$EXIT_STATUS" {binary} update --quiet ;; esac'
 # Exit 42 (auto-update) and 43 (another instance) are clean exits, so they are
 # not counted as failures — without this, rapid update cycles (exit 42 →
 # ExecStopPost → restart) could exhaust the burst limit and kill the service.
@@ -1033,14 +1131,17 @@ mod tests {
 
     #[test]
     fn systemd_units_pass_node_exit_code_to_post_stop_update() {
-        // #4073 crash-loop auto-rollback: ExecStopPost must (a) fire on ANY
-        // non-graceful exit (every status except 0 and 43) so panics / signals /
-        // early errors are covered, and (b) forward the node's stop status to
-        // `freenet update` via the env var so the updater can classify the
-        // crash. systemd escapes `$$` to a literal `$`.
+        // #4073 crash-loop auto-rollback: ExecStopPost must (a) fire on any
+        // non-graceful exit — every status except 0 and 43, and, since #5227,
+        // except a deliberate stop identified by $SERVICE_RESULT (see
+        // `exec_stop_post_counts_crashes_and_skips_deliberate_stops` for the
+        // full decision matrix) — so panics / signals / early errors are
+        // covered, and (b) forward the node's stop status to `freenet update`
+        // via the env var so the updater can classify the crash. systemd
+        // escapes `$$` to a literal `$`.
         let env = super::super::super::rollback::POST_STOP_EXIT_CODE_ENV_VAR;
-        // Broadened guard: skip only 0 and 43; run update (with the status
-        // forwarded) for everything else.
+        // Skip 0 and 43; run update (with the status forwarded) for everything
+        // else that gets past the #5227 deliberate-stop guard.
         let expected = format!(r#"case "$$EXIT_STATUS" in 0|43) ;; *) {env}="$$EXIT_STATUS""#);
         let user_unit = generate_user_service_file(
             Path::new("/usr/local/bin/freenet"),
@@ -1064,6 +1165,374 @@ mod tests {
                 "{name} unit still uses the narrow 42|45 ExecStopPost guard, missing \
                  panic/signal/early-error crashes (#4073 M1)"
             );
+            // #5227: the deliberate-stop variables must ALSO be doubled. A
+            // single-`$` revert is invisible to the decision-matrix test — it
+            // un-doubles `$$` before running the script, so both spellings
+            // produce identical text there — which is exactly why the doubling
+            // is pinned here, on the raw template, alongside $$EXIT_STATUS.
+            for var in ["$$SERVICE_RESULT", "$$EXIT_CODE"] {
+                assert!(
+                    unit.contains(var),
+                    "{name} unit must use the doubled {var} so systemd passes a literal \
+                     ${} through to sh (a single-$ revert makes the guard compare empty \
+                     strings, so a deliberate stop is counted as a crash again, #5227)",
+                    var.trim_start_matches('$')
+                );
+            }
+        }
+    }
+
+    // ── ExecStopPost decision matrix, executed against a real /bin/sh ──────
+    //
+    // The hook does TWO jobs: it self-heals (#4549) and it COUNTS crashes for
+    // the #4073 post-update rollback. So the interesting property is not "a
+    // deliberate stop is skipped" on its own — a test pinning only that would
+    // stay green if someone disabled crash counting outright. Every case below
+    // asserts the decision in BOTH directions, and the crash cases are the
+    // load-bearing half.
+    //
+    // Rather than string-matching the template we extract the script systemd
+    // would hand to `/bin/sh`, undo systemd's `$$` escaping, and actually run it
+    // with the environment systemd documents for each scenario. That exercises
+    // the real shell quoting/`case` semantics; only systemd's own choice of
+    // variable VALUES is modelled, and those come straight from the
+    // `$SERVICE_RESULT` table in `man systemd.exec`.
+
+    /// Extract the `/bin/sh -c '<script>'` body from a unit's `ExecStopPost=`
+    /// line, undoing systemd's `$$` → `$` escaping.
+    fn exec_stop_post_script(unit: &str) -> String {
+        let line = unit
+            .lines()
+            .find(|l| l.starts_with("ExecStopPost="))
+            .expect("unit must contain an ExecStopPost= line");
+        let start = line
+            .find('\'')
+            .expect("ExecStopPost must single-quote its script for systemd");
+        let end = line
+            .rfind('\'')
+            .expect("ExecStopPost script must be closed by a single quote");
+        assert!(end > start, "ExecStopPost script must not be empty");
+        line[start + 1..end].replace("$$", "$")
+    }
+
+    /// One row of the systemd `$SERVICE_RESULT` table (`man systemd.exec`).
+    struct StopPostCase {
+        /// What produced this combination on a real node.
+        scenario: &'static str,
+        /// `None` models systemd < 232, where the variable is not set at all.
+        service_result: Option<&'static str>,
+        /// `None` models the results for which systemd sets neither $EXIT_CODE
+        /// nor $EXIT_STATUS, because it never identified a main process
+        /// ("protocol", "start-limit-hit").
+        exit_code: Option<&'static str>,
+        exit_status: Option<&'static str>,
+        /// Must `freenet update` run (i.e. must this stop be counted / healed)?
+        expect_update: bool,
+    }
+
+    /// Run the extracted hook under `/bin/sh` with one scenario's environment.
+    /// Returns whether the hook invoked the (faked) `freenet update`, and the
+    /// `$EXIT_STATUS` it forwarded through the env var when it did.
+    fn run_hook(script: &str, dir: &Path, case: &StopPostCase) -> (bool, String) {
+        let marker = dir.join("update-ran");
+        let _ = std::fs::remove_file(&marker);
+
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg(script);
+        // systemd sets exactly these three; start from a known-clean slate so an
+        // inherited value from the test runner cannot mask a missing guard.
+        cmd.env_remove("SERVICE_RESULT");
+        cmd.env_remove("EXIT_CODE");
+        cmd.env_remove("EXIT_STATUS");
+        if let Some(v) = case.service_result {
+            cmd.env("SERVICE_RESULT", v);
+        }
+        if let Some(v) = case.exit_code {
+            cmd.env("EXIT_CODE", v);
+        }
+        if let Some(v) = case.exit_status {
+            cmd.env("EXIT_STATUS", v);
+        }
+
+        let status = cmd.status().expect("failed to spawn /bin/sh");
+        assert!(
+            status.success(),
+            "ExecStopPost script exited {status} for scenario {:?}. A shell syntax error \
+             here would make systemd skip the hook (and thus crash counting) on every \
+             stop. Status 126 instead means the stand-in binary could not be executed \
+             (a noexec $TMPDIR), which is an environment problem, not a template bug.",
+            case.scenario
+        );
+
+        match std::fs::read_to_string(&marker) {
+            Ok(forwarded) => (true, forwarded.trim().to_string()),
+            Err(_) => (false, String::new()),
+        }
+    }
+
+    /// Write a stand-in for the `freenet` binary that records that it ran and
+    /// which `$EXIT_STATUS` the hook forwarded to it.
+    fn write_fake_binary(dir: &Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("freenet");
+        let marker = dir.join("update-ran");
+        // Read the forwarded status through the SAME constant the template
+        // interpolates, so a rename cannot leave this test silently checking a
+        // variable nothing sets.
+        let env = super::super::super::rollback::POST_STOP_EXIT_CODE_ENV_VAR;
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"${env}\" > '{}'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    /// #5227 / #4073. A deliberate `systemctl stop` must NOT be counted as a
+    /// crash even when the SIGTERM lands before the node installs its own
+    /// handler (so the process dies under the default disposition and systemd
+    /// reports `$EXIT_STATUS` as the signal NAME "TERM") — while every genuine
+    /// fault MUST still reach `freenet update`, because that hook is what counts
+    /// crashes for the post-update rollback.
+    #[test]
+    fn exec_stop_post_counts_crashes_and_skips_deliberate_stops() {
+        let cases = [
+            // ── Deliberate stops: must NOT be counted ──────────────────────
+            StopPostCase {
+                scenario: "systemctl stop, node handled SIGTERM and exited 0",
+                service_result: Some("success"),
+                exit_code: Some("exited"),
+                exit_status: Some("0"),
+                expect_update: false,
+            },
+            StopPostCase {
+                // The #5227 regression: SIGTERM before the handler is installed.
+                scenario: "systemctl stop during startup, killed by SIGTERM (default disposition)",
+                service_result: Some("success"),
+                exit_code: Some("killed"),
+                exit_status: Some("TERM"),
+                expect_update: false,
+            },
+            StopPostCase {
+                scenario: "Ctrl+C / SIGINT before the handler is installed",
+                service_result: Some("success"),
+                exit_code: Some("killed"),
+                exit_status: Some("INT"),
+                expect_update: false,
+            },
+            // HUP and PIPE complete the "success"/"killed" cell of the
+            // $SERVICE_RESULT table, so the guard covers them too. Recorded
+            // explicitly rather than left implicit: this IS a widening of what
+            // counts as a deliberate stop, and it is only safe while the node
+            // never dies by one of these signals to report a fault (see the
+            // "TWO CONSEQUENCES" note on the ExecStopPost line). Neither is
+            // reachable today — systemd sends TERM, and Rust sets SIGPIPE to
+            // SIG_IGN — but if that changes, this decision must be revisited.
+            StopPostCase {
+                scenario: "killed by SIGHUP under the default disposition",
+                service_result: Some("success"),
+                exit_code: Some("killed"),
+                exit_status: Some("HUP"),
+                expect_update: false,
+            },
+            StopPostCase {
+                scenario: "killed by SIGPIPE under the default disposition",
+                service_result: Some("success"),
+                exit_code: Some("killed"),
+                exit_status: Some("PIPE"),
+                expect_update: false,
+            },
+            StopPostCase {
+                scenario: "another instance already holds the port (exit 43)",
+                service_result: Some("success"),
+                exit_code: Some("exited"),
+                exit_status: Some("43"),
+                expect_update: false,
+            },
+            // ── Faults and the voluntary update: MUST still run the hook ───
+            StopPostCase {
+                // Load-bearing: SuccessExitStatus=42 makes systemd call this
+                // result "success" too, so a guard keyed on $SERVICE_RESULT
+                // ALONE would silently disable auto-update entirely.
+                scenario: "voluntary update-needed exit 42",
+                service_result: Some("success"),
+                exit_code: Some("exited"),
+                exit_status: Some("42"),
+                expect_update: true,
+            },
+            StopPostCase {
+                scenario: "panic (exit 101)",
+                service_result: Some("exit-code"),
+                exit_code: Some("exited"),
+                exit_status: Some("101"),
+                expect_update: true,
+            },
+            StopPostCase {
+                scenario: "fast crash / boot wedge (exit 45, #4551)",
+                service_result: Some("exit-code"),
+                exit_code: Some("exited"),
+                exit_status: Some("45"),
+                expect_update: true,
+            },
+            StopPostCase {
+                scenario: "early startup error (exit 1)",
+                service_result: Some("exit-code"),
+                exit_code: Some("exited"),
+                exit_status: Some("1"),
+                expect_update: true,
+            },
+            StopPostCase {
+                scenario: "SIGSEGV with core dump",
+                service_result: Some("core-dump"),
+                exit_code: Some("dumped"),
+                exit_status: Some("SEGV"),
+                expect_update: true,
+            },
+            StopPostCase {
+                scenario: "SIGABRT",
+                service_result: Some("signal"),
+                exit_code: Some("killed"),
+                exit_status: Some("ABRT"),
+                expect_update: true,
+            },
+            StopPostCase {
+                // $EXIT_CODE is "killed" here too — proof the guard needs BOTH
+                // variables and cannot key on the disposition alone.
+                scenario: "OOM killer",
+                service_result: Some("oom-kill"),
+                exit_code: Some("killed"),
+                exit_status: Some("KILL"),
+                expect_update: true,
+            },
+            StopPostCase {
+                // Likewise "killed", but a hung shutdown is a fault. systemd
+                // documents both TERM and KILL for a timeout; a local systemd
+                // 255 probe produced KILL, so both are covered.
+                scenario: "shutdown hung past TimeoutStopSec, escalated to SIGKILL",
+                service_result: Some("timeout"),
+                exit_code: Some("killed"),
+                exit_status: Some("KILL"),
+                expect_update: true,
+            },
+            StopPostCase {
+                scenario: "shutdown timed out while systemd was still on SIGTERM",
+                service_result: Some("timeout"),
+                exit_code: Some("killed"),
+                exit_status: Some("TERM"),
+                expect_update: true,
+            },
+            StopPostCase {
+                // Unreachable for these units (neither sets WatchdogSec=), kept
+                // so that adding WatchdogSec= later does not silently land in
+                // an untested arm.
+                scenario: "watchdog keep-alive deadline missed",
+                service_result: Some("watchdog"),
+                exit_code: Some("killed"),
+                exit_status: Some("TERM"),
+                expect_update: true,
+            },
+            StopPostCase {
+                scenario: "ExecCondition= failed",
+                service_result: Some("exec-condition"),
+                exit_code: Some("exited"),
+                exit_status: Some("1"),
+                expect_update: true,
+            },
+            // ── Results for which systemd identifies no main process, so it
+            // sets NEITHER $EXIT_CODE nor $EXIT_STATUS. The hook still fires and
+            // forwards an EMPTY status; `rollback::post_stop_status_from_env`
+            // maps empty to None, so nothing is counted. That is pre-existing
+            // behaviour, unchanged here — pinned so the guard cannot quietly
+            // start swallowing these instead.
+            StopPostCase {
+                scenario: "protocol violation (no main process identified)",
+                service_result: Some("protocol"),
+                exit_code: None,
+                exit_status: None,
+                expect_update: true,
+            },
+            StopPostCase {
+                scenario: "start limit hit (#4551 terminal stop)",
+                service_result: Some("start-limit-hit"),
+                exit_code: None,
+                exit_status: None,
+                expect_update: true,
+            },
+            // ── systemd < 232 has no $SERVICE_RESULT: degrade to the old rule ──
+            StopPostCase {
+                scenario: "legacy systemd (<232), no $SERVICE_RESULT, clean exit 0",
+                service_result: None,
+                exit_code: None,
+                exit_status: Some("0"),
+                expect_update: false,
+            },
+            StopPostCase {
+                scenario: "legacy systemd (<232), no $SERVICE_RESULT, panic",
+                service_result: None,
+                exit_code: None,
+                exit_status: Some("101"),
+                expect_update: true,
+            },
+            StopPostCase {
+                // The #5227 case as an OLD systemd would report it: no
+                // $SERVICE_RESULT means the guard cannot fire, so the stop is
+                // still (wrongly) counted. Pinned to keep the degradation
+                // honest rather than implying <232 is covered.
+                scenario: "legacy systemd (<232), no $SERVICE_RESULT, killed by SIGTERM",
+                service_result: None,
+                exit_code: None,
+                exit_status: Some("TERM"),
+                expect_update: true,
+            },
+        ];
+
+        for unit_kind in ["user", "system"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let bin = write_fake_binary(tmp.path());
+            let log_dir = tmp.path().join("logs");
+
+            let unit = match unit_kind {
+                "user" => generate_user_service_file(&bin, &log_dir),
+                _ => generate_system_service_file(&bin, &log_dir, "testuser", tmp.path()),
+            };
+            let script = exec_stop_post_script(&unit);
+
+            for case in &cases {
+                let (ran, forwarded) = run_hook(&script, tmp.path(), case);
+                assert_eq!(
+                    ran,
+                    case.expect_update,
+                    "{unit_kind} unit, scenario {:?} (SERVICE_RESULT={:?} EXIT_CODE={:?} \
+                     EXIT_STATUS={:?}): expected `freenet update` to {}, but it {}. \
+                     Skipping a genuine fault silently disarms the #4073 crash-loop rollback.",
+                    case.scenario,
+                    case.service_result,
+                    case.exit_code,
+                    case.exit_status,
+                    if case.expect_update {
+                        "run"
+                    } else {
+                        "be skipped"
+                    },
+                    if ran { "ran" } else { "was skipped" },
+                );
+                if ran {
+                    // When systemd identified no main process it sets no
+                    // $EXIT_STATUS, and the hook forwards an empty string;
+                    // `rollback::post_stop_status_from_env` maps that to None.
+                    assert_eq!(
+                        forwarded,
+                        case.exit_status.unwrap_or(""),
+                        "{unit_kind} unit, scenario {:?}: the hook must forward the node's \
+                         stop status to `freenet update` so #4073 can classify it",
+                        case.scenario
+                    );
+                }
+            }
         }
     }
 }
