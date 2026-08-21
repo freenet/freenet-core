@@ -1480,6 +1480,232 @@ mod tests {
         assert!(finish_run(Ok(()), false).is_ok());
     }
 
+    /// Whitespace-stripped view of source text, so a source-scrape pin survives
+    /// `rustfmt` re-wrapping a call across lines (`shutdown_requested\n
+    /// .store(..)` would otherwise stop matching a contiguous needle).
+    fn squeeze(src: &str) -> String {
+        src.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// The part of this file BEFORE its `#[cfg(test)] mod tests`, i.e. production
+    /// code only.
+    ///
+    /// A pin that counts occurrences across the whole file counts its own
+    /// assertion literals too (`include_str!` pulls in the test module), so it
+    /// can never assert "exactly once". Cutting the region here is a structural
+    /// fix rather than the `concat!("a", "b")` needle-splitting used elsewhere in
+    /// this module, which only holds until someone writes the contiguous string.
+    ///
+    /// `.expect`, not a silent fallback: if the attribute stops matching, the
+    /// region would widen to the whole file and the pin would pass vacuously.
+    /// Refuse instead. (Same fail-closed reasoning as `commands::auto_update`'s
+    /// `fn_body`; see `.claude/rules/bug-prevention-patterns.md`.)
+    ///
+    /// Uniqueness is asserted rather than taking the first match: a second
+    /// `#[cfg(test)] mod` added ABOVE this one would truncate the region early
+    /// and hide any production code below it — fail-OPEN in exactly the
+    /// direction a bounded region exists to protect.
+    fn production_region(src: &str) -> &str {
+        let anchor = "\n#[cfg(test)]\nmod ";
+        assert_eq!(
+            src.matches(anchor).count(),
+            1,
+            "expected exactly one `#[cfg(test)] mod` in this file — the region this \
+             pin counts over is bounded by it, and an earlier one would truncate \
+             the region and hide production code"
+        );
+        let tests_at = src
+            .find(anchor)
+            .expect("test module not located — this pin cannot bound anything");
+        &src[..tests_at]
+    }
+
+    /// Slice `src` from `opener` (which must end at the block's `{`) to its
+    /// brace-matched close.
+    ///
+    /// Panics when the anchor is missing or the braces never balance, so a moved
+    /// anchor fails LOUDLY rather than silently widening the scoped region —
+    /// the #5102 failure mode that shipped twice.
+    fn braced_block<'a>(src: &'a str, opener: &str) -> &'a str {
+        delimited_block(src, opener, '{', '}')
+    }
+
+    /// As `braced_block`, for an arbitrary delimiter pair — used to slice a call's
+    /// argument list, where asserting on a substring would let a widened
+    /// expression through (`shutdown_requested.load(..) || whatever`).
+    fn delimited_block<'a>(src: &'a str, opener: &str, open: char, close: char) -> &'a str {
+        assert!(
+            opener.ends_with(open),
+            "opener must end at the opening delimiter: {opener}"
+        );
+        let at = src
+            .find(opener)
+            .unwrap_or_else(|| panic!("block anchor not found: {opener}"));
+        let body_start = at + opener.len();
+        let mut depth = 1usize;
+        for (i, c) in src[body_start..].char_indices() {
+            if c == open {
+                depth += 1;
+            } else if c == close {
+                depth -= 1;
+                if depth == 0 {
+                    return &src[body_start..body_start + i];
+                }
+            }
+        }
+        panic!("delimiters never balanced after: {opener}");
+    }
+
+    /// #5230 rests entirely on `shutdown_requested` meaning EXACTLY "an operator
+    /// asked THIS process to stop". `finish_run` maps
+    /// `EventLoopExitReason::GracefulShutdown` to a success exit only when that
+    /// flag is set, because the identical sentinel is ALSO raised by faults — a
+    /// dead critical `p2p_protoc` channel, or `client_events` losing every client
+    /// transport. Those must keep exiting non-zero, or systemd skips the unit's
+    /// `ExecStopPost` self-heal and the macOS/Windows wrappers read "normal
+    /// shutdown" and leave the node DOWN.
+    ///
+    /// The whole discrimination therefore depends on there being exactly ONE
+    /// place that sets the flag. `finish_run_maps_only_a_requested_graceful_stop_to_success`
+    /// above takes it as a parameter, so it cannot see WHERE it is set: a second
+    /// store elsewhere would launder a fault into a success exit — the node exits
+    /// 0, looks healthy, and stays dead — with the entire suite green. The
+    /// tempting site is the auto-update arm of the `select!` in
+    /// `run_network_node_with_signals`, which also calls `shutdown_handle
+    /// .shutdown()` but is NOT an operator stop (it must keep exiting 42).
+    ///
+    /// So: the flag is mentioned in production only in the four ways below, its
+    /// one store is in the signal-handler task, and it happens only after a
+    /// signal has actually arrived.
+    ///
+    /// The check is CLOSED-WORLD — an enumeration of every permitted mention —
+    /// rather than a blocklist of forbidden spellings. A blocklist was the first
+    /// attempt and it leaked badly: `(*shutdown_requested).store(..)`,
+    /// `shutdown_requested.as_ref().store(..)`, and passing `&shutdown_requested`
+    /// to a helper that stores through it all raise the flag while matching no
+    /// banned string. Enumerating what is ALLOWED needs no foresight about how
+    /// the next author might spell it.
+    #[test]
+    fn shutdown_requested_is_stored_only_by_the_signal_handler() {
+        let src = strip_line_comments(include_str!("freenet.rs"));
+        let prod = production_region(&src);
+        let signal_task = squeeze(braced_block(prod, "let signal_task = {"));
+
+        // Anti-vacuity: if brace matching ran past the block, these markers from
+        // later in `run_network_node_with_signals` would be inside it, and the
+        // containment assertion below would prove nothing. `update_tx` and
+        // `startup_update_check` bound the NEAR side of an over-run (the update
+        // loop, immediately after this block); the rest bound the far side.
+        for escaped in [
+            "update_tx",
+            "startup_update_check",
+            "run_network_node(",
+            "UpdateNeededError",
+            "finish_run(",
+        ] {
+            assert!(
+                !signal_task.contains(&squeeze(escaped)),
+                "the scoped signal-task block escaped its braces (found `{escaped}`) — \
+                 this pin would pass vacuously"
+            );
+        }
+        // Anti-vacuity, other direction: confirm we scoped the right block. The
+        // marker must be one the TEMPTING block does not share — awaiting a
+        // signal is unique to this task, whereas `shutdown_handle.shutdown()`
+        // appears in the auto-update arm too and so would not discriminate. A set
+        // rather than one literal, so extracting the cfg-gated wait into a helper
+        // (a legitimate refactor) does not panic with a misleading message.
+        let awaits_a_signal = ["ctrl_c()", "sigterm.recv()", "shutdown_signal("]
+            .iter()
+            .filter_map(|m| signal_task.rfind(&squeeze(m)))
+            .max()
+            .expect("scoped block is not the signal-handler task: it awaits no signal");
+
+        // Every mention of the flag in production, in source order, identified by
+        // what FOLLOWS it. Anything else — any spelling, any new call site, any
+        // borrow handed to a helper — changes this list and fails.
+        let flat = squeeze(prod);
+        let follows: Vec<String> = flat
+            .split("shutdown_requested")
+            .skip(1)
+            .map(|after| after.chars().take(13).collect())
+            .collect();
+        let expected = [
+            // The `Arc<AtomicBool>` in `run_network_node_with_signals`:
+            "=Arc::new(std", // the declaration
+            "=Arc::clone(&", // the signal task's own handle
+            ");GlobalExecu", // ... the argument to that clone
+            ".store(true,s", // THE one write, in the signal task
+            ".load(std::sy", // the read that feeds `finish_run`
+            // `finish_run`'s parameter of the same name is a DISTINCT binding, a
+            // plain `bool`, so it cannot raise the flag:
+            ":bool)->anyho", // the parameter
+            "&&freenet::li", // the guard that consumes it
+        ];
+        assert_eq!(
+            follows, expected,
+            "production mentions `shutdown_requested` in a way this pin does not \
+             recognise. Every mention is enumerated on purpose: a new one is a new \
+             way to raise the flag (`(*flag).store(..)`, `flag.as_ref().store(..)`, \
+             `helper(&flag)`, `swap`/`fetch_or`/`compare_exchange`, a second \
+             `Arc::clone`), and raising it outside an operator stop makes \
+             `finish_run` report a FAULT as a clean exit 0 — the service manager \
+             skips its self-heal and the node stays dead (#5230). If the change is \
+             legitimate, extend the list deliberately"
+        );
+
+        let store_at = signal_task
+            .find(&squeeze("shutdown_requested.store("))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the one store must live in the signal-handler task, which is \
+                     the only place that knows an operator (SIGTERM/SIGINT) asked \
+                     us to stop (#5230)"
+                )
+            });
+        // Location alone is not the invariant: a store hoisted ABOVE the signal
+        // await would still sit inside this block, yet would raise the flag
+        // unconditionally at startup and launder EVERY fault into a clean exit 0.
+        assert!(
+            store_at > awaits_a_signal,
+            "the store must come AFTER the signal await, not before it — a hoisted \
+             store raises the flag at startup, so every fault exits 0 (#5230)"
+        );
+    }
+
+    /// The write site is only half of #5230: `finish_run` must be FED the flag.
+    ///
+    /// `finish_run(result, true)` reopens the identical hole without touching the
+    /// store, and so does widening the argument
+    /// (`shutdown_requested.load(..) || transports_lost`) — which is not
+    /// hypothetical, since lost client transports are one of the two faults that
+    /// must keep exiting non-zero. No other test covers this: the truth-table test
+    /// takes the bool as a parameter and `tests/graceful_shutdown_exit_code.rs`
+    /// drives it with a real signal.
+    ///
+    /// So the whole argument list is matched, not a prefix of it.
+    #[test]
+    fn finish_run_is_fed_the_live_shutdown_flag() {
+        let src = strip_line_comments(include_str!("freenet.rs"));
+        let prod = production_region(&src);
+        // `= finish_run(` is the CALL; `fn finish_run(` is the definition. Keying
+        // on the `=` identifies the call wherever it sits in the file.
+        let args = squeeze(delimited_block(prod, "= finish_run(", '(', ')'));
+        assert!(
+            args.contains(&squeeze("shutdown_requested.load(")),
+            "`finish_run` must receive the live `shutdown_requested` flag — a \
+             constant would make every fault exit 0 (#5230); got `{args}`"
+        );
+        for widened in ["||", "&&", "true", "false"] {
+            assert!(
+                !args.contains(widened),
+                "`finish_run`'s argument must be the flag ALONE: `{widened}` widens \
+                 the operator-stop test to cover something else, which is the #5230 \
+                 fault-laundering hole in a new spelling; got `{args}`"
+            );
+        }
+    }
+
     #[test]
     fn auto_update_default_stays_enabled_flag_and_dirty_disable() {
         use super::auto_update_is_disabled;
