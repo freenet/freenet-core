@@ -555,7 +555,20 @@ mod tests {
         snap.open_connections = 3;
         let html = build_status_card(&Some(snap));
         assert!(html.contains("health-good"), "healthy banner missing");
-        assert!(html.contains("Node is healthy"));
+        // Superseded by #5370: the banner no longer declares the node healthy.
+        // Four live v0.2.128 peers showed "Node is healthy" while answering
+        // between 1.3% and 89% of their GETs, because the four inputs behind
+        // the verdict are all connectivity and none of them can see whether
+        // the node serves reads. The banner now states the connection count,
+        // which is a fact, and the measured GET rate carries the rest.
+        assert!(
+            html.contains("Connected to 3 peers"),
+            "the healthy state must still state its connection count, got: {html}"
+        );
+        assert!(
+            !html.contains("Node is healthy"),
+            "the verdict must not come back, got: {html}"
+        );
 
         // Degraded
         let mut snap = base_snapshot();
@@ -3128,6 +3141,124 @@ mod tests {
     // either survives the 5s `<main>` swap. A green run here is compatible
     // with the feature being completely broken in a browser. The behaviour is
     // covered by driving a real node with Playwright; see the PR.
+
+    // ─── GET success rate (#5370) ───────────────────────────────────────
+
+    /// The banner must not call the node healthy.
+    ///
+    /// It did, on four connectivity inputs that say nothing about whether the
+    /// node can serve reads: four live v0.2.128 peers displayed "Node is
+    /// healthy" while answering between 1.3% and 89% of their GETs. A verdict
+    /// is an assertion, and unsupported assertions are what this page keeps
+    /// getting wrong. The connection COUNT is a fact and stays.
+    #[test]
+    fn status_card_states_connections_instead_of_declaring_health() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 5;
+        snap.health = crate::node::network_status::HealthLevel::Healthy;
+        let html = build_status_card(&Some(snap));
+
+        assert!(
+            !html.contains("is healthy"),
+            "the banner must not declare the node healthy — got:\n{html}"
+        );
+        assert!(
+            html.contains("Connected to 5 peers"),
+            "the connection count is a fact and must survive — got:\n{html}"
+        );
+    }
+
+    /// A percentage over a handful of requests is theatre.
+    ///
+    /// Peers issue only a few GETs an hour, so a fresh node sits at a tiny
+    /// denominator for a long time. At two requests one outcome moves the
+    /// figure fifty points, which looks like a measurement and is not.
+    #[test]
+    fn get_success_rate_refuses_to_rate_a_tiny_sample() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 3;
+        snap.health = crate::node::network_status::HealthLevel::Healthy;
+        snap.elapsed_secs = 600;
+        snap.op_stats.gets = (1, 1);
+        let html = build_status_card(&Some(snap));
+
+        assert!(
+            html.contains("too few to rate"),
+            "a 2-request sample must not be rendered as a percentage — \
+             got:\n{html}"
+        );
+        assert!(
+            !html.contains("50%"),
+            "and specifically not as 50% — got:\n{html}"
+        );
+        assert!(
+            html.contains("1 of 2"),
+            "the counts are still worth showing — got:\n{html}"
+        );
+    }
+
+    /// The number the whole change exists to surface.
+    ///
+    /// The production gateway in #5370 answered 2 of 153 GETs and displayed
+    /// "Node is healthy". It must now read 1%.
+    #[test]
+    fn get_success_rate_reports_the_measured_share() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 12;
+        snap.health = crate::node::network_status::HealthLevel::Healthy;
+        snap.elapsed_secs = 3600 * 5;
+        snap.op_stats.gets = (2, 151);
+        let html = build_status_card(&Some(snap));
+
+        assert!(
+            html.contains("1%"),
+            "2 of 153 is 1% and must be shown as such — got:\n{html}"
+        );
+        assert!(
+            html.contains("2 of 153 requests"),
+            "the sample size must accompany the percentage, so the reader can \
+             tell 1% of 153 from 1% of 3 — got:\n{html}"
+        );
+        assert!(
+            html.contains("since start"),
+            "the figure is lifetime, not a recent window, and must say so — \
+             got:\n{html}"
+        );
+    }
+
+    /// The rate must not be styled as a verdict.
+    ///
+    /// Colouring it green or red would reintroduce through CSS exactly the
+    /// judgement the change removed from the markup — and the threshold for
+    /// that colour is the number nobody could justify picking, which is why
+    /// the verdict went in the first place.
+    #[test]
+    fn get_success_rate_carries_no_pass_fail_styling() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 4;
+        snap.health = crate::node::network_status::HealthLevel::Healthy;
+        snap.elapsed_secs = 3600;
+        snap.op_stats.gets = (10, 90);
+        let html = build_status_card(&Some(snap));
+
+        let line_start = html
+            .find("get-success-rate")
+            .expect("the rate line must be rendered");
+        let line = &html[line_start..html[line_start..].find("</p>").unwrap() + line_start];
+        for verdict_class in [
+            "health-good",
+            "health-trouble",
+            "health-degraded",
+            "op-ok",
+            "op-fail",
+        ] {
+            assert!(
+                !line.contains(verdict_class),
+                "the rate line must not carry the pass/fail class \
+                 `{verdict_class}` — got:\n{line}"
+            );
+        }
+    }
 
     // ─── Contract detail page (#5369) ───────────────────────────────────
 

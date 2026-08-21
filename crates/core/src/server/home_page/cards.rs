@@ -1,5 +1,50 @@
 use super::*;
 
+/// Contracts read successfully, as a measured rate rather than a verdict.
+///
+/// Deliberately reports the LIFETIME rate with the period it covers, not a
+/// recent window, and that is a data constraint rather than a shortcut.
+/// Measured on three live nodes: a hosted-mode peer did 101 GETs in 17h55m
+/// (~5.6/hour), a gateway 7 in 28m (~15/hour), and a third none at all. A
+/// fifteen-minute window would hold one to four requests, and even an hour
+/// holds about six, where a single failure moves the number seventeen points.
+/// A window short enough to mean "now" is empty almost all the time, so it
+/// would report nothing far more often than it reported anything.
+///
+/// The cost of using lifetime is real and worth naming: a node broken early
+/// and fine since shows a blended figure. The uptime is printed alongside so
+/// the reader can see what the number covers, and `record_op_result` keeps no
+/// history that would allow better.
+fn build_get_success_line(snap: &network_status::NetworkStatusSnapshot) -> String {
+    let (ok, failed) = snap.op_stats.gets;
+    let total = ok.saturating_add(failed);
+    let period = format_duration(snap.elapsed_secs);
+
+    // Below this, a percentage is theatre: at one or two requests it swings by
+    // fifty points per outcome. Show the counts and say why there is no rate,
+    // rather than printing a number that looks like a measurement.
+    const MIN_SAMPLE: u32 = 20;
+
+    let body = if total == 0 {
+        "<span class=\"gsr-none\">no GETs yet</span>".to_string()
+    } else if total < MIN_SAMPLE {
+        format!(
+            r#"<span class="gsr-none">too few to rate</span> <span class="gsr-detail">{ok} of {total} succeeded in {period}</span>"#
+        )
+    } else {
+        let pct = (ok as f64 / total as f64) * 100.0;
+        format!(
+            r#"<span class="gsr-value">{pct:.0}%</span> <span class="gsr-detail">{ok} of {total} requests, since start &middot; {period}</span>"#
+        )
+    };
+
+    format!(
+        r#"<p class="get-success-rate" title="The share of this node's own GET requests that returned state, over the whole time it has been running. Not a recent window: peers issue only a handful of GETs an hour, so a short window would usually be empty. A GET that dead-ends counts as a failure.">
+            <span class="gsr-label">GET success</span> {body}
+        </p>"#
+    )
+}
+
 pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> String {
     let Some(snap) = snap else {
         return r#"<div class="card">
@@ -13,12 +58,22 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
     // Health banner — the primary "everything looks good" indicator
     let health_banner = match snap.health {
         network_status::HealthLevel::Healthy => {
+            // Deliberately NOT a verdict. This used to read "Node is healthy",
+            // with a tick, on the strength of four connectivity inputs that
+            // say nothing about whether the node can actually serve reads —
+            // four live v0.2.128 peers displayed it while answering between
+            // 1.3% and 89% of their GETs (#5370).
+            //
+            // A verdict is an assertion, and asserting things that are not
+            // true is this page's recurring failure. State the connection
+            // count, which is a fact, and let the measured GET rate below
+            // speak for whether the node is working.
             let n = snap.open_connections;
             let label = if n == 1 { "peer" } else { "peers" };
             format!(
                 r#"<div class="health-banner health-good">
-                    <span class="health-icon">&#x2714;</span>
-                    <span>Node is healthy — connected to {n} {label}</span>
+                    <span class="health-icon">&#x25CF;</span>
+                    <span>Connected to {n} {label}</span>
                 </div>"#,
             )
         }
@@ -58,6 +113,8 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
             )
         }
     };
+
+    let get_success = build_get_success_line(snap);
 
     // External address info (shown once discovered via NAT traversal)
     let external_addr_html = if let Some(addr) = snap.external_address {
@@ -333,6 +390,7 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
         r#"<div class="card">
             <h2>Connection Status</h2>
             {health_banner}
+            {get_success}
             {ring_stats_html}
             {lattice_html}
             {rate_limit_html}
@@ -344,6 +402,7 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
             {failures_html}
         </div>"#,
         health_banner = health_banner,
+        get_success = get_success,
         ring_stats_html = ring_stats_html,
         lattice_html = lattice_html,
         rate_limit_html = rate_limit_html,
