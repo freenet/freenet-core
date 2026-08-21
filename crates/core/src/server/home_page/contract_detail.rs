@@ -178,7 +178,7 @@ pub fn contract_detail_html_from(
                page wants, and it degrades as the contract accumulates history.
                The cap also preserves `FirstSeen` and drops older non-anchor
                entries, so the head is not even a stable window. */
-            for t in g.history.iter().rev().take(10) {
+            for t in g.history.iter().rev().take(MAX_HISTORY_ROWS) {
                 history.push_str(&format!(
                     r#"<tr><td>{from} &rarr; {to}</td><td>{reason}</td><td class="right">{ago} ago</td></tr>"#,
                     from = html_escape(&format!("{:?}", t.from)),
@@ -236,6 +236,15 @@ pub fn contract_detail_html_from(
         governance = governance_card,
     )
 }
+
+/// Governance transitions shown on the detail page.
+///
+/// A display truncation, not a safety threshold: the snapshot's history is
+/// already bounded on the producing side. Ten is enough to show the shape of a
+/// contract's recent trajectory without turning the panel into a log. Taken
+/// from the TAIL — see the comment at the call site for why the direction
+/// matters more than the count.
+const MAX_HISTORY_ROWS: usize = 10;
 
 /// Shorten a key for display when neither card supplied a short form.
 fn abbreviate(key: &str) -> String {
