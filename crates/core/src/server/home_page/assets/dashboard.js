@@ -136,6 +136,26 @@ function handleHeaderClick(th) {
   try {
     sessionStorage.setItem(sortKey(table), idx + ':' + dir);
   } catch (e) {}
+  /* Re-apply the collapse against the NEW order. `applySort` reorders the
+     <tr> elements but never touches `style.display`, and the collapse is a
+     POSITIONAL cut — "the first 25 rows in current order". Without this the
+     display flags stay attached to whichever elements were visible under the
+     PREVIOUS order, so sorting a collapsed table showed an arbitrary
+     leftover subset re-sorted among itself, not the top 25 of the new sort.
+     The count in the status line stayed correct, which is what made it hard
+     to notice: the right number of the wrong rows. */
+  reapplyTableViewFor(table);
+}
+
+/* Find the filter controls governing `table`, if any, and recompute which of
+   its rows are visible. */
+function reapplyTableViewFor(table) {
+  var id = table.getAttribute('data-table-id');
+  if (!id) return;
+  var wrap = document.querySelector(
+    '.table-filter[data-filter-for="' + id + '"]',
+  );
+  if (wrap) applyTableView(wrap);
 }
 
 function restoreSort() {
@@ -149,6 +169,293 @@ function restoreSort() {
       if (!isNaN(idx)) applySort(table, idx, dir);
     } catch (e) {}
   });
+}
+
+/* Sort restore reorders rows too, so the collapse must be recomputed after it
+   for the same reason as a live header click. `restoreTableFilters` runs
+   after `restoreSort` at both call sites, which covers this — but the
+   ordering between them is load-bearing, so do not reverse it. */
+
+/* ── Long-table filter + collapse ──────────────────────────────────────
+   The peers and subscribed-contracts tables are unbounded: a production
+   gateway rendered 210 peer rows, 70% of an 11,780px page, with no way to
+   find one row among them. Rather than truncate server-side (which would
+   make a filter lie about what it searched), every row is still rendered
+   and the table is COLLAPSED to a readable default here, with the filter
+   searching the full set and auto-expanding while a query is active.
+
+   State lives in sessionStorage for the same reason sort order does: the
+   5s auto-refresh replaces <main> wholesale, so an un-persisted filter
+   would be wiped mid-keystroke — worse than not having one. */
+var COLLAPSE_ROWS = 25;
+
+function filterKey(id) {
+  return 'filter:' + id;
+}
+function expandKey(id) {
+  return 'expand:' + id;
+}
+
+/* sessionStorage throws in some privacy modes. The existing `sort:` handling
+   swallows that and degrades to "no saved sort", which is harmless. Here it
+   would NOT be: `applyTableView` reads the expand flag back immediately after
+   writing it, so a swallowed write made "Show all" inert — the click appeared
+   to do nothing at all. Mirror every write in memory and read that first, so
+   the controls keep working when persistence does not. */
+var tfMemory = {};
+
+function tfGet(key) {
+  if (Object.prototype.hasOwnProperty.call(tfMemory, key)) return tfMemory[key];
+  try {
+    return sessionStorage.getItem(key);
+  } catch (e) {
+    return null;
+  }
+}
+
+function tfSet(key, value) {
+  tfMemory[key] = value;
+  try {
+    sessionStorage.setItem(key, value);
+  } catch (e) {
+    /* memory copy above is the fallback */
+  }
+}
+
+/* tf-search:BEGIN
+ *
+ * The text a row is matched against. Extracted by `table_filter.test.mjs`.
+ *
+ * `textContent` alone is NOT enough and that was a real bug: the contracts
+ * table renders a 12-character abbreviated key, so pasting a real contract key
+ * — the obvious thing to do, and what the copy button beside every row puts on
+ * the clipboard — matched nothing at all.
+ *
+ * The extra text comes from `data-copy` ONLY, and the narrowness is
+ * deliberate. `data-copy` holds the full form of the value the cell
+ * abbreviates, so matching it can only ever surface a row for a reason the
+ * user can see. The two neighbouring attributes both look tempting and are
+ * both wrong: `data-sort` carries raw sort keys that differ from the display
+ * (`data-sort="1048576"` renders as "1.0 MB", `data-sort="{state_rank}"` as a
+ * badge), and `title` carries prose — every contract row has a copy button
+ * titled "Copy contract key", so including it would make the query "key"
+ * match every row in the table. Both would surface rows for reasons invisible
+ * on screen, which is worse than not matching at all: the user cannot tell
+ * why the row is there. */
+function rowSearchText(textContent, attrValues) {
+  var parts = [textContent || ''];
+  for (var i = 0; i < attrValues.length; i++) {
+    if (attrValues[i]) parts.push(attrValues[i]);
+  }
+  return parts.join(' ').toLowerCase();
+}
+
+/* Decide which row indices are visible. Pure so it can be tested without a
+ * DOM: `matches` is the per-row predicate result in current table order.
+ *
+ * Separated from the DOM application because the collapse is a POSITIONAL cut
+ * over the CURRENT order, which is what made the post-sort bug possible — the
+ * decision and the elements it was baked into could drift apart. */
+function visibleRowFlags(matches, showAll, cap) {
+  var out = [];
+  var shown = 0;
+  for (var i = 0; i < matches.length; i++) {
+    if (!matches[i]) {
+      out.push(false);
+      continue;
+    }
+    shown++;
+    out.push(showAll || shown <= cap);
+  }
+  return out;
+}
+/* tf-search:END */
+
+function applyTableView(wrap) {
+  var id = wrap.getAttribute('data-filter-for');
+  var table = document.querySelector('table[data-table-id="' + id + '"]');
+  if (!table) return;
+  var tbody = table.querySelector('tbody');
+  if (!tbody) return;
+  var input = wrap.querySelector('.tf-input');
+  var status = wrap.querySelector('.tf-status');
+  var toggle = wrap.querySelector('.tf-toggle');
+
+  var q = (input && input.value ? input.value : '').trim().toLowerCase();
+  var expanded = tfGet(expandKey(id)) === '1';
+  /* A query implies "show me everything that matches", so filtering
+     overrides the collapse rather than fighting it. */
+  var showAll = expanded || q.length > 0;
+
+  var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
+  var matches = rows.map(function (r) {
+    if (q.length === 0) return true;
+    /* Fold in the full values the cell text abbreviates. See rowSearchText
+       for why this is data-copy alone and not title or data-sort. */
+    var attrs = [];
+    var withCopy = r.querySelectorAll('[data-copy]');
+    for (var i = 0; i < withCopy.length; i++) {
+      attrs.push(withCopy[i].getAttribute('data-copy'));
+    }
+    return rowSearchText(r.textContent, attrs).indexOf(q) !== -1;
+  });
+  var flags = visibleRowFlags(matches, showAll, COLLAPSE_ROWS);
+  var matched = 0;
+  rows.forEach(function (r, i) {
+    if (matches[i]) matched++;
+    r.style.display = flags[i] ? '' : 'none';
+  });
+
+  var total = rows.length;
+  var shown = showAll ? matched : Math.min(matched, COLLAPSE_ROWS);
+  if (status) {
+    if (q.length > 0) {
+      status.textContent =
+        'Showing ' +
+        shown +
+        ' of ' +
+        matched +
+        ' matching (' +
+        total +
+        ' total)';
+    } else if (showAll) {
+      status.textContent = 'Showing all ' + total;
+    } else {
+      status.textContent = 'Showing ' + shown + ' of ' + total;
+    }
+  }
+  if (toggle) {
+    /* While a query is active the collapse is not in force, so offering to
+       toggle it would be a control that does nothing. */
+    toggle.hidden = q.length > 0 || total <= COLLAPSE_ROWS;
+    toggle.textContent = expanded ? 'Show fewer' : 'Show all ' + total;
+    toggle.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+  }
+}
+
+function applyAllTableViews() {
+  document.querySelectorAll('.table-filter').forEach(applyTableView);
+}
+
+function restoreTableFilters(focusState) {
+  document.querySelectorAll('.table-filter').forEach(function (wrap) {
+    var id = wrap.getAttribute('data-filter-for');
+    var input = wrap.querySelector('.tf-input');
+    if (input) {
+      input.value = tfGet(filterKey(id)) || '';
+      /* Restoring the VALUE alone is not enough: the refresh replaces <main>,
+         destroying the element the caret was in, so the next keystroke after a
+         refresh goes nowhere and the user has to click back into the box —
+         every five seconds, while typing. Put focus and the caret back too,
+         but ONLY when the box is on screen.
+
+         Restoring it unconditionally is what made the refresh yank the page:
+         focus() scrolls the element into view, the box sits at the TOP of a
+         card whose table can be thousands of pixels tall, so a user who
+         filtered and then scrolled down to read the matches was thrown back
+         every five seconds. Measured: scrollY 3000 -> 231.
+
+         Suppressing that scroll turned out not to be portable. `preventScroll`
+         is honoured by Chromium and Firefox but not WebKit, and neither a
+         synchronous scroll reassignment nor one on the next animation frame
+         beat WebKit's deferred scroll-into-view — it still landed on 1341,
+         deterministically, once the test stopped racing it.
+
+         So gate on visibility instead, which needs no engine cooperation: if
+         the box was already FULLY in the viewport, focusing it cannot scroll
+         anywhere. Full containment is required — see isInViewport; a
+         half-visible box is still scrolled into view on focus. If it is off screen the user is reading rows rather than
+         typing, and silently stealing focus back to an input they cannot see
+         is not the behaviour to want anyway. */
+      if (focusState && focusState.id === id && focusState.visible) {
+        input.focus({ preventScroll: true });
+        try {
+          /* Unreachable today and kept deliberately: the control is
+             `type="search"` (cards.rs), where setSelectionRange is supported
+             in every engine. It throws on `email` and `number`, so this catch
+             is here only so that changing the input's type stays a cosmetic
+             change rather than one that breaks the refresh. */
+          input.setSelectionRange(focusState.start, focusState.end);
+        } catch (e) {
+          /* leave the caret wherever focus() put it */
+        }
+      }
+    }
+    applyTableView(wrap);
+  });
+}
+
+/* Is the element FULLY within the viewport? Used to decide whether restoring
+   focus is safe — see the comment at the focus() call.
+ *
+ * Containment, not intersection, and the difference is the whole point. The
+ * browser scrolls a focused element into view unless it is ENTIRELY visible,
+ * so a box with only its top half on screen still gets scrolled — and WebKit
+ * ignores `preventScroll`, so nothing stops it there. An intersection test
+ * (`bottom > 0 && top < h`) would call that box "visible", let the focus
+ * through, and reintroduce the jump for the partial-visibility band. It would
+ * also make the claim at the focus() call ("focusing it cannot scroll
+ * anywhere") false, which is how the bug would survive review: the comment
+ * would still read as correct.
+ *
+ * The cost of being strict is that a box straddling the viewport edge loses
+ * focus on refresh, which is the same outcome as a box fully off screen and
+ * is the safe direction to err. */
+function isInViewport(el) {
+  if (!el || typeof el.getBoundingClientRect !== 'function') return false;
+  var r = el.getBoundingClientRect();
+  var h = window.innerHeight || document.documentElement.clientHeight;
+  var w = window.innerWidth || document.documentElement.clientWidth;
+  /* One pixel of slack. Sub-pixel layout routinely leaves a box that is
+     visually flush with an edge reporting a fractional overflow — measured
+     `bottom: 700.4` against a 700px viewport for a box the browser itself had
+     just scrolled fully into view. An exact comparison calls that "not
+     contained", drops the focus restore, and the caret is lost for a box the
+     user can see perfectly well. The browsers round too. */
+  var slack = 1;
+  return (
+    r.top >= -slack &&
+    r.left >= -slack &&
+    r.bottom <= h + slack &&
+    r.right <= w + slack
+  );
+}
+
+/* Which filter box had focus, and where the caret was, so the refresh can put
+   it back. Read BEFORE the <main> swap; the element does not survive it. */
+function captureFilterFocus() {
+  var el = document.activeElement;
+  if (!el || !el.classList || !el.classList.contains('tf-input')) return null;
+  var wrap = el.closest('.table-filter');
+  if (!wrap) return null;
+  return {
+    id: wrap.getAttribute('data-filter-for'),
+    start: el.selectionStart,
+    end: el.selectionEnd,
+    /* Measured on the OLD element, before the swap. Measuring the fresh one
+       instead races layout: right after the innerHTML write WebKit
+       intermittently reports an off-screen rect, which suppressed the focus
+       restore on ~3 runs in 10. The old element is also the more faithful
+       question to ask — "could the user see the box they were typing in?" —
+       and the replacement occupies the same position. */
+    visible: isInViewport(el),
+  };
+}
+
+function handleFilterInput(input) {
+  var wrap = input.closest('.table-filter');
+  if (!wrap) return;
+  tfSet(filterKey(wrap.getAttribute('data-filter-for')), input.value);
+  applyTableView(wrap);
+}
+
+function handleFilterToggle(btn) {
+  var wrap = btn.closest('.table-filter');
+  if (!wrap) return;
+  var id = wrap.getAttribute('data-filter-for');
+  var expanded = tfGet(expandKey(id)) === '1';
+  tfSet(expandKey(id), expanded ? '0' : '1');
+  applyTableView(wrap);
 }
 
 /* ── Update-available check (GitHub releases, cached 12h) ── */
@@ -599,6 +906,7 @@ document.addEventListener('DOMContentLoaded', function () {
   }
   restoreTab();
   restoreSort();
+  restoreTableFilters();
   checkForUpdate();
   checkVersionMismatch();
 
@@ -634,6 +942,11 @@ document.addEventListener('DOMContentLoaded', function () {
 
   /* Delegated click handler \u2014 survives <main> innerHTML swaps from auto-refresh,
        so we don't need to re-bind after each refresh. */
+  document.addEventListener('input', function (ev) {
+    var tf = ev.target.closest && ev.target.closest('.tf-input');
+    if (tf) handleFilterInput(tf);
+  });
+
   document.addEventListener('click', function (ev) {
     /* The open button is inside <main>, which auto-refresh re-renders, so it
        must be handled via delegation to survive innerHTML swaps. */
@@ -641,6 +954,15 @@ document.addEventListener('DOMContentLoaded', function () {
     if (importOpen) {
       ev.preventDefault();
       openImportModal();
+      return;
+    }
+    /* Same reason as the import button: the filter controls live inside
+       <main> and are destroyed by every auto-refresh, so they are handled
+       by delegation rather than re-bound. */
+    var tfToggle = ev.target.closest && ev.target.closest('.tf-toggle');
+    if (tfToggle) {
+      ev.preventDefault();
+      handleFilterToggle(tfToggle);
       return;
     }
     var copy = ev.target.closest && ev.target.closest('.copy-key');
@@ -692,6 +1014,9 @@ document.addEventListener('DOMContentLoaded', function () {
         var doc = parser.parseFromString(html, 'text/html');
         var newMain = doc.querySelector('main');
         var oldMain = document.querySelector('main');
+        /* Read the caret position BEFORE the innerHTML write on the next line
+           destroys the element holding it. */
+        var focusBeforeSwap = captureFilterFocus();
         if (newMain && oldMain) oldMain.innerHTML = newMain.innerHTML;
         /* Update the tab title (connection state + count, #3509) so a
            backgrounded tab still surfaces the current status at a glance. */
@@ -711,9 +1036,15 @@ document.addEventListener('DOMContentLoaded', function () {
         var oldIcon = document.querySelector('link[rel="icon"]');
         if (newIcon && oldIcon)
           oldIcon.setAttribute('href', newIcon.getAttribute('href'));
-        /* Restore tab selection and table sort after content swap */
+        /* Restore tab selection, table sort and table filters after the
+           content swap. The filter restore is NOT optional here: the swap
+           destroys the input element, so without this the box empties and the
+           table re-expands roughly every five seconds — which browser
+           validation caught and no Rust test could, since they never execute
+           this file. */
         restoreTab();
         restoreSort();
+        restoreTableFilters(focusBeforeSwap);
         /* Re-check the live runtime version so the stale-assets banner
                  appears (or clears) if the serving process changes while the
                  page stays open. The banner's data-asset-version stays anchored

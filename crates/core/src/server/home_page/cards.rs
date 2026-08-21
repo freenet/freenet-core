@@ -559,6 +559,7 @@ pub fn build_peers_card(snap: &Option<network_status::NetworkStatusSnapshot>) ->
         r#"<div class="card">
             <div class="card-header"><h2>Network Peers</h2>{own_loc}</div>
             {ring_svg}
+            {filter_controls}
             <div class="table-wrap">
                 <table class="sortable" data-table-id="peers">
                     <thead><tr><th data-sort-type="text">Address</th><th data-sort-type="num">Location</th><th data-sort-type="text">Type</th><th data-sort-type="num">Sent</th><th data-sort-type="num">Recv</th><th data-sort-type="num">Connected</th></tr></thead>
@@ -568,7 +569,32 @@ pub fn build_peers_card(snap: &Option<network_status::NetworkStatusSnapshot>) ->
         </div>"#,
         own_loc = own_loc,
         ring_svg = ring_svg,
+        filter_controls = table_filter_controls("peers", "peers"),
         rows = rows,
+    )
+}
+
+/// Filter + collapse controls for a long table.
+///
+/// The peers and subscribed-contracts tables are unbounded — a production
+/// gateway rendered 210 peer rows, 70% of an 11,780px page, with no way to
+/// locate one row. The rows are still all rendered (truncating server-side
+/// would make the filter lie about what it searched); `dashboard.js`
+/// collapses the table to a readable default and expands it while a query is
+/// active.
+///
+/// Rendered unconditionally rather than only past a threshold, so the control
+/// does not appear and disappear as a node's peer count crosses a boundary.
+/// The JS hides the toggle itself when there is nothing to collapse.
+fn table_filter_controls(table_id: &str, label: &str) -> String {
+    format!(
+        r#"<div class="table-filter" data-filter-for="{id}">
+            <input type="search" class="tf-input" placeholder="Filter {label}…" aria-label="Filter {label}" autocomplete="off" spellcheck="false">
+            <span class="tf-status" role="status" aria-live="polite"></span>
+            <button type="button" class="tf-toggle" hidden aria-expanded="false"></button>
+        </div>"#,
+        id = html_escape(table_id),
+        label = html_escape(label),
     )
 }
 
@@ -1757,6 +1783,7 @@ pub fn build_contracts_card(snap: &Option<network_status::NetworkStatusSnapshot>
     format!(
         r#"<div class="card">
             <h2>Subscribed Contracts</h2>
+            {filter_controls}
             <div class="table-wrap">
                 <table class="sortable" data-table-id="contracts">
                     <thead><tr><th data-sort-type="text">Contract</th><th data-sort-type="num">Freshness</th><th data-sort-type="num">Subscribed</th><th data-sort-type="num">Last Update</th></tr></thead>
@@ -1764,6 +1791,7 @@ pub fn build_contracts_card(snap: &Option<network_status::NetworkStatusSnapshot>
                 </table>
             </div>
         </div>"#,
+        filter_controls = table_filter_controls("contracts", "contracts"),
         rows = rows,
     )
 }
