@@ -3176,6 +3176,120 @@ mod tests {
         );
     }
 
+    /// A hosted-only contract CAN be cross-referenced against governance,
+    /// and this pins the non-obvious reason why.
+    ///
+    /// `HostedContractEntry` carries no `instance_id` field, and governance is
+    /// keyed by `ContractInstanceId`, so the join looks impossible. It is not:
+    /// `impl Display for ContractKey` delegates to `self.instance` and
+    /// `ContractKey::id()` returns `&self.instance`, so `key.to_string()` and
+    /// `key.id().to_string()` are THE SAME STRING. The requested key is always
+    /// a valid governance lookup value.
+    ///
+    /// This needs a test because the rustdoc on `ContractSnapshot::instance_id`
+    /// asserts the opposite — "Distinct from `key_full` which carries the full
+    /// ContractKey encoding" — which is wrong, and reading it caused a wrong
+    /// turn on this page: a "cannot be cross-referenced" branch was added for
+    /// a case that does not exist. If the stdlib ever makes the two encodings
+    /// genuinely differ, this fails and says where to look.
+    #[test]
+    fn hosted_only_contract_still_joins_to_governance() {
+        use crate::node::network_status::{ContractGovernanceEntry, GovernanceStateSnapshot};
+
+        let key = "HOSTEDONLYKEY";
+        let mut snap = base_snapshot();
+        snap.open_connections = 2;
+        // Hosted, with NO subscription entry to supply an instance id.
+        snap.hosting.contracts = vec![crate::node::network_status::HostedContractEntry {
+            key_full: key.to_string(),
+            key_short: key.to_string(),
+            size_bytes: 1024,
+            read_count: 0,
+            recency_seq: 0,
+            eviction_eligible: true,
+        }];
+        // Governance knows it under the same string, because that string IS
+        // the instance id.
+        snap.governance.contracts = vec![ContractGovernanceEntry {
+            instance_id: key.to_string(),
+            instance_id_short: key.to_string(),
+            state: GovernanceStateSnapshot::Borderline,
+            cost_used: 3.0,
+            benefit_score: 1.0,
+            log_ratio: Some(-0.4),
+            age_secs: 600,
+            last_transition_secs_ago: 60,
+            history: Vec::new(),
+        }];
+
+        let html = contract_detail_html_from(&Some(snap), key);
+        assert!(
+            html.contains("Borderline"),
+            "a hosted-only contract must still show its governance state — \
+             the requested key is a valid instance id. got:\n{html}"
+        );
+        assert!(
+            !html.contains("Not flagged by the governance manager"),
+            "and must not report it as unflagged when a record was found — \
+             got:\n{html}"
+        );
+    }
+
+    /// Governance history must show the NEWEST transitions.
+    ///
+    /// `GovernanceSnapshot::history` is documented as "newest last", so a
+    /// plain `.take(10)` renders the ten OLDEST and hides everything recent —
+    /// exactly inverted from what someone opening the page wants. The bug is
+    /// invisible until a contract accumulates more than ten transitions, which
+    /// is why it needs a test rather than a look.
+    #[test]
+    fn contract_detail_shows_the_newest_governance_transitions() {
+        use crate::node::network_status::{
+            ContractGovernanceEntry, GovernanceStateSnapshot, GovernanceTransitionEntry,
+            GovernanceTransitionReasonSnapshot,
+        };
+
+        // 14 transitions, oldest first, distinguishable by their age.
+        let history: Vec<GovernanceTransitionEntry> = (0..14)
+            .map(|i| GovernanceTransitionEntry {
+                secs_ago: (14 - i) * 60,
+                from: GovernanceStateSnapshot::Normal,
+                to: GovernanceStateSnapshot::Borderline,
+                reason: GovernanceTransitionReasonSnapshot::ThresholdCrossed,
+            })
+            .collect();
+        let oldest_secs = history[0].secs_ago;
+        let newest_secs = history[13].secs_ago;
+
+        let mut snap = base_snapshot();
+        snap.open_connections = 2;
+        snap.governance.contracts = vec![ContractGovernanceEntry {
+            instance_id: "GOVKEY1".to_string(),
+            instance_id_short: "GOVKEY1".to_string(),
+            state: GovernanceStateSnapshot::Borderline,
+            cost_used: 1.0,
+            benefit_score: 2.0,
+            log_ratio: Some(0.5),
+            age_secs: 900,
+            last_transition_secs_ago: newest_secs,
+            history,
+        }];
+
+        let html = contract_detail_html_from(&Some(snap), "GOVKEY1");
+        let newest = format_duration(newest_secs);
+        let oldest = format_duration(oldest_secs);
+        assert!(
+            html.contains(&format!("{newest} ago")),
+            "the most recent transition ({newest} ago) must be shown — \
+             got:\n{html}"
+        );
+        assert!(
+            !html.contains(&format!("{oldest} ago")),
+            "the oldest transition ({oldest} ago) must have been dropped by \
+             the cap, not the newest — got:\n{html}"
+        );
+    }
+
     /// The hosting panel must NOT imply it is showing the eviction ranking.
     ///
     /// Invariant 3 ranks by local subscriptions, then downstream subscribers,

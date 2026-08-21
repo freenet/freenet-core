@@ -53,6 +53,18 @@ pub fn contract_detail_html_from(
     let hosted = snap
         .as_ref()
         .and_then(|s| s.hosting.contracts.iter().find(|c| c.key_full == key_str));
+    // Governance is keyed by `ContractInstanceId`. That sounds like it needs a
+    // separate lookup value, and `ContractSnapshot` carries both `key_full` and
+    // `instance_id` as if they differed — but they do not.
+    // `impl Display for ContractKey` delegates to `self.instance`, and
+    // `ContractKey::id()` returns `&self.instance`, so `key.to_string()` and
+    // `key.id().to_string()` produce the SAME string. The requested key is
+    // therefore always a valid governance lookup value, including for a
+    // hosted-only contract that carries no `instance_id` field of its own.
+    //
+    // Worth stating because the rustdoc on `ContractSnapshot::instance_id`
+    // asserts the opposite ("Distinct from `key_full` which carries the full
+    // ContractKey encoding"), which is wrong and cost a wrong turn here.
     let governance = snap.as_ref().and_then(|s| {
         s.governance.contracts.iter().find(|c| {
             c.instance_id == key_str || Some(&c.instance_id) == subscribed.map(|x| &x.instance_id)
@@ -159,7 +171,14 @@ pub fn contract_detail_html_from(
     let governance_card = match governance {
         Some(g) => {
             let mut history = String::new();
-            for t in g.history.iter().take(10) {
+            /* Newest FIRST, and taken from the TAIL. `GovernanceSnapshot`
+               documents this vec as "State history (bounded). Newest last", so
+               a plain `.take(10)` shows the ten OLDEST transitions and hides
+               every recent one — the opposite of what an operator opening this
+               page wants, and it degrades as the contract accumulates history.
+               The cap also preserves `FirstSeen` and drops older non-anchor
+               entries, so the head is not even a stable window. */
+            for t in g.history.iter().rev().take(10) {
                 history.push_str(&format!(
                     r#"<tr><td>{from} &rarr; {to}</td><td>{reason}</td><td class="right">{ago} ago</td></tr>"#,
                     from = html_escape(&format!("{:?}", t.from)),
