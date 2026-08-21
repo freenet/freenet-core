@@ -234,11 +234,27 @@ test.describe("dashboard long-table filter", () => {
       const y = window.scrollY + el.getBoundingClientRect().top;
       window.scrollTo(0, y + window.innerHeight + 600);
     });
-    await page.waitForTimeout(150);
-
-    const boxOffScreen = await input.evaluate(
-      (el) => el.getBoundingClientRect().bottom < 0,
-    );
+    /* POLL until the box is actually off screen rather than assuming a fixed
+       wait was enough. WebKit does not settle `scrollTo` synchronously, so a
+       150ms sleep here was a coin flip: it passed locally and on the merged
+       branch, then failed on CI at this precondition in 1.5s. A timing
+       assumption in a precondition is worse than one in an assertion, because
+       it fails the test for a reason unrelated to the behaviour under test. */
+    const boxOffScreen = await page
+      .waitForFunction(
+        (id) => {
+          const el = document.querySelector(
+            `.table-filter[data-filter-for="${id}"] .tf-input`,
+          );
+          return !!el && el.getBoundingClientRect().bottom < 0;
+        },
+        FIXTURE_TABLE_ID,
+        { timeout: 5000 },
+      )
+      .then(
+        () => true,
+        () => false,
+      );
     expect(
       boxOffScreen,
       "the filter box must be off screen, or declining to refocus is wrong",

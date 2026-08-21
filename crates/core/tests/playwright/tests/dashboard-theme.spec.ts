@@ -130,6 +130,86 @@ test.describe("dashboard OS theme following", () => {
     ).toBeGreaterThan(3.0);
   });
 
+  /* The live listener, which nothing else here reaches.
+   *
+   * Every other test in this file calls `emulateMedia` BEFORE `goto`/`reload`,
+   * so they all re-test the load-time resolver. Review pointed out that
+   * deleting `watchOsTheme()` outright would not have failed a single one of
+   * them — the function the second commit is named after was completely
+   * unguarded.
+   *
+   * The listener is not optional polish, either: stamping the resolved theme
+   * onto `data-theme` is what makes the 24 attribute-keyed component rules
+   * work, and it also stops the `prefers-color-scheme` block from matching. So
+   * without this listener a stamped page ignores the OS until reload —
+   * stamping traded a live-follow behaviour away, and this earns it back. */
+  test("a live OS theme change is followed without a reload", async ({
+    page,
+  }) => {
+    await page.emulateMedia({ colorScheme: "dark" });
+    await page.goto(dashboardUrl!, { waitUntil: "domcontentloaded" });
+    expect(
+      await bodyBackgroundLuminance(page),
+      "precondition: starts dark",
+    ).toBeLessThan(0.2);
+
+    const iconBefore = await page.textContent("#theme-icon");
+
+    // Flip the OS preference with the page already open. No reload.
+    await page.emulateMedia({ colorScheme: "light" });
+    await page.waitForFunction(
+      () => {
+        const bg = getComputedStyle(document.body).backgroundColor;
+        const m = bg.match(/rgba?\(([^)]+)\)/);
+        if (!m) return false;
+        const [r, g, b] = m[1].split(",").map((x) => parseFloat(x.trim()));
+        // Crude but sufficient: a light background is bright in all channels.
+        return r > 200 && g > 200 && b > 200;
+      },
+      undefined,
+      { timeout: 5000 },
+    );
+
+    expect(
+      await bodyBackgroundLuminance(page),
+      "the page must follow a live OS flip without a reload",
+    ).toBeGreaterThan(0.5);
+
+    // The icon advertises what the NEXT click does, so it has to move too —
+    // otherwise it promises the opposite of what it delivers.
+    const iconAfter = await page.textContent("#theme-icon");
+    expect(
+      iconAfter,
+      `the toggle icon still reads ${iconAfter} after the OS flipped to light`,
+    ).not.toBe(iconBefore);
+  });
+
+  /* The other half: an explicit choice must NOT be overridden by the OS
+   * changing underneath it. Without this, a listener that re-stamps
+   * unconditionally would pass the test above while silently discarding the
+   * operator's decision. */
+  test("a live OS change does not override an explicit choice", async ({
+    page,
+  }) => {
+    await page.emulateMedia({ colorScheme: "dark" });
+    await page.goto(dashboardUrl!, { waitUntil: "domcontentloaded" });
+    await page.evaluate(() => localStorage.setItem("theme", "dark"));
+    await page.reload({ waitUntil: "domcontentloaded" });
+    expect(
+      await bodyBackgroundLuminance(page),
+      "precondition: explicit dark",
+    ).toBeLessThan(0.2);
+
+    await page.emulateMedia({ colorScheme: "light" });
+    await page.waitForTimeout(500);
+
+    expect(
+      await bodyBackgroundLuminance(page),
+      "an explicit dark choice must survive the OS flipping to light while " +
+        "the page is open",
+    ).toBeLessThan(0.2);
+  });
+
   test("an explicit choice beats the OS in both directions", async ({
     page,
   }) => {
