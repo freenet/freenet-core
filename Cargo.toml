@@ -46,7 +46,7 @@ tokio-util = "0.7"
 tower-http = { version = "0.7", features = ["fs", "trace"] }
 
 # Crypto
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 blake3 = { version = "1", features = ["std", "traits-preview"] }
 bs58 = "0.5"
 chacha20poly1305 = "0.10"
