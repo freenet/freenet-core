@@ -3217,6 +3217,91 @@ mod tests {
         );
     }
 
+    /// The subscribed path — the one the page exists for — rendered end to
+    /// end.
+    ///
+    /// Every other test here drives `subscribed == None` (no snapshot, an
+    /// unknown key, or a hosted-only contract), so the Subscription card's
+    /// actual logic was unexercised: the freshness pill, the in-use flag, the
+    /// never-vs-ago branch on `last_updated_secs`, and the Identity card's
+    /// instance-id row, which only renders when a subscription supplies one.
+    /// Review caught that the primary lookup path had no coverage while four
+    /// secondary paths did.
+    #[test]
+    fn contract_detail_renders_the_subscribed_path() {
+        use crate::node::network_status::ContractSnapshot;
+
+        // Slice to the Subscription card before asserting. The page embeds the
+        // whole stylesheet inline, so `html.contains("fresh-ok")` is true of
+        // every render — the CSS defines `.fresh-ok` whether or not the pill
+        // is emitted. The first version of this test asserted against the full
+        // document and passed vacuously on the positive case; only the
+        // negative case ("stale must NOT contain fresh-ok") exposed it.
+        fn subscription_panel(html: &str) -> String {
+            let start = html
+                .find("<h2>Subscription</h2>")
+                .expect("the Subscription card must be rendered");
+            let end = html[start..]
+                .find("<h2>Hosting</h2>")
+                .map(|i| start + i)
+                .unwrap_or(html.len());
+            html[start..end].to_string()
+        }
+
+        let base = |is_fresh: bool, in_use: bool, last: Option<u64>| {
+            let mut snap = base_snapshot();
+            snap.open_connections = 3;
+            snap.contracts = vec![ContractSnapshot {
+                key_short: "SUBB...".to_string(),
+                key_full: "SUBBED1".to_string(),
+                instance_id: "SUBBED1".to_string(),
+                subscribed_secs: 3600,
+                last_updated_secs: last,
+                is_receiving_updates: is_fresh,
+                in_use,
+            }];
+            contract_detail_html_from(&Some(snap), "SUBBED1")
+        };
+
+        // Fresh, in use, updated recently.
+        let fresh_html = base(true, true, Some(30));
+        let fresh = subscription_panel(&fresh_html);
+        assert!(
+            fresh.contains("fresh-ok") && fresh.contains("receiving updates"),
+            "a contract in the update mesh must show the fresh pill — \
+             got:\n{fresh}"
+        );
+        assert!(
+            fresh.contains("30s ago"),
+            "a known last-update time must be rendered as an age — got:\n{fresh}"
+        );
+        assert!(
+            fresh_html.contains("Instance id"),
+            "the instance-id row renders only when a subscription supplies \
+             one, and this is that case — got:\n{fresh}"
+        );
+
+        // Not receiving updates, not pinned by demand, never updated.
+        let stale_html = base(false, false, None);
+        let stale = subscription_panel(&stale_html);
+        assert!(
+            stale.contains("fresh-stale") && stale.contains("not receiving updates"),
+            "a contract outside the update mesh must NOT show as fresh — \
+             serving a stale copy is the failure invariant 1 forbids, so the \
+             page must not imply freshness it does not have. got:\n{stale}"
+        );
+        assert!(
+            stale.contains("never"),
+            "an absent last-update must read as 'never', not as an age of \
+             zero — got:\n{stale}"
+        );
+        // The two states must be distinguishable, or the pill is decoration.
+        assert!(
+            fresh.contains("fresh-ok") && !stale.contains("fresh-ok"),
+            "the freshness pill must differ between the two states"
+        );
+    }
+
     /// A hosted-only contract CAN be cross-referenced against governance,
     /// and this pins the non-obvious reason why.
     ///
