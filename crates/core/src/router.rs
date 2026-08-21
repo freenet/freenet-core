@@ -297,8 +297,12 @@ pub(crate) struct NetworkEfficiencyV1 {
     /// `ring::hosting::HostingCause::ALL`: client GET, transit GET, sub-op GET,
     /// client PUT, transit PUT, startup restore, unattributed.
     ///
-    /// Answers "why is this peer hosting this contract" in aggregate, which
-    /// nothing recorded before: `AccessType` distinguishes only GET from PUT and
+    /// Answers "why did this peer BEGIN hosting this contract" in aggregate,
+    /// which nothing recorded before. The present-tense sibling is
+    /// `ring::HostingReason` (`freenet.node.contracts.hosted`), which
+    /// re-derives current demand on every collection instead of freezing
+    /// provenance at admission — see that enum's rustdoc for the split.
+    /// `AccessType` distinguishes only GET from PUT and
     /// so cannot separate a client's own request from transit — the distinction
     /// every hosting-policy decision rests on. In particular a subscribe-fetch
     /// travels the ordinary GET driver as a sub-op, and was indistinguishable

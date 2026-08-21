@@ -735,8 +735,37 @@ pub enum AccessType {
     Subscribe,
 }
 
+/// One hosted row, reduced to what the hosting-REASON classifier needs (see
+/// [`HostingCache::for_each_reason_row`] and `HostingManager::hosted_by_reason`).
+///
+/// A struct rather than `&HostedContract` so the age-gated signals are derived
+/// against the cache's own time source, and so the classifier cannot reach a
+/// field it has no business classifying on.
+pub(crate) struct ReasonRow<'a> {
+    pub key: &'a ContractKey,
+    pub size_bytes: u64,
+    /// A local client GET/PUT within `SUBSCRIPTION_LEASE_DURATION` — the same
+    /// age-gated signal the hosting policy consults
+    /// (`has_recent_local_client_access`), NOT the sticky `local_client_access`
+    /// flag, which is set once and never cleared.
+    pub recent_local_client_access: bool,
+    pub abandoned: bool,
+    /// False for an entry reloaded from persisted metadata at startup, i.e.
+    /// exactly the [`HostingCause::StartupRestore`] cohort.
+    pub seeded_this_run: bool,
+}
+
 /// WHY this peer began hosting a contract — the attribution that
 /// [`AccessType`] is structurally unable to carry.
+///
+/// Answers a DIFFERENT question from `HostingReason` (`ring/hosting.rs`), and
+/// the two are easy to conflate: this one is provenance AT ADMISSION, counted
+/// once at the branch that begins hosting and never revised (exported as
+/// `host_begin`, `router.rs`); `HostingReason` is CURRENT demand, re-derived
+/// from live subscription state on every metrics collection (exported as
+/// `freenet.node.contracts.hosted`). A contract admitted here as `TransitGet`
+/// becomes `HostingReason::LocalClient` the moment a local client subscribes,
+/// while its cause stays `TransitGet` forever.
 ///
 /// `AccessType` says only GET-vs-PUT, which cannot separate a contract this
 /// node's OWN client asked for from one that merely transited it on a routed
@@ -2558,6 +2587,32 @@ impl<T: TimeSource> HostingCache<T> {
                     now.saturating_duration_since(at) < super::SUBSCRIPTION_LEASE_DURATION
                 });
             visit(key, entry.size_bytes, recently_accessed);
+        }
+    }
+
+    /// Current hosted rows for the fixed-cardinality hosting-REASON telemetry
+    /// (`HostingManager::hosted_by_reason`). Same contract-identity discipline
+    /// as [`Self::for_each_cost_eligibility_row`]: keys are visible to the
+    /// manager's classifier (which needs them to look up subscription state)
+    /// but are aggregated away before anything is exported.
+    ///
+    /// The age gate on local client access is applied HERE rather than in the
+    /// classifier, for the same reason `for_each_cost_eligibility_row` derives
+    /// `recently_accessed` here: the time source lives on the cache, and a
+    /// classifier reading the raw sticky flag would disagree with the hosting
+    /// policy (see [`ReasonRow::recent_local_client_access`]).
+    pub(crate) fn for_each_reason_row(&self, mut visit: impl FnMut(ReasonRow<'_>)) {
+        let now = self.time_source.now();
+        for (key, entry) in &self.contracts {
+            visit(ReasonRow {
+                key,
+                size_bytes: entry.size_bytes,
+                recent_local_client_access: entry.local_client_last_access.is_some_and(|at| {
+                    now.saturating_duration_since(at) < super::SUBSCRIPTION_LEASE_DURATION
+                }),
+                abandoned: entry.abandoned_at.is_some(),
+                seeded_this_run: entry.seeded_this_run,
+            });
         }
     }
 

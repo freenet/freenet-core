@@ -328,6 +328,48 @@ until a runtime path actually reads it.
 Operator-facing documentation (encryption model, migration matrix,
 `freenet secrets` CLI) lives in [`docs/secrets-at-rest.md`](docs/secrets-at-rest.md).
 
+## Two independent telemetry pipelines
+
+`telemetry-enabled` / `telemetry-endpoint` feed the project's central dashboard
+(`tracing/telemetry.rs`). `otel-telemetry-enabled` / `otel-endpoint` are a
+**separate, unrelated** OpenTelemetry SDK metrics pipeline (`tracing/otel.rs`):
+no shared config, no shared endpoint, no fallback in either direction, and
+`otel-endpoint` must never default to the dashboard collector.
+
+Rules when touching `tracing/otel.rs`:
+
+- Observable instruments must read **cumulative, never-reset** values.
+  `TransportSnapshot` fields are period accumulators that `take_snapshot`
+  zeroes for the legacy telemetry worker, so observing one as a counter yields
+  a non-monotonic series whenever `telemetry-enabled` is also on.
+- Never export a `PeerId`, socket address, or any attribute identifying the
+  remote end of a connection. `PeerId` renders as `{pub_key}@{addr}`, which
+  leaks our address and re-identifies the node whenever it changes. This node's
+  identity is two resource attributes (`freenet.node.*`, one per export batch),
+  not a per-datapoint attribute. "Peer" means the *other* end of a connection.
+- Histograms get their base-2 exponential aggregation from one `with_view` in
+  `build_provider_blocking`. Do not add explicit bucket boundaries per
+  instrument.
+- Export outcomes must be logged by `OtlpHttpClient::send_bytes`. The SDK will
+  not do it: `opentelemetry-otlp` logs network errors and non-2xx at DEBUG on
+  the stated grounds that `PeriodicReader` re-logs them at error level, which
+  is true for the batch log/span processors and false for metrics. Deleting
+  that logging makes a dead collector produce no output at all.
+- The `freenet.node.*` resource attributes are always emitted and must never
+  be made deferrable to `OTEL_RESOURCE_ATTRIBUTES`. They are what the
+  collector checks the bearer-token signature against; an override would
+  export an identity that does not match the signing key.
+- The exporter always installs its own `HttpClient`, so `opentelemetry-otlp`
+  needs none of its `reqwest-*`/TLS features — enabling one pulls a second
+  reqwest major, a second TLS stack, and a C/asm aws-lc build into every
+  release target.
+
+Everything else — the bearer-token format, endpoint precedence, the
+`OTEL_*` variables honored, and per-instrument notes — is in
+[`docs/design/otel-metrics-exporter.md`](docs/design/otel-metrics-exporter.md),
+and operator-facing configuration is in
+[`docs/otel-metrics.md`](docs/otel-metrics.md).
+
 ## External Resources
 
 - API docs: https://docs.rs/freenet
