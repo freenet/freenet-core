@@ -1627,14 +1627,26 @@ pub struct PeerSnapshot {
 pub struct ContractSnapshot {
     pub key_short: String,
     pub key_full: String,
-    /// `ContractKey.id().to_string()` — the 32-byte content hash
-    /// portion of the key. Distinct from `key_full` which carries
-    /// the full ContractKey encoding (instance id + parameters /
-    /// code-hash bookkeeping). Surfaced so the dashboard can
-    /// cross-reference this contract against
-    /// `GovernanceSnapshot.state_by_id`, which is keyed by
-    /// `ContractInstanceId::to_string()`. Codex review of
-    /// dashboard-polish PR caught the id/key string mismatch.
+    /// `ContractKey.id().to_string()` — the 32-byte instance id.
+    ///
+    /// Surfaced so the dashboard can cross-reference this contract against
+    /// `GovernanceSnapshot`, which is keyed by
+    /// `ContractInstanceId::to_string()`.
+    ///
+    /// NOT distinct from `key_full`, despite what this comment claimed until
+    /// 2026-08-21. `impl Display for ContractKey` delegates to
+    /// `self.instance` and `ContractKey::id()` returns `&self.instance`, so
+    /// `key.to_string()` and `key.id().to_string()` produce the SAME string
+    /// and the code-hash half reaches neither. The old wording ("Distinct
+    /// from `key_full` which carries the full ContractKey encoding") sent
+    /// three separate readers of the contract detail page down the same wrong
+    /// path — twice as a reported blocking bug, once as a fix for a case that
+    /// cannot occur.
+    ///
+    /// The field still earns its place: it states the intent explicitly, and
+    /// it keeps working if the Display impl ever changes. That equality is
+    /// pinned by `contract_key_display_equals_its_instance_id` in
+    /// `server/home_page.rs`, which fails if it stops holding.
     pub instance_id: String,
     pub subscribed_secs: u64,
     pub last_updated_secs: Option<u64>,

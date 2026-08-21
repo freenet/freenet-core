@@ -3176,6 +3176,47 @@ mod tests {
         );
     }
 
+    /// `ContractKey::to_string()` and `ContractKey::id().to_string()` produce
+    /// the SAME string, and this pins it against a real key rather than a
+    /// fixture that assumes it.
+    ///
+    /// This exists because the opposite belief is written down in this
+    /// codebase and has now misled three separate readers. The rustdoc on
+    /// `ContractSnapshot::instance_id` says it is "Distinct from `key_full`
+    /// which carries the full ContractKey encoding (instance id + parameters /
+    /// code-hash bookkeeping)". That is wrong: `impl Display for ContractKey`
+    /// delegates to `self.instance`, and `id()` returns `&self.instance`, so
+    /// the code-hash half never reaches either string.
+    ///
+    /// The consequences of believing otherwise are concrete. Two reviews of
+    /// the contract detail page independently reported a blocking bug — that a
+    /// hosted-only contract cannot be joined to governance, because
+    /// `HostedContractEntry` carries no `instance_id` field — and I acted on it
+    /// once, adding a "cannot be cross-referenced" branch for a case that does
+    /// not exist. The join works precisely because these two strings are the
+    /// same.
+    ///
+    /// If a future stdlib gives `ContractKey` a Display that includes the code
+    /// hash, this fails, and the detail page's governance lookup genuinely
+    /// does need the separate id.
+    #[test]
+    fn contract_key_display_equals_its_instance_id() {
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([7u8; 32]),
+            CodeHash::new([9u8; 32]),
+        );
+        assert_eq!(
+            key.to_string(),
+            key.id().to_string(),
+            "the dashboard joins hosting/subscription records (keyed by \
+             key.to_string()) against governance records (keyed by \
+             key.id().to_string()); if these ever diverge the contract detail \
+             page silently stops finding governance data"
+        );
+    }
+
     /// A hosted-only contract CAN be cross-referenced against governance,
     /// and this pins the non-obvious reason why.
     ///
