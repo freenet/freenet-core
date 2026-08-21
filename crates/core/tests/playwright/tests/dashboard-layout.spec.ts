@@ -65,6 +65,19 @@ test.describe("dashboard responsive layout", () => {
     await page.setViewportSize({ width: 768, height: 900 });
     await page.goto(dashboardUrl!, { waitUntil: "domcontentloaded" });
 
+    await page.evaluate(() => {
+      if (document.querySelector(".g-norms")) return;
+      const grid = document.createElement("div");
+      grid.className = "g-norms";
+      for (let i = 0; i < 5; i++) {
+        const tile = document.createElement("div");
+        tile.className = "g-norm";
+        tile.textContent = "TILE " + i;
+        grid.appendChild(tile);
+      }
+      document.querySelector("main")!.appendChild(grid);
+    });
+
     const columnCounts = await page.evaluate(() =>
       [...document.querySelectorAll(".g-norms")].map(
         (n) => getComputedStyle(n).gridTemplateColumns.split(" ").length,
@@ -90,6 +103,44 @@ test.describe("dashboard responsive layout", () => {
   }) => {
     await page.setViewportSize({ width: 1440, height: 1000 });
     await page.goto(dashboardUrl!, { waitUntil: "domcontentloaded" });
+
+    /* Build the structure rather than depending on the node having hosting
+       data. The hosting card only renders these rows once the node is hosting
+       contracts, so on a sparse node this test failed its own fixture guard —
+       loudly, which is the designed behaviour, but it made the test a function
+       of node state rather than of the stylesheet.
+
+       The rule under test is static CSS: `.g-verdict-row > .g-norms:only-child`
+       spanning both grid tracks. What matters is that the selector matches the
+       structure `cards.rs` emits, which is a `.g-verdict-row` whose only child
+       is a `.g-norms` of `.g-norm` tiles. Injecting exactly that exercises the
+       real rule; the Rust side pins that the server still emits this shape. */
+    await page.evaluate(() => {
+      /* Check for the SPECIFIC shape under test, not merely for any
+         `.g-verdict-row > .g-norms`. A node can render one that has a verdict
+         box beside it, which is a different case and not what this rule
+         governs — an earlier guard matched that and skipped injection, so the
+         test then failed on its own precondition. */
+      const existingSole = [
+        ...document.querySelectorAll(".g-verdict-row > .g-norms"),
+      ].some((n) => n.parentElement!.children.length === 1);
+      if (existingSole) return;
+      const row = document.createElement("div");
+      row.className = "g-verdict-row";
+      const grid = document.createElement("div");
+      grid.className = "g-norms";
+      for (let i = 0; i < 5; i++) {
+        const tile = document.createElement("div");
+        tile.className = "g-norm";
+        tile.innerHTML =
+          '<div class="g-norm-label">TILE ' +
+          i +
+          '</div><div class="g-norm-value">0</div>';
+        grid.appendChild(tile);
+      }
+      row.appendChild(grid);
+      document.querySelector("main")!.appendChild(row);
+    });
 
     const grids = await page.evaluate(() =>
       [...document.querySelectorAll(".g-verdict-row > .g-norms")].map((n) => {

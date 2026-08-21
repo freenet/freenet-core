@@ -215,6 +215,23 @@ test.describe("dashboard long-table filter", () => {
     );
     await expect(filter).toBeAttached();
 
+    /* Page height must come from OUTSIDE <main>, and the fixture's own spacer
+       is not enough. The refresh assigns `main.innerHTML`, which momentarily
+       empties it — including any spacer inside the fixture — so the document
+       collapses to about viewport height for an instant. WebKit clamps
+       scrollY to ~0 during that window and does not restore it when the new
+       content lands; Chromium and Firefox anchor through it. On a CI node
+       with no peers and no contracts, <main> supplies almost no height of its
+       own, so the collapse is total and the anchor row jumped -428 -> 886
+       with the viewport never having been touched by the code under test.
+       A body-level spacer keeps the document tall THROUGHOUT the swap. */
+    await page.evaluate(() => {
+      const spacer = document.createElement("div");
+      spacer.id = "outside-main-spacer";
+      spacer.style.height = "5000px";
+      document.body.appendChild(spacer);
+    });
+
     const input = filter.locator(".tf-input");
     /* Order matters, and getting it wrong made this test fail 1 run in 8.
        WebKit scrolls a newly-focused element into view ASYNCHRONOUSLY, after
