@@ -48,6 +48,40 @@
   );
 })();
 
+/* The theme preference, with an in-memory fallback.
+ *
+ * `localStorage` throws in some privacy modes. Swallowing that is not harmless
+ * here, because `effectiveTheme()` reads the preference back to decide what the
+ * NEXT click should do. With a throwing store the read always reported "no
+ * preference" and fell through to the OS, so after one click the page was light
+ * while the icon still described a dark page, and every further click resolved
+ * to the same direction — a toggle that goes one way and then stops, with an
+ * icon that contradicts the screen.
+ *
+ * Mirroring the write in memory makes the control work whether or not the
+ * preference can be persisted; only durability across a reload is lost, which
+ * is what a browser refusing storage has already decided. Same shape as
+ * `tfGet`/`tfSet` for the table filters, for the same reason. */
+var themeMemory = null;
+
+function themePrefGet() {
+  if (themeMemory !== null) return themeMemory;
+  try {
+    return localStorage.getItem('theme');
+  } catch (e) {
+    return null;
+  }
+}
+
+function themePrefSet(value) {
+  themeMemory = value;
+  try {
+    localStorage.setItem('theme', value);
+  } catch (e) {
+    /* memory copy above is the fallback */
+  }
+}
+
 /* theme-resolve:BEGIN
  *
  * Resolves the three-state theme setting. Extracted verbatim by
@@ -84,13 +118,7 @@ function effectiveTheme() {
      holds a resolved 'light' or 'dark', so reading it back would report every
      visitor as having made an explicit choice and the OS would stop being
      consulted after the first paint. */
-  var pref = null;
-  try {
-    pref = localStorage.getItem('theme');
-  } catch (e) {
-    /* localStorage unavailable — resolve from the OS alone */
-  }
-  return resolveTheme(pref, prefersLight);
+  return resolveTheme(themePrefGet(), prefersLight);
 }
 
 function updateThemeIcon() {
@@ -122,12 +150,7 @@ function watchOsTheme() {
   if (!window.matchMedia) return;
   var mq = window.matchMedia('(prefers-color-scheme: light)');
   var onChange = function () {
-    var pref = null;
-    try {
-      pref = localStorage.getItem('theme');
-    } catch (e) {
-      /* localStorage unavailable — the OS is the only input anyway */
-    }
+    var pref = themePrefGet();
     if (pref === 'light' || pref === 'dark') return;
     document.documentElement.setAttribute(
       'data-theme',
@@ -146,9 +169,7 @@ function watchOsTheme() {
 function toggleTheme() {
   var next = effectiveTheme() === 'light' ? 'dark' : 'light';
   document.documentElement.setAttribute('data-theme', next);
-  try {
-    localStorage.setItem('theme', next);
-  } catch (e) {}
+  themePrefSet(next);
   updateThemeIcon();
 }
 

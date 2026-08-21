@@ -210,6 +210,58 @@ test.describe("dashboard OS theme following", () => {
     ).toBeLessThan(0.2);
   });
 
+  /* Private-browsing modes reject storage entirely, and swallowing that is
+   * not harmless here: `effectiveTheme()` reads the preference back to decide
+   * what the NEXT click does. With a throwing store the read always reported
+   * "no preference", so after one click the page was light while the icon
+   * still described a dark page, and every further click resolved the same
+   * way — a toggle that goes one direction and then stops.
+   *
+   * Only a browser can show this. The Node test drives the resolver, which is
+   * correct in isolation; the bug is in what feeds it. */
+  test("the toggle still works when storage writes throw", async ({ page }) => {
+    await page.emulateMedia({ colorScheme: "dark" });
+    await page.addInitScript(() => {
+      const boom = () => {
+        throw new Error("SecurityError: localStorage is disabled");
+      };
+      Object.defineProperty(window, "localStorage", {
+        configurable: true,
+        get() {
+          return { getItem: boom, setItem: boom, removeItem: boom };
+        },
+      });
+    });
+    await page.goto(dashboardUrl!, { waitUntil: "domcontentloaded" });
+    expect(
+      await bodyBackgroundLuminance(page),
+      "precondition: follows the OS to dark even with storage broken",
+    ).toBeLessThan(0.2);
+
+    const iconDark = await page.textContent("#theme-icon");
+
+    // First click: dark -> light.
+    await page.click("#theme-btn");
+    expect(
+      await bodyBackgroundLuminance(page),
+      "first click must switch to light",
+    ).toBeGreaterThan(0.5);
+    const iconLight = await page.textContent("#theme-icon");
+    expect(
+      iconLight,
+      "the icon must describe the new state, not the failed write",
+    ).not.toBe(iconDark);
+
+    // Second click must go BACK. This is the half that failed: the preference
+    // read fell through to the OS, so the toggle recomputed the same direction.
+    await page.click("#theme-btn");
+    expect(
+      await bodyBackgroundLuminance(page),
+      "second click must switch back to dark — a toggle that only goes one " +
+        "way is the bug this covers",
+    ).toBeLessThan(0.2);
+  });
+
   test("an explicit choice beats the OS in both directions", async ({
     page,
   }) => {
