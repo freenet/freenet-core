@@ -26,22 +26,39 @@ fn build_get_success_line(snap: &network_status::NetworkStatusSnapshot) -> Strin
     const MIN_SAMPLE: u32 = 20;
 
     let body = if total == 0 {
-        "<span class=\"gsr-none\">no GETs yet</span>".to_string()
+        "<span class=\"gsr-none\">none yet</span>".to_string()
     } else if total < MIN_SAMPLE {
         format!(
-            r#"<span class="gsr-none">too few to rate</span> <span class="gsr-detail">{ok} of {total} succeeded in {period}</span>"#
+            r#"<span class="gsr-none">too few to rate</span> <span class="gsr-detail">{ok} of {total} answered in {period}</span>"#
         )
     } else {
         let pct = (ok as f64 / total as f64) * 100.0;
         format!(
-            r#"<span class="gsr-value">{pct:.0}%</span> <span class="gsr-detail">{ok} of {total} requests, since start &middot; {period}</span>"#
+            r#"<span class="gsr-value">{pct:.0}% answered</span> <span class="gsr-detail">{ok} of {total} &middot; since start {period}</span>"#
         )
     };
 
+    // A caveat that is always shown, never conditional on the number being
+    // low. Two reasons it has to be visible rather than a tooltip.
+    //
+    // First, an unanswered GET is frequently the NETWORK failing to route,
+    // not this node failing to serve — dead-ends dominate the not-found mode
+    // today. A bare "GET success 1%" invites the operator to conclude their
+    // own node is broken and report it, which is a support burden built out
+    // of our own phrasing.
+    //
+    // Second, showing the caveat only when the figure looks bad would be a
+    // threshold in disguise, and choosing that threshold is exactly the
+    // judgement this panel exists to avoid making. So it is unconditional,
+    // and it says "not by itself" rather than "not your fault", because on a
+    // node with no connections it genuinely is this node.
+    let caveat = r#"<span class="gsr-caveat">Unanswered includes requests the network could not route, so a low share does not by itself mean this node is faulty.</span>"#;
+
     format!(
-        r#"<p class="get-success-rate" title="The share of this node's own GET requests that returned state, over the whole time it has been running. Not a recent window: peers issue only a handful of GETs an hour, so a short window would usually be empty. A GET that dead-ends counts as a failure.">
-            <span class="gsr-label">GET success</span> {body}
-        </p>"#
+        r#"<p class="get-success-rate" title="Of the GET requests this node has issued, the share that came back with contract state, over the whole time it has been running. Not a recent window: peers issue only a handful of GETs an hour, so a short window would nearly always be empty. A request that dead-ends in the network counts as unanswered.">
+            <span class="gsr-label">GET requests</span> {body}
+        </p>
+        <p class="get-success-caveat">{caveat}</p>"#
     )
 }
 

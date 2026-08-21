@@ -3195,6 +3195,11 @@ mod tests {
             html.contains("1 of 2"),
             "the counts are still worth showing — got:\n{html}"
         );
+        assert!(
+            html.contains("does not by itself"),
+            "the caveat must appear even when there is no rate to qualify — \
+             got:\n{html}"
+        );
     }
 
     /// The number the whole change exists to surface.
@@ -3211,11 +3216,11 @@ mod tests {
         let html = build_status_card(&Some(snap));
 
         assert!(
-            html.contains("1%"),
+            html.contains("1% answered"),
             "2 of 153 is 1% and must be shown as such — got:\n{html}"
         );
         assert!(
-            html.contains("2 of 153 requests"),
+            html.contains("2 of 153"),
             "the sample size must accompany the percentage, so the reader can \
              tell 1% of 153 from 1% of 3 — got:\n{html}"
         );
@@ -3224,6 +3229,35 @@ mod tests {
             "the figure is lifetime, not a recent window, and must say so — \
              got:\n{html}"
         );
+    }
+
+    /// The caveat must be UNCONDITIONAL, at every rate.
+    ///
+    /// An unanswered GET is frequently the network failing to route rather
+    /// than this node failing to serve — dead-ends dominate the not-found
+    /// mode. Without the caveat, "GET requests 1% answered" invites the
+    /// operator to conclude their own node is broken and report it, and the
+    /// support burden would be built out of our own phrasing.
+    ///
+    /// Showing it only when the number looks bad would be a threshold in
+    /// disguise, and picking that threshold is precisely the judgement this
+    /// panel exists to avoid. So it is pinned at a healthy rate too: if a
+    /// future change makes it conditional, this fails.
+    #[test]
+    fn get_success_caveat_is_shown_at_every_rate() {
+        for (ok, failed, label) in [(2u32, 151u32, "very low"), (150, 3, "very high")] {
+            let mut snap = base_snapshot();
+            snap.open_connections = 6;
+            snap.health = crate::node::network_status::HealthLevel::Healthy;
+            snap.elapsed_secs = 3600 * 4;
+            snap.op_stats.gets = (ok, failed);
+            let html = build_status_card(&Some(snap));
+            assert!(
+                html.contains("could not route"),
+                "the caveat must appear at a {label} rate too, or it becomes a \
+                 threshold in disguise — got:\n{html}"
+            );
+        }
     }
 
     /// The rate must not be styled as a verdict.
