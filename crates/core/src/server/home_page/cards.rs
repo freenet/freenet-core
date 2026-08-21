@@ -84,7 +84,11 @@ fn build_get_success_line(snap: &network_status::NetworkStatusSnapshot) -> Strin
     // judgement this panel exists to avoid making. So it is unconditional,
     // and it says "not by itself" rather than "not your fault", because on a
     // node with no connections it genuinely is this node.
-    let caveat = r#"<span class="gsr-caveat">Unanswered includes requests the network could not route, so a low share does not by itself mean this node is faulty.</span>"#;
+    // Plain text, not a <span>. An earlier draft wrapped this in
+    // `class="gsr-caveat"`, which no stylesheet rule ever matched — a dead
+    // class name reads as if it carries styling and invites someone to
+    // "restore" formatting that never existed. The wrapping <p> is styled.
+    let caveat = "Unanswered includes requests the network could not route, so a low share does not by itself mean this node is faulty.";
 
     format!(
         r#"<p class="get-success-rate" title="Of the GET requests this node has issued, the share that came back with contract state, over the whole time it has been running. Not a recent window: peers issue only a handful of GETs an hour, so a short window would nearly always be empty. A request that dead-ends in the network counts as unanswered.">

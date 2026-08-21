@@ -3304,7 +3304,15 @@ mod tests {
     /// future change makes it conditional, this fails.
     #[test]
     fn get_success_caveat_is_shown_at_every_rate() {
-        for (ok, failed, label) in [(2u32, 151u32, "very low"), (150, 3, "very high")] {
+        // Includes the total == 0 branch. Review noted it was the one case
+        // the caveat's own test never exercised — and it is the state a
+        // freshly-started node sits in, so it is the branch most operators
+        // see first.
+        for (ok, failed, label) in [
+            (2u32, 151u32, "very low"),
+            (150, 3, "very high"),
+            (0, 0, "no requests yet"),
+        ] {
             let mut snap = base_snapshot();
             snap.open_connections = 6;
             snap.health = crate::node::network_status::HealthLevel::Healthy;
