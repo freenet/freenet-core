@@ -1,5 +1,37 @@
 use super::*;
 
+/// Format a success share so the ROUNDING never asserts something false.
+///
+/// `{:.0}` alone renders 199/200 as "100%" and 1/200 as "0%". Both are lies of
+/// exactly the kind this panel exists to remove: "100% answered" when a
+/// request failed is the same shape of absolute, unearned claim as "Node is
+/// healthy" was. An operator reading 100% will stop looking.
+///
+/// So the two absolute values are reserved for the cases that genuinely earn
+/// them, and the bands next to them say which side of the boundary they are
+/// on rather than rounding across it.
+fn answered_share(ok: u32, total: u32) -> String {
+    if ok == total {
+        return "100%".to_string();
+    }
+    if ok == 0 {
+        return "0%".to_string();
+    }
+    // Inspect what would ACTUALLY be displayed rather than reasoning about
+    // where the boundary falls. Comparing against 99.5 / 0.5 by hand gets the
+    // exact-half case wrong — 1 of 200 is precisely 0.5%, and Rust's `{:.0}`
+    // rounds half to even, so it renders "0" while a hand-written `pct < 0.5`
+    // does not catch it. Formatting first removes the second guess.
+    let pct = (ok as f64 / total as f64) * 100.0;
+    let rendered = format!("{pct:.0}");
+    match rendered.as_str() {
+        // Would display as an absolute, but the counts say otherwise.
+        "100" => ">99%".to_string(),
+        "0" => "<1%".to_string(),
+        other => format!("{other}%"),
+    }
+}
+
 /// Contracts read successfully, as a measured rate rather than a verdict.
 ///
 /// Deliberately reports the LIFETIME rate with the period it covers, not a
@@ -32,9 +64,9 @@ fn build_get_success_line(snap: &network_status::NetworkStatusSnapshot) -> Strin
             r#"<span class="gsr-none">too few to rate</span> <span class="gsr-detail">{ok} of {total} answered in {period}</span>"#
         )
     } else {
-        let pct = (ok as f64 / total as f64) * 100.0;
         format!(
-            r#"<span class="gsr-value">{pct:.0}% answered</span> <span class="gsr-detail">{ok} of {total} &middot; since start {period}</span>"#
+            r#"<span class="gsr-value">{share} answered</span> <span class="gsr-detail">{ok} of {total} &middot; since start {period}</span>"#,
+            share = answered_share(ok, total),
         )
     };
 

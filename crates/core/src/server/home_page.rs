@@ -3231,6 +3231,65 @@ mod tests {
         );
     }
 
+    /// Rounding must never assert something that did not happen.
+    ///
+    /// `{:.0}` alone renders 199/200 as "100%" and 1/200 as "0%". Both are
+    /// false in the way this panel exists to prevent: "100% answered" when a
+    /// request failed is the same unearned absolute as "Node is healthy" was,
+    /// and an operator who reads 100% stops looking.
+    ///
+    /// 100% and 0% are therefore reserved for the cases that earn them, and
+    /// the bands beside them say which side of the boundary they are on
+    /// instead of rounding across it.
+    #[test]
+    fn answered_share_never_rounds_across_an_absolute() {
+        let render = |ok: u32, total: u32| {
+            let mut snap = base_snapshot();
+            snap.open_connections = 4;
+            snap.health = crate::node::network_status::HealthLevel::Healthy;
+            snap.elapsed_secs = 3600;
+            snap.op_stats.gets = (ok, total - ok);
+            build_status_card(&Some(snap))
+        };
+
+        // A single failure must not render as a perfect score.
+        let near_perfect = render(199, 200);
+        assert!(
+            near_perfect.contains("&gt;99% answered") || near_perfect.contains(">99% answered"),
+            "199 of 200 must not claim 100% — got:\n{near_perfect}"
+        );
+        assert!(
+            !near_perfect.contains("100% answered"),
+            "199 of 200 rounds to 100 and must be caught — got:\n{near_perfect}"
+        );
+
+        // A single success must not render as total failure.
+        let near_zero = render(1, 200);
+        assert!(
+            near_zero.contains("&lt;1% answered") || near_zero.contains("<1% answered"),
+            "1 of 200 must not claim 0% — got:\n{near_zero}"
+        );
+
+        // The absolutes are still available when genuinely earned.
+        let perfect = render(50, 50);
+        assert!(
+            perfect.contains("100% answered"),
+            "50 of 50 really is 100% — got:\n{perfect}"
+        );
+        let zero = render(0, 50);
+        assert!(
+            zero.contains("0% answered"),
+            "0 of 50 really is 0% — got:\n{zero}"
+        );
+
+        // And an ordinary value is unaffected: the 1.3% gateway from #5370.
+        let gateway = render(2, 153);
+        assert!(
+            gateway.contains("1% answered"),
+            "2 of 153 is 1.3%, which rounds honestly to 1% — got:\n{gateway}"
+        );
+    }
+
     /// The caveat must be UNCONDITIONAL, at every rate.
     ///
     /// An unanswered GET is frequently the network failing to route rather
