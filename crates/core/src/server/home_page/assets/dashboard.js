@@ -1,31 +1,176 @@
+/* Theme is a THREE-state PREFERENCE — explicit 'light', explicit 'dark', or no
+ * choice — held in localStorage, and separately a TWO-state RESOLVED theme
+ * stamped onto `data-theme` for the stylesheet to key off.
+ *
+ * Keeping those two things apart is the whole design, and conflating them was
+ * a real bug in the first version of this change. It resolved the preference
+ * into CSS by adding one `prefers-color-scheme` block that redefined the
+ * `:root` colour variables, and left the attribute unstamped when there was no
+ * explicit choice. But 24 separate rules in style.css key their light styling
+ * off `[data-theme='light']` directly, with hardcoded colours rather than
+ * those variables — every warning banner, NAT diagnostic, health banner and
+ * verdict badge among them. An OS-light operator therefore got light page
+ * chrome with dark-locked components on top: `.warning` rendering #fbbf24
+ * amber on a #f7f5f2 background, which is harder to read than either theme
+ * done properly.
+ *
+ * Stamping the RESOLVED value fixes all 24 at once, because they were already
+ * written correctly — they were simply never reached. The preference stays in
+ * localStorage, so stamping 'dark' for an OS-dark visitor does NOT record a
+ * choice they did not make; `effectiveTheme()` reads the store, not the
+ * attribute.
+ *
+ * The `prefers-color-scheme` block stays as the no-JavaScript fallback: it
+ * gets the base colours right on its own, which is a partial theme rather than
+ * a broken one.
+ *
+ * Applied inline at the top of the file, before first paint, so the page does
+ * not flash the wrong theme on load. */
 (function () {
+  var pref = null;
   try {
-    if (localStorage.getItem('theme') === 'light') {
-      document.documentElement.setAttribute('data-theme', 'light');
-    }
+    pref = localStorage.getItem('theme');
   } catch (e) {
-    /* localStorage unavailable — default to dark */
+    /* localStorage unavailable — resolve from the OS alone */
   }
+  var prefersLight = false;
+  try {
+    prefersLight = !!(
+      window.matchMedia &&
+      window.matchMedia('(prefers-color-scheme: light)').matches
+    );
+  } catch (e) {
+    /* matchMedia unavailable — treat as no OS preference */
+  }
+  document.documentElement.setAttribute(
+    'data-theme',
+    resolveTheme(pref, prefersLight),
+  );
 })();
 
-function toggleTheme() {
-  var isLight = document.documentElement.getAttribute('data-theme') === 'light';
-  var icon = document.getElementById('theme-icon');
-  if (isLight) {
-    document.documentElement.removeAttribute('data-theme');
-    if (icon)
-      icon.textContent = '\u2600\uFE0F'; /* sun = click to switch to light */
-    try {
-      localStorage.removeItem('theme');
-    } catch (e) {}
-  } else {
-    document.documentElement.setAttribute('data-theme', 'light');
-    if (icon)
-      icon.textContent = '\uD83C\uDF19'; /* moon = click to switch to dark */
-    try {
-      localStorage.setItem('theme', 'light');
-    } catch (e) {}
+/* The theme preference, with an in-memory fallback.
+ *
+ * `localStorage` throws in some privacy modes. Swallowing that is not harmless
+ * here, because `effectiveTheme()` reads the preference back to decide what the
+ * NEXT click should do. With a throwing store the read always reported "no
+ * preference" and fell through to the OS, so after one click the page was light
+ * while the icon still described a dark page, and every further click resolved
+ * to the same direction — a toggle that goes one way and then stops, with an
+ * icon that contradicts the screen.
+ *
+ * Mirroring the write in memory makes the control work whether or not the
+ * preference can be persisted; only durability across a reload is lost, which
+ * is what a browser refusing storage has already decided. Same shape as
+ * `tfGet`/`tfSet` for the table filters, for the same reason. */
+var themeMemory = null;
+
+function themePrefGet() {
+  if (themeMemory !== null) return themeMemory;
+  try {
+    return localStorage.getItem('theme');
+  } catch (e) {
+    return null;
   }
+}
+
+function themePrefSet(value) {
+  themeMemory = value;
+  try {
+    localStorage.setItem('theme', value);
+  } catch (e) {
+    /* memory copy above is the fallback */
+  }
+}
+
+/* theme-resolve:BEGIN
+ *
+ * Resolves the three-state theme setting. Extracted verbatim by
+ * `theme_preference.test.mjs`, so it takes its browser dependencies as
+ * parameters rather than reaching for globals — a substring pin cannot tell
+ * you whether an explicit choice correctly beats the OS in BOTH directions,
+ * which is the part that was previously unrepresentable.
+ *
+ * `pref` is the STORED preference — 'light', 'dark', or null/absent when the
+ * operator has chosen nothing. Deliberately not the stamped `data-theme`
+ * attribute: that always holds a resolved value, so feeding it back in would
+ * make every visitor look like they had chosen explicitly. */
+function resolveTheme(pref, prefersLight) {
+  if (pref === 'light' || pref === 'dark') return pref;
+  return prefersLight ? 'light' : 'dark';
+}
+/* theme-resolve:END */
+
+/* What the page is CURRENTLY showing, which is not the same as what was
+ * chosen: with no explicit choice the answer comes from the OS, so reading
+ * the attribute alone would report "dark" for a light-mode user and make the
+ * first toggle click appear to do nothing. */
+function effectiveTheme() {
+  var prefersLight = false;
+  try {
+    prefersLight = !!(
+      window.matchMedia &&
+      window.matchMedia('(prefers-color-scheme: light)').matches
+    );
+  } catch (e) {
+    /* matchMedia unavailable — treat as no OS preference */
+  }
+  /* Read the PREFERENCE, not the stamped attribute. The attribute now always
+     holds a resolved 'light' or 'dark', so reading it back would report every
+     visitor as having made an explicit choice and the OS would stop being
+     consulted after the first paint. */
+  return resolveTheme(themePrefGet(), prefersLight);
+}
+
+function updateThemeIcon() {
+  var icon = document.getElementById('theme-icon');
+  if (!icon) return;
+  /* The icon shows the theme you would switch TO, not the current one. */
+  icon.textContent =
+    effectiveTheme() === 'light'
+      ? '\uD83C\uDF19' /* moon = click for dark */
+      : '\u2600\uFE0F'; /* sun  = click for light */
+}
+
+/* Follow a LIVE OS theme change, while no explicit choice is stored.
+ *
+ * Needed because the resolved theme is stamped onto `data-theme` at load: the
+ * stylesheet's `prefers-color-scheme` block is guarded on the attribute being
+ * absent, so once stamped it no longer matches and the page would otherwise
+ * ignore the OS until the next reload. Stamping is what makes the 24
+ * attribute-keyed component rules work under OS-follow, so the cost of it is
+ * this listener.
+ *
+ * It also keeps the toggle's icon honest. The icon advertises what the NEXT
+ * click will do, so an OS flip that changes the page without changing the icon
+ * leaves it promising the opposite of what it delivers.
+ *
+ * Gated on there being no stored preference: an explicit choice must not be
+ * overridden by the OS changing underneath it. */
+function watchOsTheme() {
+  if (!window.matchMedia) return;
+  var mq = window.matchMedia('(prefers-color-scheme: light)');
+  var onChange = function () {
+    var pref = themePrefGet();
+    if (pref === 'light' || pref === 'dark') return;
+    document.documentElement.setAttribute(
+      'data-theme',
+      resolveTheme(null, mq.matches),
+    );
+    updateThemeIcon();
+  };
+  if (mq.addEventListener) {
+    mq.addEventListener('change', onChange);
+  } else if (mq.addListener) {
+    /* Safari < 14 */
+    mq.addListener(onChange);
+  }
+}
+
+function toggleTheme() {
+  var next = effectiveTheme() === 'light' ? 'dark' : 'light';
+  document.documentElement.setAttribute('data-theme', next);
+  themePrefSet(next);
+  updateThemeIcon();
 }
 
 /* ── Toast notifications ── */
@@ -887,10 +1032,11 @@ function createRefreshScheduler(deps) {
 /* refresh-scheduler:END */
 
 document.addEventListener('DOMContentLoaded', function () {
-  var icon = document.getElementById('theme-icon');
-  if (icon && document.documentElement.getAttribute('data-theme') === 'light') {
-    icon.textContent = '\uD83C\uDF19'; /* moon = click to switch to dark */
-  }
+  /* Reads the EFFECTIVE theme, not the attribute: with no explicit choice the
+     page follows the OS, and checking the attribute alone showed a sun icon
+     to a light-mode user who was already looking at a light page. */
+  updateThemeIcon();
+  watchOsTheme();
 
   /* Restore active tab after page load / auto-refresh */
   function restoreTab() {
