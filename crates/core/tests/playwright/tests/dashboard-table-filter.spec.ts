@@ -157,30 +157,45 @@ async function routeFixture(page: Page, rows: number): Promise<void> {
   });
 }
 
-/* Viewport-relative top of a row that is actually RENDERED.
+/* Viewport-relative top of a FIXED row, chosen so it is the same element
+ * before and after the refresh.
  *
- * A row hidden by the collapse reports `top: 0, height: 0`, so anchoring on
- * one makes the movement assertion compare 0 with 0 and pass unconditionally.
- * This picks the last visible row and asserts it has real geometry, so the
- * test fails loudly if the collapse ever hides the anchor rather than quietly
- * measuring nothing. */
-async function anchorRowTop(page: Page): Promise<number> {
-  const r = await page.evaluate((id) => {
-    const rows = [
-      ...document.querySelectorAll(`table[data-table-id="${id}"] tbody tr`),
-    ] as HTMLElement[];
-    const visible = rows.filter((row) => row.style.display !== "none");
-    const target = visible[visible.length - 1];
-    if (!target) return null;
-    const rect = target.getBoundingClientRect();
-    return { top: rect.top, height: rect.height, count: visible.length };
-  }, FIXTURE_TABLE_ID);
+ * An earlier version anchored on "the last visible row", which is not a stable
+ * identity: the collapse is re-applied by `restoreTableFilters` AFTER the
+ * `<main>` swap, so between the swap and that call every row is briefly
+ * visible and the last one is row 150 rather than row 25. Measuring that
+ * reports a wildly different position — the observed -428 -> 886 — for a
+ * viewport that never moved. It cost two wrong diagnoses (a page-height
+ * collapse, then a scroll clamp) before the anchor itself turned out to be
+ * the moving part.
+ *
+ * Row 20 sits inside the 25-row cap, so it is rendered in both states. The
+ * helper asserts non-zero height because a `display: none` row reports
+ * `top: 0, height: 0`, which would silently compare 0 with 0. */
+const ANCHOR_ROW = 20;
 
-  expect(r, "no visible rows to anchor the viewport assertion on").not.toBeNull();
+async function anchorRowTop(page: Page): Promise<number> {
+  const r = await page.evaluate(
+    ({ id, nth }) => {
+      const row = document.querySelector(
+        `table[data-table-id="${id}"] tbody tr:nth-child(${nth})`,
+      ) as HTMLElement | null;
+      if (!row) return null;
+      const rect = row.getBoundingClientRect();
+      return { top: rect.top, height: rect.height, hidden: row.style.display === "none" };
+    },
+    { id: FIXTURE_TABLE_ID, nth: ANCHOR_ROW },
+  );
+
+  expect(r, `no row ${ANCHOR_ROW} to anchor the viewport assertion on`).not.toBeNull();
+  expect(
+    r!.hidden,
+    `the anchor row is hidden by the collapse — it must sit inside the cap, \
+     or its position proves nothing about the viewport`,
+  ).toBe(false);
   expect(
     r!.height,
-    "the anchor row has zero height — it is hidden, so measuring its position \
-     proves nothing about the viewport",
+    "the anchor row has zero height, so measuring its position proves nothing",
   ).toBeGreaterThan(0);
   return r!.top;
 }
