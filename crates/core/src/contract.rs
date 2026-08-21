@@ -977,7 +977,13 @@ where
         //   not reach this code; that was false, because
         //   `handle_delegate_notification` calls THIS function, and the guard is
         //   what finally makes the statement true.
-        if !delegate_messages.is_empty() && inter_delegate == InterDelegateDispatch::Allowed {
+        //
+        // - HOSTED (multi-user) RUNS ARE REFUSED OUTRIGHT. See the
+        //   `user_context.is_some()` arm below.
+        if !delegate_messages.is_empty()
+            && inter_delegate == InterDelegateDispatch::Allowed
+            && user_context.is_none()
+        {
             tracing::debug!(
                 delegate_key = %delegate_key,
                 count = delegate_messages.len(),
@@ -1049,6 +1055,60 @@ where
                     }
                 }
             }
+        } else if !delegate_messages.is_empty() && user_context.is_some() {
+            // HOSTED-SCOPE GUARD.
+            //
+            // A per-user context exists ONLY in hosted (multi-user) mode, so on
+            // an ordinary single-user peer this arm is unreachable and delivery
+            // is unchanged. In hosted mode it refuses the hop entirely, and the
+            // reason is that delivering it would silently misfile the caller's
+            // private data.
+            //
+            // The mechanism: `DelegateCallEnv::secret_scope` picks
+            // `SecretScope::User` when a per-user context is present and
+            // `SecretScope::Local` when it is not. The hop deliberately passes
+            // `user_context = None` (see the comment on the executor call above)
+            // because per-user namespaces are bound to the connection boundary
+            // and must not propagate transitively through the delegate graph.
+            // Both halves are correct on their own, and together they mean a
+            // hosted-driven sender reads the USER's secrets while the target
+            // writes to the NODE-SHARED store.
+            //
+            // The consequences are why this is refused rather than logged:
+            //
+            //  1. The user's own reads resolve to their per-user scope and find
+            //     nothing, which presents as "you have no data" rather than as
+            //     an error.
+            //  2. Their plaintext is re-encrypted under the node KEK instead of
+            //     their token-derived DEK, so the operator can now read secrets
+            //     that `derive_user_dek` exists to keep from them.
+            //
+            // Neither is observable to the user, the app, or the delegate, which
+            // is what makes silence unacceptable here.
+            //
+            // NOT SOLVABLE by propagating the context instead. Today this hop
+            // can only reach `Local` scope, which in hosted mode is throwaway,
+            // so already-deployed delegates use it to dump and overwrite their
+            // stores WITHOUT gating who is asking — there is nothing valuable
+            // behind it. Propagating would silently rewire every one of those
+            // paths to operate on a user's private store and return the result
+            // to whatever app drove the message. Existing honest code would
+            // change meaning underneath itself.
+            //
+            // Nor is it solvable by moving secrets per-user at all: the per-user
+            // DEK is `HKDF(ikm = client_dek_secret)` and that secret is supplied
+            // per request and is NOT available at rest (see
+            // `SecretsStore::migrate_secrets`, which is Local-scope-only for
+            // exactly this reason). Hosted secrets can only move during a live
+            // session that presents the token, which is what the app-mediated
+            // migration already does.
+            tracing::warn!(
+                delegate_key = %delegate_key,
+                count = delegate_messages.len(),
+                "Refusing delegate-to-delegate delivery for a hosted per-user run: the target \
+                 would write to node-shared Local scope while the sender read per-user scope. \
+                 Hosted secret migration must go through the client-driven path."
+            );
         } else if !delegate_messages.is_empty() {
             // SCOPE-LAUNDERING GUARD (GHSA-824h-7x5x-wfmf).
             //
@@ -3076,6 +3136,52 @@ mod tests {
     ///  2. the notification path — which has no connection and therefore
     ///     hardcodes `Local` — is `InterDelegateDispatch::Suppressed`, so that
     ///     hardcoded value can never reach the hop.
+    /// The inter-delegate hop must refuse a hosted (per-user) run.
+    ///
+    /// Source-scrape, like its sibling above, and with the same honest limit:
+    /// it pins that the DISPATCH CONDITION carries the check, not that the
+    /// runtime really declines. A behavioural test needs a hosted-mode node, a
+    /// delegate that emits `SendDelegateMessage`, and a connection carrying a
+    /// user token; if you build one, delete this and assert the real thing.
+    ///
+    /// Why it is worth pinning at all: without the check the failure is
+    /// SILENT. A hosted-driven sender reads per-user secrets, the target writes
+    /// them to node-shared `Local`, the user's reads find nothing, and their
+    /// plaintext becomes readable by the operator. Nothing errors, so nothing
+    /// else in the suite would go red.
+    #[test]
+    fn inter_delegate_hop_refuses_a_hosted_per_user_run() {
+        let src = include_str!("contract.rs");
+        let body = src
+            .split("async fn handle_delegate_with_contract_requests")
+            .nth(1)
+            .expect("handle_delegate_with_contract_requests must exist");
+        let body = body
+            .split("\nasync fn ")
+            .next()
+            .expect("bounded by the next free function");
+
+        // The dispatch condition is the `if` guarding delivery. Bound it at the
+        // opening brace so a later `user_context` mention elsewhere in the
+        // function cannot satisfy this vacuously.
+        let cond = body
+            .split("if !delegate_messages.is_empty()")
+            .nth(1)
+            .expect("the delivery dispatch condition must exist");
+        let cond = cond
+            .split('{')
+            .next()
+            .expect("the condition is bounded by its block");
+
+        assert!(
+            cond.contains("user_context.is_none()"),
+            "the hop must refuse delivery when a per-user context is present: a hosted \
+             sender reads User scope while the target writes Local, which misfiles the \
+             user's secrets into the node-shared store AND re-encrypts them under the \
+             node KEK. Got condition: {cond}"
+        );
+    }
+
     #[test]
     fn inter_delegate_hop_forwards_the_originating_scope() {
         let src = include_str!("contract.rs");
