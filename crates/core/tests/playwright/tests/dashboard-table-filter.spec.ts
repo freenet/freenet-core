@@ -95,7 +95,20 @@ function fixtureCardHtml(rows: number): string {
     `<div class="table-wrap"><table class="sortable" data-table-id="${FIXTURE_TABLE_ID}">` +
     '<thead><tr><th data-sort-type="text">Address</th>' +
     '<th data-sort-type="num">Connected</th></tr></thead>' +
-    `<tbody>${body}</tbody></table></div></div>`
+    `<tbody>${body}</tbody></table></div>` +
+    /* A spacer with a FIXED height, inside the fixture so it is re-injected on
+       every refresh and its height never changes.
+
+       The row count cannot supply this: the collapse hides all but 25 rows, so
+       150 rows render as ~25 rows tall. On a CI node with no peers and no
+       contracts the rest of <main> is short too, so the page was barely
+       taller than the viewport — the scroll offset clamped, and any height
+       change then moved the anchor row hundreds of pixels. Locally it passed
+       only because that node has 210 peers and supplied the height by
+       accident. This makes the height a property of the fixture rather than of
+       whatever the node happens to be doing. */
+    '<div style="height:4000px" aria-hidden="true"></div>' +
+    "</div>"
   );
 }
 
