@@ -157,6 +157,50 @@ async function routeFixture(page: Page, rows: number): Promise<void> {
   });
 }
 
+/* Viewport-relative top of a FIXED row, chosen so it is the same element
+ * before and after the refresh.
+ *
+ * Row 20 sits inside the 25-row collapse cap, so it is rendered in both
+ * states. An earlier version anchored on "the last visible row", which is not
+ * a stable identity: the collapse is re-applied AFTER the `<main>` swap, so
+ * between the swap and that call every row is briefly visible and the last one
+ * is row 150 rather than row 25. Measuring that reported a large jump for a
+ * viewport that never moved.
+ *
+ * The helper asserts the row is neither hidden nor zero-height, because a
+ * `display: none` row reports `top: 0, height: 0` and would silently compare
+ * 0 with 0 — a vacuous shape this file has already fallen into once. */
+const ANCHOR_ROW = 20;
+
+async function anchorRowTop(page: Page): Promise<number> {
+  const r = await page.evaluate(
+    ({ id, nth }) => {
+      const row = document.querySelector(
+        `table[data-table-id="${id}"] tbody tr:nth-child(${nth})`,
+      ) as HTMLElement | null;
+      if (!row) return null;
+      const rect = row.getBoundingClientRect();
+      return {
+        top: rect.top,
+        height: rect.height,
+        hidden: row.style.display === "none",
+      };
+    },
+    { id: FIXTURE_TABLE_ID, nth: ANCHOR_ROW },
+  );
+
+  expect(r, `no row ${ANCHOR_ROW} to anchor the viewport assertion on`).not.toBeNull();
+  expect(
+    r!.hidden,
+    "the anchor row is hidden by the collapse — it must sit inside the cap",
+  ).toBe(false);
+  expect(
+    r!.height,
+    "the anchor row has zero height, so measuring its position proves nothing",
+  ).toBeGreaterThan(0);
+  return r!.top;
+}
+
 /** Wait for one auto-refresh, detected by the uptime text changing. */
 async function waitForRefresh(page: Page): Promise<boolean> {
   const before = await page.locator(".uptime").textContent();
@@ -275,11 +319,43 @@ test.describe("dashboard long-table filter", () => {
      * This is not a weaker test. Mutating the gate to restore focus
      * unconditionally fails it in all three engines, which is the same
      * mutation the position assertion caught — with none of the machinery. */
+    /* TWO assertions, guarding TWO different failures — and review caught that
+       only having the second left the first unguarded.
+     *
+     * The viewport measurement below catches the WebKit auto-scroll: WebKit
+     * scrolls a still-FOCUSED element into view when layout changes, and the
+     * `<main>` swap is a layout change, so the page moved before any of our
+     * logic ran. The fix is to blur before the swap. Removing that blur is
+     * INVISIBLE to a `document.activeElement` check, because the swap destroys
+     * the focused input either way — so `refocused` reads false whether or not
+     * the fix is present. Measured: with the blur reverted, all six
+     * focus-based assertions still passed.
+     *
+     * The refocus assertion further down catches the other failure: the
+     * visibility gate deciding to restore focus to a box that is off screen.
+     *
+     * Note on evidence: the blur mutation cannot be reproduced on a local
+     * node — a sparse local gateway passes this assertion with the blur
+     * removed. The proof it detects the regression comes from CI, which failed
+     * exactly here at -599 -> 715 on the runs before the blur landed and has
+     * passed since. If this assertion is ever weakened, that is the signal it
+     * was protecting.
+     *
+     * Neither substitutes for the other. Reverting the blur fails the first;
+     * removing the gate fails the second. */
+    const rowTopBefore = await anchorRowTop(page);
+
     expect(
       await waitForRefresh(page),
-      "no auto-refresh fired — the assertion below would pass vacuously",
+      "no auto-refresh fired — the assertions below would pass vacuously",
     ).toBe(true);
     await page.waitForTimeout(500);
+
+    const rowTopAfter = await anchorRowTop(page);
+    expect(
+      Math.abs(rowTopAfter - rowTopBefore),
+      `the row under the reader moved from ${Math.round(rowTopBefore)} to ${Math.round(rowTopAfter)} in the viewport`,
+    ).toBeLessThan(50);
 
     /* The fixture must have SURVIVED the refresh, i.e. the route intercept
        matched the refresh's own request. `dashboard.js` refreshes with
