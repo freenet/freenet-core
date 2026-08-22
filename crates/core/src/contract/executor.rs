@@ -63,7 +63,20 @@ pub(crate) const MAX_SUBSCRIBERS_PER_CONTRACT: usize = 256;
 
 /// Maximum total subscriptions a single client may hold across all contracts.
 /// Prevents a single client from spreading thin across many contracts to exhaust resources.
-pub(crate) const MAX_SUBSCRIPTIONS_PER_CLIENT: usize = 50;
+///
+/// This is a hard-coded network-wide constant, not a per-node config option, and that is
+/// deliberate: a configurable cap would mean a dApp works on some peers and not others,
+/// which is exactly the non-uniformity Freenet must avoid (every node must enforce the
+/// same limit so client behavior is predictable network-wide). Do not make this
+/// configurable — that has been proposed and explicitly rejected (Ian, 2026-08-22).
+///
+/// Raised from 50 to 500 (2026-08-22): 50 was hit almost immediately by apps that
+/// subscribe to one contract per discoverable peer/user (e.g. Freebird's discovery
+/// pattern), and the cap was trivially bypassable by opening a second websocket
+/// connection (each connection mints a fresh `ClientId` with its own budget), so it
+/// penalized well-behaved clients while stopping no determined abuser. See the PR that
+/// raised this constant for the worst-case memory arithmetic behind the new value.
+pub(crate) const MAX_SUBSCRIPTIONS_PER_CLIENT: usize = 500;
 
 /// Buffer size for per-subscriber notification channels.
 /// When full, notifications are dropped (lossy) rather than blocking the executor.
