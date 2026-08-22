@@ -2207,6 +2207,114 @@ mod unsupported_request_tests {
         }
     }
 
+    /// End-to-end proof that the fix unblocks the CLIENT, not merely the
+    /// internal `Result`: drives the real `client_event_handling` loop (the
+    /// function every production and simulation node runs — see
+    /// `node/p2p_impl.rs` and `node/testing_impl/in_memory.rs`) with a
+    /// minimal mock `ClientEventsProxy`, feeds it one `Authenticate`
+    /// request, and asserts the mock's `send()` — the ONLY way a response
+    /// reaches a client over the wire — is actually invoked with the
+    /// "unsupported" error. Before the fix this test times out: the loop
+    /// gets `Ok(None)` from `process_open_request`, treats it as "nothing to
+    /// send" (`(_, Ok(None)) => continue`), and never calls `send()` at all
+    /// — the exact silent-hang bug, observed at the layer a real client sits
+    /// behind.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsupported_client_request_reaches_the_client_as_an_error() {
+        use freenet_stdlib::client_api::{ClientError, HostResponse};
+        use futures::FutureExt;
+        use futures::future::BoxFuture;
+        use std::collections::VecDeque;
+        use std::sync::Mutex;
+
+        /// Mock `ClientEventsProxy`: `recv()` yields one queued request then
+        /// parks forever (mirrors a real proxy idling after its client sent
+        /// everything it's going to send); `send()` forwards whatever the
+        /// node tried to deliver to the client into a channel the test reads.
+        struct MockProxy {
+            to_recv: Mutex<VecDeque<OpenRequest<'static>>>,
+            received_tx:
+                tokio::sync::mpsc::UnboundedSender<(ClientId, Result<HostResponse, ClientError>)>,
+        }
+
+        impl crate::client_events::ClientEventsProxy for MockProxy {
+            fn recv(&mut self) -> BoxFuture<'_, crate::client_events::types::HostIncomingMsg> {
+                async move {
+                    if let Some(req) = self.to_recv.lock().expect("lock poisoned").pop_front() {
+                        Ok(req)
+                    } else {
+                        // No more requests queued: park forever rather than
+                        // returning an error, so the loop just idles (as a
+                        // real proxy would between client messages) instead
+                        // of tearing down.
+                        std::future::pending().await
+                    }
+                }
+                .boxed()
+            }
+
+            fn send(
+                &mut self,
+                id: ClientId,
+                response: Result<HostResponse, ClientError>,
+            ) -> BoxFuture<'_, Result<(), ClientError>> {
+                // The test may have already dropped its receiver (e.g. after
+                // its single expected `send()`); a closed mock channel here
+                // just means "test is done looking", not a real error.
+                if self.received_tx.send((id, response)).is_err() {
+                    tracing::debug!("MockProxy: test receiver dropped, ignoring send");
+                }
+                async move { Ok(()) }.boxed()
+            }
+        }
+
+        let (op_manager, _guards) = build_op_manager("unsupported-request-e2e").await;
+
+        let mut to_recv = VecDeque::new();
+        to_recv.push_back(OpenRequest::new(
+            ClientId::FIRST,
+            Box::new(ClientRequest::Authenticate {
+                token: "irrelevant".to_string(),
+            }),
+        ));
+        let (received_tx, mut received_rx) = tokio::sync::mpsc::unbounded_channel();
+        let proxy = MockProxy {
+            to_recv: Mutex::new(to_recv),
+            received_tx,
+        };
+
+        let (client_responses_rx, _client_responses_tx) =
+            crate::contract::client_responses_channel();
+        let (node_controller_tx, _node_controller_rx) = tokio::sync::mpsc::channel(1);
+
+        // `client_event_handling` runs forever (`-> anyhow::Result<Infallible>`);
+        // spawn it and only ever inspect what it sends, never its own exit.
+        let _handle = tokio::spawn(crate::client_events::client_event_handling(
+            op_manager,
+            proxy,
+            client_responses_rx,
+            node_controller_tx,
+        ));
+
+        let (client_id, response) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), received_rx.recv())
+                .await
+                .expect(
+                    "client_event_handling never called send() within 10s — the client \
+             would hang forever on an unsupported request",
+                )
+                .expect("the mock's response channel closed unexpectedly");
+
+        assert_eq!(client_id, ClientId::FIRST);
+        let err = response.expect_err("expected an error response for an unsupported request");
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("unsupported"),
+            "the error the client actually RECEIVES must say the operation is \
+             unsupported, got: {msg}"
+        );
+    }
+
     /// Source-scrape pin for the twin `ContractRequest` catch-all (the
     /// `ContractRequest` dispatch inside `ClientRequest::ContractOp`).
     ///
