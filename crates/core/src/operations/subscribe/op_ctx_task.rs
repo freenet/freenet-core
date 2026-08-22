@@ -108,14 +108,15 @@ pub(crate) async fn start_client_subscribe(
     //      and exits via `deliver_outcome`.
     //
     // Amplification ceiling: the WS SUBSCRIBE request path enforces
-    // `MAX_SUBSCRIPTIONS_PER_CLIENT = 50` upstream via
+    // `contract::executor::MAX_SUBSCRIPTIONS_PER_CLIENT` upstream via
     // `notify_contract_handler(RegisterSubscriberListener)` →
     // `runtime.rs:623` (Executor::register_subscription), which rejects
     // the registration BEFORE `subscribe_with_id` is called. A client
-    // that tries to open more than 50 in-flight subscribes gets a
-    // `SubscriberLimit` error from the contract handler and never
-    // reaches this spawn site. In-flight task count is therefore
-    // bounded by `num_clients * 50`, not unbounded.
+    // that tries to open more than `MAX_SUBSCRIPTIONS_PER_CLIENT`
+    // in-flight subscribes gets a `SubscriberLimit` error from the
+    // contract handler and never reaches this spawn site. In-flight
+    // task count is therefore bounded by
+    // `num_clients * MAX_SUBSCRIPTIONS_PER_CLIENT`, not unbounded.
     //
     // Leak detection: if the driver somehow gets stuck without exiting
     // any of the four paths above, `test_pending_op_results_bounded`

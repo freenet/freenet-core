@@ -63,7 +63,35 @@ pub(crate) const MAX_SUBSCRIBERS_PER_CONTRACT: usize = 256;
 
 /// Maximum total subscriptions a single client may hold across all contracts.
 /// Prevents a single client from spreading thin across many contracts to exhaust resources.
-pub(crate) const MAX_SUBSCRIPTIONS_PER_CLIENT: usize = 50;
+///
+/// This is a hard-coded network-wide constant, not a per-node config option, and that is
+/// deliberate: a configurable cap would mean a dApp works on some peers and not others,
+/// which is exactly the non-uniformity Freenet must avoid (every node must enforce the
+/// same limit so client behavior is predictable network-wide). Do not make this
+/// configurable — that has been proposed and explicitly rejected (Ian, 2026-08-22).
+///
+/// Raised from 50 to 500 (2026-08-22): 50 was hit almost immediately by apps that
+/// subscribe to one contract per discoverable peer/user (e.g. Freebird's discovery
+/// pattern), and the cap was trivially bypassable by opening a second websocket
+/// connection (each connection mints a fresh `ClientId` with its own budget), so it
+/// penalized well-behaved clients while stopping no determined abuser.
+///
+/// This constant does not bound per-subscription memory, so raising it is safe by the
+/// same argument at any value: each subscription's notification channel
+/// (`SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE`) is bounded by message COUNT, not bytes, and
+/// is drained lossily (`try_send`, dropped when full) rather than growing unbounded. A
+/// queued message can itself carry a full contract-state clone up to `MAX_STATE_SIZE`
+/// (see `wasm_runtime::state_store`), so the per-subscription worst case is already
+/// governed by that channel depth and state-size cap, not by this constant — raising
+/// this value only scales an exposure that exists independently of it. See the PR that
+/// raised this constant to 500 for the full numeric worked example.
+///
+/// Note: the tokio mpsc channel behind each subscription eagerly allocates its first
+/// block (32 slots by default) at creation and allocates further blocks on demand — it
+/// is not fully preallocated to capacity, but an idle subscription is not literally
+/// zero-cost either. The order-of-magnitude conclusion (idle cost is negligible, on the
+/// order of a few hundred bytes per subscription) still holds.
+pub(crate) const MAX_SUBSCRIPTIONS_PER_CLIENT: usize = 500;
 
 /// Buffer size for per-subscriber notification channels.
 /// When full, notifications are dropped (lossy) rather than blocking the executor.

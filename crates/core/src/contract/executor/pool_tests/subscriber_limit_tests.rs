@@ -128,6 +128,55 @@ async fn test_per_client_subscription_limit_enforced() {
     );
 }
 
+/// Regression test for raising `MAX_SUBSCRIPTIONS_PER_CLIENT` from 50 to 500
+/// (2026-08-22). Registers a client to more subscriptions than the FORMER cap of 50
+/// allowed; before the raise this would have failed partway through with a
+/// `SubscriberLimit` error. Deliberately uses a literal historical value (not
+/// `MAX_SUBSCRIPTIONS_PER_CLIENT`) so the test keeps pinning "more than the old 50"
+/// even if the constant moves again later.
+#[tokio::test(flavor = "current_thread")]
+async fn test_per_client_limit_allows_more_than_former_cap_of_50() {
+    const SUBSCRIPTIONS_BEYOND_FORMER_CAP: usize = 100;
+    const {
+        assert!(
+            SUBSCRIPTIONS_BEYOND_FORMER_CAP > 50
+                && SUBSCRIPTIONS_BEYOND_FORMER_CAP < MAX_SUBSCRIPTIONS_PER_CLIENT,
+            "test constant must stay between the former cap (50) and the current cap"
+        );
+    }
+
+    let mut executor = create_executor().await;
+    let client_id = ClientId::next();
+    let mut receivers = Vec::new();
+
+    for i in 0..SUBSCRIPTIONS_BEYOND_FORMER_CAP {
+        let seed = format!("beyond_former_cap_test_{i}");
+        let key = store_contract(&mut executor, seed.as_bytes()).await;
+        let instance_id = *key.id();
+        let (tx, rx) = tokio::sync::mpsc::channel(SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE);
+        executor
+            .register_contract_notifier(instance_id, client_id, tx, None)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "registration {i} (of {SUBSCRIPTIONS_BEYOND_FORMER_CAP}, beyond the \
+                     former 50-subscription cap) should succeed under the raised limit: {e}"
+                )
+            });
+        receivers.push(rx);
+    }
+
+    let subs = executor.get_subscription_info();
+    let client_sub_count = subs
+        .iter()
+        .filter(|info| info.client_id == client_id)
+        .count();
+    assert_eq!(
+        client_sub_count, SUBSCRIPTIONS_BEYOND_FORMER_CAP,
+        "client should hold all {SUBSCRIPTIONS_BEYOND_FORMER_CAP} subscriptions, which \
+         exceeds the former cap of 50"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn test_per_client_limit_does_not_affect_other_clients() {
     let mut executor = create_executor().await;
