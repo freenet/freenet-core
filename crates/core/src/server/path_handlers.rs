@@ -1233,6 +1233,68 @@ async fn handle_get_response(
                 })),
             ..
         })) => Err(WebSocketApiError::MissingContract { instance_id }),
+        // TRANSIENT: the GET's retry loop exhausted without locating the
+        // contract. This is a SUCCESS at the client-API level, not an `Err` —
+        // `operations/get/op_ctx_task.rs` deliberately converts exhaustion into
+        // `ContractResponse::NotFound` so a client can tell that apart from "the
+        // operation failed".
+        //
+        // Read the PRODUCER, not the variant's doc, for what it means. stdlib
+        // documents `NotFound` as "Contract was not found after exhaustive
+        // search ... distinguishes 'contract doesn't exist' from other failure
+        // modes", i.e. as proof of absence. This node emits it on RETRY-LOOP
+        // EXHAUSTION, which is a much weaker claim — "nobody I asked had it",
+        // over a ring that may not yet have propagated the contract at all. The
+        // two do not say the same thing, and that gap is the whole reason this
+        // arm must not answer 404: treating exhaustion as absence is precisely
+        // the error being fixed here.
+        //
+        // Without this arm that distinction was DISCARDED here: `NotFound` is an
+        // `Ok(..)` that no arm matched, so it fell through to the catch-all
+        // below and became `NodeError { "Unexpected response from node: .." }`.
+        // `errors.rs` only maps a `NodeError` to 404 when its message begins
+        // with the literal "Contract not found", which that Debug-formatted
+        // string does not, so every dead-ended GET on the web route was served
+        // as a bare 500 — indistinguishable from a genuine internal failure, and
+        // carrying none of the `Retry-After` / `Cache-Control: no-store` headers
+        // the transient path sets.
+        //
+        // On Freenet a `NotFound` is routinely "not found YET" rather than proof
+        // of absence: a contract published elsewhere is unreachable from this
+        // node until it propagates (the #4404 placement gap), which is a window
+        // of minutes to hours. `WebSocketApiError::ContractNotFound` gives it the
+        // transient STATUS and headers (503 + `Retry-After`), which is what a
+        // programmatic client needs in order to come back later rather than write
+        // the contract off.
+        //
+        // It is a dedicated variant rather than a reuse of the `Err(_)` arm's
+        // `RequestError(Timeout)`, because this is not a timeout and must not
+        // inherit `retry_loading_page`: that page reloads forever, and the same
+        // reply is produced for a key that will never resolve, so a mistyped URL
+        // in an open tab would re-issue a network GET every minute for the life
+        // of the tab. See the variant's doc in `errors.rs`.
+        //
+        // 404 would be the WRONG call and is worse than the 500 it replaces: a
+        // well-behaved crawler treats 404 as terminal (Atlas marks such a
+        // locator seen for good and never retries it), so answering 404 here
+        // would permanently exclude every contract that was merely slow to
+        // propagate. Only answer 404 where absence is locally PROVEN — which is
+        // what the `contract: None` arm above does.
+        Ok(Some(HostCallbackResult::Result {
+            result: Ok(HostResponse::ContractResponse(ContractResponse::NotFound { .. })),
+            ..
+        })) => {
+            // Plain `info!`, like every other diagnostic in this module, so it
+            // lands in the node's log files and NOT in the OTel collector, which
+            // only carries enumerated events. Fine for reading one node's log;
+            // if anyone wants a fleet-wide dead-ended-GET rate, that needs an
+            // enumerated event, not this line.
+            tracing::info!(
+                instance_id = %instance_id.encode(),
+                "contract not found on the network (GET exhausted); serving 503"
+            );
+            Err(WebSocketApiError::ContractNotFound { instance_id })
+        }
         Ok(Some(HostCallbackResult::Result {
             result: Err(err), ..
         })) => {
@@ -4492,6 +4554,159 @@ mod tests {
                 })
             ),
             "30s timeout must map to RequestError(Timeout) (for retry page), got: {result:?}"
+        );
+    }
+
+    /// A GET whose retry loop exhausted comes back as `Ok(ContractResponse::
+    /// NotFound)` — a SUCCESS at the client-API level, produced deliberately so
+    /// a client can tell "absent" apart from "the operation failed". It must be
+    /// classified transient, not swept into the unmatched-response catch-all.
+    ///
+    /// Regression pin. Before the arm existed, `NotFound` matched no arm, fell
+    /// into `Ok(other)`, and became `NodeError { "Unexpected response from node:
+    /// .." }`, which `errors.rs` renders as a bare 500 because the message does
+    /// not begin with "Contract not found". On Freenet a `NotFound` is routinely
+    /// "not found YET" (the #4404 placement gap), so a contract published
+    /// minutes earlier served a dead-looking 500 to every visitor and every
+    /// crawler until it propagated.
+    ///
+    /// The status assertion is the half that matters, so it is made against the
+    /// real `into_response`: asserting only the error VARIANT would still pass
+    /// if `errors.rs` later stopped treating `RequestError(Timeout)` as
+    /// transient, which is exactly the coupling that broke here.
+    #[tokio::test]
+    async fn handle_get_response_maps_network_not_found_to_transient_retry() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x44;
+        let instance_id = ContractInstanceId::new(bytes);
+
+        let recv_result: Result<Option<HostCallbackResult>, tokio::time::error::Elapsed> =
+            Ok(Some(HostCallbackResult::Result {
+                id: crate::client_events::ClientId::next(),
+                result: Ok(HostResponse::ContractResponse(ContractResponse::NotFound {
+                    instance_id,
+                })),
+            }));
+
+        let result = handle_get_response(instance_id, recv_result, &test_webapp_cache()).await;
+        let err = result.expect_err("a network NotFound must not be treated as a successful fetch");
+        assert!(
+            matches!(err, WebSocketApiError::ContractNotFound { .. }),
+            "a dead-ended GET must get its own classification, not fall through to the \
+             unmatched-response catch-all, got: {err:?}"
+        );
+
+        let response = err.into_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "must serve 503 (retry later). 500 is what this bug produced; 404 would be \
+             WORSE than the bug, because a crawler treats 404 as terminal and would \
+             permanently drop a contract that was merely slow to propagate"
+        );
+
+        // The headers are the half a programmatic client acts on, and they are set
+        // by a DIFFERENT file. Asserting the status alone would still pass if
+        // `errors.rs` stopped attaching them to this variant.
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("60"),
+            "503 without Retry-After tells a client to come back but not when"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "an intermediary must not pin this page once the contract arrives"
+        );
+
+        // And it must NOT auto-refresh. The identical node reply is produced for a
+        // key that will never resolve, so a meta-refresh here re-issues a network
+        // GET every minute for the life of any tab left open on a mistyped URL.
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body must be readable");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            !body.contains("http-equiv=\"refresh\""),
+            "the not-found page must not reload itself — see browser-assets.md, \
+             'assume every open tab pays the cost'"
+        );
+    }
+
+    /// The catch-all still catches. Carving `NotFound` out of it must not leave it
+    /// dead: a response that genuinely makes no sense for a GET (here a
+    /// `PutResponse`) must still surface as an unmatched-response error.
+    ///
+    /// This arm is where the fixed bug hid, and nothing exercised it before.
+    #[tokio::test]
+    async fn handle_get_response_still_rejects_a_genuinely_unexpected_response() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x45;
+        let instance_id = ContractInstanceId::new(bytes);
+        let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            instance_id,
+            freenet_stdlib::prelude::CodeHash::new([0u8; 32]),
+        );
+
+        let recv_result: Result<Option<HostCallbackResult>, tokio::time::error::Elapsed> =
+            Ok(Some(HostCallbackResult::Result {
+                id: crate::client_events::ClientId::next(),
+                result: Ok(HostResponse::ContractResponse(
+                    ContractResponse::PutResponse { key },
+                )),
+            }));
+
+        let result = handle_get_response(instance_id, recv_result, &test_webapp_cache()).await;
+        let err = result.expect_err("a PutResponse is not a valid answer to a GET");
+        assert!(
+            matches!(err, WebSocketApiError::NodeError { .. }),
+            "an unexpected variant must still reach the catch-all, got: {err:?}"
+        );
+        assert_eq!(
+            err.into_response().status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "a genuinely unexpected node response IS a server-side error, and 500 is \
+             the right answer for it — that was never the complaint"
+        );
+    }
+
+    /// A node-returned `Err` keeps its own `ErrorKind`, so `errors.rs` can decide
+    /// transient-vs-terminal from the kind. Pinned because the NotFound arm sits
+    /// directly above this one and a mis-ordered edit would swallow it.
+    #[tokio::test]
+    async fn handle_get_response_preserves_a_node_returned_error_kind() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x46;
+        let instance_id = ContractInstanceId::new(bytes);
+
+        let recv_result: Result<Option<HostCallbackResult>, tokio::time::error::Elapsed> =
+            Ok(Some(HostCallbackResult::Result {
+                id: crate::client_events::ClientId::next(),
+                result: Err(ErrorKind::OperationError {
+                    cause: "contract banned".into(),
+                }
+                .into()),
+            }));
+
+        let result = handle_get_response(instance_id, recv_result, &test_webapp_cache()).await;
+        let err = result.expect_err("a node error must not be treated as a successful fetch");
+        assert!(
+            matches!(
+                err,
+                WebSocketApiError::AxumError {
+                    error: ErrorKind::OperationError { .. }
+                }
+            ),
+            "the node's own ErrorKind must survive so errors.rs can classify it, got: {err:?}"
         );
     }
 
