@@ -3302,6 +3302,80 @@ mod tests {
         );
     }
 
+    /// The abbreviating branch, which nothing else reaches.
+    ///
+    /// `abbreviate()` only runs when a contract has neither a subscription nor
+    /// a hosting record but DOES have a governance one — an Evicted, Banned or
+    /// WouldEvict contract this node no longer holds. That is a real and
+    /// expected state, and every other test supplies a short `key_short` from
+    /// a subscription or hosting entry instead, so the truncation arithmetic
+    /// was never executed.
+    ///
+    /// The multi-byte case is the reason the function uses `.chars()` rather
+    /// than byte slicing: a `&key[..12]` regression would panic on a
+    /// non-ASCII boundary rather than fail politely. Contract keys are base58
+    /// today, so this is defensive — which is exactly why it needs a test
+    /// rather than a reader's confidence.
+    #[test]
+    fn contract_detail_abbreviates_a_long_governance_only_key() {
+        use crate::node::network_status::{ContractGovernanceEntry, GovernanceStateSnapshot};
+
+        let gov_only = |key: &str| {
+            let mut snap = base_snapshot();
+            snap.open_connections = 2;
+            snap.governance.contracts = vec![ContractGovernanceEntry {
+                instance_id: key.to_string(),
+                instance_id_short: key.to_string(),
+                state: GovernanceStateSnapshot::Banned,
+                cost_used: 9.0,
+                benefit_score: 0.1,
+                log_ratio: Some(-2.0),
+                age_secs: 120,
+                last_transition_secs_ago: 30,
+                history: Vec::new(),
+            }];
+            contract_detail_html_from(&Some(snap), key)
+        };
+
+        // 44 base58 characters, the real shape of a contract key.
+        let long = "7WSdxLxjPvKgGZBqDpRuPMuoprnQBmXtnkHkDpTPTdcJ";
+        let html = gov_only(long);
+        assert!(
+            html.contains("7WSdxLxjPvKg…"),
+            "a governance-only contract has no short form to borrow, so the \
+             page must abbreviate the key itself — got:\n{html}"
+        );
+        assert!(
+            html.contains(long),
+            "and must still show the full key, which is what the copy button \
+             and the filter search on — got:\n{html}"
+        );
+
+        // Exactly at the boundary: 12 chars must NOT be truncated.
+        let twelve = "123456789012";
+        let at_boundary = gov_only(twelve);
+        assert!(
+            !at_boundary.contains("123456789012…"),
+            "a key exactly at the cap is not longer than the cap, so it must \
+             not gain an ellipsis — got:\n{at_boundary}"
+        );
+
+        // Multi-byte, to pin that truncation counts CHARACTERS not bytes. A
+        // byte-slicing regression panics here rather than returning something
+        // wrong, which is the failure mode worth catching early.
+        let wide = "ααααααααααααααα";
+        let multibyte = gov_only(wide);
+        let expected: String = "α".repeat(12);
+        assert!(
+            multibyte.contains(&format!("{expected}…")),
+            "a multi-byte key must abbreviate to 12 CHARACTERS, not 12 bytes. \
+             The first version of this assertion was `contains(\"…\")` behind \
+             an `||`, which is true either way — byte slicing yields 6 of \
+             these 2-byte chars and sailed through it. Counting the characters \
+             is what distinguishes the two — got:\n{multibyte}"
+        );
+    }
+
     /// A hosted-only contract CAN be cross-referenced against governance,
     /// and this pins the non-obvious reason why.
     ///
