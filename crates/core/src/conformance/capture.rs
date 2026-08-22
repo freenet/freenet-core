@@ -645,6 +645,10 @@ async fn run_writer(
     // wide open. The default is now the pessimistic variant too, but seeding this
     // correctly is the fix; the default is only the backstop.
     let mut last_focus;
+    // Validation-resolved related state that arrived for a contract with no sampler
+    // entry, and was therefore discarded. Node-wide, because there is no per-contract
+    // place to put it — that is precisely the situation being counted.
+    let mut related_untracked = 0u64;
     let mut warmup_attempts = 0u32;
     // Focused contracts with no samples yet, carried across the probe so the finished
     // tick can report them rather than silently omitting them from `focused`.
@@ -672,12 +676,29 @@ async fn run_writer(
                 let observation = match msg {
                     CaptureMsg::Transition(observation) => *observation,
                     CaptureMsg::Related { contract, related } => {
-                        if !record_related(&mut samplers, &scope, contract, &related) {
-                            continue;
+                        match record_related(&mut samplers, &scope, contract, &related) {
+                            RelatedOutcome::Recorded => {}
+                            RelatedOutcome::OutOfFocus => continue,
+                            RelatedOutcome::Untracked => {
+                                // Counted, never silent. Reaching this means a contract
+                                // needed related state to VALIDATE before it had ever
+                                // been sampled — the fresh-PUT case — so its dependency
+                                // went uncaptured and a later replay of it cannot reach
+                                // a verdict. An empty related map must not be able to
+                                // mean "never needed any" when it means "thrown away".
+                                related_untracked += 1;
+                                continue;
+                            }
                         }
                         since_flush += 1;
                         if since_flush >= FLUSH_EVERY_OBSERVATIONS {
-                            write_all(&dir, &samplers, dropped.load(Ordering::Relaxed)).await;
+                            write_all(
+                                &dir,
+                                &samplers,
+                                dropped.load(Ordering::Relaxed),
+                                related_untracked,
+                            )
+                            .await;
                             since_flush = 0;
                         }
                         continue;
@@ -702,7 +723,13 @@ async fn run_writer(
                 }
                 since_flush += 1;
                 if since_flush >= FLUSH_EVERY_OBSERVATIONS {
-                    write_all(&dir, &samplers, dropped.load(Ordering::Relaxed)).await;
+                    write_all(
+                                &dir,
+                                &samplers,
+                                dropped.load(Ordering::Relaxed),
+                                related_untracked,
+                            )
+                            .await;
                     since_flush = 0;
                 }
             }
@@ -727,7 +754,13 @@ async fn run_writer(
                 last_focus = focus;
             }
             _ = flush.tick() => {
-                write_all(&dir, &samplers, dropped.load(Ordering::Relaxed)).await;
+                write_all(
+                                &dir,
+                                &samplers,
+                                dropped.load(Ordering::Relaxed),
+                                related_untracked,
+                            )
+                            .await;
                 since_flush = 0;
             }
             // Only start a probe when none is in flight. A probe that overran its
@@ -842,7 +875,13 @@ async fn run_writer(
     }
 
     // Channel closed: the node is going away. Write what we have.
-    write_all(&dir, &samplers, dropped.load(Ordering::Relaxed)).await;
+    write_all(
+        &dir,
+        &samplers,
+        dropped.load(Ordering::Relaxed),
+        related_untracked,
+    )
+    .await;
 }
 
 pub(crate) struct TrackedContract {
@@ -1068,21 +1107,44 @@ pub(crate) fn bundle_path(dir: &Path, instance: &ContractInstanceId) -> PathBuf 
 /// Scope is honoured the same way `record` honours it: an out-of-focus contract is
 /// retained but no longer collects, and that has to include this route or "sampling
 /// follows focus" would be true of transitions and quietly false of related state.
-/// Returns whether anything was actually recorded, so the caller does not treat a
-/// no-op as progress: a stray or out-of-focus message must not push the flush counter
-/// and rewrite every bundle on disk for a map that did not change.
+/// What became of a validation-resolved related-state message.
+///
+/// A bare `bool` was not enough, and the difference matters. Two things make
+/// `record_related` do nothing, and only one of them is benign:
+///
+/// - **out of focus** — expected, and the same rule `record` applies to transitions;
+/// - **untracked** — the contract has no sampler entry, so the state is discarded and
+///   the corpus will never be able to judge that contract.
+///
+/// The second is reachable on the ordinary path, not a corner: a fresh PUT runs
+/// `validate_state` — and therefore this capture — BEFORE any transition has been
+/// observed for that contract, so the textbook use of `RequestRelated` (a contract
+/// validating its initial state against another contract) lands here every time. If
+/// nothing counts it, an empty related map is again indistinguishable from one that
+/// was never needed, which is #5376 moved from "no call site" to "silent discard".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelatedOutcome {
+    /// Merged into the contract's sample.
+    Recorded,
+    /// The contract is not in focus; retained entries stop collecting, as for
+    /// transitions.
+    OutOfFocus,
+    /// No sampler entry exists, so there was nowhere to put it. Counted node-wide.
+    Untracked,
+}
+
 #[must_use]
 pub(crate) fn record_related(
     samplers: &mut HashMap<ContractInstanceId, TrackedContract>,
     scope: &SamplingScope,
     contract: ContractInstanceId,
     related: &[(ContractInstanceId, Vec<u8>)],
-) -> bool {
+) -> RelatedOutcome {
     if !scope.admits(&contract) {
-        return false;
+        return RelatedOutcome::OutOfFocus;
     }
     let Some(tracked) = samplers.get_mut(&contract) else {
-        return false;
+        return RelatedOutcome::Untracked;
     };
     let (max_state, max_total) = related_budgets(tracked.sampler.config());
     admit_related(
@@ -1092,7 +1154,7 @@ pub(crate) fn record_related(
         max_state,
         max_total,
     );
-    true
+    RelatedOutcome::Recorded
 }
 
 /// Fold one observation into the sampler map.
@@ -1334,14 +1396,26 @@ async fn write_all(
     dir: &Path,
     samplers: &HashMap<ContractInstanceId, TrackedContract>,
     dropped: u64,
+    related_untracked: u64,
 ) {
     for (instance, tracked) in samplers {
         let mut bundle = bundle_for(*instance, tracked);
         let refused = tracked.refused_related;
         bundle.note = Some(format!(
-            "captured by freenet {} ({} observation(s) dropped node-wide){}",
+            "captured by freenet {} ({} observation(s) dropped node-wide{}){}",
             env!("CARGO_PKG_VERSION"),
             dropped,
+            // Only mentioned when non-zero, so an ordinary note stays readable. It
+            // means a contract needed related state to VALIDATE before it had ever
+            // been sampled, so that dependency was never captured.
+            if related_untracked == 0 {
+                String::new()
+            } else {
+                format!(
+                    ", {related_untracked} validation-related message(s) discarded for \
+                     untracked contracts"
+                )
+            },
             // Carried INTO the corpus, not just logged. A replay reads the bundle
             // long after the node's logs have rotated, and "no related state" versus
             // "related state was refused" is the difference between a contract that
@@ -2291,7 +2365,7 @@ mod tests {
             "fixture did not trigger a refusal, so this proves nothing"
         );
 
-        write_all(dir.path(), &samplers, 0).await;
+        write_all(dir.path(), &samplers, 0, 0).await;
 
         let bundle =
             super::super::bundle::ReplayBundle::read_from(&bundle_path(dir.path(), &watched))
@@ -2365,6 +2439,77 @@ mod tests {
         );
     }
 
+    /// A discarded-because-untracked message is COUNTED in the corpus, not silent.
+    ///
+    /// This is the reachable case, not a corner: a fresh PUT runs `validate_state`, and
+    /// therefore this capture, before any transition for that contract has been
+    /// observed — so a contract validating its initial state against another contract
+    /// lands here every time. Without a count, the resulting empty related map is
+    /// indistinguishable from one that was never needed, which is #5376 all over again
+    /// with the loss moved from "no call site" to "silent discard".
+    #[tokio::test]
+    async fn related_state_discarded_for_an_untracked_contract_is_recorded_in_the_note() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut samplers = HashMap::new();
+        let tracked = instance(1);
+
+        // One genuinely tracked contract, so a bundle gets written at all.
+        let _evicted = record(
+            &mut samplers,
+            &SamplingScope::Wide,
+            observation_for(tracked),
+        );
+
+        // Two messages for contracts with no sampler entry, as a fresh PUT produces.
+        assert_eq!(
+            record_related(&mut samplers, &SamplingScope::Wide, instance(8), &[]),
+            RelatedOutcome::Untracked
+        );
+        assert_eq!(
+            record_related(&mut samplers, &SamplingScope::Wide, instance(9), &[]),
+            RelatedOutcome::Untracked
+        );
+
+        write_all(dir.path(), &samplers, 0, 2).await;
+
+        let bundle =
+            super::super::bundle::ReplayBundle::read_from(&bundle_path(dir.path(), &tracked))
+                .expect("bundle should have been written");
+        let note = bundle.note.unwrap_or_default();
+        assert!(
+            note.contains("2 validation-related message(s) discarded"),
+            "the corpus does not record that validation-resolved related state was \
+             discarded, so a reader cannot tell an untaken dependency from an absent \
+             one: {note}"
+        );
+    }
+
+    /// The note stays quiet when nothing was discarded.
+    ///
+    /// A counter that always prints is as uninformative as one that never does.
+    #[tokio::test]
+    async fn the_note_says_nothing_about_discards_when_there_were_none() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut samplers = HashMap::new();
+        let tracked = instance(1);
+        let _evicted = record(
+            &mut samplers,
+            &SamplingScope::Wide,
+            observation_for(tracked),
+        );
+
+        write_all(dir.path(), &samplers, 0, 0).await;
+
+        let bundle =
+            super::super::bundle::ReplayBundle::read_from(&bundle_path(dir.path(), &tracked))
+                .expect("bundle should have been written");
+        let note = bundle.note.unwrap_or_default();
+        assert!(
+            !note.contains("discarded"),
+            "a clean run still claims discards, so the signal means nothing: {note}"
+        );
+    }
+
     /// Validation-resolved related state reaches the tracked contract.
     ///
     /// The #5376 regression. Related state arrives by two routes and only one travels
@@ -2395,10 +2540,11 @@ mod tests {
             &[(instance(2), vec![7u8; 32])],
         );
 
-        assert!(
+        assert_eq!(
             recorded,
-            "a real merge reported itself as a no-op, so the writer will skip the \
-             flush that persists it"
+            RelatedOutcome::Recorded,
+            "a real merge did not report itself as recorded, so the writer will skip \
+             the flush that persists it"
         );
         assert_eq!(
             samplers[&watched].related.len(),
@@ -2425,11 +2571,12 @@ mod tests {
             &[(instance(2), vec![7u8; 32])],
         );
 
-        assert!(
-            !recorded,
-            "a message for an untracked contract reported itself as recorded, so the \
-             writer will advance the flush counter and rewrite every bundle for a map \
-             that did not change"
+        assert_eq!(
+            recorded,
+            RelatedOutcome::Untracked,
+            "a message for an untracked contract must report Untracked specifically — \
+             it is the case where related state is DISCARDED, and reporting it as a \
+             plain no-op is how it goes uncounted"
         );
         assert!(
             samplers.is_empty(),
@@ -2457,10 +2604,12 @@ mod tests {
             &[(instance(3), vec![7u8; 32])],
         );
 
-        assert!(
-            !recorded,
-            "an out-of-focus message reported itself as recorded, so it would drive a \
-             pointless flush"
+        assert_eq!(
+            recorded,
+            RelatedOutcome::OutOfFocus,
+            "an out-of-focus message must report OutOfFocus, not Untracked — the first \
+             is benign and the second means data was lost, and conflating them is what \
+             the enum exists to prevent"
         );
         assert!(
             samplers[&watched].related.is_empty(),
@@ -2885,7 +3034,7 @@ mod tests {
         let _evicted = record(&mut samplers, &SamplingScope::Wide, observed);
 
         let dir = tempfile::TempDir::new().expect("tempdir");
-        write_all(dir.path(), &samplers, 0).await;
+        write_all(dir.path(), &samplers, 0, 0).await;
 
         let path = dir
             .path()
@@ -3121,7 +3270,7 @@ mod tests {
         let _evicted = record(&mut samplers, &SamplingScope::Wide, observation());
 
         let dir = tempfile::TempDir::new().expect("tempdir");
-        write_all(dir.path(), &samplers, 0).await;
+        write_all(dir.path(), &samplers, 0, 0).await;
 
         let path = dir
             .path()
@@ -3166,7 +3315,7 @@ mod tests {
         );
 
         let dir = tempfile::TempDir::new().expect("tempdir");
-        write_all(dir.path(), &samplers, 0).await;
+        write_all(dir.path(), &samplers, 0, 0).await;
 
         let path = dir
             .path()
@@ -3198,7 +3347,7 @@ mod tests {
             obs.result_state = vec![i; 17];
             let _evicted = record(&mut samplers, &SamplingScope::Wide, obs);
         }
-        write_all(dir.path(), &samplers, 0).await;
+        write_all(dir.path(), &samplers, 0, 0).await;
         let before = samplers
             .values()
             .next()
