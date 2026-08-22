@@ -295,6 +295,34 @@ impl CaptureHandle {
     /// and on the merge path, which is the hottest path a contract touches.
     ///
     /// Never blocks, never fails visibly.
+    pub fn observe_with(&self, size_hint: usize, build: impl FnOnce() -> Observation) {
+        // Refuse on bytes BEFORE reserving or copying. `size_hint` is computed from
+        // the executor's own slices, so this decision costs no allocation at all.
+        // A single observation larger than the whole budget can never be admitted;
+        // saying so here keeps one huge contract from starving every other.
+        let queued = self.queued_bytes.load(Ordering::Relaxed);
+        if size_hint > MAX_QUEUED_BYTES || queued.saturating_add(size_hint) > MAX_QUEUED_BYTES {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        match self.tx.try_reserve() {
+            Ok(permit) => {
+                let msg = CaptureMsg::Transition(Box::new(build()));
+                // Charge what was actually built, not the estimate.
+                self.queued_bytes
+                    .fetch_add(msg.queued_bytes(), Ordering::Relaxed);
+                permit.send(msg);
+            }
+            Err(_) => {
+                // Queue full or writer gone. Count it and carry on without paying
+                // for the copies: a stalled capture must never become a stalled
+                // merge, and it should not tax one either.
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Record related-contract state resolved during validation.
     ///
     /// Same discipline as [`observe_with`](Self::observe_with): refuse on bytes before
@@ -324,34 +352,6 @@ impl CaptureHandle {
                 permit.send(msg);
             }
             Err(_) => {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-
-    pub fn observe_with(&self, size_hint: usize, build: impl FnOnce() -> Observation) {
-        // Refuse on bytes BEFORE reserving or copying. `size_hint` is computed from
-        // the executor's own slices, so this decision costs no allocation at all.
-        // A single observation larger than the whole budget can never be admitted;
-        // saying so here keeps one huge contract from starving every other.
-        let queued = self.queued_bytes.load(Ordering::Relaxed);
-        if size_hint > MAX_QUEUED_BYTES || queued.saturating_add(size_hint) > MAX_QUEUED_BYTES {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-
-        match self.tx.try_reserve() {
-            Ok(permit) => {
-                let msg = CaptureMsg::Transition(Box::new(build()));
-                // Charge what was actually built, not the estimate.
-                self.queued_bytes
-                    .fetch_add(msg.queued_bytes(), Ordering::Relaxed);
-                permit.send(msg);
-            }
-            Err(_) => {
-                // Queue full or writer gone. Count it and carry on without paying
-                // for the copies: a stalled capture must never become a stalled
-                // merge, and it should not tax one either.
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -672,7 +672,9 @@ async fn run_writer(
                 let observation = match msg {
                     CaptureMsg::Transition(observation) => *observation,
                     CaptureMsg::Related { contract, related } => {
-                        record_related(&mut samplers, &scope, contract, &related);
+                        if !record_related(&mut samplers, &scope, contract, &related) {
+                            continue;
+                        }
                         since_flush += 1;
                         if since_flush >= FLUSH_EVERY_OBSERVATIONS {
                             write_all(&dir, &samplers, dropped.load(Ordering::Relaxed)).await;
@@ -1066,17 +1068,21 @@ pub(crate) fn bundle_path(dir: &Path, instance: &ContractInstanceId) -> PathBuf 
 /// Scope is honoured the same way `record` honours it: an out-of-focus contract is
 /// retained but no longer collects, and that has to include this route or "sampling
 /// follows focus" would be true of transitions and quietly false of related state.
+/// Returns whether anything was actually recorded, so the caller does not treat a
+/// no-op as progress: a stray or out-of-focus message must not push the flush counter
+/// and rewrite every bundle on disk for a map that did not change.
+#[must_use]
 pub(crate) fn record_related(
     samplers: &mut HashMap<ContractInstanceId, TrackedContract>,
     scope: &SamplingScope,
     contract: ContractInstanceId,
     related: &[(ContractInstanceId, Vec<u8>)],
-) {
+) -> bool {
     if !scope.admits(&contract) {
-        return;
+        return false;
     }
     let Some(tracked) = samplers.get_mut(&contract) else {
-        return;
+        return false;
     };
     let (max_state, max_total) = related_budgets(tracked.sampler.config());
     admit_related(
@@ -1086,6 +1092,7 @@ pub(crate) fn record_related(
         max_state,
         max_total,
     );
+    true
 }
 
 /// Fold one observation into the sampler map.
@@ -1504,6 +1511,43 @@ mod validation_related_capture_pin {
     /// Brace-counting rather than "up to the next `fn`": a region ended on a guessed
     /// anchor silently widens when the following item is not the shape assumed, and a
     /// widened region here would swallow unrelated executor code and pass vacuously.
+    /// Blank out string literals, preserving byte offsets.
+    ///
+    /// Brace counting over raw source is only correct while every brace inside a
+    /// string happens to balance. The function this pin slices already contains
+    /// `format!("contract requested {} related contracts, limit is {}", ..)` — two
+    /// opens and two closes, which nets to zero by luck rather than by construction.
+    /// One future error message carrying a lone `{` would silently move the region
+    /// boundary, and a pin whose region moves does not fail loudly; it starts checking
+    /// somewhere else.
+    ///
+    /// Offsets are preserved one-for-one (each blanked char becomes a space) so the
+    /// count can run on this and the slice on the original. Raw strings (`r#"..."#`)
+    /// are not handled; there are none in this file, and one appearing would make the
+    /// pin fail rather than pass, which is the safe direction.
+    fn blank_string_literals(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut chars = src.chars();
+        let mut in_string = false;
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\\' if in_string => {
+                    out.push(' ');
+                    if chars.next().is_some() {
+                        out.push(' ');
+                    }
+                }
+                '"' => {
+                    in_string = !in_string;
+                    out.push(' ');
+                }
+                _ if in_string => out.push(' '),
+                _ => out.push(ch),
+            }
+        }
+        out
+    }
+
     fn fetch_related_body() -> &'static str {
         let src = include_str!("../contract/executor/runtime/contract_ops.rs");
         let start = src
@@ -1511,8 +1555,10 @@ mod validation_related_capture_pin {
             .expect("fetch_related_for_validation_network not found in contract_ops.rs");
         let after = &src[start..];
         let open = after.find('{').expect("function has no body");
+        // Count on the blanked copy, slice the original.
+        let scan = blank_string_literals(after);
         let mut depth = 0usize;
-        for (offset, ch) in after[open..].char_indices() {
+        for (offset, ch) in scan[open..].char_indices() {
             match ch {
                 '{' => depth += 1,
                 '}' => {
@@ -1547,6 +1593,62 @@ mod validation_related_capture_pin {
     /// is worse than none: it eventually trips on a legitimate refactor and gets
     /// deleted wholesale, taking the pin below with it. Established by mutation, not
     /// assumed.
+    /// Slice `executor_impl.rs`'s `fetch_related_for_validation` — the PRODUCTION
+    /// implementation.
+    ///
+    /// There are two functions resolving validation-scoped related state. This one is
+    /// reached from `bridged_upsert_contract_state_inner`, which is what a network peer
+    /// runs; the one in `contract_ops.rs` is reached only from `run_local_node`, i.e.
+    /// `OperationMode::Local`. The first version of this fix instrumented the local one
+    /// alone and pinned only that, so the pin passed while the production path stayed
+    /// blind — a green test guarding the wrong function.
+    fn production_fetch_related_body() -> &'static str {
+        let src = include_str!("../contract/executor/runtime/executor_impl.rs");
+        let start = src
+            .find("    async fn fetch_related_for_validation(")
+            .expect("fetch_related_for_validation not found in executor_impl.rs");
+        let after = &src[start..];
+        let open = after.find('{').expect("function has no body");
+        let scan = blank_string_literals(after);
+        let mut depth = 0usize;
+        for (offset, ch) in scan[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &after[..open + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("fetch_related_for_validation's body is not brace-balanced");
+    }
+
+    fn production_code_only() -> String {
+        production_fetch_related_body()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The PRODUCTION path must capture. This is the one that matters.
+    #[test]
+    fn the_production_executor_captures_validation_resolved_related_state() {
+        let body = production_code_only();
+        assert!(
+            body.contains("observe_related_with("),
+            "`fetch_related_for_validation` in executor_impl.rs no longer hands \
+             validation-resolved related state to capture. This is the implementation a \
+             NETWORK peer runs, so without it contracts whose validity depends on \
+             another contract are unjudgeable on every real capture — and the \
+             local-mode pin below would still pass, which is how this shipped wrong \
+             the first time"
+        );
+    }
+
     #[test]
     fn the_executor_captures_validation_resolved_related_state() {
         let body = code_only();
@@ -2177,6 +2279,67 @@ mod tests {
         );
     }
 
+    /// The related handle refuses on bytes BEFORE building, like its sibling.
+    ///
+    /// This is new production code with its own admission branches, and the writer-side
+    /// tests do not reach them. The ordering is the load-bearing part: validation-time
+    /// related state is another contract's whole state, so building it and then finding
+    /// the queue full would make the DROP path the most expensive path — on the
+    /// executor's validation path, under exactly the load that causes drops.
+    #[test]
+    fn the_related_handle_refuses_oversized_input_without_building_it() {
+        let (tx, _rx) = mpsc::channel(64);
+        let handle = CaptureHandle {
+            tx,
+            dropped: Arc::new(AtomicU64::new(0)),
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let built = Arc::new(AtomicU64::new(0));
+        let counter = built.clone();
+        handle.observe_related_with(instance(1), MAX_QUEUED_BYTES + 1, move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+            Vec::new()
+        });
+
+        assert_eq!(
+            built.load(Ordering::Relaxed),
+            0,
+            "the closure ran, so the copy was paid for before the refusal — which is \
+             the ordering this path exists to avoid"
+        );
+        assert_eq!(handle.dropped(), 1, "the refusal was not counted");
+    }
+
+    /// A full queue drops rather than blocking, and counts it.
+    #[test]
+    fn the_related_handle_drops_when_the_queue_is_full() {
+        // Capacity 1, filled, so `try_reserve` must fail on the second offer.
+        let (tx, _rx) = mpsc::channel(1);
+        let handle = CaptureHandle {
+            tx,
+            dropped: Arc::new(AtomicU64::new(0)),
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+        };
+
+        handle.observe_related_with(instance(1), 8, || vec![(instance(2), vec![0u8; 8])]);
+        assert_eq!(handle.dropped(), 0, "the first offer should have fit");
+
+        let built = Arc::new(AtomicU64::new(0));
+        let counter = built.clone();
+        handle.observe_related_with(instance(1), 8, move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+            vec![(instance(2), vec![0u8; 8])]
+        });
+
+        assert_eq!(handle.dropped(), 1, "a full queue did not count the drop");
+        assert_eq!(
+            built.load(Ordering::Relaxed),
+            0,
+            "the closure ran on the drop path, paying for copies that were discarded"
+        );
+    }
+
     /// Validation-resolved related state reaches the tracked contract.
     ///
     /// The #5376 regression. Related state arrives by two routes and only one travels
@@ -2200,7 +2363,7 @@ mod tests {
             "fixture started with related state, so this proves nothing"
         );
 
-        record_related(
+        let _recorded = record_related(
             &mut samplers,
             &scope,
             watched,
@@ -2225,7 +2388,7 @@ mod tests {
         let mut samplers = HashMap::new();
         let stranger = instance(9);
 
-        record_related(
+        let _recorded = record_related(
             &mut samplers,
             &focused_on(&[9]),
             stranger,
@@ -2251,7 +2414,7 @@ mod tests {
 
         let _evicted = record(&mut samplers, &focused_on(&[1]), observation_for(watched));
         // Rotate away, then let validation-resolved state arrive for it.
-        record_related(
+        let _recorded = record_related(
             &mut samplers,
             &focused_on(&[2]),
             watched,

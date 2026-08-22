@@ -774,9 +774,18 @@ impl Executor<Runtime> {
             }
         }
 
-        // Conformance capture (#5376). This is the ONLY place a contract's
-        // validation-scoped related state exists in full, and it is about to be
-        // dropped.
+        // Conformance capture (#5376), LOCAL-MODE path.
+        //
+        // This function is reached only from `Executor::contract_requests`, and thence
+        // only from `run_local_node` — `OperationMode::Local`, which never joins the
+        // ring. A network peer takes the sibling implementation,
+        // `fetch_related_for_validation` in `executor_impl.rs`, which carries the same
+        // call. Both are instrumented; this one covers local-mode and `fdev` runs.
+        //
+        // The first version of this fix claimed this was "the ONLY place" that state
+        // exists and patched here alone. That was wrong, and it would have changed
+        // nothing for any real capture, because the live peer never executes this
+        // function.
         //
         // Related state reaches the executor by two routes. One travels with the
         // transition: when `update_state` returns `RequestRelated`, the retry loop
