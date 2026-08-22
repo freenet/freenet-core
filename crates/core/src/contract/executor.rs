@@ -85,6 +85,12 @@ pub(crate) const MAX_SUBSCRIBERS_PER_CONTRACT: usize = 256;
 /// governed by that channel depth and state-size cap, not by this constant — raising
 /// this value only scales an exposure that exists independently of it. See the PR that
 /// raised this constant to 500 for the full numeric worked example.
+///
+/// Note: the tokio mpsc channel behind each subscription eagerly allocates its first
+/// block (32 slots by default) at creation and allocates further blocks on demand — it
+/// is not fully preallocated to capacity, but an idle subscription is not literally
+/// zero-cost either. The order-of-magnitude conclusion (idle cost is negligible, on the
+/// order of a few hundred bytes per subscription) still holds.
 pub(crate) const MAX_SUBSCRIPTIONS_PER_CLIENT: usize = 500;
 
 /// Buffer size for per-subscriber notification channels.
