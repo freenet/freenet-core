@@ -89,6 +89,120 @@ async fn test_per_contract_subscriber_limit_enforced() {
     );
 }
 
+/// Regression test: the subscriber-limit error must carry the REAL
+/// `ContractKey` (correct `CodeHash`), not a synthetic one with a zeroed
+/// `CodeHash`. Before the fix, `subscriber_limit_error` fabricated the key
+/// from the `ContractInstanceId` alone with an all-zero `CodeHash`, so a
+/// client matching on the returned key could never match it against the
+/// contract it actually subscribed to.
+#[tokio::test(flavor = "current_thread")]
+async fn test_subscriber_limit_error_carries_real_contract_key() {
+    use freenet_stdlib::client_api::{ContractError as StdContractError, RequestError};
+
+    let mut executor = create_executor().await;
+    let key = store_contract(&mut executor, b"sub_limit_key_test").await;
+    let instance_id = *key.id();
+
+    // Saturate the per-contract subscriber limit.
+    let mut receivers = Vec::new();
+    for _ in 0..MAX_SUBSCRIBERS_PER_CONTRACT {
+        let client_id = ClientId::next();
+        let (tx, rx) = tokio::sync::mpsc::channel(SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE);
+        executor
+            .register_contract_notifier(instance_id, client_id, tx, None)
+            .expect("registration should succeed within limit");
+        receivers.push(rx);
+    }
+
+    let extra_client = ClientId::next();
+    let (tx, _rx) = tokio::sync::mpsc::channel(SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE);
+    let err = executor
+        .register_contract_notifier(instance_id, extra_client, tx, None)
+        .expect_err("registration beyond MAX_SUBSCRIBERS_PER_CONTRACT must fail");
+
+    // The catch-all below exists only to fail loudly on any other
+    // `RequestError` variant (including future ones `RequestError` being
+    // `#[non_exhaustive]` might add) — not to match them meaningfully.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    match *err {
+        RequestError::ContractError(StdContractError::Subscribe { key: err_key, .. }) => {
+            assert_eq!(
+                err_key, key,
+                "subscriber-limit error must carry the real ContractKey \
+                 (matching CodeHash) so the client can identify the refused \
+                 contract; got a different key: {err_key}"
+            );
+            assert_ne!(
+                err_key.code_hash(),
+                &CodeHash::new([0u8; 32]),
+                "subscriber-limit error regressed to a synthetic zeroed \
+                 CodeHash"
+            );
+        }
+        ref other => {
+            panic!("expected RequestError::ContractError(Subscribe {{ .. }}), got: {other:?}")
+        }
+    }
+}
+
+/// Same regression as above, for the per-client subscription limit path
+/// (the second `subscriber_limit_error` call site in
+/// `bridged_register_contract_notifier`).
+#[tokio::test(flavor = "current_thread")]
+async fn test_per_client_limit_error_carries_real_contract_key() {
+    use freenet_stdlib::client_api::{ContractError as StdContractError, RequestError};
+
+    let mut executor = create_executor().await;
+    let client_id = ClientId::next();
+
+    let mut receivers = Vec::new();
+    for i in 0..MAX_SUBSCRIPTIONS_PER_CLIENT {
+        let seed = format!("client_limit_key_test_{i}");
+        let key = store_contract(&mut executor, seed.as_bytes()).await;
+        let (tx, rx) = tokio::sync::mpsc::channel(SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE);
+        executor
+            .register_contract_notifier(*key.id(), client_id, tx, None)
+            .expect("registration should succeed within per-client limit");
+        receivers.push(rx);
+    }
+
+    let extra_key = store_contract(&mut executor, b"client_limit_key_extra").await;
+    let (tx, _rx) = tokio::sync::mpsc::channel(SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE);
+    let err = executor
+        .register_contract_notifier(*extra_key.id(), client_id, tx, None)
+        .expect_err("registration beyond MAX_SUBSCRIPTIONS_PER_CLIENT must fail");
+
+    // The catch-all below exists only to fail loudly on any other
+    // `RequestError` variant (including future ones `RequestError` being
+    // `#[non_exhaustive]` might add) — not to match them meaningfully.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    match *err {
+        RequestError::ContractError(StdContractError::Subscribe { key: err_key, .. }) => {
+            // `ContractKey`'s `PartialEq` compares only the instance id, not
+            // the code hash (see `freenet_stdlib::prelude::ContractKey`), so
+            // `err_key == extra_key` alone would pass even with a fabricated
+            // zeroed-CodeHash key — the instance id was never the broken
+            // part. Assert the code hash explicitly.
+            assert_eq!(
+                err_key, extra_key,
+                "per-client-limit error must carry the real ContractKey of \
+                 the refused contract, got: {err_key}"
+            );
+            assert_eq!(
+                err_key.code_hash(),
+                extra_key.code_hash(),
+                "per-client-limit error must carry the real CodeHash, not a \
+                 synthetic zeroed one — got: {:?}, expected: {:?}",
+                err_key.code_hash(),
+                extra_key.code_hash()
+            );
+        }
+        ref other => {
+            panic!("expected RequestError::ContractError(Subscribe {{ .. }}), got: {other:?}")
+        }
+    }
+}
+
 // =========================================================================
 // Per-client subscription limit
 // =========================================================================
@@ -1316,5 +1430,63 @@ fn register_contract_notifier_takes_one_guard_for_search_and_write() {
         "the reconnect path must actually REFRESH the stored channel; without \
          the write a reconnected client keeps its dead sender and silently \
          receives nothing"
+    );
+}
+
+/// Source-scrape pin for the subscriber-limit-error real-`ContractKey` fix in
+/// `RuntimePool::register_contract_notifier`.
+///
+/// Why a source pin and not a behavioral test: as documented on
+/// `register_contract_notifier_takes_one_guard_for_search_and_write` above,
+/// nothing in this suite constructs a real `RuntimePool`, so both
+/// subscriber-limit rejection call sites here are unreachable behaviorally
+/// from this file. The BEHAVIORAL coverage for the same fix lives in
+/// `test_subscriber_limit_error_carries_real_contract_key` and
+/// `test_per_client_limit_error_carries_real_contract_key` above, which
+/// exercise the twin `bridged_register_contract_notifier` path in
+/// `executor_impl.rs` (reached via a plain `Executor`, not `RuntimePool`).
+///
+/// The invariant: BOTH `subscriber_limit_error(...)` call sites in this file
+/// resolve the real key via `self.lookup_key(&instance_id)` first, rather
+/// than passing the bare `instance_id` straight through — which is exactly
+/// what the pre-fix code did, fabricating a zeroed-`CodeHash` key the client
+/// could never match against the contract it subscribed to.
+///
+/// Bounded to the two enforcement blocks by anchors unique in pool.rs (the
+/// "New subscriber" comment above the per-contract check, through the
+/// "Insert in sorted order" comment that starts the success path), so this
+/// cannot vacuously match content elsewhere in the file.
+///
+/// Whitespace-insensitive so rustfmt cannot break it.
+#[test]
+fn pool_subscriber_limit_error_resolves_real_key() {
+    let src = include_str!("../runtime/pool.rs");
+    let start = src
+        .find("// New subscriber: enforce per-contract limit")
+        .expect("`New subscriber` comment not found in pool.rs");
+    let after = &src[start..];
+    let end = after
+        .find("// Insert in sorted order for efficient lookup")
+        .expect("`Insert in sorted order` comment not found after the limit checks");
+    let region: String = after[..end]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+
+    assert_eq!(
+        region.matches("self.lookup_key(&instance_id)").count(),
+        2,
+        "both subscriber-limit-error call sites must resolve the real key via \
+         `self.lookup_key(&instance_id)` before calling `subscriber_limit_error` \
+         — one for the per-contract limit, one for the per-client limit"
+    );
+    assert_eq!(
+        region
+            .matches("subscriber_limit_error(instance_id,")
+            .count(),
+        0,
+        "subscriber_limit_error must never be called with the bare \
+         `instance_id` directly — that fabricates a zeroed-CodeHash key the \
+         client can never match against the refused contract (regression)"
     );
 }

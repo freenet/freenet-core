@@ -218,18 +218,28 @@ type SharedClientCounts = Arc<DashMap<ClientId, usize>>;
 
 /// Construct a subscriber limit error for a registration that was rejected.
 ///
-/// Uses `Subscribe` variant with a synthetic `ContractKey` (zeroed `CodeHash`)
-/// because the registration path only has a `ContractInstanceId`, not the full
-/// `ContractKey`. The cause string carries the real rejection reason.
-fn subscriber_limit_error(instance_id: ContractInstanceId, cause: &str) -> Box<RequestError> {
-    let synthetic_key = ContractKey::from_id_and_code(
-        instance_id,
-        freenet_stdlib::prelude::CodeHash::new([0u8; 32]),
-    );
+/// Callers resolve the real `ContractKey` (via `lookup_key` /
+/// `bridged_lookup_key`) before calling this, so the client can tell which
+/// contract was refused. The cause string carries the real rejection reason.
+fn subscriber_limit_error(key: ContractKey, cause: &str) -> Box<RequestError> {
     Box::new(RequestError::ContractError(StdContractError::Subscribe {
-        key: synthetic_key,
+        key,
         cause: cause.to_string().into(),
     }))
+}
+
+/// Fallback key for `subscriber_limit_error` when the real `ContractKey`
+/// can't be resolved from a `ContractInstanceId` (the code hash isn't
+/// registered — shouldn't happen for a contract a client is actively
+/// subscribing to, but the registration path only has the instance id to
+/// begin with, so this is the honest degradation rather than a panic).
+/// Zeroed `CodeHash` is the documented sentinel used elsewhere for the same
+/// situation (see `operations::get::op_ctx_task::synthetic_key`).
+fn synthetic_key(instance_id: ContractInstanceId) -> ContractKey {
+    ContractKey::from_id_and_code(
+        instance_id,
+        freenet_stdlib::prelude::CodeHash::new([0u8; 32]),
+    )
 }
 
 // ============================================================================
