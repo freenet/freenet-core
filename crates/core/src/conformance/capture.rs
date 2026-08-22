@@ -1505,12 +1505,6 @@ pub fn code_hash_of(key: &ContractKey) -> [u8; 32] {
 /// contracts reaching no verdict on any of 2,474 cases.
 #[cfg(test)]
 mod validation_related_capture_pin {
-    /// Slice `fetch_related_for_validation_network`'s body by counting braces to its
-    /// own closing one.
-    ///
-    /// Brace-counting rather than "up to the next `fn`": a region ended on a guessed
-    /// anchor silently widens when the following item is not the shape assumed, and a
-    /// widened region here would swallow unrelated executor code and pass vacuously.
     /// Blank out string literals, preserving byte offsets.
     ///
     /// Brace counting over raw source is only correct while every brace inside a
@@ -1521,33 +1515,52 @@ mod validation_related_capture_pin {
     /// boundary, and a pin whose region moves does not fail loudly; it starts checking
     /// somewhere else.
     ///
-    /// Offsets are preserved one-for-one (each blanked char becomes a space) so the
-    /// count can run on this and the slice on the original. Raw strings (`r#"..."#`)
-    /// are not handled; there are none in this file, and one appearing would make the
-    /// pin fail rather than pass, which is the safe direction.
+    /// Offsets are preserved per BYTE, not per character: a blanked character emits as
+    /// many spaces as it occupied bytes. One space per CHAR was wrong, and silently so
+    /// — a single multi-byte character inside a string literal (an em-dash in an error
+    /// message would do it) shortens the scanned copy relative to the original and
+    /// shifts every offset after it. The slice is taken from the ORIGINAL using offsets
+    /// computed here, so drift truncates the pinned region rather than failing, and a
+    /// truncated region can pass vacuously.
+    ///
+    /// Raw strings (`r#"..."#`) are not handled; there are none in either sliced
+    /// function, and one appearing would make the pin fail rather than pass, which is
+    /// the safe direction.
     fn blank_string_literals(src: &str) -> String {
+        /// One space per BYTE the character occupied, so offsets survive.
+        fn blank(out: &mut String, ch: char) {
+            for _ in 0..ch.len_utf8() {
+                out.push(' ');
+            }
+        }
         let mut out = String::with_capacity(src.len());
         let mut chars = src.chars();
         let mut in_string = false;
         while let Some(ch) = chars.next() {
             match ch {
                 '\\' if in_string => {
-                    out.push(' ');
-                    if chars.next().is_some() {
-                        out.push(' ');
+                    blank(&mut out, ch);
+                    if let Some(escaped) = chars.next() {
+                        blank(&mut out, escaped);
                     }
                 }
                 '"' => {
                     in_string = !in_string;
-                    out.push(' ');
+                    blank(&mut out, ch);
                 }
-                _ if in_string => out.push(' '),
+                _ if in_string => blank(&mut out, ch),
                 _ => out.push(ch),
             }
         }
         out
     }
 
+    /// Slice `fetch_related_for_validation_network`'s body by counting braces to its
+    /// own closing one.
+    ///
+    /// Brace-counting rather than "up to the next `fn`": a region ended on a guessed
+    /// anchor silently widens when the following item is not the shape assumed, and a
+    /// widened region here would swallow unrelated executor code and pass vacuously.
     fn fetch_related_body() -> &'static str {
         let src = include_str!("../contract/executor/runtime/contract_ops.rs");
         let start = src
@@ -1579,20 +1592,17 @@ mod validation_related_capture_pin {
     fn code_only() -> String {
         fetch_related_body()
             .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
+            .map(|line| match line.find("//") {
+                // Trailing comments too, not just whole-line ones: a pin satisfied by
+                // `let _ = 0; // capture.observe_related_with(..)` is matching text
+                // that never runs, which is exactly the regression it exists to catch.
+                Some(at) => &line[..at],
+                None => line,
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
 
-    /// Deliberately NOT pinned: that the call precedes `related_map` being consumed.
-    ///
-    /// The borrow checker already enforces it — moving the call after the conversion
-    /// does not compile, because the map is moved. The only reordering that DOES
-    /// compile clones the map first, which leaves capture working correctly while a
-    /// textual pin fires anyway. A pin whose sole reachable failure is a false positive
-    /// is worse than none: it eventually trips on a legitimate refactor and gets
-    /// deleted wholesale, taking the pin below with it. Established by mutation, not
-    /// assumed.
     /// Slice `executor_impl.rs`'s `fetch_related_for_validation` — the PRODUCTION
     /// implementation.
     ///
@@ -1629,7 +1639,13 @@ mod validation_related_capture_pin {
     fn production_code_only() -> String {
         production_fetch_related_body()
             .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
+            .map(|line| match line.find("//") {
+                // Trailing comments too, not just whole-line ones: a pin satisfied by
+                // `let _ = 0; // capture.observe_related_with(..)` is matching text
+                // that never runs, which is exactly the regression it exists to catch.
+                Some(at) => &line[..at],
+                None => line,
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -1649,6 +1665,15 @@ mod validation_related_capture_pin {
         );
     }
 
+    /// Deliberately NOT pinned: that the call precedes `related_map` being consumed.
+    ///
+    /// The borrow checker already enforces it — moving the call after the conversion
+    /// does not compile, because the map is moved. The only reordering that DOES
+    /// compile clones the map first, which leaves capture working correctly while a
+    /// textual pin fires anyway. A pin whose sole reachable failure is a false positive
+    /// is worse than none: it eventually trips on a legitimate refactor and gets
+    /// deleted wholesale, taking the pin below with it. Established by mutation, not
+    /// assumed.
     #[test]
     fn the_executor_captures_validation_resolved_related_state() {
         let body = code_only();
@@ -2363,13 +2388,18 @@ mod tests {
             "fixture started with related state, so this proves nothing"
         );
 
-        let _recorded = record_related(
+        let recorded = record_related(
             &mut samplers,
             &scope,
             watched,
             &[(instance(2), vec![7u8; 32])],
         );
 
+        assert!(
+            recorded,
+            "a real merge reported itself as a no-op, so the writer will skip the \
+             flush that persists it"
+        );
         assert_eq!(
             samplers[&watched].related.len(),
             1,
@@ -2388,13 +2418,19 @@ mod tests {
         let mut samplers = HashMap::new();
         let stranger = instance(9);
 
-        let _recorded = record_related(
+        let recorded = record_related(
             &mut samplers,
             &focused_on(&[9]),
             stranger,
             &[(instance(2), vec![7u8; 32])],
         );
 
+        assert!(
+            !recorded,
+            "a message for an untracked contract reported itself as recorded, so the \
+             writer will advance the flush counter and rewrite every bundle for a map \
+             that did not change"
+        );
         assert!(
             samplers.is_empty(),
             "related state alone created a tracked entry, spending a slot on a \
@@ -2414,13 +2450,18 @@ mod tests {
 
         let _evicted = record(&mut samplers, &focused_on(&[1]), observation_for(watched));
         // Rotate away, then let validation-resolved state arrive for it.
-        let _recorded = record_related(
+        let recorded = record_related(
             &mut samplers,
             &focused_on(&[2]),
             watched,
             &[(instance(3), vec![7u8; 32])],
         );
 
+        assert!(
+            !recorded,
+            "an out-of-focus message reported itself as recorded, so it would drive a \
+             pointless flush"
+        );
         assert!(
             samplers[&watched].related.is_empty(),
             "an out-of-focus contract kept collecting related state"
