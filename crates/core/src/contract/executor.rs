@@ -74,8 +74,17 @@ pub(crate) const MAX_SUBSCRIBERS_PER_CONTRACT: usize = 256;
 /// subscribe to one contract per discoverable peer/user (e.g. Freebird's discovery
 /// pattern), and the cap was trivially bypassable by opening a second websocket
 /// connection (each connection mints a fresh `ClientId` with its own budget), so it
-/// penalized well-behaved clients while stopping no determined abuser. See the PR that
-/// raised this constant for the worst-case memory arithmetic behind the new value.
+/// penalized well-behaved clients while stopping no determined abuser.
+///
+/// This constant does not bound per-subscription memory, so raising it is safe by the
+/// same argument at any value: each subscription's notification channel
+/// (`SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE`) is bounded by message COUNT, not bytes, and
+/// is drained lossily (`try_send`, dropped when full) rather than growing unbounded. A
+/// queued message can itself carry a full contract-state clone up to `MAX_STATE_SIZE`
+/// (see `wasm_runtime::state_store`), so the per-subscription worst case is already
+/// governed by that channel depth and state-size cap, not by this constant — raising
+/// this value only scales an exposure that exists independently of it. See the PR that
+/// raised this constant to 500 for the full numeric worked example.
 pub(crate) const MAX_SUBSCRIPTIONS_PER_CLIENT: usize = 500;
 
 /// Buffer size for per-subscriber notification channels.
