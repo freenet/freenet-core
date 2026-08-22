@@ -1496,6 +1496,18 @@ async fn process_open_request(
                             request_id = %request_id,
                             "Unsupported contract operation"
                         );
+                        // `ContractRequest` is `#[non_exhaustive]`: a stdlib
+                        // bump can add a variant (e.g. `Unsubscribe`) that
+                        // this node's build doesn't know how to handle yet.
+                        // Falling through silently left the client waiting
+                        // forever with no response at all — surface a real
+                        // error instead so the client can tell "unsupported"
+                        // apart from "still in flight".
+                        return Err(Error::Node(
+                            "unsupported contract operation: this node does \
+                             not support the requested operation type"
+                                .to_string(),
+                        ));
                     }
                 }
             }
@@ -1861,6 +1873,18 @@ async fn process_open_request(
                     request_id = %request_id,
                     "Unsupported operation"
                 );
+                // Same shape as the `ContractRequest` catch-all above: falling
+                // through to `Ok(None)` here left the client waiting forever
+                // instead of getting a response. `Authenticate` normally never
+                // reaches this dispatch (the websocket layer intercepts it
+                // earlier), and `ClientRequest` may grow variants this build
+                // doesn't know about — either way the client needs an error,
+                // not silence.
+                return Err(Error::Node(
+                    "unsupported operation: this node does not support the \
+                     requested operation type"
+                        .to_string(),
+                ));
             }
         }
         Ok(None)
@@ -2075,6 +2099,147 @@ mod serve_during_gate_tests {
                 && arm.contains("connection_scope,\n                            user_context,"),
             "the same connection scope must also reach the executor via \
              ContractHandlerEvent::DelegateRequest"
+        );
+    }
+}
+
+/// Regression tests: an unsupported/unhandled request must reach the client
+/// as an error, never as silence.
+///
+/// Background: both `process_open_request` match statements — the
+/// `ContractRequest` dispatch and the outer `ClientRequest` dispatch — end
+/// in a catch-all arm required because `ContractRequest` and `ClientRequest`
+/// are `#[non_exhaustive]` (a stdlib bump can add a variant, e.g. the
+/// upcoming `ContractRequest::Unsubscribe`, that this node's build doesn't
+/// know how to handle yet). Before the fix, both catch-all arms only logged
+/// and fell through to `Ok(None)`. The outer `client_event_handling` loop
+/// (`client_events.rs`) treats `Ok(None)` as "nothing to send" — so a client
+/// whose request lands in either arm waits forever with no response and no
+/// error, rather than getting a clear "unsupported" error it can act on.
+#[cfg(test)]
+mod unsupported_request_tests {
+    use std::sync::Arc;
+
+    use freenet_stdlib::client_api::ClientRequest;
+
+    use super::{ClientId, Error, OpenRequest, process_open_request};
+    use crate::config::ConfigArgs;
+    use crate::dev_tool::OperationMode;
+    use crate::node::OpManager;
+
+    /// Build a real `OpManager` backed by a temp-dir `Config`, mirroring
+    /// `pool_tests::identical_input_probe_tests::build_op_manager`.
+    /// `process_open_request` requires an `OpManager` to construct even
+    /// though the catch-all arm below returns before touching it.
+    async fn build_op_manager(id: &str) -> (Arc<OpManager>, Box<dyn std::any::Any>) {
+        let config_args = ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+
+        let (notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, ch_channel, wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+
+        let guards: Box<dyn std::any::Any> = Box::new((
+            notification_rx,
+            ch_channel,
+            wait_for_event,
+            result_router_rx,
+            task_monitor,
+        ));
+        (op_manager, guards)
+    }
+
+    /// `ClientRequest::Authenticate` normally never reaches
+    /// `process_open_request` — the websocket layer intercepts it earlier
+    /// (see `websocket.rs`) — but it's the one real, always-constructible
+    /// `ClientRequest` variant that DOES fall into the outer catch-all arm
+    /// when the dispatcher is driven directly, so it exercises the exact
+    /// "request type this dispatch doesn't explicitly handle" shape any
+    /// future `ClientRequest` variant would hit too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsupported_client_request_returns_error_not_silence() {
+        let (op_manager, _guards) = build_op_manager("unsupported-request-test-outer").await;
+
+        let open_req = OpenRequest::new(
+            ClientId::FIRST,
+            Box::new(ClientRequest::Authenticate {
+                token: "irrelevant".to_string(),
+            }),
+        );
+
+        let result = process_open_request(open_req, op_manager, None).await.await;
+
+        match result {
+            Err(Error::Node(msg)) => {
+                assert!(
+                    msg.to_lowercase().contains("unsupported"),
+                    "error message should say the operation is unsupported, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected Err(Error::Node(_)) for an unsupported ClientRequest, \
+                 got: {other:?}"
+            ),
+        }
+    }
+
+    /// Source-scrape pin for the twin `ContractRequest` catch-all (the
+    /// `ContractRequest` dispatch inside `ClientRequest::ContractOp`).
+    ///
+    /// Why a source pin and not a behavioral test: `ContractRequest` is
+    /// `#[non_exhaustive]` and currently has exactly four variants (`Put`,
+    /// `Update`, `Get`, `Subscribe`), each with its own explicit arm — so
+    /// there is no `ContractRequest` value constructible today that actually
+    /// lands in this catch-all (it exists only for a stdlib bump that adds a
+    /// variant this build predates, e.g. the upcoming `Unsubscribe`). The
+    /// behavioral test above exercises the SAME bug shape (silently falling
+    /// through to `Ok(None)`) via the sibling outer catch-all, which IS
+    /// reachable with a real value.
+    ///
+    /// The invariant: the arm must `return Err(...)`, not merely log and
+    /// fall through.
+    #[test]
+    fn contract_request_catch_all_returns_error_not_silence() {
+        let src = include_str!("client_events.rs");
+        let start = src
+            .find("\"Unsupported contract operation\"")
+            .expect("`Unsupported contract operation` log message not found");
+        let after = &src[start..];
+        let end = after
+            .find("ClientRequest::DelegateOp(req) => {")
+            .expect("the arm is bounded by the following ClientRequest::DelegateOp arm");
+        let arm = &after[..end];
+
+        assert!(
+            arm.contains("return Err("),
+            "the ContractRequest catch-all must return an error to the \
+             client, not merely log and fall through to `Ok(None)` — a \
+             client whose request lands here would wait forever with no \
+             response. Arm content: {arm:?}"
         );
     }
 }

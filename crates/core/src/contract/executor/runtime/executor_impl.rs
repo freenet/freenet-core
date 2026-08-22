@@ -1180,8 +1180,11 @@ where
                     limit = super::MAX_SUBSCRIBERS_PER_CONTRACT,
                     "Subscriber limit reached for contract, rejecting registration"
                 );
+                let key = self
+                    .bridged_lookup_key(&instance_id)
+                    .unwrap_or_else(|| synthetic_key(instance_id));
                 return Err(subscriber_limit_error(
-                    instance_id,
+                    key,
                     &format!(
                         "subscriber limit ({}) reached for contract",
                         super::MAX_SUBSCRIBERS_PER_CONTRACT
@@ -1203,8 +1206,11 @@ where
                     current = client_sub_count,
                     "Per-client subscription limit reached, rejecting registration"
                 );
+                let key = self
+                    .bridged_lookup_key(&instance_id)
+                    .unwrap_or_else(|| synthetic_key(instance_id));
                 return Err(subscriber_limit_error(
-                    instance_id,
+                    key,
                     &format!(
                         "per-client subscription limit ({}) reached",
                         super::MAX_SUBSCRIPTIONS_PER_CLIENT
