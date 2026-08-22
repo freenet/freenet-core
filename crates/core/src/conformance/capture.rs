@@ -1097,16 +1097,6 @@ pub(crate) fn bundle_path(dir: &Path, instance: &ContractInstanceId) -> PathBuf 
     dir.join(format!("{instance}.bundle"))
 }
 
-/// Fold validation-resolved related state into a contract already being tracked.
-///
-/// Deliberately does NOT create a tracked entry. Related state with no states of its
-/// own cannot produce a single case, so admitting it would spend one of
-/// `MAX_TRACKED_CONTRACTS` slots on something no replay can use — and on a peer at its
-/// cap that costs a contract that CAN be judged.
-///
-/// Scope is honoured the same way `record` honours it: an out-of-focus contract is
-/// retained but no longer collects, and that has to include this route or "sampling
-/// follows focus" would be true of transitions and quietly false of related state.
 /// What became of a validation-resolved related-state message.
 ///
 /// A bare `bool` was not enough, and the difference matters. Two things make
@@ -1133,6 +1123,16 @@ pub(crate) enum RelatedOutcome {
     Untracked,
 }
 
+/// Fold validation-resolved related state into a contract already being tracked.
+///
+/// Deliberately does NOT create a tracked entry. Related state with no states of its
+/// own cannot produce a single case, so admitting it would spend one of
+/// `MAX_TRACKED_CONTRACTS` slots on something no replay can use — and on a peer at its
+/// cap that costs a contract that CAN be judged.
+///
+/// Scope is honoured the same way `record` honours it: an out-of-focus contract is
+/// retained but no longer collects, and that has to include this route or "sampling
+/// follows focus" would be true of transitions and quietly false of related state.
 #[must_use]
 pub(crate) fn record_related(
     samplers: &mut HashMap<ContractInstanceId, TrackedContract>,
@@ -1757,6 +1757,80 @@ mod validation_related_capture_pin {
              capture, so contracts whose VALIDITY depends on another contract go back \
              to being unjudgeable — and an unjudgeable contract reads as a clean one"
         );
+    }
+}
+
+/// Guard against doc comments drifting onto the wrong item.
+///
+/// This module has had SEVEN doc blocks land on the wrong item, always by the same
+/// mechanism: a new item is inserted immediately before an existing `///` line, so the
+/// existing doc silently adopts the newcomer and the original item is left undocumented.
+/// It compiles, rustfmt is happy, `cargo doc` renders it without complaint, and the
+/// rendered text confidently describes something it is not attached to.
+///
+/// Care has demonstrably not worked — several of those instances happened in the same
+/// commit that was fixing an earlier one. So this pins the pairings mechanically.
+///
+/// A pairing here is a promise, not a description: if you deliberately move one of
+/// these, update the pin in the same commit and the failure message will tell the next
+/// person why it existed.
+#[cfg(test)]
+mod doc_attachment_pin {
+    /// The first line of a doc block, and the item that block must be attached to.
+    ///
+    /// Deliberately only covers items whose docs have actually drifted, rather than
+    /// every item in the file: a pin nobody can read is a pin nobody maintains.
+    const PAIRINGS: &[(&str, &str)] = &[
+        (
+            "/// Fold validation-resolved related state into a contract already being tracked.",
+            "pub(crate) fn record_related",
+        ),
+        (
+            "/// What became of a validation-resolved related-state message.",
+            "pub(crate) enum RelatedOutcome",
+        ),
+        (
+            "/// Fold one observation into the sampler map.",
+            "pub(crate) fn record",
+        ),
+        (
+            "/// Related state a contract offered and capture would not keep.",
+            "pub(crate) struct RelatedRefusals",
+        ),
+        (
+            "/// Offer an observation, building it only if there is somewhere to put it.",
+            "pub fn observe_with",
+        ),
+        (
+            "/// Record related-contract state resolved during validation.",
+            "pub fn observe_related_with",
+        ),
+    ];
+
+    #[test]
+    fn every_doc_block_is_attached_to_the_item_it_describes() {
+        let src = include_str!("capture.rs");
+        for (doc, item) in PAIRINGS {
+            let at = src.find(doc).unwrap_or_else(|| {
+                panic!("doc line not found, so this pin no longer checks anything: {doc}")
+            });
+            // Walk forward past the rest of the doc block; the first non-doc,
+            // non-attribute line must be the promised item.
+            let mut rest = src[at..].lines();
+            rest.next();
+            let landed = rest
+                .find(|line| {
+                    let t = line.trim_start();
+                    !t.starts_with("///") && !t.starts_with("#[") && !t.is_empty()
+                })
+                .unwrap_or("<end of file>");
+            assert!(
+                landed.trim_start().starts_with(item),
+                "doc block {doc:?} is attached to {landed:?}, not to {item:?}. An item \
+                 was inserted between the doc and what it describes, so the doc now \
+                 documents the wrong thing and the original item has none."
+            );
+        }
     }
 }
 
