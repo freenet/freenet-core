@@ -2444,6 +2444,46 @@ where
                     .or_insert_with(|| Some(s.clone().into_owned()));
             }
         }
+        // Conformance capture (#5376), production path.
+        //
+        // Related state reaches this executor by two routes and capture used to see
+        // only one. When `update_state` returns `RequestRelated`, the retry loop
+        // resolves each contract and pushes it into `updates` as
+        // `UpdateData::RelatedState`, so it travels inside the transition and the
+        // observation in `attempt_state_update` records it. When `validate_state`
+        // asks, it is answered HERE instead, used for the retry validation below, and
+        // dropped — and the transition for this same operation has already been
+        // observed by the time we get here, so it could not carry this.
+        //
+        // Missing it left contracts whose VALIDITY depends on another contract
+        // unjudgeable: every replayed case dead-ends at
+        // `Inconclusive::RelatedRequired`, which reads exactly like a clean result.
+        //
+        // There is a SECOND implementation of this same resolution,
+        // `fetch_related_for_validation_network` in `contract_ops.rs`, reached only
+        // from `run_local_node` — i.e. `OperationMode::Local`, which never joins the
+        // ring. It carries the same call for local-mode and `fdev` runs. Both are
+        // instrumented on purpose; THIS one is the path a network peer takes, and an
+        // earlier version of this fix patched only the other one, which would have
+        // changed nothing for any real capture.
+        //
+        // Costs no fetch: these states were resolved for this node's own validation,
+        // local-store-first, and are already in hand. Byte-budgeted and dropped rather
+        // than blocking, like every other capture path.
+        if let Some(capture) = crate::conformance::capture::global() {
+            let size_hint: usize = related_map
+                .values()
+                .flatten()
+                .map(|state| state.as_ref().len())
+                .sum();
+            capture.observe_related_with(*key.id(), size_hint, || {
+                related_map
+                    .iter()
+                    .filter_map(|(id, state)| state.as_ref().map(|s| (*id, s.as_ref().to_vec())))
+                    .collect()
+            });
+        }
+
         let populated_related = RelatedContracts::from(related_map);
         let retry_result = self
             .runtime
