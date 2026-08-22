@@ -5,6 +5,7 @@
 
 mod assets;
 mod cards;
+mod contract_detail;
 mod estimator;
 mod favicon;
 mod peer_detail;
@@ -22,6 +23,7 @@ use cards::{
     build_ban_list_card, build_contracts_card, build_governance_card, build_hosting_card,
     build_ops_card, build_peers_card, build_status_card, build_transfer_card,
 };
+use contract_detail::contract_detail_html;
 use favicon::{build_dashboard_title, build_favicon_data_uri};
 use peer_detail::peer_detail_html;
 
@@ -101,6 +103,13 @@ pub(super) async fn homepage() -> impl IntoResponse {
 /// Handler for `GET /peer/{address}` — returns a detail page for a single peer.
 pub(super) async fn peer_detail(Path(address): Path<String>) -> impl IntoResponse {
     Html(peer_detail_html(&address))
+}
+
+/// Per-contract detail page (#5369). Accepts either the full `ContractKey`
+/// encoding or the `ContractInstanceId`, because the dashboard's own cards key
+/// on different ones and an operator pasting either should land somewhere.
+pub(super) async fn contract_detail(Path(key): Path<String>) -> impl IntoResponse {
+    Html(contract_detail_html(&key))
 }
 
 fn homepage_html() -> String {
@@ -193,6 +202,7 @@ mod tests {
         build_peers_card, build_ring_svg, build_status_card, build_transfer_card, format_bytes,
         format_last_evaluated,
     };
+    use super::contract_detail::contract_detail_html_from;
     use super::estimator::{
         RegKind, build_estimator_chart, build_estimator_chart_or_placeholder,
         build_regression_chart, build_reliability_chart, build_renegade_accuracy_panel,
@@ -1939,8 +1949,18 @@ mod tests {
         // must NOT be lost when we add the button — that tooltip is
         // still useful for hover-only users (e.g. read-only screenshots).
         // Likewise, <code>{short}</code> must stay outside the button so
-        // the abbreviated key keeps its monospace styling without a
-        // hover state on the contract text itself.
+        // the abbreviated key keeps its monospace styling.
+        //
+        // Amended for #5369: the <code> is now wrapped in an <a> to the
+        // per-contract detail page, so it no longer DIRECTLY precedes the
+        // button. That is a deliberate reversal of one clause of the
+        // original intent, which asked for no hover state on the contract
+        // text — written when there was nowhere for the key to link TO.
+        // Now there is, and a link on the key is how the page is reached.
+        // What still holds, and is what these assertions protect, is that
+        // <code> stays OUTSIDE the copy button: nesting it would make the
+        // key text a click target for "copy" rather than for "open", and
+        // would put the monospace styling inside a button's hover state.
         use crate::node::network_status::ContractSnapshot;
         let mut snap = base_snapshot();
         snap.open_connections = 1;
@@ -1962,15 +1982,23 @@ mod tests {
             html.contains("<code>DEAD...</code>"),
             "the abbreviated key must stay as a plain <code> sibling of the button, got: {html}"
         );
-        // Lock in the simplified markup: the <code> element is a sibling
-        // of the button, NOT wrapped inside it.
+        // Lock in the markup: the <code> element is a sibling of the
+        // button, NOT wrapped inside it.
         assert!(
             !html.contains("class=\"copy-key\" data-copy=\"DEADBEEF\" title=\"Copy contract key\" aria-label=\"Copy contract key\">⧉</button><code>"),
             "<code> must come BEFORE the copy button"
         );
         assert!(
-            html.contains("</code><button type=\"button\" class=\"copy-key\""),
-            "<code> must directly precede the <button> sibling, got: {html}"
+            html.contains("</code></a><button type=\"button\" class=\"copy-key\""),
+            "<code> must sit inside the detail link and directly precede the \
+             copy button, got: {html}"
+        );
+        // The link must target the detail page with the FULL key, not the
+        // abbreviation — the abbreviation is ambiguous and the page looks up
+        // by full key or instance id.
+        assert!(
+            html.contains("href=\"/contract/DEADBEEF\""),
+            "the key must link to its detail page by full key, got: {html}"
         );
     }
 
@@ -3100,6 +3128,400 @@ mod tests {
     // either survives the 5s `<main>` swap. A green run here is compatible
     // with the feature being completely broken in a browser. The behaviour is
     // covered by driving a real node with Playwright; see the PR.
+
+    // ─── Contract detail page (#5369) ───────────────────────────────────
+
+    /// A key that reaches this page came straight out of a URL path, so it is
+    /// attacker-controlled text rendered into HTML.
+    ///
+    /// The not-found branch is the dangerous one: it echoes the key back
+    /// verbatim to say what was not found, and it is reachable by ANYONE who
+    /// can load the page with any path at all — no node state required. An
+    /// unescaped echo there is a reflected-XSS hole on the operator's own
+    /// dashboard, which is the origin that also serves every locally-hosted
+    /// app.
+    #[test]
+    fn contract_detail_escapes_a_key_from_the_url() {
+        let payload = "<script>alert(1)</script>";
+        let html = contract_detail_html_from(&None, payload);
+        assert!(
+            !html.contains("<script>alert(1)"),
+            "an unescaped key from the URL is reflected XSS — got:\n{html}"
+        );
+        assert!(
+            html.contains("&lt;script&gt;alert(1)"),
+            "the key should still be shown, escaped, so the operator can see \
+             what was not found — got:\n{html}"
+        );
+    }
+
+    /// Absence on this node is not absence from the network, and the page must
+    /// not imply otherwise.
+    ///
+    /// A node holds what demand routed to it; it has no directory and cannot
+    /// know whether a contract exists elsewhere. "Not found" phrased as a
+    /// global fact would be the same class of falsehood as the eviction card
+    /// describing a ranking the code does not implement.
+    #[test]
+    fn contract_not_found_is_scoped_to_this_node() {
+        let html = contract_detail_html_from(&None, "NOSUCHCONTRACTKEY");
+        assert!(
+            html.contains("Contract Not Found"),
+            "expected the not-found page — got:\n{html}"
+        );
+        assert!(
+            html.contains("THIS node"),
+            "the page must scope its claim to this node rather than implying \
+             the contract is absent from the network — got:\n{html}"
+        );
+    }
+
+    /// `ContractKey::to_string()` and `ContractKey::id().to_string()` produce
+    /// the SAME string, and this pins it against a real key rather than a
+    /// fixture that assumes it.
+    ///
+    /// This exists because the opposite belief is written down in this
+    /// codebase and has now misled three separate readers. The rustdoc on
+    /// `ContractSnapshot::instance_id` says it is "Distinct from `key_full`
+    /// which carries the full ContractKey encoding (instance id + parameters /
+    /// code-hash bookkeeping)". That is wrong: `impl Display for ContractKey`
+    /// delegates to `self.instance`, and `id()` returns `&self.instance`, so
+    /// the code-hash half never reaches either string.
+    ///
+    /// The consequences of believing otherwise are concrete. Two reviews of
+    /// the contract detail page independently reported a blocking bug — that a
+    /// hosted-only contract cannot be joined to governance, because
+    /// `HostedContractEntry` carries no `instance_id` field — and I acted on it
+    /// once, adding a "cannot be cross-referenced" branch for a case that does
+    /// not exist. The join works precisely because these two strings are the
+    /// same.
+    ///
+    /// If a future stdlib gives `ContractKey` a Display that includes the code
+    /// hash, this fails, and the detail page's governance lookup genuinely
+    /// does need the separate id.
+    #[test]
+    fn contract_key_display_equals_its_instance_id() {
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([7u8; 32]),
+            CodeHash::new([9u8; 32]),
+        );
+        assert_eq!(
+            key.to_string(),
+            key.id().to_string(),
+            "the dashboard joins hosting/subscription records (keyed by \
+             key.to_string()) against governance records (keyed by \
+             key.id().to_string()); if these ever diverge the contract detail \
+             page silently stops finding governance data"
+        );
+    }
+
+    /// The subscribed path — the one the page exists for — rendered end to
+    /// end.
+    ///
+    /// Every other test here drives `subscribed == None` (no snapshot, an
+    /// unknown key, or a hosted-only contract), so the Subscription card's
+    /// actual logic was unexercised: the freshness pill, the in-use flag, the
+    /// never-vs-ago branch on `last_updated_secs`, and the Identity card's
+    /// instance-id row, which only renders when a subscription supplies one.
+    /// Review caught that the primary lookup path had no coverage while four
+    /// secondary paths did.
+    #[test]
+    fn contract_detail_renders_the_subscribed_path() {
+        use crate::node::network_status::ContractSnapshot;
+
+        // Slice to the Subscription card before asserting. The page embeds the
+        // whole stylesheet inline, so `html.contains("fresh-ok")` is true of
+        // every render — the CSS defines `.fresh-ok` whether or not the pill
+        // is emitted. The first version of this test asserted against the full
+        // document and passed vacuously on the positive case; only the
+        // negative case ("stale must NOT contain fresh-ok") exposed it.
+        fn subscription_panel(html: &str) -> String {
+            let start = html
+                .find("<h2>Subscription</h2>")
+                .expect("the Subscription card must be rendered");
+            let end = html[start..]
+                .find("<h2>Hosting</h2>")
+                .map(|i| start + i)
+                .unwrap_or(html.len());
+            html[start..end].to_string()
+        }
+
+        let base = |is_fresh: bool, in_use: bool, last: Option<u64>| {
+            let mut snap = base_snapshot();
+            snap.open_connections = 3;
+            snap.contracts = vec![ContractSnapshot {
+                key_short: "SUBB...".to_string(),
+                key_full: "SUBBED1".to_string(),
+                instance_id: "SUBBED1".to_string(),
+                subscribed_secs: 3600,
+                last_updated_secs: last,
+                is_receiving_updates: is_fresh,
+                in_use,
+            }];
+            contract_detail_html_from(&Some(snap), "SUBBED1")
+        };
+
+        // Fresh, in use, updated recently.
+        let fresh_html = base(true, true, Some(30));
+        let fresh = subscription_panel(&fresh_html);
+        assert!(
+            fresh.contains("fresh-ok") && fresh.contains("receiving updates"),
+            "a contract in the update mesh must show the fresh pill — \
+             got:\n{fresh}"
+        );
+        assert!(
+            fresh.contains("30s ago"),
+            "a known last-update time must be rendered as an age — got:\n{fresh}"
+        );
+        assert!(
+            fresh_html.contains("Instance id"),
+            "the instance-id row renders only when a subscription supplies \
+             one, and this is that case — got:\n{fresh}"
+        );
+
+        // Not receiving updates, not pinned by demand, never updated.
+        let stale_html = base(false, false, None);
+        let stale = subscription_panel(&stale_html);
+        assert!(
+            stale.contains("fresh-stale") && stale.contains("not receiving updates"),
+            "a contract outside the update mesh must NOT show as fresh — \
+             serving a stale copy is the failure invariant 1 forbids, so the \
+             page must not imply freshness it does not have. got:\n{stale}"
+        );
+        assert!(
+            stale.contains("never"),
+            "an absent last-update must read as 'never', not as an age of \
+             zero — got:\n{stale}"
+        );
+        // The two states must be distinguishable, or the pill is decoration.
+        assert!(
+            fresh.contains("fresh-ok") && !stale.contains("fresh-ok"),
+            "the freshness pill must differ between the two states"
+        );
+    }
+
+    /// The abbreviating branch, which nothing else reaches.
+    ///
+    /// `abbreviate()` only runs when a contract has neither a subscription nor
+    /// a hosting record but DOES have a governance one — an Evicted, Banned or
+    /// WouldEvict contract this node no longer holds. That is a real and
+    /// expected state, and every other test supplies a short `key_short` from
+    /// a subscription or hosting entry instead, so the truncation arithmetic
+    /// was never executed.
+    ///
+    /// The multi-byte case is the reason the function uses `.chars()` rather
+    /// than byte slicing: a `&key[..12]` regression would panic on a
+    /// non-ASCII boundary rather than fail politely. Contract keys are base58
+    /// today, so this is defensive — which is exactly why it needs a test
+    /// rather than a reader's confidence.
+    #[test]
+    fn contract_detail_abbreviates_a_long_governance_only_key() {
+        use crate::node::network_status::{ContractGovernanceEntry, GovernanceStateSnapshot};
+
+        let gov_only = |key: &str| {
+            let mut snap = base_snapshot();
+            snap.open_connections = 2;
+            snap.governance.contracts = vec![ContractGovernanceEntry {
+                instance_id: key.to_string(),
+                instance_id_short: key.to_string(),
+                state: GovernanceStateSnapshot::Banned,
+                cost_used: 9.0,
+                benefit_score: 0.1,
+                log_ratio: Some(-2.0),
+                age_secs: 120,
+                last_transition_secs_ago: 30,
+                history: Vec::new(),
+            }];
+            contract_detail_html_from(&Some(snap), key)
+        };
+
+        // 44 base58 characters, the real shape of a contract key.
+        let long = "7WSdxLxjPvKgGZBqDpRuPMuoprnQBmXtnkHkDpTPTdcJ";
+        let html = gov_only(long);
+        assert!(
+            html.contains("7WSdxLxjPvKg…"),
+            "a governance-only contract has no short form to borrow, so the \
+             page must abbreviate the key itself — got:\n{html}"
+        );
+        assert!(
+            html.contains(long),
+            "and must still show the full key, which is what the copy button \
+             and the filter search on — got:\n{html}"
+        );
+
+        // Exactly at the boundary: 12 chars must NOT be truncated.
+        let twelve = "123456789012";
+        let at_boundary = gov_only(twelve);
+        assert!(
+            !at_boundary.contains("123456789012…"),
+            "a key exactly at the cap is not longer than the cap, so it must \
+             not gain an ellipsis — got:\n{at_boundary}"
+        );
+
+        // Multi-byte, to pin that truncation counts CHARACTERS not bytes. A
+        // byte-slicing regression panics here rather than returning something
+        // wrong, which is the failure mode worth catching early.
+        let wide = "ααααααααααααααα";
+        let multibyte = gov_only(wide);
+        let expected: String = "α".repeat(12);
+        assert!(
+            multibyte.contains(&format!("{expected}…")),
+            "a multi-byte key must abbreviate to 12 CHARACTERS, not 12 bytes. \
+             The first version of this assertion was `contains(\"…\")` behind \
+             an `||`, which is true either way — byte slicing yields 6 of \
+             these 2-byte chars and sailed through it. Counting the characters \
+             is what distinguishes the two — got:\n{multibyte}"
+        );
+    }
+
+    /// A hosted-only contract CAN be cross-referenced against governance,
+    /// and this pins the non-obvious reason why.
+    ///
+    /// `HostedContractEntry` carries no `instance_id` field, and governance is
+    /// keyed by `ContractInstanceId`, so the join looks impossible. It is not:
+    /// `impl Display for ContractKey` delegates to `self.instance` and
+    /// `ContractKey::id()` returns `&self.instance`, so `key.to_string()` and
+    /// `key.id().to_string()` are THE SAME STRING. The requested key is always
+    /// a valid governance lookup value.
+    ///
+    /// This needs a test because the rustdoc on `ContractSnapshot::instance_id`
+    /// asserts the opposite — "Distinct from `key_full` which carries the full
+    /// ContractKey encoding" — which is wrong, and reading it caused a wrong
+    /// turn on this page: a "cannot be cross-referenced" branch was added for
+    /// a case that does not exist. If the stdlib ever makes the two encodings
+    /// genuinely differ, this fails and says where to look.
+    #[test]
+    fn hosted_only_contract_still_joins_to_governance() {
+        use crate::node::network_status::{ContractGovernanceEntry, GovernanceStateSnapshot};
+
+        let key = "HOSTEDONLYKEY";
+        let mut snap = base_snapshot();
+        snap.open_connections = 2;
+        // Hosted, with NO subscription entry to supply an instance id.
+        snap.hosting.contracts = vec![crate::node::network_status::HostedContractEntry {
+            key_full: key.to_string(),
+            key_short: key.to_string(),
+            size_bytes: 1024,
+            read_count: 0,
+            recency_seq: 0,
+            eviction_eligible: true,
+        }];
+        // Governance knows it under the same string, because that string IS
+        // the instance id.
+        snap.governance.contracts = vec![ContractGovernanceEntry {
+            instance_id: key.to_string(),
+            instance_id_short: key.to_string(),
+            state: GovernanceStateSnapshot::Borderline,
+            cost_used: 3.0,
+            benefit_score: 1.0,
+            log_ratio: Some(-0.4),
+            age_secs: 600,
+            last_transition_secs_ago: 60,
+            history: Vec::new(),
+        }];
+
+        let html = contract_detail_html_from(&Some(snap), key);
+        assert!(
+            html.contains("Borderline"),
+            "a hosted-only contract must still show its governance state — \
+             the requested key is a valid instance id. got:\n{html}"
+        );
+        assert!(
+            !html.contains("Not flagged by the governance manager"),
+            "and must not report it as unflagged when a record was found — \
+             got:\n{html}"
+        );
+    }
+
+    /// Governance history must show the NEWEST transitions.
+    ///
+    /// `GovernanceSnapshot::history` is documented as "newest last", so a
+    /// plain `.take(10)` renders the ten OLDEST and hides everything recent —
+    /// exactly inverted from what someone opening the page wants. The bug is
+    /// invisible until a contract accumulates more than ten transitions, which
+    /// is why it needs a test rather than a look.
+    #[test]
+    fn contract_detail_shows_the_newest_governance_transitions() {
+        use crate::node::network_status::{
+            ContractGovernanceEntry, GovernanceStateSnapshot, GovernanceTransitionEntry,
+            GovernanceTransitionReasonSnapshot,
+        };
+
+        // 14 transitions, oldest first, distinguishable by their age.
+        let history: Vec<GovernanceTransitionEntry> = (0..14)
+            .map(|i| GovernanceTransitionEntry {
+                secs_ago: (14 - i) * 60,
+                from: GovernanceStateSnapshot::Normal,
+                to: GovernanceStateSnapshot::Borderline,
+                reason: GovernanceTransitionReasonSnapshot::ThresholdCrossed,
+            })
+            .collect();
+        let oldest_secs = history[0].secs_ago;
+        let newest_secs = history[13].secs_ago;
+
+        let mut snap = base_snapshot();
+        snap.open_connections = 2;
+        snap.governance.contracts = vec![ContractGovernanceEntry {
+            instance_id: "GOVKEY1".to_string(),
+            instance_id_short: "GOVKEY1".to_string(),
+            state: GovernanceStateSnapshot::Borderline,
+            cost_used: 1.0,
+            benefit_score: 2.0,
+            log_ratio: Some(0.5),
+            age_secs: 900,
+            last_transition_secs_ago: newest_secs,
+            history,
+        }];
+
+        let html = contract_detail_html_from(&Some(snap), "GOVKEY1");
+        let newest = format_duration(newest_secs);
+        let oldest = format_duration(oldest_secs);
+        assert!(
+            html.contains(&format!("{newest} ago")),
+            "the most recent transition ({newest} ago) must be shown — \
+             got:\n{html}"
+        );
+        assert!(
+            !html.contains(&format!("{oldest} ago")),
+            "the oldest transition ({oldest} ago) must have been dropped by \
+             the cap, not the newest — got:\n{html}"
+        );
+    }
+
+    /// The hosting panel must NOT imply it is showing the eviction ranking.
+    ///
+    /// Invariant 3 ranks by local subscriptions, then downstream subscribers,
+    /// then recency. Only recency is in the snapshot; the two counts that
+    /// OUTRANK it are computed during the sweep and are unavailable here. A
+    /// panel that showed recency alone, unqualified, would read as "this is
+    /// why the contract is kept" — which is exactly the falsehood PR #5371
+    /// removed from the eviction card, reintroduced on a new page.
+    #[test]
+    fn contract_detail_says_the_eviction_ranking_is_not_shown() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 2;
+        snap.hosting.contracts = vec![crate::node::network_status::HostedContractEntry {
+            key_full: "TESTKEY1".to_string(),
+            key_short: "TESTKEY1".to_string(),
+            size_bytes: 4096,
+            read_count: 3,
+            recency_seq: 42,
+            eviction_eligible: true,
+        }];
+        let html = contract_detail_html_from(&Some(snap), "TESTKEY1");
+        assert!(
+            html.contains("not shown"),
+            "the hosting panel must say the ranking keys are missing — \
+             got:\n{html}"
+        );
+        assert!(
+            html.contains("5372"),
+            "and point at the issue tracking them, so the gap is followable \
+             rather than a dead end — got:\n{html}"
+        );
+    }
 
     /// The Playwright fixture's markup must stay in step with what the server
     /// actually emits.

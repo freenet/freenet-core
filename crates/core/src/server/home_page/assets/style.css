@@ -1430,6 +1430,29 @@ table.sortable thead th.sort-desc::after {
 
 /* Freshness / demand pills in the Subscribed Contracts table (replaces the
  * retired MAD-governance column). Same compact shape as `.gov-pill`. */
+/* A full contract key is ~60 characters of unbroken base58 in a monospace
+   font, which is wider than a phone viewport and has no space to break at.
+   Without an explicit break rule it forces the whole page to scroll sideways —
+   the same class of bug the responsive work above fixed for the stat grids.
+   `anywhere` rather than `break-all` so the browser still prefers a sensible
+   break point where one exists. */
+/* The abbreviated key in a contract table links to its detail page. Styled to
+   stay legible as a link without turning the table into a wall of blue: the
+   underline only appears on hover, so the column still reads as data. */
+.key-link {
+  color: inherit;
+  text-decoration: none;
+}
+.key-link:hover code {
+  color: var(--accent-light);
+  text-decoration: underline;
+}
+
+.key-wrap {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 .fresh-pill {
   display: inline-block;
   padding: 0.1rem 0.45rem;
