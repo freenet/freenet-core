@@ -2251,25 +2251,34 @@ mod unsupported_request_tests {
     /// The invariant: the arm must `return Err(...)`, not merely log and
     /// fall through — mirrors `contract_request_catch_all_returns_error_not_silence`
     /// below for the sibling `ContractRequest` catch-all.
+    ///
+    /// Anchored on comment text (not code layout) and whitespace-insensitive
+    /// on the captured region, matching the convention in
+    /// `pool_subscriber_limit_error_resolves_real_key`
+    /// (`subscriber_limit_tests.rs`) — so `cargo fmt` reformatting this
+    /// block cannot break the anchors or the assertions.
     #[test]
     fn client_request_catch_all_returns_error_not_silence() {
         let src = include_str!("client_events.rs");
         let start = src
-            .find("ClientRequest::Authenticate { .. } => {\n                return Ok(None);\n            }")
-            .expect("the ClientRequest::Authenticate silent arm not found");
+            .find("// `StreamChunk` is named explicitly")
+            .expect("the `StreamChunk` comment before the catch-all arm not found");
         let after = &src[start..];
         let end = after
-            .find("Ok(None)\n    };")
-            .expect("the arm is bounded by the end of the match / process_open_request's tail");
-        let arm = &after[..end];
+            .find("GlobalExecutor::spawn(fut.instrument(")
+            .expect("the arm is bounded by process_open_request's closing spawn call");
+        let arm: String = after[..end]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
 
         assert!(
-            arm.contains("_ => {"),
-            "expected a `_ =>` catch-all arm after the Authenticate arm, \
-             not found in: {arm:?}"
+            arm.contains("ClientRequest::StreamChunk{..}|_=>{"),
+            "expected the catch-all arm to explicitly name `StreamChunk` \
+             alongside the wildcard, not found in: {arm:?}"
         );
         assert!(
-            arm.contains("return Err("),
+            arm.contains("returnErr("),
             "the ClientRequest catch-all must return an error to the client, \
              not merely log and fall through to `Ok(None)` — a client whose \
              request lands here would wait forever with no response. \
