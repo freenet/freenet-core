@@ -533,10 +533,31 @@ impl Stream for StreamingInboundStream {
             return Poll::Ready(None); // Stream complete
         }
 
-        // If the stream has enough data but this fragment slot is empty, we're done.
-        // The overflow slot (allocated for potential metadata overhead in fragment #1)
-        // may not be used when fragment #1 has full payload capacity.
-        if self.handle.buffer.is_complete() && self.handle.buffer.get(next_idx).is_none() {
+        // If every advertised byte has been yielded and this fragment slot is
+        // empty, we're done. The overflow slot (allocated for potential metadata
+        // overhead in fragment #1) may not be used when fragment #1 has full
+        // payload capacity, so it can stay empty forever.
+        //
+        // `is_complete()` alone is NOT sufficient to end the stream: it is
+        // `contiguous >= min_complete_fragments`, the BASE fragment count. When
+        // the sender embeds metadata in fragment #1 (fix #2757) that fragment
+        // carries a reduced payload, so the sender emits `base + 1` fragments —
+        // and `is_complete()` therefore fires one fragment EARLY, while the
+        // final overflow fragment is still in flight. Ending here on that signal
+        // truncates the stream: `pipe_stream` (the relay forwarding path, see
+        // `outbound_stream.rs`) stops forwarding short of the
+        // `total_length_bytes` it advertised, and the downstream peer waits in
+        // `assemble()` for a fragment that will never be sent until its
+        // inactivity timeout fires.
+        //
+        // The byte count is the discriminator, exactly as in `assemble()` (which
+        // keeps waiting when `is_complete()` is true but the assembled length is
+        // short). Keep the two paths in agreement — they consume the same buffer
+        // and must reach the same conclusion about when a stream has ended.
+        if self.handle.buffer.is_complete()
+            && self.handle.buffer.get(next_idx).is_none()
+            && self.bytes_read >= self.handle.buffer.total_bytes()
+        {
             return Poll::Ready(None);
         }
 
@@ -1739,5 +1760,154 @@ mod tests {
         assert!(result.is_ok(), "assemble should succeed: {:?}", result);
         let data = result.unwrap();
         assert_eq!(data.len(), total as usize);
+    }
+
+    /// Regression test: the `Stream` impl must wait for the overflow fragment
+    /// instead of silently ending the stream early.
+    ///
+    /// Counterpart to `test_assemble_waits_for_overflow_fragment` above. That
+    /// test pins the `assemble()` path, which was fixed after it truncated
+    /// River web-app payloads. `poll_next` had the same defect and was NOT
+    /// fixed, and it is the path relays use: `pipe_stream` forwards a GET/PUT
+    /// response hop-by-hop via `inbound_handle.stream()`.
+    ///
+    /// The mechanism: `is_complete()` is `contiguous >= min_complete_fragments`,
+    /// which is the base fragment count. When the sender embeds metadata in
+    /// fragment #1 (fix #2757) that fragment carries a reduced payload, so the
+    /// sender emits `base + 1` fragments. `is_complete()` therefore fires one
+    /// fragment EARLY — while the final overflow fragment is still in flight.
+    /// A consumer polling in that window saw `is_complete() && get(next) == None`
+    /// and returned `Poll::Ready(None)`, ending the relayed stream short of its
+    /// advertised `total_length_bytes`. The downstream peer then sits in
+    /// `assemble()` waiting for a fragment that will never be sent and fails
+    /// with `StreamError::InactivityTimeout` — "stream assembly: no fragments
+    /// received within inactivity timeout".
+    ///
+    /// Polling is driven manually with a no-op waker so the assertion lands on
+    /// the exact poll in that window; there is no sleep and no timing race.
+    #[test]
+    fn test_stream_waits_for_overflow_fragment() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+        use futures::StreamExt;
+
+        // Same shape as the sender: fragment #1 carries a reduced payload
+        // because metadata is embedded, so `base + 1` fragments are needed.
+        let total = (FRAGMENT_PAYLOAD_SIZE * 3) as u64;
+        let handle = StreamHandle::new(make_stream_id(), total);
+
+        let reduced_payload = FRAGMENT_PAYLOAD_SIZE / 2;
+        let remaining = total as usize - reduced_payload;
+        let overflow_size = remaining - 2 * FRAGMENT_PAYLOAD_SIZE;
+
+        handle
+            .push_fragment(1, Bytes::from(vec![1u8; reduced_payload]))
+            .unwrap();
+        handle
+            .push_fragment(2, Bytes::from(vec![2u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+        handle
+            .push_fragment(3, Bytes::from(vec![3u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+
+        // The buffer reports complete (3 contiguous >= min_complete_fragments)
+        // even though the bytes present are short of `total`.
+        assert!(handle.is_complete());
+        assert!(handle.try_assemble().is_none());
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut stream = handle.stream();
+
+        let mut yielded = 0usize;
+        for expected in [
+            reduced_payload,
+            FRAGMENT_PAYLOAD_SIZE,
+            FRAGMENT_PAYLOAD_SIZE,
+        ] {
+            match stream.poll_next_unpin(&mut cx) {
+                Poll::Ready(Some(Ok(data))) => {
+                    assert_eq!(data.len(), expected);
+                    yielded += data.len();
+                }
+                other => panic!("expected fragment of {expected} bytes, got {other:?}"),
+            }
+        }
+
+        // The defect: with the overflow fragment not yet arrived, this poll
+        // returned `Ready(None)` and the relay ended the stream having
+        // forwarded only `yielded` of `total` bytes.
+        match stream.poll_next_unpin(&mut cx) {
+            Poll::Pending => {}
+            Poll::Ready(None) => panic!(
+                "stream ended early: forwarded {yielded} of {total} bytes. \
+                 `is_complete()` fires at the base fragment count, so the \
+                 overflow fragment was still in flight; ending here truncates \
+                 the relayed stream and strands the downstream peer in \
+                 assemble() until its inactivity timeout."
+            ),
+            other => panic!("expected Pending while awaiting the overflow fragment, got {other:?}"),
+        }
+
+        // Overflow arrives: the stream must deliver it and only then end.
+        handle
+            .push_fragment(4, Bytes::from(vec![4u8; overflow_size]))
+            .unwrap();
+
+        match stream.poll_next_unpin(&mut cx) {
+            Poll::Ready(Some(Ok(data))) => {
+                assert_eq!(data.len(), overflow_size);
+                yielded += data.len();
+            }
+            other => panic!("expected the overflow fragment, got {other:?}"),
+        }
+
+        assert_eq!(
+            yielded, total as usize,
+            "the stream must forward every advertised byte"
+        );
+        assert!(matches!(stream.poll_next_unpin(&mut cx), Poll::Ready(None)));
+    }
+
+    /// The early-end path must still fire when the overflow slot is genuinely
+    /// unused, or every such stream would hang until its inactivity timeout.
+    ///
+    /// This is the case the `is_complete() && get(next).is_none()` check exists
+    /// for: when fragment #1 carries a full payload the sender emits exactly
+    /// `base` fragments and the extra allocated slot stays empty forever.
+    #[test]
+    fn test_stream_ends_when_overflow_slot_unused() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+        use futures::StreamExt;
+
+        let total = (FRAGMENT_PAYLOAD_SIZE * 2) as u64;
+        let handle = StreamHandle::new(make_stream_id(), total);
+
+        handle
+            .push_fragment(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+        handle
+            .push_fragment(2, Bytes::from(vec![2u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut stream = handle.stream();
+
+        let mut yielded = 0usize;
+        for _ in 0..2 {
+            match stream.poll_next_unpin(&mut cx) {
+                Poll::Ready(Some(Ok(data))) => yielded += data.len(),
+                other => panic!("expected a fragment, got {other:?}"),
+            }
+        }
+        assert_eq!(yielded, total as usize);
+
+        // All advertised bytes delivered and slot 3 will never be filled: the
+        // stream must end rather than wait.
+        assert!(
+            matches!(stream.poll_next_unpin(&mut cx), Poll::Ready(None)),
+            "stream must end once every advertised byte has been forwarded, \
+             even though the allocated overflow slot is still empty"
+        );
     }
 }
