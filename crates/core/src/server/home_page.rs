@@ -3282,6 +3282,27 @@ mod tests {
             "0 of 50 really is 0% — got:\n{zero}"
         );
 
+        // Exactly at MIN_SAMPLE. The gate is `total < MIN_SAMPLE`, so 20 must
+        // take the rate branch — the one boundary value the other cases do not
+        // pin, and an off-by-one here would silently withhold the number from
+        // every node sitting at the threshold.
+        let at_min = render(10, 20);
+        assert!(
+            at_min.contains("50% answered"),
+            "20 requests is exactly the minimum sample, so it must be rated — \
+             got:\n{at_min}"
+        );
+        assert!(
+            !at_min.contains("too few to rate"),
+            "and must not be refused — got:\n{at_min}"
+        );
+        let below_min = render(9, 19);
+        assert!(
+            below_min.contains("too few to rate"),
+            "19 requests is below the minimum and must be refused — \
+             got:\n{below_min}"
+        );
+
         // And an ordinary value is unaffected: the 1.3% gateway from #5370.
         let gateway = render(2, 153);
         assert!(

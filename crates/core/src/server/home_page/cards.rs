@@ -11,6 +11,15 @@ use super::*;
 /// them, and the bands next to them say which side of the boundary they are
 /// on rather than rounding across it.
 fn answered_share(ok: u32, total: u32) -> String {
+    // Defence in depth. The only caller gates on `total >= MIN_SAMPLE`, so
+    // zero cannot reach here today — but without this the `ok == total` arm
+    // below would answer "100%" for nothing at all, which is the worst
+    // possible wrong answer from a panel whose entire purpose is not
+    // overstating success. A future caller that forgets the guard should get
+    // an honest dash, not a perfect score.
+    if total == 0 {
+        return "—".to_string();
+    }
     if ok == total {
         return "100%".to_string();
     }
