@@ -724,12 +724,12 @@ async fn run_writer(
                 since_flush += 1;
                 if since_flush >= FLUSH_EVERY_OBSERVATIONS {
                     write_all(
-                                &dir,
-                                &samplers,
-                                dropped.load(Ordering::Relaxed),
-                                related_untracked,
-                            )
-                            .await;
+                        &dir,
+                        &samplers,
+                        dropped.load(Ordering::Relaxed),
+                        related_untracked,
+                    )
+                    .await;
                     since_flush = 0;
                 }
             }
@@ -755,12 +755,12 @@ async fn run_writer(
             }
             _ = flush.tick() => {
                 write_all(
-                                &dir,
-                                &samplers,
-                                dropped.load(Ordering::Relaxed),
-                                related_untracked,
-                            )
-                            .await;
+                    &dir,
+                    &samplers,
+                    dropped.load(Ordering::Relaxed),
+                    related_untracked,
+                )
+                .await;
                 since_flush = 0;
             }
             // Only start a probe when none is in flight. A probe that overran its
