@@ -1163,6 +1163,17 @@ document.addEventListener('DOMContentLoaded', function () {
         /* Read the caret position BEFORE the innerHTML write on the next line
            destroys the element holding it. */
         var focusBeforeSwap = captureFilterFocus();
+        /* Blur BEFORE the swap. WebKit re-scrolls a focused element into view
+           when layout changes, and the swap is a layout change — so with the
+           filter box still focused and off screen, WebKit scrolled the page
+           back to it before our own visibility gate below was ever consulted.
+           The gate cannot prevent a scroll that has already happened.
+           Dropping focus first leaves WebKit nothing to scroll to; the gate
+           then decides whether to give it back. */
+        if (focusBeforeSwap) {
+          var active = document.activeElement;
+          if (active && typeof active.blur === 'function') active.blur();
+        }
         if (newMain && oldMain) oldMain.innerHTML = newMain.innerHTML;
         /* Update the tab title (connection state + count, #3509) so a
            backgrounded tab still surfaces the current status at a glance. */
