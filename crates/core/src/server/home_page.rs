@@ -555,7 +555,20 @@ mod tests {
         snap.open_connections = 3;
         let html = build_status_card(&Some(snap));
         assert!(html.contains("health-good"), "healthy banner missing");
-        assert!(html.contains("Node is healthy"));
+        // Superseded by #5370: the banner no longer declares the node healthy.
+        // Four live v0.2.128 peers showed "Node is healthy" while answering
+        // between 1.3% and 89% of their GETs, because the four inputs behind
+        // the verdict are all connectivity and none of them can see whether
+        // the node serves reads. The banner now states the connection count,
+        // which is a fact, and the measured GET rate carries the rest.
+        assert!(
+            html.contains("Connected to 3 peers"),
+            "the healthy state must still state its connection count, got: {html}"
+        );
+        assert!(
+            !html.contains("Node is healthy"),
+            "the verdict must not come back, got: {html}"
+        );
 
         // Degraded
         let mut snap = base_snapshot();
@@ -3128,6 +3141,246 @@ mod tests {
     // either survives the 5s `<main>` swap. A green run here is compatible
     // with the feature being completely broken in a browser. The behaviour is
     // covered by driving a real node with Playwright; see the PR.
+
+    // ─── GET success rate (#5370) ───────────────────────────────────────
+
+    /// The banner must not call the node healthy.
+    ///
+    /// It did, on four connectivity inputs that say nothing about whether the
+    /// node can serve reads: four live v0.2.128 peers displayed "Node is
+    /// healthy" while answering between 1.3% and 89% of their GETs. A verdict
+    /// is an assertion, and unsupported assertions are what this page keeps
+    /// getting wrong. The connection COUNT is a fact and stays.
+    #[test]
+    fn status_card_states_connections_instead_of_declaring_health() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 5;
+        snap.health = crate::node::network_status::HealthLevel::Healthy;
+        let html = build_status_card(&Some(snap));
+
+        assert!(
+            !html.contains("is healthy"),
+            "the banner must not declare the node healthy — got:\n{html}"
+        );
+        assert!(
+            html.contains("Connected to 5 peers"),
+            "the connection count is a fact and must survive — got:\n{html}"
+        );
+    }
+
+    /// A percentage over a handful of requests is theatre.
+    ///
+    /// Peers issue only a few GETs an hour, so a fresh node sits at a tiny
+    /// denominator for a long time. At two requests one outcome moves the
+    /// figure fifty points, which looks like a measurement and is not.
+    #[test]
+    fn get_success_rate_refuses_to_rate_a_tiny_sample() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 3;
+        snap.health = crate::node::network_status::HealthLevel::Healthy;
+        snap.elapsed_secs = 600;
+        snap.op_stats.gets = (1, 1);
+        let html = build_status_card(&Some(snap));
+
+        assert!(
+            html.contains("too few to rate"),
+            "a 2-request sample must not be rendered as a percentage — \
+             got:\n{html}"
+        );
+        assert!(
+            !html.contains("50%"),
+            "and specifically not as 50% — got:\n{html}"
+        );
+        assert!(
+            html.contains("1 of 2"),
+            "the counts are still worth showing — got:\n{html}"
+        );
+        assert!(
+            html.contains("does not by itself"),
+            "the caveat must appear even when there is no rate to qualify — \
+             got:\n{html}"
+        );
+    }
+
+    /// The number the whole change exists to surface.
+    ///
+    /// The production gateway in #5370 answered 2 of 153 GETs and displayed
+    /// "Node is healthy". It must now read 1%.
+    #[test]
+    fn get_success_rate_reports_the_measured_share() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 12;
+        snap.health = crate::node::network_status::HealthLevel::Healthy;
+        snap.elapsed_secs = 3600 * 5;
+        snap.op_stats.gets = (2, 151);
+        let html = build_status_card(&Some(snap));
+
+        assert!(
+            html.contains("1% answered"),
+            "2 of 153 is 1% and must be shown as such — got:\n{html}"
+        );
+        assert!(
+            html.contains("2 of 153"),
+            "the sample size must accompany the percentage, so the reader can \
+             tell 1% of 153 from 1% of 3 — got:\n{html}"
+        );
+        assert!(
+            html.contains("since start"),
+            "the figure is lifetime, not a recent window, and must say so — \
+             got:\n{html}"
+        );
+    }
+
+    /// Rounding must never assert something that did not happen.
+    ///
+    /// `{:.0}` alone renders 199/200 as "100%" and 1/200 as "0%". Both are
+    /// false in the way this panel exists to prevent: "100% answered" when a
+    /// request failed is the same unearned absolute as "Node is healthy" was,
+    /// and an operator who reads 100% stops looking.
+    ///
+    /// 100% and 0% are therefore reserved for the cases that earn them, and
+    /// the bands beside them say which side of the boundary they are on
+    /// instead of rounding across it.
+    #[test]
+    fn answered_share_never_rounds_across_an_absolute() {
+        let render = |ok: u32, total: u32| {
+            let mut snap = base_snapshot();
+            snap.open_connections = 4;
+            snap.health = crate::node::network_status::HealthLevel::Healthy;
+            snap.elapsed_secs = 3600;
+            snap.op_stats.gets = (ok, total - ok);
+            build_status_card(&Some(snap))
+        };
+
+        // A single failure must not render as a perfect score.
+        let near_perfect = render(199, 200);
+        assert!(
+            near_perfect.contains("&gt;99% answered") || near_perfect.contains(">99% answered"),
+            "199 of 200 must not claim 100% — got:\n{near_perfect}"
+        );
+        assert!(
+            !near_perfect.contains("100% answered"),
+            "199 of 200 rounds to 100 and must be caught — got:\n{near_perfect}"
+        );
+
+        // A single success must not render as total failure.
+        let near_zero = render(1, 200);
+        assert!(
+            near_zero.contains("&lt;1% answered") || near_zero.contains("<1% answered"),
+            "1 of 200 must not claim 0% — got:\n{near_zero}"
+        );
+
+        // The absolutes are still available when genuinely earned.
+        let perfect = render(50, 50);
+        assert!(
+            perfect.contains("100% answered"),
+            "50 of 50 really is 100% — got:\n{perfect}"
+        );
+        let zero = render(0, 50);
+        assert!(
+            zero.contains("0% answered"),
+            "0 of 50 really is 0% — got:\n{zero}"
+        );
+
+        // Exactly at MIN_SAMPLE. The gate is `total < MIN_SAMPLE`, so 20 must
+        // take the rate branch — the one boundary value the other cases do not
+        // pin, and an off-by-one here would silently withhold the number from
+        // every node sitting at the threshold.
+        let at_min = render(10, 20);
+        assert!(
+            at_min.contains("50% answered"),
+            "20 requests is exactly the minimum sample, so it must be rated — \
+             got:\n{at_min}"
+        );
+        assert!(
+            !at_min.contains("too few to rate"),
+            "and must not be refused — got:\n{at_min}"
+        );
+        let below_min = render(9, 19);
+        assert!(
+            below_min.contains("too few to rate"),
+            "19 requests is below the minimum and must be refused — \
+             got:\n{below_min}"
+        );
+
+        // And an ordinary value is unaffected: the 1.3% gateway from #5370.
+        let gateway = render(2, 153);
+        assert!(
+            gateway.contains("1% answered"),
+            "2 of 153 is 1.3%, which rounds honestly to 1% — got:\n{gateway}"
+        );
+    }
+
+    /// The caveat must be UNCONDITIONAL, at every rate.
+    ///
+    /// An unanswered GET is frequently the network failing to route rather
+    /// than this node failing to serve — dead-ends dominate the not-found
+    /// mode. Without the caveat, "GET requests 1% answered" invites the
+    /// operator to conclude their own node is broken and report it, and the
+    /// support burden would be built out of our own phrasing.
+    ///
+    /// Showing it only when the number looks bad would be a threshold in
+    /// disguise, and picking that threshold is precisely the judgement this
+    /// panel exists to avoid. So it is pinned at a healthy rate too: if a
+    /// future change makes it conditional, this fails.
+    #[test]
+    fn get_success_caveat_is_shown_at_every_rate() {
+        // Includes the total == 0 branch. Review noted it was the one case
+        // the caveat's own test never exercised — and it is the state a
+        // freshly-started node sits in, so it is the branch most operators
+        // see first.
+        for (ok, failed, label) in [
+            (2u32, 151u32, "very low"),
+            (150, 3, "very high"),
+            (0, 0, "no requests yet"),
+        ] {
+            let mut snap = base_snapshot();
+            snap.open_connections = 6;
+            snap.health = crate::node::network_status::HealthLevel::Healthy;
+            snap.elapsed_secs = 3600 * 4;
+            snap.op_stats.gets = (ok, failed);
+            let html = build_status_card(&Some(snap));
+            assert!(
+                html.contains("could not route"),
+                "the caveat must appear at a {label} rate too, or it becomes a \
+                 threshold in disguise — got:\n{html}"
+            );
+        }
+    }
+
+    /// The rate must not be styled as a verdict.
+    ///
+    /// Colouring it green or red would reintroduce through CSS exactly the
+    /// judgement the change removed from the markup — and the threshold for
+    /// that colour is the number nobody could justify picking, which is why
+    /// the verdict went in the first place.
+    #[test]
+    fn get_success_rate_carries_no_pass_fail_styling() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 4;
+        snap.health = crate::node::network_status::HealthLevel::Healthy;
+        snap.elapsed_secs = 3600;
+        snap.op_stats.gets = (10, 90);
+        let html = build_status_card(&Some(snap));
+
+        let line_start = html
+            .find("get-success-rate")
+            .expect("the rate line must be rendered");
+        let line = &html[line_start..html[line_start..].find("</p>").unwrap() + line_start];
+        for verdict_class in [
+            "health-good",
+            "health-trouble",
+            "health-degraded",
+            "op-ok",
+            "op-fail",
+        ] {
+            assert!(
+                !line.contains(verdict_class),
+                "the rate line must not carry the pass/fail class \
+                 `{verdict_class}` — got:\n{line}"
+            );
+        }
+    }
 
     // ─── Contract detail page (#5369) ───────────────────────────────────
 

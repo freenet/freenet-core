@@ -1448,6 +1448,48 @@ table.sortable thead th.sort-desc::after {
   text-decoration: underline;
 }
 
+/* Measured GET success rate (#5370). Deliberately styled as a READING, not a
+   status: no green/red, no icon. The page replaced a healthy/unhealthy verdict
+   with this number precisely because a verdict asserts something the four
+   connectivity inputs behind it could not support, and colouring the number
+   would smuggle the verdict back in through the stylesheet. */
+.get-success-rate {
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  margin: 0.5rem 0 0.25rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.4rem;
+}
+.gsr-label {
+  color: var(--text-muted);
+  text-transform: uppercase;
+  font-size: 0.7rem;
+  letter-spacing: 0.05em;
+}
+.gsr-value {
+  color: var(--text-primary);
+  font-size: 1rem;
+  font-weight: 600;
+}
+.gsr-detail,
+.gsr-none {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+/* The caveat is deliberately quiet but always present. It exists so a low
+   share is not misread as "my node is broken" — an unanswered GET is often
+   the network failing to route rather than this node failing to serve. */
+.get-success-caveat {
+  margin: 0 0 0.4rem;
+  font-size: 0.7rem;
+  line-height: 1.35;
+  color: var(--text-muted);
+  max-width: 62ch;
+}
+
 .key-wrap {
   overflow-wrap: anywhere;
   word-break: break-word;
