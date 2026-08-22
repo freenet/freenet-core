@@ -170,6 +170,12 @@ async function routeFixture(page: Page, rows: number): Promise<void> {
  * The helper asserts the row is neither hidden nor zero-height, because a
  * `display: none` row reports `top: 0, height: 0` and would silently compare
  * 0 with 0 — a vacuous shape this file has already fallen into once. */
+/* Must stay inside `COLLAPSE_ROWS` in dashboard.js (25 at time of writing).
+   The coupling is across files and cannot be imported, so it is stated here:
+   if that cap is ever lowered to 20 or below, this anchor falls outside it.
+   That fails loudly rather than silently — `anchorRowTop` asserts the row is
+   not hidden — but the failure would point here rather than at the cap, so
+   the next person to change the cap should read this line. */
 const ANCHOR_ROW = 20;
 
 async function anchorRowTop(page: Page): Promise<number> {
@@ -525,14 +531,23 @@ test.describe("dashboard long-table filter", () => {
     ).toBe(true);
     await page.waitForTimeout(500);
 
-    const state = await page.evaluate(() => {
+    /* Scoped to the fixture's own box, like the two tests above. The page can
+       render several `.tf-input` elements once the peers and contracts cards
+       have rows, so an unscoped class check answers a question about the page
+       rather than about the element under test. The value and caret assertions
+       below would have caught a wrong box, but only indirectly. */
+    const state = await page.evaluate((id) => {
       const el = document.activeElement as HTMLInputElement | null;
+      const wrap = el && el.closest ? el.closest(".table-filter") : null;
       return {
-        focused: !!(el && el.classList && el.classList.contains("tf-input")),
+        focused:
+          !!(el && el.classList && el.classList.contains("tf-input")) &&
+          !!wrap &&
+          wrap.getAttribute("data-filter-for") === id,
         value: el ? el.value : null,
         caret: el ? el.selectionStart : null,
       };
-    });
+    }, FIXTURE_TABLE_ID);
     expect(state.focused).toBe(true);
     expect(state.value).toBe("10.9");
     expect(state.caret).toBe(2);
