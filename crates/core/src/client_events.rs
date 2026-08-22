@@ -1867,19 +1867,47 @@ async fn process_open_request(
             ClientRequest::Close => {
                 return Err(Error::Disconnected);
             }
-            ClientRequest::Authenticate { .. } | _ => {
+            // `Authenticate` DOES reach this dispatch in production (unlike
+            // `Disconnect`, which the websocket layer intercepts and returns
+            // early on) — `websocket.rs` captures the token into
+            // `auth_token` at the connection level and then forwards the
+            // request through to here (see `websocket.rs` around the
+            // `if let ClientRequest::Authenticate { token } = &req` check,
+            // just before `request_sender.send(...)`). Its effect already
+            // happened; no dispatch response is expected or awaited by the
+            // client. An earlier version of this catch-all folded
+            // `Authenticate` into the "unsupported" error path below,
+            // which meant every authentication returned an error to the
+            // client — and against a stdlib client older than the fix in
+            // freenet-stdlib#94, any `Err` response rejects ALL of that
+            // connection's in-flight requests. Keep this arm silent.
+            ClientRequest::Authenticate { .. } => {
+                return Ok(None);
+            }
+            // `StreamChunk` is named explicitly (rather than left to the
+            // bare wildcard) because it IS a currently-known variant, even
+            // though it never reaches this dispatch as itself in practice —
+            // the websocket layer always reassembles it into a different
+            // concrete request first, or returns early on an incomplete
+            // chunk (see `websocket.rs`'s `ClientRequest::StreamChunk`
+            // reassembly block). The trailing `_` covers only genuinely
+            // future variants from a stdlib bump.
+            ClientRequest::StreamChunk { .. } | _ => {
                 tracing::error!(
                     client_id = %client_id,
                     request_id = %request_id,
                     "Unsupported operation"
                 );
-                // Same shape as the `ContractRequest` catch-all above: falling
-                // through to `Ok(None)` here left the client waiting forever
-                // instead of getting a response. `Authenticate` normally never
-                // reaches this dispatch (the websocket layer intercepts it
-                // earlier), and `ClientRequest` may grow variants this build
-                // doesn't know about — either way the client needs an error,
-                // not silence.
+                // Falling through silently left the client waiting forever
+                // with no response at all — surface a real error instead so
+                // the client can tell "unsupported" apart from "still in
+                // flight". Every currently-known variant is named above
+                // (including `Authenticate`, which stays silent, and
+                // `StreamChunk`, unreachable as noted above), so this arm
+                // is unreachable with today's stdlib; it exists purely as a
+                // forward-compatibility guard. See the source-scrape pin
+                // `client_request_catch_all_returns_error_not_silence` in
+                // `unsupported_request_tests` below.
                 return Err(Error::Node(
                     "unsupported operation: this node does not support the \
                      requested operation type"
@@ -2122,7 +2150,7 @@ mod unsupported_request_tests {
 
     use freenet_stdlib::client_api::ClientRequest;
 
-    use super::{ClientId, Error, OpenRequest, process_open_request};
+    use super::{ClientId, OpenRequest, process_open_request};
     use crate::config::ConfigArgs;
     use crate::dev_tool::OperationMode;
     use crate::node::OpManager;
@@ -2173,16 +2201,20 @@ mod unsupported_request_tests {
         (op_manager, guards)
     }
 
-    /// `ClientRequest::Authenticate` normally never reaches
-    /// `process_open_request` — the websocket layer intercepts it earlier
-    /// (see `websocket.rs`) — but it's the one real, always-constructible
-    /// `ClientRequest` variant that DOES fall into the outer catch-all arm
-    /// when the dispatcher is driven directly, so it exercises the exact
-    /// "request type this dispatch doesn't explicitly handle" shape any
-    /// future `ClientRequest` variant would hit too.
+    /// Regression guard for the bug caught in review of an earlier version
+    /// of this fix: `ClientRequest::Authenticate` MUST stay silent
+    /// (`Ok(None)`), not become an error. `Authenticate` DOES reach
+    /// `process_open_request` in production (`websocket.rs` forwards it
+    /// through after capturing the token — see the comment on the
+    /// `ClientRequest::Authenticate` arm above), so an earlier revision that
+    /// folded it into the "unsupported operation" catch-all made every
+    /// client authentication return an error. Against a stdlib client older
+    /// than the fix in freenet-stdlib#94, any `Err` response rejects ALL of
+    /// that connection's in-flight requests — so this one arm being wrong
+    /// broke every hosted-mode connection, not just Authenticate itself.
     #[tokio::test(flavor = "current_thread")]
-    async fn unsupported_client_request_returns_error_not_silence() {
-        let (op_manager, _guards) = build_op_manager("unsupported-request-test-outer").await;
+    async fn authenticate_returns_ok_none_not_error() {
+        let (op_manager, _guards) = build_op_manager("authenticate-stays-silent").await;
 
         let open_req = OpenRequest::new(
             ClientId::FIRST,
@@ -2193,34 +2225,85 @@ mod unsupported_request_tests {
 
         let result = process_open_request(open_req, op_manager, None).await.await;
 
-        match result {
-            Err(Error::Node(msg)) => {
-                assert!(
-                    msg.to_lowercase().contains("unsupported"),
-                    "error message should say the operation is unsupported, got: {msg}"
-                );
-            }
-            other => panic!(
-                "expected Err(Error::Node(_)) for an unsupported ClientRequest, \
-                 got: {other:?}"
-            ),
-        }
+        assert!(
+            matches!(result, Ok(None)),
+            "Authenticate's effect already happened at the websocket layer; \
+             process_open_request must return Ok(None) (no dispatch \
+             response expected), not an error. Got: {result:?}"
+        );
     }
 
-    /// End-to-end proof that the fix unblocks the CLIENT, not merely the
-    /// internal `Result`: drives the real `client_event_handling` loop (the
-    /// function every production and simulation node runs — see
-    /// `node/p2p_impl.rs` and `node/testing_impl/in_memory.rs`) with a
-    /// minimal mock `ClientEventsProxy`, feeds it one `Authenticate`
-    /// request, and asserts the mock's `send()` — the ONLY way a response
-    /// reaches a client over the wire — is actually invoked with the
-    /// "unsupported" error. Before the fix this test times out: the loop
-    /// gets `Ok(None)` from `process_open_request`, treats it as "nothing to
-    /// send" (`(_, Ok(None)) => continue`), and never calls `send()` at all
-    /// — the exact silent-hang bug, observed at the layer a real client sits
-    /// behind.
+    /// Source-scrape pin for the outer `ClientRequest` catch-all (the plain
+    /// `_ =>` arm, now that `Authenticate` has its own explicit silent arm
+    /// above it).
+    ///
+    /// Why a source pin and not a behavioral test: every currently-known
+    /// `ClientRequest` variant has its own explicit arm somewhere in this
+    /// match (`ContractOp`, `DelegateOp`, `Disconnect`, `NodeQueries`,
+    /// `Close`, `Authenticate`), and `StreamChunk` never reaches this
+    /// dispatch as itself — the websocket layer always reassembles it into
+    /// a different concrete request first (see `websocket.rs`'s
+    /// `ClientRequest::StreamChunk` reassembly block) or returns early on an
+    /// incomplete chunk. So there is no `ClientRequest` value constructible
+    /// today that lands in the bare `_` arm; it exists purely as a
+    /// forward-compatibility guard for a stdlib bump adding a new variant.
+    ///
+    /// The invariant: the arm must `return Err(...)`, not merely log and
+    /// fall through — mirrors `contract_request_catch_all_returns_error_not_silence`
+    /// below for the sibling `ContractRequest` catch-all.
+    #[test]
+    fn client_request_catch_all_returns_error_not_silence() {
+        let src = include_str!("client_events.rs");
+        let start = src
+            .find("ClientRequest::Authenticate { .. } => {\n                return Ok(None);\n            }")
+            .expect("the ClientRequest::Authenticate silent arm not found");
+        let after = &src[start..];
+        let end = after
+            .find("Ok(None)\n    };")
+            .expect("the arm is bounded by the end of the match / process_open_request's tail");
+        let arm = &after[..end];
+
+        assert!(
+            arm.contains("_ => {"),
+            "expected a `_ =>` catch-all arm after the Authenticate arm, \
+             not found in: {arm:?}"
+        );
+        assert!(
+            arm.contains("return Err("),
+            "the ClientRequest catch-all must return an error to the client, \
+             not merely log and fall through to `Ok(None)` — a client whose \
+             request lands here would wait forever with no response. \
+             Arm content: {arm:?}"
+        );
+    }
+
+    /// End-to-end proof that a real error returned by `process_open_request`
+    /// unblocks the CLIENT, not merely the internal `Result`: drives the
+    /// real `client_event_handling` loop (the function every production and
+    /// simulation node runs — see `node/p2p_impl.rs` and
+    /// `node/testing_impl/in_memory.rs`) with a minimal mock
+    /// `ClientEventsProxy`, and asserts the mock's `send()` — the ONLY way a
+    /// response reaches a client over the wire — is actually invoked.
+    ///
+    /// Driven via `ClientRequest::Close` (an existing, always-reachable
+    /// `Err(Error::Disconnected)` return, untouched by this PR) rather than
+    /// the new "unsupported operation" arms: after the `Authenticate`
+    /// mistake caught in review, neither `ClientRequest`'s nor
+    /// `ContractRequest`'s catch-all is reachable by any value this test can
+    /// construct (see the source-scrape pins for both).
+    ///
+    /// `Close`'s `Error::Disconnected` takes its own named branch in the
+    /// `results.push` closure (`Err(Error::Disconnected) => ...`), not the
+    /// generic `Err(err) =>` arm the new `Error::Node(...)` returns fall
+    /// into — but every branch of that inner match, named or generic,
+    /// produces the same `(cli_id, Err(_: ClientError))` shape, which then
+    /// flows through the ONE later `results.next()` arm that actually calls
+    /// `client_events.send(cli_id, Err(err)).await` — the step this test
+    /// exists to verify actually runs. That final delivery step has no
+    /// per-variant branching at all, so `Close` proves it just as directly
+    /// as `Error::Node` would.
     #[tokio::test(flavor = "current_thread")]
-    async fn unsupported_client_request_reaches_the_client_as_an_error() {
+    async fn error_from_process_open_request_reaches_the_client() {
         use freenet_stdlib::client_api::{ClientError, HostResponse};
         use futures::FutureExt;
         use futures::future::BoxFuture;
@@ -2268,14 +2351,12 @@ mod unsupported_request_tests {
             }
         }
 
-        let (op_manager, _guards) = build_op_manager("unsupported-request-e2e").await;
+        let (op_manager, _guards) = build_op_manager("error-delivery-e2e").await;
 
         let mut to_recv = VecDeque::new();
         to_recv.push_back(OpenRequest::new(
             ClientId::FIRST,
-            Box::new(ClientRequest::Authenticate {
-                token: "irrelevant".to_string(),
-            }),
+            Box::new(ClientRequest::Close),
         ));
         let (received_tx, mut received_rx) = tokio::sync::mpsc::unbounded_channel();
         let proxy = MockProxy {
@@ -2300,18 +2381,18 @@ mod unsupported_request_tests {
             tokio::time::timeout(std::time::Duration::from_secs(10), received_rx.recv())
                 .await
                 .expect(
-                    "client_event_handling never called send() within 10s — the client \
-             would hang forever on an unsupported request",
+                    "client_event_handling never called send() within 10s — a real \
+                     client would never receive a response for its request",
                 )
                 .expect("the mock's response channel closed unexpectedly");
 
         assert_eq!(client_id, ClientId::FIRST);
-        let err = response.expect_err("expected an error response for an unsupported request");
+        let err = response.expect_err("Close must surface Error::Disconnected to the client");
         let msg = err.to_string();
         assert!(
-            msg.to_lowercase().contains("unsupported"),
-            "the error the client actually RECEIVES must say the operation is \
-             unsupported, got: {msg}"
+            msg.to_lowercase().contains("disconnect"),
+            "the error the client actually RECEIVES must reflect \
+             Error::Disconnected, got: {msg}"
         );
     }
 
