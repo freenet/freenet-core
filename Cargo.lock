@@ -4151,6 +4151,7 @@ dependencies = [
  "chrono",
  "clap",
  "freenet-stdlib 0.8.5",
+ "futures 0.3.32",
  "hex",
  "rand 0.9.4",
  "reqwest 0.12.28",
