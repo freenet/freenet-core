@@ -64,7 +64,47 @@ impl<T: TimeSource> ReceivedPacketTracker<T> {
         let current_time = self.time_source.now();
 
         match self.time_by_packet_id.entry(packet_id) {
-            std::collections::hash_map::Entry::Occupied(_) => ReportResult::AlreadyReceived,
+            std::collections::hash_map::Entry::Occupied(_) => {
+                // Re-acknowledge, which is what this variant has always claimed to
+                // do (see `ReportResult::AlreadyReceived`) and what the retransmit
+                // is asking for.
+                //
+                // A receipt is normally recoverable: receipts ride on noop packets,
+                // which are themselves tracked and retransmitted, so a single lost
+                // noop is repaired by its own resend. But there are paths where a
+                // receipt is destroyed outright with no recovery -- notably the
+                // flush sites in `peer_connection`'s recv loop, which have already
+                // `mem::take`n the pending list into `noop()` when the send fails.
+                // They log "will retry"; there is nothing left to retry with. When
+                // that happens the sender is left retransmitting into silence, its
+                // packet pinned in flight until the retransmit budget runs out, and
+                // if the congestion window fills first the stream aborts at
+                // CWND_WAIT_TIMEOUT (3s) -- which the receiver sees as a transfer
+                // that simply stopped mid-stream. Answering the retransmit is the
+                // only signal that can repair it.
+                //
+                // Bounded and deduplicated. `MAX_PENDING_RECEIPTS` is a real
+                // capacity, not a hint: `send_packet`'s receipt chunker only
+                // splits a list once, so an oversized list serializes past
+                // MAX_DATA_SIZE and fails the connection. The `Vacant` arm enforces
+                // the cap by returning `QueueFull`, and this arm must not be a way
+                // around it -- a peer replaying old ids must not be able to grow
+                // the list. Dropping the re-ack at capacity is safe: the list is
+                // about to be flushed, and an unrepaired receipt draws another
+                // retransmit.
+                if self.pending_receipts.len() < MAX_PENDING_RECEIPTS
+                    && !self.pending_receipts.contains(&packet_id)
+                {
+                    self.pending_receipts.push(packet_id);
+                }
+                // Deliberately still `AlreadyReceived` rather than `QueueFull`, so
+                // the caller can tell a duplicate from a fresh packet. Note this
+                // does not by itself guarantee the payload is skipped: the caller's
+                // `(_, true)` arm wins over `(AlreadyReceived, _)` when its receipt
+                // timer trips. The re-queued receipt goes out on the next
+                // background ACK tick or the next packet that flushes receipts.
+                ReportResult::AlreadyReceived
+            }
             std::collections::hash_map::Entry::Vacant(e) => {
                 e.insert(current_time);
                 self.packet_id_time.push_back((packet_id, current_time));
@@ -174,8 +214,118 @@ pub(in crate::transport) mod tests {
             tracker.report_received_packet(0),
             ReportResult::AlreadyReceived
         );
+        // Still one pending receipt, not two: the duplicate must not queue a
+        // second copy of a receipt that has not been sent yet.
         assert_eq!(tracker.pending_receipts.len(), 1);
         assert_eq!(tracker.time_by_packet_id.len(), 1);
+    }
+
+    /// A retransmitted packet must be acknowledged again, even though its
+    /// payload is ignored.
+    ///
+    /// This is the production scenario, not a synthetic one. The sender only
+    /// retransmits because it saw no receipt, and the overwhelmingly likely
+    /// reason is that the receipt itself was lost -- receipts travel on noop /
+    /// piggybacked packets, which are never retransmitted. If the duplicate is
+    /// met with silence, that packet's bytes stay in the sender's flight
+    /// accounting with no remaining way to clear them. Once flight reaches the
+    /// congestion window the sender blocks, and `CWND_WAIT_TIMEOUT` (3s) aborts
+    /// the whole stream. Downstream this surfaces as a multi-fragment GET dying
+    /// partway through with a stream-assembly inactivity timeout.
+    ///
+    /// Note the drain between the two reports: that is what makes this test
+    /// discriminating. Without it the receipt from the *first* report is still
+    /// queued, so the assertion would pass whether or not the duplicate
+    /// re-acknowledges anything.
+    #[test]
+    fn retransmitted_packet_is_reacknowledged_after_its_receipt_was_sent() {
+        let mut tracker = mock_received_packet_tracker();
+
+        assert_eq!(tracker.report_received_packet(7), ReportResult::Ok);
+        // The receipt is handed to the transport, which puts it on the wire --
+        // where it is lost. Nothing is pending any more.
+        assert_eq!(tracker.get_receipts(), vec![7]);
+        assert!(tracker.pending_receipts.is_empty());
+
+        // The sender, having heard nothing, retransmits.
+        assert_eq!(
+            tracker.report_received_packet(7),
+            ReportResult::AlreadyReceived
+        );
+
+        assert_eq!(
+            tracker.get_receipts(),
+            vec![7],
+            "a retransmit must be re-acknowledged, otherwise the sender can \
+             never drain this packet from its congestion window"
+        );
+    }
+
+    /// A burst of retransmits for the same packet must not queue the same
+    /// receipt several times over -- one flush tells the sender everything it
+    /// needs to know, and the receipt list is a fixed-capacity signal.
+    #[test]
+    fn repeated_retransmits_queue_one_receipt_per_flush() {
+        let mut tracker = mock_received_packet_tracker();
+
+        assert_eq!(tracker.report_received_packet(3), ReportResult::Ok);
+        assert_eq!(tracker.get_receipts(), vec![3]);
+
+        for _ in 0..5 {
+            assert_eq!(
+                tracker.report_received_packet(3),
+                ReportResult::AlreadyReceived
+            );
+        }
+
+        assert_eq!(tracker.get_receipts(), vec![3]);
+    }
+
+    /// Re-acknowledging must not become a way around `MAX_PENDING_RECEIPTS`.
+    ///
+    /// The cap is load-bearing rather than advisory. `send_packet`'s receipt
+    /// chunker splits an oversized list exactly once, so a list longer than
+    /// twice the per-packet maximum serializes past `MAX_DATA_SIZE`; that error
+    /// is not a transient send failure, so it tears down the connection. The
+    /// `Vacant` arm holds the line by returning `QueueFull` as soon as the list
+    /// is full, and a peer replaying already-seen ids must not be able to push
+    /// past it through the duplicate path.
+    #[test]
+    fn reacknowledging_duplicates_cannot_grow_the_list_past_capacity() {
+        let mut tracker = mock_received_packet_tracker();
+
+        // Dedup alone does NOT bound this: it caps the list at the number of
+        // *distinct* ids replayed. So the id count here has to exceed the cap by
+        // a wide margin, and it is sized past twice the ~289 receipts that fit
+        // in one packet, which is where an unbounded list starts failing to
+        // serialize. RETAIN_TIME is 60s, so all of these are still known.
+        const REPLAYED: PacketId = 600;
+
+        // Receive them for the first time, draining whenever the tracker says
+        // the list is full, exactly as the recv loop does.
+        for i in 0..REPLAYED {
+            if tracker.report_received_packet(i) == ReportResult::QueueFull {
+                let _ = tracker.get_receipts();
+            }
+        }
+        let _ = tracker.get_receipts();
+        assert!(tracker.pending_receipts.is_empty());
+
+        // A peer now replays every one of them, and nothing drains in between.
+        for i in 0..REPLAYED {
+            assert_eq!(
+                tracker.report_received_packet(i),
+                ReportResult::AlreadyReceived
+            );
+        }
+
+        assert!(
+            tracker.pending_receipts.len() <= MAX_PENDING_RECEIPTS,
+            "duplicate re-acks grew the receipt list to {}, past the {} cap that \
+             keeps it serializable",
+            tracker.pending_receipts.len(),
+            MAX_PENDING_RECEIPTS
+        );
     }
 
     #[test]
