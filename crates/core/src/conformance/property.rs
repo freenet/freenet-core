@@ -109,6 +109,107 @@ pub enum ConformanceProperty {
     /// - Any shadow finding from this property that turns out to converge in
     ///   production is a model bug, and should drop the severity immediately.
     ReconciliationCycle,
+    /// The delta path and the merge path must reach the same state.
+    ///
+    /// A contract has two write paths into the same logical state: `update_state`
+    /// handed a `Delta`, and `update_state` handed another peer's whole `State`.
+    /// Which one a peer takes is decided by the *protocol* — `gate_delta_size`
+    /// refuses an oversized delta and sends the whole state instead — not by the
+    /// application. So two peers given the same information by different routes must
+    /// end up with the same bytes, or they can never agree.
+    ///
+    /// Every other property here compares merge-to-merge or delta-to-delta.
+    /// `StateCommutativity`, `StateAssociativity`, `DeltaPermutationInvariance` and
+    /// `DeltaIdempotence` are all satisfiable by a contract whose two paths use
+    /// *different combinators*, because none of them ever puts one path beside the
+    /// other. The defect that motivated this (#5394) did exactly that: `insert`
+    /// (last write wins) when handed a delta, `entry().or_insert()` (first write
+    /// wins) when handed a state, on a map keyed by a client-chosen sequence number.
+    /// A retraction applied as a delta is silently resurrected when a replica
+    /// re-merges the same op as a state.
+    ///
+    /// # What is checked
+    ///
+    /// For a pair of observed states, in both orders:
+    ///
+    /// ```text
+    /// delta  = get_state_delta(other, summarize(base))   // what the sender ships
+    /// apply(base, delta)  ==  update_state(base, State(other))
+    /// ```
+    ///
+    /// # Why this is `Severity::Violation` and not a false-positive generator
+    ///
+    /// A plain inequality here would accuse a large and legitimate class of
+    /// contract: one whose summary is too coarse to express a particular divergence,
+    /// so its delta carries only *part* of what the other state holds. Such a
+    /// contract lands short of the merged state on this round and converges on the
+    /// next one, and this module already refuses to accuse it under
+    /// `ReconciliationCycle` for the same reason.
+    ///
+    /// So a disagreement is only reported when re-merging the whole state fails to
+    /// repair it:
+    ///
+    /// ```text
+    /// merge(apply(base, delta), other)  !=  merge(base, other)
+    /// ```
+    ///
+    /// For any contract whose merge is a genuine join, that condition is
+    /// unreachable: a delta derived from `other` can only move `base` somewhere
+    /// between `base` and `base ⊔ other`, and joining `other` back on top lands on
+    /// `base ⊔ other` either way. A partial delta therefore heals and is never
+    /// reported; a delta path that computed something the merge path cannot reach
+    /// does not heal and is. That is the same practical consequence as a
+    /// non-commutative merge — two peers with the same information, permanently
+    /// disagreeing — which is why the severity matches `StateCommutativity`.
+    ///
+    /// The guard errs toward silence in every direction, including when the merge
+    /// itself is unsound: a last-write-wins merge heals trivially, so this property
+    /// declines to pile a second accusation onto a defect `StateCommutativity`
+    /// already names. One law per property.
+    ///
+    /// # What this does NOT establish, and what would settle it
+    ///
+    /// Like `ReconciliationCycle`, and unlike the pure algebra above it, this rests
+    /// on a model of the protocol: that the sender computes its delta against the
+    /// recipient's summary, and that production would actually take the delta path.
+    /// The second is checked directly (`delta_would_be_refused`, production's own
+    /// gate); the first is the same assumption `reconciliation_cycle` makes. Unlike
+    /// `ReconciliationCycle` this is a single step with no schedule to get wrong,
+    /// which is the narrower assumption of the two.
+    ///
+    /// Shadow-mode counts are what should settle whether the severity is right:
+    /// contracts flagged by THIS property and by no other removal-eligible one. If
+    /// that number stays at zero the property earns nothing at this severity; if it
+    /// is the sole finding for real contracts, it is carrying signal the algebraic
+    /// checks miss.
+    ///
+    /// # Two measured limits, both of them misses rather than false accusations
+    ///
+    /// **The guard is direction-sensitive.** Re-merging repairs the difference for
+    /// one ordering of a pair and not the other — for the fixture in
+    /// `tests/test-contract-conformance` (mode 8) it silences exactly one of
+    /// `(A, B)` and `(B, A)`. Both directions are therefore checked for every pair.
+    /// A corpus holding only one state of such a pair still misses the defect.
+    ///
+    /// **A contract whose delta IS its state is invisible to this check.** The delta
+    /// is synthesized from the contract's own `get_state_delta`, so only a
+    /// disagreement that the contract's own delta encoding can express can be seen.
+    /// Measured against the #5394 artifacts on 2026-08-23: that contract's
+    /// `get_state_delta` returns the whole sender state for every non-trivial pair
+    /// in the corpus, and its `update_state` then treats a whole-state `Delta`
+    /// exactly as it treats a `State`, so both paths agree on every pair and this
+    /// property stays silent on the very defect it was written from. The
+    /// disagreement there lives on an APPLICATION-level delta — a client `UPDATE`
+    /// carrying one op — which `get_state_delta` never produces and which a
+    /// states-only corpus does not carry.
+    ///
+    /// Closing that needs a second, transition-shaped form of the same law, over the
+    /// captured deltas in `ReplayBundle::transitions`: for an observed
+    /// `base + delta -> result`, `merge(base, result)` must equal `result`. It is
+    /// deliberately NOT folded in here — it has a different arity and a different
+    /// false-positive profile (a capped collection trips it), and one law per
+    /// property is the rule this module follows everywhere else.
+    PathAgreement,
 }
 
 /// How seriously a failed property should be taken.
@@ -142,6 +243,7 @@ impl ConformanceProperty {
         ConformanceProperty::SelfDeltaEmpty,
         ConformanceProperty::WholeStateSelfDelta,
         ConformanceProperty::ReconciliationCycle,
+        ConformanceProperty::PathAgreement,
     ];
 
     pub fn severity(self) -> Severity {
@@ -166,7 +268,8 @@ impl ConformanceProperty {
             | ConformanceProperty::SummaryDeterminism
             | ConformanceProperty::DeltaDeterminism
             | ConformanceProperty::DeltaPermutationInvariance
-            | ConformanceProperty::ReconciliationCycle => Severity::Violation,
+            | ConformanceProperty::ReconciliationCycle
+            | ConformanceProperty::PathAgreement => Severity::Violation,
         }
     }
 
@@ -183,7 +286,8 @@ impl ConformanceProperty {
             ConformanceProperty::StateCommutativity
             | ConformanceProperty::EmittedStateValidity
             | ConformanceProperty::UpdateDeterminism
-            | ConformanceProperty::ReconciliationCycle => 2,
+            | ConformanceProperty::ReconciliationCycle
+            | ConformanceProperty::PathAgreement => 2,
             ConformanceProperty::StateAssociativity => 3,
         }
     }
@@ -202,7 +306,8 @@ impl ConformanceProperty {
             | ConformanceProperty::DeltaDeterminism
             | ConformanceProperty::SelfDeltaEmpty
             | ConformanceProperty::WholeStateSelfDelta
-            | ConformanceProperty::ReconciliationCycle => 0,
+            | ConformanceProperty::ReconciliationCycle
+            | ConformanceProperty::PathAgreement => 0,
         }
     }
 
@@ -220,6 +325,7 @@ impl ConformanceProperty {
             ConformanceProperty::SelfDeltaEmpty => "self_delta_empty",
             ConformanceProperty::WholeStateSelfDelta => "whole_state_self_delta",
             ConformanceProperty::ReconciliationCycle => "reconciliation_cycle",
+            ConformanceProperty::PathAgreement => "path_agreement",
         }
     }
 }
@@ -310,6 +416,16 @@ pub enum Inconclusive {
     RoundLimit,
     /// The case was malformed for the property (wrong arity, missing delta).
     MalformedCase(String),
+    /// There is no delta path for these inputs, so there is nothing to compare the
+    /// merge path against.
+    ///
+    /// Either the contract produced an empty delta — the protocol's "nothing to
+    /// send", which a summary too coarse to express the divergence produces
+    /// legitimately — or the delta was large enough that production's own size gate
+    /// would refuse it and send the whole state instead. In both cases the delta
+    /// path is not the path this update would take on the network, and checking it
+    /// would be checking a call that never happens.
+    NoDeltaPath,
     /// The check failed once and then did not fail the same way again.
     ///
     /// Something outside the inputs moved between the two runs — the host clock is
@@ -329,6 +445,9 @@ impl std::fmt::Display for Inconclusive {
             Inconclusive::ResourceLimit(e) => write!(f, "resource limit: {e}"),
             Inconclusive::RoundLimit => f.write_str("reconciliation round budget exhausted"),
             Inconclusive::MalformedCase(e) => write!(f, "malformed case: {e}"),
+            Inconclusive::NoDeltaPath => {
+                f.write_str("no delta path exists for these inputs to compare against")
+            }
             Inconclusive::NotReproducible => {
                 f.write_str("the finding did not reproduce on a second run")
             }

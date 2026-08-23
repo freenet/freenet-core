@@ -40,6 +40,12 @@
 //!                                conforms. Proves the verifier declines rather than
 //!                                accuses when the state is missing, and reaches a
 //!                                real verdict once it is supplied.
+//!   8 PATH_DISAGREEMENT        — the two write paths use different combinators on a
+//!                                key collision: the delta path takes the last write,
+//!                                the merge path the first. Each path is a perfectly
+//!                                good semilattice ON ITS OWN, so every existing law
+//!                                holds and only `path_agreement` can see it. The
+//!                                #5394 shape.
 //!
 //! State is always a canonical byte set: sorted, strictly ascending, no
 //! duplicates. `validate_state` accepts exactly that canonical form.
@@ -61,6 +67,21 @@
 //! contract, and it is also the realistic shape of the bug: an author reaching
 //! for a timestamp to break ties in a summary.
 
+//! ## Why mode 8 needs a different state shape from the rest
+//!
+//! Every other mode's state is a plain byte SET, and a set has no way to express
+//! "two writes to the same slot" — which is the only situation in which a
+//! last-write-wins and a first-write-wins rule can disagree. So mode 8 reads each
+//! byte as a key/value pair (high nibble / low nibble) and its state is a MAP: at
+//! most one byte per key. That is the same shape as the real defect, a map keyed by
+//! a client-chosen sequence number, and the collision is two ops carrying the same
+//! sequence number with different payloads.
+//!
+//! The two rules are the two halves of the real bug written in Rust's own idiom:
+//! `entry(key).or_insert(value)` keeps whatever is already there (first write wins)
+//! and is what the merge path used; `insert(key, value)` overwrites it (last write
+//! wins) and is what the direct-apply path used.
+
 use freenet_stdlib::prelude::*;
 
 const CONFORMING: u8 = 0;
@@ -71,6 +92,7 @@ const NONDETERMINISTIC_SUMMARY: u8 = 4;
 const CAPPED_SET: u8 = 5;
 const NEVER_SETTLES: u8 = 6;
 const REQUIRES_RELATED: u8 = 7;
+const PATH_DISAGREEMENT: u8 = 8;
 
 /// The contract [`REQUIRES_RELATED`] insists on knowing about, as a fixed id so a
 /// test can supply its state without deriving anything.
@@ -87,6 +109,46 @@ fn mode(parameters: &Parameters<'static>) -> u8 {
 
 fn is_canonical(state: &[u8]) -> bool {
     state.windows(2).all(|w| w[0] < w[1])
+}
+
+/// The key half of a [`PATH_DISAGREEMENT`] entry. The low nibble is the value.
+fn key(entry: u8) -> u8 {
+    entry >> 4
+}
+
+/// A [`PATH_DISAGREEMENT`] state is a MAP: canonical, and at most one entry per key.
+///
+/// Without the second condition a state could carry two writes to the same key at
+/// once, which is not a state any of the paths below can produce and not the shape
+/// the real defect had.
+fn is_canonical_map(state: &[u8]) -> bool {
+    is_canonical(state) && state.windows(2).all(|w| key(w[0]) != key(w[1]))
+}
+
+/// Collapse key collisions in a byte set, keeping either the first or the last
+/// entry for each key as the set is walked in ascending order.
+///
+/// `keep_last == false` is `entry(key).or_insert(value)`: whatever is already
+/// there stays. `keep_last == true` is `insert(key, value)`: the newcomer wins.
+/// Both are deterministic and depend only on the union of the two inputs, which is
+/// what leaves every existing law intact — see the mode's comment in `merge_state`.
+fn collapse_by_key(entries: &[u8], keep_last: bool) -> Vec<u8> {
+    let mut sorted: Vec<u8> = entries.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut out: Vec<u8> = Vec::new();
+    for entry in sorted {
+        match out.last().copied() {
+            Some(previous) if key(previous) == key(entry) => {
+                if keep_last {
+                    let last = out.len() - 1;
+                    out[last] = entry;
+                }
+            }
+            _ => out.push(entry),
+        }
+    }
+    out
 }
 
 fn union(a: &[u8], b: &[u8]) -> Vec<u8> {
@@ -160,6 +222,21 @@ fn merge_state(m: u8, current: &[u8], incoming: &[u8]) -> Vec<u8> {
             }
             out
         }
+        // First write wins on a key collision — `entry(key).or_insert(value)`.
+        //
+        // Resolving against the UNION rather than against "whichever argument the
+        // value came from" is what makes this mode isolate `path_agreement` alone,
+        // and it is not a softening of the real defect: the real merge folded the
+        // incoming ops into a map with `or_insert`, so the surviving op was decided
+        // by iteration order over the combined set, not by which peer supplied it.
+        //
+        // The consequence is that this merge is min-per-key, which is a genuine
+        // meet-semilattice: commutative, associative and idempotent. Every existing
+        // law therefore HOLDS here, which is the entire point of the mode — the gap
+        // #5394 describes is a contract that satisfies the whole property set and
+        // still diverges, and a fixture that also broke commutativity would prove
+        // nothing about the gap.
+        PATH_DISAGREEMENT => collapse_by_key(&union(current, incoming), false),
         // CONFORMING, NON_IDEMPOTENT_DELTA and NONDETERMINISTIC_SUMMARY all
         // merge full-state inputs conformingly: their defects are scoped to
         // delta application and summarization respectively, so isolating each
@@ -174,6 +251,14 @@ fn merge_state(m: u8, current: &[u8], incoming: &[u8]) -> Vec<u8> {
 fn apply_delta(m: u8, current: &[u8], delta: &[u8]) -> Vec<u8> {
     match m {
         MUTUAL_REJECTION => current.to_vec(),
+        // Last write wins on a key collision — `insert(key, value)`.
+        //
+        // Max-per-key, which is just as sound a semilattice as the merge path's
+        // min-per-key: applying deltas is idempotent and order-independent, so
+        // `delta_idempotence` and `delta_permutation_invariance` both hold. The two
+        // paths are individually impeccable and disagree with each other, which no
+        // property that compares merge-to-merge or delta-to-delta can see.
+        PATH_DISAGREEMENT => collapse_by_key(&union(current, delta), true),
         NON_IDEMPOTENT_DELTA => {
             // Deliberately not deduplicated/sorted: re-delivering the same
             // delta appends it again instead of being a no-op the second time.
@@ -209,7 +294,13 @@ impl ContractInterface for Contract {
             }
         }
 
-        if is_canonical(state.as_ref()) {
+        // Mode 8's state is a map, not a set: see the module comment.
+        let valid = if mode(&parameters) == PATH_DISAGREEMENT {
+            is_canonical_map(state.as_ref())
+        } else {
+            is_canonical(state.as_ref())
+        };
+        if valid {
             Ok(ValidateResult::Valid)
         } else {
             Ok(ValidateResult::Invalid)

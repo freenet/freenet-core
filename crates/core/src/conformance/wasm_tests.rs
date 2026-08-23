@@ -26,6 +26,7 @@ const NONDETERMINISTIC_SUMMARY: u8 = 4;
 const CAPPED_SET: u8 = 5;
 const NEVER_SETTLES: u8 = 6;
 const REQUIRES_RELATED: u8 = 7;
+const PATH_DISAGREEMENT: u8 = 8;
 const RELATED_ID: [u8; 32] = [7; 32];
 
 fn bytes(values: &[u8]) -> Bytes {
@@ -297,6 +298,74 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
         verify_case(&mut needs_related, &with_related),
         PropertyOutcome::Holds,
         "with the related state supplied the contract must become judgeable"
+    );
+
+    // ------------------------------------------- mode 8: disagreeing write paths
+    //
+    // The #5394 shape, and the one mode whose defect NO pre-existing property can
+    // see: the delta path takes the last write on a key collision, the merge path
+    // the first. Each rule is a sound semilattice on its own, so every law that
+    // compares merge-to-merge or delta-to-delta holds.
+    //
+    // `0x51` and `0x52` are two writes to key 5 with different values — two ops
+    // carrying the same client-chosen sequence number, which is exactly the
+    // collision the real defect resolved two different ways.
+    let mut disagreeing = RuntimeOracle::standalone(wasm.clone(), vec![PATH_DISAGREEMENT]).await?;
+    let colliding: Vec<Bytes> = vec![bytes(&[0x10, 0x51]), bytes(&[0x10, 0x52])];
+    assert_violates(
+        verify_case(
+            &mut disagreeing,
+            &ConformanceCase::new(ConformanceProperty::PathAgreement, colliding.clone()),
+        ),
+        ConformanceProperty::PathAgreement,
+    );
+
+    // Every OTHER property must stay silent on the same inputs. Without this the
+    // mode would prove nothing about the gap #5394 describes, which is precisely a
+    // contract that satisfies the entire existing property set and still diverges.
+    for property in ConformanceProperty::ALL {
+        if *property == ConformanceProperty::PathAgreement {
+            continue;
+        }
+        let states: Vec<Bytes> = match property.state_arity() {
+            3 => vec![
+                colliding[0].clone(),
+                colliding[1].clone(),
+                bytes(&[0x23, 0x51]),
+            ],
+            _ => colliding.clone(),
+        };
+        let deltas: Vec<Bytes> = match property.delta_arity() {
+            0 => Vec::new(),
+            1 => vec![bytes(&[0x52])],
+            _ => vec![bytes(&[0x52]), bytes(&[0x63])],
+        };
+        let outcome = verify_case(
+            &mut disagreeing,
+            &ConformanceCase::new(*property, states).with_deltas(deltas),
+        );
+        assert!(
+            !outcome.is_violation(),
+            "{property} fired on the disagreeing-paths mode, so it no longer \
+             isolates the one defect only path_agreement can see: {outcome:?}"
+        );
+    }
+
+    // The matched negative #5394's acceptance test asks for: the SAME contract with
+    // the SAME two write paths, on states whose keys do not collide. A property that
+    // flagged every contract with both a delta and a merge path would pass the
+    // assertion above while being worse than no property at all.
+    assert_eq!(
+        verify_case(
+            &mut disagreeing,
+            &ConformanceCase::new(
+                ConformanceProperty::PathAgreement,
+                vec![bytes(&[0x10, 0x51]), bytes(&[0x10, 0x62])],
+            ),
+        ),
+        PropertyOutcome::Holds,
+        "the two write paths only disagree on a key COLLISION; flagging a pair that \
+         has none makes this a blanket accusation rather than a finding"
     );
 
     // ---------------------------------- same code, different params, different instance

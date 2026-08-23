@@ -869,6 +869,8 @@ fn inconclusive_label(reason: &Inconclusive) -> &'static str {
         Inconclusive::ResourceLimit(_) => "resource limit hit",
         Inconclusive::RoundLimit => "reconciliation round budget exhausted",
         Inconclusive::MalformedCase(_) => "malformed case",
+        Inconclusive::NoDeltaPath => "no delta path to compare against",
+        Inconclusive::NotReproducible => "finding did not reproduce",
         _ => "other",
     }
 }

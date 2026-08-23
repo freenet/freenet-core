@@ -241,6 +241,10 @@ fn conforming_contract_satisfies_every_state_law() {
     ));
     assert_holds(verify_case(
         &mut fake,
+        &case(ConformanceProperty::PathAgreement, &[a, b]),
+    ));
+    assert_holds(verify_case(
+        &mut fake,
         &case(ConformanceProperty::DeltaIdempotence, &[a]).with_deltas(vec![bytes(&[9])]),
     ));
     assert_holds(verify_case(
@@ -927,6 +931,288 @@ fn a_case_with_too_few_states_is_malformed_not_a_violation() {
 }
 
 // ------------------------------------------------------------------------ evidence
+
+// ------------------------------------------------------ #5394: disagreeing write paths
+
+/// A contract whose state is a map keyed by the high nibble of each byte, with a
+/// deliberate disagreement between its two write paths.
+///
+/// The merge path resolves a key collision by keeping the FIRST entry in ascending
+/// order (`entry(k).or_insert(v)`); the delta path keeps the LAST (`insert(k, v)`).
+/// Each rule on its own is a sound semilattice — min-per-key and max-per-key are
+/// both commutative, associative and idempotent — so every property that compares
+/// merge-to-merge or delta-to-delta holds. Only putting one path beside the other
+/// reveals the defect. This is the #5394 shape: `insert` on the direct-apply path,
+/// `entry().or_insert()` on the merge path, on a map keyed by a client-chosen
+/// sequence number.
+fn disagreeing_paths() -> Fake {
+    Fake::conforming()
+        .validating(|state| {
+            if is_canonical(state) && state.windows(2).all(|w| w[0] >> 4 != w[1] >> 4) {
+                Ok(ValidateResult::Valid)
+            } else {
+                Ok(ValidateResult::Invalid)
+            }
+        })
+        .merging(|a, b| Ok(collapse_by_key(&union(a, b), false)))
+        .applying(|a, d| Ok(collapse_by_key(&union(a, d), true)))
+}
+
+fn collapse_by_key(entries: &[u8], keep_last: bool) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    for entry in union(entries, &[]) {
+        match out.last().copied() {
+            Some(previous) if previous >> 4 == entry >> 4 => {
+                if keep_last {
+                    let last = out.len() - 1;
+                    out[last] = entry;
+                }
+            }
+            _ => out.push(entry),
+        }
+    }
+    out
+}
+
+/// The positive case: two states whose keys collide, so the two paths resolve the
+/// collision differently and the contract cannot converge.
+///
+/// `0x51` and `0x52` are two writes to key 5 carrying different values — the two
+/// retractions stamped with the same sequence number in the real defect.
+#[test]
+fn a_contract_whose_two_write_paths_disagree_is_caught() {
+    let mut fake = disagreeing_paths();
+    assert_violates(
+        verify_case(
+            &mut fake,
+            &case(
+                ConformanceProperty::PathAgreement,
+                &[&[0x10, 0x51], &[0x10, 0x52]],
+            ),
+        ),
+        ConformanceProperty::PathAgreement,
+    );
+}
+
+/// The matched negative the acceptance test in #5394 asks for, and the half that
+/// makes the positive above mean anything.
+///
+/// The SAME contract, with the SAME two write paths, on states whose keys do not
+/// collide. A property that flagged every contract with both a delta and a merge
+/// path would satisfy the test above while being worse than no property at all, and
+/// this is what distinguishes the two.
+#[test]
+fn the_same_disagreeing_contract_is_silent_when_no_key_collides() {
+    let mut fake = disagreeing_paths();
+    assert_holds(verify_case(
+        &mut fake,
+        &case(
+            ConformanceProperty::PathAgreement,
+            &[&[0x10, 0x51], &[0x10, 0x62]],
+        ),
+    ));
+}
+
+/// Every OTHER law holds for the disagreeing contract, which is the whole claim
+/// #5394 makes: a contract can satisfy the entire existing property set and still
+/// diverge, because none of those properties ever puts one write path beside the
+/// other.
+///
+/// Without this the new property could be riding on a defect the existing set
+/// already catches, and the gap it is supposed to close would be unproven.
+#[test]
+fn the_disagreeing_contract_satisfies_every_pre_existing_law() {
+    let (a, b, c): (&[u8], &[u8], &[u8]) = (&[0x10, 0x51], &[0x10, 0x52], &[0x23, 0x51]);
+    for (property, states, deltas) in [
+        (ConformanceProperty::StateIdempotence, vec![a], vec![]),
+        (ConformanceProperty::StateCommutativity, vec![a, b], vec![]),
+        (
+            ConformanceProperty::StateAssociativity,
+            vec![a, b, c],
+            vec![],
+        ),
+        (
+            ConformanceProperty::EmittedStateValidity,
+            vec![a, b],
+            vec![],
+        ),
+        (ConformanceProperty::UpdateDeterminism, vec![a, b], vec![]),
+        (ConformanceProperty::SummaryDeterminism, vec![a], vec![]),
+        (ConformanceProperty::DeltaDeterminism, vec![a], vec![]),
+        (ConformanceProperty::ReconciliationCycle, vec![a, b], vec![]),
+        (ConformanceProperty::SelfDeltaEmpty, vec![a], vec![]),
+        (
+            ConformanceProperty::DeltaIdempotence,
+            vec![a],
+            vec![bytes(&[0x52])],
+        ),
+        (
+            ConformanceProperty::DeltaPermutationInvariance,
+            vec![a],
+            vec![bytes(&[0x52]), bytes(&[0x63])],
+        ),
+    ] {
+        let mut fake = disagreeing_paths();
+        let built = ConformanceCase::new(property, states.iter().map(|s| bytes(s)).collect())
+            .with_deltas(deltas);
+        let outcome = verify_case(&mut fake, &built);
+        assert!(
+            !outcome.is_violation(),
+            "{property} fired on the disagreeing-paths contract, so it no longer \
+             demonstrates the #5394 gap (a contract that satisfies every existing \
+             law and still diverges): {outcome:?}"
+        );
+    }
+}
+
+/// A weak delta encoding is not a disagreement, and this is the guard that keeps the
+/// property off a large legitimate class.
+///
+/// The contract is a plain union semilattice whose delta carries only PART of what
+/// the other state holds — the shape of a coarse version clock or a compact digest,
+/// which `a_weak_delta_path_with_a_sound_merge_is_not_a_cycle` already refuses to
+/// accuse under `ReconciliationCycle`. Its delta path lands short of the merged
+/// state on this round and catches up on the next one.
+///
+/// Without the re-merge guard in `path_agreement` this test fails: the raw
+/// comparison `apply(base, delta) != merge(base, other)` is true here.
+#[test]
+fn a_delta_that_carries_only_part_of_the_other_state_is_not_a_disagreement() {
+    // Ships only the smallest missing byte, so the delta path always lags.
+    let mut fake = Fake::conforming()
+        .deltaing(|state, summary| Ok(difference(state, summary).into_iter().take(1).collect()));
+
+    let outcome = verify_case(
+        &mut fake,
+        &case(ConformanceProperty::PathAgreement, &[&[1], &[2, 3, 4]]),
+    );
+    assert_holds(outcome);
+
+    // ...and the raw comparison really would have fired, so the assertion above is
+    // not passing because the two paths happened to agree.
+    let mut same = Fake::conforming()
+        .deltaing(|state, summary| Ok(difference(state, summary).into_iter().take(1).collect()));
+    let delta = same.get_state_delta(&[2, 3, 4], &[1]).expect("delta");
+    let delta_path = union(&[1], &delta);
+    let merge_path = union(&[1], &[2, 3, 4]);
+    assert_ne!(
+        delta_path, merge_path,
+        "this fixture no longer exercises the partial-delta case the guard exists \
+         for, so the assertion above passes for the wrong reason"
+    );
+}
+
+/// An empty delta is the protocol's "nothing to send", so there is no delta path to
+/// compare the merge path against and the honest answer is a refusal.
+#[test]
+fn a_contract_with_no_delta_path_is_inconclusive_rather_than_accused() {
+    let mut fake = Fake::conforming()
+        .summarizing(|_| Ok(vec![0]))
+        .deltaing(|_state, _summary| Ok(Vec::new()));
+
+    assert_inconclusive(
+        verify_case(
+            &mut fake,
+            &case(ConformanceProperty::PathAgreement, &[&[1, 2], &[3, 4]]),
+        ),
+        Inconclusive::NoDeltaPath,
+    );
+}
+
+/// A last-write-wins merge heals trivially under the guard, so this property
+/// declines to pile a second accusation onto a defect `StateCommutativity` already
+/// names. One law per property — the same rule `DeltaPermutationInvariance` follows
+/// with respect to `DeltaIdempotence`.
+#[test]
+fn a_broken_merge_is_left_to_the_property_that_names_it() {
+    let mut fake = Fake::conforming().merging(|_a, b| Ok(b.to_vec()));
+    let outcome = verify_case(
+        &mut fake,
+        &case(ConformanceProperty::PathAgreement, &[&[1, 2], &[2, 3]]),
+    );
+    assert!(
+        !outcome.is_violation(),
+        "path agreement must not re-accuse a contract whose merge is the defect: \
+         {outcome:?}"
+    );
+    assert_violates(
+        verify_case(
+            &mut fake,
+            &case(ConformanceProperty::StateCommutativity, &[&[1, 2], &[2, 3]]),
+        ),
+        ConformanceProperty::StateCommutativity,
+    );
+}
+
+/// A defect visible from only ONE of the two directions must still be found.
+///
+/// The pin for the second `path_agreement` call. The mode-8 fixture disagrees in
+/// both directions, so a test built on it passes whether or not the reverse
+/// direction is checked at all — which is a test that pins nothing. This contract's
+/// delta path adds a byte the merge path never produces, but only when the BASE
+/// already carries a marker, so exactly one of the two directions can see it.
+///
+/// The pair is listed with the marker state SECOND, which is the direction a
+/// single-direction check would miss.
+#[test]
+fn a_defect_visible_from_only_one_direction_is_still_found() {
+    const MARKER: u8 = 0xEE;
+    const EXTRA: u8 = 0xFF;
+    let make = || {
+        Fake::conforming().applying(|base, delta| {
+            let mut out = union(base, delta);
+            if base.contains(&MARKER) {
+                out = union(&out, &[EXTRA]);
+            }
+            Ok(out)
+        })
+    };
+
+    // Marker state second: the forward direction (base = the plain state) agrees,
+    // so only the reverse direction can find this.
+    assert_violates(
+        verify_case(
+            &mut make(),
+            &case(
+                ConformanceProperty::PathAgreement,
+                &[&[0x01, 0x02], &[0x01, MARKER]],
+            ),
+        ),
+        ConformanceProperty::PathAgreement,
+    );
+
+    // And the forward direction really does agree, so the assertion above is not
+    // passing because both directions happened to fire.
+    let mut fake = make();
+    let delta = fake
+        .get_state_delta(&[0x01, MARKER], &[0x01, 0x02])
+        .expect("delta");
+    assert_eq!(
+        union(&[0x01, 0x02], &delta),
+        union(&[0x01, 0x02], &[0x01, MARKER]),
+        "the forward direction must AGREE for this to pin the reverse one"
+    );
+}
+
+/// Which state the corpus happened to list first must not decide whether a defect is
+/// found. The generator emits each unordered pair once, so a one-directional check
+/// would make the finding depend on file order.
+#[test]
+fn a_disagreement_is_found_from_either_order_of_the_pair() {
+    for states in [
+        [&[0x10u8, 0x51u8][..], &[0x10, 0x52][..]],
+        [&[0x10, 0x52][..], &[0x10, 0x51][..]],
+    ] {
+        let mut fake = disagreeing_paths();
+        assert_violates(
+            verify_case(
+                &mut fake,
+                &case(ConformanceProperty::PathAgreement, &states),
+            ),
+            ConformanceProperty::PathAgreement,
+        );
+    }
+}
 
 fn instance(seed: u8) -> ContractInstanceId {
     ContractInstanceId::new([seed; 32])
