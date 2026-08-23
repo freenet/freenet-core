@@ -210,6 +210,10 @@ mod tests {
     };
     use super::favicon::{build_dashboard_title, build_favicon_data_uri};
     use super::peer_detail::peer_detail_html;
+    use crate::conformance::property::Severity;
+    use crate::conformance::status::{
+        CheckedContract, MergeCheckStatus, MergeCheckView, MergeFinding,
+    };
     use crate::node::network_status::{
         FailureSnapshot, HealthLevel, NatStatsSnapshot, NetworkStatusSnapshot, OpStatsSnapshot,
         RingStatsSnapshot,
@@ -3396,7 +3400,7 @@ mod tests {
     #[test]
     fn contract_detail_escapes_a_key_from_the_url() {
         let payload = "<script>alert(1)</script>";
-        let html = contract_detail_html_from(&None, payload);
+        let html = contract_detail_html_from(&None, payload, false, None);
         assert!(
             !html.contains("<script>alert(1)"),
             "an unescaped key from the URL is reflected XSS — got:\n{html}"
@@ -3417,7 +3421,7 @@ mod tests {
     /// describing a ranking the code does not implement.
     #[test]
     fn contract_not_found_is_scoped_to_this_node() {
-        let html = contract_detail_html_from(&None, "NOSUCHCONTRACTKEY");
+        let html = contract_detail_html_from(&None, "NOSUCHCONTRACTKEY", false, None);
         assert!(
             html.contains("Contract Not Found"),
             "expected the not-found page — got:\n{html}"
@@ -3513,7 +3517,7 @@ mod tests {
                 is_receiving_updates: is_fresh,
                 in_use,
             }];
-            contract_detail_html_from(&Some(snap), "SUBBED1")
+            contract_detail_html_from(&Some(snap), "SUBBED1", false, None)
         };
 
         // Fresh, in use, updated recently.
@@ -3587,7 +3591,7 @@ mod tests {
                 last_transition_secs_ago: 30,
                 history: Vec::new(),
             }];
-            contract_detail_html_from(&Some(snap), key)
+            contract_detail_html_from(&Some(snap), key, false, None)
         };
 
         // 44 base58 characters, the real shape of a contract key.
@@ -3675,7 +3679,7 @@ mod tests {
             history: Vec::new(),
         }];
 
-        let html = contract_detail_html_from(&Some(snap), key);
+        let html = contract_detail_html_from(&Some(snap), key, false, None);
         assert!(
             html.contains("Borderline"),
             "a hosted-only contract must still show its governance state — \
@@ -3728,7 +3732,7 @@ mod tests {
             history,
         }];
 
-        let html = contract_detail_html_from(&Some(snap), "GOVKEY1");
+        let html = contract_detail_html_from(&Some(snap), "GOVKEY1", false, None);
         let newest = format_duration(newest_secs);
         let oldest = format_duration(oldest_secs);
         assert!(
@@ -3763,7 +3767,7 @@ mod tests {
             recency_seq: 42,
             eviction_eligible: true,
         }];
-        let html = contract_detail_html_from(&Some(snap), "TESTKEY1");
+        let html = contract_detail_html_from(&Some(snap), "TESTKEY1", false, None);
         assert!(
             html.contains("not shown"),
             "the hosting panel must say the ranking keys are missing — \
@@ -3774,6 +3778,914 @@ mod tests {
             "and point at the issue tracking them, so the gap is followable \
              rather than a dead end — got:\n{html}"
         );
+    }
+
+    // ─── Merge-law card (#5397) ──────────────────────────────────────────
+
+    /// Extracts the Merge laws card. The whole stylesheet is inlined into
+    /// every render, so a bare `html.contains("fresh-ok")` is true whether or
+    /// not this card actually used that class — see `subscription_panel`
+    /// above, which exists for the identical reason.
+    fn merge_panel(html: &str) -> String {
+        let start = html
+            .find("<h2>Merge laws</h2>")
+            .expect("the Merge laws card must be rendered");
+        let end = html[start..]
+            .find("<h2>Governance</h2>")
+            .map(|i| start + i)
+            .unwrap_or(html.len());
+        html[start..end].to_string()
+    }
+
+    /// One checked-contract record, the shape `conformance::status` stores.
+    ///
+    /// Built through `CheckedContract::new` + `note_finding`, the only route
+    /// production has and — since `findings` became private — the only route
+    /// anything has. A struct literal here would let a test construct a record
+    /// production could not, which is precisely what hid `record`'s
+    /// un-deduplicating insert arm.
+    ///
+    /// Note what `note_finding` does to `findings` on the way in: it inserts at the
+    /// FRONT and drops a property already present. So the record comes back with the
+    /// list reversed and any duplicate property gone — the signature reads like "these
+    /// findings, in this order" and it is not. Today's callers assert presence, not
+    /// order; do not write an order-dependent assertion against this helper without
+    /// reading that.
+    fn checked_record(
+        contract: freenet_stdlib::prelude::ContractInstanceId,
+        verdicts: usize,
+        inconclusive: usize,
+        findings: Vec<MergeFinding>,
+    ) -> CheckedContract {
+        // The timestamp is overwritten by `record` with the tick's publish time,
+        // exactly as `status::checked_contracts` does in production.
+        let mut record = CheckedContract::new(
+            contract,
+            verdicts,
+            inconclusive,
+            tokio::time::Instant::now(),
+        );
+        for finding in findings {
+            record.note_finding(finding);
+        }
+        record
+    }
+
+    /// What the page reads: one contract's record plus the node-wide numbers.
+    ///
+    /// Goes through `MergeCheckStatus::view_for`, the same call the wrapper
+    /// makes, rather than building a `MergeCheckView` by hand — a hand-built
+    /// view would let a test assert about a record the real lookup would never
+    /// have returned.
+    fn merge_view(
+        status: &MergeCheckStatus,
+        contract: &freenet_stdlib::prelude::ContractInstanceId,
+    ) -> MergeCheckView {
+        status.view_for(Some(contract), tokio::time::Instant::now())
+    }
+
+    /// Text with the markup stripped, so "no digit in the visible content"
+    /// assertions aren't defeated by the `2` in every `<h2>` tag.
+    fn visible_text(html: &str) -> String {
+        let mut out = String::new();
+        let mut in_tag = false;
+        for c in html.chars() {
+            match c {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                _ if !in_tag => out.push(c),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// A hosted-only contract: the cheapest fixture that reaches any card at
+    /// all. A key with no subscription, hosting, or governance record
+    /// short-circuits to the "not found" page before the Merge laws card (or
+    /// any other card) ever renders.
+    fn hosted_snap(key: &str) -> NetworkStatusSnapshot {
+        let mut snap = base_snapshot();
+        snap.open_connections = 2;
+        snap.hosting.contracts = vec![crate::node::network_status::HostedContractEntry {
+            key_full: key.to_string(),
+            key_short: key.to_string(),
+            size_bytes: 1024,
+            read_count: 0,
+            recency_seq: 0,
+            eviction_eligible: true,
+        }];
+        snap
+    }
+
+    /// State 1: merge-law checking is not running on this node at all.
+    ///
+    /// Must say so plainly, and must render NO count at all — not even a
+    /// zero. A rendered "0" here would read as "0 violations found", which is
+    /// indistinguishable from a clean bill of health and is exactly the
+    /// conflation `conformance::status`'s module doc exists to prevent.
+    #[test]
+    fn merge_card_reports_checking_disabled_with_no_digits() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key = ContractInstanceId::new([1u8; 32]).to_string();
+        let snap = hosted_snap(&key);
+        let html = contract_detail_html_from(&Some(snap), &key, false, None);
+        let panel = merge_panel(&html);
+        assert!(
+            panel.to_ascii_lowercase().contains("not enabled"),
+            "must say plainly that checking is off — got:\n{panel}"
+        );
+        assert!(
+            panel.to_ascii_lowercase().contains("default"),
+            "must say this is the default state, not a fault — got:\n{panel}"
+        );
+        assert!(
+            !visible_text(&panel).chars().any(|c| c.is_ascii_digit()),
+            "no digit may appear in the VISIBLE text when checking is off — \
+             a rendered count (even a zero) would read as a clean result \
+             rather than as unmeasured. got:\n{panel}"
+        );
+    }
+
+    /// State 2a: checking is running, but this contract falls outside the
+    /// bounded recently-checked window.
+    ///
+    /// Must NOT be read as clean — the window is bounded, so absence here is
+    /// absence of knowledge, not a clean bill of health.
+    #[test]
+    fn merge_card_reports_not_recently_checked_as_unknown_not_clean() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([2u8; 32]);
+        let key = key_id.to_string();
+        // A DIFFERENT contract was checked; this one was not.
+        let other = ContractInstanceId::new([9u8; 32]);
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            [checked_record(other, 5, 0, vec![])],
+            1,
+            0,
+            tokio::time::Instant::now(),
+        );
+
+        let snap = hosted_snap(&key);
+        let view = merge_view(&status, &key_id);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+        assert!(
+            panel.contains("has not been checked recently"),
+            "must say the contract fell outside the checked window — \
+             got:\n{panel}"
+        );
+        assert!(
+            !panel
+                .to_ascii_lowercase()
+                .contains("no merge-law violation"),
+            "must not claim a clean result for a contract the checker never \
+             looked at — got:\n{panel}"
+        );
+    }
+
+    /// State 2b: checking is running, but has not published its first tick
+    /// yet (`snapshot()` is still `None`).
+    ///
+    /// This must render the same "not checked recently" message as 2a, not
+    /// "not enabled" — the checker IS on, it simply has nothing to report
+    /// yet. Conflating this with "off" would misreport a starting node as one
+    /// with checking disabled.
+    #[test]
+    fn merge_card_reports_not_checked_before_first_publish() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key = ContractInstanceId::new([3u8; 32]).to_string();
+        let snap = hosted_snap(&key);
+        let html = contract_detail_html_from(&Some(snap), &key, true, None);
+        let panel = merge_panel(&html);
+        assert!(
+            panel.contains("has not been checked recently"),
+            "before the first tick publishes, the honest answer is 'on, \
+             nothing established yet', which must read the same as the \
+             bounded-window case above — got:\n{panel}"
+        );
+        assert!(
+            !panel.to_ascii_lowercase().contains("not enabled"),
+            "must not be conflated with checking being off — got:\n{panel}"
+        );
+    }
+
+    /// State 3: checked, no findings for this contract.
+    ///
+    /// Must say plainly that no violation was found AND show how many cases
+    /// ran, so the reader can judge whether a clean result reflects a
+    /// meaningful sample or barely having looked.
+    #[test]
+    fn merge_card_reports_clean_result_with_case_count() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([4u8; 32]);
+        let key = key_id.to_string();
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            [checked_record(key_id, 250, 4, vec![])],
+            1,
+            0,
+            tokio::time::Instant::now(),
+        );
+
+        let snap = hosted_snap(&key);
+        let view = merge_view(&status, &key_id);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+        assert!(
+            panel
+                .to_ascii_lowercase()
+                .contains("no merge-law violation"),
+            "a clean, checked contract must say so plainly — got:\n{panel}"
+        );
+        assert!(
+            panel.contains("250 reached a verdict"),
+            "must show how many of THIS contract's cases reached a verdict, so a \
+             clean result can be judged for how meaningful it is — got:\n{panel}"
+        );
+        assert!(
+            panel.contains("4 inconclusive"),
+            "must show this contract's inconclusive count too: a contract with one \
+             verdict and 199 inconclusive cases must not render like one with 200 \
+             verdicts — got:\n{panel}"
+        );
+        assert!(
+            !panel
+                .to_ascii_lowercase()
+                .contains("could not reach a verdict"),
+            "the fleet-wide unjudged note must NOT appear when the count is \
+             zero — got:\n{panel}"
+        );
+    }
+
+    /// State 4: checked, with findings — the state the whole card exists for.
+    ///
+    /// Each finding must show its property, and a `Violation` must read as
+    /// visibly more serious than a `Diagnostic`: the former means the
+    /// contract cannot converge (peers disagree and retry indefinitely), the
+    /// latter is legal but wasteful. A panel that only printed the bare enum
+    /// name would satisfy "shows severity" without making the distinction an
+    /// operator actually needs.
+    #[test]
+    fn merge_card_lists_findings_with_severity_and_removal_distinguished() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([5u8; 32]);
+        let key = key_id.to_string();
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            [checked_record(
+                key_id,
+                40,
+                0,
+                vec![
+                    MergeFinding {
+                        contract: key_id,
+                        property: "state_commutativity",
+                        severity: Severity::Violation,
+                        would_remove: true,
+                    },
+                    MergeFinding {
+                        contract: key_id,
+                        property: "self_delta_empty",
+                        severity: Severity::Diagnostic,
+                        would_remove: false,
+                    },
+                ],
+            )],
+            1,
+            0,
+            tokio::time::Instant::now(),
+        );
+
+        let snap = hosted_snap(&key);
+        let view = merge_view(&status, &key_id);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+        assert!(
+            panel.contains("state_commutativity") && panel.contains("self_delta_empty"),
+            "both findings for this contract must be listed — got:\n{panel}"
+        );
+        assert!(
+            panel.contains("cannot converge"),
+            "a Violation must be explained, not just labelled with the bare \
+             enum name — got:\n{panel}"
+        );
+        assert!(
+            panel.contains("legal but wasteful"),
+            "a Diagnostic must be visibly distinguished from a Violation, \
+             not merely a different word for the same thing — got:\n{panel}"
+        );
+    }
+
+    /// The fleet-wide "could not judge" count must be surfaced when non-zero,
+    /// independent of this contract's own state — it is information the
+    /// operator needs regardless of which contract's page they are viewing.
+    #[test]
+    fn merge_card_surfaces_contracts_without_verdict_fleet_wide() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([6u8; 32]);
+        let key = key_id.to_string();
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            [checked_record(key_id, 400, 0, vec![])],
+            10,
+            3,
+            tokio::time::Instant::now(),
+        );
+
+        let snap = hosted_snap(&key);
+        let view = merge_view(&status, &key_id);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+        assert!(
+            panel.contains('3'),
+            "the unjudged count must be surfaced when non-zero — \
+             got:\n{panel}"
+        );
+        assert!(
+            panel
+                .to_ascii_lowercase()
+                .contains("could not reach a verdict"),
+            "must be phrased as an inability to judge, not folded silently \
+             into the clean result above it — got:\n{panel}"
+        );
+        assert!(
+            panel.contains("most recent tick"),
+            "the unjudged count is a per-TICK number and must be phrased as one. \
+             The earlier wording ('on this node') read as a standing property of \
+             the peer — got:\n{panel}"
+        );
+    }
+
+    /// #5403 H1: a contract with a finding must never render the green pill,
+    /// however many other contracts have been checked since.
+    ///
+    /// The two-window version kept a 256-entry checked list and a 64-entry
+    /// findings list. `merge_law_card` picked its branch from the first and
+    /// read the second, so a contract inside one and evicted from the other
+    /// rendered "no merge-law violation was found for this contract" — for a
+    /// contract the checker had positively found violating. Worse, that was
+    /// the steady state: a re-detected finding was deduplicated rather than
+    /// moved to the front, so the contract caught on every tick was the one
+    /// likeliest to lose its finding while its checked entry was refreshed.
+    ///
+    /// A hundred intervening contracts is well past the old findings cap and
+    /// well short of the checked cap, which is exactly the gap the bug lived
+    /// in. This test fails against the two-list code.
+    #[test]
+    fn merge_card_keeps_a_finding_after_the_old_findings_cap_would_have_evicted_it() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([7u8; 32]);
+        let key = key_id.to_string();
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            [checked_record(
+                key_id,
+                12,
+                0,
+                vec![MergeFinding {
+                    contract: key_id,
+                    property: "state_commutativity",
+                    severity: Severity::Violation,
+                    would_remove: true,
+                }],
+            )],
+            1,
+            0,
+            tokio::time::Instant::now(),
+        );
+        for i in 0..100u8 {
+            let other = ContractInstanceId::new([100u8.wrapping_add(i); 32]);
+            status.record(
+                [checked_record(
+                    other,
+                    3,
+                    0,
+                    vec![MergeFinding {
+                        contract: other,
+                        property: "state_idempotence",
+                        severity: Severity::Violation,
+                        would_remove: true,
+                    }],
+                )],
+                1,
+                0,
+                tokio::time::Instant::now(),
+            );
+        }
+
+        let snap = hosted_snap(&key);
+        let view = merge_view(&status, &key_id);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+        assert!(
+            !panel
+                .to_ascii_lowercase()
+                .contains("no merge-law violation"),
+            "a contract the checker FOUND violating rendered a clean result \
+             because later contracts pushed its finding out of a separately \
+             capped list — got:\n{panel}"
+        );
+        assert!(
+            panel.contains("state_commutativity"),
+            "the finding must still be listed while the contract is still in \
+             the checked window — got:\n{panel}"
+        );
+    }
+
+    /// #5403 H1, at the surface an operator reads: the card shows one row per
+    /// broken law, not one per violating case.
+    ///
+    /// Driven end to end through the production assembly — a real probe of the
+    /// deliberately-defective fixture contract, then `status::checked_contracts`,
+    /// `MergeCheckStatus::record`, `view_for`, and the real page function. Every
+    /// other merge-card test above hand-builds a `CheckedContract`, so none of them
+    /// could see a defect in the code that BUILDS one; three review rounds each
+    /// found a defect on that path and no test failed.
+    ///
+    /// Mode 6 (NEVER_SETTLES) breaks two merge laws on most generated cases, and one
+    /// probe returns thirteen findings across those two. Before the fix the card
+    /// rendered thirteen rows, eleven of them byte-identical duplicates, which then
+    /// persisted for the record's whole residency in the window because later ticks
+    /// deduplicate AGAINST them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_card_renders_one_row_per_broken_law_from_a_real_probe()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Keep in sync with the mode constants in
+        // `tests/test-contract-conformance/src/lib.rs`.
+        const NEVER_SETTLES: u8 = 6;
+
+        let (id, report, findings) =
+            crate::conformance::shadow::probe_fixture_contract(NEVER_SETTLES).await?;
+        let distinct: std::collections::BTreeSet<&str> = findings
+            .iter()
+            .map(|f| f.violation.property.as_str())
+            .collect();
+        assert!(
+            findings.len() > distinct.len() && distinct.len() > 1,
+            "the probe returned {} findings across {} properties, so this test can \
+             no longer tell one row per LAW from one row per CASE",
+            findings.len(),
+            distinct.len()
+        );
+
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            crate::conformance::status::checked_contracts(&report.judged, &findings),
+            report.judged.len(),
+            report.without_verdict,
+            tokio::time::Instant::now(),
+        );
+
+        let key = id.to_string();
+        let snap = hosted_snap(&key);
+        let view = merge_view(&status, &id);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+
+        let rows = panel.matches("<tr><td>").count();
+        assert_eq!(
+            rows,
+            distinct.len(),
+            "the card rendered {rows} finding rows for {} broken laws — a single \
+             broken law repeated across a probe's cases becomes a wall of identical \
+             rows. got:\n{panel}",
+            distinct.len()
+        );
+        for property in &distinct {
+            assert_eq!(
+                panel.matches(property).count(),
+                1,
+                "{property} appears more than once on the card:\n{panel}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A checker that has stopped publishing must say so, not present its last
+    /// tick as a current result.
+    ///
+    /// `status::publish` is reached from two places in `capture::run_writer`, and
+    /// a peer can stop reaching either indefinitely while the old snapshot
+    /// stands: the probe task can panic, a probe can hang so `in_flight` never
+    /// clears and no further tick starts, or the writer task can be gone. A peer
+    /// whose probe has been dead for a week would otherwise keep serving that
+    /// week-old "no violation found" with nothing on the page to say when it was
+    /// established.
+    #[test]
+    fn merge_card_reports_a_frozen_checker_rather_than_a_current_clean_result() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([8u8; 32]);
+        let key = key_id.to_string();
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            [checked_record(key_id, 30, 0, vec![])],
+            1,
+            0,
+            tokio::time::Instant::now(),
+        );
+
+        let snap = hosted_snap(&key);
+        // A week later. `view_for` takes `now` so the staleness branch does not
+        // need a week of wall clock to reach.
+        let a_week = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+        let view = status.view_for(Some(&key_id), tokio::time::Instant::now() + a_week);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+        assert!(
+            panel.contains("has not published"),
+            "a week-old snapshot rendered as a current result, with nothing on \
+             the card saying when the checker last ran — got:\n{panel}"
+        );
+        assert!(
+            panel.contains("Last checker tick"),
+            "every state with a snapshot must show how old that snapshot is — \
+             got:\n{panel}"
+        );
+    }
+
+    /// #5403 M1: a contract the checker has FOUND VIOLATING must not render as one
+    /// this node has never heard of.
+    ///
+    /// The page short-circuited to `contract_not_found.html` — "This node knows
+    /// nothing about &lt;key&gt;" — whenever the contract was absent from the
+    /// subscribed, hosted and governance sections of the snapshot, and threw the
+    /// already-computed merge view away. Those three empty and a merge record present
+    /// is not a corner: the checked window holds ~32 hours while the hosting cache
+    /// evicts under budget pressure well inside that, and
+    /// `network_status::get_snapshot()` returning `None` empties all three at once.
+    /// So the state the page denied all knowledge of is exactly the state where it
+    /// had the most alarming thing to say.
+    #[test]
+    fn a_contract_absent_from_the_snapshot_but_found_violating_is_not_reported_unknown() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([21u8; 32]);
+        let key = key_id.to_string();
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            [checked_record(
+                key_id,
+                8,
+                0,
+                vec![MergeFinding {
+                    contract: key_id,
+                    property: "state_commutativity",
+                    severity: Severity::Violation,
+                    would_remove: true,
+                }],
+            )],
+            1,
+            0,
+            tokio::time::Instant::now(),
+        );
+        let view = merge_view(&status, &key_id);
+
+        // No snapshot at all: the harshest form of the case, and one a live node
+        // reaches whenever `get_snapshot()` returns None.
+        let html = contract_detail_html_from(&None, &key, true, Some(&view));
+        assert!(
+            !html.contains("knows nothing about"),
+            "the page denied all knowledge of a contract it had positively found \
+             violating a merge law — got:\n{html}"
+        );
+        let panel = merge_panel(&html);
+        assert!(
+            panel.contains("state_commutativity"),
+            "the finding must still be shown when the contract is absent from the \
+             snapshot's other sections — got:\n{panel}"
+        );
+    }
+
+    /// The not-found page must still be reachable, or the fix above would simply
+    /// have deleted a state.
+    ///
+    /// A key nothing knows anything about — no snapshot entry AND no merge record —
+    /// is genuinely unknown and must say so, rather than rendering an empty detail
+    /// page that reads as a contract with nothing wrong with it.
+    #[test]
+    fn a_contract_nothing_knows_about_is_still_reported_unknown() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([22u8; 32]);
+        let other = ContractInstanceId::new([23u8; 32]);
+        let key = key_id.to_string();
+        // The checker HAS published, and has a record — for a different contract.
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            [checked_record(other, 5, 0, vec![])],
+            1,
+            0,
+            tokio::time::Instant::now(),
+        );
+        let view = merge_view(&status, &key_id);
+        assert!(
+            view.contract.is_none(),
+            "this test only means something while the requested contract has no record"
+        );
+
+        let html = contract_detail_html_from(&None, &key, true, Some(&view));
+        assert!(
+            html.contains("knows nothing about"),
+            "a genuinely unknown contract stopped being reported as unknown, so the \
+             merge-record exemption swallowed the not-found state entirely — \
+             got:\n{html}"
+        );
+    }
+
+    /// #5403 M2: "when was THIS contract last checked?" must be answered with this
+    /// contract's own record, not with the node's most recent tick.
+    ///
+    /// The card put node-wide `published_secs_ago` in the same info-grid as the
+    /// per-contract case counts, immediately beside "No merge-law violation was found
+    /// for this contract the last time it was checked". The checker probes at most two
+    /// contracts per fifteen-minute tick against a window holding 256, so a contract
+    /// judged twenty hours ago rendered as checked three minutes ago — a confident
+    /// freshness claim about a stale result. It is the same misattribution the PR had
+    /// already fixed one row up for the COUNTS; see `status::judged_last_tick`.
+    #[test]
+    fn merge_card_ages_this_contract_from_its_own_record_not_the_last_node_tick() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([24u8; 32]);
+        let key = key_id.to_string();
+        let judged_at = tokio::time::Instant::now();
+        // Added rather than subtracted: `Instant` is monotonic from boot, so
+        // `now - 20h` panics on a host that has been up for less than that.
+        let twenty_hours = std::time::Duration::from_secs(20 * 60 * 60);
+
+        let mut status = MergeCheckStatus::default();
+        status.record([checked_record(key_id, 12, 0, vec![])], 1, 0, judged_at);
+        // Twenty hours of ticks that never touched this contract. The node is
+        // perfectly healthy; the record is not fresh.
+        status.record([], 2, 0, judged_at + twenty_hours);
+
+        let snap = hosted_snap(&key);
+        let view = status.view_for(Some(&key_id), judged_at + twenty_hours);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+
+        assert!(
+            panel.contains("This contract last checked"),
+            "the card gives no per-contract age at all, so the only age on it is the \
+             node's — got:\n{panel}"
+        );
+        assert!(
+            panel.contains("20h"),
+            "a contract judged twenty hours ago is rendered as checked at the node's \
+             most recent tick, beside a sentence about what was found 'the last time \
+             it was checked' — got:\n{panel}"
+        );
+        // And the node-wide number is still there, still labelled as node-wide.
+        assert!(
+            panel.contains("Last checker tick"),
+            "the node-wide tick age must remain: a frozen checker is a different \
+             fault from a stale record, and the card has to be able to show both — \
+             got:\n{panel}"
+        );
+    }
+
+    /// The value rendered against one `info-label` in the merge card.
+    ///
+    /// Both ages sit in the same `info-grid` and both end in " ago", so a
+    /// `panel.contains("5m")` cannot tell which of them it matched — and the whole
+    /// question these two tests ask is which clock answered which label.
+    fn info_value(panel: &str, label: &str) -> String {
+        let anchor = format!(r#">{label}</div><div class="info-value">"#);
+        let start = panel
+            .find(&anchor)
+            .unwrap_or_else(|| panic!("the card renders no `{label}` row:\n{panel}"))
+            + anchor.len();
+        let end = panel[start..]
+            .find("</div>")
+            .expect("an info-value must be closed");
+        panel[start..start + end].to_string()
+    }
+
+    /// #5403 L3: re-checking a contract must refresh its per-contract age.
+    ///
+    /// `MergeCheckStatus::record` stamps `checked_at` in BOTH of its arms. Confining
+    /// that assignment to the insert (`None`) arm compiles, and the test above cannot
+    /// see it: that test records the contract ONCE, so it only ever drives the insert
+    /// arm. A contract the checker looks at every tick would then render with the age
+    /// of the first time it was ever seen, growing without bound while the checker
+    /// was in fact judging it every fifteen minutes — M2's mirror image (there the
+    /// per-contract age was too fresh; here it would be too stale), and the same
+    /// fault of the card answering one question with another clock.
+    #[test]
+    fn re_checking_a_contract_refreshes_its_per_contract_age() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([26u8; 32]);
+        let key = key_id.to_string();
+        let first_seen = tokio::time::Instant::now();
+        let twenty_hours = std::time::Duration::from_secs(20 * 60 * 60);
+        let five_minutes = std::time::Duration::from_secs(5 * 60);
+
+        let mut status = MergeCheckStatus::default();
+        // First sight: the insert arm.
+        status.record([checked_record(key_id, 12, 0, vec![])], 1, 0, first_seen);
+        // Twenty hours later the checker comes back to the SAME contract: the merge
+        // arm, which is the arm nothing covered.
+        status.record(
+            [checked_record(key_id, 3, 0, vec![])],
+            1,
+            0,
+            first_seen + twenty_hours,
+        );
+
+        let snap = hosted_snap(&key);
+        let view = status.view_for(Some(&key_id), first_seen + twenty_hours + five_minutes);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+
+        let per_contract = info_value(&panel, "This contract last checked");
+        let node_wide = info_value(&panel, "Last checker tick");
+        assert_eq!(
+            per_contract, node_wide,
+            "the contract was re-checked by the most recent tick, so its own age and \
+             the node's must agree. They do not, which means the merge arm left \
+             `checked_at` at first sight: a contract judged every tick renders as one \
+             last looked at hours or days ago — got {per_contract:?} against \
+             {node_wide:?} in:\n{panel}"
+        );
+        assert!(
+            !per_contract.contains("20h"),
+            "the re-checked contract is aged from when it was FIRST seen, not from \
+             the tick that last judged it — got {per_contract:?} in:\n{panel}"
+        );
+        // The accumulation the merge arm also owns, so this test fails loudly rather
+        // than vacuously if a refactor stops merging records at all.
+        assert!(
+            panel.contains("15 reached a verdict"),
+            "the two ticks' case counts did not accumulate, so the merge arm did not \
+             run and this test proves nothing about it — got:\n{panel}"
+        );
+    }
+
+    /// #5403 L2: a contract with no record must still show how old the snapshot is.
+    ///
+    /// The card's own doc says every state that has a snapshot renders when that
+    /// snapshot was published. The no-record branch did not: the publish age reached
+    /// it only through the staleness note, which fires at three missed ticks. Below
+    /// that threshold — a checker that died fourteen minutes ago — "this contract has
+    /// not been checked recently" carried no age at all, and a busy checker that has
+    /// simply not got round to this contract rendered identically to one that had
+    /// stopped. That is the same absence-reads-as-fine conflation this subsystem
+    /// exists to stop, in the one state where the page has nothing else to say.
+    #[test]
+    fn a_contract_with_no_record_still_shows_how_old_the_snapshot_is() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([27u8; 32]);
+        let other = ContractInstanceId::new([28u8; 32]);
+        let key = key_id.to_string();
+        let published = tokio::time::Instant::now();
+
+        // The checker HAS published — for a different contract, so the requested one
+        // has no record.
+        let mut status = MergeCheckStatus::default();
+        status.record([checked_record(other, 5, 0, vec![])], 1, 0, published);
+
+        // Well inside `STALE_AFTER` (45 minutes), so the staleness note does NOT
+        // fire and cannot supply the age on this branch's behalf. That is the whole
+        // window the branch was blind in.
+        let view = status.view_for(
+            Some(&key_id),
+            published + std::time::Duration::from_secs(840),
+        );
+        assert!(
+            view.contract.is_none() && !view.stale,
+            "this test only means anything for a fresh snapshot with no record for \
+             the requested contract"
+        );
+
+        let snap = hosted_snap(&key);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+
+        assert!(
+            panel.contains("has not been checked recently"),
+            "this test must be reading the no-record branch — got:\n{panel}"
+        );
+        assert_eq!(
+            info_value(&panel, "Last checker tick"),
+            "14m ago",
+            "the no-record state renders no snapshot age, so an operator cannot tell \
+             a busy checker that has not reached this contract from one that stopped \
+             fourteen minutes ago — got:\n{panel}"
+        );
+    }
+
+    /// #5403 M4: the unjudged count's explanation must name what it actually counts.
+    ///
+    /// It was explained as "every case it tried was inconclusive, or related state
+    /// exceeded its budget", which names the two rarest entries on the list
+    /// `shadow::ShadowReport::without_verdict` accumulates. That list also holds: no
+    /// contract store, an empty corpus, code that would not resolve, an oracle that
+    /// would not build, setup that exhausted the time budget before one case ran, a
+    /// dead probe task, and `awaiting_samples` — for most of which ZERO cases were
+    /// tried, and on a warming-up peer `awaiting_samples` dominates outright. An
+    /// operator reading the old sentence would go looking for contracts whose cases
+    /// were all inconclusive and find none.
+    #[test]
+    fn merge_card_explains_the_unjudged_count_by_what_it_counts() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([25u8; 32]);
+        let key = key_id.to_string();
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            [checked_record(key_id, 40, 0, vec![])],
+            1,
+            4,
+            tokio::time::Instant::now(),
+        );
+
+        let snap = hosted_snap(&key);
+        let view = merge_view(&status, &key_id);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+
+        assert!(
+            panel.contains("no samples collected"),
+            "the dominant cause on a warming-up peer — focus picked a contract the \
+             sampler holds nothing for — is not named at all — got:\n{panel}"
+        );
+        assert!(
+            !panel.contains("every case it tried was inconclusive"),
+            "the explanation still asserts that every unjudged contract ran cases, \
+             which is false for most of them and for all of the common ones — \
+             got:\n{panel}"
+        );
+    }
+
+    /// #5403 L6: every property name these card tests plant must be one the checker
+    /// can actually emit.
+    ///
+    /// `merge_card_lists_findings_with_severity_and_removal_distinguished` asserted on
+    /// `self_delta_size`, which `ConformanceProperty::as_str` cannot produce — the
+    /// real name is `self_delta_empty`. The test was internally consistent (it planted
+    /// the string and then found it), so it passed while asserting about a card state
+    /// no node will ever render, and the property it claimed to cover — that a
+    /// Diagnostic renders distinguishably from a Violation — was never exercised
+    /// against a real Diagnostic property at all.
+    ///
+    /// Fixing the one literal would leave the class open, so this reads every
+    /// `MergeFinding` property literal planted in this file and checks it against
+    /// `ConformanceProperty::ALL`. A future fixture invented out of thin air fails
+    /// here instead of quietly testing nothing.
+    ///
+    /// Nothing in this doc comment may spell the scrape's needle, or the scrape finds
+    /// its own prose — which it did on the first run, and failed loudly rather than
+    /// silently, because an unreal name is exactly what it rejects.
+    #[test]
+    fn merge_card_fixtures_only_use_property_names_the_checker_can_emit() {
+        use crate::conformance::property::ConformanceProperty;
+
+        let real: std::collections::BTreeSet<&str> = ConformanceProperty::ALL
+            .iter()
+            .map(|p| p.as_str())
+            .collect();
+
+        let src = include_str!("home_page.rs");
+        let needle = "property: \"";
+        let mut planted: Vec<&str> = Vec::new();
+        let mut from = 0usize;
+        while let Some(found) = src[from..].find(needle) {
+            let start = from + found + needle.len();
+            let end = start
+                + src[start..]
+                    .find('"')
+                    .expect("an unterminated string literal in this file's own source");
+            planted.push(&src[start..end]);
+            from = end;
+        }
+
+        assert!(
+            !planted.is_empty(),
+            "no `property: \"…\"` fixture was found in this file, so this test has \
+             stopped reading what it claims to read — the fixtures were probably \
+             renamed or moved, and it is now vacuous"
+        );
+        for name in &planted {
+            assert!(
+                real.contains(name),
+                "the merge-card fixtures plant `{name}`, which no \
+                 ConformanceProperty produces. A card test built on a name the \
+                 checker cannot emit asserts about a state no node will ever render. \
+                 Real names: {real:?}"
+            );
+        }
     }
 
     /// The Playwright fixture's markup must stay in step with what the server

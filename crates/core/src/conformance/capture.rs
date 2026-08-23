@@ -551,6 +551,18 @@ pub fn start(dir: PathBuf) -> std::io::Result<CaptureHandle> {
         directory = %dir.display(),
         "conformance capture enabled: recording contract merges for offline replay"
     );
+    // Tell the dashboard checking is ON before any tick has run. Without this, the
+    // first interval renders as "not enabled", which is the one thing the panel must
+    // never say wrongly — absence and success must not look alike.
+    //
+    // Deliberately LAST: both fallible steps above (the runtime check and
+    // `create_dir_all`) have already returned by the time this runs, so the flag is
+    // never set for a capture that failed to start. Both the call and its position are
+    // covered by `the_page_reports_what_the_status_global_says_and_capture_start_sets_it`
+    // in `server::home_page::contract_detail`, which owns this process-global's one
+    // transition for the whole test binary — read its doc comment before adding a
+    // second caller of `mark_enabled` anywhere in the crate or its tests.
+    crate::conformance::status::mark_enabled();
     tokio::spawn(run_writer(dir, rx, dropped, queued_bytes));
     Ok(handle)
 }
@@ -798,7 +810,40 @@ async fn run_writer(
                         candidate_source = focus.source.as_str(),
                         focused = focus.selected.len(),
                         scope = scope.as_str(),
+                        // The two counts the dashboard is fed just below, under the
+                        // names the completed-probe line uses for them. Without these
+                        // a barren tick reported neither, so an operator comparing the
+                        // log against the per-contract page had nothing to compare on
+                        // the one tick shape where the page shows every focus contract
+                        // as unjudged. Zero and `awaiting_samples` are literally what
+                        // is published; when `work` is empty `select` returns
+                        // `focus.selected.len()` for the latter, so it also matches
+                        // `focused` on this line by construction.
+                        judged = 0,
+                        without_verdict = awaiting_samples,
                         "conformance shadow tick selected nothing to probe"
+                    );
+                    // Published too, with no records and nothing judged.
+                    //
+                    // This branch is the ordinary warm-up state — focus has picked
+                    // contracts but the sampler holds nothing for them yet — and it
+                    // used to return without publishing, leaving the PREVIOUS tick's
+                    // snapshot standing unchanged. Three of these in a row is 45
+                    // minutes, past `status::STALE_AFTER`, so a peer that had one
+                    // healthy tick and then went barren kept rendering that tick as a
+                    // current result with no age advancing and no stale note: the
+                    // frozen-checker failure the publish time was added to prevent,
+                    // reached by a path that never calls the thing carrying it.
+                    //
+                    // `awaiting_samples` is the honest unjudged count here. When
+                    // `work` is empty, `ShadowRunner::select` returns
+                    // `focus.selected.len()` for it, so it is every contract this tick
+                    // formed no opinion about — which is all of them.
+                    crate::conformance::status::publish(
+                        Vec::new(),
+                        0,
+                        awaiting_samples,
+                        tokio::time::Instant::now(),
                     );
                 } else {
                     let store = contract_store().cloned();
@@ -831,11 +876,14 @@ async fn run_writer(
                         continue;
                     }
                 };
-                // Focus picked these; they simply had nothing to check yet. Counted
-                // in both, so `focused` is the size of the focus set rather than the
-                // size of the subset that happened to have samples.
-                report.focused += awaiting_samples;
-                report.skipped_no_samples += awaiting_samples;
+                // Focus picked these; they simply had nothing to check yet. All three
+                // counters have to be told — see `shadow::count_awaiting_samples`,
+                // which is shared with the `probe_fixture_contract` test seam so a
+                // test cannot be fed a report production would never publish.
+                crate::conformance::shadow::count_awaiting_samples(
+                    &mut report,
+                    awaiting_samples,
+                );
                 shadow.record(&findings);
                 // Reported even when nothing was checked. A shadow period that finds
                 // nothing and a shadow period that never ran look identical in a
@@ -868,7 +916,53 @@ async fn run_writer(
                     skipped_no_code = report.skipped_no_code,
                     skipped_no_samples = report.skipped_no_samples,
                     timed_out = report.timed_out,
+                    // `judged`/`without_verdict` are narrower than `probed`: a focus
+                    // contract can be probed and run every case without forming an
+                    // opinion (every case `Inconclusive`). These are the numbers fed
+                    // to the dashboard below, so a reader comparing the log to the
+                    // per-contract page must see the same two counts here.
+                    judged = report.judged.len(),
+                    without_verdict = report.without_verdict,
                     "conformance shadow tick"
+                );
+
+                // Same numbers the line above reports, so the dashboard and the log
+                // cannot disagree about what happened. Published here rather than
+                // derived by a reader: a count re-computed at the call site is how
+                // this project has produced wrong metrics before.
+                //
+                // `report.judged` — not `last_focus.selected` — is what feeds
+                // `recently_checked`: focus selection only names candidates, and a
+                // selected contract can be skipped before probing (no code, no
+                // samples) or probed and never reach a verdict (every case
+                // `Inconclusive`). Feeding selection here would render an
+                // unjudged contract as "checked, no violation found", which is the
+                // exact conflation this subsystem exists to prevent. Likewise
+                // `report.without_verdict` — not `skipped_no_code +
+                // skipped_no_samples` — is the complement of `judged` over the
+                // focus set: it also counts a probed contract whose every case was
+                // inconclusive, which the skip counters never see.
+                //
+                // One record per judged contract, carrying that contract's own case
+                // counts AND its own findings — see `status::checked_contracts`. The
+                // first version of this kept the checked list and the findings list
+                // separate and capped them differently, so a contract inside one and
+                // evicted from the other rendered a green "no violation found" pill
+                // for a contract found violating.
+                //
+                // The publish TIME is carried too. A tick that selects no work now
+                // publishes as well, so barrenness is no longer a way to freeze the
+                // snapshot — but a peer can still stop reaching EITHER call site
+                // indefinitely while the previous one stands: the probe task can die
+                // (the `Err` arm above `continue`s), a probe can hang so `in_flight`
+                // never clears and no further tick starts, or this writer task can be
+                // gone entirely. Without an age on the snapshot, any of those keeps
+                // serving a week-old tick as a current clean result.
+                crate::conformance::status::publish(
+                    crate::conformance::status::checked_contracts(&report.judged, &findings),
+                    report.judged.len(),
+                    report.without_verdict,
+                    tokio::time::Instant::now(),
                 );
             }
         }
@@ -2090,18 +2184,49 @@ mod probe_wiring_pins {
     /// `focused=1, skipped_no_samples=0`, which reads as "one contract, fully checked".
     /// Warm-up is the normal state now that focus draws from the hosted set rather than
     /// from what was already sampled, so this hid the common case.
+    ///
+    /// Only the DELEGATION and its arguments are pinned here. The three counters used
+    /// to be open-coded in `run_writer`, which is why this pin had to name each of
+    /// them and why the `probe_fixture_contract` seam could silently apply none of
+    /// them; they now live in `shadow::count_awaiting_samples`, whose behaviour is
+    /// tested directly in `shadow`'s own test module rather than scraped. What no test
+    /// but a source pin can see is whether `run_writer` still CALLS it, and with what.
     #[test]
     fn contracts_awaiting_samples_are_counted_in_the_tick() {
         let body = run_writer_code_only();
-        assert!(
-            body.contains("report.focused += awaiting_samples"),
-            "focus contracts still awaiting samples no longer count toward `focused`, \
-             so a warming-up focus set reports as a smaller, fully-checked one"
+        // Positional, and scoped to the call's own argument list — see
+        // `count_awaiting_samples_args`. Passing the tick's report but a literal `0`
+        // for the count type-checks, folds nothing in, and renders as a warming-up
+        // focus set that was fully judged.
+        let args = count_awaiting_samples_args();
+        assert_eq!(
+            args[0], "&mut report",
+            "the warming-up counters are folded into something other than THIS tick's \
+             report, so the numbers the dashboard is fed below describe a different \
+             object than the one the log line reports"
         );
-        assert!(
-            body.contains("report.skipped_no_samples += awaiting_samples"),
-            "focus contracts still awaiting samples are no longer reported as skipped"
+        assert_eq!(
+            args[1], "awaiting_samples",
+            "the warming-up count passed to `count_awaiting_samples` is no longer \
+             `awaiting_samples`, so the focus contracts that had nothing to check yet \
+             are dropped from the tick's counts and a warming-up focus set reports as \
+             a smaller, fully-checked one"
         );
+        // Not re-inlined alongside the call: two places that both adjust these
+        // counters is how the writer and the seam came to disagree in the first
+        // place, and a double-count reads as a plausible number.
+        for open_coded in [
+            "report.focused +=",
+            "report.skipped_no_samples +=",
+            "report.without_verdict +=",
+        ] {
+            assert!(
+                !body.contains(open_coded),
+                "`{open_coded}` is open-coded in run_writer again alongside \
+                 `count_awaiting_samples`, so the warm-up contracts are counted twice \
+                 — or, worse, the helper's own version has drifted from it"
+            );
+        }
     }
 
     #[test]
@@ -2113,6 +2238,383 @@ mod probe_wiring_pins {
              flight, so a probe that overran its interval would have another stacked \
              on top of it — unbounded concurrent WASM execution from a job whose \
              entire justification is that it is bounded"
+        );
+    }
+
+    /// How many places in `run_writer` call `status::publish`, and in what order.
+    ///
+    /// 0. the barren tick — `work.is_empty()`, the warm-up state. Publishes nothing
+    ///    but a fresh timestamp, so the snapshot ages instead of the previous tick
+    ///    standing as a current result.
+    /// 1. the completed probe — the tick that actually establishes something.
+    ///
+    /// Pinned as a COUNT because `publish_call_args` selects positionally: adding a
+    /// third call site would otherwise repoint every pin below at a different call
+    /// without any of them failing, which is the half-inert-pin failure this file has
+    /// already shipped twice. A new call site must land here deliberately.
+    const PUBLISH_CALL_SITES: usize = 2;
+
+    /// Index of the completed-probe publish in source order — see
+    /// [`PUBLISH_CALL_SITES`].
+    const PROBE_PUBLISH: usize = 1;
+
+    /// Index of the barren-tick publish in source order.
+    const BARREN_PUBLISH: usize = 0;
+
+    /// Every `status::publish` call site in `run_writer`, in source order.
+    fn publish_call_sites() -> Vec<usize> {
+        let body = run_writer_code_only();
+        let anchor = "status::publish(";
+        let mut at = Vec::new();
+        let mut from = 0usize;
+        while let Some(found) = body[from..].find(anchor) {
+            at.push(from + found + anchor.len());
+            from += found + anchor.len();
+        }
+        // Checked BEFORE the count, and against an anchor the qualified spelling
+        // cannot influence. `PUBLISH_CALL_SITES` is hand-written and the search
+        // anchor is `status::publish(`, so a third call site reached through a `use`
+        // import — `publish(...)`, or `st::publish(...)` — is invisible to BOTH: the
+        // count matches, every positional pin stays green, and all four are asserting
+        // about a set that no longer contains the call they name. Two errors that
+        // cancel, which is the shape `.claude/rules/bug-prevention-patterns.md` names
+        // under "the count must not be derived from the marker it audits".
+        //
+        // `publish(` also matches inside `status::publish(`, so equality here says
+        // exactly "every call spelled `publish(` is the qualified one". It is a
+        // PREFIX match, so it over-counts a `something.publish(` or a `republish(`
+        // — which fails safe, naming a discrepancy that is not one — and it is blind
+        // to a `use … as` rename, which both counters miss together.
+        let any_spelling = body.matches("publish(").count();
+        assert_eq!(
+            any_spelling,
+            at.len(),
+            "run_writer calls `publish(` {any_spelling} times but only {} of them are \
+             spelled `status::publish(`. A call reached through a `use` import is \
+             invisible to this anchor AND to PUBLISH_CALL_SITES, so the positional \
+             pins below would keep passing while asserting about the wrong set. \
+             Spell it `status::publish(` at every call site",
+            at.len()
+        );
+        assert_eq!(
+            at.len(),
+            PUBLISH_CALL_SITES,
+            "run_writer calls status::publish {} times, not {PUBLISH_CALL_SITES}. \
+             `publish_call_args` selects positionally, so the pins below are now \
+             asserting about a different call than the one they name — decide which \
+             index each pin means and update PUBLISH_CALL_SITES deliberately",
+            at.len()
+        );
+        at
+    }
+
+    /// The arguments of ONE `status::publish` call, in order.
+    ///
+    /// Bounded to the call itself rather than to all of `run_writer`, and that bound
+    /// is the whole point of the helper. The previous pins asserted
+    /// `body.contains("report.without_verdict")` over the entire function body, which
+    /// is satisfied by `report.without_verdict += awaiting_samples` sixty lines
+    /// earlier and by the `tracing::info!` field — both independent of the publish
+    /// call, so replacing the third argument with `0` left the pin green. Positional,
+    /// because the sibling pin could not see a SWAP either: passing `report.probed`
+    /// where `report.judged.len()` belongs kept every assertion happy.
+    fn publish_call_args(nth: usize) -> Vec<String> {
+        let body = run_writer_code_only();
+        let start = publish_call_sites()[nth];
+        let args = call_args_at(&body, start, &format!("status::publish call {nth}"));
+        assert_eq!(
+            args.len(),
+            4,
+            "status::publish's argument list changed shape, so the positional pins \
+             below are asserting about the wrong arguments: {args:?}"
+        );
+        args
+    }
+
+    /// The arguments of the call whose opening paren ends at `start`, in order.
+    ///
+    /// Shared by every argument-scoped pin in this module, because the bound is the
+    /// whole point. A free-floating `body.contains("some_arg,")` is satisfied by any
+    /// other occurrence of that text anywhere in `run_writer` — a `tracing` field, a
+    /// nearby assignment, a sibling call — so it cannot see a wrong argument at the
+    /// call it names. `label` names the call in the panic below, which is the only
+    /// diagnostic a reader gets when an anchor stops landing on a call.
+    fn call_args_at(body: &str, start: usize, label: &str) -> Vec<String> {
+        // Split on TOP-LEVEL commas only: an argument may itself be a call with its
+        // own comma-separated arguments.
+        let mut depth = 0usize;
+        let mut args: Vec<String> = Vec::new();
+        let mut current = String::new();
+        for ch in body[start..].chars() {
+            match ch {
+                '(' | '[' => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                ')' if depth == 0 => break,
+                // A `]` at depth zero cannot be balanced by anything inside this
+                // argument list, so the slice is not the call it claims to be — the
+                // anchor moved, or the call is not brace-balanced. Diagnosed rather
+                // than left to `depth -= 1` panicking with `attempt to subtract with
+                // overflow`, which names arithmetic and sends the next reader nowhere
+                // near the anchor that actually broke.
+                ']' if depth == 0 => panic!(
+                    "unbalanced `]` while slicing {label}'s arguments: the anchor no \
+                     longer lands on that call's opening paren, so nothing below is \
+                     asserting about it. parsed so far: {args:?} + {current:?}"
+                ),
+                ')' | ']' => {
+                    depth -= 1;
+                    current.push(ch);
+                }
+                ',' if depth == 0 => {
+                    args.push(current.trim().to_string());
+                    current.clear();
+                }
+                _ => current.push(ch),
+            }
+        }
+        if !current.trim().is_empty() {
+            args.push(current.trim().to_string());
+        }
+        args
+    }
+
+    /// The arguments of `run_writer`'s sole `count_awaiting_samples` call, in order.
+    ///
+    /// Bounded to the call for the same reason `publish_call_args` is. The three
+    /// unscoped `body.contains` this replaced could not see the call's arguments at
+    /// all: `"awaiting_samples,"` occurs three times in `run_writer` — the barren
+    /// tick's `without_verdict` log field, the barren publish's third argument, and
+    /// this call — so that conjunct was satisfied whatever this call was passed, and
+    /// `count_awaiting_samples(&mut report, 0)` left the pin green (mutation-verified).
+    fn count_awaiting_samples_args() -> Vec<String> {
+        let body = run_writer_code_only();
+        let anchor = "count_awaiting_samples(";
+        // EXACTLY one call, checked before `find` so both directions are diagnosed.
+        // Zero means the completed-probe arm no longer folds the warming-up focus
+        // contracts into the tick's counts at all, so a warming-up focus set reports
+        // as a smaller, fully-checked one and the dashboard's unjudged total silently
+        // omits them. Two means the writer adjusts these counters twice, which is the
+        // double-count the sibling open-coding assertions below exist to forbid — and
+        // a double-count reads as a plausible number.
+        let calls = body.matches(anchor).count();
+        assert_eq!(
+            calls, 1,
+            "run_writer calls `count_awaiting_samples` {calls} times, not once. Zero \
+             drops the warming-up focus contracts from the tick's counts; more than \
+             one folds them in twice"
+        );
+        let start = body.find(anchor).expect("checked just above") + anchor.len();
+        let args = call_args_at(&body, start, "count_awaiting_samples");
+        assert_eq!(
+            args.len(),
+            2,
+            "count_awaiting_samples's argument list changed shape, so the positional \
+             pins below are asserting about the wrong arguments: {args:?}"
+        );
+        args
+    }
+
+    /// The dashboard's checked window must be fed the contracts that actually reached
+    /// a verdict, never focus SELECTION — with each contract's own findings attached.
+    ///
+    /// The #5403 review defect: `status::publish` was fed `last_focus.selected`, so a
+    /// contract focus merely picked — including one skipped before probing (no code,
+    /// no samples) or probed and left with every case `Inconclusive` — rendered on
+    /// the per-contract page as "checked, no violation found". `report.judged` is
+    /// populated only when at least one case reached `Holds` or `Violated`
+    /// (`shadow::probe_one`), so feeding it here is what makes "recently checked"
+    /// mean "we formed an opinion" rather than "focus looked this way".
+    ///
+    /// `checked_contracts` is what attaches each contract's findings to ITS record.
+    /// Feeding the judged ids alone would restore the two-window split whose eviction
+    /// mismatch was H1: a contract inside the checked window and outside the findings
+    /// window renders clean while violating.
+    #[test]
+    fn dashboard_checked_window_is_fed_judged_contracts_with_their_findings() {
+        let body = run_writer_code_only();
+        let args = publish_call_args(PROBE_PUBLISH);
+        assert!(
+            args[0].contains("checked_contracts(&report.judged, &findings)"),
+            "the first argument no longer builds per-contract records from the judged \
+             contracts AND their findings, so either an unjudged contract renders as \
+             checked, or findings live in a window that can evict independently of \
+             the contract they belong to (#5403 H1). got: {}",
+            args[0]
+        );
+        // TWO guards, because each sees what the other cannot.
+        //
+        // The whole-body one below catches selection MATERIALISED FIRST. Every check
+        // scoped to an argument sees only the argument EXPRESSION, so building the
+        // record set from selection anywhere upstream — into a local, or straight
+        // over `report.judged`, which keeps `args[0]` byte-identical — leaves all four
+        // positional pins green while the checked window is fed selection anyway
+        // (mutation-verified). It costs nothing to keep: `last_focus.selected` appears
+        // in `run_writer` only inside a comment, which `run_writer_code_only` strips,
+        // so there is no false-positive surface here.
+        //
+        // Matched against a whitespace-STRIPPED body, and that is load-bearing rather
+        // than tidiness. The guard this restores named the contiguous spelling
+        // `last_focus.selected.iter().copied()`; `cargo fmt` breaks a chain that long
+        // across five lines, so the `report.judged` overwrite this was mutation-tested
+        // against stayed GREEN under the restored guard until it was normalised — a
+        // rustfmt reflow, not even an edit, disarmed it. Named on the RECEIVER too:
+        // the chained spelling is one of several ways to write the same
+        // materialisation, and `last_focus.selected` is the part that must not be
+        // read at all.
+        let whitespace_free: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            !whitespace_free.contains("last_focus.selected"),
+            "run_writer reads focus SELECTION out of `last_focus`. Wherever the read \
+             happens, that is the one thing the checked window must not be built \
+             from: a selected contract can be skipped before probing (no code, no \
+             samples) or probed and never reach a verdict, and it would render on the \
+             per-contract page as 'checked, no violation found'"
+        );
+        // The per-call-site loop catches what the whole-body guard cannot NAME. That
+        // guard can only speak about the `last_focus` binding: in the barren branch
+        // the in-scope binding is `focus`, so a future edit feeding selection into the
+        // barren publish would write `focus.selected…` and go unseen — and no
+        // whole-body guard can name `focus.selected`, because the scope assignment
+        // legitimately uses it two lines above that branch. Scoping to the argument is
+        // what makes that sayable at all.
+        for nth in 0..PUBLISH_CALL_SITES {
+            let first = &publish_call_args(nth)[0];
+            assert!(
+                !first.contains("selected"),
+                "status::publish call {nth} is fed focus SELECTION (`{first}`). A \
+                 selected contract can be skipped before probing (no code, no \
+                 samples) or probed and never reach a verdict, and it would render on \
+                 the per-contract page as 'checked, no violation found'"
+            );
+        }
+    }
+
+    /// The tick's two headline counts must be the report's own, positionally.
+    ///
+    /// `judged_last_tick` and `without_verdict_last_tick` are complements over the
+    /// focus set. `report.probed` is NOT the first of them (a contract can be probed
+    /// and reach no verdict), and `skipped_no_code + skipped_no_samples` is not the
+    /// second (neither skip counter sees a probed-but-inconclusive contract). Both
+    /// wrong values type-check and both render as plausible numbers.
+    #[test]
+    fn dashboard_tick_counts_are_the_report_fields_positionally() {
+        let args = publish_call_args(PROBE_PUBLISH);
+        assert_eq!(
+            args[1], "report.judged.len()",
+            "the judged-this-tick count is no longer `report.judged.len()`; \
+             `report.probed` counts contracts that ran cases without forming an \
+             opinion and would overstate what was established"
+        );
+        assert_eq!(
+            args[2], "report.without_verdict",
+            "the unjudged count is no longer `report.without_verdict`, so a probed \
+             contract whose every case was inconclusive stops counting toward the \
+             fleet-wide unjudged total and renders as a clean result"
+        );
+    }
+
+    /// The block `run_writer` runs when a tick selects nothing to probe.
+    ///
+    /// Sliced to the branch rather than searched for across `run_writer`: the whole
+    /// question this pin asks is WHICH branch publishes, and a whole-body `contains`
+    /// is answered by the completed-probe call site eighty lines further down.
+    fn work_is_empty_block() -> String {
+        let body = run_writer_code_only();
+        let anchor = "if work.is_empty() {";
+        let start = body
+            .find(anchor)
+            .expect("run_writer no longer branches on an empty work set")
+            + anchor.len()
+            - 1;
+        let mut depth = 0usize;
+        for (offset, ch) in body[start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return body[start..start + offset + 1].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("the empty-work branch is not brace-balanced");
+    }
+
+    /// #5403 M3: a tick that selects nothing must still publish.
+    ///
+    /// This branch is the ordinary warm-up state — focus has picked contracts and the
+    /// sampler holds nothing for them yet — and it used to return without publishing,
+    /// leaving the previous snapshot standing with its age frozen. Three barren ticks
+    /// is 45 minutes, past `status::STALE_AFTER`, so a peer that had one healthy tick
+    /// and then went barren kept rendering that tick as a current "no violation
+    /// found", never aged past the staleness threshold and never carrying the stale
+    /// note. The unjudged contracts of a barren tick also never reached
+    /// `without_verdict_last_tick`, so nothing said they had not been judged either.
+    ///
+    /// Pinned rather than tested end to end because `run_writer` is a select loop no
+    /// test can call — which is also exactly why a call site inside it can go missing
+    /// unnoticed.
+    #[test]
+    fn a_tick_that_selects_nothing_still_publishes() {
+        let block = work_is_empty_block();
+        assert!(
+            block.contains("status::publish("),
+            "the empty-work branch returns without publishing, so a peer whose ticks \
+             have gone barren keeps serving its last healthy tick as a current \
+             result, with the snapshot's age frozen so it never reads as stale. \
+             got:\n{block}"
+        );
+
+        let args = publish_call_args(BARREN_PUBLISH);
+        assert_eq!(
+            args[0], "Vec::new()",
+            "a tick that probed nothing must publish an EMPTY record set. Anything \
+             else — focus selection most plausibly, since `focus` is in scope right \
+             here — puts contracts the tick formed no opinion about into the checked \
+             window, where the per-contract page renders them as 'checked, no \
+             violation found'. Un-asserted, this argument was the one position of the \
+             four that a wrong value could occupy silently"
+        );
+        assert_eq!(
+            args[1], "0",
+            "a tick that probed nothing must publish zero contracts judged; anything \
+             else reports established results from a tick that established none"
+        );
+        assert_eq!(
+            args[2], "awaiting_samples",
+            "the barren tick's unjudged count must be `awaiting_samples`, which is \
+             `focus.selected.len()` when the work set is empty — every contract this \
+             tick formed no opinion about. A zero here renders a barren tick as one \
+             with nothing left unjudged"
+        );
+        assert!(
+            args[3].contains("Instant::now()"),
+            "the barren tick's snapshot carries no publish time, so it cannot age and \
+             the frozen-checker note never fires. got: {}",
+            args[3]
+        );
+    }
+
+    /// The snapshot must carry a publish time.
+    ///
+    /// `publish` is reached from two places — the barren tick and the completed probe
+    /// — and a peer can stop reaching either indefinitely while the previous snapshot
+    /// stands: the probe task can panic, a probe can hang so `in_flight` never clears
+    /// and no further tick starts, or the writer task can be gone. Without an age, a
+    /// peer whose probe has been dead for a week keeps serving that week-old tick as a
+    /// current "no violation found".
+    #[test]
+    fn the_published_snapshot_carries_its_publish_time() {
+        let args = publish_call_args(PROBE_PUBLISH);
+        assert!(
+            args[3].contains("Instant::now()"),
+            "the published snapshot no longer carries a publish time, so a frozen \
+             checker renders identically to a live clean one. got: {}",
+            args[3]
         );
     }
 }
