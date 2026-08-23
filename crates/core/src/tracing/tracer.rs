@@ -49,7 +49,35 @@ use tracing_subscriber::{Layer, Registry};
 /// on the background prune loop spawned by `init_tracer` (issue #4699),
 /// so a long-uptime node under sustained runaway logging is bounded
 /// without needing a restart.
+///
+/// **This default is overridable at runtime via `FREENET_LOG_DIR_MAX_BYTES`**
+/// (issue #5021), because one compiled-in value has to serve both the
+/// gateway shape this default is sized for and a quiet background peer
+/// that may want to hand back disk, or widen the budget while chasing an
+/// intermittent fault, without rebuilding. See [`parse_log_dir_max_bytes`]
+/// for the fallback behaviour on a missing or unusable override, and
+/// [`MIN_LOG_DIR_MAX_BYTES`] for why an override cannot go arbitrarily low.
 const LOG_DIR_MAX_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
+
+/// The smallest `FREENET_LOG_DIR_MAX_BYTES` override [`parse_log_dir_max_bytes`]
+/// will honour; anything below this falls back to [`LOG_DIR_MAX_BYTES`].
+///
+/// Exists for the same reason the compiled-in default cannot go arbitrarily
+/// low (see its doc): the size pass never deletes a file an appender has
+/// open, so a budget the two current-hour files (main + error) can fill on
+/// their own leaves *only* those files, discarding exactly the onset of
+/// whatever incident prompted the investigation (issue #5019, item 3).
+///
+/// Sized well above every observed hourly rate rather than just above it:
+/// the busiest measured gateway ran at ~20.95 MB/hour pre-#5015 and ~10.8
+/// MB/hour after (see `default_budget_holds_a_day_of_a_busy_gateways_logs`
+/// below for the measurement), combined across both families. 64 MiB is
+/// roughly 3x the worse of those two rates, so even a node logging far
+/// above anything measured so far keeps more than an hour of history
+/// before this floor would start discarding the incident onset — while
+/// still letting an operator shrink the 512 MiB default meaningfully for
+/// a quiet peer that never approaches it.
+const MIN_LOG_DIR_MAX_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
 
 /// Absolute age after which a rotated log file is deleted regardless of
 /// how little disk it occupies.
@@ -167,6 +195,61 @@ struct LogFile {
     family: LogFamily,
 }
 
+/// `FREENET_LOG_DIR_MAX_BYTES`'s raw value, or `None` if unset.
+///
+/// Split from [`parse_log_dir_max_bytes`] for the same reason as
+/// [`error_log_directives`]: keeps the parsing logic a pure function of
+/// its input, so it can be unit-tested without mutating process-global
+/// environment state (see the "Cross-test interference" entry in
+/// `.claude/rules/testing.md` — env vars are exactly that kind of state).
+fn log_dir_max_bytes_env() -> Option<String> {
+    std::env::var("FREENET_LOG_DIR_MAX_BYTES").ok()
+}
+
+/// Resolve the log directory's byte budget from `FREENET_LOG_DIR_MAX_BYTES`'s
+/// raw value, falling back to [`LOG_DIR_MAX_BYTES`] whenever the override
+/// isn't a usable one (issue #5021).
+///
+/// Degrade-safe by construction, never panics and never refuses to prune:
+/// - absent or empty → default, silently (nothing was configured)
+/// - unparseable → default, with a warning (something was configured wrong)
+/// - below [`MIN_LOG_DIR_MAX_BYTES`] (including `0`) → default, with a
+///   warning — see that constant's doc for why a tiny budget is as
+///   destructive as refusing to boot: a value of `0` would mean "delete
+///   everything the size pass may delete", and small-but-nonzero values are
+///   barely better.
+///
+/// A misconfigured value must never stop the node from starting or from
+/// pruning at all — a node that refuses to boot over a typo'd env var is
+/// worse than one that ignores it, which is why this warns and falls back
+/// rather than propagating an error.
+fn parse_log_dir_max_bytes(raw: Option<&str>) -> u64 {
+    match raw {
+        None => LOG_DIR_MAX_BYTES,
+        Some("") => LOG_DIR_MAX_BYTES,
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(bytes) if bytes >= MIN_LOG_DIR_MAX_BYTES => bytes,
+            Ok(bytes) => {
+                eprintln!(
+                    "Warning: FREENET_LOG_DIR_MAX_BYTES={bytes} is below the minimum of \
+                     {MIN_LOG_DIR_MAX_BYTES} bytes; using the default of {LOG_DIR_MAX_BYTES} \
+                     bytes instead. A budget this small can be filled entirely by the current \
+                     hour's open log files, which are never pruned, discarding exactly the \
+                     incident history logging exists to keep."
+                );
+                LOG_DIR_MAX_BYTES
+            }
+            Err(_) => {
+                eprintln!(
+                    "Warning: FREENET_LOG_DIR_MAX_BYTES={raw:?} is not a valid byte count; \
+                     using the default of {LOG_DIR_MAX_BYTES} bytes instead."
+                );
+                LOG_DIR_MAX_BYTES
+            }
+        },
+    }
+}
+
 /// Prune the log directory. The single pruning authority for the two
 /// rolling appenders (see the `max_log_files` note in `init_tracer`).
 ///
@@ -177,6 +260,7 @@ fn cleanup_old_logs(log_dir: &std::path::Path) {
 
     let retention = Duration::from_secs(LOG_RETENTION_HOURS * 3600);
     let cutoff = SystemTime::now() - retention;
+    let max_bytes = parse_log_dir_max_bytes(log_dir_max_bytes_env().as_deref());
 
     let Ok(entries) = std::fs::read_dir(log_dir) else {
         return;
@@ -208,7 +292,7 @@ fn cleanup_old_logs(log_dir: &std::path::Path) {
         });
     }
 
-    prune_log_files(files, cutoff, LOG_DIR_MAX_BYTES);
+    prune_log_files(files, cutoff, max_bytes);
 }
 
 /// The indices, in a `files` sorted ascending by `(modified, path)`, of
@@ -1173,8 +1257,9 @@ mod error_filter_tests {
 #[cfg(test)]
 mod cleanup_tests {
     use super::{
-        LOG_DIR_MAX_BYTES, LogFamily, LogFile, cleanup_old_logs, live_file_indices,
-        periodic_log_prune, prune_log_files, rotating_log_family,
+        LOG_DIR_MAX_BYTES, LogFamily, LogFile, MIN_LOG_DIR_MAX_BYTES, cleanup_old_logs,
+        live_file_indices, parse_log_dir_max_bytes, periodic_log_prune, prune_log_files,
+        rotating_log_family,
     };
     use std::fs;
     use std::time::{Duration, SystemTime};
@@ -1409,6 +1494,71 @@ mod cleanup_tests {
              {GATEWAY_BYTES_PER_HOUR} B/h; an overnight incident must still \
              be on disk in the morning"
         );
+    }
+
+    /// No override configured → the compiled-in default, unchanged.
+    #[test]
+    fn log_dir_max_bytes_default_when_env_absent() {
+        assert_eq!(parse_log_dir_max_bytes(None), LOG_DIR_MAX_BYTES);
+    }
+
+    /// An explicitly-empty value is treated the same as absent, not as
+    /// garbage — some deploy tooling sets `VAR=` to mean "unset" rather
+    /// than omitting the variable.
+    #[test]
+    fn log_dir_max_bytes_default_when_env_empty() {
+        assert_eq!(parse_log_dir_max_bytes(Some("")), LOG_DIR_MAX_BYTES);
+    }
+
+    /// A valid override at or above the floor is honoured exactly,
+    /// whether it narrows the default (small background peer) or widens
+    /// it (chasing an intermittent fault on a busy node).
+    #[test]
+    fn log_dir_max_bytes_honours_a_valid_override() {
+        assert_eq!(
+            parse_log_dir_max_bytes(Some(&MIN_LOG_DIR_MAX_BYTES.to_string())),
+            MIN_LOG_DIR_MAX_BYTES,
+            "the floor itself must be accepted, not rejected as \"below\" it"
+        );
+        assert_eq!(
+            parse_log_dir_max_bytes(Some("1073741824")), // 1 GiB, above the default
+            1_073_741_824,
+        );
+    }
+
+    /// Unparseable garbage falls back to the default rather than
+    /// panicking or propagating an error — a typo in the env var must
+    /// not stop the node from booting or from pruning.
+    #[test]
+    fn log_dir_max_bytes_default_when_env_garbage() {
+        for garbage in ["not-a-number", "512MiB", "-1", "1.5", "0x200"] {
+            assert_eq!(
+                parse_log_dir_max_bytes(Some(garbage)),
+                LOG_DIR_MAX_BYTES,
+                "garbage value {garbage:?} must fall back to the default"
+            );
+        }
+    }
+
+    /// `0` is the sharpest form of the footgun `MIN_LOG_DIR_MAX_BYTES`
+    /// guards against — it would mean "delete everything the size pass
+    /// may delete" — and must fall back to the default, not be honoured
+    /// literally.
+    #[test]
+    fn log_dir_max_bytes_default_when_env_zero() {
+        assert_eq!(parse_log_dir_max_bytes(Some("0")), LOG_DIR_MAX_BYTES);
+    }
+
+    /// A small-but-nonzero value below the floor is just as destructive
+    /// as zero (issue #5019 item 3: the current-hour files alone can fill
+    /// it) and must also fall back to the default.
+    #[test]
+    fn log_dir_max_bytes_default_when_env_below_floor() {
+        assert_eq!(
+            parse_log_dir_max_bytes(Some(&(MIN_LOG_DIR_MAX_BYTES - 1).to_string())),
+            LOG_DIR_MAX_BYTES
+        );
+        assert_eq!(parse_log_dir_max_bytes(Some("1")), LOG_DIR_MAX_BYTES);
     }
 
     /// The size cap must engage exactly at the budget boundary.
