@@ -16,8 +16,8 @@ use std::num::NonZeroUsize;
 
 use lru::LruCache;
 
-/// Per-entry structural-overhead allowance (bytes) added to every summary/delta
-/// value's payload length when accounting for the byte budget.
+/// Per-entry structural-overhead allowance (bytes) added to every value's
+/// payload length when accounting for the byte budget.
 ///
 /// Two jobs:
 ///   - It covers the real per-entry overhead the payload length ignores — the key
@@ -40,16 +40,20 @@ pub(crate) const CACHE_ENTRY_OVERHEAD_BYTES: usize = 512;
 /// Wraps [`lru::LruCache`] with running byte accounting so eviction is driven by
 /// EITHER bound, whichever binds first:
 ///
-///   - the LRU's own COUNT cap (`inner.cap()`, grown via [`Self::grow`] to the
-///     live hosted count for coverage), and
+///   - the LRU's own COUNT cap (`inner.cap()`, which the caller sets for
+///     coverage and may raise via [`Self::grow`] — the executor grows it to the
+///     live hosted count; the interest manager leaves it at its fixed target),
+///     and
 ///   - a fixed BYTE budget (`byte_budget`): after every insert, LRU entries are
 ///     popped until `total_bytes <= byte_budget`.
 ///
-/// The values (`StateSummary` / `StateDelta`) are contract-controlled and
-/// variable-size, so the count cap ALONE cannot bound RAM and the byte budget
-/// ALONE would make coverage a contract-size assumption. Both together: small
-/// digests → count binds (coverage); large values → bytes bind (safety). See the
-/// cache-sizing comment in [`crate::contract::executor`].
+/// The values every caller stores (`StateSummary` / `StateDelta`) are
+/// contract-controlled and variable-size, so the count cap ALONE cannot bound
+/// RAM and the byte budget ALONE would make coverage a contract-size
+/// assumption. Both together: small digests → count binds (coverage); large
+/// values → bytes bind (safety). For how each caller derives its two numbers
+/// see the cache-sizing comment in [`crate::contract::executor`] and the
+/// delta-cache byte-backstop comment in [`crate::ring::interest`].
 ///
 /// A single value whose accounted weight alone exceeds the whole budget is NOT
 /// cached: [`Self::put`] returns early without inserting it. The values are
