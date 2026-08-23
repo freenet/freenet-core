@@ -900,19 +900,24 @@ async fn run_writer(
                 // skipped_no_samples` — is the complement of `judged` over the
                 // focus set: it also counts a probed contract whose every case was
                 // inconclusive, which the skip counters never see.
+                //
+                // One record per judged contract, carrying that contract's own case
+                // counts AND its own findings — see `status::checked_contracts`. The
+                // first version of this kept the checked list and the findings list
+                // separate and capped them differently, so a contract inside one and
+                // evicted from the other rendered a green "no violation found" pill
+                // for a contract found violating.
+                //
+                // The publish TIME is carried too. Two live paths above skip this call
+                // indefinitely (a tick that selected no work, and a probe task that
+                // died) while the previous snapshot stands, so without an age on the
+                // snapshot a peer whose probe has been panicking for a week keeps
+                // serving a week-old tick as a current clean result.
                 crate::conformance::status::publish(
-                    report.judged.iter().copied(),
+                    crate::conformance::status::checked_contracts(&report.judged, &findings),
                     report.judged.len(),
                     report.without_verdict,
-                    report.cases,
-                    findings.iter().map(|finding| {
-                        crate::conformance::status::MergeFinding {
-                            contract: finding.contract,
-                            property: finding.violation.property.as_str(),
-                            severity: finding.violation.property.severity(),
-                            would_remove: finding.would_remove,
-                        }
-                    }),
+                    std::time::Instant::now(),
                 );
             }
         }
@@ -2146,6 +2151,17 @@ mod probe_wiring_pins {
             body.contains("report.skipped_no_samples += awaiting_samples"),
             "focus contracts still awaiting samples are no longer reported as skipped"
         );
+        // The third of the trio, and the one that was unpinned: deleting it left every
+        // test and both source pins green while the dashboard under-reported unjudged
+        // contracts by the whole warm-up count. `judged`/`without_verdict` are
+        // complements over the focus set, and a warming-up contract is in neither half
+        // unless this line puts it in one.
+        assert!(
+            body.contains("report.without_verdict += awaiting_samples"),
+            "focus contracts still awaiting samples no longer count toward \
+             `without_verdict`, so the dashboard's unjudged total silently omits them \
+             and they render as contracts nobody had a question about"
+        );
     }
 
     #[test]
@@ -2160,8 +2176,60 @@ mod probe_wiring_pins {
         );
     }
 
-    /// The dashboard's `recently_checked` must be fed the contracts that actually
-    /// reached a verdict, never focus SELECTION.
+    /// The arguments of the ONE `status::publish` call, in order.
+    ///
+    /// Bounded to the call itself rather than to all of `run_writer`, and that bound
+    /// is the whole point of the helper. The previous pins asserted
+    /// `body.contains("report.without_verdict")` over the entire function body, which
+    /// is satisfied by `report.without_verdict += awaiting_samples` sixty lines
+    /// earlier and by the `tracing::info!` field — both independent of the publish
+    /// call, so replacing the third argument with `0` left the pin green. Positional,
+    /// because the sibling pin could not see a SWAP either: passing `report.probed`
+    /// where `report.judged.len()` belongs kept every assertion happy.
+    fn publish_call_args() -> Vec<String> {
+        let body = run_writer_code_only();
+        let anchor = "status::publish(";
+        let start = body
+            .find(anchor)
+            .expect("run_writer no longer calls status::publish at all")
+            + anchor.len();
+        // Split on TOP-LEVEL commas only: an argument may itself be a call with its
+        // own comma-separated arguments.
+        let mut depth = 0usize;
+        let mut args: Vec<String> = Vec::new();
+        let mut current = String::new();
+        for ch in body[start..].chars() {
+            match ch {
+                '(' | '[' => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                ')' if depth == 0 => break,
+                ')' | ']' => {
+                    depth -= 1;
+                    current.push(ch);
+                }
+                ',' if depth == 0 => {
+                    args.push(current.trim().to_string());
+                    current.clear();
+                }
+                _ => current.push(ch),
+            }
+        }
+        if !current.trim().is_empty() {
+            args.push(current.trim().to_string());
+        }
+        assert_eq!(
+            args.len(),
+            4,
+            "status::publish's argument list changed shape, so the positional pins \
+             below are asserting about the wrong arguments: {args:?}"
+        );
+        args
+    }
+
+    /// The dashboard's checked window must be fed the contracts that actually reached
+    /// a verdict, never focus SELECTION — with each contract's own findings attached.
     ///
     /// The #5403 review defect: `status::publish` was fed `last_focus.selected`, so a
     /// contract focus merely picked — including one skipped before probing (no code,
@@ -2170,13 +2238,23 @@ mod probe_wiring_pins {
     /// populated only when at least one case reached `Holds` or `Violated`
     /// (`shadow::probe_one`), so feeding it here is what makes "recently checked"
     /// mean "we formed an opinion" rather than "focus looked this way".
+    ///
+    /// `checked_contracts` is what attaches each contract's findings to ITS record.
+    /// Feeding the judged ids alone would restore the two-window split whose eviction
+    /// mismatch was H1: a contract inside the checked window and outside the findings
+    /// window renders clean while violating.
     #[test]
-    fn dashboard_recently_checked_is_fed_judged_contracts_not_focus_selection() {
-        let body = run_writer_code_only();
+    fn dashboard_checked_window_is_fed_judged_contracts_with_their_findings() {
+        let args = publish_call_args();
         assert!(
-            body.contains("report.judged.iter().copied()"),
-            "status::publish is no longer fed the contracts that reached a verdict"
+            args[0].contains("checked_contracts(&report.judged, &findings)"),
+            "the first argument no longer builds per-contract records from the judged \
+             contracts AND their findings, so either an unjudged contract renders as \
+             checked, or findings live in a window that can evict independently of \
+             the contract they belong to (#5403 H1). got: {}",
+            args[0]
         );
+        let body = run_writer_code_only();
         assert!(
             !body.contains("last_focus.selected.iter().copied()"),
             "status::publish must not be fed focus SELECTION — a selected contract \
@@ -2184,28 +2262,45 @@ mod probe_wiring_pins {
         );
     }
 
-    /// The dashboard's `contracts_without_verdict` must be the complement of
-    /// `judged` over the focus set, not `skipped_no_code + skipped_no_samples`.
+    /// The tick's two headline counts must be the report's own, positionally.
     ///
-    /// The #5403 review defect's sibling: a contract that IS probed but whose every
-    /// case comes back `Inconclusive` is not counted by either skip counter, so
-    /// `skipped_no_code + skipped_no_samples` silently missed it and it rendered as
-    /// a clean result. `report.without_verdict` is incremented directly at every
-    /// terminal branch in `shadow::probe_one`/`probe_with_budget` that does NOT
-    /// reach a verdict, including the inconclusive-only case.
+    /// `judged_last_tick` and `without_verdict_last_tick` are complements over the
+    /// focus set. `report.probed` is NOT the first of them (a contract can be probed
+    /// and reach no verdict), and `skipped_no_code + skipped_no_samples` is not the
+    /// second (neither skip counter sees a probed-but-inconclusive contract). Both
+    /// wrong values type-check and both render as plausible numbers.
     #[test]
-    fn dashboard_without_verdict_is_report_field_not_skip_counter_sum() {
-        let body = run_writer_code_only();
-        assert!(
-            body.contains("report.without_verdict"),
-            "status::publish is no longer fed report.without_verdict, so a probed \
-             contract whose every case was inconclusive no longer counts toward the \
-             fleet-wide unjudged total"
+    fn dashboard_tick_counts_are_the_report_fields_positionally() {
+        let args = publish_call_args();
+        assert_eq!(
+            args[1], "report.judged.len()",
+            "the judged-this-tick count is no longer `report.judged.len()`; \
+             `report.probed` counts contracts that ran cases without forming an \
+             opinion and would overstate what was established"
         );
+        assert_eq!(
+            args[2], "report.without_verdict",
+            "the unjudged count is no longer `report.without_verdict`, so a probed \
+             contract whose every case was inconclusive stops counting toward the \
+             fleet-wide unjudged total and renders as a clean result"
+        );
+    }
+
+    /// The snapshot must carry a publish time.
+    ///
+    /// `publish` is reached from one place, and two live paths above skip it
+    /// indefinitely while the previous snapshot stands: a tick that selected no work,
+    /// and a probe task that panicked. Without an age, a peer whose probe has been
+    /// dead for a week keeps serving that week-old tick as a current "no violation
+    /// found".
+    #[test]
+    fn the_published_snapshot_carries_its_publish_time() {
+        let args = publish_call_args();
         assert!(
-            !body.contains("report.skipped_no_code + report.skipped_no_samples"),
-            "status::publish reverted to deriving the unjudged count from the skip \
-             counters, which cannot see a probed-but-inconclusive contract"
+            args[3].contains("Instant::now()"),
+            "the published snapshot no longer carries a publish time, so a frozen \
+             checker renders identically to a live clean one. got: {}",
+            args[3]
         );
     }
 }

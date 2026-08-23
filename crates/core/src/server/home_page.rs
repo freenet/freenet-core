@@ -211,7 +211,9 @@ mod tests {
     use super::favicon::{build_dashboard_title, build_favicon_data_uri};
     use super::peer_detail::peer_detail_html;
     use crate::conformance::property::Severity;
-    use crate::conformance::status::{MergeCheckStatus, MergeFinding};
+    use crate::conformance::status::{
+        CheckedContract, MergeCheckStatus, MergeCheckView, MergeFinding,
+    };
     use crate::node::network_status::{
         FailureSnapshot, HealthLevel, NatStatsSnapshot, NetworkStatusSnapshot, OpStatsSnapshot,
         RingStatsSnapshot,
@@ -3795,6 +3797,34 @@ mod tests {
         html[start..end].to_string()
     }
 
+    /// One checked-contract record, the shape `conformance::status` stores.
+    fn checked_record(
+        contract: freenet_stdlib::prelude::ContractInstanceId,
+        verdicts: usize,
+        inconclusive: usize,
+        findings: Vec<MergeFinding>,
+    ) -> CheckedContract {
+        CheckedContract {
+            contract,
+            verdicts,
+            inconclusive,
+            findings,
+        }
+    }
+
+    /// What the page reads: one contract's record plus the node-wide numbers.
+    ///
+    /// Goes through `MergeCheckStatus::view_for`, the same call the wrapper
+    /// makes, rather than building a `MergeCheckView` by hand — a hand-built
+    /// view would let a test assert about a record the real lookup would never
+    /// have returned.
+    fn merge_view(
+        status: &MergeCheckStatus,
+        contract: &freenet_stdlib::prelude::ContractInstanceId,
+    ) -> MergeCheckView {
+        status.view_for(Some(contract), std::time::Instant::now())
+    }
+
     /// Text with the markup stripped, so "no digit in the visible content"
     /// assertions aren't defeated by the `2` in every `<h2>` tag.
     fn visible_text(html: &str) -> String {
@@ -3868,14 +3898,21 @@ mod tests {
     fn merge_card_reports_not_recently_checked_as_unknown_not_clean() {
         use freenet_stdlib::prelude::ContractInstanceId;
 
-        let key = ContractInstanceId::new([2u8; 32]).to_string();
+        let key_id = ContractInstanceId::new([2u8; 32]);
+        let key = key_id.to_string();
         // A DIFFERENT contract was checked; this one was not.
         let other = ContractInstanceId::new([9u8; 32]);
         let mut status = MergeCheckStatus::default();
-        status.record([other], 1, 0, 5, []);
+        status.record(
+            [checked_record(other, 5, 0, vec![])],
+            1,
+            0,
+            std::time::Instant::now(),
+        );
 
         let snap = hosted_snap(&key);
-        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&status));
+        let view = merge_view(&status, &key_id);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
         let panel = merge_panel(&html);
         assert!(
             panel.contains("has not been checked recently"),
@@ -3930,10 +3967,16 @@ mod tests {
         let key_id = ContractInstanceId::new([4u8; 32]);
         let key = key_id.to_string();
         let mut status = MergeCheckStatus::default();
-        status.record([key_id], 7, 0, 250, []);
+        status.record(
+            [checked_record(key_id, 250, 4, vec![])],
+            1,
+            0,
+            std::time::Instant::now(),
+        );
 
         let snap = hosted_snap(&key);
-        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&status));
+        let view = merge_view(&status, &key_id);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
         let panel = merge_panel(&html);
         assert!(
             panel
@@ -3942,9 +3985,15 @@ mod tests {
             "a clean, checked contract must say so plainly — got:\n{panel}"
         );
         assert!(
-            panel.contains("250"),
-            "must show the case count so a clean result can be judged for \
-             how meaningful it is — got:\n{panel}"
+            panel.contains("250 reached a verdict"),
+            "must show how many of THIS contract's cases reached a verdict, so a \
+             clean result can be judged for how meaningful it is — got:\n{panel}"
+        );
+        assert!(
+            panel.contains("4 inconclusive"),
+            "must show this contract's inconclusive count too: a contract with one \
+             verdict and 199 inconclusive cases must not render like one with 200 \
+             verdicts — got:\n{panel}"
         );
         assert!(
             !panel
@@ -3971,28 +4020,33 @@ mod tests {
         let key = key_id.to_string();
         let mut status = MergeCheckStatus::default();
         status.record(
-            [key_id],
+            [checked_record(
+                key_id,
+                40,
+                0,
+                vec![
+                    MergeFinding {
+                        contract: key_id,
+                        property: "state_commutativity",
+                        severity: Severity::Violation,
+                        would_remove: true,
+                    },
+                    MergeFinding {
+                        contract: key_id,
+                        property: "self_delta_size",
+                        severity: Severity::Diagnostic,
+                        would_remove: false,
+                    },
+                ],
+            )],
             1,
             0,
-            40,
-            [
-                MergeFinding {
-                    contract: key_id,
-                    property: "state_commutativity",
-                    severity: Severity::Violation,
-                    would_remove: true,
-                },
-                MergeFinding {
-                    contract: key_id,
-                    property: "self_delta_size",
-                    severity: Severity::Diagnostic,
-                    would_remove: false,
-                },
-            ],
+            std::time::Instant::now(),
         );
 
         let snap = hosted_snap(&key);
-        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&status));
+        let view = merge_view(&status, &key_id);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
         let panel = merge_panel(&html);
         assert!(
             panel.contains("state_commutativity") && panel.contains("self_delta_size"),
@@ -4020,10 +4074,16 @@ mod tests {
         let key_id = ContractInstanceId::new([6u8; 32]);
         let key = key_id.to_string();
         let mut status = MergeCheckStatus::default();
-        status.record([key_id], 10, 3, 400, []);
+        status.record(
+            [checked_record(key_id, 400, 0, vec![])],
+            10,
+            3,
+            std::time::Instant::now(),
+        );
 
         let snap = hosted_snap(&key);
-        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&status));
+        let view = merge_view(&status, &key_id);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
         let panel = merge_panel(&html);
         assert!(
             panel.contains('3'),
@@ -4036,6 +4096,130 @@ mod tests {
                 .contains("could not reach a verdict"),
             "must be phrased as an inability to judge, not folded silently \
              into the clean result above it — got:\n{panel}"
+        );
+        assert!(
+            panel.contains("most recent tick"),
+            "the unjudged count is a per-TICK number and must be phrased as one. \
+             The earlier wording ('on this node') read as a standing property of \
+             the peer — got:\n{panel}"
+        );
+    }
+
+    /// #5403 H1: a contract with a finding must never render the green pill,
+    /// however many other contracts have been checked since.
+    ///
+    /// The two-window version kept a 256-entry checked list and a 64-entry
+    /// findings list. `merge_law_card` picked its branch from the first and
+    /// read the second, so a contract inside one and evicted from the other
+    /// rendered "no merge-law violation was found for this contract" — for a
+    /// contract the checker had positively found violating. Worse, that was
+    /// the steady state: a re-detected finding was deduplicated rather than
+    /// moved to the front, so the contract caught on every tick was the one
+    /// likeliest to lose its finding while its checked entry was refreshed.
+    ///
+    /// A hundred intervening contracts is well past the old findings cap and
+    /// well short of the checked cap, which is exactly the gap the bug lived
+    /// in. This test fails against the two-list code.
+    #[test]
+    fn merge_card_keeps_a_finding_after_the_old_findings_cap_would_have_evicted_it() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([7u8; 32]);
+        let key = key_id.to_string();
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            [checked_record(
+                key_id,
+                12,
+                0,
+                vec![MergeFinding {
+                    contract: key_id,
+                    property: "state_commutativity",
+                    severity: Severity::Violation,
+                    would_remove: true,
+                }],
+            )],
+            1,
+            0,
+            std::time::Instant::now(),
+        );
+        for i in 0..100u8 {
+            let other = ContractInstanceId::new([100u8.wrapping_add(i); 32]);
+            status.record(
+                [checked_record(
+                    other,
+                    3,
+                    0,
+                    vec![MergeFinding {
+                        contract: other,
+                        property: "state_idempotence",
+                        severity: Severity::Violation,
+                        would_remove: true,
+                    }],
+                )],
+                1,
+                0,
+                std::time::Instant::now(),
+            );
+        }
+
+        let snap = hosted_snap(&key);
+        let view = merge_view(&status, &key_id);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+        assert!(
+            !panel
+                .to_ascii_lowercase()
+                .contains("no merge-law violation"),
+            "a contract the checker FOUND violating rendered a clean result \
+             because later contracts pushed its finding out of a separately \
+             capped list — got:\n{panel}"
+        );
+        assert!(
+            panel.contains("state_commutativity"),
+            "the finding must still be listed while the contract is still in \
+             the checked window — got:\n{panel}"
+        );
+    }
+
+    /// A checker that has stopped publishing must say so, not present its last
+    /// tick as a current result.
+    ///
+    /// `status::publish` is reached from one place, and two live paths skip it
+    /// indefinitely while the old snapshot stands: a tick that selects no work,
+    /// and a probe task that panicked. A peer whose probe has been dead for a
+    /// week would otherwise keep serving that week-old "no violation found"
+    /// with nothing on the page to say when it was established.
+    #[test]
+    fn merge_card_reports_a_frozen_checker_rather_than_a_current_clean_result() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([8u8; 32]);
+        let key = key_id.to_string();
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            [checked_record(key_id, 30, 0, vec![])],
+            1,
+            0,
+            std::time::Instant::now(),
+        );
+
+        let snap = hosted_snap(&key);
+        // A week later. `view_for` takes `now` so the staleness branch does not
+        // need a week of wall clock to reach.
+        let a_week = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+        let view = status.view_for(Some(&key_id), std::time::Instant::now() + a_week);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+        assert!(
+            panel.contains("has not published"),
+            "a week-old snapshot rendered as a current result, with nothing on \
+             the card saying when the checker last ran — got:\n{panel}"
+        );
+        assert!(
+            panel.contains("Last checker tick"),
+            "every state with a snapshot must show how old that snapshot is — \
+             got:\n{panel}"
         );
     }
 

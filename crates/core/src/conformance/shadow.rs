@@ -139,7 +139,7 @@ pub struct ShadowReport {
     /// be built from this list, not from focus selection or from `probed`: selection
     /// only says a contract was a *candidate* to look at, and `probed` only says the
     /// code and samples were usable, neither says an opinion was formed.
-    pub judged: Vec<ContractInstanceId>,
+    pub judged: Vec<JudgedContract>,
     /// Focus contracts we formed NO opinion about: skipped before probing (no code, no
     /// samples), a probe whose blocking task died or whose time budget was exhausted
     /// before any case ran, or a probe that ran cases but every one came back
@@ -147,6 +147,34 @@ pub struct ShadowReport {
     /// lands in exactly one of the two, which is what makes them checkable against
     /// each other.
     pub without_verdict: usize,
+}
+
+/// One contract that reached a verdict, and how much looking that took.
+///
+/// The counts travel WITH the contract rather than being summed into the tick's
+/// fleet-wide `cases`/`inconclusive` totals alone. The dashboard needs to say how
+/// much was established about THIS contract: a contract with one verdict and 199
+/// inconclusive cases rendered byte-identically to one with 200 verdicts while the
+/// page could only reach the fleet-wide number, which is the same conflation of
+/// "barely looked at" with "clean" that `conformance::status` exists to stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JudgedContract {
+    pub contract: ContractInstanceId,
+    /// Cases that came back `Holds` or `Violated` for this contract this tick.
+    pub verdicts: usize,
+    /// Cases that came back `Inconclusive` for this contract this tick.
+    pub inconclusive: usize,
+}
+
+impl ShadowReport {
+    /// Whether this tick reached a verdict on `contract`.
+    ///
+    /// A helper rather than `judged.contains(..)`, which stopped compiling when the
+    /// list gained its per-contract counts — and which callers would otherwise
+    /// re-implement one `iter().any()` at a time.
+    pub fn judged_contains(&self, contract: &ContractInstanceId) -> bool {
+        self.judged.iter().any(|j| j.contract == *contract)
+    }
 }
 
 /// The shadow loop's state, owned by the capture writer task.
@@ -581,7 +609,15 @@ async fn probe_one(
     // "checked, no violation found" is exactly the conflation this subsystem exists to
     // prevent. See `ShadowReport::judged` / `without_verdict`.
     if outcome.reached_verdict {
-        report.judged.push(instance_copy);
+        // The counts go with the contract, not only into the tick's totals: the
+        // dashboard's clean branch has to say how much looking THIS contract got, and
+        // a fleet-wide case count cannot answer that for a contract last probed forty
+        // ticks ago. `verdicts` is what the case loop did NOT call inconclusive.
+        report.judged.push(JudgedContract {
+            contract: instance_copy,
+            verdicts: outcome.cases.saturating_sub(outcome.inconclusive),
+            inconclusive: outcome.inconclusive,
+        });
     } else {
         report.without_verdict += 1;
     }
@@ -1396,14 +1432,34 @@ mod tests {
              the fixture no longer exercises this failure mode: {report:?}"
         );
         assert!(
-            !report.judged.contains(&unjudged_id),
+            !report.judged_contains(&unjudged_id),
             "a contract whose every case was inconclusive was recorded as judged: \
              {report:?}"
         );
         assert!(
-            report.judged.contains(&judged_id),
+            report.judged_contains(&judged_id),
             "a contract that genuinely reached a verdict on every case was NOT \
              recorded as judged: {report:?}"
+        );
+        // The per-contract counts the dashboard's clean branch renders. The judged
+        // sibling's cases all reached a verdict; if that ever stops being true the
+        // page would claim more was established about it than was.
+        let judged_record = report
+            .judged
+            .iter()
+            .find(|j| j.contract == judged_id)
+            .expect("the conforming sibling is judged");
+        assert!(
+            judged_record.verdicts > 0,
+            "a judged contract carries no verdict count, so its page can only report \
+             the node-wide number and cannot say how much looking IT got: {report:?}"
+        );
+        assert_eq!(
+            judged_record.verdicts,
+            report.cases - report.inconclusive,
+            "the only contract to reach a verdict this tick must own every one of the \
+             tick's verdicts; its per-contract count disagrees with the totals, so \
+             the page and the log would report different things: {report:?}"
         );
         assert_eq!(
             report.judged.len(),

@@ -32,17 +32,29 @@ use std::str::FromStr;
 /// scope cut; this page says plainly that the counts are missing rather than
 /// implying the ranking is visible.
 pub fn contract_detail_html(key_str: &str) -> String {
+    // `ContractKey`'s `Display` and `ContractInstanceId`'s `Display` produce
+    // the same string (see the comment on the `governance` lookup below), so
+    // `key_str` — whichever form the operator pasted — is always a valid
+    // instance id to query the merge-check status by, when it parses at all.
+    // A key from a URL path can be anything, so a parse failure here means
+    // "not a real instance id" and must render as "not checked", never panic.
+    let merge_id = ContractInstanceId::from_str(key_str).ok();
     // Two separate reads, deliberately not collapsed into one: `is_enabled()`
-    // and `snapshot()` answer different questions, and can disagree during
+    // and `view_for()` answer different questions, and can disagree during
     // the checker's very first interval — enabled, but nothing published
     // yet. That state must render as "not checked recently", not as "off",
     // so both flow into the pure renderer below rather than being merged
     // here into a single bool.
+    //
+    // A VIEW, not the whole snapshot: the checked window holds up to 256
+    // records with their findings, and this page needs one of them. Cloning
+    // the set on every render made the page's cost grow with the peer's
+    // history for no reader benefit.
     contract_detail_html_from(
         &network_status::get_snapshot(),
         key_str,
         status::is_enabled(),
-        status::snapshot().as_ref(),
+        status::view_for(merge_id.as_ref()).as_ref(),
     )
 }
 
@@ -54,14 +66,14 @@ pub fn contract_detail_html(key_str: &str) -> String {
 /// made the interesting cases — a hosted-only contract, one the governance
 /// manager has flagged, one the merge-law checker has or hasn't looked at —
 /// reachable only by standing up a node and waiting for it to reach that
-/// state. `merge_enabled` and `merge_status` are the wrapper's two reads of
+/// state. `merge_enabled` and `merge_view` are the wrapper's two reads of
 /// `conformance::status` (see the doc comment at the call site above for why
 /// they stay separate parameters).
 pub fn contract_detail_html_from(
     snap: &Option<network_status::NetworkStatusSnapshot>,
     key_str: &str,
     merge_enabled: bool,
-    merge_status: Option<&status::MergeCheckStatus>,
+    merge_view: Option<&status::MergeCheckView>,
 ) -> String {
     // Match on the full key OR the instance id, so a link from any card works
     // and so an operator can paste either form.
@@ -243,14 +255,7 @@ pub fn contract_detail_html_from(
             .to_string(),
     };
 
-    // `ContractKey`'s `Display` and `ContractInstanceId`'s `Display` produce
-    // the same string (see the comment on the `governance` lookup above), so
-    // `key_str` — whichever form the operator pasted — is always a valid
-    // instance id to query the merge-check status by, when it parses at all.
-    // A key from a URL path can be anything, so a parse failure here means
-    // "not a real instance id" and must render as "not checked", never panic.
-    let merge_id = ContractInstanceId::from_str(key_str).ok();
-    let merge_card = merge_law_card(merge_enabled, merge_status, merge_id.as_ref());
+    let merge_card = merge_law_card(merge_enabled, merge_view);
 
     format!(
         include_str!("assets/contract.html"),
@@ -286,30 +291,20 @@ pub fn contract_detail_html_from(
 /// 4. Checked, with one or more findings, each carrying the property that
 ///    broke, its severity, and whether enforcement would remove it.
 ///
-/// `contracts_without_verdict` — contracts the checker looked at but could
-/// reach no verdict on for any case — is surfaced whenever non-zero,
-/// independent of which of states 2-4 this particular contract is in: it is
-/// fleet-wide information the operator needs regardless of this contract's
-/// own status.
-fn merge_law_card(
-    merge_enabled: bool,
-    merge_status: Option<&status::MergeCheckStatus>,
-    merge_id: Option<&ContractInstanceId>,
-) -> String {
-    // Fleet-wide "some contracts could not be judged at all" note. Shown
-    // whenever the checker has published a tick and the count is non-zero,
-    // regardless of this contract's own state — see the doc comment above.
-    let unjudged_note = |s: &status::MergeCheckStatus| -> String {
-        if s.contracts_without_verdict == 0 {
-            String::new()
-        } else {
-            format!(
-                r#"<p class="empty" style="margin-top:0.5rem">The checker could not reach a verdict on {n} contract(s) on this node — every case it tried was inconclusive, or related state exceeded its budget. Those contracts are neither clean nor flagged; they simply were not judged.</p>"#,
-                n = s.contracts_without_verdict,
-            )
-        }
-    };
-
+/// `without_verdict_last_tick` — contracts the checker looked at in its most
+/// recent tick but could reach no verdict on for any case — is surfaced
+/// whenever non-zero, independent of which of states 2-4 this particular
+/// contract is in: it is node-wide information the operator needs regardless
+/// of this contract's own status. It is phrased as a statement about that
+/// tick, because that is what it measures; the earlier "on this node"
+/// phrasing read as a standing property.
+///
+/// Every state that has a snapshot at all also renders WHEN the snapshot was
+/// published. Two live paths in `capture::run_writer` skip `status::publish`
+/// indefinitely while the old snapshot stands — a tick that selects no work,
+/// and a probe task that panicked — so without an age a peer whose probe has
+/// been dead for a week keeps serving that week-old tick as a current result.
+fn merge_law_card(merge_enabled: bool, merge_view: Option<&status::MergeCheckView>) -> String {
     if !merge_enabled {
         return r#"<div class="card">
                 <h2>Merge laws</h2>
@@ -318,13 +313,35 @@ fn merge_law_card(
             .to_string();
     }
 
-    let was_checked = match (merge_status, merge_id) {
-        (Some(s), Some(id)) => s.was_checked(id),
-        _ => false,
+    // Everything below needs a published snapshot. Without one the checker is
+    // on but has not finished its first interval, which must read as "not
+    // looked at yet" rather than as "off" or as "clean".
+    let Some(view) = merge_view else {
+        return r#"<div class="card">
+                <h2>Merge laws</h2>
+                <p class="empty">This contract has not been checked recently. The checked window is bounded, so this is <strong>not</strong> a statement that the contract is fine — the checker has simply not looked at it lately.</p>
+            </div>"#
+            .to_string();
     };
 
-    if !was_checked {
-        let note = merge_status.map(unjudged_note).unwrap_or_default();
+    // Node-wide "some contracts could not be judged at all" note, plus how old
+    // the tick it describes is.
+    let mut note = String::new();
+    if view.without_verdict_last_tick > 0 {
+        note.push_str(&format!(
+            r#"<p class="empty" style="margin-top:0.5rem">In its most recent tick the checker judged {judged} contract(s) and could not reach a verdict on {n} — every case it tried was inconclusive, or related state exceeded its budget. Those contracts are neither clean nor flagged; they simply were not judged.</p>"#,
+            judged = view.judged_last_tick,
+            n = view.without_verdict_last_tick,
+        ));
+    }
+    if view.stale {
+        note.push_str(&format!(
+            r#"<p class="empty" style="margin-top:0.5rem"><strong>The checker has not published for {ago}.</strong> It runs every 15 minutes when healthy, so everything on this card may be stale — a probe that dies, or a tick that finds nothing to select, leaves the previous result standing with nothing else to say so.</p>"#,
+            ago = format_duration(view.published_secs_ago),
+        ));
+    }
+
+    let Some(record) = view.contract.as_ref() else {
         return format!(
             r#"<div class="card">
                 <h2>Merge laws</h2>
@@ -333,32 +350,38 @@ fn merge_law_card(
             </div>"#,
             note = note,
         );
-    }
+    };
 
-    // `was_checked` only returns `true` when both are `Some` (see the match
-    // above), so these cannot fail.
-    let merge_status = merge_status.expect("was_checked implies a published status");
-    let merge_id = merge_id.expect("was_checked implies a parsed contract id");
-    let findings: Vec<&status::MergeFinding> = merge_status.findings_for(merge_id).collect();
-    let note = unjudged_note(merge_status);
+    // THIS contract's own case counts, not the node's most recent tick. The
+    // fleet-wide number cannot answer "how much looking did this contract
+    // get?": a contract with one verdict and 199 inconclusive cases rendered
+    // byte-identically to one with 200 verdicts, and a contract last probed
+    // forty ticks ago was shown a count from a tick that never touched it.
+    let cases_row = format!(
+        r#"<div class="info-label" title="Cases run against THIS contract while it has been in the checked window. A verdict is a case that came back Holds or Violated; an inconclusive case established nothing, so a clean result resting mostly on those is barely a result.">Cases for this contract</div><div class="info-value">{verdicts} reached a verdict, {inconclusive} inconclusive</div>
+                    <div class="info-label" title="How long ago the merge-law checker last published a tick. It probes every 15 minutes when healthy.">Last checker tick</div><div class="info-value">{ago} ago</div>"#,
+        verdicts = record.verdicts,
+        inconclusive = record.inconclusive,
+        ago = format_duration(view.published_secs_ago),
+    );
 
-    if findings.is_empty() {
+    if record.findings.is_empty() {
         format!(
             r#"<div class="card">
                 <h2>Merge laws</h2>
                 <div class="info-grid">
                     <div class="info-label">Result</div><div class="info-value"><span class="fresh-pill fresh-ok">no violation found</span></div>
-                    <div class="info-label" title="How many cases the checker ran, fleet-wide, in its most recent tick — so a clean result here can be judged against how much looking actually happened.">Cases last tick</div><div class="info-value">{cases}</div>
+                    {cases_row}
                 </div>
                 <p class="empty" style="margin-top:0.75rem">No merge-law violation was found for this contract the last time it was checked.</p>
                 {note}
             </div>"#,
-            cases = merge_status.cases_last_tick,
+            cases_row = cases_row,
             note = note,
         )
     } else {
         let mut rows = String::new();
-        for f in &findings {
+        for f in &record.findings {
             let (pill_class, label) = match f.severity {
                 Severity::Violation => ("fresh-stale", "Violation — cannot converge"),
                 Severity::Diagnostic => ("use-idle", "Diagnostic — legal but wasteful"),
@@ -373,10 +396,14 @@ fn merge_law_card(
             r#"<div class="card">
                 <h2>Merge laws</h2>
                 <div class="table-wrap"><table><thead><tr><th>Property</th><th>Severity</th><th class="right">Would remove</th></tr></thead><tbody>{rows}</tbody></table></div>
+                <div class="info-grid" style="margin-top:0.75rem">
+                    {cases_row}
+                </div>
                 <p class="empty" style="margin-top:0.75rem"><strong>Violation</strong> means the contract cannot converge: peers holding it disagree and retry indefinitely. <strong>Diagnostic</strong> is legal but wasteful — it never justifies removal on its own.</p>
                 {note}
             </div>"#,
             rows = rows,
+            cases_row = cases_row,
             note = note,
         )
     }
