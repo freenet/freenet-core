@@ -520,7 +520,7 @@ When you write a branch that drops an input:
 2. **Carry the count into the artefact, not just the log.** Logs rotate; a corpus is
    replayed months later on another machine. If the only record of "this is
    incomplete" is a log line, the replay reads as a clean bill of health.
-3. **Make it reach the documented consumer.** `fdev conformance --bundle` dropped
+3. **Make it reach the documented consumer.** `fdev verify-merge --bundle` dropped
    `bundle.note` entirely, so the durable record existed and was invisible to the one
    workflow meant to read it. Check the whole path, not just the write.
 4. **Test it by deleting the counter and asserting the test fails.** A refusal

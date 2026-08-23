@@ -42,7 +42,7 @@ pub enum ConformanceProperty {
     /// The RFC is the newer and more specific document, so the check exists. But
     /// whether any deployed first-party contract actually relies on non-idempotent
     /// deltas is an empirical question that cannot be settled by reading code, and
-    /// it must be answered by running `fdev conformance` against deployed WASM
+    /// it must be answered by running `fdev verify-merge` against deployed WASM
     /// before this property is ever allowed to influence anything on the network.
     /// Until then it is a reporting signal for contract authors.
     DeltaIdempotence,
