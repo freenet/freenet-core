@@ -64,6 +64,7 @@ use tokio::time::Instant;
 
 use crate::ring::futile_repair::{FutileRepairDetector, FutileRepairSnapshot, OutcomeEvidence};
 use crate::transport::TransportPublicKey;
+use crate::util::byte_bounded_lru::ByteBoundedLruCache;
 use crate::util::time_source::TimeSource;
 
 /// Interval between interest heartbeat messages sent to each peer.
@@ -95,7 +96,13 @@ pub const INTEREST_DISCONNECT_GRACE_PERIOD: Duration = Duration::from_secs(90);
 use crate::config::GlobalExecutor;
 use crate::config::GlobalRng;
 
-/// Maximum number of entries in the delta memoization cache.
+/// COUNT target for the delta memoization cache.
+///
+/// This is a coverage target, NOT the RAM bound: the cache's values are
+/// contract-produced `StateDelta`s, so 1024 entries is an unbounded number of
+/// BYTES (a delta may reach `MAX_STATE_SIZE`, 50 MiB, making the count-only
+/// worst case ~51 GiB). [`INTEREST_DELTA_CACHE_MAX_BYTES`] and the
+/// [`ByteBoundedLruCache`] backstop are what bound RAM; see #4805.
 ///
 // TODO(fast-follow): size this by hosted×neighbors rather than a flat 1024, so
 // the interest-heartbeat staleness probes (`peer_summary_has_pending_state`)
@@ -105,6 +112,99 @@ use crate::config::GlobalRng;
 // worst-case load, and summaries are memoized outside WASM so byte keys stay
 // stable while state is unchanged.
 const DELTA_CACHE_SIZE: usize = 1024;
+
+// ============================================================================
+// Delta-cache byte backstop (#4805)
+//
+// `DELTA_CACHE_SIZE` bounds the ENTRY COUNT. It does not bound RAM, because
+// every value is a contract-produced `StateDelta` whose size the contract
+// chooses (up to `wasm_runtime::MAX_STATE_SIZE` = 50 MiB). A contract emitting
+// large deltas could therefore pin ~51 GiB in this one cache — the #4565
+// OOM class, and the code-style rule that per-key collections influenced by
+// external actors MUST be size-bounded. #4804 fixed the identical shape in the
+// executor's summary/delta caches; this applies the same primitive
+// (`util::byte_bounded_lru::ByteBoundedLruCache`) here.
+//
+// Both bounds are kept, and whichever binds first evicts:
+//   - COUNT (coverage): the pre-existing 1024-entry target, unchanged.
+//   - BYTES (safety): a hard ceiling on retained bytes, independent of how
+//     large the contract makes its deltas.
+//
+// Under pressure the cache EVICTS (LRU); it never refuses to serve. A miss is
+// always safe: `compute_delta` and `peer_summary_has_pending_state` fall back
+// to a `GetDeltaQuery` contract round-trip on the live state, and if even that
+// fails `summary_indicates_stale_peer` treats the peer as STALE
+// (`delta_indicates_change.unwrap_or(true)`), which heals with full state.
+// So eviction can cost work — never freshness, and never a silently-missed
+// divergence.
+// ============================================================================
+
+/// Fraction of "the memory the node may use" that sizes the delta cache's byte
+/// budget. Half the share the executor's SUMMARY cache takes (`/64`) because,
+/// unlike the executor's caches, there is exactly ONE `InterestManager` per
+/// node rather than one per pool worker, and this cache is pure memoization
+/// with a safe miss path.
+const INTEREST_DELTA_CACHE_RAM_DIVISOR: usize = 128;
+
+/// Floor for the delta-cache byte budget (4 MiB).
+///
+/// Sized so the byte bound never degrades the small-entry case on a small node:
+/// at the [`crate::util::byte_bounded_lru::CACHE_ENTRY_OVERHEAD_BYTES`] (512 B)
+/// per-entry floor, 4 MiB holds
+/// ~8192 entries — 8x the [`DELTA_CACHE_SIZE`] count target. That matters
+/// because the entries this cache most needs to keep are the EMPTY deltas that
+/// record "this peer is converged"; losing those is what re-arms the #4857
+/// summarize storm. Below this the count target would stop binding even for
+/// empty deltas, so 4 MiB is the point at which the byte bound is still purely
+/// a backstop.
+const INTEREST_DELTA_CACHE_MIN_BYTES: usize = 4 * 1024 * 1024;
+
+/// Ceiling for the delta-cache byte budget (16 MiB).
+///
+/// Sized against what the cache is FOR rather than picked round:
+/// `DELTA_CACHE_SIZE` (1024) × 16 KiB. 16 KiB is the per-entry size at which
+/// the COUNT target and the BYTE budget bind at the same moment, so for deltas
+/// up to that size behaviour is exactly what it was before this bound existed
+/// — full 1024-entry coverage — and bytes bind only above it. 16 KiB is a
+/// generous allowance for a DELTA specifically: the measured mean FULL-STATE
+/// broadcast payload on this fleet is ~60-95 KiB (see
+/// [`MISSING_SUMMARY_SIZE_BUCKETS`]), and a delta is the diff against that
+/// state, not the state.
+///
+/// This is deliberately NOT sized to the worst case a contract can produce
+/// (50 MiB × 1024): that number is the vector being closed, not a working-set
+/// requirement.
+const INTEREST_DELTA_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Fallback total-RAM estimate (1 GiB) when the OS query fails, mirroring
+/// the executor's `SUMMARY_CACHE_FALLBACK_TOTAL_RAM_BYTES`.
+const INTEREST_DELTA_CACHE_FALLBACK_TOTAL_RAM_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Byte budget for the interest manager's delta cache, scaled to the memory the
+/// node may use (host RAM, or a smaller cgroup limit when containerized).
+///
+/// Node-wide, not per-executor: there is one `InterestManager` per node, so
+/// unlike the executor's caches this figure is NOT multiplied by the pool size.
+pub(crate) fn interest_delta_cache_budget_bytes() -> usize {
+    interest_delta_budget_for(
+        crate::wasm_runtime::read_total_ram_bytes()
+            .unwrap_or(INTEREST_DELTA_CACHE_FALLBACK_TOTAL_RAM_BYTES),
+    )
+}
+
+/// Pure sizing math behind [`interest_delta_cache_budget_bytes`], split out so
+/// the aggregate-commitment tests can ask what a hypothetical host would get
+/// instead of depending on the test machine's own RAM.
+///
+/// Resolved budgets: 512 MiB host → 4 MiB (floor); 1 GiB → 8 MiB; 2 GiB (the
+/// shipped `MemoryMax=2G`, which most peers report) → 16 MiB; anything larger →
+/// 16 MiB (ceiling).
+pub(crate) fn interest_delta_budget_for(total_ram: usize) -> usize {
+    (total_ram / INTEREST_DELTA_CACHE_RAM_DIVISOR).clamp(
+        INTEREST_DELTA_CACHE_MIN_BYTES,
+        INTEREST_DELTA_CACHE_MAX_BYTES,
+    )
+}
 
 /// Minimum interval between queue-full `ResyncRequest`s to the same peer for
 /// the same contract (issue #4857).
@@ -825,6 +925,15 @@ struct DeltaCacheKey {
     our_summary_hash: u64,
 }
 
+/// Payload size of a cached delta, for the delta cache's byte accounting.
+///
+/// Declared as a free `fn` (not a closure) because
+/// [`ByteBoundedLruCache::new`] takes a `fn(&V) -> usize` and the signature
+/// must match `V = StateDelta<'static>` exactly.
+fn delta_payload_len(delta: &StateDelta<'static>) -> usize {
+    delta.as_ref().len()
+}
+
 /// Hash bytes to u64 for cache key construction.
 /// Uses DefaultHasher for good distribution.
 fn hash_bytes(bytes: &[u8]) -> u64 {
@@ -1073,7 +1182,12 @@ pub struct InterestManager<T: TimeSource> {
 
     /// Cache for memoizing delta computations.
     /// Avoids recomputing the same delta for multiple peers with identical summaries.
-    delta_cache: Mutex<LruCache<DeltaCacheKey, StateDelta<'static>>>,
+    ///
+    /// Bounded by BOTH a count target ([`DELTA_CACHE_SIZE`]) and a hard byte
+    /// budget ([`interest_delta_cache_budget_bytes`]) — the values are
+    /// contract-produced `StateDelta`s, so the count alone bounds no amount of
+    /// RAM (#4805). See the byte-backstop comment near [`DELTA_CACHE_SIZE`].
+    delta_cache: Mutex<ByteBoundedLruCache<DeltaCacheKey, StateDelta<'static>>>,
 
     /// Fast hash index for connection-time discovery.
     /// Maps u32 hash of contract ID -> list of ContractKeys (handles collisions).
@@ -1222,8 +1336,10 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             interested_peers: DashMap::new(),
             peer_contracts: DashMap::new(),
             local_interests: DashMap::new(),
-            delta_cache: Mutex::new(LruCache::new(
+            delta_cache: Mutex::new(ByteBoundedLruCache::new(
                 NonZeroUsize::new(DELTA_CACHE_SIZE).expect("DELTA_CACHE_SIZE must be > 0"),
+                interest_delta_cache_budget_bytes(),
+                delta_payload_len,
             )),
             contract_hash_index: DashMap::new(),
             time_source,
@@ -4830,6 +4946,203 @@ mod tests {
                 .get_cached_delta(&contract2, &peer_summary, &our_summary)
                 .is_none()
         );
+    }
+
+    /// Tests for the delta cache's BYTE bound (#4805).
+    ///
+    /// The pre-fix cache was a plain `LruCache` capped at
+    /// [`DELTA_CACHE_SIZE`] entries. Since every value is a contract-produced
+    /// `StateDelta` (up to `MAX_STATE_SIZE`, 50 MiB), that count bounded no
+    /// amount of RAM: 1024 entries is ~51 GiB in the worst case.
+    mod delta_cache_byte_bound {
+        use super::*;
+        use crate::util::byte_bounded_lru::CACHE_ENTRY_OVERHEAD_BYTES;
+
+        /// P1 regression, mirroring #4804's
+        /// `byte_budget_bounds_ram_for_large_values` at the `InterestManager`
+        /// level: a contract emitting LARGE deltas must not be able to pin
+        /// arbitrary RAM here while staying far under the entry-count cap.
+        ///
+        /// The primary assertion is deliberately computed from figures the
+        /// TEST owns (`retained entries × the delta size it inserted`), not
+        /// from the cache's own byte accounting, so it does not check the fix
+        /// against itself. It is red against the pre-fix `LruCache`
+        /// (64 entries × 1 MiB = 64 MiB retained, vs. a 16 MiB ceiling) and
+        /// green with the byte backstop.
+        #[test]
+        fn large_deltas_stay_within_the_byte_budget() {
+            let (manager, _time) = make_manager();
+            let contract = make_contract_key(1);
+            let our_summary = vec![0u8; 8];
+
+            const DELTA_BYTES: usize = 1024 * 1024; // 1 MiB per delta
+            // 64 MiB of deltas — 4x the widest budget any host resolves to —
+            // while the ENTRY COUNT stays far below the count cap, so only a
+            // byte bound can stop this.
+            const INSERTS: usize = 64;
+            const _: () = assert!(INSERTS < DELTA_CACHE_SIZE);
+
+            let budget = interest_delta_cache_budget_bytes();
+            assert!(
+                budget <= INTEREST_DELTA_CACHE_MAX_BYTES,
+                "budget {budget} must never exceed the documented ceiling \
+                 {INTEREST_DELTA_CACHE_MAX_BYTES}"
+            );
+            assert!(
+                INSERTS * DELTA_BYTES > budget,
+                "precondition: the test must insert MORE bytes ({}) than the \
+                 budget ({budget}) or it cannot observe eviction",
+                INSERTS * DELTA_BYTES
+            );
+
+            for i in 0..INSERTS {
+                // A distinct peer-summary per insert, exactly as fan-out
+                // produces (the cache key carries the peer's summary hash).
+                let peer_summary = (i as u64).to_le_bytes().to_vec();
+                manager.cache_delta(
+                    &contract,
+                    &peer_summary,
+                    &our_summary,
+                    StateDelta::from(vec![0u8; DELTA_BYTES]),
+                );
+
+                // Independent bound: entries retained × the size WE inserted.
+                let retained = manager.delta_cache.lock().len();
+                assert!(
+                    retained * DELTA_BYTES <= budget,
+                    "after {} inserts the cache retains {retained} × {DELTA_BYTES} B = {} B, \
+                     which must stay within the {budget} B budget",
+                    i + 1,
+                    retained * DELTA_BYTES
+                );
+            }
+
+            let retained = manager.delta_cache.lock().len();
+            assert!(
+                retained < INSERTS,
+                "eviction must have occurred: {retained} of {INSERTS} inserts retained"
+            );
+            // Secondary: the cache's own accounting agrees.
+            assert!(
+                manager.delta_cache.lock().total_bytes() <= budget,
+                "accounted total {} must stay within the {budget} B budget",
+                manager.delta_cache.lock().total_bytes()
+            );
+        }
+
+        /// The byte bound must not degrade the SMALL-delta case it is a
+        /// backstop for. Empty deltas are the entries that matter most here —
+        /// they are the memoized "this peer is converged" verdicts whose loss
+        /// re-arms the #4857 summarize storm — so the floor budget has to keep
+        /// the COUNT target binding for them on every host.
+        #[test]
+        fn count_target_still_binds_for_small_deltas() {
+            let (manager, _time) = make_manager();
+            let contract = make_contract_key(1);
+            let our_summary = vec![0u8; 8];
+
+            for i in 0..DELTA_CACHE_SIZE {
+                let peer_summary = (i as u64).to_le_bytes().to_vec();
+                manager.cache_delta(
+                    &contract,
+                    &peer_summary,
+                    &our_summary,
+                    StateDelta::from(Vec::<u8>::new()),
+                );
+            }
+
+            assert_eq!(
+                manager.delta_cache.lock().len(),
+                DELTA_CACHE_SIZE,
+                "a full count-cap worth of EMPTY deltas must all be retained; \
+                 the byte budget is a backstop, not a coverage limit"
+            );
+        }
+
+        /// A single delta larger than the whole budget is not cached at all
+        /// (`ByteBoundedLruCache::put`'s skip-oversized guard) — retaining one
+        /// would break the hard cap, and `StateDelta` is contract-controlled.
+        ///
+        /// The behavioural consequence, stated so it is not rediscovered as a
+        /// bug: `compute_delta` caches even an oversized delta on purpose, so
+        /// `cached_staleness_verdict` can answer "peer is stale" without a
+        /// WASM probe. For a delta above the budget that memoization is gone
+        /// and the staleness path falls back to the contract round-trip
+        /// (bounded per message by `MAX_STALENESS_PROBES_PER_SUMMARIES`).
+        /// That costs work in exactly the abusive case this bound exists for,
+        /// and costs no correctness: a miss never reports "converged".
+        #[test]
+        fn a_single_oversized_delta_is_not_cached() {
+            let (manager, _time) = make_manager();
+            let contract = make_contract_key(1);
+            let our_summary = vec![0u8; 8];
+            let peer_summary = vec![1u8; 8];
+
+            let oversized = interest_delta_cache_budget_bytes() + 1;
+            manager.cache_delta(
+                &contract,
+                &peer_summary,
+                &our_summary,
+                StateDelta::from(vec![0u8; oversized]),
+            );
+
+            assert!(
+                manager
+                    .get_cached_delta(&contract, &peer_summary, &our_summary)
+                    .is_none(),
+                "a delta larger than the whole budget must not be retained"
+            );
+            assert_eq!(
+                manager.delta_cache.lock().total_bytes(),
+                0,
+                "refusing the oversized entry must leave the byte total at zero"
+            );
+        }
+
+        /// The resolved budget at the host shapes that actually ship, so a
+        /// future edit to the divisor or the clamps has to state its effect
+        /// here rather than moving them silently.
+        #[test]
+        fn budget_resolves_as_documented_across_host_shapes() {
+            const MIB: usize = 1024 * 1024;
+            for (label, ram, expected) in [
+                (
+                    "128 MiB container",
+                    128 * MIB,
+                    INTEREST_DELTA_CACHE_MIN_BYTES,
+                ),
+                ("512 MiB host", 512 * MIB, 4 * MIB),
+                ("1 GiB host (the OS-query fallback)", 1024 * MIB, 8 * MIB),
+                ("2 GiB peer (shipped MemoryMax=2G)", 2048 * MIB, 16 * MIB),
+                (
+                    "7600 MiB gateway",
+                    7600 * MIB,
+                    INTEREST_DELTA_CACHE_MAX_BYTES,
+                ),
+            ] {
+                assert_eq!(
+                    interest_delta_budget_for(ram),
+                    expected,
+                    "{label}: budget must resolve to {expected} bytes"
+                );
+            }
+        }
+
+        /// The floor is what keeps the byte bound a BACKSTOP rather than a
+        /// coverage limit: at the per-entry overhead floor it must still hold
+        /// more than the count target, so no host ever loses empty-delta
+        /// coverage to bytes. Pins the arithmetic behind
+        /// `count_target_still_binds_for_small_deltas` at the SMALLEST budget,
+        /// which the test machine's own RAM may not produce.
+        #[test]
+        fn floor_budget_holds_more_than_the_count_target() {
+            let entries_at_floor = INTEREST_DELTA_CACHE_MIN_BYTES / CACHE_ENTRY_OVERHEAD_BYTES;
+            assert!(
+                entries_at_floor >= DELTA_CACHE_SIZE,
+                "the floor budget holds {entries_at_floor} minimum-weight entries, which \
+                 must be at least the {DELTA_CACHE_SIZE}-entry count target"
+            );
+        }
     }
 
     #[test]

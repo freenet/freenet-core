@@ -1344,7 +1344,8 @@ pub(crate) fn delta_budget_for(total_ram: usize, pool_size: usize) -> usize {
 /// Sum of every cache ceiling a node with `memory_limit` bytes and `pool_size`
 /// workers declares: the per-executor summary, delta, and Store-arena caches
 /// times the pool, plus the single shared contract and delegate module caches,
-/// the shared source-WASM byte caches, and the redb page cache.
+/// the shared source-WASM byte caches, the interest manager's delta cache, and
+/// the redb page cache.
 ///
 /// Module ceilings are sized to the RAM the host actually has, NOT the
 /// absolute MAX clamp: the 4 GiB module-cache MAX only binds above 32 GiB of
@@ -1377,6 +1378,9 @@ pub(crate) fn declared_cache_ceiling(memory_limit: usize, pool_size: usize) -> u
     // shared; each executor used to build its own, so this term was
     // `pool_size × 2 × 10 MiB` and counted nowhere.
     let source_code = 2 * SOURCE_CODE_CACHE_MAX_BYTES as usize;
+    // The interest manager's delta memoization cache (#4805). Node-wide: there
+    // is one `InterestManager` per node, so this is NOT multiplied by the pool.
+    let interest_delta = crate::ring::interest::interest_delta_budget_for(memory_limit);
     #[cfg(feature = "redb")]
     let page_cache = crate::contract::storages::redb::page_cache_size_for(memory_limit);
     #[cfg(not(feature = "redb"))]
@@ -1386,6 +1390,7 @@ pub(crate) fn declared_cache_ceiling(memory_limit: usize, pool_size: usize) -> u
         + contract_modules
         + delegate_modules
         + source_code
+        + interest_delta
         + page_cache
 }
 
@@ -1824,6 +1829,7 @@ mod tests {
             "budget_for_ram",
             "DELEGATE_MODULE_CACHE_BUDGET_DIVISOR",
             "SOURCE_CODE_CACHE_MAX_BYTES",
+            "interest_delta_budget_for",
             "page_cache_size_for",
         ] {
             assert!(
