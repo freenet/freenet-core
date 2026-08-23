@@ -2383,22 +2383,21 @@ mod probe_wiring_pins {
     fn count_awaiting_samples_args() -> Vec<String> {
         let body = run_writer_code_only();
         let anchor = "count_awaiting_samples(";
-        // One call, so `find` is unambiguous. A second one would mean the writer
-        // adjusts these counters twice, which is the double-count the sibling
-        // open-coding assertions below exist to forbid.
+        // EXACTLY one call, checked before `find` so both directions are diagnosed.
+        // Zero means the completed-probe arm no longer folds the warming-up focus
+        // contracts into the tick's counts at all, so a warming-up focus set reports
+        // as a smaller, fully-checked one and the dashboard's unjudged total silently
+        // omits them. Two means the writer adjusts these counters twice, which is the
+        // double-count the sibling open-coding assertions below exist to forbid — and
+        // a double-count reads as a plausible number.
+        let calls = body.matches(anchor).count();
         assert_eq!(
-            body.matches(anchor).count(),
-            1,
-            "run_writer calls `count_awaiting_samples` more than once, so the \
-             warming-up focus contracts are folded into the tick's counts twice — a \
-             double-count reads as a plausible number"
+            calls, 1,
+            "run_writer calls `count_awaiting_samples` {calls} times, not once. Zero \
+             drops the warming-up focus contracts from the tick's counts; more than \
+             one folds them in twice"
         );
-        let start = body.find(anchor).expect(
-            "the completed-probe arm no longer folds the warming-up focus \
-                 contracts into the tick's counts, so a warming-up focus set reports \
-                 as a smaller, fully-checked one and the dashboard's unjudged total \
-                 silently omits them",
-        ) + anchor.len();
+        let start = body.find(anchor).expect("checked just above") + anchor.len();
         let args = call_args_at(&body, start, "count_awaiting_samples");
         assert_eq!(
             args.len(),
@@ -2438,26 +2437,40 @@ mod probe_wiring_pins {
         );
         // TWO guards, because each sees what the other cannot.
         //
-        // The whole-body one below catches selection MATERIALISED FIRST: bind
-        // `last_focus.selected.iter().copied()` to a local and pass the local, and
-        // every argument-scoped check below sees only the local's name and stays
-        // green (mutation-verified). It costs nothing to keep — `last_focus.selected`
-        // appears in `run_writer` only inside a comment, which `run_writer_code_only`
-        // strips — so it has no false-positive surface here.
+        // The whole-body one below catches selection MATERIALISED FIRST. Every check
+        // scoped to an argument sees only the argument EXPRESSION, so building the
+        // record set from selection anywhere upstream — into a local, or straight
+        // over `report.judged`, which keeps `args[0]` byte-identical — leaves all four
+        // positional pins green while the checked window is fed selection anyway
+        // (mutation-verified). It costs nothing to keep: `last_focus.selected` appears
+        // in `run_writer` only inside a comment, which `run_writer_code_only` strips,
+        // so there is no false-positive surface here.
+        //
+        // Matched against a whitespace-STRIPPED body, and that is load-bearing rather
+        // than tidiness. The guard this restores named the contiguous spelling
+        // `last_focus.selected.iter().copied()`; `cargo fmt` breaks a chain that long
+        // across five lines, so the `report.judged` overwrite this was mutation-tested
+        // against stayed GREEN under the restored guard until it was normalised — a
+        // rustfmt reflow, not even an edit, disarmed it. Named on the RECEIVER too:
+        // the chained spelling is one of several ways to write the same
+        // materialisation, and `last_focus.selected` is the part that must not be
+        // read at all.
+        let whitespace_free: String = body.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
-            !body.contains("last_focus.selected.iter().copied()"),
-            "run_writer materialises focus SELECTION as a record set. Whether or not \
-             it is passed to `status::publish` directly, that is the one thing this \
-             list must not be built from: a selected contract can be skipped before \
-             probing (no code, no samples) or probed and never reach a verdict"
+            !whitespace_free.contains("last_focus.selected"),
+            "run_writer reads focus SELECTION out of `last_focus`. Wherever the read \
+             happens, that is the one thing the checked window must not be built \
+             from: a selected contract can be skipped before probing (no code, no \
+             samples) or probed and never reach a verdict, and it would render on the \
+             per-contract page as 'checked, no violation found'"
         );
-        // The per-call-site loop catches what the whole-body guard cannot NAME. It
-        // named one spelling at one binding: in the barren branch the in-scope
-        // binding is `focus`, not `last_focus`, so a future edit feeding selection
-        // into the barren publish would write `focus.selected…` and go unseen — and
-        // a whole-body guard cannot name `focus.selected` at all, because the scope
-        // assignment legitimately uses it two lines above the branch. Scoping to the
-        // argument is what makes that sayable.
+        // The per-call-site loop catches what the whole-body guard cannot NAME. That
+        // guard can only speak about the `last_focus` binding: in the barren branch
+        // the in-scope binding is `focus`, so a future edit feeding selection into the
+        // barren publish would write `focus.selected…` and go unseen — and no
+        // whole-body guard can name `focus.selected`, because the scope assignment
+        // legitimately uses it two lines above that branch. Scoping to the argument is
+        // what makes that sayable at all.
         for nth in 0..PUBLISH_CALL_SITES {
             let first = &publish_call_args(nth)[0];
             assert!(
