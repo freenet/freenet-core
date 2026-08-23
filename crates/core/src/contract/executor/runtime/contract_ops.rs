@@ -774,6 +774,55 @@ impl Executor<Runtime> {
             }
         }
 
+        // Conformance capture (#5376), LOCAL-MODE path.
+        //
+        // This function is reached only from `Executor::contract_requests`, and thence
+        // only from `run_local_node` — `OperationMode::Local`, which never joins the
+        // ring. A network peer takes the sibling implementation,
+        // `fetch_related_for_validation` in `executor_impl.rs`, which carries the same
+        // call. Both are instrumented; this one covers local-mode and `fdev` runs.
+        //
+        // The first version of this fix claimed this was "the ONLY place" that state
+        // exists and patched here alone. That was wrong, and it would have changed
+        // nothing for any real capture, because the live peer never executes this
+        // function.
+        //
+        // Related state reaches the executor by two routes. One travels with the
+        // transition: when `update_state` returns `RequestRelated`, the retry loop
+        // pushes the resolved contracts into `updates` as `UpdateData::RelatedState`,
+        // and capture reads them from there. The other is this one, and it does not:
+        // `validate_state` asks separately, gets answered here, and the map dies at
+        // the end of this function. Capture's observation is recorded inside
+        // `attempt_state_update`, which has already run by now, so it could not see
+        // this even in principle.
+        //
+        // Missing it left contracts whose VALIDITY depends on another contract
+        // permanently unjudgeable: every replayed case dead-ends at
+        // `Inconclusive::RelatedRequired`, which reads exactly like a clean result.
+        // Measured on the live capture peer before this: 9 of 54 contracts reached no
+        // verdict on any of 2,474 cases.
+        //
+        // Costs no fetch. The states were resolved for this node's own validation,
+        // local-store-first, and are already in hand — this only stops them being
+        // thrown away. Byte-budgeted and dropped rather than blocking, like every
+        // other capture path, and reached only when a contract actually asks for
+        // related state, which is rare.
+        if let Some(capture) = crate::conformance::capture::global() {
+            // Measured from the map before anything is copied, so a full queue costs
+            // no allocation.
+            let size_hint: usize = related_map
+                .values()
+                .flatten()
+                .map(|state| state.as_ref().len())
+                .sum();
+            capture.observe_related_with(*key.id(), size_hint, || {
+                related_map
+                    .iter()
+                    .filter_map(|(id, state)| state.as_ref().map(|s| (*id, s.as_ref().to_vec())))
+                    .collect()
+            });
+        }
+
         let populated_related = RelatedContracts::from(related_map);
         // #4864 round-7/9: classify the second-round validation error too, with the
         // caller-supplied op kind (see the first `validate_state` match above).
