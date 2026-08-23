@@ -103,7 +103,16 @@ pub fn contract_detail_html_from(
         })
     });
 
-    if subscribed.is_none() && hosted.is_none() && governance.is_none() {
+    // The merge-law window is a FOURTH place this node knows about a contract, and it
+    // outlives the other three. The checked window holds ~32 hours (256 records at two
+    // per fifteen-minute tick) while the hosting cache evicts under budget pressure
+    // well inside that, and `network_status::get_snapshot()` returning `None` empties
+    // all three at once. Without this, the page asserted "This node knows nothing
+    // about <key>" while holding a recorded merge-law VIOLATION for it — the strongest
+    // statement the checker ever makes, rendered as an absence. `merge_view` was
+    // already computed at the call site and thrown away.
+    let merge_record_known = merge_view.is_some_and(|v| v.contract.is_some());
+    if subscribed.is_none() && hosted.is_none() && governance.is_none() && !merge_record_known {
         return format!(
             include_str!("assets/contract_not_found.html"),
             CSS = CSS,
@@ -291,19 +300,31 @@ pub fn contract_detail_html_from(
 /// 4. Checked, with one or more findings, each carrying the property that
 ///    broke, its severity, and whether enforcement would remove it.
 ///
-/// `without_verdict_last_tick` — contracts the checker looked at in its most
-/// recent tick but could reach no verdict on for any case — is surfaced
+/// `without_verdict_last_tick` — focus contracts the checker formed no opinion
+/// about in its most recent tick — is surfaced
 /// whenever non-zero, independent of which of states 2-4 this particular
 /// contract is in: it is node-wide information the operator needs regardless
 /// of this contract's own status. It is phrased as a statement about that
 /// tick, because that is what it measures; the earlier "on this node"
 /// phrasing read as a standing property.
 ///
+/// Its CAUSES are stated the way `shadow::ShadowReport::without_verdict` counts
+/// them, which is broader than the wording it first shipped with. "Every case
+/// was inconclusive, or related state exceeded its budget" named the two rarest
+/// entries on a list that also holds: no contract store on this node, an empty
+/// corpus, code that would not resolve, an oracle that would not build, setup
+/// that exhausted the time budget before a single case ran, a probe task that
+/// died, and `awaiting_samples` — for most of which ZERO cases were tried. On a
+/// warming-up peer `awaiting_samples` dominates outright, so the old wording
+/// described the least likely cause as though it were the only one.
+///
 /// Every state that has a snapshot at all also renders WHEN the snapshot was
-/// published. Two live paths in `capture::run_writer` skip `status::publish`
-/// indefinitely while the old snapshot stands — a tick that selects no work,
-/// and a probe task that panicked — so without an age a peer whose probe has
-/// been dead for a week keeps serving that week-old tick as a current result.
+/// published, and — for a contract with a record — when THAT CONTRACT was last
+/// checked, which is a different and usually much older number. The node-wide
+/// age is needed because `status::publish` is reached from two places in
+/// `capture::run_writer` and a probe task that panicked skips both, so without
+/// it a peer whose probe has been dead for a week keeps serving that week-old
+/// tick as a current result.
 fn merge_law_card(merge_enabled: bool, merge_view: Option<&status::MergeCheckView>) -> String {
     if !merge_enabled {
         return r#"<div class="card">
@@ -329,7 +350,7 @@ fn merge_law_card(merge_enabled: bool, merge_view: Option<&status::MergeCheckVie
     let mut note = String::new();
     if view.without_verdict_last_tick > 0 {
         note.push_str(&format!(
-            r#"<p class="empty" style="margin-top:0.5rem">In its most recent tick the checker judged {judged} contract(s) and could not reach a verdict on {n} — every case it tried was inconclusive, or related state exceeded its budget. Those contracts are neither clean nor flagged; they simply were not judged.</p>"#,
+            r#"<p class="empty" style="margin-top:0.5rem">In its most recent tick the checker judged {judged} contract(s) could not reach a verdict on {n} — most often because there was nothing yet to check (no samples collected for them, or no contract code on this node), and sometimes because every case it did try came back inconclusive. Those contracts are neither clean nor flagged; they simply were not judged.</p>"#,
             judged = view.judged_last_tick,
             n = view.without_verdict_last_tick,
         ));
@@ -357,11 +378,30 @@ fn merge_law_card(merge_enabled: bool, merge_view: Option<&status::MergeCheckVie
     // get?": a contract with one verdict and 199 inconclusive cases rendered
     // byte-identically to one with 200 verdicts, and a contract last probed
     // forty ticks ago was shown a count from a tick that never touched it.
+    //
+    // The per-contract age is the record's OWN `checked_at`, not the node's most
+    // recent tick. Those are different clocks: the checker probes at most two
+    // contracts per fifteen-minute tick against a window holding 256, so a contract
+    // judged twenty hours ago sat beside "Last checker tick: 3 minutes" and a sentence
+    // saying no violation was found "the last time it was checked". That is the same
+    // misattribution already fixed one row up for the COUNTS (see
+    // `status::MergeCheckStatus::judged_last_tick`), and both numbers are kept because
+    // both are worth knowing — what was wrong was one of them answering the other's
+    // question.
     let cases_row = format!(
         r#"<div class="info-label" title="Cases run against THIS contract while it has been in the checked window. A verdict is a case that came back Holds or Violated; an inconclusive case established nothing, so a clean result resting mostly on those is barely a result.">Cases for this contract</div><div class="info-value">{verdicts} reached a verdict, {inconclusive} inconclusive</div>
-                    <div class="info-label" title="How long ago the merge-law checker last published a tick. It probes every 15 minutes when healthy.">Last checker tick</div><div class="info-value">{ago} ago</div>"#,
+                    <div class="info-label" title="How long ago the tick that last judged THIS contract published. The checker probes at most two contracts per tick out of a window holding 256, so this can be far older than the node's last tick below.">This contract last checked</div><div class="info-value">{checked} ago</div>
+                    <div class="info-label" title="How long ago the merge-law checker last published a tick on this NODE — about any contract, not necessarily this one. It probes every 15 minutes when healthy.">Last checker tick</div><div class="info-value">{ago} ago</div>"#,
         verdicts = record.verdicts,
         inconclusive = record.inconclusive,
+        checked = view
+            .checked_secs_ago
+            .map(format_duration)
+            // Unreachable: `checked_secs_ago` is `Some` exactly when `view.contract`
+            // is, and this branch is inside `Some(record)`. Rendered as unknown rather
+            // than as a zero, because "0 seconds ago" would be a confident claim that
+            // this contract was checked just now.
+            .unwrap_or_else(|| "an unknown time".to_string()),
         ago = format_duration(view.published_secs_ago),
     );
 

@@ -786,6 +786,97 @@ fn store_epoch(dir: &Path, epoch: u64) {
     }
 }
 
+/// Drive a REAL probe of the deliberately-defective fixture contract, end to end.
+///
+/// A seam, not a convenience. Everything downstream of a probe — `checked_contracts`,
+/// `MergeCheckStatus::record`, `view_for`, the contract-detail card — was tested only
+/// against hand-built `CheckedContract`s, so the assembly production actually runs had
+/// no test touching it, and three review rounds of #5403 each found a defect somewhere
+/// along it (focus selection fed in place of judged contracts; findings evicting
+/// independently of their contract; duplicate rows on a contract's first record).
+/// Tests reach the real inputs through here so a fixture cannot quietly disagree with
+/// what a probe emits.
+///
+/// `mode` selects the fixture's defect — see `tests/test-contract-conformance`. Mode 1
+/// (LAST_WRITE_WINS) breaks several merge laws on nearly every generated case, which
+/// is what makes it the input that distinguishes a deduplicating assembly from one
+/// that appends.
+///
+/// Returns the fixture's instance id alongside the probe's own two outputs, which are
+/// exactly the pair `capture::run_writer` hands to `status::publish`. The temp
+/// directories are dropped before returning: the probe resolves and compiles the code
+/// while it runs, so nothing here outlives the call.
+#[cfg(test)]
+pub(crate) async fn probe_fixture_contract(
+    mode: u8,
+) -> Result<(ContractInstanceId, ShadowReport, Vec<Finding>), Box<dyn std::error::Error>> {
+    use freenet_stdlib::prelude::{
+        ContractCode, ContractContainer, ContractWasmAPIVersion, Parameters, WrappedContract,
+    };
+    use std::sync::Arc;
+
+    use crate::conformance::capture::{Observation, SamplingScope, TrackedContract, record};
+
+    let wasm = crate::wasm_runtime::tests::get_test_module("test_contract_conformance")?;
+    let code_hash = *blake3::hash(&wasm).as_bytes();
+    let store_dir = crate::util::tests::get_temp_dir();
+    std::fs::create_dir_all(store_dir.path())?;
+    let db = crate::contract::storages::Storage::new(store_dir.path()).await?;
+    let mut store =
+        crate::wasm_runtime::ContractStore::new(store_dir.path().into(), 10_000_000, db)?;
+
+    let parameters: Parameters<'static> = Parameters::from(vec![mode]);
+    let contract = WrappedContract::new(Arc::new(ContractCode::from(wasm)), parameters.clone());
+    let id = *contract.key().id();
+    store.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+        contract,
+    )))?;
+
+    // Several distinct merges, so the generator has a corpus wide enough to build
+    // many cases from. The fixture's state is a canonical (sorted, deduplicated)
+    // byte set, which is what its own `validate_state` accepts.
+    let transitions: &[(Vec<u8>, Vec<u8>)] = &[
+        (vec![1], vec![1, 2]),
+        (vec![2], vec![2, 3]),
+        (vec![3], vec![3, 4]),
+        (vec![1, 2], vec![1, 2, 5]),
+    ];
+    let mut samplers: HashMap<ContractInstanceId, TrackedContract> = HashMap::new();
+    for (base, result) in transitions {
+        let _evicted = record(
+            &mut samplers,
+            &SamplingScope::Wide,
+            Observation {
+                contract: id,
+                code_hash,
+                parameters: parameters.as_ref().to_vec(),
+                base_state: base.clone(),
+                incoming_state: Some(result.clone()),
+                delta: None,
+                result_state: result.clone(),
+                related: Vec::new(),
+            },
+        );
+    }
+
+    let dir = tempfile::TempDir::new()?;
+    let runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+    let focus = runner.focus(None, &samplers.keys().copied().collect::<Vec<_>>());
+    let (work, _awaiting) = runner.select(&focus, &samplers);
+    assert!(
+        !work.is_empty(),
+        "the fixture contract was not selected, so a probe never ran and any          assertion downstream of this proves nothing"
+    );
+
+    let (report, findings) = probe(
+        work,
+        Some(store_dir.path().to_path_buf()),
+        EnforcementMode::Shadow,
+    )
+    .await;
+    Ok((id, report, findings))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

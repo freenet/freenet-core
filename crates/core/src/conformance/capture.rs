@@ -804,6 +804,28 @@ async fn run_writer(
                         scope = scope.as_str(),
                         "conformance shadow tick selected nothing to probe"
                     );
+                    // Published too, with no records and nothing judged.
+                    //
+                    // This branch is the ordinary warm-up state — focus has picked
+                    // contracts but the sampler holds nothing for them yet — and it
+                    // used to return without publishing, leaving the PREVIOUS tick's
+                    // snapshot standing unchanged. Three of these in a row is 45
+                    // minutes, past `status::STALE_AFTER`, so a peer that had one
+                    // healthy tick and then went barren kept rendering that tick as a
+                    // current result with no age advancing and no stale note: the
+                    // frozen-checker failure the publish time was added to prevent,
+                    // reached by a path that never calls the thing carrying it.
+                    //
+                    // `awaiting_samples` is the honest unjudged count here. When
+                    // `work` is empty, `ShadowRunner::select` returns
+                    // `focus.selected.len()` for it, so it is every contract this tick
+                    // formed no opinion about — which is all of them.
+                    crate::conformance::status::publish(
+                        Vec::new(),
+                        0,
+                        awaiting_samples,
+                        tokio::time::Instant::now(),
+                    );
                 } else {
                     let store = contract_store().cloned();
                     let mode = shadow.mode();
@@ -917,7 +939,7 @@ async fn run_writer(
                     crate::conformance::status::checked_contracts(&report.judged, &findings),
                     report.judged.len(),
                     report.without_verdict,
-                    std::time::Instant::now(),
+                    tokio::time::Instant::now(),
                 );
             }
         }
@@ -2176,7 +2198,49 @@ mod probe_wiring_pins {
         );
     }
 
-    /// The arguments of the ONE `status::publish` call, in order.
+    /// How many places in `run_writer` call `status::publish`, and in what order.
+    ///
+    /// 0. the barren tick — `work.is_empty()`, the warm-up state. Publishes nothing
+    ///    but a fresh timestamp, so the snapshot ages instead of the previous tick
+    ///    standing as a current result.
+    /// 1. the completed probe — the tick that actually establishes something.
+    ///
+    /// Pinned as a COUNT because `publish_call_args` selects positionally: adding a
+    /// third call site would otherwise repoint every pin below at a different call
+    /// without any of them failing, which is the half-inert-pin failure this file has
+    /// already shipped twice. A new call site must land here deliberately.
+    const PUBLISH_CALL_SITES: usize = 2;
+
+    /// Index of the completed-probe publish in source order — see
+    /// [`PUBLISH_CALL_SITES`].
+    const PROBE_PUBLISH: usize = 1;
+
+    /// Index of the barren-tick publish in source order.
+    const BARREN_PUBLISH: usize = 0;
+
+    /// Every `status::publish` call site in `run_writer`, in source order.
+    fn publish_call_sites() -> Vec<usize> {
+        let body = run_writer_code_only();
+        let anchor = "status::publish(";
+        let mut at = Vec::new();
+        let mut from = 0usize;
+        while let Some(found) = body[from..].find(anchor) {
+            at.push(from + found + anchor.len());
+            from += found + anchor.len();
+        }
+        assert_eq!(
+            at.len(),
+            PUBLISH_CALL_SITES,
+            "run_writer calls status::publish {} times, not {PUBLISH_CALL_SITES}. \
+             `publish_call_args` selects positionally, so the pins below are now \
+             asserting about a different call than the one they name — decide which \
+             index each pin means and update PUBLISH_CALL_SITES deliberately",
+            at.len()
+        );
+        at
+    }
+
+    /// The arguments of ONE `status::publish` call, in order.
     ///
     /// Bounded to the call itself rather than to all of `run_writer`, and that bound
     /// is the whole point of the helper. The previous pins asserted
@@ -2186,13 +2250,9 @@ mod probe_wiring_pins {
     /// call, so replacing the third argument with `0` left the pin green. Positional,
     /// because the sibling pin could not see a SWAP either: passing `report.probed`
     /// where `report.judged.len()` belongs kept every assertion happy.
-    fn publish_call_args() -> Vec<String> {
+    fn publish_call_args(nth: usize) -> Vec<String> {
         let body = run_writer_code_only();
-        let anchor = "status::publish(";
-        let start = body
-            .find(anchor)
-            .expect("run_writer no longer calls status::publish at all")
-            + anchor.len();
+        let start = publish_call_sites()[nth];
         // Split on TOP-LEVEL commas only: an argument may itself be a call with its
         // own comma-separated arguments.
         let mut depth = 0usize;
@@ -2245,7 +2305,7 @@ mod probe_wiring_pins {
     /// window renders clean while violating.
     #[test]
     fn dashboard_checked_window_is_fed_judged_contracts_with_their_findings() {
-        let args = publish_call_args();
+        let args = publish_call_args(PROBE_PUBLISH);
         assert!(
             args[0].contains("checked_contracts(&report.judged, &findings)"),
             "the first argument no longer builds per-contract records from the judged \
@@ -2271,7 +2331,7 @@ mod probe_wiring_pins {
     /// wrong values type-check and both render as plausible numbers.
     #[test]
     fn dashboard_tick_counts_are_the_report_fields_positionally() {
-        let args = publish_call_args();
+        let args = publish_call_args(PROBE_PUBLISH);
         assert_eq!(
             args[1], "report.judged.len()",
             "the judged-this-tick count is no longer `report.judged.len()`; \
@@ -2286,6 +2346,81 @@ mod probe_wiring_pins {
         );
     }
 
+    /// The block `run_writer` runs when a tick selects nothing to probe.
+    ///
+    /// Sliced to the branch rather than searched for across `run_writer`: the whole
+    /// question this pin asks is WHICH branch publishes, and a whole-body `contains`
+    /// is answered by the completed-probe call site eighty lines further down.
+    fn work_is_empty_block() -> String {
+        let body = run_writer_code_only();
+        let anchor = "if work.is_empty() {";
+        let start = body
+            .find(anchor)
+            .expect("run_writer no longer branches on an empty work set")
+            + anchor.len()
+            - 1;
+        let mut depth = 0usize;
+        for (offset, ch) in body[start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return body[start..start + offset + 1].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("the empty-work branch is not brace-balanced");
+    }
+
+    /// #5403 M3: a tick that selects nothing must still publish.
+    ///
+    /// This branch is the ordinary warm-up state — focus has picked contracts and the
+    /// sampler holds nothing for them yet — and it used to return without publishing,
+    /// leaving the previous snapshot standing with its age frozen. Three barren ticks
+    /// is 45 minutes, past `status::STALE_AFTER`, so a peer that had one healthy tick
+    /// and then went barren kept rendering that tick as a current "no violation
+    /// found", never aged past the staleness threshold and never carrying the stale
+    /// note. The unjudged contracts of a barren tick also never reached
+    /// `without_verdict_last_tick`, so nothing said they had not been judged either.
+    ///
+    /// Pinned rather than tested end to end because `run_writer` is a select loop no
+    /// test can call — which is also exactly why a call site inside it can go missing
+    /// unnoticed.
+    #[test]
+    fn a_tick_that_selects_nothing_still_publishes() {
+        let block = work_is_empty_block();
+        assert!(
+            block.contains("status::publish("),
+            "the empty-work branch returns without publishing, so a peer whose ticks \
+             have gone barren keeps serving its last healthy tick as a current \
+             result, with the snapshot's age frozen so it never reads as stale. \
+             got:\n{block}"
+        );
+
+        let args = publish_call_args(BARREN_PUBLISH);
+        assert_eq!(
+            args[1], "0",
+            "a tick that probed nothing must publish zero contracts judged; anything \
+             else reports established results from a tick that established none"
+        );
+        assert_eq!(
+            args[2], "awaiting_samples",
+            "the barren tick's unjudged count must be `awaiting_samples`, which is \
+             `focus.selected.len()` when the work set is empty — every contract this \
+             tick formed no opinion about. A zero here renders a barren tick as one \
+             with nothing left unjudged"
+        );
+        assert!(
+            args[3].contains("Instant::now()"),
+            "the barren tick's snapshot carries no publish time, so it cannot age and \
+             the frozen-checker note never fires. got: {}",
+            args[3]
+        );
+    }
+
     /// The snapshot must carry a publish time.
     ///
     /// `publish` is reached from one place, and two live paths above skip it
@@ -2295,7 +2430,7 @@ mod probe_wiring_pins {
     /// found".
     #[test]
     fn the_published_snapshot_carries_its_publish_time() {
-        let args = publish_call_args();
+        let args = publish_call_args(PROBE_PUBLISH);
         assert!(
             args[3].contains("Instant::now()"),
             "the published snapshot no longer carries a publish time, so a frozen \
