@@ -4479,6 +4479,65 @@ mod tests {
         );
     }
 
+    /// #5403 L6: every property name these card tests plant must be one the checker
+    /// can actually emit.
+    ///
+    /// `merge_card_lists_findings_with_severity_and_removal_distinguished` asserted on
+    /// `self_delta_size`, which `ConformanceProperty::as_str` cannot produce — the
+    /// real name is `self_delta_empty`. The test was internally consistent (it planted
+    /// the string and then found it), so it passed while asserting about a card state
+    /// no node will ever render, and the property it claimed to cover — that a
+    /// Diagnostic renders distinguishably from a Violation — was never exercised
+    /// against a real Diagnostic property at all.
+    ///
+    /// Fixing the one literal would leave the class open, so this reads every
+    /// `MergeFinding` property literal planted in this file and checks it against
+    /// `ConformanceProperty::ALL`. A future fixture invented out of thin air fails
+    /// here instead of quietly testing nothing.
+    ///
+    /// Nothing in this doc comment may spell the scrape's needle, or the scrape finds
+    /// its own prose — which it did on the first run, and failed loudly rather than
+    /// silently, because an unreal name is exactly what it rejects.
+    #[test]
+    fn merge_card_fixtures_only_use_property_names_the_checker_can_emit() {
+        use crate::conformance::property::ConformanceProperty;
+
+        let real: std::collections::BTreeSet<&str> = ConformanceProperty::ALL
+            .iter()
+            .map(|p| p.as_str())
+            .collect();
+
+        let src = include_str!("home_page.rs");
+        let needle = "property: \"";
+        let mut planted: Vec<&str> = Vec::new();
+        let mut from = 0usize;
+        while let Some(found) = src[from..].find(needle) {
+            let start = from + found + needle.len();
+            let end = start
+                + src[start..]
+                    .find('"')
+                    .expect("an unterminated string literal in this file's own source");
+            planted.push(&src[start..end]);
+            from = end;
+        }
+
+        assert!(
+            !planted.is_empty(),
+            "no `property: \"…\"` fixture was found in this file, so this test has \
+             stopped reading what it claims to read — the fixtures were probably \
+             renamed or moved, and it is now vacuous"
+        );
+        for name in &planted {
+            assert!(
+                real.contains(name),
+                "the merge-card fixtures plant `{name}`, which no \
+                 ConformanceProperty produces. A card test built on a name the \
+                 checker cannot emit asserts about a state no node will ever render. \
+                 Real names: {real:?}"
+            );
+        }
+    }
+
     /// The Playwright fixture's markup must stay in step with what the server
     /// actually emits.
     ///
