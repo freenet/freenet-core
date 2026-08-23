@@ -13354,6 +13354,180 @@ fn test_piece_e_findability_sparse_ring_gate() {
     );
 }
 
+/// One SEEDED-lone-holder findability run at `seed` on the sparse ring.
+///
+/// Unlike [`run_findability_seed`] (which PUTs from a far node, so on main
+/// relay-caching's PUT half scatters copies toward the key), this SEEDS a single
+/// near-key holder via `SeedHostedContract`, which installs the contract locally
+/// with NO network PUT and scatters NOTHING. Distant requesters must then reach
+/// that lone holder by ROUTING alone — the true post-relay-caching findability
+/// case the bounded-backtracking prerequisite (§E, #4642) targets.
+///
+/// With greedy single-path routing + a 1-hop terminal consult, a requester whose
+/// greedy descent stalls more than one hop from the lone holder DEAD-ENDS.
+/// Bounded backtracking lets each relay try the next-closest already-computed
+/// `k_closest` candidates on a clean downstream NotFound (bounded by the shared
+/// per-request budget), so the request can route around the stall and reach the
+/// holder.
+///
+/// No churn: this isolates the routing signal (can a distant GET find a lone
+/// holder?). The companion `test_piece_e_findability_sparse_ring_gate` covers the
+/// under-churn PUT-scattered case.
+fn run_seeded_lone_holder_findability(seed: u64) -> (PieceEGateMetrics, bool) {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+    const NUM_NODES: usize = 15; // + 1 gateway = 16 peers
+
+    setup_deterministic_state(seed);
+    let network = format!("piece-e-lone-{seed:x}");
+
+    let contract = SimOperation::create_test_contract(0xA5);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+    let state_v1 = SimOperation::create_test_state(1);
+
+    // Evenly spread NUM_NODES around the whole ring, offset from the key.
+    let wrap = |x: f64| x.rem_euclid(1.0);
+    let node_locations: Vec<f64> = (0..NUM_NODES)
+        .map(|i| wrap(key_loc + i as f64 / NUM_NODES as f64))
+        .collect();
+
+    let rt = create_runtime();
+    let sim = rt.block_on(async {
+        SimNetwork::new_with_node_locations(
+            &network,
+            1,
+            NUM_NODES,
+            10, // ring_max_htl
+            7,  // rnd_if_htl_above
+            5,  // max_connections (deliberately sparse ring)
+            2,  // min_connections
+            seed,
+            &node_locations,
+        )
+        .await
+    });
+
+    let locs = sim.get_peer_locations();
+    let ranked = nodes_by_distance_to_key(&locs, NUM_NODES, key_loc);
+    // Lone holder: the node NEAREST the key. `SeedHostedContract` seeds it with
+    // no scatter, so nothing but routing can carry a requester to it.
+    let holder_no = ranked[0];
+    // Requesters: the mid/far nodes (excluding the holder + its immediate
+    // near-key neighbours) so their greedy descent has real distance to stall in.
+    let requester_nos: Vec<usize> = [5usize, 6, 7, 8, 9, 10, 11, 12, 13]
+        .iter()
+        .map(|&i| ranked[i])
+        .collect();
+
+    let holder = NodeLabel::node(&network, holder_no);
+    let get_requesters: Vec<NodeLabel> = requester_nos
+        .iter()
+        .map(|n| NodeLabel::node(&network, *n))
+        .collect();
+
+    let mut operations = Vec::new();
+    operations.push(ScheduledOperation::new(
+        holder.clone(),
+        SimOperation::SeedHostedContract {
+            contract: contract.clone(),
+            state: state_v1.clone(),
+        },
+    ));
+    for r in &get_requesters {
+        operations.push(ScheduledOperation::new(
+            r.clone(),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ));
+    }
+
+    let logs_handle = sim.event_logs_handle();
+    let result = sim.run_controlled_simulation(
+        seed,
+        operations,
+        Duration::from_secs(300),
+        Duration::from_secs(90),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "seed={seed:x}: lone-holder findability sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let logs = rt.block_on(async { logs_handle.lock().await.clone() });
+    let metrics =
+        compute_piece_e_metrics(&result, &logs, &contract_key, &holder, &get_requesters, &[]);
+    let holder_hosting = result.is_node_hosting(&holder, &contract_key);
+    (metrics, holder_hosting)
+}
+
+/// BOUNDED-BACKTRACKING findability gate — a SEEDED lone holder (no scatter)
+/// must be reachable by distant requesters through routing alone.
+///
+/// This is the direct falsifier for the bounded-backtracking prerequisite (§E,
+/// #4642). On origin/main (greedy single-path + `MAX_RELAY_RETRIES=1` +
+/// `TERMINAL_CONSULT_HOSTS=1`) a lone seeded holder is near-unfindable across
+/// most seeds; the shared-budget backtracking added in this PR lets a stalled
+/// descent try the next-closest candidates and reach the holder.
+///
+/// The floor is set below the observed backtracking result and well ABOVE the
+/// origin/main baseline (both numbers reported in the PR body; the SAME test run
+/// on origin/main gives the baseline). Aggregate over several seeds because
+/// sparse-ring findability is seed-sensitive.
+#[test_log::test]
+fn test_backtrack_seeded_lone_holder_findability() {
+    const SEEDS: [u64; 6] = [
+        0x4642_E0C0_5A1D,
+        0x4642_E0C0_0002,
+        0x4642_E0C0_0003,
+        0x4642_E0C0_0005,
+        0x4642_E0C0_0007,
+        0x4642_E0C0_000B,
+    ];
+    // Floor: below the backtracking result, above the main baseline. Tightened
+    // after measuring both (see PR body).
+    const MEAN_FLOOR: f64 = 0.30;
+
+    let mut rates = Vec::new();
+    tracing::info!(target: "piece_e_gate",
+        "===== BOUNDED-BACKTRACK SEEDED-LONE-HOLDER FINDABILITY ({} seeds) =====",
+        SEEDS.len());
+    for seed in SEEDS {
+        let (m, holder_hosting) = run_seeded_lone_holder_findability(seed);
+        assert!(m.get_attempts > 0, "seed={seed:x}: no GET attempts");
+        assert!(
+            holder_hosting,
+            "seed={seed:x}: seeded lone holder must still host the contract"
+        );
+        rates.push(m.client_findability_rate);
+        tracing::info!(target: "piece_e_gate",
+            "  lone-holder seed=0x{seed:X}: client_findability={:.3} ({}/{}) \
+             wire={:.3} hosting_nodes={} ttf_ms={:?}",
+            m.client_findability_rate, m.requesters_with_state, m.requesters_total,
+            m.findability_rate, m.hosting_nodes, m.time_to_first_success_ms);
+    }
+    let n = rates.len() as f64;
+    let mean = rates.iter().sum::<f64>() / n;
+    let min = rates.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = rates.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    tracing::info!(target: "piece_e_gate",
+        "  LONE-HOLDER MEAN client_findability = {mean:.3} (min={min:.3} max={max:.3}); \
+         rates={rates:?}");
+    tracing::info!(target: "piece_e_gate",
+        "===== END BOUNDED-BACKTRACK SEEDED-LONE-HOLDER FINDABILITY =====");
+
+    assert!(
+        mean >= MEAN_FLOOR,
+        "BACKTRACK FINDABILITY: mean lone-holder client-findability {mean:.3} across {} \
+         seeds < floor {MEAN_FLOOR} (rates={rates:?})",
+        SEEDS.len()
+    );
+}
+
 /// GATE B — invariant-1 STRUCTURAL guard + forced-stale DETECTOR positive control.
 ///
 /// HONEST SCOPE (do not mistake this for a discriminating stale-serve gate): a
