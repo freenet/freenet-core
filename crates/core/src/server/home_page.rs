@@ -3798,21 +3798,30 @@ mod tests {
     }
 
     /// One checked-contract record, the shape `conformance::status` stores.
+    ///
+    /// Built through `CheckedContract::new` + `note_finding`, the only route
+    /// production has and — since `findings` became private — the only route
+    /// anything has. A struct literal here would let a test construct a record
+    /// production could not, which is precisely what hid `record`'s
+    /// un-deduplicating insert arm.
     fn checked_record(
         contract: freenet_stdlib::prelude::ContractInstanceId,
         verdicts: usize,
         inconclusive: usize,
         findings: Vec<MergeFinding>,
     ) -> CheckedContract {
-        CheckedContract {
+        // The timestamp is overwritten by `record` with the tick's publish time,
+        // exactly as `status::checked_contracts` does in production.
+        let mut record = CheckedContract::new(
             contract,
             verdicts,
             inconclusive,
-            findings,
-            // Overwritten by `record` with the tick's publish time, exactly as
-            // `status::checked_contracts` does in production.
-            checked_at: tokio::time::Instant::now(),
+            tokio::time::Instant::now(),
+        );
+        for finding in findings {
+            record.note_finding(finding);
         }
+        record
     }
 
     /// What the page reads: one contract's record plus the node-wide numbers.
@@ -4257,11 +4266,13 @@ mod tests {
     /// A checker that has stopped publishing must say so, not present its last
     /// tick as a current result.
     ///
-    /// `status::publish` is reached from one place, and two live paths skip it
-    /// indefinitely while the old snapshot stands: a tick that selects no work,
-    /// and a probe task that panicked. A peer whose probe has been dead for a
-    /// week would otherwise keep serving that week-old "no violation found"
-    /// with nothing on the page to say when it was established.
+    /// `status::publish` is reached from two places in `capture::run_writer`, and
+    /// a peer can stop reaching either indefinitely while the old snapshot
+    /// stands: the probe task can panic, a probe can hang so `in_flight` never
+    /// clears and no further tick starts, or the writer task can be gone. A peer
+    /// whose probe has been dead for a week would otherwise keep serving that
+    /// week-old "no violation found" with nothing on the page to say when it was
+    /// established.
     #[test]
     fn merge_card_reports_a_frozen_checker_rather_than_a_current_clean_result() {
         use freenet_stdlib::prelude::ContractInstanceId;
@@ -4433,6 +4444,138 @@ mod tests {
             "the node-wide tick age must remain: a frozen checker is a different \
              fault from a stale record, and the card has to be able to show both — \
              got:\n{panel}"
+        );
+    }
+
+    /// The value rendered against one `info-label` in the merge card.
+    ///
+    /// Both ages sit in the same `info-grid` and both end in " ago", so a
+    /// `panel.contains("5m")` cannot tell which of them it matched — and the whole
+    /// question these two tests ask is which clock answered which label.
+    fn info_value(panel: &str, label: &str) -> String {
+        let anchor = format!(r#">{label}</div><div class="info-value">"#);
+        let start = panel
+            .find(&anchor)
+            .unwrap_or_else(|| panic!("the card renders no `{label}` row:\n{panel}"))
+            + anchor.len();
+        let end = panel[start..]
+            .find("</div>")
+            .expect("an info-value must be closed");
+        panel[start..start + end].to_string()
+    }
+
+    /// #5403 L3: re-checking a contract must refresh its per-contract age.
+    ///
+    /// `MergeCheckStatus::record` stamps `checked_at` in BOTH of its arms. Confining
+    /// that assignment to the insert (`None`) arm compiles, and the test above cannot
+    /// see it: that test records the contract ONCE, so it only ever drives the insert
+    /// arm. A contract the checker looks at every tick would then render with the age
+    /// of the first time it was ever seen, growing without bound while the checker
+    /// was in fact judging it every fifteen minutes — M2's mirror image (there the
+    /// per-contract age was too fresh; here it would be too stale), and the same
+    /// fault of the card answering one question with another clock.
+    #[test]
+    fn re_checking_a_contract_refreshes_its_per_contract_age() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([26u8; 32]);
+        let key = key_id.to_string();
+        let first_seen = tokio::time::Instant::now();
+        let twenty_hours = std::time::Duration::from_secs(20 * 60 * 60);
+        let five_minutes = std::time::Duration::from_secs(5 * 60);
+
+        let mut status = MergeCheckStatus::default();
+        // First sight: the insert arm.
+        status.record([checked_record(key_id, 12, 0, vec![])], 1, 0, first_seen);
+        // Twenty hours later the checker comes back to the SAME contract: the merge
+        // arm, which is the arm nothing covered.
+        status.record(
+            [checked_record(key_id, 3, 0, vec![])],
+            1,
+            0,
+            first_seen + twenty_hours,
+        );
+
+        let snap = hosted_snap(&key);
+        let view = status.view_for(Some(&key_id), first_seen + twenty_hours + five_minutes);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+
+        let per_contract = info_value(&panel, "This contract last checked");
+        let node_wide = info_value(&panel, "Last checker tick");
+        assert_eq!(
+            per_contract, node_wide,
+            "the contract was re-checked by the most recent tick, so its own age and \
+             the node's must agree. They do not, which means the merge arm left \
+             `checked_at` at first sight: a contract judged every tick renders as one \
+             last looked at hours or days ago — got {per_contract:?} against \
+             {node_wide:?} in:\n{panel}"
+        );
+        assert!(
+            !per_contract.contains("20h"),
+            "the re-checked contract is aged from when it was FIRST seen, not from \
+             the tick that last judged it — got {per_contract:?} in:\n{panel}"
+        );
+        // The accumulation the merge arm also owns, so this test fails loudly rather
+        // than vacuously if a refactor stops merging records at all.
+        assert!(
+            panel.contains("15 reached a verdict"),
+            "the two ticks' case counts did not accumulate, so the merge arm did not \
+             run and this test proves nothing about it — got:\n{panel}"
+        );
+    }
+
+    /// #5403 L2: a contract with no record must still show how old the snapshot is.
+    ///
+    /// The card's own doc says every state that has a snapshot renders when that
+    /// snapshot was published. The no-record branch did not: the publish age reached
+    /// it only through the staleness note, which fires at three missed ticks. Below
+    /// that threshold — a checker that died fourteen minutes ago — "this contract has
+    /// not been checked recently" carried no age at all, and a busy checker that has
+    /// simply not got round to this contract rendered identically to one that had
+    /// stopped. That is the same absence-reads-as-fine conflation this subsystem
+    /// exists to stop, in the one state where the page has nothing else to say.
+    #[test]
+    fn a_contract_with_no_record_still_shows_how_old_the_snapshot_is() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([27u8; 32]);
+        let other = ContractInstanceId::new([28u8; 32]);
+        let key = key_id.to_string();
+        let published = tokio::time::Instant::now();
+
+        // The checker HAS published — for a different contract, so the requested one
+        // has no record.
+        let mut status = MergeCheckStatus::default();
+        status.record([checked_record(other, 5, 0, vec![])], 1, 0, published);
+
+        // Well inside `STALE_AFTER` (45 minutes), so the staleness note does NOT
+        // fire and cannot supply the age on this branch's behalf. That is the whole
+        // window the branch was blind in.
+        let view = status.view_for(
+            Some(&key_id),
+            published + std::time::Duration::from_secs(840),
+        );
+        assert!(
+            view.contract.is_none() && !view.stale,
+            "this test only means anything for a fresh snapshot with no record for \
+             the requested contract"
+        );
+
+        let snap = hosted_snap(&key);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+
+        assert!(
+            panel.contains("has not been checked recently"),
+            "this test must be reading the no-record branch — got:\n{panel}"
+        );
+        assert_eq!(
+            info_value(&panel, "Last checker tick"),
+            "14m ago",
+            "the no-record state renders no snapshot age, so an operator cannot tell \
+             a busy checker that has not reached this contract from one that stopped \
+             fourteen minutes ago — got:\n{panel}"
         );
     }
 

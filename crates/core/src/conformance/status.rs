@@ -43,11 +43,12 @@
 //! # Bounded
 //!
 //! The window is capped at [`MAX_REMEMBERED_CHECKED`] contracts. Per-contract findings
-//! need no separate cap, but only because of a property that has to be maintained
-//! rather than assumed: every finding enters a record through
+//! need no separate cap, because every finding enters a record through
 //! [`CheckedContract::note_finding`], which deduplicates on the property that broke,
 //! and `ConformanceProperty` is a closed enum of twelve — so one contract holds at
-//! most twelve findings.
+//! most twelve findings. That is enforced rather than agreed: `CheckedContract`'s
+//! `findings` field is PRIVATE and [`CheckedContract::new`] starts it empty, so
+//! `note_finding` is not merely the only current way in, it is the only way in.
 //!
 //! That claim was written here before it was true, and stood for three review rounds
 //! while it was false. [`checked_contracts`] appended one finding per violating CASE,
@@ -55,8 +56,10 @@
 //! law produced up to 64 identical rows on a contract's first record — the normal
 //! path, since the first probe is where a violation is found. A justification comment
 //! that is merely aspirational is worse than none: it tells the next reader the
-//! question is settled. If a second way to add a finding is ever introduced, this
-//! paragraph stops being true again, which is why `note_finding` is the only one.
+//! question is settled. It was aspirational a second time after that, while the
+//! `findings` field was still `pub` — the claim held only by convention, and the
+//! orphan branch of [`checked_contracts`] was already breaking it. Privacy is what
+//! makes the paragraph a fact rather than a request.
 //!
 //! A reader who needs the full picture should replay the corpus rather than scroll a
 //! web page.
@@ -89,8 +92,9 @@ use super::shadow::{Finding, JudgedContract};
 /// page no longer pays for the window's size.
 ///
 /// The "at most twelve" half of that arithmetic is a consequence of
-/// [`CheckedContract::note_finding`] being the only way a finding reaches a record,
-/// not a standing fact. While [`checked_contracts`] appended without deduplicating,
+/// [`CheckedContract::note_finding`] being the only way a finding reaches a record —
+/// which the private `findings` field now guarantees rather than merely asks for.
+/// While [`checked_contracts`] appended without deduplicating,
 /// one record could hold up to `shadow::MAX_CASES_PER_PROBE` (64) findings and the
 /// real worst case was nearer 0.9 MB — a bound stated in a comment is only as good as
 /// the invariant it rests on, and this one was stated before that invariant held.
@@ -144,9 +148,18 @@ pub struct CheckedContract {
     /// Findings for THIS contract, newest first. Deduplicated on the property that
     /// broke, so the length is bounded by the property count.
     ///
-    /// Only ever added to through [`CheckedContract::note_finding`] — see its doc for
-    /// why the deduplication is not repeated at each call site.
-    pub findings: Vec<MergeFinding>,
+    /// PRIVATE, and that privacy is the whole guarantee.
+    /// [`CheckedContract::note_finding`] is the only way a finding gets in, and the
+    /// module doc, [`MAX_REMEMBERED_CHECKED`] and [`MergeCheckStatus::record`] all
+    /// rest on that. While the field was `pub` in a `pub mod`, any caller could hand
+    /// [`MergeCheckStatus::record`] a hand-built record carrying duplicate
+    /// properties, and `record`'s INSERT arm does not deduplicate — only its merge
+    /// arm does — so those duplicates would be stored and every later tick would
+    /// deduplicate AGAINST them. That is #5403 H1 verbatim, unreachable only because
+    /// [`checked_contracts`] happened to be the sole producer. Build records with
+    /// [`CheckedContract::new`] and read them through
+    /// [`CheckedContract::findings`].
+    findings: Vec<MergeFinding>,
     /// When the most recent tick that judged THIS contract published.
     ///
     /// Per contract, not per node. The card used to answer "when was this contract
@@ -163,6 +176,37 @@ pub struct CheckedContract {
 }
 
 impl CheckedContract {
+    /// A record with no findings yet — the ONLY way to build one.
+    ///
+    /// Pairs with the private `findings` field. A record cannot come into existence
+    /// already holding an un-deduplicated finding list, so
+    /// [`MergeCheckStatus::record`]'s insert arm — which does not deduplicate, and
+    /// which is the arm a violating contract's first tick takes — has nothing
+    /// un-deduplicated it could be handed. The invariant is enforced by construction
+    /// rather than by every producer remembering it, which is what three review
+    /// rounds of #5403 established it cannot be.
+    pub(crate) fn new(
+        contract: ContractInstanceId,
+        verdicts: usize,
+        inconclusive: usize,
+        checked_at: Instant,
+    ) -> Self {
+        Self {
+            contract,
+            verdicts,
+            inconclusive,
+            findings: Vec::new(),
+            checked_at,
+        }
+    }
+
+    /// This contract's findings, newest first.
+    ///
+    /// Read-only by design — see the field's doc.
+    pub fn findings(&self) -> &[MergeFinding] {
+        &self.findings
+    }
+
     /// Add one finding to this record, deduplicated on the property that broke.
     ///
     /// The ONE place a finding is added to a record. It was previously open-coded in
@@ -218,10 +262,12 @@ pub struct MergeCheckStatus {
     /// When the last tick published.
     ///
     /// Carried because nothing else on the snapshot ages. `publish` is reached from
-    /// one place and two live paths skip it indefinitely while the old snapshot stands
-    /// (a tick that selected no work, and a probe task that died), so a peer whose
-    /// probe has been panicking for a week would otherwise keep serving "no violation
-    /// found" from a week-old tick with nothing on the page saying so.
+    /// two places in `capture::run_writer` — the barren tick and the completed probe —
+    /// and a peer can stop reaching either indefinitely while the old snapshot stands:
+    /// the probe task can die, a probe can hang so `in_flight` never clears and no
+    /// further tick starts, or the writer task itself can be gone. In any of those a
+    /// peer would otherwise keep serving "no violation found" from a week-old tick
+    /// with nothing on the page saying so.
     pub published_at: Instant,
 }
 
@@ -351,6 +397,13 @@ impl MergeCheckStatus {
     /// one test's findings appeared in another's assertions — which is the failure
     /// `.claude/rules/testing.md` describes and which per-process isolation hides
     /// rather than prevents.
+    ///
+    /// The INSERT arm below stores the incoming record as-is; only the merge arm
+    /// deduplicates. That is safe because a `CheckedContract` cannot be built holding
+    /// findings — [`CheckedContract::new`] starts empty and the field is private — so
+    /// no caller can hand this an un-deduplicated list. Do not make `findings` public
+    /// to "simplify a test"; the insert arm would then store whatever it was given,
+    /// and every later tick would deduplicate against those duplicates.
     pub fn record(
         &mut self,
         checked: impl IntoIterator<Item = CheckedContract>,
@@ -417,13 +470,7 @@ pub(crate) fn checked_contracts(
     let checked_at = Instant::now();
     let mut out: Vec<CheckedContract> = judged
         .iter()
-        .map(|j| CheckedContract {
-            contract: j.contract,
-            verdicts: j.verdicts,
-            inconclusive: j.inconclusive,
-            findings: Vec::new(),
-            checked_at,
-        })
+        .map(|j| CheckedContract::new(j.contract, j.verdicts, j.inconclusive, checked_at))
         .collect();
     for finding in findings {
         let merge = MergeFinding {
@@ -454,22 +501,25 @@ pub(crate) fn checked_contracts(
                     property = merge.property,
                     "merge finding for a contract the tick did not record as judged"
                 );
-                out.push(CheckedContract {
-                    contract: finding.contract,
-                    // ONE, not zero. A finding IS a verdict — it comes from a
-                    // `Violated` outcome — so a record carrying a violation and
-                    // `verdicts: 0` renders "0 reached a verdict" directly beside a
-                    // Violation row, which reads as a page contradicting itself and
-                    // gives an operator no way to tell which half to believe. One is
-                    // the honest floor: at least the case that produced this finding
-                    // reached a verdict. Any further findings for the same contract
-                    // take the `Some` arm above, so this is not a per-finding count
-                    // and does not claim to be.
-                    verdicts: 1,
-                    inconclusive: 0,
-                    findings: vec![merge],
-                    checked_at,
-                });
+                // ONE verdict, not zero. A finding IS a verdict — it comes from a
+                // `Violated` outcome — so a record carrying a violation and
+                // `verdicts: 0` renders "0 reached a verdict" directly beside a
+                // Violation row, which reads as a page contradicting itself and gives
+                // an operator no way to tell which half to believe. One is the honest
+                // floor: at least the case that produced this finding reached a
+                // verdict. Any further findings for the same contract take the `Some`
+                // arm above, so this is not a per-finding count and does not claim to
+                // be.
+                let mut record = CheckedContract::new(finding.contract, 1, 0, checked_at);
+                // Through `note_finding`, like every other producer. This branch used
+                // to build the vec directly (`findings: vec![merge]`) — the one place
+                // in the module that contradicted the "note_finding is the only way
+                // in" claim that the module doc, `MAX_REMEMBERED_CHECKED` and
+                // `record`'s un-deduplicating insert arm all rest on. It is also the
+                // branch that exists precisely for the case where an assumption has
+                // already broken, which is the worst place to keep a second way in.
+                record.note_finding(merge);
+                out.push(record);
             }
         }
     }
@@ -528,15 +578,19 @@ mod tests {
         }
     }
 
+    /// A record, built the only way production can build one.
+    ///
+    /// Goes through `new` + `note_finding` rather than a struct literal — which the
+    /// private `findings` field now forbids anyway. A hand-built literal was how a
+    /// test could construct a record production never could, which is what let the
+    /// insert arm's missing deduplication sit unnoticed.
     fn checked(n: u8, findings: Vec<MergeFinding>) -> CheckedContract {
-        CheckedContract {
-            contract: instance(n),
-            verdicts: 1,
-            inconclusive: 0,
-            findings,
-            // Overwritten by `record` with the tick's publish time, as in production.
-            checked_at: Instant::now(),
+        // Overwritten by `record` with the tick's publish time, as in production.
+        let mut record = CheckedContract::new(instance(n), 1, 0, Instant::now());
+        for finding in findings {
+            record.note_finding(finding);
         }
+        record
     }
 
     /// The fixture contract's NEVER_SETTLES mode — see
@@ -842,25 +896,13 @@ mod tests {
     fn per_contract_case_counts_accumulate_across_ticks() {
         let mut s = MergeCheckStatus::default();
         s.record(
-            [CheckedContract {
-                contract: instance(1),
-                verdicts: 2,
-                inconclusive: 5,
-                findings: Vec::new(),
-                checked_at: Instant::now(),
-            }],
+            [CheckedContract::new(instance(1), 2, 5, Instant::now())],
             1,
             0,
             Instant::now(),
         );
         s.record(
-            [CheckedContract {
-                contract: instance(1),
-                verdicts: 3,
-                inconclusive: 1,
-                findings: Vec::new(),
-                checked_at: Instant::now(),
-            }],
+            [CheckedContract::new(instance(1), 3, 1, Instant::now())],
             1,
             0,
             Instant::now(),

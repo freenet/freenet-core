@@ -149,6 +149,31 @@ pub struct ShadowReport {
     pub without_verdict: usize,
 }
 
+/// Fold the focus contracts that had no samples yet into a tick's counts.
+///
+/// [`ShadowRunner::select`] returns them separately from the work set, because
+/// [`probe`] cannot see them at all: no case ran for them, so nothing downstream of
+/// the probe knows they existed. Every one of the three counters has to be told.
+/// `focused` so it is the size of the focus SET rather than of the subset that
+/// happened to have samples; `skipped_no_samples` so the reason is legible; and
+/// `without_verdict` because `judged`/`without_verdict` are complements over the
+/// focus set, and a warming-up contract lands in neither half unless it is put in
+/// one. Warm-up is the ordinary state now that focus draws from the hosted set, so
+/// this is the common path, not a corner.
+///
+/// A shared function rather than three lines at each caller. `capture::run_writer`
+/// and the `probe_fixture_contract` test seam both hand a `ShadowReport` onward —
+/// the writer to `status::publish`, the seam to whatever a test does with it — and
+/// while the seam open-coded nothing at all, tests fed `report.without_verdict`
+/// straight into `MergeCheckStatus::record` as a tick's unjudged count, a value
+/// production would never publish while any focus contract was warming up. One
+/// function is the only shape in which the seam cannot drift from the writer.
+pub(crate) fn count_awaiting_samples(report: &mut ShadowReport, awaiting: usize) {
+    report.focused += awaiting;
+    report.skipped_no_samples += awaiting;
+    report.without_verdict += awaiting;
+}
+
 /// One contract that reached a verdict, and how much looking that took.
 ///
 /// The counts travel WITH the contract rather than being summed into the tick's
@@ -797,15 +822,21 @@ fn store_epoch(dir: &Path, epoch: u64) {
 /// Tests reach the real inputs through here so a fixture cannot quietly disagree with
 /// what a probe emits.
 ///
-/// `mode` selects the fixture's defect — see `tests/test-contract-conformance`. Mode 1
-/// (LAST_WRITE_WINS) breaks several merge laws on nearly every generated case, which
-/// is what makes it the input that distinguishes a deduplicating assembly from one
-/// that appends.
+/// `mode` selects the fixture's defect — see `tests/test-contract-conformance`. Every
+/// caller today passes mode 6 (NEVER_SETTLES), which breaks more than one merge law on
+/// most generated cases and repeats each of them across the tick's cases: the input
+/// that distinguishes a deduplicating assembly both from one that appends and from one
+/// that collapses everything onto the contract. (This doc named mode 1,
+/// LAST_WRITE_WINS, which nothing calls it with — a reader checking the fixture would
+/// have found a different defect than the tests actually exercise.)
 ///
 /// Returns the fixture's instance id alongside the probe's own two outputs, which are
-/// exactly the pair `capture::run_writer` hands to `status::publish`. The temp
-/// directories are dropped before returning: the probe resolves and compiles the code
-/// while it runs, so nothing here outlives the call.
+/// exactly the pair `capture::run_writer` hands to `status::publish` — and the report
+/// has been through `count_awaiting_samples`, the same fold the writer applies, so a
+/// test feeding `report.without_verdict` to `MergeCheckStatus::record` is feeding a
+/// number production would actually publish. The temp directories are dropped before
+/// returning: the probe resolves and compiles the code while it runs, so nothing here
+/// outlives the call.
 #[cfg(test)]
 pub(crate) async fn probe_fixture_contract(
     mode: u8,
@@ -862,18 +893,25 @@ pub(crate) async fn probe_fixture_contract(
     let dir = tempfile::TempDir::new()?;
     let runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
     let focus = runner.focus(None, &samplers.keys().copied().collect::<Vec<_>>());
-    let (work, _awaiting) = runner.select(&focus, &samplers);
+    let (work, awaiting) = runner.select(&focus, &samplers);
     assert!(
         !work.is_empty(),
-        "the fixture contract was not selected, so a probe never ran and any          assertion downstream of this proves nothing"
+        "the fixture contract was not selected, so a probe never ran and any \
+         assertion downstream of this proves nothing"
     );
 
-    let (report, findings) = probe(
+    let (mut report, findings) = probe(
         work,
         Some(store_dir.path().to_path_buf()),
         EnforcementMode::Shadow,
     )
     .await;
+    // The same fold `capture::run_writer` applies before publishing. Discarding it
+    // here made the seam diverge from production in exactly the counts tests read:
+    // `report.without_verdict` fed to `MergeCheckStatus::record` would have been a
+    // tick's unjudged count that a live peer could not produce while any focus
+    // contract was still warming up.
+    count_awaiting_samples(&mut report, awaiting);
     Ok((id, report, findings))
 }
 
@@ -896,10 +934,54 @@ mod tests {
         // to the sampler keys - which is exactly the fallback path production reports
         // as `candidate_source=sampler`.
         let focus = runner.focus(None, &samplers.keys().copied().collect::<Vec<_>>());
-        let (work, _awaiting) = runner.select(&focus, samplers);
-        let (report, findings) = probe(work, store.map(|p| p.to_path_buf()), runner.mode()).await;
+        let (work, awaiting) = runner.select(&focus, samplers);
+        let (mut report, findings) =
+            probe(work, store.map(|p| p.to_path_buf()), runner.mode()).await;
+        // The writer's own fold, for the same reason `probe_fixture_contract` applies
+        // it: a report that skipped it is one no live peer publishes.
+        count_awaiting_samples(&mut report, awaiting);
         runner.record(&findings);
         report
+    }
+
+    /// The warm-up fold has to reach all three counters.
+    ///
+    /// `judged` and `without_verdict` are complements over the focus set, so a
+    /// contract focus picked but the sampler had nothing for lands in NEITHER half
+    /// unless this puts it in one — and the dashboard's unjudged total then silently
+    /// omits it, rendering it as a contract nobody had a question about. Warm-up is
+    /// the ordinary state now that focus draws from the hosted set, so this is the
+    /// common path.
+    ///
+    /// Tested against the function rather than scraped out of `run_writer`: while the
+    /// three lines lived at the call site, the only guard was a source pin, and the
+    /// `probe_fixture_contract` seam applied none of them at all.
+    #[test]
+    fn awaiting_samples_reach_focused_skipped_and_without_verdict() {
+        let mut report = ShadowReport {
+            focused: 1,
+            skipped_no_samples: 0,
+            without_verdict: 0,
+            probed: 1,
+            ..Default::default()
+        };
+        count_awaiting_samples(&mut report, 3);
+        assert_eq!(
+            (
+                report.focused,
+                report.skipped_no_samples,
+                report.without_verdict
+            ),
+            (4, 3, 3),
+            "a warming-up focus contract must reach `focused` (or the focus set \
+             reports as the smaller subset that had samples), `skipped_no_samples` \
+             (or the reason is unstated) and `without_verdict` (or it counts as \
+             neither judged nor unjudged): {report:?}"
+        );
+        assert_eq!(
+            report.probed, 1,
+            "the fold must not touch `probed` — no case ran for a warming-up contract"
+        );
     }
 
     /// A fresh `FocusTick` must NOT claim the hosted source is already in use.

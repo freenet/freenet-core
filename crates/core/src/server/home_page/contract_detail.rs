@@ -318,13 +318,14 @@ pub fn contract_detail_html_from(
 /// warming-up peer `awaiting_samples` dominates outright, so the old wording
 /// described the least likely cause as though it were the only one.
 ///
-/// Every state that has a snapshot at all also renders WHEN the snapshot was
-/// published, and — for a contract with a record — when THAT CONTRACT was last
-/// checked, which is a different and usually much older number. The node-wide
-/// age is needed because `status::publish` is reached from two places in
-/// `capture::run_writer` and a probe task that panicked skips both, so without
-/// it a peer whose probe has been dead for a week keeps serving that week-old
-/// tick as a current result.
+/// Every state that has a snapshot at all — states 2, 3 and 4 — renders WHEN
+/// the snapshot was published, including the no-record state, where it is the
+/// only age there is. For a contract with a record it also renders when THAT
+/// CONTRACT was last checked, a different and usually much older number. The
+/// node-wide age is needed because a peer can stop publishing indefinitely
+/// while the old snapshot stands (a probe task that panicked, a probe that hangs
+/// so no later tick starts, a writer task that is gone), and without it that
+/// peer keeps serving a week-old tick as a current result.
 fn merge_law_card(merge_enabled: bool, merge_view: Option<&status::MergeCheckView>) -> String {
     if !merge_enabled {
         return r#"<div class="card">
@@ -357,18 +358,28 @@ fn merge_law_card(merge_enabled: bool, merge_view: Option<&status::MergeCheckVie
     }
     if view.stale {
         note.push_str(&format!(
-            r#"<p class="empty" style="margin-top:0.5rem"><strong>The checker has not published for {ago}.</strong> It runs every 15 minutes when healthy, so everything on this card may be stale — a probe that dies, or a tick that finds nothing to select, leaves the previous result standing with nothing else to say so.</p>"#,
+            r#"<p class="empty" style="margin-top:0.5rem"><strong>The checker has not published for {ago}.</strong> It runs every 15 minutes when healthy, so everything on this card may be stale — a probe that died, a probe still running that blocks every later tick from starting, or a capture writer that is gone, each leaves the previous result standing with nothing else to say so. The node's log is where to look next.</p>"#,
             ago = format_duration(view.published_secs_ago),
         ));
     }
 
     let Some(record) = view.contract.as_ref() else {
+        // The node-wide tick age is rendered HERE too, not only in the stale note.
+        // "Not checked recently" has two very different explanations — a busy checker
+        // that has not got round to this contract, and a checker that stopped — and
+        // without the age the page cannot tell them apart at all below the staleness
+        // threshold, which is where a checker that died fourteen minutes ago sits.
+        // There is no per-contract age to show, because there is no record.
         return format!(
             r#"<div class="card">
                 <h2>Merge laws</h2>
                 <p class="empty">This contract has not been checked recently. The checked window is bounded, so this is <strong>not</strong> a statement that the contract is fine — the checker has simply not looked at it lately.</p>
+                <div class="info-grid" style="margin-top:0.75rem">
+                    <div class="info-label" title="How long ago the merge-law checker last published a tick on this NODE — about any contract, not this one, which it has no record of. It probes every 15 minutes when healthy.">Last checker tick</div><div class="info-value">{ago} ago</div>
+                </div>
                 {note}
             </div>"#,
+            ago = format_duration(view.published_secs_ago),
             note = note,
         );
     };
@@ -405,7 +416,7 @@ fn merge_law_card(merge_enabled: bool, merge_view: Option<&status::MergeCheckVie
         ago = format_duration(view.published_secs_ago),
     );
 
-    if record.findings.is_empty() {
+    if record.findings().is_empty() {
         format!(
             r#"<div class="card">
                 <h2>Merge laws</h2>
@@ -421,7 +432,7 @@ fn merge_law_card(merge_enabled: bool, merge_view: Option<&status::MergeCheckVie
         )
     } else {
         let mut rows = String::new();
-        for f in &record.findings {
+        for f in record.findings() {
             let (pill_class, label) = match f.severity {
                 Severity::Violation => ("fresh-stale", "Violation — cannot converge"),
                 Severity::Diagnostic => ("use-idle", "Diagnostic — legal but wasteful"),
