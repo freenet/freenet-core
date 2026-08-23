@@ -578,12 +578,54 @@ mod tests {
         }
     }
 
+    /// The `findings` field must stay private — the guarantee, not a convention.
+    ///
+    /// `note_finding` being the only way a finding reaches a record is what the module
+    /// doc, `MAX_REMEMBERED_CHECKED` and `record`'s un-deduplicating INSERT arm all
+    /// rest on, and it held by convention through three review rounds of #5403 before
+    /// the field was made private. Re-adding `pub` here breaks NOTHING at compile
+    /// time on its own: the visibility only bites once some caller also writes a
+    /// struct literal, and at that point the invariant is already gone. So the
+    /// privacy itself is what has to be asserted.
+    ///
+    /// Scoped to the struct's own body. A whole-file search would be answered by any
+    /// other `pub` field, and — the failure this file's sibling pins were written
+    /// against — by this test's own assertion string.
+    #[test]
+    fn the_findings_field_stays_private() {
+        let src = include_str!("status.rs");
+        let anchor = "pub struct CheckedContract {";
+        let start = src
+            .find(anchor)
+            .expect("CheckedContract is no longer declared here; this pin reads nothing")
+            + anchor.len();
+        let end = start
+            + src[start..]
+                .find("\n}\n")
+                .expect("CheckedContract's declaration is not brace-balanced");
+        let decl = &src[start..end];
+        assert!(
+            decl.contains("\n    findings: Vec<MergeFinding>,"),
+            "CheckedContract no longer declares `findings` privately. While it was \
+             `pub` in a `pub mod`, any caller could hand `record` a hand-built record \
+             carrying duplicate properties, and the insert arm does not deduplicate — \
+             that is #5403 H1 verbatim. Build records with `CheckedContract::new` and \
+             read them through `findings()`. got:{decl}"
+        );
+    }
+
     /// A record, built the only way production can build one.
     ///
     /// Goes through `new` + `note_finding` rather than a struct literal — which the
     /// private `findings` field now forbids anyway. A hand-built literal was how a
     /// test could construct a record production never could, which is what let the
     /// insert arm's missing deduplication sit unnoticed.
+    ///
+    /// Note what `note_finding` does to `findings` on the way in: it inserts at the
+    /// FRONT and drops a property already present. So the record comes back with the
+    /// list reversed and any duplicate property gone — the signature reads like "these
+    /// findings, in this order" and it is not. Nothing asserts on order today; do not
+    /// write an order-dependent assertion against this helper without reading that.
     fn checked(n: u8, findings: Vec<MergeFinding>) -> CheckedContract {
         // Overwritten by `record` with the tick's publish time, as in production.
         let mut record = CheckedContract::new(instance(n), 1, 0, Instant::now());

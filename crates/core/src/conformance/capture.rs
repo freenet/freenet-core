@@ -2177,22 +2177,32 @@ mod probe_wiring_pins {
     /// Warm-up is the normal state now that focus draws from the hosted set rather than
     /// from what was already sampled, so this hid the common case.
     ///
-    /// Only the DELEGATION is pinned here. The three counters used to be open-coded
-    /// in `run_writer`, which is why this pin had to name each of them and why the
-    /// `probe_fixture_contract` seam could silently apply none of them; they now live
-    /// in `shadow::count_awaiting_samples`, whose behaviour is tested directly in
-    /// `shadow`'s own test module rather than scraped. What no test but a source pin
-    /// can see is whether `run_writer` still CALLS it.
+    /// Only the DELEGATION and its arguments are pinned here. The three counters used
+    /// to be open-coded in `run_writer`, which is why this pin had to name each of
+    /// them and why the `probe_fixture_contract` seam could silently apply none of
+    /// them; they now live in `shadow::count_awaiting_samples`, whose behaviour is
+    /// tested directly in `shadow`'s own test module rather than scraped. What no test
+    /// but a source pin can see is whether `run_writer` still CALLS it, and with what.
     #[test]
     fn contracts_awaiting_samples_are_counted_in_the_tick() {
         let body = run_writer_code_only();
-        assert!(
-            body.contains("count_awaiting_samples(")
-                && body.contains("&mut report,")
-                && body.contains("awaiting_samples,"),
-            "the completed-probe arm no longer folds the warming-up focus contracts \
-             into the tick's counts, so a warming-up focus set reports as a smaller, \
-             fully-checked one and the dashboard's unjudged total silently omits them"
+        // Positional, and scoped to the call's own argument list — see
+        // `count_awaiting_samples_args`. Passing the tick's report but a literal `0`
+        // for the count type-checks, folds nothing in, and renders as a warming-up
+        // focus set that was fully judged.
+        let args = count_awaiting_samples_args();
+        assert_eq!(
+            args[0], "&mut report",
+            "the warming-up counters are folded into something other than THIS tick's \
+             report, so the numbers the dashboard is fed below describe a different \
+             object than the one the log line reports"
+        );
+        assert_eq!(
+            args[1], "awaiting_samples",
+            "the warming-up count passed to `count_awaiting_samples` is no longer \
+             `awaiting_samples`, so the focus contracts that had nothing to check yet \
+             are dropped from the tick's counts and a warming-up focus set reports as \
+             a smaller, fully-checked one"
         );
         // Not re-inlined alongside the call: two places that both adjust these
         // counters is how the writer and the seam came to disagree in the first
@@ -2263,7 +2273,10 @@ mod probe_wiring_pins {
         // under "the count must not be derived from the marker it audits".
         //
         // `publish(` also matches inside `status::publish(`, so equality here says
-        // exactly "every call spelled `publish(` is the qualified one".
+        // exactly "every call spelled `publish(` is the qualified one". It is a
+        // PREFIX match, so it over-counts a `something.publish(` or a `republish(`
+        // — which fails safe, naming a discrepancy that is not one — and it is blind
+        // to a `use … as` rename, which both counters miss together.
         let any_spelling = body.matches("publish(").count();
         assert_eq!(
             any_spelling,
@@ -2300,6 +2313,25 @@ mod probe_wiring_pins {
     fn publish_call_args(nth: usize) -> Vec<String> {
         let body = run_writer_code_only();
         let start = publish_call_sites()[nth];
+        let args = call_args_at(&body, start, &format!("status::publish call {nth}"));
+        assert_eq!(
+            args.len(),
+            4,
+            "status::publish's argument list changed shape, so the positional pins \
+             below are asserting about the wrong arguments: {args:?}"
+        );
+        args
+    }
+
+    /// The arguments of the call whose opening paren ends at `start`, in order.
+    ///
+    /// Shared by every argument-scoped pin in this module, because the bound is the
+    /// whole point. A free-floating `body.contains("some_arg,")` is satisfied by any
+    /// other occurrence of that text anywhere in `run_writer` — a `tracing` field, a
+    /// nearby assignment, a sibling call — so it cannot see a wrong argument at the
+    /// call it names. `label` names the call in the panic below, which is the only
+    /// diagnostic a reader gets when an anchor stops landing on a call.
+    fn call_args_at(body: &str, start: usize, label: &str) -> Vec<String> {
         // Split on TOP-LEVEL commas only: an argument may itself be a call with its
         // own comma-separated arguments.
         let mut depth = 0usize;
@@ -2319,10 +2351,9 @@ mod probe_wiring_pins {
                 // overflow`, which names arithmetic and sends the next reader nowhere
                 // near the anchor that actually broke.
                 ']' if depth == 0 => panic!(
-                    "unbalanced `]` while slicing status::publish call {nth}'s \
-                     arguments: the anchor no longer lands on the call's opening \
-                     paren, so nothing below is asserting about a publish call. \
-                     parsed so far: {args:?} + {current:?}"
+                    "unbalanced `]` while slicing {label}'s arguments: the anchor no \
+                     longer lands on that call's opening paren, so nothing below is \
+                     asserting about it. parsed so far: {args:?} + {current:?}"
                 ),
                 ')' | ']' => {
                     depth -= 1;
@@ -2338,11 +2369,42 @@ mod probe_wiring_pins {
         if !current.trim().is_empty() {
             args.push(current.trim().to_string());
         }
+        args
+    }
+
+    /// The arguments of `run_writer`'s sole `count_awaiting_samples` call, in order.
+    ///
+    /// Bounded to the call for the same reason `publish_call_args` is. The three
+    /// unscoped `body.contains` this replaced could not see the call's arguments at
+    /// all: `"awaiting_samples,"` occurs three times in `run_writer` — the barren
+    /// tick's `without_verdict` log field, the barren publish's third argument, and
+    /// this call — so that conjunct was satisfied whatever this call was passed, and
+    /// `count_awaiting_samples(&mut report, 0)` left the pin green (mutation-verified).
+    fn count_awaiting_samples_args() -> Vec<String> {
+        let body = run_writer_code_only();
+        let anchor = "count_awaiting_samples(";
+        // One call, so `find` is unambiguous. A second one would mean the writer
+        // adjusts these counters twice, which is the double-count the sibling
+        // open-coding assertions below exist to forbid.
+        assert_eq!(
+            body.matches(anchor).count(),
+            1,
+            "run_writer calls `count_awaiting_samples` more than once, so the \
+             warming-up focus contracts are folded into the tick's counts twice — a \
+             double-count reads as a plausible number"
+        );
+        let start = body.find(anchor).expect(
+            "the completed-probe arm no longer folds the warming-up focus \
+                 contracts into the tick's counts, so a warming-up focus set reports \
+                 as a smaller, fully-checked one and the dashboard's unjudged total \
+                 silently omits them",
+        ) + anchor.len();
+        let args = call_args_at(&body, start, "count_awaiting_samples");
         assert_eq!(
             args.len(),
-            4,
-            "status::publish's argument list changed shape, so the positional pins \
-             below are asserting about the wrong arguments: {args:?}"
+            2,
+            "count_awaiting_samples's argument list changed shape, so the positional \
+             pins below are asserting about the wrong arguments: {args:?}"
         );
         args
     }
@@ -2364,6 +2426,7 @@ mod probe_wiring_pins {
     /// window renders clean while violating.
     #[test]
     fn dashboard_checked_window_is_fed_judged_contracts_with_their_findings() {
+        let body = run_writer_code_only();
         let args = publish_call_args(PROBE_PUBLISH);
         assert!(
             args[0].contains("checked_contracts(&report.judged, &findings)"),
@@ -2373,14 +2436,28 @@ mod probe_wiring_pins {
              the contract they belong to (#5403 H1). got: {}",
             args[0]
         );
-        // Every call site, and bounded to the ARGUMENT rather than to the whole body.
-        // The old guard was `!body.contains("last_focus.selected.iter().copied()")`,
-        // which names one spelling at one binding: in the barren branch the in-scope
+        // TWO guards, because each sees what the other cannot.
+        //
+        // The whole-body one below catches selection MATERIALISED FIRST: bind
+        // `last_focus.selected.iter().copied()` to a local and pass the local, and
+        // every argument-scoped check below sees only the local's name and stays
+        // green (mutation-verified). It costs nothing to keep — `last_focus.selected`
+        // appears in `run_writer` only inside a comment, which `run_writer_code_only`
+        // strips — so it has no false-positive surface here.
+        assert!(
+            !body.contains("last_focus.selected.iter().copied()"),
+            "run_writer materialises focus SELECTION as a record set. Whether or not \
+             it is passed to `status::publish` directly, that is the one thing this \
+             list must not be built from: a selected contract can be skipped before \
+             probing (no code, no samples) or probed and never reach a verdict"
+        );
+        // The per-call-site loop catches what the whole-body guard cannot NAME. It
+        // named one spelling at one binding: in the barren branch the in-scope
         // binding is `focus`, not `last_focus`, so a future edit feeding selection
-        // into the barren publish would write `focus.selected…` and the guard would
-        // not see it. A whole-body guard also cannot name `focus.selected` at all —
-        // the scope assignment legitimately uses it two lines above the branch — so
-        // it has to be scoped to the call to be able to say this at all.
+        // into the barren publish would write `focus.selected…` and go unseen — and
+        // a whole-body guard cannot name `focus.selected` at all, because the scope
+        // assignment legitimately uses it two lines above the branch. Scoping to the
+        // argument is what makes that sayable.
         for nth in 0..PUBLISH_CALL_SITES {
             let first = &publish_call_args(nth)[0];
             assert!(

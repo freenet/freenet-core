@@ -3804,6 +3804,13 @@ mod tests {
     /// anything has. A struct literal here would let a test construct a record
     /// production could not, which is precisely what hid `record`'s
     /// un-deduplicating insert arm.
+    ///
+    /// Note what `note_finding` does to `findings` on the way in: it inserts at the
+    /// FRONT and drops a property already present. So the record comes back with the
+    /// list reversed and any duplicate property gone — the signature reads like "these
+    /// findings, in this order" and it is not. Today's callers assert presence, not
+    /// order; do not write an order-dependent assertion against this helper without
+    /// reading that.
     fn checked_record(
         contract: freenet_stdlib::prelude::ContractInstanceId,
         verdicts: usize,

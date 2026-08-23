@@ -358,7 +358,7 @@ fn merge_law_card(merge_enabled: bool, merge_view: Option<&status::MergeCheckVie
     }
     if view.stale {
         note.push_str(&format!(
-            r#"<p class="empty" style="margin-top:0.5rem"><strong>The checker has not published for {ago}.</strong> It runs every 15 minutes when healthy, so everything on this card may be stale — a probe that died, a probe still running that blocks every later tick from starting, or a capture writer that is gone, each leaves the previous result standing with nothing else to say so. The node's log is where to look next.</p>"#,
+            r#"<p class="empty" style="margin-top:0.5rem"><strong>The checker has not published for {ago}.</strong> It runs every 15 minutes when healthy, so everything on this card may be stale — a probe that died, a probe still running (no later tick starts while one is in flight, and a probe that stalls outside contract code has no deadline of its own), or a capture writer that is gone, each leaves the previous result standing with nothing else to say so. The node's log is where to look next.</p>"#,
             ago = format_duration(view.published_secs_ago),
         ));
     }
