@@ -39,6 +39,12 @@ use super::property::Severity;
 /// against a bundle, which can afford to be exhaustive.
 const MAX_DISPLAYED_FINDINGS: usize = 64;
 
+/// How many recently-checked contracts to remember.
+///
+/// Larger than the finding cap because most checks find nothing, and "this one was
+/// looked at and was fine" is the common answer a per-contract page needs to give.
+const MAX_REMEMBERED_CHECKED: usize = 256;
+
 /// One contract's failure to obey a merge law.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeFinding {
@@ -69,6 +75,33 @@ pub struct MergeCheckStatus {
     pub cases_last_tick: usize,
     /// Findings, newest first, capped at [`MAX_DISPLAYED_FINDINGS`].
     pub findings: Vec<MergeFinding>,
+    /// Contracts recently checked, newest first, capped at [`MAX_REMEMBERED_CHECKED`].
+    ///
+    /// Without this a per-contract view cannot tell "checked, and clean" from "never
+    /// looked at", and would render them the same way — which is the conflation this
+    /// whole subsystem exists to stop, displayed on a page an operator will act on.
+    pub recently_checked: Vec<ContractInstanceId>,
+}
+
+impl MergeCheckStatus {
+    /// Whether this contract is known to have been checked.
+    ///
+    /// `false` means "not in the recent window", NOT "not checked ever" — the window
+    /// is bounded. A caller must phrase it as absence of knowledge rather than as a
+    /// clean bill of health.
+    pub fn was_checked(&self, contract: &ContractInstanceId) -> bool {
+        self.recently_checked.contains(contract)
+    }
+
+    /// Findings recorded against one contract.
+    pub fn findings_for<'a>(
+        &'a self,
+        contract: &'a ContractInstanceId,
+    ) -> impl Iterator<Item = &'a MergeFinding> + 'a {
+        self.findings
+            .iter()
+            .filter(move |f| f.contract == *contract)
+    }
 }
 
 /// `None` until the checker publishes, which it only does when capture is enabled.
@@ -106,11 +139,17 @@ impl MergeCheckStatus {
     /// rather than prevents.
     pub fn record(
         &mut self,
+        checked: impl IntoIterator<Item = ContractInstanceId>,
         contracts_checked: usize,
         contracts_without_verdict: usize,
         cases_last_tick: usize,
         new_findings: impl IntoIterator<Item = MergeFinding>,
     ) {
+        for contract in checked {
+            self.recently_checked.retain(|c| *c != contract);
+            self.recently_checked.insert(0, contract);
+        }
+        self.recently_checked.truncate(MAX_REMEMBERED_CHECKED);
         self.contracts_checked = contracts_checked;
         self.contracts_without_verdict = contracts_without_verdict;
         self.cases_last_tick = cases_last_tick;
@@ -133,6 +172,7 @@ impl MergeCheckStatus {
 
 /// Publish a tick's outcome. Called by the shadow loop; cheap and non-blocking.
 pub fn publish(
+    checked: impl IntoIterator<Item = ContractInstanceId>,
     contracts_checked: usize,
     contracts_without_verdict: usize,
     cases_last_tick: usize,
@@ -142,6 +182,7 @@ pub fn publish(
         .write()
         .get_or_insert_with(MergeCheckStatus::default)
         .record(
+            checked,
             contracts_checked,
             contracts_without_verdict,
             cases_last_tick,
@@ -175,8 +216,8 @@ mod tests {
     #[test]
     fn repeated_findings_for_one_contract_and_property_collapse() {
         let mut s = MergeCheckStatus::default();
-        s.record(1, 0, 10, [finding(1, "state_commutativity")]);
-        s.record(1, 0, 10, [finding(1, "state_commutativity")]);
+        s.record([], 1, 0, 10, [finding(1, "state_commutativity")]);
+        s.record([], 1, 0, 10, [finding(1, "state_commutativity")]);
         assert_eq!(
             s.findings.len(),
             1,
@@ -189,8 +230,8 @@ mod tests {
     #[test]
     fn different_properties_on_one_contract_stay_separate() {
         let mut s = MergeCheckStatus::default();
-        s.record(1, 0, 10, [finding(2, "state_commutativity")]);
-        s.record(1, 0, 10, [finding(2, "state_associativity")]);
+        s.record([], 1, 0, 10, [finding(2, "state_commutativity")]);
+        s.record([], 1, 0, 10, [finding(2, "state_associativity")]);
         assert_eq!(
             s.findings.len(),
             2,
@@ -204,7 +245,7 @@ mod tests {
     fn findings_are_bounded() {
         let mut s = MergeCheckStatus::default();
         for i in 0..(MAX_DISPLAYED_FINDINGS + 40) {
-            s.record(1, 0, 1, [finding((i % 251) as u8, "state_idempotence")]);
+            s.record([], 1, 0, 1, [finding((i % 251) as u8, "state_idempotence")]);
         }
         assert!(
             s.findings.len() <= MAX_DISPLAYED_FINDINGS,
@@ -221,7 +262,7 @@ mod tests {
     #[test]
     fn contracts_without_a_verdict_are_reported_separately() {
         let mut s = MergeCheckStatus::default();
-        s.record(10, 3, 400, []);
+        s.record([], 10, 3, 400, []);
         assert_eq!(s.contracts_without_verdict, 3);
         assert!(
             s.findings.is_empty(),

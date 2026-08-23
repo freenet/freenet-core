@@ -880,6 +880,7 @@ async fn run_writer(
                 // derived by a reader: a count re-computed at the call site is how
                 // this project has produced wrong metrics before.
                 crate::conformance::status::publish(
+                    last_focus.selected.iter().copied(),
                     report.probed,
                     report.skipped_no_code + report.skipped_no_samples,
                     report.cases,
