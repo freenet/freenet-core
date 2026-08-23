@@ -1561,6 +1561,102 @@ mod cleanup_tests {
         assert_eq!(parse_log_dir_max_bytes(Some("1")), LOG_DIR_MAX_BYTES);
     }
 
+    /// Bound `include_str!`-scraped source to one free function's body, so a
+    /// source-scrape pin can never silently widen to the whole file or match
+    /// itself. Copied from `bin/commands/auto_update.rs::fn_body` (see its
+    /// doc for the incident history motivating each check below) rather than
+    /// shared, since this file has no existing dependency on that module.
+    fn fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        let at = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("definition not found: {signature}"));
+        // Only valid for FREE functions at column 0 — a method's closing
+        // brace is indented, so the first `\n}\n` after it belongs to the
+        // enclosing `impl`, silently returning every sibling method too.
+        let tests_at = src
+            .find("\n#[cfg(test)]\nmod ")
+            .map(|i| i + 1)
+            .expect("test module not located — this guard cannot verify anything");
+        assert!(
+            at < tests_at,
+            "`{signature}` matched inside the test module — this pin is \
+             scraping its own source and would pass vacuously"
+        );
+        assert!(
+            at == 0 || src.as_bytes()[at - 1] == b'\n',
+            "fn_body only supports column-0 free functions; `{signature}` is \
+             indented (a method?), where the `\\n}}\\n` end-anchor would slice to \
+             the end of the enclosing impl instead"
+        );
+        let after = &src[at + signature.len()..];
+        let (body, _) = after
+            .split_once("\n}\n")
+            .unwrap_or_else(|| panic!("could not locate end of: {signature}"));
+        // Vacuity detector: a correctly-bounded function body can never
+        // contain the test-module attribute. If it does, the `\n}\n` search
+        // ran past the function and this pin is measuring the whole file.
+        assert!(
+            !body.contains("\n#[cfg(test)]\nmod "),
+            "scoped region for `{signature}` escaped into the test module — this \
+             pin would pass vacuously"
+        );
+        body
+    }
+
+    /// Pin that `cleanup_old_logs` actually wires the parsed
+    /// `FREENET_LOG_DIR_MAX_BYTES` override into `prune_log_files`, rather
+    /// than computing it and discarding it in favor of the hardcoded
+    /// `LOG_DIR_MAX_BYTES` constant.
+    ///
+    /// None of the `log_dir_max_bytes_*` tests above can catch this class of
+    /// regression: they call `parse_log_dir_max_bytes` directly and stay
+    /// green even if nothing in production ever calls it — a well-tested
+    /// function wired to nothing, the same shape
+    /// `init_tracer_wires_every_error_layer_through_build_error_filter`
+    /// (`error_filter_tests`, this file) already guards against for the
+    /// error-filter wiring. Verified against a live mutation of the call
+    /// site (`let max_bytes = LOG_DIR_MAX_BYTES;`), which this pin catches
+    /// and the runtime tests above do not — see the PR description for
+    /// issue #5021.
+    ///
+    /// Source-scrape rather than a runtime assertion because reaching this
+    /// call site behaviourally would mean mutating
+    /// `FREENET_LOG_DIR_MAX_BYTES` in the process environment from a test,
+    /// exactly the cross-test interference `.claude/rules/testing.md` and
+    /// `parse_log_dir_max_bytes`'s own doc warn against.
+    #[test]
+    fn cleanup_old_logs_wires_the_parsed_budget_into_prune_log_files() {
+        let body = fn_body(
+            include_str!("tracer.rs"),
+            "fn cleanup_old_logs(log_dir: &std::path::Path) {",
+        );
+
+        // Anchor on the call itself — the API surface that must be
+        // reached — not on the local variable it's assigned to, which a
+        // harmless rename should not be able to break this pin.
+        let calls = body
+            .matches("parse_log_dir_max_bytes(log_dir_max_bytes_env().as_deref())")
+            .count();
+        assert_eq!(
+            calls, 1,
+            "cleanup_old_logs must call parse_log_dir_max_bytes(log_dir_max_bytes_env()...) \
+             exactly once to resolve the byte budget; if the call was renamed or removed, \
+             update this pin deliberately"
+        );
+
+        // And the parsed value — not a hardcoded default sitting next to
+        // it — must be what reaches prune_log_files. LOG_DIR_MAX_BYTES is
+        // a stable named constant (itself pinned elsewhere in this file),
+        // not a local variable subject to casual renaming, so anchoring
+        // the negative check on it doesn't share that fragility.
+        assert!(
+            !body.contains("prune_log_files(files, cutoff, LOG_DIR_MAX_BYTES)"),
+            "prune_log_files must never be called with the hardcoded LOG_DIR_MAX_BYTES \
+             constant directly — that would silently disconnect \
+             FREENET_LOG_DIR_MAX_BYTES from the pruner"
+        );
+    }
+
     /// The size cap must engage exactly at the budget boundary.
     /// Clock-free: exercises the pure size math, so it asserts the
     /// boundary regardless of how large the budget is. `budget + 1` total
