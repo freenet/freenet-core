@@ -350,7 +350,7 @@ fn merge_law_card(merge_enabled: bool, merge_view: Option<&status::MergeCheckVie
     let mut note = String::new();
     if view.without_verdict_last_tick > 0 {
         note.push_str(&format!(
-            r#"<p class="empty" style="margin-top:0.5rem">In its most recent tick the checker judged {judged} contract(s) could not reach a verdict on {n} — most often because there was nothing yet to check (no samples collected for them, or no contract code on this node), and sometimes because every case it did try came back inconclusive. Those contracts are neither clean nor flagged; they simply were not judged.</p>"#,
+            r#"<p class="empty" style="margin-top:0.5rem">In its most recent tick the checker judged {judged} contract(s) and could not reach a verdict on {n} — most often because there was nothing yet to check (no samples collected for them, or no contract code on this node), and sometimes because every case it did try came back inconclusive. Those contracts are neither clean nor flagged; they simply were not judged.</p>"#,
             judged = view.judged_last_tick,
             n = view.without_verdict_last_tick,
         ));
