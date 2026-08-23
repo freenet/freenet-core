@@ -1294,7 +1294,14 @@ mod tests {
     }
 
     /// A contract that is genuinely probed, and runs every one of its cases, but
-    /// reaches NO verdict on any of them, must not be recorded as judged.
+    /// reaches NO verdict on any of them, must not be recorded as judged — and a
+    /// SIBLING contract probed in the same tick that DOES reach a verdict must
+    /// still land in `judged`. Both halves run in one tick on purpose: a version
+    /// of the fix that stopped populating `judged` entirely (rather than
+    /// correctly excluding the inconclusive-only contract) would still pass an
+    /// inconclusive-only-contract-not-judged assertion in isolation, so the
+    /// positive half is what actually pins the mechanism rather than just its
+    /// absence.
     ///
     /// The #5403 review defect: `probe_one` incremented `report.probed` before any
     /// case ran and nothing distinguished "every case was `Inconclusive`" from "at
@@ -1302,11 +1309,12 @@ mod tests {
     /// caller that only had `probed`, so a contract nothing was ever concluded about
     /// rendered on the dashboard exactly like a contract checked and found clean.
     ///
-    /// Mode 7 (`REQUIRES_RELATED`) is the fixture built for this: `validate_state`
-    /// asks for another contract's state, and `samplers_for` never supplies any
-    /// (`related: Vec::new()`), so every case dead-ends at
+    /// Mode 7 (`REQUIRES_RELATED`) is the fixture built for the inconclusive half:
+    /// `validate_state` asks for another contract's state, and `samplers_for` never
+    /// supplies any (`related: Vec::new()`), so every case dead-ends at
     /// `Inconclusive::RelatedRequired` — a real, unforced instance of the failure
-    /// mode, not a hand-built stub.
+    /// mode, not a hand-built stub. Mode 0 (`CONFORMING`) is the sibling that
+    /// reaches `Holds` on every case.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_contract_whose_every_case_is_inconclusive_is_not_judged()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1316,6 +1324,7 @@ mod tests {
         use std::sync::Arc;
 
         // Keep in sync with `tests/test-contract-conformance/src/lib.rs`.
+        const CONFORMING: u8 = 0;
         const REQUIRES_RELATED: u8 = 7;
 
         let wasm = crate::wasm_runtime::tests::get_test_module("test_contract_conformance")?;
@@ -1327,20 +1336,46 @@ mod tests {
         let mut store =
             crate::wasm_runtime::ContractStore::new(store_dir.path().into(), 10_000_000, db)?;
 
-        let parameters: Parameters<'static> = Parameters::from(vec![REQUIRES_RELATED]);
-        let contract = WrappedContract::new(Arc::new(ContractCode::from(wasm)), parameters.clone());
-        let id = *contract.key().id();
-        store.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
-            contract,
-        )))?;
+        let transitions = &[(vec![1u8], vec![1u8, 2]), (vec![2u8], vec![2u8, 3])];
 
         // No `related` state is attached to any transition, so `validate_state`
         // never gets what it asks for and every case is inconclusive.
-        let samplers = samplers_for(
-            id,
-            vec![REQUIRES_RELATED],
+        let unjudged_parameters: Parameters<'static> = Parameters::from(vec![REQUIRES_RELATED]);
+        let unjudged_contract = WrappedContract::new(
+            Arc::new(ContractCode::from(wasm.clone())),
+            unjudged_parameters.clone(),
+        );
+        let unjudged_id = *unjudged_contract.key().id();
+        store.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+            unjudged_contract,
+        )))?;
+        let mut samplers =
+            samplers_for(unjudged_id, vec![REQUIRES_RELATED], code_hash, transitions);
+
+        // A genuinely conforming sibling, probed in the SAME tick, must still be
+        // recorded as judged.
+        let judged_parameters: Parameters<'static> = Parameters::from(vec![CONFORMING]);
+        let judged_contract = WrappedContract::new(
+            Arc::new(ContractCode::from(wasm)),
+            judged_parameters.clone(),
+        );
+        let judged_id = *judged_contract.key().id();
+        store.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+            judged_contract,
+        )))?;
+        samplers.extend(samplers_for(
+            judged_id,
+            vec![CONFORMING],
             code_hash,
-            &[(vec![1], vec![1, 2]), (vec![2], vec![2, 3])],
+            transitions,
+        ));
+
+        // Both candidates fit within MAX_FOCUS_CONTRACTS, so both are selected —
+        // this is not testing which one focus happened to pick.
+        assert_eq!(
+            samplers.len(),
+            2,
+            "test setup did not produce two distinct contracts"
         );
 
         let dir = tempfile::TempDir::new()?;
@@ -1348,22 +1383,32 @@ mod tests {
         let report = tick(&mut runner, &samplers, Some(store_dir.path())).await;
 
         assert_eq!(
-            report.probed, 1,
-            "the contract was not probed at all, so this proves nothing: {report:?}"
+            report.probed, 2,
+            "both contracts were not probed, so this proves nothing: {report:?}"
         );
         assert!(
             report.cases > 0,
             "no case ran, so this proves nothing: {report:?}"
         );
-        assert_eq!(
-            report.inconclusive, report.cases,
-            "expected every case to be inconclusive, or the fixture no longer \
-             exercises this failure mode: {report:?}"
+        assert!(
+            report.inconclusive > 0,
+            "expected the REQUIRES_RELATED contract's cases to be inconclusive, or \
+             the fixture no longer exercises this failure mode: {report:?}"
         );
         assert!(
-            report.judged.is_empty(),
+            !report.judged.contains(&unjudged_id),
             "a contract whose every case was inconclusive was recorded as judged: \
              {report:?}"
+        );
+        assert!(
+            report.judged.contains(&judged_id),
+            "a contract that genuinely reached a verdict on every case was NOT \
+             recorded as judged: {report:?}"
+        );
+        assert_eq!(
+            report.judged.len(),
+            1,
+            "expected exactly the conforming sibling to be judged: {report:?}"
         );
         assert_eq!(
             report.without_verdict, 1,
