@@ -210,6 +210,8 @@ mod tests {
     };
     use super::favicon::{build_dashboard_title, build_favicon_data_uri};
     use super::peer_detail::peer_detail_html;
+    use crate::conformance::property::Severity;
+    use crate::conformance::status::{MergeCheckStatus, MergeFinding};
     use crate::node::network_status::{
         FailureSnapshot, HealthLevel, NatStatsSnapshot, NetworkStatusSnapshot, OpStatsSnapshot,
         RingStatsSnapshot,
@@ -3396,7 +3398,7 @@ mod tests {
     #[test]
     fn contract_detail_escapes_a_key_from_the_url() {
         let payload = "<script>alert(1)</script>";
-        let html = contract_detail_html_from(&None, payload);
+        let html = contract_detail_html_from(&None, payload, false, None);
         assert!(
             !html.contains("<script>alert(1)"),
             "an unescaped key from the URL is reflected XSS — got:\n{html}"
@@ -3417,7 +3419,7 @@ mod tests {
     /// describing a ranking the code does not implement.
     #[test]
     fn contract_not_found_is_scoped_to_this_node() {
-        let html = contract_detail_html_from(&None, "NOSUCHCONTRACTKEY");
+        let html = contract_detail_html_from(&None, "NOSUCHCONTRACTKEY", false, None);
         assert!(
             html.contains("Contract Not Found"),
             "expected the not-found page — got:\n{html}"
@@ -3513,7 +3515,7 @@ mod tests {
                 is_receiving_updates: is_fresh,
                 in_use,
             }];
-            contract_detail_html_from(&Some(snap), "SUBBED1")
+            contract_detail_html_from(&Some(snap), "SUBBED1", false, None)
         };
 
         // Fresh, in use, updated recently.
@@ -3587,7 +3589,7 @@ mod tests {
                 last_transition_secs_ago: 30,
                 history: Vec::new(),
             }];
-            contract_detail_html_from(&Some(snap), key)
+            contract_detail_html_from(&Some(snap), key, false, None)
         };
 
         // 44 base58 characters, the real shape of a contract key.
@@ -3675,7 +3677,7 @@ mod tests {
             history: Vec::new(),
         }];
 
-        let html = contract_detail_html_from(&Some(snap), key);
+        let html = contract_detail_html_from(&Some(snap), key, false, None);
         assert!(
             html.contains("Borderline"),
             "a hosted-only contract must still show its governance state — \
@@ -3728,7 +3730,7 @@ mod tests {
             history,
         }];
 
-        let html = contract_detail_html_from(&Some(snap), "GOVKEY1");
+        let html = contract_detail_html_from(&Some(snap), "GOVKEY1", false, None);
         let newest = format_duration(newest_secs);
         let oldest = format_duration(oldest_secs);
         assert!(
@@ -3763,7 +3765,7 @@ mod tests {
             recency_seq: 42,
             eviction_eligible: true,
         }];
-        let html = contract_detail_html_from(&Some(snap), "TESTKEY1");
+        let html = contract_detail_html_from(&Some(snap), "TESTKEY1", false, None);
         assert!(
             html.contains("not shown"),
             "the hosting panel must say the ranking keys are missing — \
@@ -3773,6 +3775,267 @@ mod tests {
             html.contains("5372"),
             "and point at the issue tracking them, so the gap is followable \
              rather than a dead end — got:\n{html}"
+        );
+    }
+
+    // ─── Merge-law card (#5397) ──────────────────────────────────────────
+
+    /// Extracts the Merge laws card. The whole stylesheet is inlined into
+    /// every render, so a bare `html.contains("fresh-ok")` is true whether or
+    /// not this card actually used that class — see `subscription_panel`
+    /// above, which exists for the identical reason.
+    fn merge_panel(html: &str) -> String {
+        let start = html
+            .find("<h2>Merge laws</h2>")
+            .expect("the Merge laws card must be rendered");
+        let end = html[start..]
+            .find("<h2>Governance</h2>")
+            .map(|i| start + i)
+            .unwrap_or(html.len());
+        html[start..end].to_string()
+    }
+
+    /// Text with the markup stripped, so "no digit in the visible content"
+    /// assertions aren't defeated by the `2` in every `<h2>` tag.
+    fn visible_text(html: &str) -> String {
+        let mut out = String::new();
+        let mut in_tag = false;
+        for c in html.chars() {
+            match c {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                _ if !in_tag => out.push(c),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// A hosted-only contract: the cheapest fixture that reaches any card at
+    /// all. A key with no subscription, hosting, or governance record
+    /// short-circuits to the "not found" page before the Merge laws card (or
+    /// any other card) ever renders.
+    fn hosted_snap(key: &str) -> NetworkStatusSnapshot {
+        let mut snap = base_snapshot();
+        snap.open_connections = 2;
+        snap.hosting.contracts = vec![crate::node::network_status::HostedContractEntry {
+            key_full: key.to_string(),
+            key_short: key.to_string(),
+            size_bytes: 1024,
+            read_count: 0,
+            recency_seq: 0,
+            eviction_eligible: true,
+        }];
+        snap
+    }
+
+    /// State 1: merge-law checking is not running on this node at all.
+    ///
+    /// Must say so plainly, and must render NO count at all — not even a
+    /// zero. A rendered "0" here would read as "0 violations found", which is
+    /// indistinguishable from a clean bill of health and is exactly the
+    /// conflation `conformance::status`'s module doc exists to prevent.
+    #[test]
+    fn merge_card_reports_checking_disabled_with_no_digits() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key = ContractInstanceId::new([1u8; 32]).to_string();
+        let snap = hosted_snap(&key);
+        let html = contract_detail_html_from(&Some(snap), &key, false, None);
+        let panel = merge_panel(&html);
+        assert!(
+            panel.to_ascii_lowercase().contains("not enabled"),
+            "must say plainly that checking is off — got:\n{panel}"
+        );
+        assert!(
+            panel.to_ascii_lowercase().contains("default"),
+            "must say this is the default state, not a fault — got:\n{panel}"
+        );
+        assert!(
+            !visible_text(&panel).chars().any(|c| c.is_ascii_digit()),
+            "no digit may appear in the VISIBLE text when checking is off — \
+             a rendered count (even a zero) would read as a clean result \
+             rather than as unmeasured. got:\n{panel}"
+        );
+    }
+
+    /// State 2a: checking is running, but this contract falls outside the
+    /// bounded recently-checked window.
+    ///
+    /// Must NOT be read as clean — the window is bounded, so absence here is
+    /// absence of knowledge, not a clean bill of health.
+    #[test]
+    fn merge_card_reports_not_recently_checked_as_unknown_not_clean() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key = ContractInstanceId::new([2u8; 32]).to_string();
+        // A DIFFERENT contract was checked; this one was not.
+        let other = ContractInstanceId::new([9u8; 32]);
+        let mut status = MergeCheckStatus::default();
+        status.record([other], 1, 0, 5, []);
+
+        let snap = hosted_snap(&key);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&status));
+        let panel = merge_panel(&html);
+        assert!(
+            panel.contains("has not been checked recently"),
+            "must say the contract fell outside the checked window — \
+             got:\n{panel}"
+        );
+        assert!(
+            !panel
+                .to_ascii_lowercase()
+                .contains("no merge-law violation"),
+            "must not claim a clean result for a contract the checker never \
+             looked at — got:\n{panel}"
+        );
+    }
+
+    /// State 2b: checking is running, but has not published its first tick
+    /// yet (`snapshot()` is still `None`).
+    ///
+    /// This must render the same "not checked recently" message as 2a, not
+    /// "not enabled" — the checker IS on, it simply has nothing to report
+    /// yet. Conflating this with "off" would misreport a starting node as one
+    /// with checking disabled.
+    #[test]
+    fn merge_card_reports_not_checked_before_first_publish() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key = ContractInstanceId::new([3u8; 32]).to_string();
+        let snap = hosted_snap(&key);
+        let html = contract_detail_html_from(&Some(snap), &key, true, None);
+        let panel = merge_panel(&html);
+        assert!(
+            panel.contains("has not been checked recently"),
+            "before the first tick publishes, the honest answer is 'on, \
+             nothing established yet', which must read the same as the \
+             bounded-window case above — got:\n{panel}"
+        );
+        assert!(
+            !panel.to_ascii_lowercase().contains("not enabled"),
+            "must not be conflated with checking being off — got:\n{panel}"
+        );
+    }
+
+    /// State 3: checked, no findings for this contract.
+    ///
+    /// Must say plainly that no violation was found AND show how many cases
+    /// ran, so the reader can judge whether a clean result reflects a
+    /// meaningful sample or barely having looked.
+    #[test]
+    fn merge_card_reports_clean_result_with_case_count() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([4u8; 32]);
+        let key = key_id.to_string();
+        let mut status = MergeCheckStatus::default();
+        status.record([key_id], 7, 0, 250, []);
+
+        let snap = hosted_snap(&key);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&status));
+        let panel = merge_panel(&html);
+        assert!(
+            panel
+                .to_ascii_lowercase()
+                .contains("no merge-law violation"),
+            "a clean, checked contract must say so plainly — got:\n{panel}"
+        );
+        assert!(
+            panel.contains("250"),
+            "must show the case count so a clean result can be judged for \
+             how meaningful it is — got:\n{panel}"
+        );
+        assert!(
+            !panel
+                .to_ascii_lowercase()
+                .contains("could not reach a verdict"),
+            "the fleet-wide unjudged note must NOT appear when the count is \
+             zero — got:\n{panel}"
+        );
+    }
+
+    /// State 4: checked, with findings — the state the whole card exists for.
+    ///
+    /// Each finding must show its property, and a `Violation` must read as
+    /// visibly more serious than a `Diagnostic`: the former means the
+    /// contract cannot converge (peers disagree and retry indefinitely), the
+    /// latter is legal but wasteful. A panel that only printed the bare enum
+    /// name would satisfy "shows severity" without making the distinction an
+    /// operator actually needs.
+    #[test]
+    fn merge_card_lists_findings_with_severity_and_removal_distinguished() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([5u8; 32]);
+        let key = key_id.to_string();
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            [key_id],
+            1,
+            0,
+            40,
+            [
+                MergeFinding {
+                    contract: key_id,
+                    property: "state_commutativity",
+                    severity: Severity::Violation,
+                    would_remove: true,
+                },
+                MergeFinding {
+                    contract: key_id,
+                    property: "self_delta_size",
+                    severity: Severity::Diagnostic,
+                    would_remove: false,
+                },
+            ],
+        );
+
+        let snap = hosted_snap(&key);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&status));
+        let panel = merge_panel(&html);
+        assert!(
+            panel.contains("state_commutativity") && panel.contains("self_delta_size"),
+            "both findings for this contract must be listed — got:\n{panel}"
+        );
+        assert!(
+            panel.contains("cannot converge"),
+            "a Violation must be explained, not just labelled with the bare \
+             enum name — got:\n{panel}"
+        );
+        assert!(
+            panel.contains("legal but wasteful"),
+            "a Diagnostic must be visibly distinguished from a Violation, \
+             not merely a different word for the same thing — got:\n{panel}"
+        );
+    }
+
+    /// The fleet-wide "could not judge" count must be surfaced when non-zero,
+    /// independent of this contract's own state — it is information the
+    /// operator needs regardless of which contract's page they are viewing.
+    #[test]
+    fn merge_card_surfaces_contracts_without_verdict_fleet_wide() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let key_id = ContractInstanceId::new([6u8; 32]);
+        let key = key_id.to_string();
+        let mut status = MergeCheckStatus::default();
+        status.record([key_id], 10, 3, 400, []);
+
+        let snap = hosted_snap(&key);
+        let html = contract_detail_html_from(&Some(snap), &key, true, Some(&status));
+        let panel = merge_panel(&html);
+        assert!(
+            panel.contains('3'),
+            "the unjudged count must be surfaced when non-zero — \
+             got:\n{panel}"
+        );
+        assert!(
+            panel
+                .to_ascii_lowercase()
+                .contains("could not reach a verdict"),
+            "must be phrased as an inability to judge, not folded silently \
+             into the clean result above it — got:\n{panel}"
         );
     }
 
