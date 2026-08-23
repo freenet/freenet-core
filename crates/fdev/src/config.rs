@@ -86,7 +86,7 @@ pub enum SubCommand {
     /// Runs the *same* verifier the network runs, so a finding here means exactly
     /// what it would mean on the network.
     ///
-    /// Named `conformance` before 0.2.131; that spelling still works.
+    /// Previously named `conformance`; that spelling still works.
     #[clap(alias = "conformance")]
     VerifyMerge(crate::conformance::ConformanceConfig),
 }
