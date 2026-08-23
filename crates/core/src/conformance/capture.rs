@@ -554,6 +554,14 @@ pub fn start(dir: PathBuf) -> std::io::Result<CaptureHandle> {
     // Tell the dashboard checking is ON before any tick has run. Without this, the
     // first interval renders as "not enabled", which is the one thing the panel must
     // never say wrongly — absence and success must not look alike.
+    //
+    // Deliberately LAST: both fallible steps above (the runtime check and
+    // `create_dir_all`) have already returned by the time this runs, so the flag is
+    // never set for a capture that failed to start. Both the call and its position are
+    // covered by `the_page_reports_what_the_status_global_says_and_capture_start_sets_it`
+    // in `server::home_page::contract_detail`, which owns this process-global's one
+    // transition for the whole test binary — read its doc comment before adding a
+    // second caller of `mark_enabled` anywhere in the crate or its tests.
     crate::conformance::status::mark_enabled();
     tokio::spawn(run_writer(dir, rx, dropped, queued_bytes));
     Ok(handle)

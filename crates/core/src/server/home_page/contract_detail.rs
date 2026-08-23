@@ -1,10 +1,12 @@
+use std::str::FromStr;
+
+use freenet_stdlib::prelude::ContractInstanceId;
+
 use super::assets::{CSS, JS, PEER_CSS};
 use super::cards::format_bytes;
 use super::*;
 use crate::conformance::property::Severity;
 use crate::conformance::status;
-use freenet_stdlib::prelude::ContractInstanceId;
-use std::str::FromStr;
 
 // ─── Contract detail page ────────────────────────────────────────────────────
 
@@ -476,4 +478,169 @@ fn abbreviate(key: &str) -> String {
     }
     let head: String = key.chars().take(12).collect();
     format!("{head}…")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conformance::capture;
+    use crate::conformance::status::{CheckedContract, MergeFinding};
+
+    /// The law this page reports when it has one to report.
+    const PROPERTY: &str = "state_commutativity";
+
+    /// The wrapper's two reads of the process-global merge status — and the one
+    /// write anywhere in production that makes them mean anything.
+    ///
+    /// Every other test on this page drives [`contract_detail_html_from`], which
+    /// takes both values as parameters, so the tested surface is not the
+    /// production surface. [`contract_detail_html`] is what the HTTP route calls
+    /// and the only caller of `status::is_enabled` and `status::view_for`: a
+    /// refactor that dropped either read, or replaced it with a constant, changed
+    /// nothing any test could see. The same "the parameterized function is what's
+    /// tested, the wrapper is what runs" gap produced three blocking defects
+    /// earlier in this change.
+    ///
+    /// **One test rather than four, deliberately.** `status`'s `ENABLED` is a
+    /// `OnceLock` with no reset, so whichever test flips it decides what every
+    /// later test in the same process sees — and `cargo test` runs the lib tests
+    /// in ONE process while nextest (what CI runs) gives each its own. Split
+    /// across tests, the "off" assertions would be deterministic in CI and
+    /// order-dependent locally, which is the worst of both. Sequenced inside a
+    /// single test, both halves are deterministic under either runner.
+    ///
+    /// This is therefore the ONLY place in the crate that reaches
+    /// `status::mark_enabled`, directly or through [`capture::start`]. The
+    /// pre-condition is asserted rather than assumed so that a second enabler
+    /// added later fails HERE, with an explanation, instead of quietly making the
+    /// "off" half of this test unable to fail.
+    ///
+    /// It doubles as the coverage for `capture::start`'s `mark_enabled()` call
+    /// and for that call's POSITION. `start` must never claim checking is on for
+    /// a capture that then failed to start, so the flag is checked after each of
+    /// `start`'s two failure paths (no tokio runtime, unusable directory) as well
+    /// as after the success path.
+    #[tokio::test]
+    async fn the_page_reports_what_the_status_global_says_and_capture_start_sets_it() {
+        assert!(
+            !status::is_enabled(),
+            "merge-check status was already enabled before this test enabled it, so \
+             something else in this test binary now reaches status::mark_enabled(). \
+             The 'checking is off' half of this test can no longer fail; either make \
+             that other test stop enabling the process-global, or fold its case in \
+             here — do not delete this assertion"
+        );
+
+        let checked = ContractInstanceId::new([0x5a; 32]);
+        let unchecked = ContractInstanceId::new([0x17; 32]);
+        let mut record = CheckedContract::new(checked, 7, 2, tokio::time::Instant::now());
+        record.note_finding(MergeFinding {
+            contract: checked,
+            property: PROPERTY,
+            severity: Severity::Violation,
+            would_remove: false,
+        });
+        status::publish([record], 1, 0, tokio::time::Instant::now());
+
+        // No node is running, so `network_status::get_snapshot()` is `None` and
+        // this contract has no subscription, no hosted copy and no governance
+        // record. The published merge record is the ONLY thing that can keep the
+        // page off the "this node knows nothing about it" branch — so rendering
+        // anything else is proof the wrapper fetched it.
+        let html = contract_detail_html(&checked.to_string());
+        assert!(
+            !html.contains("Contract Not Found"),
+            "the page rendered as 'this node knows nothing about it' for a contract \
+             with a published merge-law record, so the wrapper is not reading \
+             status::view_for — got:\n{html}"
+        );
+        assert!(
+            html.contains("not enabled on this node"),
+            "checking is off in this process and the card did not say so, so the \
+             wrapper is not reading status::is_enabled — got:\n{html}"
+        );
+        assert!(
+            !html.contains(PROPERTY),
+            "the card reported a finding while checking is off. A count or a finding \
+             shown here reads as a measured result rather than as unmeasured, which \
+             is the conflation conformance::status exists to prevent — got:\n{html}"
+        );
+
+        // …and the lookup uses the REQUESTED key, not merely "some record was
+        // published". A contract outside the window still gets the absence page.
+        let other = contract_detail_html(&unchecked.to_string());
+        assert!(
+            other.contains("Contract Not Found"),
+            "a contract with no record of any kind rendered a detail page, so the \
+             wrapper is not passing the requested key to status::view_for — \
+             got:\n{other}"
+        );
+
+        // ── capture::start is what turns the flag on, and only once it cannot fail ──
+
+        let root = tempfile::TempDir::new().expect("tempdir");
+
+        // Failure path 1: no tokio runtime, so there is nothing to spawn the
+        // writer on and `start` refuses before doing anything else.
+        let no_runtime_dir = root.path().join("no-runtime");
+        let refused = std::thread::spawn({
+            let dir = no_runtime_dir.clone();
+            move || capture::start(dir)
+        })
+        .join()
+        .expect("the thread that called capture::start panicked");
+        assert!(
+            refused.is_err(),
+            "capture::start must refuse outside a tokio runtime rather than start a \
+             writer that can never run"
+        );
+        assert!(
+            !status::is_enabled(),
+            "capture::start marked checking enabled from a thread with no tokio \
+             runtime, where it had already refused to start. mark_enabled() must \
+             stay AFTER the runtime check — the dashboard would otherwise report a \
+             capture that is not running"
+        );
+
+        // Failure path 2: inside a runtime, but the directory cannot be created —
+        // its parent is a regular file.
+        let blocker = root.path().join("not-a-directory");
+        std::fs::write(&blocker, b"a file where a directory would have to be").expect("write");
+        assert!(
+            capture::start(blocker.join("capture")).is_err(),
+            "capture::start must fail when its directory cannot be created"
+        );
+        assert!(
+            !status::is_enabled(),
+            "capture::start marked checking enabled after create_dir_all failed. \
+             mark_enabled() must stay AFTER the fallible directory creation, or the \
+             dashboard reports a capture that never started"
+        );
+
+        // The success path.
+        let _handle = capture::start(root.path().join("capture"))
+            .expect("capture must start against a fresh temp directory inside a runtime");
+        assert!(
+            status::is_enabled(),
+            "capture::start did not mark the dashboard status enabled, so every \
+             render before the checker's first tick says 'not enabled' for a node \
+             that IS checking — absence and success must not look alike"
+        );
+
+        // Same contract, same published record, flag now on: the card must switch
+        // from "not enabled" to the finding it has been holding all along.
+        let enabled_html = contract_detail_html(&checked.to_string());
+        assert!(
+            !enabled_html.contains("not enabled on this node"),
+            "the card still said checking is off after capture::start enabled it, so \
+             the wrapper is not reading status::is_enabled — got:\n{enabled_html}"
+        );
+        assert_eq!(
+            enabled_html.matches(PROPERTY).count(),
+            1,
+            "the card did not render the one finding on the published record, so the \
+             wrapper's status::view_for result is not reaching the renderer — \
+             got:\n{enabled_html}"
+        );
+    }
 }
