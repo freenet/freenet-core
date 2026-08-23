@@ -837,9 +837,11 @@ async fn run_writer(
                 };
                 // Focus picked these; they simply had nothing to check yet. Counted
                 // in both, so `focused` is the size of the focus set rather than the
-                // size of the subset that happened to have samples.
+                // size of the subset that happened to have samples. No case ran for
+                // them, so no opinion was formed either — see `ShadowReport::judged`.
                 report.focused += awaiting_samples;
                 report.skipped_no_samples += awaiting_samples;
+                report.without_verdict += awaiting_samples;
                 shadow.record(&findings);
                 // Reported even when nothing was checked. A shadow period that finds
                 // nothing and a shadow period that never ran look identical in a
@@ -872,6 +874,13 @@ async fn run_writer(
                     skipped_no_code = report.skipped_no_code,
                     skipped_no_samples = report.skipped_no_samples,
                     timed_out = report.timed_out,
+                    // `judged`/`without_verdict` are narrower than `probed`: a focus
+                    // contract can be probed and run every case without forming an
+                    // opinion (every case `Inconclusive`). These are the numbers fed
+                    // to the dashboard below, so a reader comparing the log to the
+                    // per-contract page must see the same two counts here.
+                    judged = report.judged.len(),
+                    without_verdict = report.without_verdict,
                     "conformance shadow tick"
                 );
 
@@ -879,10 +888,22 @@ async fn run_writer(
                 // cannot disagree about what happened. Published here rather than
                 // derived by a reader: a count re-computed at the call site is how
                 // this project has produced wrong metrics before.
+                //
+                // `report.judged` — not `last_focus.selected` — is what feeds
+                // `recently_checked`: focus selection only names candidates, and a
+                // selected contract can be skipped before probing (no code, no
+                // samples) or probed and never reach a verdict (every case
+                // `Inconclusive`). Feeding selection here would render an
+                // unjudged contract as "checked, no violation found", which is the
+                // exact conflation this subsystem exists to prevent. Likewise
+                // `report.without_verdict` — not `skipped_no_code +
+                // skipped_no_samples` — is the complement of `judged` over the
+                // focus set: it also counts a probed contract whose every case was
+                // inconclusive, which the skip counters never see.
                 crate::conformance::status::publish(
-                    last_focus.selected.iter().copied(),
-                    report.probed,
-                    report.skipped_no_code + report.skipped_no_samples,
+                    report.judged.iter().copied(),
+                    report.judged.len(),
+                    report.without_verdict,
                     report.cases,
                     findings.iter().map(|finding| {
                         crate::conformance::status::MergeFinding {
@@ -2136,6 +2157,55 @@ mod probe_wiring_pins {
              flight, so a probe that overran its interval would have another stacked \
              on top of it — unbounded concurrent WASM execution from a job whose \
              entire justification is that it is bounded"
+        );
+    }
+
+    /// The dashboard's `recently_checked` must be fed the contracts that actually
+    /// reached a verdict, never focus SELECTION.
+    ///
+    /// The #5403 review defect: `status::publish` was fed `last_focus.selected`, so a
+    /// contract focus merely picked — including one skipped before probing (no code,
+    /// no samples) or probed and left with every case `Inconclusive` — rendered on
+    /// the per-contract page as "checked, no violation found". `report.judged` is
+    /// populated only when at least one case reached `Holds` or `Violated`
+    /// (`shadow::probe_one`), so feeding it here is what makes "recently checked"
+    /// mean "we formed an opinion" rather than "focus looked this way".
+    #[test]
+    fn dashboard_recently_checked_is_fed_judged_contracts_not_focus_selection() {
+        let body = run_writer_code_only();
+        assert!(
+            body.contains("report.judged.iter().copied()"),
+            "status::publish is no longer fed the contracts that reached a verdict"
+        );
+        assert!(
+            !body.contains("last_focus.selected.iter().copied()"),
+            "status::publish must not be fed focus SELECTION — a selected contract \
+             can be skipped before probing, or probed and never reach a verdict"
+        );
+    }
+
+    /// The dashboard's `contracts_without_verdict` must be the complement of
+    /// `judged` over the focus set, not `skipped_no_code + skipped_no_samples`.
+    ///
+    /// The #5403 review defect's sibling: a contract that IS probed but whose every
+    /// case comes back `Inconclusive` is not counted by either skip counter, so
+    /// `skipped_no_code + skipped_no_samples` silently missed it and it rendered as
+    /// a clean result. `report.without_verdict` is incremented directly at every
+    /// terminal branch in `shadow::probe_one`/`probe_with_budget` that does NOT
+    /// reach a verdict, including the inconclusive-only case.
+    #[test]
+    fn dashboard_without_verdict_is_report_field_not_skip_counter_sum() {
+        let body = run_writer_code_only();
+        assert!(
+            body.contains("report.without_verdict"),
+            "status::publish is no longer fed report.without_verdict, so a probed \
+             contract whose every case was inconclusive no longer counts toward the \
+             fleet-wide unjudged total"
+        );
+        assert!(
+            !body.contains("report.skipped_no_code + report.skipped_no_samples"),
+            "status::publish reverted to deriving the unjudged count from the skip \
+             counters, which cannot see a probed-but-inconclusive contract"
         );
     }
 }

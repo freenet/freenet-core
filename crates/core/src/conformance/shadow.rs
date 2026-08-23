@@ -131,6 +131,22 @@ pub struct ShadowReport {
     pub reported: usize,
     /// Probes cut short by [`PROBE_TIME_BUDGET`].
     pub timed_out: usize,
+    /// Focus contracts that reached a verdict: at least one case came back `Holds` or
+    /// `Violated`. This is deliberately narrower than `probed` — a contract can be
+    /// probed, run every one of its cases, and still form no opinion (every case
+    /// `Inconclusive`), and `probed` alone cannot tell that apart from a contract that
+    /// was genuinely judged and found clean. `recently_checked` on the dashboard must
+    /// be built from this list, not from focus selection or from `probed`: selection
+    /// only says a contract was a *candidate* to look at, and `probed` only says the
+    /// code and samples were usable, neither says an opinion was formed.
+    pub judged: Vec<ContractInstanceId>,
+    /// Focus contracts we formed NO opinion about: skipped before probing (no code, no
+    /// samples), a probe whose blocking task died or whose time budget was exhausted
+    /// before any case ran, or a probe that ran cases but every one came back
+    /// `Inconclusive`. Complements `judged` over the focus set — every focus contract
+    /// lands in exactly one of the two, which is what makes them checkable against
+    /// each other.
+    pub without_verdict: usize,
 }
 
 /// The shadow loop's state, owned by the capture writer task.
@@ -423,6 +439,7 @@ pub(crate) async fn probe_with_budget(
         // a skip rather than returned as an empty report, which would read as a clean
         // run for contracts nobody could execute.
         report.skipped_no_code = work.len();
+        report.without_verdict += work.len();
         return (report, findings);
     };
 
@@ -463,6 +480,8 @@ async fn probe_one(
     let corpus = bundle.to_corpus();
     if corpus.is_empty() {
         report.skipped_no_samples += 1;
+        // No cases means no opinion was formed. See `ShadowReport::without_verdict`.
+        report.without_verdict += 1;
         return;
     }
 
@@ -475,6 +494,7 @@ async fn probe_one(
             // violations.
             tracing::debug!(%instance, error = %err, "shadow probe has no code for a focus contract");
             report.skipped_no_code += 1;
+            report.without_verdict += 1;
             return;
         }
     };
@@ -485,6 +505,7 @@ async fn probe_one(
             // A contract whose WASM will not load is not a conformance finding either.
             tracing::debug!(%instance, error = %err, "shadow probe could not build an oracle");
             report.skipped_no_code += 1;
+            report.without_verdict += 1;
             return;
         }
     };
@@ -509,6 +530,8 @@ async fn probe_one(
     // Only what setup did not already spend.
     let Some(remaining) = budget.checked_sub(started.elapsed()) else {
         report.timed_out += 1;
+        // Setup alone exhausted the budget: no case ran, so no opinion was formed.
+        report.without_verdict += 1;
         return;
     };
     let joined = tokio::task::spawn_blocking(move || {
@@ -522,7 +545,14 @@ async fn probe_one(
             let outcome = verify_case(&mut oracle, case);
             out.cases += 1;
             out.decisions.push(decide(mode, &outcome));
-            out.inconclusive += usize::from(matches!(outcome, PropertyOutcome::Inconclusive(_)));
+            let inconclusive = matches!(outcome, PropertyOutcome::Inconclusive(_));
+            out.inconclusive += usize::from(inconclusive);
+            // A verdict is `Holds` or `Violated` — anything that is not `Inconclusive`.
+            // One is enough: the contract is no longer merely a candidate we looked at,
+            // it is one we formed an opinion about.
+            if !inconclusive {
+                out.reached_verdict = true;
+            }
         }
         out
     })
@@ -531,8 +561,10 @@ async fn probe_one(
     let outcome = match joined {
         Ok(outcome) => outcome,
         Err(err) => {
-            // A probe that died is not a finding about the contract.
+            // A probe that died is not a finding about the contract, and it formed no
+            // opinion either — counted as such rather than silently dropped.
             tracing::warn!(%instance, error = %err, "shadow probe thread failed");
+            report.without_verdict += 1;
             return;
         }
     };
@@ -541,6 +573,17 @@ async fn probe_one(
     report.inconclusive += outcome.inconclusive;
     if outcome.timed_out {
         report.timed_out += 1;
+    }
+
+    // `recently_checked` on the dashboard must mean "we formed an opinion", not "we
+    // looked". A contract whose every case came back `Inconclusive` was probed — it
+    // consumed a full case budget — but reached no verdict, and rendering it as
+    // "checked, no violation found" is exactly the conflation this subsystem exists to
+    // prevent. See `ShadowReport::judged` / `without_verdict`.
+    if outcome.reached_verdict {
+        report.judged.push(instance_copy);
+    } else {
+        report.without_verdict += 1;
     }
 
     for action in outcome.decisions {
@@ -590,6 +633,9 @@ struct ProbeOutcome {
     inconclusive: usize,
     timed_out: bool,
     decisions: Vec<ConformanceAction>,
+    /// Whether any case in this batch reached `Holds` or `Violated`. See
+    /// `ShadowReport::judged`.
+    reached_verdict: bool,
 }
 
 /// Read this peer's focus salt, creating one if it does not exist.
@@ -990,6 +1036,25 @@ mod tests {
             "cases were checked without any contract code"
         );
         assert_eq!(report.would_remove, 0);
+        // The #5403 review defect: a contract skipped before probing must not be
+        // recorded as judged, and must count toward `without_verdict` — otherwise the
+        // dashboard's `recently_checked` would carry a contract nothing looked at, and
+        // its card would read "no violation found" for a contract with no code to run.
+        assert!(
+            report.judged.is_empty(),
+            "a contract with no resolvable code was recorded as judged: {report:?}"
+        );
+        assert_eq!(
+            report.without_verdict, report.focused,
+            "a contract skipped for no code did not count toward without_verdict: \
+             {report:?}"
+        );
+        assert_eq!(
+            report.judged.len() + report.without_verdict,
+            report.focused,
+            "judged and without_verdict must be complements over the focus set, or \
+             the dashboard silently under- or over-reports: {report:?}"
+        );
     }
 
     /// `Disabled` means nothing runs at all — not "runs but reports nothing".
@@ -1199,6 +1264,22 @@ mod tests {
         let broken = &outcomes[0].1;
         let honest = &outcomes[1].1;
 
+        for (mode, report) in [(LAST_WRITE_WINS, broken), (CONFORMING, honest)] {
+            assert_eq!(
+                report.judged.len() + report.without_verdict,
+                report.focused,
+                "mode {mode}: judged and without_verdict must be complements over \
+                 the focus set, or the dashboard silently under- or over-reports: \
+                 {report:?}"
+            );
+            assert_eq!(
+                report.judged.len(),
+                1,
+                "mode {mode} reached a verdict but was not recorded as judged: \
+                 {report:?}"
+            );
+        }
+
         assert!(
             broken.would_remove > 0,
             "a contract that provably breaks commutativity produced no prospective \
@@ -1208,6 +1289,92 @@ mod tests {
             honest.would_remove, 0,
             "a conforming contract produced a prospective removal, which is the false \
              positive the whole deployment plan is gated on not happening: {honest:?}"
+        );
+        Ok(())
+    }
+
+    /// A contract that is genuinely probed, and runs every one of its cases, but
+    /// reaches NO verdict on any of them, must not be recorded as judged.
+    ///
+    /// The #5403 review defect: `probe_one` incremented `report.probed` before any
+    /// case ran and nothing distinguished "every case was `Inconclusive`" from "at
+    /// least one case reached `Holds` or `Violated`". Both looked identical to a
+    /// caller that only had `probed`, so a contract nothing was ever concluded about
+    /// rendered on the dashboard exactly like a contract checked and found clean.
+    ///
+    /// Mode 7 (`REQUIRES_RELATED`) is the fixture built for this: `validate_state`
+    /// asks for another contract's state, and `samplers_for` never supplies any
+    /// (`related: Vec::new()`), so every case dead-ends at
+    /// `Inconclusive::RelatedRequired` — a real, unforced instance of the failure
+    /// mode, not a hand-built stub.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_contract_whose_every_case_is_inconclusive_is_not_judged()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use freenet_stdlib::prelude::{
+            ContractCode, ContractContainer, ContractWasmAPIVersion, Parameters, WrappedContract,
+        };
+        use std::sync::Arc;
+
+        // Keep in sync with `tests/test-contract-conformance/src/lib.rs`.
+        const REQUIRES_RELATED: u8 = 7;
+
+        let wasm = crate::wasm_runtime::tests::get_test_module("test_contract_conformance")?;
+        let code_hash = *blake3::hash(&wasm).as_bytes();
+
+        let store_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(store_dir.path())?;
+        let db = crate::contract::storages::Storage::new(store_dir.path()).await?;
+        let mut store =
+            crate::wasm_runtime::ContractStore::new(store_dir.path().into(), 10_000_000, db)?;
+
+        let parameters: Parameters<'static> = Parameters::from(vec![REQUIRES_RELATED]);
+        let contract = WrappedContract::new(Arc::new(ContractCode::from(wasm)), parameters.clone());
+        let id = *contract.key().id();
+        store.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+            contract,
+        )))?;
+
+        // No `related` state is attached to any transition, so `validate_state`
+        // never gets what it asks for and every case is inconclusive.
+        let samplers = samplers_for(
+            id,
+            vec![REQUIRES_RELATED],
+            code_hash,
+            &[(vec![1], vec![1, 2]), (vec![2], vec![2, 3])],
+        );
+
+        let dir = tempfile::TempDir::new()?;
+        let mut runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        let report = tick(&mut runner, &samplers, Some(store_dir.path())).await;
+
+        assert_eq!(
+            report.probed, 1,
+            "the contract was not probed at all, so this proves nothing: {report:?}"
+        );
+        assert!(
+            report.cases > 0,
+            "no case ran, so this proves nothing: {report:?}"
+        );
+        assert_eq!(
+            report.inconclusive, report.cases,
+            "expected every case to be inconclusive, or the fixture no longer \
+             exercises this failure mode: {report:?}"
+        );
+        assert!(
+            report.judged.is_empty(),
+            "a contract whose every case was inconclusive was recorded as judged: \
+             {report:?}"
+        );
+        assert_eq!(
+            report.without_verdict, 1,
+            "a probed contract that never reached a verdict did not count toward \
+             without_verdict: {report:?}"
+        );
+        assert_eq!(
+            report.judged.len() + report.without_verdict,
+            report.focused,
+            "judged and without_verdict must be complements over the focus set, or \
+             the dashboard silently under- or over-reports: {report:?}"
         );
         Ok(())
     }
