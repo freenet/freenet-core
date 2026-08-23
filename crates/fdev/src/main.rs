@@ -91,7 +91,7 @@ fn conformance_log_level(
     sub_command: &SubCommand,
     rust_log_is_set: bool,
 ) -> Option<tracing::level_filters::LevelFilter> {
-    let SubCommand::Conformance(config) = sub_command else {
+    let SubCommand::VerifyMerge(config) = sub_command else {
         return None;
     };
     if rust_log_is_set {
@@ -179,7 +179,7 @@ fn main() -> anyhow::Result<()> {
             SubCommand::VerifyState(verify_config) => {
                 verify_state::verify_state(verify_config).await
             }
-            SubCommand::Conformance(conformance_config) => {
+            SubCommand::VerifyMerge(conformance_config) => {
                 conformance::conformance(conformance_config).await
             }
             SubCommand::Website { command } => match command {
@@ -230,6 +230,37 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Both spellings parse, and both reach the same subcommand.
+    ///
+    /// `fdev conformance` shipped in v0.2.129 and anything scripted against it must
+    /// keep working — a rename that silently breaks a released command is worse than
+    /// the naming it fixes. `verify-merge` is the name going forward because
+    /// "conformance" never said what was being checked: it is the merge laws, and a
+    /// contract that breaks them cannot converge.
+    #[test]
+    fn both_the_new_and_released_subcommand_names_parse() {
+        use clap::Parser;
+
+        for name in ["verify-merge", "conformance"] {
+            let parsed = super::config::Config::try_parse_from([
+                "fdev",
+                name,
+                "--wasm",
+                "/nonexistent.wasm",
+                "--state",
+                "/nonexistent.state",
+            ])
+            .unwrap_or_else(|e| panic!("`fdev {name}` no longer parses: {e}"));
+            assert!(
+                matches!(
+                    parsed.sub_command,
+                    super::config::SubCommand::VerifyMerge(_)
+                ),
+                "`fdev {name}` parsed to the wrong subcommand"
+            );
+        }
+    }
     use super::{EXIT_RESPONSE_TIMEOUT, exit_code_for_error};
     use crate::commands::ResponseTimeout;
     use std::time::Duration;
@@ -288,7 +319,7 @@ mod tests {
     /// runtime logging.
     #[test]
     fn conformance_quiets_default_log_level_when_rust_log_unset() {
-        let sub = super::SubCommand::Conformance(empty_conformance_config());
+        let sub = super::SubCommand::VerifyMerge(empty_conformance_config());
         assert_eq!(
             super::conformance_log_level(&sub, false),
             Some(tracing::level_filters::LevelFilter::INFO)
@@ -306,7 +337,7 @@ mod tests {
     fn conformance_silences_logging_entirely_for_json_output() {
         let mut config = empty_conformance_config();
         config.json = true;
-        let sub = super::SubCommand::Conformance(config);
+        let sub = super::SubCommand::VerifyMerge(config);
         assert_eq!(
             super::conformance_log_level(&sub, false),
             Some(tracing::level_filters::LevelFilter::OFF),
@@ -317,7 +348,7 @@ mod tests {
     /// An explicit `RUST_LOG` from the user must always win.
     #[test]
     fn conformance_defers_to_explicit_rust_log() {
-        let sub = super::SubCommand::Conformance(empty_conformance_config());
+        let sub = super::SubCommand::VerifyMerge(empty_conformance_config());
         assert_eq!(super::conformance_log_level(&sub, true), None);
     }
 

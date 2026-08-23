@@ -224,7 +224,7 @@ fn write_bundle(
     bundle.deltas = corpus.deltas.iter().map(|d| d.to_vec()).collect();
     bundle.summaries = corpus.summaries.iter().map(|s| s.to_vec()).collect();
     bundle.note = Some(format!(
-        "captured by fdev conformance {}",
+        "captured by fdev verify-merge {}",
         env!("CARGO_PKG_VERSION")
     ));
     bundle
@@ -244,7 +244,10 @@ fn write_bundle(
 /// can tell "this contract is unsound" apart from "the check could not run" — a
 /// distinction CI needs and a single exit code cannot express.
 #[derive(Debug, thiserror::Error)]
-#[error("{count} enforceable conformance violation(s) found")]
+#[error(
+    "{count} merge-law violation(s) found: this contract cannot converge, so peers \
+     holding it will disagree and keep retrying"
+)]
 pub struct ConformanceViolations {
     pub count: usize,
 }
@@ -762,11 +765,11 @@ impl Report {
 
     fn print_human(&self) {
         println!(
-            "conformance: {} state(s), {} delta(s), {} summary/summaries in the corpus",
+            "merge check: {} state(s), {} delta(s), {} summary/summaries in the corpus",
             self.corpus_states, self.corpus_deltas, self.corpus_summaries
         );
         println!(
-            "conformance: {} case(s) run \u{2014} {} held, {} violation(s) ({} enforceable, {} diagnostic-only), {} inconclusive",
+            "merge check: {} case(s) run \u{2014} {} held, {} violation(s) ({} enforceable, {} diagnostic-only), {} inconclusive",
             self.cases_run,
             self.holds,
             self.violations,
@@ -796,7 +799,7 @@ impl Report {
         // code.
         if !self.inconclusive_reasons.is_empty() {
             println!(
-                "\ninconclusive ({} total, not failures \u{2014} see freenet::conformance::Inconclusive):",
+                "\ninconclusive ({} total \u{2014} NOT passes: these cases reached no verdict, so they say nothing about the contract):",
                 self.inconclusive
             );
             for r in &self.inconclusive_reasons {

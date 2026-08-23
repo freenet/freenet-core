@@ -75,12 +75,20 @@ pub enum SubCommand {
         #[clap(subcommand)]
         command: crate::website::WebsiteCommand,
     },
-    /// Check a contract against the conformance laws (RFC #5320): merge
-    /// commutativity/associativity/idempotence, delta idempotence, and more.
+    /// Check that a contract's merge obeys the laws the network requires: that
+    /// merging is order-independent, groups the same way whichever pairing is used,
+    /// and applying the same change twice does nothing the second time.
     ///
-    /// Runs the *same* verifier the network runs (`freenet::conformance`), so
-    /// a finding here means the same thing it would mean on the network.
-    Conformance(crate::conformance::ConformanceConfig),
+    /// A contract that breaks these cannot converge — two peers given the same
+    /// updates in different orders end up with different state, never agree, and
+    /// retry indefinitely. That is what this looks for.
+    ///
+    /// Runs the *same* verifier the network runs, so a finding here means exactly
+    /// what it would mean on the network.
+    ///
+    /// Named `conformance` before 0.2.131; that spelling still works.
+    #[clap(alias = "conformance")]
+    VerifyMerge(crate::conformance::ConformanceConfig),
 }
 
 impl SubCommand {
