@@ -213,7 +213,8 @@ fn reproduced_identically(first: &Violation, second: &Violation) -> bool {
         | ConformanceProperty::SelfDeltaEmpty
         | ConformanceProperty::WholeStateSelfDelta
         | ConformanceProperty::ReconciliationCycle
-        | ConformanceProperty::PathAgreement => {
+        | ConformanceProperty::PathAgreement
+        | ConformanceProperty::TransitionPathAgreement => {
             first.left == second.left && first.right == second.right
         }
     }
@@ -514,6 +515,51 @@ fn run<O: ConformanceOracle + ?Sized>(
                 (Err(_), Ok(outcome)) => Ok(outcome),
                 (Err(reason), Err(_)) => Err(reason),
             }
+        }
+
+        ConformanceProperty::TransitionPathAgreement => {
+            // `states[0]` is the base a peer held, `states[1]` the result it
+            // actually reached. The generator only ever builds this case from a
+            // recorded transition, which is what makes the order meaningful: for an
+            // arbitrary pair, "merging B into A yields B" is last-write-wins.
+            let (base, result) = (&case.states[0], &case.states[1]);
+
+            // Drive `result` to a fixpoint of its own merge before comparing.
+            //
+            // A canonicalizing contract legitimately rewrites a stored state the
+            // first time it is merged — the PUT install path stores the client's raw
+            // bytes without ever running `update_state` — so the state a peer holds
+            // may not be canonical yet. Comparing against the raw bytes would report
+            // that rewrite as a merge-law break. `StateIdempotence` iterates for the
+            // same reason and to the same budget.
+            let mut settled = result.to_vec();
+            let mut reached_fixpoint = false;
+            for _ in 0..MAX_CANONICALIZATION_APPLIES {
+                let again = merge(oracle, &settled, &settled)?;
+                if again == settled {
+                    reached_fixpoint = true;
+                    break;
+                }
+                settled = again;
+            }
+            if !reached_fixpoint {
+                // A state that rewrites itself on every re-apply cannot be asked
+                // whether some OTHER state absorbs into it, and the defect already
+                // has a name. Accusing it here would name the wrong law.
+                return Err(Inconclusive::StateNotSettled);
+            }
+            require_valid(oracle, &settled, &case.related)?;
+
+            let merged = merge(oracle, base, &settled)?;
+            Ok(compare(
+                case.property,
+                &merged,
+                &settled,
+                "merging a state a peer actually REACHED back into the state it came \
+                 from did not reproduce it, so the merge path cannot reach what the \
+                 update path reached: every peer that receives this state merges it \
+                 into something else, and the two can never agree",
+            ))
         }
     }
 }

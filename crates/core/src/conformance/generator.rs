@@ -32,6 +32,19 @@ pub struct Corpus {
     /// law is about.
     pub delta_bases: Vec<Option<Bytes>>,
     pub summaries: Vec<Bytes>,
+    /// Observed `(base, result)` steps: a peer held `base`, applied an update, and
+    /// ended up at `result`.
+    ///
+    /// This is PROVENANCE, and it is the whole reason
+    /// [`ConformanceProperty::TransitionPathAgreement`] is a law rather than an
+    /// accusation of last-write-wins. For an arbitrary pair of states, "merging B
+    /// into A yields B" is false for every conforming contract; it is only required
+    /// when the corpus witnesses that B was reached FROM A.
+    ///
+    /// So this must never be filled from states that merely appeared together. A
+    /// bundle's `transitions` and the sampler's own transition records are the only
+    /// sources; loose `--state` files carry no provenance and contribute none.
+    pub transitions: Vec<(Bytes, Bytes)>,
     pub related: RelatedContracts<'static>,
 }
 
@@ -60,6 +73,15 @@ impl Corpus {
         self.deltas = deltas;
         self.delta_bases = bases;
         self.summaries = dedup(self.summaries);
+        // A contract oscillating between two states offers the same step over and
+        // over; without this a thousand observations are one case repeated.
+        let mut seen = std::collections::HashSet::new();
+        self.transitions.retain(|(base, result)| {
+            seen.insert((
+                *blake3::hash(base).as_bytes(),
+                *blake3::hash(result).as_bytes(),
+            ))
+        });
         self
     }
 
@@ -196,6 +218,20 @@ fn cases_for(
             for summary in &corpus.summaries {
                 push(build(vec![state.clone()]).with_summary(summary.clone()));
             }
+        }
+        return cases;
+    }
+
+    // Transition cases come from recorded provenance, never from pairing states.
+    //
+    // Handled before the arity match for the same reason `DeltaDeterminism` is: the
+    // generic arity-2 branch pairs every state with every other, and this property
+    // is only a law for the ORDERED pair a transition witnesses. Falling through to
+    // that branch would emit `(A, B)` for every pair in the corpus and accuse every
+    // conforming contract of last-write-wins.
+    if property == ConformanceProperty::TransitionPathAgreement {
+        for (base, result) in &corpus.transitions {
+            push(build(vec![base.clone(), result.clone()]));
         }
         return cases;
     }

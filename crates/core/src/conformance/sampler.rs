@@ -376,10 +376,30 @@ impl ContractSampler {
             .map(|s| Arc::from(s.as_slice()))
             .collect();
 
+        // Carry the ORDERED base -> result steps, not just the states either end.
+        //
+        // Without this the node's own shadow-mode corpus produces no
+        // `TransitionPathAgreement` cases at all, and a property that only works on
+        // a hand-built `fdev --bundle` corpus is a check nothing on the network ever
+        // runs. `materialize` is the same resolver `to_bundle` uses, so the in-memory
+        // corpus and the exported bundle agree about what a transition is.
+        let transitions: Vec<(Bytes, Bytes)> = self
+            .transitions
+            .iter()
+            .filter_map(|record| {
+                let materialized = self.materialize(record)?;
+                Some((
+                    Arc::from(materialized.base_state.as_slice()),
+                    Arc::from(materialized.result_state.as_slice()),
+                ))
+            })
+            .collect();
+
         Corpus {
             states,
             deltas,
             summaries,
+            transitions,
             ..Default::default()
         }
         .deduplicated()

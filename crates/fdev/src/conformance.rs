@@ -17,6 +17,9 @@
 //!
 //! # Replay a bundle captured from the network (or an earlier `fdev` run)
 //! fdev verify-merge --bundle observed.bin
+//!
+//! # Supply an observed step by hand: the state held, then the state reached
+//! fdev verify-merge --wasm contract.wasm --transition before.bin after.bin
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -28,7 +31,7 @@ use freenet::conformance::verifier::Bytes;
 use freenet::conformance::{
     ConformanceCase, ConformanceEvidence, ConformanceProperty, EVIDENCE_SCHEMA_VERSION,
     GeneratorConfig, Inconclusive, MinimizeConfig, OracleBuildError, PropertyOutcome, ReplayBundle,
-    RuntimeOracle, Severity, generate_cases, minimize, verify_case,
+    RuntimeOracle, Severity, Transition, generate_cases, minimize, verify_case,
 };
 use freenet_stdlib::prelude::{CodeHash, ContractCode, ContractInstanceId};
 use serde::Serialize;
@@ -56,6 +59,20 @@ pub struct ConformanceConfig {
     /// Required unless `--bundle` is given.
     #[arg(long = "state")]
     pub(crate) states: Vec<PathBuf>,
+
+    /// An observed step: the state a peer held, and the state it reached after
+    /// applying an update. Takes two paths. Repeat for multiple steps.
+    ///
+    /// This is PROVENANCE, and `transition_path_agreement` cannot be checked
+    /// without it. Loose `--state` files say only that both states existed; a
+    /// transition says the second was reached FROM the first, which is what makes
+    /// "merging it back must reproduce it" a law rather than an accusation of
+    /// last-write-wins against every conforming contract.
+    ///
+    /// A capture bundle already carries these (`ReplayBundle::transitions`); this
+    /// is how a developer supplies one by hand from two state files.
+    #[arg(long = "transition", num_args = 2, value_names = ["BASE", "RESULT"])]
+    pub(crate) transitions: Vec<PathBuf>,
 
     /// Replay a corpus captured earlier (see `freenet::conformance::bundle`)
     /// instead of building one from `--state`.
@@ -146,8 +163,8 @@ pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
             "no cases could be generated from this corpus: {} state(s), {} delta(s), \
              {} summary/summaries for the selected properties. Nothing was checked, \
              so this is not a pass — supply more states (commutativity and \
-             reconciliation need at least two), or captured deltas for the \
-             delta properties.",
+             reconciliation need at least two), captured deltas for the delta \
+             properties, or --transition BASE RESULT for transition_path_agreement.",
             corpus.states.len(),
             corpus.deltas.len(),
             corpus.summaries.len(),
@@ -226,6 +243,18 @@ fn write_bundle(
     bundle.states = corpus.states.iter().map(|s| s.to_vec()).collect();
     bundle.deltas = corpus.deltas.iter().map(|d| d.to_vec()).collect();
     bundle.summaries = corpus.summaries.iter().map(|s| s.to_vec()).collect();
+    // Carry the steps through, or `--bundle-out` would silently drop the one input
+    // `transition_path_agreement` needs and the replayed bundle would report a clean
+    // run where the original found something.
+    bundle.transitions = corpus
+        .transitions
+        .iter()
+        .map(|(base, result)| Transition {
+            base_state: base.to_vec(),
+            result_state: result.to_vec(),
+            ..Default::default()
+        })
+        .collect();
     bundle.note = Some(format!(
         "captured by fdev verify-merge {}",
         env!("CARGO_PKG_VERSION")
@@ -234,11 +263,13 @@ fn write_bundle(
         .write_to(path)
         .with_context(|| format!("writing bundle to {}", path.display()))?;
     eprintln!(
-        "wrote replay bundle to {} ({} state(s), {} delta(s), {} summary/summaries)",
+        "wrote replay bundle to {} ({} state(s), {} delta(s), {} summary/summaries, \
+         {} transition(s))",
         path.display(),
         bundle.states.len(),
         bundle.deltas.len(),
         bundle.summaries.len(),
+        bundle.transitions.len(),
     );
     Ok(())
 }
@@ -529,14 +560,38 @@ fn load_inputs(config: &ConformanceConfig) -> anyhow::Result<(Vec<u8>, Vec<u8>, 
             Some(path) => read_file(path)?,
             None => Vec::new(),
         };
-        if config.states.is_empty() {
-            anyhow::bail!("at least one --state is required unless --bundle is given");
+        if config.states.is_empty() && config.transitions.is_empty() {
+            anyhow::bail!(
+                "at least one --state or --transition is required unless --bundle is given"
+            );
         }
         let mut states = Vec::with_capacity(config.states.len());
         for path in &config.states {
             states.push(read_file(path)?);
         }
-        let corpus = Corpus::from_states(states).deduplicated();
+        // `num_args = 2` guarantees an even count, so the chunks are always whole
+        // pairs; the assert states that rather than leaving a lone path to be
+        // silently dropped if the arg definition is ever loosened.
+        assert!(
+            config.transitions.len() % 2 == 0,
+            "--transition takes two paths per occurrence"
+        );
+        let mut steps: Vec<(Bytes, Bytes)> = Vec::with_capacity(config.transitions.len() / 2);
+        for pair in config.transitions.chunks(2) {
+            let base = read_file(&pair[0])?;
+            let result = read_file(&pair[1])?;
+            // Both endpoints are ordinary observed states too, so the other
+            // properties get to use them rather than the transition being a
+            // dead-end input.
+            states.push(base.clone());
+            states.push(result.clone());
+            steps.push((Bytes::from(base), Bytes::from(result)));
+        }
+        let corpus = Corpus {
+            transitions: steps,
+            ..Corpus::from_states(states)
+        }
+        .deduplicated();
         Ok((wasm, parameters, corpus))
     }
 }
@@ -870,6 +925,7 @@ fn inconclusive_label(reason: &Inconclusive) -> &'static str {
         Inconclusive::RoundLimit => "reconciliation round budget exhausted",
         Inconclusive::MalformedCase(_) => "malformed case",
         Inconclusive::NoDeltaPath => "no delta path to compare against",
+        Inconclusive::StateNotSettled => "observed result state never settles",
         Inconclusive::NotReproducible => "finding did not reproduce",
         _ => "other",
     }

@@ -118,7 +118,7 @@ mod tests;
 #[cfg(test)]
 mod wasm_tests;
 
-pub use bundle::ReplayBundle;
+pub use bundle::{ReplayBundle, Transition};
 pub use capture::{CaptureHandle, Observation};
 pub use evidence::{ConformanceEvidence, EVIDENCE_SCHEMA_VERSION, EvidenceId, EvidenceRejected};
 pub use focus::FocusSelector;

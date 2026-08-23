@@ -33,6 +33,38 @@ fn bytes(values: &[u8]) -> Bytes {
     Arc::from(values)
 }
 
+/// Build the `(base, result)` step a peer would have recorded, by driving the
+/// contract's own delta path through the real runtime.
+///
+/// Computed rather than hard-coded so the case cannot drift into asserting against
+/// a result this contract would never actually produce.
+fn transition_case(
+    oracle: &mut RuntimeOracle,
+    base: &[u8],
+    delta: &[u8],
+) -> Result<ConformanceCase, Box<dyn std::error::Error>> {
+    use super::oracle::ConformanceOracle;
+    let result = oracle
+        .update_state(
+            base,
+            &[freenet_stdlib::prelude::UpdateData::Delta(
+                freenet_stdlib::prelude::StateDelta::from(delta.to_vec()),
+            )],
+        )?
+        .new_state
+        .ok_or("contract produced no state")?
+        .into_bytes();
+    assert_ne!(
+        base,
+        result.as_slice(),
+        "a transition that changed nothing proves nothing"
+    );
+    Ok(ConformanceCase::new(
+        ConformanceProperty::TransitionPathAgreement,
+        vec![bytes(base), bytes(&result)],
+    ))
+}
+
 #[track_caller]
 fn assert_violates(outcome: PropertyOutcome, property: ConformanceProperty) {
     match outcome {
@@ -214,6 +246,27 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
         );
     }
 
+    // The transition law and a bounded collection.
+    //
+    // This is the false-positive boundary the `transition_path_agreement` severity
+    // rests on, so it is measured here against real WASM rather than argued. This
+    // cap evicts by an index derived from the set's own contents — independent of
+    // the merge's ordering — and merging the reached state back into its base
+    // genuinely does not reproduce it. That is the same information loss
+    // `StateAssociativity` already reports for this mode, so the contract is
+    // removal-eligible either way; what matters is that it is a real divergence and
+    // not an artifact of capping.
+    //
+    // The contrasting SOUND cap (keep the largest N, evicting BY the merge order) is
+    // pinned silent in `tests.rs::a_sound_bounded_collection_is_not_accused` — the
+    // two together are what show the property discriminates rather than flagging
+    // every bounded collection.
+    let capped_transition = transition_case(&mut capped, &[1, 2], &[3, 4, 5])?;
+    assert_violates(
+        verify_case(&mut capped, &capped_transition),
+        ConformanceProperty::TransitionPathAgreement,
+    );
+
     // ------------------------------------------------ mode 6: never settles
     //
     // Regression cover for the worst shape found on the live network: a contract
@@ -324,7 +377,12 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
     // mode would prove nothing about the gap #5394 describes, which is precisely a
     // contract that satisfies the entire existing property set and still diverges.
     for property in ConformanceProperty::ALL {
-        if *property == ConformanceProperty::PathAgreement {
+        // Both halves of the path-agreement family see this defect, which is the
+        // point of the mode; they are asserted positively above and below instead.
+        if matches!(
+            property,
+            ConformanceProperty::PathAgreement | ConformanceProperty::TransitionPathAgreement
+        ) {
             continue;
         }
         let states: Vec<Bytes> = match property.state_arity() {
@@ -350,6 +408,24 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
              isolates the one defect only path_agreement can see: {outcome:?}"
         );
     }
+
+    // The transition-shaped half of the same law, on the same mode. This is the form
+    // that reaches the #5394 artifacts, where the contract's own `get_state_delta`
+    // ships whole states and the pairwise form is therefore blind.
+    let disagreeing_transition = transition_case(&mut disagreeing, &[0x10, 0x51], &[0x52])?;
+    assert_violates(
+        verify_case(&mut disagreeing, &disagreeing_transition),
+        ConformanceProperty::TransitionPathAgreement,
+    );
+
+    // Its matched negative: the same contract, an op whose key collides with nothing.
+    let harmless_transition = transition_case(&mut disagreeing, &[0x10, 0x51], &[0x62])?;
+    assert_eq!(
+        verify_case(&mut disagreeing, &harmless_transition),
+        PropertyOutcome::Holds,
+        "a transition whose op collides with nothing must not be flagged, or the \
+         property is a blanket accusation against every contract with a delta path"
+    );
 
     // The matched negative #5394's acceptance test asks for: the SAME contract with
     // the SAME two write paths, on states whose keys do not collide. A property that

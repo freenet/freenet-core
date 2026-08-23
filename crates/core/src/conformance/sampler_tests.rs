@@ -30,6 +30,45 @@ fn state(tag: u8, len: usize) -> Vec<u8> {
     out
 }
 
+/// The node's own corpus must carry the ORDERED step, not just the two states.
+///
+/// `TransitionPathAgreement` is a law only because the corpus witnesses that one
+/// state was reached from the other; for an arbitrary pair, "merging B into A yields
+/// B" is last-write-wins and false for every conforming contract. So the generator
+/// builds no case for it at all without provenance.
+///
+/// This pins the in-memory path specifically. `to_bundle` already exported
+/// transitions, but `corpus()` — which is what shadow mode on a live node actually
+/// checks — pulled only `delta` and `summary` out of them and dropped the pairing.
+/// A property that ran on a hand-built `fdev --bundle` corpus and never once on the
+/// network would be the most expensive kind of miss: it reads as coverage.
+#[test]
+fn the_in_memory_corpus_carries_transition_provenance() {
+    let mut sampler = ContractSampler::new(config());
+    let base = state(1, 32);
+    let result = state(2, 48);
+    assert_eq!(
+        sampler.observe_transition(&base, None, Some(&[9]), None, &result),
+        Admission::Stored
+    );
+
+    let corpus = sampler.corpus();
+    assert_eq!(
+        corpus.transitions.len(),
+        1,
+        "the ordered base -> result step is what the transition law needs, and \
+         without it shadow mode checks that law on nothing"
+    );
+    assert_eq!(corpus.transitions[0].0.as_ref(), base.as_slice());
+    assert_eq!(corpus.transitions[0].1.as_ref(), result.as_slice());
+
+    // The exported bundle and the in-memory corpus must agree about what a
+    // transition is, or a finding on a live node would vanish on replay.
+    let bundle = sampler.to_bundle(None, Some([0u8; 32]), Vec::new());
+    assert_eq!(bundle.transitions.len(), 1);
+    assert_eq!(bundle.to_corpus().transitions, corpus.transitions);
+}
+
 // ------------------------------------------------------------------ deduplication
 
 #[test]

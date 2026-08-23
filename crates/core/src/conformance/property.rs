@@ -210,6 +210,72 @@ pub enum ConformanceProperty {
     /// false-positive profile (a capped collection trips it), and one law per
     /// property is the rule this module follows everywhere else.
     PathAgreement,
+    /// A state a peer actually REACHED must be reachable by the merge path too.
+    ///
+    /// The transition-shaped half of [`ConformanceProperty::PathAgreement`], and the
+    /// half that reaches the defect #5394 was written from. Where the corpus records
+    /// a transition `base -> result` — a peer that held `base`, applied an update,
+    /// and ended up at `result` — merging `result` back into `base` must reproduce
+    /// `result`:
+    ///
+    /// ```text
+    /// update_state(base, State(result))  ==  result
+    /// ```
+    ///
+    /// # Why this needs provenance, and why the pairwise form cannot substitute
+    ///
+    /// `PathAgreement` synthesizes its delta from the contract's own
+    /// `get_state_delta`, so it can only see a disagreement that the contract's own
+    /// delta ENCODING can express. Measured against the #5394 artifacts on
+    /// 2026-08-23, that contract returns the whole sender state for every
+    /// non-trivial pair in the corpus and then treats a whole-state `Delta` exactly
+    /// as a `State` — so both paths agree on every pair and the pairwise form is
+    /// silent on it. The disagreement lives on an APPLICATION-level delta, a client
+    /// `UPDATE` carrying one op, which `get_state_delta` never produces.
+    ///
+    /// A transition carries that op's effect as the `result` state, so no delta
+    /// encoding is needed to see it. What cannot be substituted is the ORDERING:
+    /// `merge(A, B) == B` is last-write-wins for an arbitrary pair and would accuse
+    /// every conforming contract. It is a law only because the corpus witnesses that
+    /// `result` came FROM `base`, which is what makes `base` the earlier state.
+    ///
+    /// # What a real capture must carry
+    ///
+    /// `ReplayBundle::transitions` (`base_state` + `result_state`), which the node's
+    /// capture path records for every merge — `Observation` owns both. Loose
+    /// `--state` files carry no provenance and produce no cases for this property at
+    /// all, which is not a clean run but an absence of evidence; `fdev --transition
+    /// BASE RESULT` is how a developer supplies it by hand.
+    ///
+    /// # Why this is `Severity::Violation`
+    ///
+    /// Two guards, and each one corresponds to a contract shape that would otherwise
+    /// be accused wrongly:
+    ///
+    /// 1. `result` is first driven to a fixpoint of its own merge, and the case is
+    ///    declined if it never settles. A canonicalizing contract legitimately
+    ///    rewrites a stored state on first merge (the PUT install path stores the
+    ///    client's raw bytes without running `update_state` at all), and a contract
+    ///    that never settles is [`ConformanceProperty::StateIdempotence`]'s defect,
+    ///    not this one.
+    /// 2. The comparison is against that settled form, so canonicalization alone can
+    ///    never produce a finding.
+    ///
+    /// What survives both is a merge that cannot reach a state one of its own peers
+    /// is already holding, which is non-convergence by definition: the peer at
+    /// `result` gossips it, every peer that merges it lands somewhere else, and the
+    /// two never agree.
+    ///
+    /// A bounded collection is the shape most likely to look like a false positive
+    /// here, and the distinction is measured rather than assumed. A cap that evicts
+    /// by the merge's OWN ordering (keep the largest N) is a genuine bounded
+    /// semilattice and passes: the entries `base` would re-add are exactly the ones
+    /// the cap drops again. A cap that evicts by something independent of that
+    /// ordering — arrival order, a hash, `CAPPED_SET` in the fixture contract — does
+    /// fire, and that contract is already removal-eligible under
+    /// [`ConformanceProperty::StateAssociativity`] for the same underlying reason.
+    /// Both are pinned by tests.
+    TransitionPathAgreement,
 }
 
 /// How seriously a failed property should be taken.
@@ -244,6 +310,7 @@ impl ConformanceProperty {
         ConformanceProperty::WholeStateSelfDelta,
         ConformanceProperty::ReconciliationCycle,
         ConformanceProperty::PathAgreement,
+        ConformanceProperty::TransitionPathAgreement,
     ];
 
     pub fn severity(self) -> Severity {
@@ -269,7 +336,8 @@ impl ConformanceProperty {
             | ConformanceProperty::DeltaDeterminism
             | ConformanceProperty::DeltaPermutationInvariance
             | ConformanceProperty::ReconciliationCycle
-            | ConformanceProperty::PathAgreement => Severity::Violation,
+            | ConformanceProperty::PathAgreement
+            | ConformanceProperty::TransitionPathAgreement => Severity::Violation,
         }
     }
 
@@ -287,7 +355,8 @@ impl ConformanceProperty {
             | ConformanceProperty::EmittedStateValidity
             | ConformanceProperty::UpdateDeterminism
             | ConformanceProperty::ReconciliationCycle
-            | ConformanceProperty::PathAgreement => 2,
+            | ConformanceProperty::PathAgreement
+            | ConformanceProperty::TransitionPathAgreement => 2,
             ConformanceProperty::StateAssociativity => 3,
         }
     }
@@ -307,7 +376,8 @@ impl ConformanceProperty {
             | ConformanceProperty::SelfDeltaEmpty
             | ConformanceProperty::WholeStateSelfDelta
             | ConformanceProperty::ReconciliationCycle
-            | ConformanceProperty::PathAgreement => 0,
+            | ConformanceProperty::PathAgreement
+            | ConformanceProperty::TransitionPathAgreement => 0,
         }
     }
 
@@ -326,6 +396,7 @@ impl ConformanceProperty {
             ConformanceProperty::WholeStateSelfDelta => "whole_state_self_delta",
             ConformanceProperty::ReconciliationCycle => "reconciliation_cycle",
             ConformanceProperty::PathAgreement => "path_agreement",
+            ConformanceProperty::TransitionPathAgreement => "transition_path_agreement",
         }
     }
 }
@@ -426,6 +497,13 @@ pub enum Inconclusive {
     /// path is not the path this update would take on the network, and checking it
     /// would be checking a call that never happens.
     NoDeltaPath,
+    /// An observed result state is not a fixpoint of its own merge.
+    ///
+    /// A contract whose state keeps changing every time it is re-merged cannot be
+    /// judged on whether some OTHER state absorbs into it, and the defect already
+    /// has a name: [`ConformanceProperty::StateIdempotence`]. Reporting it here
+    /// would accuse the right contract under the wrong law.
+    StateNotSettled,
     /// The check failed once and then did not fail the same way again.
     ///
     /// Something outside the inputs moved between the two runs — the host clock is
@@ -447,6 +525,9 @@ impl std::fmt::Display for Inconclusive {
             Inconclusive::MalformedCase(e) => write!(f, "malformed case: {e}"),
             Inconclusive::NoDeltaPath => {
                 f.write_str("no delta path exists for these inputs to compare against")
+            }
+            Inconclusive::StateNotSettled => {
+                f.write_str("an observed result state is not a fixpoint of its own merge")
             }
             Inconclusive::NotReproducible => {
                 f.write_str("the finding did not reproduce on a second run")

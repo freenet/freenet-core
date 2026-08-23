@@ -244,10 +244,19 @@ impl ReplayBundle {
             .iter()
             .map(|s| Arc::from(s.as_slice()))
             .collect();
+        let mut steps: Vec<(Bytes, Bytes)> = Vec::with_capacity(self.transitions.len());
 
         for transition in &self.transitions {
             states.push(Arc::from(transition.base_state.as_slice()));
             states.push(Arc::from(transition.result_state.as_slice()));
+            // The ORDERED step, kept alongside the two loose states. Only this
+            // carries the fact that `result` was reached from `base`, which is what
+            // `TransitionPathAgreement` is a law about; the loose states alone
+            // cannot support the question.
+            steps.push((
+                Arc::from(transition.base_state.as_slice()),
+                Arc::from(transition.result_state.as_slice()),
+            ));
             if let Some(state) = &transition.incoming_state {
                 states.push(Arc::from(state.as_slice()));
             }
@@ -277,6 +286,7 @@ impl ReplayBundle {
             states,
             deltas,
             summaries,
+            transitions: steps,
             related: freenet_stdlib::prelude::RelatedContracts::from(related),
         }
         .deduplicated()

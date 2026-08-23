@@ -243,6 +243,15 @@ fn conforming_contract_satisfies_every_state_law() {
         &mut fake,
         &case(ConformanceProperty::PathAgreement, &[a, b]),
     ));
+    // A transition a conforming contract really could have taken: `a` merged with
+    // `b` is a state a peer at `a` reaches, and merging it back must be a no-op.
+    assert_holds(verify_case(
+        &mut fake,
+        &case(
+            ConformanceProperty::TransitionPathAgreement,
+            &[a, &[1, 2, 3]],
+        ),
+    ));
     assert_holds(verify_case(
         &mut fake,
         &case(ConformanceProperty::DeltaIdempotence, &[a]).with_deltas(vec![bytes(&[9])]),
@@ -1214,6 +1223,266 @@ fn a_disagreement_is_found_from_either_order_of_the_pair() {
     }
 }
 
+// -------------------------------------- #5394: the transition-shaped half of the law
+
+/// Build the `(base, result)` step a peer would have recorded, by running the
+/// contract's own delta path — so the test cannot accidentally assert against a
+/// result the contract would never have produced.
+fn transition_case(fake: &mut Fake, base: &[u8], delta: &[u8]) -> ConformanceCase {
+    let result = fake
+        .update_state(
+            base,
+            &[UpdateData::Delta(
+                freenet_stdlib::prelude::StateDelta::from(delta.to_vec()),
+            )],
+        )
+        .expect("apply")
+        .new_state
+        .expect("new state")
+        .into_bytes();
+    ConformanceCase::new(
+        ConformanceProperty::TransitionPathAgreement,
+        vec![bytes(base), bytes(&result)],
+    )
+}
+
+/// The positive case, and the one that reaches the defect #5394 was written from.
+///
+/// A peer at `[0x10, 0x51]` receives an op for key 5 carrying a different value and
+/// its delta path lands on `[0x10, 0x52]`. Merging that state back into the base it
+/// came from resurrects `0x51`, so no peer that receives it as a whole state can
+/// reach where the peer that applied the delta already is.
+#[test]
+fn a_reached_state_the_merge_path_cannot_reproduce_is_caught() {
+    let mut fake = disagreeing_paths();
+    let built = transition_case(&mut fake, &[0x10, 0x51], &[0x52]);
+    // The delta path really did move somewhere the base was not, so the case is not
+    // asserting against a no-op transition.
+    assert_ne!(
+        built.states[0], built.states[1],
+        "a transition that changed nothing proves nothing"
+    );
+    assert_violates(
+        verify_case(&mut fake, &built),
+        ConformanceProperty::TransitionPathAgreement,
+    );
+}
+
+/// The matched negative: the SAME contract, the SAME two write paths, an op whose
+/// key collides with nothing. A property that fired on every transition would pass
+/// the test above while being worse than the gap it closes.
+#[test]
+fn the_same_contract_is_silent_on_a_transition_whose_key_does_not_collide() {
+    let mut fake = disagreeing_paths();
+    let built = transition_case(&mut fake, &[0x10, 0x51], &[0x62]);
+    assert_ne!(
+        built.states[0], built.states[1],
+        "a transition that changed nothing proves nothing"
+    );
+    assert_holds(verify_case(&mut fake, &built));
+}
+
+/// A bounded collection that evicts by the merge's OWN ordering is a genuine
+/// bounded semilattice and must not be accused.
+///
+/// This is the false-positive risk that decides the severity. "Keep the newest N"
+/// is one of the most common shapes a real application writes, and the entries the
+/// base would re-add on a merge are exactly the ones the cap drops again — so the
+/// merge path reproduces what the delta path reached, and the law holds.
+///
+/// The contrast is `capped_collection_evicting_outside_the_merge_order_is_caught`
+/// below: the same cap, evicting by something independent of that ordering, does
+/// fire. Neither result is assumed; both are asserted.
+#[test]
+fn a_sound_bounded_collection_is_not_accused() {
+    const CAP: usize = 3;
+    let keep_largest = |a: &[u8], b: &[u8]| {
+        let mut out = union(a, b);
+        while out.len() > CAP {
+            out.remove(0);
+        }
+        Ok(out)
+    };
+    let mut fake = Fake::conforming()
+        .merging(keep_largest)
+        .applying(keep_largest);
+
+    let built = transition_case(&mut fake, &[1, 2], &[3, 4, 5]);
+    assert_eq!(
+        built.states[1].as_ref(),
+        &[3, 4, 5],
+        "the cap must actually have evicted something, or this tests nothing"
+    );
+    assert_holds(verify_case(&mut fake, &built));
+}
+
+/// The same cap, evicting by something INDEPENDENT of the merge's own ordering, is
+/// caught — and that is correct rather than a false positive: such a contract is
+/// already removal-eligible under `StateAssociativity`, for the same underlying
+/// reason (an entry dropped early destroys information a different merge order
+/// would have kept).
+///
+/// Asserted rather than left in prose, because it is the boundary the severity
+/// argument rests on: the property distinguishes the two caps, and does not simply
+/// flag every bounded collection.
+#[test]
+fn capped_collection_evicting_outside_the_merge_order_is_caught() {
+    const CAP: usize = 3;
+    let evict_by_content = |a: &[u8], b: &[u8]| {
+        let mut out = union(a, b);
+        while out.len() > CAP {
+            let sum: usize = out.iter().map(|byte| *byte as usize).sum();
+            out.remove(sum % out.len());
+        }
+        Ok(out)
+    };
+    let mut fake = Fake::conforming()
+        .merging(evict_by_content)
+        .applying(evict_by_content);
+
+    let built = transition_case(&mut fake, &[1, 2], &[3, 4, 5]);
+    assert_violates(
+        verify_case(&mut fake, &built),
+        ConformanceProperty::TransitionPathAgreement,
+    );
+
+    // ...and the SOUND cap above really is a different answer from this one, so the
+    // pair together shows the property discriminates rather than flagging all caps.
+    let mut sound = Fake::conforming()
+        .merging(|a: &[u8], b: &[u8]| {
+            let mut out = union(a, b);
+            while out.len() > CAP {
+                out.remove(0);
+            }
+            Ok(out)
+        })
+        .applying(|a: &[u8], b: &[u8]| {
+            let mut out = union(a, b);
+            while out.len() > CAP {
+                out.remove(0);
+            }
+            Ok(out)
+        });
+    let sound_case = transition_case(&mut sound, &[1, 2], &[3, 4, 5]);
+    assert_holds(verify_case(&mut sound, &sound_case));
+}
+
+/// A contract that rewrites a stored state into canonical form on first merge must
+/// not be accused.
+///
+/// The PUT install path stores the client's raw bytes without ever running
+/// `update_state`, so the state a peer holds — and therefore the `result` a
+/// transition records — may not be canonical yet. Comparing against those raw bytes
+/// would report that legitimate rewrite as a merge-law break, which is why `result`
+/// is driven to a fixpoint first.
+#[test]
+fn a_canonicalizing_contract_is_not_accused_by_the_transition_law() {
+    // Accepts a trailing marker byte but strips it on any merge, then stabilizes.
+    const MARKER: u8 = 0xFF;
+    let strip = |a: &[u8], b: &[u8]| {
+        let mut out = union(a, b);
+        out.retain(|byte| *byte != MARKER);
+        Ok(out)
+    };
+    let mut fake = Fake::conforming().merging(strip).applying(|a, d| {
+        // The delta path leaves the marker in place, so the recorded result is a
+        // non-canonical state exactly as a PUT-installed one would be.
+        Ok(union(a, d))
+    });
+
+    let built = transition_case(&mut fake, &[1, 2], &[MARKER]);
+    assert_eq!(
+        built.states[1].as_ref(),
+        &[1, 2, MARKER],
+        "the recorded result must be non-canonical, or the guard is untested"
+    );
+    assert_holds(verify_case(&mut fake, &built));
+}
+
+/// A result state that keeps rewriting itself cannot be judged here, and the defect
+/// already has a name. Reporting it under this law would accuse the right contract
+/// under the wrong one.
+#[test]
+fn a_result_state_that_never_settles_is_inconclusive_not_a_violation() {
+    let mut fake = Fake::conforming()
+        .validating(|_| Ok(ValidateResult::Valid))
+        .merging(|a, b| {
+            Ok(union(a, b)
+                .iter()
+                .map(|byte| byte.wrapping_add(1))
+                .collect())
+        });
+
+    assert_inconclusive(
+        verify_case(
+            &mut fake,
+            &case(
+                ConformanceProperty::TransitionPathAgreement,
+                &[&[1, 2], &[3, 4]],
+            ),
+        ),
+        Inconclusive::StateNotSettled,
+    );
+}
+
+/// The generator must build transition cases ONLY from recorded provenance.
+///
+/// This is the pin that keeps the property from becoming an accusation of
+/// last-write-wins against every conforming contract. "Merging B into A yields B" is
+/// false for a union semilattice on an arbitrary pair; it is a law only when the
+/// corpus witnesses that B was reached FROM A. If this property ever fell through to
+/// the generic arity-2 branch — which pairs every state with every other — the
+/// conforming baseline would start failing, and it would look like a real finding.
+#[test]
+fn transition_cases_come_only_from_recorded_provenance() {
+    let config = GeneratorConfig {
+        properties: vec![ConformanceProperty::TransitionPathAgreement],
+        ..Default::default()
+    };
+
+    // Negative: plenty of states, no provenance, so nothing to check.
+    let loose = Corpus::from_states(vec![vec![1], vec![2], vec![1, 2], vec![2, 3]]);
+    assert!(
+        generate_cases(&loose, &config).is_empty(),
+        "states that merely appeared together are not a transition; pairing them \
+         would accuse every conforming contract of last-write-wins"
+    );
+
+    // Positive: one recorded step yields exactly one case, in the recorded order.
+    let witnessed = Corpus {
+        transitions: vec![(bytes(&[1]), bytes(&[1, 2]))],
+        ..Corpus::from_states(vec![vec![1], vec![1, 2]])
+    };
+    let cases = generate_cases(&witnessed, &config);
+    assert_eq!(cases.len(), 1, "one recorded step is one case");
+    assert_eq!(cases[0].states[0].as_ref(), &[1], "base comes first");
+    assert_eq!(cases[0].states[1].as_ref(), &[1, 2], "result comes second");
+}
+
+/// A bundle must carry provenance across a round trip.
+///
+/// `to_corpus` flattens transitions into loose states, and before this it dropped
+/// the ORDERING while doing so — which would leave a replayed capture unable to
+/// check the one property that needs it, silently, and reading as a clean run.
+#[test]
+fn a_bundle_round_trip_preserves_transition_provenance() {
+    let mut bundle = super::bundle::ReplayBundle::new(b"code".to_vec(), Vec::new());
+    bundle.transitions.push(super::bundle::Transition {
+        base_state: vec![1],
+        result_state: vec![1, 2],
+        ..Default::default()
+    });
+
+    let decoded =
+        super::bundle::ReplayBundle::decode(&bundle.encode().expect("encode")).expect("decode");
+    let corpus = decoded.to_corpus();
+    assert_eq!(
+        corpus.transitions,
+        vec![(bytes(&[1]), bytes(&[1, 2]))],
+        "a replayed capture must still know which state came first"
+    );
+}
+
 fn instance(seed: u8) -> ContractInstanceId {
     ContractInstanceId::new([seed; 32])
 }
@@ -1461,7 +1730,11 @@ fn a_tight_case_budget_still_covers_every_law() {
     let base: Bytes = Arc::from([1u8].as_slice());
     let corpus = Corpus {
         deltas: vec![Arc::from([9u8].as_slice()), Arc::from([7u8].as_slice())],
-        delta_bases: vec![Some(base.clone()), Some(base)],
+        delta_bases: vec![Some(base.clone()), Some(base.clone())],
+        // `transition_path_agreement` is gated on recorded provenance and would
+        // otherwise contribute no cases at all — which would look like the budget
+        // dropping a law when in fact the corpus never offered one.
+        transitions: vec![(base, Arc::from([1u8, 9].as_slice()))],
         ..Corpus::from_states(states)
     };
     let config = GeneratorConfig {

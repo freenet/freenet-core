@@ -303,6 +303,7 @@ mod tests {
             wasm: None,
             params: None,
             states: Vec::new(),
+            transitions: Vec::new(),
             bundle: None,
             contract_store: None,
             max_cases: None,
