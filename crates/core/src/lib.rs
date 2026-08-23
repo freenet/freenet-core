@@ -9,7 +9,7 @@ mod contract;
 
 /// Contract conformance: the shared verifier and evidence model (RFC #5320).
 ///
-/// Public because `fdev conformance` runs the *same* verifier the network does.
+/// Public because `fdev verify-merge` runs the *same* verifier the network does.
 /// A developer-facing check that could disagree with the network-facing one would
 /// be worse than no check at all.
 pub mod conformance;

@@ -8,7 +8,7 @@
 //! exactly that.
 //!
 //! This module is the *single* implementation of what "conformance" means. The
-//! offline `fdev conformance` harness and (later) the node-side checker both call
+//! offline `fdev verify-merge` harness and (later) the node-side checker both call
 //! [`verify_case`], so the developer-facing answer and the network-facing answer
 //! cannot disagree.
 //!

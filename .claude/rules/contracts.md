@@ -194,7 +194,7 @@ State merging rules:
     checks deltas, but reports them at `Severity::Diagnostic` so the check
     can never justify removing a contract while the question is open.
     Whether any deployed contract actually relies on the unsafe pattern is
-    empirical and unanswered; `fdev conformance` against deployed WASM is
+    empirical and unanswered; `fdev verify-merge` against deployed WASM is
     how it gets answered. Do not treat either side as decided until it is.
   - Invalid merges should return error, not panic
 ```

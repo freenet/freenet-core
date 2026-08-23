@@ -3,7 +3,7 @@
 //! Conformance findings are only worth anything if they were produced by the same
 //! runtime configuration the network actually runs. A check that passes under a
 //! permissive test harness and fails in production (or the reverse) would make
-//! `fdev conformance` an unreliable oracle for authors and, later, would make peers
+//! `fdev verify-merge` an unreliable oracle for authors and, later, would make peers
 //! disagree about the same evidence. So this wraps [`crate::wasm_runtime::Runtime`]
 //! directly rather than reimplementing anything.
 

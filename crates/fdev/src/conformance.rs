@@ -1,4 +1,7 @@
-//! `fdev conformance`: run the contract conformance verifier offline (RFC #5320).
+//! `fdev verify-merge`: check a contract's merge laws offline (RFC #5320).
+//!
+//! A contract that breaks them cannot converge — peers given the same updates
+//! in different orders end up with different state and never agree.
 //!
 //! This is a thin CLI wrapper around `freenet::conformance` and does not
 //! reimplement any of the laws itself. That is the whole point: `fdev
@@ -10,10 +13,10 @@
 //!
 //! ```text
 //! # Check a contract directly against a handful of observed states
-//! fdev conformance --wasm contract.wasm --state s1.bin --state s2.bin
+//! fdev verify-merge --wasm contract.wasm --state s1.bin --state s2.bin
 //!
 //! # Replay a bundle captured from the network (or an earlier `fdev` run)
-//! fdev conformance --bundle observed.bin
+//! fdev verify-merge --bundle observed.bin
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -224,7 +227,7 @@ fn write_bundle(
     bundle.deltas = corpus.deltas.iter().map(|d| d.to_vec()).collect();
     bundle.summaries = corpus.summaries.iter().map(|s| s.to_vec()).collect();
     bundle.note = Some(format!(
-        "captured by fdev conformance {}",
+        "captured by fdev verify-merge {}",
         env!("CARGO_PKG_VERSION")
     ));
     bundle
@@ -244,7 +247,10 @@ fn write_bundle(
 /// can tell "this contract is unsound" apart from "the check could not run" — a
 /// distinction CI needs and a single exit code cannot express.
 #[derive(Debug, thiserror::Error)]
-#[error("{count} enforceable conformance violation(s) found")]
+#[error(
+    "{count} merge-law violation(s) found: this contract cannot converge, so peers \
+     holding it will disagree and keep retrying"
+)]
 pub struct ConformanceViolations {
     pub count: usize,
 }
@@ -502,7 +508,7 @@ fn load_inputs(config: &ConformanceConfig) -> anyhow::Result<(Vec<u8>, Vec<u8>, 
         if let Some(note) = bundle.note.as_deref() {
             // STDERR deliberately. `--json` writes one JSON document to stdout, and a
             // plain line ahead of it corrupts the stream for anything parsing it -
-            // `fdev conformance --bundle x --json | jq` would simply fail. `write_bundle`
+            // `fdev verify-merge --bundle x --json | jq` would simply fail. `write_bundle`
             // in this same file already uses `eprintln!` for its status line for
             // exactly this reason; the first version of this did not follow it.
             //
@@ -762,11 +768,11 @@ impl Report {
 
     fn print_human(&self) {
         println!(
-            "conformance: {} state(s), {} delta(s), {} summary/summaries in the corpus",
+            "merge check: {} state(s), {} delta(s), {} summary/summaries in the corpus",
             self.corpus_states, self.corpus_deltas, self.corpus_summaries
         );
         println!(
-            "conformance: {} case(s) run \u{2014} {} held, {} violation(s) ({} enforceable, {} diagnostic-only), {} inconclusive",
+            "merge check: {} case(s) run \u{2014} {} held, {} violation(s) ({} enforceable, {} diagnostic-only), {} inconclusive",
             self.cases_run,
             self.holds,
             self.violations,
@@ -796,7 +802,7 @@ impl Report {
         // code.
         if !self.inconclusive_reasons.is_empty() {
             println!(
-                "\ninconclusive ({} total, not failures \u{2014} see freenet::conformance::Inconclusive):",
+                "\ninconclusive ({} total \u{2014} NOT passes: these cases reached no verdict, so they say nothing about the contract):",
                 self.inconclusive
             );
             for r in &self.inconclusive_reasons {
@@ -872,7 +878,7 @@ fn inconclusive_label(reason: &Inconclusive) -> &'static str {
 /// `--json` promises a machine-readable report, which means stdout must carry ONE JSON
 /// document and nothing else. `load_inputs` runs before the report is emitted, so
 /// anything it prints to stdout lands ahead of that document and breaks every consumer
-/// that parses it — `fdev conformance --bundle x --json | jq` simply fails.
+/// that parses it — `fdev verify-merge --bundle x --json | jq` simply fails.
 ///
 /// That shipped once: the bundle note was printed with `println!`, and because every
 /// bundle this codebase writes always sets a note, it fired on essentially every

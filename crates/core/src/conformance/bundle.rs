@@ -75,7 +75,7 @@ pub struct Transition {
 /// and the states, deltas, summaries and transitions observed for it.
 ///
 /// This is the unit that moves between a peer and an offline analysis: capture on a
-/// node writes one, `fdev conformance --bundle` reads one, and a bundle archived
+/// node writes one, `fdev verify-merge --bundle` reads one, and a bundle archived
 /// today must still replay against a later build. That is why it carries its own
 /// magic and schema version, and why it stays separate from any internal on-disk
 /// sampler format, which is free to change.
