@@ -551,6 +551,10 @@ pub fn start(dir: PathBuf) -> std::io::Result<CaptureHandle> {
         directory = %dir.display(),
         "conformance capture enabled: recording contract merges for offline replay"
     );
+    // Tell the dashboard checking is ON before any tick has run. Without this, the
+    // first interval renders as "not enabled", which is the one thing the panel must
+    // never say wrongly — absence and success must not look alike.
+    crate::conformance::status::mark_enabled();
     tokio::spawn(run_writer(dir, rx, dropped, queued_bytes));
     Ok(handle)
 }
@@ -869,6 +873,24 @@ async fn run_writer(
                     skipped_no_samples = report.skipped_no_samples,
                     timed_out = report.timed_out,
                     "conformance shadow tick"
+                );
+
+                // Same numbers the line above reports, so the dashboard and the log
+                // cannot disagree about what happened. Published here rather than
+                // derived by a reader: a count re-computed at the call site is how
+                // this project has produced wrong metrics before.
+                crate::conformance::status::publish(
+                    report.probed,
+                    report.skipped_no_code + report.skipped_no_samples,
+                    report.cases,
+                    findings.iter().map(|finding| {
+                        crate::conformance::status::MergeFinding {
+                            contract: finding.contract,
+                            property: finding.violation.property.as_str(),
+                            severity: finding.violation.property.severity(),
+                            would_remove: finding.would_remove,
+                        }
+                    }),
                 );
             }
         }
