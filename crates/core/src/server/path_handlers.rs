@@ -121,8 +121,39 @@ static CONTRACT_CACHE_REFRESH: LazyLock<DashMap<ContractInstanceId, Instant>> =
 /// is the one per-key map here an attacker can grow at will, and it is capped
 /// at [`MAX_REFRESH_LOCKS`] — see `acquire_refresh_lock` and the
 /// per-key-collection rule in `.claude/rules/code-style.md`.
-static CONTRACT_REFRESH_LOCKS: LazyLock<DashMap<ContractInstanceId, Arc<tokio::sync::Mutex<()>>>> =
-    LazyLock::new(DashMap::new);
+static CONTRACT_REFRESH_LOCKS: LazyLock<
+    DashMap<ContractInstanceId, Arc<tokio::sync::Mutex<RefreshState>>>,
+> = LazyLock::new(DashMap::new);
+
+/// What a contract's refresh lock guards, beyond the decision itself.
+///
+/// Kept inside the mutex rather than in a map of its own because the mutex is
+/// already the thing that serializes refreshers for one contract, and a second
+/// map keyed by a contract id from the URL would be another unbounded per-key
+/// collection to bound (`.claude/rules/code-style.md`).
+#[derive(Default, Debug)]
+struct RefreshState {
+    /// When a COLD fetch last failed, and for which contract.
+    ///
+    /// Without this, every subresource on a page pointing at a contract nobody
+    /// can find pays its own full network GET, one after another, because each
+    /// queued follower re-checks the cache, still finds it cold, and tries
+    /// again: a page with 30 such images spends 30 sequential fetches getting
+    /// 30 identical answers. Recording the failure lets the followers stop.
+    ///
+    /// The id is carried because [`REFRESH_LOCK_OVERFLOW`] stripes are shared
+    /// between contracts, so a stripe's state may describe a different one.
+    last_cold_failure: Option<(ContractInstanceId, Instant)>,
+}
+
+impl RefreshState {
+    /// Whether a cold fetch for `instance_id` failed recently enough that
+    /// trying again now would just repeat it.
+    fn cold_fetch_failed_recently(&self, instance_id: &ContractInstanceId) -> bool {
+        self.last_cold_failure
+            .is_some_and(|(id, at)| id == *instance_id && at.elapsed() < CONTRACT_CACHE_REFRESH_TTL)
+    }
+}
 
 /// Cap on retained entries in [`CONTRACT_REFRESH_LOCKS`].
 ///
@@ -131,43 +162,97 @@ static CONTRACT_REFRESH_LOCKS: LazyLock<DashMap<ContractInstanceId, Arc<tokio::s
 /// a spray of never-seen keys cannot grow the map without limit.
 const MAX_REFRESH_LOCKS: usize = 4096;
 
-/// Take the per-contract refresh lock, keeping [`CONTRACT_REFRESH_LOCKS`] under
-/// [`MAX_REFRESH_LOCKS`] entries.
+/// Shared mutexes used once [`CONTRACT_REFRESH_LOCKS`] is full — see
+/// [`refresh_lock_for`].
+///
+/// A contract maps to a stripe by hash, so two requests for the SAME contract
+/// still land on the same mutex and still coalesce. Unrelated contracts sharing
+/// a stripe serialize their refresh decisions, which is the price of the
+/// overflow state and is why there are enough stripes to make it rare.
+const REFRESH_LOCK_OVERFLOW_STRIPES: usize = 64;
+
+static REFRESH_LOCK_OVERFLOW: LazyLock<Vec<Arc<tokio::sync::Mutex<RefreshState>>>> =
+    LazyLock::new(|| {
+        (0..REFRESH_LOCK_OVERFLOW_STRIPES)
+            .map(|_| Arc::new(tokio::sync::Mutex::new(RefreshState::default())))
+            .collect()
+    });
+
+/// Serializes ADMISSION of new entries to [`CONTRACT_REFRESH_LOCKS`], so
+/// [`MAX_REFRESH_LOCKS`] is enforced at insertion rather than approached from
+/// both sides at once.
+///
+/// A plain `len()` check before `insert` is not the cap it looks like: two
+/// callers for distinct keys can both read `len() == MAX - 1` and both insert.
+/// The overshoot is small, but the per-key-collection rule in
+/// `.claude/rules/code-style.md` asks for a maximum enforced at insertion time,
+/// and "usually about 4096" is not that. Lookups of an EXISTING lock never take
+/// this, so the cost falls only on first sight of a contract, and nothing
+/// awaits while holding it.
+static REFRESH_LOCK_ADMISSION: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// The mutex that coalesces refresh decisions for `instance_id`, keeping
+/// [`CONTRACT_REFRESH_LOCKS`] at or under [`MAX_REFRESH_LOCKS`] entries.
 ///
 /// When the map is full, entries no other task holds are dropped first. The
 /// `Arc::strong_count == 1` test is what makes that safe: a count of one means
 /// the map is the only owner, so no task is waiting on or holding that mutex
-/// and re-creating it later cannot break mutual exclusion. `retain` holds the
-/// shard lock while it runs, so a task racing to clone an entry either gets it
-/// first (count 2, retained) or blocks and then creates a fresh one.
+/// and re-creating it later cannot break mutual exclusion. `retain` takes each
+/// shard's write lock while it runs, so a task racing to clone an entry either
+/// gets it first (count 2, retained) or blocks and then creates a fresh one.
 ///
-/// If nothing can be pruned the caller gets a private mutex instead of an
-/// entry in the map. That costs coalescing for this one request — two callers
-/// for the same contract could each issue a GET — which is a fair trade against
-/// unbounded growth, and the speculative-fetch lane still bounds how many such
-/// GETs can be in flight.
-async fn acquire_refresh_lock(
-    instance_id: &ContractInstanceId,
-) -> tokio::sync::OwnedMutexGuard<()> {
-    if let Some(existing) = CONTRACT_REFRESH_LOCKS.get(instance_id) {
-        return existing.clone().lock_owned().await;
+/// If nothing can be pruned — every one of 4096 contracts refreshing at
+/// once — the caller gets a stripe from [`REFRESH_LOCK_OVERFLOW`] rather than a
+/// private mutex. A private mutex would silently drop coalescing exactly when
+/// the node is busiest, and a warm-but-stale refresh takes no speculative-fetch
+/// permit, so nothing else would bound the duplicate GETs that follow.
+///
+/// Returns the `Arc` rather than the guard so no DashMap reference is alive
+/// when the caller awaits the mutex. Holding one across that await would pin a
+/// shard's read lock for the length of a network GET, blocking every insert and
+/// the prune sweep itself on contracts that merely hash to the same shard.
+fn refresh_lock_for(instance_id: &ContractInstanceId) -> Arc<tokio::sync::Mutex<RefreshState>> {
+    if let Some(existing) = CONTRACT_REFRESH_LOCKS.get(instance_id).map(|e| e.clone()) {
+        return existing;
+    }
+
+    let _admission = REFRESH_LOCK_ADMISSION.lock();
+    // Re-check: another admission may have inserted this key while we queued.
+    if let Some(existing) = CONTRACT_REFRESH_LOCKS.get(instance_id).map(|e| e.clone()) {
+        return existing;
     }
 
     if CONTRACT_REFRESH_LOCKS.len() >= MAX_REFRESH_LOCKS {
         CONTRACT_REFRESH_LOCKS.retain(|_, lock| Arc::strong_count(lock) > 1);
-        if CONTRACT_REFRESH_LOCKS.len() >= MAX_REFRESH_LOCKS {
-            tracing::debug!(
-                "webapp cache: refresh-lock table full; serving {instance_id} without coalescing"
-            );
-            return Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
-        }
+    }
+    if CONTRACT_REFRESH_LOCKS.len() >= MAX_REFRESH_LOCKS {
+        tracing::debug!(
+            "webapp cache: refresh-lock table full; {instance_id} shares an overflow stripe"
+        );
+        return overflow_refresh_lock(instance_id);
     }
 
-    let mutex = CONTRACT_REFRESH_LOCKS
-        .entry(*instance_id)
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone();
-    mutex.lock_owned().await
+    let mutex = Arc::new(tokio::sync::Mutex::new(RefreshState::default()));
+    CONTRACT_REFRESH_LOCKS.insert(*instance_id, mutex.clone());
+    mutex
+}
+
+/// Deterministic overflow stripe for `instance_id` — the same contract always
+/// gets the same one, which is what preserves coalescing when the lock table is
+/// full.
+fn overflow_refresh_lock(
+    instance_id: &ContractInstanceId,
+) -> Arc<tokio::sync::Mutex<RefreshState>> {
+    use std::hash::Hasher;
+    let mut hasher = ahash::AHasher::default();
+    hasher.write(instance_id.as_bytes());
+    REFRESH_LOCK_OVERFLOW[hasher.finish() as usize % REFRESH_LOCK_OVERFLOW_STRIPES].clone()
+}
+
+async fn acquire_refresh_lock(
+    instance_id: &ContractInstanceId,
+) -> tokio::sync::OwnedMutexGuard<RefreshState> {
+    refresh_lock_for(instance_id).lock_owned().await
 }
 
 /// How many *speculative* webapp fetches a node will have in flight at once.
@@ -184,9 +269,29 @@ async fn acquire_refresh_lock(
 ///
 /// 32 is well above what a page load needs (a page pulls subresources from one
 /// or two contracts) and well below what would make the fan-out interesting to
-/// an attacker: with the 30s fetch timeout, a saturated lane caps outbound
-/// speculative GETs at roughly one per second sustained.
+/// an attacker.
+///
+/// Be precise about what it bounds: CONCURRENT speculative GETs, not their
+/// rate. A GET for a key nobody has ends when its retry loop is exhausted,
+/// which is usually well before the 30s timeout ceiling, so the sustained rate
+/// is 32 divided by however long a failing GET actually takes. What bounds the
+/// rate for a REPEATED key is `RefreshState::last_cold_failure`, which stops
+/// the same dead contract being re-fetched inside the TTL window; a sprayer
+/// using fresh keys every time gets no benefit from that and is bounded only by
+/// the concurrency.
 const SPECULATIVE_FETCH_LIMIT: usize = 32;
+
+/// How long a cold request queues for a permit before giving up on the lane.
+///
+/// `tokio`'s semaphore hands out permits FIFO, so queueing briefly is what
+/// stops a client that holds `SPECULATIVE_FETCH_LIMIT` requests open from
+/// starving everyone else — without it, a saturated lane means every other
+/// caller falls back to the presence query and a legitimate first-ever
+/// subresource load fails for exactly the reason #5406 was filed about. The
+/// wait is short because a queued request holds nothing but a task: a caller
+/// that gives up still has the presence-query fallback and, failing that, a
+/// fast 404.
+const SPECULATIVE_FETCH_WAIT: Duration = Duration::from_secs(2);
 
 /// Take `CONTRACT_CACHE_LOCKS[instance_id]` without waiting. `None` means an
 /// unpack for that contract is in flight, which is exactly when the eviction
@@ -418,15 +523,23 @@ impl WebappCache {
         }
     }
 
-    /// Claim one of this node's speculative-fetch permits, or `None` if all
-    /// [`SPECULATIVE_FETCH_LIMIT`] are already in flight.
+    /// Claim one of this node's speculative-fetch permits, waiting at most
+    /// [`SPECULATIVE_FETCH_WAIT`] for one to come free.
     ///
-    /// Never waits: the caller is serving an HTTP request that has a cheap
-    /// alternative to waiting (ask whether the node already knows the contract,
-    /// and otherwise 404), and queueing requests behind a 30s network GET is
-    /// exactly the resource exhaustion the bound exists to prevent.
-    fn try_speculative_fetch_slot(&self) -> Option<OwnedSemaphorePermit> {
-        self.speculative_fetches.clone().try_acquire_owned().ok()
+    /// The wait is bounded rather than absent so the lane stays fair (see
+    /// [`SPECULATIVE_FETCH_WAIT`]), and bounded rather than open-ended so a
+    /// request never queues behind a 30s network GET — that would be the
+    /// resource exhaustion the bound exists to prevent.
+    async fn speculative_fetch_slot(&self) -> Option<OwnedSemaphorePermit> {
+        let lane = self.speculative_fetches.clone();
+        // Fast path: a free permit costs no timer and no queue.
+        if let Ok(slot) = lane.clone().try_acquire_owned() {
+            return Some(slot);
+        }
+        tokio::time::timeout(SPECULATIVE_FETCH_WAIT, lane.acquire_owned())
+            .await
+            .ok()
+            .and_then(Result::ok)
     }
 
     /// The directory this cache owns — i.e. the one its sweep deletes from.
@@ -1078,7 +1191,7 @@ async fn refresh_cache_if_due(
 
     // Slow path: refresh looks due. Serialize concurrent refreshers for this
     // contract so only the first issues a GET; the rest re-check below.
-    let _guard = acquire_refresh_lock(&instance_id).await;
+    let mut refresh = acquire_refresh_lock(&instance_id).await;
     // Re-check under the lock, and RE-STAT rather than trusting the timer
     // alone. The timer is per-process; the cache directory is per-USER, and the
     // documented multi-peer setup (peer-manager.sh) runs several nodes as one
@@ -1126,9 +1239,25 @@ async fn refresh_cache_if_due(
     // another process just evicted down the speculative path, and requiring
     // only the pre-lock snapshot would miss a concurrent refresher that warmed
     // the cache while we waited.
+    let cold = !(cache_warm || still_warm);
+
+    // A cold fetch that just failed will fail again: the answer came from the
+    // network and nothing has changed since. Without this, the subresources of
+    // a page pointing at an unfindable contract each pay their own full GET in
+    // turn. Callers inside the window get the empty-cache 404 rather than the
+    // first caller's error, which is also what they got before the fetch
+    // existed at all.
+    if cold && refresh.cold_fetch_failed_recently(&instance_id) {
+        return Ok(());
+    }
+
+    // `_speculative_slot` must stay a NAMED binding: it holds the permit for
+    // the fetch below, and `let _ = ...` would drop it immediately, silently
+    // removing the concurrency bound. Pinned by
+    // `an_in_flight_fetch_holds_its_speculative_permit`.
     let mut _speculative_slot = None;
-    if !(cache_warm || still_warm) {
-        match cache.try_speculative_fetch_slot() {
+    if cold {
+        match cache.speculative_fetch_slot().await {
             Some(slot) => _speculative_slot = Some(slot),
             None if is_locally_known(instance_id, request_sender).await => {}
             None => {
@@ -1140,7 +1269,11 @@ async fn refresh_cache_if_due(
         }
     }
 
-    ensure_contract_cached(instance_id, request_sender, None, cache).await?;
+    let fetched = ensure_contract_cached(instance_id, request_sender, None, cache).await;
+    if cold {
+        refresh.last_cold_failure = fetched.is_err().then(|| (instance_id, Instant::now()));
+    }
+    fetched?;
     CONTRACT_CACHE_REFRESH.insert(instance_id, Instant::now());
     // The fetch populated the entry, so it now exists and is about to be read.
     note_cache_access(cache, instance_id).await;
@@ -1169,6 +1302,18 @@ pub(super) async fn contract_home(
     // Register the assigned token with origin_contracts so subsequent
     // WebSocket connections from the shell iframe authenticate against
     // the correct contract identity, then fetch + unpack the contract.
+    //
+    // Deliberately NOT behind `SPECULATIVE_FETCH_LIMIT`. This fetch is just as
+    // speculative as the subresource one — an unauthenticated `GET
+    // /v1/contract/web/<random>/` reaches it with any key — and it has never
+    // been bounded or gated, including while #4417's presence gate was on the
+    // subresource path. So the bound covers the narrower of two doors, and the
+    // wider one stands open exactly as it did before. #3945 called this out and
+    // ranked it Low ("top-level page navigations are typically human-paced");
+    // bounding a human's first visit to a contract is a different trade from
+    // bounding a machine-fetched subresource, and belongs in its own change.
+    // Do NOT read `SPECULATIVE_FETCH_LIMIT` as covering the whole webapp-fetch
+    // surface.
     ensure_contract_cached(
         instance_id,
         &request_sender,
@@ -1238,12 +1383,23 @@ async fn ensure_contract_cached(
         .map_err(|err| WebSocketApiError::NodeError {
             error_cause: format!("{err}"),
         })?;
-    let client_id = if let Some(HostCallbackResult::NewId { id }) = response_recv.recv().await {
-        id
-    } else {
-        return Err(WebSocketApiError::NodeError {
-            error_cause: "Couldn't register new client in the node".into(),
-        });
+    // Bound the wait for the connection id. A node that accepts the connection
+    // and then never assigns one would otherwise pin this task forever — and
+    // with it the speculative-fetch permit the caller is holding, so a wedged
+    // node would drain the lane permanently and never refill it.
+    //
+    // This used to be unreachable: #4417's presence gate ran first, and its own
+    // timeouts failed closed, so a cold request never got here unless the node
+    // was answering. Removing that gate is what makes the bare `recv()` matter,
+    // which is why the timeout arrives with it. Same bound as the presence
+    // query, for the same handshake.
+    let client_id = match tokio::time::timeout(PRESENCE_QUERY_TIMEOUT, response_recv.recv()).await {
+        Ok(Some(HostCallbackResult::NewId { id })) => id,
+        _ => {
+            return Err(WebSocketApiError::NodeError {
+                error_cause: "Couldn't register new client in the node".into(),
+            });
+        }
     };
     request_sender
         .send(ClientConnection::Request {
@@ -1486,8 +1642,20 @@ async fn unpack_if_stale(
             error_cause: format!("Failed to create cache dir: {e}"),
         })?;
 
-    let mut web = WebApp::try_from(state.as_ref()).map_err(|e| err(e, contract))?;
-    web.unpack(&path).map_err(|e| err(e, contract))?;
+    let unpacked = WebApp::try_from(state.as_ref())
+        .and_then(|mut web| web.unpack(&path))
+        .map_err(|e| err(e, contract));
+    if let Err(unpack_failed) = unpacked {
+        // Take the directory back out. A contract that is not a web archive
+        // fails here every time it is requested, and the sweep would never
+        // reclaim what it leaves: an empty directory contributes 0 bytes to a
+        // budget measured in bytes. With the cold fetch no longer gated on
+        // local presence, that would be one attacker-named directory per key.
+        if let Err(cleanup_failed) = tokio::fs::remove_dir_all(&path).await {
+            debug!("webapp cache: could not remove failed unpack dir: {cleanup_failed}");
+        }
+        return Err(unpack_failed);
+    }
 
     // Store new hash LAST, so a partial unpack does not leave a stale
     // hash file that would make future requests skip the fetch.
@@ -1874,6 +2042,18 @@ pub(super) async fn serve_sandbox_content(
             error_cause: format!("{err}"),
         })?;
 
+    // Reject a page path that can never resolve BEFORE fetching, for the same
+    // reason `variable_content` does: a request that cannot succeed must not
+    // spend one of the node's speculative-fetch permits. `sandbox_content_body`
+    // runs the identical check again — it is the security boundary and stays
+    // there — along with the canonicalization half, which can only run once the
+    // bundle is on disk.
+    if has_escaping_component(Path::new(page)) {
+        return Err(WebSocketApiError::InvalidParam {
+            error_cause: "Path traversal not allowed".to_string(),
+        });
+    }
+
     // Reconcile the on-disk cache against current network state before serving.
     // Previously this path only checked `path.exists()` and served whatever was
     // already extracted, so a republished contract kept serving the old bundle
@@ -2241,8 +2421,17 @@ fn test_webapp_cache() -> WebappCache {
 /// `Semaphore`, so draining it cannot affect a concurrently running test.
 #[cfg(test)]
 fn test_webapp_cache_saturated() -> WebappCache {
+    // CLOSED rather than merely empty: a closed semaphore refuses instantly,
+    // where an empty one makes every caller sit out `SPECULATIVE_FETCH_WAIT`
+    // first. These tests are about what happens AFTER the lane is given up on,
+    // and coupling each of them to that timer buys nothing and makes them
+    // fragile under paused time. The wait itself is covered by
+    // `an_in_flight_fetch_holds_its_speculative_permit`, which saturates a real
+    // one-permit lane.
+    let lane = Semaphore::new(0);
+    lane.close();
     WebappCache {
-        speculative_fetches: Arc::new(Semaphore::new(0)),
+        speculative_fetches: Arc::new(lane),
         ..test_webapp_cache()
     }
 }
@@ -3835,16 +4024,174 @@ mod tests {
         clear_cache(&second).await;
     }
 
+    /// A page embedding several subresources from a contract nobody can find
+    /// must pay ONE network GET, not one per subresource. Each follower queues
+    /// on the refresh lock, finds the cache still cold, and would otherwise
+    /// fetch again — 30 images means 30 sequential GETs, each up to the 30s
+    /// ceiling, for 30 identical answers. The recorded failure is what stops
+    /// them, and this test is the only thing standing between that record and a
+    /// future cleanup that drops it as redundant with the refresh timer (it is
+    /// not: the timer is only set on SUCCESS, deliberately, so a transient
+    /// failure does not suppress the next retry).
+    #[tokio::test]
+    async fn a_failed_cold_fetch_is_not_repeated_within_the_window() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3b;
+        bytes[1] = 0x11;
+        let instance_id = ContractInstanceId::new(bytes);
+        clear_cache(&instance_id).await;
+        CONTRACT_REFRESH_LOCKS.remove(&instance_id);
+
+        let (sender, mut rx) = request_channel();
+
+        // First request: fetches, and the node answers "not found".
+        let first = {
+            let sender = sender.clone();
+            tokio::spawn(async move {
+                refresh_cache_if_due(instance_id, &sender, &test_webapp_cache()).await
+            })
+        };
+        let callbacks = expect_fetch_pair_holding_callbacks(&mut rx, instance_id).await;
+        callbacks
+            .send(HostCallbackResult::Result {
+                id: crate::client_events::ClientId::next(),
+                result: Ok(HostResponse::ContractResponse(ContractResponse::NotFound {
+                    instance_id,
+                })),
+            })
+            .expect("callback receiver live for the NotFound reply");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), first)
+                .await
+                .expect("the first request must resolve")
+                .expect("handler must not panic")
+                .is_err(),
+            "premise: an exhausted GET must surface as an error"
+        );
+        while rx.try_recv().is_ok() {} // the fetch's trailing Disconnect
+
+        // Second request, same contract, still cold: no GET may go out.
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            refresh_cache_if_due(instance_id, &sender, &test_webapp_cache()),
+        )
+        .await
+        .expect("the second request must resolve, not queue behind a refetch");
+        assert!(
+            second.is_ok(),
+            "a request inside the failure window serves the empty-cache 404, it \
+             does not propagate the first caller's error"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a cold fetch that just failed must not be repeated inside the \
+             window — one dead contract, one GET"
+        );
+
+        CONTRACT_REFRESH_LOCKS.remove(&instance_id);
+        clear_cache(&instance_id).await;
+    }
+
+    /// A node that accepts the fetch's connection but never assigns it an id
+    /// must not pin the request — and above all must not pin the
+    /// speculative-fetch permit it is holding, because a permit that never
+    /// comes back drains the lane for the life of the process.
+    ///
+    /// Unreachable before this change: #4417's gate ran its own bounded
+    /// presence query first and failed closed, so a cold request never reached
+    /// the fetch against a silent node. Removing the gate is what put this
+    /// handshake on the path, so the bound belongs to the same change. Found by
+    /// mutation-testing the traversal check, where the test hung instead of
+    /// failing.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_node_cannot_pin_a_speculative_permit() {
+        let webapp_cache = WebappCache {
+            speculative_fetches: Arc::new(Semaphore::new(1)),
+            ..test_webapp_cache()
+        };
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3b;
+        bytes[1] = 0x21;
+        let instance_id = ContractInstanceId::new(bytes);
+        clear_cache(&instance_id).await;
+        CONTRACT_REFRESH_LOCKS.remove(&instance_id);
+
+        let (sender, mut rx) = request_channel();
+        let handler = {
+            let webapp_cache = webapp_cache.clone();
+            tokio::spawn(
+                async move { refresh_cache_if_due(instance_id, &sender, &webapp_cache).await },
+            )
+        };
+
+        // Accept the connection, then go silent — never send `NewId`. Hold the
+        // sender so the channel stays OPEN: a closed channel short-circuits the
+        // recv, and the timeout is what this test is about.
+        let new_conn = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the fetch must open with NewConnection")
+            .expect("channel must remain open");
+        let _callbacks = match new_conn {
+            ClientConnection::NewConnection { callbacks, .. } => callbacks,
+            other => panic!("the fetch must open with NewConnection, got: {other:?}"),
+        };
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(60), handler)
+                .await
+                .expect("a silent node must not pin the request task")
+                .expect("handler must not panic")
+                .is_err(),
+            "a fetch that never got a client id is a failed fetch"
+        );
+        assert_eq!(
+            webapp_cache.speculative_fetches.available_permits(),
+            1,
+            "the permit must come back when the fetch gives up, or one wedged \
+             node drains the lane for good"
+        );
+
+        CONTRACT_REFRESH_LOCKS.remove(&instance_id);
+        clear_cache(&instance_id).await;
+    }
+
+    /// The production cache must actually hand out `SPECULATIVE_FETCH_LIMIT`
+    /// permits. Every other lane test overrides the count, so without this a
+    /// mistake in `with_root` — a zero, or a `usize::MAX` that bounds
+    /// nothing — would pass the whole suite.
+    #[test]
+    fn with_root_opens_the_lane_at_the_declared_limit() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let cache = WebappCache::with_root(root.path().to_path_buf());
+        assert_eq!(
+            cache.speculative_fetches.available_permits(),
+            SPECULATIVE_FETCH_LIMIT,
+            "the node's speculative-fetch lane must open at the declared limit"
+        );
+    }
+
     /// `CONTRACT_REFRESH_LOCKS` is keyed by a contract id an unauthenticated
     /// caller puts in the URL, and the entry is created before anything has
     /// decided the contract is worth fetching — so without a cap it is an
     /// unbounded per-key map an attacker grows for free by spraying keys (the
-    /// per-key-collection rule in `.claude/rules/code-style.md`). Pruning must
-    /// not, however, drop a lock another task is holding or waiting on: that
-    /// would let two refreshers for one contract run concurrently, which is the
-    /// coalescing the lock exists to provide.
+    /// per-key-collection rule in `.claude/rules/code-style.md`).
+    ///
+    /// Three properties, in one test because they cannot safely be separated:
+    /// while this holds the table full, a CONCURRENT sibling asking for a lock
+    /// correctly receives an overflow stripe instead of a table entry — which
+    /// is precisely what the first half asserts against. Split across two
+    /// `#[tokio::test]`s they would fail each other under plain `cargo test`,
+    /// which runs them as threads in one process (`.claude/rules/testing.md`).
+    ///
+    /// 1. the table stays at or under its cap under a spray;
+    /// 2. pruning never drops a lock another task holds or waits on, which
+    ///    would let two refreshers for one contract run at once;
+    /// 3. once the table is full of HELD locks, a newcomer gets a shared
+    ///    overflow stripe — deterministic per contract, so it still coalesces —
+    ///    rather than a private mutex, which would drop coalescing for every
+    ///    request at once while nothing bounds the warm refreshes that follow.
     #[tokio::test]
-    async fn refresh_lock_table_is_bounded_and_never_prunes_a_held_lock() {
+    async fn refresh_lock_table_is_bounded_prunes_safely_and_overflows_per_contract() {
         let mut bytes = [0u8; 32];
         bytes[0] = 0x3c;
         let held_id = ContractInstanceId::new(bytes);
@@ -3854,11 +4201,16 @@ mod tests {
             .map(|entry| entry.clone())
             .expect("the held lock must be in the table");
 
-        for i in 0..(MAX_REFRESH_LOCKS + 64) {
-            let mut bytes = [0u8; 32];
-            bytes[0] = 0x3d;
-            bytes[1..9].copy_from_slice(&(i as u64).to_be_bytes());
-            drop(acquire_refresh_lock(&ContractInstanceId::new(bytes)).await);
+        let sprayed: Vec<_> = (0..(MAX_REFRESH_LOCKS + 64))
+            .map(|i| {
+                let mut bytes = [0u8; 32];
+                bytes[0] = 0x3d;
+                bytes[1..9].copy_from_slice(&(i as u64).to_be_bytes());
+                ContractInstanceId::new(bytes)
+            })
+            .collect();
+        for id in &sprayed {
+            drop(acquire_refresh_lock(id).await);
         }
 
         assert!(
@@ -3876,7 +4228,52 @@ mod tests {
             "the prune must keep the SAME mutex a task is holding, not replace \
              it — a replacement lets two refreshers for one contract run at once"
         );
+
+        // Now fill the table with locks that are HELD, so the prune can reclaim
+        // nothing and a newcomer has to take the overflow path.
+        let mut held = Vec::with_capacity(MAX_REFRESH_LOCKS);
+        let mut held_ids = Vec::with_capacity(MAX_REFRESH_LOCKS);
+        for i in 0..MAX_REFRESH_LOCKS {
+            let mut bytes = [0u8; 32];
+            bytes[0] = 0x3f;
+            bytes[1..9].copy_from_slice(&(i as u64).to_be_bytes());
+            let id = ContractInstanceId::new(bytes);
+            held.push(acquire_refresh_lock(&id).await);
+            held_ids.push(id);
+        }
+
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x40;
+        let newcomer = ContractInstanceId::new(bytes);
+        let first = refresh_lock_for(&newcomer);
+        let second = refresh_lock_for(&newcomer);
+        assert!(
+            !CONTRACT_REFRESH_LOCKS.contains_key(&newcomer),
+            "a full table must not admit another entry — that is the cap"
+        );
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "two callers for one contract must still meet on the same mutex \
+             when the table is full, or the overflow path silently stops \
+             coalescing every request at once"
+        );
+        assert!(
+            Arc::ptr_eq(&first, &overflow_refresh_lock(&newcomer)),
+            "the full-table path must hand out the contract's overflow stripe"
+        );
+
         drop(guard);
+        drop(held);
+
+        // `CONTRACT_REFRESH_LOCKS` is process-global and `cargo test` runs these
+        // threads in ONE process, so leaving thousands of entries behind would
+        // push a sibling test's `acquire_refresh_lock` toward the overflow
+        // stripes and change what it measures. Nextest would never show it (one
+        // process per test) — see `.claude/rules/testing.md`.
+        for id in sprayed.iter().chain(held_ids.iter()) {
+            CONTRACT_REFRESH_LOCKS.remove(id);
+        }
+        CONTRACT_REFRESH_LOCKS.remove(&held_id);
     }
 
     /// #3977-interaction regression for the cold/warm split: a WARM-but-stale
@@ -4028,6 +4425,81 @@ mod tests {
     /// Security regression: a `../`-style traversal in the (decoded) asset path
     /// must NOT read a file outside the contract's cache directory.
     ///
+    /// The overflow fallback must stay per-contract. When the lock table is
+    /// full, giving each caller a private mutex would drop coalescing for every
+    /// request at once — and a warm-but-stale refresh takes no speculative
+    /// permit, so nothing else would bound the duplicate GETs that follow.
+    /// Striping by contract id keeps two callers for one contract on one mutex.
+    #[test]
+    fn overflow_refresh_locks_are_shared_per_contract() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3e;
+        let id = ContractInstanceId::new(bytes);
+        bytes[1] = 0x01;
+        let other = ContractInstanceId::new(bytes);
+
+        assert!(
+            Arc::ptr_eq(&overflow_refresh_lock(&id), &overflow_refresh_lock(&id)),
+            "one contract must always land on the same overflow stripe, or the \
+             overflow state stops coalescing anything"
+        );
+        // Not an assertion that these two differ — a hash collision is legal —
+        // only that the stripes are actually distinguishing contracts at all.
+        let distinct: std::collections::HashSet<_> = (0u8..64)
+            .map(|i| {
+                let mut bytes = [0u8; 32];
+                bytes[0] = 0x3e;
+                bytes[2] = i;
+                Arc::as_ptr(&overflow_refresh_lock(&ContractInstanceId::new(bytes)))
+            })
+            .collect();
+        assert!(
+            distinct.len() > 1,
+            "the overflow stripes must spread contracts, not funnel them onto one"
+        );
+        let _ = other;
+    }
+
+    /// The sandbox handler must refuse a traversal before fetching too. The
+    /// sibling assertion for `variable_content`; without it, moving only ONE of
+    /// the two checks back after the fetch passes the suite, and this path is
+    /// reachable with an arbitrary key just like the other.
+    #[tokio::test]
+    async fn serve_sandbox_content_rejects_traversal_before_fetching() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x56;
+        let instance_id = ContractInstanceId::new(bytes);
+        let key = instance_id.to_string();
+        // Cold cache: without the early check this request WOULD fetch.
+        clear_cache(&instance_id).await;
+        CONTRACT_REFRESH_LOCKS.remove(&instance_id);
+
+        let (sender, mut rx) = request_channel();
+        let err = serve_sandbox_content(
+            key,
+            ApiVersion::V1,
+            Some("../../etc/hostname"),
+            sender,
+            &test_webapp_cache(),
+        )
+        .await
+        .err()
+        .expect("a traversal page path must be refused");
+        assert!(
+            matches!(err, WebSocketApiError::InvalidParam { .. }),
+            "a traversal page path must be an invalid param, got: {err:?}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a traversal page path must not reach the node at all — no fetch, \
+             no permit spent"
+        );
+
+        CONTRACT_REFRESH_LOCKS.remove(&instance_id);
+        clear_cache(&instance_id).await;
+    }
+
     /// A traversal path must be refused BEFORE the speculative fetch, not
     /// after. Two things ride on the ordering: a request that can never resolve
     /// must not spend one of the node's speculative-fetch permits (a spray of
