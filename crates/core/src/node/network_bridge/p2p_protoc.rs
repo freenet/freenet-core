@@ -752,7 +752,7 @@ pub(in crate::node) struct P2pConnManager {
 /// general wire-gated-floor rule in `docs/RELEASING.md` (do NOT bump it on later
 /// releases). Only peer pairs both on `>= 0.2.80` exchange hints, so activation
 /// ramps with fleet upgrade rather than switching on everywhere at once.
-pub(crate) const SUBSCRIBE_HINT_MIN_VERSION: (u8, u8, u16) = (0, 2, 80);
+pub(crate) const SUBSCRIBE_HINT_MIN_VERSION: (u8, u8, u16) = (0, 3, 0);
 
 /// This node's own crate version as a `(major, minor, patch)` tuple, parsed at
 /// compile time from `CARGO_PKG_VERSION`.
