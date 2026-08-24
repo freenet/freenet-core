@@ -1,0 +1,85 @@
+name: PR Backlog Sweep
+
+# Reports open PRs that have stalled: green and unmerged >48h, no activity >7d,
+# or decayed into conflicts. Nothing was measuring this, so nothing reported it,
+# and the backlog reached 59 open PRs -- 26 of them green and simply never
+# merged -- before a manual audit on 2026-08-24 noticed.
+#
+# The job body is deliberately thin: all the logic is in
+# scripts/pr-backlog-sweep.sh, which is shellcheck-linted and has a self-test
+# (scripts/pr-backlog-sweep_test.sh), both run by CI's Fmt job. A workflow file
+# cannot be tested before it reaches the default branch; a script can.
+#
+# THE POINT IS THAT A BROKEN SWEEP LOOKS BROKEN. The script exits non-zero on
+# any failure to enumerate PRs, and the sweep step below is deliberately NOT
+# continue-on-error, so a red X appears here rather than a green run with an
+# empty report. Only the notifier is best-effort.
+
+on:
+  schedule:
+    # 06:00 UTC, after the nightlies, so the morning's first look at Actions
+    # shows the backlog next to the test results.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+# One sweep at a time. Not cancel-in-progress: a run that is already talking to
+# the API should finish and report rather than be replaced by a manual trigger.
+concurrency:
+  group: pr-backlog-sweep
+  cancel-in-progress: false
+
+permissions:
+  contents: read # actions/checkout
+  pull-requests: read # gh pr list
+  checks: read # statusCheckRollup: check-run entries
+  statuses: read # statusCheckRollup: legacy commit-status entries
+  actions: read # gh run list --status action_required
+  # Deliberately NOT `actions: write`. This job REPORTS the approval queue; it
+  # must not be able to approve a run. Approving outside-contributor CI is a
+  # human trust decision (it lets that fork's workflow run on this repo's
+  # runners), and the whole point of section (d) is to surface that decision,
+  # not to automate it away.
+
+jobs:
+  sweep:
+    name: Sweep the open PR backlog
+    runs-on: ubuntu-latest
+    # A normal run is under a minute; the cap exists so an API stall shows up as
+    # a failure rather than a job that hangs unnoticed.
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run the sweep
+        id: sweep
+        # NOT continue-on-error, on purpose. See the header comment: the whole
+        # value of this workflow is that "nothing is stalled" and "the sweep is
+        # broken" cannot look the same. The script writes the report to
+        # $GITHUB_STEP_SUMMARY on every run, including a clean one, so a run
+        # that produced no summary is evidence it did not run.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # coalesce-exempt: read-only (gh pr list / gh run list / gh api GET); emits no downstream-triggering event, so RELEASE_PAT would only widen the blast radius
+          SWEEP_REPO: ${{ github.repository }}
+        run: bash scripts/pr-backlog-sweep.sh
+
+      # Notify only when the sweep found something. A daily all-clear ping is
+      # how a room learns to filter this notifier out, and then the one message
+      # that mattered is filtered out with it.
+      #
+      # The message is built from the script's own counts plus the run URL. No
+      # PR title and no author login is forwarded: those are attacker-controlled
+      # strings, and the sweep's headline output is pinned by its self-test to
+      # contain neither. Nothing repository-controlled is interpolated into a
+      # `run:` block anywhere in this workflow.
+      - name: Notify the dev room
+        if: steps.sweep.outputs.notify == 'true'
+        # Best-effort: a riverctl/gateway hiccup in the notifier must never
+        # red-X the sweep, and must never be mistaken for a sweep failure.
+        continue-on-error: true
+        uses: ./.github/actions/river-dev-notify
+        with:
+          message: "🧹 PR backlog sweep — ${{ steps.sweep.outputs.headline }} — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
+          room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
+          gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}

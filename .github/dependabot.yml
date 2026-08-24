@@ -1,13 +1,44 @@
 version: 2
+
+# Dependency bumps are grouped so routine churn arrives as ONE reviewable PR
+# per ecosystem instead of thirty.
+#
+# Measured 2026-08-24: 25 of the repo's 59 open PRs were dependabot's, 20 of
+# them fully green and simply never merged. That backlog is not free — open PRs
+# rot into conflicts, and a wall of them trains reviewers to skim past the whole
+# list, including the bumps that matter.
+#
+# MAJOR bumps are deliberately left UNGROUPED (one PR each). A major bump is
+# real work, not a chore: `ed25519-dalek 2 -> 3` verifies RELEASE SIGNATURES,
+# and a break there strands the fleet with no recovery path. That must never
+# arrive buried in a 30-crate group PR where the diff is skimmed as routine.
 updates:
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 50
+    groups:
+      # Everything semver-safe rides in one PR. Anything NOT matched here —
+      # i.e. every major bump — still gets its own PR and its own review.
+      cargo-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
 
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       # Check for updates to GitHub Actions every weekday
       interval: "daily"
+    groups:
+      # Action bumps are near-always mechanical; majors (e.g. actions/checkout
+      # v7 -> v8) still land alone because they can change runner behaviour.
+      github-actions-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"

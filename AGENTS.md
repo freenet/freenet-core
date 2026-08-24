@@ -46,6 +46,40 @@ When unsure which bucket a change is in, open an issue first.
 3. Check .claude/rules/git-workflow.md for PR requirements
 ```
 
+### AFTER opening a PR
+
+**Do not open a PR you are not going to drive to a terminal state.** A terminal
+state is merged, or closed with a reason. "Opened, CI green, walked away" is not
+an outcome — it is a liability handed to whoever comes next.
+
+```
+1. Watch CI to completion. Fix what it reports; don't leave it red and leave.
+2. Get the review the change's risk tier requires (CONTRIBUTING.md, and the
+   `pr-review` skill it links). Required approving reviews is 0 on this repo —
+   nothing external will stop a PR from sitting unreviewed forever, so the
+   author has to ask for the review.
+3. Merge it (the merge queue rebases and retests), or close it and say why.
+4. If you genuinely cannot finish, say so IN A PR COMMENT before you stop:
+   what is done, what remains, what you would do next. An abandoned PR with a
+   hand-off note is recoverable. A silent one is archaeology.
+```
+
+Why this is a rule and not a preference: measured 2026-08-24, the repo had **59
+open PRs**. Twenty were green, mergeable, and unreviewed — the oldest green and
+untouched since 2026-07-28, and a team member's PR had gone five weeks without a
+reply. None were blocked on CI. They were blocked on nobody owning the last step.
+
+The compounding cost is the real damage. Nine of those PRs had gone from mergeable
+to CONFLICTING, and they conflicted with *each other*, not just with main —
+`ring.rs` was contested by five open PRs at once. Every day a PR waits raises the
+cost of landing it, which lowers the odds it ever lands. That is a doom loop, not
+a static pile, and the only cheap moment to break it is before you walk away.
+
+The same applies to work that never reaches a PR: **an unpushed branch is invisible
+and unrecoverable by anyone but you.** Push before you stop, even mid-change. The
+2026-08-24 sweep found uncommitted work and orphan commits sitting in agent
+worktrees that no live session owned any more.
+
 ### WHEN fixing a bug (fix: PRs)
 
 ```
