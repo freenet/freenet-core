@@ -3740,7 +3740,7 @@ async fn handle_interest_sync_message(
                     |pk| {
                         op_manager
                             .interest_manager
-                            .summary_window_start(pk, &matching)
+                            .begin_summary_window(pk, &matching)
                     },
                 );
                 crate::ring::interest::rotation_window_indices(
@@ -3851,10 +3851,20 @@ async fn handle_interest_sync_message(
             // short of the selected window must not advance past the entries it
             // dropped, or they wait a full cycle instead of coming next.
             //
-            // Two known imprecisions here, both accepted, both costing at most
-            // one cycle of delay for the affected contracts and neither able to
-            // skip one permanently (the window wraps, and a cycle boundary
-            // restarts at a random offset):
+            // The entry COUNT goes with it (#5181): it is what tells the next
+            // round whether the cycle finished (re-randomise) or merely wrapped
+            // past the last id (resume at 0). Deriving that from the resume
+            // index alone was the bug.
+            //
+            // Known imprecisions, all accepted, none able to skip a contract
+            // permanently — because the window WRAPS and cycles complete, which
+            // is the property doing that work. The random origin defends a
+            // different failure (peer steering) and does not contribute to
+            // non-permanence; the two used to be offered jointly here, which is
+            // how the claim ended up wrong. Several of these end the cycle
+            // EARLY rather than late, so an arc can go unadvertised for an
+            // extra cycle — `SummaryCursor` is explicit that this is not a
+            // safe-direction-only approximation:
             //
             // - This advances on send ATTEMPT. The reply is handed to the
             //   connection afterwards and a send failure is only logged, so a
@@ -3864,7 +3874,18 @@ async fn handle_interest_sync_message(
             //   read the same start and build the same window, losing one
             //   round of progress. Reserving the window at read time instead
             //   would trade that for a worse failure: a budget-cut round would
-            //   then skip everything it did not reach.
+            //   then skip everything it did not reach. The duplicate is not
+            //   double-CHARGED — it covers no new distance, so the advance
+            //   check discards it — but the round is still spent.
+            // - Two concurrent replies cut at DIFFERENT lengths by the byte
+            //   budget carry different last ids, so the shorter is not
+            //   recognised as ground the longer already covered.
+            // - Contract CHURN: ids removed from ground already swept while
+            //   others are inserted below the cursor let the count reach the
+            //   set size with current members never advertised this cycle.
+            // - The peer chooses `sorted`, so it chooses the length the count
+            //   is compared against. See `begin_summary_window`'s rustdoc for
+            //   the anti-steering limit this leaves open (#5313).
             //
             // #5238: recorded for BOTH forms now. Under #5155 only the
             // full-bytes path rotated, so only it had a cursor to advance.
@@ -3874,7 +3895,12 @@ async fn handle_interest_sync_message(
             // source port, which sent that peer's rotation back to a random
             // offset every reconnect.
             if let (Some(pk), Some(last)) = (peer_key.as_ref(), last_included) {
-                op_manager.interest_manager.record_summary_cursor(pk, last);
+                op_manager.interest_manager.record_summary_cursor(
+                    pk,
+                    last,
+                    entries.len(),
+                    &matching,
+                );
             }
 
             if entries.is_empty() {
@@ -10582,14 +10608,16 @@ mod tests {
 
             // Seed the cursor so both rounds are mid-cycle and the starting
             // offset is fixed. Without this the first round would begin at a
-            // random cycle-boundary offset (see `summary_window_start`) and a
+            // random cycle-boundary offset (see `begin_summary_window`) and a
             // start on the last contract would wrap into a second random draw,
             // making the "moved on to a different contract" assertion flaky.
             let mut sorted = keys.clone();
             sorted.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
-            h.op_manager
-                .interest_manager
-                .record_summary_cursor(&h.peer_key_of(h.old_peer), *sorted[0].id());
+            h.op_manager.interest_manager.seed_summary_cursor(
+                &h.peer_key_of(h.old_peer),
+                *sorted[0].id(),
+                1,
+            );
 
             let mut seen: Vec<u32> = Vec::new();
             for round in 0..2 {
@@ -10721,22 +10749,27 @@ mod tests {
         ///
         /// # Why the CURSOR is seeded, not just the RNG
         ///
-        /// `ceil(n / cap)` rounds tile the set exactly only while every round
-        /// is mid-cycle. A round whose window ENDS on the highest id leaves the
-        /// cursor past the end, which `summary_window_start` reads as a cycle
-        /// boundary and answers with a fresh random offset. That is deliberate
-        /// anti-starvation behaviour rather than a bug, but it re-covers ground
-        /// already covered, and the exact-tiling assertion then fails.
+        /// HISTORICAL, and the rationale was WRONG — kept because the seeding
+        /// is still worth having, but corrected because the old wording talked
+        /// the reader out of the bug.
         ///
-        /// At n=200 and cap=64 that happens for 3 of the 200 possible starts,
-        /// so the first version of this test failed about 1% of runs — and
-        /// non-reproducibly, because `GlobalRng` falls back to `rand::rng()`
-        /// when unseeded. It duly failed on the very next full-suite run.
-        /// Seeding the cursor fixes the start at index 1 and removes the
-        /// boundary re-draw from the schedule entirely, so the test pins the
-        /// tiling property itself rather than one lucky seed. The RNG is seeded
-        /// as well, so that any future edit reintroducing a draw stays
-        /// reproducible instead of flaky.
+        /// It used to read: a round whose window ends on the highest id leaves
+        /// the cursor past the end, which the window-start helper reads as a
+        /// cycle boundary and answers with a fresh random offset, and "that is
+        /// deliberate anti-starvation behaviour rather than a bug". It was a
+        /// bug — #5181. A window ending on the highest id has WRAPPED, not
+        /// finished, and re-drawing there breaks the very contiguity the
+        /// `ceil(n / cap)` tiling depends on. At n=200 and cap=64 it hit 3 of
+        /// the 200 possible starts, which is where this test's ~1% flake came
+        /// from; the test was right and the production code was wrong.
+        ///
+        /// Since #5181 `begin_summary_window` wraps mid-cycle, so the tiling
+        /// now holds from ANY origin and neither seed is load-bearing for it.
+        /// Both are kept for determinism: `GlobalRng` falls back to
+        /// `rand::rng()` when unseeded, and a reproducible schedule is worth
+        /// more here than exercising a random one. The rotation's
+        /// origin-independence is asserted directly, over every origin, by
+        /// `ring::interest::tests::the_real_api_covers_every_contract_from_every_origin`.
         #[tokio::test]
         async fn digest_rotation_covers_the_whole_shared_set() {
             // Guarded rather than bare: `set_seed` also pins THREAD_INDEX to 0,
@@ -10753,9 +10786,11 @@ mod tests {
 
             let mut sorted = keys.clone();
             sorted.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
-            h.op_manager
-                .interest_manager
-                .record_summary_cursor(&h.peer_key_of(h.new_peer), *sorted[0].id());
+            h.op_manager.interest_manager.seed_summary_cursor(
+                &h.peer_key_of(h.new_peer),
+                *sorted[0].id(),
+                1,
+            );
 
             let mut covered: HashSet<u32> = HashSet::new();
             for round in 0..rounds {
@@ -11014,9 +11049,11 @@ mod tests {
             // An id below every contract in the fixture, so the window starts
             // at index 0 with no random draw.
             let pk = h.peer_key_of(h.new_peer);
-            h.op_manager
-                .interest_manager
-                .record_summary_cursor(&pk, ContractInstanceId::new([0u8; 32]));
+            h.op_manager.interest_manager.seed_summary_cursor(
+                &pk,
+                ContractInstanceId::new([0u8; 32]),
+                1,
+            );
 
             let before = h.summary_queries.load(Ordering::Relaxed);
             let reply = handle_interest_sync_message(
@@ -11427,7 +11464,7 @@ mod tests {
             let known = h.peer_key_of(h.new_peer);
             h.op_manager
                 .interest_manager
-                .record_summary_cursor(&known, *sorted[5].id());
+                .seed_summary_cursor(&known, *sorted[5].id(), 1);
 
             // Full bytes, not digests: the version gate fails closed on a
             // source we have no connection entry for.
@@ -11543,9 +11580,11 @@ mod tests {
             // An id below every contract in the fixture, so the window starts
             // at index 0 with no random draw.
             let pk = h.peer_key_of(h.new_peer);
-            h.op_manager
-                .interest_manager
-                .record_summary_cursor(&pk, ContractInstanceId::new([0u8; 32]));
+            h.op_manager.interest_manager.seed_summary_cursor(
+                &pk,
+                ContractInstanceId::new([0u8; 32]),
+                1,
+            );
 
             let before = h.summary_queries.load(Ordering::Relaxed);
             let reply = handle_interest_sync_message(
@@ -11905,9 +11944,11 @@ mod tests {
 
             let mut sorted = keys.clone();
             sorted.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
-            h.op_manager
-                .interest_manager
-                .record_summary_cursor(&h.peer_key_of(h.old_peer), *sorted[0].id());
+            h.op_manager.interest_manager.seed_summary_cursor(
+                &h.peer_key_of(h.old_peer),
+                *sorted[0].id(),
+                1,
+            );
 
             let mut covered: HashSet<u32> = HashSet::new();
             for round in 0..rounds {
