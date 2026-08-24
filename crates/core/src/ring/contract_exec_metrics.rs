@@ -30,11 +30,18 @@
 //! calls to bridged_get_contract_state_delta
 //!   = delta_fast_hits     + delta_reload_hits     + delta_wasm_calls
 //!
-//! total WASM summarize_state invocations = summarize_wasm_calls + summarize_wasm_uncached
-//! total WASM get_state_delta invocations = delta_wasm_calls     + delta_wasm_uncached
+//! executor-mediated summarize_state invocations
+//!   = summarize_wasm_calls + summarize_wasm_uncached
+//! executor-mediated get_state_delta invocations
+//!   = delta_wasm_calls     + delta_wasm_uncached
 //! ```
 //!
-//! Four exceptions to the partition, all deliberate:
+//! Note the qualifier on the last two: **executor-mediated**, not "total". These
+//! arms count WASM driven through the contract executor, which is every
+//! invocation on the request and fan-out paths. They are deliberately NOT a
+//! whole-process total — see exception 5.
+//!
+//! Five exceptions to the partition, all deliberate:
 //!
 //! 1. **A call that never returns records nothing.** An early error — state
 //!    missing, params missing — exits before any terminal arm. So does a
@@ -52,6 +59,17 @@
 //!    local-only executors have no `Ring` to attribute the work to). Every
 //!    production executor is built by `RuntimePool` with an `OpManager`.
 //! 4. **A snapshot can land mid-call.** See [`ContractExecSnapshot`].
+//! 5. **The conformance oracle's WASM is not counted.**
+//!    `conformance::runtime_oracle::RuntimeOracle` calls `Runtime`'s
+//!    `summarize_state` / `get_state_delta` directly rather than through the
+//!    executor, and it runs on a real node (`conformance::shadow`'s opt-in probe
+//!    loop constructs one per focus contract). Its work is therefore real WASM
+//!    execution that these arms do not see. That is why the identity above says
+//!    "executor-mediated" rather than "total": the oracle is a diagnostic
+//!    probe whose cost belongs to the conformance budget, not to the request
+//!    path these counters are read to size. If the oracle ever moves onto the
+//!    executor, fold it in and delete this exception — but do NOT quietly
+//!    restore the word "total" while a second uncounted WASM caller exists.
 //!
 //! # What each counter answers
 //!
