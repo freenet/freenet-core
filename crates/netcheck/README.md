@@ -98,11 +98,14 @@ disentangle.
 another contract and skipped. A server-side error for an op that already
 hit its own deadline arrives during the *next* op's wait window; charging
 it to that op stamps the wrong contract's key into the reported error.
-Zero is emitted too — "no stale error arrived during this op" is a
-measurement, and an absent field would be indistinguishable from a run
-that never counted. Errors that name no contract stay unattributable and
-still fail whichever op is waiting, so this can never swallow a real
-failure silently.
+Zero is emitted too, because an absent field would be indistinguishable
+from a run that never counted. Read it precisely: it counts errors the
+key filter skipped inside an op'''s own wait window. Errors arriving in the
+gap *between* ops are discarded by the pre-op drain, unfiltered and
+uncounted, so a zero means "the filter did not fire during this op", not
+"no stale error existed anywhere near it". Errors that name no contract
+stay unattributable and still fail whichever op is waiting, so this can
+never swallow a real failure silently.
 
 Both fields reach the jsonl report. Neither reaches the telemetry
 dashboard yet: `insert_check_op` writes a fixed column list that has no
