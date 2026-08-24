@@ -192,6 +192,15 @@ per month (Basic tier) — 2 per run. That is a large budget and ordinary
 recovery will not dent it, but a dispatch loop is not free, which is one more
 reason to check for a running job before firing another.
 
+**What a signing failure looks like from the outside: a draft release with NO
+Windows assets at all.** The `Verify signatures` step runs BEFORE the two
+`upload-artifact` steps, so when it throws they are *skipped* — the unsigned
+binaries never become artifacts, and there is nothing for `attach-to-release`
+to attach. Do not go debugging artifact upload; an empty Windows slot is the
+expected shape of a signing failure. Go straight to the `Verify signatures`
+step output. (Verified by deliberately failing the gate: `Verify signatures =>
+failure`, `Upload freenet binary => skipped`, `Upload fdev binary => skipped`.)
+
 **If this job fails at signing, the failure is Azure-side and cannot be fixed
 from the repo.** Unlike every other release secret, Windows signing is
 fail-closed: the `Verify signatures` step throws if either binary is unsigned,
