@@ -194,6 +194,14 @@ RESULT="$(printf '%s' "$PRS" | jq -c \
     def epoch: if . == null or . == "" then null
                else (try (. | fromdateiso8601) catch null) end;
 
+    # PR titles and branch names are written by whoever opened the PR, and this
+    # report is read as markdown. Rendered raw, a title of the form
+    # "[click me](https://elsewhere)" becomes a working link in a maintainer-only
+    # page. Newlines collapse (they would break the list item); the markdown
+    # metacharacters are backslash-escaped so the text renders as itself.
+    # This is presentation only -- nothing here reaches a shell either way.
+    def md: gsub("[\\r\\n]"; " ") | gsub("(?<x>[\\[\\]<>`\\\\])"; "\\\(.x)");
+
     # "Green since" is when the LAST check finished, not when the PR was last
     # touched: a comment on a green PR must not reset its green age.
     def green_since:
@@ -211,7 +219,7 @@ RESULT="$(printf '%s' "$PRS" | jq -c \
                    + fmt_age(.[$agefield]) + "d — "
                    # Titles are author-controlled text. jq renders them into
                    # markdown here; they never reach a shell as script text.
-                   + (.title | gsub("[\\r\\n]"; " ")))
+                   + (.title | md))
                | join("\n")))
       | if length == 0 then "_none_" else join("\n") end;
 
@@ -293,7 +301,11 @@ RESULT="$(printf '%s' "$PRS" | jq -c \
              else "" end)
           + (if ($awaiting | length) == 0 then "_none_"
              else ($awaiting
-                   | map("- `" + .branch + "` — "
+                   # Bold rather than a code span: a git ref may legitimately
+                   # contain a backtick, and there is no way to escape one
+                   # INSIDE a code span, so a code span here could be broken
+                   # out of by a fork branch name.
+                   | map("- **" + (.branch | md) + "** — "
                          + (.pending | tostring) + " run(s) pending, oldest "
                          + fmt_age(.oldest) + "d"
                          + (if (.prs | length) > 0
