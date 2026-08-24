@@ -334,13 +334,12 @@ async fn drive_client_get_inner(
     // `op_manager.completed(client_tx)` runs from the
     // `ClientGetCompletionGuard` in `run_client_get` AFTER this fn
     // returns (and the side-effect block below has run). Do not add
-    // explicit `completed()` calls in the arms here — doing so would
-    // race the originator-side side effects (`cache_contract_locally`,
-    // `auto_subscribe_on_get_response`, `maybe_subscribe_child`)
-    // because once the tx is in `ops.completed`, any
-    // `op_manager.push(...)` for that tx is silently dropped (see
-    // `op_state_manager.rs::push` short-circuit on
-    // `ops.completed.contains`).
+    // explicit `completed()` calls in the arms here — `completed()`
+    // tears down the transaction's bookkeeping (live-tx tracker,
+    // request router), and calling it before the originator-side side
+    // effects (`cache_contract_locally`, `auto_subscribe_on_get_response`,
+    // `maybe_subscribe_child`) have run would race that teardown
+    // against them.
 
     match loop_result {
         RetryLoopOutcome::Done(terminal) => {

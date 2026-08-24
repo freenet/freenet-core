@@ -877,8 +877,10 @@ mod tests {
     }
 
     /// Pin: `OpManager::completed` must not touch any per-op DashMap.
-    /// The surviving completion side effects are limited to the global
-    /// `under_progress` / `completed` sets and the `request_router`.
+    /// The per-op DashMaps are gone, and so are the global `completed` /
+    /// `under_progress` sets (the #4110 dead-GC leak — removed). The only
+    /// surviving completion side effects are the `live_tx_tracker` removal
+    /// and the `request_router` cleanup.
     #[test]
     fn completed_must_not_touch_per_op_dashmaps() {
         let src = include_str!("../node/op_state_manager.rs");

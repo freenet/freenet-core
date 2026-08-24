@@ -53,12 +53,12 @@ impl OpCtx {
     ///
     /// # Single-use per [`Transaction`]
     ///
-    /// The reply callback fires exactly once per tx because the
-    /// `completed`/`under_progress` dedup sets suppress subsequent
-    /// dispatches. A second call with the same tx will hang on
-    /// `response_receiver.recv()`. Multi-attempt protocols (e.g.
-    /// SUBSCRIBE's fallback to alternative peers) must allocate a
-    /// fresh [`Transaction`] per attempt.
+    /// The reply callback fires exactly once per tx: the
+    /// `pending_op_results[tx]` waiter registered here is consumed by
+    /// the first matching reply, so a second call with the same tx
+    /// will hang on `response_receiver.recv()`. Multi-attempt
+    /// protocols (e.g. SUBSCRIBE's fallback to alternative peers) must
+    /// allocate a fresh [`Transaction`] per attempt.
     ///
     /// # Deadlock risk
     ///
@@ -1179,17 +1179,17 @@ mod tests {
     }
 
     /// Documents the "single-use per `Transaction`" constraint on
-    /// Pin the doc claim that a second `send_and_await` on the same
-    /// tx hangs forever. The reply helper fires exactly once per tx
-    /// (the `completed`/`under_progress` dedup sets short-circuit
-    /// subsequent dispatches in `OpManager`); the second
-    /// `send_and_await` call has its callback registered but
-    /// `forward_pending_op_result_if_completed` never runs.
+    /// `send_and_await`: pin the doc claim that a second call on the
+    /// same tx hangs forever. The reply helper fires exactly once per
+    /// tx because the first matching reply consumes the
+    /// `pending_op_results[tx]` waiter; the second `send_and_await`
+    /// call has its callback registered but
+    /// `forward_pending_op_result_if_completed` never runs for it.
     ///
-    /// The test simulates the dedup effect by holding the second
+    /// The test simulates that effect by holding the second
     /// `reply_sender` alive without firing it. It does NOT guard the
-    /// real dedup logic — that lives in `OpManager` and is covered
-    /// by integration tests.
+    /// real waiter-consumption logic — that lives in `OpManager` and
+    /// is covered by integration tests.
     #[tokio::test]
     async fn send_and_await_second_call_hangs_as_documented() {
         use tokio::sync::oneshot;

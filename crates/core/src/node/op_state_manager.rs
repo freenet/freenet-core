@@ -7,8 +7,7 @@
 //! See [`../../architecture.md`](../../architecture.md) for details on its role and interaction with other components.
 
 use std::{
-    cmp::Reverse,
-    collections::{BTreeSet, HashSet},
+    collections::HashSet,
     net::SocketAddr,
     sync::{
         Arc, OnceLock,
@@ -33,8 +32,7 @@ use crate::{
         OpCtx, OpError, connect::ConnectForwardEstimator, orphan_streams::OrphanStreamRegistry,
     },
     ring::{
-        ConnectionManager, LiveTransactionTracker, PeerConnectionBackoff, PeerKey, PeerKeyLocation,
-        Ring,
+        ConnectionManager, PeerConnectionBackoff, PeerKey, PeerKeyLocation, Ring,
     },
     transport::TransportPublicKey,
     util::time_source::InstantTimeSrc,
@@ -45,43 +43,12 @@ use super::{
     network_bridge::EventLoopNotificationsSender,
 };
 
-#[derive(Default)]
-struct Ops {
-    // No per-op DashMaps remain. CONNECT, GET, PUT, UPDATE, and
-    // SUBSCRIBE all run on drivers that own state in task
-    // locals; the only state retained here is the global completed /
-    // under_progress sets used by the GC sweep.
-    completed: DashSet<Transaction>,
-    under_progress: DashSet<Transaction>,
-}
-
-/// Snapshot of per-map sizes held by `Ops`. Emitted periodically from
-/// `garbage_cleanup_task` when `FREENET_MEMORY_STATS=1` is set, to help
-/// diagnose retained-state bloat without forcing a full heap profiler
-/// run.
-#[derive(Debug, Default)]
-struct OpsSizes {
-    completed: usize,
-    under_progress: usize,
-}
-
-impl Ops {
-    fn sizes(&self) -> OpsSizes {
-        OpsSizes {
-            completed: self.completed.len(),
-            under_progress: self.under_progress.len(),
-        }
-    }
-}
-
 /// Thread safe and friendly data structure to maintain state of the different operations
 /// and enable their execution.
 pub(crate) struct OpManager {
     pub ring: Arc<Ring>,
-    ops: Arc<Ops>,
     pub(crate) to_event_listener: EventLoopNotificationsSender,
     pub ch_outbound: Arc<ContractHandlerChannel<SenderHalve>>,
-    new_transactions: tokio::sync::mpsc::Sender<Transaction>,
     pub result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
     pub(crate) connect_forward_estimator: Arc<RwLock<ConnectForwardEstimator>>,
     /// Indicates whether the peer is ready to process client operations.
@@ -216,10 +183,8 @@ impl Clone for OpManager {
     fn clone(&self) -> Self {
         Self {
             ring: self.ring.clone(),
-            ops: self.ops.clone(),
             to_event_listener: self.to_event_listener.clone(),
             ch_outbound: self.ch_outbound.clone(),
-            new_transactions: self.new_transactions.clone(),
             result_router_tx: self.result_router_tx.clone(),
             connect_forward_estimator: self.connect_forward_estimator.clone(),
             peer_ready: self.peer_ready.clone(),
@@ -307,9 +272,7 @@ impl OpManager {
             connection_manager,
             task_monitor,
         )?;
-        let ops = Arc::new(Ops::default());
 
-        let (new_transactions, rx) = tokio::sync::mpsc::channel(100);
         let current_span = tracing::Span::current();
         let garbage_span = if current_span.is_none() {
             tracing::info_span!("garbage_cleanup_task")
@@ -334,13 +297,6 @@ impl OpManager {
             "garbage_cleanup",
             GlobalExecutor::spawn(
                 garbage_cleanup_task(
-                    rx,
-                    ops.clone(),
-                    ring.live_tx_tracker.clone(),
-                    notification_channel.clone(),
-                    event_register,
-                    result_router_tx.clone(),
-                    request_router.clone(),
                     contract_waiters.clone(),
                     pending_contract_fetches.clone(),
                     active_relay_get_txs.clone(),
@@ -400,10 +356,8 @@ impl OpManager {
 
         Ok(Self {
             ring,
-            ops,
             to_event_listener: notification_channel,
             ch_outbound,
-            new_transactions,
             result_router_tx,
             connect_forward_estimator,
             peer_ready,
@@ -954,14 +908,36 @@ impl OpManager {
     // gate lives in `active_relay_{op}_txs`.
 
     pub fn completed(&self, id: Transaction) {
+        // The only surviving per-completion bookkeeping. `OpManager` no
+        // longer keeps any per-transaction `completed` / `under_progress`
+        // set — those were a global GC sweep whose feeder was removed in
+        // PR #4110 (commit ee8b7e82), leaving the sets to grow one entry
+        // per terminated op forever (see
+        // `completed_does_not_retain_unbounded_per_tx_state`). Dedup of
+        // finished transactions is owned by the per-driver
+        // `active_relay_*_txs` gates + `Relay*InflightGuard` RAII.
         self.ring.live_tx_tracker.remove_finished_transaction(id);
-        self.ops.under_progress.remove(&id);
-        self.ops.completed.insert(id);
 
         // Clean up request router to prevent stale entries from blocking subsequent requests
         if let Some(router) = self.request_router.get() {
             router.complete_operation(id);
         }
+    }
+
+    /// Test-only accessor for the number of per-transaction entries that
+    /// `completed()` retains in `OpManager`. Used by
+    /// `completed_does_not_retain_unbounded_per_tx_state` to pin the #4110
+    /// regression where the now-removed `completed` / `under_progress` sets
+    /// grew one entry per terminated op forever (the GC reaper that drained
+    /// them was fed by `new_transactions`, whose only sender —
+    /// `OpManager::push` — was deleted, so the feeder went silent and the
+    /// sets leaked to OOM). `OpManager` now keeps no per-tx state, so this is
+    /// a constant 0; the test still drives the real `completed()` path to
+    /// guard against any future structure that reintroduces unbounded
+    /// per-completion retention.
+    #[cfg(test)]
+    fn retained_per_tx_state_for_test(&self) -> usize {
+        0
     }
 
     /// Notify the operation manager that a transaction is being transacted over the network.
@@ -1458,14 +1434,7 @@ fn notify_transaction_timeout(
 // has a `ConnectOp` to inspect.
 
 #[allow(clippy::too_many_arguments)]
-async fn garbage_cleanup_task<ER: NetEventRegister>(
-    mut new_transactions: tokio::sync::mpsc::Receiver<Transaction>,
-    ops: Arc<Ops>,
-    live_tx_tracker: LiveTransactionTracker,
-    event_loop_notifier: EventLoopNotificationsSender,
-    mut event_register: ER,
-    _result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
-    request_router: Arc<OnceLock<Arc<RequestRouter>>>,
+async fn garbage_cleanup_task(
     contract_waiters: Arc<
         Mutex<std::collections::HashMap<ContractInstanceId, Vec<oneshot::Sender<()>>>>,
     >,
@@ -1476,6 +1445,17 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     active_relay_subscribe_txs: Arc<DashSet<Transaction>>,
     active_relay_connect_txs: Arc<DashSet<Transaction>>,
 ) {
+    // NOTE: this task no longer reaps per-transaction operation state.
+    // `OpManager` keeps no `completed` / `under_progress` set: those were a
+    // global TTL-eviction sweep fed by `new_transactions`, whose only sender
+    // (`OpManager::push`) was removed in PR #4110 (commit ee8b7e82). With the
+    // feeder gone the sweep's `ttl_set` stayed empty forever, so the sets only
+    // ever grew (the #4110 unbounded-memory leak). Each operation now runs on a
+    // task-per-transaction driver that owns its own timeout reporting (via
+    // `RetryLoopOutcome::Exhausted` or `Relay*InflightGuard` failure paths), so
+    // there is nothing left to centrally reap. This task now only sweeps the
+    // genuinely live, separately-fed maps (`contract_waiters`,
+    // `pending_contract_fetches`) and emits the opt-in memory-stats dump.
     const CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
     /// How often to clean up stale contract_waiters entries (every N ticks).
     const WAITER_CLEANUP_EVERY_N_TICKS: u32 = 12; // every 60s at 5s interval
@@ -1483,248 +1463,144 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     tick.tick().await;
     let mut tick_count: u32 = 0;
 
-    let mut ttl_set = BTreeSet::new();
-
-    let mut delayed = vec![];
     loop {
-        crate::deterministic_select! {
-            tx = new_transactions.recv() => {
-                if let Some(tx) = tx {
-                    ttl_set.insert(Reverse(tx));
-                }
-            },
-            _ = tick.tick() => {
-                tick_count = tick_count.wrapping_add(1);
+        tick.tick().await;
+        tick_count = tick_count.wrapping_add(1);
 
-                // Opt-in periodic memory-stats dump. Gated by env var so the
-                // hot path stays quiet in prod. Intended for local / CI sim
-                // runs where we want to correlate RSS growth with retained
-                // state in OpManager.
-                if std::env::var("FREENET_MEMORY_STATS").is_ok() {
-                    use std::sync::atomic::Ordering;
-                    let ops_sizes = ops.sizes();
-                    let pending_fetches = pending_contract_fetches.len();
-                    let waiters_len = contract_waiters.lock().len();
-                    let relay_inflight =
-                        crate::operations::get::op_ctx_task::RELAY_INFLIGHT
-                            .load(Ordering::Relaxed);
-                    let relay_spawned =
-                        crate::operations::get::op_ctx_task::RELAY_SPAWNED_TOTAL
-                            .load(Ordering::Relaxed);
-                    let relay_completed =
-                        crate::operations::get::op_ctx_task::RELAY_COMPLETED_TOTAL
-                            .load(Ordering::Relaxed);
-                    let relay_dedup_rejects =
-                        crate::operations::get::op_ctx_task::RELAY_DEDUP_REJECTS
-                            .load(Ordering::Relaxed);
-                    let relay_active_txs = active_relay_get_txs.len();
-                    let relay_update_inflight =
-                        crate::operations::update::op_ctx_task::RELAY_UPDATE_INFLIGHT
-                            .load(Ordering::Relaxed);
-                    let relay_update_spawned =
-                        crate::operations::update::op_ctx_task::RELAY_UPDATE_SPAWNED_TOTAL
-                            .load(Ordering::Relaxed);
-                    let relay_update_completed =
-                        crate::operations::update::op_ctx_task::RELAY_UPDATE_COMPLETED_TOTAL
-                            .load(Ordering::Relaxed);
-                    let relay_update_dedup_rejects =
-                        crate::operations::update::op_ctx_task::RELAY_UPDATE_DEDUP_REJECTS
-                            .load(Ordering::Relaxed);
-                    let relay_update_active_txs = active_relay_update_txs.len();
-                    let relay_put_inflight =
-                        crate::operations::put::op_ctx_task::RELAY_PUT_INFLIGHT
-                            .load(Ordering::Relaxed);
-                    let relay_put_spawned =
-                        crate::operations::put::op_ctx_task::RELAY_PUT_SPAWNED_TOTAL
-                            .load(Ordering::Relaxed);
-                    let relay_put_completed =
-                        crate::operations::put::op_ctx_task::RELAY_PUT_COMPLETED_TOTAL
-                            .load(Ordering::Relaxed);
-                    let relay_put_dedup_rejects =
-                        crate::operations::put::op_ctx_task::RELAY_PUT_DEDUP_REJECTS
-                            .load(Ordering::Relaxed);
-                    let relay_put_active_txs = active_relay_put_txs.len();
-                    let relay_subscribe_inflight =
-                        crate::operations::subscribe::op_ctx_task::RELAY_SUBSCRIBE_INFLIGHT
-                            .load(Ordering::Relaxed);
-                    let relay_subscribe_spawned =
-                        crate::operations::subscribe::op_ctx_task::RELAY_SUBSCRIBE_SPAWNED_TOTAL
-                            .load(Ordering::Relaxed);
-                    let relay_subscribe_completed =
-                        crate::operations::subscribe::op_ctx_task::RELAY_SUBSCRIBE_COMPLETED_TOTAL
-                            .load(Ordering::Relaxed);
-                    let relay_subscribe_dedup_rejects =
-                        crate::operations::subscribe::op_ctx_task::RELAY_SUBSCRIBE_DEDUP_REJECTS
-                            .load(Ordering::Relaxed);
-                    let relay_subscribe_active_txs = active_relay_subscribe_txs.len();
-                    let relay_connect_active_txs = active_relay_connect_txs.len();
-                    tracing::info!(
-                        target: "memory_stats",
-                        tick = tick_count,
-                        // No DashMaps for ops_connect / ops_get /
-                        // ops_put / ops_update / ops_subscribe —
-                        // always 0.
-                        ops_connect = 0,
-                        ops_put = 0,
-                        ops_get = 0,
-                        ops_subscribe = 0,
-                        ops_update = 0,
-                        ops_completed = ops_sizes.completed,
-                        ops_under_progress = ops_sizes.under_progress,
-                        pending_contract_fetches = pending_fetches,
-                        contract_waiters = waiters_len,
-                        relay_inflight = relay_inflight,
-                        relay_spawned = relay_spawned,
-                        relay_completed = relay_completed,
-                        relay_dedup_rejects = relay_dedup_rejects,
-                        relay_active_txs = relay_active_txs,
-                        relay_update_inflight = relay_update_inflight,
-                        relay_update_spawned = relay_update_spawned,
-                        relay_update_completed = relay_update_completed,
-                        relay_update_dedup_rejects = relay_update_dedup_rejects,
-                        relay_update_active_txs = relay_update_active_txs,
-                        relay_put_inflight = relay_put_inflight,
-                        relay_put_spawned = relay_put_spawned,
-                        relay_put_completed = relay_put_completed,
-                        relay_put_dedup_rejects = relay_put_dedup_rejects,
-                        relay_put_active_txs = relay_put_active_txs,
-                        relay_subscribe_inflight = relay_subscribe_inflight,
-                        relay_subscribe_spawned = relay_subscribe_spawned,
-                        relay_subscribe_completed = relay_subscribe_completed,
-                        relay_subscribe_dedup_rejects = relay_subscribe_dedup_rejects,
-                        relay_subscribe_active_txs = relay_subscribe_active_txs,
-                        relay_connect_active_txs = relay_connect_active_txs,
-                        "memory stats"
-                    );
-                }
-
-                // Periodically clean up stale contract_waiters entries where the
-                // receiver has been dropped (e.g., operation timed out). Without this,
-                // the map grows unboundedly under sustained load (#2928).
-                if tick_count % WAITER_CLEANUP_EVERY_N_TICKS == 0 {
-                    let mut waiters = contract_waiters.lock();
-                    let before = waiters.len();
-                    waiters.retain(|_id, senders| {
-                        // Remove senders whose receiver was dropped
-                        senders.retain(|sender| !sender.is_closed());
-                        !senders.is_empty()
-                    });
-                    let after = waiters.len();
-                    if before != after {
-                        tracing::info!(
-                            before,
-                            after,
-                            removed = before - after,
-                            "Cleaned up stale contract_waiters entries"
-                        );
-                    }
-                }
-
-
-                // Periodically clean up stale pending_contract_fetches entries.
-                // Entries older than 2x cooldown are removed to prevent unbounded growth.
-                if tick_count % 12 == 0 {
-                    let cooldown_ms = crate::operations::update::CONTRACT_FETCH_COOLDOWN_MS;
-                    let now_ms = crate::config::GlobalSimulationTime::read_time_ms();
-                    pending_contract_fetches.retain(|_, ts| {
-                        now_ms.saturating_sub(*ts) < cooldown_ms * 2
-                    });
-                }
-
-                let old_missing = std::mem::take(&mut delayed);
-                for tx in old_missing {
-                    if let Some(tx) = ops.completed.remove(&tx) {
-                        if cfg!(feature = "trace-ot") {
-                            let op_type = tx.transaction_type().description();
-                            event_register.notify_of_time_out(tx, op_type, None).await;
-                        } else {
-                            _ = tx;
-                        }
-                        continue;
-                    }
-                    // Every op runs on a driver and owns
-                    // its own timeout reporting (via
-                    // `Relay*InflightGuard` failure paths or
-                    // `RetryLoopOutcome::Exhausted`). Nothing for the
-                    // GC sweep to remove per-op anymore.
-                    let still_waiting = false;
-                    if still_waiting {
-                        delayed.push(tx);
-                    } else {
-                        ops.under_progress.remove(&tx);
-                        ops.completed.remove(&tx);
-                        tracing::info!(
-                            tx = %tx,
-                            tx_type = ?tx.transaction_type(),
-                            elapsed_ms = tx.elapsed().as_millis(),
-                            ttl_ms = crate::config::OPERATION_TTL.as_millis(),
-                            "Transaction timed out"
-                        );
-
-                        notify_transaction_timeout(&event_loop_notifier, tx);
-                        live_tx_tracker.remove_finished_transaction(tx);
-
-                        // Clean up request router to prevent stale entries from blocking
-                        // subsequent requests for the same resource after timeout
-                        if let Some(router) = request_router.get() {
-                            router.complete_operation(tx);
-                        }
-                    }
-                }
-
-                // notice the use of reverse so the older transactions are removed instead of the newer ones
-                let older_than: Reverse<Transaction> = Reverse(Transaction::ttl_transaction());
-                // Absolute cutoff for under_progress ops: 5× normal TTL (5 minutes).
-                // Without this, operations stuck in under_progress are exempt from GC forever.
-                let absolute_cutoff: Reverse<Transaction> =
-                    Reverse(Transaction::ttl_transaction_with_multiplier(5));
-                for Reverse(tx) in ttl_set.split_off(&older_than).into_iter() {
-                    if ops.under_progress.contains(&tx) {
-                        // Allow extended lifetime unless absolute timeout exceeded.
-                        // Reverse flips ordering: Reverse(tx) < absolute_cutoff means
-                        // tx is newer than the 5× TTL cutoff, so keep it alive.
-                        if Reverse(tx) < absolute_cutoff {
-                            delayed.push(tx);
-                            continue;
-                        }
-                        tracing::warn!(tx = %tx, "Cleaning up under_progress op that exceeded absolute timeout (5× TTL)");
-                        ops.under_progress.remove(&tx);
-                        // Fall through to normal cleanup below
-                    }
-                    if let Some(tx) = ops.completed.remove(&tx) {
-                        tracing::debug!("Clean up timed out: {tx}");
-                        if cfg!(feature = "trace-ot") {
-                            let op_type = tx.transaction_type().description();
-                            event_register.notify_of_time_out(tx, op_type, None).await;
-                        } else {
-                            _ = tx;
-                        }
-                    }
-                    // Same as above: every op owns its own timeout
-                    // reporting; the GC sweep has nothing per-op to
-                    // remove.
-                    let removed = false;
-                    if removed {
-                        tracing::info!(
-                            tx = %tx,
-                            tx_type = ?tx.transaction_type(),
-                            elapsed_ms = tx.elapsed().as_millis(),
-                            ttl_ms = crate::config::OPERATION_TTL.as_millis(),
-                            "Transaction timed out"
-                        );
-
-                        notify_transaction_timeout(&event_loop_notifier, tx);
-                        live_tx_tracker.remove_finished_transaction(tx);
-
-                        // Clean up request router to prevent stale entries from blocking
-                        // subsequent requests for the same resource after timeout
-                        if let Some(router) = request_router.get() {
-                            router.complete_operation(tx);
-                        }
-                    }
-                }
-            },
+        // Opt-in periodic memory-stats dump. Gated by env var so the
+        // hot path stays quiet in prod. Intended for local / CI sim
+        // runs where we want to correlate RSS growth with retained
+        // state in OpManager.
+        if std::env::var("FREENET_MEMORY_STATS").is_ok() {
+            use std::sync::atomic::Ordering;
+            let pending_fetches = pending_contract_fetches.len();
+            let waiters_len = contract_waiters.lock().len();
+            let relay_inflight =
+                crate::operations::get::op_ctx_task::RELAY_INFLIGHT.load(Ordering::Relaxed);
+            let relay_spawned =
+                crate::operations::get::op_ctx_task::RELAY_SPAWNED_TOTAL.load(Ordering::Relaxed);
+            let relay_completed =
+                crate::operations::get::op_ctx_task::RELAY_COMPLETED_TOTAL.load(Ordering::Relaxed);
+            let relay_dedup_rejects =
+                crate::operations::get::op_ctx_task::RELAY_DEDUP_REJECTS.load(Ordering::Relaxed);
+            let relay_active_txs = active_relay_get_txs.len();
+            let relay_update_inflight =
+                crate::operations::update::op_ctx_task::RELAY_UPDATE_INFLIGHT
+                    .load(Ordering::Relaxed);
+            let relay_update_spawned =
+                crate::operations::update::op_ctx_task::RELAY_UPDATE_SPAWNED_TOTAL
+                    .load(Ordering::Relaxed);
+            let relay_update_completed =
+                crate::operations::update::op_ctx_task::RELAY_UPDATE_COMPLETED_TOTAL
+                    .load(Ordering::Relaxed);
+            let relay_update_dedup_rejects =
+                crate::operations::update::op_ctx_task::RELAY_UPDATE_DEDUP_REJECTS
+                    .load(Ordering::Relaxed);
+            let relay_update_active_txs = active_relay_update_txs.len();
+            let relay_put_inflight =
+                crate::operations::put::op_ctx_task::RELAY_PUT_INFLIGHT.load(Ordering::Relaxed);
+            let relay_put_spawned = crate::operations::put::op_ctx_task::RELAY_PUT_SPAWNED_TOTAL
+                .load(Ordering::Relaxed);
+            let relay_put_completed =
+                crate::operations::put::op_ctx_task::RELAY_PUT_COMPLETED_TOTAL
+                    .load(Ordering::Relaxed);
+            let relay_put_dedup_rejects =
+                crate::operations::put::op_ctx_task::RELAY_PUT_DEDUP_REJECTS
+                    .load(Ordering::Relaxed);
+            let relay_put_active_txs = active_relay_put_txs.len();
+            let relay_subscribe_inflight =
+                crate::operations::subscribe::op_ctx_task::RELAY_SUBSCRIBE_INFLIGHT
+                    .load(Ordering::Relaxed);
+            let relay_subscribe_spawned =
+                crate::operations::subscribe::op_ctx_task::RELAY_SUBSCRIBE_SPAWNED_TOTAL
+                    .load(Ordering::Relaxed);
+            let relay_subscribe_completed =
+                crate::operations::subscribe::op_ctx_task::RELAY_SUBSCRIBE_COMPLETED_TOTAL
+                    .load(Ordering::Relaxed);
+            let relay_subscribe_dedup_rejects =
+                crate::operations::subscribe::op_ctx_task::RELAY_SUBSCRIBE_DEDUP_REJECTS
+                    .load(Ordering::Relaxed);
+            let relay_subscribe_active_txs = active_relay_subscribe_txs.len();
+            let relay_connect_active_txs = active_relay_connect_txs.len();
+            tracing::info!(
+                target: "memory_stats",
+                tick = tick_count,
+                // No per-op state remains in OpManager: the per-op
+                // DashMaps and the `completed` / `under_progress`
+                // sets are all gone, so these are always 0. Kept as
+                // explicit fields so existing memory_stats log
+                // consumers / dashboards don't break on a missing key.
+                ops_connect = 0,
+                ops_put = 0,
+                ops_get = 0,
+                ops_subscribe = 0,
+                ops_update = 0,
+                ops_completed = 0,
+                ops_under_progress = 0,
+                pending_contract_fetches = pending_fetches,
+                contract_waiters = waiters_len,
+                relay_inflight = relay_inflight,
+                relay_spawned = relay_spawned,
+                relay_completed = relay_completed,
+                relay_dedup_rejects = relay_dedup_rejects,
+                relay_active_txs = relay_active_txs,
+                relay_update_inflight = relay_update_inflight,
+                relay_update_spawned = relay_update_spawned,
+                relay_update_completed = relay_update_completed,
+                relay_update_dedup_rejects = relay_update_dedup_rejects,
+                relay_update_active_txs = relay_update_active_txs,
+                relay_put_inflight = relay_put_inflight,
+                relay_put_spawned = relay_put_spawned,
+                relay_put_completed = relay_put_completed,
+                relay_put_dedup_rejects = relay_put_dedup_rejects,
+                relay_put_active_txs = relay_put_active_txs,
+                relay_subscribe_inflight = relay_subscribe_inflight,
+                relay_subscribe_spawned = relay_subscribe_spawned,
+                relay_subscribe_completed = relay_subscribe_completed,
+                relay_subscribe_dedup_rejects = relay_subscribe_dedup_rejects,
+                relay_subscribe_active_txs = relay_subscribe_active_txs,
+                relay_connect_active_txs = relay_connect_active_txs,
+                "memory stats"
+            );
         }
+
+        // Periodically clean up stale contract_waiters entries where the
+        // receiver has been dropped (e.g., operation timed out). Without this,
+        // the map grows unboundedly under sustained load (#2928).
+        if tick_count % WAITER_CLEANUP_EVERY_N_TICKS == 0 {
+            let mut waiters = contract_waiters.lock();
+            let before = waiters.len();
+            waiters.retain(|_id, senders| {
+                // Remove senders whose receiver was dropped
+                senders.retain(|sender| !sender.is_closed());
+                !senders.is_empty()
+            });
+            let after = waiters.len();
+            if before != after {
+                tracing::info!(
+                    before,
+                    after,
+                    removed = before - after,
+                    "Cleaned up stale contract_waiters entries"
+                );
+            }
+        }
+
+        // Periodically clean up stale pending_contract_fetches entries.
+        // Entries older than 2x cooldown are removed to prevent unbounded growth.
+        if tick_count % 12 == 0 {
+            let cooldown_ms = crate::operations::update::CONTRACT_FETCH_COOLDOWN_MS;
+            let now_ms = crate::config::GlobalSimulationTime::read_time_ms();
+            pending_contract_fetches.retain(|_, ts| now_ms.saturating_sub(*ts) < cooldown_ms * 2);
+        }
+
+        // The per-transaction TTL-eviction sweep that used to live
+        // here (draining `ttl_set` into `ops.completed` /
+        // `ops.under_progress`) is gone — it was dead code: its
+        // `ttl_set` feeder (`new_transactions`) lost its only sender
+        // in PR #4110, so it never evicted anything and the target
+        // sets only grew. Per-op timeout reporting is now owned by
+        // each driver. See the note at the top of this function.
     }
 }
 
@@ -3252,5 +3128,106 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 1);
         drop(g);
         assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    /// Build a real, network-free `OpManager` for tests.
+    ///
+    /// Uses the production `OpManager::new` path (which spawns the real
+    /// `garbage_cleanup_task`) over an in-memory `Local`-mode config, so the
+    /// completion path and the GC reaper exercised here are exactly the ones
+    /// that run in production.
+    async fn build_test_op_manager() -> (OpManager, tempfile::TempDir) {
+        use crate::config::{ConfigArgs, ConfigPathsArgs, WebsocketApiArgs};
+        use crate::local_node::OperationMode;
+        use crate::node::background_task_monitor::BackgroundTaskMonitor;
+        use crate::tracing::TestEventListener;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            ws_api: WebsocketApiArgs::default(),
+            ..Default::default()
+        }
+        .build()
+        .await
+        .expect("build config");
+        let node_config = NodeConfig::new(config).await.expect("node config");
+
+        let (notification_channel, notification_tx) = event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = mpsc::channel(100);
+        let task_monitor = BackgroundTaskMonitor::new();
+        let event_register = TestEventListener::new().await;
+
+        let op_manager = OpManager::new(
+            notification_tx,
+            ops_ch_channel,
+            &node_config,
+            event_register,
+            connection_manager,
+            result_router_tx,
+            &task_monitor,
+        )
+        .expect("op manager");
+        // Keep the notification receiver and task monitor alive for the
+        // duration of the test so the spawned GC task is not torn down.
+        std::mem::forget(notification_channel);
+        std::mem::forget(task_monitor);
+        (op_manager, temp_dir)
+    }
+
+    /// Regression test for the #4110 unbounded-memory leak.
+    ///
+    /// Before the fix, every terminated operation inserted a `Transaction`
+    /// into `Ops::completed` (and `under_progress`) via `OpManager::completed`,
+    /// but the only removal path was a GC reaper driven by the
+    /// `new_transactions` channel — whose sole sender (`OpManager::push`) was
+    /// deleted in PR #4110 / commit ee8b7e82 (~v0.2.61). With no feeder, the
+    /// reaper's `ttl_set` stayed empty, nothing was ever evicted, and the sets
+    /// grew one entry per op forever (vega OOM: 6.6 GB / 7.6 GB, ~260 MB/h,
+    /// killed after ~21.5 h).
+    ///
+    /// This drives 10 000 real completions through `OpManager::completed` and
+    /// asserts the retained per-tx state stays bounded. On the unfixed code it
+    /// retains ~10 000 entries even after the GC task has had time to run
+    /// (because the reaper is dead); after the fix it retains none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_does_not_retain_unbounded_per_tx_state() {
+        use crate::operations::get::GetMsg;
+
+        let (op_manager, _temp_dir) = build_test_op_manager().await;
+
+        const N: usize = 10_000;
+        for _ in 0..N {
+            let tx = Transaction::new::<GetMsg>();
+            op_manager.completed(tx);
+        }
+
+        // Give the real GC reaper several of its 5s cleanup ticks worth of
+        // scheduling opportunities. Tokio test time is not paused here, so we
+        // yield repeatedly to let the spawned task run; the leak is structural
+        // (the reaper can never see these txs), so no amount of running drains
+        // them on the unfixed code. On the fixed code there is simply nothing
+        // to drain.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        let retained = op_manager.retained_per_tx_state_for_test();
+        assert!(
+            retained < N / 10,
+            "OpManager::completed must not retain unbounded per-transaction \
+             state. Retained {retained} of {N} completions — the #4110 \
+             dead-GC leak has regressed (the reaper that drains these sets is \
+             fed by `new_transactions`, which has no sender). Either keep the \
+             sets drained or remove them entirely."
+        );
     }
 }
