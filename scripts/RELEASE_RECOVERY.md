@@ -544,6 +544,24 @@ If you need to rollback a release:
 ./scripts/release-rollback.sh --version 0.1.X --yank-crates
 ```
 
+`--yank-crates` yanks BOTH crates, and the fdev version is read from
+`crates/fdev/Cargo.toml` **at the release tag** — fdev's version is independent
+of freenet's (0.3.x against 0.2.x), and the working tree has usually bumped it
+again by the time anyone is rolling a release back. If the tag is already gone
+both locally and on origin, the script stops before it deletes anything and
+asks for the version explicitly:
+
+```bash
+./scripts/release-rollback.sh --version 0.1.X --yank-crates --fdev-version 0.Y.Z
+```
+
+The script exits **non-zero** if any step fails, and says which. A yank is
+attempted only for a version crates.io reports as published (200); a 404 is
+reported as "not published, skipping" and is not a failure, while any other
+status is UNKNOWN and IS a failure — the 403-without-a-User-Agent trap
+described in the Quick Reference, which a two-state check reads as "not
+published" for every version ever released.
+
 ## Verification Checklist
 
 After recovery, verify:
