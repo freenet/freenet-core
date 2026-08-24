@@ -1223,7 +1223,8 @@ mod tests {
         service_result: Option<&'static str>,
         /// `None` models the results for which systemd sets neither $EXIT_CODE
         /// nor $EXIT_STATUS, because it never identified a main process
-        /// ("protocol", "start-limit-hit").
+        /// ("protocol", "start-limit-hit") — and systemd < 232, where none of
+        /// the three variables exist at all.
         exit_code: Option<&'static str>,
         exit_status: Option<&'static str>,
         /// Must `freenet update` run (i.e. must this stop be counted / healed)?
@@ -1442,6 +1443,18 @@ mod tests {
                 exit_status: Some("1"),
                 expect_update: true,
             },
+            StopPostCase {
+                // The catch-all result. `man systemd.exec` gives it "any of the
+                // above" for $EXIT_CODE/$EXIT_STATUS, so model the combination
+                // an $EXIT_CODE-only guard would wrongly swallow — otherwise the
+                // "still counted" list on the ExecStopPost line names a value no
+                // row backs.
+                scenario: "resources (catch-all systemd failure), killed",
+                service_result: Some("resources"),
+                exit_code: Some("killed"),
+                exit_status: Some("TERM"),
+                expect_update: true,
+            },
             // ── Results for which systemd identifies no main process, so it
             // sets NEITHER $EXIT_CODE nor $EXIT_STATUS. The hook still fires and
             // forwards an EMPTY status; `rollback::post_stop_status_from_env`
@@ -1462,30 +1475,28 @@ mod tests {
                 exit_status: None,
                 expect_update: true,
             },
-            // ── systemd < 232 has no $SERVICE_RESULT: degrade to the old rule ──
+            // ── systemd < 232: the guard cannot fire, and neither can 0|43 ────
             StopPostCase {
-                scenario: "legacy systemd (<232), no $SERVICE_RESULT, clean exit 0",
+                // $SERVICE_RESULT, $EXIT_CODE and $EXIT_STATUS were introduced
+                // TOGETHER in systemd v232 (`man systemd.exec` marks all three
+                // "Added in version 232"), so no systemd sets one without the
+                // others — on <232 the hook runs with all three UNSET. Modelling
+                // "no $SERVICE_RESULT but an $EXIT_STATUS of 0/101/TERM" would
+                // pin a configuration that has never existed, so this single row
+                // replaces those.
+                //
+                // The consequence, stated rather than assumed: with $EXIT_STATUS
+                // empty the `0|43` arm cannot match either, so `freenet update`
+                // runs on EVERY stop, a graceful one included. That is
+                // pre-existing on <232 — the guard only ever ADDS a skip — and
+                // `post_stop_status_from_env` maps the empty status to None, so
+                // nothing is counted as a crash either way. <232 is EOL (RHEL 7
+                // ships 219, Ubuntu 16.04 ships 229); this row exists to keep
+                // the degradation honest, NOT to claim <232 is covered.
+                scenario: "legacy systemd (<232): none of the three variables are set",
                 service_result: None,
                 exit_code: None,
-                exit_status: Some("0"),
-                expect_update: false,
-            },
-            StopPostCase {
-                scenario: "legacy systemd (<232), no $SERVICE_RESULT, panic",
-                service_result: None,
-                exit_code: None,
-                exit_status: Some("101"),
-                expect_update: true,
-            },
-            StopPostCase {
-                // The #5227 case as an OLD systemd would report it: no
-                // $SERVICE_RESULT means the guard cannot fire, so the stop is
-                // still (wrongly) counted. Pinned to keep the degradation
-                // honest rather than implying <232 is covered.
-                scenario: "legacy systemd (<232), no $SERVICE_RESULT, killed by SIGTERM",
-                service_result: None,
-                exit_code: None,
-                exit_status: Some("TERM"),
+                exit_status: None,
                 expect_update: true,
             },
         ];

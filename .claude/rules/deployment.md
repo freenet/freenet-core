@@ -23,6 +23,35 @@ WHY: systemd counts unknown exit codes as failures. After N rapid restarts
 (e.g., intentional "update needed" exit), systemd permanently stops the service.
 ```
 
+### WHEN classifying a supervisor's stop reason
+
+```
+systemd's $EXIT_STATUS is NOT always a number. It is the numeric exit
+code only when $EXIT_CODE is "exited"; for every other disposition it is
+a SIGNAL NAME ("TERM", "SEGV", "ABRT", ...). A `case` (or a match) whose
+arms are all numeric therefore falls through to its catch-all on every
+signal death, silently scoring it as whatever the catch-all means.
+
+BEFORE writing or changing such a classifier (ExecStopPost hooks,
+`rollback.rs::classify_stop`):
+  1. Decide explicitly what each of the THREE variables contributes:
+     $SERVICE_RESULT (systemd's verdict), $EXIT_CODE (exited / killed /
+     dumped), $EXIT_STATUS (number OR signal name). One of them alone is
+     almost always the wrong key — see the table in `man systemd.exec`.
+  2. Test by RUNNING the extracted script under a real shell across the
+     whole result table, not by string-matching the unit template.
+  3. Assert BOTH directions. A hook that both self-heals and COUNTS
+     crashes can be disarmed by a too-broad skip, and a pin that only
+     checks the skip stays green through that.
+
+WHY: #5227 — a `case "$EXIT_STATUS" in 0|43)` had no arm for "TERM", so a
+deliberate `systemctl stop` landing before the node installed its SIGTERM
+handler fell to `*)` and was counted as a post-update probation crash.
+Three of those roll a freshly-updated node back. Fixed in #5242; the
+decision matrix lives in
+`service::linux::tests::exec_stop_post_counts_crashes_and_skips_deliberate_stops`.
+```
+
 ### WHEN implementing auto-update
 
 ```
