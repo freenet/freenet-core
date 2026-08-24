@@ -381,7 +381,10 @@ mod tests {
         ]);
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
 
-        // Exactly one sink: accepted.
+        // Exactly one sink: accepted. `--deserialization-format` is passed so
+        // this case stays valid whichever way #5416 is resolved — today only
+        // `terminal_output` carries `requires = "fmt"`, and this test should
+        // not quietly pin that asymmetry while testing the output group.
         assert!(
             Config::try_parse_from([
                 "fdev",
@@ -390,9 +393,11 @@ mod tests {
                 "/tmp/in",
                 "--output-file",
                 "/tmp/out",
+                "--deserialization-format",
+                "json",
             ])
             .is_ok(),
-            "--output-file alone should satisfy the output group"
+            "one output sink should satisfy the output group"
         );
     }
 
