@@ -494,11 +494,74 @@ pub enum InterestMessage {
         /// Sender's current state summary bytes.
         summary_bytes: Vec<u8>,
     },
+
+    // ---------------------------------------------------------------------
+    // Hash-first summary exchange (#4965).
+    //
+    // APPENDED, and any future variant must be appended too: bincode encodes
+    // the variant as its positional index, so inserting anywhere above would
+    // renumber `Summaries`/`ResyncRequest`/… and silently mis-decode every
+    // message from an older peer. `wire_variant_indices_are_frozen` pins this.
+    // ---------------------------------------------------------------------
+    /// Hash-first replacement for [`InterestMessage::Summaries`]: advertises a
+    /// *digest* of each summary instead of the summary itself.
+    ///
+    /// Sent in place of `Summaries` when — and only when — the recipient's
+    /// reported version is at or above
+    /// `crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION` (an older peer cannot
+    /// deserialize this variant index and would drop the connection).
+    ///
+    /// The receiver compares each digest against a digest of **its own actual
+    /// summary**, and asks for the bytes of only the ones that differ (via
+    /// [`InterestMessage::SummaryRequest`]). Measured on the fleet, 98.1% of
+    /// summary comparisons find both sides already byte-identical (#4965), so
+    /// the overwhelmingly common case stops shipping ~33 KB per contract to
+    /// say "nothing changed".
+    SummaryDigests {
+        /// (contract_hash, summary_digest) pairs for shared contracts.
+        /// The digest is `None` if we're interested but hold no state yet —
+        /// exactly the case `SummaryEntry::summary_bytes == None` covers.
+        entries: Vec<SummaryDigestEntry>,
+        /// Which code path built this message — the SAME non-wire provenance
+        /// tag [`InterestMessage::Summaries`] carries, and for the same reason
+        /// (#5052).
+        ///
+        /// Load-bearing once hash-first is on: this variant REPLACES
+        /// `Summaries` on every capable peer, so without the tag all four
+        /// named emitters would drain into the residual arm the moment the
+        /// gate opens, and the #5052 split would report nothing but
+        /// "unattributed" for the traffic it exists to attribute. Tagged here,
+        /// each emitter's byte total stays a like-for-like before/after of the
+        /// SAME emitter across the encoding change — which is what makes the
+        /// per-arm collapse the falsifier for #4965.
+        #[serde(skip)]
+        emitter: SummariesEmitter,
+    },
+
+    /// Ask a peer for the FULL summary bytes of specific contracts.
+    ///
+    /// Sent only in reply to [`InterestMessage::SummaryDigests`], for the
+    /// entries whose advertised digest did not match our own summary's digest.
+    /// The peer answers with a plain [`InterestMessage::Summaries`], so the
+    /// mismatch path funnels back into the unchanged `Summaries` handler —
+    /// including its semantic staleness check and targeted `SyncStateToPeer`
+    /// heal. The exchange terminates there (`Summaries` never replies).
+    SummaryRequest {
+        /// Contract hashes (same `contract_hash` space as
+        /// [`InterestMessage::Interests`]) whose summary bytes we need.
+        hashes: Vec<u32>,
+    },
 }
 
-/// Which code path built an [`InterestMessage::Summaries`] — a NON-WIRE
-/// provenance tag carried alongside the message so the outbound byte census
+/// Which code path built a summary-exchange message — a NON-WIRE provenance
+/// tag carried alongside [`InterestMessage::Summaries`] and its hash-first
+/// replacement [`InterestMessage::SummaryDigests`] so the outbound byte census
 /// can attribute it (#5052).
+///
+/// Both variants carry it because hash-first (#4965) swaps one for the other
+/// per peer: an emitter's bytes must stay in the emitter's own arm across that
+/// swap, or the split reports a collapse that is really just a re-encoding
+/// landing somewhere else.
 ///
 /// ## Why the tag rides on the message
 ///
@@ -553,6 +616,25 @@ pub enum SummariesEmitter {
     /// `operations::update::send_summary_back_on_rejection` — one entry, only
     /// when a rejected broadcast's summary already matched ours.
     Rejection,
+    /// `node::handle_interest_sync_message`, asking a peer for the bytes behind
+    /// digests that did not match ours — an [`InterestMessage::SummaryRequest`],
+    /// the only variant that carries no summary bytes at all (a `Vec<u32>`).
+    ///
+    /// Structural rather than tagged at construction: `SummaryRequest` has
+    /// exactly ONE emitter by construction (the digest-mismatch branch), so the
+    /// variant itself *is* the attribution and a field would add a value that
+    /// can only ever hold one thing. [`OutboundClass::classify`][c] assigns it.
+    DigestRequest,
+    /// `node::handle_interest_sync_message`, answering a `SummaryRequest` with
+    /// full bytes — the hash-first fallback leg, and the one whose size the
+    /// digest exchange trades a round trip to avoid.
+    ///
+    /// Its own arm rather than folded into [`Self::InterestsReply`]: this fires
+    /// only on the ~1.9% of comparisons a digest cannot settle, so watching it
+    /// separately is how the cost of the fallback is read off the rollup. Folded
+    /// in, a rising mismatch rate would look like a rising heartbeat cost —
+    /// pointing at the wrong remedy, which is the conflation #5052 undoes.
+    DigestRequestReply,
     /// Residual: no emitter claimed this message. The `Default`, so it is also
     /// what a decoded inbound message carries.
     ///
@@ -591,6 +673,46 @@ impl SummaryEntry {
         self.summary_bytes
             .as_ref()
             .map(|bytes| freenet_stdlib::prelude::StateSummary::from(bytes.clone()))
+    }
+}
+
+/// The hash-first counterpart of [`SummaryEntry`]: identifies a contract and
+/// describes our summary of it, without carrying the summary.
+///
+/// The two fields are DIFFERENT hashes of different things and must not be
+/// conflated — see [`crate::ring::interest::summary_digest`] for the full
+/// contrast table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SummaryDigestEntry {
+    /// Fast FNV-1a hash of the contract INSTANCE ID — identical in meaning and
+    /// value to [`SummaryEntry::hash`]. Says *which* contract; says nothing
+    /// about its state.
+    pub hash: u32,
+    /// Truncated-BLAKE3 digest of our summary BYTES for that contract, or
+    /// `None` if we're interested but hold no state yet. Says *what state* we
+    /// hold.
+    pub summary_digest: Option<crate::ring::interest::SummaryDigest>,
+}
+
+impl SummaryDigestEntry {
+    /// Build a digest entry from the full-bytes entry we would otherwise have
+    /// sent.
+    ///
+    /// This is deliberately the ONLY constructor: every digest is a pure
+    /// function of the exact `SummaryEntry` the fallback `Summaries` form
+    /// would have carried, so the two wire forms cannot describe different
+    /// state and no call site can compute a digest over something other than
+    /// the summary it is advertising. Those summaries in turn always come from
+    /// the node's ACTUAL state (`summary_if_hosted_or_in_use` /
+    /// `get_contract_summary`), never from a cached belief about a peer.
+    pub fn from_entry(entry: &SummaryEntry) -> Self {
+        Self {
+            hash: entry.hash,
+            summary_digest: entry
+                .summary_bytes
+                .as_deref()
+                .map(crate::ring::interest::summary_digest),
+        }
     }
 }
 
@@ -963,6 +1085,12 @@ impl Display for NodeEvent {
                     } => {
                         format!("ResyncResponse({key}, {} bytes)", state_bytes.len())
                     }
+                    InterestMessage::SummaryDigests { entries, emitter } => {
+                        format!("SummaryDigests({} entries, {emitter:?})", entries.len())
+                    }
+                    InterestMessage::SummaryRequest { hashes } => {
+                        format!("SummaryRequest({} hashes)", hashes.len())
+                    }
                 };
                 write!(f, "SendInterestMessage (to: {target}, {msg_summary})")
             }
@@ -1091,6 +1219,214 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bincode variant index of every pre-existing `InterestMessage`
+    /// variant, frozen (#4965).
+    ///
+    /// bincode encodes an enum variant as its POSITIONAL index, so inserting a
+    /// variant anywhere but the end renumbers everything after it. That is not
+    /// a compile error and not a deserialization error either — a peer on the
+    /// old build would decode a `Summaries` as a `ChangeInterests` and act on
+    /// garbage. This is the v0.2.11 incident class, and the whole reason the
+    /// hash-first variants are APPENDED.
+    ///
+    /// bincode's default config writes the index as a little-endian u32, so
+    /// the first four bytes of a serialized `InterestMessage` are its index.
+    #[test]
+    fn interest_message_wire_variant_indices_are_frozen() {
+        use freenet_stdlib::prelude::CodeHash;
+
+        fn variant_index(msg: &InterestMessage) -> u32 {
+            let bytes = bincode::serialize(msg).expect("serialize InterestMessage");
+            u32::from_le_bytes(bytes[..4].try_into().expect("variant index prefix"))
+        }
+
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([1u8; 32]),
+            CodeHash::new([2u8; 32]),
+        );
+
+        // These five indices are on the wire of every released peer. Changing
+        // any of them is a protocol break; a new variant goes at the END.
+        assert_eq!(
+            variant_index(&InterestMessage::Interests { hashes: vec![1] }),
+            0,
+            "Interests must stay variant 0"
+        );
+        assert_eq!(
+            variant_index(&InterestMessage::Summaries {
+                entries: vec![SummaryEntry {
+                    hash: 1,
+                    summary_bytes: Some(vec![9]),
+                }],
+                emitter: SummariesEmitter::InterestsReply,
+            }),
+            1,
+            "Summaries must stay variant 1"
+        );
+        assert_eq!(
+            variant_index(&InterestMessage::ChangeInterests {
+                added: vec![1],
+                removed: vec![],
+            }),
+            2,
+            "ChangeInterests must stay variant 2"
+        );
+        assert_eq!(
+            variant_index(&InterestMessage::ResyncRequest { key }),
+            3,
+            "ResyncRequest must stay variant 3"
+        );
+        assert_eq!(
+            variant_index(&InterestMessage::ResyncResponse {
+                key,
+                state_bytes: vec![1],
+                summary_bytes: vec![2],
+            }),
+            4,
+            "ResyncResponse must stay variant 4"
+        );
+
+        // The hash-first additions occupy the next two slots. Pinned so a
+        // future insertion above them is caught here rather than in
+        // production: their indices are what
+        // `HASH_FIRST_SUMMARIES_MIN_VERSION` gates on being decodable.
+        assert_eq!(
+            variant_index(&InterestMessage::SummaryDigests {
+                entries: vec![],
+                emitter: SummariesEmitter::InterestsReply,
+            }),
+            5,
+            "SummaryDigests must stay variant 5 (appended, #4965)"
+        );
+        assert_eq!(
+            variant_index(&InterestMessage::SummaryRequest { hashes: vec![] }),
+            6,
+            "SummaryRequest must stay variant 6 (appended, #4965)"
+        );
+    }
+
+    /// The hash-first variants must survive a bincode round trip intact —
+    /// including the fixed-size digest array, which is the one field whose
+    /// encoding differs in kind from anything `SummaryEntry` carries.
+    #[test]
+    fn hash_first_variants_wire_roundtrip() {
+        let digest = crate::ring::interest::summary_digest(b"a summary");
+        let msg = InterestMessage::SummaryDigests {
+            entries: vec![
+                SummaryDigestEntry {
+                    hash: 0xDEAD_BEEF,
+                    summary_digest: Some(digest),
+                },
+                SummaryDigestEntry {
+                    hash: 7,
+                    summary_digest: None,
+                },
+            ],
+            emitter: SummariesEmitter::InterestsReply,
+        };
+        let bytes = bincode::serialize(&msg).expect("serialize SummaryDigests");
+        let decoded: InterestMessage =
+            bincode::deserialize(&bytes).expect("deserialize SummaryDigests");
+        match decoded {
+            InterestMessage::SummaryDigests { entries, .. } => {
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].hash, 0xDEAD_BEEF);
+                assert_eq!(entries[0].summary_digest, Some(digest));
+                assert_eq!(entries[1].hash, 7);
+                assert_eq!(
+                    entries[1].summary_digest, None,
+                    "a peer with no state must round-trip as None, not as a \
+                     zero digest — a zero digest would read as a real summary \
+                     and could accidentally 'agree'"
+                );
+            }
+            other => panic!("expected SummaryDigests, got {other:?}"),
+        }
+
+        let req = InterestMessage::SummaryRequest {
+            hashes: vec![1, 2, 3],
+        };
+        let bytes = bincode::serialize(&req).expect("serialize SummaryRequest");
+        let decoded: InterestMessage =
+            bincode::deserialize(&bytes).expect("deserialize SummaryRequest");
+        match decoded {
+            InterestMessage::SummaryRequest { hashes } => assert_eq!(hashes, vec![1, 2, 3]),
+            other => panic!("expected SummaryRequest, got {other:?}"),
+        }
+    }
+
+    /// A `SummaryDigests` message must be dramatically smaller than the
+    /// `Summaries` it replaces — that is the entire point (#4965), and a
+    /// refactor that accidentally re-attached the bytes would otherwise pass
+    /// every behavioural test in this PR while saving nothing.
+    ///
+    /// Sized against a River-scale summary (~33 KB measured in production).
+    #[test]
+    fn digest_form_is_orders_of_magnitude_smaller_than_full_bytes() {
+        let summary = vec![0xABu8; 33 * 1024];
+        let entry = SummaryEntry {
+            hash: 42,
+            summary_bytes: Some(summary),
+        };
+        let full = bincode::serialize(&InterestMessage::Summaries {
+            entries: vec![entry.clone()],
+            emitter: SummariesEmitter::InterestsReply,
+        })
+        .expect("serialize Summaries");
+        let digests = bincode::serialize(&InterestMessage::SummaryDigests {
+            entries: vec![SummaryDigestEntry::from_entry(&entry)],
+            emitter: SummariesEmitter::InterestsReply,
+        })
+        .expect("serialize SummaryDigests");
+
+        assert!(
+            digests.len() < 64,
+            "one digest entry should be a few dozen bytes, got {}",
+            digests.len()
+        );
+        assert!(
+            full.len() > 100 * digests.len(),
+            "the digest form must be >100x smaller than the bytes form \
+             ({} vs {} bytes) — if this fails, the digest is carrying the \
+             summary and the wire change saves nothing",
+            digests.len(),
+            full.len()
+        );
+    }
+
+    /// `SummaryDigestEntry::from_entry` must be a pure function of the entry it
+    /// is derived from: same contract hash, and a digest that is exactly the
+    /// digest of the bytes the fallback `Summaries` would have shipped.
+    ///
+    /// This is what makes the two wire forms interchangeable. If they could
+    /// describe different state, a digest "match" would no longer prove the
+    /// peer holds our summary, and the heal-suppression on agreement would be
+    /// unsound.
+    #[test]
+    fn digest_entry_is_derived_from_the_bytes_it_replaces() {
+        let bytes = vec![1u8, 2, 3, 4, 5];
+        let entry = SummaryEntry {
+            hash: 99,
+            summary_bytes: Some(bytes.clone()),
+        };
+        let digest_entry = SummaryDigestEntry::from_entry(&entry);
+        assert_eq!(digest_entry.hash, entry.hash);
+        assert_eq!(
+            digest_entry.summary_digest,
+            Some(crate::ring::interest::summary_digest(&bytes))
+        );
+
+        let none_entry = SummaryEntry {
+            hash: 99,
+            summary_bytes: None,
+        };
+        assert_eq!(
+            SummaryDigestEntry::from_entry(&none_entry).summary_digest,
+            None,
+            "'we hold no state' must stay distinguishable from any digest value"
+        );
+    }
 
     #[test]
     fn subscribe_hint_wire_roundtrip_and_version() {

@@ -872,10 +872,26 @@ pub(crate) async fn send_proactive_summary_notification(
         return;
     };
 
-    // Build the Summaries message with our updated summary
+    // Build both wire forms once. Which one a given peer gets depends on its
+    // reported version (#4965): the hash-first `SummaryDigests` where
+    // supported, the full-bytes `Summaries` otherwise. The digest is derived
+    // from the SAME `SummaryEntry` the fallback carries, so the two forms can
+    // never describe different state.
+    //
+    // This is the send site that fires on every state change to every
+    // interested peer, so it is where a ~33 KB summary is most often shipped
+    // to a peer that just received the same update and therefore already
+    // agrees.
     let hash = contract_hash(key);
-    let message = InterestMessage::Summaries {
-        entries: vec![SummaryEntry::from_summary(hash, Some(&summary))],
+    let full_entry = SummaryEntry::from_summary(hash, Some(&summary));
+    let digest_message = InterestMessage::SummaryDigests {
+        entries: vec![crate::message::SummaryDigestEntry::from_entry(&full_entry)],
+        // Same emitter as the full-bytes form below: this is the per-state-change
+        // fan-out either way, and hash-first only changes how it is encoded.
+        emitter: SummariesEmitter::Notification,
+    };
+    let full_message = InterestMessage::Summaries {
+        entries: vec![full_entry],
         // #5052: this is the per-state-change fan-out, the emitter #5003
         // targets. It is the only SINGLE-entry emitter that fans across peers,
         // so its bytes/msgs ratio is what tells a `summary` apart from a
@@ -909,10 +925,20 @@ pub(crate) async fn send_proactive_summary_notification(
             continue;
         }
 
+        let message = if op_manager
+            .ring
+            .connection_manager
+            .supports_hash_first_summaries(peer_addr)
+        {
+            digest_message.clone()
+        } else {
+            full_message.clone()
+        };
+
         if let Err(e) = op_manager
             .notify_node_event(NodeEvent::SendInterestMessage {
                 target: peer_addr,
-                message: message.clone(),
+                message,
             })
             .await
         {
@@ -1026,13 +1052,32 @@ pub(crate) async fn send_summary_back_on_rejection(
     }
 
     let hash = contract_hash(key);
-    let message = InterestMessage::Summaries {
-        entries: vec![SummaryEntry::from_summary(hash, Some(&our_summary))],
-        // #5052: same SHAPE as the notification above (single entry, real
-        // summary) but a different trigger and a much narrower gate, so it
-        // gets its own arm. Sharing one would make the notification arm look
-        // larger than the fan-out #5003 actually changes.
-        emitter: SummariesEmitter::Rejection,
+    let full_entry = SummaryEntry::from_summary(hash, Some(&our_summary));
+    // Hash-first where supported (#4965). This helper only runs when we have
+    // ALREADY established that `our_summary == sender_summary_bytes`, so the
+    // digest is guaranteed to match on the receiving side and the seeding this
+    // exists to do (their cache of us flipping `None` → `Some`) completes from
+    // the digest alone — the receiver caches its own bytes, which the digest
+    // proved are ours. Shipping the bytes would be pure waste in the one case
+    // this path is reachable at all.
+    let message = if op_manager
+        .ring
+        .connection_manager
+        .supports_hash_first_summaries(target_addr)
+    {
+        InterestMessage::SummaryDigests {
+            entries: vec![crate::message::SummaryDigestEntry::from_entry(&full_entry)],
+            emitter: SummariesEmitter::Rejection,
+        }
+    } else {
+        InterestMessage::Summaries {
+            entries: vec![full_entry],
+            // #5052: same SHAPE as the notification above (single entry, real
+            // summary) but a different trigger and a much narrower gate, so it
+            // gets its own arm. Sharing one would make the notification arm look
+            // larger than the fan-out #5003 actually changes.
+            emitter: SummariesEmitter::Rejection,
+        }
     };
 
     if let Err(e) = op_manager

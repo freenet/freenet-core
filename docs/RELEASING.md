@@ -115,6 +115,26 @@ Current wire-gated floors:
   incident-scale fan-out, and the broadcast-assembly-failure telemetry (#4498)
   was deployed to record a baseline and watch the rollout.
 
+- `SUMMARY_FIRST_PUT_MIN_VERSION` in the same file (summary-first PUT
+  probe/dispatch variants, #4642 step 3-bis).
+
+  Set to **`(0, 2, 95)`** and FROZEN — the release that first shipped the
+  `PutMsg::ProbeRequest` / `ProbeResponse` / `ProbeReconcile` variants together
+  with their handler.
+
+- `HASH_FIRST_SUMMARIES_MIN_VERSION` in the same file (hash-first InterestSync
+  summary exchange, #4965).
+
+  Set to **`(0, 2, 116)`**, the release that first ships the
+  `InterestMessage::SummaryDigests` / `SummaryRequest` variants and their
+  handlers. **RELEASE-TIME CHECK:** if the release that first carries this
+  feature is renumbered, update the constant to match BEFORE cutting the tag,
+  then freeze it. A floor below the shipping version sends an undecodable
+  variant to peers on the prior release and drops their connections during the
+  0-4h staggered rollout; a floor above it silently disables the feature.
+  `connection_manager.rs::hash_first_floor_stays_above_every_release_without_the_variants`
+  guards the lower bound.
+
 When a NEW wire-gated feature first ships (not this one), set its floor to
 **exactly that release version** and freeze it, as described above.
 

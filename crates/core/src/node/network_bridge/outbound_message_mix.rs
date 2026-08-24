@@ -123,15 +123,23 @@ pub(crate) enum OutboundKind {
     /// arm could not tell them apart — the #4965 measurement hinges on which
     /// leg the 53-75% actually sits in.
     InterestSyncInterests,
-    /// InterestSync reply leg: `Summaries`. The leading suspect, because
-    /// `SummaryEntry::summary_bytes` ships a FULL `StateSummary` per shared
-    /// contract to every connected peer on every cycle
-    /// (`node.rs::handle_interest_sync_message`).
+    /// InterestSync reply leg — the WHOLE summary exchange: `Summaries`, plus
+    /// its hash-first replacements `SummaryDigests` and `SummaryRequest`
+    /// (#4965).
     ///
-    /// Measured at 49.8% of all outbound bytes on the fleet (v0.2.115, 1,174
-    /// peers), which is what makes it worth a second level of split: this arm
-    /// alone still lumps four unrelated emitters together. See
-    /// [`SummariesEmitter`] and [`Window::summaries_bytes`].
+    /// The leading suspect, because `SummaryEntry::summary_bytes` ships a FULL
+    /// `StateSummary` per shared contract to every connected peer on every
+    /// cycle (`node.rs::handle_interest_sync_message`). Measured at 49.8% of
+    /// all outbound bytes on the fleet (v0.2.115, 1,174 peers). The hash-first
+    /// exchange sends a digest first and the bytes only on mismatch; all three
+    /// legs land here so this one field stays a like-for-like before/after
+    /// total. See [`OutboundKind::classify`].
+    ///
+    /// That total is worth a second level of split, because this arm alone
+    /// lumps unrelated emitters together — and hash-first re-encodes each of
+    /// them rather than removing any, so the sub-split has to survive the
+    /// change to stay readable. See [`SummariesEmitter`] and
+    /// [`Window::summaries_bytes`].
     InterestSyncSummaries,
     /// InterestSync heal leg: `ResyncRequest` / `ResyncResponse`. Separate
     /// because `ResyncResponse` carries full contract STATE, so folding it
@@ -238,13 +246,20 @@ pub(crate) struct SummariesDetail {
 /// Kept here rather than on [`SummariesEmitter`] itself: the enum is a
 /// protocol-adjacent type, the index and the field stem are facts about this
 /// rollup's wire-to-telemetry shape.
-const SUMMARIES_ARMS: [SummariesEmitter; 5] = [
+const SUMMARIES_ARMS: [SummariesEmitter; 7] = [
     SummariesEmitter::Notification,
     SummariesEmitter::InterestsReply,
     SummariesEmitter::ChangeInterestsReply,
     SummariesEmitter::Rejection,
+    SummariesEmitter::DigestRequest,
+    SummariesEmitter::DigestRequestReply,
     SummariesEmitter::Other,
 ];
+
+/// Width of every per-sub-arm counter array, derived from the table above so a
+/// new arm cannot land with the arrays still sized for the old count — that
+/// would panic on the new index rather than fail to compile.
+const SUMMARIES_ARM_COUNT: usize = SUMMARIES_ARMS.len();
 
 const fn summaries_index(emitter: SummariesEmitter) -> usize {
     match emitter {
@@ -252,7 +267,9 @@ const fn summaries_index(emitter: SummariesEmitter) -> usize {
         SummariesEmitter::InterestsReply => 1,
         SummariesEmitter::ChangeInterestsReply => 2,
         SummariesEmitter::Rejection => 3,
-        SummariesEmitter::Other => 4,
+        SummariesEmitter::DigestRequest => 4,
+        SummariesEmitter::DigestRequestReply => 5,
+        SummariesEmitter::Other => 6,
     }
 }
 
@@ -264,6 +281,8 @@ const fn summaries_stem(emitter: SummariesEmitter) -> &'static str {
         SummariesEmitter::InterestsReply => "interest_sync_summaries_interests_reply",
         SummariesEmitter::ChangeInterestsReply => "interest_sync_summaries_change_interests_reply",
         SummariesEmitter::Rejection => "interest_sync_summaries_rejection",
+        SummariesEmitter::DigestRequest => "interest_sync_summaries_digest_request",
+        SummariesEmitter::DigestRequestReply => "interest_sync_summaries_digest_request_reply",
         SummariesEmitter::Other => "interest_sync_summaries_other",
     }
 }
@@ -309,11 +328,49 @@ impl OutboundClass {
                     InterestMessage::Interests { .. } | InterestMessage::ChangeInterests { .. } => {
                         Self::plain(OutboundKind::InterestSyncInterests)
                     }
+                    // All three legs of the summary exchange share ONE PARENT
+                    // arm on purpose (#4965): the hash-first redesign replaces
+                    // one `Summaries` with up to three messages
+                    // (`SummaryDigests` → `SummaryRequest` → `Summaries`), so
+                    // splitting the parent would make
+                    // `interest_sync_summaries_bytes` collapse for a trivial
+                    // reason and hide the extra legs in a bucket that did not
+                    // exist before the change. Keeping them together makes the
+                    // same field a like-for-like before/after total for the
+                    // whole mechanism — which is exactly the falsifier: if
+                    // hash-first does not shrink this number, it did not work.
+                    //
+                    // The #5052 SUB-arm is still resolved per message, so the
+                    // parent stays like-for-like without the emitter split
+                    // going blind the moment the gate opens.
                     InterestMessage::Summaries { entries, emitter } => Self {
                         kind: OutboundKind::InterestSyncSummaries,
                         summaries: Some(SummariesDetail {
                             emitter: *emitter,
                             entries: entries.len() as u64,
+                        }),
+                    },
+                    // Carries the emitter of whatever built it, exactly as the
+                    // `Summaries` it stands in for would have — that is the
+                    // point of tagging this variant too.
+                    InterestMessage::SummaryDigests { entries, emitter } => Self {
+                        kind: OutboundKind::InterestSyncSummaries,
+                        summaries: Some(SummariesDetail {
+                            emitter: *emitter,
+                            entries: entries.len() as u64,
+                        }),
+                    },
+                    // Structural attribution: one emitter by construction (the
+                    // digest-mismatch branch), so the variant IS the tag. Its
+                    // `hashes` count is the entry count — same "how many
+                    // contracts did this message speak for" quantity the other
+                    // legs report, which keeps the per-arm entries check
+                    // meaningful across the round trip.
+                    InterestMessage::SummaryRequest { hashes } => Self {
+                        kind: OutboundKind::InterestSyncSummaries,
+                        summaries: Some(SummariesDetail {
+                            emitter: SummariesEmitter::DigestRequest,
+                            entries: hashes.len() as u64,
                         }),
                     },
                     InterestMessage::ResyncRequest { .. }
@@ -353,18 +410,18 @@ struct Window {
     /// convention every future call site has to honour — but it is asserted
     /// anyway (`summaries_sub_arms_reconcile_with_the_parent_arm`), since a
     /// silently non-reconciling split is worse than no split.
-    summaries_msgs: [u64; 5],
-    summaries_bytes: [u64; 5],
-    summaries_max_bytes: [u64; 5],
+    summaries_msgs: [u64; SUMMARIES_ARM_COUNT],
+    summaries_bytes: [u64; SUMMARIES_ARM_COUNT],
+    summaries_max_bytes: [u64; SUMMARIES_ARM_COUNT],
     /// Total `SummaryEntry` count across the window's messages, per sub-arm.
     /// Divided by `summaries_msgs` this gives mean entries per message, the
     /// independent check that a call site is labelled correctly — see
     /// [`SummariesDetail::entries`].
-    summaries_entries: [u64; 5],
+    summaries_entries: [u64; SUMMARIES_ARM_COUNT],
     /// Largest single message's entry count, per sub-arm. Separates "every
     /// reply is moderately wide" from "one peer shares 400 contracts with us",
     /// which the mean cannot.
-    summaries_max_entries: [u64; 5],
+    summaries_max_entries: [u64; SUMMARIES_ARM_COUNT],
     /// InterestSync summary comparisons where both sides held a summary and
     /// the bytes were IDENTICAL. See [`OutboundMix::record_summary_comparison`].
     summary_entries_identical: u64,

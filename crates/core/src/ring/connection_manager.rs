@@ -1385,6 +1385,31 @@ impl ConnectionManager {
         crate::node::version_supports_summary_first_put(remote, floor)
     }
 
+    /// Whether the peer at `addr` reports a version new enough to understand
+    /// the hash-first `InterestSync` variants (`InterestMessage::SummaryDigests`
+    /// / `SummaryRequest`, #4965).
+    ///
+    /// Same shape and same fail-closed rule as
+    /// [`Self::supports_summary_first_put`]: an unknown version is treated as
+    /// unsupported, because a peer that lacks the variant index drops the
+    /// connection on the decode failure. Every caller's fallback is the
+    /// existing full-bytes `InterestMessage::Summaries`, so failing closed
+    /// costs bandwidth, never convergence.
+    ///
+    /// Deliberately has NO floor override: the gate that actually binds is
+    /// `remote_version`, which is only ever populated by the real transport
+    /// handshake (`p2p_protoc::connection_lifecycle`). An override would not
+    /// make the feature reachable anywhere the handshake does not run, so it
+    /// would be dead configuration. The receive-side handlers are unit-tested
+    /// directly against a `ConnectionManager` seeded with
+    /// [`Self::record_remote_version`] — the production mechanism.
+    pub(crate) fn supports_hash_first_summaries(&self, addr: SocketAddr) -> bool {
+        crate::node::version_supports_hash_first_summaries(
+            self.remote_version(addr),
+            crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION,
+        )
+    }
+
     /// Reserve the next `window`-sized slice of the hosting set for a migration
     /// scan and advance the rotating cursor by `window`. Returns the start
     /// offset (callers should take it modulo the current hosting-set size). Over
@@ -2708,6 +2733,85 @@ mod tests {
         let at_floor_addr = make_addr(9004);
         cm.record_remote_version(at_floor_addr, crate::node::SUMMARY_FIRST_PUT_MIN_VERSION);
         assert!(cm.supports_summary_first_put(at_floor_addr));
+    }
+
+    // ============ hash-first summary version-gate tests (#4965) ============
+
+    /// The send gate for `InterestMessage::SummaryDigests` / `SummaryRequest`.
+    ///
+    /// Mirrors the summary-first PUT gate above and matters for the same
+    /// reason: a peer that predates the variants cannot bincode-deserialize
+    /// them and DROPS THE CONNECTION on the decode failure. During the 0-4h
+    /// staggered rollout most peers are pre-floor, so getting this wrong
+    /// churns live connections network-wide.
+    ///
+    /// Asserts the gate DISCRIMINATES rather than merely always-rejecting: an
+    /// unknown peer and the last pre-floor release are refused, the floor
+    /// release and anything newer are accepted.
+    #[test]
+    fn supports_hash_first_summaries_gate_discriminates_by_version() {
+        let cm = make_connection_manager(Some(make_addr(9100)), 1, 10, false);
+
+        let unknown = make_addr(9101);
+        assert!(
+            !cm.supports_hash_first_summaries(unknown),
+            "an unrecorded peer version must fail CLOSED — sending an \
+             undecodable variant to a pre-floor peer drops the connection, \
+             while the fallback merely costs the bytes we send today"
+        );
+
+        // 0.2.115 is the highest already-released version at the time this
+        // shipped and carries neither variant.
+        let pre_floor = make_addr(9102);
+        cm.record_remote_version(pre_floor, (0, 2, 115));
+        assert!(
+            !cm.supports_hash_first_summaries(pre_floor),
+            "a peer one release below the floor has no SummaryDigests variant \
+             index; it must keep receiving full-bytes Summaries"
+        );
+
+        let at_floor = make_addr(9103);
+        cm.record_remote_version(at_floor, crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION);
+        assert!(
+            cm.supports_hash_first_summaries(at_floor),
+            "the floor release itself carries the variants and their handlers, \
+             so it must be accepted — otherwise the feature never activates"
+        );
+
+        let newer = make_addr(9104);
+        cm.record_remote_version(newer, (0, 3, 0));
+        assert!(
+            cm.supports_hash_first_summaries(newer),
+            "a peer above the floor must stay supported (the floor is a \
+             minimum, never an equality test)"
+        );
+    }
+
+    /// The hash-first floor must stay strictly ABOVE the last release that
+    /// shipped WITHOUT the variants.
+    ///
+    /// 0.2.115 is that release — it is the version this feature branched from,
+    /// and it carries neither `SummaryDigests` nor `SummaryRequest`. Every
+    /// peer on 0.2.115 or below drops its connection on receiving one.
+    ///
+    /// Deliberately pinned against that FROZEN constant rather than against
+    /// `CARGO_PKG_VERSION`: the floor is frozen at the first-shipping release
+    /// while the crate version keeps moving, so a comparison against the
+    /// current crate version would fail on the very next release and train the
+    /// next agent to edit the floor — the exact mistake `docs/RELEASING.md`
+    /// forbids ("set it to the first-shipping release, then freeze").
+    #[test]
+    fn hash_first_floor_stays_above_every_release_without_the_variants() {
+        /// Last release that does NOT carry the hash-first wire variants.
+        const LAST_RELEASE_WITHOUT_VARIANTS: (u8, u8, u16) = (0, 2, 115);
+        assert!(
+            crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION > LAST_RELEASE_WITHOUT_VARIANTS,
+            "HASH_FIRST_SUMMARIES_MIN_VERSION ({:?}) dropped to or below \
+             {LAST_RELEASE_WITHOUT_VARIANTS:?}, a release with no \
+             SummaryDigests variant index. Emitting to those peers fails to \
+             decode and drops the connection.",
+            crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION,
+        );
     }
 
     // ============ cleanup_expired_transients tests ============

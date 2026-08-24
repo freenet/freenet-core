@@ -64,7 +64,8 @@ pub(crate) use network_bridge::broadcast_queue::BROADCAST_STREAM_METRICS;
 // re-export rather than a path through `network_bridge` directly. Mirrors
 // `BROADCAST_STREAM_METRICS` above.
 pub(crate) use network_bridge::p2p_protoc::{
-    SUMMARY_FIRST_PUT_MIN_VERSION, version_supports_summary_first_put,
+    HASH_FIRST_SUMMARIES_MIN_VERSION, SUMMARY_FIRST_PUT_MIN_VERSION,
+    version_supports_hash_first_summaries, version_supports_summary_first_put,
 };
 #[cfg(test)]
 pub(crate) use network_bridge::{EventLoopNotificationsReceiver, event_loop_notification_channel};
@@ -2217,6 +2218,29 @@ fn stale_sync_emit_budget(stale_contracts_len: usize) -> usize {
     stale_contracts_len.min(MAX_STALE_SYNCS_PER_SUMMARIES)
 }
 
+/// Per-message cap on how many DISTINCT contract hashes the hash-first
+/// handlers will process — both the `SummaryDigests` entries we examine and
+/// the `SummaryRequest` hashes we answer (#4965).
+///
+/// A digest entry costs the SENDER ~20 bytes and can cost the RECEIVER a
+/// `summary_if_hosted_or_in_use` round trip, which is an amplification ratio
+/// the full-bytes `Summaries` never had: there, an entry cost the sender a
+/// whole `StateSummary`. The cap restores a bound. It is per-message and per
+/// DISTINCT hash: a peer repeating one hash is deduplicated before any work,
+/// so repetition buys nothing.
+///
+/// Over-cap contracts are not dropped permanently — the ~5-min interest
+/// heartbeat re-advertises them, and the `SummaryDigests` arm rotates its
+/// starting offset when the cap binds (the same random-rotation starvation
+/// argument [`MAX_STALE_SYNCS_PER_SUMMARIES`] makes, which matters here for
+/// the same reason: `get_matching_contracts` sorts by contract id, so a fixed
+/// prefix would starve the tail forever).
+///
+/// 256 is deliberately far above the handful of contracts a healthy pair
+/// actually shares (and 8x the 32-contract heal budget that gates the outcome
+/// of any request), so it binds only on abuse.
+const MAX_SUMMARY_HASHES_PER_MESSAGE: usize = 256;
+
 /// Per-`Summaries`-message cap on semantic-staleness probes — the WASM
 /// `get_state_delta` calls the `Summaries` handler issues to decide, for a
 /// byte-differing summary, whether a peer is genuinely stale (#4857 secondary
@@ -2590,11 +2614,213 @@ fn stale_peer_sync_event(
     }
 }
 
+/// What a peer's advertised summary digest tells us about that contract.
+///
+/// Pure classification of one [`crate::message::SummaryDigestEntry`] against
+/// OUR OWN summary, factored out so the one comparison the whole hash-first
+/// exchange rests on is unit-testable without a node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DigestVerdict {
+    /// The peer's digest equals a digest of our own summary, so we know their
+    /// summary bytes without them sending any: they are ours.
+    ///
+    /// This is the 98.1% case (#4965) and the entire point of the exchange.
+    Agree,
+    /// The peer reported no summary at all (`summary_digest: None`) — they are
+    /// interested but hold no state. Identical in meaning to a
+    /// `SummaryEntry { summary_bytes: None }`, and handled identically: clear
+    /// our cached summary for them, no heal (there is no divergence to heal
+    /// when one side has nothing).
+    PeerHasNoState,
+    /// We cannot settle this entry from the digest alone and must ask for the
+    /// bytes. Either the digests differ (real divergence, or a
+    /// non-deterministically-serialized summary), or the peer has a summary
+    /// and we do not — in which case we still need their bytes to seed the
+    /// peer-summary cache (#4952) and keep them off the full-state broadcast
+    /// path.
+    NeedBytes,
+}
+
+/// Classify one advertised digest against our own summary.
+///
+/// Both inputs come from FACT, never belief: `our_summary` is this node's
+/// actual state summary (`summary_if_hosted_or_in_use`), and `their_digest` is
+/// what the peer computed from its actual state. The cached
+/// `PeerInterest.summary` — our *belief* about the peer — is deliberately not
+/// consulted, because every failure anti-entropy exists to repair is precisely
+/// that belief being wrong.
+fn classify_summary_digest(
+    our_summary: Option<&freenet_stdlib::prelude::StateSummary<'static>>,
+    their_digest: Option<&crate::ring::interest::SummaryDigest>,
+) -> DigestVerdict {
+    match (our_summary, their_digest) {
+        (_, None) => DigestVerdict::PeerHasNoState,
+        (None, Some(_)) => DigestVerdict::NeedBytes,
+        (Some(ours), Some(theirs)) => {
+            if crate::ring::interest::summary_digest(ours.as_ref()) == *theirs {
+                DigestVerdict::Agree
+            } else {
+                DigestVerdict::NeedBytes
+            }
+        }
+    }
+}
+
+/// Choose the wire form for a `Summaries` reply aimed at `target`: the
+/// hash-first [`InterestMessage::SummaryDigests`] when the peer is new enough
+/// to decode it, otherwise the full-bytes [`InterestMessage::Summaries`].
+///
+/// The digest form is derived from the very `SummaryEntry` values we would
+/// otherwise have sent, so the two forms cannot describe different state: the
+/// digest is a pure function of the exact bytes the fallback carries. Callers
+/// therefore build entries exactly as before and let this decide the encoding.
+///
+/// Fail-closed on an unknown peer version (see
+/// [`crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION`]): the fallback is what
+/// every peer does today, so the cost of guessing wrong is bandwidth, never
+/// convergence.
+///
+/// `emitter` is the #5052 provenance tag, and is applied to BOTH forms — the
+/// caller's identity does not change with the encoding, so neither may the arm
+/// its bytes land in. Passing it in rather than picking one here is what keeps
+/// the two reply sites (`Interests` vs `ChangeInterests`) distinguishable
+/// through this shared helper; hard-coding a single tag would silently merge
+/// them, which is the conflation #5052 exists to undo.
+fn summaries_reply_for_peer(
+    op_manager: &Arc<OpManager>,
+    target: std::net::SocketAddr,
+    entries: Vec<crate::message::SummaryEntry>,
+    emitter: crate::message::SummariesEmitter,
+) -> crate::message::InterestMessage {
+    use crate::message::{InterestMessage, SummaryDigestEntry};
+
+    if op_manager
+        .ring
+        .connection_manager
+        .supports_hash_first_summaries(target)
+    {
+        InterestMessage::SummaryDigests {
+            entries: entries.iter().map(SummaryDigestEntry::from_entry).collect(),
+            emitter,
+        }
+    } else {
+        InterestMessage::Summaries { entries, emitter }
+    }
+}
+
+/// Emit targeted `SyncStateToPeer` heals for the contracts on which `source`
+/// was found stale, bounded by [`stale_sync_emit_budget`].
+///
+/// Extracted from the `Summaries` arm so the `SummaryDigests` arm shares the
+/// IDENTICAL heal path rather than growing a second copy that can drift. The
+/// hash-first exchange must not cost convergence, so there is exactly one
+/// implementation of "we decided this peer is stale, now fix it".
+async fn emit_stale_peer_syncs(
+    op_manager: &Arc<OpManager>,
+    source: std::net::SocketAddr,
+    mut stale_contracts: Vec<freenet_stdlib::prelude::ContractKey>,
+) {
+    // #3798 Gap 1: cap the number of SyncStateToPeer events emitted per
+    // message so a peer diverging on many contracts cannot trigger an
+    // unbounded burst in one handler call. `emit_budget` bounds *emitted*
+    // events (not loop iterations) — banned and no-local-state contracts are
+    // skipped without consuming the budget. Overflow is not dropped
+    // permanently: each later heartbeat re-derives the still-stale set from
+    // the durable summary comparison and syncs the next batch (see
+    // MAX_STALE_SYNCS_PER_SUMMARIES rustdoc for the eventual-consistency
+    // argument).
+    let total_stale = stale_contracts.len();
+    let emit_budget = stale_sync_emit_budget(total_stale);
+    // Starvation avoidance: when the stale set exceeds the cap, rotate the
+    // start of the iteration by a random offset so the cap window slides
+    // across the whole set over successive cycles. Without this, a contract
+    // stuck in the leading `cap` positions (dropped emit, lost packet, peer
+    // fails to apply) would re-consume the budget every cycle and permanently
+    // starve everything past the cap. No rotation when total_stale <= cap —
+    // every contract is emitted anyway, so the order does not matter.
+    // GlobalRng keeps this deterministic under simulation/test.
+    if total_stale > emit_budget {
+        let start = crate::config::GlobalRng::random_range(0..total_stale);
+        stale_contracts.rotate_left(start);
+    }
+    let mut emitted = 0usize;
+    for contract in stale_contracts {
+        if emitted >= emit_budget {
+            // Cap reached; the still-stale remainder (any that are not
+            // banned / have local state) is re-detected and synced on a
+            // subsequent interest-sync cycle rather than emitted now.
+            tracing::warn!(
+                stale_peer = %source,
+                total_stale,
+                emitted,
+                cap = MAX_STALE_SYNCS_PER_SUMMARIES,
+                "Stale-contract sync cap hit for Summaries message; \
+                 deferring the remainder to a later interest-sync cycle"
+            );
+            break;
+        }
+        // Phase 7 egress gate. Don't repair a stale peer's summary mismatch by
+        // pushing state for a contract we have banned — same rationale as the
+        // inbound wire-boundary drop, applied to the proactive heal path.
+        if op_manager.ring.contract_ban_list.is_banned(contract.id()) {
+            tracing::debug!(
+                %contract,
+                stale_peer = %source,
+                phase = "interest_sync_banned_skip",
+                "skipping summary-mismatch sync for banned contract"
+            );
+            continue;
+        }
+        let Some(state) = get_contract_state(op_manager, &contract).await else {
+            tracing::trace!(
+                contract = %contract,
+                "Skipping stale-peer sync — no local state available"
+            );
+            continue;
+        };
+        // Count this contract against the emit budget: it has local state and
+        // is not banned, so we are about to emit a SyncStateToPeer event for
+        // it. Increment before the emit so a channel-full drop still consumes
+        // the budget — the dropped event is retried next cycle exactly like an
+        // over-cap one.
+        emitted += 1;
+        // Fires per stale-peer detection during interest sync, which is
+        // dominant on hot contracts. Diagnostic-grade rather than
+        // user-actionable; keep accessible via RUST_LOG=…=debug.
+        tracing::debug!(
+            contract = %contract,
+            stale_peer = %source,
+            "Summary mismatch in interest sync — syncing state to stale peer"
+        );
+        // Non-blocking emit: SyncStateToPeer is best-effort gossip — if
+        // dropped, the next interest-sync round will retry. Blocking here
+        // would stack the heal path on the same notification channel the
+        // executor is trying to keep responsive (#4145 / #4234).
+        // Targeted heal: `stale_peer_sync_event` builds a `SyncStateToPeer`
+        // aimed at exactly `source`, NEVER an all-subscriber fan-out. Pinned
+        // by `stale_peer_sync_event_is_targeted_not_broadcast` (#3791/#3796).
+        if let Err(e) =
+            op_manager.try_notify_node_event(stale_peer_sync_event(contract, state, source))
+        {
+            // Best-effort by design (see comment above); log at debug to keep
+            // the caller layer in step with the helper-internal downgrade
+            // (#4238).
+            tracing::debug!(
+                contract = %contract,
+                error = %e,
+                "Failed to emit SyncStateToPeer for stale peer correction (best-effort)"
+            );
+        }
+    }
+}
+
 /// Handle incoming InterestSync messages for delta-based state synchronization.
 ///
 /// This function processes the interest exchange protocol:
 /// - `Interests`: Connection-time discovery of shared contract interests
 /// - `Summaries`: State summaries for shared contracts
+/// - `SummaryDigests`: hash-first advertisement of those same summaries (#4965)
+/// - `SummaryRequest`: the bytes-on-mismatch follow-up to `SummaryDigests`
 /// - `ChangeInterests`: Incremental interest changes
 /// - `ResyncRequest`: Request full state when delta application fails
 async fn handle_interest_sync_message(
@@ -2697,13 +2923,16 @@ async fn handle_interest_sync_message(
             if entries.is_empty() {
                 None
             } else {
-                Some(InterestMessage::Summaries {
+                // #5052: the heartbeat reply — MULTI-entry, one per shared
+                // advertised contract, on every `Interests` received. This is
+                // the emitter hash-first (#4965) changes, so the tag rides
+                // through the encoding chooser onto whichever form it picks.
+                Some(summaries_reply_for_peer(
+                    op_manager,
+                    source,
                     entries,
-                    // #5052: the heartbeat reply — MULTI-entry, one per shared
-                    // advertised contract, on every `Interests` received. This
-                    // is the emitter hash-first (#4965) would change.
-                    emitter: SummariesEmitter::InterestsReply,
-                })
+                    SummariesEmitter::InterestsReply,
+                ))
             }
         }
 
@@ -2894,105 +3123,9 @@ async fn handle_interest_sync_message(
             // summary. Previously this emitted BroadcastStateChange which fanned
             // out to ALL subscribers (~28 peers), causing O(peers^2) traffic when
             // many peers reported mismatches within the same heartbeat cycle.
-            //
-            // #3798 Gap 1: cap the number of SyncStateToPeer events emitted per
-            // Summaries message so a peer diverging on many contracts cannot
-            // trigger an unbounded burst in one handler call. `emit_budget`
-            // bounds *emitted* events (not loop iterations) — banned and
-            // no-local-state contracts are skipped without consuming the
-            // budget. Overflow is not dropped permanently: each later
-            // heartbeat re-derives the still-stale set from the durable summary
-            // comparison above and syncs the next batch (see
-            // MAX_STALE_SYNCS_PER_SUMMARIES rustdoc for the eventual-consistency
-            // argument).
-            let total_stale = stale_contracts.len();
-            let emit_budget = stale_sync_emit_budget(total_stale);
-            // Starvation avoidance: when the stale set exceeds the cap, rotate
-            // the start of the iteration by a random offset so the cap window
-            // slides across the whole set over successive cycles. Without this,
-            // a contract stuck in the leading `cap` positions (dropped emit,
-            // lost packet, peer fails to apply) would re-consume the budget
-            // every cycle and permanently starve everything past the cap. No
-            // rotation when total_stale <= cap — every contract is emitted
-            // anyway, so the order does not matter. GlobalRng keeps this
-            // deterministic under simulation/test.
-            if total_stale > emit_budget {
-                let start = crate::config::GlobalRng::random_range(0..total_stale);
-                stale_contracts.rotate_left(start);
-            }
-            let mut emitted = 0usize;
-            for contract in stale_contracts {
-                if emitted >= emit_budget {
-                    // Cap reached; the still-stale remainder (any that are not
-                    // banned / have local state) is re-detected and synced on a
-                    // subsequent interest-sync cycle rather than emitted now.
-                    tracing::warn!(
-                        stale_peer = %source,
-                        total_stale,
-                        emitted,
-                        cap = MAX_STALE_SYNCS_PER_SUMMARIES,
-                        "Stale-contract sync cap hit for Summaries message; \
-                         deferring the remainder to a later interest-sync cycle"
-                    );
-                    break;
-                }
-                // Phase 7 egress gate. Don't repair a stale peer's
-                // summary mismatch by pushing state for a contract
-                // we have banned — same rationale as the inbound
-                // wire-boundary drop, applied to the proactive heal
-                // path.
-                if op_manager.ring.contract_ban_list.is_banned(contract.id()) {
-                    tracing::debug!(
-                        %contract,
-                        stale_peer = %source,
-                        phase = "interest_sync_banned_skip",
-                        "skipping summary-mismatch sync for banned contract"
-                    );
-                    continue;
-                }
-                let Some(state) = get_contract_state(op_manager, &contract).await else {
-                    tracing::trace!(
-                        contract = %contract,
-                        "Skipping stale-peer sync — no local state available"
-                    );
-                    continue;
-                };
-                // Count this contract against the emit budget: it has local
-                // state and is not banned, so we are about to emit a
-                // SyncStateToPeer event for it. Increment before the emit so a
-                // channel-full drop still consumes the budget — the dropped
-                // event is retried next cycle exactly like an over-cap one.
-                emitted += 1;
-                // Fires per stale-peer detection during interest sync, which
-                // is dominant on hot contracts. Diagnostic-grade rather than
-                // user-actionable; keep accessible via RUST_LOG=…=debug.
-                tracing::debug!(
-                    contract = %contract,
-                    stale_peer = %source,
-                    "Summary mismatch in interest sync — syncing state to stale peer"
-                );
-                // Non-blocking emit: SyncStateToPeer is best-effort
-                // gossip — if dropped, the next interest-sync round
-                // will retry. Blocking here would stack the heal
-                // path on the same notification channel the executor
-                // is trying to keep responsive (#4145 / #4234).
-                // Targeted heal: `stale_peer_sync_event` builds a
-                // `SyncStateToPeer` aimed at exactly `source`, NEVER an
-                // all-subscriber fan-out. Pinned by
-                // `stale_peer_sync_event_is_targeted_not_broadcast` (#3791/#3796).
-                if let Err(e) =
-                    op_manager.try_notify_node_event(stale_peer_sync_event(contract, state, source))
-                {
-                    // Best-effort by design (see comment above); log
-                    // at debug to keep the caller layer in step with
-                    // the helper-internal downgrade (#4238).
-                    tracing::debug!(
-                        contract = %contract,
-                        error = %e,
-                        "Failed to emit SyncStateToPeer for stale peer correction (best-effort)"
-                    );
-                }
-            }
+            // The bounded, targeted emission lives in `emit_stale_peer_syncs`,
+            // shared verbatim with the `SummaryDigests` arm.
+            emit_stale_peer_syncs(op_manager, source, stale_contracts).await;
 
             // Emit deferred StateConfirmed telemetry so the convergence
             // checker has up-to-date state hashes for CRDT-merged state.
@@ -3009,6 +3142,250 @@ async fn handle_interest_sync_message(
 
             // No response needed for Summaries
             None
+        }
+
+        InterestMessage::SummaryDigests { entries, .. } => {
+            tracing::debug!(
+                from = %source,
+                entry_count = entries.len(),
+                "Received SummaryDigests message"
+            );
+
+            // Hash-first half of the summary exchange (#4965).
+            //
+            // The peer told us what its summaries HASH to instead of shipping
+            // them. For each entry we compute OUR OWN summary from actual
+            // local state — exactly as the `Summaries` arm does — and compare.
+            //
+            // # This does not short-circuit the heal
+            //
+            // A digest match proves the peer's summary bytes EQUAL ours. That
+            // is the same input the `Summaries` arm's staleness check gets, so
+            // this arm runs that check for real rather than assuming its
+            // answer: `record_summary_comparison` is called with the operands
+            // it would have been called with, `summary_indicates_stale_peer`
+            // is invoked, and a `true` verdict lands in the SAME
+            // `emit_stale_peer_syncs` the `Summaries` arm uses. Nothing is
+            // skipped on the strength of "identical summaries are never
+            // stale"; that stays a property of the predicate, not an
+            // assumption baked in here.
+            //
+            // Everything the digest CANNOT settle — differing digests, or a
+            // peer holding state we don't — is answered with a
+            // `SummaryRequest`, and the bytes come back as a plain
+            // `Summaries` that runs the untouched original handler, including
+            // its semantic (`get_state_delta`) staleness probe. Divergence
+            // therefore costs one extra round trip (sub-second) against a
+            // ~5-min heartbeat, and is never silently dropped. If the request
+            // or its answer IS lost, the contract simply stays diverged until
+            // the next heartbeat re-advertises it — the same outcome a lost
+            // `Summaries` has today, not a new failure mode.
+            //
+            // Telemetry note: the #4965 identical/differing counters are
+            // recorded on AGREEMENT here and on ARRIVAL of the requested bytes
+            // in the `Summaries` arm, so each contract is counted exactly once
+            // per exchange. A request whose answer never arrives is the one
+            // case that goes uncounted, biasing the ratio very slightly toward
+            // "identical"; read the counters as a floor on the agreement rate,
+            // not a point estimate.
+            let peer_key = get_peer_key_from_addr(op_manager, source);
+            let mut stale_contracts = Vec::new();
+            let emit_confirmed = crate::config::SimulationIdleTimeout::is_enabled();
+            let mut confirmed_states: Vec<(freenet_stdlib::prelude::ContractKey, String)> =
+                Vec::new();
+            let mut request_hashes: Vec<u32> = Vec::new();
+
+            if let Some(pk) = peer_key {
+                // See `MAX_SUMMARY_HASHES_PER_MESSAGE`: entries are
+                // peer-supplied and cheap for the peer to fabricate, so
+                // deduplicate by hash and process a bounded window. The window
+                // starts at a random offset when the cap binds, for the same
+                // starvation reason `emit_stale_peer_syncs` rotates — a
+                // sender's entries arrive in contract-id order, so a fixed
+                // prefix would starve the tail on every cycle forever.
+                let mut entries = entries;
+                if entries.len() > MAX_SUMMARY_HASHES_PER_MESSAGE {
+                    let start = crate::config::GlobalRng::random_range(0..entries.len());
+                    entries.rotate_left(start);
+                }
+                let mut seen_hashes: HashSet<u32> = HashSet::new();
+                let mut compared_contracts: HashSet<ContractInstanceId> = HashSet::new();
+                for entry in entries {
+                    if seen_hashes.len() >= MAX_SUMMARY_HASHES_PER_MESSAGE {
+                        break;
+                    }
+                    if !seen_hashes.insert(entry.hash) {
+                        continue;
+                    }
+                    // One hash can resolve to several contracts (FNV-1a
+                    // collisions), and any one of them needing bytes is enough
+                    // to ask — but the hash goes on the request list at most
+                    // once, so the reply cannot be inflated by collisions.
+                    let mut needs_bytes = false;
+                    for contract in op_manager.interest_manager.lookup_by_hash(entry.hash) {
+                        if !op_manager.interest_manager.has_local_interest(&contract) {
+                            continue;
+                        }
+
+                        // Our ACTUAL summary, from the same gated helper the
+                        // `Summaries` arm uses (#4473). Never the cached
+                        // `PeerInterest.summary`: that is our belief about the
+                        // peer, and repairing a wrong belief is the entire job
+                        // of this exchange.
+                        let our_summary = summary_if_hosted_or_in_use(op_manager, &contract).await;
+
+                        if emit_confirmed {
+                            if let Some(ref summary) = our_summary {
+                                confirmed_states.push((contract, hex::encode(summary.as_ref())));
+                            }
+                        }
+
+                        match classify_summary_digest(
+                            our_summary.as_ref(),
+                            entry.summary_digest.as_ref(),
+                        ) {
+                            DigestVerdict::Agree => {
+                                // The digest proves their summary bytes are
+                                // ours, so hand the staleness machinery those
+                                // bytes and let it decide, exactly as the
+                                // `Summaries` arm would have.
+                                let ours = our_summary
+                                    .expect("DigestVerdict::Agree is only reachable with Some");
+                                op_manager.outbound_mix.record_summary_comparison(
+                                    contract.id(),
+                                    ours.as_ref(),
+                                    ours.as_ref(),
+                                    &mut compared_contracts,
+                                );
+                                // `None` delta verdict: there is nothing to
+                                // probe. `summary_indicates_stale_peer` sees
+                                // byte-equal summaries and never reaches the
+                                // verdict — the same path a byte-identical
+                                // `SummaryEntry` takes today.
+                                let is_stale = crate::ring::interest::summary_indicates_stale_peer(
+                                    &ours, &ours, None,
+                                );
+                                // #4952: seed the peer-summary cache so an
+                                // advertised co-host does not stay a
+                                // full-state broadcast target. Fact, not
+                                // belief: the digest established that these
+                                // bytes are what the peer holds.
+                                op_manager
+                                    .interest_manager
+                                    .upsert_peer_summary(&contract, &pk, ours);
+                                if is_stale && !stale_contracts.contains(&contract) {
+                                    stale_contracts.push(contract);
+                                }
+                            }
+                            DigestVerdict::PeerHasNoState => {
+                                // Same handling a `SummaryEntry` with
+                                // `summary_bytes: None` gets: clear-only, no
+                                // entry created just to hold `None`, no heal.
+                                op_manager.interest_manager.clear_peer_summary(
+                                    &contract,
+                                    &pk,
+                                    crate::ring::interest::SummaryMissingReason::ClearedByNoneReport,
+                                );
+                            }
+                            // Defer to the full-bytes path: the digest cannot
+                            // settle this contract, so ask for the summary and
+                            // let the untouched `Summaries` handler decide.
+                            DigestVerdict::NeedBytes => needs_bytes = true,
+                        }
+                    }
+                    if needs_bytes {
+                        request_hashes.push(entry.hash);
+                    }
+                }
+            }
+
+            // A digest-match verdict of "stale" is not expected (the predicate
+            // short-circuits on equal bytes) but is honoured rather than
+            // assumed away — same bounded, targeted emission as `Summaries`.
+            emit_stale_peer_syncs(op_manager, source, stale_contracts).await;
+
+            for (key, state_hash) in confirmed_states {
+                if let Some(event) =
+                    crate::tracing::NetEventLog::state_confirmed(&op_manager.ring, key, state_hash)
+                {
+                    op_manager
+                        .ring
+                        .register_events(either::Either::Left(event))
+                        .await;
+                }
+            }
+
+            if request_hashes.is_empty() {
+                // The 98.1% case: both sides already agree on every shared
+                // contract and not one summary byte crossed the wire.
+                None
+            } else {
+                Some(InterestMessage::SummaryRequest {
+                    hashes: request_hashes,
+                })
+            }
+        }
+
+        InterestMessage::SummaryRequest { hashes } => {
+            tracing::debug!(
+                from = %source,
+                hash_count = hashes.len(),
+                "Received SummaryRequest message"
+            );
+
+            // The peer's digest comparison could not settle these contracts,
+            // so it needs the actual bytes. Answer with a plain `Summaries` —
+            // ALWAYS the full-bytes form, NEVER the version-gated encoding
+            // chooser the other reply sites use. (The chooser is not named
+            // here on purpose: the pin test below asserts its identifier is
+            // absent from this arm, and a mention in a comment would satisfy
+            // that search and disarm the pin.)
+            //
+            // Two reasons, both load-bearing: replying with digests to a
+            // request FOR bytes would loop (request → digests → request …),
+            // and the requester has already established that a digest cannot
+            // settle these entries. `summary_request_reply_is_always_full_bytes`
+            // pins this.
+            //
+            // Disclosure and cost are identical to the `Interests` arm: the
+            // same `get_matching_contracts` filter (so only contracts we
+            // already track can be named) and the same
+            // `summary_if_hosted_or_in_use` gate. Unlike the `Interests` arm
+            // this registers no interest and removes none — a request is not
+            // an interest advertisement. Bounded by
+            // `MAX_SUMMARY_HASHES_PER_MESSAGE` on the input so a peer cannot
+            // name an arbitrarily long hash list.
+            //
+            // No separate rate limit, deliberately: a peer that wanted to
+            // force this work could already do so by spamming `Interests`,
+            // which runs the identical `get_matching_contracts` +
+            // `summary_if_hosted_or_in_use` loop AND additionally rewrites its
+            // interest registrations. This arm is strictly the cheaper of the
+            // two, so it adds no amplification surface that is not already
+            // reachable — and the summaries themselves are memoized on the
+            // state hash, so repeats do not re-enter WASM.
+            let bounded = &hashes[..hashes.len().min(MAX_SUMMARY_HASHES_PER_MESSAGE)];
+            let matching = op_manager.interest_manager.get_matching_contracts(bounded);
+            let mut entries = Vec::with_capacity(matching.len());
+            for contract in matching {
+                let hash = contract_hash(&contract);
+                let summary = summary_if_hosted_or_in_use(op_manager, &contract).await;
+                entries.push(SummaryEntry::from_summary(hash, summary.as_ref()));
+            }
+
+            if entries.is_empty() {
+                None
+            } else {
+                Some(InterestMessage::Summaries {
+                    entries,
+                    // #5052: its OWN arm, not `InterestsReply`. This fires only
+                    // on the fraction of comparisons a digest could not settle,
+                    // so it is the cost of the hash-first fallback; folded into
+                    // the heartbeat arm, a rising mismatch rate would read as a
+                    // rising heartbeat cost and point at the wrong remedy.
+                    emitter: SummariesEmitter::DigestRequestReply,
+                })
+            }
         }
 
         InterestMessage::ChangeInterests { added, removed } => {
@@ -3110,15 +3487,17 @@ async fn handle_interest_sync_message(
             if entries.is_empty() {
                 None
             } else {
-                Some(InterestMessage::Summaries {
+                // #5052: also multi-entry and also built by
+                // `summary_if_hosted_or_in_use`, but driven by interest CHURN
+                // rather than the heartbeat clock — a peer joining or dropping
+                // interest, not a periodic tick. Same bytes, a different thing
+                // to fix if it is the large one.
+                Some(summaries_reply_for_peer(
+                    op_manager,
+                    source,
                     entries,
-                    // #5052: also multi-entry and also built by
-                    // `summary_if_hosted_or_in_use`, but driven by interest
-                    // CHURN rather than the heartbeat clock — a peer joining or
-                    // dropping interest, not a periodic tick. Same bytes, a
-                    // different thing to fix if it is the large one.
-                    emitter: SummariesEmitter::ChangeInterestsReply,
-                })
+                    SummariesEmitter::ChangeInterestsReply,
+                ))
             }
         }
 
@@ -4114,9 +4493,13 @@ mod tests {
             .matches("summary_if_hosted_or_in_use(")
             .count();
         assert!(
-            gated_calls >= 3,
-            "expected the 3 periodic interest-sync arms to call \
-             summary_if_hosted_or_in_use, found {gated_calls}"
+            gated_calls >= 5,
+            "expected the 5 periodic interest-sync arms (Interests, Summaries, \
+             SummaryDigests, SummaryRequest, ChangeInterests) to call \
+             summary_if_hosted_or_in_use, found {gated_calls}. The hash-first \
+             arms (#4965) summarize on the same schedule as the ones they \
+             replace, so an ungated call there re-opens the #4473 storm on the \
+             hottest path in the protocol."
         );
     }
 
@@ -4149,10 +4532,17 @@ mod tests {
         let summaries_off = src[handler_start..]
             .find("InterestMessage::Summaries { entries, .. }")
             .expect("Summaries arm not found");
-        let change_off = src[handler_start..]
-            .find("InterestMessage::ChangeInterests")
-            .expect("ChangeInterests arm not found");
-        let summaries_arm = &src[handler_start + summaries_off..handler_start + change_off];
+        // End at the arm that IMMEDIATELY follows, not at a later one. When
+        // the hash-first arms (#4965) were inserted between `Summaries` and
+        // `ChangeInterests`, an end marker of `ChangeInterests` silently
+        // widened this window to cover them — and because the digest arm also
+        // calls `record_summary_comparison` and `summary_indicates_stale_peer`,
+        // the positive assertions below would have kept passing with those
+        // calls deleted from `Summaries` itself.
+        let next_off = src[handler_start..]
+            .find("InterestMessage::SummaryDigests { entries, .. }")
+            .expect("SummaryDigests arm not found");
+        let summaries_arm = &src[handler_start + summaries_off..handler_start + next_off];
 
         // #4965: the measurement call must stay wired into this arm. It is
         // pure observation, so deleting it breaks no test and no behavior —
@@ -7544,5 +7934,784 @@ mod tests {
                  instead of a targeted SyncStateToPeer (#3791/#3796)"
             );
         }
+    }
+
+    /// Behavioural tests for the hash-first `InterestSync` exchange (#4965).
+    ///
+    /// The exchange replaces "ship every summary to every co-host every cycle"
+    /// with "ship a digest, ship the bytes only on mismatch". The properties
+    /// that matter, and that these tests pin:
+    ///
+    /// 1. A digest MATCH puts no summary bytes on the wire, yet still seeds the
+    ///    peer-summary cache and still runs the staleness check.
+    /// 2. A digest MISMATCH asks for the bytes, and the resulting `Summaries`
+    ///    runs the untouched original handler — so the targeted
+    ///    `SyncStateToPeer` heal still fires.
+    /// 3. A peer that sends no digest at all (an old peer, or one with no
+    ///    state) still converges.
+    mod hash_first_summaries {
+        use super::*;
+        use crate::contract::{ContractHandlerEvent, StoreResponse};
+        use crate::message::{
+            InterestMessage, NodeEvent, SummariesEmitter, SummaryDigestEntry, SummaryEntry,
+        };
+        use crate::ring::interest::{PeerKey, contract_hash, summary_digest};
+        use either::Either;
+        use freenet_stdlib::prelude::{
+            CodeHash, ContractInstanceId, ContractKey, StateSummary, WrappedState,
+        };
+        use std::net::SocketAddr;
+
+        /// Everything a hash-first handler test needs, kept alive together.
+        struct Harness {
+            op_manager: Arc<OpManager>,
+            notifications: crate::node::EventLoopNotificationsReceiver,
+            /// The one contract the node hosts, is locally interested in, and
+            /// can summarize.
+            key: ContractKey,
+            /// The summary the stand-in contract handler reports for `key`.
+            our_summary: Vec<u8>,
+            /// A connected peer, recorded at the hash-first version floor.
+            new_peer: SocketAddr,
+            /// A connected peer with NO recorded version (an old peer, as far
+            /// as the fail-closed gate is concerned).
+            old_peer: SocketAddr,
+            _guard: Box<dyn std::any::Any>,
+        }
+
+        impl Harness {
+            fn peer_key_of(&self, addr: SocketAddr) -> PeerKey {
+                PeerKey::from(
+                    self.op_manager
+                        .ring
+                        .connection_manager
+                        .get_peer_by_addr(addr)
+                        .expect("peer must be connected")
+                        .pub_key
+                        .clone(),
+                )
+            }
+
+            /// Every `SyncStateToPeer` heal emitted so far, as
+            /// (contract, target). This is the observable the "PRESERVE THE
+            /// HEAL" property is asserted on.
+            fn drain_heals(&mut self) -> Vec<(ContractKey, SocketAddr)> {
+                let mut out = Vec::new();
+                while let Ok(ev) = self.notifications.notifications_receiver.try_recv() {
+                    if let Either::Right(NodeEvent::SyncStateToPeer { key, target, .. }) = ev {
+                        out.push((key, target));
+                    }
+                }
+                out
+            }
+        }
+
+        /// Build a node that hosts exactly one contract with a known summary,
+        /// connected to one hash-first-capable peer and one pre-floor peer.
+        ///
+        /// `contract_state_present` returns `true` when no hosting storage is
+        /// attached, so the `should_summarize_or_broadcast` gate is satisfied
+        /// by `host_contract` alone and no redb temp dir is needed.
+        async fn build_harness(id: &str, port_base: u16, our_summary: Vec<u8>) -> Harness {
+            let config_args = crate::config::ConfigArgs {
+                id: Some(id.to_string()),
+                mode: Some(crate::contract::OperationMode::Local),
+                ..Default::default()
+            };
+            let node_config = NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+            let (notifications, notification_tx) = crate::node::event_loop_notification_channel();
+            let (ops_ch_channel, mut ch_channel, wait_for_event) =
+                crate::contract::contract_handler_channel();
+            let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+            let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+            let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+            let op_manager = Arc::new(
+                crate::node::OpManager::new(
+                    notification_tx,
+                    ops_ch_channel,
+                    &node_config,
+                    crate::tracing::DynamicRegister::new(vec![]),
+                    connection_manager,
+                    result_router_tx,
+                    &task_monitor,
+                )
+                .expect("build OpManager"),
+            );
+            op_manager.ring.attach_op_manager(&op_manager);
+            let self_addr: SocketAddr = format!("127.0.0.1:{port_base}").parse().unwrap();
+            op_manager
+                .ring
+                .connection_manager
+                .set_own_addr_local_for_test(self_addr);
+
+            let key = ContractKey::from_id_and_code(
+                ContractInstanceId::new([42u8; 32]),
+                CodeHash::new([43u8; 32]),
+            );
+            // Hosted + locally interested + hash-indexed, so
+            // `summary_if_hosted_or_in_use` will summarize it and
+            // `lookup_by_hash` will resolve the peer's advertised hash to it.
+            let _ = op_manager
+                .ring
+                .host_contract(key, 128, crate::ring::AccessType::Put);
+            op_manager.interest_manager.register_local_hosting(&key);
+
+            // Two connected peers, distinguished ONLY by whether a remote
+            // version was recorded — the exact production discriminator.
+            let new_peer: SocketAddr = format!("127.0.0.1:{}", port_base + 1).parse().unwrap();
+            let old_peer: SocketAddr = format!("127.0.0.1:{}", port_base + 2).parse().unwrap();
+            for (i, addr) in [new_peer, old_peer].into_iter().enumerate() {
+                let pub_key = crate::transport::TransportPublicKey::from_bytes([(i as u8) + 1; 32]);
+                assert!(
+                    op_manager.ring.connection_manager.add_connection(
+                        crate::ring::Location::new(0.1 + (i as f64) * 0.1),
+                        addr,
+                        pub_key,
+                        false,
+                    ),
+                    "test peer must be admitted to the ring"
+                );
+            }
+            op_manager
+                .ring
+                .connection_manager
+                .record_remote_version(new_peer, crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION);
+
+            let summary_for_handler = our_summary.clone();
+            let handler_key = key;
+            let handler = tokio::spawn(async move {
+                while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                    let response = match ev {
+                        ContractHandlerEvent::GetSummaryQuery { key } => {
+                            ContractHandlerEvent::GetSummaryResponse {
+                                key,
+                                summary: Ok(StateSummary::from(summary_for_handler.clone())),
+                            }
+                        }
+                        ContractHandlerEvent::GetQuery { .. } => {
+                            ContractHandlerEvent::GetResponse {
+                                key: Some(handler_key),
+                                response: Ok(StoreResponse {
+                                    state: Some(WrappedState::new(vec![1u8, 2, 3])),
+                                    contract: None,
+                                }),
+                            }
+                        }
+                        // The semantic-staleness probe (#4857): a NON-EMPTY
+                        // delta is the contract answering "yes, I hold state
+                        // this peer lacks", which is what turns a byte
+                        // mismatch into a real heal. Returning an empty delta
+                        // here would make every divergence test vacuous.
+                        ContractHandlerEvent::GetDeltaQuery { key, .. } => {
+                            ContractHandlerEvent::GetDeltaResponse {
+                                key,
+                                delta: Ok(freenet_stdlib::prelude::StateDelta::from(vec![
+                                    1u8, 2, 3,
+                                ])),
+                            }
+                        }
+                        other => panic!("unexpected handler event: {other:?}"),
+                    };
+                    if ch_channel.send_to_sender(id, response).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let guard: Box<dyn std::any::Any> =
+                Box::new((handler, result_router_rx, task_monitor, wait_for_event));
+            Harness {
+                op_manager,
+                notifications,
+                key,
+                our_summary,
+                new_peer,
+                old_peer,
+                _guard: guard,
+            }
+        }
+
+        /// A hash-first-capable peer asking for our interests gets DIGESTS
+        /// back; a peer whose version we don't know gets the full bytes.
+        ///
+        /// This is the backward-compatibility property stated as behaviour
+        /// rather than as a predicate: the same node, the same contract, the
+        /// same handler call — only the recorded peer version differs, and the
+        /// old peer still receives a message it can decode.
+        #[tokio::test]
+        async fn interests_reply_is_digests_only_for_capable_peers() {
+            let mut h = build_harness("hf-reply-form", 17000, vec![7u8; 64]).await;
+            let hash = contract_hash(&h.key);
+
+            let to_new = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::Interests { hashes: vec![hash] },
+            )
+            .await;
+            match to_new {
+                Some(InterestMessage::SummaryDigests { entries, emitter }) => {
+                    assert_eq!(entries.len(), 1);
+                    assert_eq!(entries[0].hash, hash);
+                    assert_eq!(
+                        emitter,
+                        SummariesEmitter::InterestsReply,
+                        "#5052: the emitter tag must ride through the encoding \
+                         chooser onto the digest form. Losing it here drains \
+                         the heartbeat arm into the residual the moment \
+                         hash-first is on — exactly the attribution the split \
+                         exists to provide."
+                    );
+                    assert_eq!(
+                        entries[0].summary_digest,
+                        Some(summary_digest(&h.our_summary)),
+                        "the digest must be computed from our ACTUAL summary"
+                    );
+                }
+                other => panic!("expected SummaryDigests for a capable peer, got {other:?}"),
+            }
+
+            let to_old = handle_interest_sync_message(
+                &h.op_manager,
+                h.old_peer,
+                InterestMessage::Interests { hashes: vec![hash] },
+            )
+            .await;
+            match to_old {
+                Some(InterestMessage::Summaries { entries, emitter }) => {
+                    assert_eq!(entries.len(), 1);
+                    assert_eq!(
+                        emitter,
+                        SummariesEmitter::InterestsReply,
+                        "the fallback form carries the SAME emitter as the \
+                         digest form — the caller's identity does not change \
+                         with the encoding"
+                    );
+                    assert_eq!(
+                        entries[0].summary_bytes.as_deref(),
+                        Some(h.our_summary.as_slice()),
+                        "a peer with an unknown version must still receive the \
+                         full summary bytes — it cannot decode SummaryDigests \
+                         and would drop the connection"
+                    );
+                }
+                other => panic!("expected full Summaries for a pre-floor peer, got {other:?}"),
+            }
+
+            assert!(
+                h.drain_heals().is_empty(),
+                "answering an Interests query must not emit any heal"
+            );
+        }
+
+        /// The 98.1% case: the peer advertises a digest equal to ours.
+        ///
+        /// Asserts all three halves of "cheap AND correct":
+        /// - no `SummaryRequest` goes back, so NO summary bytes cross the wire;
+        /// - the peer-summary cache is seeded with the agreed bytes (#4952), so
+        ///   the peer does not stay a full-state broadcast target;
+        /// - no heal fires, because there is nothing to heal.
+        #[tokio::test]
+        async fn matching_digest_costs_no_bytes_and_still_seeds_the_summary_cache() {
+            let mut h = build_harness("hf-agree", 17010, vec![5u8; 128]).await;
+            let hash = contract_hash(&h.key);
+            let pk = h.peer_key_of(h.new_peer);
+
+            assert!(
+                h.op_manager
+                    .interest_manager
+                    .get_peer_summary(&h.key, &pk)
+                    .is_none(),
+                "precondition: we hold no cached summary for this peer"
+            );
+
+            let reply = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::SummaryDigests {
+                    entries: vec![SummaryDigestEntry {
+                        hash,
+                        summary_digest: Some(summary_digest(&h.our_summary)),
+                    }],
+                    // Inbound: the wire carries no tag, so a decoded
+                    // message is always the residual (see SummariesEmitter).
+                    emitter: SummariesEmitter::Other,
+                },
+            )
+            .await;
+
+            assert!(
+                reply.is_none(),
+                "a digest that matches must produce NO follow-up message — not \
+                 one summary byte on the wire. Got {reply:?}"
+            );
+            assert_eq!(
+                h.op_manager
+                    .interest_manager
+                    .get_peer_summary(&h.key, &pk)
+                    .as_deref()
+                    .map(|s| s.to_vec()),
+                Some(h.our_summary.clone()),
+                "the agreed summary must still be cached for the peer (#4952): \
+                 the digest PROVED these are the bytes it holds, so skipping \
+                 the seeding would leave it a full-state broadcast target"
+            );
+            assert!(
+                h.drain_heals().is_empty(),
+                "two peers that agree must not trigger a state push"
+            );
+        }
+
+        /// A digest we cannot match must ask for the bytes — and the answer to
+        /// that request must be the FULL-BYTES `Summaries`, whose untouched
+        /// handler then emits the targeted heal.
+        ///
+        /// This is the "PRESERVE THE HEAL" property end to end: the digest
+        /// exchange defers the decision rather than making it, so divergence
+        /// still reaches exactly the same `SyncStateToPeer` it reaches today,
+        /// one round trip later.
+        #[tokio::test]
+        async fn mismatching_digest_requests_bytes_and_the_heal_still_fires() {
+            let mut h = build_harness("hf-mismatch", 17020, vec![5u8; 128]).await;
+            let hash = contract_hash(&h.key);
+
+            // Leg 1: peer advertises a digest of DIFFERENT state.
+            let reply = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::SummaryDigests {
+                    entries: vec![SummaryDigestEntry {
+                        hash,
+                        summary_digest: Some(summary_digest(b"some other state")),
+                    }],
+                    // Inbound: the wire carries no tag, so a decoded
+                    // message is always the residual (see SummariesEmitter).
+                    emitter: SummariesEmitter::Other,
+                },
+            )
+            .await;
+            match &reply {
+                Some(InterestMessage::SummaryRequest { hashes }) => {
+                    assert_eq!(hashes, &vec![hash]);
+                }
+                other => panic!("a mismatching digest must request bytes, got {other:?}"),
+            }
+            assert!(
+                h.drain_heals().is_empty(),
+                "the digest leg must not heal on its own — it has not yet seen \
+                 the peer's summary, so any heal here would be guesswork"
+            );
+
+            // Leg 2: the peer answers our request. It must answer with real
+            // bytes, never with more digests (that would loop).
+            let their_summary = vec![6u8; 128];
+            let answer = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::SummaryRequest { hashes: vec![hash] },
+            )
+            .await;
+            match &answer {
+                Some(InterestMessage::Summaries { entries, emitter }) => {
+                    assert_eq!(
+                        entries[0].summary_bytes.as_deref(),
+                        Some(h.our_summary.as_slice()),
+                        "a SummaryRequest must be answered with the real bytes"
+                    );
+                    assert_eq!(
+                        *emitter,
+                        SummariesEmitter::DigestRequestReply,
+                        "#5052: the fallback leg gets its OWN arm. Folded into \
+                         InterestsReply, a rising mismatch rate would read as a \
+                         rising heartbeat cost and point at the wrong remedy."
+                    );
+                }
+                other => panic!(
+                    "a SummaryRequest must be answered with full-bytes Summaries \
+                     (answering with digests would loop), got {other:?}"
+                ),
+            }
+
+            // Leg 3: the peer's bytes arrive here, through the ORIGINAL
+            // handler. The heal fires exactly as it does on today's main.
+            let follow_up = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::Summaries {
+                    entries: vec![SummaryEntry {
+                        hash,
+                        summary_bytes: Some(their_summary.clone()),
+                    }],
+                    // Inbound: the wire carries no tag, so a decoded
+                    // message is always the residual (see SummariesEmitter).
+                    emitter: SummariesEmitter::Other,
+                },
+            )
+            .await;
+            assert!(follow_up.is_none(), "Summaries never replies");
+            assert_eq!(
+                h.drain_heals(),
+                vec![(h.key, h.new_peer)],
+                "once the bytes arrive, the targeted SyncStateToPeer heal MUST \
+                 fire — hash-first defers the heal by one round trip, it does \
+                 not remove it"
+            );
+            let pk = h.peer_key_of(h.new_peer);
+            assert_eq!(
+                h.op_manager
+                    .interest_manager
+                    .get_peer_summary(&h.key, &pk)
+                    .as_deref()
+                    .map(|s| s.to_vec()),
+                Some(their_summary),
+                "their real summary must be cached once received"
+            );
+        }
+
+        /// Control for the test above: the same `Summaries` message, but
+        /// carrying OUR bytes, must NOT heal.
+        ///
+        /// Without this pair, `mismatching_digest_requests_bytes_and_the_heal_
+        /// still_fires` would also pass against a handler that healed
+        /// unconditionally — which would be a broadcast storm, not a fix.
+        #[tokio::test]
+        async fn identical_summary_bytes_do_not_heal() {
+            let mut h = build_harness("hf-agree-control", 17030, vec![5u8; 128]).await;
+            let hash = contract_hash(&h.key);
+
+            let reply = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::Summaries {
+                    entries: vec![SummaryEntry {
+                        hash,
+                        summary_bytes: Some(h.our_summary.clone()),
+                    }],
+                    // Inbound: the wire carries no tag, so a decoded
+                    // message is always the residual (see SummariesEmitter).
+                    emitter: SummariesEmitter::Other,
+                },
+            )
+            .await;
+            assert!(reply.is_none());
+            assert!(
+                h.drain_heals().is_empty(),
+                "byte-identical summaries must never heal (that is the \
+                 property the digest-agreement path inherits)"
+            );
+        }
+
+        /// A peer that reports no state for a contract (`summary_digest: None`)
+        /// must be handled exactly like a `SummaryEntry { summary_bytes: None }`
+        /// — cached summary cleared, no bytes requested, no heal.
+        ///
+        /// Asking for bytes here would be pointless traffic (there are none),
+        /// and healing would push state at a peer that should get it through
+        /// the normal subscribe/GET flow.
+        #[tokio::test]
+        async fn peer_reporting_no_state_is_not_asked_for_bytes() {
+            let mut h = build_harness("hf-none", 17040, vec![5u8; 128]).await;
+            let hash = contract_hash(&h.key);
+            let pk = h.peer_key_of(h.new_peer);
+
+            // Seed a stale cached summary so the clear is observable.
+            h.op_manager.interest_manager.upsert_peer_summary(
+                &h.key,
+                &pk,
+                StateSummary::from(vec![9u8; 8]),
+            );
+            assert!(
+                h.op_manager
+                    .interest_manager
+                    .get_peer_summary(&h.key, &pk)
+                    .is_some(),
+                "precondition: a cached summary exists"
+            );
+
+            let reply = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::SummaryDigests {
+                    entries: vec![SummaryDigestEntry {
+                        hash,
+                        summary_digest: None,
+                    }],
+                    // Inbound: the wire carries no tag, so a decoded
+                    // message is always the residual (see SummariesEmitter).
+                    emitter: SummariesEmitter::Other,
+                },
+            )
+            .await;
+
+            assert!(
+                reply.is_none(),
+                "a peer with no state has no bytes to send; requesting them \
+                 would be pure round-trip cost. Got {reply:?}"
+            );
+            assert!(
+                h.op_manager
+                    .interest_manager
+                    .get_peer_summary(&h.key, &pk)
+                    .is_none(),
+                "a None report must clear our cached summary for the peer, \
+                 same as SummaryEntry {{ summary_bytes: None }} does"
+            );
+            assert!(h.drain_heals().is_empty());
+        }
+
+        /// An unknown contract hash must not produce a request.
+        ///
+        /// Otherwise a peer could make us emit `SummaryRequest` messages for
+        /// contracts we have never heard of, and each answer would be an empty
+        /// `Summaries` — traffic amplification from nothing.
+        #[tokio::test]
+        async fn unknown_contract_hash_produces_no_request() {
+            let mut h = build_harness("hf-unknown", 17050, vec![5u8; 128]).await;
+
+            let reply = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::SummaryDigests {
+                    entries: vec![SummaryDigestEntry {
+                        hash: contract_hash(&h.key).wrapping_add(1),
+                        summary_digest: Some(summary_digest(b"whatever")),
+                    }],
+                    // Inbound: the wire carries no tag, so a decoded
+                    // message is always the residual (see SummariesEmitter).
+                    emitter: SummariesEmitter::Other,
+                },
+            )
+            .await;
+
+            assert!(
+                reply.is_none(),
+                "a hash that resolves to no locally-tracked contract must be \
+                 ignored, not turned into a request. Got {reply:?}"
+            );
+            assert!(h.drain_heals().is_empty());
+        }
+
+        /// The per-message hash cap bounds both the work a peer can force and
+        /// the size of the request it can provoke.
+        ///
+        /// A digest entry is ~20 bytes for the sender and can cost the
+        /// receiver a contract round trip, an amplification ratio the
+        /// full-bytes `Summaries` never had. Duplicate hashes must be free.
+        #[tokio::test]
+        async fn digest_entries_are_deduplicated_and_capped() {
+            let h = build_harness("hf-cap", 17060, vec![5u8; 128]).await;
+            let hash = contract_hash(&h.key);
+
+            // 5,000 entries: the one real contract repeated, plus a long tail
+            // of unknown hashes.
+            let mut entries = vec![
+                SummaryDigestEntry {
+                    hash,
+                    summary_digest: Some(summary_digest(b"divergent")),
+                };
+                64
+            ];
+            for i in 0..5_000u32 {
+                entries.push(SummaryDigestEntry {
+                    hash: hash.wrapping_add(i + 1),
+                    summary_digest: Some(summary_digest(b"divergent")),
+                });
+            }
+
+            let reply = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::SummaryDigests {
+                    entries,
+                    emitter: SummariesEmitter::Other,
+                },
+            )
+            .await;
+
+            match reply {
+                Some(InterestMessage::SummaryRequest { hashes }) => {
+                    assert!(
+                        hashes.len() <= MAX_SUMMARY_HASHES_PER_MESSAGE,
+                        "the request must stay bounded by \
+                         MAX_SUMMARY_HASHES_PER_MESSAGE, got {}",
+                        hashes.len()
+                    );
+                    assert_eq!(
+                        hashes.iter().filter(|h| **h == hash).count(),
+                        1,
+                        "a repeated hash must appear in the request at most \
+                         once — repetition must buy the sender nothing"
+                    );
+                }
+                // Legitimate: the random rotation may push the one known hash
+                // outside the processed window. The cap is what is under test.
+                None => {}
+                other => panic!("unexpected reply {other:?}"),
+            }
+        }
+
+        /// A `SummaryRequest` naming a huge hash list must not produce an
+        /// unbounded reply, and must only ever name contracts we already
+        /// track.
+        #[tokio::test]
+        async fn summary_request_reply_is_bounded_and_scoped_to_known_contracts() {
+            let h = build_harness("hf-req-bound", 17070, vec![5u8; 128]).await;
+            let hash = contract_hash(&h.key);
+            let mut hashes: Vec<u32> = (0..10_000u32).map(|i| hash.wrapping_add(i + 1)).collect();
+            hashes.insert(0, hash);
+
+            let reply = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::SummaryRequest { hashes },
+            )
+            .await;
+
+            match reply {
+                Some(InterestMessage::Summaries { entries, .. }) => {
+                    assert_eq!(
+                        entries.len(),
+                        1,
+                        "only the one contract this node actually tracks may be \
+                         answered — a peer must not be able to enumerate or \
+                         inflate the reply with hashes we know nothing about"
+                    );
+                    assert_eq!(entries[0].hash, hash);
+                }
+                other => panic!("expected Summaries for the one known hash, got {other:?}"),
+            }
+        }
+
+        /// Source pin: the `SummaryRequest` arm must build its reply as a plain
+        /// `InterestMessage::Summaries`, NEVER through
+        /// `summaries_reply_for_peer`.
+        ///
+        /// Routing it through the encoding chooser would answer a request FOR
+        /// BYTES with more digests, and the two sides would ping-pong
+        /// (digests → request → digests → …) forever. Behavioural coverage
+        /// exists above, but only for the one shape a test can construct; this
+        /// pins the decision itself.
+        #[test]
+        fn summary_request_reply_is_always_full_bytes() {
+            let src = include_str!("node.rs");
+            let arm = src
+                .find("InterestMessage::SummaryRequest { hashes } => {")
+                .expect("SummaryRequest arm not found");
+            // End at the NEXT arm, not at a later one: the arms between
+            // would drag their own `summaries_reply_for_peer` into the window
+            // and make the negative assertion below fire on innocent code.
+            let end = src[arm..]
+                .find("InterestMessage::ChangeInterests { added, removed } => {")
+                .expect("end of SummaryRequest arm not found");
+            let body = &src[arm..arm + end];
+            assert!(
+                body.contains("get_matching_contracts"),
+                "window extraction is off — the SummaryRequest arm body should \
+                 contain its get_matching_contracts lookup"
+            );
+            assert!(
+                body.contains("Some(InterestMessage::Summaries { entries })"),
+                "the SummaryRequest arm must reply with a plain full-bytes \
+                 Summaries"
+            );
+            assert!(
+                !body.contains("summaries_reply_for_peer"),
+                "the SummaryRequest arm must NOT route through \
+                 summaries_reply_for_peer: answering a request for bytes with \
+                 digests loops the exchange (digests → request → digests → …)"
+            );
+        }
+
+        /// Source pin: the `SummaryDigests` arm must reach the heal through the
+        /// SHARED `emit_stale_peer_syncs`, and must not grow its own emission.
+        ///
+        /// A second copy of the heal path is how "hash-first traded bandwidth
+        /// for convergence" happens: the copies drift, the digest arm loses a
+        /// guard (the ban check, the budget, the targeting), and nothing fails
+        /// until production.
+        #[test]
+        fn digest_arm_shares_the_single_heal_path() {
+            let src = include_str!("node.rs");
+            let arm = src
+                .find("InterestMessage::SummaryDigests { entries, .. } => {")
+                .expect("SummaryDigests arm not found");
+            let end = src[arm..]
+                .find("InterestMessage::SummaryRequest { hashes } => {")
+                .expect("end of SummaryDigests arm not found");
+            let body = &src[arm..arm + end];
+            assert!(
+                body.contains("emit_stale_peer_syncs(op_manager, source, stale_contracts)"),
+                "the SummaryDigests arm must delegate healing to the shared \
+                 emit_stale_peer_syncs"
+            );
+            assert!(
+                !body.contains("stale_peer_sync_event("),
+                "the SummaryDigests arm must not construct heal events itself \
+                 — a second emission path drifts from the shared one and \
+                 loses its ban check / budget / targeting guards"
+            );
+            assert!(
+                !body.contains("NodeEvent::BroadcastStateChange"),
+                "a heal from the digest arm must never become an \
+                 all-subscriber fan-out (#3791/#3796)"
+            );
+            assert!(
+                body.contains("summary_indicates_stale_peer"),
+                "the SummaryDigests arm must RUN the staleness predicate on \
+                 agreement rather than assume its answer — the assumption \
+                 ('identical summaries are never stale') is a property of the \
+                 predicate, and baking it in here is how a digest match would \
+                 come to short-circuit a real heal"
+            );
+            assert!(
+                body.contains("record_summary_comparison"),
+                "the digest-agreement path must still record the #4965 \
+                 identical/differing comparison, or the telemetry that \
+                 justifies this change stops being able to measure it"
+            );
+        }
+    }
+
+    /// The pure digest classifier — the one comparison the whole exchange rests
+    /// on. Every arm is asserted, because each maps to a different wire
+    /// outcome and getting any of them backwards is silent.
+    #[test]
+    fn classify_summary_digest_covers_every_case() {
+        use freenet_stdlib::prelude::StateSummary;
+
+        let ours = StateSummary::from(vec![1u8, 2, 3]);
+        let matching = crate::ring::interest::summary_digest(&[1u8, 2, 3]);
+        let differing = crate::ring::interest::summary_digest(&[9u8, 9, 9]);
+
+        assert_eq!(
+            classify_summary_digest(Some(&ours), Some(&matching)),
+            DigestVerdict::Agree,
+            "equal digests mean the peer holds our summary — the 98.1% case"
+        );
+        assert_eq!(
+            classify_summary_digest(Some(&ours), Some(&differing)),
+            DigestVerdict::NeedBytes,
+            "differing digests must fetch the bytes so the semantic staleness \
+             probe (and the heal) can run on real data"
+        );
+        assert_eq!(
+            classify_summary_digest(None, Some(&matching)),
+            DigestVerdict::NeedBytes,
+            "we hold no summary but the peer does: we still need their bytes \
+             to seed the peer-summary cache (#4952), or they stay a full-state \
+             broadcast target forever"
+        );
+        assert_eq!(
+            classify_summary_digest(Some(&ours), None),
+            DigestVerdict::PeerHasNoState,
+            "a peer with no state is not a divergence"
+        );
+        assert_eq!(
+            classify_summary_digest(None, None),
+            DigestVerdict::PeerHasNoState,
+            "neither side holds state: nothing to exchange, nothing to heal"
+        );
     }
 }
