@@ -107,6 +107,24 @@ jobs:
         if: failure() && steps.sweep.outcome == 'failure'
         # Best-effort like the other notifier: the job is already red, and a
         # second red X from the notifier would only obscure which thing failed.
+        #
+        # SO WHAT IS THE HONEST WORST CASE, written down rather than assumed
+        # away: this page is the LAST line, not a guaranteed one. If the Freenet
+        # gateway is unreachable, `river-dev-notify` degrades to a `::warning::`
+        # and exits 0 by design, `continue-on-error` swallows anything it does
+        # not, and the only surviving signal is the red X on the Actions tab --
+        # the very channel this step exists because nobody watches. A sweep that
+        # breaks while the gateway is also down is therefore invisible until
+        # someone looks.
+        #
+        # That floor is accepted deliberately, not overlooked. Making the
+        # notifier able to fail the job would trade a missed page for a red X
+        # that blames the notifier instead of the sweep, which is strictly
+        # worse: it corrupts the diagnosis, and the run was already red anyway.
+        # A genuinely better answer is a second, independent channel (a GitHub
+        # issue opened on failure, say) rather than making this one blocking.
+        # Not built here; the floor is stated so the next reader can weigh it
+        # instead of inheriting a guarantee that was never made.
         continue-on-error: true
         uses: ./.github/actions/river-dev-notify
         with:
