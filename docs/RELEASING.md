@@ -39,8 +39,9 @@ Within ~30–60 minutes you should see:
 2. An auto-created bump PR titled `build: release X.Y.Z` that merges itself.
 3. A `vX.Y.Z` git tag pushed and a **draft** GitHub release created, which
    triggers `Build and Cross-Compile`.
-4. Cross-compile builds Linux musl + macOS (Intel + arm64) + Windows + signed
-   DMG and attaches all 14 artifacts to the draft release.
+4. Cross-compile builds Linux musl + macOS (Intel + arm64) + Windows
+   (Authenticode-signed) + signed DMG and attaches all 14 artifacts to the
+   draft release.
 5. Still inside that job, in this order: **Gate A** (the blocking auto-update
    pre-flight, see "Release gates" below) → `freenet` and `fdev` published to
    crates.io → undraft.
@@ -66,12 +67,74 @@ a `::warning::` annotation telling you what to fix.
 | `MATRIX_ACCESS_TOKEN` | release-announce.yml | Matrix job warns + skips. |
 | `RELEASE_AGENT_HMAC_NOVA` | gateway-update.yml, release-announce.yml | nova update + River announce fail (HTTP 401). |
 | `RELEASE_AGENT_HMAC_VEGA` | gateway-update.yml | vega update fails (HTTP 401). |
+| `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` | cross-compile.yml `build-x86_64-windows` (Authenticode signing) | **Does NOT degrade gracefully — this one fails the release.** See "Windows code signing" below. |
 | `FREENET_RELEASE_SIGNING_KEY` | cross-compile.yml (`Sign SHA256SUMS.txt`) | Releases are UNSIGNED (no `SHA256SUMS.txt.sig` attached). Clients accept unsigned releases during the transition window (`REQUIRE_RELEASE_SIGNATURE = false`), but once that flag is flipped to `true` in a future release, unsigned releases are REFUSED by the auto-updater. PEM-encoded ed25519 private key whose public half is baked into the updater (`update.rs` `FREENET_RELEASE_PUBKEY`). |
 
 To validate `FREENET_RELEASE_SIGNING_KEY` without cutting a release, run the
 `Build and Cross-Compile` workflow via `workflow_dispatch`: its
 `verify-signing-key` job derives the public key from the secret, asserts it
 matches the key baked into the binary, and does a sign/verify round-trip.
+
+### Windows code signing (Authenticode)
+
+`freenet.exe` and `fdev.exe` are Authenticode-signed in
+`build-x86_64-windows` via [Azure Artifact
+Signing](https://learn.microsoft.com/azure/artifact-signing/), on release tags
+and on manual `workflow_dispatch` only (routine main-push builds are not
+signed, and can never become a release because `attach-to-release` is
+tag-gated). Signing sits between the smoke test and the `upload-artifact`
+steps, so `SHA256SUMS.txt` — generated later in `attach-to-release` from the
+downloaded artifacts — covers the signed bytes.
+
+Signing `freenet.exe` covers the installer, uninstaller, tray, service wrapper
+and updater at once: on Windows they are all the same self-contained binary.
+`fdev.exe` is signed because `installer::run_install` downloads it from the
+GitHub release at install time.
+
+Expected signer subject:
+
+```
+CN=Freenet Project Inc, O=Freenet Project Inc, L=Austin, S=Texas, C=US
+```
+
+**Unlike every other secret in the table above, this path is fail-closed.** The
+`Verify signatures` step runs `Get-AuthenticodeSignature` on the runner and
+throws if a binary is unsigned, invalid, or missing its RFC3161 timestamp. A
+broken Azure configuration therefore fails `build-x86_64-windows`, and because
+`attach-to-release` needs that job, the release stops as a draft rather than
+shipping unsigned binaries. That is deliberate — but it means Azure-side
+breakage is a release-blocking failure, not a warning.
+
+Authentication is OIDC federation (`azure/login@v3`), so there is no client
+secret and no exportable key: the Artifact Signing key lives in Microsoft's
+HSM and never leaves it. The three `AZURE_*` values are identifiers, stored as
+secrets only by convention. The federated credential in Entra is pinned to the
+subject `repo:freenet/freenet-core:environment:release`, which is why the job
+declares `environment: release` and `permissions: id-token: write`. **Those
+three lines are load-bearing for authentication — do not "simplify" them.**
+
+Note that adding required reviewers to the `release` environment would pause
+*every* `Build and Cross-Compile` run, including main-push builds, since the
+Windows job is not itself gated to tags.
+
+The RFC3161 timestamp is not optional: Artifact Signing certificates are
+short-lived (~3 days), so without a countersigned timestamp every release
+binary would stop validating almost immediately.
+
+To verify a published asset from Linux/macOS (no Windows machine needed):
+
+```bash
+osslsigncode verify -in freenet.exe
+```
+
+Expect `Signature verification: ok`, the signer subject above, and a
+`Timestamp` block. A complaint about an untrusted root usually just means the
+Microsoft Identity Verification Root CA 2020 is absent from the local trust
+store; the signer, digest and timestamp lines are the useful signal.
+
+SmartScreen reputation is per-publisher and accrues over downloads, so expect
+the download warning to soften rather than vanish on the first signed release.
+Observing that requires a Windows machine and does not gate anything.
 
 `RELEASE_PAT` is a personal access token with `repo` (Contents, Pull
 requests, Metadata) and `workflow` scopes. See AGENTS.md → "Release Workflow
