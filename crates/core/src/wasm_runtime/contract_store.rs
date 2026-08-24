@@ -8,6 +8,27 @@ use crate::contract::storages::Storage;
 
 use super::RuntimeResult;
 
+/// Whether [`ContractStore::remove_contract`] actually dropped the shared code
+/// for a contract, or left it in place because another instance still uses it.
+///
+/// The WASM blob is keyed by CODE HASH and shared by every instance with the
+/// same code (every River room shares one room-contract WASM — issue #2380),
+/// so removing one instance usually must NOT drop the code. Callers that hold
+/// their own code-hash-keyed state — notably the compiled-module cache — need
+/// to know which happened, and re-deriving it afterwards would race a sibling
+/// executor's `store_contract`: this value is decided while `remove_contract`
+/// still holds the shared `contract_blob_lock`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeDisposition {
+    /// No remaining instance referenced this code hash, so the `.wasm` blob and
+    /// the code cache entry were dropped. Anything else keyed by this code hash
+    /// is now stale and should be dropped too.
+    Removed,
+    /// At least one other instance still references this code hash. The blob
+    /// stays, and so must every code-hash-keyed cache entry.
+    StillReferenced,
+}
+
 /// Shared in-memory contract instance index: `ContractInstanceId -> CodeHash`.
 ///
 /// One `Arc` is owned by `RuntimePool` and cloned into every pool executor's
@@ -499,7 +520,7 @@ impl ContractStore {
     /// referenced by another instance — corrupting every surviving
     /// contract that shares the code (e.g. every River room shares one
     /// room-contract WASM, see issue #2380).
-    pub fn remove_contract(&mut self, key: &ContractKey) -> RuntimeResult<()> {
+    pub fn remove_contract(&mut self, key: &ContractKey) -> RuntimeResult<CodeDisposition> {
         let contract_hash = *key.code_hash();
 
         // Serialize against concurrent `store_contract` on the SAME shared code
@@ -572,8 +593,9 @@ impl ContractStore {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
             }
+            return Ok(CodeDisposition::Removed);
         }
-        Ok(())
+        Ok(CodeDisposition::StillReferenced)
     }
 
     /// Returns true if the WASM code blob for `code_hash` is already present on

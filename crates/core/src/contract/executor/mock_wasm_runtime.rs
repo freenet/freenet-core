@@ -334,7 +334,9 @@ impl ContractStoreBridge for MockWasmRuntime {
     }
 
     fn remove_contract(&mut self, key: &ContractKey) -> Result<(), anyhow::Error> {
-        self.contract_store.remove_contract(key)
+        // The code disposition is only meaningful to callers holding
+        // code-hash-keyed state (the compiled-module cache); the mock has none.
+        self.contract_store.remove_contract(key).map(|_| ())
     }
 }
 

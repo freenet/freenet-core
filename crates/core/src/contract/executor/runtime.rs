@@ -2556,6 +2556,137 @@ mod remove_contract_tests {
         );
     }
 
+    /// Regression for #4754: reclaiming the LAST instance of a code hash must
+    /// also drop its compiled module from the shared module cache, mirroring the
+    /// delegate path. Before the fix, `reclaim_contract_storage` deleted the
+    /// state and the `.wasm` blob but left the module resident until byte-budget
+    /// LRU pressure evicted it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reclaim_evicts_the_compiled_module_when_the_code_is_dropped() {
+        let (mut executor, contracts_dir, _temp) = build_disk_executor("module-cache").await;
+        let (container, key) = make_contract(0x55, 0x66);
+        let params = container.params();
+        let code_hash = *key.code_hash();
+        let state = WrappedState::new(b"payload".to_vec());
+
+        executor
+            .runtime
+            .contract_store
+            .store_contract(container)
+            .expect("store contract code");
+        executor
+            .state_store
+            .store(key, state, params)
+            .await
+            .expect("store contract state");
+
+        // Seed the module cache directly: the fixture blobs are not real WASM,
+        // so nothing here would ever compile one.
+        executor.runtime.seed_contract_module_for_test(code_hash);
+        assert!(
+            executor.runtime.contract_module_cached_for_test(&code_hash),
+            "module must be cached before reclamation, or the assertion below is vacuous"
+        );
+
+        executor
+            .reclaim_contract_storage(&key)
+            .await
+            .expect("reclaim must succeed");
+
+        assert!(
+            !wasm_path(&contracts_dir, &key).exists(),
+            "precondition for this test: the code blob must actually have been dropped"
+        );
+        assert!(
+            !executor.runtime.contract_module_cached_for_test(&code_hash),
+            "compiled module must be evicted once its code hash is unreferenced (#4754)"
+        );
+    }
+
+    /// The other half of #4754, and the one the `CodeHash` re-key in PR #5324
+    /// makes easy to get wrong: the module cache is keyed by CODE HASH, so one
+    /// module serves every instance compiled from the same code. Reclaiming ONE
+    /// instance while a sibling is still hosted must NOT evict it — every River
+    /// room shares a single room-contract WASM (#2380), so a naive
+    /// evict-on-every-reclaim would force a recompile for every surviving room.
+    ///
+    /// This is the test that fails if someone "simplifies" the fix by dropping
+    /// the `CodeDisposition::Removed` guard.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reclaim_keeps_the_compiled_module_while_a_sibling_instance_remains() {
+        let (mut executor, contracts_dir, _temp) = build_disk_executor("module-shared").await;
+
+        // Same code (0x77), different params -> same code hash, two instance ids.
+        let (container_a, key_a) = make_contract(0x77, 0x01);
+        let (container_b, key_b) = make_contract(0x77, 0x02);
+        let code_hash = *key_a.code_hash();
+        assert_eq!(
+            code_hash,
+            *key_b.code_hash(),
+            "fixture must produce two instances sharing one code hash"
+        );
+        assert_ne!(
+            key_a.id(),
+            key_b.id(),
+            "fixture must produce two DISTINCT instances"
+        );
+
+        let params_a = container_a.params();
+        let params_b = container_b.params();
+        executor
+            .runtime
+            .contract_store
+            .store_contract(container_a)
+            .expect("store instance A");
+        executor
+            .runtime
+            .contract_store
+            .store_contract(container_b)
+            .expect("store instance B");
+        executor
+            .state_store
+            .store(key_a, WrappedState::new(b"a".to_vec()), params_a)
+            .await
+            .expect("store state A");
+        executor
+            .state_store
+            .store(key_b, WrappedState::new(b"b".to_vec()), params_b)
+            .await
+            .expect("store state B");
+
+        executor.runtime.seed_contract_module_for_test(code_hash);
+        assert!(
+            executor.runtime.contract_module_cached_for_test(&code_hash),
+            "module must be cached before reclamation, or the assertion below is vacuous"
+        );
+
+        executor
+            .reclaim_contract_storage(&key_a)
+            .await
+            .expect("reclaiming instance A must succeed");
+
+        assert!(
+            wasm_path(&contracts_dir, &key_a).exists(),
+            "the shared code blob must survive while instance B still references it"
+        );
+        assert!(
+            executor.runtime.contract_module_cached_for_test(&code_hash),
+            "the compiled module is shared by code hash and MUST survive while a \
+             sibling instance is still hosted (#2380) — evicting it here would \
+             force a recompile for every surviving instance"
+        );
+
+        // ...and once the last instance goes, the module goes with it.
+        executor
+            .reclaim_contract_storage(&key_b)
+            .await
+            .expect("reclaiming instance B must succeed");
+        assert!(
+            !executor.runtime.contract_module_cached_for_test(&code_hash),
+            "the module must be evicted once the LAST instance of its code is reclaimed"
+        );
+    }
+
     /// Double eviction is idempotent: a second `remove_contract` on an
     /// already-reclaimed contract is a harmless no-op, not an error.
     #[tokio::test(flavor = "multi_thread")]

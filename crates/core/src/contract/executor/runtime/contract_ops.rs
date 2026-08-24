@@ -450,7 +450,7 @@ impl Executor<Runtime> {
             )
             .await
             .inspect_err(|_| {
-                if let Err(e) = self.runtime.contract_store.remove_contract(&key) {
+                if let Err(e) = self.runtime.remove_contract_and_module(&key) {
                     tracing::warn!(contract = %key, error = %e, "failed to remove contract after validation failure");
                 }
                 // Reverse the wasm charge (#4683): the blob is removed.
@@ -462,7 +462,7 @@ impl Executor<Runtime> {
         // fetch_related_for_validation resolves RequestRelated internally,
         // so only Valid or Invalid are possible here.
         if result != ValidateResult::Valid {
-            if let Err(e) = self.runtime.contract_store.remove_contract(&key) {
+            if let Err(e) = self.runtime.remove_contract_and_module(&key) {
                 tracing::warn!(contract = %key, error = %e, "failed to remove contract after invalid validation");
             }
             // Reverse the wasm charge (#4683): the blob is removed.
@@ -492,7 +492,7 @@ impl Executor<Runtime> {
                     %over,
                     "Rejecting PUT: disk budget exceeded"
                 );
-                if let Err(e) = self.runtime.contract_store.remove_contract(&key) {
+                if let Err(e) = self.runtime.remove_contract_and_module(&key) {
                     tracing::warn!(contract = %key, error = %e, "failed to remove contract after disk-budget rejection");
                 }
                 // Reverse the wasm charge (#4683): the blob is removed.
@@ -579,7 +579,14 @@ impl Executor<Runtime> {
                 Err(())
             }
         };
-        let code_result = match self.runtime.contract_store.remove_contract(key) {
+        // `remove_contract_and_module`, not a bare `remove_contract`: reclaim the
+        // compiled module eagerly too, not only under cold-LRU pressure (#4754).
+        // The helper evicts ONLY when the shared code was actually dropped —
+        // the module cache is keyed by CODE HASH (PR #5324), so one module
+        // serves every instance compiled from the same code, and evicting it
+        // while a sibling is still hosted would force a recompile for all of
+        // them (every River room shares one room-contract WASM, #2380).
+        let code_result = match self.runtime.remove_contract_and_module(key) {
             Ok(()) => Ok(()),
             Err(e) => {
                 tracing::warn!(

@@ -1,6 +1,6 @@
 use super::{
     RuntimeResult,
-    contract_store::ContractStore,
+    contract_store::{CodeDisposition, ContractStore},
     delegate_api::DelegateApiVersion,
     delegate_store::DelegateStore,
     engine::{BackendEngine, Engine, InstanceHandle, WasmEngine},
@@ -1529,6 +1529,71 @@ impl super::contract::ContractStoreBridge for Runtime {
     fn remove_contract(&mut self, key: &ContractKey) -> Result<(), anyhow::Error> {
         self.contract_store.remove_contract(key)?;
         Ok(())
+    }
+}
+
+impl Runtime {
+    /// Drop the compiled module for `code_hash` from the shared contract-module
+    /// cache.
+    ///
+    /// Mirrors `unregister_delegate`'s `delegate_modules.remove`: when
+    /// `Executor::reclaim_contract_storage` deletes a contract's persisted
+    /// state and its `.wasm` blob, the compiled module would otherwise linger
+    /// in the byte-budget LRU until cold-eviction pressure. See issue #4754.
+    ///
+    /// **Call this ONLY when `ContractStore::remove_contract` reported
+    /// [`CodeDisposition::Removed`].** The cache is keyed by CODE HASH, which
+    /// one module shares with every instance compiled from the same code (every
+    /// River room shares one room-contract WASM — issue #2380). Evicting on any
+    /// single instance's reclaim would force a recompile for every sibling
+    /// still hosted, which costs more than the ~1-2 MB it reclaims.
+    pub(crate) fn remove_contract_module(&self, code_hash: &CodeHash) {
+        self.contract_modules.lock().unwrap().remove(code_hash);
+    }
+
+    /// Remove a contract's code and, when that actually dropped the shared code,
+    /// the compiled module with it.
+    ///
+    /// **Every site that removes contract code must go through this**, not
+    /// through `contract_store.remove_contract` plus a hand-written module
+    /// eviction. There are four such sites (the reclaim path plus three PUT
+    /// rollbacks), and the repeated-side-effect shape is exactly the one that
+    /// rots: a later migration re-inlines a subset and silently drops the
+    /// eviction on one path. Keeping the pair in one place means there is
+    /// nothing to forget.
+    pub(crate) fn remove_contract_and_module(&mut self, key: &ContractKey) -> RuntimeResult<()> {
+        let code_hash = *key.code_hash();
+        if self.contract_store.remove_contract(key)? == CodeDisposition::Removed {
+            self.remove_contract_module(&code_hash);
+        }
+        Ok(())
+    }
+
+    /// Test-only: compile a minimal module and seed the shared contract-module
+    /// cache for `code_hash`, so a test can assert whether reclamation later
+    /// removes it. `contract_modules` is `pub(super)`, so the same-crate
+    /// `remove_contract_tests` module cannot reach it directly.
+    #[cfg(test)]
+    pub(crate) fn seed_contract_module_for_test(&mut self, code_hash: CodeHash) {
+        // Minimal valid module: `\0asm` + version 1. Compiles fine; export/ABI
+        // validation happens at instantiation, not at compile.
+        const EMPTY_WASM: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        let module = self.engine.compile(EMPTY_WASM).expect("compile empty wasm");
+        let size = self.engine.module_compiled_size(&module);
+        self.contract_modules
+            .lock()
+            .unwrap()
+            .insert(code_hash, module, size);
+    }
+
+    /// Test-only companion to [`Runtime::seed_contract_module_for_test`].
+    #[cfg(test)]
+    pub(crate) fn contract_module_cached_for_test(&self, code_hash: &CodeHash) -> bool {
+        self.contract_modules
+            .lock()
+            .unwrap()
+            .get(code_hash)
+            .is_some()
     }
 }
 
