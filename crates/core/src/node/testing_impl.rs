@@ -633,6 +633,25 @@ impl ControlledSimulationResult {
             .unwrap_or_default()
     }
 
+    /// Socket addresses of `label`'s connected neighbors at the end of the
+    /// run, read from the captured live `Ring`'s connection manager. Empty if
+    /// the node never published its Ring.
+    ///
+    /// Unlike [`Self::node_neighbor_locations`] (which loses peer identity),
+    /// this preserves `SocketAddr` so a caller can reconstruct the actual
+    /// connectivity GRAPH (which peer is connected to which) by joining
+    /// against a label/pubkey -> addr map such as
+    /// [`SimNetwork::all_node_addresses`]. Used by the #5147 covered-set
+    /// broadcast-suppression measurement to extract the real post-CONNECT
+    /// mesh topology rather than a synthetic graph model.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn node_neighbor_addrs(&self, label: &NodeLabel) -> Vec<std::net::SocketAddr> {
+        self.node_rings
+            .get(label)
+            .map(|ring| ring.connection_manager.connected_peer_addrs())
+            .unwrap_or_default()
+    }
+
     /// Whether `label`'s node was actively receiving updates for `key` (has a
     /// live network/client subscription keeping the copy fresh) at the end of the
     /// run. Returns `false` if the node never published its Ring. The serve-DURING
