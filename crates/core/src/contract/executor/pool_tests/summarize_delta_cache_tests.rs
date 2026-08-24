@@ -870,12 +870,27 @@ async fn delta_cold_detector_over_unchanged_state_counts_a_reload_hit() {
 /// This arm is the one most likely to dominate `get_state_delta` volume on a
 /// client-facing node, so it gets its own coverage rather than riding on the
 /// cached-path tests.
+///
+/// Run against BOTH fan-out arms. `send_update_notification` has two
+/// textually-duplicated delta loops — one over `shared_notifications`, one over
+/// the executor-local `update_notifications` — and `RuntimePool` calls
+/// `set_shared_notifications` on EVERY executor it builds, so the SHARED arm is
+/// the only one a real node ever takes. A test that drove only the local arm
+/// would stay green with the production recorder deleted: exactly the
+/// sim-covered / field-blind shape this whole change exists to undo.
 #[tokio::test(flavor = "current_thread")]
 async fn client_notification_fanout_delta_counts_as_uncached() {
-    use crate::contract::executor::ClientId;
+    for shared in [false, true] {
+        run_fanout_uncached_case(shared).await;
+    }
+}
 
+async fn run_fanout_uncached_case(shared: bool) {
+    use crate::contract::executor::{ClientId, HostResult};
+
+    let arm = if shared { "shared" } else { "local" };
     let storage = MockStateStorage::new();
-    let (op_manager, _guards) = build_op_manager("exec_counts_fanout").await;
+    let (op_manager, _guards) = build_op_manager(&format!("exec_counts_fanout_{arm}")).await;
     let mut exec = Executor::new_mock_wasm_uncached_with_op_manager(
         "exec_counts_fanout",
         storage.clone(),
@@ -884,7 +899,31 @@ async fn client_notification_fanout_delta_counts_as_uncached() {
     .await
     .expect("create uncached executor with op_manager");
 
-    let contract = test_contract(b"exec_counts_fanout");
+    // Mirror what `RuntimePool::new` does to every executor it builds, so the
+    // fan-out takes the shared-storage arm rather than the local one.
+    #[allow(clippy::type_complexity)]
+    let shared_notifications: Arc<
+        dashmap::DashMap<
+            ContractInstanceId,
+            Vec<(ClientId, tokio::sync::mpsc::Sender<HostResult>)>,
+        >,
+    > = Arc::new(dashmap::DashMap::new());
+    #[allow(clippy::type_complexity)]
+    let shared_summaries: Arc<
+        dashmap::DashMap<
+            ContractInstanceId,
+            std::collections::HashMap<ClientId, Option<StateSummary<'static>>>,
+        >,
+    > = Arc::new(dashmap::DashMap::new());
+    if shared {
+        exec.set_shared_notifications(
+            shared_notifications.clone(),
+            shared_summaries.clone(),
+            Arc::new(dashmap::DashMap::new()),
+        );
+    }
+
+    let contract = test_contract(format!("exec_counts_fanout_{arm}").as_bytes());
     let key = contract.key();
     exec.upsert_contract_state(
         key,
@@ -897,14 +936,29 @@ async fn client_notification_fanout_delta_counts_as_uncached() {
 
     // A subscriber WITH a cached summary is what makes the fan-out take the
     // delta arm rather than shipping full state.
+    //
+    // The registration has to be written where the arm under test READS it:
+    // `Executor::register_contract_notifier` only ever writes the executor-LOCAL
+    // maps, while production registration goes through
+    // `RuntimePool::register_contract_notifier` into the shared `DashMap`s. That
+    // asymmetry is exactly why the shared arm needs its own case — a test that
+    // registered locally and then asserted on the shared arm would find no
+    // subscribers, return early, and prove nothing.
     let (tx, _rx) = tokio::sync::mpsc::channel(16);
-    exec.register_contract_notifier(
-        *key.id(),
-        ClientId::FIRST,
-        tx,
-        Some(StateSummary::from(vec![2u8; 4])),
-    )
-    .expect("register subscriber");
+    let peer_summary = StateSummary::from(vec![2u8; 4]);
+    if shared {
+        shared_notifications
+            .entry(*key.id())
+            .or_default()
+            .push((ClientId::FIRST, tx));
+        shared_summaries
+            .entry(*key.id())
+            .or_default()
+            .insert(ClientId::FIRST, Some(peer_summary.into_owned()));
+    } else {
+        exec.register_contract_notifier(*key.id(), ClientId::FIRST, tx, Some(peer_summary))
+            .expect("register subscriber");
+    }
 
     let before = exec_counts(&op_manager);
     exec.upsert_contract_state(
@@ -920,16 +974,17 @@ async fn client_notification_fanout_delta_counts_as_uncached() {
     assert_eq!(
         after.delta_wasm_uncached - before.delta_wasm_uncached,
         1,
-        "the per-subscriber fan-out delta must be counted on the UNCACHED arm"
+        "[{arm} arm] the per-subscriber fan-out delta must be counted on the \
+         UNCACHED arm"
     );
     assert_eq!(
         after.delta_wasm_calls, before.delta_wasm_calls,
-        "the fan-out delta has no cache in front of it, so it must NOT inflate \
-         the cached path's miss count"
+        "[{arm} arm] the fan-out delta has no cache in front of it, so it must \
+         NOT inflate the cached path's miss count"
     );
     assert_eq!(
         after.delta_fast_hits, before.delta_fast_hits,
-        "the fan-out delta is not a cache hit"
+        "[{arm} arm] the fan-out delta is not a cache hit"
     );
 }
 

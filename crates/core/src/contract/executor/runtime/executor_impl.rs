@@ -3248,4 +3248,110 @@ mod contract_exec_counter_pins {
              ({summarize_state_pos})"
         );
     }
+
+    /// Slice `bridged_get_contract_state_delta`'s CODE, same bounds and same
+    /// comment-stripping as [`summarize_body`].
+    fn delta_body() -> String {
+        let src = include_str!("executor_impl.rs");
+        let start = src
+            .find("pub(in crate::contract::executor) async fn bridged_get_contract_state_delta(")
+            .expect("bridged_get_contract_state_delta not found");
+        let after = &src[start..];
+        let end = after
+            .find("pub(in crate::contract::executor) async fn bridged_upsert_contract_state(")
+            .expect("next method after bridged_get_contract_state_delta not found");
+        after[..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Delta twin of the summarize ordering pin. The behavioural tests reach
+    /// this path (unlike the sim-only sink, `MockWasmRuntime` can drive it), so
+    /// this pin is documentation plus a guard on the one drift the fixtures
+    /// would not see: a counter moved ABOVE its cache check counts hits as WASM
+    /// work, and totals alone stay consistent if a hit and a miss move together.
+    #[test]
+    fn delta_wasm_counter_sits_after_both_cache_hit_returns() {
+        let body = delta_body();
+
+        let fast_hit_pos = body
+            .find(".record_delta_fast_hit();")
+            .expect("fast-path cache-hit counter not found");
+        let reload_hit_pos = body
+            .find(".record_delta_reload_hit();")
+            .expect("reload-path cache-hit counter not found");
+        let wasm_pos = body
+            .find(".record_delta_wasm_call();")
+            .expect("WASM-call counter not found");
+        let get_delta_pos = body
+            .find(".get_state_delta(&key, &params, &state, &their_summary)")
+            .expect("the WASM get_state_delta call not found");
+
+        assert!(
+            fast_hit_pos < reload_hit_pos && reload_hit_pos < wasm_pos,
+            "counter order must follow the path order: fast hit ({fast_hit_pos}) < \
+             reload hit ({reload_hit_pos}) < WASM call ({wasm_pos})"
+        );
+        assert!(
+            wasm_pos < get_delta_pos,
+            "the WASM counter ({wasm_pos}) must be recorded at the decision, \
+             immediately before the get_state_delta call it describes \
+             ({get_delta_pos})"
+        );
+    }
+
+    /// Slice `send_update_notification`'s CODE, bounded by the next top-level
+    /// item and comment-stripped, as above.
+    fn fanout_body() -> String {
+        let src = include_str!("executor_impl.rs");
+        let start = src
+            .find("pub(super) async fn send_update_notification(")
+            .expect("send_update_notification not found");
+        let after = &src[start..];
+        let end = after
+            .find("\n/// Source-scrape pins for the full-state version-gate invariant")
+            .expect("next item after send_update_notification not found");
+        after[..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// BOTH fan-out arms must record the UNCACHED delta counter.
+    ///
+    /// `send_update_notification` carries two textually-duplicated delta loops —
+    /// one over `shared_notifications`, one over the executor-local
+    /// `update_notifications`. `RuntimePool` calls `set_shared_notifications` on
+    /// every executor it builds, so the SHARED arm is the only one a real node
+    /// takes; a recorder dropped there would zero this counter in the field
+    /// while a test driving the local arm stayed green. That is the
+    /// sim-covered / field-blind shape this change exists to undo, so it gets a
+    /// structural guard on top of the two-arm behavioural test.
+    #[test]
+    fn both_fanout_arms_record_the_uncached_delta() {
+        let body = fanout_body();
+        let norm = body.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert_eq!(
+            norm.matches(".get_state_delta(").count(),
+            2,
+            "expected exactly 2 fan-out delta loops in send_update_notification; a \
+             new one needs its own record_delta_wasm_uncached() call"
+        );
+        assert_eq!(
+            norm.matches("m.record_delta_wasm_uncached();").count(),
+            2,
+            "BOTH fan-out arms must record the uncached delta arm — the shared arm \
+             is the one every RuntimePool-hosted node actually takes"
+        );
+        assert_eq!(
+            norm.matches("record_delta_wasm_call()").count(),
+            0,
+            "neither fan-out delta has a cache in front of it, so neither may \
+             record the CACHED-path arm"
+        );
+    }
 }
