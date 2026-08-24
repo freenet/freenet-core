@@ -245,21 +245,7 @@ pub fn enable_abort_on_fatal_listener_exit() {
 /// Graceful shutdown (`NodeEvent::Disconnect`, e.g. SIGTERM or auto-update) returns
 /// [`EventLoopExitReason::GracefulShutdown`]; every other listener-exit error
 /// (UDP-listener death, unexpected stream end, a handler/transport error) is fatal.
-///
-/// Public because the `freenet` binary must classify the SAME error with the SAME
-/// predicate to choose its PROCESS EXIT CODE (#5227): this predicate already
-/// reported "graceful" for a SIGTERM stop while `main` still fell through to
-/// `eprintln!("Error: …")` + `std::process::exit(1)`, so a clean `systemctl stop`
-/// logged `status=1/FAILURE` and the crash-loop rollback counted it as a crash.
-///
-/// **Necessary but NOT sufficient for a success exit.** `p2p_protoc` also raises
-/// [`EventLoopExitReason::GracefulShutdown`] when a critical internal channel dies
-/// (`ChannelCloseReason::{Bridge, Controller, Notification, OpExecution}`) — a
-/// node-fatal fault nobody requested. This predicate is deliberately permissive
-/// there, because its own job is only to suppress the #4549 force-exit; a caller
-/// choosing an EXIT CODE must additionally confirm the stop was REQUESTED. See
-/// `bin/freenet.rs::finish_run`.
-pub fn listener_exit_is_graceful(err: &anyhow::Error) -> bool {
+fn listener_exit_is_graceful(err: &anyhow::Error) -> bool {
     err.downcast_ref::<EventLoopExitReason>()
         .is_some_and(|reason| matches!(reason, EventLoopExitReason::GracefulShutdown))
 }

@@ -109,7 +109,6 @@ pub(crate) mod testing_impl;
 pub(crate) use p2p_impl::abort_process_on_redb_poison;
 pub use p2p_impl::{
     enable_abort_on_fatal_listener_exit, enable_abort_on_redb_poison, enable_fast_crash_exit_code,
-    listener_exit_is_graceful,
 };
 pub use request_router::{DeduplicatedRequest, RequestRouter};
 
@@ -1088,14 +1087,6 @@ fn try_forward_driver_reply(
     op_label: &'static str,
 ) -> bool {
     let Some(callback) = pending_op_result else {
-        // Was silent at every level. Finding the clobber bug required patching
-        // a node to see this branch at all, because "no waiter is registered"
-        // is exactly the symptom a displaced waiter produces.
-        tracing::debug!(
-            tx_id = %reply.id(),
-            %op_label,
-            "try_forward_driver_reply: no waiter registered for this tx; dropping the reply"
-        );
         return false;
     };
     let tx_id = *reply.id();

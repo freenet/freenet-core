@@ -58,18 +58,6 @@ retries = 0
 filter = "test(test_ping_blocked_peers)"
 retries = 0
 
-# #5227 graceful-shutdown exit code. The whole subject of this test is a signal
-# race (SIGTERM must reach an installed handler and the process must exit 0), so
-# a retry would be indistinguishable from the regression it exists to catch —
-# exactly the flake-laundering the repo's flaky-tests rule forbids. It also boots
-# a real `freenet network` subprocess, so its budget (120s readiness + 45s exit)
-# needs more headroom than the 240s default; without this the harness SIGKILLs it
-# instead of letting the test emit its own log-attached diagnostic.
-[[profile.ci.overrides]]
-filter = "test(graceful_shutdown_on_sigterm_exits_zero)"
-retries = 0
-slow-timeout = { period = "300s", terminate-after = 2 }
-
 [profile.nightly]
 # Nightly tests run longer by design; no retries since failures need investigation.
 retries = 0

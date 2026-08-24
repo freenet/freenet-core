@@ -251,9 +251,6 @@ gh workflow run release.yml
             └─→ creates "build: release X.Y.Z" PR
             └─→ ci.yml runs on PR (using RELEASE_PAT scope)
             └─→ PR auto-merges to main
-    └─→ release.yml: wait_for_pr
-            └─→ resolves the bump PR's merge commit -> RELEASE_SHA
-                (everything below checks out that exact commit; see #5233)
     └─→ release.yml: publish_crates
             └─→ cargo publish freenet
             └─→ cargo publish fdev
@@ -315,9 +312,8 @@ If it failed with "please provide a non-empty token" or similar, the
 then `gh run rerun --failed`.
 
 If a single crate failed mid-publish (e.g. `fdev` failed but `freenet`
-succeeded), `cargo publish -p fdev` from a checkout of the **release commit**
-(see below — not from whatever `main` is now), then manually move forward to
-tag + draft release as below.
+succeeded), `cargo publish -p fdev` from a clean main checkout, then
+manually move forward to tag + draft release as below.
 
 ### `create_release` failed
 
@@ -328,21 +324,8 @@ the runner. Fixed by [PR #4135] — if it recurs, check that the
 
 To unblock manually:
 
-Tag the **release commit**, not `main`. The release is cut from one pinned
-commit — the version-bump PR's merge commit — and `main` may have moved past
-it since (that is #5233; tagging `main` reintroduces exactly the bug the
-pipeline now prevents). Resolve it the same way the workflow does:
-
 ```bash
-# The bump PR is the "build: release X.Y.Z" one; the run log also prints
-# "📌 Release pinned to <sha>".
-RELEASE_SHA=$(gh pr view <BUMP_PR> --repo freenet/freenet-core \
-  --json mergeCommit --jq '.mergeCommit.oid')
-
-# Sanity-check it really is the bump commit before tagging it.
-git show "$RELEASE_SHA:crates/core/Cargo.toml" | grep '^version'
-
-git tag -a vX.Y.Z "$RELEASE_SHA" -m "Release vX.Y.Z"
+git tag -a vX.Y.Z <main-sha> -m "Release vX.Y.Z"
 git push origin vX.Y.Z
 gh release create vX.Y.Z --title "vX.Y.Z" \
     --notes "Release vX.Y.Z (binaries attached by cross-compile workflow)" \
@@ -480,9 +463,7 @@ release is already public by then.
 
 Both assertions are deliberately **two-sided**: the `Startup update check
 against GitHub` line must be PRESENT *and* there must be no
-`Startup update check: failed to parse` warning (the marker stops at
-`parse` so it covers the current-version arm as well as the latest-version
-one). Absence of the error on its own
+`failed to parse latest version` warning. Absence of the error on its own
 proves nothing — it is equally consistent with the check never running, which
 is exactly what `--disable-auto-update` or a dirty build produces. The canary
 also fails if the node under test has auto-update disabled at all, so
@@ -490,98 +471,6 @@ also fails if the node under test has auto-update disabled at all, so
 someone has to remember. (It had been forgotten: `framework`, the designated
 real-NAT pre-release smoke peer, ran with `--disable-auto-update` for nine days
 after a #5040 measurement window, which is why it never caught this.)
-
-### What the gates do NOT cover
-
-Worth knowing before you conclude "we have an auto-update canary, why didn't it
-catch this?"
-
-**Gate A proves exactly one chain: fetch → tag normalise → semver parse →
-compare.** That is the #5221 break and nothing more. It does *not* exercise
-signature verification, checksum-manifest matching, asset download, the binary
-swap, the exit-42 supervisor plumbing, or crash-loop rollback. A release whose
-*detection* works and whose *installer* is broken passes Gate A cleanly.
-
-**Gate B does cover download, signature, checksum and swap — but it runs the
-PREVIOUS release's binary**, because a node can only self-update *from*
-something. So a break in the installer half of the binary you are shipping is
-caught by Gate B one release later, when that binary becomes the previous one.
-Gate B is also post-publish and non-blocking, so even then it reports rather
-than stops.
-
-**Gate A cannot see a wrong COMPARISON of correct values.** Since #5236 it
-checks the version the node says it observed (`latest=`) against the tag
-`releases/latest` actually resolves to, so a fetch or normaliser that returns
-the wrong string is caught. The comparison that follows it is not covered.
-Mutate `compare_versions_for_startup`'s `latest_ver > current_ver`
-(`crates/core/src/bin/commands/auto_update.rs`) to `<` and Gate A stays green:
-the fetch is right, the parse is right, the observed value is right, and every
-marker the gate reads is exactly what a healthy run produces.
-
-This is structural, not something the gate is failing to do properly. Gate A's
-subject is by construction NEWER than `releases/latest` — the release it
-belongs to is still a draft — so there is no newer release for it to find and
-"decided not to update" is the correct outcome of a healthy run. A gate whose
-input can only produce one answer cannot distinguish comparators by their
-answer.
-
-Worth being precise about the direction, because the obvious reading is the
-wrong way round: inverting that operator does not make the node quietly do
-nothing. `latest < current` is TRUE for a Gate A run, so the node returns the
-OLDER release and requests an update to it — a self-downgrade. Gate A reports
-green on it, because a trigger is one of the outcomes it accepts. (Gate A's
-verdict comes only from `assert_detection_healthy`; it does not assert that
-the shipping binary declined to update. Adding that assertion would close this
-particular hole, at the cost of failing any release cut from a branch whose
-version is genuinely below `releases/latest` — a hotfix on an older line. It
-has not been added.)
-
-What does cover the comparison is the Rust unit tests on
-`compare_versions_for_startup` (same file, `mod tests`), which assert both
-directions and the equal case. Gate B covers it end-to-end for real, but only
-for the PREVIOUS release's binary.
-
-**An orphaned node was observed once, and the pin cannot see it.** After a real
-`preflight` returned, a `timeout 240 target/release/freenet network …` was still
-alive about four minutes later, its workdir already deleted by the EXIT trap. It
-did not reproduce: 0 leaks in 9 subsequent runs, so there is no known rate and
-no mechanism. Lifecycle case 4 pins exactly this property, but against a bash
-fake node with none of a real node's SIGTERM handling or graceful shutdown, so
-the environment that test runs in cannot produce the fault — a green case 4 is
-not evidence the leak is gone. If a canary run ever seems to hang or a later run
-reports "the startup update check never ran" for no clear reason, check for a
-stray `freenet network` process first; a leaked node holds its ports and burns
-CPU, which is how this surfaced before (see the lifecycle test's case 2 notes).
-
-**Gate B's own code is never executed by any test.** The two gaps above are
-about what the gates cannot observe when they run. This one is about the tests
-*behind* the gates, and it is worth stating separately because it is easy to
-mistake a large green suite for coverage it does not have.
-
-`scripts/auto-update-canary_test.sh` runs the canary's pure helpers against
-fixtures and source-scrapes the rest. `cmd_selfupdate` — the whole of Gate B —
-is never invoked, and neither is `resolve_expected_latest`. So nothing at any
-level runs the previous release's tarball download, the extraction check, the
-exit-42 assertion, `freenet update --quiet`, or the `awk '{print $3}'` field
-split that reads the updated binary's version. Those run for the first time
-during a real release, against a real GitHub.
-
-What the suite does pin around that code is real, and the distinction matters
-when reading a failure: the version gate that decides whether Gate B's equality
-check arms is tested behaviourally (`prev_emits_latest_seen`), and the call
-site that consumes it is pinned including its `if ` prefix, so neither a
-negation nor a reworded call can disarm the gate silently. That is the decision
-logic. The I/O sequence it guards has no test.
-
-Practical consequence: a Gate B failure is more likely to be the canary's own
-plumbing than the fleet's updater, and it is non-blocking either way. Read the
-job log before concluding anything about auto-update. Closing this needs a
-runtime test with a stubbed release archive; it is a known gap, deliberately
-deferred, not an oversight.
-
-Net: the installer half of a shipping binary has no blocking gate, and neither
-does its comparison logic. Treat a green Gate A as "this binary can still fetch
-and read new release tags", not as "auto-update works".
 
 ### If Gate A fails
 
@@ -600,20 +489,8 @@ nightly `binstall-smoke-test` will go red. crates.io versions cannot be
 un-published, so **do not delete the tag** — a yanked-looking crate pointing at
 a tag that no longer exists is worse than the draft.
 
-1. Read the job log. It distinguishes a genuine parse failure from `UNVERIFIED`
-   (GitHub was unreachable) or a port collision (exit 43, another node or
-   canary run on the host — re-run the job).
-
-   It does not always name an offending *line*, and an earlier version of this
-   step said it did. The parse-fail and fetch-fail branches echo the offending
-   log lines; the two branches most likely to fire on a healthy release — "the
-   check never ran" and "started but never logged an outcome" — have no single
-   line to name. Those now print a `canary node evidence` group holding the tail
-   of `node.out` and of the node log, because the canary deletes its workdir on
-   exit and a blocking run used to leave nothing at all behind. Read that group
-   first: a startup failure there (gateway-list fetch, config, port bind) means
-   the node never reached the update task, and the update path is not the
-   problem.
+1. Read the job log; it names the offending line and distinguishes a genuine
+   parse failure from `UNVERIFIED` (GitHub was unreachable).
 2. **If the failure was `UNVERIFIED` or a job timeout**, it is infrastructure,
    not a bug: use **Re-run failed jobs** on the cross-compile run. The build
    artifacts persist, so `attach-to-release` re-runs on its own and publishes

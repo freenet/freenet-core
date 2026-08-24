@@ -185,24 +185,6 @@ jobs:
       - name: Self-test merge-queue concurrency guard
         run: bash scripts/merge_group_concurrency_test.sh
 
-      # Regression gate for the release driver's cross-compile wait: under
-      # `set -euo pipefail` a bare `var=$(gh ...)` aborts the whole driver on a
-      # transient GitHub blip, AFTER the release publishes but BEFORE the
-      # gateways are updated and the release is announced. Pins that a failing
-      # `gh` makes the poll loop retry, while a genuinely failed attach job and
-      # an unknown publish gate still stop the release loudly.
-      - name: Self-test release wait_for_binaries gh resilience
-        run: bash scripts/release_wait_for_binaries_test.sh
-
-      # Pins the WIRING of the blocking pre-flight canary, which is what
-      # makes it a gate at all: it must run inside attach-to-release, after
-      # the assets upload and BEFORE `gh release edit --draft=false`, and
-      # not be disabled in place. Also pins release.sh's ATTACH_JOB_NAME
-      # against the job's name in cross-compile.yml -- the driver polls for
-      # that string and a rename on either side is otherwise silent.
-      - name: Self-test release canary wiring
-        run: bash scripts/release_canary_wiring_test.sh
-
       # Regression gate for #5221/#5222: auto-update was broken fleet-wide for
       # TWO releases (v0.2.120, v0.2.121) and nothing noticed, because every
       # signal was one-sided — the release built, published, installed and ran.
@@ -230,11 +212,8 @@ jobs:
       # root/sudo. shellcheck guards the installer/uninstaller scripts too.
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
-      # The canary scripts are linted here too. They were claimed shellcheck
-      # clean when they landed but were not actually in this list, so nothing
-      # held them to it. `-x` because the two test scripts `source` the canary.
       - name: Lint install/uninstall scripts (shellcheck)
-        run: shellcheck -x scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh scripts/release_wait_for_binaries_test.sh scripts/release_canary_wiring_test.sh scripts/release.sh
+        run: shellcheck scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh
       - name: Self-test install.sh service-mode decision
         run: sh scripts/test-install-sh.sh
       - name: Self-test uninstall.sh
