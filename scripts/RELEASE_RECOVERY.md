@@ -204,8 +204,9 @@ failure`, `Upload freenet binary => skipped`, `Upload fdev binary => skipped`.)
 **If this job fails at signing, the failure is Azure-side and cannot be fixed
 from the repo.** Unlike every other release secret, Windows signing is
 fail-closed: the `Verify signatures` step throws if either binary is unsigned,
-invalid, or missing its RFC3161 timestamp, and `attach-to-release` needs this
-job, so the release stops as a draft rather than shipping unsigned binaries.
+invalid, missing its RFC3161 timestamp, or signed by a publisher other than
+`CN=Freenet Project Inc`, and `attach-to-release` needs this job, so the
+release stops as a draft rather than shipping unsigned binaries.
 Read the `Verify signatures` step output first — it prints each binary's status
 and signer subject. Expect:
 

@@ -321,6 +321,16 @@ jobs:
             Write-Host "$f => $($sig.Status) / $($sig.SignerCertificate.Subject)"
             if ($sig.Status -ne 'Valid') { throw "Unsigned or invalid: $f" }
             if (-not $sig.TimeStamperCertificate) { throw "Missing timestamp: $f" }
+            # `Valid` only means "signed by SOMETHING that chains to a trusted
+            # root and is timestamped" -- it does not mean "signed by us". Both
+            # RELEASING.md and RELEASE_RECOVERY.md tell an operator to expect
+            # the subject below, which reads as though CI enforces it; without
+            # this line it did not. Matched on the CN substring rather than the
+            # whole DN so attribute order or an added attribute on reissue does
+            # not fail a release spuriously.
+            if ($sig.SignerCertificate.Subject -notlike '*CN=Freenet Project Inc*') {
+              throw "Unexpected signer for ${f}: $($sig.SignerCertificate.Subject)"
+            }
           }
 
       - name: Upload freenet binary
