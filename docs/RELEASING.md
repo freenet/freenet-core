@@ -121,16 +121,48 @@ The RFC3161 timestamp is not optional: Artifact Signing certificates are
 short-lived (~3 days), so without a countersigned timestamp every release
 binary would stop validating almost immediately.
 
-To verify a published asset from Linux/macOS (no Windows machine needed):
+To verify a published asset from Linux/macOS (no Windows machine needed),
+fetch the Microsoft root first and verify against it. **A bare
+`osslsigncode verify -in freenet.exe` reports `Signature verification: failed`
+on a correctly-signed binary** — the Microsoft Identity Verification Root CA
+2020 is not in a typical Linux trust store, so the chain cannot be built. That
+failure is a local trust-store artifact, not a problem with the signature, and
+it is confusing enough to be worth avoiding:
 
 ```bash
-osslsigncode verify -in freenet.exe
+# apt install osslsigncode   |   brew install osslsigncode
+curl -o msroot.crt \
+  "https://www.microsoft.com/pkiops/certs/microsoft%20identity%20verification%20root%20certificate%20authority%202020.crt"
+openssl x509 -inform DER -in msroot.crt -out msroot.pem
+cat /etc/ssl/certs/ca-certificates.crt msroot.pem > combined.pem
+
+osslsigncode verify -in freenet.exe -CAfile combined.pem -TSA-CAfile combined.pem
 ```
 
-Expect `Signature verification: ok`, the signer subject above, and a
-`Timestamp` block. A complaint about an untrusted root usually just means the
-Microsoft Identity Verification Root CA 2020 is absent from the local trust
-store; the signer, digest and timestamp lines are the useful signal.
+Expect, on a good binary:
+
+```
+Current message digest    : <hash>
+Calculated message digest : <hash>      # must MATCH — this is the integrity check
+Signature verification: ok
+Timestamp Server Signature verification: ok
+Number of verified signatures: 1
+Succeeded
+```
+
+and the signer subject above. Note `-TSA-CAfile` is needed as well as
+`-CAfile`; without it the timestamp chain fails separately.
+
+Do NOT pass `-CAfile msroot.pem` alone. The signature bundle embeds the root,
+and OpenSSL then rejects the chain with `self-signed certificate in
+certificate chain` even though the binary is fine. Concatenate the root onto
+the system bundle as above.
+
+**The signing certificate is valid for about 3 days** (a real example:
+`notBefore Aug 24 15:22:28 2026`, `notAfter Aug 27 15:22:28 2026`). That is
+normal for Artifact Signing and is exactly why the RFC3161 countersignature is
+mandatory — the timestamp is what keeps already-shipped binaries validating
+after the certificate expires.
 
 SmartScreen reputation is per-publisher and accrues over downloads, so expect
 the download warning to soften rather than vanish on the first signed release.
