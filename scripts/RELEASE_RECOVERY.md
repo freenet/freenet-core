@@ -544,6 +544,40 @@ If you need to rollback a release:
 ./scripts/release-rollback.sh --version 0.1.X --yank-crates
 ```
 
+`--yank-crates` yanks BOTH crates, and the fdev version is read from
+`crates/fdev/Cargo.toml` **at the release tag** — fdev's version is independent
+of freenet's (0.3.x against 0.2.x), and the working tree has usually bumped it
+again by the time anyone is rolling a release back. **Origin's tag wins** over a
+local tag of the same name: `release.sh` skips tag creation when a local tag
+already exists, so an aborted run can leave a stale one behind, while the tag
+that shipped is the one CI pushed. A disagreement between the two is printed.
+
+If the tag is gone both locally and on origin — or the manifest at it cannot be
+parsed — the script stops **before deleting anything** and asks for the version:
+
+```bash
+./scripts/release-rollback.sh --version 0.1.X --yank-crates --fdev-version 0.Y.Z
+```
+
+That is also why a run **without** `--yank-crates` prints the fdev version in
+its follow-up suggestion: the run has just deleted the tag (and the release
+page) the number would have been read from, so the second invocation needs it
+passed in.
+
+The script exits **non-zero** if any step fails, and says which. A yank is
+attempted only for a version crates.io reports as published (200); a 404 is
+reported as "not published, skipping" and is not a failure, while any other
+status is UNKNOWN and IS a failure — the 403-without-a-User-Agent trap
+described in the Quick Reference, which a two-state check reads as "not
+published" for every version ever released. There is deliberately no override
+for that: if crates.io is rate-limiting or down and the yank has to happen now,
+run it by hand once you have confirmed the version's state (`cargo yank
+--version X.Y.Z freenet`, `cargo yank --version 0.Y.Z fdev`).
+
+`--dry-run` resolves and prints the fdev version and asks crates.io whether both
+versions are actually published, without yanking or deleting anything. Worth
+running first.
+
 ## Verification Checklist
 
 After recovery, verify:

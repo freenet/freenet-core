@@ -263,6 +263,16 @@ jobs:
       - name: Self-test Rule Lint shell-assertion counter
         run: bash scripts/rule_lint_shell_assertion_counter_test.sh
 
+      # Behavioural cover for the ROLLBACK tool, the thing reached for when a
+      # release has already gone wrong. It derived fdev's version from
+      # freenet's by arithmetic (`0.$((minor + 2)).$patch`, so fdev 0.4.129 for
+      # freenet 0.2.129 — a version that has never existed, fdev's patch number
+      # being independent of freenet's), then swallowed the resulting failure
+      # and printed "Rollback complete!" over it. Both halves are properties of
+      # what the script DOES, so it is run end to end against stubs.
+      - name: Self-test release rollback
+        run: bash scripts/release_rollback_test.sh
+
       # install.sh now sets up a supervised service by default (issue #4073) so
       # new nodes auto-update. The system-vs-user + lingering decision is the
       # load-bearing new logic; these smoke tests pin it without needing real
@@ -273,7 +283,7 @@ jobs:
       # clean when they landed but were not actually in this list, so nothing
       # held them to it. `-x` because the two test scripts `source` the canary.
       - name: Lint install/uninstall scripts (shellcheck)
-        run: shellcheck -x scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh scripts/release_wait_for_binaries_test.sh scripts/release_canary_wiring_test.sh scripts/rule_lint_shell_assertion_counter_test.sh scripts/release.sh
+        run: shellcheck -x scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh scripts/release_wait_for_binaries_test.sh scripts/release_canary_wiring_test.sh scripts/rule_lint_shell_assertion_counter_test.sh scripts/release.sh scripts/release-rollback.sh scripts/release_rollback_test.sh
       - name: Self-test install.sh service-mode decision
         run: sh scripts/test-install-sh.sh
       - name: Self-test uninstall.sh
