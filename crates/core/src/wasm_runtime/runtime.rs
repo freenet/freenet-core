@@ -15,6 +15,7 @@ use freenet_stdlib::{
     },
     prelude::*,
 };
+use std::path::Path;
 use std::sync::atomic::AtomicI64;
 use std::sync::{Arc, Mutex};
 
@@ -39,7 +40,37 @@ use super::ModuleCache;
 ///   *count* cap did (the eviction-recompilation cycle behind issue #4441).
 /// - It bounds the cache's absolute memory footprint regardless of contract
 ///   count, which a count cap could not (1024 large modules ≫ 1024 small ones).
+///
+/// The contract cache is keyed by [`CodeHash`], NOT by `ContractKey`. Compilation
+/// only ever sees the WASM code (`engine.compile(code)`); parameters are written
+/// into linear memory at call time. Keying by `ContractKey` — whose `Hash`/`Eq`
+/// compare `instance = blake3(code_hash ‖ params)` — therefore compiled and
+/// retained one copy of identical machine code per PARAMETER SET: a measured
+/// ~17x duplication on a production gateway (3,746 cached modules for 215
+/// distinct `.wasm` files), which is issue #5268's largest single contributor to
+/// peers being OOM-killed at the shipped 2 GiB `MemoryMax`. The source-bytes
+/// cache one layer down (`ContractStore::contract_cache`) already keys this way.
 pub(crate) type SharedModuleCache<K> = Arc<Mutex<ModuleCache<K, <Engine as WasmEngine>::Module>>>;
+
+/// Content hash of a contract container's WASM code, derived from the bytes
+/// themselves rather than from the container's self-declared `code` field
+/// (`ContractCode::hash()` returns a stored field; nothing recomputes it on
+/// deserialization — see `ContractStore::verify_contract_identity`).
+/// Returns an error rather than `unimplemented!()` on the catch-all, matching
+/// `ContractStore::store_contract`'s reasoning for the identical situation:
+/// unreachable today (V1 is `ContractWasmAPIVersion`'s only variant), but the
+/// enum is `#[non_exhaustive]`, and this now runs on the common PUT path, so a
+/// future variant would make that panic reachable from ordinary traffic.
+fn wasm_code_hash(contract: &ContractContainer) -> RuntimeResult<CodeHash> {
+    match contract {
+        ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_v1)) => {
+            Ok(CodeHash::from_code(contract_v1.code().data()))
+        }
+        ContractContainer::Wasm(_) | _ => {
+            Err(anyhow::anyhow!("unsupported contract container version").into())
+        }
+    }
+}
 
 static INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
 
@@ -171,6 +202,13 @@ pub enum ContractExecError {
     /// peers). See `ExecutorError::host_timeout` in `contract/executor.rs`.
     #[error("The operation was queued too long on a saturated execution pool and never ran")]
     SchedulerOverloaded,
+
+    /// The module loaded but does not export the contract entry points.
+    ///
+    /// Distinct from a contract that errors: this is not a contract at all, and the
+    /// difference matters to any caller that treats "could not judge" as benign.
+    #[error("module is not a contract: missing required export(s): {missing}")]
+    MissingContractExports { missing: String },
 }
 
 pub struct RuntimeConfig {
@@ -210,8 +248,9 @@ pub struct RuntimeConfig {
     /// overrides wasmtime's 512 MiB default via
     /// `CacheConfig::with_files_total_size_soft_limit`; `None` keeps the default.
     /// Production resolves it from
-    /// [`default_wasmtime_cache_size_bytes`], which scales it to the memory the
-    /// node may use instead of pinning a flat constant.
+    /// [`default_wasmtime_cache_size_bytes_for_dir`], which scales it to BOTH
+    /// the memory the node may use AND the disk actually free on the cache's
+    /// mount, instead of pinning a flat constant or a RAM-only figure.
     pub wasmtime_cache_size_bytes: Option<u64>,
 }
 
@@ -311,12 +350,15 @@ pub(crate) const MAX_WASMTIME_CACHE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 /// defaults* stay ordered at every host size. Do not restate this as a
 /// system-level invariant.
 ///
-/// Note also that a RAM signal is not the right shape for this cache's real
-/// constraint: the compile cache is charged against the aggregate **disk** budget
-/// (`DiskUsageTracker::total_bytes()` sums state + wasm + compile-cache bytes and
-/// gates `admit_state_write` / `admit_wasm_write`), so a disk-tight but RAM-rich
-/// host is not protected by any RAM-derived bound. Tracked separately in #5014;
-/// this constant narrows the exposure on RAM-poor hosts without closing it.
+/// Note also that a RAM signal ALONE is not the right shape for this cache's
+/// real constraint: the compile cache is charged against the aggregate
+/// **disk** budget (`DiskUsageTracker::total_bytes()` sums state + wasm +
+/// compile-cache bytes and gates `admit_state_write` / `admit_wasm_write`), so
+/// a disk-tight but RAM-rich host is not protected by a RAM-derived bound on
+/// its own. This divisor narrows the exposure on RAM-poor hosts; the disk-tight
+/// case is closed by composing this RAM term with a disk-derived term via
+/// `min()` — see [`combine_wasmtime_cache_size`] / [`wasmtime_cache_size_for_disk`]
+/// (#5014).
 const WASMTIME_CACHE_RAM_DIVISOR: u64 = 8;
 
 /// Fallback "memory the node may use" estimate (1 GiB) when the OS query fails.
@@ -371,22 +413,327 @@ const WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES: u64 = 1024 * 1024 * 1024;
 /// [`default_module_cache_budget_bytes`](super::default_module_cache_budget_bytes)
 /// and overridable via `--module-cache-budget-bytes`). The two are separate
 /// caches with separate budgets; this one has no operator override today (it
-/// never had one — it was a private constant), so this derived default is its
-/// only source.
-pub(crate) fn default_wasmtime_cache_size_bytes() -> u64 {
-    let total_ram = super::read_total_ram_bytes()
-        .map(|v| v as u64)
-        .unwrap_or(WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES);
-    wasmtime_cache_size_for_ram(total_ram)
-}
-
-/// Pure clamp math behind [`default_wasmtime_cache_size_bytes`], split out so the
-/// small-box / large-box / cgroup boundary behavior is unit-testable without
-/// depending on the test host's real RAM. Mirrors the `budget_for_ram` /
-/// `disk_budget_for_clamped` pattern used by the sibling budgets.
+/// never had one — it was a private constant), so this derived default (see
+/// [`default_wasmtime_cache_size_bytes_for_dir`]) is its only source.
+///
+/// # Pure clamp math behind the RAM-side term
+///
+/// Split out so the small-box / large-box / cgroup boundary behavior is
+/// unit-testable without depending on the test host's real RAM. Mirrors the
+/// `budget_for_ram` / `disk_budget_for_clamped` pattern used by the sibling
+/// budgets.
 pub(crate) fn wasmtime_cache_size_for_ram(total_ram: u64) -> u64 {
     (total_ram / WASMTIME_CACHE_RAM_DIVISOR)
         .clamp(MIN_WASMTIME_CACHE_SIZE_BYTES, MAX_WASMTIME_CACHE_SIZE_BYTES)
+}
+
+/// Fraction of the disk space *available* on the compile-cache's mount that
+/// sizes the on-disk compile cache's disk-side term (#5014): 1/8, the SAME
+/// fraction [`WASMTIME_CACHE_RAM_DIVISOR`] applies on the RAM side, so this
+/// stays one story ("an eighth of the resource, floored and ceilinged the
+/// same way") rather than two unrelated fractions.
+const WASMTIME_CACHE_DISK_DIVISOR: u64 = 8;
+
+/// Lower clamp for the compile cache's DISK-side term ONLY (#5328 review) —
+/// deliberately LOWER than [`MIN_WASMTIME_CACHE_SIZE_BYTES`] (the RAM-side
+/// floor, also the aggregate hosting-disk budget's own floor,
+/// `MIN_DEFAULT_HOSTING_BUDGET_BYTES` in `ring/hosting/cache.rs`).
+///
+/// If the disk-side term shared the 128 MiB RAM-side floor, the two floors
+/// would COLLIDE on a genuinely small disk: `wasmtime_cache_size_for_disk`
+/// would floor at 128 MiB at the exact same reachable-disk size
+/// (256 MiB) where the aggregate disk budget ALSO floors at 128 MiB,
+/// leaving EXACTLY ZERO headroom for actual contract state — the compile
+/// cache alone would consume the entire disk-budget floor, on any host with
+/// <= 256 MiB reachable disk. That is a narrower, but still real, residual
+/// instance of the wedge #5014 exists to fix.
+///
+/// Set to `MIN_WASMTIME_CACHE_SIZE_BYTES / 4` (32 MiB) so the two floors'
+/// breakeven points coincide exactly (`32 MiB * WASMTIME_CACHE_DISK_DIVISOR
+/// == 256 MiB == MIN_DEFAULT_HOSTING_BUDGET_BYTES /
+/// DEFAULT_HOSTING_DISK_PCT`), which makes the headroom function
+/// `disk_budget - disk_term` CONTINUOUS and strictly positive across every
+/// reachable-disk size, not just the one worked example in the issue —
+/// verified by `disk_term_never_exceeds_a_quarter_of_the_aggregate_disk_budget_floor`
+/// and `headroom_is_always_positive_across_reachable_disk_sizes` below. 32 MiB
+/// still buys ~40 entries at the measured p90 on-disk artifact size (811 KiB,
+/// see [`MIN_WASMTIME_CACHE_SIZE_BYTES`]'s doc) — reduced from the RAM
+/// floor's ~161, but a host this disk-constrained also hosts far fewer
+/// distinct contracts, so a smaller working set is the right trade rather
+/// than zero state headroom.
+const MIN_WASMTIME_CACHE_SIZE_BYTES_FOR_DISK: u64 = MIN_WASMTIME_CACHE_SIZE_BYTES / 4;
+
+/// Pure clamp math for the compile cache's DISK-side term (#5014), the disk
+/// analogue of [`wasmtime_cache_size_for_ram`]. Same ceiling
+/// (`MAX_WASMTIME_CACHE_SIZE_BYTES`) as the RAM side but its OWN, lower floor
+/// ([`MIN_WASMTIME_CACHE_SIZE_BYTES_FOR_DISK`] — see that constant's doc for
+/// why sharing the RAM-side floor would leave zero state-budget headroom on
+/// a small disk).
+///
+/// `available_disk_bytes` is deliberately just the free-space reading, NOT
+/// `used + available` the way [`crate::ring::hosting::cache::disk_budget_for_clamped`]
+/// sizes the aggregate hosting-disk budget: that basis exists so the OVERALL
+/// budget doesn't shrink as a node fills with its OWN legitimately-admitted
+/// state. Here we want the opposite bias — a fresh `statvfs` read of "what's
+/// free right now" is the more conservative (safer) signal for a cache that
+/// is about to compete with state/wasm writes for that same headroom, and it
+/// needs no pre-seeded "used" figure, which isn't available yet at the point
+/// in startup this sizing runs (see [`default_wasmtime_cache_size_bytes_for_dir`]).
+/// The caller is responsible for making `available_disk_bytes` itself stable
+/// across restarts (folding the cache's OWN current footprint back in) — see
+/// that function's "Why `available_disk_bytes` folds the cache's own size
+/// back in" section; this function only applies the clamp.
+pub(crate) fn wasmtime_cache_size_for_disk(available_disk_bytes: u64) -> u64 {
+    (available_disk_bytes / WASMTIME_CACHE_DISK_DIVISOR).clamp(
+        MIN_WASMTIME_CACHE_SIZE_BYTES_FOR_DISK,
+        MAX_WASMTIME_CACHE_SIZE_BYTES,
+    )
+}
+
+/// Combine the RAM-side and disk-side terms into the compile cache's actual
+/// soft limit (#5014): `min(ram_term, disk_term)`, so a disk-tight host is
+/// bounded even when RAM is ample. `available_disk_bytes` is `None` when the
+/// mount's free-space signal could not be read (statvfs failure or an
+/// unsupported platform) — mirrors
+/// [`crate::ring::hosting::disk_usage::available_bytes`]'s own rule that an
+/// unreadable signal must not silently shrink a budget: fall back to the
+/// RAM-only figure (today's shipped behavior) rather than invent a possibly-
+/// wrong tight cap from a signal we don't trust.
+///
+/// Split out from [`default_wasmtime_cache_size_bytes_for_dir`] as pure
+/// function so the RAM/disk interaction (which one binds, the `None`
+/// fallback) is unit-testable without a real host's RAM or a real mount.
+pub(crate) fn combine_wasmtime_cache_size(
+    total_ram: u64,
+    available_disk_bytes: Option<u64>,
+) -> u64 {
+    let ram_term = wasmtime_cache_size_for_ram(total_ram);
+    match available_disk_bytes {
+        Some(available) => ram_term.min(wasmtime_cache_size_for_disk(available)),
+        None => ram_term,
+    }
+}
+
+/// The wasmtime on-disk compile cache's soft limit, bounded by BOTH the
+/// memory the node may use AND the disk space actually free on the cache
+/// directory's mount (#5014). This is the function the production path
+/// (`Executor::from_config_with_shared_modules`) calls; the non-production
+/// `Runtime::build` path never relocates the cache and has no directory to
+/// probe, so it keeps wasmtime's own default location + flat 512 MiB limit,
+/// unchanged.
+///
+/// # Callers MUST gate this on actually building a new backend engine
+///
+/// This does real filesystem work (a `statvfs` call and, via
+/// [`reconcile_existing_cache_dir`], a full recursive directory walk and
+/// possibly a `remove_dir_all`), so a caller must call it only for the ONE
+/// executor per node that actually builds a fresh `wasmtime::Engine` /
+/// `Cache` (`shared_backend.is_none()` in `from_config_with_shared_modules`
+/// — every other pool worker, and every mid-life
+/// `create_replacement_executor` panic-recovery call, reuses the already-built
+/// shared engine and never reads the value this returns). Calling it
+/// unconditionally would, on a live node, run the reconciliation's
+/// `remove_dir_all` against a directory the shared engine is actively
+/// reading/writing — exactly the kind of already-populated, in-use cache the
+/// reconciliation is meant to only ever touch once, at boot, before anything
+/// is using it (#5328 review).
+///
+/// # Why this needs the directory, not just a number
+///
+/// Wasmtime applies its soft limit once, at `Cache::new`, with no live
+/// re-application path — so this is a start-time-only value, and the
+/// filesystem probe (`statvfs` on `dir`) has to happen HERE, synchronously,
+/// before the engine is built. It cannot go through the aggregate
+/// [`crate::ring::hosting::disk_usage::DiskUsageTracker`] instead: that
+/// tracker is seeded lazily on the first ~60s sweep tick, well after this
+/// function's caller needs an answer, and seeding it here would mean walking
+/// every persisted contract-state row before the node can even build its WASM
+/// engine.
+///
+/// # Immediate relief for an already-oversized cache
+///
+/// A node upgrading from an older build (or one that just got less disk) can
+/// already have MORE on disk than the limit computed here. Wasmtime's own
+/// cleanup is gated by a marker file compared against a ~1h interval, and
+/// that marker persists across restarts — so a node that hasn't cleaned up
+/// recently often DOES prune promptly on its first post-restart cache write
+/// (#5328 review), not after a fixed wait. But there is no GUARANTEE of
+/// that (a node that restarts often, or restarts shortly after its own
+/// cleanup ran, waits out the rest of the interval either way), and while
+/// waiting the wedge persists. Reconciling here, once, at startup, gives
+/// the fix effect on the very next restart unconditionally, rather than
+/// depending on wasmtime's internal cleanup timing (see
+/// [`reconcile_existing_cache_dir`]).
+///
+/// # Why `available_disk_bytes` folds the cache's own current size back in
+///
+/// A naive `statvfs` read of raw free space makes the computed limit a
+/// function of the cache's OWN current footprint — the cache occupies disk,
+/// so a bigger cache means less "available," means a SMALLER computed limit
+/// next boot, which (if it now reads as an overshoot) triggers
+/// [`reconcile_existing_cache_dir`] to wipe the cache, which makes MORE disk
+/// "available" next boot, computing a LARGER limit, letting the cache regrow
+/// toward it, shrinking "available" again on the boot after that — a
+/// feedback loop that (#5328 review, verified by hand) converges to
+/// wiping-every-other-restart in steady state for an actively-used node,
+/// defeating the entire point of a persistent on-disk compile cache. Adding
+/// the cache's OWN current on-disk size back to the raw `statvfs` reading
+/// makes the basis `raw_free + current_cache_bytes` — the disk capacity
+/// reachable if the cache were empty — which does NOT depend on the cache's
+/// current size, so the computed limit is STABLE across restarts as long as
+/// other disk usage (state, wasm, unrelated files) doesn't change. This
+/// mirrors the SAME `used + available` stability rationale
+/// [`crate::ring::hosting::cache::disk_budget_for_clamped`] already documents
+/// for the aggregate hosting-disk budget.
+///
+/// # Why the operator's configured disk budget also has to bind
+///
+/// Bounding purely by PHYSICAL disk availability closes the accidental case
+/// (a small physical disk) but not the deliberate one: an operator who sets
+/// `--max-hosting-disk` below the disk's physical capacity (e.g. to reserve
+/// room for other services on a large shared disk) still has physical
+/// availability read as large, so the physical term alone would still
+/// resolve to the RAM ceiling — reproducing #5014's wedge against the
+/// operator's OWN configured budget instead of against physical scarcity.
+/// This was the ORIGINAL issue's own suggested direction (reuse
+/// [`crate::ring::hosting::cache::disk_budget_for_clamped`], the exact
+/// function the live aggregate budget uses), not an addition beyond its
+/// scope. See [`bound_by_configured_disk_budget`].
+pub(crate) fn default_wasmtime_cache_size_bytes_for_dir(
+    dir: &Path,
+    hosting_disk_pct: f64,
+    max_hosting_disk: u64,
+) -> u64 {
+    let total_ram = super::read_total_ram_bytes()
+        .map(|v| v as u64)
+        .unwrap_or(WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES);
+    // Walk ONCE, share the result between the stabilized availability signal
+    // and the reconciliation threshold check below — no need to re-walk.
+    let current_cache_bytes = crate::ring::disk_directory_size_bytes(dir);
+    let raw_available_disk_bytes = crate::ring::disk_available_bytes(dir);
+    let stabilized_available_disk_bytes =
+        stabilize_available_disk_bytes(raw_available_disk_bytes, current_cache_bytes);
+    let physical_term = combine_wasmtime_cache_size(total_ram, stabilized_available_disk_bytes);
+    let limit = bound_by_configured_disk_budget(
+        physical_term,
+        current_cache_bytes,
+        raw_available_disk_bytes,
+        hosting_disk_pct,
+        max_hosting_disk,
+    );
+    reconcile_existing_cache_dir(dir, current_cache_bytes, limit);
+    limit
+}
+
+/// Fraction of the operator's CONFIGURED aggregate disk budget the compile
+/// cache may consume on its own (#5328 review) — 1/4, the SAME fraction
+/// [`MIN_WASMTIME_CACHE_SIZE_BYTES_FOR_DISK`] uses relative to the RAM-side
+/// floor, so the two mechanisms agree at their shared worst case: when the
+/// configured budget is itself at ITS OWN floor
+/// (`MIN_DEFAULT_HOSTING_BUDGET_BYTES` = 128 MiB), a quarter of it is exactly
+/// 32 MiB — [`MIN_WASMTIME_CACHE_SIZE_BYTES_FOR_DISK`]'s own value — so this
+/// term never re-opens the floor-collision headroom gap that constant was
+/// added to close.
+const CONFIGURED_DISK_BUDGET_ALLOWANCE_DIVISOR: u64 = 4;
+
+/// Further bound `physical_term` (already sized from RAM + raw physical disk)
+/// by a fraction of what the AGGREGATE hosting-disk budget will project to,
+/// using the operator's configured `hosting_disk_pct` / `max_hosting_disk`
+/// (#5328 review — see [`default_wasmtime_cache_size_bytes_for_dir`]'s "Why
+/// the operator's configured disk budget also has to bind"). Computed via
+/// the SAME [`crate::ring::hosting::cache::disk_budget_for_clamped`] function
+/// the live aggregate budget uses, fed `(used = current_cache_bytes,
+/// available = raw_available_disk_bytes)` — the same `used + available`
+/// identity [`stabilize_available_disk_bytes`] already relies on, so this
+/// projection is STABLE across restarts for the same reason that function
+/// is (a pure function of total reachable capacity, not of how much the
+/// cache itself currently occupies).
+///
+/// `raw_available_disk_bytes: None` (unreadable signal) skips this bound
+/// entirely — the physical term's own `None`-fallback already applies, and
+/// there is no available/used basis to project a budget from.
+fn bound_by_configured_disk_budget(
+    physical_term: u64,
+    current_cache_bytes: u64,
+    raw_available_disk_bytes: Option<u64>,
+    hosting_disk_pct: f64,
+    max_hosting_disk: u64,
+) -> u64 {
+    let Some(raw_available) = raw_available_disk_bytes else {
+        return physical_term;
+    };
+    let configured_budget = crate::ring::disk_budget_for_clamped(
+        current_cache_bytes,
+        raw_available,
+        hosting_disk_pct,
+        crate::ring::MIN_DEFAULT_HOSTING_BUDGET_BYTES,
+        max_hosting_disk,
+    );
+    physical_term.min(configured_budget / CONFIGURED_DISK_BUDGET_ALLOWANCE_DIVISOR)
+}
+
+/// Fold a directory's own current on-disk size back into a raw free-space
+/// reading, so the result represents "disk reachable if this directory were
+/// empty" rather than "disk free right now" — see
+/// [`default_wasmtime_cache_size_bytes_for_dir`]'s "Why `available_disk_bytes`
+/// folds the cache's own current size back in" doc for the boot-to-boot
+/// oscillation this prevents (#5328 review). `None` (unreadable raw signal)
+/// stays `None` — folding must never turn an untrusted signal into a trusted
+/// one.
+///
+/// Split out as a pure function so the stabilization property is testable
+/// deterministically: a real end-to-end test through actual `statvfs` cannot
+/// reliably distinguish "fixed" from "buggy" on a host with generous free
+/// disk (the oscillation only manifests when the cache's own footprint is a
+/// non-negligible fraction of `available` — a real dev/CI machine's disk is
+/// typically hundreds of GB free, dwarfing even a full 512 MiB cache, so both
+/// versions land on the same ceiling-clamped answer and the test is vacuous).
+fn stabilize_available_disk_bytes(
+    raw_available: Option<u64>,
+    current_cache_bytes: u64,
+) -> Option<u64> {
+    raw_available.map(|raw| raw.saturating_add(current_cache_bytes))
+}
+
+/// If a PRIOR run already left more than `new_soft_limit_bytes` on disk under
+/// `dir` — a RAM-rich host whose disk tightened, an operator who moved to a
+/// smaller disk, or simply a node upgrading from before #5014 narrowed this
+/// limit — clear the directory rather than waiting on wasmtime's own ~1h
+/// internal prune cycle to catch up. `current_bytes` is the caller's ALREADY
+/// walked measurement (see [`default_wasmtime_cache_size_bytes_for_dir`]) —
+/// this function does no filesystem read of its own beyond the delete.
+///
+/// This is a pure cache of recompiled-from-WASM artifacts: clearing it is
+/// always safe (worst case, the next distinct contract blob recompiles once
+/// instead of hitting the cache) and is the only way to give an
+/// ALREADY-WEDGED node (#5014: the aggregate disk budget's `admit_state_write`
+/// / `admit_wasm_write` rejecting every write because the disk budget counts
+/// the oversized cache) relief on the very next restart, instead of an
+/// up-to-an-hour wait.
+///
+/// Best-effort: this is a startup optimization, not a correctness
+/// requirement, so a delete failure is logged and otherwise ignored — it must
+/// never fail node boot, and a directory that fails to clear just falls back
+/// to wasmtime's own prune cycle, the pre-#5014 behavior.
+fn reconcile_existing_cache_dir(dir: &Path, current_bytes: u64, new_soft_limit_bytes: u64) {
+    if current_bytes <= new_soft_limit_bytes {
+        return;
+    }
+    tracing::info!(
+        dir = %dir.display(),
+        current_bytes,
+        new_soft_limit_bytes,
+        "wasmtime compile cache exceeds the newly-computed disk-aware soft \
+         limit; clearing it for immediate relief (#5014)"
+    );
+    if let Err(error) = std::fs::remove_dir_all(dir) {
+        tracing::warn!(
+            dir = %dir.display(),
+            %error,
+            "failed to clear oversized wasmtime compile cache; falling back \
+             to wasmtime's own prune cycle"
+        );
+    }
 }
 
 impl Default for RuntimeConfig {
@@ -467,8 +814,10 @@ pub struct Runtime {
 
     pub(super) secret_store: SecretsStore,
     pub(super) delegate_store: DelegateStore,
-    /// LRU cache of compiled delegate modules (shared across pool executors).
-    pub(super) delegate_modules: SharedModuleCache<DelegateKey>,
+    /// LRU cache of compiled delegate modules (shared across pool executors),
+    /// keyed by the CODE hash rather than the delegate key — see
+    /// [`SharedModuleCache`] and `prepare_delegate_call`.
+    pub(super) delegate_modules: SharedModuleCache<CodeHash>,
     /// Persisted `ctx.write()` bytes per delegate, shared across pool
     /// executors so a prompt round-trip routed to a different `Runtime` still
     /// sees the pending state. See `native_api::DelegateContextCache`.
@@ -486,8 +835,10 @@ pub struct Runtime {
 
     /// Local contract storage.
     pub(crate) contract_store: ContractStore,
-    /// LRU cache of compiled contract modules (shared across pool executors).
-    pub(super) contract_modules: SharedModuleCache<ContractKey>,
+    /// LRU cache of compiled contract modules (shared across pool executors),
+    /// keyed by the CODE hash rather than the contract instance — see
+    /// [`SharedModuleCache`] and `prepare_contract_call_inner`.
+    pub(super) contract_modules: SharedModuleCache<CodeHash>,
 
     /// Optional state storage backend for V2 delegate contract access.
     pub(crate) state_store_db: Option<crate::contract::storages::Storage>,
@@ -632,6 +983,16 @@ impl Runtime {
     ///
     /// Runs ON the contract loop (serialized with delegate `store_secret`),
     /// mirroring the on-loop write discipline of `import_secret_bundle`.
+    ///
+    /// UNREACHABLE as of GHSA-824h-7x5x-wfmf: the sole caller (the
+    /// `RegisterDelegateWithPredecessors` handler in
+    /// `crates/core/src/contract/executor/runtime/delegates.rs`) no longer
+    /// calls this, because the `origin_contract` this method's H1 gate relies
+    /// on is forgeable by any HTTP client — see GHSA-824h-7x5x-wfmf for the exploit chain.
+    /// Kept (not deleted) so the underlying `SecretsStore::migrate_secrets`
+    /// mechanism, which is otherwise sound, is easy to re-wire once
+    /// `origin_contract` attestation is hardened.
+    #[allow(dead_code)]
     pub(crate) fn migrate_delegate_secrets(
         &mut self,
         predecessors: &[DelegateKey],
@@ -726,8 +1087,8 @@ impl Runtime {
         delegate_store: DelegateStore,
         secret_store: SecretsStore,
         host_mem: bool,
-        contract_modules: SharedModuleCache<ContractKey>,
-        delegate_modules: SharedModuleCache<DelegateKey>,
+        contract_modules: SharedModuleCache<CodeHash>,
+        delegate_modules: SharedModuleCache<CodeHash>,
         delegate_contexts: super::native_api::DelegateContextCache,
         created_delegates_count: super::native_api::SharedDelegateCounter,
         inherited_origins: super::native_api::SharedInheritedOrigins,
@@ -899,6 +1260,40 @@ impl Runtime {
         Ok(unsafe { WasmLinearMem::new(ptr, size as u64) })
     }
 
+    /// Compile and instantiate a stored contract without calling any of its exports.
+    ///
+    /// Used by the conformance tooling so that malformed WASM, or a module missing
+    /// the contract ABI, fails at the point the caller says "load this contract"
+    /// rather than surfacing later as an inconclusive check result. The distinction
+    /// matters because "the contract could not be loaded" and "the contract could
+    /// not be judged" look identical to a caller otherwise, and the first should be
+    /// a hard error while the second must never be one.
+    /// Compiling is not enough on its own: a module can compile and instantiate
+    /// while exporting none of the contract entry points, in which case every later
+    /// call fails and a conformance run reads that as "could not judge this
+    /// contract" instead of "this is not a contract". So the ABI is resolved here
+    /// too.
+    pub(crate) fn compile_check(
+        &mut self,
+        key: &ContractKey,
+        parameters: &Parameters<'_>,
+    ) -> RuntimeResult<()> {
+        let mut running = self.prepare_contract_call(key, parameters, 0)?;
+        let missing = self.engine.missing_contract_exports_for(&running.handle);
+        // Release the instance explicitly. Dropping `RunningInstance` alone only
+        // clears `MEM_ADDR`; the engine keeps the instance and its memory until the
+        // engine itself is dropped, so every oracle built would otherwise carry a
+        // leaked instance and log the cleanup warning.
+        self.drop_running_instance(&mut running);
+        if !missing.is_empty() {
+            return Err(ContractExecError::MissingContractExports {
+                missing: missing.join(", "),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     pub(super) fn prepare_contract_call(
         &mut self,
         key: &ContractKey,
@@ -940,15 +1335,46 @@ impl Runtime {
         req_bytes: usize,
         already_fetched: Option<&ContractContainer>,
     ) -> RuntimeResult<RunningInstance> {
+        // Resolve the CODE hash this instance runs, which is what the compiled
+        // module is keyed by (issue #5268). Compilation only ever sees the WASM
+        // code — parameters are written into linear memory at call time — so N
+        // instances of one contract share one compiled module.
+        //
+        // The hash must NOT come from `key.code_hash()`: that is an unverified
+        // serde field which `ContractKey`'s `Hash`/`Eq` never consult, so a
+        // caller naming an instance it is entitled to could otherwise choose
+        // WHICH cached module ran for it (the same reasoning as
+        // `ContractStore::fetch_contract`). Instead it comes from the node's own
+        // instance index, or — for a caller holding a not-yet-indexed container
+        // — from hashing the very bytes we are about to compile.
+        let code_hash = match already_fetched {
+            Some(contract) => wasm_code_hash(contract)?,
+            None => self
+                .contract_store
+                .code_hash_from_id(key.id())
+                .ok_or_else(|| {
+                    tracing::error!(
+                        contract = %key,
+                        phase = "prepare_contract_call_failed",
+                        "Contract not indexed in store during WASM execution"
+                    );
+                    RuntimeInnerError::ContractNotFound(*key)
+                })?,
+        };
         // Check shared cache first. The lock is held only for the duration of
         // the lookup + Module clone (an Arc bump) and is ALWAYS dropped before
         // the compile below — never held across the blocking compile.
-        let cached = self.contract_modules.lock().unwrap().get(key).cloned();
+        let cached = self
+            .contract_modules
+            .lock()
+            .unwrap()
+            .get(&code_hash)
+            .cloned();
         let module = if let Some(module) = cached {
-            tracing::debug!(contract = %key, "Module cache hit");
+            tracing::debug!(contract = %key, %code_hash, "Module cache hit");
             module
         } else {
-            tracing::info!(contract = %key, "Module cache miss — compiling");
+            tracing::info!(contract = %key, %code_hash, "Module cache miss — compiling");
             // Cache miss — obtain the code and compile with the lock released
             // so the (potentially multi-hundred-millisecond) Cranelift compile
             // never blocks other executors waiting on the shared cache. When
@@ -992,10 +1418,10 @@ impl Runtime {
             // duplicate Cranelift work, but two distinct misses can still race
             // to this insert). Prefer the already-cached clone if present.
             let mut cache = self.contract_modules.lock().unwrap();
-            if let Some(existing) = cache.get(key).cloned() {
+            if let Some(existing) = cache.get(&code_hash).cloned() {
                 existing
             } else {
-                cache.insert(*key, module.clone(), compiled_size);
+                cache.insert(code_hash, module.clone(), compiled_size);
                 module
             }
         };
@@ -1018,14 +1444,32 @@ impl Runtime {
         key: &DelegateKey,
         req_bytes: usize,
     ) -> RuntimeResult<(RunningInstance, DelegateApiVersion)> {
+        // Same defect and same fix as the contract cache above (#5268):
+        // `prepare_delegate_call` compiles `delegate.code()` alone, but
+        // `DelegateKey`'s identity covers `key = BLAKE3(code_hash ‖ params)`, so
+        // keying by it compiled and retained one copy of identical machine code
+        // per PARAMETER SET — the shape per-user / per-room parameterized
+        // delegates hit hardest. The hash is resolved through this node's own
+        // delegate index for the same trust reason: `key.code_hash()` is
+        // unverified serde data, so a caller could otherwise name a delegate
+        // while choosing which cached module ran for it.
+        let code_hash = self
+            .delegate_store
+            .code_hash_from_key(key)
+            .ok_or_else(|| RuntimeInnerError::DelegateNotFound(key.clone()))?;
         // Lock held only for the lookup + Module clone; always dropped before
         // the compile below (never held across the blocking compile).
-        let cached = self.delegate_modules.lock().unwrap().get(key).cloned();
+        let cached = self
+            .delegate_modules
+            .lock()
+            .unwrap()
+            .get(&code_hash)
+            .cloned();
         let module = if let Some(module) = cached {
-            tracing::debug!(delegate = %key, "Module cache hit");
+            tracing::debug!(delegate = %key, %code_hash, "Module cache hit");
             module
         } else {
-            tracing::info!(delegate = %key, "Module cache miss — compiling");
+            tracing::info!(delegate = %key, %code_hash, "Module cache miss — compiling");
             let delegate = self
                 .delegate_store
                 .fetch_delegate(key, params)
@@ -1036,10 +1480,10 @@ impl Runtime {
             // Re-check cache: the lock was released before compilation, so
             // another executor may have compiled and cached this delegate.
             let mut cache = self.delegate_modules.lock().unwrap();
-            if let Some(existing) = cache.get(key).cloned() {
+            if let Some(existing) = cache.get(&code_hash).cloned() {
                 existing
             } else {
-                cache.insert(key.clone(), module.clone(), compiled_size);
+                cache.insert(code_hash, module.clone(), compiled_size);
                 module
             }
         };
@@ -1086,11 +1530,6 @@ impl super::contract::ContractStoreBridge for Runtime {
         self.contract_store.remove_contract(key)?;
         Ok(())
     }
-
-    fn ensure_key_indexed(&mut self, key: &ContractKey) -> Result<(), anyhow::Error> {
-        self.contract_store.ensure_key_indexed(key)?;
-        Ok(())
-    }
 }
 
 impl super::contract::ContractRuntimeBridge for Runtime {}
@@ -1099,8 +1538,7 @@ impl super::contract::ContractRuntimeBridge for Runtime {}
 mod wasmtime_disk_cache_sizing_tests {
     use super::{
         MAX_WASMTIME_CACHE_SIZE_BYTES, MIN_WASMTIME_CACHE_SIZE_BYTES,
-        WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES, default_wasmtime_cache_size_bytes,
-        wasmtime_cache_size_for_ram,
+        WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES, wasmtime_cache_size_for_ram,
     };
     use crate::ring::hosting_budget_for_ram;
 
@@ -1262,52 +1700,50 @@ mod wasmtime_disk_cache_sizing_tests {
         );
     }
 
-    /// The live reader applies the pure clamp to the RAM signal rather than
-    /// carrying its own arithmetic.
-    ///
-    /// This is a consistency check, and on a host above the ceiling-binding
-    /// point (>= 4 GiB, i.e. most CI machines) it CANNOT distinguish a reader
-    /// that ignores RAM and returns the ceiling constant — both sides evaluate
-    /// to the ceiling. `default_soft_limit_reader_derives_from_the_ram_signal`
-    /// below covers that host-independently, which is why the previous
-    /// `(MIN..=MAX).contains(&resolved)` assertion was dropped: a function that
-    /// clamps by construction can never fail a containment check, so it tested
-    /// nothing at all.
+    /// Host-independent pin: the live reader (`default_wasmtime_cache_size_bytes_for_dir`,
+    /// #5014) must derive its value from the shared RAM signal AND the disk
+    /// availability signal, delegating to the pure combiner rather than
+    /// carrying its own arithmetic or re-hardcoding a flat constant. This is a
+    /// source-scrape pin (not a live-value comparison) because on a host above
+    /// the ceiling-binding point on BOTH axes a reader that ignores its inputs
+    /// entirely would still coincidentally return the ceiling — see
+    /// `wasmtime_disk_cache_disk_sizing_tests` for the live-value coverage that
+    /// exercises the RAM/disk interaction itself.
     #[test]
-    fn default_soft_limit_matches_the_pure_clamp_of_this_hosts_ram_signal() {
-        let signal = crate::wasm_runtime::read_total_ram_bytes()
-            .map(|v| v as u64)
-            .unwrap_or(WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES);
-        assert_eq!(
-            default_wasmtime_cache_size_bytes(),
-            wasmtime_cache_size_for_ram(signal),
-            "the live reader must apply the pure clamp to the RAM signal"
-        );
-    }
-
-    /// Host-independent pin: the live reader must derive its value from the
-    /// shared RAM signal and delegate to the pure clamp. Fails if a future edit
-    /// re-hardcodes the limit or introduces a second notion of machine size —
-    /// the mutation a runtime assertion cannot catch on a large CI host.
-    #[test]
-    fn default_soft_limit_reader_derives_from_the_ram_signal() {
+    fn default_soft_limit_reader_derives_from_ram_and_disk_signals() {
         let src = include_str!("runtime.rs");
         let body = src
-            .split("pub(crate) fn default_wasmtime_cache_size_bytes() -> u64 {")
+            .split("pub(crate) fn default_wasmtime_cache_size_bytes_for_dir(")
             .nth(1)
-            .expect("default_wasmtime_cache_size_bytes must exist")
+            .expect("default_wasmtime_cache_size_bytes_for_dir must exist")
             .split("\n}\n")
             .next()
-            .expect("end of default_wasmtime_cache_size_bytes");
+            .expect("end of default_wasmtime_cache_size_bytes_for_dir");
         assert!(
             body.contains("read_total_ram_bytes()"),
             "the reader must consult the shared read_total_ram_bytes() signal, not \
              a second notion of machine size"
         );
         assert!(
-            body.contains("wasmtime_cache_size_for_ram("),
-            "the reader must delegate to the pure clamp so the boundary math has \
-             exactly one implementation"
+            body.contains("disk_available_bytes("),
+            "the reader must consult a real disk-availability signal — a RAM-only \
+             reader is exactly the #5014 defect"
+        );
+        assert!(
+            body.contains("combine_wasmtime_cache_size("),
+            "the reader must delegate to the pure combiner so the RAM/disk \
+             interaction has exactly one implementation"
+        );
+        assert!(
+            body.contains("bound_by_configured_disk_budget("),
+            "the reader must ALSO bound the physical-disk term by the \
+             operator's configured hosting-disk budget — a physical-only \
+             bound leaves an operator-shrunk --max-hosting-disk wedged"
+        );
+        assert!(
+            body.contains("reconcile_existing_cache_dir("),
+            "the reader must reconcile an already-oversized cache directory, not \
+             just narrow the limit for future growth"
         );
     }
 
@@ -1327,7 +1763,501 @@ mod wasmtime_disk_cache_sizing_tests {
     /// *increase* for hosts that are unaffected today.
     #[test]
     fn clamp_bounds_are_ordered_and_ceiling_is_the_historical_default() {
-        assert!(MIN_WASMTIME_CACHE_SIZE_BYTES < MAX_WASMTIME_CACHE_SIZE_BYTES);
+        // Compile-time tripwire: the clamp bounds are consts, so checking their
+        // ordering at compile time catches a regression immediately rather than
+        // only when this test happens to run.
+        const _: () = assert!(MIN_WASMTIME_CACHE_SIZE_BYTES < MAX_WASMTIME_CACHE_SIZE_BYTES);
         assert_eq!(MAX_WASMTIME_CACHE_SIZE_BYTES, LEGACY_FLAT_SOFT_LIMIT_BYTES);
+    }
+}
+
+/// #5014: the disk-side term, the RAM/disk composition, and the startup
+/// reconciliation that gives an already-oversized cache immediate relief.
+#[cfg(test)]
+mod wasmtime_disk_cache_disk_sizing_tests {
+    use super::{
+        MAX_WASMTIME_CACHE_SIZE_BYTES, MIN_WASMTIME_CACHE_SIZE_BYTES,
+        WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES, bound_by_configured_disk_budget,
+        combine_wasmtime_cache_size, default_wasmtime_cache_size_bytes_for_dir,
+        reconcile_existing_cache_dir, stabilize_available_disk_bytes, wasmtime_cache_size_for_disk,
+        wasmtime_cache_size_for_ram,
+    };
+    use std::io::Write;
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+
+    /// Floor/ceiling boundary for the disk-side term, mirroring
+    /// `compile_cache_floor_binds_on_tiny_hosts` /
+    /// `compile_cache_ceiling_binds_on_large_hosts` for the RAM-side term.
+    /// Concrete byte values, not comparisons against the constants — see
+    /// those tests' doc comment for why a self-referential assertion would
+    /// pass even if the floor were mutated to 0.
+    #[test]
+    fn disk_term_floor_and_ceiling_bind() {
+        // The disk-side floor is 32 MiB — deliberately LOWER than the 128 MiB
+        // RAM-side/aggregate-budget floor, see
+        // `MIN_WASMTIME_CACHE_SIZE_BYTES_FOR_DISK`'s doc (#5328 review).
+        assert_eq!(wasmtime_cache_size_for_disk(0), 32 * MIB);
+        assert_eq!(wasmtime_cache_size_for_disk(1), 32 * MIB);
+        // Exactly at the binding point: 256 MiB / 8 == 32 MiB == the floor.
+        assert_eq!(wasmtime_cache_size_for_disk(256 * MIB), 32 * MIB);
+        // One divisor-step above it the derived value takes over.
+        assert_eq!(wasmtime_cache_size_for_disk(256 * MIB + 8), 32 * MIB + 1);
+        // Exactly at the binding point: 4 GiB / 8 == 512 MiB == the ceiling.
+        assert_eq!(wasmtime_cache_size_for_disk(4 * GIB), 512 * MIB);
+        assert_eq!(wasmtime_cache_size_for_disk(8 * GIB), 512 * MIB);
+        // u64::MAX must clamp, not wrap or panic.
+        assert_eq!(wasmtime_cache_size_for_disk(u64::MAX), 512 * MIB);
+    }
+
+    /// The exact shape from #5014's worked example: a 16 GiB VM (RAM ample —
+    /// the RAM term resolves to the historical 512 MiB ceiling) with only
+    /// 400 MiB free on the data-dir mount. Before this fix, ONLY the RAM term
+    /// existed, so this host got a 512 MiB compile cache while its whole disk
+    /// budget (`clamp(0.5 * (used + available), ...)`) sat far below that —
+    /// wedging `admit_state_write`/`admit_wasm_write` shut. The disk term
+    /// must now pull the combined result down from the RAM ceiling.
+    #[test]
+    fn ram_rich_disk_tight_host_is_bounded_by_the_disk_term() {
+        let ram_only = wasmtime_cache_size_for_ram(16 * GIB);
+        assert_eq!(
+            ram_only,
+            512 * MIB,
+            "16 GiB RAM must hit the RAM-side ceiling"
+        );
+
+        let available_disk = 400 * MIB;
+        let combined = combine_wasmtime_cache_size(16 * GIB, Some(available_disk));
+        assert!(
+            combined < ram_only,
+            "a disk-tight host (400 MiB free) must get LESS than the RAM-only \
+             figure ({ram_only}); got {combined}"
+        );
+        // 400 MiB / 8 == 50 MiB — above the disk-side floor (32 MiB), so the
+        // raw division binds here, not a floor (#5328 review: an earlier
+        // version of this test asserted the value landed exactly on the
+        // shared 128 MiB floor, which mutation-tested green even when the
+        // disk divisor was changed from 8 to 64 — it was pinning the floor,
+        // not the disk term. This value is a genuine division result.)
+        assert_eq!(combined, 50 * MIB);
+    }
+
+    /// The composition is `min(ram_term, disk_term)` — whichever signal is
+    /// tighter wins, in both directions.
+    #[test]
+    fn combine_takes_the_tighter_of_the_two_terms() {
+        // RAM-poor, disk-rich: the RAM term binds (unchanged from before #5014).
+        assert_eq!(
+            combine_wasmtime_cache_size(2 * GIB, Some(100 * GIB)),
+            wasmtime_cache_size_for_ram(2 * GIB),
+        );
+        // RAM-rich, disk-poor: the disk term binds (the #5014 fix).
+        assert_eq!(
+            combine_wasmtime_cache_size(100 * GIB, Some(2 * GIB)),
+            wasmtime_cache_size_for_disk(2 * GIB),
+        );
+        // Both ample: both clamp to the shared ceiling, so it's a no-op either way.
+        assert_eq!(
+            combine_wasmtime_cache_size(100 * GIB, Some(100 * GIB)),
+            MAX_WASMTIME_CACHE_SIZE_BYTES,
+        );
+    }
+
+    /// An unreadable disk signal (statvfs failure / unsupported platform)
+    /// must NOT invent a possibly-wrong tight cap — it falls back to the
+    /// RAM-only figure, i.e. today's shipped behavior, unchanged.
+    #[test]
+    fn unreadable_disk_signal_falls_back_to_ram_only() {
+        assert_eq!(
+            combine_wasmtime_cache_size(16 * GIB, None),
+            wasmtime_cache_size_for_ram(16 * GIB),
+        );
+    }
+
+    /// A directory already over the newly-computed limit (the "upgrading an
+    /// already-wedged gateway" case) is cleared immediately rather than left
+    /// for wasmtime's own ~1h prune cycle.
+    #[test]
+    fn reconcile_clears_a_directory_already_over_the_new_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("wasmtime-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let mut f = std::fs::File::create(cache_dir.join("big.bin")).unwrap();
+        f.write_all(&vec![0u8; 200 * 1024 * 1024]).unwrap(); // 200 MiB
+
+        reconcile_existing_cache_dir(&cache_dir, 200 * MIB, 128 * MIB);
+
+        assert!(
+            !cache_dir.exists(),
+            "an over-limit cache directory must be cleared, not left for the \
+             ~1h wasmtime prune cycle to catch up"
+        );
+    }
+
+    /// A directory already AT OR UNDER the limit must be left alone — this is
+    /// a startup optimization for the over-limit case, not an unconditional
+    /// wipe of the compile cache on every boot.
+    #[test]
+    fn reconcile_leaves_a_directory_under_the_limit_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("wasmtime-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let mut f = std::fs::File::create(cache_dir.join("small.bin")).unwrap();
+        f.write_all(&vec![0u8; 1024]).unwrap(); // 1 KiB
+
+        reconcile_existing_cache_dir(&cache_dir, 1024, 128 * MIB);
+
+        assert!(
+            cache_dir.join("small.bin").exists(),
+            "a directory already under the limit must not be touched"
+        );
+    }
+
+    /// A missing directory (fresh node, nothing written yet) must be a no-op,
+    /// not a panic or an error — `du_walk`'s own contract for a missing dir is
+    /// "contributes 0", so 0 is never `>` any real limit.
+    #[test]
+    fn reconcile_is_a_no_op_on_a_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist-yet");
+        reconcile_existing_cache_dir(&missing, 0, 128 * MIB); // must not panic
+        assert!(!missing.exists());
+    }
+
+    /// Smoke test for the impure entry point end-to-end against a real
+    /// directory: whatever this host's actual RAM/disk resolve to, the result
+    /// must stay within the shared clamp bounds, and it must not panic when
+    /// run against a directory that doesn't exist yet (the fresh-node case).
+    #[test]
+    fn default_for_dir_stays_within_bounds_when_the_directory_does_not_exist_yet() {
+        // Defensive-only: in production `config.rs` always `create_dir_all`s
+        // this directory before `Executor::from_config_with_shared_modules`
+        // ever runs, so this exact input never reaches this function on a real
+        // node. Kept as a "must not panic, must fall back sanely" guard, not
+        // as a stand-in for the real disk-derived path — see the sibling test
+        // below for that.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("wasmtime-cache");
+        let result = default_wasmtime_cache_size_bytes_for_dir(
+            &missing,
+            crate::ring::DEFAULT_HOSTING_DISK_PCT,
+            crate::ring::DEFAULT_MAX_HOSTING_DISK_BYTES,
+        );
+        assert!(
+            (MIN_WASMTIME_CACHE_SIZE_BYTES..=MAX_WASMTIME_CACHE_SIZE_BYTES).contains(&result),
+            "result {result} must stay within [{MIN_WASMTIME_CACHE_SIZE_BYTES}, \
+             {MAX_WASMTIME_CACHE_SIZE_BYTES}] regardless of this host's real RAM/disk"
+        );
+    }
+
+    /// #5328 review: the fresh-directory test above never actually created the
+    /// directory, so `statvfs` returned ENOENT and it silently exercised the
+    /// SAME `None`-fallback path as `unreadable_disk_signal_falls_back_to_ram_only`
+    /// — never the real `Some(...)` disk-reading path a production node
+    /// actually takes (the cache dir always exists by the time this runs; see
+    /// the sibling test's comment). This test creates the directory first, so
+    /// `disk_available_bytes` succeeds, and cross-checks the live entry
+    /// point's result against the SAME real signals read independently
+    /// (`super::read_total_ram_bytes()`, `crate::ring::disk_available_bytes`)
+    /// and fed through the pure combiner — not a hardcoded expectation, since
+    /// this host's real RAM/disk are unknown to the test. A maximally
+    /// PERMISSIVE configured budget (pct=1.0, max=u64::MAX) is passed so the
+    /// configured-budget bound (#5328 review) cannot additionally constrain
+    /// the result — that mechanism gets its own dedicated test below.
+    #[test]
+    fn default_for_dir_uses_the_real_disk_reading_on_an_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("wasmtime-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let total_ram = crate::wasm_runtime::read_total_ram_bytes()
+            .map(|v| v as u64)
+            .unwrap_or(WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES);
+        let available_disk_bytes = crate::ring::disk_available_bytes(&cache_dir);
+        assert!(
+            available_disk_bytes.is_some(),
+            "statvfs on a directory that genuinely exists must succeed on this \
+             platform — if this fails, the test tempdir setup is wrong, not the \
+             production code"
+        );
+        let expected = combine_wasmtime_cache_size(total_ram, available_disk_bytes);
+
+        assert_eq!(
+            default_wasmtime_cache_size_bytes_for_dir(&cache_dir, 1.0, u64::MAX),
+            expected,
+            "the live entry point must match the pure combiner fed the SAME \
+             real RAM/disk signals — this pins that it actually reads a live \
+             Some(...) disk signal, not silently falling back to RAM-only"
+        );
+    }
+
+    /// #5328 review (rev-skeptical-2 finding): an operator who shrinks
+    /// `--max-hosting-disk` below physical disk capacity must ALSO be
+    /// protected — bounding only by raw physical availability leaves that
+    /// operator permanently wedged against their OWN configured budget. A
+    /// tiny `max_hosting_disk` must pull the result down from what physical
+    /// disk alone would allow, and the result must still respect the
+    /// documented headroom relationship (a quarter of what
+    /// `disk_budget_for_clamped` would compute for the SAME inputs).
+    #[test]
+    fn default_for_dir_is_bounded_by_a_tiny_configured_disk_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("wasmtime-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        // Permissive physical/RAM signals (pct=1.0 isn't physical/RAM — this
+        // is the operator's CONFIGURED knob under test): a tiny
+        // max_hosting_disk must bind regardless of how much physical disk or
+        // RAM this test host actually has.
+        let tiny_max_hosting_disk = 40 * MIB;
+        let result = default_wasmtime_cache_size_bytes_for_dir(
+            &cache_dir,
+            crate::ring::DEFAULT_HOSTING_DISK_PCT,
+            tiny_max_hosting_disk,
+        );
+
+        assert!(
+            result <= tiny_max_hosting_disk,
+            "a compile cache larger than the operator's OWN configured \
+             --max-hosting-disk ({tiny_max_hosting_disk}) defeats the whole \
+             point of the setting; got {result}"
+        );
+    }
+
+    /// #5328 review finding 1 (rev-domain, verified by hand): giving the
+    /// disk-side term the SAME floor as the aggregate hosting-disk budget's
+    /// own floor left EXACTLY ZERO headroom for real contract state on any
+    /// host with <= 256 MiB reachable disk — the compile cache alone would
+    /// consume the entire disk-budget floor, so #5014's wedge would persist
+    /// (narrower, but not closed) for small-disk hosts. This sweeps a wide
+    /// range of reachable-disk sizes and asserts the aggregate disk budget
+    /// (computed via the SAME `disk_budget_for_clamped` the real
+    /// eviction/admission path uses) always leaves STRICTLY positive headroom
+    /// over the compile-cache disk term — mirroring
+    /// `compile_cache_default_never_exceeds_hosting_default`'s sweep shape
+    /// for the RAM axis. `reachable_disk` models `used + available` at the
+    /// moment the disk term is computed (worst case: the compile cache is the
+    /// ONLY consumer, i.e. right after `reconcile_existing_cache_dir` clears
+    /// a stale cache — the scenario most likely to wedge).
+    #[test]
+    fn disk_term_always_leaves_positive_headroom_against_the_aggregate_disk_budget() {
+        for reachable_disk in [
+            0,
+            1,
+            MIB,
+            32 * MIB,
+            64 * MIB,
+            128 * MIB,
+            200 * MIB,
+            255 * MIB,
+            256 * MIB, // the exact breakeven point both floors share
+            257 * MIB,
+            300 * MIB,
+            400 * MIB, // the issue's worked example
+            912 * MIB, // the issue's worked example, post-reconcile
+            GIB,
+            2 * GIB,
+            4 * GIB,
+            8 * GIB,
+            32 * GIB,
+            100 * GIB,
+            u64::MAX,
+        ] {
+            let disk_term = wasmtime_cache_size_for_disk(reachable_disk);
+            let available = reachable_disk.saturating_sub(disk_term);
+            let disk_budget = crate::ring::disk_budget_for_clamped(
+                disk_term,
+                available,
+                crate::ring::DEFAULT_HOSTING_DISK_PCT,
+                crate::ring::MIN_DEFAULT_HOSTING_BUDGET_BYTES,
+                crate::ring::DEFAULT_MAX_HOSTING_DISK_BYTES,
+            );
+            assert!(
+                disk_budget > disk_term,
+                "at reachable_disk={reachable_disk} the compile cache's disk \
+                 term ({disk_term}) must leave POSITIVE headroom under the \
+                 aggregate disk budget ({disk_budget}) for real contract \
+                 state — zero or negative headroom means the compile cache \
+                 alone wedges admission"
+            );
+        }
+    }
+
+    /// #5328 review (rev-skeptical-2 finding): `bound_by_configured_disk_budget`
+    /// must actually bind when the operator's configured budget is the
+    /// tighter constraint, must NOT bind when it's generous (physical term
+    /// wins), and must fall back to the physical term when the disk signal
+    /// is unreadable (no `used + available` basis to project a budget from).
+    #[test]
+    fn bound_by_configured_disk_budget_binds_only_when_tighter() {
+        // Ample physical term (RAM-ceiling-bound), tiny configured budget:
+        // the configured bound must win.
+        let physical_term = 512 * MIB;
+        let tight = bound_by_configured_disk_budget(
+            physical_term,
+            0,              // current_cache_bytes
+            Some(40 * MIB), // raw_available_disk_bytes
+            crate::ring::DEFAULT_HOSTING_DISK_PCT,
+            crate::ring::MIN_DEFAULT_HOSTING_BUDGET_BYTES, // tiny max_hosting_disk
+        );
+        assert!(
+            tight < physical_term,
+            "a tiny configured max_hosting_disk must pull the result below \
+             the physical term; got {tight}"
+        );
+
+        // Generous configured budget: the physical term must win unchanged.
+        let generous = bound_by_configured_disk_budget(
+            physical_term,
+            0,
+            Some(100 * GIB),
+            crate::ring::DEFAULT_HOSTING_DISK_PCT,
+            crate::ring::DEFAULT_MAX_HOSTING_DISK_BYTES,
+        );
+        assert_eq!(
+            generous, physical_term,
+            "a generous configured budget must not tighten the physical term"
+        );
+
+        // Unreadable disk signal: no used+available basis to project a
+        // budget from, so the physical term passes through unchanged.
+        let unreadable = bound_by_configured_disk_budget(
+            physical_term,
+            0,
+            None,
+            crate::ring::DEFAULT_HOSTING_DISK_PCT,
+            crate::ring::MIN_DEFAULT_HOSTING_BUDGET_BYTES,
+        );
+        assert_eq!(
+            unreadable, physical_term,
+            "an unreadable disk signal must fall back to the physical term, \
+             not invent a budget projection from nothing"
+        );
+    }
+
+    /// #5328 review: the configured-budget bound must ALSO leave positive
+    /// headroom against the real aggregate budget, across a sweep of
+    /// operator-configured `max_hosting_disk` values (not just the default) —
+    /// extending `disk_term_always_leaves_positive_headroom_against_the_aggregate_disk_budget`
+    /// to the axis that test doesn't cover.
+    #[test]
+    fn configured_budget_bound_always_leaves_positive_headroom() {
+        for reachable_disk in [0, MIB, 128 * MIB, 256 * MIB, GIB, 100 * GIB] {
+            for max_hosting_disk in [
+                crate::ring::MIN_DEFAULT_HOSTING_BUDGET_BYTES, // operator floors it
+                16 * GIB,
+                crate::ring::DEFAULT_MAX_HOSTING_DISK_BYTES,
+            ] {
+                let physical_term = wasmtime_cache_size_for_disk(reachable_disk);
+                let available = reachable_disk.saturating_sub(physical_term);
+                let bound = bound_by_configured_disk_budget(
+                    physical_term,
+                    physical_term, // current_cache_bytes: conservative, matches `used` below
+                    Some(available),
+                    crate::ring::DEFAULT_HOSTING_DISK_PCT,
+                    max_hosting_disk,
+                );
+                let real_budget = crate::ring::disk_budget_for_clamped(
+                    bound,
+                    available,
+                    crate::ring::DEFAULT_HOSTING_DISK_PCT,
+                    crate::ring::MIN_DEFAULT_HOSTING_BUDGET_BYTES,
+                    max_hosting_disk,
+                );
+                assert!(
+                    real_budget > bound,
+                    "at reachable_disk={reachable_disk}, \
+                     max_hosting_disk={max_hosting_disk}: the configured-budget-\
+                     bound compile cache ({bound}) must leave POSITIVE headroom \
+                     under the real aggregate budget ({real_budget})"
+                );
+            }
+        }
+    }
+
+    /// #5328 review finding 2 (rev-domain, verified by hand): folding the
+    /// directory's own current size back into the raw free-space reading
+    /// must recover "total reachable capacity", independent of how big the
+    /// directory currently is. Deliberately host-independent (small,
+    /// hand-chosen numbers) — see [`stabilize_available_disk_bytes`]'s doc
+    /// for why a real end-to-end test through actual `statvfs` cannot
+    /// reliably distinguish fixed from buggy on a host with generous free
+    /// disk.
+    #[test]
+    fn stabilize_available_disk_bytes_recovers_total_reachable_capacity() {
+        // 400 MiB total; the cache currently occupies 50 MiB of it, so a raw
+        // statvfs read sees only 350 MiB free. Folding the cache's own 50 MiB
+        // back in must recover the full 400 MiB.
+        assert_eq!(
+            stabilize_available_disk_bytes(Some(350 * MIB), 50 * MIB),
+            Some(400 * MIB)
+        );
+        // An empty directory contributes nothing to fold back — a no-op.
+        assert_eq!(
+            stabilize_available_disk_bytes(Some(400 * MIB), 0),
+            Some(400 * MIB)
+        );
+        // An unreadable raw signal must stay unreadable — folding a KNOWN
+        // quantity into an UNKNOWN one must not manufacture a trusted result.
+        assert_eq!(stabilize_available_disk_bytes(None, 50 * MIB), None);
+        // Overflow-safe: saturating, never panics or wraps.
+        assert_eq!(
+            stabilize_available_disk_bytes(Some(u64::MAX), 50 * MIB),
+            Some(u64::MAX)
+        );
+    }
+
+    /// #5328 review finding 2 (rev-domain, verified by hand): a naive
+    /// `statvfs`-only availability reading makes the computed limit a
+    /// function of the cache's OWN current size (bigger cache -> less
+    /// "available" -> smaller next-boot limit -> wipe -> more "available" ->
+    /// bigger limit -> cache regrows -> repeat), which converges to wiping
+    /// the compile cache on roughly every OTHER restart for an actively-used
+    /// node — defeating the entire point of a persistent on-disk cache. This
+    /// simulates two successive "boots" against a FIXED total reachable disk
+    /// (deterministic, no real filesystem involved): boot 1 computes a limit
+    /// against an empty cache; the cache then regrows to fill exactly that
+    /// limit (the worst case — a busy node whose cache regrew to fill its
+    /// budget between restarts, so the raw free-space reading on boot 2 is
+    /// `total - limit1`); boot 2 must compute the SAME limit via
+    /// [`stabilize_available_disk_bytes`]'s fold-back — and the final
+    /// assertion demonstrates, on the SAME numbers, that WITHOUT the
+    /// fold-back the limit would have shrunk (the bug this fixes).
+    #[test]
+    fn folding_the_caches_own_size_back_in_makes_the_limit_stable_across_simulated_restarts() {
+        let total_ram = 100 * GIB; // ample — only the disk term can bind here
+        let total_reachable_disk = 2 * GIB; // fixed total capacity, both boots
+
+        // Boot 1: cache is empty, so raw free space IS the total.
+        let limit1 = combine_wasmtime_cache_size(
+            total_ram,
+            stabilize_available_disk_bytes(Some(total_reachable_disk), 0),
+        );
+
+        // Between boots: cache regrows to fill exactly limit1. Raw free space
+        // on boot 2 is reduced by exactly what the cache now occupies.
+        let raw_available_boot2 = total_reachable_disk - limit1;
+        let limit2 = combine_wasmtime_cache_size(
+            total_ram,
+            stabilize_available_disk_bytes(Some(raw_available_boot2), limit1),
+        );
+
+        assert_eq!(
+            limit1, limit2,
+            "the computed limit must be STABLE across restarts when nothing \
+             other than the cache's own regrowth changed on disk"
+        );
+
+        // Sanity: on these SAME numbers, the fold-back is load-bearing — a
+        // raw (unstabilized) reading on boot 2 computes a SMALLER limit,
+        // which is exactly what would trigger reconcile's wipe.
+        let unstabilized_limit2 = combine_wasmtime_cache_size(total_ram, Some(raw_available_boot2));
+        assert!(
+            unstabilized_limit2 < limit1,
+            "sanity check failed: this scenario no longer demonstrates the \
+             bug the fold-back fixes, so it's not exercising anything — \
+             unstabilized_limit2={unstabilized_limit2}, limit1={limit1}"
+        );
     }
 }

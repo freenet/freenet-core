@@ -1420,29 +1420,24 @@ impl<'a> NetEventLog<'a> {
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
-            NetMessageV1::Update(UpdateMsg::BroadcastTo {
-                payload, key, id, ..
-            }) => {
-                let this_peer = op_manager.ring.connection_manager.own_location();
-                // Convert payload to WrappedState for telemetry
-                let value = match payload {
-                    crate::message::DeltaOrFullState::FullState(bytes) => {
-                        WrappedState::from(bytes.clone())
-                    }
-                    crate::message::DeltaOrFullState::Delta(bytes) => {
-                        WrappedState::from(bytes.clone())
-                    }
-                };
-                EventKind::Update(UpdateEvent::BroadcastReceived {
-                    id: *id,
-                    requester: this_peer.clone(),
-                    key: *key,
-                    value,
-                    target: this_peer, // We are the target
-                    timestamp: chrono::Utc::now().timestamp() as u64,
-                    state_hash: None, // Hash not available from message
-                })
-            }
+            // NOTE: UpdateMsg::BroadcastTo intentionally has NO arm here.
+            //
+            // This generic inbound-message logger fires before per-op dispatch
+            // and, for BroadcastTo, could only hard-code `requester == target ==
+            // self` (the real sender's PeerKeyLocation isn't resolvable from
+            // this context) and clone the full payload into a WrappedState
+            // purely to populate an event whose `state_hash` was always None —
+            // self-attributed and payload-identity-blind, so unusable for
+            // per-sender or per-payload analysis, on the UPDATE hot receive
+            // path. The driver-side emitters
+            // (`operations/update/op_ctx_task.rs::drive_relay_broadcast_to` and
+            // `::apply_streaming_broadcast`, both calling
+            // `NetEventLog::update_broadcast_received`) already produce a
+            // correct, sender-attributed `update_broadcast_received` record for
+            // every inbound BroadcastTo/BroadcastToStreaming, resolving the
+            // sender via `get_peer_by_addr(sender_addr)` — the same pattern the
+            // `Unsubscribe` arm below uses. Adding an arm here would just
+            // reintroduce the duplicate. See #5149.
             NetMessageV1::Subscribe(SubscribeMsg::Unsubscribe { id, instance_id }) => {
                 let this_peer = op_manager.ring.connection_manager.own_location();
                 let from = source_addr
@@ -2094,6 +2089,159 @@ mod eventlog_backpressure_tests {
         )
         .await
         .expect("register_events must return promptly on a closed channel");
+    }
+}
+
+#[cfg(test)]
+mod broadcast_to_telemetry_tests {
+    //! Regression coverage for #5149: every inbound `BroadcastTo` used to
+    //! emit TWO `update_broadcast_received` events — the generic
+    //! `from_inbound_msg_v1` logger below (self-attributed, `state_hash:
+    //! None`, full payload cloned for nothing) alongside the correctly
+    //! sender-attributed record the UPDATE driver already emits via
+    //! `NetEventLog::update_broadcast_received`
+    //! (`operations/update/op_ctx_task.rs`). The fix deletes the
+    //! `from_inbound_msg_v1` arm entirely rather than fixing it in place,
+    //! since the driver-side record was already correct and duplicating it.
+    //!
+    //! `from_inbound_msg_v1` takes `&OpManager`, which needs a live `Ring` /
+    //! connection manager to construct — too heavy for a unit test in this
+    //! module (no lightweight test constructor exists; see the driver-level
+    //! tests in `operations/update/op_ctx_task.rs` for the equivalent
+    //! source-scrape pattern this mirrors, e.g.
+    //! `finalize_put_at_originator_uses_wire_hop_count`). These are
+    //! source-scrape pins instead: they assert the specific match arm stays
+    //! deleted, and that both driver call sites resolve the real sender
+    //! rather than hard-coding self.
+
+    /// Isolate the body of `from_inbound_msg_v1` from the rest of the file so
+    /// assertions below can't accidentally match text in an unrelated
+    /// function.
+    fn from_inbound_msg_v1_body() -> &'static str {
+        const SOURCE: &str = include_str!("register.rs");
+        let start = SOURCE
+            .find("pub fn from_inbound_msg_v1(")
+            .expect("from_inbound_msg_v1 must exist in register.rs");
+        // The function ends where the next sibling method begins.
+        let after_start = &SOURCE[start..];
+        let end = after_start
+            .find("\n    /// Create a ResyncRequestReceived event.")
+            .expect(
+                "from_inbound_msg_v1 anchor end not found — if you've added/reordered \
+                 methods on NetEventLog, update this anchor but keep it bounding just \
+                 the from_inbound_msg_v1 body",
+            );
+        &after_start[..end]
+    }
+
+    /// #5149: `from_inbound_msg_v1` must NOT have a dedicated match arm for
+    /// `UpdateMsg::BroadcastTo` that builds an `UpdateEvent::BroadcastReceived`.
+    /// That arm could only self-attribute (`requester == target == this
+    /// peer`) and clone the full payload for a record whose `state_hash` was
+    /// always `None` — pure duplication of the sender-attributed record the
+    /// UPDATE driver already emits. `BroadcastTo` must keep falling through
+    /// to the generic `NetMessageV1::Update(_) => EventKind::Ignored`
+    /// wildcard a few lines below.
+    #[test]
+    fn from_inbound_msg_v1_has_no_broadcast_to_arm() {
+        let body = from_inbound_msg_v1_body();
+        // Every payload-bearing broadcast variant, not just the original.
+        // #5147 added V2 forms of both; an arm for either would reintroduce the
+        // #5149 duplicate exactly as an arm for `BroadcastTo` would, and would
+        // additionally make the two encodings produce DIFFERENT event counts
+        // for the same logical delivery — which would move the very metric the
+        // #5147 rollout is judged on, in the direction that flatters it.
+        for variant in [
+            "UpdateMsg::BroadcastTo {",
+            "UpdateMsg::BroadcastToStreaming {",
+            "UpdateMsg::BroadcastToV2 {",
+            "UpdateMsg::BroadcastToStreamingV2 {",
+        ] {
+            assert!(
+                !body.contains(variant),
+                "from_inbound_msg_v1 must not match `{variant}` directly — \
+                 doing so reintroduces the #5149 duplicate/self-attributed \
+                 update_broadcast_received event. The driver-side emitters in \
+                 operations/update/op_ctx_task.rs (drive_relay_broadcast_to, \
+                 apply_streaming_broadcast) already cover this event correctly \
+                 for every variant."
+            );
+        }
+        assert!(
+            body.contains("NetMessageV1::Update(_)"),
+            "the generic Update wildcard arm must still exist so BroadcastTo \
+             (and BroadcastToStreaming) fall through to EventKind::Ignored"
+        );
+    }
+
+    /// #5149: both UPDATE-driver call sites of
+    /// `NetEventLog::update_broadcast_received` must resolve the requester
+    /// from the real sender address (`get_peer_by_addr(sender_addr)`), never
+    /// hard-code `this_peer`/self — that self-attribution is exactly what
+    /// made the deleted `from_inbound_msg_v1` arm useless.
+    /// Return just the body of `signature_prefix`'s function, bounded by
+    /// brace depth. An unbounded `SOURCE[start..].find(..)` would keep
+    /// scanning past the function's end and match a *later* function's call
+    /// site, so a regression inside this function would pass vacuously —
+    /// exactly the failure AGENTS.md's source-scrape-pin rule describes.
+    fn fn_body<'a>(source: &'a str, signature_prefix: &str) -> &'a str {
+        let start = source
+            .find(signature_prefix)
+            .unwrap_or_else(|| panic!("{signature_prefix} not found in op_ctx_task.rs"));
+        let brace = source[start..]
+            .find('{')
+            .unwrap_or_else(|| panic!("{signature_prefix} must have a body"));
+        let body_start = start + brace + 1;
+        let bytes = source.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = body_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[body_start..i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("unbalanced braces while scanning {signature_prefix}");
+    }
+
+    #[test]
+    fn driver_broadcast_received_call_sites_resolve_sender_not_self() {
+        const SOURCE: &str = include_str!("../operations/update/op_ctx_task.rs");
+        let mut checked = 0;
+        for anchor in [
+            "async fn drive_relay_broadcast_to(",
+            "async fn apply_streaming_broadcast(",
+        ] {
+            let body = fn_body(SOURCE, anchor);
+            let call = body
+                .find("NetEventLog::update_broadcast_received(")
+                .unwrap_or_else(|| {
+                    panic!("{anchor} must call NetEventLog::update_broadcast_received")
+                });
+            // The requester resolution immediately precedes the call as an
+            // `if let Some(requester_pkl) = ... get_peer_by_addr(sender_addr)`
+            // guard; look at the ~400 bytes leading up to the call site.
+            let window_start = call.saturating_sub(400);
+            // `get` rather than direct slicing: a non-ASCII byte in a comment
+            // could put `window_start` mid-character, and panicking on that
+            // would be an unrelated failure. Falling back to the whole prefix
+            // only ever widens the window, never narrows it.
+            let window = body.get(window_start..call).unwrap_or(&body[..call]);
+            assert!(
+                window.contains("get_peer_by_addr(sender_addr)"),
+                "{anchor} must resolve the update_broadcast_received requester via \
+                 get_peer_by_addr(sender_addr), not hard-code self — see #5149"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 2, "expected to check both driver call sites");
     }
 }
 

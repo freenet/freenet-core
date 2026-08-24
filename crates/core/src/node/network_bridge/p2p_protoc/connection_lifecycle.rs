@@ -1053,9 +1053,11 @@ impl P2pConnManager {
         // `supports_summary_first_put` check. Keep this write paired with
         // the `self.connections.insert` above if that call site changes.
         // Write the Option THROUGH — unconditionally, so a reconnection whose
-        // version is unknown (`None`, the joiner->gateway path) CLEARS any
-        // stale entry rather than leaving us believing a downgraded peer is
-        // still current. See `ConnectionManager::record_remote_version`.
+        // version is unknown CLEARS any stale entry rather than leaving us
+        // believing a downgraded peer is still current. Since #5161 a `None`
+        // here means the remote is genuinely below the version-carrying-ack
+        // floor, not that this path cannot observe it.
+        // See `ConnectionManager::record_remote_version`.
         self.bridge
             .op_manager
             .ring

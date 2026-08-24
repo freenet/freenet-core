@@ -135,6 +135,7 @@ impl<const N: usize> super::ClientEventsProxy for ClientEventsCombinator<N> {
                                 notification_channel,
                                 token,
                                 origin_contract,
+                                connection_scope,
                                 user_context,
                             }) => {
                                 let id = *self.external_clients[idx]
@@ -152,8 +153,10 @@ impl<const N: usize> super::ClientEventsProxy for ClientEventsCombinator<N> {
                                     notification_channel,
                                     token,
                                     origin_contract,
-                                    // Preserve the connection's user context through
-                                    // the ID-remapping proxy combinator unchanged.
+                                    // Preserve the connection's scope and user
+                                    // context through the ID-remapping proxy
+                                    // combinator unchanged.
+                                    connection_scope,
                                     user_context,
                                 })
                             }
@@ -295,6 +298,7 @@ async fn client_fn(
                         notification_channel,
                         token,
                         origin_contract,
+                        connection_scope,
                         user_context,
                     }) => {
                         tracing::debug!(
@@ -308,7 +312,9 @@ async fn client_fn(
                                 notification_channel,
                                 token,
                                 origin_contract,
-                                // Forward the connection's user context unchanged.
+                                // Forward the connection's scope and user context
+                                // unchanged.
+                                connection_scope,
                                 user_context,
                             }))
                             .await

@@ -51,7 +51,7 @@
 //! This self-healing mechanism catches forgotten cleanup and prevents zombie interests.
 
 use dashmap::DashMap;
-use freenet_stdlib::prelude::{ContractKey, StateDelta, StateSummary};
+use freenet_stdlib::prelude::{ContractInstanceId, ContractKey, StateDelta, StateSummary};
 use lru::LruCache;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -62,7 +62,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
 
+use crate::ring::futile_repair::{FutileRepairDetector, FutileRepairSnapshot, OutcomeEvidence};
 use crate::transport::TransportPublicKey;
+use crate::util::byte_bounded_lru::ByteBoundedLruCache;
 use crate::util::time_source::TimeSource;
 
 /// Interval between interest heartbeat messages sent to each peer.
@@ -94,7 +96,13 @@ pub const INTEREST_DISCONNECT_GRACE_PERIOD: Duration = Duration::from_secs(90);
 use crate::config::GlobalExecutor;
 use crate::config::GlobalRng;
 
-/// Maximum number of entries in the delta memoization cache.
+/// COUNT target for the delta memoization cache.
+///
+/// This is a coverage target, NOT the RAM bound: the cache's values are
+/// contract-produced `StateDelta`s, so 1024 entries is an unbounded number of
+/// BYTES (a delta may reach `MAX_STATE_SIZE`, 50 MiB, making the count-only
+/// worst case ~51 GiB). [`INTEREST_DELTA_CACHE_MAX_BYTES`] and the
+/// [`ByteBoundedLruCache`] backstop are what bound RAM; see #4805.
 ///
 // TODO(fast-follow): size this by hosted×neighbors rather than a flat 1024, so
 // the interest-heartbeat staleness probes (`peer_summary_has_pending_state`)
@@ -104,6 +112,99 @@ use crate::config::GlobalRng;
 // worst-case load, and summaries are memoized outside WASM so byte keys stay
 // stable while state is unchanged.
 const DELTA_CACHE_SIZE: usize = 1024;
+
+// ============================================================================
+// Delta-cache byte backstop (#4805)
+//
+// `DELTA_CACHE_SIZE` bounds the ENTRY COUNT. It does not bound RAM, because
+// every value is a contract-produced `StateDelta` whose size the contract
+// chooses (up to `wasm_runtime::MAX_STATE_SIZE` = 50 MiB). A contract emitting
+// large deltas could therefore pin ~51 GiB in this one cache — the #4565
+// OOM class, and the code-style rule that per-key collections influenced by
+// external actors MUST be size-bounded. #4804 fixed the identical shape in the
+// executor's summary/delta caches; this applies the same primitive
+// (`util::byte_bounded_lru::ByteBoundedLruCache`) here.
+//
+// Both bounds are kept, and whichever binds first evicts:
+//   - COUNT (coverage): the pre-existing 1024-entry target, unchanged.
+//   - BYTES (safety): a hard ceiling on retained bytes, independent of how
+//     large the contract makes its deltas.
+//
+// Under pressure the cache EVICTS (LRU); it never refuses to serve. A miss is
+// always safe: `compute_delta` and `peer_summary_has_pending_state` fall back
+// to a `GetDeltaQuery` contract round-trip on the live state, and if even that
+// fails `summary_indicates_stale_peer` treats the peer as STALE
+// (`delta_indicates_change.unwrap_or(true)`), which heals with full state.
+// So eviction can cost work — never freshness, and never a silently-missed
+// divergence.
+// ============================================================================
+
+/// Fraction of "the memory the node may use" that sizes the delta cache's byte
+/// budget. Half the share the executor's SUMMARY cache takes (`/64`) because,
+/// unlike the executor's caches, there is exactly ONE `InterestManager` per
+/// node rather than one per pool worker, and this cache is pure memoization
+/// with a safe miss path.
+const INTEREST_DELTA_CACHE_RAM_DIVISOR: usize = 128;
+
+/// Floor for the delta-cache byte budget (4 MiB).
+///
+/// Sized so the byte bound never degrades the small-entry case on a small node:
+/// at the [`crate::util::byte_bounded_lru::CACHE_ENTRY_OVERHEAD_BYTES`] (512 B)
+/// per-entry floor, 4 MiB holds
+/// ~8192 entries — 8x the [`DELTA_CACHE_SIZE`] count target. That matters
+/// because the entries this cache most needs to keep are the EMPTY deltas that
+/// record "this peer is converged"; losing those is what re-arms the #4857
+/// summarize storm. Below this the count target would stop binding even for
+/// empty deltas, so 4 MiB is the point at which the byte bound is still purely
+/// a backstop.
+const INTEREST_DELTA_CACHE_MIN_BYTES: usize = 4 * 1024 * 1024;
+
+/// Ceiling for the delta-cache byte budget (16 MiB).
+///
+/// Sized against what the cache is FOR rather than picked round:
+/// `DELTA_CACHE_SIZE` (1024) × 16 KiB. 16 KiB is the per-entry size at which
+/// the COUNT target and the BYTE budget bind at the same moment, so for deltas
+/// up to that size behaviour is exactly what it was before this bound existed
+/// — full 1024-entry coverage — and bytes bind only above it. 16 KiB is a
+/// generous allowance for a DELTA specifically: the measured mean FULL-STATE
+/// broadcast payload on this fleet is ~60-95 KiB (see
+/// [`MISSING_SUMMARY_SIZE_BUCKETS`]), and a delta is the diff against that
+/// state, not the state.
+///
+/// This is deliberately NOT sized to the worst case a contract can produce
+/// (50 MiB × 1024): that number is the vector being closed, not a working-set
+/// requirement.
+const INTEREST_DELTA_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Fallback total-RAM estimate (1 GiB) when the OS query fails, mirroring
+/// the executor's `SUMMARY_CACHE_FALLBACK_TOTAL_RAM_BYTES`.
+const INTEREST_DELTA_CACHE_FALLBACK_TOTAL_RAM_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Byte budget for the interest manager's delta cache, scaled to the memory the
+/// node may use (host RAM, or a smaller cgroup limit when containerized).
+///
+/// Node-wide, not per-executor: there is one `InterestManager` per node, so
+/// unlike the executor's caches this figure is NOT multiplied by the pool size.
+pub(crate) fn interest_delta_cache_budget_bytes() -> usize {
+    interest_delta_budget_for(
+        crate::wasm_runtime::read_total_ram_bytes()
+            .unwrap_or(INTEREST_DELTA_CACHE_FALLBACK_TOTAL_RAM_BYTES),
+    )
+}
+
+/// Pure sizing math behind [`interest_delta_cache_budget_bytes`], split out so
+/// the aggregate-commitment tests can ask what a hypothetical host would get
+/// instead of depending on the test machine's own RAM.
+///
+/// Resolved budgets: 512 MiB host → 4 MiB (floor); 1 GiB → 8 MiB; 2 GiB (the
+/// shipped `MemoryMax=2G`, which most peers report) → 16 MiB; anything larger →
+/// 16 MiB (ceiling).
+pub(crate) fn interest_delta_budget_for(total_ram: usize) -> usize {
+    (total_ram / INTEREST_DELTA_CACHE_RAM_DIVISOR).clamp(
+        INTEREST_DELTA_CACHE_MIN_BYTES,
+        INTEREST_DELTA_CACHE_MAX_BYTES,
+    )
+}
 
 /// Minimum interval between queue-full `ResyncRequest`s to the same peer for
 /// the same contract (issue #4857).
@@ -132,6 +233,38 @@ pub(crate) const RESYNC_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(30)
 /// open: forgetting an entry merely permits one extra healing `ResyncRequest`,
 /// which is safe.
 const RESYNC_THROTTLE_CACHE_SIZE: usize = 4096;
+
+/// Bound on the number of peers tracked by the periodic summary rotation
+/// cursor (#5155; every peer since #5238, not just the full-bytes minority).
+/// Keyed by remote peer, so it MUST be bounded — see the per-key-collection
+/// rule in `.claude/rules/code-style.md`.
+///
+/// Eviction costs a peer its place in the cycle, not coverage: a forgotten
+/// cursor restarts that peer's rotation at a random offset, so the contracts
+/// re-sent are ones it may have seen recently rather than ones it is owed.
+///
+/// The random restart is load-bearing here, not decoration. Under a fixed
+/// restart, a single eviction would be harmless, but SUSTAINED eviction — more
+/// concurrently-syncing peers than cache slots — would return every peer to the
+/// head of its set every round and starve the tail permanently. The cap is well
+/// above `max_connections`, so that is not the expected regime; the
+/// randomisation is what makes it a slow cycle rather than a silent hole if it
+/// ever is. See [`InterestManager::summary_window_start`].
+///
+/// #5238 widened the tracked population from the full-bytes minority to every
+/// connected peer. That does not change the conclusion — 4096 still clears
+/// `max_connections` by an order of magnitude — but it does mean the headroom
+/// is no longer as large as the original margin suggested, so re-check it
+/// against `max_connections` rather than against this paragraph if either
+/// moves.
+///
+/// #5338 re-keyed the cache from [`SocketAddr`] to [`PeerKey`], which makes
+/// this bound the number of tracked PEERS rather than the number of tracked
+/// ADDRESSES. A NATed peer that reconnects on a new source port used to
+/// consume a fresh slot each time (and abandon its old one to age out), so the
+/// occupancy was churn-driven; it is now one slot per peer for as long as that
+/// peer keeps its key.
+const SUMMARY_WINDOW_CURSOR_CACHE_SIZE: usize = 4096;
 
 /// Bounds diagnostic correlation state influenced by remote (contract, peer)
 /// pairs. Eviction only loses classification detail; it never changes routing.
@@ -499,6 +632,53 @@ enum NeverPopulatedOrigin {
     OverwriteMissing,
 }
 
+/// Size buckets for `delivered_size_hist`.
+///
+/// Log-4 scale with the tails merged: <4 KiB, <16 KiB, <64 KiB, <256 KiB,
+/// <1 MiB, >=1 MiB. The measured mean full-state payload sits around 60-95
+/// KiB, so resolution is kept on both sides of ~64 KiB while the extremes,
+/// which a full-state broadcast rarely occupies, share a bucket. Six rather
+/// than eight because eight put the busy-fleet `network_efficiency_v1` block
+/// 31 bytes over its explicit 5120-byte budget, and the two merged tails cost
+/// far less information than raising that budget would cost in trust.
+pub(crate) const MISSING_SUMMARY_SIZE_BUCKETS: usize = 6;
+
+/// Buckets for `untracked_prior_removal_age`.
+pub(crate) const UNTRACKED_PRIOR_REMOVAL_BUCKETS: usize = 6;
+
+// Both bucket functions below HARDCODE their match arms while these constants
+// size the arrays those arms index. Nothing in the type system couples them, so
+// trimming a constant to save telemetry bytes — exactly the edit this module's
+// own budget pressure invites — would compile clean and then panic with
+// index-out-of-bounds inside the broadcast task on the first oversized payload.
+// `SIZE_HIST_ROWS` is immune because it derives from `.len()`; these only LOOK
+// as safe.
+const _: () = assert!(MISSING_SUMMARY_SIZE_BUCKETS == 6);
+const _: () = assert!(UNTRACKED_PRIOR_REMOVAL_BUCKETS == 6);
+
+/// Classes carrying a size histogram, in row order.
+///
+/// Deliberately NOT all ten classes. A 10x8 matrix pushed the busy-fleet
+/// `network_efficiency_v1` block to 5499 bytes against its explicit 5120-byte
+/// budget, and most of that spend was on classes that do not fire: both
+/// `*_overwrite_*` classes are a measured ZERO fleet-wide, and all four
+/// `*_repeat_*` classes round to zero. These four carry ~99% of observed
+/// missing-summary bytes.
+///
+/// The trade-off, stated so it is not rediscovered: a repeat/overwrite class
+/// that later becomes significant would have no SIZE distribution here. Its
+/// COUNT and BYTES remain fully visible in `ms_s`/`ms_b`, which keep all ten
+/// classes, so the growth itself could not hide — only its shape.
+pub(crate) const SIZE_HIST_CLASSES: [MissingSummaryClass; 4] = [
+    MissingSummaryClass::TrackedFirstNew,
+    MissingSummaryClass::TrackedFirstRecreated,
+    MissingSummaryClass::UntrackedFirstObserved,
+    MissingSummaryClass::UntrackedFirstRecreated,
+];
+
+/// Rows in `delivered_size_hist`.
+pub(crate) const SIZE_HIST_ROWS: usize = SIZE_HIST_CLASSES.len();
+
 #[derive(Clone, Copy, Debug, Default)]
 struct MissingPairHistory {
     send_starts: u32,
@@ -512,6 +692,8 @@ pub(crate) struct InterestLifecycleSnapshot {
     pub(crate) delivered_sends: [u64; MissingSummaryClass::COUNT],
     pub(crate) delivered_bytes: [u64; MissingSummaryClass::COUNT],
     pub(crate) first_send_age: [u64; 5],
+    pub(crate) delivered_size_hist: [[u64; MISSING_SUMMARY_SIZE_BUCKETS]; SIZE_HIST_ROWS],
+    pub(crate) untracked_prior_removal_age: [u64; UNTRACKED_PRIOR_REMOVAL_BUCKETS],
     pub(crate) registration_overwrite_known: [u64; InterestRegistrationSource::COUNT],
     pub(crate) registration_overwrite_missing: [u64; InterestRegistrationSource::COUNT],
     pub(crate) registration_new_known: [u64; InterestRegistrationSource::COUNT],
@@ -530,6 +712,10 @@ struct InterestLifecycleMetrics {
     delivered_sends: [AtomicU64; MissingSummaryClass::COUNT],
     delivered_bytes: [AtomicU64; MissingSummaryClass::COUNT],
     first_send_age: [AtomicU64; 5],
+    /// Per-class size histogram of delivered missing-summary payloads.
+    delivered_size_hist: [[AtomicU64; MISSING_SUMMARY_SIZE_BUCKETS]; SIZE_HIST_ROWS],
+    /// Untracked sends bucketed by how long ago the pair's entry was removed.
+    untracked_prior_removal_age: [AtomicU64; UNTRACKED_PRIOR_REMOVAL_BUCKETS],
     registration_overwrite_known: [AtomicU64; InterestRegistrationSource::COUNT],
     registration_overwrite_missing: [AtomicU64; InterestRegistrationSource::COUNT],
     registration_new_known: [AtomicU64; InterestRegistrationSource::COUNT],
@@ -546,6 +732,9 @@ pub(crate) struct MissingSummaryAttempt {
     key: (ContractKey, PeerKey),
     class: MissingSummaryClass,
     first_age_bucket: Option<usize>,
+    /// Set only on the UNTRACKED path: how long ago this pair's interest entry
+    /// was removed, or bucket 5 when there is no record of one.
+    untracked_prior_removal_bucket: Option<usize>,
     active_tracked: bool,
 }
 
@@ -564,6 +753,10 @@ impl InterestLifecycleMetrics {
             delivered_sends: std::array::from_fn(|_| AtomicU64::new(0)),
             delivered_bytes: std::array::from_fn(|_| AtomicU64::new(0)),
             first_send_age: std::array::from_fn(|_| AtomicU64::new(0)),
+            delivered_size_hist: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicU64::new(0))
+            }),
+            untracked_prior_removal_age: std::array::from_fn(|_| AtomicU64::new(0)),
             registration_overwrite_known: std::array::from_fn(|_| AtomicU64::new(0)),
             registration_overwrite_missing: std::array::from_fn(|_| AtomicU64::new(0)),
             registration_new_known: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -732,6 +925,15 @@ struct DeltaCacheKey {
     our_summary_hash: u64,
 }
 
+/// Payload size of a cached delta, for the delta cache's byte accounting.
+///
+/// Declared as a free `fn` (not a closure) because
+/// [`ByteBoundedLruCache::new`] takes a `fn(&V) -> usize` and the signature
+/// must match `V = StateDelta<'static>` exactly.
+fn delta_payload_len(delta: &StateDelta<'static>) -> usize {
+    delta.as_ref().len()
+}
+
 /// Hash bytes to u64 for cache key construction.
 /// Uses DefaultHasher for good distribution.
 fn hash_bytes(bytes: &[u8]) -> u64 {
@@ -825,7 +1027,13 @@ pub fn summary_digest(summary_bytes: &[u8]) -> SummaryDigest {
 /// delta marginally exceeds its state keeps sending deltas, while the
 /// poisoned-summary population this gate targets (state-sized deltas at
 /// 550-840 KB) still refuses by a wide margin.
-const MIN_FULL_STATE_SAVING_BYTES: usize = 1024;
+/// How much smaller than the full state a delta must be to be worth sending.
+///
+/// `pub(crate)` so the conformance simulation can gate with the SAME margin the
+/// production path uses. A simulation that mirrors the gate approximately decides a
+/// different thing than the network does, and the consequence there is an accusation
+/// against a contract that converges in production.
+pub(crate) const MIN_FULL_STATE_SAVING_BYTES: usize = 1024;
 
 /// Heuristic: would a delta *probably* be efficient compared to sending full
 /// state, judging only by the peer's summary size?
@@ -974,7 +1182,12 @@ pub struct InterestManager<T: TimeSource> {
 
     /// Cache for memoizing delta computations.
     /// Avoids recomputing the same delta for multiple peers with identical summaries.
-    delta_cache: Mutex<LruCache<DeltaCacheKey, StateDelta<'static>>>,
+    ///
+    /// Bounded by BOTH a count target ([`DELTA_CACHE_SIZE`]) and a hard byte
+    /// budget ([`interest_delta_cache_budget_bytes`]) — the values are
+    /// contract-produced `StateDelta`s, so the count alone bounds no amount of
+    /// RAM (#4805). See the byte-backstop comment near [`DELTA_CACHE_SIZE`].
+    delta_cache: Mutex<ByteBoundedLruCache<DeltaCacheKey, StateDelta<'static>>>,
 
     /// Fast hash index for connection-time discovery.
     /// Maps u32 hash of contract ID -> list of ContractKeys (handles collisions).
@@ -1018,6 +1231,52 @@ pub struct InterestManager<T: TimeSource> {
     /// issue #4857.
     resync_request_throttle: Mutex<LruCache<(ContractKey, SocketAddr), Instant>>,
 
+    /// Rotation cursor for the bounded periodic summary reply (#5155, extended
+    /// to the digest form by #5238), keyed by the peer's stable transport
+    /// public key.
+    ///
+    /// KEYED BY [`PeerKey`], NOT BY [`SocketAddr`] (#5338). The address is not
+    /// the peer's identity — a NATed peer that resumes on a new source port is
+    /// the same peer with the same hosted set, and keying by address threw its
+    /// cursor away on every reconnect. That is not a lost optimisation: with no
+    /// cursor, [`Self::summary_window_start`] re-draws a RANDOM offset, so
+    /// coverage degrades from a contiguous `ceil(n / limit)` tiling to
+    /// coupon-collector — about `(n / limit) * H_(n / limit)` rounds, ~90
+    /// minutes rather than ~40 at n = 450 and the 5-minute heartbeat. The
+    /// population it hit hardest was the frequently-reconnecting NATed peer
+    /// #5238 was measured on, i.e. the convergence figure was least accurate
+    /// exactly where it was validated.
+    ///
+    /// Holds the contract id of the LAST entry included in that peer's previous
+    /// reply — a KEY, not an index. That distinction is what preserves
+    /// the coverage BOUND when the shared set changes between rounds.
+    ///
+    /// A stored index names a position, and a removal below it shifts every
+    /// later contract down by one, so the resume lands one past where it should
+    /// and that contract goes unadvertised for the rest of the cycle. Wrapping
+    /// means it is eventually revisited, so the failure is not permanent
+    /// starvation — but "eventually" is not the property this change is sold
+    /// on. The whole safety argument is a stated upper bound on how long a
+    /// divergence can go unnoticed, and under ordinary contract churn an index
+    /// cursor degrades that from `ceil(n / limit)` rounds to no bound at all.
+    ///
+    /// A key resumes after what was actually SENT, so consecutive rounds are
+    /// contiguous in id space no matter what happened to the set in between:
+    /// an id inserted above the cursor is in the very next window, an id
+    /// inserted below it is picked up on the wrap, and a removed cursor id
+    /// still orders correctly against the rest because the comparison is
+    /// against the stored bytes rather than a lookup that could now fail.
+    /// `rotation_does_not_lose_the_coverage_bound_when_contracts_are_removed`
+    /// runs both designs over the same removal schedule and shows the index
+    /// one missing contracts the key one covers.
+    ///
+    /// BOTH wire forms consult this. It served only the full-bytes fallback
+    /// under #5155 — digest-capable peers received the complete set every round
+    /// and never touched it — and #5238 ended that, because the cost the window
+    /// really bounds is the per-entry summarize call, which the digest form
+    /// pays in full.
+    summary_window_cursor: Mutex<LruCache<PeerKey, ContractInstanceId>>,
+
     /// Count of concurrently-outstanding queue-full-resync retry tasks (#4862 P1).
     /// Bounds aggregate retry tasks node-wide, independent of the throttle LRU
     /// (which can evict active reservations under key churn). See
@@ -1039,6 +1298,12 @@ pub struct InterestManager<T: TimeSource> {
     /// concurrent racers, not fixed at one).
     missing_summary_active: DashMap<(ContractKey, PeerKey), u16>,
     interest_lifecycle_metrics: InterestLifecycleMetrics,
+
+    /// SHADOW MODE. Counts (contract, peer) edges whose repairs keep failing to
+    /// converge — the observable signature of a contract whose merge is not
+    /// commutative. Observes only: it never gates, throttles, or suppresses a
+    /// heal. See [`crate::ring::futile_repair`].
+    futile_repair: FutileRepairDetector,
 }
 
 /// Delivery-gated lifecycle accounting. Dropping an unmarked guard records no
@@ -1071,8 +1336,10 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             interested_peers: DashMap::new(),
             peer_contracts: DashMap::new(),
             local_interests: DashMap::new(),
-            delta_cache: Mutex::new(LruCache::new(
+            delta_cache: Mutex::new(ByteBoundedLruCache::new(
                 NonZeroUsize::new(DELTA_CACHE_SIZE).expect("DELTA_CACHE_SIZE must be > 0"),
+                interest_delta_cache_budget_bytes(),
+                delta_payload_len,
             )),
             contract_hash_index: DashMap::new(),
             time_source,
@@ -1087,12 +1354,17 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 NonZeroUsize::new(RESYNC_THROTTLE_CACHE_SIZE)
                     .expect("RESYNC_THROTTLE_CACHE_SIZE must be > 0"),
             )),
+            summary_window_cursor: Mutex::new(LruCache::new(
+                NonZeroUsize::new(SUMMARY_WINDOW_CURSOR_CACHE_SIZE)
+                    .expect("SUMMARY_WINDOW_CURSOR_CACHE_SIZE must be > 0"),
+            )),
             missing_summary_history: Mutex::new(LruCache::new(
                 NonZeroUsize::new(MISSING_SUMMARY_HISTORY_SIZE)
                     .expect("MISSING_SUMMARY_HISTORY_SIZE must be > 0"),
             )),
             missing_summary_active: DashMap::new(),
             interest_lifecycle_metrics: InterestLifecycleMetrics::new(),
+            futile_repair: FutileRepairDetector::new(),
         }
     }
 
@@ -1211,6 +1483,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                     key,
                     class,
                     first_age_bucket,
+                    untracked_prior_removal_bucket: None,
                     active_tracked,
                 }),
             };
@@ -1258,6 +1531,13 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             .recent_removal
             .filter(|(_, removed_at)| now.saturating_duration_since(*removed_at) <= INTEREST_TTL)
             .is_some();
+        // Deliberately NOT filtered by INTEREST_TTL, unlike `recreated` above:
+        // the whole question this counter answers is how the age is
+        // distributed, so clamping it to the TTL first would discard the tail
+        // that distinguishes "recently lost its entry" from "no record at all".
+        let prior_removal_age = record
+            .recent_removal
+            .map(|(_, removed_at)| now.saturating_duration_since(removed_at));
         let (inflight, active_tracked) = self.begin_active_attempt(&key);
         let class = if inflight {
             MissingSummaryClass::UntrackedRepeatInflight
@@ -1282,6 +1562,9 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 key,
                 class,
                 first_age_bucket: None,
+                untracked_prior_removal_bucket: Some(Self::untracked_prior_removal_bucket(
+                    prior_removal_age,
+                )),
                 active_tracked,
             }),
         }
@@ -1339,6 +1622,66 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         }
     }
 
+    /// Row for `class` in `delivered_size_hist`, if it carries one.
+    fn size_hist_row(class: MissingSummaryClass) -> Option<usize> {
+        SIZE_HIST_CLASSES.iter().position(|c| *c == class)
+    }
+
+    /// Bucket a delivered missing-summary payload by size.
+    ///
+    /// Exists because the 0.2.120 investigation found that full-state BYTES
+    /// rose ~63% while full-state SEND COUNT rose only ~12% (#5153). Every
+    /// counter available at the time measured counts, so the axis that actually
+    /// moved could not be observed at all. A mean would not have settled it
+    /// either: a mean cannot distinguish "every payload grew" from "the mix
+    /// shifted toward a few large contracts", and those want different fixes.
+    fn delivered_size_bucket(bytes: u64) -> usize {
+        match bytes {
+            0..=4095 => 0,
+            4096..=16383 => 1,
+            16384..=65535 => 2,
+            65536..=262_143 => 3,
+            262_144..=1_048_575 => 4,
+            _ => 5,
+        }
+    }
+
+    /// Bucket an untracked send by how long ago the pair's entry was removed.
+    ///
+    /// `ms_age` cannot answer this: `first_age_bucket` is computed only on the
+    /// tracked path and is hardcoded `None` on the untracked one, so the class
+    /// that grew (`untracked_first_observed`, ~4x the population `ms_age`
+    /// covers) had no age signal at all.
+    ///
+    /// An untracked pair has no interest entry, so it has no entry age to
+    /// report. What it does have is the history record's `recent_removal`, and
+    /// the distinction that matters is whether we are broadcasting to a peer
+    /// that RECENTLY lost its entry (a churn/removal problem) or one we hold no
+    /// removal record for. Bucket 5 is the latter.
+    ///
+    /// Bucket 5 is NOT "genuine first contact", for two reasons, and both bias
+    /// it the same way — toward concluding that churn is not the cause:
+    ///
+    /// 1. It also counts REPEAT untracked sends (`UntrackedRepeat*`), which are
+    ///    by definition not first contact.
+    /// 2. It absorbs LRU evictions. `recent_removal` lives in
+    ///    `missing_summary_history` (bounded, LRU), and `history.get` PROMOTES
+    ///    on every untracked send — so the entries most likely to be evicted are
+    ///    the oldest un-rebroadcast removals, which is precisely the bucket-4
+    ///    tail. Bucket 4 is therefore systematically undercounted INTO bucket 5.
+    ///    Cross-check against `corr_ovf[0]` before reading bucket 5 as evidence
+    ///    of anything; `recreated` carries the same caveat for the same reason.
+    fn untracked_prior_removal_bucket(age: Option<Duration>) -> usize {
+        match age {
+            Some(d) if d < Duration::from_secs(10) => 0,
+            Some(d) if d < Duration::from_secs(60) => 1,
+            Some(d) if d < Duration::from_secs(300) => 2,
+            Some(d) if d < Duration::from_secs(1200) => 3,
+            Some(_) => 4,
+            None => 5,
+        }
+    }
+
     fn finish_missing_summary_attempt(
         &self,
         attempt: MissingSummaryAttempt,
@@ -1368,7 +1711,58 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 self.interest_lifecycle_metrics.first_send_age[bucket]
                     .fetch_add(1, Ordering::Relaxed);
             }
+            if let Some(row) = Self::size_hist_row(attempt.class) {
+                self.interest_lifecycle_metrics.delivered_size_hist[row]
+                    [Self::delivered_size_bucket(bytes)]
+                .fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(bucket) = attempt.untracked_prior_removal_bucket {
+                self.interest_lifecycle_metrics.untracked_prior_removal_age[bucket]
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
+    }
+
+    /// SHADOW MODE — record that a `SyncStateToPeer` heal was actually emitted
+    /// for this (contract, peer) edge.
+    ///
+    /// Call from the one site that emits the heal
+    /// (`node::emit_stale_peer_syncs`) and only for contracts that really got
+    /// one: a contract skipped for being banned, having no local state, or
+    /// exceeding the per-message emit budget is not an attempt. Changes no
+    /// behaviour — see [`crate::ring::futile_repair`].
+    pub(crate) fn record_repair_attempt(&self, contract: &ContractKey, peer: &PeerKey) {
+        self.futile_repair
+            .record_repair_attempt(contract, peer, self.now());
+    }
+
+    /// SHADOW MODE — record the verdict of a TWO-SIDED summary comparison for
+    /// this (contract, peer) edge, settling any outstanding repair attempt.
+    ///
+    /// `converged` is the anti-entropy staleness verdict inverted: pass
+    /// `!is_stale` from the comparison that produced it. Only call this where
+    /// BOTH sides reported a real summary — a one-sided comparison is not an
+    /// outcome, because there was no divergence to repair.
+    ///
+    /// `evidence` says what that verdict rests on. `is_stale` collapses a real
+    /// verdict together with two conservative defaults (probe budget spent,
+    /// probe unavailable) that classify as STALE with nothing behind them, and
+    /// whose frequency grows with load; pass the right
+    /// [`OutcomeEvidence`] so the detector can keep them out of the headline.
+    /// Changes no behaviour.
+    pub(crate) fn record_repair_outcome(
+        &self,
+        contract: &ContractKey,
+        peer: &PeerKey,
+        converged: bool,
+        evidence: OutcomeEvidence,
+    ) {
+        self.futile_repair
+            .record_repair_outcome(contract, peer, converged, evidence, self.now());
+    }
+
+    pub(crate) fn futile_repair_snapshot(&self) -> FutileRepairSnapshot {
+        self.futile_repair.snapshot()
     }
 
     pub(crate) fn interest_lifecycle_snapshot(&self) -> InterestLifecycleSnapshot {
@@ -1391,6 +1785,14 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             }),
             first_send_age: std::array::from_fn(|i| {
                 load(&self.interest_lifecycle_metrics.first_send_age[i])
+            }),
+            delivered_size_hist: std::array::from_fn(|class| {
+                std::array::from_fn(|bucket| {
+                    load(&self.interest_lifecycle_metrics.delivered_size_hist[class][bucket])
+                })
+            }),
+            untracked_prior_removal_age: std::array::from_fn(|i| {
+                load(&self.interest_lifecycle_metrics.untracked_prior_removal_age[i])
             }),
             registration_overwrite_known: std::array::from_fn(|i| {
                 load(&self.interest_lifecycle_metrics.registration_overwrite_known[i])
@@ -2037,6 +2439,20 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             .filter(|contract| self.remove_peer_interest_for(contract, peer, cause))
             .count();
 
+        // SHADOW MODE (futile-repair detector). The edge's state dies with the
+        // peer's interest state: this is what bounds the lifetime of an
+        // outstanding repair attempt now that pairing an attempt with its
+        // outcome is NOT wall-clock gated (a wall-clock gate expired every
+        // attempt on slow-rotation links — see `crate::ring::futile_repair`,
+        // "Pairing an attempt with its outcome"). Nothing will settle a heal
+        // sent to a peer that is gone, so the attempt is discarded rather than
+        // left for a comparison after some later reconnect. Pure accounting:
+        // no gate, no behaviour change. Deliberately hooked HERE and not in
+        // the per-contract `remove_peer_interest`, so ordinary interest churn
+        // (a `ChangeInterests` message) does not throw away live attempts.
+        self.futile_repair
+            .discard_peer_attempts(peer, contracts.iter());
+
         if removed_count > 0 {
             tracing::debug!(removed_count, "Removed peer interests on disconnect");
         }
@@ -2479,6 +2895,139 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         contracts
     }
 
+    /// Index at which `peer`'s next periodic summary window starts, given the
+    /// shared-contract set in [`Self::get_matching_contracts`] order
+    /// (ascending by contract id).
+    ///
+    /// Serves BOTH wire forms. #5155 introduced it for the full-bytes fallback
+    /// only, hence the `fallback` names it used to carry; #5238 windows the
+    /// hash-first digest path too, because what the window really bounds is the
+    /// number of `summary_if_hosted_or_in_use` calls a reply makes, and that
+    /// cost is identical in either form. One cursor per peer is correct: a
+    /// peer's form is a property of its version and does not alternate, and
+    /// even if it did, the cursor names a position in id space rather than
+    /// anything form-specific.
+    ///
+    /// Mid-cycle this resumes immediately after the last contract SENT to that
+    /// peer, which is what makes successive windows contiguous in id space
+    /// (see [`first_index_after`]). At a cycle BOUNDARY — no cursor yet, the
+    /// cursor evicted or lost, or the previous window ending on the highest id
+    /// — the next cycle starts at a RANDOM offset rather than at 0.
+    ///
+    /// A fixed restart at 0 is the failure this codebase has already rejected
+    /// twice, for the same reason each time: see the rotations in
+    /// `emit_stale_peer_syncs` and in the `SummaryDigests` arm, both of which
+    /// note that a fixed prefix "would starve the tail on every cycle
+    /// forever". The two ways to land back at a boundary repeatedly are both
+    /// reachable here, and neither needs an attacker:
+    ///
+    /// - The cursor is in-memory, so it is lost on our own restart and on LRU
+    ///   eviction. A peer whose cursor is dropped more often than one cycle
+    ///   completes would, with a fixed restart, only ever be told about the
+    ///   head of the set. (Reconnection from a new source port used to be a
+    ///   third way in — the cache was keyed by address — and is not one since
+    ///   #5338; see [`Self::summary_window_cursor`].)
+    /// - `sorted` is the INTERSECTION with the hash list the peer advertised,
+    ///   so the peer influences where the cursor lands. Advertising a single
+    ///   high-id contract parks the cursor at the end, and the following full
+    ///   round would restart at 0 — repeat, and everything past the first
+    ///   window is never advertised.
+    ///
+    /// Randomising the boundary costs nothing in the ordinary case: a cycle
+    /// beginning at any offset still advances contiguously and still covers
+    /// the whole set in `ceil(len / limit)` rounds, because the window wraps.
+    /// It only removes the guarantee that the SAME contracts are the ones
+    /// covered first every time.
+    ///
+    /// `GlobalRng` keeps this deterministic under simulation and test.
+    pub(crate) fn summary_window_start(&self, peer: &PeerKey, sorted: &[ContractKey]) -> usize {
+        if sorted.is_empty() {
+            return 0;
+        }
+        let after = { self.summary_window_cursor.lock().peek(peer).copied() };
+        let resumed = after.map(|after| first_index_after(sorted, &after));
+        match resumed {
+            // Mid-cycle: continue exactly where the last reply stopped.
+            Some(start) if start < sorted.len() => start,
+            // Cycle boundary (cursor absent, or exhausted past the end).
+            _ => crate::config::GlobalRng::random_range(0..sorted.len()),
+        }
+    }
+
+    /// Record the contract id of the last entry actually included in `peer`'s
+    /// periodic summary reply, so the next reply resumes after it.
+    ///
+    /// Takes what was SENT, not what was selected: the byte budget can cut a
+    /// window short, and advancing past entries we dropped would skip them
+    /// until the rotation wrapped all the way round.
+    pub(crate) fn record_summary_cursor(&self, peer: &PeerKey, last_sent: ContractInstanceId) {
+        self.summary_window_cursor
+            .lock()
+            .put(peer.clone(), last_sent);
+    }
+
+    /// Test accessor for the stored cursor.
+    #[cfg(test)]
+    pub(crate) fn peek_summary_cursor(&self, peer: &PeerKey) -> Option<ContractInstanceId> {
+        self.summary_window_cursor.lock().peek(peer).copied()
+    }
+}
+
+/// First index in `sorted` (ascending by contract id, as
+/// [`InterestManager::get_matching_contracts`] returns it) whose id is strictly
+/// greater than `after`. Returns `sorted.len()` when `after` is at or past the
+/// end, which [`InterestManager::summary_window_start`] reads as the end of a
+/// cycle and answers with a fresh random offset.
+///
+/// This is the churn-safe half of the rotation. Because it is a binary search
+/// over ids rather than a stored offset, it behaves correctly when the set
+/// changed since the cursor was recorded:
+///
+/// - The cursor's own contract removed: nothing else moves relative to the
+///   remaining ids, so the search still lands on the same successor.
+/// - A contract inserted BELOW the cursor: it sorts before the resume point and
+///   is picked up when the rotation wraps, not skipped.
+/// - A contract inserted ABOVE the cursor: it is inside the very next window.
+///
+/// An index-based cursor gets the removal case wrong: the position it named
+/// now holds a different contract, so the round steps over one. Wrapping means
+/// that contract is seen again eventually, so this is not permanent
+/// starvation — it is the loss of the `ceil(n / limit)` bound, which is the
+/// only thing that makes bounding the reply defensible in the first place.
+pub(crate) fn first_index_after(sorted: &[ContractKey], after: &ContractInstanceId) -> usize {
+    sorted.partition_point(|c| c.id().as_bytes() <= after.as_bytes())
+}
+
+/// Indices of the next rotation window: up to `limit` entries beginning at
+/// `start`, wrapping past the end of the set.
+///
+/// Wrapping is what makes the coverage argument hold. A window that stopped at
+/// the end of the set would give the tail a shorter turn than the head on every
+/// cycle; wrapping makes each round advance by a full `limit` entries.
+///
+/// That gives `ceil(len / limit)` rounds to cover a stable set — but ONLY when
+/// every selected entry is actually sent. The caller may send fewer than the
+/// window it asked for (the byte budget in `node.rs` cuts a reply once it has
+/// spent its allowance) and then records the cursor against what it SENT, so
+/// the real cycle length is set by bytes rather than by entry count whenever
+/// summaries are large. See `MAX_FALLBACK_SUMMARY_BYTES_PER_REPLY` for the
+/// honest bound; do not quote `ceil(len / limit)` as the cycle time without
+/// checking which of the limits binds.
+///
+/// Since #5338 `limit` is the per-message ENTRY CEILING rather than the
+/// summarize budget, and the caller stops early on the budget — so this is now
+/// the widest span a round may walk, not the span it will use. The cycle time
+/// for the contracts that cost a summarize is `ceil(hosted / budget)`; the
+/// cycle time for the whole shared set is what this function's `limit` bounds.
+pub(crate) fn rotation_window_indices(len: usize, start: usize, limit: usize) -> Vec<usize> {
+    if len == 0 || limit == 0 {
+        return Vec::new();
+    }
+    let start = if start >= len { 0 } else { start };
+    (0..limit.min(len)).map(|i| (start + i) % len).collect()
+}
+
+impl<T: TimeSource + Sync> InterestManager<T> {
     /// Cache a computed delta for reuse.
     pub fn cache_delta(
         &self,
@@ -3014,6 +3563,70 @@ mod tests {
         (manager, time_source)
     }
 
+    /// Wiring pin for the SHADOW-MODE futile-repair detector's attempt
+    /// lifetime.
+    ///
+    /// Pairing an attempt with its outcome is deliberately not wall-clock
+    /// gated: on links still taking the byte-budgeted full-bytes summary
+    /// fallback a contract is re-compared on the order of ten hours, and the
+    /// 30-minute expiry this replaces would have expired every attempt on
+    /// exactly the heavy-summary links the detector exists to find. What bounds
+    /// the attempt instead is the edge's own lifetime — so peer-interest
+    /// teardown MUST discard it, or a comparison made after some later
+    /// reconnect settles a long-dead heal as though it had just failed.
+    ///
+    /// The detector's own unit tests cover `discard_peer_attempts`; what they
+    /// cannot see is whether disconnect teardown actually calls it.
+    #[test]
+    fn disconnect_teardown_discards_outstanding_repair_attempts() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let departing = make_peer_key(1);
+        let staying = make_peer_key(2);
+
+        for peer in [&departing, &staying] {
+            manager.register_peer_interest(&contract, peer.clone(), None, false);
+            manager.record_repair_attempt(&contract, peer);
+        }
+        assert_eq!(manager.futile_repair_snapshot().tracked_edges, 2);
+
+        manager.remove_all_peer_interests(&departing);
+
+        let snap = manager.futile_repair_snapshot();
+        assert_eq!(
+            snap.attempts_discarded, 1,
+            "the departing peer's outstanding heal must be discarded when its \
+             interest state is torn down — nothing will ever settle it"
+        );
+        assert_eq!(
+            snap.tracked_edges, 1,
+            "only the departing peer's edge is dropped"
+        );
+
+        // The departed peer's attempt is gone, so a comparison after a
+        // reconnect is unpaired rather than futile...
+        manager.record_repair_outcome(
+            &contract,
+            &departing,
+            false,
+            crate::ring::futile_repair::OutcomeEvidence::Verdict,
+        );
+        // ...while the peer that stayed still has its attempt to settle.
+        manager.record_repair_outcome(
+            &contract,
+            &staying,
+            false,
+            crate::ring::futile_repair::OutcomeEvidence::Verdict,
+        );
+
+        let snap = manager.futile_repair_snapshot();
+        assert_eq!(snap.observations_unpaired, 1);
+        assert_eq!(
+            snap.futile, 1,
+            "teardown must be scoped to the departing peer, not to the contract"
+        );
+    }
+
     /// [`summary_digest`] must be a FIXED function of the bytes — identical on
     /// every node, every platform, and every release (#4965).
     ///
@@ -3157,6 +3770,281 @@ mod tests {
 
         // Remove again returns false
         assert!(!manager.remove_peer_interest(&contract, &peer));
+    }
+
+    /// The SIZE histogram must bucket by the delivered payload, per class.
+    ///
+    /// The 0.2.120 investigation could not tell "every payload grew" from "the
+    /// mix shifted toward large contracts", because every counter measured
+    /// COUNTS. A histogram answers both; a mean would answer neither.
+    #[test]
+    fn delivered_size_histogram_buckets_by_payload_and_class() {
+        let (manager, _time) = make_manager();
+
+        // Two DIFFERENT untracked pairs, so both sends are first-observed, with
+        // payloads that must land in different buckets of the same row.
+        for (seed, bytes) in [(41u8, 512usize), (45u8, 200_000usize)] {
+            let contract = make_contract_key(seed);
+            let peer = make_peer_key(seed);
+            let PeerSummaryForBroadcast::Missing {
+                attempt: Some(attempt),
+                ..
+            } = manager.begin_peer_summary_broadcast(&contract, &peer)
+            else {
+                panic!("an untracked pair must start lifecycle accounting");
+            };
+            assert_eq!(attempt.class, MissingSummaryClass::UntrackedFirstObserved);
+            let mut guard = manager.missing_summary_attempt_guard(attempt);
+            guard.mark_delivered(bytes);
+            drop(guard);
+        }
+
+        let snap = manager.interest_lifecycle_snapshot();
+        // Literal, NOT `size_hist_row(..)`. Deriving the expected row from the
+        // function under test makes the assertion self-referential: permuting
+        // SIZE_HIST_CLASSES would keep this green while silently mislabelling
+        // every ms_size row against the order router.rs promises the dashboard.
+        let row = 2;
+        assert_eq!(
+            SIZE_HIST_CLASSES,
+            [
+                MissingSummaryClass::TrackedFirstNew,
+                MissingSummaryClass::TrackedFirstRecreated,
+                MissingSummaryClass::UntrackedFirstObserved,
+                MissingSummaryClass::UntrackedFirstRecreated,
+            ],
+            "ms_size row order is a WIRE contract with the dashboard \
+             (router.rs documents it); reordering silently reattributes every \
+             row to the wrong class"
+        );
+        // 512 B -> bucket 0; 200 KB -> bucket 3 (65536..=262_143).
+        assert_eq!(
+            snap.delivered_size_hist[row][0], 1,
+            "the 512-byte send must be counted in bucket 0 (<4 KiB)"
+        );
+        assert_eq!(
+            snap.delivered_size_hist[row][3], 1,
+            "the 200KiB send must land in bucket 3 — separating these two is \
+             the whole point, since a mean cannot tell 'everything grew' from \
+             'the mix shifted toward large contracts'"
+        );
+
+        // The narrowing is deliberate: a REPEAT send carries no size row.
+        assert!(
+            TestInterestManager::size_hist_row(MissingSummaryClass::UntrackedRepeatSequential)
+                .is_none(),
+            "repeat classes are a measured zero fleet-wide and are excluded to \
+             stay inside the network_efficiency_v1 byte budget"
+        );
+    }
+
+    /// Every bucket boundary of both classifiers, including the exact edges.
+    ///
+    /// The arms are hardcoded literals, so an off-by-one at an edge is invisible
+    /// to any test that only samples interior values — which is all the others
+    /// did.
+    #[test]
+    fn bucket_classifiers_are_exact_at_every_boundary() {
+        type M = TestInterestManager;
+
+        // Size: contiguous, no gap, no overlap, exhaustive over u64.
+        for (bytes, want) in [
+            (0u64, 0usize),
+            (4095, 0),
+            (4096, 1),
+            (16_383, 1),
+            (16_384, 2),
+            (65_535, 2),
+            (65_536, 3),
+            (262_143, 3),
+            (262_144, 4),
+            (1_048_575, 4),
+            (1_048_576, 5),
+            (u64::MAX, 5),
+        ] {
+            assert_eq!(
+                M::delivered_size_bucket(bytes),
+                want,
+                "size bucket for {bytes} bytes"
+            );
+        }
+
+        // Age: strict `<`, so each stated edge belongs to the NEXT bucket up.
+        // The 1200s edge is INTEREST_TTL, which is what makes bucket 4 mean
+        // "older than the adjacent `recreated` filter would have kept".
+        for (secs, want) in [
+            (0u64, 0usize),
+            (9, 0),
+            (10, 1),
+            (59, 1),
+            (60, 2),
+            (299, 2),
+            (300, 3),
+            (1199, 3),
+            (1200, 4),
+            (86_400, 4),
+        ] {
+            assert_eq!(
+                M::untracked_prior_removal_bucket(Some(Duration::from_secs(secs))),
+                want,
+                "age bucket for {secs}s"
+            );
+        }
+        assert_eq!(
+            M::untracked_prior_removal_bucket(None),
+            5,
+            "no removal record is its own bucket, never folded into the tail"
+        );
+        assert_eq!(
+            Duration::from_secs(1200),
+            INTEREST_TTL,
+            "the 1200s edge is INTEREST_TTL by intent, not coincidence; if the \
+             TTL moves, bucket 4 stops meaning 'beyond what `recreated` keeps'"
+        );
+    }
+
+    /// The age read must NOT be clamped by `INTEREST_TTL`.
+    ///
+    /// This is the one novel decision in the change: `recreated` (three lines
+    /// above the read) filters by `INTEREST_TTL`, and this deliberately does
+    /// not, because the whole question is how the age is DISTRIBUTED and
+    /// clamping would discard the tail that separates "recently lost its entry"
+    /// from "no record at all".
+    ///
+    /// Without this test the decision is unpinned: adding the filter back moves
+    /// bucket 4's contents into bucket 5 and every other test stays green.
+    #[test]
+    fn untracked_age_keeps_the_tail_beyond_interest_ttl() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(46);
+        let peer = make_peer_key(46);
+
+        manager.register_peer_interest(&contract, peer.clone(), None, false);
+        assert!(manager.remove_peer_interest_for(
+            &contract,
+            &peer,
+            InterestRemovalCause::DisconnectGrace
+        ));
+
+        // Well past INTEREST_TTL, so a TTL-filtered read would report None.
+        time.advance_time(INTEREST_TTL + Duration::from_secs(600));
+
+        let PeerSummaryForBroadcast::Missing {
+            attempt: Some(attempt),
+            ..
+        } = manager.begin_peer_summary_broadcast(&contract, &peer)
+        else {
+            panic!("untracked pair");
+        };
+        let mut guard = manager.missing_summary_attempt_guard(attempt);
+        guard.mark_delivered(1024);
+        drop(guard);
+
+        let snap = manager.interest_lifecycle_snapshot();
+        assert_eq!(
+            snap.untracked_prior_removal_age[4], 1,
+            "a removal older than INTEREST_TTL must stay in the older-than-20m \
+             bucket. If this lands in bucket 5 the read has been clamped by the \
+             TTL and the counter can no longer tell a churned pair from one it \
+             has no record of"
+        );
+        assert_eq!(
+            snap.untracked_prior_removal_age[5], 0,
+            "and must NOT be folded into the no-record bucket"
+        );
+    }
+
+    /// A send that is never delivered must not be counted in the histogram.
+    ///
+    /// `delivered_bytes` gates the existing counters, and the new histogram has
+    /// to sit inside the same gate or it would over-count exactly the sends the
+    /// byte counters deliberately exclude.
+    #[test]
+    fn undelivered_send_is_absent_from_the_size_histogram() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(42);
+        let peer = make_peer_key(42);
+
+        let PeerSummaryForBroadcast::Missing {
+            attempt: Some(attempt),
+            ..
+        } = manager.begin_peer_summary_broadcast(&contract, &peer)
+        else {
+            panic!("an untracked pair must start lifecycle accounting");
+        };
+        // Dropped WITHOUT mark_delivered.
+        drop(manager.missing_summary_attempt_guard(attempt));
+
+        let snap = manager.interest_lifecycle_snapshot();
+        assert_eq!(
+            snap.delivered_size_hist.iter().flatten().sum::<u64>(),
+            0,
+            "an undelivered send must not appear in the size histogram"
+        );
+        assert_eq!(
+            snap.untracked_prior_removal_age.iter().sum::<u64>(),
+            0,
+            "nor in the untracked-age histogram"
+        );
+    }
+
+    /// The untracked-age histogram must separate "recently lost its entry" from
+    /// "no record of one at all".
+    ///
+    /// This is the population `ms_age` structurally cannot see: `first_age_bucket`
+    /// is computed only on the tracked path, so `untracked_first_observed` — the
+    /// class that grew under 0.2.120, and ~4x the population `ms_age` covers —
+    /// had no age signal whatsoever.
+    #[test]
+    fn untracked_age_histogram_separates_recent_removal_from_no_record() {
+        let (manager, time) = make_manager();
+
+        // Pair A: never seen before -> the "no record" bucket (5).
+        let contract_a = make_contract_key(43);
+        let peer_a = make_peer_key(43);
+        let PeerSummaryForBroadcast::Missing {
+            attempt: Some(attempt),
+            ..
+        } = manager.begin_peer_summary_broadcast(&contract_a, &peer_a)
+        else {
+            panic!("untracked pair");
+        };
+        let mut guard = manager.missing_summary_attempt_guard(attempt);
+        guard.mark_delivered(1024);
+        drop(guard);
+
+        // Pair B: tracked, removed, then broadcast to 30s later -> bucket 1
+        // (<1m), NOT the no-record bucket.
+        let contract_b = make_contract_key(44);
+        let peer_b = make_peer_key(44);
+        manager.register_peer_interest(&contract_b, peer_b.clone(), None, false);
+        assert!(manager.remove_peer_interest_for(
+            &contract_b,
+            &peer_b,
+            InterestRemovalCause::DisconnectGrace
+        ));
+        time.advance_time(Duration::from_secs(30));
+        let PeerSummaryForBroadcast::Missing {
+            attempt: Some(attempt),
+            ..
+        } = manager.begin_peer_summary_broadcast(&contract_b, &peer_b)
+        else {
+            panic!("untracked pair");
+        };
+        let mut guard = manager.missing_summary_attempt_guard(attempt);
+        guard.mark_delivered(1024);
+        drop(guard);
+
+        let snap = manager.interest_lifecycle_snapshot();
+        assert_eq!(
+            snap.untracked_prior_removal_age[5], 1,
+            "a pair with no removal record must land in the no-record bucket"
+        );
+        assert_eq!(
+            snap.untracked_prior_removal_age[1], 1,
+            "a pair whose entry was removed 30s ago must land in the <1m \
+             bucket, which is the whole distinction this counter exists to draw"
+        );
     }
 
     /// The untracked-path staleness reset must not wipe `recent_removal`.
@@ -3435,19 +4323,19 @@ mod tests {
             InterestRegistrationSource::SubscribeRelay,
         ));
 
-        let first = match manager.begin_peer_summary_broadcast(&contract, &missing_peer) {
-            PeerSummaryForBroadcast::Missing {
-                attempt: Some(attempt),
-                ..
-            } => attempt,
-            _ => panic!("missing peer must produce a tracked attempt"),
+        let PeerSummaryForBroadcast::Missing {
+            attempt: Some(first),
+            ..
+        } = manager.begin_peer_summary_broadcast(&contract, &missing_peer)
+        else {
+            panic!("missing peer must produce a tracked attempt");
         };
-        let second = match manager.begin_peer_summary_broadcast(&contract, &missing_peer) {
-            PeerSummaryForBroadcast::Missing {
-                attempt: Some(attempt),
-                ..
-            } => attempt,
-            _ => panic!("overlapping missing send must produce another attempt"),
+        let PeerSummaryForBroadcast::Missing {
+            attempt: Some(second),
+            ..
+        } = manager.begin_peer_summary_broadcast(&contract, &missing_peer)
+        else {
+            panic!("overlapping missing send must produce another attempt");
         };
         assert_eq!(second.class, MissingSummaryClass::TrackedRepeatInflight);
         drop(manager.missing_summary_attempt_guard(first));
@@ -3502,15 +4390,15 @@ mod tests {
         let (manager, _time) = make_manager();
 
         for seed in 0..=MISSING_SUMMARY_HISTORY_SIZE as u32 {
-            let attempt = match manager.begin_peer_summary_broadcast(
+            let PeerSummaryForBroadcast::Missing {
+                attempt: Some(attempt),
+                ..
+            } = manager.begin_peer_summary_broadcast(
                 &make_unique_contract_key(seed),
                 &make_unique_peer_key(seed),
-            ) {
-                PeerSummaryForBroadcast::Missing {
-                    attempt: Some(attempt),
-                    ..
-                } => attempt,
-                _ => panic!("untracked pair must produce an attempt"),
+            )
+            else {
+                panic!("untracked pair must produce an attempt");
             };
             drop(manager.missing_summary_attempt_guard(attempt));
         }
@@ -3522,15 +4410,15 @@ mod tests {
         let active_probe_start = MISSING_SUMMARY_HISTORY_SIZE as u32 + 10_000;
         for seed in active_probe_start..active_probe_start + MISSING_SUMMARY_ACTIVE_SIZE as u32 + 1
         {
-            let attempt = match manager.begin_peer_summary_broadcast(
+            let PeerSummaryForBroadcast::Missing {
+                attempt: Some(attempt),
+                ..
+            } = manager.begin_peer_summary_broadcast(
                 &make_unique_contract_key(seed),
                 &make_unique_peer_key(seed),
-            ) {
-                PeerSummaryForBroadcast::Missing {
-                    attempt: Some(attempt),
-                    ..
-                } => attempt,
-                _ => panic!("untracked pair must produce an attempt"),
+            )
+            else {
+                panic!("untracked pair must produce an attempt");
             };
             guards.push(manager.missing_summary_attempt_guard(attempt));
         }
@@ -3563,15 +4451,15 @@ mod tests {
         );
 
         for seed in 0..WORKING_SET {
-            let attempt = match manager.begin_peer_summary_broadcast(
+            let PeerSummaryForBroadcast::Missing {
+                attempt: Some(attempt),
+                ..
+            } = manager.begin_peer_summary_broadcast(
                 &make_unique_contract_key(seed),
                 &make_unique_peer_key(seed),
-            ) {
-                PeerSummaryForBroadcast::Missing {
-                    attempt: Some(attempt),
-                    ..
-                } => attempt,
-                _ => panic!("untracked pair must produce an attempt"),
+            )
+            else {
+                panic!("untracked pair must produce an attempt");
             };
             drop(manager.missing_summary_attempt_guard(attempt));
         }
@@ -4058,6 +4946,203 @@ mod tests {
                 .get_cached_delta(&contract2, &peer_summary, &our_summary)
                 .is_none()
         );
+    }
+
+    /// Tests for the delta cache's BYTE bound (#4805).
+    ///
+    /// The pre-fix cache was a plain `LruCache` capped at
+    /// [`DELTA_CACHE_SIZE`] entries. Since every value is a contract-produced
+    /// `StateDelta` (up to `MAX_STATE_SIZE`, 50 MiB), that count bounded no
+    /// amount of RAM: 1024 entries is ~51 GiB in the worst case.
+    mod delta_cache_byte_bound {
+        use super::*;
+        use crate::util::byte_bounded_lru::CACHE_ENTRY_OVERHEAD_BYTES;
+
+        /// P1 regression, mirroring #4804's
+        /// `byte_budget_bounds_ram_for_large_values` at the `InterestManager`
+        /// level: a contract emitting LARGE deltas must not be able to pin
+        /// arbitrary RAM here while staying far under the entry-count cap.
+        ///
+        /// The primary assertion is deliberately computed from figures the
+        /// TEST owns (`retained entries × the delta size it inserted`), not
+        /// from the cache's own byte accounting, so it does not check the fix
+        /// against itself. It is red against the pre-fix `LruCache`
+        /// (64 entries × 1 MiB = 64 MiB retained, vs. a 16 MiB ceiling) and
+        /// green with the byte backstop.
+        #[test]
+        fn large_deltas_stay_within_the_byte_budget() {
+            let (manager, _time) = make_manager();
+            let contract = make_contract_key(1);
+            let our_summary = vec![0u8; 8];
+
+            const DELTA_BYTES: usize = 1024 * 1024; // 1 MiB per delta
+            // 64 MiB of deltas — 4x the widest budget any host resolves to —
+            // while the ENTRY COUNT stays far below the count cap, so only a
+            // byte bound can stop this.
+            const INSERTS: usize = 64;
+            const _: () = assert!(INSERTS < DELTA_CACHE_SIZE);
+
+            let budget = interest_delta_cache_budget_bytes();
+            assert!(
+                budget <= INTEREST_DELTA_CACHE_MAX_BYTES,
+                "budget {budget} must never exceed the documented ceiling \
+                 {INTEREST_DELTA_CACHE_MAX_BYTES}"
+            );
+            assert!(
+                INSERTS * DELTA_BYTES > budget,
+                "precondition: the test must insert MORE bytes ({}) than the \
+                 budget ({budget}) or it cannot observe eviction",
+                INSERTS * DELTA_BYTES
+            );
+
+            for i in 0..INSERTS {
+                // A distinct peer-summary per insert, exactly as fan-out
+                // produces (the cache key carries the peer's summary hash).
+                let peer_summary = (i as u64).to_le_bytes().to_vec();
+                manager.cache_delta(
+                    &contract,
+                    &peer_summary,
+                    &our_summary,
+                    StateDelta::from(vec![0u8; DELTA_BYTES]),
+                );
+
+                // Independent bound: entries retained × the size WE inserted.
+                let retained = manager.delta_cache.lock().len();
+                assert!(
+                    retained * DELTA_BYTES <= budget,
+                    "after {} inserts the cache retains {retained} × {DELTA_BYTES} B = {} B, \
+                     which must stay within the {budget} B budget",
+                    i + 1,
+                    retained * DELTA_BYTES
+                );
+            }
+
+            let retained = manager.delta_cache.lock().len();
+            assert!(
+                retained < INSERTS,
+                "eviction must have occurred: {retained} of {INSERTS} inserts retained"
+            );
+            // Secondary: the cache's own accounting agrees.
+            assert!(
+                manager.delta_cache.lock().total_bytes() <= budget,
+                "accounted total {} must stay within the {budget} B budget",
+                manager.delta_cache.lock().total_bytes()
+            );
+        }
+
+        /// The byte bound must not degrade the SMALL-delta case it is a
+        /// backstop for. Empty deltas are the entries that matter most here —
+        /// they are the memoized "this peer is converged" verdicts whose loss
+        /// re-arms the #4857 summarize storm — so the floor budget has to keep
+        /// the COUNT target binding for them on every host.
+        #[test]
+        fn count_target_still_binds_for_small_deltas() {
+            let (manager, _time) = make_manager();
+            let contract = make_contract_key(1);
+            let our_summary = vec![0u8; 8];
+
+            for i in 0..DELTA_CACHE_SIZE {
+                let peer_summary = (i as u64).to_le_bytes().to_vec();
+                manager.cache_delta(
+                    &contract,
+                    &peer_summary,
+                    &our_summary,
+                    StateDelta::from(Vec::<u8>::new()),
+                );
+            }
+
+            assert_eq!(
+                manager.delta_cache.lock().len(),
+                DELTA_CACHE_SIZE,
+                "a full count-cap worth of EMPTY deltas must all be retained; \
+                 the byte budget is a backstop, not a coverage limit"
+            );
+        }
+
+        /// A single delta larger than the whole budget is not cached at all
+        /// (`ByteBoundedLruCache::put`'s skip-oversized guard) — retaining one
+        /// would break the hard cap, and `StateDelta` is contract-controlled.
+        ///
+        /// The behavioural consequence, stated so it is not rediscovered as a
+        /// bug: `compute_delta` caches even an oversized delta on purpose, so
+        /// `cached_staleness_verdict` can answer "peer is stale" without a
+        /// WASM probe. For a delta above the budget that memoization is gone
+        /// and the staleness path falls back to the contract round-trip
+        /// (bounded per message by `MAX_STALENESS_PROBES_PER_SUMMARIES`).
+        /// That costs work in exactly the abusive case this bound exists for,
+        /// and costs no correctness: a miss never reports "converged".
+        #[test]
+        fn a_single_oversized_delta_is_not_cached() {
+            let (manager, _time) = make_manager();
+            let contract = make_contract_key(1);
+            let our_summary = vec![0u8; 8];
+            let peer_summary = vec![1u8; 8];
+
+            let oversized = interest_delta_cache_budget_bytes() + 1;
+            manager.cache_delta(
+                &contract,
+                &peer_summary,
+                &our_summary,
+                StateDelta::from(vec![0u8; oversized]),
+            );
+
+            assert!(
+                manager
+                    .get_cached_delta(&contract, &peer_summary, &our_summary)
+                    .is_none(),
+                "a delta larger than the whole budget must not be retained"
+            );
+            assert_eq!(
+                manager.delta_cache.lock().total_bytes(),
+                0,
+                "refusing the oversized entry must leave the byte total at zero"
+            );
+        }
+
+        /// The resolved budget at the host shapes that actually ship, so a
+        /// future edit to the divisor or the clamps has to state its effect
+        /// here rather than moving them silently.
+        #[test]
+        fn budget_resolves_as_documented_across_host_shapes() {
+            const MIB: usize = 1024 * 1024;
+            for (label, ram, expected) in [
+                (
+                    "128 MiB container",
+                    128 * MIB,
+                    INTEREST_DELTA_CACHE_MIN_BYTES,
+                ),
+                ("512 MiB host", 512 * MIB, 4 * MIB),
+                ("1 GiB host (the OS-query fallback)", 1024 * MIB, 8 * MIB),
+                ("2 GiB peer (shipped MemoryMax=2G)", 2048 * MIB, 16 * MIB),
+                (
+                    "7600 MiB gateway",
+                    7600 * MIB,
+                    INTEREST_DELTA_CACHE_MAX_BYTES,
+                ),
+            ] {
+                assert_eq!(
+                    interest_delta_budget_for(ram),
+                    expected,
+                    "{label}: budget must resolve to {expected} bytes"
+                );
+            }
+        }
+
+        /// The floor is what keeps the byte bound a BACKSTOP rather than a
+        /// coverage limit: at the per-entry overhead floor it must still hold
+        /// more than the count target, so no host ever loses empty-delta
+        /// coverage to bytes. Pins the arithmetic behind
+        /// `count_target_still_binds_for_small_deltas` at the SMALLEST budget,
+        /// which the test machine's own RAM may not produce.
+        #[test]
+        fn floor_budget_holds_more_than_the_count_target() {
+            let entries_at_floor = INTEREST_DELTA_CACHE_MIN_BYTES / CACHE_ENTRY_OVERHEAD_BYTES;
+            assert!(
+                entries_at_floor >= DELTA_CACHE_SIZE,
+                "the floor budget holds {entries_at_floor} minimum-weight entries, which \
+                 must be at least the {DELTA_CACHE_SIZE}-entry count target"
+            );
+        }
     }
 
     #[test]
@@ -6528,6 +7613,369 @@ mod tests {
             queries_served.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "the contract must have been consulted for the verdict"
+        );
+    }
+
+    // ===== #5155: bounded, rotating full-bytes summary fallback =====
+
+    /// One round of the rotation over `sorted`, resuming after `cursor`.
+    /// Returns the ids covered and the new cursor.
+    ///
+    /// `cursor: None` starts at index 0 here rather than at the random offset
+    /// production uses at a cycle boundary. That is deliberate: these tests
+    /// pin the WITHIN-cycle contiguity and coverage properties, which must hold
+    /// from any starting offset, so the tests below sweep the starts explicitly
+    /// instead of sampling them. `summary_window_start_randomises_the_cycle_
+    /// boundary` covers the production entry point.
+    fn rotation_round(
+        sorted: &[ContractKey],
+        cursor: Option<ContractInstanceId>,
+        limit: usize,
+    ) -> (Vec<ContractInstanceId>, Option<ContractInstanceId>) {
+        let start = match cursor {
+            Some(ref after) => first_index_after(sorted, after),
+            None => 0,
+        };
+        let sent: Vec<ContractInstanceId> = rotation_window_indices(sorted.len(), start, limit)
+            .into_iter()
+            .map(|i| *sorted[i].id())
+            .collect();
+        let next = sent.last().copied();
+        (sent, next)
+    }
+
+    /// `sorted` in the order `get_matching_contracts` produces (ascending by
+    /// contract id), which the rotation's binary search depends on.
+    fn sorted_keys(seeds: impl IntoIterator<Item = u32>) -> Vec<ContractKey> {
+        let mut keys: Vec<ContractKey> = seeds.into_iter().map(make_unique_contract_key).collect();
+        keys.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+        keys
+    }
+
+    /// The window never exceeds the limit, never exceeds the set, and wraps
+    /// past the end rather than returning a short tail.
+    ///
+    /// The wrap is the part worth pinning: a window that truncated at the end
+    /// of the set would give the tail a smaller share of every cycle than the
+    /// head, so the "covered in ceil(n/k) rounds" claim below would be false
+    /// for exactly the contracts furthest from the cursor's starting point.
+    #[test]
+    fn rotation_window_is_bounded_and_wraps() {
+        assert!(rotation_window_indices(0, 0, 64).is_empty(), "empty set");
+        assert!(rotation_window_indices(10, 0, 0).is_empty(), "zero limit");
+
+        // Limit binds.
+        assert_eq!(rotation_window_indices(10, 0, 4), vec![0, 1, 2, 3]);
+        // Set size binds.
+        assert_eq!(rotation_window_indices(3, 0, 64), vec![0, 1, 2]);
+        // Wraps rather than truncating.
+        assert_eq!(rotation_window_indices(10, 8, 4), vec![8, 9, 0, 1]);
+        // A start past the end (every id below the cursor) restarts at 0
+        // instead of producing nothing, which would stall the rotation.
+        assert_eq!(rotation_window_indices(4, 4, 2), vec![0, 1]);
+        assert_eq!(rotation_window_indices(4, 99, 2), vec![0, 1]);
+
+        for len in [1usize, 2, 7, 64, 65, 266, 2448] {
+            for start in [0usize, 1, len / 2, len - 1] {
+                let w = rotation_window_indices(len, start, 64);
+                assert!(w.len() <= 64, "window exceeded the limit at len={len}");
+                assert!(w.len() <= len, "window exceeded the set at len={len}");
+                assert!(
+                    w.iter().collect::<HashSet<_>>().len() == w.len(),
+                    "window repeated an index at len={len} start={start}"
+                );
+            }
+        }
+    }
+
+    /// A stable shared set is fully covered within `ceil(n / limit)` rounds.
+    ///
+    /// This is the convergence claim the bound rests on: bounding the reply
+    /// only trades detection LATENCY, never detection itself. If this fails,
+    /// some contract is never advertised to that peer at all, which is
+    /// permanent silent divergence rather than a slower safety net.
+    /// Coverage must hold from ANY starting offset, not just from index 0, and
+    /// for set sizes that do not divide evenly by the limit.
+    ///
+    /// Both conditions matter. Production starts each cycle at a random offset,
+    /// so a coverage property that only holds from 0 would not describe it. And
+    /// a set size divisible by the limit never produces a short final round,
+    /// which is exactly the case where a window that truncated at the end of
+    /// the set instead of wrapping would still look correct.
+    #[test]
+    fn rotation_covers_every_contract_within_ceil_n_over_limit_rounds() {
+        const LIMIT: usize = 64;
+        for n in [1usize, 5, 63, 64, 65, 100, 128, 266, 2448] {
+            let sorted = sorted_keys(0..n as u32);
+            let expected: HashSet<ContractInstanceId> =
+                sorted.iter().map(|k| *k.id()).collect::<HashSet<_>>();
+            let rounds = n.div_ceil(LIMIT);
+
+            // Sweep the starting offsets a random cycle boundary could pick.
+            for first in [0usize, 1, n / 3, n / 2, n - 1] {
+                let mut covered: HashSet<ContractInstanceId> = HashSet::new();
+                // Seed the cursor so round one begins at `first`.
+                let mut cursor = if first == 0 {
+                    None
+                } else {
+                    Some(*sorted[first - 1].id())
+                };
+                for _ in 0..rounds {
+                    let (sent, next) = rotation_round(&sorted, cursor, LIMIT);
+                    assert!(
+                        sent.len() <= LIMIT,
+                        "a round exceeded the entry bound at n={n}"
+                    );
+                    covered.extend(sent);
+                    cursor = next;
+                }
+                assert_eq!(
+                    covered, expected,
+                    "n={n} starting at {first} was not fully covered in \
+                     {rounds} rounds (ceil({n}/{LIMIT}))"
+                );
+            }
+        }
+    }
+
+    /// Contracts removed mid-cycle must not cost the rotation its coverage
+    /// BOUND: every contract still shared after `ceil(n / limit)` rounds must
+    /// have been advertised within those rounds.
+    ///
+    /// This is the property that justifies bounding the reply at all. The
+    /// safety argument is "a divergence goes unnoticed for at most one cycle",
+    /// and a cursor that loses entries under churn downgrades that to "at some
+    /// point", which is not a bound and not what the change was reviewed on.
+    ///
+    /// The second half runs the identical removal schedule with an INDEX
+    /// cursor. It is not permanently starved — wrapping revisits everything
+    /// eventually — but it does miss contracts inside the cycle, which is what
+    /// makes the assertion above discriminating rather than true of any cursor.
+    #[test]
+    fn rotation_does_not_lose_the_coverage_bound_when_contracts_are_removed() {
+        const LIMIT: usize = 4;
+        const N: usize = 12;
+        let rounds = N.div_ceil(LIMIT);
+        let full = sorted_keys(0..N as u32);
+
+        // Key-based cursor.
+        let mut sorted = full.clone();
+        let mut covered: HashSet<ContractInstanceId> = HashSet::new();
+        let mut cursor = None;
+        for _ in 0..rounds {
+            let (sent, next) = rotation_round(&sorted, cursor, LIMIT);
+            covered.extend(sent);
+            cursor = next;
+            // Drop the lowest-sorting contract, i.e. one at or below the
+            // cursor — the direction that shifts positions under a cursor
+            // that stored one.
+            if !sorted.is_empty() {
+                sorted.remove(0);
+            }
+        }
+        let survivors: HashSet<ContractInstanceId> = sorted.iter().map(|k| *k.id()).collect();
+        let missed: Vec<_> = survivors.difference(&covered).collect();
+        assert!(
+            missed.is_empty(),
+            "key cursor left {} still-shared contract(s) unadvertised within \
+             {rounds} rounds — the coverage bound the change is sold on",
+            missed.len()
+        );
+
+        // The same schedule with an INDEX cursor, as the control.
+        let mut sorted = full.clone();
+        let mut idx_covered: HashSet<ContractInstanceId> = HashSet::new();
+        let mut idx_cursor = 0usize;
+        for _ in 0..rounds {
+            let w = rotation_window_indices(sorted.len(), idx_cursor, LIMIT);
+            for i in &w {
+                idx_covered.insert(*sorted[*i].id());
+            }
+            // Resume at the position after the last one sent. Nothing records
+            // WHICH contract that was, which is the whole defect.
+            idx_cursor = w.last().map_or(0, |i| i + 1);
+            if !sorted.is_empty() {
+                sorted.remove(0);
+            }
+        }
+        let idx_survivors: HashSet<ContractInstanceId> = sorted.iter().map(|k| *k.id()).collect();
+        assert!(
+            !idx_survivors.is_subset(&idx_covered),
+            "premise of this test: under this removal schedule an index cursor \
+             is supposed to miss a contract inside the cycle. If it no longer \
+             does, the scenario stopped discriminating between the two designs \
+             and the assertion above proves nothing about the key cursor."
+        );
+    }
+
+    /// A contract added mid-cycle is picked up rather than waiting behind a
+    /// cursor that has already passed its position.
+    ///
+    /// Insertion ABOVE the cursor lands in the very next window; insertion
+    /// BELOW it is covered when the rotation wraps. Both are bounded, which is
+    /// the property that matters — neither is skipped indefinitely.
+    #[test]
+    fn rotation_picks_up_contracts_added_mid_cycle() {
+        const LIMIT: usize = 4;
+        let mut sorted = sorted_keys(0..12);
+        let mut cursor = None;
+        // Two rounds in, so the cursor sits in the middle of the set.
+        for _ in 0..2 {
+            let (_, next) = rotation_round(&sorted, cursor, LIMIT);
+            cursor = next;
+        }
+
+        // Add contracts on both sides of the cursor.
+        sorted = sorted_keys((0..12).chain(100..112));
+        let added: HashSet<ContractInstanceId> = sorted_keys(100..112)
+            .iter()
+            .map(|k| *k.id())
+            .collect::<HashSet<_>>();
+
+        let mut covered: HashSet<ContractInstanceId> = HashSet::new();
+        let rounds = sorted.len().div_ceil(LIMIT);
+        for _ in 0..rounds {
+            let (sent, next) = rotation_round(&sorted, cursor, LIMIT);
+            covered.extend(sent);
+            cursor = next;
+        }
+        let missed: Vec<_> = added.difference(&covered).collect();
+        assert!(
+            missed.is_empty(),
+            "{} newly added contract(s) were not covered within one full cycle",
+            missed.len()
+        );
+    }
+
+    /// `first_index_after` resumes correctly when the cursor's own contract is
+    /// the one that was removed — the cursor is compared as bytes, not looked
+    /// up, so a missing id still orders against the rest.
+    #[test]
+    fn first_index_after_handles_a_removed_cursor() {
+        let sorted = sorted_keys(0..8);
+        let cursor = *sorted[3].id();
+
+        assert_eq!(
+            first_index_after(&sorted, &cursor),
+            4,
+            "with the cursor present, resume at the next contract"
+        );
+
+        let mut without = sorted.clone();
+        without.remove(3);
+        let resumed = first_index_after(&without, &cursor);
+        assert_eq!(
+            *without[resumed].id(),
+            *sorted[4].id(),
+            "with the cursor's own contract gone, resume at the SAME successor \
+             rather than stepping over it"
+        );
+
+        // Cursor at the end: signals a completed cycle to the caller, which
+        // restarts at a random offset rather than at 0.
+        let beyond = *sorted[7].id();
+        assert_eq!(first_index_after(&sorted, &beyond), sorted.len());
+    }
+
+    /// Mid-cycle the stored cursor round-trips and resumes deterministically,
+    /// and cursors do not leak between peers.
+    #[test]
+    fn summary_cursor_round_trips_and_resumes_mid_cycle() {
+        let (mgr, _clock) = make_manager();
+        let peer = make_peer_key(1);
+        let sorted = sorted_keys(0..8);
+
+        assert_eq!(mgr.peek_summary_cursor(&peer), None);
+
+        mgr.record_summary_cursor(&peer, *sorted[2].id());
+        assert_eq!(mgr.peek_summary_cursor(&peer), Some(*sorted[2].id()));
+        assert_eq!(
+            mgr.summary_window_start(&peer, &sorted),
+            3,
+            "mid-cycle the resume point must be exactly after the last id sent"
+        );
+
+        // Cursors are per peer: one peer's progress must not advance another's.
+        let other = make_peer_key(2);
+        mgr.record_summary_cursor(&other, *sorted[6].id());
+        assert_eq!(mgr.summary_window_start(&peer, &sorted), 3);
+        assert_eq!(mgr.summary_window_start(&other, &sorted), 7);
+
+        // An empty shared set has no valid offset; it must not panic or draw.
+        assert_eq!(mgr.summary_window_start(&peer, &[]), 0);
+    }
+
+    /// At a CYCLE BOUNDARY the start is random, not a fixed 0.
+    ///
+    /// A boundary is reached with no cursor (first reply, our own restart, LRU
+    /// eviction, a peer reconnecting on a new port) or with a cursor already at
+    /// the highest id. Restarting at 0 every time would re-send the head of the
+    /// set and starve the tail for any peer that keeps returning to a boundary,
+    /// which is the failure `emit_stale_peer_syncs` and the `SummaryDigests`
+    /// arm both already rotate to avoid.
+    ///
+    /// The peer influences this: `sorted` is the intersection with the hash
+    /// list it advertised, so advertising one high-id contract parks the cursor
+    /// at the end. With a fixed restart that alternation pins the window to the
+    /// head forever; with a random one it cannot.
+    #[test]
+    fn summary_window_start_randomises_the_cycle_boundary() {
+        let (mgr, _clock) = make_manager();
+        let sorted = sorted_keys(0..64);
+
+        // No cursor: many draws, all in range, and not all the same value.
+        let mut seen = HashSet::new();
+        for i in 0..40u32 {
+            let peer = make_unique_peer_key(9200 + i);
+            let start = mgr.summary_window_start(&peer, &sorted);
+            assert!(start < sorted.len(), "start {start} out of range");
+            seen.insert(start);
+        }
+        assert!(
+            seen.len() > 1,
+            "a missing cursor must not always restart at the same offset — 40 \
+             draws over 64 contracts all landed on {seen:?}"
+        );
+
+        // Cursor at the highest id: also a boundary, also randomised.
+        let peer = make_unique_peer_key(9300);
+        let mut seen_wrapped = HashSet::new();
+        for _ in 0..40 {
+            mgr.record_summary_cursor(&peer, *sorted[sorted.len() - 1].id());
+            seen_wrapped.insert(mgr.summary_window_start(&peer, &sorted));
+        }
+        assert!(
+            seen_wrapped.iter().all(|s| *s < sorted.len()),
+            "wrapped start out of range"
+        );
+        assert!(
+            seen_wrapped.len() > 1,
+            "a cursor at the end of the set must restart at a random offset, \
+             not deterministically at 0 — got {seen_wrapped:?}"
+        );
+    }
+
+    /// Source pin: the cycle-boundary offset must come from `GlobalRng`.
+    ///
+    /// Two things ride on this and neither is visible in the behavioural test
+    /// above: a non-random restart re-opens the tail-starvation failure, and an
+    /// offset drawn from anything other than `GlobalRng` is not reproducible
+    /// under the deterministic simulation harness, which would make any
+    /// convergence simulation covering this path silently non-deterministic.
+    #[test]
+    fn summary_window_start_draws_its_offset_from_global_rng() {
+        let src = include_str!("interest.rs");
+        let at = src
+            .find("pub(crate) fn summary_window_start(")
+            .expect("summary_window_start not found");
+        let body_end = at + src[at..].find("\n    }\n").expect("body end not found");
+        let body = &src[at..body_end];
+        assert!(
+            body.contains("GlobalRng::random_range"),
+            "the cycle-boundary offset is no longer drawn from GlobalRng — a \
+             fixed restart starves the tail of the set for any peer that keeps \
+             returning to a boundary, and a non-GlobalRng source breaks \
+             simulation determinism"
         );
     }
 }

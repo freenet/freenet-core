@@ -292,6 +292,11 @@ async fn drive_client_update(
                 related_contracts,
                 crate::contract::Priority::ClientLocal,
                 crate::node::ApplyOrigin::ClientLocal,
+                // #5147: no upstream sender, so nothing is covered. An EMPTY
+                // registration is not the same as no registration — it collapses
+                // any concurrent relayed coverage for this contract, so a local
+                // update is never suppressed against someone else's target list.
+                crate::ring::broadcast_coverage::BroadcastOrigin::local(),
             )
             .await
             {
@@ -411,6 +416,11 @@ async fn drive_client_update(
                 related_contracts.clone(),
                 crate::contract::Priority::ClientLocal,
                 crate::node::ApplyOrigin::ClientLocal,
+                // #5147: no upstream sender, so nothing is covered. An EMPTY
+                // registration is not the same as no registration — it collapses
+                // any concurrent relayed coverage for this contract, so a local
+                // update is never suppressed against someone else's target list.
+                crate::ring::broadcast_coverage::BroadcastOrigin::local(),
             )
             .await;
 
@@ -747,6 +757,107 @@ pub(crate) async fn start_relay_request_update(
     Ok(())
 }
 
+/// Resolve an originator's target list against the peers we could ourselves
+/// broadcast this contract to (#5147).
+///
+/// Resolves against `advertised_cohost_pub_keys` — the exact set
+/// `get_broadcast_targets_update` draws from — rather than every connected
+/// peer, so the work is proportional to the fan-out (median 16-17) instead of
+/// the connection count, and a named peer we would never have targeted costs
+/// nothing.
+///
+/// `tx` is the transaction the list arrived on. The hashes are seeded with it,
+/// so resolving under any other transaction yields nothing; that is what stops
+/// a list from being replayed onto a different broadcast.
+///
+/// # Both halves are behind the #5147 version gate, including the sender
+///
+/// The sender exclusion needs no wire change of its own — it is a decision
+/// about our OWN fan-out — so it would ship unconditionally if left ungated.
+/// It is gated anyway, and deliberately:
+///
+/// * It has the same unsafe shape as the target list. Excluding the peer that
+///   delivered a payload assumes it holds what we are about to send, and on a
+///   merge path our post-merge state can be strictly newer than what it sent
+///   us. That is the same assumption the target list makes, so it deserves the
+///   same caution rather than inheriting the list's without its gate.
+/// * Ungated, it would reach every peer on the floor release with none of the
+///   machinery that makes the rest of this reviewable — no sim override, so no
+///   simulation could turn it off to get a baseline, and no version floor, so
+///   no staged rollout.
+///
+/// Gating on the SENDER's version is the coherent choice: if the peer that
+/// delivered this payload predates the feature, we are in the legacy world
+/// with it and behave toward it exactly as today. An unknown version fails
+/// closed, which on a gateway link is the common case until #5161 deploys.
+/// NOTE: `pub(crate)` rather than private, and deliberately NOT reached through
+/// a test-only shim, so a unit test in `node::op_state_manager` drives the real
+/// gate.
+///
+/// A test-gated item must not be introduced above this point in the file. The
+/// source-scrape pins below slice production code with `production_source`,
+/// which truncates the file at the first test-gate attribute, so an earlier one
+/// silently hides every function after it from those pins — they then fail with
+/// "could not find ...", or worse, pass vacuously. Note the attribute must not
+/// be spelled out in prose here either: `production_source` matches the literal
+/// text, so even a comment mentioning it truncates the slice. That is not
+/// hypothetical; writing this warning the obvious way broke four pins.
+pub(crate) fn resolve_covered_peers(
+    op_manager: &OpManager,
+    key: &ContractKey,
+    tx: &Transaction,
+    sender_addr: SocketAddr,
+    covered: &crate::ring::broadcast_coverage::CoveredPeers,
+) -> crate::ring::broadcast_coverage::BroadcastOrigin {
+    // The two halves are gated SEPARATELY, and conflating them is what made the
+    // whole feature inert. See `BroadcastOrigin::relayed_list_only`.
+    //
+    // The covered LIST is self-gating: it rides only on the V2 variants, so a
+    // pre-floor sender hands us an empty one and suppresses nothing no matter
+    // what we do here. Holding a populated list IS proof the sender supports the
+    // feature — its own act, rather than our record of it.
+    //
+    // The sender EXCLUSION keeps the version gate — but as a ROLLOUT SWITCH,
+    // not as wire or semantic safety, and it is worth being exact because the
+    // obvious reading is wrong. Not sending a peer a message cannot break its
+    // decoding, so there is no wire-compat exposure to fail closed against; and
+    // the semantic worry (our post-merge state can be newer than what the
+    // sender gave us) is version-INDEPENDENT — a post-floor sender has exactly
+    // the same property, and that is the risk the list half accepts and the
+    // multi-writer simulation validates. What the gate buys is a staged rollout
+    // and a sim toggle, both of which are worth having on a change with this
+    // blast radius.
+    //
+    // Consequence to keep in view: on an unknown-version link we honour the
+    // sender's list while still echoing back to the sender itself — suppressing
+    // legs that are only probably redundant, while keeping the one that is
+    // certainly redundant. At the fleet median fan-out of 16-17 that is roughly
+    // 6% of legs left on the table, on the gateway links that matter most,
+    // until #5167 propagates.
+    let resolved = if covered.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        let candidates = op_manager.advertised_cohost_pub_keys(key);
+        covered.resolve(tx, candidates.iter())
+    };
+
+    if op_manager
+        .ring
+        .connection_manager
+        .supports_broadcast_target_list(sender_addr)
+    {
+        crate::ring::broadcast_coverage::BroadcastOrigin::relayed(sender_addr, resolved)
+    } else {
+        // Pre-floor or UNKNOWN sender version. Unknown is the common case, not a
+        // corner: a node does not learn its gateway's version until #5167
+        // propagates, and simulations default that ack gate OFF. Gating the list
+        // on this lookup too discarded a claim the message in hand had already
+        // proven honourable, which zeroed suppression on the highest-degree
+        // links in production and entirely in simulation.
+        crate::ring::broadcast_coverage::BroadcastOrigin::relayed_list_only(resolved)
+    }
+}
+
 /// Spawn a relay driver for a fresh inbound `UpdateMsg::BroadcastTo`.
 ///
 /// Same gates as `start_relay_request_update`. The driver applies the
@@ -754,6 +865,7 @@ pub(crate) async fn start_relay_request_update(
 /// `BroadcastStateChange` event fans out to other interested peers
 /// automatically — the driver itself never sends `BroadcastTo`
 /// downstream.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_relay_broadcast_to(
     op_manager: Arc<OpManager>,
     incoming_tx: Transaction,
@@ -761,6 +873,9 @@ pub(crate) async fn start_relay_broadcast_to(
     payload: DeltaOrFullState,
     sender_summary_bytes: Vec<u8>,
     sender_addr: SocketAddr,
+    // Peers the sender says it already delivered to (#5147). Empty for the
+    // legacy `BroadcastTo`, which names none.
+    covered: crate::ring::broadcast_coverage::CoveredPeers,
 ) -> Result<(), OpError> {
     #[cfg(any(test, feature = "testing"))]
     RELAY_UPDATE_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -807,6 +922,7 @@ pub(crate) async fn start_relay_broadcast_to(
         payload,
         sender_summary_bytes,
         sender_addr,
+        covered,
     ));
     Ok(())
 }
@@ -872,6 +988,7 @@ async fn run_relay_request_update(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_relay_broadcast_to(
     guard: RelayUpdateInflightGuard,
     op_manager: Arc<OpManager>,
@@ -880,6 +997,7 @@ async fn run_relay_broadcast_to(
     payload: DeltaOrFullState,
     sender_summary_bytes: Vec<u8>,
     sender_addr: SocketAddr,
+    covered: crate::ring::broadcast_coverage::CoveredPeers,
 ) {
     let _guard = guard;
 
@@ -890,6 +1008,7 @@ async fn run_relay_broadcast_to(
         payload,
         sender_summary_bytes,
         sender_addr,
+        covered,
     )
     .await
     {
@@ -978,6 +1097,11 @@ async fn drive_relay_request_update(
             related_contracts.clone(),
             crate::contract::Priority::NetworkRelay,
             crate::node::ApplyOrigin::NetworkRelay,
+            // #5147: a `RequestUpdate` names no delivery targets (it is a
+            // routed request, not a fan-out), so this apply attests to no
+            // coverage. Registering empty is deliberate — see the two
+            // client-local sites.
+            crate::ring::broadcast_coverage::BroadcastOrigin::local(),
         )
         .await?;
 
@@ -1683,6 +1807,7 @@ fn seed_sender_summary_from_broadcast(
 ///    on full-state failure → `try_auto_fetch_contract`.
 /// 5. Telemetry: `update_broadcast_applied`.
 /// 6. Spawn proactive summary notification background task.
+#[allow(clippy::too_many_arguments)]
 async fn drive_relay_broadcast_to(
     op_manager: &OpManager,
     incoming_tx: Transaction,
@@ -1690,6 +1815,7 @@ async fn drive_relay_broadcast_to(
     payload: DeltaOrFullState,
     sender_summary_bytes: Vec<u8>,
     sender_addr: SocketAddr,
+    covered: crate::ring::broadcast_coverage::CoveredPeers,
 ) -> Result<(), OpError> {
     let self_location = op_manager.ring.connection_manager.own_location();
 
@@ -1803,6 +1929,7 @@ async fn drive_relay_broadcast_to(
         RelatedContracts::default(),
         crate::contract::Priority::NetworkRelay,
         crate::node::ApplyOrigin::NetworkRelay,
+        resolve_covered_peers(op_manager, &key, &incoming_tx, sender_addr, &covered),
     )
     .await;
 
@@ -2209,6 +2336,7 @@ pub(crate) async fn start_relay_request_update_streaming(
 
 /// Spawn a relay driver for a fresh inbound
 /// `UpdateMsg::BroadcastToStreaming`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_relay_broadcast_to_streaming(
     op_manager: Arc<OpManager>,
     incoming_tx: Transaction,
@@ -2216,6 +2344,9 @@ pub(crate) async fn start_relay_broadcast_to_streaming(
     stream_id: StreamId,
     total_size: u64,
     sender_addr: SocketAddr,
+    // Peers the sender says it already delivered to (#5147). Empty for the
+    // legacy `BroadcastToStreaming`.
+    covered: crate::ring::broadcast_coverage::CoveredPeers,
 ) -> Result<(), OpError> {
     #[cfg(any(test, feature = "testing"))]
     RELAY_UPDATE_STREAMING_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2260,6 +2391,7 @@ pub(crate) async fn start_relay_broadcast_to_streaming(
         stream_id,
         total_size,
         sender_addr,
+        covered,
     ));
     Ok(())
 }
@@ -2324,6 +2456,7 @@ async fn run_relay_request_update_streaming(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_relay_broadcast_to_streaming(
     guard: RelayUpdateStreamingInflightGuard,
     op_manager: Arc<OpManager>,
@@ -2332,6 +2465,7 @@ async fn run_relay_broadcast_to_streaming(
     stream_id: StreamId,
     total_size: u64,
     sender_addr: SocketAddr,
+    covered: crate::ring::broadcast_coverage::CoveredPeers,
 ) {
     let _guard = guard;
 
@@ -2342,6 +2476,7 @@ async fn run_relay_broadcast_to_streaming(
         stream_id,
         total_size,
         sender_addr,
+        covered,
     )
     .await
     {
@@ -2473,6 +2608,9 @@ async fn drive_relay_request_update_streaming(
         related_contracts,
         crate::contract::Priority::NetworkRelay,
         crate::node::ApplyOrigin::NetworkRelay,
+        // A streaming `RequestUpdateStreaming` names no delivery targets; see
+        // the non-streaming twin.
+        crate::ring::broadcast_coverage::BroadcastOrigin::local(),
     )
     .await?;
 
@@ -2534,6 +2672,7 @@ async fn drive_relay_broadcast_to_streaming(
     stream_id: StreamId,
     total_size: u64,
     sender_addr: SocketAddr,
+    covered: crate::ring::broadcast_coverage::CoveredPeers,
 ) -> Result<(), OpError> {
     use crate::operations::orphan_streams::{OrphanStreamError, STREAM_CLAIM_TIMEOUT};
 
@@ -2620,6 +2759,7 @@ async fn drive_relay_broadcast_to_streaming(
         state_bytes,
         sender_summary_bytes,
         sender_addr,
+        covered,
     )
     .await
 }
@@ -2630,6 +2770,7 @@ async fn drive_relay_broadcast_to_streaming(
 /// proactive summary. Extracted from the driver so the #4857 queue-full heal on
 /// the streaming path is unit-testable without the transport stream plumbing
 /// (steps 1-3: claim + assemble + deserialize).
+#[allow(clippy::too_many_arguments)]
 async fn apply_streaming_broadcast(
     op_manager: &OpManager,
     incoming_tx: Transaction,
@@ -2637,6 +2778,7 @@ async fn apply_streaming_broadcast(
     state_bytes: Vec<u8>,
     sender_summary_bytes: Vec<u8>,
     sender_addr: SocketAddr,
+    covered: crate::ring::broadcast_coverage::CoveredPeers,
 ) -> Result<(), OpError> {
     let mut receiver_terminal = op_manager
         .payload_mix
@@ -2716,6 +2858,7 @@ async fn apply_streaming_broadcast(
         RelatedContracts::default(),
         crate::contract::Priority::NetworkRelay,
         crate::node::ApplyOrigin::NetworkRelay,
+        resolve_covered_peers(op_manager, &key, &incoming_tx, sender_addr, &covered),
     )
     .await;
 
@@ -3983,6 +4126,10 @@ mod tests {
 
         let handler = tokio::spawn(async move {
             while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "a stand-in handler that serves exactly the two events this test drives; any other event is an unexpected-input panic, and enumerating all 20+ ContractHandlerEvent variants to reach the same panic would only rot"
+                )]
                 let response = match ev {
                     ContractHandlerEvent::GetQuery { .. } => ContractHandlerEvent::GetResponse {
                         key: None,
@@ -4050,6 +4197,7 @@ mod tests {
             DeltaOrFullState::Delta(vec![1, 2, 3]),
             Vec::new(),
             sender_addr,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
         )
         .await;
         assert!(
@@ -4075,6 +4223,7 @@ mod tests {
             DeltaOrFullState::Delta(vec![4, 5, 6]),
             Vec::new(),
             sender_addr,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
         )
         .await;
         assert!(
@@ -4124,6 +4273,7 @@ mod tests {
             vec![1, 2, 3],
             Vec::new(),
             sender_addr,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
         )
         .await;
         assert!(
@@ -4148,6 +4298,7 @@ mod tests {
             vec![4, 5, 6],
             Vec::new(),
             sender_addr,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
         )
         .await;
         assert!(
@@ -4257,6 +4408,10 @@ mod tests {
         let counter = update_query_count.clone();
         let handler = tokio::spawn(async move {
             while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "a stand-in handler that serves exactly the two events this test drives; any other event is an unexpected-input panic, and enumerating all 20+ ContractHandlerEvent variants to reach the same panic would only rot"
+                )]
                 let response = match ev {
                     ContractHandlerEvent::GetQuery { .. } => ContractHandlerEvent::GetResponse {
                         key: None,
@@ -4360,6 +4515,7 @@ mod tests {
                 DeltaOrFullState::Delta(bytes),
                 Vec::new(),
                 sender,
+                crate::ring::broadcast_coverage::CoveredPeers::empty(),
             )
             .await;
             assert!(r.is_err(), "each poison delta must fail the merge");
@@ -4380,6 +4536,7 @@ mod tests {
             DeltaOrFullState::Delta(vec![4u8]),
             Vec::new(),
             sender,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
         )
         .await;
         assert!(
@@ -4419,15 +4576,22 @@ mod tests {
 
         // Two delta failures (count = 2, below the trip threshold).
         for bytes in [vec![1u8], vec![2u8]] {
-            let _ = drive_relay_broadcast_to(
+            let driven = drive_relay_broadcast_to(
                 &op_manager,
                 Transaction::new::<UpdateMsg>(),
                 key,
                 DeltaOrFullState::Delta(bytes),
                 Vec::new(),
                 sender,
+                crate::ring::broadcast_coverage::CoveredPeers::empty(),
             )
             .await;
+            // Pin the PREMISE: these two must actually fail, or the backoff
+            // count below never advances and the test passes vacuously.
+            assert!(
+                driven.is_err(),
+                "the stand-in executor must reject this delta, got {driven:?}"
+            );
             let _ = drain_resync_targets(&mut notification_rx, key);
         }
         // A full-state broadcast SUCCEEDS via the stand-in — but must NOT reset
@@ -4439,6 +4603,7 @@ mod tests {
             DeltaOrFullState::FullState(vec![9, 9, 9]),
             Vec::new(),
             sender,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
         )
         .await;
         assert!(
@@ -4449,15 +4614,20 @@ mod tests {
 
         // A 3rd delta failure now trips (count 2 → 3), proving the success did
         // NOT reset it to 0 (else the count would only reach 1 here).
-        let _ = drive_relay_broadcast_to(
+        let third = drive_relay_broadcast_to(
             &op_manager,
             Transaction::new::<UpdateMsg>(),
             key,
             DeltaOrFullState::Delta(vec![3u8]),
             Vec::new(),
             sender,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
         )
         .await;
+        assert!(
+            third.is_err(),
+            "the tripping delta must actually fail, got {third:?}"
+        );
         let _ = drain_resync_targets(&mut notification_rx, key);
         let queries_after_trip = update_queries.load(Ordering::Relaxed);
 
@@ -4470,6 +4640,7 @@ mod tests {
             DeltaOrFullState::Delta(vec![4u8]),
             Vec::new(),
             sender,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
         )
         .await;
         assert!(r.is_ok());
@@ -4501,15 +4672,22 @@ mod tests {
 
         // Sender A trips its own Invalid channel (3 consecutive delta failures).
         for bytes in [vec![1u8], vec![2u8], vec![3u8]] {
-            let _ = drive_relay_broadcast_to(
+            let driven = drive_relay_broadcast_to(
                 &op_manager,
                 Transaction::new::<UpdateMsg>(),
                 key,
                 DeltaOrFullState::Delta(bytes),
                 Vec::new(),
                 sender_a,
+                crate::ring::broadcast_coverage::CoveredPeers::empty(),
             )
             .await;
+            // Pin the PREMISE: A must actually fail 3 times, or it never trips
+            // and the per-sender scoping below is never exercised.
+            assert!(
+                driven.is_err(),
+                "the stand-in executor must reject A's delta, got {driven:?}"
+            );
             let _ = drain_resync_targets(&mut notification_rx, key);
         }
         assert_eq!(
@@ -4526,6 +4704,7 @@ mod tests {
             DeltaOrFullState::Delta(vec![4u8]),
             Vec::new(),
             sender_a,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
         )
         .await;
         assert!(ra.is_ok(), "A's suppressed broadcast completes Ok");
@@ -4545,6 +4724,7 @@ mod tests {
             DeltaOrFullState::Delta(vec![5u8]),
             Vec::new(),
             sender_b,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
         )
         .await;
         let _ = drain_resync_targets(&mut notification_rx, key);
@@ -4578,15 +4758,22 @@ mod tests {
         // Five consecutive queue-full delta failures (well past the N=3 Invalid
         // trip threshold). None may be recorded to the backoff.
         for bytes in [vec![1u8], vec![2u8], vec![3u8], vec![4u8], vec![5u8]] {
-            let _ = drive_relay_broadcast_to(
+            let driven = drive_relay_broadcast_to(
                 &op_manager,
                 Transaction::new::<UpdateMsg>(),
                 key,
                 DeltaOrFullState::Delta(bytes),
                 Vec::new(),
                 sender,
+                crate::ring::broadcast_coverage::CoveredPeers::empty(),
             )
             .await;
+            // Pin the PREMISE: every one of the five must be a queue-full
+            // failure, else "5 failures did not trip the backoff" proves nothing.
+            assert!(
+                driven.is_err(),
+                "the stand-in executor must report queue-full, got {driven:?}"
+            );
             let _ = drain_resync_targets(&mut notification_rx, key);
         }
         assert_eq!(
@@ -4626,15 +4813,22 @@ mod tests {
         let sender_count = 6u16;
         for i in 0..sender_count {
             let sender: SocketAddr = format!("127.0.0.1:{}", 13000 + i).parse().unwrap();
-            let _ = drive_relay_broadcast_to(
+            let driven = drive_relay_broadcast_to(
                 &op_manager,
                 Transaction::new::<UpdateMsg>(),
                 key,
                 DeltaOrFullState::Delta(vec![i as u8]),
                 Vec::new(),
                 sender,
+                crate::ring::broadcast_coverage::CoveredPeers::empty(),
             )
             .await;
+            // Pin the PREMISE: each sender's delta must actually hit queue-full,
+            // or the emit cap below is never put under pressure.
+            assert!(
+                driven.is_err(),
+                "the stand-in executor must report queue-full, got {driven:?}"
+            );
         }
         // The global per-contract emit cap (EMIT_BURST = 2) bounds total emissions
         // regardless of sender count — NOT one per sender.
@@ -4882,6 +5076,7 @@ mod tests {
                 DeltaOrFullState::Delta(p.clone()),
                 Vec::new(),
                 sender_b,
+                crate::ring::broadcast_coverage::CoveredPeers::empty(),
             )
             .await;
             assert!(
@@ -4913,6 +5108,7 @@ mod tests {
             DeltaOrFullState::Delta(vec![94u8]),
             Vec::new(),
             sender_b,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
         )
         .await;
         let _ = drain_resync_targets(&mut notification_rx, key);
@@ -4942,9 +5138,12 @@ mod tests {
         );
         // Make the local node host the contract so drive_client_update's
         // target=None path applies the update locally instead of erroring.
-        op_manager
-            .ring
-            .host_contract(key, 100, crate::ring::AccessType::Put);
+        op_manager.ring.host_contract(
+            key,
+            100,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
 
         let remote_sender: SocketAddr = "127.0.0.1:12700".parse().unwrap();
         let probe_sender: SocketAddr = "127.0.0.1:12800".parse().unwrap();
@@ -5028,9 +5227,12 @@ mod tests {
             ContractInstanceId::new([63u8; 32]),
             CodeHash::new([64u8; 32]),
         );
-        op_manager
-            .ring
-            .host_contract(key, 100, crate::ring::AccessType::Put);
+        op_manager.ring.host_contract(
+            key,
+            100,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
 
         let remote_sender: SocketAddr = "127.0.0.1:15100".parse().unwrap();
         let probe_sender: SocketAddr = "127.0.0.1:15200".parse().unwrap();
@@ -5113,9 +5315,12 @@ mod tests {
             ContractInstanceId::new([65u8; 32]),
             CodeHash::new([66u8; 32]),
         );
-        op_manager
-            .ring
-            .host_contract(key, 100, crate::ring::AccessType::Put);
+        op_manager.ring.host_contract(
+            key,
+            100,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
 
         let remote_sender: SocketAddr = "127.0.0.1:15300".parse().unwrap();
         let probe_sender: SocketAddr = "127.0.0.1:15400".parse().unwrap();
@@ -5361,6 +5566,7 @@ mod tests {
             DeltaOrFullState::Delta(vec![1, 2, 3]),
             Vec::new(),
             sender_addr,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
         )
         .await;
         assert!(
@@ -5442,6 +5648,7 @@ mod tests {
             DeltaOrFullState::Delta(vec![1, 2, 3]),
             Vec::new(),
             sender_addr,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
         )
         .await;
         assert!(
@@ -5518,6 +5725,7 @@ mod tests {
             DeltaOrFullState::Delta(vec![1, 2, 3]),
             Vec::new(),
             sender_addr,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
         )
         .await;
         assert!(
@@ -5606,6 +5814,7 @@ mod tests {
             DeltaOrFullState::Delta(vec![1, 2, 3]),
             Vec::new(),
             sender_addr,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
         )
         .await;
         assert!(
@@ -5846,7 +6055,10 @@ mod tests {
                 break;
             }
         }
-        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the resend task must finish once the deadline passes")
+            .expect("the resend task must not panic");
 
         assert!(
             !fired.is_empty(),

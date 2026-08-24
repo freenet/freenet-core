@@ -59,6 +59,12 @@ async fn web_home_v1(
     config: axum::extract::State<Config>,
     headers: axum::http::HeaderMap,
     axum::extract::RawQuery(query): axum::extract::RawQuery,
+    // Peer address for the token-issuance audit log, read out of the request
+    // extensions rather than as a `ConnectInfo` extractor: a router composed
+    // without `into_make_service_with_connect_info` (standalone tests) has no
+    // `ConnectInfo`, and a required extractor there would 500 the whole route.
+    // Same tolerance as `hosted_mode` above.
+    extensions: axum::http::Extensions,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     web_home(
         key,
@@ -68,6 +74,9 @@ async fn web_home_v1(
         ApiVersion::V1,
         query,
         hosted_mode_or_default(hosted_mode),
+        extensions
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|ci| ci.0),
     )
     .await
 }
@@ -80,6 +89,8 @@ async fn web_subpages_v1(
     headers: axum::http::HeaderMap,
     axum::extract::State(config): axum::extract::State<Config>,
     Extension(rs): Extension<HttpClientApiRequest>,
+    // See `web_home_*`: read from extensions so standalone routers do not 500.
+    extensions: axum::http::Extensions,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     web_subpages(
         key,
@@ -90,6 +101,9 @@ async fn web_subpages_v1(
         &config,
         rs,
         hosted_mode_or_default(hosted_mode),
+        extensions
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|ci| ci.0),
     )
     .await
 }

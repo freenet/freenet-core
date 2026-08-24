@@ -336,10 +336,6 @@ impl ContractStoreBridge for MockWasmRuntime {
     fn remove_contract(&mut self, key: &ContractKey) -> Result<(), anyhow::Error> {
         self.contract_store.remove_contract(key)
     }
-
-    fn ensure_key_indexed(&mut self, key: &ContractKey) -> Result<(), anyhow::Error> {
-        self.contract_store.ensure_key_indexed(key)
-    }
 }
 
 impl crate::wasm_runtime::ContractRuntimeBridge for MockWasmRuntime {}
@@ -400,6 +396,7 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
         _req: DelegateRequest<'_>,
         _origin_contract: Option<&ContractInstanceId>,
         _caller_delegate: Option<&DelegateKey>,
+        _connection_scope: crate::client_events::ConnectionScope,
         _user_context: Option<&UserSecretContext>,
     ) -> Response {
         Err(ExecutorError::other(anyhow::anyhow!(

@@ -33,7 +33,11 @@ use freenet_stdlib::{
     prelude::*,
 };
 use tokio::time::Instant;
-use tokio::{fs::File, io::AsyncReadExt, sync::mpsc};
+use tokio::{
+    fs::File,
+    io::AsyncReadExt,
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+};
 
 use crate::client_events::AuthToken;
 
@@ -110,18 +114,184 @@ static CONTRACT_CACHE_REFRESH: LazyLock<DashMap<ContractInstanceId, Instant>> =
 /// is not reentrant, so the refresh gate — which is held *across* the GET (and
 /// therefore across `unpack_if_stale`'s own lock acquisition) — must use its
 /// own mutex to avoid a self-deadlock.
-static CONTRACT_REFRESH_LOCKS: LazyLock<DashMap<ContractInstanceId, Arc<tokio::sync::Mutex<()>>>> =
-    LazyLock::new(DashMap::new);
+///
+/// Unlike the two maps above, this one is keyed by an instance id an
+/// UNAUTHENTICATED caller supplies in the URL, and the entry is created
+/// *before* any gate has decided whether the contract is worth fetching. So it
+/// is the one per-key map here an attacker can grow at will, and it is capped
+/// at [`MAX_REFRESH_LOCKS`] — see `acquire_refresh_lock` and the
+/// per-key-collection rule in `.claude/rules/code-style.md`.
+static CONTRACT_REFRESH_LOCKS: LazyLock<
+    DashMap<ContractInstanceId, Arc<tokio::sync::Mutex<RefreshState>>>,
+> = LazyLock::new(DashMap::new);
+
+/// What a contract's refresh lock guards, beyond the decision itself.
+///
+/// Kept inside the mutex rather than in a map of its own because the mutex is
+/// already the thing that serializes refreshers for one contract, and a second
+/// map keyed by a contract id from the URL would be another unbounded per-key
+/// collection to bound (`.claude/rules/code-style.md`).
+#[derive(Default, Debug)]
+struct RefreshState {
+    /// When a COLD fetch last failed, and for which contract.
+    ///
+    /// Without this, every subresource on a page pointing at a contract nobody
+    /// can find pays its own full network GET, one after another, because each
+    /// queued follower re-checks the cache, still finds it cold, and tries
+    /// again: a page with 30 such images spends 30 sequential fetches getting
+    /// 30 identical answers. Recording the failure lets the followers stop.
+    ///
+    /// The id is carried because [`REFRESH_LOCK_OVERFLOW`] stripes are shared
+    /// between contracts, so a stripe's state may describe a different one.
+    last_cold_failure: Option<(ContractInstanceId, Instant)>,
+}
+
+impl RefreshState {
+    /// Whether a cold fetch for `instance_id` failed recently enough that
+    /// trying again now would just repeat it.
+    fn cold_fetch_failed_recently(&self, instance_id: &ContractInstanceId) -> bool {
+        self.last_cold_failure
+            .is_some_and(|(id, at)| id == *instance_id && at.elapsed() < CONTRACT_CACHE_REFRESH_TTL)
+    }
+}
+
+/// Cap on retained entries in [`CONTRACT_REFRESH_LOCKS`].
+///
+/// Generous next to the number of web contracts a node realistically serves,
+/// so the prune below effectively never runs in normal operation; it exists so
+/// a spray of never-seen keys cannot grow the map without limit.
+const MAX_REFRESH_LOCKS: usize = 4096;
+
+/// Shared mutexes used once [`CONTRACT_REFRESH_LOCKS`] is full — see
+/// [`refresh_lock_for`].
+///
+/// A contract maps to a stripe by hash, so two requests for the SAME contract
+/// still land on the same mutex and still coalesce. Unrelated contracts sharing
+/// a stripe serialize their refresh decisions, which is the price of the
+/// overflow state and is why there are enough stripes to make it rare.
+const REFRESH_LOCK_OVERFLOW_STRIPES: usize = 64;
+
+static REFRESH_LOCK_OVERFLOW: LazyLock<Vec<Arc<tokio::sync::Mutex<RefreshState>>>> =
+    LazyLock::new(|| {
+        (0..REFRESH_LOCK_OVERFLOW_STRIPES)
+            .map(|_| Arc::new(tokio::sync::Mutex::new(RefreshState::default())))
+            .collect()
+    });
+
+/// Serializes ADMISSION of new entries to [`CONTRACT_REFRESH_LOCKS`], so
+/// [`MAX_REFRESH_LOCKS`] is enforced at insertion rather than approached from
+/// both sides at once.
+///
+/// A plain `len()` check before `insert` is not the cap it looks like: two
+/// callers for distinct keys can both read `len() == MAX - 1` and both insert.
+/// The overshoot is small, but the per-key-collection rule in
+/// `.claude/rules/code-style.md` asks for a maximum enforced at insertion time,
+/// and "usually about 4096" is not that. Lookups of an EXISTING lock never take
+/// this, so the cost falls only on first sight of a contract, and nothing
+/// awaits while holding it.
+static REFRESH_LOCK_ADMISSION: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// The mutex that coalesces refresh decisions for `instance_id`, keeping
+/// [`CONTRACT_REFRESH_LOCKS`] at or under [`MAX_REFRESH_LOCKS`] entries.
+///
+/// When the map is full, entries no other task holds are dropped first. The
+/// `Arc::strong_count == 1` test is what makes that safe: a count of one means
+/// the map is the only owner, so no task is waiting on or holding that mutex
+/// and re-creating it later cannot break mutual exclusion. `retain` takes each
+/// shard's write lock while it runs, so a task racing to clone an entry either
+/// gets it first (count 2, retained) or blocks and then creates a fresh one.
+///
+/// If nothing can be pruned — every one of 4096 contracts refreshing at
+/// once — the caller gets a stripe from [`REFRESH_LOCK_OVERFLOW`] rather than a
+/// private mutex. A private mutex would silently drop coalescing exactly when
+/// the node is busiest, and a warm-but-stale refresh takes no speculative-fetch
+/// permit, so nothing else would bound the duplicate GETs that follow.
+///
+/// Returns the `Arc` rather than the guard so no DashMap reference is alive
+/// when the caller awaits the mutex. Holding one across that await would pin a
+/// shard's read lock for the length of a network GET, blocking every insert and
+/// the prune sweep itself on contracts that merely hash to the same shard.
+fn refresh_lock_for(instance_id: &ContractInstanceId) -> Arc<tokio::sync::Mutex<RefreshState>> {
+    if let Some(existing) = CONTRACT_REFRESH_LOCKS.get(instance_id).map(|e| e.clone()) {
+        return existing;
+    }
+
+    let _admission = REFRESH_LOCK_ADMISSION.lock();
+    // Re-check: another admission may have inserted this key while we queued.
+    if let Some(existing) = CONTRACT_REFRESH_LOCKS.get(instance_id).map(|e| e.clone()) {
+        return existing;
+    }
+
+    if CONTRACT_REFRESH_LOCKS.len() >= MAX_REFRESH_LOCKS {
+        CONTRACT_REFRESH_LOCKS.retain(|_, lock| Arc::strong_count(lock) > 1);
+    }
+    if CONTRACT_REFRESH_LOCKS.len() >= MAX_REFRESH_LOCKS {
+        tracing::debug!(
+            "webapp cache: refresh-lock table full; {instance_id} shares an overflow stripe"
+        );
+        return overflow_refresh_lock(instance_id);
+    }
+
+    let mutex = Arc::new(tokio::sync::Mutex::new(RefreshState::default()));
+    CONTRACT_REFRESH_LOCKS.insert(*instance_id, mutex.clone());
+    mutex
+}
+
+/// Deterministic overflow stripe for `instance_id` — the same contract always
+/// gets the same one, which is what preserves coalescing when the lock table is
+/// full.
+fn overflow_refresh_lock(
+    instance_id: &ContractInstanceId,
+) -> Arc<tokio::sync::Mutex<RefreshState>> {
+    use std::hash::Hasher;
+    let mut hasher = ahash::AHasher::default();
+    hasher.write(instance_id.as_bytes());
+    REFRESH_LOCK_OVERFLOW[hasher.finish() as usize % REFRESH_LOCK_OVERFLOW_STRIPES].clone()
+}
 
 async fn acquire_refresh_lock(
     instance_id: &ContractInstanceId,
-) -> tokio::sync::OwnedMutexGuard<()> {
-    let mutex = CONTRACT_REFRESH_LOCKS
-        .entry(*instance_id)
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone();
-    mutex.lock_owned().await
+) -> tokio::sync::OwnedMutexGuard<RefreshState> {
+    refresh_lock_for(instance_id).lock_owned().await
 }
+
+/// How many *speculative* webapp fetches a node will have in flight at once.
+///
+/// A speculative fetch is a cold-cache network GET for a contract this node has
+/// no local trace of — the shape an attacker gets by spraying random keys at
+/// `/v{1,2}/contract/web/<KEY>/<path>` (#3945), and equally the shape a
+/// legitimate cross-contract `<img src>` takes the first time anyone on this
+/// node loads it (#3940). The two are indistinguishable at the HTTP layer, so
+/// the bound is on CONCURRENCY rather than on who is asking: real subresource
+/// loads are a handful of distinct contracts and never approach it, while a
+/// spray saturates it and every further key is refused without touching the
+/// network.
+///
+/// 32 is well above what a page load needs (a page pulls subresources from one
+/// or two contracts) and well below what would make the fan-out interesting to
+/// an attacker.
+///
+/// Be precise about what it bounds: CONCURRENT speculative GETs, not their
+/// rate. A GET for a key nobody has ends when its retry loop is exhausted,
+/// which is usually well before the 30s timeout ceiling, so the sustained rate
+/// is 32 divided by however long a failing GET actually takes. What bounds the
+/// rate for a REPEATED key is `RefreshState::last_cold_failure`, which stops
+/// the same dead contract being re-fetched inside the TTL window; a sprayer
+/// using fresh keys every time gets no benefit from that and is bounded only by
+/// the concurrency.
+const SPECULATIVE_FETCH_LIMIT: usize = 32;
+
+/// How long a cold request queues for a permit before giving up on the lane.
+///
+/// `tokio`'s semaphore hands out permits FIFO, so queueing briefly is what
+/// stops a client that holds `SPECULATIVE_FETCH_LIMIT` requests open from
+/// starving everyone else — without it, a saturated lane means every other
+/// caller falls back to the presence query and a legitimate first-ever
+/// subresource load fails for exactly the reason #5406 was filed about. The
+/// wait is short because a queued request holds nothing but a task: a caller
+/// that gives up still has the presence-query fallback and, failing that, a
+/// fast 404.
+const SPECULATIVE_FETCH_WAIT: Duration = Duration::from_secs(2);
 
 /// Take `CONTRACT_CACHE_LOCKS[instance_id]` without waiting. `None` means an
 /// unpack for that contract is in flight, which is exactly when the eviction
@@ -242,9 +412,10 @@ struct CacheAccess {
 /// cache entry is known to exist (a warm `{key}.hash`, or a fetch that just
 /// populated one), and the sweep drops the record when it evicts the entry.
 /// That gating is load-bearing, not incidental — `variable_content` is reachable
-/// unauthenticated with an arbitrary key, so recording an access before the
-/// #3945 presence gate has run would hand an attacker an unbounded per-key map
-/// (see the per-key-collection rule in `.claude/rules/code-style.md`).
+/// unauthenticated with an arbitrary key, so recording an access for a key that
+/// has not yet produced a cache entry would hand an attacker an unbounded
+/// per-key map (see the per-key-collection rule in
+/// `.claude/rules/code-style.md`).
 static WEBAPP_CACHE_ACCESS: LazyLock<DashMap<ContractInstanceId, CacheAccess>> =
     LazyLock::new(DashMap::new);
 
@@ -297,6 +468,14 @@ pub(crate) struct WebappCache {
     root: PathBuf,
     max_bytes: u64,
     sweep: Arc<parking_lot::Mutex<SweepState>>,
+    /// Permits for in-flight speculative fetches — see
+    /// [`SPECULATIVE_FETCH_LIMIT`].
+    ///
+    /// Carried here rather than in a process global for the same reason `root`
+    /// is: the bound belongs to a node, and a process can run several (the
+    /// simulation harness does). A global would let one simulated node's
+    /// traffic refuse another's.
+    speculative_fetches: Arc<Semaphore>,
 }
 
 impl WebappCache {
@@ -340,7 +519,27 @@ impl WebappCache {
             root,
             max_bytes: WEBAPP_CACHE_MAX_BYTES,
             sweep: Arc::new(parking_lot::Mutex::new(SweepState::default())),
+            speculative_fetches: Arc::new(Semaphore::new(SPECULATIVE_FETCH_LIMIT)),
         }
+    }
+
+    /// Claim one of this node's speculative-fetch permits, waiting at most
+    /// [`SPECULATIVE_FETCH_WAIT`] for one to come free.
+    ///
+    /// The wait is bounded rather than absent so the lane stays fair (see
+    /// [`SPECULATIVE_FETCH_WAIT`]), and bounded rather than open-ended so a
+    /// request never queues behind a 30s network GET — that would be the
+    /// resource exhaustion the bound exists to prevent.
+    async fn speculative_fetch_slot(&self) -> Option<OwnedSemaphorePermit> {
+        let lane = self.speculative_fetches.clone();
+        // Fast path: a free permit costs no timer and no queue.
+        if let Ok(slot) = lane.clone().try_acquire_owned() {
+            return Some(slot);
+        }
+        tokio::time::timeout(SPECULATIVE_FETCH_WAIT, lane.acquire_owned())
+            .await
+            .ok()
+            .and_then(Result::ok)
     }
 
     /// The directory this cache owns — i.e. the one its sweep deletes from.
@@ -767,7 +966,7 @@ fn cache_reconciled_recently(instance_id: &ContractInstanceId) -> bool {
 /// Whether the local node already has `instance_id` in its contract store /
 /// hosting cache, or holds an active subscription to it.
 ///
-/// # Why this gate exists (DoS amplification — #3945)
+/// # Why this exists (DoS amplification — #3945)
 ///
 /// #3942 made `variable_content` issue a cold-cache network GET so a
 /// subresource (`<img src>`) pointing at a contract resolves instead of
@@ -777,20 +976,16 @@ fn cache_reconciled_recently(instance_id: &ContractInstanceId) -> bool {
 /// GET (fan-out to remote peers) + unpack. Subresource URLs are
 /// machine-fetchable, so an attacker can spray random keys and force the
 /// node to issue outbound GETs it would never otherwise issue. Per-key rate
-/// is bounded by the 30s fetch timeout but the parallel fan-out is not.
+/// is bounded by the 30s fetch timeout but the parallel fan-out was not.
 ///
-/// Gating the cold fetch on local-presence closes that vector while keeping
-/// the real #3940 scenario working. The #3940 case is a cross-contract
-/// `<img src="…/web/X/img.png">`: the user visits webapp Delta, whose page
-/// embeds a subresource from a *different* contract X. The user has NOT
-/// visited X's root, so X is NOT in the node's application-subscription set.
-/// But the node will have **stored** X in its hosting cache the first time
-/// any client (this one or another, on a shared gateway) fetched it — and
-/// that store presence is exactly the bar #3945 option 2 names ("already
-/// known to the local contract store, pinned/subscribed"). So the gate keys
-/// off store/hosting presence, which covers the cross-contract subresource
-/// case, while a random never-seen key — present in neither the store nor
-/// the subscription set — gets the pre-#3942 404.
+/// #4417 made this a hard GATE on the cold fetch, which closed the vector by
+/// also closing #3940 for any contract the node had never seen: a link to an
+/// image inside another container 404'd unless the reader had already visited
+/// that container's root (#5406). What bounds the fan-out now is
+/// [`SPECULATIVE_FETCH_LIMIT`], so this query has become the FALLBACK that
+/// runs only when that lane is saturated — the answer that lets a contract the
+/// node demonstrably already has skip the queue during a spray, rather than
+/// the permission every cold fetch needs.
 ///
 /// # Signal & mechanism
 ///
@@ -866,6 +1061,10 @@ async fn is_locally_known(
             })),
             auth_token: None,
             origin_contract: None,
+            // Node-internal fetch issued by the HTTP layer itself (webapp cache
+            // reconcile), not a client connection. It carries no
+            // `origin_contract`, so the scope attests nothing either way.
+            connection_scope: crate::client_events::ConnectionScope::Local,
             // Internal node-query request: no delegate secrets, no user context.
             user_context: None,
             api_version: Default::default(),
@@ -897,6 +1096,10 @@ async fn is_locally_known(
             req: Box::new(ClientRequest::Disconnect { cause: None }),
             auth_token: None,
             origin_contract: None,
+            // Node-internal fetch issued by the HTTP layer itself (webapp cache
+            // reconcile), not a client connection. It carries no
+            // `origin_contract`, so the scope attests nothing either way.
+            connection_scope: crate::client_events::ConnectionScope::Local,
             // Internal node-query request: no delegate secrets, no user context.
             user_context: None,
             api_version: Default::default(),
@@ -917,14 +1120,18 @@ async fn is_locally_known(
 /// - more than `CONTRACT_CACHE_REFRESH_TTL` has elapsed since the last
 ///   reconciliation for this contract.
 ///
-/// For a **cold** cache the GET is additionally gated on the contract being
-/// locally KNOWN (see `is_locally_known`): a cold cache for a contract the node
-/// neither stores nor subscribes to is the random-key DoS amplification vector
-/// #3942 opened, so this returns `Ok(())` without issuing the network GET and
-/// the caller serves a 404 from the empty cache directory (the pre-#3942
-/// behaviour). See #3945. A **warm-but-stale** refresh is NOT gated: a warm
-/// on-disk cache already proves the node legitimately fetched this contract,
-/// so refreshing it is not the amplification vector, and gating it would
+/// A **cold**-cache GET is speculative — nothing local says the contract
+/// exists — so it must claim one of the node's [`SPECULATIVE_FETCH_LIMIT`]
+/// permits, held for the duration of the fetch. When they are all in flight,
+/// the contract has to be locally KNOWN (see `is_locally_known`) to fetch
+/// anyway; otherwise this returns `Ok(())` without issuing the network GET and
+/// the caller serves a 404 from the empty cache directory. That is the
+/// random-key DoS amplification vector #3942 opened and #3945 raised, bounded
+/// rather than closed, so the legitimate half of the same shape — the #3940
+/// cross-contract subresource for a contract this node has never seen — works
+/// again (#5406). A **warm-but-stale** refresh takes no permit: a warm on-disk
+/// cache already proves the node legitimately fetched this contract, so
+/// refreshing it is not the amplification vector, and bounding it would
 /// silently regress the #3977 republish-pickup for a warm-but-unsubscribed
 /// contract. The warm-and-fresh fast path never reaches either branch, so
 /// steady-state requests pay nothing.
@@ -970,8 +1177,8 @@ async fn refresh_cache_if_due(
     // The entry is about to be read, so mark it in use before anything else:
     // that both steers a concurrent budget sweep away from it for the duration
     // of this request and keeps its LRU marker current. Gated on `cache_warm`
-    // because an arbitrary key reaching this handler has not yet cleared the
-    // #3945 presence gate — see the bounding note on `WEBAPP_CACHE_ACCESS`.
+    // because an arbitrary key reaching this handler has no cache entry yet —
+    // see the bounding note on `WEBAPP_CACHE_ACCESS`.
     if cache_warm {
         note_cache_access(cache, instance_id).await;
     }
@@ -984,7 +1191,7 @@ async fn refresh_cache_if_due(
 
     // Slow path: refresh looks due. Serialize concurrent refreshers for this
     // contract so only the first issues a GET; the rest re-check below.
-    let _guard = acquire_refresh_lock(&instance_id).await;
+    let mut refresh = acquire_refresh_lock(&instance_id).await;
     // Re-check under the lock, and RE-STAT rather than trusting the timer
     // alone. The timer is per-process; the cache directory is per-USER, and the
     // documented multi-peer setup (peer-manager.sh) runs several nodes as one
@@ -1001,32 +1208,72 @@ async fn refresh_cache_if_due(
         return Ok(());
     }
 
-    // DoS amplification gate (#3945) — COLD path only. A cold cache (no
-    // `{key}.hash` on disk) for a contract the node has no local presence for
-    // is exactly the random-key enumeration vector #3942 opened: skip the
-    // network GET and let the caller serve a 404 from the empty cache
-    // directory (the pre-#3942 behavior). A locally-KNOWN instance — the node
-    // stores it (the #3940 cross-contract `<img src>` case, where X was stored
-    // when the subresource was first loaded for some user) or subscribes to it
-    // — falls through and fetches.
+    // Cold path only: bound how many contracts this node will speculatively
+    // fetch at once, and hold the permit until the GET below returns.
     //
-    // The WARM-but-stale refresh is deliberately NOT gated: a warm on-disk
-    // cache is itself proof the node legitimately fetched this contract
-    // before, so a TTL-driven re-fetch of an already-cached bundle is not the
-    // random-key amplification vector. Gating it would also silently break the
-    // #3977 republish-pickup for a contract that is cached warm but currently
-    // unsubscribed (it would serve the stale bundle instead of refreshing).
-    // The gate reads `cache_warm || still_warm`: a sentinel seen at EITHER
-    // observation is proof this node legitimately fetched the contract before,
-    // which is the whole basis for exempting the warm path. Requiring both
-    // would send a legitimate entry that another process just evicted through
-    // the presence query, and requiring only the pre-lock snapshot would miss a
-    // concurrent refresher that warmed the cache while we waited.
-    if !(cache_warm || still_warm || is_locally_known(instance_id, request_sender).await) {
+    // A cold cache (no `{key}.hash` on disk) for a contract with no local
+    // trace is BOTH the #3940 cross-contract `<img src>` a user is waiting on
+    // and the random-key enumeration #3942 opened, and nothing at this layer
+    // tells them apart. #4417 resolved that by fetching only for contracts the
+    // node already stored or subscribed to, which closed the vector by also
+    // closing #3940 for every contract this node had never seen — so a page
+    // linking an image inside another container 404'd unless the reader had
+    // already visited that container's root (#5406). The bound replaces the
+    // refusal: the fetch goes ahead while permits last, and only a caller that
+    // finds the lane saturated has to prove local presence first.
+    //
+    // Ordering matters. The permit is tried FIRST because it is a local
+    // atomic, where `is_locally_known` costs a round trip to the node; asking
+    // only when the lane is saturated keeps that cost off the path every real
+    // page load takes. It also means a locally-known contract can still be
+    // fetched once the lane is full — the query is the fallback, not a gate,
+    // so nothing that resolved before this change stops resolving now.
+    //
+    // The WARM-but-stale refresh takes no permit: a warm on-disk cache is
+    // itself proof the node legitimately fetched this contract before, so a
+    // TTL-driven re-fetch of an already-cached bundle is not the random-key
+    // amplification vector, and bounding it would silently break the #3977
+    // republish-pickup for a contract cached warm but currently unsubscribed.
+    // The check reads `cache_warm || still_warm`: a sentinel seen at EITHER
+    // observation is that proof. Requiring both would send a legitimate entry
+    // another process just evicted down the speculative path, and requiring
+    // only the pre-lock snapshot would miss a concurrent refresher that warmed
+    // the cache while we waited.
+    let cold = !(cache_warm || still_warm);
+
+    // A cold fetch that just failed will fail again: the answer came from the
+    // network and nothing has changed since. Without this, the subresources of
+    // a page pointing at an unfindable contract each pay their own full GET in
+    // turn. Callers inside the window get the empty-cache 404 rather than the
+    // first caller's error, which is also what they got before the fetch
+    // existed at all.
+    if cold && refresh.cold_fetch_failed_recently(&instance_id) {
         return Ok(());
     }
 
-    ensure_contract_cached(instance_id, request_sender, None, cache).await?;
+    // `_speculative_slot` must stay a NAMED binding: it holds the permit for
+    // the fetch below, and `let _ = ...` would drop it immediately, silently
+    // removing the concurrency bound. Pinned by
+    // `an_in_flight_fetch_holds_its_speculative_permit`.
+    let mut _speculative_slot = None;
+    if cold {
+        match cache.speculative_fetch_slot().await {
+            Some(slot) => _speculative_slot = Some(slot),
+            None if is_locally_known(instance_id, request_sender).await => {}
+            None => {
+                tracing::debug!(
+                    "webapp cache: speculative fetch lane full; not fetching unknown {instance_id}"
+                );
+                return Ok(());
+            }
+        }
+    }
+
+    let fetched = ensure_contract_cached(instance_id, request_sender, None, cache).await;
+    if cold {
+        refresh.last_cold_failure = fetched.is_err().then(|| (instance_id, Instant::now()));
+    }
+    fetched?;
     CONTRACT_CACHE_REFRESH.insert(instance_id, Instant::now());
     // The fetch populated the entry, so it now exists and is about to be read.
     note_cache_access(cache, instance_id).await;
@@ -1055,6 +1302,18 @@ pub(super) async fn contract_home(
     // Register the assigned token with origin_contracts so subsequent
     // WebSocket connections from the shell iframe authenticate against
     // the correct contract identity, then fetch + unpack the contract.
+    //
+    // Deliberately NOT behind `SPECULATIVE_FETCH_LIMIT`. This fetch is just as
+    // speculative as the subresource one — an unauthenticated `GET
+    // /v1/contract/web/<random>/` reaches it with any key — and it has never
+    // been bounded or gated, including while #4417's presence gate was on the
+    // subresource path. So the bound covers the narrower of two doors, and the
+    // wider one stands open exactly as it did before. #3945 called this out and
+    // ranked it Low ("top-level page navigations are typically human-paced");
+    // bounding a human's first visit to a contract is a different trade from
+    // bounding a machine-fetched subresource, and belongs in its own change.
+    // Do NOT read `SPECULATIVE_FETCH_LIMIT` as covering the whole webapp-fetch
+    // surface.
     ensure_contract_cached(
         instance_id,
         &request_sender,
@@ -1124,12 +1383,23 @@ async fn ensure_contract_cached(
         .map_err(|err| WebSocketApiError::NodeError {
             error_cause: format!("{err}"),
         })?;
-    let client_id = if let Some(HostCallbackResult::NewId { id }) = response_recv.recv().await {
-        id
-    } else {
-        return Err(WebSocketApiError::NodeError {
-            error_cause: "Couldn't register new client in the node".into(),
-        });
+    // Bound the wait for the connection id. A node that accepts the connection
+    // and then never assigns one would otherwise pin this task forever — and
+    // with it the speculative-fetch permit the caller is holding, so a wedged
+    // node would drain the lane permanently and never refill it.
+    //
+    // This used to be unreachable: #4417's presence gate ran first, and its own
+    // timeouts failed closed, so a cold request never got here unless the node
+    // was answering. Removing that gate is what makes the bare `recv()` matter,
+    // which is why the timeout arrives with it. Same bound as the presence
+    // query, for the same handshake.
+    let client_id = match tokio::time::timeout(PRESENCE_QUERY_TIMEOUT, response_recv.recv()).await {
+        Ok(Some(HostCallbackResult::NewId { id })) => id,
+        _ => {
+            return Err(WebSocketApiError::NodeError {
+                error_cause: "Couldn't register new client in the node".into(),
+            });
+        }
     };
     request_sender
         .send(ClientConnection::Request {
@@ -1145,6 +1415,10 @@ async fn ensure_contract_cached(
             ),
             auth_token: None,
             origin_contract: None,
+            // Node-internal fetch issued by the HTTP layer itself (webapp cache
+            // reconcile), not a client connection. It carries no
+            // `origin_contract`, so the scope attests nothing either way.
+            connection_scope: crate::client_events::ConnectionScope::Local,
             // Internal node-query request: no delegate secrets, no user context.
             user_context: None,
             api_version: Default::default(),
@@ -1169,6 +1443,10 @@ async fn ensure_contract_cached(
             req: Box::new(ClientRequest::Disconnect { cause: None }),
             auth_token: None,
             origin_contract: None,
+            // Node-internal fetch issued by the HTTP layer itself (webapp cache
+            // reconcile), not a client connection. It carries no
+            // `origin_contract`, so the scope attests nothing either way.
+            connection_scope: crate::client_events::ConnectionScope::Local,
             // Internal node-query request: no delegate secrets, no user context.
             user_context: None,
             api_version: Default::default(),
@@ -1217,6 +1495,68 @@ async fn handle_get_response(
                 })),
             ..
         })) => Err(WebSocketApiError::MissingContract { instance_id }),
+        // TRANSIENT: the GET's retry loop exhausted without locating the
+        // contract. This is a SUCCESS at the client-API level, not an `Err` —
+        // `operations/get/op_ctx_task.rs` deliberately converts exhaustion into
+        // `ContractResponse::NotFound` so a client can tell that apart from "the
+        // operation failed".
+        //
+        // Read the PRODUCER, not the variant's doc, for what it means. stdlib
+        // documents `NotFound` as "Contract was not found after exhaustive
+        // search ... distinguishes 'contract doesn't exist' from other failure
+        // modes", i.e. as proof of absence. This node emits it on RETRY-LOOP
+        // EXHAUSTION, which is a much weaker claim — "nobody I asked had it",
+        // over a ring that may not yet have propagated the contract at all. The
+        // two do not say the same thing, and that gap is the whole reason this
+        // arm must not answer 404: treating exhaustion as absence is precisely
+        // the error being fixed here.
+        //
+        // Without this arm that distinction was DISCARDED here: `NotFound` is an
+        // `Ok(..)` that no arm matched, so it fell through to the catch-all
+        // below and became `NodeError { "Unexpected response from node: .." }`.
+        // `errors.rs` only maps a `NodeError` to 404 when its message begins
+        // with the literal "Contract not found", which that Debug-formatted
+        // string does not, so every dead-ended GET on the web route was served
+        // as a bare 500 — indistinguishable from a genuine internal failure, and
+        // carrying none of the `Retry-After` / `Cache-Control: no-store` headers
+        // the transient path sets.
+        //
+        // On Freenet a `NotFound` is routinely "not found YET" rather than proof
+        // of absence: a contract published elsewhere is unreachable from this
+        // node until it propagates (the #4404 placement gap), which is a window
+        // of minutes to hours. `WebSocketApiError::ContractNotFound` gives it the
+        // transient STATUS and headers (503 + `Retry-After`), which is what a
+        // programmatic client needs in order to come back later rather than write
+        // the contract off.
+        //
+        // It is a dedicated variant rather than a reuse of the `Err(_)` arm's
+        // `RequestError(Timeout)`, because this is not a timeout and must not
+        // inherit `retry_loading_page`: that page reloads forever, and the same
+        // reply is produced for a key that will never resolve, so a mistyped URL
+        // in an open tab would re-issue a network GET every minute for the life
+        // of the tab. See the variant's doc in `errors.rs`.
+        //
+        // 404 would be the WRONG call and is worse than the 500 it replaces: a
+        // well-behaved crawler treats 404 as terminal (Atlas marks such a
+        // locator seen for good and never retries it), so answering 404 here
+        // would permanently exclude every contract that was merely slow to
+        // propagate. Only answer 404 where absence is locally PROVEN — which is
+        // what the `contract: None` arm above does.
+        Ok(Some(HostCallbackResult::Result {
+            result: Ok(HostResponse::ContractResponse(ContractResponse::NotFound { .. })),
+            ..
+        })) => {
+            // Plain `info!`, like every other diagnostic in this module, so it
+            // lands in the node's log files and NOT in the OTel collector, which
+            // only carries enumerated events. Fine for reading one node's log;
+            // if anyone wants a fleet-wide dead-ended-GET rate, that needs an
+            // enumerated event, not this line.
+            tracing::info!(
+                instance_id = %instance_id.encode(),
+                "contract not found on the network (GET exhausted); serving 503"
+            );
+            Err(WebSocketApiError::ContractNotFound { instance_id })
+        }
         Ok(Some(HostCallbackResult::Result {
             result: Err(err), ..
         })) => {
@@ -1302,8 +1642,20 @@ async fn unpack_if_stale(
             error_cause: format!("Failed to create cache dir: {e}"),
         })?;
 
-    let mut web = WebApp::try_from(state.as_ref()).map_err(|e| err(e, contract))?;
-    web.unpack(&path).map_err(|e| err(e, contract))?;
+    let unpacked = WebApp::try_from(state.as_ref())
+        .and_then(|mut web| web.unpack(&path))
+        .map_err(|e| err(e, contract));
+    if let Err(unpack_failed) = unpacked {
+        // Take the directory back out. A contract that is not a web archive
+        // fails here every time it is requested, and the sweep would never
+        // reclaim what it leaves: an empty directory contributes 0 bytes to a
+        // budget measured in bytes. With the cold fetch no longer gated on
+        // local presence, that would be one attacker-named directory per key.
+        if let Err(cleanup_failed) = tokio::fs::remove_dir_all(&path).await {
+            debug!("webapp cache: could not remove failed unpack dir: {cleanup_failed}");
+        }
+        return Err(unpack_failed);
+    }
 
     // Store new hash LAST, so a partial unpack does not leave a stale
     // hash file that would make future requests skip the fetch.
@@ -1345,22 +1697,6 @@ pub(super) async fn variable_content(
     let base_path = cache.entry_dir(&instance_id);
     debug!("variable_content: Base path resolved to: {:?}", base_path);
 
-    // Fetch + unpack the contract if its cache is cold OR stale. Without the
-    // cold-cache fetch, any subresource request (e.g. an <img src> pointing at
-    // this contract from a different webapp) would 404 because the cache is
-    // only populated by the shell-root handler (`contract_home`). See #3940.
-    // The TTL-gated staleness refresh additionally picks up a republished
-    // bundle on this path without requiring a prior hit on the shell root.
-    // See #3977.
-    //
-    // The cold-cache GET is gated on the contract being locally KNOWN (see
-    // `refresh_cache_if_due` / `is_locally_known`): an unknown random key 404s
-    // from the empty cache below instead of triggering an outbound network GET,
-    // closing the DoS amplification #3942 opened. See #3945.
-    refresh_cache_if_due(instance_id, &request_sender, cache)
-        .await
-        .map_err(Box::new)?;
-
     // Extract the relative asset path from the already-decoded request path.
     //
     // `req_path` is built by the caller from axum's percent-DECODED wildcard
@@ -1377,6 +1713,35 @@ pub(super) async fn variable_content(
         "variable_content: Extracted relative path: {}",
         relative_path
     );
+    // Reject a path that can never resolve inside the cache BEFORE fetching.
+    // There is no reason to pull a contract off the network to serve a
+    // traversal, and it keeps a spray of `../` requests from consuming
+    // speculative-fetch permits. `resolve_web_asset_path` re-runs this check
+    // below; the symlink/TOCTOU half of it can only run once the unpack has
+    // happened, which is why the two are not merged.
+    if has_escaping_component(Path::new(&relative_path)) {
+        return Err(Box::new(WebSocketApiError::InvalidParam {
+            error_cause: "Path traversal not allowed".to_string(),
+        }));
+    }
+
+    // Fetch + unpack the contract if its cache is cold OR stale. Without the
+    // cold-cache fetch, any subresource request (e.g. an <img src> pointing at
+    // this contract from a different webapp) would 404 because the cache is
+    // only populated by the shell-root handler (`contract_home`). See #3940.
+    // The TTL-gated staleness refresh additionally picks up a republished
+    // bundle on this path without requiring a prior hit on the shell root.
+    // See #3977.
+    //
+    // The cold-cache GET is speculative — nothing local says the key names a
+    // real contract — so it claims one of the node's `SPECULATIVE_FETCH_LIMIT`
+    // permits. Once those are in flight an unknown key 404s from the empty
+    // cache below without touching the network, which bounds the DoS
+    // amplification #3942 opened (#3945) without re-breaking #3940 for
+    // contracts this node has not seen before (#5406).
+    refresh_cache_if_due(instance_id, &request_sender, cache)
+        .await
+        .map_err(Box::new)?;
 
     // Resolve the relative path UNDER the contract's cache dir with a
     // traversal guard. do NOT remove — this is the containment check that
@@ -1677,6 +2042,18 @@ pub(super) async fn serve_sandbox_content(
             error_cause: format!("{err}"),
         })?;
 
+    // Reject a page path that can never resolve BEFORE fetching, for the same
+    // reason `variable_content` does: a request that cannot succeed must not
+    // spend one of the node's speculative-fetch permits. `sandbox_content_body`
+    // runs the identical check again — it is the security boundary and stays
+    // there — along with the canonicalization half, which can only run once the
+    // bundle is on disk.
+    if has_escaping_component(Path::new(page)) {
+        return Err(WebSocketApiError::InvalidParam {
+            error_cause: "Path traversal not allowed".to_string(),
+        });
+    }
+
     // Reconcile the on-disk cache against current network state before serving.
     // Previously this path only checked `path.exists()` and served whatever was
     // already extracted, so a republished contract kept serving the old bundle
@@ -1765,13 +2142,16 @@ async fn sandbox_content_body(
     body = body.replace("\"/./", &format!("\"{prefix}"));
     body = body.replace("'/./", &format!("'{prefix}"));
 
-    // Inject the WebSocket shim and navigation interceptor before any other scripts.
-    // The shim overrides window.WebSocket so that wasm-bindgen routes connections
-    // through the shell page's bridge. The interceptor catches <a> clicks AND
-    // overrides programmatic window.open, routing both through postMessage for
-    // multi-page navigation without a sandbox-inheriting popup (#4645).
-    let injected_scripts =
-        format!("<script>{WEBSOCKET_SHIM_JS}</script><script>{NAVIGATION_INTERCEPTOR_JS}</script>");
+    // Inject the WebSocket shim, navigation interceptor, and title sync before
+    // any other scripts. The shim overrides window.WebSocket so that
+    // wasm-bindgen routes connections through the shell page's bridge. The
+    // interceptor catches <a> clicks AND overrides programmatic window.open,
+    // routing both through postMessage for multi-page navigation without a
+    // sandbox-inheriting popup (#4645). The title sync forwards this page's
+    // <title> to the shell so the browser tab reflects it.
+    let injected_scripts = format!(
+        "<script>{WEBSOCKET_SHIM_JS}</script><script>{NAVIGATION_INTERCEPTOR_JS}</script><script>{TITLE_SYNC_JS}</script>"
+    );
     if let Some(pos) = body.find("</head>") {
         body.insert_str(pos, &injected_scripts);
     } else if let Some(pos) = body.find("<body") {
@@ -1883,6 +2263,20 @@ const WEBSOCKET_SHIM_JS: &str = include_str!("path_handlers/assets/websocket_shi
 /// inside the click handler, where the gesture is live.
 const NAVIGATION_INTERCEPTOR_JS: &str =
     include_str!("path_handlers/assets/navigation_interceptor.js");
+
+/// JavaScript that forwards the sandboxed iframe's `document.title` to the
+/// shell via the `__freenet_shell__` / `type: 'title'` postMessage
+/// `SHELL_BRIDGE_JS` already handles.
+///
+/// The shell page's own `<title>` is hardcoded (`shell.html`) because this
+/// iframe has no `allow-same-origin` and cannot touch the parent's
+/// `document.title` directly. Before this script existed, the shell's title
+/// only ever changed for the handful of apps that hand-rolled this exact
+/// postMessage themselves (River, Atlas, Delta); every other app — including
+/// a static, JS-free contract website — left the browser tab reading
+/// "Freenet" forever. Injected into every sandboxed page unconditionally so
+/// the tab title is correct with zero per-app opt-in.
+const TITLE_SYNC_JS: &str = include_str!("path_handlers/assets/title_sync.js");
 
 /// Strips the version + contract + key prefix from a request path and returns
 /// the remaining relative asset path (e.g. `assets/app.js`, or `my image.png`).
@@ -2018,6 +2412,30 @@ fn test_webapp_cache() -> WebappCache {
     TEST_CACHE.clone()
 }
 
+/// [`test_webapp_cache`] with every speculative-fetch permit already taken, so
+/// a cold-cache test exercises the saturated-lane fallback (`is_locally_known`)
+/// instead of fetching straight away.
+///
+/// Shares the singleton's root — the tests that use it want the same cache
+/// directory, only a different answer from the lane — and takes its own
+/// `Semaphore`, so draining it cannot affect a concurrently running test.
+#[cfg(test)]
+fn test_webapp_cache_saturated() -> WebappCache {
+    // CLOSED rather than merely empty: a closed semaphore refuses instantly,
+    // where an empty one makes every caller sit out `SPECULATIVE_FETCH_WAIT`
+    // first. These tests are about what happens AFTER the lane is given up on,
+    // and coupling each of them to that timer buys nothing and makes them
+    // fragile under paused time. The wait itself is covered by
+    // `an_in_flight_fetch_holds_its_speculative_permit`, which saturates a real
+    // one-permit lane.
+    let lane = Semaphore::new(0);
+    lane.close();
+    WebappCache {
+        speculative_fetches: Arc::new(lane),
+        ..test_webapp_cache()
+    }
+}
+
 /// Cache paths of [`test_webapp_cache`], so a test can seed an entry the
 /// handlers will then find.
 #[cfg(test)]
@@ -2093,6 +2511,7 @@ mod tests {
             root: root.to_path_buf(),
             max_bytes,
             sweep: Arc::new(parking_lot::Mutex::new(SweepState::default())),
+            speculative_fetches: Arc::new(Semaphore::new(SPECULATIVE_FETCH_LIMIT)),
         }
     }
 
@@ -2963,9 +3382,8 @@ mod tests {
             })
         };
 
-        // A refetch means the #3945 cold-path gate runs first; answer it as
-        // "the node stores this contract", then serve the GET.
-        answer_presence_query_hosted(&mut rx, instance_id).await;
+        // Cold cache with a free speculative-fetch permit, so the GET goes out
+        // directly — no presence query ahead of it.
         serve_one_get(&mut rx, &contract, &state).await;
         handler
             .await
@@ -3064,25 +3482,27 @@ mod tests {
         );
     }
 
-    /// Regression test for #3940, updated for the #3945 store-presence gate.
-    /// `variable_content` must trigger a network fetch when the contract's
-    /// webapp cache is cold **and** the contract is locally present. This
-    /// models the REAL #3940 cross-contract scenario: a Delta page `<img>`s a
-    /// SEPARATE contract X that the node has fetched-and-STORED before (for
-    /// some user) but that THIS user never visited at its root — so X is NOT in
-    /// the application-subscription set, only in the contract store. The gate
-    /// must still resolve it (store presence is the bar #3945 names), proving
-    /// the fix does not re-break #3940 for stored-but-unsubscribed contracts.
+    /// Regression test for #3940 and #5406. `variable_content` must trigger a
+    /// network fetch when the contract's webapp cache is cold, WITHOUT any
+    /// prior local trace of the contract. This is the real cross-contract
+    /// scenario: a page on contract Delta `<img>`s a SEPARATE contract X, and
+    /// the reader has never visited X — not at its root, not through any other
+    /// page — so X is in neither the contract store nor the subscription set.
     ///
     /// Prior to #3942 a cold-cache subpath request returned 404; #3942 made it
-    /// fetch; #3945 narrows that fetch to locally-present instances — answered
-    /// here via the `NodeDiagnostics` presence query as "node hosts/stores X".
+    /// fetch; #4417 narrowed that to locally-present instances only, which put
+    /// this case back to 404 (#5406); the speculative-fetch lane restores it
+    /// under a concurrency bound.
     ///
-    /// Verifies the handler emits the `NewConnection` + `Request(Get)` fetch
-    /// pair on the client-connection channel for the present instance. The
-    /// fetch is cancelled mid-flight (we don't deliver a response) so the test
-    /// stays bounded. See `variable_content_skips_fetch_for_unknown_instance`
-    /// for the security side of the gate.
+    /// Load-bearing in two directions. It asserts the `NewConnection` +
+    /// `Request(Get)` fetch pair is what the handler emits, so re-introducing a
+    /// presence gate ahead of the fetch fails here (the first message would be
+    /// the `NodeDiagnostics` query). And the permit must be tried before the
+    /// presence query, not after, or every cold request pays a node round trip.
+    /// The fetch is cancelled mid-flight (we don't deliver a response) so the
+    /// test stays bounded. See
+    /// `variable_content_skips_fetch_for_unknown_instance_when_lane_is_full`
+    /// for the bound's security side.
     #[tokio::test]
     async fn variable_content_triggers_fetch_on_cache_miss() {
         // Unique 32-byte seed so the resulting contract key does not collide
@@ -3111,11 +3531,10 @@ mod tests {
             })
         };
 
-        // Cold cache → the #3945 gate runs. `expect_fetch_pair_cold` answers
-        // the presence query as "node hosts/stores X" (stored-but-unsubscribed,
-        // the #3940 cross-contract case), then asserts the resulting
-        // `NewConnection` + `Get` fetch pair for our contract key.
-        expect_fetch_pair_cold(&mut rx, instance_id).await;
+        // Cold cache, unknown contract, free permit → the fetch pair must be
+        // the FIRST thing on the channel. A presence query here would mean the
+        // #4417 gate is back.
+        expect_fetch_pair(&mut rx, instance_id).await;
 
         handler.abort();
         // Clean up after the test — handler was aborted mid-fetch, so no
@@ -3124,19 +3543,23 @@ mod tests {
         clear_cache(&instance_id).await;
     }
 
-    /// Security regression for #3945. A cold-cache subresource request for an
-    /// UNKNOWN contract (not in the store AND not subscribed) must NOT issue a
-    /// network GET — that is the random-key DoS amplification vector #3942
-    /// opened. The presence query returns empty `contract_states` and empty
-    /// `subscriptions`, so the gate fails closed and the handler serves a 404
-    /// from the empty cache directory (pre-#3942 behaviour), issuing no `Get`
-    /// on the channel.
+    /// Security regression for #3945, re-pinned on the speculative-fetch bound
+    /// (#5406). Once every permit is in flight, a cold-cache subresource
+    /// request for an UNKNOWN contract (not in the store AND not subscribed)
+    /// must NOT issue a network GET — that is the random-key DoS amplification
+    /// vector #3942 opened, and a spray is exactly what saturates the lane. The
+    /// presence query returns empty `contract_states` and empty
+    /// `subscriptions`, so the fallback reads "not known" and the handler
+    /// serves a 404 from the empty cache directory, issuing no `Get`.
     ///
-    /// Load-bearing: without the gate the handler would fall straight through
-    /// to `ensure_contract_cached` and emit a `NewConnection` + `Get`, which
-    /// this test's "no Get" assertion would catch.
+    /// Load-bearing: with the bound removed the handler would fall straight
+    /// through to `ensure_contract_cached` and emit a `NewConnection` + `Get`,
+    /// which this test's "no Get" assertion catches. The sibling
+    /// `variable_content_triggers_fetch_on_cache_miss` pins the other side —
+    /// that an unknown contract IS fetched while permits remain — so neither a
+    /// re-tightened gate nor a dropped bound can pass both.
     #[tokio::test]
-    async fn variable_content_skips_fetch_for_unknown_instance() {
+    async fn variable_content_skips_fetch_for_unknown_instance_when_lane_is_full() {
         let mut bytes = [0u8; 32];
         bytes[0] = 0x3a;
         bytes[1] = 0x47;
@@ -3153,16 +3576,16 @@ mod tests {
                     format!("/v1/contract/web/{key}/image.jpg"),
                     ApiVersion::V1,
                     sender,
-                    &test_webapp_cache(),
+                    &test_webapp_cache_saturated(),
                 )
                 .await
                 .map(|r| r.into_response())
             })
         };
 
-        // The #3945 presence query runs (cold cache). Answer it as "the node
-        // has NO local presence for this contract" — empty contract_states AND
-        // empty subscriptions → not locally known.
+        // Lane saturated → the presence query runs as the fallback. Answer it
+        // as "the node has NO local presence for this contract" — empty
+        // contract_states AND empty subscriptions → not locally known.
         answer_presence_query(&mut rx, instance_id, |_query_id| empty_diagnostics()).await;
 
         // The handler must finish and return a 404 — NO further Get may appear.
@@ -3196,19 +3619,21 @@ mod tests {
         }
         assert!(
             !saw_fetch,
-            "unknown-instance request must NOT issue a network fetch (#3945 DoS gate)"
+            "an unknown instance must NOT be fetched once the speculative-fetch \
+             lane is saturated (#3945 DoS bound)"
         );
 
         clear_cache(&instance_id).await;
     }
 
-    /// Fail-closed regression for #3945: when the presence query is NEVER
-    /// answered (the node accepted the transient `NewConnection` but never
-    /// replies to the `NodeDiagnostics` query), `is_locally_known` must time
-    /// out and read as NOT known, so the cold-cache request 404s and issues NO
-    /// network GET. This is the DoS guarantee under a wedged node — without the
-    /// 5s recv timeout the request task would hang forever, which under a spray
-    /// of unknown keys is itself a resource-exhaustion vector.
+    /// Fail-closed regression for #3945. With the speculative-fetch lane
+    /// saturated and the presence query NEVER answered (the node accepted the
+    /// transient `NewConnection` but never replies to the `NodeDiagnostics`
+    /// query), `is_locally_known` must time out and read as NOT known, so the
+    /// cold-cache request 404s and issues NO network GET. This is the DoS
+    /// guarantee under a wedged node — without the 5s recv timeout the request
+    /// task would hang forever, which under a spray of unknown keys is itself a
+    /// resource-exhaustion vector.
     ///
     /// Uses paused time so the 5s presence-query timeout elapses via
     /// `advance()` rather than wall-clock, keeping the test fast and
@@ -3231,7 +3656,7 @@ mod tests {
                     format!("/v1/contract/web/{key}/image.jpg"),
                     ApiVersion::V1,
                     sender,
-                    &test_webapp_cache(),
+                    &test_webapp_cache_saturated(),
                 )
                 .await
                 .map(|r| r.into_response())
@@ -3337,7 +3762,7 @@ mod tests {
                     format!("/v1/contract/web/{key}/image.jpg"),
                     ApiVersion::V1,
                     sender,
-                    &test_webapp_cache(),
+                    &test_webapp_cache_saturated(),
                 )
                 .await
                 .map(|r| r.into_response())
@@ -3396,11 +3821,11 @@ mod tests {
         clear_cache(&instance_id).await;
     }
 
-    /// Fail-closed regression for #3945: if the node is gone entirely (the
-    /// `ClientConnection` receiver is dropped, so even the presence query's
-    /// `NewConnection` send fails), the cold-cache request must 404 and issue
-    /// no GET. Covers the `request_sender.send(...).is_err()` branch of
-    /// `is_locally_known`.
+    /// Fail-closed regression for #3945: with the lane saturated and the node
+    /// gone entirely (the `ClientConnection` receiver is dropped, so even the
+    /// presence query's `NewConnection` send fails), the cold-cache request
+    /// must 404 and issue no GET. Covers the `request_sender.send(...).is_err()`
+    /// branch of `is_locally_known`.
     #[tokio::test]
     async fn variable_content_fails_closed_when_node_channel_closed() {
         let mut bytes = [0u8; 32];
@@ -3419,7 +3844,7 @@ mod tests {
             format!("/v1/contract/web/{key}/image.jpg"),
             ApiVersion::V1,
             sender,
-            &test_webapp_cache(),
+            &test_webapp_cache_saturated(),
         )
         .await
         .map(|r| r.into_response());
@@ -3436,10 +3861,50 @@ mod tests {
         clear_cache(&instance_id).await;
     }
 
-    /// #3945 broaden-signal coverage: a cold cache for a contract that is
-    /// SUBSCRIBED but NOT in the store (e.g. the lease outlived LRU eviction)
-    /// must still fetch. Proves `is_locally_known`'s OR branch — known =
-    /// in-store OR subscribed — not store-presence alone.
+    /// The other half of `is_locally_known`'s OR, on the saturated-lane
+    /// fallback: a contract the node STORES but is not subscribed to must
+    /// fetch. That is the cross-contract case a shared gateway sees most —
+    /// contract X was fetched for some other reader, so this reader's `<img
+    /// src>` finds it in the store — and it is the branch that would silently
+    /// stop mattering if the fallback ever narrowed to subscriptions alone.
+    #[tokio::test]
+    async fn variable_content_triggers_fetch_for_stored_not_subscribed() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x4d;
+        let instance_id = ContractInstanceId::new(bytes);
+        let key = instance_id.to_string();
+        clear_cache(&instance_id).await;
+
+        let (sender, mut rx) = request_channel();
+        let handler = {
+            let key = key.clone();
+            tokio::spawn(async move {
+                variable_content(
+                    key.clone(),
+                    format!("/v1/contract/web/{key}/image.jpg"),
+                    ApiVersion::V1,
+                    sender,
+                    &test_webapp_cache_saturated(),
+                )
+                .await
+                .map(|_| ())
+            })
+        };
+
+        answer_presence_query_hosted(&mut rx, instance_id).await;
+        expect_fetch_pair(&mut rx, instance_id).await;
+
+        handler.abort();
+        clear_cache(&instance_id).await;
+    }
+
+    /// #3945 broaden-signal coverage, on the saturated-lane fallback: a cold
+    /// cache for a contract that is SUBSCRIBED but NOT in the store (e.g. the
+    /// lease outlived LRU eviction) must still fetch even with every permit in
+    /// flight. Proves `is_locally_known`'s OR branch — known = in-store OR
+    /// subscribed — not store-presence alone, and that the fallback is a way
+    /// PAST a saturated lane rather than a second gate.
     #[tokio::test]
     async fn variable_content_triggers_fetch_for_subscribed_not_stored() {
         let mut bytes = [0u8; 32];
@@ -3458,7 +3923,7 @@ mod tests {
                     format!("/v1/contract/web/{key}/image.jpg"),
                     ApiVersion::V1,
                     sender,
-                    &test_webapp_cache(),
+                    &test_webapp_cache_saturated(),
                 )
                 .await
                 .map(|_| ())
@@ -3478,22 +3943,348 @@ mod tests {
         })
         .await;
 
-        // The gate must let the fetch through.
+        // Known contracts fetch even with the lane saturated.
         expect_fetch_pair(&mut rx, instance_id).await;
 
         handler.abort();
         clear_cache(&instance_id).await;
     }
 
-    /// #3977-interaction regression for the #3945 cold/warm gate split: a
-    /// WARM-but-stale cache for an UNSUBSCRIBED, UNHOSTED contract must still
-    /// refresh. The gate is cold-path only, so a warm-but-stale refresh issues
-    /// its GET WITHOUT a preceding presence query — even though the contract is
-    /// not currently "known". A warm on-disk cache already proves the node
-    /// legitimately fetched this contract before, so refreshing it to pick up a
-    /// republish (#3977) is not the random-key amplification vector. Without
-    /// this split the handler would gate the warm refresh on a presence query
-    /// that says "unknown" and serve a stale bundle forever.
+    /// The bound is on CONCURRENCY, so a permit has to stay claimed for as long
+    /// as its GET is in flight — that is the whole difference between "32
+    /// speculative fetches at once" and "32 per request, unbounded in
+    /// aggregate". With a one-permit lane, a second cold contract arriving
+    /// while the first fetch is still outstanding must find the lane full and
+    /// fall back to the presence query, and must fetch again once the first
+    /// fetch's future is dropped and the permit returns.
+    ///
+    /// Load-bearing against two opposite mistakes: taking the permit and
+    /// dropping it before `ensure_contract_cached` (the second request would
+    /// fetch, and no bound would exist), and holding it past the fetch (the
+    /// third request would 404 forever once the lane drained).
+    #[tokio::test]
+    async fn an_in_flight_fetch_holds_its_speculative_permit() {
+        let webapp_cache = WebappCache {
+            speculative_fetches: Arc::new(Semaphore::new(1)),
+            ..test_webapp_cache()
+        };
+
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3b;
+        bytes[1] = 0x01;
+        let first = ContractInstanceId::new(bytes);
+        bytes[1] = 0x02;
+        let second = ContractInstanceId::new(bytes);
+        clear_cache(&first).await;
+        clear_cache(&second).await;
+
+        let (sender, mut rx) = request_channel();
+        let in_flight = {
+            let (sender, webapp_cache) = (sender.clone(), webapp_cache.clone());
+            tokio::spawn(async move { refresh_cache_if_due(first, &sender, &webapp_cache).await })
+        };
+        // The only permit is now claimed. Hold the callback sender for the rest
+        // of the test so this fetch stays genuinely in flight: dropping it
+        // closes the channel, which ends the fetch and returns the permit —
+        // and would make the assertion below pass for the wrong reason.
+        let _in_flight_callbacks = expect_fetch_pair_holding_callbacks(&mut rx, first).await;
+
+        let blocked = {
+            let (sender, webapp_cache) = (sender.clone(), webapp_cache.clone());
+            tokio::spawn(async move { refresh_cache_if_due(second, &sender, &webapp_cache).await })
+        };
+        // Lane full → the fallback runs. Answer "not known" and it must give up
+        // without a GET.
+        answer_presence_query(&mut rx, second, |_query_id| empty_diagnostics()).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), blocked)
+            .await
+            .expect("the blocked request must resolve, not queue behind the fetch")
+            .expect("handler must not panic")
+            .expect("a refused speculative fetch is not an error");
+        assert!(
+            rx.try_recv().is_err(),
+            "a request refused by the saturated lane must issue no further \
+             messages, and above all no Get"
+        );
+
+        // Drop the in-flight fetch: its permit returns and the lane reopens.
+        in_flight.abort();
+        assert!(
+            in_flight.await.is_err(),
+            "the in-flight fetch must be cancelled, not have completed on its own"
+        );
+        let retried = {
+            let (sender, webapp_cache) = (sender.clone(), webapp_cache.clone());
+            tokio::spawn(async move { refresh_cache_if_due(second, &sender, &webapp_cache).await })
+        };
+        expect_fetch_pair(&mut rx, second).await;
+        retried.abort();
+
+        clear_cache(&first).await;
+        clear_cache(&second).await;
+    }
+
+    /// A page embedding several subresources from a contract nobody can find
+    /// must pay ONE network GET, not one per subresource. Each follower queues
+    /// on the refresh lock, finds the cache still cold, and would otherwise
+    /// fetch again — 30 images means 30 sequential GETs, each up to the 30s
+    /// ceiling, for 30 identical answers. The recorded failure is what stops
+    /// them, and this test is the only thing standing between that record and a
+    /// future cleanup that drops it as redundant with the refresh timer (it is
+    /// not: the timer is only set on SUCCESS, deliberately, so a transient
+    /// failure does not suppress the next retry).
+    #[tokio::test]
+    async fn a_failed_cold_fetch_is_not_repeated_within_the_window() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3b;
+        bytes[1] = 0x11;
+        let instance_id = ContractInstanceId::new(bytes);
+        clear_cache(&instance_id).await;
+        CONTRACT_REFRESH_LOCKS.remove(&instance_id);
+
+        let (sender, mut rx) = request_channel();
+
+        // First request: fetches, and the node answers "not found".
+        let first = {
+            let sender = sender.clone();
+            tokio::spawn(async move {
+                refresh_cache_if_due(instance_id, &sender, &test_webapp_cache()).await
+            })
+        };
+        let callbacks = expect_fetch_pair_holding_callbacks(&mut rx, instance_id).await;
+        callbacks
+            .send(HostCallbackResult::Result {
+                id: crate::client_events::ClientId::next(),
+                result: Ok(HostResponse::ContractResponse(ContractResponse::NotFound {
+                    instance_id,
+                })),
+            })
+            .expect("callback receiver live for the NotFound reply");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), first)
+                .await
+                .expect("the first request must resolve")
+                .expect("handler must not panic")
+                .is_err(),
+            "premise: an exhausted GET must surface as an error"
+        );
+        while rx.try_recv().is_ok() {} // the fetch's trailing Disconnect
+
+        // Second request, same contract, still cold: no GET may go out.
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            refresh_cache_if_due(instance_id, &sender, &test_webapp_cache()),
+        )
+        .await
+        .expect("the second request must resolve, not queue behind a refetch");
+        assert!(
+            second.is_ok(),
+            "a request inside the failure window serves the empty-cache 404, it \
+             does not propagate the first caller's error"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a cold fetch that just failed must not be repeated inside the \
+             window — one dead contract, one GET"
+        );
+
+        CONTRACT_REFRESH_LOCKS.remove(&instance_id);
+        clear_cache(&instance_id).await;
+    }
+
+    /// A node that accepts the fetch's connection but never assigns it an id
+    /// must not pin the request — and above all must not pin the
+    /// speculative-fetch permit it is holding, because a permit that never
+    /// comes back drains the lane for the life of the process.
+    ///
+    /// Unreachable before this change: #4417's gate ran its own bounded
+    /// presence query first and failed closed, so a cold request never reached
+    /// the fetch against a silent node. Removing the gate is what put this
+    /// handshake on the path, so the bound belongs to the same change. Found by
+    /// mutation-testing the traversal check, where the test hung instead of
+    /// failing.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_node_cannot_pin_a_speculative_permit() {
+        let webapp_cache = WebappCache {
+            speculative_fetches: Arc::new(Semaphore::new(1)),
+            ..test_webapp_cache()
+        };
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3b;
+        bytes[1] = 0x21;
+        let instance_id = ContractInstanceId::new(bytes);
+        clear_cache(&instance_id).await;
+        CONTRACT_REFRESH_LOCKS.remove(&instance_id);
+
+        let (sender, mut rx) = request_channel();
+        let handler = {
+            let webapp_cache = webapp_cache.clone();
+            tokio::spawn(
+                async move { refresh_cache_if_due(instance_id, &sender, &webapp_cache).await },
+            )
+        };
+
+        // Accept the connection, then go silent — never send `NewId`. Hold the
+        // sender so the channel stays OPEN: a closed channel short-circuits the
+        // recv, and the timeout is what this test is about.
+        let new_conn = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the fetch must open with NewConnection")
+            .expect("channel must remain open");
+        let _callbacks = match new_conn {
+            ClientConnection::NewConnection { callbacks, .. } => callbacks,
+            other => panic!("the fetch must open with NewConnection, got: {other:?}"),
+        };
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(60), handler)
+                .await
+                .expect("a silent node must not pin the request task")
+                .expect("handler must not panic")
+                .is_err(),
+            "a fetch that never got a client id is a failed fetch"
+        );
+        assert_eq!(
+            webapp_cache.speculative_fetches.available_permits(),
+            1,
+            "the permit must come back when the fetch gives up, or one wedged \
+             node drains the lane for good"
+        );
+
+        CONTRACT_REFRESH_LOCKS.remove(&instance_id);
+        clear_cache(&instance_id).await;
+    }
+
+    /// The production cache must actually hand out `SPECULATIVE_FETCH_LIMIT`
+    /// permits. Every other lane test overrides the count, so without this a
+    /// mistake in `with_root` — a zero, or a `usize::MAX` that bounds
+    /// nothing — would pass the whole suite.
+    #[test]
+    fn with_root_opens_the_lane_at_the_declared_limit() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let cache = WebappCache::with_root(root.path().to_path_buf());
+        assert_eq!(
+            cache.speculative_fetches.available_permits(),
+            SPECULATIVE_FETCH_LIMIT,
+            "the node's speculative-fetch lane must open at the declared limit"
+        );
+    }
+
+    /// `CONTRACT_REFRESH_LOCKS` is keyed by a contract id an unauthenticated
+    /// caller puts in the URL, and the entry is created before anything has
+    /// decided the contract is worth fetching — so without a cap it is an
+    /// unbounded per-key map an attacker grows for free by spraying keys (the
+    /// per-key-collection rule in `.claude/rules/code-style.md`).
+    ///
+    /// Three properties, in one test because they cannot safely be separated:
+    /// while this holds the table full, a CONCURRENT sibling asking for a lock
+    /// correctly receives an overflow stripe instead of a table entry — which
+    /// is precisely what the first half asserts against. Split across two
+    /// `#[tokio::test]`s they would fail each other under plain `cargo test`,
+    /// which runs them as threads in one process (`.claude/rules/testing.md`).
+    ///
+    /// 1. the table stays at or under its cap under a spray;
+    /// 2. pruning never drops a lock another task holds or waits on, which
+    ///    would let two refreshers for one contract run at once;
+    /// 3. once the table is full of HELD locks, a newcomer gets a shared
+    ///    overflow stripe — deterministic per contract, so it still coalesces —
+    ///    rather than a private mutex, which would drop coalescing for every
+    ///    request at once while nothing bounds the warm refreshes that follow.
+    #[tokio::test]
+    async fn refresh_lock_table_is_bounded_prunes_safely_and_overflows_per_contract() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3c;
+        let held_id = ContractInstanceId::new(bytes);
+        let guard = acquire_refresh_lock(&held_id).await;
+        let held_lock = CONTRACT_REFRESH_LOCKS
+            .get(&held_id)
+            .map(|entry| entry.clone())
+            .expect("the held lock must be in the table");
+
+        let sprayed: Vec<_> = (0..(MAX_REFRESH_LOCKS + 64))
+            .map(|i| {
+                let mut bytes = [0u8; 32];
+                bytes[0] = 0x3d;
+                bytes[1..9].copy_from_slice(&(i as u64).to_be_bytes());
+                ContractInstanceId::new(bytes)
+            })
+            .collect();
+        for id in &sprayed {
+            drop(acquire_refresh_lock(id).await);
+        }
+
+        assert!(
+            CONTRACT_REFRESH_LOCKS.len() <= MAX_REFRESH_LOCKS,
+            "a spray of unknown keys must not grow the refresh-lock table past \
+             its cap, got {}",
+            CONTRACT_REFRESH_LOCKS.len()
+        );
+        let survivor = CONTRACT_REFRESH_LOCKS
+            .get(&held_id)
+            .map(|entry| entry.clone())
+            .expect("a held refresh lock must survive the prune");
+        assert!(
+            Arc::ptr_eq(&held_lock, &survivor),
+            "the prune must keep the SAME mutex a task is holding, not replace \
+             it — a replacement lets two refreshers for one contract run at once"
+        );
+
+        // Now fill the table with locks that are HELD, so the prune can reclaim
+        // nothing and a newcomer has to take the overflow path.
+        let mut held = Vec::with_capacity(MAX_REFRESH_LOCKS);
+        let mut held_ids = Vec::with_capacity(MAX_REFRESH_LOCKS);
+        for i in 0..MAX_REFRESH_LOCKS {
+            let mut bytes = [0u8; 32];
+            bytes[0] = 0x3f;
+            bytes[1..9].copy_from_slice(&(i as u64).to_be_bytes());
+            let id = ContractInstanceId::new(bytes);
+            held.push(acquire_refresh_lock(&id).await);
+            held_ids.push(id);
+        }
+
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x40;
+        let newcomer = ContractInstanceId::new(bytes);
+        let first = refresh_lock_for(&newcomer);
+        let second = refresh_lock_for(&newcomer);
+        assert!(
+            !CONTRACT_REFRESH_LOCKS.contains_key(&newcomer),
+            "a full table must not admit another entry — that is the cap"
+        );
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "two callers for one contract must still meet on the same mutex \
+             when the table is full, or the overflow path silently stops \
+             coalescing every request at once"
+        );
+        assert!(
+            Arc::ptr_eq(&first, &overflow_refresh_lock(&newcomer)),
+            "the full-table path must hand out the contract's overflow stripe"
+        );
+
+        drop(guard);
+        drop(held);
+
+        // `CONTRACT_REFRESH_LOCKS` is process-global and `cargo test` runs these
+        // threads in ONE process, so leaving thousands of entries behind would
+        // push a sibling test's `acquire_refresh_lock` toward the overflow
+        // stripes and change what it measures. Nextest would never show it (one
+        // process per test) — see `.claude/rules/testing.md`.
+        for id in sprayed.iter().chain(held_ids.iter()) {
+            CONTRACT_REFRESH_LOCKS.remove(id);
+        }
+        CONTRACT_REFRESH_LOCKS.remove(&held_id);
+    }
+
+    /// #3977-interaction regression for the cold/warm split: a WARM-but-stale
+    /// cache for an UNSUBSCRIBED, UNHOSTED contract must still refresh. Only a
+    /// cold fetch is speculative, so a warm-but-stale refresh issues its GET
+    /// without claiming a permit and without a presence query — even though the
+    /// contract is not currently "known". A warm on-disk cache already proves
+    /// the node legitimately fetched this contract before, so refreshing it to
+    /// pick up a republish (#3977) is not the random-key amplification vector.
+    /// Without this split the handler would hold warm refreshes behind the
+    /// speculative bound and serve a stale bundle whenever it was saturated.
     #[tokio::test]
     async fn warm_but_stale_refreshes_without_presence_gate() {
         let mut bytes = [0u8; 32];
@@ -3634,6 +4425,124 @@ mod tests {
     /// Security regression: a `../`-style traversal in the (decoded) asset path
     /// must NOT read a file outside the contract's cache directory.
     ///
+    /// The overflow fallback must stay per-contract. When the lock table is
+    /// full, giving each caller a private mutex would drop coalescing for every
+    /// request at once — and a warm-but-stale refresh takes no speculative
+    /// permit, so nothing else would bound the duplicate GETs that follow.
+    /// Striping by contract id keeps two callers for one contract on one mutex.
+    #[test]
+    fn overflow_refresh_locks_are_shared_per_contract() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3e;
+        let id = ContractInstanceId::new(bytes);
+        bytes[1] = 0x01;
+        let other = ContractInstanceId::new(bytes);
+
+        assert!(
+            Arc::ptr_eq(&overflow_refresh_lock(&id), &overflow_refresh_lock(&id)),
+            "one contract must always land on the same overflow stripe, or the \
+             overflow state stops coalescing anything"
+        );
+        // Not an assertion that these two differ — a hash collision is legal —
+        // only that the stripes are actually distinguishing contracts at all.
+        let distinct: std::collections::HashSet<_> = (0u8..64)
+            .map(|i| {
+                let mut bytes = [0u8; 32];
+                bytes[0] = 0x3e;
+                bytes[2] = i;
+                Arc::as_ptr(&overflow_refresh_lock(&ContractInstanceId::new(bytes)))
+            })
+            .collect();
+        assert!(
+            distinct.len() > 1,
+            "the overflow stripes must spread contracts, not funnel them onto one"
+        );
+        let _ = other;
+    }
+
+    /// The sandbox handler must refuse a traversal before fetching too. The
+    /// sibling assertion for `variable_content`; without it, moving only ONE of
+    /// the two checks back after the fetch passes the suite, and this path is
+    /// reachable with an arbitrary key just like the other.
+    #[tokio::test]
+    async fn serve_sandbox_content_rejects_traversal_before_fetching() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x56;
+        let instance_id = ContractInstanceId::new(bytes);
+        let key = instance_id.to_string();
+        // Cold cache: without the early check this request WOULD fetch.
+        clear_cache(&instance_id).await;
+        CONTRACT_REFRESH_LOCKS.remove(&instance_id);
+
+        let (sender, mut rx) = request_channel();
+        let err = serve_sandbox_content(
+            key,
+            ApiVersion::V1,
+            Some("../../etc/hostname"),
+            sender,
+            &test_webapp_cache(),
+        )
+        .await
+        .err()
+        .expect("a traversal page path must be refused");
+        assert!(
+            matches!(err, WebSocketApiError::InvalidParam { .. }),
+            "a traversal page path must be an invalid param, got: {err:?}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a traversal page path must not reach the node at all — no fetch, \
+             no permit spent"
+        );
+
+        CONTRACT_REFRESH_LOCKS.remove(&instance_id);
+        clear_cache(&instance_id).await;
+    }
+
+    /// A traversal path must be refused BEFORE the speculative fetch, not
+    /// after. Two things ride on the ordering: a request that can never resolve
+    /// must not spend one of the node's speculative-fetch permits (a spray of
+    /// `../` paths would otherwise deny the lane to real subresources), and the
+    /// 400 must not be masked by whatever the fetch returns first — with the
+    /// check after the fetch, a node error surfaced as a 500 instead
+    /// (`web_subpages_error_response_carries_cors_header` caught exactly that).
+    #[tokio::test]
+    async fn variable_content_rejects_traversal_before_fetching() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x55;
+        let instance_id = ContractInstanceId::new(bytes);
+        let key = instance_id.to_string();
+        // Cold cache: without the early check this request WOULD fetch.
+        clear_cache(&instance_id).await;
+
+        let (sender, mut rx) = request_channel();
+        let result = variable_content(
+            key.clone(),
+            format!("/v1/contract/web/{key}/../../etc/hostname"),
+            ApiVersion::V1,
+            sender,
+            &test_webapp_cache(),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result.as_ref().map(|_| ()),
+                Err(err) if matches!(err.as_ref(), WebSocketApiError::InvalidParam { .. })
+            ),
+            "a traversal path must be rejected as an invalid param"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a traversal path must not reach the node at all — no fetch, no \
+             permit spent"
+        );
+
+        clear_cache(&instance_id).await;
+    }
+
     /// `..%2f..%2f…` decodes to `../../…`; the old code joined it onto the cache
     /// dir with no containment check and served whatever it resolved to — an
     /// unauthenticated arbitrary local-file read, made cross-origin-readable by
@@ -3991,10 +4900,10 @@ mod tests {
     /// asserting the contract key on the `Get`, then aborts the in-flight
     /// fetch. Returns once both messages have been observed.
     ///
-    /// This is the **warm-but-stale** path: the #3945 presence gate runs ONLY
-    /// on a cold cache, so a warm-cache refresh emits the fetch pair directly
-    /// with no preceding presence query. Cold-cache tests use
-    /// `expect_fetch_pair_cold`, which answers the presence query first.
+    /// Used for both the warm-but-stale refresh and the cold speculative fetch:
+    /// neither is preceded by a presence query. Only a cold fetch that finds
+    /// the speculative-fetch lane saturated falls back to one, and those tests
+    /// answer it with `answer_presence_query` before calling this.
     ///
     /// Replies to the `NewConnection` callback with a synthetic client id so
     /// the handler progresses past its blocking `NewId` recv to the `Get`.
@@ -4002,6 +4911,19 @@ mod tests {
         rx: &mut tokio::sync::mpsc::Receiver<ClientConnection>,
         instance_id: ContractInstanceId,
     ) {
+        expect_fetch_pair_holding_callbacks(rx, instance_id).await;
+    }
+
+    /// `expect_fetch_pair`, returning the fetch's callback sender.
+    ///
+    /// Dropping that sender closes the channel the handler is waiting on, so
+    /// the fetch ends immediately — fine for a test that aborts the handler
+    /// next, wrong for one that needs the fetch to stay outstanding (and to
+    /// keep holding its speculative-fetch permit).
+    async fn expect_fetch_pair_holding_callbacks(
+        rx: &mut tokio::sync::mpsc::Receiver<ClientConnection>,
+        instance_id: ContractInstanceId,
+    ) -> tokio::sync::mpsc::UnboundedSender<HostCallbackResult> {
         let new_conn = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
             .await
             .expect("handler must send NewConnection when a refresh is due")
@@ -4033,18 +4955,7 @@ mod tests {
             }
             other => panic!("expected ClientConnection::Request, got: {other:?}"),
         }
-    }
-
-    /// Cold-cache variant of `expect_fetch_pair`: answers the #3945 presence
-    /// query as "node hosts/stores `instance_id`" (the #3940 cross-contract
-    /// case) first, then asserts the resulting fetch pair. Use this whenever the
-    /// cache is COLD (no `{key}.hash` on disk), where the DoS gate runs.
-    async fn expect_fetch_pair_cold(
-        rx: &mut tokio::sync::mpsc::Receiver<ClientConnection>,
-        instance_id: ContractInstanceId,
-    ) {
-        answer_presence_query_hosted(rx, instance_id).await;
-        expect_fetch_pair(rx, instance_id).await;
+        callbacks
     }
 
     /// Regression test for #3977. `serve_sandbox_content` (the `?__sandbox=1`
@@ -4462,6 +5373,159 @@ mod tests {
         );
     }
 
+    /// A GET whose retry loop exhausted comes back as `Ok(ContractResponse::
+    /// NotFound)` — a SUCCESS at the client-API level, produced deliberately so
+    /// a client can tell "absent" apart from "the operation failed". It must be
+    /// classified transient, not swept into the unmatched-response catch-all.
+    ///
+    /// Regression pin. Before the arm existed, `NotFound` matched no arm, fell
+    /// into `Ok(other)`, and became `NodeError { "Unexpected response from node:
+    /// .." }`, which `errors.rs` renders as a bare 500 because the message does
+    /// not begin with "Contract not found". On Freenet a `NotFound` is routinely
+    /// "not found YET" (the #4404 placement gap), so a contract published
+    /// minutes earlier served a dead-looking 500 to every visitor and every
+    /// crawler until it propagated.
+    ///
+    /// The status assertion is the half that matters, so it is made against the
+    /// real `into_response`: asserting only the error VARIANT would still pass
+    /// if `errors.rs` later stopped treating `RequestError(Timeout)` as
+    /// transient, which is exactly the coupling that broke here.
+    #[tokio::test]
+    async fn handle_get_response_maps_network_not_found_to_transient_retry() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x44;
+        let instance_id = ContractInstanceId::new(bytes);
+
+        let recv_result: Result<Option<HostCallbackResult>, tokio::time::error::Elapsed> =
+            Ok(Some(HostCallbackResult::Result {
+                id: crate::client_events::ClientId::next(),
+                result: Ok(HostResponse::ContractResponse(ContractResponse::NotFound {
+                    instance_id,
+                })),
+            }));
+
+        let result = handle_get_response(instance_id, recv_result, &test_webapp_cache()).await;
+        let err = result.expect_err("a network NotFound must not be treated as a successful fetch");
+        assert!(
+            matches!(err, WebSocketApiError::ContractNotFound { .. }),
+            "a dead-ended GET must get its own classification, not fall through to the \
+             unmatched-response catch-all, got: {err:?}"
+        );
+
+        let response = err.into_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "must serve 503 (retry later). 500 is what this bug produced; 404 would be \
+             WORSE than the bug, because a crawler treats 404 as terminal and would \
+             permanently drop a contract that was merely slow to propagate"
+        );
+
+        // The headers are the half a programmatic client acts on, and they are set
+        // by a DIFFERENT file. Asserting the status alone would still pass if
+        // `errors.rs` stopped attaching them to this variant.
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("60"),
+            "503 without Retry-After tells a client to come back but not when"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "an intermediary must not pin this page once the contract arrives"
+        );
+
+        // And it must NOT auto-refresh. The identical node reply is produced for a
+        // key that will never resolve, so a meta-refresh here re-issues a network
+        // GET every minute for the life of any tab left open on a mistyped URL.
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body must be readable");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            !body.contains("http-equiv=\"refresh\""),
+            "the not-found page must not reload itself — see browser-assets.md, \
+             'assume every open tab pays the cost'"
+        );
+    }
+
+    /// The catch-all still catches. Carving `NotFound` out of it must not leave it
+    /// dead: a response that genuinely makes no sense for a GET (here a
+    /// `PutResponse`) must still surface as an unmatched-response error.
+    ///
+    /// This arm is where the fixed bug hid, and nothing exercised it before.
+    #[tokio::test]
+    async fn handle_get_response_still_rejects_a_genuinely_unexpected_response() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x45;
+        let instance_id = ContractInstanceId::new(bytes);
+        let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            instance_id,
+            freenet_stdlib::prelude::CodeHash::new([0u8; 32]),
+        );
+
+        let recv_result: Result<Option<HostCallbackResult>, tokio::time::error::Elapsed> =
+            Ok(Some(HostCallbackResult::Result {
+                id: crate::client_events::ClientId::next(),
+                result: Ok(HostResponse::ContractResponse(
+                    ContractResponse::PutResponse { key },
+                )),
+            }));
+
+        let result = handle_get_response(instance_id, recv_result, &test_webapp_cache()).await;
+        let err = result.expect_err("a PutResponse is not a valid answer to a GET");
+        assert!(
+            matches!(err, WebSocketApiError::NodeError { .. }),
+            "an unexpected variant must still reach the catch-all, got: {err:?}"
+        );
+        assert_eq!(
+            err.into_response().status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "a genuinely unexpected node response IS a server-side error, and 500 is \
+             the right answer for it — that was never the complaint"
+        );
+    }
+
+    /// A node-returned `Err` keeps its own `ErrorKind`, so `errors.rs` can decide
+    /// transient-vs-terminal from the kind. Pinned because the NotFound arm sits
+    /// directly above this one and a mis-ordered edit would swallow it.
+    #[tokio::test]
+    async fn handle_get_response_preserves_a_node_returned_error_kind() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x46;
+        let instance_id = ContractInstanceId::new(bytes);
+
+        let recv_result: Result<Option<HostCallbackResult>, tokio::time::error::Elapsed> =
+            Ok(Some(HostCallbackResult::Result {
+                id: crate::client_events::ClientId::next(),
+                result: Err(ErrorKind::OperationError {
+                    cause: "contract banned".into(),
+                }
+                .into()),
+            }));
+
+        let result = handle_get_response(instance_id, recv_result, &test_webapp_cache()).await;
+        let err = result.expect_err("a node error must not be treated as a successful fetch");
+        assert!(
+            matches!(
+                err,
+                WebSocketApiError::AxumError {
+                    error: ErrorKind::OperationError { .. }
+                }
+            ),
+            "the node's own ErrorKind must survive so errors.rs can classify it, got: {err:?}"
+        );
+    }
+
     /// A closed response channel (`Ok(None)`, node shutting down) surfaces as
     /// `AxumError(ChannelClosed)` — an unambiguously transient kind that maps
     /// to the 503 retry page (#3472).
@@ -4843,17 +5907,58 @@ mod tests {
             "overlay must declare role=dialog for a11y"
         );
         assert!(html.contains("aria-modal"), "overlay must set aria-modal");
-        // Subscribes to the new SSE endpoint and POSTs back with the response.
-        // /permission/pending is still referenced as the bootstrap-on-connect
-        // and `resync` reconciliation endpoint, plus the no-EventSource
-        // fallback, so the assertion below still holds.
+        // Subscribes to the permission-event WebSocket and POSTs back with the
+        // response. /permission/pending is still referenced as the
+        // bootstrap-on-connect and `resync` reconciliation endpoint, plus the
+        // no-WebSocket fallback, so the assertion below still holds.
         assert!(
-            html.contains("/permission/events"),
-            "shell JS must subscribe to /permission/events (SSE)"
+            html.contains("/permission/events/ws"),
+            "shell JS must subscribe to the /permission/events/ws WebSocket"
         );
         assert!(
             html.contains("/permission/pending"),
             "shell JS must reference /permission/pending for bootstrap/resync"
+        );
+        // #5213 regression pin. The permission channel MUST NOT ride a
+        // long-lived HTTP request. Every open tab holds it for the tab's whole
+        // life and all Freenet apps share one origin, so an SSE/EventSource
+        // (or any other held-open HTTP request) permanently consumes one of
+        // the browser's ~6 connections per origin PER TAB. At six tabs the
+        // budget is gone and a seventh tab's document request queues forever
+        // with no error surfaced — reproduced as a hard stall at tab 7, with
+        // tabs 1-6 loading in ~30ms.
+        //
+        // This asserts on the SHELL JS only. The server still serves the
+        // legacy SSE route for tabs opened before a node upgrade, so pinning
+        // the absence of the route itself would be wrong; what must not come
+        // back is the CLIENT holding one.
+        //
+        // SCOPE, so nobody mistakes this for the real guard: a substring check
+        // can only rule out the ONE spelling of the violation that shipped. A
+        // streamed `fetch()`, a long-poll, or any other request the shell
+        // never lets finish would reintroduce #5213 and keep this assertion
+        // green. The invariant itself ("the shell holds no HTTP request open")
+        // is enforced behaviourally in a real browser by
+        // crates/core/tests/playwright/tests/connection-exhaustion.spec.ts,
+        // which loads the shell, waits, and fails if any request is still
+        // unfinished. Keep this cheap check as the fast local signal, but if
+        // you change how the shell subscribes, that spec is what must pass.
+        //
+        // Note that spec runs in a workflow that is path-filtered and NOT a
+        // required check, so the strongest guard for this invariant cannot
+        // block a merge while this weaker one can. Tracked in #5275.
+        assert!(
+            !html.contains("EventSource("),
+            "shell JS must not open an EventSource: one held-open HTTP request \
+             per tab exhausts the browser's ~6-connections-per-origin budget \
+             and hangs the 7th Freenet tab (#5213)"
+        );
+        // The WebSocket has no auto-reconnect (EventSource did), so the shell
+        // owns reconnection. Without it a single node restart would leave
+        // every open tab permanently on the 3s polling fallback.
+        assert!(
+            html.contains("schedulePermReconnect"),
+            "shell JS must reconnect the permission WebSocket itself (#5213)"
         );
         assert!(
             html.contains("/respond"),
@@ -4865,15 +5970,18 @@ mod tests {
             html.contains("r.status === 404"),
             "shell JS must treat 404 on respond as 'already answered' and hide the card"
         );
-        // SSE event names the server emits. Pinning these here ensures the
-        // shell stays in sync with the gateway's wire format.
+        // Event names the server emits. Pinning these here ensures the shell
+        // stays in sync with the gateway's wire format. The names and payload
+        // shapes are shared by both transports (the WebSocket carries the name
+        // inside a JSON envelope; the legacy SSE route uses its `event:`
+        // field), so these assertions are transport-independent.
         assert!(
             html.contains("'prompt_added'") || html.contains("\"prompt_added\""),
-            "shell JS must subscribe to the prompt_added SSE event"
+            "shell JS must handle the prompt_added event"
         );
         assert!(
             html.contains("'prompt_removed'") || html.contains("\"prompt_removed\""),
-            "shell JS must subscribe to the prompt_removed SSE event"
+            "shell JS must handle the prompt_removed event"
         );
         // All delegate-controlled strings must go through textContent, never
         // innerHTML — guards against a future refactor re-opening XSS into
@@ -4885,11 +5993,13 @@ mod tests {
         // Bound the overlay code path by the explicit `perm-overlay-flow`
         // markers in shell_bridge.js, NOT a code anchor. The previous bound
         // (`setInterval(reconcileFromPending` / `EventSource`) stopped SHORT of
-        // the SSE `prompt_added`/`prompt_removed` handlers, which ARE part of
-        // the prompt-render flow #3836 protects — so a browser Notification
-        // reintroduced into an SSE handler would have slipped past this guard.
-        // The markers bracket the whole overlay + SSE region so the asserts
-        // below scan all of it (#4849 F2).
+        // the `prompt_added`/`prompt_removed` handlers, which ARE part of the
+        // prompt-render flow #3836 protects — so a browser Notification
+        // reintroduced into an event handler would have slipped past this
+        // guard. The markers bracket the whole overlay + event-channel region
+        // so the asserts below scan all of it (#4849 F2). Note the old code
+        // anchor named `EventSource`, which #5213 removed: another reason
+        // marker bounds beat code anchors here.
         let overlay_start = html
             .find("perm-overlay-flow:BEGIN")
             .expect("perm-overlay-flow:BEGIN marker must bracket the overlay flow");
@@ -4898,14 +6008,14 @@ mod tests {
             .expect("perm-overlay-flow:END marker must bracket the overlay flow");
         let overlay_slice = &html[overlay_start..overlay_start + overlay_end];
         // The negative asserts below are only meaningful if the slice actually
-        // CONTAINS the SSE prompt-render surface. Pin that the marker-bounded
+        // CONTAINS the permission prompt-render surface. Pin that the marker-bounded
         // region includes the `prompt_added`/`prompt_removed` handlers, so a
         // refactor that moves them past `perm-overlay-flow:END` (shrinking the
         // slice) fails HERE rather than silently making the negative asserts
         // pass vacuously — the exact regression F2 exists to prevent (#4849).
         assert!(
             overlay_slice.contains("'prompt_added'") && overlay_slice.contains("'prompt_removed'"),
-            "overlay guard slice must cover the SSE prompt handlers (#4849 F2)"
+            "overlay guard slice must cover the permission prompt handlers (#4849 F2)"
         );
         assert!(
             !overlay_slice.contains("innerHTML"),
@@ -4915,7 +6025,7 @@ mod tests {
         // The old permission-prompt-via-Notification flow must be gone: the
         // permission OVERLAY code path must not request or construct a browser
         // Notification (#3836 — delegate permission prompts must render as the
-        // in-page SSE overlay, never as a browser Notification users
+        // in-page permission overlay, never as a browser Notification users
         // block/miss/dismiss). Scoped to `overlay_slice`, NOT the whole shell:
         // browser Notifications are now legitimately used ELSEWHERE in the
         // bridge for new-MESSAGE notifications (a best-effort UX where a
@@ -4936,8 +6046,9 @@ mod tests {
                 && !html.contains("window.open(\"/permission/"),
             "shell must no longer open /permission/{{nonce}} as a popup (#3836)"
         );
-        // The visibility-gated polling loop has been replaced by SSE. SSE
-        // pushes regardless of tab visibility, so the visibility-skip code
+        // The visibility-gated polling loop was replaced by a pushed channel
+        // (SSE originally, a WebSocket since #5213). A push arrives
+        // regardless of tab visibility, so the visibility-skip code
         // path that caused the originating tab to silently miss prompts
         // when in the background MUST NOT be reintroduced. Pin this
         // contract by asserting `visibilityState` no longer appears in the
@@ -4948,7 +6059,8 @@ mod tests {
         assert!(
             !html.contains("visibilityState"),
             "overlay must not gate on document.visibilityState; \
-             visibility-skip caused background tabs to miss prompts (SSE replaces polling)"
+             visibility-skip caused background tabs to miss prompts (the permission \
+             channel replaces polling)"
         );
 
         // Regression test for issue #3857: the overlay must read the new
@@ -5304,6 +6416,45 @@ mod tests {
         assert!(
             !result.contains("__FREENET_AUTH_TOKEN__"),
             "auth token leaked into sandbox content"
+        );
+    }
+
+    /// Regression test: the shell page's `<title>` is hardcoded (`shell.html`)
+    /// and the sandboxed iframe cannot touch `document.title` on the parent
+    /// directly (no `allow-same-origin`), so before `TITLE_SYNC_JS` existed
+    /// the browser tab showed "Freenet" forever for any contract that did not
+    /// hand-roll its own postMessage sender — which was every contract except
+    /// River, Atlas, and Delta. This asserts the sync script is injected
+    /// alongside the WS shim and interceptor for EVERY sandboxed page,
+    /// including one with no app JS at all.
+    #[tokio::test]
+    async fn sandbox_content_injects_title_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "testkey123";
+        let html =
+            r#"<!DOCTYPE html><html><head><title>My App</title></head><body>Hello</body></html>"#;
+        std::fs::write(dir.path().join("index.html"), html).unwrap();
+
+        let result = response_body(
+            sandbox_content_body(dir.path(), key, ApiVersion::V1, "index.html")
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        assert!(
+            result.contains("type: 'title'"),
+            "title sync script not injected"
+        );
+        assert!(
+            result.contains("__freenet_shell__: true"),
+            "title sync script must use the shell postMessage bridge protocol"
+        );
+        // Must forward document.title, not a hardcoded string — this is what
+        // makes it work for every app rather than needing per-app wiring.
+        assert!(
+            TITLE_SYNC_JS.contains("document.title"),
+            "title sync script must read document.title, not a fixed string"
         );
     }
 

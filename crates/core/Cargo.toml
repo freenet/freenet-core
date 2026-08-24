@@ -1,6 +1,6 @@
 [package]
 name = "freenet"
-version = "0.2.119"
+version = "0.2.131"
 edition = "2024"
 rust-version = "1.85"
 publish = true
@@ -150,7 +150,7 @@ tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
-winapi = { workspace = true, features = ["shellapi", "sysinfoapi", "wincon", "winuser", "synchapi", "handleapi", "errhandlingapi", "winerror", "winnt", "minwindef"] }
+winapi = { workspace = true, features = ["shellapi", "sysinfoapi", "wincon", "winuser", "synchapi", "handleapi", "errhandlingapi", "winerror", "winnt", "minwindef", "psapi", "processthreadsapi"] }
 serde = { workspace = true }
 zip = { workspace = true }
 tray-icon = { workspace = true }
@@ -163,6 +163,19 @@ winreg = { workspace = true }
 tray-icon = { workspace = true }
 muda = { workspace = true }
 tao = { workspace = true }
+# Live memory-pressure signals for the resident-overhead hosting budget
+# (#5333) — `host_statistics64` (system-wide available memory) and
+# `task_info` (this process's own resident size) — are read via `libc`
+# (already a `cfg(unix)` dependency above), not a separate Mach-specific
+# crate: an earlier revision of this comment pinned `mach2 = "0.4"` here on
+# the theory that a purpose-built crate would avoid struct-layout mistakes,
+# but that version of `mach2` does not export `mach_host`, `HOST_VM_INFO64`,
+# or a `mach_task_basic_info` struct at all — a #5333-review-caught compile
+# break the "real macOS CI compiles this" claim in the same removed comment
+# had not actually been confirmed by (the job was still pending). `libc`
+# has every symbol needed, including the `_COUNT` size constants that avoid
+# hand-rolled `size_of` arithmetic — see `wasm_runtime::module_cache`'s
+# `read_macos_available_bytes`/`read_macos_own_rss_bytes`.
 
 [dev-dependencies]
 arbitrary = { workspace = true }
@@ -267,6 +280,23 @@ unsafe_op_in_unsafe_fn = "deny"
 [lints.clippy]
 # Disallow `let _ = expr` when `expr` is #[must_use].
 # Forces explicit handling or an intentional `drop()` call.
+#
+# CAVEAT, learned the hard way (#5292): the suggested `drop()` escape hatch is
+# NOT always available, and then the two lints forbid opposite spellings of the
+# same statement. If the discarded value is `#[must_use]` AND `Copy` (e.g. a
+# `Result<(), SendError<T>>` where `T: Copy`), `let _ = x` is denied here while
+# `drop(x)` is denied by rustc's `dropping_copy_types` -- the drop genuinely
+# does nothing, so the lint is right. The same applies to a `#[must_use]` type
+# with no `Drop` glue, via `clippy::drop_non_drop`.
+#
+# When that happens, the resolution is a PER-SITE
+# `#[allow(clippy::let_underscore_must_use)]` with a comment saying why the
+# value is ignorable -- see `broadcast_queue.rs` in `mod observation_tests`.
+# Do NOT widen this to a module-level allow (it un-gates every future discard in
+# that module) and do NOT disable `dropping_copy_types`/`drop_non_drop`
+# crate-wide to make `drop()` work everywhere: both catch real mistakes, and
+# suppressing a lint to make a fix convenient is what produced the test-code
+# blind spot #5292 had to close.
 let_underscore_must_use = "deny"
 
 # Flag `_ =>` catch-all arms on non-exhaustive enums.

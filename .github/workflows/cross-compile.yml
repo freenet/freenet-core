@@ -208,6 +208,19 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
 
+    # Gates the OIDC token behind the `release` environment; the federated
+    # credential in Entra is pinned to exactly this subject
+    # (repo:freenet/freenet-core:environment:release), so a job that does not
+    # declare it cannot obtain an Azure token and signing fails closed.
+    # A fork PR or an unrelated workflow cannot borrow the signing identity.
+    environment: release
+
+    # Required for OIDC federation to Azure. `contents: read` must be restated
+    # because naming any permission drops the rest to none.
+    permissions:
+      id-token: write
+      contents: read
+
     steps:
       - uses: actions/checkout@v7
 
@@ -231,6 +244,84 @@ jobs:
         run: |
           target/release/freenet.exe --version
           target/release/freenet.exe service --help
+
+      # --- Authenticode signing (Azure Artifact Signing) -------------------
+      # freenet.exe IS the Windows installer, uninstaller, tray, service
+      # wrapper and updater -- they are all the same self-contained binary
+      # (crates/core/src/bin/commands/setup_wizard/, service/, tray.rs), so
+      # signing it covers every one of those roles. fdev.exe is downloaded
+      # from the GitHub release by `installer::run_install`, so it must be
+      # signed as a release artifact too or the installer drops an unsigned
+      # binary next to a signed one.
+      #
+      # Signing runs AFTER the smoke test and BEFORE both upload-artifact
+      # steps, so the artifacts -- and therefore SHA256SUMS.txt, generated in
+      # the attach-to-release job after downloading them -- cover the SIGNED
+      # bytes. Do not move these steps.
+      #
+      # Gated to release tags and manual dispatch so routine main-push builds
+      # don't burn signing quota (Basic tier: 5,000 signatures/month).
+      #
+      # NOTE the gating SCOPE differs from build-macos-dmg: that job puts the
+      # same `if:` expression at JOB level, so it does not run at all on a main
+      # push. Here the condition is per-STEP, because build-x86_64-windows must
+      # still run on main pushes to produce artifacts -- which means the job,
+      # and therefore its `environment: release` declaration, is entered on
+      # every main push. That is currently harmless (the environment has no
+      # protection rules and no branch policy), but adding required reviewers
+      # to it would pause every Build and Cross-Compile run. See
+      # docs/RELEASING.md.
+      - name: Azure login (OIDC)
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        # Bounded so a hung Azure endpoint surfaces in minutes instead of
+        # consuming the job's 60-minute budget, which during a release reads
+        # as "the build is stuck" rather than "Azure is down".
+        timeout-minutes: 10
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign Windows binaries (Azure Artifact Signing)
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        # Same reasoning as the login step above; this one also reaches the
+        # RFC3161 timestamp server, which is a second external dependency that
+        # can hang. Observed real duration is a few seconds per file plus
+        # tooling download, so 15 minutes is generous.
+        timeout-minutes: 15
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: https://eus.codesigning.azure.net/
+          signing-account-name: freenetsigning
+          certificate-profile-name: freenet-public-trust
+          # files-folder + filter picks up anything else that lands in
+          # target\release and needs signing, without maintaining a list.
+          # recurse stays false so it does not descend into build/ and deps/
+          # and burn signature quota on intermediate artifacts.
+          files-folder: ${{ github.workspace }}\target\release
+          files-folder-filter: exe,dll
+          files-folder-recurse: false
+          file-digest: SHA256
+          # Not optional: Artifact Signing certificates are short-lived
+          # (~3 days). Without a countersigned timestamp, every release binary
+          # stops validating almost immediately.
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # The gate. Runs on a real Windows machine and fails the build rather
+      # than shipping something unsigned -- this is what stands in for the
+      # Windows box the project doesn't have.
+      - name: Verify signatures
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        run: |
+          foreach ($f in @('target\release\freenet.exe','target\release\fdev.exe')) {
+            $sig = Get-AuthenticodeSignature $f
+            Write-Host "$f => $($sig.Status) / $($sig.SignerCertificate.Subject)"
+            if ($sig.Status -ne 'Valid') { throw "Unsigned or invalid: $f" }
+            if (-not $sig.TimeStamperCertificate) { throw "Missing timestamp: $f" }
+          }
 
       - name: Upload freenet binary
         uses: actions/upload-artifact@v7
@@ -271,6 +362,18 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: binaries-x86_64-macos-freenet
+          path: bin-x86_64
+
+      - name: Download ARM64 macOS fdev binary
+        uses: actions/download-artifact@v8
+        with:
+          name: binaries-arm64-macos-fdev
+          path: bin-arm64
+
+      - name: Download x86_64 macOS fdev binary
+        uses: actions/download-artifact@v8
+        with:
+          name: binaries-x86_64-macos-fdev
           path: bin-x86_64
 
       - name: Install packaging dependencies
@@ -336,12 +439,14 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
           FREENET_ARM64_BIN: bin-arm64/freenet
           FREENET_X86_BIN: bin-x86_64/freenet
+          FREENET_ARM64_FDEV_BIN: bin-arm64/fdev
+          FREENET_X86_FDEV_BIN: bin-x86_64/fdev
           CODESIGN_IDENTITY: "Developer ID Application: Ian CLARKE (R55ZESJCXG)"
           ASC_API_KEY_ID: ${{ secrets.APPLE_ASC_API_KEY_ID }}
           ASC_API_ISSUER_ID: ${{ secrets.APPLE_ASC_API_KEY_ISSUER_ID }}
           # ASC_API_KEY_PATH set by the previous step via $GITHUB_ENV.
         run: |
-          chmod +x bin-arm64/freenet bin-x86_64/freenet
+          chmod +x bin-arm64/freenet bin-x86_64/freenet bin-arm64/fdev bin-x86_64/fdev
           ./scripts/package-macos.sh
 
       - name: Clean up secrets from runner
@@ -361,7 +466,35 @@ jobs:
   attach-to-release:
     name: Attach binaries to GitHub release
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Raised from 10 for the auto-update pre-flight canary (#5222). The job
+    # itself takes ~40s; the canary adds ~70s on the happy path but up to ~8
+    # min if it has to retry an unreachable GitHub. At the old budget a retry
+    # got the job CANCELLED before the `Publish release` step ran, leaving a
+    # permanently stuck draft — the exact failure the retry existed to avoid.
+    #
+    # NOTE that the timeout is NOT the only cancellation vector, and is not the
+    # likeliest one. This workflow's `concurrency` block sets
+    # `cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}`, which is TRUE
+    # for every `refs/tags/v*` — so a second run for the SAME TAG cancels this
+    # one, wherever it has got to. The documented
+    # `gh workflow run cross-compile.yml --ref vX.Y.Z` asset recovery lands in
+    # that group, and the moment an operator reaches for it ("did it start? is
+    # it stuck?") is precisely when a run may be in flight. Post-move such a
+    # cancellation can land between the two crate publishes, or between the
+    # publish and the un-draft. Both states are recoverable — the publish step
+    # skips whatever already uploaded, and re-running completes the un-draft —
+    # which is why this is a note rather than a redesign, and why
+    # scripts/RELEASE_RECOVERY.md tells operators to check for a running job
+    # before dispatching.
+    #
+    # Raised again from 25 for the crates.io publish, which moved here from
+    # release.yml so it sits downstream of Gate A. `cargo publish` builds and
+    # verifies each package; release.yml budgeted 20 minutes for the pair. Same
+    # reasoning as the last raise applies with more force now: a cancellation
+    # between the upload and the un-draft leaves a published crate and a draft
+    # release, which is precisely the 0.2.124 state this move exists to make
+    # unreachable. Budget generously.
+    timeout-minutes: 60
     needs: [build-x86_64-linux, build-arm64-linux, build-arm64-macos, build-x86_64-macos, build-x86_64-windows, build-macos-dmg]
     if: startsWith(github.ref, 'refs/tags/v')
 
@@ -369,6 +502,56 @@ jobs:
       contents: write
 
     steps:
+      # The release source and its toolchain are staged FIRST, before the
+      # artifacts, so that everything `cargo publish` needs is already on disk
+      # by the time the job reaches the window between Gate A and the un-draft.
+      #
+      # That window is the one this PR identifies as dangerous: a cancellation
+      # inside it can leave crates published and the release still a draft. It
+      # should therefore contain the upload and nothing else. Fetching a Rust
+      # toolchain there -- minutes, on a runner with no rust-cache -- would be
+      # adding avoidable minutes to exactly the interval we are trying to keep
+      # short.
+      #
+      # Checking out here is also strictly safer than checking out later.
+      # `actions/checkout` cleans its target path and the release assets live in
+      # the workspace ROOT, which is why this must go in a subdirectory at all;
+      # running before any asset exists removes the hazard rather than working
+      # around it. The default ref for a tag push is the tag, so the tree
+      # published later is exactly the tree the shipped binaries were built from.
+      - name: Check out the release source
+        uses: actions/checkout@v7
+        with:
+          path: _src
+
+      # NOT a pinned toolchain version, and that is the point.
+      # `rust-toolchain.toml` at the repo root pins the channel, its components
+      # and its targets, and rustup's toolchain-file override beats
+      # `rustup default` -- so a `dtolnay/rust-toolchain` step naming a version
+      # here would install that version and then be silently ignored, because
+      # `cargo` runs in `_src` where the toolchain file lives. An earlier draft
+      # of this job pinned 1.93.0 and was defended in the PR description on the
+      # grounds that it matched release.yml's dry run; both were in fact running
+      # 1.94.0 from the toolchain file. A pin that cannot take effect is worse
+      # than no pin: it invites the next editor to "fix" a number that changes
+      # nothing.
+      #
+      # The toolchain file is the single authority for BOTH this publish and
+      # release.yml's `cargo publish --dry-run`, so the two match by
+      # construction rather than by two hand-synchronised numbers. This step
+      # exists only to make rustup materialise it HERE, outside the Gate A
+      # window, instead of on first use inside it.
+      - name: Materialise the release toolchain
+        working-directory: _src
+        run: |
+          set -euo pipefail
+          echo "rust-toolchain.toml governs this publish:"
+          cat rust-toolchain.toml
+          # Any cargo invocation inside _src makes rustup honour the file,
+          # downloading the channel plus its components and targets if absent.
+          cargo --version
+          rustup show active-toolchain
+
       # Linux x86_64
       - name: Download x86_64 Linux freenet binary
         uses: actions/download-artifact@v8
@@ -578,14 +761,419 @@ jobs:
           gh release upload "$TAG_NAME" $ASSETS \
             --repo ${{ github.repository }} \
             --clobber
+          echo "✅ Assets uploaded to draft release $TAG_NAME"
 
-          # Publish the release now that binaries are attached.
-          # The release is created as a draft by release.sh/release.yml to
-          # prevent the installer from seeing a version before binaries exist.
+      # The crates.io credential is checked HERE: AFTER the binaries are
+      # uploaded, and immediately before the canary.
+      #
+      # It was originally the job's first step, which was wrong in a way worth
+      # recording, because it inverted this PR's own thesis. This job is the
+      # only path that attaches binaries and un-drafts the release, and neither
+      # of those needs a crates.io token. Failing at step 1 on a missing
+      # credential therefore blocked BINARY DELIVERY -- the reversible half --
+      # on a credential only the irreversible half requires. An operator
+      # re-running this job to re-attach assets to an already-tagged release
+      # (the documented `gh workflow run cross-compile.yml --ref vX.Y.Z`
+      # recovery) would have got a job that died having done nothing, with a
+      # repo-secret rotation as the only remedy. Sharper still: on a re-run
+      # where both crates are ALREADY published, the publish step skips both
+      # and no token is needed at all, yet the step-1 check demanded one.
+      #
+      # Here it keeps the fail-fast value that motivated it -- there is no point
+      # spending the canary's minutes if the publish cannot happen -- while the
+      # assets are already delivered whatever it decides.
+      #
+      # release.yml's `validate` job does the stronger check (it also asks
+      # crates.io whether the token is ACCEPTED) and does it before the bump PR
+      # exists. This one exists for the path where `validate` never ran: a bare
+      # tag push, or that same manual recovery. Presence only, no network call
+      # -- deterministic, so it cannot fail a release for a reason that is not a
+      # bug. A token that is present but DEAD still surfaces at the publish.
+      #
+      # Residual, accepted: a re-run whose crates are already published still
+      # fails here without a token, after delivering the assets. The assets are
+      # the point of that re-run, so the cost is a red job rather than lost work.
+      - name: Check the crates.io credential is present
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error title=CARGO_REGISTRY_TOKEN not set::This job publishes to crates.io after the pre-flight canary, so without the secret the release cannot complete. Failing now rather than after the canary. The binaries above are already uploaded. Set the CARGO_REGISTRY_TOKEN repo secret and re-run this job."
+            exit 1
+          fi
+          echo "✅ CARGO_REGISTRY_TOKEN is present."
+
+      # ---------------------------------------------------------------------
+      # Gate A of the auto-update canary (#5222) — BLOCKS PUBLICATION.
+      #
+      # #5104 made the node's release-tag fetch return the tag verbatim
+      # ("v0.2.121") and normalised it at only one of its two consumers. The
+      # DETECTION path kept the raw tag, semver parsing failed, and auto-update
+      # was dead fleet-wide for v0.2.120 AND v0.2.121 — silently, for two
+      # releases, until ~1,100 nodes had to be updated by hand. A broken
+      # updater cannot deliver its own fix, which is what makes this class of
+      # bug worth a blocking gate rather than a report.
+      #
+      # This runs the binary we are ABOUT to ship and asserts its updater can
+      # read GitHub's current release tag. It sits here, between upload and
+      # un-draft, deliberately:
+      #   - the assets exist, so we are testing the real artifact;
+      #   - the release is still a DRAFT, so nothing has reached a user yet and
+      #     a failure costs us a stuck draft rather than a broken fleet;
+      #   - the crates.io publish is BELOW it (it moved out of release.yml for
+      #     exactly this), so a failure here costs a deletable tag rather than a
+      #     permanently-spent version number;
+      #   - it is a `needs`-chained step, not a `release: published` listener,
+      #     so it cannot silently stop running if RELEASE_PAT lapses (that
+      #     token already suppresses downstream events when unset — see #4118).
+      #
+      # It adds ~1 minute: the node's startup check fires after a 0-60s jitter
+      # and the script returns as soon as it has a verdict.
+      #
+      # IF THIS FAILS: the release stays an unpublished draft and NOTHING
+      # irreversible has happened — no crates were uploaded. That is the correct
+      # fail-closed state. Do NOT un-draft it by hand to "unblock" the release:
+      # the updater in that binary is broken and publishing it strands the fleet
+      # on the previous version. Fix the detection path, then either re-run this
+      # workflow for the tag (if the fix is not in the binary) or delete the tag
+      # and re-cut on the corrected commit. Deleting and re-cutting is cheap
+      # here, which is the point; see scripts/RELEASE_RECOVERY.md.
+      # ---------------------------------------------------------------------
+      # This job downloads artifacts and never checks out the repo, so the
+      # canary script is not on disk. Sparse-checkout just that one file into
+      # its own subdirectory: `actions/checkout` cleans its target path, and
+      # the release assets live in the workspace ROOT, so scoping the path is
+      # what keeps this from wiping the very artifacts we are about to publish.
+      # The default ref for a tag push is the tag itself, so the script version
+      # matches the release it is gating.
+      - name: Check out the canary script
+        uses: actions/checkout@v7
+        with:
+          path: _canary
+          sparse-checkout: scripts/auto-update-canary.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Auto-update pre-flight canary (blocks publish)
+        # Step-level bound so a hung canary is reported as the canary timing
+        # out, not as the whole publish job dying for unclear reasons.
+        timeout-minutes: 12
+        run: |
+          tar xzf freenet-x86_64-unknown-linux-musl.tar.gz -C /tmp
+          chmod +x /tmp/freenet
+          bash _canary/scripts/auto-update-canary.sh preflight /tmp/freenet
+
+      # ---------------------------------------------------------------------
+      # crates.io publish — the IRREVERSIBLE step, deliberately DOWNSTREAM of
+      # Gate A and immediately UPSTREAM of the un-draft.
+      #
+      # It used to run in release.yml, before the tag was even pushed, so the
+      # one action that can never be undone happened before the gate that
+      # decides whether to ship. v0.2.124 is the standing proof: Gate A blocked
+      # it (correctly, as it turned out — on a harness bug, #5290), its crates
+      # were already on crates.io, and a published crate version cannot be
+      # replaced. The release could only ever remain a draft; the version number
+      # was spent and 0.2.125 was cut in its place.
+      #
+      # In this position a Gate A block costs a TAG. `git push --delete origin
+      # vX.Y.Z`, fix, re-tag the corrected commit — a re-run, not a lost
+      # version. That asymmetry is the whole reason for the move: order the
+      # pipeline so the reversible failures happen where the irreversible step
+      # has not run yet.
+      #
+      # Placed BEFORE the un-draft rather than after so the release only becomes
+      # visible once its crates exist. A failure here leaves a draft with assets
+      # and no crates, which is recoverable by re-running this job: the publish
+      # steps below skip a version that is already on crates.io.
+      #
+      # The job otherwise never checks out the repo, and the release assets sit
+      # in the workspace ROOT — `actions/checkout` cleans its target path, so
+      # this must go in a subdirectory for the same reason the canary checkout
+      # does. The default ref for a tag push is the tag, so the tree published
+      # here is exactly the tree the shipped binaries were built from.
+      # ---------------------------------------------------------------------
+      - name: Publish crates to crates.io
+        # Tag-gated as well as job-gated. The job's own
+        # `if: startsWith(github.ref, 'refs/tags/v')` already blocks this on a
+        # main push -- this workflow's `on:` includes `branches: [main]`, so
+        # main pushes DO run it -- but a step that uploads to crates.io should
+        # be structurally incapable of firing off a tag, not incapable only for
+        # as long as nobody edits the job's condition. It is also what bounds
+        # CARGO_REGISTRY_TOKEN's exposure to the tag path.
+        #
+        # `success() &&` is written out rather than relied upon. A step `if:`
+        # that contains no status-check function has `success()` applied
+        # implicitly, so the plain condition would still require every earlier
+        # step to have passed -- which is the ENTIRE mechanism putting this
+        # publish downstream of Gate A. Stating it removes any dependence on
+        # that implicit rule being remembered correctly by the next editor.
+        #
+        # Note the one asymmetry this `if:` introduces, and why it is harmless:
+        # a step that is SKIPPED (unlike one that FAILED) does not stop later
+        # steps, so a false tag test would let the un-draft run with no crates
+        # published. That branch is unreachable — the enclosing job already
+        # carries the identical `startsWith(github.ref, 'refs/tags/v')`, so
+        # whenever this job runs at all the step's tag test is necessarily true.
+        # The tag test here is belt to the job's braces, bounding
+        # CARGO_REGISTRY_TOKEN to the tag path; do not remove EITHER on the
+        # grounds that the other one covers it.
+        if: ${{ success() && startsWith(github.ref, 'refs/tags/v') }}
+        working-directory: _src
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          VERSION="${TAG_NAME#v}"
+
+          # The tag and the tree must agree before anything is uploaded. This is
+          # the same class of guard as release.yml's verify_release_checkout.sh:
+          # a crates.io version is permanent, so "which tree am I publishing"
+          # gets asserted, not assumed.
+          CORE_VERSION="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' crates/core/Cargo.toml | head -1)"
+          FDEV_VERSION="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' crates/fdev/Cargo.toml | head -1)"
+          echo "tag=$TAG_NAME  crates/core=$CORE_VERSION  crates/fdev=$FDEV_VERSION"
+          if [ "$CORE_VERSION" != "$VERSION" ]; then
+            echo "::error::tag $TAG_NAME does not match crates/core/Cargo.toml version '$CORE_VERSION'. Refusing to publish: a crates.io upload cannot be taken back."
+            exit 1
+          fi
+
+          # Already on crates.io? Then this is a re-run of a job that got past
+          # the upload (a failed un-draft, a cancelled runner), and re-uploading
+          # is an error rather than a no-op. `jq` reads a variable via a here-
+          # string, not a pipe: under `set -o pipefail` a short-circuiting
+          # reader makes the producer die 141 and a PRESENT answer read as
+          # ABSENT, which here would mean attempting a duplicate upload.
+          crate_published() {
+            local body
+            body="$(curl -sS -A 'freenet-release-ci' --max-time 30 \
+              --retry 3 --retry-all-errors \
+              "https://crates.io/api/v1/crates/$1/$2" 2>/dev/null)" || return 1
+            jq -e '.version.num? // empty' >/dev/null 2>&1 <<<"$body"
+          }
+
+          if crate_published freenet "$VERSION"; then
+            echo "✅ freenet $VERSION is already on crates.io (re-run); skipping"
+          else
+            echo "📦 Publishing freenet $VERSION to crates.io..."
+            cargo publish -p freenet
+            echo "✅ freenet $VERSION published"
+            echo "⏳ Waiting 30s for crates.io to propagate (fdev resolves freenet from the registry)..."
+            sleep 30
+          fi
+
+          if crate_published fdev "$FDEV_VERSION"; then
+            echo "✅ fdev $FDEV_VERSION is already on crates.io (re-run); skipping"
+          else
+            echo "📦 Publishing fdev $FDEV_VERSION to crates.io..."
+            cargo publish -p fdev
+            echo "✅ fdev $FDEV_VERSION published"
+          fi
+
+      - name: Publish release
+        env:
+          # Coalesce on RELEASE_PAT so `--draft=false` fires a
+          # `release.published` event that downstream workflows
+          # (`gateway-update.yml`, `release-announce.yml`) can react to.
+          # GITHUB_TOKEN suppresses workflow-triggering events as an
+          # anti-recursion safeguard, which broke the v0.2.57 release cascade
+          # and required manual `workflow_dispatch`. See issue #4118 and
+          # `AGENTS.md` → "Release Workflow & RELEASE_PAT".
+          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          # Publish the release now that binaries are attached AND the shipping
+          # binary's updater has been verified. The release is created as a
+          # draft by release.sh/release.yml to prevent the installer from
+          # seeing a version before binaries exist.
           gh release edit "$TAG_NAME" \
             --repo ${{ github.repository }} \
             --draft=false
           echo "✅ Release $TAG_NAME published with all binaries attached"
+
+  # -----------------------------------------------------------------------
+  # Gate B of the auto-update canary (#5222) — end-to-end, after publication.
+  #
+  # Gate A proved the binary we shipped can PARSE GitHub's release tags. This
+  # proves the transition that actually matters to the fleet: a node on the
+  # PREVIOUS release detects this one, exits 42, and self-replaces via
+  # `freenet update`. Not "the log looks right" but "the old version ends up
+  # on the new one".
+  #
+  # It necessarily runs AFTER publication: the node's detection path is
+  # hardwired to GitHub's `/releases/latest`, and a draft release does not
+  # appear there, so there is no way to exercise the real path earlier. That
+  # is why Gate A exists as the blocking half — this one is the alarm.
+  #
+  # A failure here means the fleet will NOT converge onto this release on its
+  # own. The release is already public at that point, so the job is red and
+  # notifies rather than blocking; the response is to ship a fix and/or roll
+  # the fleet by hand, exactly as v0.2.120/v0.2.121 required.
+  # -----------------------------------------------------------------------
+  auto-update-selfupdate-canary:
+    name: Auto-update self-update canary (previous release -> this one)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: attach-to-release
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+    outputs:
+      # 'ok' | 'environmental' | 'fault'. Read by the notify job below to pick
+      # its message. Job outputs are still populated when the job fails, which
+      # is the only case that reads this one.
+      classification: ${{ steps.canary.outputs.classification }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve the previous published release
+        id: prev
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # coalesce-exempt: read-only `gh api` release listing; emits no downstream event
+        run: |
+          set -euo pipefail
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          THIS_VERSION="${TAG_NAME#v}"
+          # Newest published, non-draft, non-prerelease release that is not the
+          # one we just cut. Drafts and prereleases are excluded because the
+          # fleet never runs them, so they are not the version we need to prove
+          # a transition from.
+          PREV_TAG=$(gh api "repos/${{ github.repository }}/releases?per_page=30" \
+            --jq "[.[] | select(.draft==false and .prerelease==false) | .tag_name]
+                  | map(select(. != \"$TAG_NAME\")) | .[0] // empty")
+          if [ -z "$PREV_TAG" ]; then
+            echo "::error::could not resolve a previous published release to canary from."
+            exit 1
+          fi
+          echo "this_version=$THIS_VERSION"  >> "$GITHUB_OUTPUT"
+          echo "prev_version=${PREV_TAG#v}"  >> "$GITHUB_OUTPUT"
+          echo "Canarying ${PREV_TAG} -> ${TAG_NAME}"
+
+      # Exit 75 (EX_TEMPFAIL, EXIT_UNVERIFIED_ENVIRONMENTAL in the canary) means
+      # the run was environmental -- the previous release's binary could not
+      # reach GitHub from this runner, or the ports were held -- so nothing was
+      # learned about the updater in either direction. The step still FAILS on
+      # it: unverified is not verified, and a green job here would be the
+      # vacuous pass the canary exists to remove. What the classification buys
+      # is the WORDING of the Matrix message below, which otherwise tells the
+      # dev room a node on the previous release may not be able to auto-update
+      # -- the #5221 alarm -- because a socket did not open.
+      #
+      # Not hypothetical: the node's startup fetch has no retry, and `framework`
+      # logged that WARN twice on 2026-08-11. Gate B's subject is a PUBLISHED
+      # binary, so that cannot be fixed from this side.
+      #
+      # `|| rc=$?` and NOT `|| true`: the exit code is re-raised at the end of
+      # the step. Swallowing it is how this gate would stop gating.
+      - name: Previous release self-updates to this release
+        id: canary
+        run: |
+          rc=0
+          bash scripts/auto-update-canary.sh selfupdate \
+            "${{ steps.prev.outputs.prev_version }}" \
+            "${{ steps.prev.outputs.this_version }}" || rc=$?
+          if [ "$rc" -eq 75 ]; then
+            echo "classification=environmental" >> "$GITHUB_OUTPUT"
+          elif [ "$rc" -ne 0 ]; then
+            echo "classification=fault" >> "$GITHUB_OUTPUT"
+          else
+            echo "classification=ok" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$rc"
+
+  # A red job in a release run is the primary signal, but nobody is guaranteed
+  # to be watching Actions at release time — and a silent fail-closed is
+  # indistinguishable from working. Mirror it into the dev room.
+  # Covers BOTH gates. An earlier revision hung this off Gate B alone, which
+  # left the BLOCKING gate silent: a Gate A failure fails `attach-to-release`,
+  # which SKIPS Gate B, so `needs.auto-update-selfupdate-canary.result` is
+  # 'skipped' and no message went out — leaving a release stuck as an
+  # unpublished draft with nobody told. That is precisely the
+  # silent-fail-closed shape this whole change exists to remove.
+  notify-auto-update-canary-failure:
+    name: Notify dev room if the release pre-flight failed
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [attach-to-release, auto-update-selfupdate-canary]
+    if: |
+      always() && startsWith(github.ref, 'refs/tags/v') &&
+      (needs.attach-to-release.result == 'failure' ||
+       needs.attach-to-release.result == 'cancelled' ||
+       needs.auto-update-selfupdate-canary.result == 'failure' ||
+       needs.auto-update-selfupdate-canary.result == 'cancelled')
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      # The ENVIRONMENTAL case, and the only one that does not raise the alarm.
+      # Both conditions are required: the publish job succeeded (so the release
+      # is out and nothing is stuck as a draft), AND the canary itself said the
+      # run told us nothing about the updater (exit 75; see the canary step's
+      # comment and EXIT_UNVERIFIED_ENVIRONMENTAL in auto-update-canary.sh).
+      #
+      # WHY THIS BRANCH EXISTS. Everything below it says a node on the previous
+      # release "may not be able to auto-update to this one", which is the #5221
+      # text. Before this split, a runner that could not open a socket to
+      # github.com for a few seconds sent exactly that. The previous release's
+      # binary retries its startup fetch zero times, so the trigger is a routine
+      # network blip on a hosted runner, not a rare event -- and an alarm that
+      # cries #5221 on a blip is one the room learns to scroll past. That is the
+      # same alarm-fatigue failure that let `--disable-auto-update` sit unnoticed
+      # on `framework` for nine days.
+      #
+      # The job is still RED either way. This changes what is SAID, never
+      # whether it is reported.
+      - name: Notify (unverified for environmental reasons, not a fleet problem)
+        # `id:` so `release_canary_wiring_test.sh` can find this step by
+        # something structural. Locating it by a phrase from its own message was
+        # tried first and an ordinary reword of that message immediately broke
+        # the pin -- which is the same "expectation stored as a copy of the
+        # thing it guards" shape this PR is about, one level down.
+        id: notify-environmental
+        if: >
+          needs.attach-to-release.result == 'success' &&
+          needs.auto-update-selfupdate-canary.outputs.classification == 'environmental'
+        uses: ./.github/actions/river-dev-notify
+        with:
+          # Names BOTH environmental causes rather than assuming the network
+          # one. Exit 75 covers two: the previous release's binary could not
+          # reach GitHub (and neither could the runner), or every attempt lost a
+          # port race on this host. An earlier version of this message asserted
+          # the first, so a self-hosted runner with something holding the ports
+          # sent the operator after DNS. The job log's `UNVERIFIED
+          # (ENVIRONMENTAL)` line says which; this says what to do, which is the
+          # same either way.
+          message: "⚠️ ${{ github.ref_name }} published fine, but auto-update for it is **UNVERIFIED** — the self-update canary never reached a verdict, for an environmental reason: either the previous release's binary could not reach GitHub (and neither could the runner) or every attempt hit a port collision on the runner. The job log's `UNVERIFIED (ENVIRONMENTAL)` line says which. The run is not evidence in either direction. Nothing suggests a stranded fleet and no fleet action is indicated, but this release has NOT been shown to be reachable by auto-update: re-run the job to actually verify it. If you are seeing this on consecutive releases, stop treating it as noise — whatever it names, something is persistently stopping the gate from running, the post-publish gate is not working, and nothing has been verified since the last green run. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
+          room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
+          gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}
+
+      # Everything else, unchanged. Written as the NEGATION of the branch above
+      # rather than as its own list of results, so a state neither branch
+      # anticipated (a cancelled job, an empty classification because the step
+      # never ran) lands HERE, in the loud one. A gate's unknown case belongs on
+      # the side that gets read.
+      #
+      # DO NOT CONSOLIDATE THESE TWO STEPS. One step with a conditional message
+      # expression is the obvious tidy and it loses the property: the two
+      # conditions must remain each other's exact complement, which is what a
+      # reviewer can check at a glance and what
+      # `release_canary_wiring_test.sh` asserts by comparing them to each other.
+      # Both steps are located there by `id:`, so a rename fails loudly.
+      - name: Notify (possible auto-update fault)
+        id: notify-fault
+        if: >
+          !(needs.attach-to-release.result == 'success' &&
+          needs.auto-update-selfupdate-canary.outputs.classification == 'environmental')
+        uses: ./.github/actions/river-dev-notify
+        with:
+          # Deliberately does NOT assert which failure happened. The job can be
+          # red because the updater is broken OR because GitHub was unreachable,
+          # and a message that overstates ("the fleet is stranded") on a network
+          # blip trains people to ignore the channel.
+          message: "\U0001F6A8 RELEASE PRE-FLIGHT did not pass for ${{ github.ref_name }} (publish job: ${{ needs.attach-to-release.result }}, auto-update self-update canary: ${{ needs.auto-update-selfupdate-canary.result }}). Check WHICH step failed before concluding anything: the publish job also does artifact download, checksumming, signing and the crates.io upload, so a red result here is not by itself an auto-update fault. If the publish job failed, the release is STUCK AS A DRAFT and needs a decision — and note that whether the crates.io upload already ran decides the recovery, because it is the one step that cannot be undone (it sits AFTER the pre-flight canary and BEFORE the un-draft; read the job log to see which side of it the failure fell on). If the self-update canary failed, a node on the previous release may not be able to auto-update to this one (#5221 failure mode — the fleet would need `freenet update` by hand). ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
+          room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
+          gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}
 
   verify-signing-key:
     name: Verify release signing key (dry-run)

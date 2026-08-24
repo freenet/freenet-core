@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Display, time::Duration};
+use std::{collections::BTreeMap, fmt::Display, time::Duration};
 
 use chrono::{DateTime, Utc};
 
@@ -37,14 +37,19 @@ const MAX_HISTORY_PER_PEER: usize = 10;
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize, Clone)]
 pub struct Ping {
-    from: HashMap<String, Vec<DateTime<Utc>>>,
+    /// BTreeMap, not HashMap: contract state is compared byte-for-byte across
+    /// peers to decide whether they have converged, and a HashMap serializes in
+    /// iteration order, so two peers holding the same logical state encode it
+    /// differently and never agree. Canonical encoding is a platform requirement
+    /// (freenet-core #5320).
+    from: BTreeMap<String, Vec<DateTime<Utc>>>,
     /// Optional padding to inflate serialized size for streaming tests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub padding: Option<Vec<u8>>,
 }
 
 impl core::ops::Deref for Ping {
-    type Target = HashMap<String, Vec<DateTime<Utc>>>;
+    type Target = BTreeMap<String, Vec<DateTime<Utc>>>;
 
     fn deref(&self) -> &Self::Target {
         &self.from
@@ -65,7 +70,7 @@ impl Ping {
     /// Create a Ping with padding of the given size in bytes.
     pub fn with_padding(size: usize) -> Self {
         Self {
-            from: HashMap::new(),
+            from: BTreeMap::new(),
             padding: Some(vec![0xAB; size]),
         }
     }
@@ -86,10 +91,52 @@ impl Ping {
         }
     }
 
-    pub fn merge(&mut self, mut other: Self, ttl: Duration) -> HashMap<String, Vec<DateTime<Utc>>> {
-        // Preserve the larger padding
+    /// Merge another peer's ping state into this one.
+    ///
+    /// The retention rule is applied to the UNION of both sides, not to the
+    /// incoming side alone. Filtering only `other` made the merge order-dependent:
+    /// the same expired timestamp survived if this peer already held it and vanished
+    /// if it arrived from a peer, so `merge(A, B)` and `merge(B, A)` disagreed
+    /// permanently. That is a broken merge law (freenet-core #5320), and it was
+    /// found by running the conformance verifier against this contract.
+    ///
+    /// The retention policy itself is unchanged and deliberate: keep the newest
+    /// `MAX_HISTORY_PER_PEER` entries regardless of age, plus any older entries
+    /// still within TTL. Applied to the union it is a pure function of (union, now),
+    /// so it is commutative, associative and idempotent at a given instant.
+    pub fn merge(
+        &mut self,
+        mut other: Self,
+        ttl: Duration,
+    ) -> BTreeMap<String, Vec<DateTime<Utc>>> {
+        #[cfg(feature = "std")]
+        let now = Utc::now();
+        #[cfg(not(feature = "std"))]
+        let now = freenet_stdlib::time::now();
+
+        // Preserve the larger padding. Rewriting this function wholesale dropped this
+        // step, which is a convergence bug of exactly the kind this change exists to
+        // fix: a peer starting with `padding: None` that merges an update carrying
+        // `Some(..)` would never adopt it, so the two would disagree forever on a
+        // field neither side is wrong about.
+        // Longer wins; equal lengths are broken by content, NOT left-biased.
+        //
+        // The original compared lengths only, so two paddings of the same length but
+        // different bytes kept whichever side happened to be `self`: merge(A, B) kept
+        // A's bytes and merge(B, A) kept B's, and the two peers then disagreed
+        // forever. That is the same defect this change exists to remove, on a
+        // different field, and the doc comment above claimed commutativity while the
+        // code broke it. Latent rather than live — the only constructor fills a
+        // uniform byte — but the field is public and arbitrary bytes deserialize.
+        //
+        // Comparing content on a tie is a total order over the padding itself, so
+        // both merge orders pick the same winner.
         let replace_padding = match (&self.padding, &other.padding) {
-            (Some(existing), Some(other_p)) => existing.len() < other_p.len(),
+            (Some(existing), Some(incoming)) => match existing.len().cmp(&incoming.len()) {
+                std::cmp::Ordering::Less => true,
+                std::cmp::Ordering::Greater => false,
+                std::cmp::Ordering::Equal => existing < incoming,
+            },
             (None, Some(_)) => true,
             _ => false,
         };
@@ -97,81 +144,73 @@ impl Ping {
             self.padding = other.padding.take();
         }
 
-        #[cfg(feature = "std")]
-        let now = Utc::now();
-        #[cfg(not(feature = "std"))]
-        let now = freenet_stdlib::time::now();
+        let before = self.from.clone();
 
-        let mut updates = HashMap::new();
-
-        // Process entries from other Ping
-        for (name, other_timestamps) in other.from.into_iter() {
-            let mut new_entries = Vec::new();
-
-            // Filter entries that are still within TTL
-            for timestamp in other_timestamps {
-                if now <= timestamp + ttl {
-                    new_entries.push(timestamp);
-                }
-            }
-
-            if !new_entries.is_empty() {
-                let entry = self.from.entry(name.clone()).or_default();
-
-                // Track which entries are new for the updates return value
-                let before_len = entry.len();
-
-                // Add new entries
-                entry.extend(new_entries.iter().cloned());
-
-                // Sort all entries (newest first)
-                entry.sort_by(|a, b| b.cmp(a));
-
-                // Remove duplicates (keep earliest occurrence which is the newest due to sorting)
-                entry.dedup();
-
-                // Truncate to maximum history size
-                if entry.len() > MAX_HISTORY_PER_PEER {
-                    entry.truncate(MAX_HISTORY_PER_PEER);
-                }
-
-                // If there are new entries added, record as an update
-                if entry.len() > before_len {
-                    updates.insert(name, entry.clone());
-                }
-            }
+        // Union first. Nothing is judged before both sides are in one place, which
+        // is what keeps the rule symmetric.
+        for (name, incoming) in other.from {
+            self.from.entry(name).or_default().extend(incoming);
         }
 
-        // For our own entries, sort them and only remove expired entries
-        // if we have more than MAX_HISTORY_PER_PEER
-        for (_, timestamps) in self.from.iter_mut() {
-            // Sort by newest first
-            timestamps.sort_by(|a, b| b.cmp(a));
-
-            // Only remove expired entries if we have more than MAX_HISTORY_PER_PEER
-            if timestamps.len() > MAX_HISTORY_PER_PEER {
-                // Keep first MAX_HISTORY_PER_PEER entries regardless of TTL
-                let mut keep = timestamps[..MAX_HISTORY_PER_PEER].to_vec();
-
-                // For entries beyond MAX_HISTORY_PER_PEER, only keep those within TTL
-                if timestamps.len() > MAX_HISTORY_PER_PEER {
-                    let additional: Vec<_> = timestamps[MAX_HISTORY_PER_PEER..]
-                        .iter()
-                        .filter(|v| now <= **v + ttl)
-                        .cloned()
-                        .collect();
-
-                    keep.extend(additional);
-                }
-
-                *timestamps = keep;
-            }
+        for timestamps in self.from.values_mut() {
+            Self::retain_history(timestamps, now, ttl);
         }
 
-        // Remove empty entries
+        // Remove empty entries. `or_default()` above creates one for any name the
+        // incoming state mentions, including with an empty list, and nothing else
+        // would ever remove it: a hand-built payload naming a peer with no timestamps
+        // would otherwise persist forever and propagate to every peer that merged
+        // from this one. It also keeps `len()` (map keys) in step with
+        // `contains_key()` (non-empty).
         self.from.retain(|_, timestamps| !timestamps.is_empty());
 
+        // Report peers that gained a timestamp we did not have.
+        //
+        // Deliberately NOT "anything that differs from before": `retain_history`
+        // sorts and prunes, so a plain diff also fires when entries were merely
+        // reordered or aged out, and the one caller
+        // (`ping_client.rs::record_received`) counts each reported peer as a ping
+        // RECEIVED. That would inflate the stats, including reporting a ping from
+        // this node itself the first time its own unsorted entries get sorted.
+        //
+        // Note this is not quite what the original did, and is deliberately better:
+        // the original compared list LENGTH after truncation, so once a peer was at
+        // MAX_HISTORY_PER_PEER a genuinely new timestamp that displaced an older one
+        // left the length unchanged and was never counted — a chronic under-count in
+        // exactly the steady state where every peer is at the cap.
+        let mut updates = BTreeMap::new();
+        for (name, timestamps) in &self.from {
+            let had = before.get(name);
+            let gained = match had {
+                Some(previous) => timestamps.iter().any(|t| !previous.contains(t)),
+                None => true,
+            };
+            if gained {
+                updates.insert(name.clone(), timestamps.clone());
+            }
+        }
         updates
+    }
+
+    /// Newest first, deduplicated, keeping `MAX_HISTORY_PER_PEER` regardless of age
+    /// plus any older entries still within TTL.
+    ///
+    /// Sorting is by timestamp descending, a total order over the entries' own
+    /// content, so the surviving set does not depend on the order they arrived in.
+    fn retain_history(timestamps: &mut Vec<DateTime<Utc>>, now: DateTime<Utc>, ttl: Duration) {
+        timestamps.sort_by(|a, b| b.cmp(a));
+        timestamps.dedup();
+
+        if timestamps.len() > MAX_HISTORY_PER_PEER {
+            let mut keep = timestamps[..MAX_HISTORY_PER_PEER].to_vec();
+            keep.extend(
+                timestamps[MAX_HISTORY_PER_PEER..]
+                    .iter()
+                    .filter(|t| now <= **t + ttl)
+                    .copied(),
+            );
+            *timestamps = keep;
+        }
     }
 
     /// Gets the last timestamp for a peer, if available
@@ -226,23 +265,242 @@ impl Display for Ping {
 mod tests {
     use super::*;
 
+    /// Padding must survive a merge.
+    ///
+    /// Rewriting `merge` wholesale dropped this, and the omission is a convergence
+    /// bug of exactly the kind this contract is being fixed for: a peer holding
+    /// `None` that merges an update carrying `Some(..)` would never adopt it, so two
+    /// peers disagree forever on a field neither is wrong about. Caught in review,
+    /// pinned here.
     #[test]
-    fn test_merge_expired() {
+    fn merge_adopts_padding_from_the_other_side() {
+        let mut empty = Ping::new();
+        assert!(empty.padding.is_none());
+
+        let padded = Ping::with_padding(64);
+        empty.merge(padded, Duration::from_secs(30));
+        assert_eq!(
+            empty.padding.as_ref().map(Vec::len),
+            Some(64),
+            "a peer with no padding must adopt the other side's"
+        );
+
+        // And the larger of the two wins, rather than the most recent.
+        let mut small = Ping::with_padding(8);
+        small.merge(Ping::with_padding(128), Duration::from_secs(30));
+        assert_eq!(small.padding.as_ref().map(Vec::len), Some(128));
+
+        let mut large = Ping::with_padding(128);
+        large.merge(Ping::with_padding(8), Duration::from_secs(30));
+        assert_eq!(
+            large.padding.as_ref().map(Vec::len),
+            Some(128),
+            "merging a smaller padding must not shrink ours, or the two orders \
+             disagree"
+        );
+    }
+
+    /// Equal-length paddings must resolve the same way whichever side merges.
+    ///
+    /// The length-only comparison kept whichever side happened to be `self`, so two
+    /// peers holding same-length different-content padding disagreed forever — the
+    /// defect this contract is being fixed for, on a different field, while the doc
+    /// comment claimed commutativity. Found by review; the state map's own
+    /// commutativity test cannot catch it, because `Ping` has no `PartialEq` and the
+    /// comparison goes through `Deref` to the timestamp map only.
+    #[test]
+    fn equal_length_padding_resolves_commutatively() {
+        let ttl = Duration::from_secs(30);
+        let mut a = Ping::new();
+        a.padding = Some(vec![0x01; 16]);
+        let mut b = Ping::new();
+        b.padding = Some(vec![0x02; 16]);
+
+        let mut a_then_b = a.clone();
+        a_then_b.merge(b.clone(), ttl);
+        let mut b_then_a = b.clone();
+        b_then_a.merge(a.clone(), ttl);
+
+        assert_eq!(
+            a_then_b.padding, b_then_a.padding,
+            "same-length paddings must resolve identically in both merge orders, or \
+             the two peers never agree on the serialized state"
+        );
+    }
+
+    /// A new timestamp that displaces an older one at capacity is still a ping.
+    ///
+    /// The original compared list length after truncation, so at
+    /// MAX_HISTORY_PER_PEER a genuinely new timestamp left the length unchanged and
+    /// went uncounted — an under-count in exactly the steady state where every peer
+    /// sits at the cap. Pinned because it is the one place the reporting rule
+    /// deliberately differs from what it replaced.
+    #[test]
+    fn updates_reports_a_new_timestamp_that_displaces_one_at_capacity() {
+        // The held entries are all EXPIRED, so they survive only as the
+        // newest-MAX-regardless-of-age set. A fresh arrival then pushes the oldest
+        // past the cap, where being expired means it is dropped — a genuine
+        // displacement with the length unchanged. (With everything inside TTL the
+        // list would simply grow past the cap instead, since the rule keeps older
+        // entries that are still fresh, and nothing would be displaced at all.)
+        let ttl = Duration::from_secs(5);
+        let expired = Utc::now() - Duration::from_secs(600);
+
+        let mut ping = Ping::new();
+        let full: Vec<_> = (0..MAX_HISTORY_PER_PEER)
+            .map(|i| expired + Duration::from_secs(i as u64))
+            .collect();
+        ping.from.insert("Peer".to_string(), full);
+
+        let mut other = Ping::new();
+        other.from.insert("Peer".to_string(), vec![Utc::now()]);
+
+        let updates = ping.merge(other, ttl);
+        assert!(
+            updates.contains_key("Peer"),
+            "a displacing timestamp is a ping received, even though the list length \
+             did not change"
+        );
+        assert_eq!(ping.from["Peer"].len(), MAX_HISTORY_PER_PEER);
+    }
+
+    /// Merging a state with itself changes nothing.
+    ///
+    /// Idempotence is one of the three laws this change is about, and nothing pinned
+    /// it directly.
+    #[test]
+    fn merge_is_idempotent() {
+        let ttl = Duration::from_secs(600);
         let mut ping = Ping::new();
         ping.insert("Alice".to_string());
         ping.insert("Bob".to_string());
+        ping.padding = Some(vec![0xAB; 8]);
+        // One merge first, so the state is already in the canonical form a peer would
+        // actually hold; idempotence on unsorted input would be a weaker claim.
+        ping.merge(Ping::new(), ttl);
 
+        let before = ping.clone();
+        ping.merge(before.clone(), ttl);
+
+        assert_eq!(
+            *ping, *before,
+            "merging a state with itself must not change it"
+        );
+        assert_eq!(ping.padding, before.padding, "nor its padding");
+    }
+
+    /// A peer named with no timestamps must not become a permanent phantom entry.
+    ///
+    /// The union step creates an entry for every name the incoming state mentions,
+    /// so a payload naming a peer with an empty list would otherwise persist forever
+    /// and propagate to everyone who merged from this peer. It also keeps `len()`
+    /// (map keys) in step with `contains_key()` (non-empty).
+    #[test]
+    fn merge_does_not_leave_empty_entries_behind() {
+        let mut ping = Ping::new();
+        ping.insert("Alice".to_string());
+
+        let mut phantom = Ping::new();
+        phantom.from.insert("Nobody".to_string(), Vec::new());
+
+        ping.merge(phantom, Duration::from_secs(30));
+
+        assert!(
+            !ping.contains_key("Nobody"),
+            "an empty entry must not survive the merge"
+        );
+        assert_eq!(
+            ping.len(),
+            1,
+            "len() counts map keys, so a phantom entry would desync it from \
+             contains_key()"
+        );
+    }
+
+    /// `updates` reports peers that gained a timestamp, not merely changed bytes.
+    ///
+    /// The caller counts each reported peer as a ping RECEIVED, so reporting a peer
+    /// whose entries were only reordered or pruned inflates the statistics — and the
+    /// first merge sorts this node's own unsorted entries, which would report a ping
+    /// received from itself.
+    #[test]
+    fn updates_reports_only_peers_that_gained_entries() {
+        let mut ping = Ping::new();
+        // Two entries inserted in ascending order, which `insert` does not sort while
+        // under the history limit; the first merge will sort them descending.
+        let older = Utc::now() - Duration::from_secs(2);
+        let newer = Utc::now();
+        ping.from.insert("Self".to_string(), vec![older, newer]);
+
+        // Merging an empty ping changes the byte layout (sorting) but adds nothing.
+        let updates = ping.merge(Ping::new(), Duration::from_secs(30));
+        assert!(
+            !updates.contains_key("Self"),
+            "sorting our own entries is not a ping received from ourselves"
+        );
+
+        // A genuinely new timestamp is reported.
         let mut other = Ping::new();
+        other.from.insert(
+            "Self".to_string(),
+            vec![Utc::now() + Duration::from_secs(1)],
+        );
+        let updates = ping.merge(other, Duration::from_secs(30));
+        assert!(
+            updates.contains_key("Self"),
+            "a new timestamp must still be reported"
+        );
+    }
+
+    /// Expired entries are retained on BOTH sides, or on neither.
+    ///
+    /// Updated for the #5320 conformance fix. This previously asserted that an
+    /// incoming peer whose only entry was expired got dropped, while
+    /// `test_keep_newest_entries_regardless_of_ttl` and
+    /// `test_preserve_max_history_when_all_expired` assert that this peer's OWN
+    /// expired entries are kept. Those two expectations are the same rule applied
+    /// asymmetrically, and the asymmetry is what broke commutativity: the same
+    /// expired timestamp survived if you held it and vanished if a peer sent it, so
+    /// `merge(A, B)` and `merge(B, A)` disagreed permanently.
+    ///
+    /// The retention policy is unchanged — newest `MAX_HISTORY_PER_PEER` regardless
+    /// of age — and is now applied to the union, so an incoming expired entry is
+    /// kept exactly as an own expired entry is.
+    #[test]
+    fn test_merge_expired_is_symmetric() {
         let old_time = Utc::now() - Duration::from_secs(6);
-        other.from.insert("Alice".to_string(), vec![old_time]);
-        other.from.insert("Charlie".to_string(), vec![old_time]);
+        let ttl = Duration::from_secs(5);
 
-        ping.merge(other, Duration::from_secs(5));
+        // Build the two inputs ONCE and clone them per direction. Constructing them
+        // separately stamps `Utc::now()` again, so the two orders would be fed
+        // different inputs and the comparison would say nothing about the merge.
+        let mut a = Ping::new();
+        a.insert("Alice".to_string());
+        a.insert("Bob".to_string());
+        let mut b = Ping::new();
+        b.from.insert("Alice".to_string(), vec![old_time]);
+        b.from.insert("Charlie".to_string(), vec![old_time]);
 
-        assert_eq!(ping.len(), 2);
-        assert!(ping.contains_key("Alice"));
-        assert!(ping.contains_key("Bob"));
-        assert!(!ping.contains_key("Charlie"));
+        let mut a_then_b = a.clone();
+        a_then_b.merge(b.clone(), ttl);
+
+        // Charlie is kept, on the same rule that keeps our own expired entries.
+        assert!(a_then_b.contains_key("Alice"));
+        assert!(a_then_b.contains_key("Bob"));
+        assert!(
+            a_then_b.contains_key("Charlie"),
+            "an incoming expired entry must be retained on the same terms as an own \
+             expired entry, or the merge is order-dependent"
+        );
+
+        // The property that matters: merging the other way round agrees.
+        let mut b_then_a = b.clone();
+        b_then_a.merge(a.clone(), ttl);
+        assert_eq!(
+            *a_then_b, *b_then_a,
+            "merge must be commutative; this is the defect the conformance verifier \
+             found against the deployed ping contract"
+        );
     }
 
     #[test]

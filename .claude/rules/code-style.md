@@ -100,6 +100,21 @@ actors (clients, network peers) can influence.
    → Fall back to cheaper alternatives (e.g., full state vs computed delta)
    → Log warnings when fan-out exceeds a threshold
 
+4. A cap on the ENTRY COUNT is not a cap on BYTES when the VALUE is
+   contract- or peer-controlled and variable-size.
+   → Multiply the count cap by the largest value the other side may send.
+     `StateDelta`/`StateSummary`/`WrappedState` reach MAX_STATE_SIZE (50 MiB),
+     so a "bounded" 1024-entry cache is a ~51 GiB worst case (#4805).
+   → Reuse crate::util::byte_bounded_lru::ByteBoundedLruCache (count target
+     for coverage + hard byte budget + per-entry overhead floor); do not
+     hand-roll byte accounting a third time (#4804 wrote it, #4805 shared it)
+   → Name any new cache byte budget in
+     contract::executor::declared_cache_ceiling. The hosting budget
+     (ring::hosting::cache::resident_overhead_budget_for) is a RESIDUAL of
+     that sum, so an unnamed budget silently over-grants hosted contracts
+     against memory already committed. Pinned by
+     declared_cache_ceiling_names_every_budget.
+
 WHY: Unbounded collections are amplification vectors.
 An attacker who can register N subscribers or open N channels can
 multiply the cost of every state update by N, exhausting memory,

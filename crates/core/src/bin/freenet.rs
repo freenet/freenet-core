@@ -209,6 +209,14 @@ fn auto_update_is_disabled(git_dirty: &str, disable_flag: bool) -> bool {
 async fn run_network(config: Config) -> anyhow::Result<()> {
     tracing::info!("Starting freenet node in network mode");
 
+    // Initialise conformance capture (RFC #5320) here rather than leaving it to the
+    // first merge. It is a no-op unless FREENET_CONFORMANCE_CAPTURE_DIR is set, but
+    // an operator who set it needs to see confirmation at startup: initialising
+    // lazily means the "capture enabled" line only appears once traffic happens to
+    // arrive, so a freshly-joined peer looks identical whether capture is working or
+    // silently misconfigured.
+    let _ = freenet::conformance::capture::global();
+
     // Honor a persistent operator disable (`freenet service disable`, #4690
     // sibling): while the marker is present the node must not run, and must stay
     // down across restarts/reboots. Idle instead of serving so the supervisor
@@ -366,9 +374,18 @@ async fn run_network_node_with_signals(
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
         .context("failed to install SIGTERM handler")?;
 
+    // Set when THIS process asks the node to stop because an operator signalled
+    // it (SIGTERM from `systemctl stop`, SIGINT from Ctrl+C). Load-bearing for
+    // the exit code: see `finish_run` — an "operator asked us to stop" exit is a
+    // SUCCESS, but the same `EventLoopExitReason::GracefulShutdown` value is
+    // ALSO produced by a fault (a critical internal channel dying, see
+    // `p2p_protoc::ChannelCloseReason`), which must keep failing loudly.
+    let shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // Spawn a task to listen for shutdown signals and trigger graceful shutdown
     let signal_task = {
         let shutdown_handle = shutdown_handle.clone();
+        let shutdown_requested = Arc::clone(&shutdown_requested);
         GlobalExecutor::spawn(async move {
             #[cfg(unix)]
             let shutdown_reason = tokio::select! {
@@ -383,6 +400,9 @@ async fn run_network_node_with_signals(
             };
 
             tracing::info!(reason = shutdown_reason, "Initiating graceful shutdown");
+            // Record the request BEFORE making it, so the flag is always visible
+            // by the time the event loop can observe the shutdown and return.
+            shutdown_requested.store(true, std::sync::atomic::Ordering::SeqCst);
             shutdown_handle.shutdown().await;
         })
     };
@@ -528,7 +548,27 @@ async fn run_network_node_with_signals(
                 return;
             }
         }
-        tracing::debug!("Startup update check: no newer version found");
+        // INFO, not `debug!`: release builds set `release_max_level_info`
+        // (crates/core/Cargo.toml), so a `debug!` here is compiled OUT of every
+        // shipped binary. That left the startup check with no observable ENDING
+        // on the outcome it takes most often. "The check finished and decided to
+        // stay put" looked exactly like "the check was killed mid-request", and
+        // the release canary (#5222) cannot pass a binary safely without telling
+        // those apart: absence of a parse error is evidence that parsing worked
+        // only if the check is known to have finished. Without this line Gate A
+        // would wave through a binary carrying the #5221 bug whenever GitHub
+        // answered slowly enough that the canary stopped the node first.
+        //
+        // Reached on EVERY non-triggering outcome -- already up to date, GitHub
+        // unreachable, unparseable tag, #4073 locally-blocked version -- so it
+        // claims only that the check ended. The WARN above it, if any, says why.
+        // Do not reword it into a claim about the version, and do not change the
+        // leading phrase: scripts/auto-update-canary.sh greps for it, and
+        // scripts/auto-update-canary_test.sh pins it against this file.
+        tracing::info!(
+            current = build_info::VERSION,
+            "Startup update check complete: staying on the current version"
+        );
 
         /// Parse our version string into a (major, minor, patch) tuple for comparison.
         fn parse_our_version() -> Option<(u8, u8, u16)> {
@@ -899,11 +939,62 @@ async fn run_network_node_with_signals(
     // and complete their cleanup without being forcefully killed by SIGKILL.
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
+    let result = finish_run(
+        result,
+        shutdown_requested.load(std::sync::atomic::Ordering::SeqCst),
+    );
+
     if result.is_ok() {
         tracing::info!("Graceful shutdown complete");
     }
 
     result
+}
+
+/// Decide what a finished node run means for the PROCESS EXIT CODE (#5227).
+///
+/// `run_network_node` reports a clean SIGTERM/SIGINT stop as
+/// `Err(EventLoopExitReason::GracefulShutdown)` — a typed sentinel, not a real
+/// error. `main` used to hand that straight to its `eprintln!("Error: …")` +
+/// `std::process::exit(1)` fallback, so a deliberate `systemctl stop` was logged
+/// as `status=1/FAILURE`; and because `rollback::classify_stop` treats any
+/// status outside {0, 2, 42, 43, 44} as a crash, three clean stops of a freshly
+/// updated node inside its post-update probation window were enough to trigger
+/// an auto-rollback of a perfectly healthy release (#4073).
+///
+/// Two conditions are required to map that to a success exit, and the second is
+/// the load-bearing one:
+///
+/// 1. `listener_exit_is_graceful(&err)` — the SAME predicate the #4549
+///    fatal-listener force-exit path uses, so the two cannot disagree about
+///    which errors are candidates.
+/// 2. `shutdown_requested` — THIS process asked the node to stop, because an
+///    operator signalled it.
+///
+/// (1) alone is NOT sufficient, and this is the whole reason the flag exists.
+/// `p2p_protoc` raises the very same `GracefulShutdown` when a critical internal
+/// channel dies (`ChannelCloseReason::{Bridge, Controller, Notification,
+/// OpExecution}`) — a node-fatal fault that logs `CRITICAL: Channel closed …`.
+/// `client_events.rs` likewise sends the identical `NodeEvent::Disconnect` when
+/// every client transport has died, a degraded state its own comments call
+/// "restart recommended". Neither is distinguishable from an operator stop at the
+/// p2p layer, so this flag is the sole discriminator. Both must keep a non-zero
+/// exit: on Linux that is what still fires the unit's `ExecStopPost` self-heal
+/// and counts the crash toward probation, and on the macOS/Windows wrappers an
+/// exit 0 is read as "normal shutdown" and would leave the node DOWN rather than
+/// relaunching it.
+///
+/// The auto-update exit is untouched: it surfaces as `UpdateNeededError`, not an
+/// `EventLoopExitReason`, so it still exits 42 and still fires the supervisor's
+/// `freenet update` hook. In the rare race where an update is detected in the
+/// same instant as a SIGTERM, the unbiased `select!` above may resolve the node
+/// arm and the exit is a clean 0 — the operator asked us to stop, so stopping
+/// wins, and the update is picked up by `startup_update_check` on the next boot.
+fn finish_run(result: anyhow::Result<()>, shutdown_requested: bool) -> anyhow::Result<()> {
+    match result {
+        Err(e) if shutdown_requested && freenet::listener_exit_is_graceful(&e) => Ok(()),
+        other => other,
+    }
 }
 
 /// Exit code when another freenet instance is already running.
@@ -1058,6 +1149,12 @@ fn run_node(config_args: ConfigArgs) -> anyhow::Result<()> {
     rt.block_on(async move {
         let config = config_args.build().await?;
         freenet::config::set_logger(None, None, config.paths().log_dir());
+        // Same reason as the info! below: `ConfigArgs::build()` resolves the
+        // client API's bind address, but it runs with no subscriber installed,
+        // so it records the decision instead of logging it. Replay it here —
+        // this is the only place an operator learns that their node stopped
+        // answering clients on other machines, and why.
+        config.log_client_api_exposure();
         // The logger is needed before this info which is why it's here instead of above
         tracing::info!(
             max_blocking_threads,
@@ -1070,6 +1167,34 @@ fn run_node(config_args: ConfigArgs) -> anyhow::Result<()> {
     })?;
 
     Ok(())
+}
+
+/// Carry the client-API exposure flags across the subcommand boundary.
+///
+/// `--ws-api-address` / `--allowed-host` / `--allowed-source-cidrs` placed
+/// BEFORE the subcommand (`freenet --ws-api-address :: network`) land in the
+/// top-level `ConfigArgs`, which the `Network`/`Local` arms otherwise discard —
+/// the same trap `--disable-auto-update` hit in #4690.
+///
+/// This matters more since the client API started defaulting to loopback
+/// (GHSA-824h-7x5x-wfmf): these three flags are exactly how an operator asks
+/// for a wider bind, so silently dropping one leaves the node loopback-only
+/// while the operator believes they opted out. Previously the same typo was
+/// harmless, because network mode bound `::` either way.
+///
+/// The subcommand's own value wins; the top-level one only fills a gap.
+fn merge_pre_subcommand_ws_api_args(config: &mut ConfigArgs, top_level: &ConfigArgs) {
+    config.ws_api.address = config.ws_api.address.or(top_level.ws_api.address);
+    config.ws_api.allowed_host = config
+        .ws_api
+        .allowed_host
+        .take()
+        .or_else(|| top_level.ws_api.allowed_host.clone());
+    config.ws_api.allowed_source_cidrs = config
+        .ws_api
+        .allowed_source_cidrs
+        .take()
+        .or_else(|| top_level.ws_api.allowed_source_cidrs.clone());
 }
 
 fn freenet_main() -> anyhow::Result<()> {
@@ -1111,11 +1236,13 @@ fn freenet_main() -> anyhow::Result<()> {
             // opt-out leaves the from-source node auto-updating (the exact loop
             // we are preventing).
             config.disable_auto_update |= cli.config.disable_auto_update;
+            merge_pre_subcommand_ws_api_args(&mut config, &cli.config);
             run_node(config)
         }
         Some(Command::Local { mut config }) => {
             config.mode = Some(OperationMode::Local);
             config.disable_auto_update |= cli.config.disable_auto_update;
+            merge_pre_subcommand_ws_api_args(&mut config, &cli.config);
             run_node(config)
         }
         None => {
@@ -1296,6 +1423,63 @@ mod tests {
     #[cfg(target_os = "linux")]
     use super::parse_listening_inode;
 
+    /// #5227 truth table for the process exit code. The end-to-end proof is
+    /// `tests/graceful_shutdown_exit_code.rs` (it asserts the real process's
+    /// status); this pins the decision itself, including the case that test
+    /// cannot drive a live node into — an UNREQUESTED `GracefulShutdown`, raised
+    /// when a critical internal channel dies (`p2p_protoc::ChannelCloseReason`)
+    /// or every client transport is lost (`client_events.rs`).
+    ///
+    /// Restoring the bug (`finish_run` returning `result`), broadening the guard
+    /// to `Err(_) => Ok(())`, or dropping either conjunct fails this test.
+    #[test]
+    fn finish_run_maps_only_a_requested_graceful_stop_to_success() {
+        use super::commands::auto_update::UpdateNeededError;
+        use super::finish_run;
+        use freenet::EventLoopExitReason;
+
+        // The bug: an operator-requested stop is a SUCCESS.
+        assert!(
+            finish_run(Err(EventLoopExitReason::GracefulShutdown.into()), true).is_ok(),
+            "a SIGTERM/SIGINT stop must exit 0, or systemd logs status=1/FAILURE for a \
+             clean `systemctl stop` and the post-update probation counts it as a crash"
+        );
+
+        // The trap: the SAME sentinel is raised by a critical-channel death that
+        // nobody asked for. It must keep failing, or the macOS/Windows wrappers
+        // read "normal shutdown" and leave the node DOWN, and systemd skips the
+        // ExecStopPost self-heal and the probation crash count.
+        assert!(
+            finish_run(Err(EventLoopExitReason::GracefulShutdown.into()), false).is_err(),
+            "an UNREQUESTED graceful-shutdown exit is a fault and must stay non-zero"
+        );
+
+        // Ordinary fatal listener exits are untouched, requested or not.
+        assert!(finish_run(Err(EventLoopExitReason::UnexpectedStreamEnd.into()), true).is_err());
+        assert!(finish_run(Err(anyhow::anyhow!("boom")), true).is_err());
+
+        // Auto-update must still exit 42, or `ExecStopPost` (which skips `0|43`)
+        // never runs `freenet update`.
+        let update = finish_run(
+            Err(UpdateNeededError {
+                new_version: "9.9.9".to_string(),
+            }
+            .into()),
+            true,
+        )
+        .expect_err("update exit must not become a success");
+        assert_eq!(
+            update
+                .downcast_ref::<UpdateNeededError>()
+                .map(|u| u.new_version.as_str()),
+            Some("9.9.9"),
+            "the UpdateNeededError must survive so `main` exits 42"
+        );
+
+        // A run that somehow returned Ok stays Ok.
+        assert!(finish_run(Ok(()), false).is_ok());
+    }
+
     #[test]
     fn auto_update_default_stays_enabled_flag_and_dirty_disable() {
         use super::auto_update_is_disabled;
@@ -1340,6 +1524,82 @@ mod tests {
                 "flag must be honored in either position: {argv:?}"
             );
         }
+    }
+
+    /// Same trap, for the flags that now decide the client API's bind: placed
+    /// before the subcommand they land in the top-level `ConfigArgs`, which the
+    /// `Network`/`Local` arms discard. Dropping one leaves the node
+    /// loopback-only while the operator believes they widened it.
+    #[test]
+    fn ws_api_exposure_flags_are_honored_before_the_subcommand() {
+        use super::{Cli, Command, merge_pre_subcommand_ws_api_args};
+        use clap::Parser;
+        for argv in [
+            vec![
+                "freenet",
+                "--ws-api-address",
+                "::",
+                "--allowed-host",
+                "node.example",
+                "--allowed-source-cidrs",
+                "100.64.0.0/10",
+                "network",
+            ],
+            vec![
+                "freenet",
+                "network",
+                "--ws-api-address",
+                "::",
+                "--allowed-host",
+                "node.example",
+                "--allowed-source-cidrs",
+                "100.64.0.0/10",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(&argv).expect("parse");
+            let mut config = match cli.command {
+                Some(Command::Network { config }) => config,
+                _ => panic!("expected network subcommand"),
+            };
+            merge_pre_subcommand_ws_api_args(&mut config, &cli.config);
+            assert_eq!(
+                config.ws_api.address,
+                Some("::".parse().unwrap()),
+                "--ws-api-address must survive in either position: {argv:?}"
+            );
+            assert_eq!(
+                config.ws_api.allowed_host.as_deref(),
+                Some(&["node.example".to_string()][..]),
+                "--allowed-host must survive in either position: {argv:?}"
+            );
+            assert_eq!(
+                config.ws_api.allowed_source_cidrs.as_deref(),
+                Some(&["100.64.0.0/10".to_string()][..]),
+                "--allowed-source-cidrs must survive in either position: {argv:?}"
+            );
+        }
+    }
+
+    /// The subcommand's own value wins; the top-level one only fills a gap.
+    #[test]
+    fn subcommand_ws_api_address_beats_the_pre_subcommand_one() {
+        use super::{Cli, Command, merge_pre_subcommand_ws_api_args};
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "freenet",
+            "--ws-api-address",
+            "::",
+            "network",
+            "--ws-api-address",
+            "127.0.0.1",
+        ])
+        .expect("parse");
+        let mut config = match cli.command {
+            Some(Command::Network { config }) => config,
+            _ => panic!("expected network subcommand"),
+        };
+        merge_pre_subcommand_ws_api_args(&mut config, &cli.config);
+        assert_eq!(config.ws_api.address, Some("127.0.0.1".parse().unwrap()));
     }
 
     #[test]

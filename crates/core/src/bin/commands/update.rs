@@ -22,6 +22,13 @@ use super::service::{generate_system_service_file, generate_user_service_file};
 /// list, which the quota-free redirect cannot provide. The former
 /// `/releases/latest` REST call that ran on every invocation is gone: see
 /// `auto_update::GITHUB_LATEST_REDIRECT_URL`.
+/// Total deadline for the small release assets (`SHA256SUMS.txt`, `.sig`).
+const MANIFEST_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Idle (between-bytes) timeout for the release archive. Bounds a stalled
+/// connection without capping a slow-but-progressing download.
+const STALLED_TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 const GITHUB_API_TAG_URL_PREFIX: &str =
     "https://api.github.com/repos/freenet/freenet-core/releases/tags/";
 
@@ -100,6 +107,19 @@ static FREENET_REVOCATION_PUBKEY: [u8; 32] = [
 ///     established — otherwise nodes on the unsigned lineage brick their own
 ///     auto-update.
 const REQUIRE_RELEASE_SIGNATURE: bool = false;
+
+// Tripwire for the two-release rollout, checked at compile time so flipping
+// the constant fails the build immediately rather than only when the test
+// suite happens to run. Flipping this to `true` makes an ABSENT signature
+// refuse the install, which bricks auto-update for any node still updating
+// from an unsigned older release. Only flip it (and then update this
+// assertion) once every release a live node could be updating from publishes
+// SHA256SUMS.txt.sig. See REQUIRE_RELEASE_SIGNATURE's doc comment above.
+const _: () = assert!(
+    !REQUIRE_RELEASE_SIGNATURE,
+    "do not require signatures until the signed floor is established; \
+     see the two-release transition note on REQUIRE_RELEASE_SIGNATURE"
+);
 
 /// Exit code returned when the binary is already up to date (no update performed).
 /// Used by the service wrapper to avoid unnecessary restarts.
@@ -374,7 +394,12 @@ impl UpdateCommand {
         //     REST quota once per crash), and
         //   * `--check`, which never installs by definition.
         let latest_tag = probe_latest_tag(self.force, self.quiet).await?;
-        let latest_version = latest_tag.as_str();
+        // `latest_tag` is the tag verbatim (`v0.2.118`); `latest_version` is its
+        // semver part. Both are kept: the version is what we compare and what
+        // the rollback/pin bookkeeping keys on, while the RAW tag is what
+        // addresses the release. Deriving the URL by re-adding a `v` instead
+        // would 404 for any tag the strip/re-add round trip does not reproduce.
+        let latest_version = super::auto_update::version_from_tag(&latest_tag);
         if !self.quiet {
             println!("Latest version: {}", latest_version);
         }
@@ -457,7 +482,7 @@ impl UpdateCommand {
         // gnu→musl fallback search and the macOS DMG lookup). Requested by exact
         // tag rather than `/releases/latest` so we install the release we just
         // decided about, even if a newer one is published in between.
-        let latest = fetch_release_assets(latest_version).await?;
+        let latest = fetch_release_assets(&latest_tag, self.quiet).await?;
         // #4073 per-target-version install-failure gate. Count a DETERMINISTIC
         // install failure of this version — a checksum mismatch or invalid
         // release signature (`ReleaseVerificationError`) — toward the gate. After
@@ -1223,6 +1248,22 @@ async fn probe_latest_tag(force: bool, quiet: bool) -> Result<String> {
     // `--force` (an explicit operator action) bypasses OUR local self-restraint —
     // both this token bucket and the cached rate-limit cooldown below. It does
     // NOT bypass a live 403/429 from GitHub, which is still honoured.
+    // Cooldown before the token, for the same reason as the node path: a
+    // token spent during a cooldown we will not act on just delays recovery
+    // once the cooldown lifts. `--force` waives both.
+    if !force {
+        if let Some(remaining) = super::auto_update::github_cooldown_remaining_public() {
+            let rate_limited = super::auto_update::GithubRateLimitedError {
+                retry_after: Some(remaining),
+            };
+            if !quiet {
+                eprintln!("{}", rate_limited.user_message());
+            }
+            tracing::warn!("Update check deferred: {}", rate_limited.user_message());
+            std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
+        }
+    }
+
     if !force && !super::auto_update::try_consume_install_poll() {
         if !quiet {
             eprintln!(
@@ -1278,8 +1319,10 @@ async fn probe_latest_tag(force: bool, quiet: bool) -> Result<String> {
 /// runs only when an install is actually going ahead (#5102). Keyed by exact tag
 /// rather than `latest` so the assets we install match the version we decided to
 /// install, even if a new release lands between the probe and here.
-async fn fetch_release_assets(tag: &str) -> Result<Release> {
-    let url = format!("{GITHUB_API_TAG_URL_PREFIX}v{tag}");
+async fn fetch_release_assets(tag: &str, quiet: bool) -> Result<Release> {
+    // `tag` is verbatim from the redirect, so it is used as-is — no `v` is
+    // re-added. See `version_from_tag` for why the round trip was removed.
+    let url = format!("{GITHUB_API_TAG_URL_PREFIX}{tag}");
 
     let client = reqwest::Client::builder()
         .user_agent(super::auto_update::GITHUB_USER_AGENT)
@@ -1300,8 +1343,7 @@ async fn fetch_release_assets(tag: &str) -> Result<Release> {
 
     let status = response.status();
     if super::auto_update::is_rate_limited_status(status) {
-        // Record the cooldown so subsequent polls (from any path) stay quiet,
-        // then surface the legible message rather than a bare status line.
+        // Record the cooldown so subsequent polls (from any path) stay quiet.
         let rate_limited = super::auto_update::note_rate_limited_response(|name| {
             response
                 .headers()
@@ -1309,7 +1351,31 @@ async fn fetch_release_assets(tag: &str) -> Result<Release> {
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_owned)
         });
-        anyhow::bail!("{}", rate_limited.user_message());
+        // Exit as up-to-date rather than returning an error, matching
+        // `probe_latest_tag`. Being rate-limited is "we could not find out", not
+        // "the install failed".
+        //
+        // The mechanism that makes this matter is the macOS launchd wrapper
+        // (`service/macos.rs`): it counts CONSECUTIVE_FAILURES on a non-zero
+        // updater exit and, past MAX_CONSECUTIVE_FAILURES, `give_up_if_failing`
+        // exits 0 — which under `SuccessfulExit=false` STOPS the node
+        // permanently. Exit code 2 (ALREADY_UP_TO_DATE) is explicitly exempt
+        // there. So without this, a rate limit caused by any other client
+        // sharing the IP could take a perfectly healthy node offline for good.
+        //
+        // (An earlier version of this comment blamed the #3934 lockout counter.
+        // That was wrong and a reviewer traced it: `classify_update_subprocess`
+        // maps this to `OtherFailure` -> `NoChange`, deliberately not counting
+        // transient network errors. The macOS path is the real hazard, and a
+        // bigger one.)
+        //
+        // It also previously flattened the typed `GithubRateLimitedError` into a
+        // string, so no caller could tell it from a genuine install failure.
+        if !quiet {
+            eprintln!("{}", rate_limited.user_message());
+        }
+        tracing::warn!("Update deferred: {}", rate_limited.user_message());
+        std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
     }
 
     if !status.is_success() {
@@ -1343,7 +1409,13 @@ async fn download_bytes(url: &str) -> Result<Vec<u8>> {
     use futures::StreamExt;
 
     let client = reqwest::Client::builder()
-        .user_agent("freenet-updater")
+        .user_agent(super::auto_update::GITHUB_USER_AGENT)
+        // A TOTAL deadline is right here: these assets are a manifest of a few
+        // hundred bytes and a 64-byte signature, so there is no legitimate slow
+        // transfer to protect. Unbounded, a half-open connection would hang until
+        // systemd SIGKILLs the post-stop updater — the exact hazard the sibling
+        // timeout on the asset-list fetch was added to prevent.
+        .timeout(MANIFEST_DOWNLOAD_TIMEOUT)
         .build()?;
 
     let response = client
@@ -1588,7 +1660,14 @@ fn get_archive_extension() -> &'static str {
 
 async fn download_file(url: &str, dest: &Path, quiet: bool) -> Result<()> {
     let client = reqwest::Client::builder()
-        .user_agent("freenet-updater")
+        .user_agent(super::auto_update::GITHUB_USER_AGENT)
+        // A READ timeout, deliberately NOT a total one: this is the release
+        // archive (tens of MB), so a total deadline would abort a legitimately
+        // slow connection. `read_timeout` bounds time between bytes, which is
+        // what actually distinguishes "slow link" from "stalled connection" —
+        // and it is the stall that would otherwise hang until SIGKILL on the
+        // ExecStopPost path.
+        .read_timeout(STALLED_TRANSFER_TIMEOUT)
         .build()?;
 
     let response = client
@@ -4027,19 +4106,10 @@ done
             .expect("baked-in revocation public key must be a valid ed25519 point");
     }
 
-    #[test]
-    fn transition_flag_is_false_until_signed_floor_established() {
-        // Tripwire for the two-release rollout. Flipping this to `true` makes
-        // an ABSENT signature refuse the install, which bricks auto-update for
-        // any node still updating from an unsigned older release. Only flip it
-        // (and then update this test) once every release a live node could be
-        // updating from publishes SHA256SUMS.txt.sig. See REQUIRE_RELEASE_SIGNATURE.
-        assert!(
-            !REQUIRE_RELEASE_SIGNATURE,
-            "do not require signatures until the signed floor is established; \
-             see the two-release transition note on REQUIRE_RELEASE_SIGNATURE"
-        );
-    }
+    // transition_flag_is_false_until_signed_floor_established: superseded by
+    // the `const _: () = assert!(...)` compile-time tripwire next to
+    // REQUIRE_RELEASE_SIGNATURE's definition, which catches the flip at
+    // build time instead of only when this test happens to run.
 
     #[test]
     fn valid_signature_accepted() {

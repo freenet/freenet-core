@@ -29,6 +29,11 @@ enum InboundAppMessage {
     Ping {
         data: Vec<u8>,
     },
+    /// Appended in lockstep with the fixture. Variants MUST stay in the same
+    /// order in both copies: bincode encodes the discriminant positionally.
+    VerifySecret {
+        expected: Vec<u8>,
+    },
 }
 
 /// Message types matching test-delegate-messaging's OutboundAppMessage
@@ -42,6 +47,70 @@ enum OutboundAppMessage {
     PingResponse {
         data: Vec<u8>,
     },
+    /// Appended in lockstep with the fixture — see the note above.
+    SecretStored {
+        byte_count: u64,
+        sender_key_bytes: Vec<u8>,
+        origin_delegate_key_bytes: Option<Vec<u8>>,
+    },
+    SecretVerified {
+        present: bool,
+        matches: bool,
+    },
+}
+
+/// Does `haystack` contain `needle` as a contiguous subsequence?
+fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Every byte the runtime hands back to the driving client, as one buffer.
+///
+/// Serialises the WHOLE response rather than picking out variants. That is
+/// deliberate: `contract.rs:1036-1039` filters only `SendDelegateMessage` from the
+/// target's output and forwards **everything else** — `ApplicationMessage`,
+/// `ContextUpdated`, `RequestUserInput` and all four contract-request variants,
+/// each of which carries a `context` field that could hold the payload. An
+/// earlier revision enumerated two of those seven and silently missed the rest.
+///
+/// Serialising also means a variant added to `OutboundDelegateMsg` in future is
+/// covered automatically, where a match with a `_ => {}` arm would quietly not be.
+///
+/// `ContextUpdated` is ORDER-DEPENDENT, which is easy to get wrong when writing a
+/// mutation for it. Emitted BEFORE a terminal message it is consumed by
+/// `process_outbound` to update the delegate's own stored context
+/// (`wasm_runtime/delegate/execution.rs:393`) and never reaches the client.
+/// Emitted AFTER one it goes out through the drain path (`execution.rs:69-74`)
+/// and does reach the client. Only the second ordering is a leak, and a mutation
+/// written the first way passes while proving nothing.
+fn client_visible_bytes(values: &[OutboundDelegateMsg]) -> Vec<u8> {
+    bincode::serialize(values).expect("OutboundDelegateMsg is serializable")
+}
+
+/// Smallest run of secret bytes whose appearance counts as a leak.
+///
+/// Requiring the WHOLE secret would pass a receiver that leaked half of it, so
+/// the check is on any window of this length. The secret below is high-entropy
+/// precisely so a window this size cannot collide with unrelated bytes.
+const LEAK_WINDOW: usize = 8;
+
+/// Does any `LEAK_WINDOW`-sized run of `secret` appear in `haystack`?
+///
+/// LIMIT, stated rather than implied: this catches a secret that is leaked
+/// verbatim, whole or in part, contiguously or split across messages. It CANNOT
+/// catch one that is transformed first (hex, base64, XOR, reversed). No byte
+/// scan can. Ruling that out is the receiving delegate's own responsibility and
+/// this test does not prove it.
+fn leaks_any_window(haystack: &[u8], secret: &[u8]) -> bool {
+    if secret.len() < LEAK_WINDOW {
+        return contains_subsequence(haystack, secret);
+    }
+    secret
+        .windows(LEAK_WINDOW)
+        .any(|w| contains_subsequence(haystack, w))
 }
 
 /// E2E test for delegate-to-delegate messaging over WebSocket.
@@ -275,10 +344,164 @@ async fn test_delegate_to_delegate_messaging_e2e() -> anyhow::Result<()> {
                         sent_msg.is_some(),
                         "Expected MessageSent from delegate A in output"
                     );
+
+                    // NEGATIVE CONTROL for step 3, and the reason step 3 means
+                    // anything. B echoed its received payload, and that payload
+                    // is reachable in the RAW bytes returned to this client. If
+                    // this assertion ever fails, the observer below is blind and
+                    // step 3's silence proves nothing.
+                    let leaked =
+                        leaks_any_window(&client_visible_bytes(&values), b"inter-delegate-e2e");
+                    assert!(
+                        leaked,
+                        "NEGATIVE CONTROL FAILED: an echoing receiver's payload did not reach \
+                         the driving client, so this harness cannot observe a leak and the \
+                         no-leak assertion in step 3 would pass vacuously"
+                    );
                 }
                 other => {
                     return Err(anyhow!(
                         "Expected DelegateResponse for send-to-delegate, got: {other:?}"
+                    ));
+                }
+            }
+        }
+
+        // Step 3: the same hop, but the receiver DEPOSITS instead of echoing.
+        //
+        // This is the shape delegate succession relies on: the predecessor pushes
+        // secrets to its successor, the successor stores them via `set_secret`
+        // and reports a count only. Nothing carrying the payload may reach the
+        // client driving the sender.
+        // High-entropy on purpose: `leaks_any_window` matches on 8-byte runs, so a
+        // low-entropy or ASCII secret could collide with unrelated response bytes
+        // and fail the test for the wrong reason.
+        let secret: Vec<u8> = (0u8..32)
+            .map(|i| i.wrapping_mul(97).wrapping_add(29))
+            .collect();
+        {
+            let mut deposit = b"SECRET:".to_vec();
+            deposit.extend_from_slice(&secret);
+
+            let payload = bincode::serialize(&InboundAppMessage::SendToDelegate {
+                target_key_bytes: key_b.bytes().to_vec(),
+                target_code_hash: key_b.code_hash().as_ref().to_vec(),
+                payload: deposit,
+            })?;
+            let app_msg = ApplicationMessage::new(payload);
+
+            client
+                .send(ClientRequest::DelegateOp(
+                    freenet_stdlib::client_api::DelegateRequest::ApplicationMessages {
+                        key: key_a.clone(),
+                        params: params_a.clone(),
+                        inbound: vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
+                    },
+                ))
+                .await?;
+
+            let resp = tokio::time::timeout(Duration::from_secs(30), client.recv()).await??;
+            match resp {
+                HostResponse::DelegateResponse { values, .. } => {
+                    // THE SECURITY ASSERTION. Scans the CONCATENATION of every
+                    // client-visible payload, for any 8-byte run of the secret —
+                    // so a leak that is partial, or split across two messages, or
+                    // routed through `ContextUpdated` instead, is still caught.
+                    // A transformed leak (hex, XOR, reversed) is NOT caught; see
+                    // `leaks_any_window`.
+                    assert!(
+                        !leaks_any_window(&client_visible_bytes(&values), &secret),
+                        "LEAK: deposited secret bytes reached the driving client"
+                    );
+
+                    let stored = values
+                        .iter()
+                        .filter_map(|m| match m {
+                            OutboundDelegateMsg::ApplicationMessage(msg) => {
+                                bincode::deserialize::<OutboundAppMessage>(&msg.payload).ok()
+                            }
+                            _ => None,
+                        })
+                        .find(|m| matches!(m, OutboundAppMessage::SecretStored { .. }));
+
+                    match stored {
+                        Some(OutboundAppMessage::SecretStored {
+                            byte_count,
+                            sender_key_bytes,
+                            origin_delegate_key_bytes,
+                        }) => {
+                            assert_eq!(
+                                byte_count as usize,
+                                secret.len(),
+                                "Receiver reported the wrong deposited length"
+                            );
+                            assert_eq!(
+                                sender_key_bytes,
+                                key_a.bytes(),
+                                "Deposit should be attributed to delegate A"
+                            );
+                            assert_eq!(
+                                origin_delegate_key_bytes.as_deref(),
+                                Some(key_a.bytes()),
+                                "Runtime-attested origin should be delegate A"
+                            );
+                        }
+                        _ => return Err(anyhow!("Expected SecretStored from delegate B")),
+                    }
+                }
+                other => {
+                    return Err(anyhow!(
+                        "Expected DelegateResponse for deposit, got: {other:?}"
+                    ));
+                }
+            }
+        }
+
+        // Step 4: prove the deposit actually landed.
+        //
+        // Without this, step 3 would pass for a receiver that silently discarded
+        // the payload. B compares internally and returns booleans only, so this
+        // check cannot itself become the leak it is guarding.
+        {
+            let payload = bincode::serialize(&InboundAppMessage::VerifySecret {
+                expected: secret.clone(),
+            })?;
+            let app_msg = ApplicationMessage::new(payload);
+
+            client
+                .send(ClientRequest::DelegateOp(
+                    freenet_stdlib::client_api::DelegateRequest::ApplicationMessages {
+                        key: key_b.clone(),
+                        params: params_b.clone(),
+                        inbound: vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
+                    },
+                ))
+                .await?;
+
+            let resp = tokio::time::timeout(Duration::from_secs(30), client.recv()).await??;
+            match resp {
+                HostResponse::DelegateResponse { values, .. } => {
+                    let verified = values
+                        .iter()
+                        .filter_map(|m| match m {
+                            OutboundDelegateMsg::ApplicationMessage(msg) => {
+                                bincode::deserialize::<OutboundAppMessage>(&msg.payload).ok()
+                            }
+                            _ => None,
+                        })
+                        .find(|m| matches!(m, OutboundAppMessage::SecretVerified { .. }));
+
+                    match verified {
+                        Some(OutboundAppMessage::SecretVerified { present, matches }) => {
+                            assert!(present, "Delegate B holds no deposited secret");
+                            assert!(matches, "Delegate B's deposited secret does not match");
+                        }
+                        _ => return Err(anyhow!("Expected SecretVerified from delegate B")),
+                    }
+                }
+                other => {
+                    return Err(anyhow!(
+                        "Expected DelegateResponse for verify, got: {other:?}"
                     ));
                 }
             }

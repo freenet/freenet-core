@@ -37,7 +37,7 @@ use crate::ring::{ConnectionFailureReason, Location, PeerKeyLocation};
 use crate::tracing::NetEventLog;
 
 use super::{
-    ConnectMsg, ConnectRequest, ForwardAttempt, RelayEnv, RelayState,
+    ConnectMsg, ConnectRequest, ForwardAttempt, RejectReason, RelayEnv, RelayState,
     dispatch_expect_connection_from,
 };
 
@@ -908,12 +908,19 @@ async fn drive_relay_connect(
         .await?;
     }
 
-    if initial_actions.rejected {
+    if let Some(reject_reason) = initial_actions.rejected {
+        // Pass the SPECIFIC cause, never a constant: the terminus-rejection log
+        // lines are `debug!` (#5335) and `release_max_level_info` compiles them
+        // out of release builds, so this event's reason string is the only
+        // thing distinguishing the three causes in production — "no uphill
+        // peers available" (connectivity), "uphill budget exhausted" (the
+        // amplification bound), and "TTL exhausted" (reach). See
+        // `RejectReason::as_event_reason`, which owns those strings.
         if let Some(event) = NetEventLog::connect_rejected(
             &incoming_tx,
             &op_manager.ring,
             state.request.desired_location,
-            "rejected by handle_request",
+            reject_reason.as_event_reason(),
         ) {
             op_manager.ring.register_events(Either::Left(event)).await;
         }
@@ -1081,12 +1088,32 @@ async fn drive_relay_connect(
                         failed_peer = ?failed_peer,
                         "CONNECT relay: forwarding rejection upstream (no retry peers)"
                     );
-                    if let Some(event) = NetEventLog::connect_rejected(
-                        &incoming_tx,
-                        &op_manager.ring,
-                        dl,
-                        "relay no retry peers available",
-                    ) {
+                    // This `else` is reached by re-running the SAME
+                    // `handle_request` whose terminus arms carry a specific
+                    // cause, so a constant here would reintroduce exactly the
+                    // conflation #5335 removed from the initial path — and on
+                    // live traffic this retry path is roughly half of this
+                    // driver's rejections, so it is not a corner case.
+                    //
+                    // The generic fallback is for the case where
+                    // `handle_request` returned no forward, no accept AND no
+                    // rejection. That is genuinely reachable, but NOT via the
+                    // already-forwarded arm: `forwarded_to.take()` above sets
+                    // it to `None` before the call, and that arm is gated on
+                    // `forwarded_to.is_some()`. The reachable path is
+                    // `accepted_locally == true` — near-terminus acceptance
+                    // accepts while ALSO forwarding, so when that forward is
+                    // later rejected we re-enter here with every terminus arm
+                    // gated off by `!accepted_locally` and nothing set. A
+                    // different situation from a terminus rejection, so it
+                    // keeps its own wording rather than borrowing a cause.
+                    let reason = retry
+                        .rejected
+                        .map(RejectReason::as_event_reason)
+                        .unwrap_or("relay no retry peers available");
+                    if let Some(event) =
+                        NetEventLog::connect_rejected(&incoming_tx, &op_manager.ring, dl, reason)
+                    {
                         op_manager.ring.register_events(Either::Left(event)).await;
                     }
                     let mut ctx = op_manager.op_ctx(incoming_tx);
@@ -1226,10 +1253,37 @@ async fn drive_relay_connect(
                     )
                     .await?;
                 } else {
+                    // KNOWN GAP (#5335): `retry.rejected` may carry a specific
+                    // cause here, and this branch deliberately emits NO
+                    // `connect_rejected` event. In a release build this
+                    // `debug!` is compiled out by `release_max_level_info`, so
+                    // on this path the cause is recorded NOWHERE — not in a
+                    // log, not in an event, on this node or any other. State
+                    // that plainly rather than implying it is relocated: a
+                    // `ConnectFailed` is handled in exactly one place (the arm
+                    // this branch belongs to) and its outcomes are forward
+                    // downstream, re-route, accept locally, or propagate
+                    // further upstream. At NO hop does it turn into a
+                    // `Rejected` or emit `connect_rejected`, so there is
+                    // nothing upstream that re-records this.
+                    //
+                    // It is nonetheless deliberate, for a reason that survives
+                    // the above: the terminal outcome here is ConnectFailed
+                    // PROPAGATION, which is a different decision from a
+                    // rejection. Folding it into `connect_rejected` would make
+                    // one event name cover two decisions and inflate
+                    // `connect_rejects_emitted` across this release boundary,
+                    // breaking comparability of the counter. No event variant
+                    // exists for "propagated ConnectFailed" and adding one is a
+                    // telemetry schema change beyond the scope of #5335.
+                    //
+                    // So: an accepted, documented loss on this path, not a
+                    // covered case. Revisit if it is ever sized in production.
                     tracing::debug!(
                         tx = %incoming_tx,
                         %upstream_addr,
                         failed_acceptor = %failed_acceptor_addr,
+                        reject_reason = ?retry.rejected,
                         "CONNECT relay: propagating ConnectFailed upstream (no re-route)"
                     );
                     let mut ctx = op_manager.op_ctx(incoming_tx);

@@ -707,13 +707,22 @@ mod tests {
              messages don't pay the spawn cost"
         );
 
-        // (c) all four wire variants are matched in the dispatch, and
-        //     each spawn site is also present.
+        // (c) EVERY wire variant is matched in the dispatch, and each spawn
+        //     site is also present. Kept in step with the variant list in
+        //     `contract_ban_list.rs`; see the note there about #5147.
         for variant in [
             "UpdateMsg::RequestUpdate {",
             "UpdateMsg::BroadcastTo {",
             "UpdateMsg::RequestUpdateStreaming {",
             "UpdateMsg::BroadcastToStreaming {",
+            // #5147 appended these two. The list was NOT extended when they
+            // landed, so this guard — whose entire job is to fail when a new
+            // UPDATE wire variant appears ungated — silently passed on the very
+            // change that added two. No live bypass resulted (the key is
+            // extracted from all six variants at node.rs before both gates run),
+            // but the guard had stopped guarding.
+            "UpdateMsg::BroadcastToV2 {",
+            "UpdateMsg::BroadcastToStreamingV2 {",
         ] {
             assert!(
                 block.contains(variant),

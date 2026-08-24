@@ -9,6 +9,55 @@ use redb::{
 
 use crate::wasm_runtime::StateStorage;
 
+/// Fraction of the memory the node may use that the redb page cache may hold.
+const PAGE_CACHE_RAM_DIVISOR: usize = 32;
+
+/// Floor for the redb page cache (16 MiB) — small enough for a tightly
+/// constrained peer, large enough to keep the hot index pages resident.
+const PAGE_CACHE_MIN_BYTES: usize = 16 * 1024 * 1024;
+
+/// Ceiling for the redb page cache (1 GiB), which is also redb's own default, so
+/// an unconstrained gateway keeps exactly the cache it had.
+const PAGE_CACHE_MAX_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Page cache size for the contract database.
+///
+/// `Database::create` was called bare, so redb applied its 1 GiB default cache —
+/// an unaccounted third of a peer's whole 2 GiB `MemoryMax`, never composed
+/// against the memory limit alongside the module and summary/delta caches
+/// (#5268 defect 3). Scaling it to `clamp(memory_limit / 32, 16 MiB, 1 GiB)`
+/// makes it part of that composition: 64 MiB on a 2 GiB peer, unchanged at the
+/// 1 GiB default on any host with 32 GiB or more.
+///
+/// The cache is a maximum, not a reservation — redb fills it only as pages are
+/// read — so lowering it costs extra reads on a working set larger than the
+/// cache, never correctness.
+fn page_cache_size_bytes() -> usize {
+    let total_ram =
+        crate::wasm_runtime::read_total_ram_bytes().unwrap_or(PAGE_CACHE_FALLBACK_TOTAL_RAM_BYTES);
+    page_cache_size_for(total_ram)
+}
+
+/// Pure sizing math behind [`page_cache_size_bytes`], split out so aggregate
+/// cache-commitment tests can ask what a hypothetical host would get rather than
+/// depending on the test machine's own RAM.
+pub(crate) fn page_cache_size_for(total_ram: usize) -> usize {
+    (total_ram / PAGE_CACHE_RAM_DIVISOR).clamp(PAGE_CACHE_MIN_BYTES, PAGE_CACHE_MAX_BYTES)
+}
+
+/// Fallback total-RAM estimate (1 GiB) when the OS query fails, mirroring the
+/// module and summary/delta caches' own fallbacks.
+const PAGE_CACHE_FALLBACK_TOTAL_RAM_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Open (creating if needed) the contract database with a memory-composed page
+/// cache. Every production open MUST go through this rather than
+/// `Database::create`, which silently applies redb's 1 GiB default.
+fn open_database(db_path: &Path) -> Result<Database, DatabaseError> {
+    redb::Builder::new()
+        .set_cache_size(page_cache_size_bytes())
+        .create(db_path)
+}
+
 /// Minimum reclaimable bytes before a startup compaction is worth the whole-file
 /// rewrite it costs. Paired with [`MIN_COMPACTION_RECLAIM_FRACTION`].
 const MIN_COMPACTION_RECLAIM_BYTES: u64 = 64 * 1024 * 1024;
@@ -174,9 +223,18 @@ pub(crate) const MIGRATION_MARKER_TABLE: TableDefinition<&[u8], &[u8]> =
 /// `RegisterDelegateWithPredecessors`). Copy-forward consults it: a predecessor's
 /// Local secrets are copied into a successor ONLY when the registering request's
 /// origin is among the predecessor's recorded origins (or both are the Admin/None
-/// class), so a malicious web-app cannot register a delegate that names an
-/// unrelated victim delegate as a predecessor to exfiltrate its secrets
-/// (predecessor keys are public-derivable). See `SecretsStore::delegate_origins`.
+/// class).
+///
+/// **This gate alone is NOT sufficient protection (GHSA-824h-7x5x-wfmf).**
+/// The registering request's `origin_contract` is itself forgeable by any HTTP
+/// client (see GHSA-824h-7x5x-wfmf for the exploit chain), so a malicious web-app CAN obtain
+/// a value that matches an unrelated victim delegate's recorded origin. The
+/// actual protection today is that the copy-forward's sole caller
+/// (`RegisterDelegateWithPredecessors`'s handler) is unconditionally disabled —
+/// this gate is not currently invoked in production at all. Do not treat this
+/// table as a sufficient authorization control if the copy-forward is ever
+/// re-wired; `origin_contract` attestation needs hardening first. See
+/// `SecretsStore::delegate_origins` and `SecretsStore::migrate_secrets`.
 ///
 /// Key: DelegateKey (64 bytes)
 /// Value: `[has_admin_none: 1][N × ContractInstanceId(32)]` — `has_admin_none`
@@ -485,7 +543,7 @@ impl ReDb {
             "Loading contract store"
         );
 
-        match Database::create(&db_path) {
+        match open_database(&db_path) {
             Ok(db) => {
                 let db = Self::reclaim_free_pages(db, &db_path)?;
                 Self::initialize_database(db)
@@ -507,7 +565,7 @@ impl ReDb {
                     phase = "create_new_db",
                     "Creating new database"
                 );
-                let db = Database::create(&db_path)?;
+                let db = open_database(&db_path)?;
                 // No reclaim pass here: the database was just created empty.
                 Self::initialize_database(db)
             }
@@ -731,7 +789,7 @@ impl ReDb {
         const ATTEMPTS: usize = 5;
         let mut last_err = None;
         for attempt in 1..=ATTEMPTS {
-            match Database::create(db_path) {
+            match open_database(db_path) {
                 Ok(db) => return Ok(db),
                 Err(e) => {
                     tracing::warn!(
@@ -1216,7 +1274,7 @@ impl ReDb {
     // These replace the legacy KEY_DATA file in contracts directory
 
     /// Store a contract index entry: ContractInstanceId → CodeHash
-    pub fn store_contract_index(
+    pub(crate) fn store_contract_index(
         &self,
         instance_id: &ContractInstanceId,
         code_hash: &CodeHash,
@@ -1300,7 +1358,7 @@ impl ReDb {
 
     /// Store a delegate index entry: DelegateKey → CodeHash
     /// DelegateKey is serialized as 64 bytes (32 byte key + 32 byte code_hash)
-    pub fn store_delegate_index(
+    pub(crate) fn store_delegate_index(
         &self,
         delegate_key: &DelegateKey,
         code_hash: &CodeHash,

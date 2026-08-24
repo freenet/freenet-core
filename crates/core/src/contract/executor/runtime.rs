@@ -9,7 +9,7 @@ use super::{
     ContractExecutor, ContractRequest, ContractResponse, ExecutorError, InitCheckResult,
     RequestError, Response, SLOW_INIT_THRESHOLD, STALE_INIT_THRESHOLD, StateStoreError, now_nanos,
 };
-use crate::wasm_runtime::default_wasmtime_cache_size_bytes;
+use crate::wasm_runtime::default_wasmtime_cache_size_bytes_for_dir;
 pub(crate) use contract_ops::ReclaimOutcome;
 pub use pool::RuntimePool;
 pub(crate) use pool::{ExportAdmission, ExportDone, MAX_CONCURRENT_EXPORTS};
@@ -87,8 +87,8 @@ fn byte_multiset_eq(a: &[u8], b: &[u8]) -> bool {
 
 use crate::node::OpManager;
 use crate::wasm_runtime::{
-    BackendEngine, MAX_STATE_SIZE, ModuleCache, RuntimeConfig, SharedContractIndex,
-    SharedModuleCache, UserSecretContext,
+    BackendEngine, MAX_STATE_SIZE, ModuleCache, RuntimeConfig, SharedModuleCache, SharedStores,
+    UserSecretContext,
 };
 
 use dashmap::DashMap;
@@ -218,18 +218,28 @@ type SharedClientCounts = Arc<DashMap<ClientId, usize>>;
 
 /// Construct a subscriber limit error for a registration that was rejected.
 ///
-/// Uses `Subscribe` variant with a synthetic `ContractKey` (zeroed `CodeHash`)
-/// because the registration path only has a `ContractInstanceId`, not the full
-/// `ContractKey`. The cause string carries the real rejection reason.
-fn subscriber_limit_error(instance_id: ContractInstanceId, cause: &str) -> Box<RequestError> {
-    let synthetic_key = ContractKey::from_id_and_code(
-        instance_id,
-        freenet_stdlib::prelude::CodeHash::new([0u8; 32]),
-    );
+/// Callers resolve the real `ContractKey` (via `lookup_key` /
+/// `bridged_lookup_key`) before calling this, so the client can tell which
+/// contract was refused. The cause string carries the real rejection reason.
+fn subscriber_limit_error(key: ContractKey, cause: &str) -> Box<RequestError> {
     Box::new(RequestError::ContractError(StdContractError::Subscribe {
-        key: synthetic_key,
+        key,
         cause: cause.to_string().into(),
     }))
+}
+
+/// Fallback key for `subscriber_limit_error` when the real `ContractKey`
+/// can't be resolved from a `ContractInstanceId` (the code hash isn't
+/// registered — shouldn't happen for a contract a client is actively
+/// subscribing to, but the registration path only has the instance id to
+/// begin with, so this is the honest degradation rather than a panic).
+/// Zeroed `CodeHash` is the documented sentinel used elsewhere for the same
+/// situation (see `operations::get::op_ctx_task::synthetic_key`).
+fn synthetic_key(instance_id: ContractInstanceId) -> ContractKey {
+    ContractKey::from_id_and_code(
+        instance_id,
+        freenet_stdlib::prelude::CodeHash::new([0u8; 32]),
+    )
 }
 
 // ============================================================================
@@ -292,9 +302,16 @@ impl ContractExecutor for Executor<Runtime> {
         req: DelegateRequest<'_>,
         origin_contract: Option<&ContractInstanceId>,
         caller_delegate: Option<&DelegateKey>,
+        connection_scope: crate::client_events::ConnectionScope,
         user_context: Option<&UserSecretContext>,
     ) -> Response {
-        self.delegate_request(req, origin_contract, caller_delegate, user_context)
+        self.delegate_request(
+            req,
+            origin_contract,
+            caller_delegate,
+            connection_scope,
+            user_context,
+        )
     }
 
     // NOTE: `ContractExecutor::try_begin_export` / `finish_export` are NOT
@@ -431,20 +448,20 @@ impl Executor<Runtime> {
         config: Arc<Config>,
         shared_state_store: StateStore<Storage>,
         op_manager: Option<Arc<OpManager>>,
-        contract_modules: SharedModuleCache<ContractKey>,
-        delegate_modules: SharedModuleCache<DelegateKey>,
+        contract_modules: SharedModuleCache<CodeHash>,
+        delegate_modules: SharedModuleCache<CodeHash>,
         delegate_contexts: crate::wasm_runtime::DelegateContextCache,
         created_delegates_count: crate::wasm_runtime::SharedDelegateCounter,
         inherited_origins: crate::wasm_runtime::SharedInheritedOrigins,
         shared_backend: Option<BackendEngine>,
-        shared_contract_index: SharedContractIndex,
+        shared_stores: SharedStores,
     ) -> anyhow::Result<Self> {
         let db = shared_state_store.storage();
         // Pool executors all share ONE contract instance index (#4218), so a
         // contract stored / indexed / removed via any executor is visible to
         // every other executor's `ContractStore`.
         let (contract_store, delegate_store, secret_store) =
-            Self::get_runtime_stores(&config, db.clone(), Some(shared_contract_index))?;
+            Self::get_runtime_stores(&config, db.clone(), Some(shared_stores))?;
         // Production RuntimeConfig: opt in to compile offload so a cold-contract
         // Cranelift compile can run on a blocking thread instead of stalling the
         // current worker's other tasks (issue #4441). Whether the offload
@@ -455,6 +472,29 @@ impl Executor<Runtime> {
         // panics in `current_thread` integration tests. The byte budget here
         // also threads into the backend (though the *shared* cache size comes
         // from the caches passed in by RuntimePool::new).
+        // Only probe disk / size the compile-cache soft limit when we're about
+        // to build a NEW backend engine (`shared_backend.is_none()`) — that is
+        // the ONLY branch that reads `wasmtime_cache_dir`/`wasmtime_cache_size_bytes`
+        // (inside `create_backend_engine`, see below). Computing it
+        // unconditionally would run `default_wasmtime_cache_size_bytes_for_dir`'s
+        // startup reconciliation (#5014) for every pool worker AND on every
+        // mid-life `create_replacement_executor` call (panic recovery) — the
+        // latter passes `shared_backend: Some(..)`, so it would run
+        // `reconcile_existing_cache_dir`'s directory walk / possible
+        // `remove_dir_all` against a directory the LIVE, already-in-use shared
+        // engine is actively reading/writing, exactly when the cache is most
+        // likely to be genuinely populated. Gating on `is_none()` makes this
+        // run exactly once per node, only for the executor that actually
+        // builds the engine, matching the doc comment on
+        // `default_wasmtime_cache_size_bytes_for_dir` (#5328 review).
+        let wasmtime_cache_dir = config.wasmtime_cache_dir();
+        let wasmtime_cache_size_bytes = shared_backend.is_none().then(|| {
+            default_wasmtime_cache_size_bytes_for_dir(
+                &wasmtime_cache_dir,
+                config.hosting_disk_pct,
+                config.max_hosting_disk,
+            )
+        });
         let runtime_config = RuntimeConfig {
             offload_compilation: production_offload_compilation(),
             module_cache_budget_bytes: config.module_cache_budget_bytes,
@@ -462,13 +502,15 @@ impl Executor<Runtime> {
             // pin its soft-size limit (#4683) so it lives on the mount whose
             // free space sizes the disk budget and is measurable as freenet's
             // own on-disk usage. `with_directory` requires an absolute path;
-            // the data dir is absolute. The soft limit is derived from the
-            // memory the node may use rather than a flat constant, so a small or
-            // containerized node no longer gets a compile cache larger than the
-            // contract state it accelerates — see
-            // `default_wasmtime_cache_size_bytes`.
-            wasmtime_cache_dir: Some(config.wasmtime_cache_dir()),
-            wasmtime_cache_size_bytes: Some(default_wasmtime_cache_size_bytes()),
+            // the data dir is absolute. The soft limit is bounded by BOTH the
+            // memory the node may use AND the disk actually free on that mount
+            // (#5014), so a small/containerized node no longer gets a compile
+            // cache larger than the contract state it accelerates, AND a
+            // disk-tight-but-RAM-rich host no longer gets a cache the disk
+            // budget can't actually afford — see
+            // `default_wasmtime_cache_size_bytes_for_dir`.
+            wasmtime_cache_dir: Some(wasmtime_cache_dir),
+            wasmtime_cache_size_bytes,
             ..RuntimeConfig::default()
         };
         let mut rt = Runtime::build_with_shared_module_caches(
@@ -573,7 +615,16 @@ impl Executor<Runtime> {
             ClientRequest::ContractOp(op) => self.contract_requests(op, id, updates).await,
             // Local-node path (no hosted-mode connection): always single-user
             // (`user_context = None`), so secrets stay `SecretScope::Local`.
-            ClientRequest::DelegateOp(op) => self.delegate_request(op, None, None, None),
+            // `origin_contract` is `None` here, so the connection scope changes
+            // nothing about what this path can attest — pass `Local` so the
+            // behavior is byte-for-byte what it was.
+            ClientRequest::DelegateOp(op) => self.delegate_request(
+                op,
+                None,
+                None,
+                crate::client_events::ConnectionScope::Local,
+                None,
+            ),
             ClientRequest::Disconnect { cause } => {
                 if let Some(cause) = cause {
                     tracing::info!("disconnecting cause: {cause}");
@@ -1308,18 +1359,49 @@ mod executor_pin_tests {
             "backend engine must be built from the threaded runtime_config"
         );
         // The wasmtime ON-DISK compile cache's soft limit must be derived from
-        // the memory the node may use, never re-hardcoded to a flat constant: a
+        // BOTH the memory the node may use AND the disk actually free on the
+        // cache's mount, never re-hardcoded to a flat constant or RAM alone: a
         // fixed 512 MiB let a 2 GiB-cgroup node keep a compile cache larger than
-        // its entire 256 MiB contract-state budget. Whitespace is collapsed so
-        // the pin survives a rustfmt line-wrap of the field.
+        // its entire 256 MiB contract-state budget (#4683), and a RAM-only figure
+        // left a disk-tight-but-RAM-rich host's admission gate wedged shut by its
+        // own oversized compile cache (#5014). Whitespace is collapsed so the pin
+        // survives a rustfmt line-wrap of the field.
         let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            collapsed.contains(concat!(
-                "wasmtime_cache_size_bytes: Some(",
-                "default_wasmtime_cache_size_bytes())"
-            )),
+            collapsed.contains("default_wasmtime_cache_size_bytes_for_dir( &wasmtime_cache_dir,"),
             "the wasmtime on-disk compile-cache soft limit must come from \
-             default_wasmtime_cache_size_bytes() (node-relative), not a constant"
+             default_wasmtime_cache_size_bytes_for_dir() (RAM- AND disk-relative), \
+             not a constant or a RAM-only figure"
+        );
+        // #5328 review: the operator's configured disk-budget knobs
+        // (`--hosting-disk-pct` / `--max-hosting-disk`) must feed the sizing
+        // call too — a raw-physical-disk-only bound leaves an operator who
+        // shrinks `--max-hosting-disk` below physical capacity permanently
+        // wedged, since the compile cache would still size itself off the
+        // larger physical disk. This is the case the ORIGINAL issue (#5014)
+        // suggested addressing via `disk_budget_for_clamped`.
+        assert!(
+            collapsed.contains("config.hosting_disk_pct, config.max_hosting_disk,"),
+            "the sizing call must be fed the operator's configured \
+             hosting-disk-pct/max-hosting-disk, not just raw physical disk \
+             availability — otherwise an operator-shrunk disk budget below \
+             physical capacity stays permanently wedged"
+        );
+        // #5328 review: that sizing call does real filesystem work — a statvfs
+        // read and, via reconciliation, a directory walk and possibly a
+        // remove_dir_all — so it MUST be gated on `shared_backend.is_none()`
+        // (the one branch that actually builds a fresh engine/Cache). Without
+        // this gate, every pool worker AND every mid-life
+        // `create_replacement_executor` panic-recovery call would re-run it
+        // against a directory the shared, already-in-use engine is actively
+        // reading/writing.
+        assert!(
+            collapsed.contains("shared_backend.is_none().then(|| {"),
+            "the disk-aware compile-cache sizing (and its reconciliation side \
+             effect) must be gated on shared_backend.is_none(), so it runs only \
+             for the executor that actually builds a new backend engine — never \
+             for a pool worker reusing the shared engine or a mid-life \
+             executor replacement"
         );
     }
 
@@ -1506,21 +1588,305 @@ mod remove_contract_tests {
             .with_extension("wasm")
     }
 
-    /// Handler-level (#4117): a `RegisterDelegateWithPredecessors` request
-    /// registers the successor AND copies a predecessor's Local secret into the
-    /// successor's namespace end-to-end — the request→register→migrate→disk
-    /// wiring that the store-level `migrate_secrets` tests do not cover. Verified
-    /// on disk (the successor's secret file materializes), so no successor
-    /// secret-store handle is needed. Also asserts the one-shot marker prevents
-    /// resurrection when the delegate re-registers after the user deletes a copy.
+    /// The executor's "code already stored" branch must refuse a container whose
+    /// instance id is not derived from its own code and parameters — tested at the
+    /// executor entry point, not at the store.
     ///
-    /// Exercises the H1 same-origin gate (#4117): the predecessor's
-    /// FIRST-registration origin is recorded as `Some(ORIGIN)` before the
-    /// migrating registration, and the registration itself supplies
-    /// `origin_contract = Some(&contract_instance_id)` whose bytes equal
-    /// `ORIGIN` — otherwise the copy would be refused as `no_provenance`.
+    /// This test exists because of WHERE the original defect lived. Every test for
+    /// the identity check was scoped to `contract_store.rs`, and the bypass was one
+    /// layer up: `bridged_upsert_contract_state_inner` reached the durable
+    /// instance→code index through a bare index-write helper instead of through
+    /// `store_contract`, so the store's own tests could not see it and a four-lens
+    /// review did not catch it. A pin on the source text is not the same thing as
+    /// exercising the entry point, so this drives the real
+    /// `Executor<Runtime>` — real `ContractStore`, real `StateStore`, no network.
+    ///
+    /// # Why garbage WASM bytes are sufficient
+    ///
+    /// The refusal happens in the store/index branch, BEFORE
+    /// `fetch_related_for_validation` (and therefore before any WASM call), so the
+    /// forged container is rejected without the module ever being compiled. The
+    /// control below relies on the same ordering from the other side: an HONEST
+    /// second instance gets past the identity check and is indexed, then fails
+    /// later in WASM validation because `vec![3u8; 64]` is not a real module. That
+    /// asymmetry — indexed-and-failed-late versus refused-and-not-indexed — is
+    /// what makes this discriminating rather than a blanket "PUT fails" assertion.
+    #[tokio::test]
+    async fn already_stored_branch_refuses_an_underived_instance() {
+        use crate::contract::executor::ContractExecutor;
+        use crate::wasm_runtime::ContractStoreBridge;
+        use either::Either;
+        use freenet_stdlib::prelude::RelatedContracts;
+
+        let (mut executor, contracts_dir, _temp) = build_disk_executor("identity-gate").await;
+
+        // Precondition: the code blob is on disk, so `code_blob_stored` reports
+        // true and a PUT of another instance of that code takes the already-stored
+        // branch. Established through the store directly because this is setup,
+        // not the behaviour under test — and because routing it through the
+        // executor would fail in WASM validation and then remove the blob again.
+        let (honest, honest_key) = make_contract(3, 3);
+        executor
+            .runtime
+            .store_contract(honest)
+            .expect("seeding the code blob must succeed");
+        assert!(
+            wasm_path(&contracts_dir, &honest_key).exists(),
+            "fixture must leave the code blob on disk"
+        );
+
+        // CONTROL first: an honest second instance of the same code. Its identity
+        // is derived, so the branch indexes it; it then dies in WASM validation.
+        let (honest_b, honest_b_key) = make_contract(3, 9);
+        assert_eq!(
+            honest_b_key.code_hash(),
+            honest_key.code_hash(),
+            "fixture must share the code blob"
+        );
+        assert_ne!(honest_b_key.id(), honest_key.id(), "must be a NEW instance");
+        let control = executor
+            .upsert_contract_state(
+                honest_b_key,
+                Either::Left(WrappedState::new(vec![7u8; 8])),
+                RelatedContracts::default(),
+                Some(honest_b),
+            )
+            .await;
+        assert!(
+            !format!("{control:?}").contains("identity does not match its code"),
+            "an honestly-derived instance must pass the identity check (it may fail \
+             later in WASM validation): {control:?}"
+        );
+        assert_eq!(
+            executor.runtime.code_hash_from_id(honest_b_key.id()),
+            Some(*honest_key.code_hash()),
+            "the honest new instance must have been indexed by the guarded ingress"
+        );
+
+        // Now the forgery: same code, so the blob is present and the branch is
+        // taken, but an instance id derived from DIFFERENT parameters.
+        let code = ContractCode::from(vec![3u8; 64]);
+        let real_params = Parameters::from(vec![3u8; 8]);
+        let unrelated_instance =
+            *ContractKey::from_params_and_code(Parameters::from(vec![200u8; 8]), &code).id();
+        let mut forged = WrappedContract::new(Arc::new(code.clone()), real_params);
+        forged.key = ContractKey::from_id_and_code(unrelated_instance, *code.hash());
+        let forged_key = forged.key;
+
+        let err = executor
+            .upsert_contract_state(
+                forged_key,
+                Either::Left(WrappedState::new(vec![7u8; 8])),
+                RelatedContracts::default(),
+                Some(ContractContainer::Wasm(ContractWasmAPIVersion::V1(forged))),
+            )
+            .await
+            .expect_err("an underived instance must be refused at the executor entry point");
+        assert!(
+            format!("{err:?}").contains("identity does not match its code"),
+            "expected the store's identity refusal to surface here, got: {err:?}"
+        );
+        assert!(
+            executor
+                .runtime
+                .code_hash_from_id(&unrelated_instance)
+                .is_none(),
+            "a refused container must not leave an instance→code index row"
+        );
+    }
+
+    /// GHSA-824h-7x5x-wfmf regression: a NON-LOCAL registration must not be able
+    /// to write the durable first-registration origin record.
+    ///
+    /// The gate on `resolve_message_origin` only controls what a delegate is
+    /// TOLD about its caller. `origin_contract` has a second, far more damaging
+    /// consumer: `register_delegate_and_record_origin` writes it into a record
+    /// that is FIRST-WRITER-WINS and IMMUTABLE. An off-host caller could mint a
+    /// token for any contract id (the node issues one on request, for any id,
+    /// existing or not) and permanently freeze a delegate's recorded provenance
+    /// to a value of their choosing — unrepairable short of wiping the database.
+    ///
+    /// Delegate WASM and params are public, so the key is derivable and the
+    /// record can be poisoned BEFORE the legitimate app ever registers.
     #[tokio::test(flavor = "multi_thread")]
-    async fn register_delegate_with_predecessors_copies_secrets_forward() {
+    async fn remote_registration_cannot_write_the_durable_origin_record() {
+        use crate::contract::storages::Storage;
+        use freenet_stdlib::client_api::DelegateRequest;
+        use freenet_stdlib::prelude::{
+            ContractInstanceId, Delegate, DelegateContainer, DelegateWasmAPIVersion,
+        };
+
+        let temp_dir = crate::util::tests::get_temp_dir();
+        let db = Storage::new(temp_dir.path()).await.expect("create db");
+        let contract_store =
+            ContractStore::new(temp_dir.path().join("contracts"), 10_000, db.clone())
+                .expect("contract store");
+        let delegate_store =
+            DelegateStore::new(temp_dir.path().join("delegate"), 10_000, db.clone())
+                .expect("delegate store");
+        let secrets_store = SecretsStore::new(
+            temp_dir.path().join("secrets"),
+            Default::default(),
+            db.clone(),
+        )
+        .expect("secrets store");
+        let state_store = StateStore::new(db.clone(), 10_000_000).expect("state store");
+        let runtime = Runtime::build(contract_store, delegate_store, secrets_store, false)
+            .expect("build runtime");
+        let mut executor = Executor::new(
+            state_store,
+            || Ok(()),
+            crate::contract::executor::OperationMode::Local,
+            runtime,
+            None,
+        )
+        .await
+        .expect("create executor");
+
+        let victim = Delegate::from((&vec![0u8].into(), &vec![0xD4u8].into()));
+        let attacker_claim = ContractInstanceId::new([0x99u8; 32]);
+
+        // An off-host caller registers the delegate, presenting a token bound to
+        // a contract id it does not own.
+        executor
+            .delegate_request(
+                DelegateRequest::RegisterDelegate {
+                    delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(victim.clone())),
+                    cipher: [7u8; 32],
+                    nonce: [9u8; 24],
+                },
+                Some(&attacker_claim),
+                None,
+                crate::client_events::ConnectionScope::Remote,
+                None,
+            )
+            .expect("registration itself still succeeds; only the attestation is withheld");
+
+        let (_has_admin_none, origins) = db
+            .get_delegate_origins(victim.key())
+            .expect("record must be readable")
+            .expect("registration must have written a record");
+        assert!(
+            origins.is_empty(),
+            "a non-local registration must record NO contract id (the record is \
+             immutable, so a poisoned value can never be corrected); got {origins:?}"
+        );
+
+        // Control: the SAME request from a local connection DOES record the id,
+        // so the assertion above is about the scope gate and not about the
+        // record being write-only.
+        let legit = Delegate::from((&vec![0u8].into(), &vec![0xD5u8].into()));
+        let app = ContractInstanceId::new([0x11u8; 32]);
+        executor
+            .delegate_request(
+                DelegateRequest::RegisterDelegate {
+                    delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(legit.clone())),
+                    cipher: [7u8; 32],
+                    nonce: [9u8; 24],
+                },
+                Some(&app),
+                None,
+                crate::client_events::ConnectionScope::Local,
+                None,
+            )
+            .expect("local registration must succeed");
+
+        let (_, origins) = db
+            .get_delegate_origins(legit.key())
+            .expect("record must be readable")
+            .expect("registration must have written a record");
+        assert_eq!(
+            origins.len(),
+            1,
+            "a local registration must still record its attested contract id"
+        );
+        assert_eq!(origins[0], *app.as_bytes(), "wrong contract id recorded");
+    }
+
+    /// GHSA-824h-7x5x-wfmf regression: an UNATTESTED delegate must still be
+    /// able to send delegate-to-delegate messages.
+    ///
+    /// A revision of that fix refused to dispatch from any delegate whose
+    /// first-registration record held no contract id. That record is `None` both
+    /// for "never registered here" AND for the tokenless local CLI shape, so it
+    /// silently broke every delegate installed by riverctl / atlasctl / fdev —
+    /// silently because the caller swallows the error into a warning and the
+    /// client still receives `Ok` with the second delegate's reply simply
+    /// missing. Re-adding any such gate must fail here.
+    ///
+    /// The escalation that gate was aimed at is closed by connection scope
+    /// instead (`resolve_message_origin` returns `None` for a non-local
+    /// connection, and the scope is propagated into the hop), which the
+    /// `remote_connection_gets_no_caller_delegate_origin` unit test pins.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unattested_delegate_can_still_dispatch_to_another_delegate() {
+        use freenet_stdlib::client_api::DelegateRequest;
+        use freenet_stdlib::prelude::{
+            Delegate, DelegateContainer, DelegateWasmAPIVersion, Parameters,
+        };
+
+        let (mut executor, _contracts_dir, _temp) =
+            build_disk_executor("unattested-inter-delegate").await;
+
+        // Registered with NO attested origin — the tokenless CLI shape.
+        let cli_delegate = Delegate::from((&vec![0u8].into(), &vec![0xA1u8].into()));
+        let victim = Delegate::from((&vec![0u8].into(), &vec![0xC3u8].into()));
+
+        for delegate in [&cli_delegate, &victim] {
+            executor
+                .delegate_request(
+                    DelegateRequest::RegisterDelegate {
+                        delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(
+                            delegate.clone(),
+                        )),
+                        cipher: [7u8; 32],
+                        nonce: [9u8; 24],
+                    },
+                    None,
+                    None,
+                    crate::client_events::ConnectionScope::Local,
+                    None,
+                )
+                .expect("registration must succeed");
+        }
+
+        let result = executor.delegate_request(
+            DelegateRequest::ApplicationMessages {
+                key: victim.key().clone(),
+                params: Parameters::from(Vec::new()),
+                inbound: vec![],
+            },
+            None,
+            Some(cli_delegate.key()),
+            crate::client_events::ConnectionScope::Local,
+            None,
+        );
+
+        // The fixture delegates are not real WASM, so the call still fails — but
+        // it must fail on EXECUTION, never on a provenance/attestation refusal.
+        // Asserting on the absence of that refusal is the whole point: a
+        // re-introduced gate would short-circuit before execution.
+        if let Err(e) = result {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("attested registration origin") && !msg.contains("dispatch refused"),
+                "an unattested delegate must not be refused dispatch; got: {msg}"
+            );
+        }
+    }
+
+    /// Handler-level (GHSA-824h-7x5x-wfmf): `RegisterDelegateWithPredecessors`
+    /// NEVER copies a predecessor's secrets, even when the registering request's
+    /// `origin_contract` exactly matches the predecessor's recorded
+    /// first-registration origin (the one case the H1 same-origin gate in
+    /// `SecretsStore::migrate_secrets` would otherwise allow). The copy-forward
+    /// call is disabled at the handler level because `origin_contract` itself is
+    /// forgeable by any HTTP client (see GHSA-824h-7x5x-wfmf) — so even a "matching" origin
+    /// proves nothing. Registration still succeeds, exactly as plain
+    /// `RegisterDelegate` would. This replaces the pre-advisory test asserting the
+    /// copy DID happen on a matching origin.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn register_delegate_with_predecessors_never_copies_secrets() {
         use crate::wasm_runtime::SecretScope;
         use freenet_stdlib::client_api::{DelegateRequest, HostResponse};
         use freenet_stdlib::prelude::{
@@ -1596,38 +1962,140 @@ mod remove_contract_tests {
             predecessors: vec![pred.key().clone()],
         };
         let resp = executor
-            .delegate_request(req, Some(&origin_contract), None, None)
+            .delegate_request(
+                req,
+                Some(&origin_contract),
+                None,
+                crate::client_events::ConnectionScope::Local,
+                None,
+            )
             .expect("register-with-predecessors must succeed");
-        match resp {
-            HostResponse::DelegateResponse { key, .. } => {
-                assert_eq!(&key, succ.key(), "response carries the successor key");
-            }
-            other => panic!("expected DelegateResponse, got {other:?}"),
-        }
+        let HostResponse::DelegateResponse { key, .. } = &resp else {
+            panic!("expected DelegateResponse, got {resp:?}");
+        };
+        assert_eq!(key, succ.key(), "response carries the successor key");
 
-        // The predecessor's Local secret was copied into the successor namespace.
+        // The predecessor's Local secret must NOT be copied — the copy-forward
+        // is unconditionally disabled (GHSA-824h-7x5x-wfmf), even though the supplied
+        // `origin_contract` matches the predecessor's recorded origin exactly
+        // (the one case the underlying H1 gate would otherwise have allowed).
         assert!(
-            successor_secret_path.exists(),
-            "successor secret file must exist after copy-forward"
+            !successor_secret_path.exists(),
+            "successor secret file must NOT exist: copy-forward is disabled (GHSA-824h-7x5x-wfmf) \
+             regardless of origin_contract"
         );
 
-        // One-shot / anti-resurrection at the handler level: delete the copy and
-        // re-register — the marker must make the re-run a no-op (the marker gate
-        // short-circuits before the origin gate, so the same origin is supplied
-        // here purely for realism, not because it's load-bearing for this part).
-        std::fs::remove_file(&successor_secret_path).expect("remove copied secret");
-        let req2 = DelegateRequest::RegisterDelegateWithPredecessors {
+        // The predecessor's own secret is untouched (registration never mutates
+        // or deletes a predecessor's data, disabled copy-forward or not).
+        let predecessor_secret_path = secrets_dir
+            .join(pred.key().encode())
+            .join(secret_id.encode());
+        assert!(
+            predecessor_secret_path.exists(),
+            "predecessor secret must remain untouched"
+        );
+    }
+
+    /// Regression test for GHSA-824h-7x5x-wfmf, directory-level: a
+    /// predecessor holding MULTIPLE Local secrets, named in a
+    /// `RegisterDelegateWithPredecessors` request with a matching
+    /// `origin_contract`, must leave the successor's on-disk secrets
+    /// directory completely absent (or empty) — not merely missing one
+    /// known secret ID. This is stronger than
+    /// `register_delegate_with_predecessors_never_copies_secrets`, which
+    /// only checks a single secret path; a copy-forward bug that mis-copies
+    /// a DIFFERENT secret ID than the one under test would slip past a
+    /// single-path check but not a whole-directory scan.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn register_delegate_with_predecessors_successor_dir_stays_empty() {
+        use crate::wasm_runtime::SecretScope;
+        use freenet_stdlib::client_api::{DelegateRequest, HostResponse};
+        use freenet_stdlib::prelude::{
+            ContractInstanceId, Delegate, DelegateContainer, DelegateWasmAPIVersion, SecretsId,
+        };
+        use zeroize::Zeroizing;
+
+        const ORIGIN: [u8; 32] = [0x22u8; 32];
+
+        let temp_dir = crate::util::tests::get_temp_dir();
+        let db = Storage::new(temp_dir.path()).await.expect("create db");
+        let contract_store =
+            ContractStore::new(temp_dir.path().join("contracts"), 10_000, db.clone())
+                .expect("create contract store");
+        let delegate_store =
+            DelegateStore::new(temp_dir.path().join("delegate"), 10_000, db.clone())
+                .expect("create delegate store");
+        let secrets_dir = temp_dir.path().join("secrets");
+        let mut secrets_store =
+            SecretsStore::new(secrets_dir.clone(), Default::default(), db.clone())
+                .expect("create secrets store");
+
+        let pred = Delegate::from((&vec![9u8].into(), &vec![1u8].into()));
+        let succ = Delegate::from((&vec![9u8].into(), &vec![2u8].into()));
+
+        // Seed THREE Local secrets under the predecessor.
+        for i in 0u8..3 {
+            secrets_store
+                .store_secret(
+                    pred.key(),
+                    &SecretsId::new(format!("secret-{i}").into_bytes()),
+                    SecretScope::Local,
+                    Zeroizing::new(format!("value-{i}").into_bytes()),
+                )
+                .expect("seed predecessor secret");
+        }
+        secrets_store
+            .record_delegate_registration_origin(pred.key(), Some(ORIGIN))
+            .unwrap();
+
+        let successor_secrets_dir = secrets_dir.join(succ.key().encode());
+        assert!(
+            !successor_secrets_dir.exists(),
+            "successor secrets directory must not exist before registration"
+        );
+
+        let state_store = StateStore::new(db, 10_000_000).expect("create state store");
+        let runtime = Runtime::build(contract_store, delegate_store, secrets_store, false)
+            .expect("build runtime");
+        let mut executor = Executor::new(
+            state_store,
+            || Ok(()),
+            crate::contract::executor::OperationMode::Local,
+            runtime,
+            None,
+        )
+        .await
+        .expect("create executor");
+
+        let origin_contract = ContractInstanceId::new(ORIGIN);
+        let req = DelegateRequest::RegisterDelegateWithPredecessors {
             delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ.clone())),
             cipher: [7u8; 32],
             nonce: [9u8; 24],
             predecessors: vec![pred.key().clone()],
         };
-        executor
-            .delegate_request(req2, Some(&origin_contract), None, None)
-            .expect("re-registration must succeed");
+        let resp = executor
+            .delegate_request(
+                req,
+                Some(&origin_contract),
+                None,
+                crate::client_events::ConnectionScope::Local,
+                None,
+            )
+            .expect("register-with-predecessors must succeed");
+        assert!(matches!(resp, HostResponse::DelegateResponse { .. }));
+
+        // Whole-directory check: NOTHING was copied into the successor's
+        // namespace, whether the directory was never created or was created
+        // empty.
+        let successor_has_any_secret = successor_secrets_dir
+            .read_dir()
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false);
         assert!(
-            !successor_secret_path.exists(),
-            "one-shot marker must prevent resurrection on re-registration"
+            !successor_has_any_secret,
+            "successor secrets directory must be absent or empty: copy-forward is \
+             disabled (GHSA-824h-7x5x-wfmf) regardless of origin_contract or predecessor secret count"
         );
     }
 
@@ -1638,8 +2106,10 @@ mod remove_contract_tests {
     /// registered (no `.reg` file) and no predecessor secret is copied, so a
     /// registered-but-recordless delegate (a claimable first-writer slot an
     /// attacker could later name as its own) can never exist. Once the disk
-    /// recovers, the app's retry registers, records, and copies normally. Uses
-    /// the fault-injecting redb backend to fail the origin-record write on demand.
+    /// recovers, the app's retry registers and records normally (copy-forward
+    /// itself is unconditionally disabled, GHSA-824h-7x5x-wfmf, so it never copies — see
+    /// the final assertion). Uses the fault-injecting redb backend to fail the
+    /// origin-record write on demand.
     #[cfg(feature = "redb")]
     #[tokio::test(flavor = "multi_thread")]
     async fn register_aborts_when_origin_record_fails_then_recovers() {
@@ -1722,7 +2192,13 @@ mod remove_contract_tests {
         };
         assert!(
             executor
-                .delegate_request(req, Some(&origin_contract), None, None)
+                .delegate_request(
+                    req,
+                    Some(&origin_contract),
+                    None,
+                    crate::client_events::ConnectionScope::Local,
+                    None
+                )
                 .is_err(),
             "registration must FAIL when the first-writer origin record cannot persist"
         );
@@ -1747,7 +2223,13 @@ mod remove_contract_tests {
         };
         assert!(
             executor
-                .delegate_request(req_plain, Some(&origin_contract), None, None)
+                .delegate_request(
+                    req_plain,
+                    Some(&origin_contract),
+                    None,
+                    crate::client_events::ConnectionScope::Local,
+                    None
+                )
                 .is_err(),
             "plain RegisterDelegate must ALSO fail when the origin record cannot persist"
         );
@@ -1800,15 +2282,24 @@ mod remove_contract_tests {
             predecessors: vec![pred.key().clone()],
         };
         executor2
-            .delegate_request(req2, Some(&origin_contract), None, None)
+            .delegate_request(
+                req2,
+                Some(&origin_contract),
+                None,
+                crate::client_events::ConnectionScope::Local,
+                None,
+            )
             .expect("retry after recovery must succeed");
         assert!(
             succ_reg_path.exists(),
             "after recovery the successor IS registered (.reg present)"
         );
+        // Copy-forward is unconditionally disabled (GHSA-824h-7x5x-wfmf): the retry succeeds
+        // (registration itself was only ever blocked by the origin-record
+        // write failure, now healed), but no secret is ever copied.
         assert!(
-            succ_secret_path.exists(),
-            "after recovery the predecessor secret IS copied forward"
+            !succ_secret_path.exists(),
+            "the predecessor secret must NOT be copied forward: copy-forward is disabled (GHSA-824h-7x5x-wfmf)"
         );
     }
 
@@ -1850,7 +2341,13 @@ mod remove_contract_tests {
         };
         assert!(
             executor
-                .delegate_request(req_over, None, None, None)
+                .delegate_request(
+                    req_over,
+                    None,
+                    None,
+                    crate::client_events::ConnectionScope::Local,
+                    None
+                )
                 .is_err(),
             "an over-cap UNIQUE predecessor list must be rejected"
         );
@@ -1881,7 +2378,13 @@ mod remove_contract_tests {
             predecessors: dupes,
         };
         executor
-            .delegate_request(req_ok, None, None, None)
+            .delegate_request(
+                req_ok,
+                None,
+                None,
+                crate::client_events::ConnectionScope::Local,
+                None,
+            )
             .expect("a duplicate-heavy but under-cap-UNIQUE list must be accepted");
         assert!(
             reg_path(&succ_ok).exists(),
@@ -1900,7 +2403,13 @@ mod remove_contract_tests {
         };
         assert!(
             executor
-                .delegate_request(req_raw, None, None, None)
+                .delegate_request(
+                    req_raw,
+                    None,
+                    None,
+                    crate::client_events::ConnectionScope::Local,
+                    None
+                )
                 .is_err(),
             "a raw list past the DoS sanity bound must be rejected even when unique count is small"
         );
@@ -1920,7 +2429,13 @@ mod remove_contract_tests {
             predecessors: at_cap,
         };
         executor
-            .delegate_request(req_at_cap, None, None, None)
+            .delegate_request(
+                req_at_cap,
+                None,
+                None,
+                crate::client_events::ConnectionScope::Local,
+                None,
+            )
             .expect("an exactly-at-cap UNIQUE count (64) must be accepted");
         assert!(
             reg_path(&succ_at_cap).exists(),
@@ -1938,7 +2453,13 @@ mod remove_contract_tests {
             predecessors: Vec::new(),
         };
         executor
-            .delegate_request(req_empty, None, None, None)
+            .delegate_request(
+                req_empty,
+                None,
+                None,
+                crate::client_events::ConnectionScope::Local,
+                None,
+            )
             .expect("an empty predecessor list must be accepted (plain-register equivalent)");
         assert!(
             reg_path(&succ_empty).exists(),
@@ -1965,7 +2486,13 @@ mod remove_contract_tests {
             predecessors: raw_at_bound,
         };
         executor
-            .delegate_request(req_raw_boundary, None, None, None)
+            .delegate_request(
+                req_raw_boundary,
+                None,
+                None,
+                crate::client_events::ConnectionScope::Local,
+                None,
+            )
             .expect("a raw list at exactly the sanity bound (unique within cap) must be accepted");
         assert!(
             reg_path(&succ_raw_boundary).exists(),

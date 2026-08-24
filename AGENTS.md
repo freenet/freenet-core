@@ -31,6 +31,8 @@ When unsure which bucket a change is in, open an issue first.
    → operations/      → Check .claude/rules/operations.md
    → transport/       → Check .claude/rules/transport.md
    → contract/wasm_runtime/ → Check .claude/rules/contracts.md
+   → server/path_handlers* or server/client_api* → Check .claude/rules/browser-assets.md
+     (the injected JS, plus the HTML/CSP wrappers that decide what it may do)
 
 3. Is this Rust code?
    → Check .claude/rules/code-style.md
@@ -74,6 +76,23 @@ Is the test superseded by new semantics?
   → Add #[ignore] with a comment explaining the semantic change
   → Reference the PR that changed the behavior
   → Keep the test as historical documentation
+```
+
+### WHEN writing a source-scrape pin test
+
+```
+A test that include_str!s its own source and asserts a symbol appears
+inside a function MUST bound the region to that function.
+
+A bare split_once(anchor) does NOT fail when the anchor moves — it
+matches a later occurrence, typically the pin's own assertion string,
+and the assertion then passes vacuously.
+
+Use the fn_body() helper pattern (commands::auto_update tests), and
+mutation-test the pin when you write it: apply the exact regression it
+names and confirm it FAILS.
+
+See .claude/rules/bug-prevention-patterns.md — this has shipped twice.
 ```
 
 ### WHEN writing cleanup/GC logic
@@ -175,6 +194,7 @@ docs/architecture/    # Design docs
 | Operations | `.claude/rules/operations.md` |
 | Transport | `.claude/rules/transport.md` |
 | Contracts | `.claude/rules/contracts.md` |
+| Browser assets (injected JS + its HTML/CSP wrappers) | `.claude/rules/browser-assets.md` |
 
 ### General Rules
 

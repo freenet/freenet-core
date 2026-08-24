@@ -2552,6 +2552,15 @@ impl SecretsStore {
     /// `RegisterDelegateWithPredecessors` handler), mirroring the on-loop write
     /// discipline of `store_secret` / the live bundle import. The work is bounded
     /// by the predecessors' own on-disk secret count.
+    ///
+    /// UNREACHABLE FROM PRODUCTION as of GHSA-824h-7x5x-wfmf: the H1 gate
+    /// above is sound only if `origin_contract` is trustworthy, and it isn't —
+    /// any HTTP client can forge an `origin_contract` value for an arbitrary
+    /// public contract key (see GHSA-824h-7x5x-wfmf). The one caller
+    /// (`RegisterDelegateWithPredecessors`'s handler) no longer invokes this
+    /// method; it is kept, with its test suite, for potential reactivation once
+    /// `origin_contract` attestation is hardened. Do not re-wire a caller to
+    /// this method without first fixing that.
     pub fn migrate_secrets(
         &mut self,
         predecessors: &[DelegateKey],
@@ -2983,6 +2992,16 @@ impl SecretsStore {
     /// the H1 same-origin copy-forward gate (#4117). FIRST-WRITER-WINS: a record
     /// is written only if none exists, and is NEVER modified afterward — an
     /// attacker who re-registers a victim's public WASM later cannot add itself.
+    ///
+    /// FIRST-WRITER-WINS ALSO MEANS UNREPAIRABLE. A value written here can never
+    /// be corrected, so a wrong one is permanent for the life of the node's
+    /// database. Two consequences for anything tempted to read it: `origin`
+    /// MUST already be gated on the connection scope before it reaches here
+    /// (`Executor::delegate_request` does this — an ungated write let a remote
+    /// caller mint a token for any contract id and freeze a delegate's
+    /// provenance to a value of their choosing), and it is NOT a safe key for
+    /// any live authorization decision, because an app that re-keys can never
+    /// match the frozen value. It is provenance, not policy.
     /// Called on EVERY registration, BEFORE the delegate is registered.
     ///
     /// # Errors

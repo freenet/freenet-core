@@ -7,6 +7,13 @@ pub mod config;
 /// Handling of contracts and delegates functionality.
 mod contract;
 
+/// Contract conformance: the shared verifier and evidence model (RFC #5320).
+///
+/// Public because `fdev verify-merge` runs the *same* verifier the network does.
+/// A developer-facing check that could disagree with the network-facing one would
+/// be worse than no check at all.
+pub mod conformance;
+
 // Re-export for integration tests (tests/ directory needs pub access)
 #[cfg(any(test, feature = "testing", feature = "redb"))]
 pub use contract::storages;
@@ -21,7 +28,8 @@ mod message;
 mod node;
 pub use node::{
     EventLoopExitReason, Node, ShutdownHandle, enable_abort_on_fatal_listener_exit,
-    enable_abort_on_redb_poison, enable_fast_crash_exit_code, run_local_node, run_network_node,
+    enable_abort_on_redb_poison, enable_fast_crash_exit_code, listener_exit_is_graceful,
+    run_local_node, run_network_node,
 };
 
 /// Network operation/transaction state machines.

@@ -599,10 +599,32 @@ pub enum SummariesEmitter {
     /// every ~5-min heartbeat received.
     InterestsReply,
     /// `node::handle_interest_sync_message`, replying to a `ChangeInterests`
-    /// delta — also multi-entry, but driven by interest churn rather than by
-    /// the heartbeat clock. Kept apart from [`Self::InterestsReply`] so the
-    /// residual arm below stays a pure residual; folding the two would repeat,
-    /// one level down, exactly the conflation this tag exists to undo.
+    /// delta — driven by interest churn rather than by the heartbeat clock. Kept
+    /// apart from [`Self::InterestsReply`] so the residual arm below stays a pure
+    /// residual; folding the two would repeat, one level down, exactly the
+    /// conflation this tag exists to undo.
+    ///
+    /// **SINGLE-entry, essentially always — but by CALLER convention, not by
+    /// construction.** `broadcast_change_interests` takes `added: Vec<ContractKey>`
+    /// and every caller today passes at most one, yet nothing pins that; and the
+    /// reply loop's hash-collision path can yield 2+ entries on a u32 FNV-1a
+    /// collision. So this is an empirical property of the current call sites, and
+    /// it is deliberately left unpinned: the R4b instrument is robust either way
+    /// (a multi-entry reply simply classifies as `MultiEntry` and leaves the
+    /// single-entry population). Contrast the NOTIFICATION leg, whose identical
+    /// structural property IS pinned, by
+    /// `notification_leg_is_always_full_bytes_and_single_entry` — because `p` is
+    /// read off that leg, so drift there corrupts the measurement rather than
+    /// merely shrinking its denominator.
+    ///
+    /// Corrected 2026-08-12 (#5153 review
+    /// F1); this said "also multi-entry" and that was measurably false.
+    /// `operations::broadcast_change_interests` is called with one contract per
+    /// gossip, so the reply built for it carries one entry: mean **1.000**
+    /// entries/msg with `max_entries` **1** across 418,476 messages on 1,284
+    /// peers in one window. Load-bearing, not trivia — it is why message LENGTH
+    /// is not a clean proxy for "this is a notification", which the R4b
+    /// agreement-rate instrument depends on.
     ChangeInterestsReply,
     /// `operations::update::send_summary_back_on_rejection` — one entry, only
     /// when a rejected broadcast's summary already matched ours.
@@ -1327,6 +1349,10 @@ mod tests {
         let bytes = bincode::serialize(&msg).expect("serialize SummaryDigests");
         let decoded: InterestMessage =
             bincode::deserialize(&bytes).expect("deserialize SummaryDigests");
+        #[allow(
+            clippy::wildcard_enum_match_arm,
+            reason = "a round-trip test asserts ONE variant; any other variant is a loud panic, not a silent fallthrough"
+        )]
         match decoded {
             InterestMessage::SummaryDigests { entries, .. } => {
                 assert_eq!(entries.len(), 2);
@@ -1349,10 +1375,10 @@ mod tests {
         let bytes = bincode::serialize(&req).expect("serialize SummaryRequest");
         let decoded: InterestMessage =
             bincode::deserialize(&bytes).expect("deserialize SummaryRequest");
-        match decoded {
-            InterestMessage::SummaryRequest { hashes } => assert_eq!(hashes, vec![1, 2, 3]),
-            other => panic!("expected SummaryRequest, got {other:?}"),
-        }
+        let InterestMessage::SummaryRequest { hashes } = &decoded else {
+            panic!("expected SummaryRequest, got {decoded:?}");
+        };
+        assert_eq!(hashes, &vec![1, 2, 3]);
     }
 
     /// A `SummaryDigests` message must be dramatically smaller than the
@@ -1742,19 +1768,17 @@ mod tests {
         );
 
         let decoded: InterestMessage = bincode::deserialize(&notification).expect("deserialize");
-        match decoded {
-            InterestMessage::Summaries { entries, emitter } => {
-                assert_eq!(entries.len(), 1, "payload must survive the round trip");
-                assert_eq!(entries[0].hash, 0xDEAD_BEEF);
-                assert_eq!(
-                    emitter,
-                    SummariesEmitter::Other,
-                    "a decoded message carries no provenance, so it must land \
-                     in the residual arm rather than claim an emitter"
-                );
-            }
-            other => panic!("expected Summaries, got {other:?}"),
-        }
+        let InterestMessage::Summaries { entries, emitter } = &decoded else {
+            panic!("expected Summaries, got {decoded:?}");
+        };
+        assert_eq!(entries.len(), 1, "payload must survive the round trip");
+        assert_eq!(entries[0].hash, 0xDEAD_BEEF);
+        assert_eq!(
+            *emitter,
+            SummariesEmitter::Other,
+            "a decoded message carries no provenance, so it must land \
+             in the residual arm rather than claim an emitter"
+        );
     }
 
     #[test]

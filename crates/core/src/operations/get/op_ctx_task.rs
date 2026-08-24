@@ -440,6 +440,7 @@ async fn drive_client_get_inner(
         "get",
         &mut driver,
         /* emit_route_failure_on_retry */ true,
+        crate::ring::HostingCause::ClientGet,
     )
     .await;
 
@@ -507,6 +508,7 @@ async fn drive_client_get_inner(
                         state.clone(),
                         contract.clone(),
                         true, // client driver: this node initiated the GET
+                        crate::ring::HostingCause::ClientGet,
                     )
                     .await;
                     *key
@@ -1119,6 +1121,11 @@ async fn drive_get_with_assembly_retry(
     op_label: &str,
     driver: &mut GetRetryDriver<'_>,
     emit_route_failure_on_retry: bool,
+    // Hosting attribution for the streamed store this wrapper performs. Both the
+    // client driver and the sub-op driver use this wrapper, and the stream store
+    // is unconditionally `is_client_requester = true`, so the flag cannot tell
+    // them apart — the caller names itself instead. Telemetry only.
+    cause: crate::ring::HostingCause,
 ) -> (RetryLoopOutcome<Terminal>, AssemblyOutcome) {
     let mut attempt_tx = first_tx;
     let mut assembly = AssemblyOutcome::default();
@@ -1217,8 +1224,15 @@ async fn drive_get_with_assembly_retry(
         };
 
         let stream_start = tokio::time::Instant::now();
-        match assemble_and_cache_stream(op_manager, peer_addr, stream_id, key, includes_contract)
-            .await
+        match assemble_and_cache_stream(
+            op_manager,
+            peer_addr,
+            stream_id,
+            key,
+            includes_contract,
+            cause,
+        )
+        .await
         {
             Ok(progress) => {
                 assembly.transfer_duration = Some(stream_start.elapsed());
@@ -1471,6 +1485,12 @@ fn synthetic_key(instance_id: &ContractInstanceId) -> ContractKey {
 ///    (i.e., `access_result.is_new && put_persisted`). NOT gated on
 ///    `is_client_requester`; legacy announces on any first-time relay
 ///    cache too (`get.rs:2278, 2370`).
+///
+/// `cause` names WHY this store may begin hosting (client GET, relay transit,
+/// or a sub-op fetch). It is TELEMETRY ONLY and is threaded from the call site
+/// because only the call site knows which driver it is: `is_client_requester`
+/// cannot stand in for it, since the streaming originator path passes `true`
+/// for BOTH the client and the sub-op driver.
 // NAMING LANDMINE: "cache"/"store" here means HOSTING, not a lesser cache tier. A
 // peer stores a contract because a GET routed through it, and a routed GET is a
 // demand signal, so the peer HOSTS the contract (WASM+state, kept fresh in the
@@ -1482,6 +1502,7 @@ async fn cache_contract_locally(
     state: WrappedState,
     contract: Option<ContractContainer>,
     is_client_requester: bool,
+    cause: crate::ring::HostingCause,
 ) -> bool {
     // EXPERIMENT-ONLY (findability_probe): suppress RELAY-path GET-return caching
     // so the seeded copy cannot self-scatter along successful GET return paths
@@ -1585,7 +1606,7 @@ async fn cache_contract_locally(
     // or put failed). This mirrors the legacy invariant that a
     // successful wire-level GET must refresh the hosting LRU/TTL
     // regardless of what the local executor did with the state.
-    let access_result = op_manager.ring.record_get_access(key, state_size);
+    let access_result = op_manager.ring.record_get_access(key, state_size, cause);
     // Sticky flag gating subscription renewal; only the client-originating
     // node sets it. Relays that pass through a Found MUST NOT taint their
     // own hosting cache with another node's client access. Legacy mirror:
@@ -1701,6 +1722,8 @@ async fn assemble_and_cache_stream(
     stream_id: StreamId,
     expected_key: ContractKey,
     includes_contract: bool,
+    // Hosting attribution for the store below; see `cache_contract_locally`.
+    cause: crate::ring::HostingCause,
 ) -> Result<StreamProgress, AssemblyFailure> {
     // Test-only deterministic fault injection (#4345). Returning before
     // the claim mirrors the production claim-timeout failure (the inbound
@@ -1830,7 +1853,7 @@ async fn assemble_and_cache_stream(
     // but it uses its own inline assemble+cache with `local_client_access =
     // false`; this path is the originator, which IS the client requester, so
     // the sticky `local_client_access` flag applies here.
-    cache_contract_locally(op_manager, payload.key, state, contract, true).await;
+    cache_contract_locally(op_manager, payload.key, state, contract, true, cause).await;
     Ok(StreamProgress {
         fragments_received,
         total_fragments,
@@ -2267,6 +2290,7 @@ async fn drive_sub_op_get(
         // on the sub-op path), so skip the per-retry failure events.
         /* emit_route_failure_on_retry */
         false,
+        crate::ring::HostingCause::SubOpGet,
     )
     .await;
 
@@ -2289,6 +2313,7 @@ async fn drive_sub_op_get(
                         state.clone(),
                         contract.clone(),
                         false, // sub-op: not a client-originating GET
+                        crate::ring::HostingCause::SubOpGet,
                     )
                     .await;
                 }
@@ -3062,6 +3087,31 @@ where
     }
 }
 
+/// Hosting attribution for a local store made by the GET forwarding driver:
+/// did this node's OWN request put the contract here, or did someone else's
+/// merely transit?
+///
+/// `node.rs` maps a locally-originated GET (`source_addr = None`) to
+/// `upstream_addr = own_addr` and drives it through this same forwarding driver,
+/// so "this driver is running" does NOT imply transit. Counting that loopback as
+/// transit defeats the whole point of the enum, which exists to separate our own
+/// demand from someone else's. `start_relay_get` already applies exactly this
+/// gate before `record_relayed_get`; this is the hosting-side twin of it.
+///
+/// Fails safe to [`HostingCause::TransitGet`] when our own address is unknown:
+/// an unattributable store is someone else's until proven otherwise, and the
+/// symmetric mistake (inflating this node's own demand) is the one that would
+/// mislead a hosting-policy decision.
+fn relay_get_hosting_cause(
+    own_addr: Option<SocketAddr>,
+    upstream_addr: SocketAddr,
+) -> crate::ring::HostingCause {
+    match own_addr {
+        Some(own) if own == upstream_addr => crate::ring::HostingCause::ClientGet,
+        _ => crate::ring::HostingCause::TransitGet,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_relay_get_inner<CB>(
     op_manager: &Arc<OpManager>,
@@ -3132,9 +3182,19 @@ where
         return Ok(());
     }
 
+    let own_addr = op_manager.ring.connection_manager.get_own_addr();
+
+    // Hosting attribution for EVERY local store this driver makes. Computed once
+    // here, at the one place that knows whether this driver invocation is transit
+    // at all, and threaded down — a per-callsite literal is how the loopback case
+    // leaked into the transit row in the first place. See
+    // `relay_get_hosting_cause` for why loopback is not transit; `start_relay_get`
+    // applies the identical gate to `record_relayed_get`.
+    let hosting_cause = relay_get_hosting_cause(own_addr, upstream_addr);
+
     // ── Update visited set: mark this peer and the upstream ─────────────
     let mut new_visited = visited.with_transaction(&incoming_tx);
-    if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
+    if let Some(own_addr) = own_addr {
         new_visited.mark_visited(own_addr);
     }
     new_visited.mark_visited(upstream_addr);
@@ -3279,7 +3339,7 @@ where
             hop_count,
         )
         .await;
-        cache_contract_locally(op_manager, key, state, contract, false).await;
+        cache_contract_locally(op_manager, key, state, contract, false, hosting_cause).await;
         send_result?;
         return Ok(());
     }
@@ -3369,7 +3429,8 @@ where
                         hop_count,
                     )
                     .await;
-                    cache_contract_locally(op_manager, key, state, contract, false).await;
+                    cache_contract_locally(op_manager, key, state, contract, false, hosting_cause)
+                        .await;
                     send_result?;
                     return Ok(());
                 }
@@ -3759,7 +3820,8 @@ where
                 // `get.rs:2370` which announces on any first-time relay
                 // cache).
                 let state_present =
-                    cache_contract_locally(op_manager, key, state, contract, false).await;
+                    cache_contract_locally(op_manager, key, state, contract, false, hosting_cause)
+                        .await;
                 send_result?;
 
                 // Register the requester as a downstream subscriber (subscribe
@@ -3900,6 +3962,7 @@ where
                                         state,
                                         contract,
                                         false,
+                                        hosting_cause,
                                     )
                                     .await;
                                     // Loopback delivery succeeded (state cached
@@ -4035,6 +4098,7 @@ where
                                     state,
                                     contract,
                                     false,
+                                    hosting_cause,
                                 )
                                 .await
                             } else {
@@ -6721,17 +6785,116 @@ mod tests {
                 panic!("unterminated cache_contract_locally call at relay callsite #{idx}")
             });
             let call = &tail[..=end];
-            // The last argument must be `false`. Normalize whitespace.
-            let normalized: String = call.chars().filter(|c| !c.is_whitespace()).collect();
-            assert!(
-                normalized.ends_with("false,).await")
-                    || normalized.ends_with("false)")
-                    || normalized.ends_with("false,)"),
+            // Split the argument list at depth 1 and check arguments BY
+            // POSITION. The older form of this check asserted the call "ends
+            // with `false`", which silently stopped testing `is_client_requester`
+            // the moment a sixth argument was appended — position is what the
+            // invariant is actually about.
+            let args_start = call.find('(').expect("call must have an arg list");
+            let inner = &call[args_start + 1..call.len() - 1];
+            let mut args: Vec<String> = Vec::new();
+            let mut arg_depth: i32 = 0;
+            let mut current = String::new();
+            for c in inner.chars() {
+                match c {
+                    '(' | '[' | '<' => {
+                        arg_depth += 1;
+                        current.push(c);
+                    }
+                    ')' | ']' | '>' => {
+                        arg_depth -= 1;
+                        current.push(c);
+                    }
+                    ',' if arg_depth == 0 => {
+                        args.push(current.trim().to_string());
+                        current.clear();
+                    }
+                    _ => current.push(c),
+                }
+            }
+            if !current.trim().is_empty() {
+                args.push(current.trim().to_string());
+            }
+            assert_eq!(
+                args.len(),
+                6,
+                "relay callsite #{idx} should pass six arguments (op_manager, \
+                 key, state, contract, is_client_requester, cause). \
+                 Call text: {call}"
+            );
+            assert_eq!(
+                args[4], "false",
                 "Relay callsite #{idx} of cache_contract_locally must pass \
                  `false` for is_client_requester (relay is not the client). \
                  Call text: {call}"
             );
+            // The hosting attribution must be the DRIVER-COMPUTED `hosting_cause`,
+            // never a per-callsite literal. `is_client_requester` is `false` at
+            // every one of these sites because a forwarder is never the client;
+            // the CAUSE is not that simple, because dispatch drives a
+            // locally-originated GET through this same driver with
+            // `upstream_addr = own_addr`. A hardcoded `TransitGet` here therefore
+            // reports this node's OWN request as someone else's transit, which is
+            // precisely the distinction the enum exists to make. Threading one
+            // value computed by `relay_get_hosting_cause` is what keeps that
+            // impossible; a literal at any site re-opens it.
+            assert_eq!(
+                args[5], "hosting_cause",
+                "Relay callsite #{idx} of cache_contract_locally must pass the \
+                 driver-computed `hosting_cause`, not a hardcoded variant — \
+                 dispatch routes an originator-loopback GET through this same \
+                 driver, so a literal `HostingCause::TransitGet` would file this \
+                 node's own request under transit. Call text: {call}"
+            );
         }
+        // ...and `hosting_cause` must be the loopback-aware value, not a
+        // constant bound to make the assertion above pass. Matched with
+        // whitespace stripped so a future rustfmt line-split cannot disarm it.
+        let packed: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            packed.contains("lethosting_cause=relay_get_hosting_cause(own_addr,upstream_addr);"),
+            "drive_relay_get_inner must bind `hosting_cause` from \
+             `relay_get_hosting_cause(own_addr, upstream_addr)`; binding it to a \
+             constant would satisfy the per-callsite check while re-introducing \
+             the mislabelling."
+        );
+    }
+
+    /// The loopback gate itself: `relay_get_hosting_cause` must map an
+    /// originator-loopback GET to `ClientGet` and a genuine forward to
+    /// `TransitGet`.
+    ///
+    /// Dispatch (`node.rs`) maps a locally-originated GET (`source_addr = None`)
+    /// to `upstream_addr = own_addr` and runs it through the forwarding driver,
+    /// so the driver cannot infer transit from its own existence. Recording that
+    /// case as transit is not a cosmetic mislabel: the ONLY thing this enum adds
+    /// over `AccessType` is the own-demand-vs-transit split, so leaking one into
+    /// the other empties the counter of meaning while it keeps reporting
+    /// plausible numbers.
+    #[test]
+    fn relay_get_hosting_cause_attributes_originator_loopback_to_client_get() {
+        let own: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let peer: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+
+        assert_eq!(
+            super::relay_get_hosting_cause(Some(own), own),
+            crate::ring::HostingCause::ClientGet,
+            "an originator-loopback GET (upstream == own_addr) is this node's \
+             OWN demand, not transit"
+        );
+        assert_eq!(
+            super::relay_get_hosting_cause(Some(own), peer),
+            crate::ring::HostingCause::TransitGet,
+            "a GET forwarded from a genuine upstream peer is transit"
+        );
+        // Fail safe: an unknown own address must not be read as loopback, or a
+        // node that has not yet learned its address would file every forwarded
+        // GET as its own client demand.
+        assert_eq!(
+            super::relay_get_hosting_cause(None, peer),
+            crate::ring::HostingCause::TransitGet,
+            "unknown own address must fall back to transit"
+        );
     }
 
     /// The `client_driver`-side callsite (drive_client_get_inner's
@@ -6796,9 +6959,25 @@ mod tests {
         let fn_pos = src
             .find("async fn cache_contract_locally(")
             .expect("cache_contract_locally must exist");
-        // Look in the 1500 chars before the fn for the docstring.
-        let window_start = fn_pos.saturating_sub(1500);
-        let window = &src[window_start..fn_pos];
+        // Take the WHOLE contiguous comment block above the fn, walking back
+        // until a non-comment line. A fixed-size character window (what this
+        // used to be) silently drops the TOP of the docstring the moment the
+        // docstring grows, which turns a rot guard into a length guard.
+        let head = &src[..fn_pos];
+        let doc_len: usize = head
+            .lines()
+            .rev()
+            .take_while(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with("//") || trimmed.starts_with("#[")
+            })
+            .map(|line| line.len() + 1)
+            .sum();
+        let window = &head[head.len().saturating_sub(doc_len)..];
+        assert!(
+            !window.trim().is_empty(),
+            "cache_contract_locally must keep a docstring above it"
+        );
         assert!(
             window.contains("is_client_requester"),
             "cache_contract_locally docstring must describe the \

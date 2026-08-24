@@ -1101,14 +1101,26 @@ mod tests {
              the rate limiter (offset {rate_limit_pos}) so banned \
              traffic doesn't consume the rate-limit budget"
         );
-        // All four UPDATE wire variants must remain matched; if a new
-        // one is added it must be gated through both the ban list
-        // and the rate limiter.
+        // EVERY UPDATE wire variant must remain matched; if a new one is
+        // added it must be gated through both the ban list and the rate
+        // limiter, and named here. The list was left at four when #5147
+        // appended the two V2 variants — behaviour stayed correct because the
+        // new arms sit inside the same dispatch block, but the guard silently
+        // stopped covering them, which is precisely what a guard carrying the
+        // instruction "update this list" exists to prevent.
         for variant in [
             "UpdateMsg::RequestUpdate {",
             "UpdateMsg::BroadcastTo {",
             "UpdateMsg::RequestUpdateStreaming {",
             "UpdateMsg::BroadcastToStreaming {",
+            // #5147 appended these two. The list was NOT extended when they
+            // landed, so this guard — whose entire job is to fail when a new
+            // UPDATE wire variant appears ungated — silently passed on the very
+            // change that added two. No live bypass resulted (the key is
+            // extracted from all six variants at node.rs before both gates run),
+            // but the guard had stopped guarding.
+            "UpdateMsg::BroadcastToV2 {",
+            "UpdateMsg::BroadcastToStreamingV2 {",
         ] {
             assert!(
                 block.contains(variant),

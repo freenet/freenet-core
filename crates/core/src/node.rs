@@ -65,12 +65,16 @@ pub(crate) use network_bridge::broadcast_queue_metrics::BROADCAST_QUEUE_EFFICIEN
 // re-export rather than a path through `network_bridge` directly. Mirrors
 // `BROADCAST_STREAM_METRICS` above.
 pub(crate) use network_bridge::p2p_protoc::{
-    HASH_FIRST_SUMMARIES_MIN_VERSION, SUMMARY_FIRST_PUT_MIN_VERSION,
+    BROADCAST_TARGET_LIST_MIN_VERSION, HASH_FIRST_SUMMARIES_MIN_VERSION,
+    SUMMARY_FIRST_PUT_MIN_VERSION, version_supports_broadcast_target_list,
     version_supports_hash_first_summaries, version_supports_summary_first_put,
 };
 // Test-only: the release-timing marker has no runtime reader by design (see
 // its rustdoc), so re-exporting it unconditionally is an unused import in the
 // non-test build.
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use network_bridge::p2p_protoc::BROADCAST_TARGET_LIST_SHIPPED_IN;
 #[cfg(test)]
 pub(crate) use network_bridge::p2p_protoc::HASH_FIRST_SHIPPED_IN;
 #[cfg(test)]
@@ -105,6 +109,7 @@ pub(crate) mod testing_impl;
 pub(crate) use p2p_impl::abort_process_on_redb_poison;
 pub use p2p_impl::{
     enable_abort_on_fatal_listener_exit, enable_abort_on_redb_poison, enable_fast_crash_exit_code,
+    listener_exit_is_graceful,
 };
 pub use request_router::{DeduplicatedRequest, RequestRouter};
 
@@ -406,6 +411,55 @@ pub struct NodeConfig {
     /// `#[serde(skip)]`; never serialized.
     #[serde(skip)]
     pub(crate) hash_first_summaries_floor_override: Option<(u8, u8, u16)>,
+    /// Test-only override for the version-carrying-ack floor
+    /// (`GATEWAY_ACK_VERSION_MIN_VERSION`, #5161). Threaded down into the
+    /// TRANSPORT layer (`create_connection_handler`), unlike the three
+    /// overrides above, which are read at the `ConnectionManager`: the gate it
+    /// controls decides how a handshake ack is ENCODED, and the handshake runs
+    /// below the node layer entirely.
+    ///
+    /// In production this is `None` → the real `(0, 2, 120)` floor (untouched).
+    ///
+    /// **Simulations default this OFF**, like the two cascade gates and unlike
+    /// `hash_first_summaries_floor_override`. The gate is encoding-only where it
+    /// fires, but the version it teaches is the INPUT to every other
+    /// `version_supports_*` gate, so enabling it network-wide makes
+    /// node->gateway links newly eligible for those features — a cascade in
+    /// effect. Measured rather than assumed: defaulting it ON changes the
+    /// outcome of the summary-first PUT sims.
+    ///
+    /// A sim that wants it calls `SimNetwork::enable_gateway_ack_version`; see
+    /// that method for the full argument and for what the OFF default costs.
+    ///
+    /// Not cfg-gated for the same reason as `subscribe_hint_floor_override`:
+    /// `node::testing_impl` sets it and is compiled unconditionally.
+    /// `#[serde(skip)]`; never serialized.
+    #[serde(skip)]
+    pub(crate) ack_version_floor_override: Option<(u8, u8, u16)>,
+    /// Test-only override for the originator-target-list version floor
+    /// ([`BROADCAST_TARGET_LIST_MIN_VERSION`], #5147). Threaded exactly like
+    /// the three overrides above and consulted as
+    /// `broadcast_target_list_floor_override.unwrap_or(BROADCAST_TARGET_LIST_MIN_VERSION)`
+    /// by `ConnectionManager::supports_broadcast_target_list`.
+    ///
+    /// In production this is `None` → the real `(0, 2, 120)` floor.
+    ///
+    /// **Simulations default this to `SIM_MIGRATION_DISABLED_FLOOR` — OFF —
+    /// like `subscribe_hint_floor_override` and `summary_first_put_floor_override`,
+    /// and unlike `hash_first_summaries_floor_override`.** The rule stated at
+    /// that field applies: hash-first defaults ON because it changes only the
+    /// ENCODING of an exchange with identical semantics, whereas this gate
+    /// changes BEHAVIOUR — it removes peers from a fan-out. Every sim that
+    /// asserts on delivery or convergence would silently be exercising a
+    /// different delivery graph, and a failure could not be attributed between
+    /// the sim's own subject and this suppression. Tests that want it opt in
+    /// via `SimNetwork::enable_broadcast_target_list`.
+    ///
+    /// Not cfg-gated, for the same reason as the others: `node::testing_impl`
+    /// sets it and is compiled unconditionally. `#[serde(skip)]`; never
+    /// serialized.
+    #[serde(skip)]
+    pub(crate) broadcast_target_list_floor_override: Option<(u8, u8, u16)>,
     /// Test-only harness flag: when set, a startup-hosted contract
     /// (`SeedHostedContract`, i.e. `append_contracts` with `subscription =
     /// true`) is registered in the neighbor-hosting advertised set so the
@@ -573,6 +627,8 @@ impl NodeConfig {
             subscribe_hint_floor_override: None,
             summary_first_put_floor_override: None,
             hash_first_summaries_floor_override: None,
+            ack_version_floor_override: None,
+            broadcast_target_list_floor_override: None,
             advertise_seeded_hosts: false,
             hosting_time_source_override: None,
         })
@@ -1032,6 +1088,14 @@ fn try_forward_driver_reply(
     op_label: &'static str,
 ) -> bool {
     let Some(callback) = pending_op_result else {
+        // Was silent at every level. Finding the clobber bug required patching
+        // a node to see this branch at all, because "no waiter is registered"
+        // is exactly the symptom a displaced waiter produces.
+        tracing::debug!(
+            tx_id = %reply.id(),
+            %op_label,
+            "try_forward_driver_reply: no waiter registered for this tx; dropping the reply"
+        );
         return false;
     };
     let tx_id = *reply.id();
@@ -1509,7 +1573,9 @@ where
                     update::UpdateMsg::RequestUpdate { key, .. }
                     | update::UpdateMsg::BroadcastTo { key, .. }
                     | update::UpdateMsg::RequestUpdateStreaming { key, .. }
-                    | update::UpdateMsg::BroadcastToStreaming { key, .. } => *key,
+                    | update::UpdateMsg::BroadcastToStreaming { key, .. }
+                    | update::UpdateMsg::BroadcastToV2 { key, .. }
+                    | update::UpdateMsg::BroadcastToStreamingV2 { key, .. } => *key,
                 };
 
                 // Phase 7 ban-list gate. Runs BEFORE the rate limiter
@@ -1570,6 +1636,10 @@ where
                         }
                         return Ok(());
                     }
+                    // The legacy variant carries no target list, so the
+                    // relayer suppresses nothing and behaves exactly as it does
+                    // today. `CoveredPeers::empty()` is that "nobody is
+                    // covered" statement, not a missing value.
                     update::UpdateMsg::BroadcastTo {
                         id,
                         key,
@@ -1583,6 +1653,7 @@ where
                             payload.clone(),
                             sender_summary_bytes.clone(),
                             sender_addr,
+                            crate::ring::broadcast_coverage::CoveredPeers::empty(),
                         )
                         .await
                         {
@@ -1635,6 +1706,7 @@ where
                             *stream_id,
                             *total_size,
                             sender_addr,
+                            crate::ring::broadcast_coverage::CoveredPeers::empty(),
                         )
                         .await
                         {
@@ -1643,6 +1715,69 @@ where
                                 %key,
                                 error = %err,
                                 "UPDATE relay dispatch: start_relay_broadcast_to_streaming failed"
+                            );
+                        }
+                        return Ok(());
+                    }
+                    // #5147. These two arms are the ONLY places a target list
+                    // is honored, and that is the security rule rather than an
+                    // implementation detail: the list is trusted solely because
+                    // it arrived on the message that delivered the payload, so
+                    // its author is attesting to sends it actually made. A
+                    // relayer therefore cannot fabricate an "everyone is
+                    // covered" list to suppress third-party fan-out, because
+                    // there is no other message type that carries one. Do NOT
+                    // add a `covered` field to a non-payload-bearing variant.
+                    update::UpdateMsg::BroadcastToV2 {
+                        id,
+                        key,
+                        payload,
+                        sender_summary_bytes,
+                        covered,
+                    } => {
+                        if let Err(err) = update::op_ctx_task::start_relay_broadcast_to(
+                            op_manager.clone(),
+                            *id,
+                            *key,
+                            payload.clone(),
+                            sender_summary_bytes.clone(),
+                            sender_addr,
+                            covered.clone(),
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                tx = %id,
+                                %key,
+                                error = %err,
+                                "UPDATE relay dispatch: start_relay_broadcast_to (v2) failed"
+                            );
+                        }
+                        return Ok(());
+                    }
+                    update::UpdateMsg::BroadcastToStreamingV2 {
+                        id,
+                        key,
+                        stream_id,
+                        total_size,
+                        covered,
+                    } => {
+                        if let Err(err) = update::op_ctx_task::start_relay_broadcast_to_streaming(
+                            op_manager.clone(),
+                            *id,
+                            *key,
+                            *stream_id,
+                            *total_size,
+                            sender_addr,
+                            covered.clone(),
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                tx = %id,
+                                %key,
+                                error = %err,
+                                "UPDATE relay dispatch: start_relay_broadcast_to_streaming (v2) failed"
                             );
                         }
                         return Ok(());
@@ -2129,12 +2264,18 @@ where
             // insert/remove) and never reads the interested gauge — we skip it to
             // avoid paying that per-hint cost for nothing (Codex review). The
             // refresh makes the gauge reflect the cache's CURRENT resident hot set
-            // at decision time (no-op before the runtime pool is built). It cannot
+            // as of the last interest-set snapshot (no-op before the runtime pool
+            // is built). Since #5268 that is NOT strictly decision-time fresh: the
+            // cache is keyed by code hash, so its interest predicate answers "is
+            // any in-use contract running this code", and that set is itself
+            // memoized for 10 s (`InUseCodeHashes`). The scan this forces is fresh;
+            // the demand it reads can be up to that window stale. It also cannot
             // see migrations still in-flight (admitted but not yet
             // hosted/compiled), so a tight burst can still overshoot by ~one
             // migration-completion latency before completed migrations push the hot
             // set to the ceiling — a bounded, self-correcting residual, not the
-            // unbounded 10-s-stale window. Uses the GAUGES-ONLY refresher: it must
+            // unbounded 10-s-stale window this refresh was added to close. Uses the
+            // GAUGES-ONLY refresher: it must
             // NOT bump the throttle-sampled would-reclassify counter (a burst would
             // inflate it by hint volume) nor reset that throttle (Codex review).
             if interest_tiered {
@@ -2263,9 +2404,22 @@ fn stale_sync_emit_budget(stale_contracts_len: usize) -> usize {
     stale_contracts_len.min(MAX_STALE_SYNCS_PER_SUMMARIES)
 }
 
-/// Per-message cap on how many DISTINCT contract hashes the hash-first
-/// handlers will process — both the `SummaryDigests` entries we examine and
-/// the `SummaryRequest` hashes we answer (#4965).
+/// Per-message cap on how many DISTINCT contract hashes a `SummaryRequest`
+/// may name (#4965).
+///
+/// # Scope, after #5238
+///
+/// This constant used to govern the `SummaryDigests` window and the
+/// `SummaryRequest` answer as well. It no longer does: the WORK bound on both
+/// moved to [`MAX_SUMMARY_COMPARISONS_PER_MESSAGE`], which is two orders of
+/// magnitude smaller, because the reasoning recorded below — that per-entry
+/// work is a cheap DashMap get — was wrong about the receive side, and being
+/// wrong about it in exactly this way is what produced the #5238 storm.
+///
+/// What is left here is the INPUT filter on `SummaryRequest`'s hash list, where
+/// the constant is still doing its original job: stopping a peer naming an
+/// arbitrarily long list. The two are now independently tunable, which the
+/// paragraph at the end of this comment used to say they were not.
 ///
 /// A digest entry costs the SENDER ~20 bytes and can cost the RECEIVER a
 /// `summary_if_hosted_or_in_use` round trip, which is an amplification ratio
@@ -2274,12 +2428,12 @@ fn stale_sync_emit_budget(stale_contracts_len: usize) -> usize {
 /// DISTINCT hash: a peer repeating one hash is deduplicated before any work,
 /// so repetition buys nothing.
 ///
-/// Over-cap contracts are not dropped permanently — the ~5-min interest
-/// heartbeat re-advertises them, and the `SummaryDigests` arm rotates its
-/// starting offset when the cap binds (the same random-rotation starvation
-/// argument [`MAX_STALE_SYNCS_PER_SUMMARIES`] makes, which matters here for
-/// the same reason: `get_matching_contracts` sorts by contract id, so a fixed
-/// prefix would starve the tail forever).
+/// Over-cap hashes are not dropped permanently — the interest heartbeat
+/// re-advertises them, though since #5238 that takes `ceil(n / 64)` rounds
+/// rather than the next one. The starvation argument
+/// [`MAX_STALE_SYNCS_PER_SUMMARIES`] makes still applies wherever a cap binds
+/// on this path: `get_matching_contracts` sorts by contract id, so a fixed
+/// prefix would starve the tail forever, and every capped site here rotates.
 ///
 /// # Why 4096, measured rather than guessed
 ///
@@ -2308,17 +2462,24 @@ fn stale_sync_emit_budget(stale_contracts_len: usize) -> usize {
 ///
 /// # What the cap is, and is not
 ///
-/// It is a **backstop, not the operative bound.** The sender's entry count is
-/// naturally bounded by its own tracked set (`get_matching_contracts` iterates
-/// the responder's hash index), and the expensive receive-side work is bounded
-/// the same way: `lookup_by_hash` can only resolve contracts WE already track,
-/// so a peer cannot make us summarize something we do not have. What this cap
-/// actually bounds is a per-entry DashMap-get loop — cheap, which is why a
-/// generous value costs nothing.
+/// It is a **backstop, not the operative bound**, and the argument for that
+/// used to run: `lookup_by_hash` can only resolve contracts WE already track,
+/// so a peer cannot make us summarize something we do not have, and what the
+/// cap really bounds is a per-entry DashMap-get loop — cheap, so a generous
+/// value costs nothing.
 ///
-/// There is no send-side chunking at this value; all three uses are
-/// receive-side (the `SummaryDigests` window and the `SummaryRequest` answer),
-/// so the constant moves them together and cannot be raised on one side only.
+/// **The last step of that is what #5238 disproved.** "A peer cannot make us
+/// summarize something we do not have" bounds WHICH contracts, not HOW MANY,
+/// and on a peer hosting 933 contracts the honest heartbeat is itself hundreds
+/// of entries. The per-entry work is a contract-handler round trip that
+/// re-enters WASM on a cache miss, not a DashMap get. Left in place because it
+/// is the reasoning error, and a future editor is better served by seeing it
+/// than by seeing a corrected version that looks like nobody ever got it wrong.
+///
+/// Its one remaining use is the `SummaryRequest` input slice, and there the
+/// original reasoning does hold: a long hash list really is only a
+/// `get_matching_contracts` filter, and the summarize loop that follows it is
+/// separately bounded by [`MAX_SUMMARY_COMPARISONS_PER_MESSAGE`].
 const MAX_SUMMARY_HASHES_PER_MESSAGE: usize = 4096;
 
 /// Per-`Summaries`-message cap on semantic-staleness probes — the WASM
@@ -2752,19 +2913,36 @@ fn classify_summary_digest(
 ///
 /// The digest form is derived from the very `SummaryEntry` values we would
 /// otherwise have sent, so the two forms cannot describe different state: the
-/// digest is a pure function of the exact bytes the fallback carries. Callers
-/// therefore build entries exactly as before and let this decide the encoding.
+/// digest is a pure function of the exact bytes the fallback carries.
 ///
 /// Fail-closed on an unknown peer version (see
 /// [`crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION`]): the fallback is what
 /// every peer does today, so the cost of guessing wrong is bandwidth, never
 /// convergence.
 ///
-/// # Only the two MULTI-ENTRY reply legs use this (#4965 review §2)
+/// # Only the REPLY legs use this (#4965 review §2)
 ///
-/// `InterestsReply` and `ChangeInterestsReply` route through here. The two
-/// single-entry legs — `Notification` and `Rejection` — call
-/// [`full_summaries_message`] directly and ship full bytes this release.
+/// `ChangeInterestsReply` routes through here. `InterestsReply` no longer
+/// does: #5155 needs the form BEFORE it builds entries, so that it can bound
+/// what the full-bytes fallback carries, and it calls [`summary_reply_form`]
+/// and [`summaries_reply_in_form`] separately rather than reading the gate
+/// twice. The encoding decision is identical; only the point at which it is
+/// taken moved.
+///
+/// The heading said "MULTI-ENTRY reply legs" until 2026-08-12; corrected per
+/// #5153 review F1, because **`ChangeInterestsReply` is single-entry** (one
+/// contract per `broadcast_change_interests` gossip; measured mean 1.000
+/// entries/msg, `max_entries` 1, over 418,476 messages on 1,284 peers). Only
+/// `InterestsReply` is genuinely multi-entry. The distinction is load-bearing
+/// for the R4b agreement-rate instrument, which cannot read the emitter tag and
+/// so uses message length as its proxy: `ChangeInterestsReply` is that proxy's
+/// largest contaminant, and calling it multi-entry is what made the proxy look
+/// clean. See `network_bridge::outbound_message_mix`.
+///
+/// `Notification` and `Rejection` are also single-entry, but call
+/// [`full_summaries_message`] directly and ship full bytes this release — which
+/// is why a single-entry observation on the DIGEST leg cannot be a notification
+/// today.
 ///
 /// The reason is evidential, not technical: the 98.1% agreement rate that
 /// justifies hash-first was measured on a heartbeat-dominated population, and
@@ -2779,20 +2957,514 @@ pub(crate) fn summaries_reply_for_peer(
     entries: Vec<crate::message::SummaryEntry>,
     emitter: crate::message::SummariesEmitter,
 ) -> crate::message::InterestMessage {
-    use crate::message::{InterestMessage, SummaryDigestEntry};
+    summaries_reply_in_form(summary_reply_form(op_manager, target), entries, emitter)
+}
 
+/// Maximum number of entries in one full-bytes summary fallback reply (#5155).
+///
+/// The fallback carries every shared contract's summary in a single message.
+/// At the measured 265.91 shared contracts and 16,675 B per summary that is a
+/// multi-megabyte message every 5 minutes, and the largest single message
+/// observed in the field was 1.26 MB. Bounding it is what stops one peer we
+/// cannot negotiate digests with from costing more than every peer we can.
+///
+/// 64 comes from tying the fallback's cost to the digest message it stands in
+/// for: a digest reply over the same set is 265.91 x 21 B ~= 5.6 KB, and a
+/// full-bytes entry averages 143 B, so ~39 entries is break-even. 64 spends
+/// about 9.2 KB for a shorter rotation.
+///
+/// # This is the SECONDARY bound, and on a real fallback link it is inert
+///
+/// 143 B/entry is the interests_reply average across the whole fleet, which is
+/// dominated by 21-byte digest entries and by entries for contracts the sender
+/// does not host (those carry no summary at all). It does not describe the
+/// population that takes this path. A peer whose shared set is mostly hosted
+/// River rooms carries ~16.7 KB per entry, so
+/// [`MAX_FALLBACK_SUMMARY_BYTES_PER_REPLY`] binds after the first hosted
+/// contract and this cap is never reached.
+///
+/// The entry cap is therefore best read as the guard for the OPPOSITE
+/// extreme — a wide set of contracts we do not host, where each entry costs
+/// almost nothing and the byte budget would never bind — not as the number
+/// that governs how fast the rotation turns. Quote the byte budget for that.
+const MAX_FALLBACK_SUMMARIES_PER_REPLY: usize = 64;
+
+/// Byte budget for one full-bytes summary fallback reply (#5155).
+///
+/// [`MAX_FALLBACK_SUMMARIES_PER_REPLY`] on its own does NOT bound the message.
+/// An entry carries a whole summary and summaries are not uniform: a contract
+/// we do not host contributes no summary bytes at all, while a River room
+/// contributes ~16.7 KB. The 143 B/entry that the entry cap is derived from is
+/// a fleet AVERAGE, so it describes the typical mix rather than the worst case,
+/// and 64 heavy entries is ~1.07 MB — the message class this change exists to
+/// remove, reproduced under a cap that looks like it forbids it.
+///
+/// 9 KiB is the same break-even target expressed in the unit that actually
+/// bounds the wire (64 x 143 B ~= 9.2 KB). On a typical mix it never binds and
+/// the entry cap governs; it binds exactly where the entry cap would have
+/// failed.
+///
+/// The budget is checked BEFORE adding each entry and never blocks the first
+/// one, so a reply is at most `budget + one summary` and a contract whose
+/// summary alone exceeds the budget still gets sent rather than stalling the
+/// rotation forever. That trade is deliberate: a single oversized summary is
+/// bounded by the contract, an unbounded reply is not.
+///
+/// # What this actually costs, in rounds
+///
+/// Because the budget usually binds before the entry cap, the cycle length is
+/// governed by BYTES, not by entry count:
+///
+/// ```text
+/// rounds per cycle ~= total summary bytes for the shared set / 9 KiB
+/// ```
+///
+/// For the heaviest links this change targets — the reconstructed ~1.16 MB
+/// reply behind the 1.26 MB largest message observed in the field — that is
+/// ~130 rounds at a 5-minute heartbeat, so **on the order of ten hours** to
+/// come back round, not the ~25 minutes a naive `ceil(266 / 64)` reading
+/// suggests. Worst case, a set where every summary exceeds the whole budget,
+/// it degenerates to one contract per round.
+///
+/// That is the real, stated cost of this bound. It is defensible because this
+/// is the backstop layer and not the delivery path — the event-driven paths
+/// (push-on-update, request-full-state-when-too-far-behind, resend-on-failed-
+/// patch) are untouched and still bound detection for any contract anybody
+/// touches — but it must not be quoted as minutes. The alternative on those
+/// same links is a multi-megabyte message every 5 minutes; there is no setting
+/// of this constant that is both cheap and fast, which is the argument for
+/// repairing the version gate (#5156 / #5161) rather than tuning here.
+///
+/// # Before retuning either constant, get the field reading
+///
+/// Everything above is a MODEL, derived from fleet averages. That is how the
+/// entry cap came to be sized off a mean of 143 B/entry when the population it
+/// governs is nothing like the mean — the error survived review of the
+/// arithmetic because no counter contradicted it. **#5168** adds
+/// entries-per-reply and bytes-per-reply on this path. Do not move either
+/// constant on the strength of another average; read the distribution.
+///
+/// Those counters are also the cleanest read on #5161: as gateway links learn
+/// peer versions and stop taking this path at all, they should fall toward
+/// zero.
+const MAX_FALLBACK_SUMMARY_BYTES_PER_REPLY: usize = 9 * 1024;
+
+/// Maximum number of contract summaries one periodic `Interests` reply computes
+/// on the hash-first DIGEST path (#5238).
+///
+/// #5155 bounded the full-bytes fallback and deliberately left this path alone,
+/// on the reasoning that digests are cheap to SEND. They are — 21 bytes each.
+/// But an entry of either form costs one `summary_if_hosted_or_in_use` call to
+/// PRODUCE, and that call is a contract-handler round trip that re-enters WASM
+/// whenever the memoised state-hash misses. Bounding bytes never bounded that,
+/// so once digest-capability became the common case (#5066 merged 2026-07-31,
+/// floor 0.2.116) the periodic heartbeat was left looping over the WHOLE shared
+/// interest set, on every message, in both directions.
+///
+/// That produced the third `summarize_contract_state` storm in the family
+/// (#4473 -> #4610 -> #5238): a real NATed peer hosting 933 contracts over 18
+/// connections sustained ~54 calls/sec against the 30/sec per-callsite log
+/// limiter, resuming within seconds of every restart. It is NOT a
+/// phantom-hosting recurrence — every call in that loop is a correctly-gated
+/// summarize of a genuinely hosted contract (`should_summarize_or_broadcast`
+/// holds), and the `Contract state not found in store` WARN that was #4610's
+/// signature does not appear. The defect is that nothing bounded HOW MANY.
+///
+/// # Where 64 comes from
+///
+/// The cost bounded here is CPU, so it is sized against a CPU budget rather
+/// than a message size. Per heartbeat and per peer we pay two summarize-heavy
+/// legs: the reply we build here, and the peer's reply that we compare against
+/// our own state in the `SummaryDigests` arm (bounded by
+/// [`MAX_SUMMARY_COMPARISONS_PER_MESSAGE`]). So
+///
+/// ```text
+/// summarize calls/sec ~= 2 x cap x connected_peers / INTEREST_HEARTBEAT_INTERVAL
+/// ```
+///
+/// At 64 and the observed 18 connections that is ~7.7/sec — about a quarter of
+/// the 30/sec per-callsite limiter these storms are measured against, and an
+/// ~7x reduction from the measured 54/sec. It is also the same number as
+/// [`MAX_FALLBACK_SUMMARIES_PER_REPLY`], which restores the property #5155's
+/// split lost: one periodic reply costs the same whichever wire form it takes.
+///
+/// # What it costs in convergence
+///
+/// A stable shared set of `n` contracts is covered in `ceil(n / 64)` heartbeats
+/// (the window rotates and wraps — see `rotation_window_indices`). At the
+/// ~450-contract shared sets implied by the field measurement that is 8 rounds,
+/// or **~40 minutes** for the anti-entropy backstop to come back round to a
+/// given contract, against 5 minutes before. Two reasons that is affordable,
+/// and one caveat:
+///
+/// - This is the BACKSTOP layer, not the delivery path. A committed update goes
+///   to every connected advertised co-host immediately via live fan-out, with
+///   no INTEREST check and untouched by this change; the event-driven repairs
+///   (resend-on-failed-patch, request-full-state-when-too-far-behind) are also
+///   untouched. Anti-entropy only has to catch a divergence that ALL of those
+///   missed.
+///
+///   Read "no interest check" narrowly, because live fan-out is not
+///   unconditional. It has a SUMMARY gate — `plan_fanout_send` returns `Skip`
+///   when our cached belief about the peer's summary is byte-equal to ours —
+///   and that gate is fed by the very cache this change warms more slowly. A
+///   MISSING belief is safe in the direction that matters (see the
+///   second-order cost below: it makes us send more, never skip). A WRONG
+///   belief is the case this bullet must not be read as covering: after a lost
+///   stream tail the sender can believe a peer has state it does not have,
+///   nothing is sent, so no delta fails and the ResyncRequest repair cannot
+///   fire either. For a contract that then goes quiet, anti-entropy is the
+///   only correction, and this change stretches that window by roughly 8x.
+///   It stays bounded, and it is confined to quiescent contracts, but it is a
+///   real cost of this change rather than one the delivery path absorbs.
+///   `broadcast_queue.rs` carries the same note where the belief is cached.
+/// - It is far tighter than the cost already accepted on the sibling path:
+///   [`MAX_FALLBACK_SUMMARY_BYTES_PER_REPLY`] documents cycles on the order of
+///   ten HOURS for the heaviest full-bytes links, shipped in #5155.
+/// - **The layer being slowed almost never finds anything.** Measured
+///   fleet-wide over ~27,500 node-minutes: 26,457,275 summary comparisons
+///   agreed against 44,305 that differed — 99.83% identical. Anti-entropy is
+///   paying a continuous CPU cost to discover a divergence roughly one time in
+///   six hundred, which is what makes trading its latency for that CPU the
+///   right side of the deal.
+///
+/// # The second-order cost: the peer-summary cache warms at the same rate
+///
+/// Not obvious, and it lands on the majority of links rather than the minority
+/// #5155's equivalent did, so it is stated here rather than left to be
+/// discovered. `SummaryPopulationSource::DigestAgreement` is the only thing
+/// that seeds our cached belief about a peer's summary for a QUIESCENT contract
+/// on a digest link, and it now fires for at most 64 contracts per heartbeat.
+/// The broadcast path sends a delta only to a peer whose summary we hold, so
+/// for up to `ceil(n / 64)` heartbeats after a connection forms, the first
+/// update to a not-yet-covered contract ships FULL STATE instead of a delta.
+///
+/// Two things bound it. The direction is safe — a missing cached summary makes
+/// us send more, never skip — so no update is lost. And `Delivery` seeds the
+/// cache after any successful send, so only the FIRST update per
+/// (contract, peer) pays, and #5153 found 57.5% of cold-start sends fire before
+/// any heartbeat could have helped anyway. It is a bytes-for-bytes trade
+/// against a CPU saving, not purely a latency one.
+///
+/// # The caveat, and the retune candidate
+///
+/// This is a per-REPLY cap, so the per-NODE rate still scales with connection
+/// count. A 200-connection gateway sharing 64+ contracts with every peer would
+/// model to ~85 calls/sec even at this cap. Capping is monotone — it can only
+/// lower what a reply computes, never raise it — so no peer is made worse off,
+/// but an aggregate node-wide budget is a real remaining gap. Sizing one needs
+/// the entries-per-reply distribution (#5168), not another fleet average; see
+/// [`MAX_FALLBACK_SUMMARIES_PER_REPLY`] for how retuning off a mean went wrong
+/// last time.
+///
+/// **128 is the obvious retune candidate and was deliberately not taken here.**
+/// It models to ~15.4 calls/sec at 18 connections, still half the limiter, and
+/// it would halve both the convergence latency and the cache-warm latency
+/// above. The reason to ship 64 first is that the node this was measured on is
+/// pinned at its 2 GB cgroup cap right now, so the larger margin is worth more
+/// than the latency; and that the equality with
+/// [`MAX_FALLBACK_SUMMARIES_PER_REPLY`] is a symmetry argument, not a budget
+/// one, so it should not by itself hold the value down once #5168 gives a
+/// distribution to read.
+const MAX_DIGEST_SUMMARIES_PER_REPLY: usize = 64;
+
+/// Maximum number of inbound entries one `SummaryDigests` (or `Summaries`)
+/// message may COMPARE against local state (#5238), where "compare" means the
+/// entries that cost us a `summary_if_hosted_or_in_use` call.
+///
+/// The digest exchange has two summarize-heavy legs, not one, and they are
+/// independent: the sender pays [`MAX_DIGEST_SUMMARIES_PER_REPLY`] calls to
+/// build the message, and the receiver pays one call per COSTED entry to
+/// compute its OWN summary for the comparison. Bounding only the send side
+/// would move half the storm rather than remove it, and would leave the
+/// receiver exposed to any peer that has not upgraded (or is not honest)
+/// sending a full set.
+///
+/// # It bounds CALLS, not entries (#5338)
+///
+/// An entry advertising no summary — `summary_digest: None`, or
+/// `summary_bytes: None` on the full-bytes twin — is settled without our
+/// summary being consulted at all (`classify_summary_digest`'s `(_, None)` arm;
+/// the `_ => false` staleness arm on the twin), so the receiver skips the round
+/// trip and does not charge it. Entry COUNT is bounded separately, by
+/// [`MAX_SUMMARY_ENTRIES_PER_MESSAGE`].
+///
+/// # One exception, and it is deliberate: `SimulationIdleTimeout`
+///
+/// Under that flag (`emit_confirmed`, off in production, on for every
+/// direct-runner simulation) both receive arms fetch our summary for free
+/// entries too, so the round trips are bounded by
+/// [`MAX_SUMMARY_ENTRIES_PER_MESSAGE`] rather than by this constant — up to 2x.
+/// Bounded, not unbounded, but a different bound, so **a simulation's
+/// receive-leg summarize count reads high and cannot be used to measure this
+/// path's CPU cost.** Do not size a future cap from a simulation number without
+/// subtracting the telemetry probes.
+///
+/// The exception is not an oversight and removing it is not a cleanup. The
+/// `StateConfirmed` events those fetches produce feed the convergence checker
+/// via `EventKind::stored_state_hash()`; without them a peer's recorded state
+/// hash goes stale or the peer drops out of the check's per-contract map
+/// entirely, which takes the contract below the two-peer threshold and skips it
+/// SILENTLY. Trading a suite that can pass vacuously for an accurate CPU
+/// number in a measurement nobody is currently taking is the wrong way round.
+/// #5338 made that trade once, on a consumer search for the literal variant
+/// name — the consumption goes through a generic accessor, so the name does not
+/// appear at the consumers and the search came back empty.
+///
+/// Until #5338 this cap counted entries, which was the same number because the
+/// send leg charged its own budget the same way. Once the send leg stopped
+/// charging free entries its replies could exceed 64 entries, and an
+/// entry-counting receiver would have truncated them back — discarding a random
+/// subset of the digests the sender spent its whole budget producing, and
+/// turning the send window's contiguous tiling into a random sample at the
+/// receiver. The two legs charge on the same basis so that cannot happen.
+///
+/// Equal to [`MAX_DIGEST_SUMMARIES_PER_REPLY`] on purpose: a sender running
+/// this release never COSTS us more than that, so between two upgraded peers
+/// this cap never truncates and the two legs cover exactly the same contracts
+/// each round. It binds only on a message from a peer that predates this
+/// change.
+///
+/// This REPLACES [`MAX_SUMMARY_HASHES_PER_MESSAGE`] (4096) as the WORK bound on
+/// this arm. That constant is unchanged and still bounds the `SummaryRequest`
+/// input, where it remains the right anti-abuse ceiling.
+///
+/// Over-ceiling messages are still processed from a random offset (the existing
+/// `rotate_left`), so truncating never starves the tail of a set the sender
+/// happens to emit in contract-id order.
+///
+/// # What truncation costs, when it binds
+///
+/// The random offset is a fresh uniform draw each round rather than the
+/// id-keyed cursor the send side uses, so coverage of an over-cap sender's set
+/// is coupon-collector rather than `ceil(n / 64)`: about `(n / 64) * H_n`
+/// rounds, ~43 rounds (a few hours) for n = 450, against 8. That is worth
+/// knowing and is NOT the same guarantee the send side gives.
+///
+/// It is nevertheless the right trade, for a reason specific to who can reach
+/// it. Only a pre-#5238 sender emits an over-cap message, so this binds during
+/// a rollout and then stops. In that window the degraded direction is only "we
+/// notice that IT is stale"; the old peer's own view is repaired by our SEND
+/// leg, which is cursor-rotated and covers in `ceil(n / 64)`, and which the old
+/// peer compares in full because it has no cap. So the un-upgraded peer
+/// converges on the normal schedule and only our detection of its staleness is
+/// a slower random walk. Giving this leg a cursor too would need the truncated
+/// set sorted and a second cursor cache keyed the same way; worth doing if a
+/// long-lived mixed-version population ever becomes normal, and not worth the
+/// machinery for a rollout window.
+const MAX_SUMMARY_COMPARISONS_PER_MESSAGE: usize = MAX_DIGEST_SUMMARIES_PER_REPLY;
+
+/// Absolute ceiling on the number of ENTRIES one periodic summary exchange
+/// carries or processes, in either wire form (#5338).
+///
+/// Distinct from [`MAX_DIGEST_SUMMARIES_PER_REPLY`] /
+/// [`MAX_SUMMARY_COMPARISONS_PER_MESSAGE`], which bound the expensive thing (a
+/// `summary_if_hosted_or_in_use` call). Since #5338 an entry that costs no such
+/// call is not charged against those, so they no longer bound the entry count
+/// on their own and something else has to: entries still cost wire bytes on the
+/// way out and a `lookup_by_hash` plus a `clear_peer_summary` on the way in.
+///
+/// **Why it is 2x rather than 1x.** At 1x this ceiling would bind before the
+/// summarize budget did and the #5338 fix would be a no-op — a reply would
+/// still stop at 64 entries however few of them were hosted. 2x lets the window
+/// walk past a shared set that is up to half not-hosted-by-us and still fill
+/// all 64 summarize slots with contracts we can actually advertise. Past that
+/// point the fix degrades gracefully rather than failing: a set that is 70%
+/// not-hosted still gets ~38 costed entries per round against the ~19 it gets
+/// today.
+///
+/// **Why not 4x**, which was the first value here and buys a fully-filled
+/// budget out to 75% not-hosted. Every entry past the summarize budget is a
+/// free rider on two things worth rationing, and 4x quadruples both where 2x
+/// doubles them:
+///
+/// - On the RECEIVE leg each free entry drives a `clear_peer_summary`, and per
+///   the #4952 note there that turns the peer from a delta target into a
+///   full-state broadcast target for that contract. Full-state broadcast volume
+///   is exactly what #5153 is investigating right now, so this is a lever on a
+///   number somebody is actively trying to bring down.
+/// - A peer below [`HASH_FIRST_SUMMARIES_MIN_VERSION`] has no receive-side cap
+///   at all and summarizes every entry it is sent (see the mixed-version note
+///   below), so the ceiling is the whole of its per-message cost.
+///
+/// # The adversarial case, in numbers
+///
+/// State it explicitly, because this ceiling is the ONLY thing bounding it and
+/// the honest case above is not the one that decides the value.
+///
+/// A hostile or broken peer's message is truncated to this ceiling, so the
+/// worst FULLY-PROCESSED message is 128 entries. Of those:
+///
+/// - **Summarize round trips: at most 64, unchanged by #5338.**
+///   [`MAX_SUMMARY_COMPARISONS_PER_MESSAGE`] still caps them, and free entries
+///   cannot consume that budget because they make no call. (The full-bytes arm
+///   charges per ENTRY, so a hash collision can still make one entry fetch for
+///   several contracts — a pre-existing property, noted at that loop.)
+/// - **`clear_peer_summary` calls: at most 128, up from 64.** A message of
+///   nothing but free entries reaches the summarize budget never, so every one
+///   of them is processed. That is the 2x, and it is a 2x on the lever
+///   described above; at 4x it would have been 256.
+///
+/// **`break` instead of `continue` past the budget would not help**, which is
+/// worth recording so the next reader does not reach for it as the cheap fix. A
+/// message of pure free entries never reaches the budget at all, so the `break`
+/// would never fire and the count would be identical. Charging free entries
+/// against the budget would bound it — and would also delete the fix. Lowering
+/// the ceiling is the only lever that moves this number, which is the second
+/// reason it is 2x rather than 4x.
+///
+/// The benefit above 2x is speculative — nobody has measured the not-hosted
+/// fraction of a real shared set — while the cost above 2x is concrete and
+/// lands on a number #5153 is actively measuring. Raise it when there IS a
+/// measurement (#5168's entries-per-reply distribution is the natural one),
+/// which is a one-line change that
+/// `an_all_free_window_stops_at_the_entry_ceiling` will notice.
+///
+/// A digest entry is 21 bytes, so 128 of them is ~2.7 KB, well inside the 9 KiB
+/// the full-bytes path already spends per reply
+/// ([`MAX_FALLBACK_SUMMARY_BYTES_PER_REPLY`]).
+///
+/// **It is deliberately the same number on both legs.** The receive leg
+/// truncates an over-ceiling message (random offset, as its siblings do), so a
+/// sender that respects this ceiling is never truncated by a receiver that
+/// enforces it. Lower it on the receive side alone and the send window's
+/// `ceil(n / 64)` tiling silently becomes a random sample at the receiver —
+/// which is the class of "narrower than advertised" defect #5338 is about.
+///
+/// # Mixed versions
+///
+/// The two legs have DIFFERENT baselines in the shipped release, and an earlier
+/// version of this comment got that wrong by treating them as one. In
+/// v0.2.127's `Interests` arm the window is `None` for `Digests` and
+/// `Some(MAX_FALLBACK_SUMMARIES_PER_REPLY)` for `FullBytes` (#5164), so:
+///
+/// - **A peer receiving DIGESTS** (at or above [`HASH_FIRST_SUMMARIES_MIN_VERSION`],
+///   which is most of the fleet) is sent the ENTIRE shared set today — hundreds
+///   of entries, the storm #5238 exists to stop. For that population this
+///   ceiling is a large reduction whatever it is set to.
+/// - **A peer receiving FULL BYTES** (below that floor) is already sent at most
+///   `MAX_FALLBACK_SUMMARIES_PER_REPLY` = 64 entries today, and does not skip
+///   the free ones on receipt. For that population this ceiling is an INCREASE,
+///   up to 2x, in the number of summarize round trips one reply can cost it.
+///
+/// That second bullet is a real regression for that population, and it is the
+/// honest reason the ceiling is 2x rather than 4x.
+///
+/// **It COULD be version-gated away, and is not.** An earlier revision claimed
+/// gating was impossible because the entries pushing a reply past 64 are
+/// precisely the free ones, so withholding them would withhold their
+/// `PeerHasNoState` repairs. That reasoning is measured against the NEW
+/// behaviour and is wrong against the shipped one: v0.2.127's full-bytes window
+/// counts ENTRIES, not costed entries, so such a peer already receives 64
+/// entries of which some are free today. Gating `FullBytes` back to
+/// [`MAX_FALLBACK_SUMMARIES_PER_REPLY`] would restore exactly today's behaviour
+/// for it and drop no repair it currently gets.
+///
+/// So this is a judgement rather than an impossibility, and the judgement is:
+/// one uniform ceiling, because a version-conditional bound adds a second thing
+/// to reason about in code whose invariants have already needed correcting
+/// twice, and because the size of the affected population is **unmeasured** —
+/// `hash_first_declined_pre_floor` and `hash_first_declined_unknown_version` in
+/// `connection_manager.rs` would answer it. If that measurement ever shows the
+/// pre-floor population is not negligible, gate it; do not assume it is small
+/// because this comment is short.
+const MAX_SUMMARY_ENTRIES_PER_MESSAGE: usize = 2 * MAX_DIGEST_SUMMARIES_PER_REPLY;
+
+/// The send ceiling must not exceed the receive ceiling, or our own replies
+/// would be truncated by an upgraded peer — see
+/// [`MAX_SUMMARY_ENTRIES_PER_MESSAGE`]. Trivially true while one constant
+/// serves both; the assertion is here so that splitting it into two later
+/// cannot silently invert the inequality.
+const _: () = assert!(
+    MAX_SUMMARY_ENTRIES_PER_MESSAGE >= MAX_DIGEST_SUMMARIES_PER_REPLY
+        && MAX_SUMMARY_ENTRIES_PER_MESSAGE >= MAX_FALLBACK_SUMMARIES_PER_REPLY,
+    "the per-message entry ceiling must leave room for a full summarize budget, \
+     or the budget can never be spent"
+);
+
+/// The `Summaries` receive-leg cap is documented (see its comment above) as
+/// never binding against a peer running #5155 or later, because such a peer
+/// caps its own `InterestsReply` fallback at
+/// [`MAX_FALLBACK_SUMMARIES_PER_REPLY`]. That is a relationship BETWEEN two
+/// independently-motivated constants, not a property of either one: the
+/// fallback cap has its own byte-budget rationale, and raising it alone would
+/// start silently truncating legitimate replies from upgraded peers with no
+/// test failing. The alias above keeps the 64 -> 128 retune this module
+/// actively invites self-consistent; this assertion is what keeps the OTHER
+/// side of the inequality honest.
+///
+/// Since #5338 both sides of this inequality count SUMMARIZE CALLS rather than
+/// entries, so what it now forbids is an upgraded sender costing an upgraded
+/// receiver more comparisons than the receiver will make. The entry-count
+/// analogue is asserted separately, on
+/// [`MAX_SUMMARY_ENTRIES_PER_MESSAGE`].
+const _: () = assert!(
+    MAX_FALLBACK_SUMMARIES_PER_REPLY <= MAX_SUMMARY_COMPARISONS_PER_MESSAGE,
+    "raising MAX_FALLBACK_SUMMARIES_PER_REPLY above MAX_SUMMARY_COMPARISONS_PER_MESSAGE \
+     would make the Summaries receive-leg cap truncate replies from #5155+ peers"
+);
+
+/// Which wire form a multi-entry `Summaries` reply to a peer takes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SummaryReplyForm {
+    /// Peer is at or above the hash-first floor: 21-byte digests, bounded and
+    /// rotated by entry COUNT (#5238 — #5155 left this form unbounded because
+    /// it was bounding bytes, and digests are 21 bytes each; what stormed was
+    /// the summarize call each entry costs to produce).
+    Digests,
+    /// Peer is pre-floor, or its version is unknown: full summary bytes,
+    /// bounded and rotated by entry count AND by bytes (#5155).
+    FullBytes,
+}
+
+/// Resolve the reply's wire form ONCE, so the size decision and the encoding
+/// decision cannot disagree.
+///
+/// The caller needs the answer twice — to decide how many entries to build, and
+/// to encode them — and reading the version gate twice would open a window in
+/// which a reconnect changes it in between. The dangerous direction is known ->
+/// unknown: `record_remote_version` writes `None` THROUGH on the
+/// joiner->gateway path (`ring/connection_manager.rs`), clearing the entry, so
+/// a re-read could build the FULL entry set believing it was headed for digests
+/// and then encode it as full bytes. That is precisely the unbounded message
+/// this change removes, reassembled from two correct-looking halves. One read,
+/// threaded through.
+pub(crate) fn summary_reply_form(
+    op_manager: &OpManager,
+    target: std::net::SocketAddr,
+) -> SummaryReplyForm {
     if op_manager
         .ring
         .connection_manager
         .supports_hash_first_summaries(target)
     {
-        crate::config::GlobalTestMetrics::record_summary_digest_msg();
-        InterestMessage::SummaryDigests {
-            entries: entries.iter().map(SummaryDigestEntry::from_entry).collect(),
-            emitter,
-        }
+        SummaryReplyForm::Digests
     } else {
-        full_summaries_message(entries, emitter)
+        SummaryReplyForm::FullBytes
+    }
+}
+
+/// Encode `entries` in an already-resolved [`SummaryReplyForm`].
+///
+/// Split out of [`summaries_reply_for_peer`] so a caller that must know the
+/// form in advance (to bound what it builds) can reuse the one decision rather
+/// than taking a second, possibly different, reading of the gate.
+pub(crate) fn summaries_reply_in_form(
+    form: SummaryReplyForm,
+    entries: Vec<crate::message::SummaryEntry>,
+    emitter: crate::message::SummariesEmitter,
+) -> crate::message::InterestMessage {
+    use crate::message::{InterestMessage, SummaryDigestEntry};
+
+    match form {
+        SummaryReplyForm::Digests => {
+            crate::config::GlobalTestMetrics::record_summary_digest_msg();
+            InterestMessage::SummaryDigests {
+                entries: entries.iter().map(SummaryDigestEntry::from_entry).collect(),
+                emitter,
+            }
+        }
+        SummaryReplyForm::FullBytes => full_summaries_message(entries, emitter),
     }
 }
 
@@ -2830,9 +3502,16 @@ pub(crate) fn full_summaries_message(
 /// IDENTICAL heal path rather than growing a second copy that can drift. The
 /// hash-first exchange must not cost convergence, so there is exactly one
 /// implementation of "we decided this peer is stale, now fix it".
+///
+/// `peer_key` is the stable identity of `source`, carried in solely so the
+/// shadow-mode futile-repair detector can attribute the attempt to the same
+/// (contract, peer) edge the outcome is later observed on
+/// (`crate::ring::futile_repair`). It gates nothing: a `None` here suppresses
+/// only the diagnostic recording, never a heal.
 async fn emit_stale_peer_syncs(
     op_manager: &Arc<OpManager>,
     source: std::net::SocketAddr,
+    peer_key: Option<&crate::ring::interest::PeerKey>,
     mut stale_contracts: Vec<freenet_stdlib::prelude::ContractKey>,
 ) {
     // #3798 Gap 1: cap the number of SyncStateToPeer events emitted per
@@ -2899,6 +3578,17 @@ async fn emit_stale_peer_syncs(
         // the budget — the dropped event is retried next cycle exactly like an
         // over-cap one.
         emitted += 1;
+        // SHADOW MODE (futile-repair detector, `crate::ring::futile_repair`).
+        // Recorded HERE — past the ban and no-local-state gates and inside the
+        // budget — because those three skips mean no repair was sent. Charging
+        // the edge for a heal we never emitted would make the detector measure
+        // our own emit budget rather than whether repair works. Pure
+        // accounting: no gate, no early return, no behaviour change.
+        if let Some(pk) = peer_key {
+            op_manager
+                .interest_manager
+                .record_repair_attempt(&contract, pk);
+        }
         // Fires per stale-peer detection during interest sync, which is
         // dominant on hot contracts. Diagnostic-grade rather than
         // user-actionable; keep accessible via RUST_LOG=…=debug.
@@ -2992,19 +3682,82 @@ async fn handle_interest_sync_message(
             // Find contracts we share interest in
             let matching = op_manager.interest_manager.get_matching_contracts(&hashes);
 
-            // Build summaries for shared contracts and register/refresh peer interest
-            let mut entries = Vec::with_capacity(matching.len());
-            for contract in matching {
-                let hash = contract_hash(&contract);
-                // Only summarize contracts we host or actively serve; phantom
-                // peer-interest contracts (no state, no live subscriber) have
-                // nothing to advertise and their pointless GetSummaryQuery
-                // round-trips were the dominant #4473 storm. See
-                // `summary_if_hosted_or_in_use`.
-                let summary = summary_if_hosted_or_in_use(op_manager, &contract).await;
-                entries.push(SummaryEntry::from_summary(hash, summary.as_ref()));
+            // #5155: resolve the wire form BEFORE building anything, and take
+            // exactly one reading of the version gate (see
+            // `summary_reply_form`). The form still decides the ENCODING and
+            // whether a byte budget applies; since #5238 it no longer decides
+            // WHETHER the reply is bounded — both forms are.
+            let form = summary_reply_form(op_manager, source);
 
-                if let Some(ref pk) = peer_key {
+            // Positions in `matching` whose summaries this reply carries, in
+            // the order they are charged against the caps.
+            //
+            // A bounded window that rotates from where the last reply to this
+            // peer stopped, so successive rounds cover the whole set instead of
+            // re-sending the same prefix forever. The resume point is derived
+            // from the last contract id SENT rather than a stored index, which
+            // is what makes it survive contracts being added and removed
+            // between rounds — see `first_index_after`.
+            //
+            // #5238: the digest path is windowed too. #5155 left it whole
+            // because it was bounding BYTES and a digest is 21 of them, but
+            // every entry of either form costs one `summary_if_hosted_or_in_use`
+            // call to produce, and that call is what stormed. Only the LIMIT
+            // differs by form, and only the full-bytes path additionally
+            // charges a byte budget on top (see the loop below).
+            //
+            // #5338: the cap counts entries that COST a summarize call, and the
+            // window is walked up to `MAX_SUMMARY_ENTRIES_PER_MESSAGE`
+            // candidate positions to fill it. `matching` comes from
+            // `contract_hash_index`, which peer interest registrations populate
+            // as well as our own hosting, so it contains contracts we track but
+            // do NOT host; those return `None` through the in-memory gate
+            // without any contract-handler round trip. Charging them a slot
+            // spent a CPU budget on entries that cost no CPU, so convergence
+            // latency for the contracts we can actually advertise scaled with
+            // `|matching|` while the cost being bounded scaled only with the
+            // hosted subset.
+            let summarize_cap = match form {
+                SummaryReplyForm::Digests => MAX_DIGEST_SUMMARIES_PER_REPLY,
+                SummaryReplyForm::FullBytes => MAX_FALLBACK_SUMMARIES_PER_REPLY,
+            };
+            // #5338: keyed by the peer's stable transport key, not by the
+            // address it happens to be reaching us from. Without a resolvable
+            // key there is no identity to rotate against, so the reply takes a
+            // fresh random offset and records nothing — the same degraded mode
+            // an evicted cursor gets, and it only arises for a source we have
+            // no connection entry for, which is also a source whose interest we
+            // do not register above.
+            let window = {
+                let start = peer_key.as_ref().map_or_else(
+                    || {
+                        if matching.is_empty() {
+                            0
+                        } else {
+                            crate::config::GlobalRng::random_range(0..matching.len())
+                        }
+                    },
+                    |pk| {
+                        op_manager
+                            .interest_manager
+                            .summary_window_start(pk, &matching)
+                    },
+                );
+                crate::ring::interest::rotation_window_indices(
+                    matching.len(),
+                    start,
+                    MAX_SUMMARY_ENTRIES_PER_MESSAGE,
+                )
+            };
+
+            // Register/refresh peer interest for EVERY shared contract, not just
+            // the ones this round summarises. The rotation bounds what we
+            // ADVERTISE; interest bookkeeping decides who is a viable broadcast
+            // target, and rotating it would drop this peer out of the broadcast
+            // set for whatever fell outside the window — turning a bandwidth
+            // bound into missed updates.
+            if let Some(ref pk) = peer_key {
+                for contract in &matching {
                     // Refresh TTL for existing entries (preserves cached summary).
                     // Only register new interest if this is a genuinely new entry;
                     // otherwise register_peer_interest would overwrite the cached
@@ -3016,10 +3769,10 @@ async fn handle_interest_sync_message(
                     // per shared contract per heartbeat, so the clone was not free.
                     if !op_manager
                         .interest_manager
-                        .refresh_peer_interest(&contract, pk)
+                        .refresh_peer_interest(contract, pk)
                     {
                         let is_new = op_manager.interest_manager.register_peer_interest_from(
-                            &contract,
+                            contract,
                             pk.clone(),
                             None, // New entry; summary arrives in their Summaries response
                             false,
@@ -3031,11 +3784,97 @@ async fn handle_interest_sync_message(
                             // any deferred fresh-contract broadcast so a cold-id
                             // PUT that gave up with no targets reaches it.
                             op_manager
-                                .flush_pending_broadcast_on_interest(&contract)
+                                .flush_pending_broadcast_on_interest(contract)
                                 .await;
                         }
                     }
                 }
+            }
+
+            // Build the summaries this reply carries, in rotation order.
+            // Sized to the WINDOW, not the summarize budget: the vec holds the
+            // free entries too, so `summarize_cap` would under-reserve by up to
+            // the ceiling and reallocate mid-reply (#5338 review D).
+            let mut entries = Vec::with_capacity(window.len());
+            let mut summary_bytes_used = 0usize;
+            let mut last_included: Option<ContractInstanceId> = None;
+            // Entries that cost a `summary_if_hosted_or_in_use` round trip.
+            // This — not `entries.len()` — is what the cap bounds (#5338).
+            let mut summarized = 0usize;
+            for &index in &window {
+                // Checked BEFORE the entry rather than after, so the loop stops
+                // on the round trip that would breach the budget instead of
+                // making it first. A free entry never trips it, which is the
+                // whole point; free entries trailing the last charged one are
+                // simply not reached, keeping the message no larger than the
+                // budget needs it to be.
+                if summarized >= summarize_cap {
+                    break;
+                }
+                let contract = matching[index];
+                // #5155 byte budget. The check is RETROSPECTIVE — it asks
+                // whether the budget is already spent, not whether this entry
+                // would breach it — which is what guarantees the first entry
+                // always goes out and a summary larger than the whole budget
+                // cannot stall the rotation behind it. `entries.is_empty()` is
+                // belt-and-braces: the accumulator only grows once an entry is
+                // pushed, so it is implied today, and it is here so that a
+                // future edit charging bytes for skipped entries cannot turn
+                // this into a reply that carries nothing. See
+                // `MAX_FALLBACK_SUMMARY_BYTES_PER_REPLY`.
+                if form == SummaryReplyForm::FullBytes
+                    && !entries.is_empty()
+                    && summary_bytes_used >= MAX_FALLBACK_SUMMARY_BYTES_PER_REPLY
+                {
+                    break;
+                }
+                let hash = contract_hash(&contract);
+                // Only summarize contracts we host or actively serve; phantom
+                // peer-interest contracts (no state, no live subscriber) have
+                // nothing to advertise and their pointless GetSummaryQuery
+                // round-trips were the dominant #4473 storm. See
+                // `summary_if_hosted_or_in_use`.
+                let probe = summary_if_hosted_or_in_use(op_manager, &contract).await;
+                // Charged from the PROBE's own report of what it did, never
+                // re-derived from whether a summary came back: a round trip
+                // that ran and returned nothing cost exactly as much as one
+                // that returned bytes, and must be charged.
+                if probe.summarized {
+                    summarized += 1;
+                }
+                summary_bytes_used += probe.summary.as_ref().map_or(0, |s| s.as_ref().len());
+                entries.push(SummaryEntry::from_summary(hash, probe.summary.as_ref()));
+                last_included = Some(*contract.id());
+            }
+
+            // Advance the rotation to what was actually SENT. A budget cut
+            // short of the selected window must not advance past the entries it
+            // dropped, or they wait a full cycle instead of coming next.
+            //
+            // Two known imprecisions here, both accepted, both costing at most
+            // one cycle of delay for the affected contracts and neither able to
+            // skip one permanently (the window wraps, and a cycle boundary
+            // restarts at a random offset):
+            //
+            // - This advances on send ATTEMPT. The reply is handed to the
+            //   connection afterwards and a send failure is only logged, so a
+            //   dropped reply costs those contracts a cycle. Making it
+            //   delivery-driven would need an ack this exchange does not have.
+            // - Two `Interests` from the same peer handled concurrently both
+            //   read the same start and build the same window, losing one
+            //   round of progress. Reserving the window at read time instead
+            //   would trade that for a worse failure: a budget-cut round would
+            //   then skip everything it did not reach.
+            //
+            // #5238: recorded for BOTH forms now. Under #5155 only the
+            // full-bytes path rotated, so only it had a cursor to advance.
+            //
+            // #5338: recorded against the peer's KEY. Keying this by address
+            // discarded the cursor whenever a NATed peer resumed on a new
+            // source port, which sent that peer's rotation back to a random
+            // offset every reconnect.
+            if let (Some(pk), Some(last)) = (peer_key.as_ref(), last_included) {
+                op_manager.interest_manager.record_summary_cursor(pk, last);
             }
 
             if entries.is_empty() {
@@ -3046,9 +3885,10 @@ async fn handle_interest_sync_message(
                 // is the change #5052 anticipated here: this emitter now sends
                 // DIGESTS to a capable peer, and the tag rides the full-bytes
                 // fallback so the per-emitter rollup keeps attributing it.
-                Some(summaries_reply_for_peer(
-                    op_manager,
-                    source,
+                // #5155 bounds the full-bytes side; `form` is the single gate
+                // reading both that bound and this encoding are taken from.
+                Some(summaries_reply_in_form(
+                    form,
                     entries,
                     SummariesEmitter::InterestsReply,
                 ))
@@ -3087,7 +3927,13 @@ async fn handle_interest_sync_message(
             let mut confirmed_states: Vec<(freenet_stdlib::prelude::ContractKey, String)> =
                 Vec::new();
 
-            if let Some(pk) = peer_key {
+            // Cloned rather than moved so `peer_key` survives for the
+            // `emit_stale_peer_syncs` call below, which needs the peer's stable
+            // identity to attribute the heal to a futile-repair edge. A
+            // `PeerKey` wraps an x25519 `PublicKey` — a 32-byte `Copy` — so
+            // this is a byte copy, not a key operation, and it happens once per
+            // InterestSync message.
+            if let Some(pk) = peer_key.clone() {
                 // Per-message budget for semantic-staleness WASM probes
                 // (`get_state_delta`), spent across ALL entries/contracts in
                 // this Summaries message. Bounds the DoS surface of a peer
@@ -3107,7 +3953,67 @@ async fn handle_interest_sync_message(
                 // never both in one message, and sharing one set would let the
                 // first kind silence the second.
                 let mut one_sided_counted: HashSet<ContractInstanceId> = HashSet::new();
+                // R4b instrument (#5153). THIS is the arm that reads `p`
+                // BACKWARD: a proactive summary notification lands here today as
+                // a single-entry FULL-BYTES `Summaries`, and the loop below
+                // already performs exactly the comparison a 21-byte digest would
+                // have made. So classifying by message shape measures the
+                // notification leg's agreement rate on real production traffic
+                // before R4b ships anything — no wire change, no new variant, no
+                // version gate. See `OutboundMix::record_summary_comparison` for
+                // why shape is the only available discriminator (the emitter tag
+                // is `#[serde(skip)]`) and for the measured contamination.
+                //
+                // Computed BEFORE the loop consumes `entries`, and before the
+                // #5238 truncation below, so it classifies the length of the
+                // message the peer actually sent rather than the windowed
+                // remainder. Same expression as the `SummaryDigests` arm's, so
+                // the two legs stay comparable.
+                let single_entry = entries.len() == 1;
+
+                // #5238: bound this leg too. It is the full-bytes twin of the
+                // `SummaryDigests` arm and pays the same per-entry summarize
+                // cost, with neither that arm's per-message memo nor its pair
+                // dedup, so it was the cheapest remaining path in the family
+                // once the other three were bounded — the same argument the
+                // `SummaryRequest` arm records.
+                //
+                // It never binds on a peer running #5155 or later: an
+                // `InterestsReply` fallback is capped at
+                // `MAX_FALLBACK_SUMMARIES_PER_REPLY` entries and a
+                // `SummaryRequestReply` answers a request we ourselves capped
+                // at `MAX_SUMMARY_COMPARISONS_PER_MESSAGE`. Random offset
+                // rather than a prefix, for the tail-starvation reason the
+                // sibling arms document.
+                //
+                // #5338: the ENTRY ceiling and the SUMMARIZE budget are two
+                // different numbers now, for the reason the `SummaryDigests`
+                // arm states at length — an entry carrying no summary bytes
+                // reaches the `_ => false` staleness arm and a
+                // `clear_peer_summary` without our summary being needed, so it
+                // costs no round trip and must not be charged one.
+                let mut entries = entries;
+                if entries.len() > MAX_SUMMARY_ENTRIES_PER_MESSAGE {
+                    let start = crate::config::GlobalRng::random_range(0..entries.len());
+                    entries.rotate_left(start);
+                    entries.truncate(MAX_SUMMARY_ENTRIES_PER_MESSAGE);
+                }
+                // Charged per ENTRY rather than per contract, as the pre-#5338
+                // cap was: a hash collision makes one entry fetch for several
+                // contracts, so this is the same slight under-count it always
+                // had, bounded by the collision rate rather than by anything a
+                // peer chooses.
+                let mut charged = 0usize;
                 for entry in entries {
+                    let costs_a_summarize = entry.summary_bytes.is_some();
+                    if costs_a_summarize {
+                        if charged >= MAX_SUMMARY_COMPARISONS_PER_MESSAGE {
+                            // See the sibling arm: free entries past the budget
+                            // still carry their repair and still cost nothing.
+                            continue;
+                        }
+                        charged += 1;
+                    }
                     for contract in op_manager.interest_manager.lookup_by_hash(entry.hash) {
                         if !op_manager.interest_manager.has_local_interest(&contract) {
                             continue;
@@ -3120,7 +4026,23 @@ async fn handle_interest_sync_message(
                         // has nothing to advertise and no subscriber whose stale
                         // copy we'd heal: `our_summary` is None → not stale → no
                         // SyncStateToPeer, while the loop round-trip is avoided.
-                        let our_summary = summary_if_hosted_or_in_use(op_manager, &contract).await;
+                        //
+                        // #5338: skipped outright when the peer sent no summary
+                        // bytes — the comparison below cannot reach a two-sided
+                        // arm, so our summary could only ever have been
+                        // discarded. `emit_confirmed` (simulation only) keeps
+                        // paying it so the convergence checker still receives a
+                        // `StateConfirmed` for these contracts — see the
+                        // `SummaryDigests` twin for the consumer chain, the
+                        // vacuous-pass failure mode it prevents, and why a
+                        // search for the variant name wrongly reports it unused.
+                        let our_summary = if costs_a_summarize || emit_confirmed {
+                            summary_if_hosted_or_in_use(op_manager, &contract)
+                                .await
+                                .summary
+                        } else {
+                            None
+                        };
 
                         if emit_confirmed {
                             if let Some(ref summary) = our_summary {
@@ -3140,6 +4062,17 @@ async fn handle_interest_sync_message(
                         // differ byte-wise; ask the contract itself whether we
                         // hold state the peer lacks. See
                         // `summary_indicates_stale_peer`.
+                        // SHADOW MODE (futile-repair detector). What the
+                        // `is_stale` below actually RESTS ON. `is_stale` is the
+                        // right heal decision in all three cases, but only one
+                        // of them is evidence about convergence: the other two
+                        // default to stale with nothing behind them, and their
+                        // frequency grows with peer breadth and node load
+                        // rather than with brokenness. Tracked alongside rather
+                        // than re-derived afterwards, because only the branch
+                        // that TOOK the default knows it took one. See
+                        // `crate::ring::futile_repair::OutcomeEvidence`.
+                        let mut evidence = crate::ring::futile_repair::OutcomeEvidence::Verdict;
                         let is_stale = match (our_summary.as_ref(), their_summary.as_ref()) {
                             (Some(ours), Some(theirs)) => {
                                 let identical = ours.as_ref() == theirs.as_ref();
@@ -3164,6 +4097,8 @@ async fn handle_interest_sync_message(
                                     contract.id(),
                                     ours.as_ref(),
                                     theirs.as_ref(),
+                                    crate::node::network_bridge::outbound_message_mix::
+                                        SummaryObservation::full_bytes(single_entry),
                                     &mut compared_contracts,
                                 );
                                 let delta_verdict = if identical {
@@ -3186,12 +4121,22 @@ async fn handle_interest_sync_message(
                                         }
                                         StalenessProbeAction::RunProbe => {
                                             staleness_probes_used += 1;
-                                            op_manager
+                                            let verdict = op_manager
                                                 .interest_manager
                                                 .peer_summary_has_pending_state(
                                                     op_manager, &contract, theirs, ours,
                                                 )
-                                                .await
+                                                .await;
+                                            if verdict.is_none() {
+                                                // The probe ran and produced no
+                                                // answer (delta error, timeout,
+                                                // unexpected response), so the
+                                                // byte-compare default below is
+                                                // not a convergence verdict.
+                                                evidence = crate::ring::futile_repair::
+                                                    OutcomeEvidence::ProbeUnavailable;
+                                            }
+                                            verdict
                                         }
                                         StalenessProbeAction::BudgetExhaustedFallBack => {
                                             // Budget spent for this message: fall
@@ -3201,6 +4146,15 @@ async fn handle_interest_sync_message(
                                             // Re-evaluated next heartbeat once the
                                             // cache warms. `None` => byte-compare in
                                             // `summary_indicates_stale_peer`.
+                                            //
+                                            // This is the load-correlated channel:
+                                            // everything past the 32-probe budget
+                                            // reads as stale every round with no
+                                            // divergence at all, so it must never
+                                            // reach the futile-repair detector as a
+                                            // verdict.
+                                            evidence = crate::ring::futile_repair::
+                                                OutcomeEvidence::ProbeBudgetExhausted;
                                             None
                                         }
                                     }
@@ -3224,12 +4178,36 @@ async fn handle_interest_sync_message(
                             (None, Some(_)) => {
                                 op_manager.outbound_mix.record_summary_one_sided(
                                     contract.id(),
+                                    crate::node::network_bridge::outbound_message_mix::
+                                        SummaryObservation::full_bytes(single_entry),
                                     &mut one_sided_counted,
                                 );
                                 false
                             }
                             _ => false,
                         };
+
+                        // SHADOW MODE (futile-repair detector,
+                        // `crate::ring::futile_repair`). This is the OUTCOME
+                        // observation: a two-sided comparison — both sides
+                        // reported a real summary — that settles whatever heal
+                        // we last sent on this edge. Gated on two-sidedness
+                        // because a one-sided comparison is not a verdict about
+                        // convergence; the `(None, Some(_))` and `_` arms above
+                        // return `false` for "no basis to heal", not for
+                        // "agreed", and feeding that in would score every
+                        // contract we don't host as a successful repair.
+                        //
+                        // Passing `!is_stale` rather than a constant is the
+                        // whole detector: it is what separates a repair that
+                        // failed to converge from one that worked. `evidence`
+                        // is what keeps the two conservative defaults out of
+                        // that number. Pure accounting, no behaviour change.
+                        if our_summary.is_some() && their_summary.is_some() {
+                            op_manager
+                                .interest_manager
+                                .record_repair_outcome(&contract, &pk, !is_stale, evidence);
+                        }
 
                         // #4952: upsert (not update) when the peer reported a
                         // real summary, so the ~5-min anti-entropy exchange can
@@ -3286,7 +4264,7 @@ async fn handle_interest_sync_message(
             // many peers reported mismatches within the same heartbeat cycle.
             // The bounded, targeted emission lives in `emit_stale_peer_syncs`,
             // shared verbatim with the `SummaryDigests` arm.
-            emit_stale_peer_syncs(op_manager, source, stale_contracts).await;
+            emit_stale_peer_syncs(op_manager, source, peer_key.as_ref(), stale_contracts).await;
 
             // Emit deferred StateConfirmed telemetry so the convergence
             // checker has up-to-date state hashes for CRDT-merged state.
@@ -3339,8 +4317,16 @@ async fn handle_interest_sync_message(
             // therefore costs one extra round trip (sub-second) against a
             // ~5-min heartbeat, and is never silently dropped. If the request
             // or its answer IS lost, the contract simply stays diverged until
-            // the next heartbeat re-advertises it — the same outcome a lost
+            // a later heartbeat re-advertises it — the same outcome a lost
             // `Summaries` has today, not a new failure mode.
+            //
+            // #5238 made "a later heartbeat" materially later: the reply is
+            // windowed, so re-advertisement takes up to `ceil(shared / 64)`
+            // rounds rather than the very next one — on the order of an hour
+            // for a peer sharing the whole of a 933-contract hosted set,
+            // against 5 minutes before. Still bounded, still not a new failure
+            // mode, but this sentence used to lean on a latency it no longer
+            // has, so read it with that number rather than the old one.
             //
             // Telemetry note: the #4965 identical/differing counters are
             // recorded on AGREEMENT here and on ARRIVAL of the requested bytes
@@ -3356,29 +4342,77 @@ async fn handle_interest_sync_message(
                 Vec::new();
             let mut request_hashes: Vec<u32> = Vec::new();
 
-            if let Some(pk) = peer_key {
-                // See `MAX_SUMMARY_HASHES_PER_MESSAGE`: entries are
+            // Cloned rather than moved so `peer_key` survives for the
+            // `emit_stale_peer_syncs` call below, which needs the peer's stable
+            // identity to attribute the heal to a futile-repair edge. A
+            // `PeerKey` wraps an x25519 `PublicKey` — a 32-byte `Copy` — so
+            // this is a byte copy, not a key operation, and it happens once per
+            // InterestSync message.
+            if let Some(pk) = peer_key.clone() {
+                // See `MAX_SUMMARY_COMPARISONS_PER_MESSAGE`: entries are
                 // peer-supplied and cheap for the peer to fabricate, so
                 // deduplicate by hash and process a bounded window. The window
                 // starts at a random offset when the cap binds, for the same
                 // starvation reason `emit_stale_peer_syncs` rotates — a
                 // sender's entries arrive in contract-id order, so a fixed
                 // prefix would starve the tail on every cycle forever.
+                //
+                // #5238: this cap was `MAX_SUMMARY_HASHES_PER_MESSAGE` (4096),
+                // which bounds the MESSAGE but not the WORK — each entry costs
+                // a `summary_if_hosted_or_in_use` call below, so a routine
+                // heartbeat from a peer sharing hundreds of contracts ran
+                // hundreds of them. This is the receiving half of the same
+                // storm the send-side window closes; both legs of one
+                // round-trip pay it independently.
+                //
+                // #5338: the ceiling that bounds the ENTRY count is now
+                // `MAX_SUMMARY_ENTRIES_PER_MESSAGE`, and
+                // `MAX_SUMMARY_COMPARISONS_PER_MESSAGE` bounds only the
+                // entries that cost us a summarize (below). An entry whose
+                // digest is `None` is settled by
+                // `classify_summary_digest`'s `(_, None)` arm without
+                // consulting our summary at all, so it costs no round trip
+                // and charging it one was bounding the wrong thing —
+                // symmetrically with the send leg, whose replies since #5338
+                // may carry free entries past the summarize budget. Sized to
+                // match the send ceiling exactly, so an upgraded peer's reply
+                // is never truncated here.
                 let mut entries = entries;
-                if entries.len() > MAX_SUMMARY_HASHES_PER_MESSAGE {
+                if entries.len() > MAX_SUMMARY_ENTRIES_PER_MESSAGE {
                     let start = crate::config::GlobalRng::random_range(0..entries.len());
                     entries.rotate_left(start);
+                    entries.truncate(MAX_SUMMARY_ENTRIES_PER_MESSAGE);
                 }
-                // #4965 agreement-rate proxy: single-entry messages come
-                // from the state-change-driven send sites (proactive
-                // notification, rejection summary-back) by construction, while
-                // the heartbeat / interest-churn replies are multi-entry. The
-                // emitter tag is non-wire so the receiver cannot read it; this
-                // is the closest available discriminator. Reads `entries.len()`
-                // — the length of the message the peer actually SENT. The
-                // rotation above reorders but never shortens, and the cap
-                // applies to the processing window rather than to this count,
-                // so a capped message is still classified by its true size.
+                // #4965 agreement-rate proxy: the state-change-driven send
+                // sites (proactive notification, rejection summary-back) are
+                // single-entry by construction, and only `InterestsReply` (the
+                // ~5-min heartbeat) is genuinely multi-entry. The emitter tag
+                // is non-wire so the receiver cannot read it; this is the
+                // closest available discriminator.
+                //
+                // It is a CONTAMINATED discriminator, and on THIS arm — the
+                // digest leg — the contamination is the whole population.
+                // `ChangeInterestsReply` is single-entry 100% of the time
+                // (measured mean exactly 1.000, `max_entries` 1, over 418,476
+                // messages on 1,284 peers; corroborated in two further
+                // windows), because `broadcast_change_interests` gossips one
+                // contract per message. It is ALSO version-gated to digests and
+                // the fleet is past the floor, so 95-99% of its sends arrive
+                // here. Meanwhile a notification ships full bytes
+                // unconditionally (`send_proactive_summary_notification`), so a
+                // single-entry observation on the digest leg is churn-leg BY
+                // CONSTRUCTION and is not the R4b population at all — which is
+                // why `SummaryObservation::digest` keeps it in separate buckets
+                // rather than folding it into `*_single`. Do not read this flag
+                // here as "this was a notification"; it is not, today.
+                //
+                // Reads `entries.len()` AFTER the ceiling above, which since
+                // #5338 both reorders and truncates. For any message at or under
+                // the ceiling — every message from a peer running this release —
+                // that is the length the peer actually sent. An over-ceiling
+                // message is classified by the truncated length instead, which
+                // only affects the `single_entry` flag, and a message long
+                // enough to be truncated is not single-entry either way.
                 let single_entry = entries.len() == 1;
                 // Dedup on the (hash, digest) PAIR, not on the hash alone.
                 //
@@ -3443,8 +4477,14 @@ async fn handle_interest_sync_message(
                 > = std::collections::HashMap::new();
                 let mut cached_for_hash: Option<u32> = None;
                 let mut compared_contracts: HashSet<ContractInstanceId> = HashSet::new();
-                // See the sibling set in the `Summaries` arm.
-                let mut one_sided_counted: HashSet<ContractInstanceId> = HashSet::new();
+                // No `one_sided_counted` set here, unlike the `Summaries` arm:
+                // this arm no longer records one-sided observations at all
+                // (#5153 review F2 — it double-counted against the full-bytes
+                // reply that follows). Its absence is a nudge, NOT a guard: a
+                // re-added recording could pass `&mut HashSet::new()` as a
+                // temporary and compile fine. The actual guard is the test
+                // `digest_arm_records_no_one_sided_observation`, which fails if
+                // this arm regains a one-sided call.
                 // WIRE-ORDER INDEPENDENCE — the invariant this grouping exists
                 // to establish.
                 //
@@ -3472,15 +4512,31 @@ async fn handle_interest_sync_message(
                 // them, it removes the ordering freedom they were being asked to
                 // absorb.
                 let mut bounded: Vec<crate::message::SummaryDigestEntry> = Vec::new();
+                // Distinct PAIRS that cost a summarize, matching what is
+                // actually paid for — counting distinct hashes would no longer
+                // bound the work now that several pairs can share a hash, and
+                // counting ENTRIES would charge the free ones (#5338).
+                let mut charged = 0usize;
                 for entry in entries {
-                    // The cap counts distinct PAIRS, matching what is actually
-                    // processed — counting distinct hashes would no longer
-                    // bound the work now that several pairs can share a hash.
-                    if seen_pairs.len() >= MAX_SUMMARY_HASHES_PER_MESSAGE {
-                        break;
+                    // Whether this entry can make us summarize, decided from
+                    // the entry itself: an absent digest is settled by
+                    // `classify_summary_digest` without our summary, so the
+                    // fetch below is skipped for it. That makes this an upper
+                    // bound on the round trips — never an under-count, which is
+                    // the direction a budget has to err in.
+                    let costs_a_summarize = entry.summary_digest.is_some();
+                    if costs_a_summarize && charged >= MAX_SUMMARY_COMPARISONS_PER_MESSAGE {
+                        // `continue`, not `break`: the free entries after this
+                        // point still cost nothing and still carry a real
+                        // repair (`clear_peer_summary`), so dropping them would
+                        // discard information for no saving.
+                        continue;
                     }
                     if !seen_pairs.insert((entry.hash, entry.summary_digest)) {
                         continue;
+                    }
+                    if costs_a_summarize {
+                        charged += 1;
                     }
                     bounded.push(entry);
                 }
@@ -3531,17 +4587,57 @@ async fn handle_interest_sync_message(
                         // value cannot change while this handler runs, and
                         // re-fetching per pair is the amplification the pair
                         // dedup would otherwise open.
-                        if !local_summaries.contains_key(contract.id()) {
-                            let fetched = summary_if_hosted_or_in_use(op_manager, &contract).await;
-                            local_summaries.insert(*contract.id(), fetched);
-                            crate::config::GlobalTestMetrics::note_summary_cache_size(
-                                local_summaries.len(),
-                            );
-                        }
-                        let our_summary = local_summaries
-                            .get(contract.id())
-                            .expect("just inserted")
-                            .clone();
+                        //
+                        // #5338: skipped entirely when the peer advertised no
+                        // digest. `classify_summary_digest` settles `(_, None)`
+                        // as `PeerHasNoState` whatever our summary is, so the
+                        // round trip could not change the verdict — it was pure
+                        // cost, and it is what made a free entry expensive for
+                        // the RECEIVER even though it was free for the sender.
+                        // `emit_confirmed` (SIMULATION ONLY) keeps paying it,
+                        // and that exception is load-bearing rather than
+                        // decorative. `StateConfirmed` feeds the convergence
+                        // checker through `EventKind::stored_state_hash()`,
+                        // which `SimNetwork::check_convergence` and
+                        // `check_convergence_from_logs` fold into a
+                        // per-(peer, contract) latest-state map, and the direct
+                        // runner enables this flag for EVERY simulation. Drop
+                        // the exception and a peer's recorded hash goes stale
+                        // (false divergence, flaky red) or the peer leaves
+                        // `contract_states` entirely, taking the contract below
+                        // the two-peer threshold the check needs — which skips
+                        // it silently and passes VACUOUSLY. That second failure
+                        // mode is why this stays: it makes the suite report
+                        // success while checking less.
+                        //
+                        // #5338 removed this exception once, on a search for the
+                        // literal `StateConfirmed` at the consumers. The
+                        // consumption is through a generic accessor, so the
+                        // string does not appear there and the search found
+                        // nothing. Trace `stored_state_hash()`, not the variant
+                        // name, before concluding this is unused.
+                        //
+                        // The cost is stated at
+                        // `MAX_SUMMARY_COMPARISONS_PER_MESSAGE`: under this flag
+                        // the receive leg's round trips are bounded by
+                        // `MAX_SUMMARY_ENTRIES_PER_MESSAGE` instead.
+                        let needs_our_summary = entry.summary_digest.is_some() || emit_confirmed;
+                        let our_summary = if needs_our_summary {
+                            if !local_summaries.contains_key(contract.id()) {
+                                let fetched =
+                                    summary_if_hosted_or_in_use(op_manager, &contract).await;
+                                local_summaries.insert(*contract.id(), fetched.summary);
+                                crate::config::GlobalTestMetrics::note_summary_cache_size(
+                                    local_summaries.len(),
+                                );
+                            }
+                            local_summaries
+                                .get(contract.id())
+                                .expect("just inserted")
+                                .clone()
+                        } else {
+                            None
+                        };
 
                         if emit_confirmed {
                             if let Some(ref summary) = our_summary {
@@ -3564,6 +4660,15 @@ async fn handle_interest_sync_message(
                                     contract.id(),
                                     ours.as_ref(),
                                     ours.as_ref(),
+                                    // DIGEST leg, deliberately a separate bucket
+                                    // from the full-bytes one: a notification
+                                    // ships full bytes unconditionally today, so
+                                    // a single-entry observation arriving here is
+                                    // churn-leg by construction and is NOT part
+                                    // of the population R4b's `p` is about
+                                    // (#5153 review F1).
+                                    crate::node::network_bridge::outbound_message_mix::
+                                        SummaryObservation::digest(single_entry),
                                     &mut compared_contracts,
                                 );
                                 crate::config::GlobalTestMetrics::record_summary_digest_agreement(
@@ -3576,6 +4681,29 @@ async fn handle_interest_sync_message(
                                 // `SummaryEntry` takes today.
                                 let is_stale = crate::ring::interest::summary_indicates_stale_peer(
                                     &ours, &ours, None,
+                                );
+                                // SHADOW MODE (futile-repair detector,
+                                // `crate::ring::futile_repair`). Two-sided by
+                                // construction: the digest PROVED the peer's
+                                // summary bytes are ours, so this settles an
+                                // outstanding heal on the edge exactly as the
+                                // `Summaries` arm does. `NeedBytes` deliberately
+                                // records nothing — it defers to the full-bytes
+                                // `Summaries` reply, which observes there, so
+                                // one divergence is never counted twice.
+                                //
+                                // Evidence is `Verdict` by construction and NOT
+                                // a shortcut: `summary_indicates_stale_peer` is
+                                // called on byte-identical operands here, which
+                                // short-circuits before any delta probe, so no
+                                // probe budget is consulted and no default can
+                                // be taken. Pure accounting, no behaviour
+                                // change.
+                                op_manager.interest_manager.record_repair_outcome(
+                                    &contract,
+                                    &pk,
+                                    !is_stale,
+                                    crate::ring::futile_repair::OutcomeEvidence::Verdict,
                                 );
                                 // #4952: seed the peer-summary cache so an
                                 // advertised co-host does not stay a
@@ -3609,19 +4737,68 @@ async fn handle_interest_sync_message(
                                 crate::config::GlobalTestMetrics::record_summary_digest_mismatch(
                                     single_entry,
                                 );
-                                // #4965 review S2: separate "we hold nothing,
-                                // they do" from a genuine digest disagreement.
-                                // Only the former sat outside the 98.1%
-                                // denominator, and it is the one costing +2
-                                // messages for bytes the full-bytes path
-                                // shipped immediately (and used to seed our
-                                // peer-summary cache).
-                                if our_summary.is_none() {
-                                    op_manager.outbound_mix.record_summary_one_sided(
-                                        contract.id(),
-                                        &mut one_sided_counted,
-                                    );
-                                }
+                                // R4b instrument (#5153): a genuine digest
+                                // disagreement deliberately does NOT record a
+                                // `summary_entries_differing` here, on either the
+                                // total or the single-entry bucket. It defers to
+                                // the full-bytes `Summaries` reply that the
+                                // `SummaryRequest` below provokes, which observes
+                                // it in the other arm — recording here as well
+                                // would count one divergence twice and inflate
+                                // exactly the denominator `p` is computed
+                                // against. Continuity across R4b is preserved
+                                // rather than lost: the reply carries one entry
+                                // per requested hash, so a single-entry digest
+                                // mismatch produces a single-entry reply and
+                                // classifies the same way on arrival.
+                                //
+                                // ACCEPTED BIAS: if the `SummaryRequest` or its
+                                // reply is DROPPED, this divergence is never
+                                // recorded anywhere, so it pushes `p` UP by the
+                                // loss rate on one round trip. Double-counting
+                                // would be plain wrong arithmetic, so the
+                                // deferral stays.
+                                //
+                                // This is NOT the only bias and `p` is NOT a
+                                // ceiling — an earlier revision of this comment
+                                // said it was. The contamination term runs the
+                                // other way and is larger: a single-entry
+                                // `SummaryRequestReply` is differing by
+                                // construction, so it inflates the denominator.
+                                // See `OutboundMix::record_summary_comparison`
+                                // and `notification_share_bounds` for both terms
+                                // and why `p` must be quoted as an interval.
+                                //
+                                // Also not shape-preserving under hash collision:
+                                // if two locally-known contracts share one 32-bit
+                                // FNV-1a hash, the reply carries TWO entries and
+                                // classifies as `MultiEntry`, so the deferred
+                                // observation reaches no single-entry bucket at
+                                // all. Rare, and it removes rather than
+                                // fabricates, but it is a third small downward
+                                // path on the single-entry counters.
+                                // #5153 review F2 — the one-sided recording that
+                                // used to live here is REMOVED, not moved.
+                                //
+                                // It fired when `our_summary.is_none()` and then
+                                // set `needs_bytes`, so the bytes were requested
+                                // and the full-bytes `Summaries` arm observed the
+                                // SAME contract again on its `(None, Some(_))`
+                                // branch. Two different messages with two
+                                // different per-message dedup sets, so nothing
+                                // suppressed the repeat: one divergence, counted
+                                // twice. That directly contradicted the
+                                // no-double-count property this arm's `differing`
+                                // deferral is built on, and it inflated
+                                // `summary_entries_one_sided_single`, which is
+                                // presented as an R4b cost input.
+                                //
+                                // The full-bytes arm still records it, so nothing
+                                // is lost: `our_summary` is None there too, so
+                                // the reply takes `(None, Some(_))` and counts
+                                // exactly once. One-sided now defers exactly as
+                                // `differing` already did — consistently, rather
+                                // than one of the two.
                                 needs_bytes = true;
                             }
                         }
@@ -3644,7 +4821,7 @@ async fn handle_interest_sync_message(
             // sub-second RTT is not a convergence risk, but it is a real
             // regression in heal LATENCY on the legs that ship digests, and it
             // is the price of not shipping the summary every cycle.
-            emit_stale_peer_syncs(op_manager, source, stale_contracts).await;
+            emit_stale_peer_syncs(op_manager, source, peer_key.as_ref(), stale_contracts).await;
 
             // A contract on the mismatch path is confirmed TWICE: once here,
             // once again when the requested bytes arrive at the `Summaries`
@@ -3714,24 +4891,39 @@ async fn handle_interest_sync_message(
             // already track can be named) and the same
             // `summary_if_hosted_or_in_use` gate. Unlike the `Interests` arm
             // this registers no interest and removes none — a request is not
-            // an interest advertisement. Bounded by
-            // `MAX_SUMMARY_HASHES_PER_MESSAGE` on the input so a peer cannot
-            // name an arbitrarily long hash list.
+            // an interest advertisement. `MAX_SUMMARY_HASHES_PER_MESSAGE`
+            // bounds the input so a peer cannot name an arbitrarily long hash
+            // list.
             //
-            // No separate rate limit, deliberately: a peer that wanted to
-            // force this work could already do so by spamming `Interests`,
-            // which runs the identical `get_matching_contracts` +
-            // `summary_if_hosted_or_in_use` loop AND additionally rewrites its
-            // interest registrations. This arm is strictly the cheaper of the
-            // two, so it adds no amplification surface that is not already
-            // reachable — and the summaries themselves are memoized on the
-            // state hash, so repeats do not re-enter WASM.
+            // #5238: this arm now ALSO bounds the summarize loop itself, and
+            // the reason is a consequence of that change rather than a new
+            // policy. The previous justification for leaving it unbounded was
+            // that "a peer could already force the same work by spamming
+            // `Interests`, which runs the same loop" — true while the
+            // `Interests` arm gave a digest-capable peer an unwindowed loop.
+            // Now that BOTH forms of `Interests` are windowed, that arm is
+            // strictly cheaper than this one, so leaving this one unbounded
+            // would leave behind an amplification path easier than the one
+            // being closed. Bounding it costs nothing in practice: a requester
+            // running this release compares at most
+            // `MAX_SUMMARY_COMPARISONS_PER_MESSAGE` entries, so it can never
+            // ask for more hashes than this cap allows, and anything a
+            // pre-upgrade peer asks for beyond it is re-requested from its next
+            // heartbeat's digest comparison. Random offset, not a prefix, for
+            // the tail-starvation reason the sibling arms document.
             let bounded = &hashes[..hashes.len().min(MAX_SUMMARY_HASHES_PER_MESSAGE)];
-            let matching = op_manager.interest_manager.get_matching_contracts(bounded);
+            let mut matching = op_manager.interest_manager.get_matching_contracts(bounded);
+            if matching.len() > MAX_SUMMARY_COMPARISONS_PER_MESSAGE {
+                let start = crate::config::GlobalRng::random_range(0..matching.len());
+                matching.rotate_left(start);
+                matching.truncate(MAX_SUMMARY_COMPARISONS_PER_MESSAGE);
+            }
             let mut entries = Vec::with_capacity(matching.len());
             for contract in matching {
                 let hash = contract_hash(&contract);
-                let summary = summary_if_hosted_or_in_use(op_manager, &contract).await;
+                let summary = summary_if_hosted_or_in_use(op_manager, &contract)
+                    .await
+                    .summary;
                 entries.push(SummaryEntry::from_summary(hash, summary.as_ref()));
             }
 
@@ -3776,7 +4968,41 @@ async fn handle_interest_sync_message(
             // Handle additions - respond with summaries for newly shared contracts
             let mut entries = Vec::new();
             if let Some(ref pk) = peer_key {
+                // #5238: deduplicate the peer-supplied hash list before doing
+                // any work.
+                //
+                // This arm is deliberately NOT windowed — it is driven by
+                // interest churn rather than by a clock, so there is no
+                // guaranteed next round to rotate into and a window could defer
+                // a newly-added interest indefinitely rather than by a bounded
+                // number of heartbeats. That argument is recorded at the arm
+                // below and it still stands.
+                //
+                // It is an argument against ROTATION, not against DEDUP, and
+                // the two are not the same trade. A rotation window can drop a
+                // new interest; a dedup set cannot, because the second and
+                // later copies of a hash carry no information the first did not
+                // already deliver. So dedup is free here in exactly the way a
+                // window is not.
+                //
+                // It is worth doing because bounding the other four loops makes
+                // THIS the cheapest amplification path in the family: `added`
+                // is peer-supplied and uncapped, and every entry costs one
+                // `summary_if_hosted_or_in_use` round trip that re-enters WASM
+                // on a memo miss, sequentially on the handler. Leaving it would
+                // repeat #5155's mistake one level up — bound the paths you
+                // measured and leave the equivalent one you did not.
+                //
+                // Note this bounds work by DISTINCT hash, not by message size.
+                // A peer naming many genuinely-distinct new interests still
+                // costs one round trip each, by design: those are real
+                // additions and dropping them is the failure mode the missing
+                // window is avoiding.
+                let mut seen_added: HashSet<u32> = HashSet::new();
                 for hash in added {
+                    if !seen_added.insert(hash) {
+                        continue;
+                    }
                     // Handle hash collisions - process all matching contracts
                     for contract in op_manager.interest_manager.lookup_by_hash(hash) {
                         // Only process if we have local interest in this contract
@@ -3842,7 +5068,22 @@ async fn handle_interest_sync_message(
                         // Get our summary to send back — only for contracts we
                         // host or actively serve (see `summary_if_hosted_or_in_use`,
                         // #4473).
-                        let summary = summary_if_hosted_or_in_use(op_manager, &contract).await;
+                        //
+                        // #5238 bounded every OTHER summarize loop in this
+                        // handler and deliberately left this one alone, for
+                        // #5155's reason: this arm is driven by interest CHURN,
+                        // not by a clock, so there is no guaranteed next round
+                        // to rotate into and a window here could defer a
+                        // newly-added interest indefinitely rather than by a
+                        // bounded number of heartbeats. Production emits
+                        // `ChangeInterests` on a 0->1 transition, so `added` is
+                        // normally one hash. A peer CAN name many at once, and
+                        // that is the residual of this family; bounding it
+                        // needs a mechanism that cannot drop a new interest,
+                        // not the rotation the periodic arms use.
+                        let summary = summary_if_hosted_or_in_use(op_manager, &contract)
+                            .await
+                            .summary;
                         entries.push(SummaryEntry::from_summary(hash, summary.as_ref()));
                     }
                 }
@@ -3851,11 +5092,20 @@ async fn handle_interest_sync_message(
             if entries.is_empty() {
                 None
             } else {
-                // #5052: also multi-entry and also built by
-                // `summary_if_hosted_or_in_use`, but driven by interest CHURN
-                // rather than the heartbeat clock — a peer joining or dropping
-                // interest, not a periodic tick. Same bytes, a different thing
-                // to fix if it is the large one.
+                // #5052: also built by `summary_if_hosted_or_in_use`, but driven
+                // by interest CHURN rather than the heartbeat clock — a peer
+                // joining or dropping interest, not a periodic tick. A different
+                // thing to fix if it is the large one.
+                //
+                // SINGLE-entry, unlike the `InterestsReply` above — corrected
+                // 2026-08-12 (#5153 review F1), where this said "also
+                // multi-entry". `broadcast_change_interests` gossips one contract
+                // per message, so the `entries` built above carries exactly one:
+                // measured mean 1.000, `max_entries` 1, over 418,476 messages on
+                // 1,284 peers. Load-bearing rather than trivia — the R4b
+                // agreement-rate instrument cannot read the emitter tag and uses
+                // message LENGTH as its proxy for "this was a notification", so
+                // this arm is that proxy's largest contaminant.
                 Some(summaries_reply_for_peer(
                     op_manager,
                     source,
@@ -4374,14 +5624,61 @@ async fn get_contract_summary(
 async fn summary_if_hosted_or_in_use(
     op_manager: &Arc<OpManager>,
     key: &freenet_stdlib::prelude::ContractKey,
-) -> Option<freenet_stdlib::prelude::StateSummary<'static>> {
+) -> SummaryProbe {
     if op_manager.ring.should_summarize_or_broadcast(key) {
         // Periodic interest-sync summarize: best-effort background work, so it
         // yields the contract loop to client/relay traffic (#4534 / #4473).
-        get_contract_summary(op_manager, key, crate::contract::Priority::Background).await
+        SummaryProbe {
+            summary: get_contract_summary(op_manager, key, crate::contract::Priority::Background)
+                .await,
+            summarized: true,
+        }
     } else {
-        None
+        SummaryProbe {
+            summary: None,
+            summarized: false,
+        }
     }
+}
+
+/// What one [`summary_if_hosted_or_in_use`] call produced, together with
+/// whether it actually paid for it.
+///
+/// The two are reported together on purpose (#5338). The rotation window exists
+/// to bound the number of contract-handler round trips a reply makes, so its
+/// budget must be charged by the code that decides whether to make one — not
+/// re-derived by the caller from `summary.is_none()`, which conflates "the gate
+/// declined, nothing was spent" with "the round trip ran and came back empty".
+/// See the "metric describing a filtering decision" entry in
+/// `.claude/rules/bug-prevention-patterns.md` for the general shape and the
+/// three wrong counts it produced last time.
+///
+/// For the population this matters for — a contract we track only because a
+/// peer registered interest in it — the gate really is pure in-memory work:
+/// `should_summarize_or_broadcast` is
+/// `(is_hosting_contract || contract_in_use) && contract_state_present`, and
+/// `&&` short-circuits, so a contract that is neither hosted nor in use never
+/// reaches the state-store lookup at all. It costs two map reads.
+///
+/// The one declining class that DOES pay a state-store point lookup is the
+/// hosted-or-in-use contract with no stored state — the #4610 phantom — which
+/// is a small population by construction and still makes no contract-handler
+/// round trip and runs no WASM, which is the cost the budget is sized against.
+///
+/// This paragraph is load-bearing for anyone retuning
+/// [`MAX_SUMMARY_ENTRIES_PER_MESSAGE`], which is why it is stated precisely
+/// rather than hedged. An earlier version of it claimed the gate was "not
+/// literally free" because of that state-store lookup, without noting the
+/// short-circuit — and a comment that overstates what walking past a free entry
+/// costs is an invitation to tighten the ceiling in order to buy back a cost
+/// that is not there. The costs that ceiling really rations are on the RECEIVE
+/// side and on the wire; see the constant.
+struct SummaryProbe {
+    /// Our summary. Absent when the gate declined OR when the round trip ran
+    /// and produced nothing; `summarized` is what tells those apart.
+    summary: Option<freenet_stdlib::prelude::StateSummary<'static>>,
+    /// Whether the contract-handler round trip actually ran.
+    summarized: bool,
 }
 
 /// Get the PeerKey for a socket address.
@@ -4515,6 +5812,7 @@ pub async fn run_local_node(
             notification_channel,
             token,
             origin_contract,
+            connection_scope,
             user_context,
             ..
         } = req;
@@ -4546,7 +5844,17 @@ pub async fn run_local_node(
                 );
                 // `user_context` is `Some` only in hosted mode with a user token;
                 // `None` keeps secrets on the single-user `SecretScope::Local`.
-                executor.delegate_request(op, origin_contract.as_ref(), None, user_context.as_ref())
+                // `connection_scope` decides whether this request may receive an
+                // ATTESTED application identity (GHSA-824h-7x5x-wfmf). It comes
+                // from the connection layer on the same forge-proof channel as
+                // `origin_contract` and `user_context`.
+                executor.delegate_request(
+                    op,
+                    origin_contract.as_ref(),
+                    None,
+                    connection_scope,
+                    user_context.as_ref(),
+                )
             }
             ClientRequest::Disconnect { cause } => {
                 if let Some(cause) = cause {
@@ -5657,6 +6965,13 @@ mod tests {
         let handler_key = key;
         let _handler = tokio::spawn(async move {
             while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "a stand-in executor loop: it only serves the two \
+                              queries this test issues, and ContractHandlerEvent \
+                              has 20+ variants — any other event reaching it is \
+                              an unexpected-input panic, not a silent fallthrough"
+                )]
                 let response = match ev {
                     ContractHandlerEvent::GetQuery { .. } => ContractHandlerEvent::GetResponse {
                         key: Some(handler_key),
@@ -5776,6 +7091,14 @@ mod tests {
         let handler_flag = update_query_seen.clone();
         let _handler = tokio::spawn(async move {
             while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "a stand-in executor loop: it only serves the one \
+                              query this test expects, and ContractHandlerEvent \
+                              has 20+ variants — any other event reaching it is \
+                              the regression under test, so it panics rather \
+                              than falling through silently"
+                )]
                 let response = match ev {
                     ContractHandlerEvent::UpdateQuery { .. } => {
                         handler_flag.store(true, Ordering::SeqCst);
@@ -5905,6 +7228,13 @@ mod tests {
         let handler_flag = update_query_seen.clone();
         let _handler = tokio::spawn(async move {
             while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "a stand-in executor loop: it only serves the one \
+                              query this test expects, and ContractHandlerEvent \
+                              has 20+ variants — any other event reaching it is \
+                              an unexpected-input panic, not a silent fallthrough"
+                )]
                 let response = match ev {
                     ContractHandlerEvent::UpdateQuery { .. } => {
                         handler_flag.store(true, Ordering::SeqCst);
@@ -8176,6 +9506,173 @@ mod tests {
                  breaks simulation determinism"
             );
         }
+
+        /// Source-scrape pin: the shadow-mode futile-repair attempt is recorded
+        /// only where a heal is ACTUALLY emitted.
+        ///
+        /// The behavioural tests in `futile_repair_shadow` cannot see this: the
+        /// harness contract is never banned, always has local state, and never
+        /// exceeds the emit budget, so moving `record_repair_attempt` above
+        /// those gates leaves them all green. But a heal we did not send is not
+        /// a repair, and counting one would turn the detector into a measure of
+        /// our own emit budget — the exact "metric re-derived away from the
+        /// decision" failure in `.claude/rules/bug-prevention-patterns.md`.
+        #[test]
+        fn futile_repair_attempt_is_recorded_only_where_the_heal_is_emitted() {
+            const SOURCE: &str = include_str!("node.rs");
+
+            // Scoped to `emit_stale_peer_syncs`'s OWN body. An earlier revision
+            // ran the window from the loop header to an anchor ~500 lines later
+            // in the `Summaries` arm, so it stayed green for a
+            // `record_repair_attempt` moved clean out of the function — which
+            // is precisely the regression it names. The function's body ends at
+            // the first `\n}` in column 0 after its signature, which is what a
+            // top-level `fn` terminator looks like in this file.
+            let fn_start = SOURCE
+                .find("async fn emit_stale_peer_syncs(")
+                .expect("emit_stale_peer_syncs not found — update this pin");
+            let fn_end = fn_start
+                + SOURCE[fn_start..]
+                    .find("\n}\n")
+                    .expect("end of emit_stale_peer_syncs not found")
+                + 1;
+            let body = &SOURCE[fn_start..fn_end];
+            let start = fn_start
+                + body
+                    .find("for contract in stale_contracts {")
+                    .expect("stale-contract emission loop not found");
+            let window = &SOURCE[start..fn_end];
+
+            let record = window.find("record_repair_attempt(").expect(
+                "the futile-repair attempt is no longer recorded in the heal \
+                 emission loop — the detector cannot pair an outcome with an \
+                 attempt that was never recorded",
+            );
+            for (gate, why) in [
+                (
+                    "if emitted >= emit_budget {",
+                    "an over-budget contract is deferred, not healed",
+                ),
+                (
+                    "is_banned(contract.id())",
+                    "a banned contract is skipped, not healed",
+                ),
+                (
+                    "Skipping stale-peer sync",
+                    "a contract with no local state is skipped, not healed",
+                ),
+                (
+                    "emitted += 1;",
+                    "the attempt must be counted with the emission it belongs to",
+                ),
+            ] {
+                let gate_pos = window.find(gate).unwrap_or_else(|| {
+                    panic!("heal-loop gate `{gate}` not found — update this pin")
+                });
+                assert!(
+                    gate_pos < record,
+                    "record_repair_attempt must come AFTER `{gate}`: {why}, so \
+                     charging the edge for it makes the futile-repair detector \
+                     measure our own emit budget instead of whether repair works"
+                );
+            }
+        }
+
+        /// Source-scrape pin: the outcome sites must pass the COMPARISON
+        /// VERDICT, not a constant.
+        ///
+        /// This is the mutation the feature is defined against — a detector fed
+        /// `false` unconditionally counts every repair as futile and is
+        /// measuring load. `futile_repair_shadow` fails under that mutation
+        /// too; this pin survives a `#[cfg(test)]` module being cut, and names
+        /// the two observation sites so a third one cannot be added silently.
+        #[test]
+        fn futile_repair_outcome_sites_pass_the_staleness_verdict() {
+            use crate::node::tests::code_only;
+
+            const SOURCE: &str = include_str!("node.rs");
+            let handler = SOURCE
+                .find("async fn handle_interest_sync_message(")
+                .expect("handle_interest_sync_message not found");
+            // Bound the window to the handler region. Without this the pin
+            // matches its OWN source (this test names every needle it looks
+            // for) and passes no matter what the handler does — the
+            // self-matching-needle trap.
+            let handler_end = handler
+                + SOURCE[handler..]
+                    .find("\n#[cfg(test)]")
+                    .or_else(|| SOURCE[handler..].find("\nmod tests {"))
+                    .expect("end of handler region not found");
+            let body = code_only(&SOURCE[handler..handler_end]);
+
+            let sites: Vec<_> = body.match_indices("record_repair_outcome(").collect();
+            assert_eq!(
+                sites.len(),
+                2,
+                "expected exactly two futile-repair outcome sites (the \
+                 `Summaries` two-sided comparison and the `SummaryDigests` \
+                 agreement); found {}. A new site must be a genuinely \
+                 two-sided comparison, or the detector starts scoring \
+                 one-sided reports as successful repairs",
+                sites.len()
+            );
+            let mut passes_tracked_evidence = 0usize;
+            for (pos, _) in sites {
+                let call = &body[pos..body[pos..]
+                    .find(");")
+                    .map(|o| pos + o)
+                    .unwrap_or(body.len())];
+                // Whitespace-stripped: rustfmt collapses or explodes an
+                // argument list depending on how long the arguments are, so a
+                // pin that matches raw source breaks the first time an argument
+                // is renamed — and a broken pin gets weakened, not fixed. Only
+                // the argument SEQUENCE is load-bearing here.
+                let squashed_call: String = call.split_whitespace().collect();
+                assert!(
+                    squashed_call.contains("!is_stale"),
+                    "a futile-repair outcome site passes something other than \
+                     `!is_stale`: the verdict IS the detector — a constant \
+                     there measures repair volume, not repair failure. Got: \
+                     {call}"
+                );
+                // The verdict alone is not enough. `is_stale` also comes out
+                // `true` when the per-message probe budget ran out or the delta
+                // probe failed, neither of which is evidence about convergence,
+                // and the first of those grows with peer breadth rather than
+                // with brokenness. Every site must say which it is.
+                assert!(
+                    squashed_call.contains("evidence")
+                        || squashed_call.contains("OutcomeEvidence::"),
+                    "a futile-repair outcome site no longer passes an \
+                     `OutcomeEvidence`: without it the load-correlated \
+                     budget-exhausted default is counted as futility and the \
+                     headline number tracks how busy this node is. Got: {call}"
+                );
+                if squashed_call.contains("!is_stale,evidence") {
+                    passes_tracked_evidence += 1;
+                }
+            }
+            assert_eq!(
+                passes_tracked_evidence, 1,
+                "exactly one outcome site (the `Summaries` arm) must pass the \
+                 `evidence` TRACKED alongside the staleness decision. \
+                 Hard-coding `OutcomeEvidence::Verdict` there re-derives the \
+                 provenance away from the branch that took the default, which \
+                 is the whole finding — only the `SummaryDigests` agreement \
+                 arm may name a literal, and only because it compares \
+                 byte-identical operands and can take no default"
+            );
+            // Whitespace-stripped so rustfmt wrapping the condition cannot
+            // break the pin.
+            let squashed: String = body.split_whitespace().collect();
+            assert!(
+                squashed.contains("our_summary.is_some()&&their_summary.is_some()"),
+                "the `Summaries` outcome site no longer gates on a TWO-SIDED \
+                 comparison — the one-sided arms return `false` for \"no basis \
+                 to heal\", not for \"converged\", and feeding those in scores \
+                 every contract we do not host as a successful repair"
+            );
+        }
     }
 
     // ───────────────────────────────────────────────────────────
@@ -8516,7 +10013,41 @@ mod tests {
         /// `contract_state_present` returns `true` when no hosting storage is
         /// attached, so the `should_summarize_or_broadcast` gate is satisfied
         /// by `host_contract` alone and no redb temp dir is needed.
+        /// What the stand-in contract handler answers a `GetDeltaQuery` — the
+        /// semantic-staleness probe (#4857) — with.
+        ///
+        /// These are the three things `interest::peer_summary_has_pending_state`
+        /// can return, and they produce three DIFFERENT provenances for one
+        /// `is_stale: bool`. The futile-repair detector has to tell them apart
+        /// (see `crate::ring::futile_repair::OutcomeEvidence`), so the harness
+        /// has to be able to produce them.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum DeltaBehavior {
+            /// The contract holds state the peer lacks: a byte mismatch is a
+            /// real divergence and heals. The default, and what every
+            /// pre-existing test here assumes.
+            NonEmpty,
+            /// The contract says the peer is logically converged despite
+            /// differing summary bytes — the non-deterministic-serialization
+            /// shape #4857 exists for. A real verdict, and it is NOT stale.
+            Empty,
+            /// The probe produced no verdict at all.
+            /// `summary_indicates_stale_peer` then falls back to the
+            /// conservative byte compare, so the peer reads STALE on no
+            /// evidence whatsoever.
+            Failing,
+        }
+
         async fn build_harness(id: &str, port_base: u16, our_summary: Vec<u8>) -> Harness {
+            build_harness_with(id, port_base, our_summary, DeltaBehavior::NonEmpty).await
+        }
+
+        async fn build_harness_with(
+            id: &str,
+            port_base: u16,
+            our_summary: Vec<u8>,
+            delta_behavior: DeltaBehavior,
+        ) -> Harness {
             let config_args = crate::config::ConfigArgs {
                 id: Some(id.to_string()),
                 mode: Some(crate::contract::OperationMode::Local),
@@ -8557,9 +10088,12 @@ mod tests {
             // Hosted + locally interested + hash-indexed, so
             // `summary_if_hosted_or_in_use` will summarize it and
             // `lookup_by_hash` will resolve the peer's advertised hash to it.
-            let _ = op_manager
-                .ring
-                .host_contract(key, 128, crate::ring::AccessType::Put);
+            let _ = op_manager.ring.host_contract(
+                key,
+                128,
+                crate::ring::AccessType::Put,
+                crate::ring::HostingCause::Other,
+            );
             op_manager.interest_manager.register_local_hosting(&key);
 
             // Two connected peers, distinguished ONLY by whether a remote
@@ -8589,6 +10123,14 @@ mod tests {
             let queries_for_handler = std::sync::Arc::clone(&summary_queries);
             let handler = tokio::spawn(async move {
                 while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                    #[allow(
+                        clippy::wildcard_enum_match_arm,
+                        reason = "a stand-in executor loop: it only serves the \
+                                  three queries this test issues, and \
+                                  ContractHandlerEvent has 20+ variants — any \
+                                  other event reaching it is an unexpected-input \
+                                  panic, not a silent fallthrough"
+                    )]
                     let response = match ev {
                         ContractHandlerEvent::GetSummaryQuery { key } => {
                             queries_for_handler.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -8606,18 +10148,29 @@ mod tests {
                                 }),
                             }
                         }
-                        // The semantic-staleness probe (#4857): a NON-EMPTY
-                        // delta is the contract answering "yes, I hold state
-                        // this peer lacks", which is what turns a byte
-                        // mismatch into a real heal. Returning an empty delta
-                        // here would make every divergence test vacuous.
+                        // The semantic-staleness probe (#4857). The default
+                        // (`NonEmpty`) is the contract answering "yes, I hold
+                        // state this peer lacks", which is what turns a byte
+                        // mismatch into a real heal — returning an empty delta
+                        // by default would make every divergence test vacuous.
+                        // The other two variants exist so a test can produce
+                        // the OTHER two provenances of `is_stale`; see
+                        // `DeltaBehavior`.
                         ContractHandlerEvent::GetDeltaQuery { key, .. } => {
-                            ContractHandlerEvent::GetDeltaResponse {
-                                key,
-                                delta: Ok(freenet_stdlib::prelude::StateDelta::from(vec![
-                                    1u8, 2, 3,
-                                ])),
-                            }
+                            let delta = match delta_behavior {
+                                DeltaBehavior::NonEmpty => {
+                                    Ok(freenet_stdlib::prelude::StateDelta::from(vec![1u8, 2, 3]))
+                                }
+                                DeltaBehavior::Empty => {
+                                    Ok(freenet_stdlib::prelude::StateDelta::from(Vec::<u8>::new()))
+                                }
+                                DeltaBehavior::Failing => {
+                                    Err(crate::contract::ExecutorError::other(
+                                        crate::contract::ContractQueueFull,
+                                    ))
+                                }
+                            };
+                            ContractHandlerEvent::GetDeltaResponse { key, delta }
                         }
                         other => panic!("unexpected handler event: {other:?}"),
                     };
@@ -8849,6 +10402,1836 @@ mod tests {
             );
         }
 
+        // ===== #5155: bounded, rotating full-bytes summary fallback =====
+
+        /// Host `n` additional contracts, all summarizable by the harness's
+        /// stand-in handler, and return them in advertisement order.
+        fn host_many(h: &Harness, n: u32) -> Vec<ContractKey> {
+            let mut keys = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                let mut id = [0u8; 32];
+                id[0..4].copy_from_slice(&i.to_le_bytes());
+                id[4] = 0x5A;
+                let mut code = [0u8; 32];
+                code[0..4].copy_from_slice(&i.to_le_bytes());
+                code[4] = 0xC0;
+                let key =
+                    ContractKey::from_id_and_code(ContractInstanceId::new(id), CodeHash::new(code));
+                let _ = h.op_manager.ring.host_contract(
+                    key,
+                    128,
+                    crate::ring::AccessType::Put,
+                    crate::ring::HostingCause::Other,
+                );
+                h.op_manager.interest_manager.register_local_hosting(&key);
+                keys.push(key);
+            }
+            keys
+        }
+
+        /// Advertised hashes for `keys`, asserting they are pairwise distinct
+        /// so entry counts can be compared against contract counts.
+        fn distinct_hashes(keys: &[ContractKey]) -> Vec<u32> {
+            let hashes: Vec<u32> = keys.iter().map(contract_hash).collect();
+            assert_eq!(
+                hashes.iter().copied().collect::<HashSet<u32>>().len(),
+                hashes.len(),
+                "premise: the fixture's contract hashes must not collide, or \
+                 entry counts stop being comparable to contract counts"
+            );
+            hashes
+        }
+
+        fn summary_bytes_of(entries: &[SummaryEntry]) -> usize {
+            entries
+                .iter()
+                .filter_map(|e| e.summary_bytes.as_ref())
+                .map(|b| b.len())
+                .sum()
+        }
+
+        /// The fallback reply is bounded at the widest shared set observed in
+        /// the field (2,448 contracts), not merely at the fleet average.
+        ///
+        /// This is the whole point of #5155: `get_matching_contracts` returned
+        /// one full summary per shared contract with no send-side cap, and the
+        /// largest single message seen in production was 1.26 MB. The bound has
+        /// to hold at the tail, because the tail is where the bytes are.
+        #[tokio::test]
+        async fn fallback_reply_is_bounded_at_the_widest_observed_shared_set() {
+            let h = build_harness("hf-bound-wide", 17100, vec![7u8; 64]).await;
+            let keys = host_many(&h, 2448);
+            let hashes = distinct_hashes(&keys);
+
+            let reply = handle_interest_sync_message(
+                &h.op_manager,
+                h.old_peer,
+                InterestMessage::Interests {
+                    hashes: hashes.clone(),
+                },
+            )
+            .await;
+
+            match reply {
+                Some(InterestMessage::Summaries { entries, .. }) => {
+                    assert!(
+                        !entries.is_empty(),
+                        "the reply must still carry something — a bound that \
+                         sends nothing is not a bound, it is a silent outage"
+                    );
+                    // ABSOLUTE literals, deliberately not the constants. An
+                    // assertion written against the constant that produced the
+                    // value moves with any regression to it and can never fail:
+                    // raising the cap to 100k would leave `entries.len() <=
+                    // MAX_FALLBACK_SUMMARIES_PER_REPLY` true and this test
+                    // green while the field message went back to megabytes.
+                    assert!(
+                        entries.len() <= 64,
+                        "fallback reply carried {} entries against {} shared \
+                         contracts; the intended cap is 64",
+                        entries.len(),
+                        hashes.len()
+                    );
+                    // The byte bound is `budget + one entry` by construction:
+                    // the budget is checked before each entry and never blocks
+                    // the first. See `MAX_FALLBACK_SUMMARY_BYTES_PER_REPLY`.
+                    let bytes = summary_bytes_of(&entries);
+                    assert!(
+                        bytes <= 9 * 1024 + h.our_summary.len(),
+                        "fallback reply carried {bytes} summary bytes, over the \
+                         intended 9 KiB budget plus one entry"
+                    );
+                    // Pin which limit is doing the work in THIS fixture, so a
+                    // regression to either one is caught rather than masked by
+                    // the other. 64-byte summaries: 64 entries is 4 KB, well
+                    // under the byte budget, so the entry cap must bind exactly.
+                    assert_eq!(
+                        entries.len(),
+                        64,
+                        "premise: with 64-byte summaries the ENTRY cap should be \
+                         the binding constraint at 2,448 shared contracts"
+                    );
+                }
+                other => panic!("a version-unknown peer must get full bytes, got {other:?}"),
+            }
+        }
+
+        /// The entry cap alone does not bound the message, so the byte budget
+        /// has to bind first when summaries are large.
+        ///
+        /// Summaries are ~16.7 KB for a River room and near-zero for a contract
+        /// we do not host. The 143 B/entry the entry cap is derived from is a
+        /// fleet AVERAGE; 64 heavy entries is ~1.07 MB, which is the message
+        /// class this change exists to remove. Without this test the cap could
+        /// regress to entries-only and every other assertion here would still
+        /// pass.
+        #[tokio::test]
+        async fn fallback_byte_budget_binds_before_the_entry_cap() {
+            let h = build_harness("hf-bound-bytes", 17110, vec![9u8; 5000]).await;
+            let keys = host_many(&h, 200);
+            let hashes = distinct_hashes(&keys);
+
+            let reply = handle_interest_sync_message(
+                &h.op_manager,
+                h.old_peer,
+                InterestMessage::Interests { hashes },
+            )
+            .await;
+
+            match reply {
+                Some(InterestMessage::Summaries { entries, .. }) => {
+                    let bytes = summary_bytes_of(&entries);
+                    assert!(
+                        bytes > 0,
+                        "premise: the fixture's contracts must actually be \
+                         summarizable, or the byte budget is untested"
+                    );
+                    assert!(
+                        entries.len() < MAX_FALLBACK_SUMMARIES_PER_REPLY,
+                        "with 5 KB summaries the BYTE budget must bind before \
+                         the {MAX_FALLBACK_SUMMARIES_PER_REPLY}-entry cap; got \
+                         {} entries",
+                        entries.len()
+                    );
+                    assert!(
+                        bytes <= MAX_FALLBACK_SUMMARY_BYTES_PER_REPLY + h.our_summary.len(),
+                        "{bytes} summary bytes exceeds the budget plus one entry"
+                    );
+                }
+                other => panic!("expected full bytes, got {other:?}"),
+            }
+        }
+
+        /// A single summary larger than the whole budget still goes out, and
+        /// the rotation still advances past it.
+        ///
+        /// The alternative — refusing any entry that would breach the budget —
+        /// makes an oversized contract a permanent hole: it is never
+        /// advertised, and because the cursor never passes it, nothing behind
+        /// it is either. A stalled rotation is far worse than one oversized
+        /// message, so the budget never blocks the first entry.
+        #[tokio::test]
+        async fn oversized_summary_still_sends_and_the_rotation_advances() {
+            let h = build_harness("hf-bound-oversize", 17120, vec![3u8; 20_000]).await;
+            assert!(
+                h.our_summary.len() > MAX_FALLBACK_SUMMARY_BYTES_PER_REPLY,
+                "premise: this fixture's summary must exceed the whole budget"
+            );
+            let keys = host_many(&h, 8);
+            let hashes = distinct_hashes(&keys);
+
+            // Seed the cursor so both rounds are mid-cycle and the starting
+            // offset is fixed. Without this the first round would begin at a
+            // random cycle-boundary offset (see `summary_window_start`) and a
+            // start on the last contract would wrap into a second random draw,
+            // making the "moved on to a different contract" assertion flaky.
+            let mut sorted = keys.clone();
+            sorted.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+            h.op_manager
+                .interest_manager
+                .record_summary_cursor(&h.peer_key_of(h.old_peer), *sorted[0].id());
+
+            let mut seen: Vec<u32> = Vec::new();
+            for round in 0..2 {
+                let reply = handle_interest_sync_message(
+                    &h.op_manager,
+                    h.old_peer,
+                    InterestMessage::Interests {
+                        hashes: hashes.clone(),
+                    },
+                )
+                .await;
+                match reply {
+                    Some(InterestMessage::Summaries { entries, .. }) => {
+                        assert_eq!(
+                            entries.len(),
+                            1,
+                            "round {round}: exactly one oversized entry should \
+                             fit — more would breach the budget, none would stall"
+                        );
+                        seen.push(entries[0].hash);
+                    }
+                    other => panic!("round {round}: expected full bytes, got {other:?}"),
+                }
+            }
+            assert_ne!(
+                seen[0], seen[1],
+                "the rotation must move on to the next contract rather than \
+                 re-sending the same oversized one every heartbeat"
+            );
+        }
+
+        // ===== #5238: the digest path is bounded by CALLS, not by bytes =====
+
+        /// The digest reply is bounded too, and the observable is the number of
+        /// `GetSummaryQuery` round trips it makes — not the entry count.
+        ///
+        /// This is the regression test for #5238, and it deliberately asserts
+        /// on the EXPENSIVE operation rather than on the message. #5155 read
+        /// this path as cheap because a digest is 21 bytes; the cost that
+        /// stormed is the `summary_if_hosted_or_in_use` call each entry needs
+        /// to PRODUCE its digest, which is a contract-handler round trip that
+        /// can re-enter WASM. An entry-count assertion alone would stay green
+        /// under a regression that trimmed the reply after summarizing
+        /// everything, which is exactly the shape that costs nothing to write
+        /// and reproduces the storm in full.
+        ///
+        /// The fixture is the field case: 933 hosted contracts on the NATed
+        /// peer in #5238, all shared with one digest-capable neighbour.
+        #[tokio::test]
+        async fn digest_reply_bounds_the_summarize_calls_not_just_the_entries() {
+            use std::sync::atomic::Ordering;
+
+            let h = build_harness("hf-digest-bound", 17130, vec![7u8; 64]).await;
+            let keys = host_many(&h, 933);
+            let hashes = distinct_hashes(&keys);
+
+            let before = h.summary_queries.load(Ordering::Relaxed);
+            let reply = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::Interests {
+                    hashes: hashes.clone(),
+                },
+            )
+            .await;
+            let fetches = h.summary_queries.load(Ordering::Relaxed) - before;
+
+            match reply {
+                Some(InterestMessage::SummaryDigests { entries, .. }) => {
+                    assert!(
+                        !entries.is_empty(),
+                        "the reply must still carry something — a bound that \
+                         sends nothing is not a bound, it is a silent outage"
+                    );
+                    // ABSOLUTE literals, not the constants that produced them:
+                    // an assertion written against its own constant moves with
+                    // any regression to it and can never fail.
+                    assert!(
+                        entries.len() <= 64,
+                        "digest reply carried {} entries against {} shared \
+                         contracts; the intended cap is 64",
+                        entries.len(),
+                        hashes.len()
+                    );
+                    assert_eq!(
+                        entries.len(),
+                        64,
+                        "premise: at 933 shared contracts the entry cap must be \
+                         the binding constraint"
+                    );
+                }
+                other => panic!("a hash-first-capable peer must get digests, got {other:?}"),
+            }
+
+            assert!(
+                fetches > 0,
+                "premise: the fixture must actually reach the summarize path, \
+                 or the bound below can never fail. Entry count does not cover \
+                 this — entries are pushed with a `None` summary when the gate \
+                 declines, so a gate regression would leave `entries.len()` at \
+                 64 and `fetches` at 0"
+            );
+            assert!(
+                fetches <= 64,
+                "building the digest reply made {fetches} summarize round trips \
+                 against {} shared contracts. This is the #5238 storm: bounding \
+                 the MESSAGE without bounding the LOOP leaves the CPU cost \
+                 exactly where it was, because a digest costs a full summarize \
+                 to produce",
+                hashes.len()
+            );
+        }
+
+        /// Successive digest replies rotate, so the whole shared set is still
+        /// covered — in `ceil(n / cap)` heartbeats instead of one.
+        ///
+        /// This is the convergence half of the bound. A cap without rotation
+        /// would advertise the same 64 contracts to that peer forever and never
+        /// tell it about the rest, converting a CPU fix into permanent silent
+        /// divergence. The cost that IS accepted is latency: at the 5-minute
+        /// heartbeat, a peer sharing 933 contracts takes 15 rounds — about 75
+        /// minutes — for anti-entropy to come back round to a given contract.
+        /// (`MAX_DIGEST_SUMMARIES_PER_REPLY` quotes ~40 minutes for the same
+        /// node: that is the ~450-contract SHARED set implied by the field
+        /// measurement, where 933 is the HOSTED set, i.e. the worst case of a
+        /// peer sharing interest in every contract we hold.) Live fan-out and
+        /// the event-driven repairs are untouched and still carry every update
+        /// anybody actually makes.
+        ///
+        /// # Why the CURSOR is seeded, not just the RNG
+        ///
+        /// `ceil(n / cap)` rounds tile the set exactly only while every round
+        /// is mid-cycle. A round whose window ENDS on the highest id leaves the
+        /// cursor past the end, which `summary_window_start` reads as a cycle
+        /// boundary and answers with a fresh random offset. That is deliberate
+        /// anti-starvation behaviour rather than a bug, but it re-covers ground
+        /// already covered, and the exact-tiling assertion then fails.
+        ///
+        /// At n=200 and cap=64 that happens for 3 of the 200 possible starts,
+        /// so the first version of this test failed about 1% of runs — and
+        /// non-reproducibly, because `GlobalRng` falls back to `rand::rng()`
+        /// when unseeded. It duly failed on the very next full-suite run.
+        /// Seeding the cursor fixes the start at index 1 and removes the
+        /// boundary re-draw from the schedule entirely, so the test pins the
+        /// tiling property itself rather than one lucky seed. The RNG is seeded
+        /// as well, so that any future edit reintroducing a draw stays
+        /// reproducible instead of flaky.
+        #[tokio::test]
+        async fn digest_rotation_covers_the_whole_shared_set() {
+            // Guarded rather than bare: `set_seed` also pins THREAD_INDEX to 0,
+            // and `config.rs` asks callers to pair it with `clear_seed`. The
+            // guard does that on unwind too, so a panicking assertion below
+            // cannot leave the seed pinned for whatever runs next on this
+            // thread.
+            let _seed = crate::config::GlobalRng::seed_guard(0x5238_D16E);
+            let h = build_harness("hf-digest-rotate", 17150, vec![7u8; 64]).await;
+            let keys = host_many(&h, 200);
+            let hashes = distinct_hashes(&keys);
+            let expected: HashSet<u32> = hashes.iter().copied().collect();
+            let rounds = hashes.len().div_ceil(MAX_DIGEST_SUMMARIES_PER_REPLY);
+
+            let mut sorted = keys.clone();
+            sorted.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+            h.op_manager
+                .interest_manager
+                .record_summary_cursor(&h.peer_key_of(h.new_peer), *sorted[0].id());
+
+            let mut covered: HashSet<u32> = HashSet::new();
+            for round in 0..rounds {
+                let reply = handle_interest_sync_message(
+                    &h.op_manager,
+                    h.new_peer,
+                    InterestMessage::Interests {
+                        hashes: hashes.clone(),
+                    },
+                )
+                .await;
+                match reply {
+                    Some(InterestMessage::SummaryDigests { entries, .. }) => {
+                        // Holds BY FIXTURE, not by the cap: since #5338 a reply
+                        // is bounded at 64 SUMMARIZE CALLS and at
+                        // MAX_SUMMARY_ENTRIES_PER_MESSAGE entries, so a reply may
+                        // legitimately carry more than 64 entries. Every contract
+                        // here is hosted, so every entry is costed and the
+                        // summarize budget is what binds. Do not read this as
+                        // "replies are capped at 64 entries".
+                        assert!(entries.len() <= MAX_DIGEST_SUMMARIES_PER_REPLY);
+                        covered.extend(entries.iter().map(|e| e.hash));
+                    }
+                    other => panic!("round {round}: expected digests, got {other:?}"),
+                }
+            }
+
+            assert_eq!(
+                covered.len(),
+                expected.len(),
+                "after {rounds} rounds (ceil({}/{MAX_DIGEST_SUMMARIES_PER_REPLY})) \
+                 the digest rotation covered {} of {} shared contracts — the \
+                 window is not advancing, so the cap is starving the tail",
+                hashes.len(),
+                covered.len(),
+                expected.len()
+            );
+            assert_eq!(covered, expected);
+        }
+
+        // ===== #5338: the window is as wide as it is advertised to be =====
+
+        /// Hashes carried by a `SummaryDigests` reply, in wire order.
+        fn digest_hashes(reply: Option<InterestMessage>) -> Vec<u32> {
+            match reply {
+                Some(InterestMessage::SummaryDigests { entries, .. }) => {
+                    entries.iter().map(|e| e.hash).collect()
+                }
+                other => panic!("expected a digest reply, got {other:?}"),
+            }
+        }
+
+        /// A peer that resumes on a NEW SOURCE PORT keeps its place in the
+        /// rotation.
+        ///
+        /// The cursor was keyed by `SocketAddr` until #5338, so a NATed peer
+        /// reconnecting on a fresh port lost it outright — no LRU pressure
+        /// needed. A missing cursor is not a missing optimisation: it re-draws a
+        /// RANDOM offset (deliberately, as anti-starvation), which turns the
+        /// advertised contiguous `ceil(n / 64)` tiling into coupon-collector,
+        /// roughly 90 minutes rather than 40 at n = 450. The population that hit
+        /// hardest was the frequently-reconnecting NATed peer #5238 was measured
+        /// on, so the headline convergence number was least accurate exactly
+        /// where it was validated.
+        ///
+        /// The assertion is on the EXACT window both rounds carry, not merely
+        /// that round 2 differs from round 1: a random re-draw agrees with the
+        /// contiguous answer 1 time in 200 here, and "not equal to the previous
+        /// window" would pass under the bug on all the other 199.
+        #[tokio::test]
+        async fn summary_window_cursor_follows_the_peer_not_its_address() {
+            // Seeded because BOTH paths draw here: round one has no cursor, so
+            // it takes the cycle-boundary arm and draws an offset, and a
+            // regression's re-draw on round two must be reproducible rather than
+            // flaky-red. (An earlier comment claimed the fixed path never draws,
+            // which was wrong — the fix changes WHICH rounds draw, not whether
+            // any does.)
+            let _seed = crate::config::GlobalRng::seed_guard(0x5338_ADD8);
+            let h = build_harness("hf-cursor-identity", 17200, vec![7u8; 64]).await;
+            let keys = host_many(&h, 200);
+            let hashes = distinct_hashes(&keys);
+            let mut sorted = keys.clone();
+            sorted.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+            // 64 hashes from `start`, WRAPPING — `rotation_window_indices`
+            // wraps, and a window that runs off the end mid-cycle is ordinary.
+            let expected_from = |start: usize| -> Vec<u32> {
+                (0..64)
+                    .map(|i| contract_hash(&sorted[(start + i) % sorted.len()]))
+                    .collect()
+            };
+
+            // The first round is driven through the handler rather than by
+            // seeding the cursor directly, so that the SECOND round's assertion
+            // is the one a regression trips. Seeding via
+            // `record_summary_cursor` would make a re-keyed cursor miss on
+            // round one too, and the test would then fail on its own premise
+            // without ever exercising the reconnect.
+            let pk = h.peer_key_of(h.new_peer);
+            let first = digest_hashes(
+                handle_interest_sync_message(
+                    &h.op_manager,
+                    h.new_peer,
+                    InterestMessage::Interests {
+                        hashes: hashes.clone(),
+                    },
+                )
+                .await,
+            );
+            assert_eq!(
+                first.len(),
+                64,
+                "premise: the first round must fill the whole entry cap"
+            );
+            // Where the second round MUST resume: immediately after the last id
+            // the first one sent. Derived from what round one actually did, so
+            // it is an exact expectation without depending on which offset the
+            // cycle-boundary draw picked.
+            let resume = sorted
+                .iter()
+                .position(|k| contract_hash(k) == *first.last().expect("64 entries"))
+                .expect("the last hash sent must be one of ours")
+                + 1;
+            assert!(
+                resume < sorted.len(),
+                "premise: round one must not end on the highest id (resume=\
+                 {resume}), or round two is at a CYCLE BOUNDARY and re-draws a \
+                 random offset legitimately, proving nothing about the cursor"
+            );
+
+            // The SAME peer reappears on a different source port. Public key
+            // unchanged — that is what makes it the same peer — and the
+            // previous address is left registered because the harness has no
+            // disconnect hook; the reply is built for whichever address the
+            // request arrives on, which is the whole point.
+            let resumed_addr: SocketAddr = "127.0.0.1:17209".parse().unwrap();
+            assert!(
+                h.op_manager.ring.connection_manager.add_connection(
+                    crate::ring::Location::new(0.42),
+                    resumed_addr,
+                    pk.0.clone(),
+                    false,
+                ),
+                "the reconnecting peer must be admitted to the ring"
+            );
+            h.op_manager.ring.connection_manager.record_remote_version(
+                resumed_addr,
+                Some(crate::node::HASH_FIRST_SUMMARIES_MIN_VERSION),
+            );
+            assert_eq!(
+                h.peer_key_of(resumed_addr),
+                pk,
+                "premise: the new address must resolve to the SAME peer key, or \
+                 this test is about two different peers and proves nothing"
+            );
+
+            let second = digest_hashes(
+                handle_interest_sync_message(
+                    &h.op_manager,
+                    resumed_addr,
+                    InterestMessage::Interests { hashes },
+                )
+                .await,
+            );
+            assert_eq!(
+                second,
+                expected_from(resume),
+                "the rotation must resume where the previous reply to this PEER \
+                 stopped. Keying the cursor by address instead loses it on every \
+                 reconnect and restarts the cycle at a random offset"
+            );
+            assert_eq!(
+                h.op_manager
+                    .interest_manager
+                    .peek_summary_cursor(&pk)
+                    .as_ref(),
+                Some(sorted[(resume + 63) % sorted.len()].id()),
+                "and the advanced cursor must be stored against the peer, not \
+                 against the address it happened to arrive from"
+            );
+        }
+
+        /// Contracts we track but do NOT host must not consume slots of the
+        /// summarize budget — and must still be advertised.
+        ///
+        /// `matching` comes from `contract_hash_index`, which peer interest
+        /// registrations populate as well as our own hosting, so it contains
+        /// contracts we track and cannot summarize. Those return `None` through
+        /// the in-memory gate with no contract-handler round trip, yet the build
+        /// loop charged them a slot of a budget that exists to bound exactly
+        /// that round trip. Convergence latency for the contracts we CAN
+        /// advertise therefore scaled with `|matching|` while the cost being
+        /// bounded scaled only with the hosted subset.
+        ///
+        /// # What each assertion rules out
+        ///
+        /// The fixture alternates hosted and tracked-only contracts in id order,
+        /// so a slot-charging regression halves the hosted coverage. Three
+        /// independent observables are pinned, because no one of them
+        /// distinguishes the two ways this can go wrong:
+        ///
+        /// - `fetches` — the budget is still spent in full, and still only 64.
+        ///   Goes to 32 if free entries are charged again.
+        /// - the `Some` entries — the advertised set is the whole hosted
+        ///   subset, not half of it.
+        /// - the `None` entries — the free entries are still SENT. They drive
+        ///   `clear_peer_summary` through `DigestVerdict::PeerHasNoState`, so
+        ///   "don't charge it" must not become "don't send it"; that regression
+        ///   would leave `fetches` at 64 and only this assertion would notice.
+        #[tokio::test]
+        async fn non_hosted_entries_do_not_consume_summarize_slots() {
+            use std::sync::atomic::Ordering;
+
+            let h = build_harness("hf-free-entries", 17220, vec![7u8; 64]).await;
+            let tracker = h.peer_key_of(h.old_peer);
+
+            // Big-endian index in the leading bytes, so sorted-by-id order is
+            // exactly `j` order and the interleave is a property of the fixture
+            // rather than of how the ids happen to hash.
+            let mut all = Vec::with_capacity(128);
+            let mut hosted = Vec::new();
+            let mut tracked = Vec::new();
+            for j in 0..128u32 {
+                let mut id = [0u8; 32];
+                id[0..4].copy_from_slice(&j.to_be_bytes());
+                id[4] = 0x99;
+                let key = ContractKey::from_id_and_code(
+                    ContractInstanceId::new(id),
+                    CodeHash::new([0xC1; 32]),
+                );
+                if j % 2 == 0 {
+                    let _ = h.op_manager.ring.host_contract(
+                        key,
+                        128,
+                        crate::ring::AccessType::Put,
+                        crate::ring::HostingCause::Other,
+                    );
+                    h.op_manager.interest_manager.register_local_hosting(&key);
+                    hosted.push(key);
+                } else {
+                    // Indexed by a DIFFERENT peer's interest and never hosted
+                    // here: the exact shape the build loop was charging for.
+                    h.op_manager.interest_manager.register_peer_interest_from(
+                        &key,
+                        tracker.clone(),
+                        None,
+                        false,
+                        crate::ring::interest::InterestRegistrationSource::Interests,
+                    );
+                    tracked.push(key);
+                }
+                all.push(key);
+            }
+            let hashes = distinct_hashes(&all);
+            assert_eq!((hosted.len(), tracked.len()), (64, 64));
+
+            // An id below every contract in the fixture, so the window starts
+            // at index 0 with no random draw.
+            let pk = h.peer_key_of(h.new_peer);
+            h.op_manager
+                .interest_manager
+                .record_summary_cursor(&pk, ContractInstanceId::new([0u8; 32]));
+
+            let before = h.summary_queries.load(Ordering::Relaxed);
+            let reply = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::Interests { hashes },
+            )
+            .await;
+            let fetches = h.summary_queries.load(Ordering::Relaxed) - before;
+
+            let entries = match reply {
+                Some(InterestMessage::SummaryDigests { entries, .. }) => entries,
+                other => panic!("expected a digest reply, got {other:?}"),
+            };
+            let advertised: Vec<u32> = entries
+                .iter()
+                .filter(|e| e.summary_digest.is_some())
+                .map(|e| e.hash)
+                .collect();
+            let free: Vec<u32> = entries
+                .iter()
+                .filter(|e| e.summary_digest.is_none())
+                .map(|e| e.hash)
+                .collect();
+
+            assert_eq!(
+                fetches, 64,
+                "the reply must spend its whole 64-call budget on contracts it \
+                 can actually summarize; charging the tracked-only contracts a \
+                 slot leaves half the budget buying nothing"
+            );
+            assert_eq!(
+                advertised,
+                hosted.iter().map(contract_hash).collect::<Vec<u32>>(),
+                "one round must advertise all 64 hosted contracts, in id order"
+            );
+            assert_eq!(
+                free,
+                tracked[..63]
+                    .iter()
+                    .map(contract_hash)
+                    .collect::<Vec<u32>>(),
+                "the tracked-only contracts encountered on the way must still be \
+                 SENT — they are what clears a peer's stale belief that we hold \
+                 state (`DigestVerdict::PeerHasNoState`). Not charging them a \
+                 slot must not turn into not sending them"
+            );
+            assert_eq!(
+                entries.len(),
+                127,
+                "64 charged entries plus the 63 free ones interleaved between \
+                 them; the loop stops on the 64th charged entry rather than \
+                 running on to collect free entries nobody asked for"
+            );
+            assert_eq!(
+                h.op_manager
+                    .interest_manager
+                    .peek_summary_cursor(&pk)
+                    .as_ref(),
+                Some(hosted[63].id()),
+                "the cursor advances to the last entry SENT, so the next round \
+                 resumes after it"
+            );
+        }
+
+        /// BOTH receive arms charge their comparison budget for the entries
+        /// that COST a comparison, not for every entry.
+        ///
+        /// This is the half of #5338 the issue did not name, and without it the
+        /// send-side fix above delivers nothing. `MAX_SUMMARY_COMPARISONS_PER_MESSAGE`
+        /// used to cap the number of ENTRIES a message could contribute, so a
+        /// reply carrying 64 charged entries plus free ones would be randomly
+        /// truncated back to 64 entries by the receiver — the free entries would
+        /// crowd out the very digests the sender spent its CPU budget producing,
+        /// and the send window's contiguous tiling would arrive as a random
+        /// sample. In the worst case (half the shared set not hosted) the sender
+        /// would summarize 64 contracts to deliver 32, which is what it delivers
+        /// today: double the CPU for identical coverage.
+        ///
+        /// An entry carrying no summary is settled without our summary being
+        /// consulted — `classify_summary_digest`'s `(_, None)` arm on the digest
+        /// leg, the `_ => false` staleness arm on the full-bytes one — so it
+        /// genuinely costs nothing here either. The free entries are placed
+        /// FIRST so that a budget-charged-per-entry regression consumes the
+        /// whole budget on them and reaches none of the costed entries behind.
+        ///
+        /// # Why both forms, and why that is not symmetry for its own sake
+        ///
+        /// The two arms carry near-identical logic that was written twice, so
+        /// covering one proves nothing about the other. And the full-bytes arm
+        /// is not the legacy path its name suggests. It is reached two ways:
+        ///
+        /// - Directly, by any peer below [`HASH_FIRST_SUMMARIES_MIN_VERSION`].
+        /// - **As the second leg of every digest exchange that finds a
+        ///   disagreement**, for every peer at every version: a `SummaryRequest`
+        ///   is answered with a plain `Summaries`, which lands here. The digest
+        ///   arm defers its heal decision to this one by design.
+        ///
+        /// So the arm whose new `costs_a_summarize` branch had no coverage at
+        /// all was the one with the widest live reach in the change.
+        ///
+        /// The per-form observable differs because the arms answer differently:
+        /// a disagreeing digest provokes a `SummaryRequest`, while disagreeing
+        /// BYTES are resolved in place and recorded by `upsert_peer_summary_from`.
+        /// Both are proof that the costed entries were reached at all, which is
+        /// what a per-entry budget would have prevented.
+        #[tokio::test]
+        async fn free_entries_do_not_consume_the_receive_budget() {
+            use std::sync::atomic::Ordering;
+
+            for (label, port) in [("digests", 17240u16), ("full-bytes", 17260)] {
+                // Seeded because the pre-fix path rotates by a random offset
+                // before truncating; a regression must fail reproducibly.
+                let _seed = crate::config::GlobalRng::seed_guard(0x5338_5EC0);
+                let h = build_harness(&format!("hf-recv-free-{label}"), port, vec![7u8; 64]).await;
+                // Exactly MAX_SUMMARY_ENTRIES_PER_MESSAGE entries: 64 free then
+                // 64 costed. Sized to sit ON the ceiling rather than over it,
+                // so the receive leg's over-ceiling truncation is not what this
+                // test measures — a bigger fixture would drop costed entries at
+                // random and the assertions below would be testing the
+                // truncation instead of the budget.
+                let keys = host_many(&h, 128);
+                let hashes = distinct_hashes(&keys);
+                let pk = h.peer_key_of(h.new_peer);
+
+                // A belief about the peer that the free entries must clear.
+                // Without it, "processed for free" and "silently dropped" look
+                // identical from the costed-entry observable alone.
+                h.op_manager.interest_manager.upsert_peer_summary_from(
+                    &keys[127],
+                    &pk,
+                    StateSummary::from(vec![4u8; 8]),
+                    crate::ring::interest::SummaryPopulationSource::InterestSummary,
+                );
+
+                // Disagrees with the harness's `vec![7u8; 64]`, so nothing
+                // short-circuits and every costed entry reaches the comparison.
+                let theirs = vec![9u8; 8];
+                let message = if label == "digests" {
+                    let mut entries: Vec<SummaryDigestEntry> = hashes[64..]
+                        .iter()
+                        .map(|&hash| SummaryDigestEntry {
+                            hash,
+                            summary_digest: None,
+                        })
+                        .collect();
+                    entries.extend(hashes[..64].iter().map(|&hash| SummaryDigestEntry {
+                        hash,
+                        summary_digest: Some(summary_digest(&theirs)),
+                    }));
+                    assert_eq!(
+                        entries.len(),
+                        128,
+                        "{label} premise: 64 free entries, then 64 costed ones"
+                    );
+                    InterestMessage::SummaryDigests {
+                        entries,
+                        emitter: crate::message::SummariesEmitter::InterestsReply,
+                    }
+                } else {
+                    let mut entries: Vec<SummaryEntry> = hashes[64..]
+                        .iter()
+                        .map(|&hash| SummaryEntry {
+                            hash,
+                            summary_bytes: None,
+                        })
+                        .collect();
+                    entries.extend(hashes[..64].iter().map(|&hash| SummaryEntry {
+                        hash,
+                        summary_bytes: Some(theirs.clone()),
+                    }));
+                    assert_eq!(
+                        entries.len(),
+                        128,
+                        "{label} premise: 64 free entries, then 64 costed ones"
+                    );
+                    InterestMessage::Summaries {
+                        entries,
+                        emitter: crate::message::SummariesEmitter::InterestsReply,
+                    }
+                };
+
+                let before = h.summary_queries.load(Ordering::Relaxed);
+                let reply = handle_interest_sync_message(&h.op_manager, h.new_peer, message).await;
+                let fetches = h.summary_queries.load(Ordering::Relaxed) - before;
+
+                // Per-form proof that the costed entries were reached.
+                if label == "digests" {
+                    match reply {
+                        Some(InterestMessage::SummaryRequest { hashes: requested }) => {
+                            assert_eq!(
+                                requested.iter().copied().collect::<HashSet<u32>>(),
+                                hashes[..64].iter().copied().collect::<HashSet<u32>>(),
+                                "every digest that disagreed must be followed up. \
+                                 A budget charged per ENTRY is spent on the 64 \
+                                 free ones first and never reaches these at all"
+                            );
+                        }
+                        other => panic!(
+                            "{label}: a message full of disagreeing digests must \
+                             ask for bytes, got {other:?}"
+                        ),
+                    }
+                } else {
+                    assert!(
+                        reply.is_none(),
+                        "{label}: the `Summaries` arm resolves in place and sends \
+                         no reply, got {reply:?}"
+                    );
+                    assert_eq!(
+                        h.op_manager
+                            .interest_manager
+                            .get_peer_interest(&keys[0], &pk)
+                            .and_then(|i| i.summary)
+                            .map(|s| s.as_ref().to_vec()),
+                        Some(theirs.clone()),
+                        "{label}: a costed entry must be compared and its bytes \
+                         cached against the peer. A budget charged per ENTRY is \
+                         spent on the 64 free entries first, so this one is \
+                         never processed and no summary is recorded"
+                    );
+                }
+
+                assert_eq!(
+                    fetches, 64,
+                    "{label}: exactly one summarize per costed entry, and none at \
+                     all for the free ones — the receive budget must bound the \
+                     round trips, not the entry count"
+                );
+                assert_eq!(
+                    h.op_manager
+                        .interest_manager
+                        .get_peer_interest(&keys[127], &pk)
+                        .and_then(|i| i.summary),
+                    None,
+                    "{label}: a free entry still carries its repair — it clears \
+                     our cached belief that the peer holds state. Not charging \
+                     it must not mean discarding it"
+                );
+            }
+        }
+
+        /// The simulation-only `emit_confirmed` path still summarizes for a free
+        /// entry, where production does not. Pinned deliberately, in both
+        /// directions, because each half protects something different.
+        ///
+        /// **Why production must skip.** The verdict for an entry carrying no
+        /// summary cannot depend on ours, so the round trip is pure cost — the
+        /// whole point of #5338's receive half.
+        ///
+        /// **Why simulation must NOT skip.** The `StateConfirmed` events these
+        /// fetches produce are consumed, and a search for the variant name at
+        /// the consumers will tell you they are not. The chain is:
+        /// `EventKind::stored_state_hash()` returns the hash for this variant;
+        /// `SimNetwork::check_convergence` and `check_convergence_from_logs`
+        /// fold it with `contract_key()` into a per-(peer, contract) latest-hash
+        /// map; several `simulation_integration` assertions read the same
+        /// accessor directly; and `StateVerifier::build_histories` admits the
+        /// event through `contract_key()`. The direct runner calls
+        /// `SimulationIdleTimeout::enable()` for EVERY simulation, so this is
+        /// not a corner.
+        ///
+        /// Removing it fails in both directions. A peer's last recorded hash
+        /// goes stale, which reads as divergence that is not there (flaky red);
+        /// or the peer leaves `contract_states` for that contract, dropping it
+        /// below the two-peer threshold the check requires, so the contract is
+        /// skipped without comment and the suite **passes vacuously**. The
+        /// second is the one that matters — a green signal that has quietly
+        /// stopped checking.
+        ///
+        /// #5338 removed this exception once and had to put it back. The
+        /// reasoning was "nothing reads `StateConfirmed`", from a grep for that
+        /// string across the consumers; the consumption is through a generic
+        /// accessor, so the string is not there to find. If you are about to
+        /// delete this test because the divergence looks untidy, trace
+        /// `stored_state_hash()` first.
+        ///
+        /// The cost is real and is recorded at
+        /// `MAX_SUMMARY_COMPARISONS_PER_MESSAGE`: under the flag the receive
+        /// leg's round trips are bounded by `MAX_SUMMARY_ENTRIES_PER_MESSAGE`
+        /// instead, so a simulation's summarize count reads high.
+        #[tokio::test]
+        async fn emit_confirmed_keeps_the_free_entry_summarize_production_skips() {
+            use std::sync::atomic::Ordering;
+
+            /// Restores the thread-local flag even if an assertion panics, so a
+            /// failure here cannot silently change what the next test on this
+            /// thread observes.
+            struct FlagGuard;
+            impl Drop for FlagGuard {
+                fn drop(&mut self) {
+                    crate::config::SimulationIdleTimeout::disable();
+                }
+            }
+
+            for (label, port) in [("digests", 17320u16), ("full-bytes", 17340)] {
+                let h = build_harness(&format!("hf-emit-conf-{label}"), port, vec![7u8; 64]).await;
+                let keys = host_many(&h, 64);
+                let hashes = distinct_hashes(&keys);
+
+                // Every entry free, so the fetch count is exactly the number of
+                // free-entry summarize calls and nothing else.
+                let message = || {
+                    if label == "digests" {
+                        InterestMessage::SummaryDigests {
+                            entries: hashes
+                                .iter()
+                                .map(|&hash| SummaryDigestEntry {
+                                    hash,
+                                    summary_digest: None,
+                                })
+                                .collect(),
+                            emitter: crate::message::SummariesEmitter::InterestsReply,
+                        }
+                    } else {
+                        InterestMessage::Summaries {
+                            entries: hashes
+                                .iter()
+                                .map(|&hash| SummaryEntry {
+                                    hash,
+                                    summary_bytes: None,
+                                })
+                                .collect(),
+                            emitter: crate::message::SummariesEmitter::InterestsReply,
+                        }
+                    }
+                };
+
+                assert!(
+                    !crate::config::SimulationIdleTimeout::is_enabled(),
+                    "{label} premise: the production path is the default, or the \
+                     two halves of this test measure the same thing"
+                );
+                let before = h.summary_queries.load(Ordering::Relaxed);
+                let _ = handle_interest_sync_message(&h.op_manager, h.new_peer, message()).await;
+                let production = h.summary_queries.load(Ordering::Relaxed) - before;
+
+                let guard = FlagGuard;
+                crate::config::SimulationIdleTimeout::enable();
+                let before = h.summary_queries.load(Ordering::Relaxed);
+                let _ = handle_interest_sync_message(&h.op_manager, h.new_peer, message()).await;
+                let simulated = h.summary_queries.load(Ordering::Relaxed) - before;
+                drop(guard);
+
+                assert_eq!(
+                    production, 0,
+                    "{label}: production must make no summarize round trip for an \
+                     entry that carries no summary — the verdict cannot depend on \
+                     ours, so the call is pure cost"
+                );
+                assert_eq!(
+                    simulated, 64,
+                    "{label}: and simulation must still make it. These fetches are \
+                     what produce the StateConfirmed events the convergence \
+                     checker folds into its per-peer state map; without them a \
+                     contract can fall below the two-peer threshold and be \
+                     skipped silently, so the suite passes while checking less"
+                );
+            }
+        }
+
+        /// A source we hold no connection for gets a reply, and gets no cursor.
+        ///
+        /// `peer_key` is an `Option`, and #5338 made the rotation depend on it.
+        /// The degraded branch is the one the change's safety argument leans on,
+        /// so it is worth exercising rather than asserting: with no stable
+        /// identity there is nothing to rotate against, so the reply draws a
+        /// fresh random offset and records nothing. That is the same degraded
+        /// mode an evicted cursor already gets, and it is acceptable for the
+        /// same reason — a source with no connection entry is also a source
+        /// whose interest this handler declines to register.
+        ///
+        /// The load-bearing assertion is the third one: a fabricated
+        /// address-derived key would make round two resume contiguously after
+        /// round one. It is an inequality because "holds no memory of this
+        /// source" is the property, and pinning which random offset it draws
+        /// would pin `GlobalRng`'s internals rather than the behaviour.
+        ///
+        /// Note which WIRE FORM this path produces, because it is not the one
+        /// you would guess: `summary_reply_form` fails closed on an unknown
+        /// peer version, and a source with no connection entry has no recorded
+        /// version, so an unresolvable source gets FULL BYTES. Asserted rather
+        /// than tolerated — it means this degraded path also spends the
+        /// full-bytes byte budget, which is worth knowing if the fail-closed
+        /// default ever moves.
+        #[tokio::test]
+        async fn an_unresolvable_source_gets_a_reply_but_no_cursor() {
+            let _seed = crate::config::GlobalRng::seed_guard(0x5338_0FFC);
+            let h = build_harness("hf-no-peer-key", 17280, vec![7u8; 64]).await;
+            let keys = host_many(&h, 200);
+            let hashes = distinct_hashes(&keys);
+            let mut sorted = keys.clone();
+            sorted.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+
+            // Never added to the ring, so `get_peer_key_from_addr` returns None.
+            let stranger: SocketAddr = "127.0.0.1:17289".parse().unwrap();
+            assert!(
+                h.op_manager
+                    .ring
+                    .connection_manager
+                    .get_peer_by_addr(stranger)
+                    .is_none(),
+                "premise: this address must have no connection entry, or the \
+                 test exercises the resolvable path instead"
+            );
+
+            // A known peer's cursor, which the stranger must not touch.
+            let known = h.peer_key_of(h.new_peer);
+            h.op_manager
+                .interest_manager
+                .record_summary_cursor(&known, *sorted[5].id());
+
+            // Full bytes, not digests: the version gate fails closed on a
+            // source we have no connection entry for.
+            let full_bytes_hashes = |reply: Option<InterestMessage>| -> Vec<u32> {
+                match reply {
+                    Some(InterestMessage::Summaries { entries, .. }) => {
+                        entries.iter().map(|e| e.hash).collect()
+                    }
+                    other => panic!(
+                        "an unresolvable source has no recorded version, so the \
+                         fail-closed gate must send full bytes, got {other:?}"
+                    ),
+                }
+            };
+
+            let first = full_bytes_hashes(
+                handle_interest_sync_message(
+                    &h.op_manager,
+                    stranger,
+                    InterestMessage::Interests {
+                        hashes: hashes.clone(),
+                    },
+                )
+                .await,
+            );
+            assert_eq!(
+                first.len(),
+                64,
+                "an unresolvable source is still served a full bounded reply — \
+                 degrading the rotation must not degrade the answer"
+            );
+
+            let resume = sorted
+                .iter()
+                .position(|k| contract_hash(k) == *first.last().expect("64 entries"))
+                .expect("the last hash sent must be one of ours")
+                + 1;
+            let second = full_bytes_hashes(
+                handle_interest_sync_message(
+                    &h.op_manager,
+                    stranger,
+                    InterestMessage::Interests { hashes },
+                )
+                .await,
+            );
+            let contiguous: Vec<u32> = (0..64)
+                .map(|i| contract_hash(&sorted[(resume + i) % sorted.len()]))
+                .collect();
+            assert_ne!(
+                second, contiguous,
+                "with no peer key there is no cursor to resume from, so round \
+                 two must NOT continue where round one stopped. Fabricating a \
+                 key from the address would make it resume — and would key the \
+                 cursor by address again, which is the defect #5338 fixes"
+            );
+
+            assert_eq!(
+                h.op_manager
+                    .interest_manager
+                    .peek_summary_cursor(&known)
+                    .as_ref(),
+                Some(sorted[5].id()),
+                "and an unresolvable source must not advance — or read — the \
+                 cursor of a peer we DO know"
+            );
+        }
+
+        /// A window with nothing to summarize walks to the entry ceiling and
+        /// stops there, spending no budget at all.
+        ///
+        /// Two properties in one fixture, both otherwise unpinned:
+        ///
+        /// - **The `MAX_SUMMARY_ENTRIES_PER_MESSAGE` ceiling.** Every other test
+        ///   here stops on the summarize budget well before it, so a regression
+        ///   shrinking the ceiling back toward 64 would pass all of them. The
+        ///   sizing is the crux of the argument that the send-side fix is not
+        ///   a no-op — at 1x the ceiling binds before the budget and the whole
+        ///   change does nothing — and an unpinned constant is an argument with
+        ///   nothing holding it up.
+        /// - **The all-free window.** With no hosted contract anywhere in the
+        ///   set the loop never reaches `summarized >= summarize_cap`, so the
+        ///   ceiling is the ONLY thing that terminates it. Without one it would
+        ///   walk the entire shared set — the unbounded reply #5238 removed.
+        #[tokio::test]
+        async fn an_all_free_window_stops_at_the_entry_ceiling() {
+            use std::sync::atomic::Ordering;
+
+            let h = build_harness("hf-all-free", 17300, vec![7u8; 64]).await;
+            let tracker = h.peer_key_of(h.old_peer);
+
+            // 400 contracts we track and none we host, so every entry is free.
+            // Big-endian index so sorted-by-id order is `j` order.
+            let mut tracked = Vec::with_capacity(400);
+            for j in 0..400u32 {
+                let mut id = [0u8; 32];
+                id[0..4].copy_from_slice(&j.to_be_bytes());
+                id[4] = 0x77;
+                let key = ContractKey::from_id_and_code(
+                    ContractInstanceId::new(id),
+                    CodeHash::new([0xC2; 32]),
+                );
+                h.op_manager.interest_manager.register_peer_interest_from(
+                    &key,
+                    tracker.clone(),
+                    None,
+                    false,
+                    crate::ring::interest::InterestRegistrationSource::Interests,
+                );
+                tracked.push(key);
+            }
+            let hashes = distinct_hashes(&tracked);
+
+            // An id below every contract in the fixture, so the window starts
+            // at index 0 with no random draw.
+            let pk = h.peer_key_of(h.new_peer);
+            h.op_manager
+                .interest_manager
+                .record_summary_cursor(&pk, ContractInstanceId::new([0u8; 32]));
+
+            let before = h.summary_queries.load(Ordering::Relaxed);
+            let reply = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::Interests { hashes },
+            )
+            .await;
+            let fetches = h.summary_queries.load(Ordering::Relaxed) - before;
+
+            let entries = match reply {
+                Some(InterestMessage::SummaryDigests { entries, .. }) => entries,
+                other => panic!("expected a digest reply, got {other:?}"),
+            };
+            assert_eq!(
+                fetches, 0,
+                "not one of these contracts is hosted, so the gate declines every \
+                 one of them without a contract-handler round trip"
+            );
+            // ABSOLUTE literal, not the constant that produced it: an
+            // assertion written against its own constant moves with any
+            // regression to it and can never fail.
+            assert_eq!(
+                entries.len(),
+                128,
+                "the walk must stop at MAX_SUMMARY_ENTRIES_PER_MESSAGE (2 x 64). \
+                 Nothing here charges the summarize budget, so the ceiling is \
+                 the only thing that ends the loop — change it and this is the \
+                 test that notices, since every other fixture stops on the \
+                 budget first"
+            );
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|e| e.summary_digest.is_some())
+                    .count(),
+                0,
+                "premise: an all-free window advertises no summary at all"
+            );
+            assert_eq!(
+                h.op_manager
+                    .interest_manager
+                    .peek_summary_cursor(&pk)
+                    .as_ref(),
+                Some(tracked[127].id()),
+                "the cursor advances across the whole walked span, so the next \
+                 round resumes at 256 rather than re-walking the same prefix"
+            );
+        }
+
+        /// The RECEIVING leg is bounded independently of the sending one.
+        ///
+        /// One heartbeat round-trip pays two summarize-heavy loops, not one:
+        /// the sender computes a summary per entry to build the digests, and
+        /// the receiver computes its OWN summary per entry to compare against
+        /// them. Bounding only the send side would halve the storm and leave
+        /// the other half reachable from any peer that predates this release —
+        /// which, during a rollout, is most of them.
+        ///
+        /// The old bound on this arm was `MAX_SUMMARY_HASHES_PER_MESSAGE`
+        /// (4096), which bounds the message but is far above the point where
+        /// the WORK matters.
+        #[tokio::test]
+        async fn digest_receive_leg_bounds_its_summarize_calls() {
+            use std::sync::atomic::Ordering;
+
+            let h = build_harness("hf-digest-recv-bound", 17160, vec![7u8; 64]).await;
+            let keys = host_many(&h, 933);
+            let hashes = distinct_hashes(&keys);
+
+            // A pre-#5238 sender: one entry per shared contract, no window.
+            // Digests deliberately DISAGREE with ours, so nothing short-
+            // circuits the comparison — this measures the loop, not the
+            // agreement path.
+            let entries: Vec<SummaryDigestEntry> = hashes
+                .iter()
+                .map(|&hash| SummaryDigestEntry {
+                    hash,
+                    summary_digest: Some(summary_digest(b"not our summary")),
+                })
+                .collect();
+
+            let before = h.summary_queries.load(Ordering::Relaxed);
+            let _ = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::SummaryDigests {
+                    entries,
+                    emitter: crate::message::SummariesEmitter::InterestsReply,
+                },
+            )
+            .await;
+            let fetches = h.summary_queries.load(Ordering::Relaxed) - before;
+
+            assert!(
+                fetches > 0,
+                "premise: the fixture must actually reach the summarize path, \
+                 or this test cannot fail"
+            );
+            assert!(
+                fetches <= 64,
+                "comparing an inbound digest message made {fetches} summarize \
+                 round trips against {} entries. The receiving leg is the other \
+                 half of the #5238 storm and needs its own bound — the sender's \
+                 window does not constrain what an un-upgraded peer sends us",
+                hashes.len()
+            );
+        }
+
+        /// The full-bytes `Summaries` receive leg is bounded too.
+        ///
+        /// It is the twin of `digest_receive_leg_bounds_its_summarize_calls`:
+        /// same per-entry summarize cost, different wire form, and this one has
+        /// neither the digest arm's per-message memo nor its pair dedup, so an
+        /// unbounded version is the cheaper of the two to drive.
+        ///
+        /// It cannot bind against a peer running #5155 or later, which is why
+        /// the fixture builds the message by hand rather than provoking one.
+        #[tokio::test]
+        async fn summaries_receive_leg_bounds_its_summarize_calls() {
+            use std::sync::atomic::Ordering;
+
+            let h = build_harness("hf-summaries-recv-bound", 17180, vec![7u8; 64]).await;
+            let keys = host_many(&h, 933);
+            let hashes = distinct_hashes(&keys);
+
+            // Summaries that DISAGREE with ours, so nothing short-circuits.
+            let entries: Vec<SummaryEntry> = hashes
+                .iter()
+                .map(|&hash| {
+                    SummaryEntry::from_summary(hash, Some(&StateSummary::from(vec![9u8; 8])))
+                })
+                .collect();
+
+            let before = h.summary_queries.load(Ordering::Relaxed);
+            let _ = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::Summaries {
+                    entries,
+                    emitter: crate::message::SummariesEmitter::InterestsReply,
+                },
+            )
+            .await;
+            let fetches = h.summary_queries.load(Ordering::Relaxed) - before;
+
+            assert!(
+                fetches > 0,
+                "premise: the fixture must actually reach the summarize path, \
+                 or the bound below can never fail"
+            );
+            assert!(
+                fetches <= 64,
+                "comparing an inbound Summaries message made {fetches} summarize \
+                 round trips against {} entries; this leg has no per-message \
+                 memo, so an unbounded version is the cheapest path in the \
+                 #5238 family",
+                hashes.len()
+            );
+        }
+
+        /// `ChangeInterests` deduplicates its peer-supplied hash list.
+        ///
+        /// This arm is deliberately not windowed — it is churn-driven, so a
+        /// window could defer a newly-added interest indefinitely rather than
+        /// by a bounded number of heartbeats. That leaves it as the cheapest
+        /// amplification path in the family once the other four are bounded:
+        /// `added` is peer-supplied and uncapped, and every entry costs a
+        /// `summary_if_hosted_or_in_use` round trip.
+        ///
+        /// Dedup is the part that is free. A window can drop a real new
+        /// interest; a repeated hash carries nothing the first copy did not,
+        /// so collapsing it cannot lose anything. The assertion is therefore
+        /// on REPETITION only — a peer naming many genuinely distinct new
+        /// interests still pays per interest, by design.
+        #[tokio::test]
+        async fn change_interests_deduplicates_repeated_hashes() {
+            use std::sync::atomic::Ordering;
+
+            let h = build_harness("hf-change-dedup", 17185, vec![7u8; 64]).await;
+            let keys = host_many(&h, 1);
+            let hashes = distinct_hashes(&keys);
+            // NOT "the fixture hosts exactly one contract" — `build_harness`
+            // already hosts and locally-registers its own `h.key` before
+            // `host_many` adds this one, so the node hosts two. What matters is
+            // narrower, and is what this asserts: `host_many(1)` yielded a
+            // single hash, and that hash is the only thing we put in `added`.
+            // `h.key`'s hash is never sent, so the arm never reaches it.
+            //
+            // Near-vacuous by construction (`host_many(1)` returns one key, so
+            // `distinct_hashes` returns one hash barring a self-collision), and
+            // kept as a guard on the FIXTURE rather than on the behaviour: if
+            // someone grows `host_many`'s argument, the expected fetch count
+            // below stops being 1, and this fires first with a clearer reason
+            // than the equality would give.
+            assert_eq!(hashes.len(), 1, "premise: exactly one hash is advertised");
+
+            // 500 copies of ONE hash. Pre-dedup this is 500 sequential
+            // summarize round trips for a single contract.
+            let repeats = 500usize;
+            let added: Vec<u32> = std::iter::repeat_n(hashes[0], repeats).collect();
+
+            let before = h.summary_queries.load(Ordering::Relaxed);
+            let _ = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::ChangeInterests {
+                    added,
+                    removed: Vec::new(),
+                },
+            )
+            .await;
+            let fetches = h.summary_queries.load(Ordering::Relaxed) - before;
+
+            assert!(
+                fetches > 0,
+                "premise: the fixture must actually reach the summarize path, \
+                 or the bound below can never fail"
+            );
+            // Pin the EXACT value, not `< repeats`. The fixture hosts one
+            // contract and `lookup_by_hash` resolves the single hash to it, so
+            // correct dedup collapses the loop to exactly one round trip.
+            //
+            // `< repeats` was the first form and it is far too weak to be worth
+            // having: an INVERTED condition (`if seen_added.insert(hash)`,
+            // skipping only the FIRST occurrence) processes the other 499 and
+            // still passes, as does any batched dedup collapsing to repeats/K.
+            // That mutation removes ~1 round trip out of 500 — a dedup that is
+            // essentially entirely broken — and only an equality assertion
+            // separates it from the fix.
+            assert_eq!(
+                fetches, 1,
+                "{repeats} copies of one hash made {fetches} summarize round \
+                 trips, expected exactly 1. Bounding the other four loops makes \
+                 this arm the cheapest amplification path in the #5238 family, \
+                 and dedup is the one bound here that cannot drop a real new \
+                 interest"
+            );
+        }
+
+        /// The digest path RECORDS a rotation cursor, not just reads one.
+        ///
+        /// `digest_rotation_covers_the_whole_shared_set` covers this only
+        /// indirectly, through the coverage it produces. Asserting the cursor
+        /// directly is what the full-bytes sibling already does, and it is the
+        /// single line that distinguishes "the window advances" from "the
+        /// window happens to have been drawn differently each round".
+        #[tokio::test]
+        async fn digest_reply_records_the_rotation_cursor() {
+            let h = build_harness("hf-digest-cursor", 17190, vec![7u8; 64]).await;
+            let keys = host_many(&h, 200);
+            let hashes = distinct_hashes(&keys);
+
+            assert!(
+                h.op_manager
+                    .interest_manager
+                    .peek_summary_cursor(&h.peer_key_of(h.new_peer))
+                    .is_none(),
+                "premise: no cursor before the first reply"
+            );
+
+            let _ = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::Interests { hashes },
+            )
+            .await;
+
+            assert!(
+                h.op_manager
+                    .interest_manager
+                    .peek_summary_cursor(&h.peer_key_of(h.new_peer))
+                    .is_some(),
+                "a digest reply must record where it stopped, or the next round \
+                 re-draws at random and the ceil(n / cap) coverage bound is lost \
+                 — this was `if form == FullBytes` before #5238"
+            );
+        }
+
+        /// The `SummaryRequest` reply is bounded too, because bounding
+        /// `Interests` made this the cheapest remaining amplification path.
+        ///
+        /// The recorded reason for leaving this arm unbounded was that a peer
+        /// could already force the same work by spamming `Interests`, which ran
+        /// the same loop. That was true; it is not any more. With both forms of
+        /// `Interests` windowed, an unbounded reply here would be strictly
+        /// easier to abuse than the loop this change closes.
+        ///
+        /// It costs nothing against an upgraded peer: a requester running this
+        /// release compares at most 64 entries per message, so it cannot ask
+        /// for more hashes than the cap allows.
+        #[tokio::test]
+        async fn summary_request_reply_bounds_its_summarize_calls() {
+            use std::sync::atomic::Ordering;
+
+            let h = build_harness("hf-request-bound", 17170, vec![7u8; 64]).await;
+            let keys = host_many(&h, 933);
+            let hashes = distinct_hashes(&keys);
+
+            let before = h.summary_queries.load(Ordering::Relaxed);
+            let reply = handle_interest_sync_message(
+                &h.op_manager,
+                h.new_peer,
+                InterestMessage::SummaryRequest {
+                    hashes: hashes.clone(),
+                },
+            )
+            .await;
+            let fetches = h.summary_queries.load(Ordering::Relaxed) - before;
+
+            match reply {
+                Some(InterestMessage::Summaries { entries, .. }) => {
+                    assert!(
+                        !entries.is_empty(),
+                        "a bounded reply must still answer the request"
+                    );
+                    assert!(entries.len() <= 64, "got {} entries", entries.len());
+                }
+                other => panic!("a SummaryRequest must be answered with full bytes, got {other:?}"),
+            }
+            assert!(
+                fetches > 0,
+                "premise: the fixture must actually reach the summarize path, \
+                 or the bound below can never fail"
+            );
+            assert!(
+                fetches <= 64,
+                "answering a {}-hash SummaryRequest made {fetches} summarize \
+                 round trips; the intended cap is 64",
+                hashes.len()
+            );
+        }
+
+        /// Successive fallback replies rotate, so the whole shared set is
+        /// covered within `ceil(n / cap)` rounds rather than the same prefix
+        /// being re-sent forever.
+        ///
+        /// A hard cap with no rotation would be simpler and strictly worse:
+        /// everything past the first window would never be advertised to that
+        /// peer at all, turning a bandwidth fix into permanent silent
+        /// divergence.
+        ///
+        /// Cursor-seeded for the reason spelled out on
+        /// `digest_rotation_covers_the_whole_shared_set`: this test carried the
+        /// same ~1% cycle-boundary flake latently since #5155, and it is a
+        /// latent flake rather than an observed one only because nothing had
+        /// run it enough times to land on one of the three bad starts.
+        #[tokio::test]
+        async fn fallback_rotation_covers_the_whole_shared_set() {
+            // Guarded — see the sibling rotation test for why.
+            let _seed = crate::config::GlobalRng::seed_guard(0x5155_0704);
+            let h = build_harness("hf-bound-rotate", 17140, vec![7u8; 64]).await;
+            let keys = host_many(&h, 200);
+            let hashes = distinct_hashes(&keys);
+            let expected: HashSet<u32> = hashes.iter().copied().collect();
+            let rounds = hashes.len().div_ceil(MAX_FALLBACK_SUMMARIES_PER_REPLY);
+
+            let mut sorted = keys.clone();
+            sorted.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+            h.op_manager
+                .interest_manager
+                .record_summary_cursor(&h.peer_key_of(h.old_peer), *sorted[0].id());
+
+            let mut covered: HashSet<u32> = HashSet::new();
+            for round in 0..rounds {
+                let reply = handle_interest_sync_message(
+                    &h.op_manager,
+                    h.old_peer,
+                    InterestMessage::Interests {
+                        hashes: hashes.clone(),
+                    },
+                )
+                .await;
+                match reply {
+                    Some(InterestMessage::Summaries { entries, .. }) => {
+                        // Holds BY FIXTURE, not by the cap — same as the digest
+                        // twin. Since #5338 a reply is bounded at 64 SUMMARIZE
+                        // CALLS and at MAX_SUMMARY_ENTRIES_PER_MESSAGE entries,
+                        // so a reply may legitimately carry more than 64
+                        // entries. Every contract here is hosted, so every entry
+                        // is costed and the summarize budget binds. Do not read
+                        // this as "replies are capped at 64 entries".
+                        assert!(entries.len() <= MAX_FALLBACK_SUMMARIES_PER_REPLY);
+                        covered.extend(entries.iter().map(|e| e.hash));
+                    }
+                    other => panic!("round {round}: expected full bytes, got {other:?}"),
+                }
+            }
+
+            assert_eq!(
+                covered.len(),
+                expected.len(),
+                "after {rounds} rounds (ceil({}/{MAX_FALLBACK_SUMMARIES_PER_REPLY})) \
+                 the rotation still had not advertised {} of the shared contracts",
+                hashes.len(),
+                expected.difference(&covered).count()
+            );
+        }
+
+        /// When summaries are large the byte budget, not the entry cap, sets
+        /// the cycle length — and the cycle is then FAR longer than
+        /// `ceil(n / 64)` rounds.
+        ///
+        /// This test exists to stop the comfortable number being quoted. The
+        /// PR-level claim is naturally read as "a divergence is noticed within
+        /// ceil(266/64) ~= 5 heartbeats, about 25 minutes"; that holds only in
+        /// the regime where entries are cheap. Here every summary is 5 KB, so
+        /// a round carries two entries and covering 40 contracts takes ~20
+        /// rounds, not 1. At a 5-minute heartbeat that is a bit over an hour,
+        /// and for a set of River-sized summaries it is longer still.
+        ///
+        /// If someone later makes the budget adaptive, or reworks the bound so
+        /// the entry cap governs again, this test SHOULD fail — and its failure
+        /// means the cost story in the PR needs rewriting, not that the test
+        /// needs relaxing.
+        #[tokio::test]
+        async fn heavy_summaries_make_the_cycle_far_longer_than_the_entry_cap_suggests() {
+            let h = build_harness("hf-bound-cycle-cost", 17160, vec![4u8; 5000]).await;
+            let keys = host_many(&h, 40);
+            let hashes = distinct_hashes(&keys);
+            let expected: HashSet<u32> = hashes.iter().copied().collect();
+
+            // The optimistic reading: entry cap only.
+            let optimistic_rounds = hashes.len().div_ceil(64);
+            assert_eq!(
+                optimistic_rounds, 1,
+                "premise: 40 contracts is one round under the entry cap alone"
+            );
+
+            let mut covered: HashSet<u32> = HashSet::new();
+            let mut rounds_taken = 0usize;
+            for _ in 0..200 {
+                rounds_taken += 1;
+                let reply = handle_interest_sync_message(
+                    &h.op_manager,
+                    h.old_peer,
+                    InterestMessage::Interests {
+                        hashes: hashes.clone(),
+                    },
+                )
+                .await;
+                match reply {
+                    Some(InterestMessage::Summaries { entries, .. }) => {
+                        covered.extend(entries.iter().map(|e| e.hash));
+                    }
+                    other => panic!("expected full bytes, got {other:?}"),
+                }
+                if covered == expected {
+                    break;
+                }
+            }
+
+            assert_eq!(
+                covered, expected,
+                "the rotation must still reach every contract — slower is the \
+                 accepted cost, never-covered is not"
+            );
+            assert!(
+                rounds_taken > optimistic_rounds * 5,
+                "premise of this test: with 5 KB summaries the byte budget must \
+                 dominate, making the real cycle much longer than the \
+                 {optimistic_rounds}-round entry-cap reading. It took \
+                 {rounds_taken}. If this now passes quickly, the cost model in \
+                 the PR and in MAX_FALLBACK_SUMMARY_BYTES_PER_REPLY is stale."
+            );
+        }
+
+        /// Two `Interests` from the same peer handled concurrently cost at
+        /// most one round of rotation progress, and cannot wedge or corrupt it.
+        ///
+        /// The handler reads the cursor, awaits up to 64 summary fetches, then
+        /// writes the cursor back, so two overlapping invocations for one peer
+        /// can both read the same start and build the same window. Inbound
+        /// messages are dispatched one task per message, so this is reachable
+        /// in production and a peer can provoke it deliberately. The comment at
+        /// the cursor-advance site accepts that cost as "one round"; this test
+        /// is that claim's evidence rather than its restatement.
+        ///
+        /// The load-bearing assertion is the progress floor: after `PAIRS`
+        /// concurrent pairs run back to back with no sequential round between
+        /// them, the union of what was advertised must be at least
+        /// `PAIRS * 64` contracts — i.e. every pair advanced the rotation by at
+        /// least one window even in the worst interleaving. Losing MORE than
+        /// one round per pair, or losing the cursor entirely and re-sending the
+        /// same window forever, both fail here. The bound holds for any
+        /// interleaving, so the test does not depend on the scheduler
+        /// reproducing a particular one: a genuinely concurrent run and a
+        /// serialised run both satisfy it, and only a broken rotation does not.
+        ///
+        /// Multi-threaded flavour with `spawn` on purpose: an earlier version
+        /// of this test used `join!` on a current-thread runtime and the two
+        /// futures did NOT overlap — it passed while exercising nothing.
+        ///
+        /// # How that was caught, since the same trap is easy to re-enter
+        ///
+        /// A concurrency test that passes first time deserves suspicion,
+        /// because the cheapest way to pass one is not to be concurrent. The
+        /// check that separated "passes" from "is evidence" was to probe for
+        /// the race's own signature rather than for the assertions: both
+        /// handlers reading the same cursor must produce the SAME window, so
+        /// **identical windows prove the overlap happened and different ones
+        /// prove it did not**. The `join!` version produced different windows,
+        /// which is what exposed it as vacuous.
+        ///
+        /// If you rewrite this test, re-run that probe rather than trusting a
+        /// green result — and do not "simplify" it back to `join!` on the
+        /// default runtime, which is where it started.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn concurrent_interests_from_one_peer_cost_at_most_one_round() {
+            const PAIRS: usize = 3;
+            let h = build_harness("hf-bound-concurrent", 17170, vec![7u8; 64]).await;
+            let keys = host_many(&h, 400);
+            let hashes = distinct_hashes(&keys);
+            let expected: HashSet<u32> = hashes.iter().copied().collect();
+            let ids: HashSet<ContractInstanceId> = keys.iter().map(|k| *k.id()).collect();
+
+            let mut covered: HashSet<u32> = HashSet::new();
+            for pair in 0..PAIRS {
+                let spawn_one = || {
+                    let op_manager = Arc::clone(&h.op_manager);
+                    let hashes = hashes.clone();
+                    let peer = h.old_peer;
+                    tokio::spawn(async move {
+                        handle_interest_sync_message(
+                            &op_manager,
+                            peer,
+                            InterestMessage::Interests { hashes },
+                        )
+                        .await
+                    })
+                };
+                let (first, second) = tokio::join!(spawn_one(), spawn_one());
+
+                for (which, joined) in [("first", first), ("second", second)] {
+                    match joined.expect("handler task panicked") {
+                        Some(InterestMessage::Summaries { entries, .. }) => {
+                            assert!(
+                                entries.len() <= 64,
+                                "pair {pair} {which} reply carried {} entries; the \
+                                 per-reply bound must hold regardless of overlap",
+                                entries.len()
+                            );
+                            assert!(summary_bytes_of(&entries) <= 9 * 1024 + h.our_summary.len());
+                            covered.extend(entries.iter().map(|e| e.hash));
+                        }
+                        other => panic!("pair {pair} {which} reply was {other:?}"),
+                    }
+                }
+
+                // The cursor must still name a contract that exists, not a
+                // value torn between the two writers.
+                let cursor = h
+                    .op_manager
+                    .interest_manager
+                    .peek_summary_cursor(&h.peer_key_of(h.old_peer))
+                    .expect("a fallback reply must leave a cursor");
+                assert!(
+                    ids.contains(&cursor),
+                    "after pair {pair} the cursor is no longer a member of the \
+                     shared set — concurrent writers corrupted the rotation \
+                     rather than merely duplicating a window"
+                );
+            }
+
+            assert!(
+                covered.len() >= PAIRS * 64,
+                "{PAIRS} concurrent pairs advertised only {} distinct contracts; \
+                 each pair must advance the rotation by at least one 64-entry \
+                 window, so the overlap cost more than the one round the \
+                 cursor-advance comment claims",
+                covered.len()
+            );
+
+            // And the rotation still completes from there.
+            for _ in 0..hashes.len().div_ceil(64) {
+                match handle_interest_sync_message(
+                    &h.op_manager,
+                    h.old_peer,
+                    InterestMessage::Interests {
+                        hashes: hashes.clone(),
+                    },
+                )
+                .await
+                {
+                    Some(InterestMessage::Summaries { entries, .. }) => {
+                        covered.extend(entries.iter().map(|e| e.hash));
+                    }
+                    other => panic!("expected full bytes, got {other:?}"),
+                }
+            }
+            assert_eq!(
+                covered.len(),
+                expected.len(),
+                "{} contracts still unadvertised after the concurrent pairs plus \
+                 a full sequential cycle",
+                expected.difference(&covered).count()
+            );
+        }
+
+        /// The rotation bounds what we ADVERTISE, never who we consider a
+        /// broadcast target.
+        ///
+        /// Peer interest is registered for every shared contract, including the
+        /// ones outside this round's window. Rotating that too would drop the
+        /// peer out of the broadcast set for whatever fell outside, converting
+        /// a bandwidth bound into missed updates — a correctness bug wearing a
+        /// performance fix's clothes.
+        ///
+        /// This is the most load-bearing test in the change, because
+        /// `INTEREST_TTL` is 20 minutes (4 heartbeats) while the new coverage
+        /// cycle is ~40-75 minutes. Had the registration loop been moved inside
+        /// the window, `sweep_expired_interests` would have started removing
+        /// (contract, peer) pairs in steady state for any peer sharing more
+        /// than 4 x 64 contracts — silent, and fatal to live fan-out.
+        ///
+        /// Be precise about what running BOTH forms buys, because it is easy to
+        /// overstate: there is exactly ONE registration loop today, shared by
+        /// both forms, so any move of it inside the window breaks BOTH cases
+        /// and either alone would catch it. The second case is insurance
+        /// against a FUTURE per-form split of that loop, not additional
+        /// coverage of the code as it stands.
+        #[tokio::test]
+        async fn bounding_the_reply_does_not_bound_interest_registration() {
+            // #5238: run against BOTH wire forms. Under #5155 only the
+            // full-bytes reply was windowed, so `old_peer` was the only case
+            // where a contract could be registered-but-unadvertised. Now that
+            // both are windowed the invariant matters for every peer, and a
+            // test that only covers one form would not notice if the
+            // registration loop were moved inside the window for the other.
+            for (label, peer) in [("full-bytes", 17150u16), ("digests", 17151)] {
+                let h =
+                    build_harness(&format!("hf-bound-interest-{label}"), peer, vec![7u8; 64]).await;
+                let target = if label == "digests" {
+                    h.new_peer
+                } else {
+                    h.old_peer
+                };
+                let keys = host_many(&h, 200);
+                let hashes = distinct_hashes(&keys);
+
+                let reply = handle_interest_sync_message(
+                    &h.op_manager,
+                    target,
+                    InterestMessage::Interests {
+                        hashes: hashes.clone(),
+                    },
+                )
+                .await;
+                let advertised: HashSet<u32> = match reply {
+                    Some(InterestMessage::Summaries { ref entries, .. }) => {
+                        entries.iter().map(|e| e.hash).collect()
+                    }
+                    Some(InterestMessage::SummaryDigests { ref entries, .. }) => {
+                        entries.iter().map(|e| e.hash).collect()
+                    }
+                    other => panic!("{label}: unexpected reply {other:?}"),
+                };
+                assert!(
+                    advertised.len() < hashes.len(),
+                    "{label} premise: this round must NOT have advertised \
+                     everything, or the test cannot distinguish \
+                     registered-for-all from registered-for-the-window"
+                );
+
+                let pk = h.peer_key_of(target);
+                let unadvertised: Vec<&ContractKey> = keys
+                    .iter()
+                    .filter(|k| !advertised.contains(&contract_hash(k)))
+                    .collect();
+                assert!(
+                    !unadvertised.is_empty(),
+                    "{label} premise: some contract was cut"
+                );
+                for key in unadvertised {
+                    assert!(
+                        h.op_manager
+                            .interest_manager
+                            .get_peer_interest(key, &pk)
+                            .is_some(),
+                        "{label}: peer interest must be registered for {key} \
+                         even though this round's window did not advertise it"
+                    );
+                }
+            }
+        }
+
         /// Control for the test above: the same `Summaries` message, but
         /// carrying OUR bytes, must NOT heal.
         ///
@@ -9058,10 +12441,12 @@ mod tests {
             // and makes the dropped entry invisible.
             let h = build_harness("hf-collision", 17080, vec![3u8; 64]).await;
             for k in [key_a, key_b] {
-                let _ = h
-                    .op_manager
-                    .ring
-                    .host_contract(k, 128, crate::ring::AccessType::Put);
+                let _ = h.op_manager.ring.host_contract(
+                    k,
+                    128,
+                    crate::ring::AccessType::Put,
+                    crate::ring::HostingCause::Other,
+                );
                 h.op_manager.interest_manager.register_local_hosting(&k);
             }
 
@@ -9124,7 +12509,7 @@ mod tests {
         /// `summary_if_hosted_or_in_use` runs. That is a contract-handler round
         /// trip, sequential, on the loop the executor needs responsive. With
         /// pair-dedup and no further bound, one message could name a single
-        /// known hash with up to `MAX_SUMMARY_HASHES_PER_MESSAGE` distinct
+        /// known hash with up to `MAX_SUMMARY_COMPARISONS_PER_MESSAGE` distinct
         /// digests and force that many fetches per matching contract.
         ///
         /// Two mechanisms bound it:
@@ -9141,8 +12526,15 @@ mod tests {
         ///
         /// Stated because the obvious reading is wrong. Mutation-tested three
         /// ways: removing the cache alone PASSES, removing the skip alone
-        /// PASSES, removing BOTH fails at 512 fetches. So this test bounds the
-        /// CONJUNCTION, not either mechanism individually.
+        /// PASSES, removing BOTH fails at one fetch per pair. So this test
+        /// bounds the CONJUNCTION, not either mechanism individually.
+        ///
+        /// The fixture was 512 pairs until #5238 lowered the per-message
+        /// comparison cap to 64; it is now sized just under that cap, so the
+        /// cap is still not what this test measures. The amplification factor
+        /// it demonstrates shrank with the fixture, but its discrimination did
+        /// not: removing both mechanisms still yields one fetch per pair
+        /// against an assertion of at most one in total.
         ///
         /// That is not a defect in the test so much as a property of the fix:
         /// each mechanism is independently sufficient for this observable. Only
@@ -9164,17 +12556,18 @@ mod tests {
             let h = build_harness("hf-amp", 17090, vec![5u8; 128]).await;
             let hash = contract_hash(&h.key);
 
-            // 512 distinct fabricated digests, all naming the ONE hash this
+            // 63 distinct fabricated digests, all naming the ONE hash this
             // node tracks. Every one of them is a real, distinct pair, so
             // pair-dedup does not collapse them.
-            let entries: Vec<SummaryDigestEntry> = (0..512u32)
+            let entries: Vec<SummaryDigestEntry> = (0..63u32)
                 .map(|i| SummaryDigestEntry {
                     hash,
                     summary_digest: Some(summary_digest(&i.to_le_bytes())),
                 })
                 .collect();
+            let pairs = entries.len();
             assert!(
-                entries.len() < MAX_SUMMARY_HASHES_PER_MESSAGE,
+                pairs < MAX_SUMMARY_COMPARISONS_PER_MESSAGE,
                 "premise: stay under the cap so the CAP is not what bounds \
                  this — the cache and the skip must be doing the work"
             );
@@ -9192,14 +12585,14 @@ mod tests {
             let fetches = h.summary_queries.load(Ordering::Relaxed) - before;
 
             // One contract matches this hash, so one fetch is the floor. The
-            // bound is what matters: NOT proportional to the 512 pairs.
+            // bound is what matters: NOT proportional to the pair count.
             assert!(
                 fetches <= 1,
-                "512 fabricated digests for one hash caused {fetches} summary \
-                 fetches; the per-message cache should hold it to at most one \
-                 per matching contract. A count near 512 means the cache is \
-                 gone and a peer can monopolize the contract loop with a single \
-                 message."
+                "{pairs} fabricated digests for one hash caused {fetches} \
+                 summary fetches; the per-message cache should hold it to at \
+                 most one per matching contract. A count near {pairs} means the \
+                 cache is gone and a peer can monopolize the contract loop with \
+                 a single message."
             );
 
             // And the divergence is still handled: the hash IS requested.
@@ -9209,8 +12602,8 @@ mod tests {
                         hashes,
                         vec![hash],
                         "the hash must be requested exactly once — bounding the \
-                         work must not cost the request, and must not let 512 \
-                         pairs inflate it either"
+                         work must not cost the request, and must not let \
+                         {pairs} pairs inflate it either"
                     );
                 }
                 other => panic!(
@@ -9254,10 +12647,12 @@ mod tests {
                     ContractInstanceId::new([i.wrapping_add(100); 32]),
                     CodeHash::new([i; 32]),
                 );
-                let _ = h
-                    .op_manager
-                    .ring
-                    .host_contract(k, 128, crate::ring::AccessType::Put);
+                let _ = h.op_manager.ring.host_contract(
+                    k,
+                    128,
+                    crate::ring::AccessType::Put,
+                    crate::ring::HostingCause::Other,
+                );
                 h.op_manager.interest_manager.register_local_hosting(&k);
                 hashes.push(contract_hash(&k));
             }
@@ -9335,24 +12730,30 @@ mod tests {
 
             let h = build_harness("hf-interleave", 17110, vec![5u8; 128]).await;
 
-            // 32 hosted contracts, each its own hash.
+            // 21 hosted contracts, each its own hash. Sized so that the three
+            // interleaved rounds below total 63 entries — just under #5238's
+            // 64-entry per-message comparison cap, which must not be what
+            // bounds this test (it was 32 contracts / 96 entries before that
+            // cap existed).
             let mut hashes = Vec::new();
-            for i in 0u8..32 {
+            for i in 0u8..21 {
                 let k = ContractKey::from_id_and_code(
                     ContractInstanceId::new([i.wrapping_add(160); 32]),
                     CodeHash::new([i.wrapping_add(3); 32]),
                 );
-                let _ = h
-                    .op_manager
-                    .ring
-                    .host_contract(k, 128, crate::ring::AccessType::Put);
+                let _ = h.op_manager.ring.host_contract(
+                    k,
+                    128,
+                    crate::ring::AccessType::Put,
+                    crate::ring::HostingCause::Other,
+                );
                 h.op_manager.interest_manager.register_local_hosting(&k);
                 hashes.push(contract_hash(&k));
             }
             hashes.sort_unstable();
             hashes.dedup();
             let n = hashes.len();
-            assert!(n >= 16, "premise: need many distinct hashes, got {n}");
+            assert!(n >= 12, "premise: need many distinct hashes, got {n}");
 
             // Three INTERLEAVED rounds, and the SHAPES matter — this is where
             // a first attempt at this test went wrong. A round of MISMATCHING
@@ -9389,7 +12790,7 @@ mod tests {
                 });
             }
             assert!(
-                entries.len() < MAX_SUMMARY_HASHES_PER_MESSAGE,
+                entries.len() < MAX_SUMMARY_COMPARISONS_PER_MESSAGE,
                 "premise: stay under the cap so the CAP is not what bounds this"
             );
 
@@ -9418,10 +12819,10 @@ mod tests {
         }
 
         /// Repeated hashes must be free: a peer that names the same contract
-        /// 64 times must provoke exactly ONE entry in the request.
+        /// 20 times must provoke exactly ONE entry in the request.
         ///
         /// Entry count is deliberately kept UNDER
-        /// [`MAX_SUMMARY_HASHES_PER_MESSAGE`] so the handler's over-cap
+        /// [`MAX_SUMMARY_COMPARISONS_PER_MESSAGE`] so the handler's over-cap
         /// rotation is the identity and this test is deterministic. The
         /// over-cap behaviour is the sibling test below; separating them is
         /// what lets BOTH have hard assertions.
@@ -9442,19 +12843,26 @@ mod tests {
                     hash,
                     summary_digest: Some(summary_digest(b"divergent")),
                 };
-                64
+                20
             ];
-            // A short tail of unknown hashes, still well under the cap.
-            for i in 0..100u32 {
+            // A short tail of unknown hashes, still under the cap. Sized to 63
+            // entries in total: #5238 lowered the per-message comparison cap to
+            // 64, and going over it would reintroduce exactly the
+            // rotation-dependent flakiness the History note below describes.
+            for i in 0..43u32 {
                 entries.push(SummaryDigestEntry {
                     hash: hash.wrapping_add(i + 1),
                     summary_digest: Some(summary_digest(b"divergent")),
                 });
             }
             assert!(
-                entries.len() < MAX_SUMMARY_HASHES_PER_MESSAGE,
-                "premise: the fixture must stay under the cap so no rotation \
-                 occurs and this test is deterministic"
+                entries.len() < MAX_SUMMARY_ENTRIES_PER_MESSAGE,
+                "premise: the fixture must stay under the ENTRY ceiling so no \
+                 rotation occurs and this test is deterministic. Anchored to the \
+                 ceiling rather than to MAX_SUMMARY_COMPARISONS_PER_MESSAGE \
+                 because since #5338 that is the constant the rotation triggers \
+                 on — the two were the same number before, so the old anchor \
+                 held for the wrong reason"
             );
 
             let reply = handle_interest_sync_message(
@@ -9472,14 +12880,14 @@ mod tests {
                     assert_eq!(
                         hashes.iter().filter(|h| **h == hash).count(),
                         1,
-                        "a hash repeated 64 times must appear in the request \
+                        "a hash repeated 20 times must appear in the request \
                          exactly once — repetition must buy the sender nothing"
                     );
                     assert_eq!(
                         hashes.len(),
                         1,
                         "only the one locally-tracked contract may be \
-                         requested; the 100 unknown hashes resolve to nothing"
+                         requested; the 43 unknown hashes resolve to nothing"
                     );
                 }
                 other => panic!(
@@ -9499,19 +12907,50 @@ mod tests {
         /// sampling must seed.
         #[tokio::test]
         async fn over_cap_digest_message_stays_bounded() {
-            crate::config::GlobalRng::set_seed(0x0496_5CA9);
+            // Guarded, like the two rotation tests. This was the last bare
+            // `set_seed` in the file: it pins THREAD_SEED, THREAD_RNG and
+            // THREAD_INDEX and never cleared them, on the success path as well
+            // as on panic. That is the cross-test-interference class
+            // `.claude/rules/bug-prevention-patterns.md` records from #5314,
+            // which plain `cargo test` can see and `cargo nextest` structurally
+            // cannot.
+            let _seed = crate::config::GlobalRng::seed_guard(0x0496_5CA9);
             let h = build_harness("hf-cap", 17065, vec![5u8; 128]).await;
             let hash = contract_hash(&h.key);
 
+            // #5238: the KNOWN hash is INTERLEAVED through the unknowns, once
+            // every 32 entries, not appended as a block.
+            //
+            // Without a known hash at all, nothing resolves, the
+            // `SummaryRequest` arm below is unreachable and this degenerates
+            // into a no-panic smoke test — tolerable when the cap was 4,096 of
+            // 6,096 entries, much less so now that only 64 are processed.
+            //
+            // Appending it as a block does not work either, and the reason is
+            // worth recording because it is not the obvious probability
+            // argument: pair dedup collapses every copy of the known hash to a
+            // SINGLE pair, so a 2,000-entry block still contributes one, and
+            // the scan stops after 64 DISTINCT pairs. A rotation landing
+            // anywhere in the ~6,000 unknowns therefore fills its quota long
+            // before reaching the block. Measured: it missed outright under the
+            // seeded rotation. Interleaving at a period below the cap puts a
+            // copy inside every possible 64-entry window, so inclusion is
+            // structural rather than probabilistic.
             let mut entries = Vec::new();
             for i in 0..(MAX_SUMMARY_HASHES_PER_MESSAGE as u32 + 2_000) {
                 entries.push(SummaryDigestEntry {
                     hash: hash.wrapping_add(i + 1),
                     summary_digest: Some(summary_digest(b"divergent")),
                 });
+                if i % 32 == 0 {
+                    entries.push(SummaryDigestEntry {
+                        hash,
+                        summary_digest: Some(summary_digest(b"divergent")),
+                    });
+                }
             }
             assert!(
-                entries.len() > MAX_SUMMARY_HASHES_PER_MESSAGE,
+                entries.len() > MAX_SUMMARY_COMPARISONS_PER_MESSAGE,
                 "premise: the fixture must EXCEED the cap, or the bound below \
                  is not being exercised"
             );
@@ -9526,22 +12965,56 @@ mod tests {
             )
             .await;
 
-            // Every hash here is unknown to this node, so nothing resolves and
-            // no request is warranted. The property under test is that an
-            // over-cap message is absorbed without panic and without
-            // manufacturing work: `lookup_by_hash` yields nothing for any of
-            // them, so the peer's 6,096 entries buy it exactly nothing.
+            // The known hash MUST come back, and it must come back alone.
+            //
+            // The interleaved shape is what makes this a real assertion rather
+            // than a no-panic smoke test. The ~6,096 unknown hashes resolve to
+            // nothing whatever the peer does, so before the known hash was
+            // introduced this arm was unreachable and the bound assertion ran
+            // against an empty set.
+            //
+            // Inclusion is STRUCTURAL, not probabilistic — see the fixture
+            // construction above. The known hash is interleaved at a period
+            // below the 64-distinct-pair scan, so a copy falls inside every
+            // possible window and no rotation offset can miss it. The obvious
+            // alternative, appending the copies as one contiguous block, does
+            // NOT work: pair dedup collapses them to a single pair and the scan
+            // stops after 64 DISTINCT pairs, so a rotation landing anywhere in
+            // the unknowns fills its quota long before reaching the block. That
+            // is a near-certainty rather than a low probability, and it failed
+            // on the first run rather than flaking.
+            //
+            // Pair dedup still does the other half of the work: all copies of
+            // the known hash share one (hash, digest) pair, so the reply can
+            // name it at most once however the rotation lands.
+            //
+            // What this test is NOT: a regression pin for #5238. Under a full
+            // revert to the 4,096 cap the fixture still exceeds it, the known
+            // hash is still found by the same gap argument, and the reply is
+            // still `vec![hash]` — so it passes either way. It is a repair of a
+            // previously VACUOUS test, which is worth having on its own terms,
+            // but the bound on this change is pinned by the five tests that do
+            // fail on a targeted revert. Do not count this one among them.
             match reply {
-                None => {}
                 Some(InterestMessage::SummaryRequest { hashes }) => {
                     assert!(
-                        hashes.len() <= MAX_SUMMARY_HASHES_PER_MESSAGE,
+                        hashes.len() <= MAX_SUMMARY_COMPARISONS_PER_MESSAGE,
                         "the request must stay bounded by \
-                         MAX_SUMMARY_HASHES_PER_MESSAGE, got {}",
+                         MAX_SUMMARY_COMPARISONS_PER_MESSAGE, got {}",
                         hashes.len()
                     );
+                    assert_eq!(
+                        hashes,
+                        vec![hash],
+                        "an over-cap message must still answer for the one \
+                         contract this node tracks, and must not let 6,096 \
+                         unknown hashes inflate the reply"
+                    );
                 }
-                other => panic!("unexpected reply {other:?}"),
+                other => panic!(
+                    "the known hash must provoke a bounded SummaryRequest; got \
+                     {other:?}"
+                ),
             }
         }
 
@@ -9704,12 +13177,24 @@ mod tests {
                  full_summaries_message — the instrumented full-bytes \
                  constructor"
             );
-            assert!(
-                !body.contains("summaries_reply_for_peer"),
-                "the SummaryRequest arm must NOT route through \
-                 summaries_reply_for_peer: answering a request for bytes with \
-                 digests loops the exchange (digests → request → digests → …)"
-            );
+            // Every entry point to the encoding CHOICE, not just the original
+            // one. #5155 split `summaries_reply_for_peer` into
+            // `summary_reply_form` + `summaries_reply_in_form`, and neither new
+            // name is a substring of the old one — so a future edit routing
+            // this arm through the split pair would reintroduce the
+            // digests → request → digests loop with this pin still green.
+            for banned in [
+                "summaries_reply_for_peer",
+                "summary_reply_form",
+                "summaries_reply_in_form",
+            ] {
+                assert!(
+                    !body.contains(banned),
+                    "the SummaryRequest arm must NOT route through {banned}: \
+                     answering a request for bytes with digests loops the \
+                     exchange (digests → request → digests → …)"
+                );
+            }
         }
 
         /// Source pin: the `SummaryDigests` arm must reach the heal through the
@@ -9730,7 +13215,9 @@ mod tests {
                 .expect("end of SummaryDigests arm not found");
             let body = &code_only(&src[arm..arm + end]);
             assert!(
-                body.contains("emit_stale_peer_syncs(op_manager, source, stale_contracts)"),
+                body.contains(
+                    "emit_stale_peer_syncs(op_manager, source, peer_key.as_ref(), stale_contracts)"
+                ),
                 "the SummaryDigests arm must delegate healing to the shared \
                  emit_stale_peer_syncs"
             );
@@ -9759,6 +13246,825 @@ mod tests {
                  identical/differing comparison, or the telemetry that \
                  justifies this change stops being able to measure it"
             );
+        }
+
+        /// The R4b agreement-rate instrument (#5153), driven through the REAL
+        /// receive arm.
+        ///
+        /// R4b would swap the proactive summary notification's full summary
+        /// bytes for a 21-byte digest, and that trade wins or loses entirely on
+        /// `p`, the agreement rate ON THAT LEG. The fleet-wide rate cannot
+        /// answer it: comparisons are per ENTRY, and a notification carries
+        /// 1.000 entries/message against the heartbeat's 222.97, so a 99.73%
+        /// aggregate is essentially the heartbeat's population.
+        ///
+        /// The measurement is possible today only because a notification
+        /// already arrives here as a single-entry FULL-BYTES `Summaries` and
+        /// this arm already performs the comparison a digest would have made.
+        /// These tests live at the handler level rather than on `OutboundMix`
+        /// because a unit test on the counter cannot tell a live discriminator
+        /// from a constant: only driving the real arm can, and what it asserts
+        /// on is the rollup body production telemetry would actually ship.
+        mod r4b_single_entry_instrument {
+            use super::*;
+
+            /// Feed one full-bytes `Summaries` message and return the rollup
+            /// body the node would emit for the window.
+            async fn report(
+                h: &Harness,
+                peer: SocketAddr,
+                entries: Vec<SummaryEntry>,
+            ) -> serde_json::Value {
+                handle_interest_sync_message(
+                    &h.op_manager,
+                    peer,
+                    InterestMessage::Summaries {
+                        emitter: crate::message::SummariesEmitter::Other,
+                        entries,
+                    },
+                )
+                .await;
+                h.op_manager.outbound_mix.rollup_body_for_test()
+            }
+
+            fn count(body: &serde_json::Value, key: &str) -> u64 {
+                body.get(key)
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or_else(|| panic!("rollup body must carry `{key}`"))
+            }
+
+            /// A summary entry for `key` carrying `summary`.
+            fn entry_for(key: &ContractKey, summary: &[u8]) -> SummaryEntry {
+                SummaryEntry {
+                    hash: contract_hash(key),
+                    summary_bytes: Some(summary.to_vec()),
+                }
+            }
+
+            /// A SINGLE-entry message's comparison lands in both the total and
+            /// the single-entry bucket; a MULTI-entry one lands in the total
+            /// only.
+            ///
+            /// The two halves are the whole instrument. Only the second can
+            /// fail if the discriminator is replaced by a constant `true`, and
+            /// only the first if it is replaced by `false` — the realistic
+            /// mutations, since either is one token. Asserting the multi-entry
+            /// message adds EXACTLY nothing to the single bucket (rather than
+            /// merely less) is what stops that bucket from quietly measuring
+            /// something other than message shape.
+            #[tokio::test]
+            async fn message_shape_decides_which_bucket_an_agreement_lands_in() {
+                let ours = vec![4u8; 64];
+                let h = build_harness("r4b-shape", 17300, ours.clone()).await;
+                // A second locally-hosted, summarizable contract, so the
+                // multi-entry message is genuinely multi-CONTRACT rather than a
+                // repeat the per-message dedup would collapse.
+                let second = host_many(&h, 1);
+                let hashes = distinct_hashes(&[h.key, second[0]]);
+                assert_eq!(hashes.len(), 2, "premise: two distinct advertised hashes");
+
+                // SINGLE entry, agreeing.
+                let body = report(&h, h.new_peer, vec![entry_for(&h.key, &ours)]).await;
+                assert_eq!(
+                    count(&body, "summary_entries_identical"),
+                    1,
+                    "premise: the fixture must produce a real two-sided \
+                     agreement, or neither bucket is under test"
+                );
+                assert_eq!(
+                    count(&body, "summary_entries_identical_single"),
+                    1,
+                    "a single-entry `Summaries` IS the notification leg's shape \
+                     — its agreement must reach the single-entry bucket, or \
+                     `p` reads as zero and R4b looks unbuildable"
+                );
+
+                // MULTI entry, both agreeing. Counters are cumulative over the
+                // window, so the deltas are what matter.
+                let body = report(
+                    &h,
+                    h.new_peer,
+                    vec![entry_for(&h.key, &ours), entry_for(&second[0], &ours)],
+                )
+                .await;
+                assert_eq!(
+                    count(&body, "summary_entries_identical"),
+                    3,
+                    "premise: both entries of the multi-entry message must \
+                     resolve to a locally-interested, summarizable contract, \
+                     or the multi-entry case is not actually exercised"
+                );
+                assert_eq!(
+                    count(&body, "summary_entries_identical_single"),
+                    1,
+                    "a MULTI-entry message is heartbeat-shaped and must add \
+                     nothing to the single-entry bucket — a bucket that grows \
+                     here is counting comparisons, not message shape, and `p` \
+                     silently becomes the fleet-wide rate the instrument \
+                     exists because it cannot use"
+                );
+            }
+
+            /// The same split applies to DISAGREEMENT, which is `p`'s
+            /// denominator.
+            ///
+            /// Without it a low single-entry agreement COUNT and a low
+            /// single-entry comparison VOLUME are indistinguishable — the ratio
+            /// would have a numerator and no denominator.
+            #[tokio::test]
+            async fn message_shape_decides_which_bucket_a_disagreement_lands_in() {
+                let ours = vec![4u8; 64];
+                let theirs = vec![9u8; 64];
+                let h = build_harness("r4b-shape-diff", 17310, ours.clone()).await;
+                let second = host_many(&h, 1);
+
+                let body = report(&h, h.new_peer, vec![entry_for(&h.key, &theirs)]).await;
+                assert_eq!(count(&body, "summary_entries_differing"), 1);
+                assert_eq!(
+                    count(&body, "summary_entries_differing_single"),
+                    1,
+                    "the notification leg's disagreements are `p`'s denominator"
+                );
+
+                let body = report(
+                    &h,
+                    h.new_peer,
+                    vec![entry_for(&h.key, &theirs), entry_for(&second[0], &theirs)],
+                )
+                .await;
+                assert_eq!(count(&body, "summary_entries_differing"), 3);
+                assert_eq!(
+                    count(&body, "summary_entries_differing_single"),
+                    1,
+                    "a multi-entry message must add nothing to the \
+                     single-entry denominator"
+                );
+
+                // The per-contract attribution carries the subset too, which is
+                // what separates "a few non-converging contracts" (structural
+                // `p` = 0) from "the leg disagrees in general".
+                let listed = body
+                    .get("summary_differing_contracts")
+                    .and_then(|v| v.as_array())
+                    .expect("summary_differing_contracts must be an array");
+                let mine = listed
+                    .iter()
+                    .find(|e| {
+                        e.get("contract").and_then(|v| v.as_str())
+                            == Some(h.key.id().to_string().as_str())
+                    })
+                    .expect("the diverging contract must be named");
+                assert_eq!(mine.get("count").and_then(|v| v.as_u64()), Some(2));
+                assert_eq!(
+                    mine.get("single_count").and_then(|v| v.as_u64()),
+                    Some(1),
+                    "per-contract attribution must carry the notification-leg \
+                     subset, not just the total"
+                );
+            }
+
+            /// Every `OutboundMix` summary-observation call in this file passes
+            /// the message-shape discriminator, and there are exactly as many
+            /// such call sites as this pin knows about.
+            ///
+            /// The behavioural tests above cover the two-sided sites. They
+            /// cannot reach the ONE-SIDED sites, which need a contract this node
+            /// is interested in but cannot summarize — so a future edit could
+            /// hard-code `false` there and stay green. This pin closes that gap,
+            /// and fails on a NEW call site too, which is the case that would
+            /// otherwise silently under-count.
+            ///
+            /// Two scoping rules make it non-vacuous, and both were needed:
+            ///
+            /// * Comments are stripped (`code_only`) — the prose around these
+            ///   call sites names `single_entry` repeatedly, so a
+            ///   comment-inclusive scan would pass with the argument deleted.
+            /// * The scan stops at the test module — otherwise the needles below
+            ///   match THEMSELVES (string literals survive `code_only`), which
+            ///   is how a self-matching pin comes to count its own text as
+            ///   evidence. Confirmed by observation: the unscoped version found
+            ///   6 sites, not 4.
+            #[test]
+            fn every_summary_observation_passes_the_message_shape() {
+                const TEST_MOD: &str = "\n#[cfg(test)]\nmod tests {";
+                let whole = include_str!("node.rs");
+                let production_end = whole
+                    .find(TEST_MOD)
+                    .expect("the test module anchor must still exist — update this pin");
+                let src = code_only(&whole[..production_end]);
+                let sites: Vec<usize> = [
+                    "outbound_mix.record_summary_comparison(",
+                    "outbound_mix.record_summary_one_sided(",
+                ]
+                .iter()
+                .flat_map(|needle| {
+                    src.match_indices(needle)
+                        .map(|(i, m)| i + m.len())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+                // THREE, not four: the `Summaries` arm's two (comparison +
+                // one-sided) and the `SummaryDigests` arm's one (comparison
+                // only). The digest arm's one-sided recording was REMOVED as a
+                // double count (#5153 review F2), and this count is what will
+                // notice if it comes back — it did notice when the fix landed.
+                assert_eq!(
+                    sites.len(),
+                    3,
+                    "expected 3 summary-observation call sites (two on the \
+                     full-bytes `Summaries` arm, one on `SummaryDigests`); found \
+                     {}. A NEW site must pass the message-shape discriminator \
+                     too, and a new one-sided recording on the digest arm is the \
+                     #5153 F2 double count returning",
+                    sites.len()
+                );
+                let mut full_bytes_legs = 0;
+                let mut digest_legs = 0;
+                for start in sites {
+                    // Bound the window at the call's closing `);` so a match
+                    // cannot come from the NEXT call site's arguments.
+                    let end = src[start..]
+                        .find(");")
+                        .map(|off| start + off)
+                        .expect("a call site must have a closing `);`");
+                    let args = &src[start..end];
+                    assert!(
+                        args.contains("single_entry"),
+                        "a summary-observation call site does not pass the \
+                         message-shape discriminator; its args were: {args}"
+                    );
+                    // The LEG matters as much as the shape: a digest-leg
+                    // observation labelled full-bytes silently merges churn
+                    // traffic into the R4b population (#5153 review F1), and
+                    // both spellings contain `single_entry`, so the assertion
+                    // above cannot tell them apart.
+                    if args.contains("SummaryObservation::full_bytes(") {
+                        full_bytes_legs += 1;
+                    } else if args.contains("SummaryObservation::digest(") {
+                        digest_legs += 1;
+                    } else {
+                        panic!(
+                            "a summary-observation call site names neither leg \
+                             constructor, so which population it lands in is \
+                             unpinned; its args were: {args}"
+                        );
+                    }
+                }
+                assert_eq!(
+                    (full_bytes_legs, digest_legs),
+                    (2, 1),
+                    "expected 2 full-bytes-leg sites and 1 digest-leg site; a \
+                     digest observation recorded as full-bytes would fold \
+                     churn-leg traffic into the notification population `p` is \
+                     computed over"
+                );
+            }
+
+            /// THE TWO PROPERTIES THIS WHOLE INSTRUMENT RESTS ON (#5153 review F4).
+            ///
+            /// `p` is read off single-entry FULL-BYTES `Summaries`, and that is a
+            /// proxy for "this is a notification" only while both of these hold:
+            ///
+            /// 1. A notification ships **full bytes unconditionally** — it must
+            ///    not consult the hash-first version gate. If it did, the
+            ///    pre-R4b full-bytes buckets would silently go quiet AND the
+            ///    claim "a digest single is provably not a notification" would
+            ///    INVERT, with every test still green.
+            /// 2. A notification is **single-entry** — one contract per send. If
+            ///    notifications were ever batched (plausible: coalescing work is
+            ///    already in this tree), they would leave the single-entry
+            ///    population entirely and `p` would silently become the
+            ///    agreement rate of whatever failed to batch.
+            ///
+            /// Both are true today, verified from code and field: the emitter
+            /// calls `full_summaries_message(vec![...], Notification)` with no
+            /// reference to the gate, and the field shows mean 41,642 B/msg with
+            /// entries exactly equal to msgs and **no rollup anywhere reporting
+            /// `max_entries > 1`**. So multi-entry false negatives are impossible
+            /// today rather than merely unobserved.
+            ///
+            /// Neither was pinned. This mirrors
+            /// `summary_request_reply_is_always_full_bytes`, which pins exactly
+            /// this shape for the request-reply arm — and note that
+            /// `no_uninstrumented_full_summaries_construction` does NOT cover it:
+            /// that forces `Summaries` through the instrumented constructor but
+            /// says nothing about a site switching to the digest gate.
+            #[test]
+            fn notification_leg_is_always_full_bytes_and_single_entry() {
+                let src = include_str!("operations/update.rs");
+                let f = src
+                    .find("pub(crate) async fn send_proactive_summary_notification(")
+                    .expect("notification emitter not found — update this pin");
+                // Bound at the next top-level `pub(crate)` item so a sibling's
+                // gate usage cannot satisfy or trip the assertions below.
+                let end = src[f..]
+                    .find("\npub(crate) ")
+                    .map(|off| f + off)
+                    .unwrap_or(src.len());
+                let body = code_only(&src[f..end]);
+
+                assert!(
+                    body.contains("full_summaries_message("),
+                    "the notification leg must build its message through \
+                     full_summaries_message — the instrumented FULL-BYTES \
+                     constructor. Window extraction may also be off; check that \
+                     first."
+                );
+                assert!(
+                    body.contains("SummariesEmitter::Notification"),
+                    "window extraction is off — the notification emitter body \
+                     should tag its own emitter"
+                );
+                // Property 1. Every entry point to the encoding CHOICE, matching
+                // the sibling pin: #5155 split `summaries_reply_for_peer` into
+                // two names, neither a substring of the old one.
+                for banned in [
+                    "summaries_reply_for_peer",
+                    "summary_reply_form",
+                    "summaries_reply_in_form",
+                ] {
+                    assert!(
+                        !body.contains(banned),
+                        "the notification leg now consults `{banned}`, i.e. the \
+                         hash-first version gate. That moves notifications onto \
+                         the digest leg, so the R4b full-bytes single-entry \
+                         buckets go quiet AND `SummaryObservation::SingleEntryDigest`'s \
+                         'not a notification' premise inverts — silently, with \
+                         every other test green (#5153 review F4)"
+                    );
+                }
+                // Property 2. One contract per send. `vec![` with a single
+                // element is the shape; a batched send would collect or extend.
+                assert!(
+                    body.contains("vec![full_entry.clone()]"),
+                    "the notification leg no longer sends exactly one entry. If \
+                     notifications are now batched they leave the single-entry \
+                     population, and `p` becomes the agreement rate of whatever \
+                     failed to batch (#5153 review F4). Re-derive the proxy \
+                     before changing this."
+                );
+            }
+
+            /// The `SummaryDigests` arm must NOT record a one-sided observation
+            /// (#5153 review F2 — it double-counted).
+            ///
+            /// It used to: on a digest mismatch with no local summary it recorded
+            /// one-sided AND set `needs_bytes`, so the full-bytes reply observed
+            /// the same contract again on its `(None, Some(_))` branch. Two
+            /// messages, two per-message dedup sets, nothing suppressing the
+            /// repeat — one divergence counted twice, inflating a field that is
+            /// presented as an R4b cost input.
+            ///
+            /// Pinned at the source because the property is an ABSENCE, and the
+            /// behavioural fixture for it would need a contract this node is
+            /// interested in but cannot summarize. The complementary behavioural
+            /// half lives in `outbound_message_mix`:
+            /// `digest_leg_single_entry_observations_stay_out_of_the_full_bytes_bucket`
+            /// asserts a digest-leg observation reaches no single bucket even if
+            /// one did arrive.
+            ///
+            /// Scoped to production code and comment-stripped for the same two
+            /// reasons as the pin above; the count assertion is what makes it
+            /// non-vacuous, since a needle that matched nothing at all would
+            /// otherwise look like a pass.
+            #[test]
+            fn digest_arm_records_no_one_sided_observation() {
+                const TEST_MOD: &str = "\n#[cfg(test)]\nmod tests {";
+                let whole = include_str!("node.rs");
+                let production_end = whole
+                    .find(TEST_MOD)
+                    .expect("the test module anchor must still exist — update this pin");
+                let src = code_only(&whole[..production_end]);
+
+                let digest_arm = src
+                    .find("InterestMessage::SummaryDigests { entries, .. } => {")
+                    .expect("SummaryDigests arm not found — update this pin");
+                let arm_end = src[digest_arm..]
+                    .find("InterestMessage::SummaryRequest { hashes } => {")
+                    .map(|off| digest_arm + off)
+                    .expect("end of SummaryDigests arm not found — update this pin");
+                let arm = &src[digest_arm..arm_end];
+
+                assert!(
+                    !arm.contains("record_summary_one_sided"),
+                    "the SummaryDigests arm records a one-sided observation \
+                     again. The full-bytes `Summaries` arm ALSO records it once \
+                     the requested bytes arrive, so this counts one divergence \
+                     twice and inflates summary_entries_one_sided(_single) \
+                     (#5153 review F2)"
+                );
+                // Non-vacuity: the arm must still be the arm, and must still
+                // contain the sibling observation the instrument depends on.
+                assert!(
+                    arm.contains("record_summary_comparison"),
+                    "window no longer covers the digest arm's observation site — \
+                     this pin would pass against unrelated text"
+                );
+                // And the full-bytes arm must still be the one that records it,
+                // or the deferral loses the observation entirely.
+                let full_bytes_arm = src
+                    .find("InterestMessage::Summaries { entries, .. } => {")
+                    .expect("Summaries arm not found — update this pin");
+                let full_bytes = &src[full_bytes_arm..digest_arm];
+                assert!(
+                    full_bytes.contains("record_summary_one_sided"),
+                    "nothing records one-sided any more: the digest arm defers to \
+                     the full-bytes arm, so the full-bytes arm must still count it"
+                );
+            }
+        }
+
+        /// End-to-end wiring for the SHADOW-MODE futile-repair detector
+        /// (`crate::ring::futile_repair`).
+        ///
+        /// The detector's whole claim is that it measures an OUTCOME — whether
+        /// this node's repair actually made the edge converge — rather than
+        /// how much repair traffic there is. These tests drive the REAL
+        /// `handle_interest_sync_message` and hold the attempt count fixed
+        /// while varying only what the peer reports back, so a detector that
+        /// counted attempts (or scored every outcome as failure) cannot pass
+        /// them.
+        mod futile_repair_shadow {
+            use super::*;
+            use crate::ring::futile_repair::QUARANTINE_THRESHOLD;
+
+            /// Feed one full-bytes `Summaries` report from `peer` and return
+            /// the heals it produced.
+            async fn report_summary(
+                h: &mut Harness,
+                peer: SocketAddr,
+                summary: &[u8],
+            ) -> Vec<(ContractKey, SocketAddr)> {
+                let hash = contract_hash(&h.key);
+                handle_interest_sync_message(
+                    &h.op_manager,
+                    peer,
+                    InterestMessage::Summaries {
+                        emitter: crate::message::SummariesEmitter::Other,
+                        entries: vec![SummaryEntry {
+                            hash,
+                            summary_bytes: Some(summary.to_vec()),
+                        }],
+                    },
+                )
+                .await;
+                h.drain_heals()
+            }
+
+            /// THE test for this feature. Two peers, the SAME number of
+            /// repairs emitted to each. The only difference is what the next
+            /// summary exchange said: one peer stays diverged forever (the
+            /// non-commutative-merge signature), the other converges after
+            /// every heal.
+            ///
+            /// A detector that counted repair ATTEMPTS would score these two
+            /// edges identically and report `would_quarantine == 2` with
+            /// `productive == 0`. That is exactly the documented mutation:
+            /// replacing `!is_stale` with `false` at the `Summaries` arm's
+            /// `record_repair_outcome` call makes this test fail on both
+            /// counts.
+            #[tokio::test]
+            async fn a_stuck_edge_is_separated_from_a_converging_one() {
+                let ours = vec![5u8; 128];
+                let theirs = vec![6u8; 128];
+                let mut h = build_harness("futile-shadow", 17100, ours.clone()).await;
+                let (stuck_peer, healthy_peer, key) = (h.new_peer, h.old_peer, h.key);
+
+                // STUCK edge: the peer reports a divergent summary every
+                // round and never moves — no heal can land.
+                //
+                // One extra round because the first exchange has no
+                // outstanding attempt to settle: round 1 only emits the first
+                // heal, rounds 2..=N+1 each settle the previous one as futile.
+                for round in 0..=QUARANTINE_THRESHOLD {
+                    let heals = report_summary(&mut h, stuck_peer, &theirs).await;
+                    assert_eq!(
+                        heals.len(),
+                        1,
+                        "round {round}: shadow mode must not suppress the heal \
+                         — every diverged round still emits exactly one \
+                         targeted SyncStateToPeer"
+                    );
+                    assert_eq!(heals[0], (key, stuck_peer), "the heal must stay targeted");
+                }
+
+                // CONVERGING edge: same number of heals emitted, but each one
+                // lands, so the following round reports OUR summary back.
+                for _ in 0..QUARANTINE_THRESHOLD {
+                    let heals = report_summary(&mut h, healthy_peer, &theirs).await;
+                    assert_eq!(heals.len(), 1, "a diverged round emits one heal");
+                    let healed = report_summary(&mut h, healthy_peer, &ours).await;
+                    assert!(healed.is_empty(), "a converged round must not emit a heal");
+                }
+
+                let snap = h.op_manager.interest_manager.futile_repair_snapshot();
+                assert_eq!(
+                    snap.attempts,
+                    u64::from(QUARANTINE_THRESHOLD) * 2 + 1,
+                    "both edges were healed the same number of times \
+                     (the stuck edge has one extra opening round)"
+                );
+                assert_eq!(
+                    snap.futile,
+                    u64::from(QUARANTINE_THRESHOLD),
+                    "only the stuck edge's repairs left the summaries differing"
+                );
+                assert_eq!(
+                    snap.productive,
+                    u64::from(QUARANTINE_THRESHOLD),
+                    "every repair to the converging edge landed — a detector \
+                     that ignored the comparison verdict would report zero here"
+                );
+                assert_eq!(
+                    snap.would_quarantine, 1,
+                    "exactly ONE edge reached the shadow threshold; a detector \
+                     counting attempts rather than outcomes would report two"
+                );
+                assert_eq!(
+                    snap.edges_at_threshold, 1,
+                    "the converging edge must never be at the threshold"
+                );
+                assert_eq!(
+                    snap.evictions, 0,
+                    "two edges cannot overflow the LRU — a non-zero eviction \
+                     count here would mean the counts above are unreliable"
+                );
+            }
+
+            /// A repair that lands resets the streak, so an edge that recovers
+            /// one round before the threshold never crosses it. This is what
+            /// stops a busy-but-healthy contract from being flagged.
+            #[tokio::test]
+            async fn a_late_recovery_clears_the_streak() {
+                let ours = vec![9u8; 64];
+                let theirs = vec![8u8; 64];
+                let mut h = build_harness("futile-recover", 17110, ours.clone()).await;
+                let peer = h.new_peer;
+
+                // Diverge for one round short of the threshold...
+                for _ in 0..QUARANTINE_THRESHOLD {
+                    report_summary(&mut h, peer, &theirs).await;
+                }
+                let snap = h.op_manager.interest_manager.futile_repair_snapshot();
+                assert_eq!(snap.futile, u64::from(QUARANTINE_THRESHOLD) - 1);
+                assert_eq!(snap.would_quarantine, 0, "not yet at the threshold");
+
+                // ...then the heal finally lands.
+                report_summary(&mut h, peer, &ours).await;
+                let snap = h.op_manager.interest_manager.futile_repair_snapshot();
+                assert_eq!(snap.productive, 1);
+                assert_eq!(
+                    snap.would_quarantine, 0,
+                    "one landed repair clears the streak"
+                );
+                assert_eq!(snap.edges_at_threshold, 0);
+            }
+
+            /// A peer that agrees from the outset produces no attempts and no
+            /// futility — the detector must not manufacture a signal out of
+            /// ordinary anti-entropy traffic. Covers BOTH wire forms, since
+            /// the `SummaryDigests` agreement arm is a second observation site
+            /// that could drift from the `Summaries` one.
+            #[tokio::test]
+            async fn an_agreeing_peer_produces_no_futility_on_either_wire_form() {
+                let ours = vec![3u8; 32];
+                let mut h = build_harness("futile-agree", 17120, ours.clone()).await;
+                let hash = contract_hash(&h.key);
+                let peer = h.new_peer;
+
+                for _ in 0..QUARANTINE_THRESHOLD {
+                    assert!(report_summary(&mut h, peer, &ours).await.is_empty());
+                    handle_interest_sync_message(
+                        &h.op_manager,
+                        peer,
+                        InterestMessage::SummaryDigests {
+                            emitter: crate::message::SummariesEmitter::Other,
+                            entries: vec![SummaryDigestEntry {
+                                hash,
+                                summary_digest: Some(summary_digest(&ours)),
+                            }],
+                        },
+                    )
+                    .await;
+                    assert!(h.drain_heals().is_empty());
+                }
+
+                let snap = h.op_manager.interest_manager.futile_repair_snapshot();
+                assert_eq!(
+                    snap.attempts, 0,
+                    "nothing was healed, so nothing was attempted"
+                );
+                assert_eq!(snap.futile, 0);
+                assert_eq!(snap.would_quarantine, 0);
+                assert_eq!(
+                    snap.observations_unpaired,
+                    u64::from(QUARANTINE_THRESHOLD) * 2,
+                    "both wire forms must reach the detector as observations — \
+                     a zero here on either arm means that observation site is \
+                     not wired at all"
+                );
+            }
+
+            /// HIGH-2, the load-correlated false-positive channel, end to end.
+            ///
+            /// `MAX_STALENESS_PROBES_PER_SUMMARIES` caps semantic-staleness
+            /// probes at 32 per `Summaries` message. Past that,
+            /// `summary_indicates_stale_peer` takes the conservative
+            /// bytes-differ-means-stale DEFAULT — correct as a heal decision,
+            /// but it means everything after position 32 reads as stale every
+            /// round with no divergence at all. If that fed the detector, the
+            /// headline number would grow with how many contracts a peer
+            /// reports, i.e. with peer breadth and node load, rather than with
+            /// brokenness.
+            ///
+            /// This drives exactly that shape through the real handler: a
+            /// filler contract burns the whole probe budget, and the contract
+            /// we track is always the entry past the budget. Its bytes differ
+            /// every round, but the contract's own delta is EMPTY — it is
+            /// logically converged (the #4857 non-deterministic-summary shape)
+            /// and would be scored converged if it were ever probed. Nothing
+            /// here is broken.
+            ///
+            /// Mutation that must fail this test: pass
+            /// `OutcomeEvidence::Verdict` unconditionally at the `Summaries`
+            /// outcome site — i.e. the pre-fix code, which passed `!is_stale`
+            /// alone. The tracked contract then accrues a futile streak of
+            /// `QUARANTINE_THRESHOLD` from load alone and reports
+            /// `would_quarantine == 1`.
+            #[tokio::test]
+            async fn probe_budget_exhaustion_is_not_counted_as_futility() {
+                let ours = vec![5u8; 128];
+                let mut h =
+                    build_harness_with("futile-budget", 17130, ours.clone(), DeltaBehavior::Empty)
+                        .await;
+                let peer = h.new_peer;
+
+                // A second hosted contract, purely to burn the probe budget.
+                // The one from the harness (`h.key`) is the one we track.
+                let filler = ContractKey::from_id_and_code(
+                    ContractInstanceId::new([77u8; 32]),
+                    CodeHash::new([78u8; 32]),
+                );
+                let _ = h.op_manager.ring.host_contract(
+                    filler,
+                    128,
+                    crate::ring::AccessType::Put,
+                    crate::ring::HostingCause::Other,
+                );
+                h.op_manager
+                    .interest_manager
+                    .register_local_hosting(&filler);
+
+                let filler_hash = contract_hash(&filler);
+                let tracked_hash = contract_hash(&h.key);
+                // Novel bytes every entry and every round, so every lookup is a
+                // genuine cache MISS — a cache hit costs no budget and would
+                // answer with a real verdict, defeating the setup.
+                let mut nonce = 0u16;
+                let mut novel = |len: usize| {
+                    nonce += 1;
+                    let mut bytes = vec![0u8; len];
+                    bytes[0] = (nonce & 0xff) as u8;
+                    bytes[1] = (nonce >> 8) as u8;
+                    bytes
+                };
+
+                // One extra round for the same reason as the stuck-edge test:
+                // the opening round has no outstanding attempt to settle.
+                for _ in 0..=QUARANTINE_THRESHOLD {
+                    let mut entries: Vec<SummaryEntry> = (0..MAX_STALENESS_PROBES_PER_SUMMARIES)
+                        .map(|_| SummaryEntry {
+                            hash: filler_hash,
+                            summary_bytes: Some(novel(64)),
+                        })
+                        .collect();
+                    // The budget is now spent, so THIS entry is defaulted.
+                    entries.push(SummaryEntry {
+                        hash: tracked_hash,
+                        summary_bytes: Some(novel(64)),
+                    });
+                    handle_interest_sync_message(
+                        &h.op_manager,
+                        peer,
+                        InterestMessage::Summaries {
+                            emitter: crate::message::SummariesEmitter::Other,
+                            entries,
+                        },
+                    )
+                    .await;
+                    // SHADOW MODE: the defaulted verdict still heals, exactly
+                    // as before. Only the accounting changes.
+                    let heals = h.drain_heals();
+                    assert_eq!(
+                        heals,
+                        vec![(h.key, peer)],
+                        "the conservative default must still emit its heal — \
+                         this change must not alter behaviour"
+                    );
+                }
+
+                // The harm first, so a regression names it rather than naming
+                // a bookkeeping row.
+                let snap = h.op_manager.interest_manager.futile_repair_snapshot();
+                assert_eq!(
+                    snap.would_quarantine, 0,
+                    "a contract that is logically CONVERGED reached the shadow \
+                     threshold purely because the peer reported more contracts \
+                     than the probe budget covers — the headline is now a load \
+                     metric: {snap:?}"
+                );
+                assert_eq!(
+                    snap.futile, 0,
+                    "running out of probe budget is not evidence that a repair \
+                     failed — counting it makes the headline grow with peer \
+                     breadth and node load instead of with brokenness"
+                );
+                assert_eq!(
+                    snap.outcomes_probe_budget_exhausted,
+                    u64::from(QUARANTINE_THRESHOLD) + 1,
+                    "every round's over-budget entry must be recorded as a \
+                     defaulted verdict, one per message"
+                );
+                assert_eq!(snap.edges_at_threshold, 0);
+                assert!(
+                    snap.attempts >= u64::from(QUARANTINE_THRESHOLD),
+                    "the heals were emitted and charged as attempts; only \
+                     their OUTCOMES are unclassifiable, got {snap:?}"
+                );
+                // The readable signature of the "we cannot tell" regime, and
+                // the one an evasion attempt would produce (see the module
+                // docs' second known limitation): heals keep going out and
+                // keep being superseded unsettled, while `futile` and
+                // `productive` both stay flat. A defaulted outcome must NOT
+                // consume the attempt, so the count rises.
+                assert!(
+                    snap.attempts_superseded >= u64::from(QUARANTINE_THRESHOLD) - 1,
+                    "an unclassifiable outcome must leave the attempt \
+                     outstanding, so the next heal supersedes it — that pairing \
+                     of high `attempts_superseded` with flat futile/productive \
+                     is how the regime is recognised in the field: {snap:?}"
+                );
+            }
+
+            /// The other evidence-free provenance: the probe RAN and produced
+            /// no verdict (delta error / timeout). `summary_indicates_stale_peer`
+            /// falls back to the byte compare and reports stale, so without the
+            /// evidence split a contract-side or runtime-side fault would
+            /// manufacture a full futility streak on a healthy edge.
+            ///
+            /// Mutation that must fail this test: as above, pass
+            /// `OutcomeEvidence::Verdict` unconditionally — `would_quarantine`
+            /// goes to 1 and `futile` to `QUARANTINE_THRESHOLD`.
+            #[tokio::test]
+            async fn a_failed_delta_probe_is_not_counted_as_futility() {
+                let ours = vec![5u8; 128];
+                let mut h = build_harness_with(
+                    "futile-probe-fail",
+                    17140,
+                    ours.clone(),
+                    DeltaBehavior::Failing,
+                )
+                .await;
+                let peer = h.new_peer;
+
+                let mut rounds = 0u64;
+                for round in 0..=QUARANTINE_THRESHOLD {
+                    // Novel bytes each round: a repeated pair would be served
+                    // from the delta cache rather than re-probed.
+                    let theirs = vec![(round as u8).wrapping_add(1); 64];
+                    let heals = report_summary(&mut h, peer, &theirs).await;
+                    assert_eq!(
+                        heals.len(),
+                        1,
+                        "a failed probe still falls back to the byte compare \
+                         and still heals — behaviour is unchanged"
+                    );
+                    rounds += 1;
+                }
+
+                // The harm first, so a regression names it rather than naming
+                // a bookkeeping row.
+                let snap = h.op_manager.interest_manager.futile_repair_snapshot();
+                assert_eq!(
+                    snap.would_quarantine, 0,
+                    "a contract-side or runtime-side probe fault manufactured a \
+                     quarantine candidate on a healthy edge: {snap:?}"
+                );
+                assert_eq!(
+                    snap.futile, 0,
+                    "a probe that produced no verdict is not evidence that a \
+                     repair failed"
+                );
+                assert_eq!(
+                    snap.outcomes_probe_unavailable, rounds,
+                    "each round's unanswerable probe must be recorded as its \
+                     own class, separate from budget exhaustion"
+                );
+                assert_eq!(
+                    snap.attempts, rounds,
+                    "every round still emitted (and charged) its heal"
+                );
+            }
         }
     }
 

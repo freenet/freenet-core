@@ -310,21 +310,41 @@ where
                         key: key.into(),
                     }));
                 }
-            } else {
-                // Contract already in store. ensure_key_indexed handles the case of contracts
-                // that reuse the same WASM code with different parameters (e.g., different
-                // River rooms). Without this, lookup_key() fails for the new instance_id.
-                // See issue #2380.
+            } else if let Some(ref contract_code) = code {
+                // Contract code already on disk, but this may be a NEW instance of
+                // it: instances that reuse the same WASM with different parameters
+                // (e.g. different River rooms) each need their own
+                // instance→code row, or `lookup_key()` fails for the new
+                // instance id. See issue #2380.
                 //
-                // We only index when code was provided in this request (code.is_some()).
-                // When code is None, this is a state-only update to an existing contract
-                // that should already be indexed.
-                if code.is_some() {
-                    self.runtime
-                        .ensure_key_indexed(&key)
-                        .map_err(ExecutorError::other)?;
-                }
-                (false, code.is_some(), None)
+                // This goes through `store_contract`, NOT through a bare
+                // index-write helper, and that is the point. `store_contract` is
+                // the store's ONE guarded ingress: it verifies that the key is
+                // derived from the code and parameters in hand (see
+                // `ContractStore::verify_contract_identity`) before it writes
+                // anything, and its own fast paths then do exactly the
+                // "just index this instance" work this branch needs — the blob is
+                // already on disk, so no blob is rewritten and no byte is
+                // re-charged against the disk budget.
+                //
+                // It used to call `ContractStore::ensure_key_indexed` directly,
+                // which wrote the durable instance→code row with no derivation
+                // check at all. That made this — the COMMON path, since any
+                // contract reusing an already-stored binary lands here — an
+                // unverified second ingress to the same index that
+                // `store_contract` guards. Two writers of one durable row, one
+                // guarded and one not, is the structure to avoid; do NOT
+                // reintroduce a direct index write here.
+                //
+                // Only reached when code was provided in this request. With no
+                // code this is a state-only update to a contract that is already
+                // indexed, and there is nothing to verify against.
+                self.runtime
+                    .store_contract(contract_code.clone())
+                    .map_err(ExecutorError::other)?;
+                (false, true, None)
+            } else {
+                (false, false, None)
             };
 
         let is_new_contract = self.state_store.get(&key).await.is_err();
@@ -1160,8 +1180,11 @@ where
                     limit = super::MAX_SUBSCRIBERS_PER_CONTRACT,
                     "Subscriber limit reached for contract, rejecting registration"
                 );
+                let key = self
+                    .bridged_lookup_key(&instance_id)
+                    .unwrap_or_else(|| synthetic_key(instance_id));
                 return Err(subscriber_limit_error(
-                    instance_id,
+                    key,
                     &format!(
                         "subscriber limit ({}) reached for contract",
                         super::MAX_SUBSCRIBERS_PER_CONTRACT
@@ -1183,8 +1206,11 @@ where
                     current = client_sub_count,
                     "Per-client subscription limit reached, rejecting registration"
                 );
+                let key = self
+                    .bridged_lookup_key(&instance_id)
+                    .unwrap_or_else(|| synthetic_key(instance_id));
                 return Err(subscriber_limit_error(
-                    instance_id,
+                    key,
                     &format!(
                         "per-client subscription limit ({}) reached",
                         super::MAX_SUBSCRIPTIONS_PER_CLIENT
@@ -1528,6 +1554,107 @@ where
             }
         };
         let new_state = WrappedState::new(new_state.into_bytes());
+
+        // Conformance capture (RFC #5320), off unless an operator sets
+        // FREENET_CONFORMANCE_CAPTURE_DIR. This is the seam where the base state,
+        // the update that was applied and the resulting state are all in hand,
+        // which is exactly the transition an offline replay needs.
+        //
+        // Cost when disabled is one atomic load. When enabled it is a `try_send` on
+        // a bounded channel that drops rather than waits, so a slow writer can never
+        // stall a merge — capture losing observations is always preferable to
+        // synchronization queueing behind it.
+        if let Some(capture) = crate::conformance::capture::global() {
+            // Measure first, copy later.
+            //
+            // Everything below this point that costs an allocation happens inside the
+            // `observe_with` closure, which runs only after a queue slot and byte
+            // budget are secured. An earlier version computed the incoming state,
+            // delta and related payloads BEFORE the budget check and then claimed in
+            // a comment that no byte was copied before it — which was false for
+            // exactly the three largest fields, and worst for related state, since
+            // that carries another contract's whole state. Under sustained load with
+            // a full queue, that made the drop path pay full allocate-and-copy on the
+            // merge path, which is the cost this ordering exists to avoid.
+            let mut incoming_len = 0usize;
+            let mut delta_len = 0usize;
+            let mut related_len = 0usize;
+            for update in updates {
+                match update {
+                    UpdateData::State(state) => incoming_len = state.as_ref().len(),
+                    UpdateData::Delta(delta) => delta_len = delta.as_ref().len(),
+                    UpdateData::StateAndDelta { state, delta } => {
+                        incoming_len = state.as_ref().len();
+                        delta_len = delta.as_ref().len();
+                    }
+                    UpdateData::RelatedState { state, .. }
+                    | UpdateData::RelatedStateAndDelta { state, .. } => {
+                        related_len += state.as_ref().len();
+                    }
+                    UpdateData::RelatedDelta { .. } => {}
+                    // `UpdateData` is `#[non_exhaustive]`. A future variant carrying
+                    // related state would be missed here and in the closure below;
+                    // both sites are marked so the pair is updated together.
+                    // AUDIT: new Related* variant -> update both match sites.
+                    _ => {}
+                }
+            }
+
+            let size_hint = parameters.as_ref().len()
+                + current_state.as_ref().len()
+                + new_state.as_ref().len()
+                + incoming_len
+                + delta_len
+                + related_len;
+
+            capture.observe_with(size_hint, || {
+                let (incoming_state, delta) = updates.iter().fold((None, None), |acc, update| {
+                    match update {
+                        UpdateData::State(state) => (Some(state.as_ref().to_vec()), acc.1),
+                        UpdateData::Delta(delta) => (acc.0, Some(delta.as_ref().to_vec())),
+                        UpdateData::StateAndDelta { state, delta } => {
+                            (Some(state.as_ref().to_vec()), Some(delta.as_ref().to_vec()))
+                        }
+                        // Related payloads are not part of THIS transition; they are
+                        // collected separately below as the context the contract needs
+                        // to execute at all.
+                        UpdateData::RelatedState { .. }
+                        | UpdateData::RelatedDelta { .. }
+                        | UpdateData::RelatedStateAndDelta { .. }
+                        | _ => acc,
+                    }
+                });
+
+                // Only full states: a related DELTA cannot be applied without the
+                // state it is relative to, which this peer may not hold.
+                // AUDIT: new Related* variant -> update both match sites.
+                let related: Vec<(ContractInstanceId, Vec<u8>)> = updates
+                    .iter()
+                    .filter_map(|update| match update {
+                        UpdateData::RelatedState { related_to, state }
+                        | UpdateData::RelatedStateAndDelta {
+                            related_to, state, ..
+                        } => Some((*related_to, state.as_ref().to_vec())),
+                        UpdateData::State(_)
+                        | UpdateData::Delta(_)
+                        | UpdateData::StateAndDelta { .. }
+                        | UpdateData::RelatedDelta { .. }
+                        | _ => None,
+                    })
+                    .collect();
+
+                crate::conformance::capture::Observation {
+                    contract: *key.id(),
+                    code_hash: crate::conformance::capture::code_hash_of(key),
+                    parameters: parameters.as_ref().to_vec(),
+                    base_state: current_state.as_ref().to_vec(),
+                    incoming_state,
+                    delta,
+                    result_state: new_state.as_ref().to_vec(),
+                    related,
+                }
+            });
+        }
 
         if new_state.as_ref() == current_state.as_ref() {
             tracing::debug!(
@@ -2317,6 +2444,46 @@ where
                     .or_insert_with(|| Some(s.clone().into_owned()));
             }
         }
+        // Conformance capture (#5376), production path.
+        //
+        // Related state reaches this executor by two routes and capture used to see
+        // only one. When `update_state` returns `RequestRelated`, the retry loop
+        // resolves each contract and pushes it into `updates` as
+        // `UpdateData::RelatedState`, so it travels inside the transition and the
+        // observation in `attempt_state_update` records it. When `validate_state`
+        // asks, it is answered HERE instead, used for the retry validation below, and
+        // dropped — and the transition for this same operation has already been
+        // observed by the time we get here, so it could not carry this.
+        //
+        // Missing it left contracts whose VALIDITY depends on another contract
+        // unjudgeable: every replayed case dead-ends at
+        // `Inconclusive::RelatedRequired`, which reads exactly like a clean result.
+        //
+        // There is a SECOND implementation of this same resolution,
+        // `fetch_related_for_validation_network` in `contract_ops.rs`, reached only
+        // from `run_local_node` — i.e. `OperationMode::Local`, which never joins the
+        // ring. It carries the same call for local-mode and `fdev` runs. Both are
+        // instrumented on purpose; THIS one is the path a network peer takes, and an
+        // earlier version of this fix patched only the other one, which would have
+        // changed nothing for any real capture.
+        //
+        // Costs no fetch: these states were resolved for this node's own validation,
+        // local-store-first, and are already in hand. Byte-budgeted and dropped rather
+        // than blocking, like every other capture path.
+        if let Some(capture) = crate::conformance::capture::global() {
+            let size_hint: usize = related_map
+                .values()
+                .flatten()
+                .map(|state| state.as_ref().len())
+                .sum();
+            capture.observe_related_with(*key.id(), size_hint, || {
+                related_map
+                    .iter()
+                    .filter_map(|(id, state)| state.as_ref().map(|s| (*id, s.as_ref().to_vec())))
+                    .collect()
+            });
+        }
+
         let populated_related = RelatedContracts::from(related_map);
         let retry_result = self
             .runtime
@@ -2963,6 +3130,28 @@ mod full_state_version_gate_pins {
         &after[..end]
     }
 
+    /// `upsert_body` with `//` comment lines removed, so a pin can assert that a
+    /// name does not appear in the CODE without tripping over prose that
+    /// deliberately names it (the removed index writer is discussed in a comment
+    /// right where it used to be called).
+    ///
+    /// This strips whole-line `//` comments only — not block comments, not trailing
+    /// comments, not `//` inside a string literal. That narrowness is deliberate
+    /// rather than an oversight: every gap in it produces a false FAILURE, never a
+    /// false pass, because a real call's identifier can never sit on a line whose
+    /// `trim_start()` begins with `//`. So the filter is sound in the direction that
+    /// matters and does not need to become a lexer. There are no block or trailing
+    /// comments in the scraped region today; if someone adds one naming a forbidden
+    /// symbol, the pin fails with a confusing message, which is why the assertion
+    /// text says how to word it.
+    fn upsert_code_only() -> String {
+        upsert_body()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// A full state over EXISTING state must reach the contract's
     /// `update_state` (the contract's version acceptance is the ONLY version
     /// oracle core has), and the only WASM-merge bypass writing an initial
@@ -3008,6 +3197,69 @@ mod full_state_version_gate_pins {
         );
     }
 
+    /// The "code already stored" branch must route through `store_contract`,
+    /// the store's one guarded ingress, and must not write the durable
+    /// instance→code index by any other means.
+    ///
+    /// This branch is the COMMON path, not an edge case: any contract reusing an
+    /// already-stored binary lands here, which is every River room after the
+    /// first. It used to call `ContractStore::ensure_key_indexed`, which wrote
+    /// that durable row from a bare `&ContractKey` — no code, no parameters — so
+    /// it could verify neither the identity it was filing nor that the blob it
+    /// pointed at existed. Both gaps were found the same day
+    /// (`verify_contract_identity` for the first, #5280 for the second), which is
+    /// what makes this structural rather than two coincidences.
+    ///
+    /// Reverting the call site alone no longer compiles, since
+    /// `ContractStoreBridge` has no index-writing method any more — this pin
+    /// covers the case where someone restores the trait method too.
+    #[test]
+    fn already_stored_branch_routes_through_the_guarded_store_ingress() {
+        let body = upsert_code_only();
+
+        assert!(
+            !body.contains("ensure_key_indexed"),
+            "the upsert path must not write the instance→code index directly; \
+             route through store_contract, which verifies the key against the \
+             code and parameters first (see ContractStore::verify_contract_identity). \
+             If you are seeing this because you MENTIONED the old helper in prose \
+             rather than called it: use a `//` line — only whole-line `//` comments \
+             are stripped, so block comments and string literals still match."
+        );
+
+        // Slice the branch's OWN region — anchor to its `else if`, and stop at the
+        // `} else {` that closes it. Searching from the anchor to the end of the
+        // function would only prove "a store_contract call exists somewhere at or
+        // after this branch", which an unconditional call hoisted out of the
+        // branch satisfies just as well. That is not the property being pinned.
+        const ANCHOR: &str = "} else if let Some(ref contract_code) = code {";
+        let branch_start = body
+            .find(ANCHOR)
+            .expect("the 'code already stored' branch is not where this pin expects it");
+        let after_anchor = branch_start + ANCHOR.len();
+        let branch_end = body[after_anchor..]
+            .find("} else {")
+            .map(|offset| after_anchor + offset)
+            .expect("the already-stored branch must be closed by an else arm");
+        let branch = &body[branch_start..branch_end];
+
+        assert!(
+            branch.contains(".store_contract(contract_code.clone())"),
+            "the already-stored branch must index the new instance by calling \
+             store_contract INSIDE the branch — its fast paths do exactly that \
+             work once the identity is verified"
+        );
+        // Both `store_contract` calls in this body are legitimate: the new-code
+        // branch and this one. A third needs thought, and a call hoisted out of
+        // the branch would push this to three.
+        assert_eq!(
+            body.matches(".store_contract(").count(),
+            2,
+            "expected exactly two store_contract calls in the upsert path: the \
+             new-code branch and the already-stored branch"
+        );
+    }
+
     /// The corrupted-state recovery path (the ONE branch that replaces
     /// existing state without a successful WASM merge) must stay gated on the
     /// LOCAL state failing `validate_state` (#3109). Without that gate, a
@@ -3032,6 +3284,159 @@ mod full_state_version_gate_pins {
             "recovery ordering must be: validate local ({local_valid_pos}) < \
              keep-local-when-valid ({keep_local_pos}) < recovery ({recovery_pos}) — \
              recovery may only replace state the contract itself calls invalid"
+        );
+    }
+}
+
+/// Source-scrape pins for the conformance capture hook (RFC #5320).
+///
+/// Capture sits on the merge path, which is the hottest path a contract touches.
+/// Two properties keep it safe to run on a live node, and neither is visible from
+/// the capture module's own tests, because both are facts about the CALL SITE:
+///
+/// 1. it observes where the transition actually is, inside `attempt_state_update`;
+/// 2. it never blocks the executor.
+///
+/// A refactor that "tidied" the `observe` call into an `await`, or moved it to a
+/// path that cannot see the base state, would leave every capture-module test green
+/// while making the node liable to stall behind a diagnostic writer. That is the
+/// #4145 / #4466 shape, and `.claude/rules/channel-safety.md` exists because it has
+/// happened repeatedly.
+#[cfg(test)]
+mod conformance_capture_pins {
+    /// Slice `attempt_state_update`'s body, from its signature to the next
+    /// function's. A missing anchor panics rather than silently widening the region
+    /// to the rest of the file, which is how a source pin quietly stops testing
+    /// anything (see the `include_str!` note in
+    /// `.claude/rules/bug-prevention-patterns.md`).
+    fn attempt_state_update_body() -> &'static str {
+        let src = include_str!("executor_impl.rs");
+        let start = src
+            .find("    pub(super) async fn attempt_state_update(")
+            .expect("attempt_state_update not found");
+        let after = &src[start..];
+        let end = after
+            .find("    async fn maybe_probe_idempotency(")
+            .expect("maybe_probe_idempotency no longer follows attempt_state_update");
+        &after[..end]
+    }
+
+    /// Capture must read the transition from the merge path itself. Recording it
+    /// anywhere else means recording something other than what the contract did.
+    #[test]
+    fn capture_observes_from_the_merge_path() {
+        let body = attempt_state_update_body();
+        assert!(
+            body.contains("capture.observe_with("),
+            "conformance capture is no longer invoked from attempt_state_update, so \
+             captured corpora would no longer reflect the merges the node performs"
+        );
+
+        // Bound the field check to the `Observation` literal itself.
+        //
+        // Searching the whole function body was vacuous for `incoming_state`: the
+        // name also appears in the `let (incoming_state, delta) = ...` binding that
+        // computes it, so deleting the FIELD left the assertion green while the
+        // bundle silently lost half the transition. This is the failure mode
+        // `AGENTS.md` warns about for source-scrape pins, and it is why the region
+        // has to be bounded to the thing being pinned rather than to its file.
+        let literal = body
+            .split_once("Observation {")
+            .expect("the capture hook no longer constructs an Observation literal")
+            .1;
+        let literal = literal
+            .split_once("});")
+            .expect("could not find the end of the Observation literal")
+            .0;
+
+        // `related,` included deliberately: without it, a refactor that drops the
+        // field or hardcodes an empty vec reverts related-contract capture entirely
+        // while every pin stays green — the same failure this pin's own history
+        // records for `incoming_state`.
+        for field in [
+            "base_state:",
+            "result_state:",
+            "incoming_state,",
+            "delta,",
+            "related,",
+        ] {
+            assert!(
+                literal.contains(field),
+                "capture no longer records `{field}` from the merge path; a replay \
+                 bundle missing part of the transition cannot reproduce it"
+            );
+        }
+    }
+
+    /// Nothing may be copied before the byte budget is checked.
+    ///
+    /// The sampler side of this is already pinned: `observe_with` provably does not
+    /// invoke its builder once the queue or byte budget is exhausted
+    /// (`a_full_queue_skips_building_the_observation_entirely`). What that test cannot
+    /// see is the CALL SITE. An earlier version of this hook computed the incoming
+    /// state, delta and related payloads BEFORE calling `observe_with`, so the copies
+    /// happened unconditionally whenever capture was enabled — queue full or not —
+    /// while the comment above them claimed the opposite. Moving them back would
+    /// restore that bug with every existing test green, including both pins in this
+    /// module, because the `Observation` literal would be unchanged and the hook would
+    /// still not await.
+    ///
+    /// Related state is the reason this matters more since related-contract capture:
+    /// it can carry another contract's entire state, so the drop path would pay the
+    /// largest copy of the three, on the merge path, under exactly the load that
+    /// causes drops.
+    #[test]
+    fn nothing_is_copied_before_the_budget_check() {
+        let body = attempt_state_update_body();
+        let hook_start = body
+            .find("if let Some(capture) =")
+            .expect("capture hook not found in attempt_state_update");
+        let hook = &body[hook_start..];
+        let (before_budget, inside_closure) = hook
+            .split_once("capture.observe_with(")
+            .expect("the capture hook no longer routes through observe_with");
+
+        for alloc in [".to_vec()", ".to_owned()", ".clone()"] {
+            assert!(
+                !before_budget.contains(alloc),
+                "the capture hook calls `{alloc}` before `observe_with`, so the copy \
+                 happens whether or not a queue slot and byte budget are secured. \
+                 Measure lengths from the slices already held, and do every \
+                 allocation inside the `observe_with` closure, which runs only after \
+                 the budget check"
+            );
+        }
+
+        // Guard against passing vacuously: if the copies were deleted outright rather
+        // than moved, the loop above would also be satisfied. Both spellings count,
+        // so a refactor from one to the other does not fail here claiming the copies
+        // are gone — which is what the first version of this guard did.
+        assert!(
+            inside_closure.contains(".to_vec()") || inside_closure.contains(".to_owned()"),
+            "no copies remain inside the `observe_with` closure, so this pin would \
+             pass for a hook that records nothing at all"
+        );
+    }
+
+    /// The executor must never wait on capture. A slow or stuck writer would
+    /// otherwise stall contract synchronization, which is the one thing this path
+    /// is required never to do.
+    #[test]
+    fn capture_never_awaits_on_the_merge_path() {
+        let body = attempt_state_update_body();
+        let hook_start = body
+            .find("if let Some(capture) =")
+            .expect("capture hook not found in attempt_state_update");
+        let rest = &body[hook_start..];
+        let hook_end = rest
+            .find("\n        }")
+            .expect("capture hook block not delimited as expected");
+        let hook = &rest[..hook_end];
+        assert!(
+            !hook.contains(".await"),
+            "the conformance capture hook awaits on the merge path. It must not: a \
+             slow or stuck writer would then stall contract synchronization. Use \
+             `try_send` and drop on full, per .claude/rules/channel-safety.md"
         );
     }
 }

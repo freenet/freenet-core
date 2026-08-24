@@ -75,6 +75,20 @@ pub enum SubCommand {
         #[clap(subcommand)]
         command: crate::website::WebsiteCommand,
     },
+    /// Check that a contract's merge obeys the laws the network requires: that
+    /// merging is order-independent, groups the same way whichever pairing is used,
+    /// and applying the same change twice does nothing the second time.
+    ///
+    /// A contract that breaks these cannot converge — two peers given the same
+    /// updates in different orders end up with different state, never agree, and
+    /// retry indefinitely. That is what this looks for.
+    ///
+    /// Runs the *same* verifier the network runs, so a finding here means exactly
+    /// what it would mean on the network.
+    ///
+    /// Previously named `conformance`; that spelling still works.
+    #[clap(alias = "conformance")]
+    VerifyMerge(crate::conformance::ConformanceConfig),
 }
 
 impl SubCommand {
@@ -300,6 +314,112 @@ mod tests {
     use clap::Parser as _;
 
     use super::Config;
+
+    /// Regression test for #5362: `fdev wasm-runtime` panicked inside clap on
+    /// every invocation, including `--help`.
+    ///
+    /// `ExecutorConfig`'s `ArgGroup` listed its members by their kebab-cased
+    /// *long flag* spellings (`"output-file"`, `"terminal-output"`) instead of
+    /// the arg ids clap derives from the field names (`output_file`,
+    /// `terminal_output`). Clap resolves a name in a group that matches no arg
+    /// as a nested group, finds no such group, and hits
+    /// `.expect(INTERNAL_ERROR_MSG)` in `Command::unroll_args_in_group`.
+    ///
+    /// `debug_assert` walks the whole command tree, so this guards every fdev
+    /// subcommand rather than just `wasm-runtime`: a malformed clap definition
+    /// anywhere in the CLI fails here instead of at a user's terminal.
+    ///
+    /// Note what this test depends on: the checks inside `debug_assert` are
+    /// `#[cfg(debug_assertions)]`-gated, but `debug_assert` itself is not, so
+    /// with assertions off it becomes a silently-passing no-op rather than a
+    /// build error. It is live today because CI runs `cargo nextest` in the test
+    /// profile and the workspace sets no `[profile.test] debug-assertions`
+    /// override. If that ever changes, this test stops checking anything and
+    /// `wasm_runtime_help_does_not_panic` below becomes the only guard.
+    #[test]
+    fn cli_definition_is_internally_consistent() {
+        use clap::CommandFactory as _;
+        Config::command().debug_assert();
+    }
+
+    /// `Config` deliberately has no `Debug`, so `Result::expect_err` is not
+    /// available on a parse result. Recover the error by hand instead.
+    fn expect_rejected(args: &[&str]) -> clap::Error {
+        match Config::try_parse_from(args) {
+            Ok(_) => panic!("expected `{}` to be rejected", args.join(" ")),
+            Err(err) => err,
+        }
+    }
+
+    /// Companion to `cli_definition_is_internally_consistent`. Clap's
+    /// `debug_assert` checks compile out when `debug_assertions` are off, so on
+    /// its own it would stop guarding a release build — and #5362 panicked in
+    /// `unroll_args_in_group`, which is a plain `expect` that runs in every
+    /// profile. Building the usage string for the required `ArgGroup` is what
+    /// reached it, so render `wasm-runtime --help` for real.
+    #[test]
+    fn wasm_runtime_help_does_not_panic() {
+        // clap reports --help as an error rather than a parsed config. Reaching
+        // this line at all is the load-bearing half: the group walk happens
+        // inside `try_parse_from`, so a regression panics before we get here.
+        let err = expect_rejected(&["fdev", "wasm-runtime", "--help"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+
+        // `render()` does NOT re-walk the group — for `DisplayHelp` the text is
+        // already built during parse and stored as `Message::Formatted`, which
+        // `render()` hands back verbatim. So assert something the flag list
+        // alone cannot satisfy: that the usage line still presents the two sinks
+        // as one required either/or group. A bare `--terminal-output` substring
+        // would match the per-flag "Options:" listing even with the group gone.
+        let rendered = err.render().to_string();
+        assert!(
+            rendered.contains("<--output-file <OUTPUT_FILE>|--terminal-output>"),
+            "usage line should show the output group; got:\n{rendered}"
+        );
+    }
+
+    /// While the group's members were misspelled the constraint it exists to
+    /// enforce was dead as well as fatal, so pin the behaviour rather than only
+    /// the absence of the panic: exactly one output sink, never zero or two.
+    #[test]
+    fn wasm_runtime_requires_exactly_one_output_sink() {
+        // Neither sink: the required group rejects it.
+        let err = expect_rejected(&["fdev", "wasm-runtime", "--input-file", "/tmp/in"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+
+        // Both sinks: the group is mutually exclusive.
+        let err = expect_rejected(&[
+            "fdev",
+            "wasm-runtime",
+            "--input-file",
+            "/tmp/in",
+            "--output-file",
+            "/tmp/out",
+            "--terminal-output",
+            "--deserialization-format",
+            "json",
+        ]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        // Exactly one sink: accepted. `--deserialization-format` is passed so
+        // this case stays valid whichever way #5416 is resolved — today only
+        // `terminal_output` carries `requires = "fmt"`, and this test should
+        // not quietly pin that asymmetry while testing the output group.
+        assert!(
+            Config::try_parse_from([
+                "fdev",
+                "wasm-runtime",
+                "--input-file",
+                "/tmp/in",
+                "--output-file",
+                "/tmp/out",
+                "--deserialization-format",
+                "json",
+            ])
+            .is_ok(),
+            "one output sink should satisfy the output group"
+        );
+    }
 
     /// Regression test for #4088: `fdev publish --release` used to bail
     /// unconditionally with "Cannot publish contracts in the network yet".

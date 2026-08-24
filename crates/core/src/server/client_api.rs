@@ -285,6 +285,10 @@ impl HttpClientApi {
                 "/peer/{address}",
                 axum::routing::get(home_page::peer_detail),
             )
+            .route(
+                "/contract/{key}",
+                axum::routing::get(home_page::contract_detail),
+            )
             // Notification service worker, served at the origin root so its
             // default scope (`/`) covers every contract shell page. The shell
             // registers it to show notifications via showNotification() — the
@@ -409,6 +413,7 @@ async fn notify_service_worker() -> impl IntoResponse {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn web_home(
     Path(key): Path<String>,
     Extension(rs): Extension<HttpClientApiRequest>,
@@ -417,6 +422,7 @@ async fn web_home(
     api_version: ApiVersion,
     query_string: Option<String>,
     hosted_mode: bool,
+    source_addr: Option<std::net::SocketAddr>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     // Check if this is the sandboxed iframe requesting its content
     let is_sandbox = query_string
@@ -446,6 +452,7 @@ async fn web_home(
         None,
         rs,
         hosted_mode,
+        source_addr,
     )
     .await
 }
@@ -461,6 +468,7 @@ async fn web_home(
 /// freenet/freenet-core#3841). Both must issue the SAME credentials and
 /// headers; factoring it here keeps the deep-link path from drifting out
 /// of sync with the root path (e.g. forgetting the cookie or the CSP).
+#[allow(clippy::too_many_arguments)]
 async fn render_shell_response(
     key: String,
     config: &Config,
@@ -469,11 +477,43 @@ async fn render_shell_response(
     sub_path: Option<&str>,
     rs: HttpClientApiRequest,
     hosted_mode: bool,
+    // Peer address of the requesting connection, for the issuance audit log.
+    // `None` only where no `ConnectInfo` is installed (standalone test routers).
+    source_addr: Option<std::net::SocketAddr>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     use headers::{Header, HeaderMapExt};
 
     // Shell page: generate auth token, serve iframe wrapper with CSP
     let token = AuthToken::generate();
+
+    // AUDIT (GHSA-824h-7x5x-wfmf): this is THE issuance point for an
+    // app-identity auth token — the node mints one on request for ANY contract
+    // id, and whoever holds it is thereafter attested as that app. Record every
+    // issuance so the trail exists after the fact.
+    //
+    // `info!` deliberately, not `debug!`: the crate builds with
+    // `release_max_level_info`, so a `debug!` here would be compiled out of
+    // every shipped binary and the audit log would exist only in development.
+    //
+    // Ids and addresses ONLY. The token itself is never logged — it IS the
+    // credential — and neither is any key material.
+    //
+    // LOG THE PARSED ID, NEVER THE RAW PATH. `key` is an unvalidated
+    // `Path<String>` that axum has already percent-DECODED, and this route is
+    // exposed publicly through the hosted proxy, so logging it raw would let any
+    // internet user inject newlines (`%0A`) and forge entries inside the very
+    // audit trail this line exists to produce. Parsing first bounds the value to
+    // 32 base58-encoded bytes with no control characters. An unparseable key is
+    // not logged here at all — it cannot yield a token, and the request fails
+    // below.
+    if let Ok(instance_id) = ContractInstanceId::from_base58(&key) {
+        tracing::info!(
+            contract_id = %instance_id,
+            peer_addr = ?source_addr,
+            api_version = %api_version.prefix(),
+            "Issued app-identity auth token for a contract shell page"
+        );
+    }
 
     let auth_header = headers::Authorization::<headers::authorization::Bearer>::name().to_string();
     let version_prefix = api_version.prefix();
@@ -561,6 +601,7 @@ async fn web_subpages(
     config: &Config,
     request_sender: HttpClientApiRequest,
     hosted_mode: bool,
+    source_addr: Option<std::net::SocketAddr>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     let is_sandbox = query_string
         .as_ref()
@@ -616,6 +657,7 @@ async fn web_subpages(
             Some(&last_path),
             request_sender,
             hosted_mode,
+            source_addr,
         )
         .await;
     }
@@ -1010,12 +1052,20 @@ impl ClientEventsProxy for HttpClientApi {
                         req,
                         auth_token,
                         origin_contract,
+                        // Forwarded explicitly rather than swallowed by `..`.
+                        // Every request on THIS proxy is node-internal today
+                        // (webapp-cache fetches, which carry no origin), so
+                        // dropping it would be inert — but the producers set it
+                        // deliberately, and a future client-facing request here
+                        // would otherwise lose its attestation silently.
+                        connection_scope,
                         user_context,
                         ..
                     } => {
                         return Ok(OpenRequest::new(client_id, req)
                             .with_token(auth_token)
                             .with_origin_contract(origin_contract)
+                            .with_connection_scope(connection_scope)
                             .with_user_context(user_context));
                     }
                 }
@@ -1722,6 +1772,7 @@ mod tests {
                     &localhost_config(),
                     sender,
                     false,
+                    None,
                 )
                 .await
                 .map(|_| ())
@@ -1756,6 +1807,7 @@ mod tests {
             &localhost_config(),
             dead_request_sender(),
             false,
+            None,
         )
         .await
         .expect("sandbox document load must redirect, not error");
@@ -1776,6 +1828,7 @@ mod tests {
             &localhost_config(),
             dead_request_sender(),
             false,
+            None,
         )
         .await;
         match res {
@@ -1826,6 +1879,7 @@ mod tests {
             &localhost_config(),
             dead_request_sender(),
             false,
+            None,
         )
         .await
         .expect("web_subpages must convert the inner error into a response, not propagate it");
@@ -1905,6 +1959,7 @@ mod tests {
                     &localhost_config(),
                     dead_request_sender(),
                     false,
+                    None,
                 )
                 .await
                 .expect("web_subpages must respond, not propagate")

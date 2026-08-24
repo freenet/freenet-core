@@ -543,6 +543,35 @@ impl ControlledSimulationResult {
             .is_some_and(|ring| ring.is_hosting_contract(key))
     }
 
+    /// The protocol version `label`'s node had recorded for the peer at `addr`
+    /// at the end of the run, or `None` if it never learned one (#5161).
+    ///
+    /// Reads the same `ConnectionManager` mirror the production emission gates
+    /// read, so it answers the question those gates ask rather than a proxy for
+    /// it. `None` when the node never published its Ring.
+    pub fn node_recorded_remote_version(
+        &self,
+        label: &NodeLabel,
+        addr: SocketAddr,
+    ) -> Option<(u8, u8, u16)> {
+        self.node_rings
+            .get(label)
+            .and_then(|ring| ring.connection_manager.remote_version(addr))
+    }
+
+    /// Whether `label`'s node would emit the hash-first summary encoding to the
+    /// peer at `addr` — i.e. whether that link passes the version gate (#4965).
+    ///
+    /// The end-to-end consequence of #5161 on a node->gateway link: before the
+    /// version-carrying ack this could never be true from the node's side, so
+    /// the node answered every anti-entropy exchange with full summary bytes.
+    /// `false` when the node never published its Ring.
+    pub fn node_supports_hash_first_summaries(&self, label: &NodeLabel, addr: SocketAddr) -> bool {
+        self.node_rings
+            .get(label)
+            .is_some_and(|ring| ring.connection_manager.supports_hash_first_summaries(addr))
+    }
+
     /// Number of contracts `label`'s node held in its hosting cache at the end
     /// of the run (its "cache size"). Returns 0 if the node never published its
     /// Ring. See [`Ring::hosting_contracts_count`](crate::ring::Ring::hosting_contracts_count).
@@ -1407,6 +1436,34 @@ pub struct SimNetwork {
     /// release PR, where a red sim could not be attributed between the
     /// feature and the version bump.
     hash_first_summaries_floor_override: Option<(u8, u8, u16)>,
+    /// Per-node version-carrying-ack version-floor override (#5161, see
+    /// [`SimNetwork::enable_gateway_ack_version`]).
+    ///
+    /// **Defaults to `Some(SIM_MIGRATION_DISABLED_FLOOR)` — OFF**, like the two
+    /// cascade gates and unlike `hash_first_summaries_floor_override`. The gate
+    /// is encoding-only where it fires, but the version it teaches is the INPUT
+    /// to every other `version_supports_*` gate, so enabling it network-wide
+    /// makes node->gateway links newly eligible for those features. Measured,
+    /// not assumed: defaulting it ON changed the outcome of unrelated sims.
+    ///
+    /// The cost of OFF, stated plainly: sims keep the pre-0.2.120 topology
+    /// asymmetry (a regular node never learns its gateway's version) even after
+    /// production stops having it. `enable_gateway_ack_version` is how a test
+    /// that cares opts in.
+    ack_version_floor_override: Option<(u8, u8, u16)>,
+    /// Per-node override for the originator-target-list version floor (#5147).
+    ///
+    /// Defaults to `SIM_MIGRATION_DISABLED_FLOOR` — OFF — grouping with
+    /// `subscribe_hint_floor_override` and `summary_first_put_floor_override`
+    /// rather than with `hash_first_summaries_floor_override`. Hash-first is ON
+    /// by default because it changes only the ENCODING of an exchange with
+    /// identical semantics. This one changes fan-out BEHAVIOUR: it removes
+    /// peers from a broadcast. Defaulting it ON would silently alter the
+    /// delivery graph under every sim that asserts on convergence or delivery
+    /// counts, and a failure could not be attributed between that sim's own
+    /// subject and this suppression. Tests that want it call
+    /// [`enable_broadcast_target_list`](Self::enable_broadcast_target_list).
+    broadcast_target_list_floor_override: Option<(u8, u8, u16)>,
     /// Optional controllable hosting clock injected into every node's
     /// `HostingManager` (via `NodeConfig::hosting_time_source_override`). When
     /// set, hosting-cache TTL and subscription-lease eviction advance ONLY when
@@ -1606,6 +1663,15 @@ impl SimNetwork {
             // version-gated wire change simulation coverage BEFORE the release
             // that lifts the crate version past its floor.
             hash_first_summaries_floor_override: Some(Self::SIM_MIGRATION_ENABLED_FLOOR),
+            // Fail-CLOSED by default, like the two cascade gates and unlike
+            // hash-first. This gate is encoding-only where it fires, but what
+            // it teaches — the remote's version — is the INPUT to every other
+            // `version_supports_*` gate, so switching it on network-wide is a
+            // cascade in effect. Opt in per sim via `enable_gateway_ack_version`.
+            ack_version_floor_override: Some(Self::SIM_MIGRATION_DISABLED_FLOOR),
+            // Fail-CLOSED by default, like the two behavioural gates above and
+            // unlike hash-first (#5147). See the field's rustdoc.
+            broadcast_target_list_floor_override: Some(Self::SIM_MIGRATION_DISABLED_FLOOR),
             hosting_clock: None,
             hosting_budget_override: None,
             shared_rings: HashMap::new(),
@@ -1962,6 +2028,85 @@ impl SimNetwork {
         self
     }
 
+    /// Opt this simulation into the version-carrying connection ack (#5161) by
+    /// pinning the per-node floor to the always-passing
+    /// [`Self::SIM_MIGRATION_ENABLED_FLOOR`], so a joiner learns the version of
+    /// the gateway (or ack-racing peer) it connects to.
+    ///
+    /// Genuinely opt-in, unlike
+    /// [`enable_hash_first_summaries`](Self::enable_hash_first_summaries) which
+    /// only restates a default. The reasoning is the fail-closed criterion this
+    /// codebase already applies: hash-first is opt-OUT because it changes only
+    /// the ENCODING of an exchange every sim already runs. This gate looks like
+    /// that from the inside — it changes only how one ack is encoded — but its
+    /// EFFECT is a cascade, because the version it teaches is the input to
+    /// every other `version_supports_*` gate. Turning it on network-wide makes
+    /// node->gateway links newly eligible for summary-first PUT probes and
+    /// hash-first digests in whatever sims have those enabled, which is exactly
+    /// the "piles load onto unrelated simulations" shape that
+    /// `subscribe_hint_floor_override` and `summary_first_put_floor_override`
+    /// default OFF to avoid. Measured, not assumed: defaulting it ON changed
+    /// the outcome of several unrelated sims.
+    ///
+    /// Note this leaves the sim suite pinned OFF even after the production
+    /// floor is reached, so sims and production diverge on this from 0.2.120
+    /// onwards. That is the deliberate trade — the alternative is every sim
+    /// silently changing behaviour at a release — and the coverage it costs is
+    /// bought back by `test_joiner_records_gateway_version_through_sim_handshake`
+    /// plus the transport-level tests in `connection_handler`.
+    #[allow(dead_code)]
+    pub fn enable_gateway_ack_version(&mut self) -> &mut Self {
+        let floor = Some(Self::SIM_MIGRATION_ENABLED_FLOOR);
+        self.ack_version_floor_override = floor;
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.ack_version_floor_override = floor;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.ack_version_floor_override = floor;
+        }
+        self
+    }
+
+    /// Turn the originator target list (#5147) ON for this simulation by
+    /// pinning the per-node version floor to the always-passing
+    /// [`Self::SIM_MIGRATION_ENABLED_FLOOR`].
+    ///
+    /// Unlike [`enable_hash_first_summaries`](Self::enable_hash_first_summaries),
+    /// this is NOT the default and the call is load-bearing: without it every
+    /// peer falls back to the legacy `BroadcastTo` and the sim measures
+    /// today's unsuppressed fan-out. That is exactly what the control arm of a
+    /// suppression measurement wants, so the two arms differ by this one call.
+    #[allow(dead_code)]
+    pub fn enable_broadcast_target_list(&mut self) -> &mut Self {
+        let floor = Some(Self::SIM_MIGRATION_ENABLED_FLOOR);
+        self.broadcast_target_list_floor_override = floor;
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.broadcast_target_list_floor_override = floor;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.broadcast_target_list_floor_override = floor;
+        }
+        self
+    }
+
+    /// Force the originator target list OFF for this simulation.
+    ///
+    /// Already the default (see `new_inner`); exists so the CONTROL arm of a
+    /// suppression measurement states its premise at the call site rather than
+    /// depending on a default a future edit could flip.
+    #[allow(dead_code)]
+    pub fn disable_broadcast_target_list(&mut self) -> &mut Self {
+        let floor = Some(Self::SIM_MIGRATION_DISABLED_FLOOR);
+        self.broadcast_target_list_floor_override = floor;
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.broadcast_target_list_floor_override = floor;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.broadcast_target_list_floor_override = floor;
+        }
+        self
+    }
+
     /// Force the hash-first summary exchange OFF for this simulation by
     /// pinning the per-node floor to the unreachable
     /// [`Self::SIM_MIGRATION_DISABLED_FLOOR`], so every peer falls back to the
@@ -1974,10 +2119,10 @@ impl SimNetwork {
     /// simulation — one peer at the floor, one below — is constructible by
     /// setting the two builders differently rather than using this helper,
     /// which sets every node uniformly. No such test exists yet; the mixed
-    /// case that IS covered today is incidental rather than constructed: a
-    /// regular node never learns its gateway's version (the gateway's
-    /// `AckConnection` carries none), so every gateway link already runs
-    /// digests one way and full bytes the other.
+    /// case that IS covered today is incidental rather than constructed: unless
+    /// a sim calls [`enable_gateway_ack_version`](Self::enable_gateway_ack_version),
+    /// a regular node never learns its gateway's version, so every gateway link
+    /// already runs digests one way and full bytes the other.
     #[allow(dead_code)]
     pub fn disable_hash_first_summaries(&mut self) -> &mut Self {
         let floor = Some(Self::SIM_MIGRATION_DISABLED_FLOOR);
@@ -2644,6 +2789,8 @@ impl SimNetwork {
             config.subscribe_hint_floor_override = self.subscribe_hint_floor_override;
             config.summary_first_put_floor_override = self.summary_first_put_floor_override;
             config.hash_first_summaries_floor_override = self.hash_first_summaries_floor_override;
+            config.ack_version_floor_override = self.ack_version_floor_override;
+            config.broadcast_target_list_floor_override = self.broadcast_target_list_floor_override;
             config.hosting_time_source_override = self
                 .hosting_clock
                 .clone()
@@ -2745,6 +2892,8 @@ impl SimNetwork {
             config.subscribe_hint_floor_override = self.subscribe_hint_floor_override;
             config.summary_first_put_floor_override = self.summary_first_put_floor_override;
             config.hash_first_summaries_floor_override = self.hash_first_summaries_floor_override;
+            config.ack_version_floor_override = self.ack_version_floor_override;
+            config.broadcast_target_list_floor_override = self.broadcast_target_list_floor_override;
             config.hosting_time_source_override = self
                 .hosting_clock
                 .clone()
