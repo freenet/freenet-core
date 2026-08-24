@@ -315,6 +315,87 @@ mod tests {
 
     use super::Config;
 
+    /// Regression test for #5362: `fdev wasm-runtime` panicked inside clap on
+    /// every invocation, including `--help`.
+    ///
+    /// `ExecutorConfig`'s `ArgGroup` listed its members by their kebab-cased
+    /// *long flag* spellings (`"output-file"`, `"terminal-output"`) instead of
+    /// the arg ids clap derives from the field names (`output_file`,
+    /// `terminal_output`). Clap resolves a name in a group that matches no arg
+    /// as a nested group, finds no such group, and hits
+    /// `.expect(INTERNAL_ERROR_MSG)` in `Command::unroll_args_in_group`.
+    ///
+    /// `debug_assert` walks the whole command tree, so this guards every fdev
+    /// subcommand rather than just `wasm-runtime`: a malformed clap definition
+    /// anywhere in the CLI fails here instead of at a user's terminal.
+    #[test]
+    fn cli_definition_is_internally_consistent() {
+        use clap::CommandFactory as _;
+        Config::command().debug_assert();
+    }
+
+    /// `Config` deliberately has no `Debug`, so `Result::expect_err` is not
+    /// available on a parse result. Recover the error by hand instead.
+    fn expect_rejected(args: &[&str]) -> clap::Error {
+        match Config::try_parse_from(args) {
+            Ok(_) => panic!("expected `{}` to be rejected", args.join(" ")),
+            Err(err) => err,
+        }
+    }
+
+    /// Companion to `cli_definition_is_internally_consistent`. Clap's
+    /// `debug_assert` checks compile out when `debug_assertions` are off, so on
+    /// its own it would stop guarding a release build — and #5362 panicked in
+    /// `unroll_args_in_group`, which is a plain `expect` that runs in every
+    /// profile. Building the usage string for the required `ArgGroup` is what
+    /// reached it, so render `wasm-runtime --help` for real.
+    #[test]
+    fn wasm_runtime_help_does_not_panic() {
+        // clap reports --help as an error rather than a parsed config.
+        let err = expect_rejected(&["fdev", "wasm-runtime", "--help"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+        // Rendering is a second opportunity to walk the group.
+        assert!(err.render().to_string().contains("--terminal-output"));
+    }
+
+    /// While the group's members were misspelled the constraint it exists to
+    /// enforce was dead as well as fatal, so pin the behaviour rather than only
+    /// the absence of the panic: exactly one output sink, never zero or two.
+    #[test]
+    fn wasm_runtime_requires_exactly_one_output_sink() {
+        // Neither sink: the required group rejects it.
+        let err = expect_rejected(&["fdev", "wasm-runtime", "--input-file", "/tmp/in"]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+
+        // Both sinks: the group is mutually exclusive.
+        let err = expect_rejected(&[
+            "fdev",
+            "wasm-runtime",
+            "--input-file",
+            "/tmp/in",
+            "--output-file",
+            "/tmp/out",
+            "--terminal-output",
+            "--deserialization-format",
+            "json",
+        ]);
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        // Exactly one sink: accepted.
+        assert!(
+            Config::try_parse_from([
+                "fdev",
+                "wasm-runtime",
+                "--input-file",
+                "/tmp/in",
+                "--output-file",
+                "/tmp/out",
+            ])
+            .is_ok(),
+            "--output-file alone should satisfy the output group"
+        );
+    }
+
     /// Regression test for #4088: `fdev publish --release` used to bail
     /// unconditionally with "Cannot publish contracts in the network yet".
     /// After the fix the `--release` flag no longer exists on `publish`;
