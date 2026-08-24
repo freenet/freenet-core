@@ -3575,7 +3575,20 @@ mod contract_exec_counter_pins {
     /// the comment came first. A pin that matches its own explanation is not
     /// pinning anything.
     fn summarize_body() -> String {
-        let src = include_str!("executor_impl.rs");
+        // Cut the test modules off FIRST. Both bounds below are searched for as
+        // literal signatures, and both literals also occur in this helper's own
+        // source, which `include_str!` pulls in. Without this truncation a
+        // rename of the delta method would not panic: `find` would fall through
+        // to the copy of the string on the line just below, silently widening
+        // the region from ~135 lines to everything up to this module — which is
+        // the "expect that can never fire" shape the module doc claims to have
+        // closed, and which `contract_ops.rs::production_source` avoids the
+        // same way.
+        let full = include_str!("executor_impl.rs");
+        let cutoff = full
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("executor_impl.rs must have a top-level #[cfg(test)] mod section");
+        let src = &full[..cutoff];
         let start = src
             .find("pub(in crate::contract::executor) async fn bridged_summarize_contract_state(")
             .expect("bridged_summarize_contract_state not found");
@@ -3652,5 +3665,70 @@ mod contract_exec_counter_pins {
              immediately before the summarize_state call it describes \
              ({summarize_state_pos})"
         );
+    }
+
+    /// Production source with the test modules cut off, so no needle below can
+    /// match this module's own assertion strings via `include_str!`.
+    fn production_source() -> String {
+        let src = include_str!("executor_impl.rs");
+        let cutoff = src
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("executor_impl.rs must have a top-level #[cfg(test)] mod section");
+        src[..cutoff]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Pin: BOTH client-notification fan-out arms must count their uncached
+    /// delta.
+    ///
+    /// The fan-out has two mutually exclusive arms — one for the shared
+    /// notification/summary maps, one for the `else` — and each runs its own
+    /// WASM `get_state_delta`. Only one of them is reachable from any single
+    /// test fixture, so the behavioral test
+    /// `client_notification_fanout_delta_counts_as_uncached` covers exactly one
+    /// and leaves the other free to lose its counter with CI still green.
+    ///
+    /// That is precisely the failure this whole module exists to remove: a
+    /// counter that is a no-op on the path that actually matters, with a
+    /// passing test standing over it. Counting the sites from source covers
+    /// both arms without needing a fixture that can reach each one.
+    #[test]
+    fn both_fanout_delta_arms_count_an_uncached_delta() {
+        let src = production_source();
+        let norm = src.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let recorders = norm.matches("m.record_delta_wasm_uncached();").count();
+        assert_eq!(
+            recorders, 2,
+            "expected exactly 2 uncached-delta recorders (one per fan-out arm), \
+             found {recorders} — a new arm needs its own recorder, and a removed \
+             one means an arm now runs WASM uncounted"
+        );
+
+        // Each recorder must be the thing immediately before a `get_state_delta`
+        // call, not merely present somewhere in the file. Anchored on the call's
+        // API surface rather than on local variable names, which drift.
+        for (i, tail) in norm
+            .match_indices("m.record_delta_wasm_uncached();")
+            .map(|(pos, _)| &norm[pos..])
+            .enumerate()
+        {
+            let next_delta = tail.find(".get_state_delta(").unwrap_or_else(|| {
+                panic!("recorder {i} is not followed by a get_state_delta call")
+            });
+            let next_recorder = tail[1..]
+                .find("m.record_delta_wasm_uncached();")
+                .map(|p| p + 1)
+                .unwrap_or(usize::MAX);
+            assert!(
+                next_delta < next_recorder,
+                "recorder {i} must bind to its OWN get_state_delta call — another \
+                 recorder ({next_recorder}) intervenes before the next call \
+                 ({next_delta}), so one arm is counting the other arm's work"
+            );
+        }
     }
 }

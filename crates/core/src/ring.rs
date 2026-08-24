@@ -2116,6 +2116,32 @@ impl Ring {
             // one, because it terminates the investigation.
             let ce = ring.contract_exec_metrics.snapshot();
             let ce_d = ce.window_deltas(&mut prev_exec);
+            // Exhaustive destructure with no `..` rest pattern, on BOTH the
+            // lifetime snapshot and the window deltas. A 9th counter arm then
+            // fails to COMPILE here until it is exported, which is strictly
+            // stronger than the source-scrape pin below: a scrape that hardcodes
+            // today's eight names passes unchanged when a ninth is added, which
+            // is exactly how a counter ends up recorded but never exported.
+            let contract_exec_metrics::ContractExecSnapshot {
+                summarize_fast_hits: _,
+                summarize_reload_hits: _,
+                summarize_wasm_calls: _,
+                summarize_wasm_uncached: _,
+                delta_fast_hits: _,
+                delta_reload_hits: _,
+                delta_wasm_calls: _,
+                delta_wasm_uncached: _,
+            } = ce;
+            let contract_exec_metrics::ContractExecSnapshot {
+                summarize_fast_hits: _,
+                summarize_reload_hits: _,
+                summarize_wasm_calls: _,
+                summarize_wasm_uncached: _,
+                delta_fast_hits: _,
+                delta_reload_hits: _,
+                delta_wasm_calls: _,
+                delta_wasm_uncached: _,
+            } = ce_d;
             snapshot.contract_exec_summarize_fast_hits_total = Some(ce.summarize_fast_hits);
             snapshot.contract_exec_summarize_reload_hits_total = Some(ce.summarize_reload_hits);
             snapshot.contract_exec_summarize_wasm_calls_total = Some(ce.summarize_wasm_calls);
