@@ -19,6 +19,19 @@ pub struct RunMeta {
     pub pinned_gateways: Vec<String>,
     pub ephemeral_peers: Vec<String>,
     pub duration_ms: u128,
+    /// Seed the run's operation order was shuffled from, derived from
+    /// `run_id`.
+    ///
+    /// In the artifact rather than only on stderr because the uploaded
+    /// artifact is stdout, and because this records a METHODOLOGY change:
+    /// before the shuffle, every 0h GET ran in the first few slots right after
+    /// settle, and afterwards a 0h GET can be the run's last operation minutes
+    /// later. Success rates either side of that change are not comparable, and
+    /// a longitudinal metric whose method changed silently is how a reporting
+    /// artefact gets read as a network event. A run with no seed recorded is a
+    /// run from before the shuffle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_seed: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -44,6 +57,7 @@ impl RunMeta {
             pinned_gateways,
             ephemeral_peers: Vec::new(),
             duration_ms: 0,
+            order_seed: None,
         }
     }
 

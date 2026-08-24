@@ -86,6 +86,7 @@ chrono = { version = "0.4", default-features = true }
 
 # Random
 rand = "0.9"
+rand_chacha = "0.9"
 
 # Observability
 opentelemetry = "0.32"

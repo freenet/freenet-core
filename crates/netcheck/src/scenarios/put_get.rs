@@ -52,13 +52,33 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
     );
 
     let mut report = Report::default();
+    let seed = interleave_seed(&run_id);
+    meta.order_seed = Some(seed);
 
     // ---- PUT phase, via the existing gateway ----
+    //
+    // Shuffled for the same reason the GET phase is. `build_run_contracts`
+    // appends `large-1MB` after the smalls, so issuing them in vector order
+    // put the only large contract last every single night: "the 1 MB PUT
+    // failed" and "the last PUT failed" were one variable, which is the
+    // age/position confound again on the size axis. Fixing one phase and not
+    // the other would leave the report unable to answer the size question
+    // while claiming to have fixed the ordering problem.
+    let mut put_order: Vec<&contracts::RunContract> = run_contracts.iter().collect();
+    interleave(&mut put_order, seed);
+    eprintln!(
+        "PUT order for this run (interleave seed {seed}): {:?}",
+        put_order
+            .iter()
+            .map(|c| c.label.as_str())
+            .collect::<Vec<_>>()
+    );
+
     let mut gw = client::connect(&args.gateway_ws, Duration::from_secs(15))
         .await
         .context("connecting to gateway ws api")?;
     let mut put_ok: Vec<&contracts::RunContract> = Vec::new();
-    for c in &run_contracts {
+    for c in put_order {
         let key = c.contract.key();
         let attempt = client::put(
             &mut gw,
@@ -149,7 +169,6 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
             });
         }
     }
-    let seed = interleave_seed(&run_id);
     interleave(&mut ops, seed);
     eprintln!(
         "GET order for this run (interleave seed {seed}, derived from run id {run_id}): {:?}",
@@ -265,7 +284,14 @@ fn interleave<T>(ops: &mut [T], seed: u64) {
     use rand::SeedableRng;
     use rand::seq::SliceRandom;
 
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    // `ChaCha8Rng`, not `StdRng`. `rand` documents `StdRng`'s algorithm as
+    // explicitly NOT reproducible across versions, so a dependabot bump would
+    // silently invalidate every historical replay while
+    // `the_order_is_reproducible_from_the_run_id` kept passing -- it only
+    // compares one build against itself. `rand_chacha` carries a portability
+    // guarantee, which is what makes the claim on `interleave_seed` true
+    // rather than merely intended.
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
     ops.shuffle(&mut rng);
 }
 
@@ -511,6 +537,31 @@ mod tests {
         assert_eq!(report.ops().last().expect("one op").errors_ignored, 2);
     }
 
+    /// Split `body` at a call that is actually executed.
+    ///
+    /// `split_once` on the call text alone is not enough: commenting the call
+    /// out leaves the string in place, so the pin passes while the call is
+    /// gone. That is the same vacuity `fn_body` guards against one level up,
+    /// and it was reachable here — verified by commenting the call out and
+    /// watching the pin stay green. Requiring the call to begin its line, after
+    /// nothing but whitespace, is what makes deleting or disabling it fail.
+    fn split_at_call<'a>(body: &'a str, call: &str) -> (&'a str, &'a str) {
+        let at = body
+            .match_indices(call)
+            .find(|(i, _)| {
+                let line_start = body[..*i].rfind('\n').map_or(0, |n| n + 1);
+                body[line_start..*i].trim().is_empty()
+            })
+            .map(|(i, _)| i)
+            .unwrap_or_else(|| {
+                panic!(
+                    "`{call}` is not called at statement position in this function — it is \
+                     missing, or commented out, or buried inside another expression"
+                )
+            });
+        (&body[..at], &body[at + call.len()..])
+    }
+
     /// The body of a column-0 free function, bounded to that function.
     ///
     /// Copied from `commands::auto_update`, which carries the incident this
@@ -557,9 +608,7 @@ mod tests {
             include_str!("put_get.rs"),
             "pub async fn run(args: PutGetArgs) -> Result<bool> {",
         );
-        let (before, after) = body
-            .split_once("interleave(&mut ops, seed);")
-            .expect("run() must shuffle the op list it is about to issue");
+        let (before, after) = split_at_call(body, "interleave(&mut ops, seed);");
 
         assert!(
             before.contains("for c in &put_ok {"),
@@ -573,6 +622,46 @@ mod tests {
         assert!(
             after.contains("for op in &ops {"),
             "the GETs must be issued after the shuffle, or it changed nothing"
+        );
+    }
+
+    /// The PUT phase has the same confound on the size axis and needs the same
+    /// call-site pin, for the same reason: shuffling a synthetic vector in a
+    /// unit test says nothing about what `run` actually issues.
+    #[test]
+    fn the_run_shuffles_the_puts_so_the_large_contract_is_not_always_last() {
+        let body = fn_body(
+            include_str!("put_get.rs"),
+            "pub async fn run(args: PutGetArgs) -> Result<bool> {",
+        );
+        let (before, after) = split_at_call(body, "interleave(&mut put_order, seed);");
+
+        assert!(
+            before.contains("let mut put_order: Vec<&contracts::RunContract> ="),
+            "the shuffle must come after the PUT order is collected"
+        );
+        assert!(
+            after.contains("for c in put_order {"),
+            "the PUTs must be issued from the shuffled order, or it changed nothing — \
+             `build_run_contracts` appends `large-1MB` last, so vector order puts the only \
+             large contract at the end of every run and confounds size with position"
+        );
+    }
+
+    #[test]
+    fn the_put_order_is_not_always_the_build_order() {
+        // The property the call-site pin cannot check: that the shuffle
+        // actually moves `large-1MB` off the end across runs.
+        let last: HashSet<&str> = (0..20)
+            .map(|i| {
+                let mut order = vec!["small-0", "small-1", "small-2", "small-3", "large-1MB"];
+                interleave(&mut order, interleave_seed(&format!("2026081{i}-051006")));
+                *order.last().expect("non-empty")
+            })
+            .collect();
+        assert!(
+            last.len() > 1,
+            "the last PUT of a run was always {last:?}; size is still confounded with position"
         );
     }
 }

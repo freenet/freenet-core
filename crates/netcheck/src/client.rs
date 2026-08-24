@@ -146,7 +146,15 @@ fn error_contract_ids(err: &ClientError) -> Vec<ContractInstanceId> {
         ErrorKind::IncorrectState(key) => vec![*key.id()],
         // The shape terminal network failures actually arrive in: no key
         // field, the id written into the prose. See `contract_ids_in_text`.
-        ErrorKind::OperationError { cause } => contract_ids_in_text(cause.as_ref()),
+        //
+        // `Unhandled` is the same shape and matters for the same reason: it is
+        // what `ClientError::from(String)` produces, which is the sink stdlib's
+        // own stream-assembly failure path uses -- and stream assembly is the
+        // motivating failure class here, so leaving it unscanned would exempt
+        // the very errors this filter exists to attribute.
+        ErrorKind::OperationError { cause } | ErrorKind::Unhandled { cause } => {
+            contract_ids_in_text(cause.as_ref())
+        }
         // `ErrorKind` is `#[non_exhaustive]` too, and the same reasoning
         // applies: unrecognised means unattributed means fatal.
         _ => Vec::new(),
@@ -233,6 +241,30 @@ fn classify_get(
             match contract {
                 Some(contract) => Reaction::Done((contract, state)),
                 None => Reaction::Fatal(anyhow!("GET {label} ({id}) returned no contract")),
+            }
+        }
+        // A dead-ended GET does NOT arrive as `Err`. The node answers
+        // `Ok(NotFound)` on purpose, so a client can tell "contract genuinely
+        // absent" from "operation failed" -- see the comment on the arm that
+        // publishes it in `operations/get/op_ctx_task.rs`, which calls this
+        // "the dominant production `not_found` mode".
+        //
+        // Falling through to `Ignore` here is what made defect 2 survive its
+        // own fix: netcheck would discard the node's terminal answer, keep
+        // waiting, and report `latency_ms: 120000` -- the configured deadline
+        // again, for the single most common failure, now dressed as a
+        // measurement instead of an acknowledged constant. `NotFound` carries
+        // `instance_id`, so it is key-filtered exactly like every other
+        // terminal reply.
+        Ok(HostResponse::ContractResponse(ContractResponse::NotFound { instance_id })) => {
+            if instance_id != id {
+                Reaction::Ignore(format!(
+                    "GET {label}: NotFound for different key {instance_id}, ignoring"
+                ))
+            } else {
+                Reaction::Fatal(anyhow!(
+                    "GET {label} ({id}): node answered NotFound (contract not located)"
+                ))
             }
         }
         Ok(other) => Reaction::Ignore(format!(
@@ -459,6 +491,15 @@ mod tests {
 
     fn id_of(byte: u8) -> ContractInstanceId {
         ContractInstanceId::new([byte; 32])
+    }
+
+    fn reaction_name<T>(r: &Reaction<T>) -> &'static str {
+        match r {
+            Reaction::Done(_) => "Done",
+            Reaction::Ignore(_) => "Ignore",
+            Reaction::IgnoredError(_) => "IgnoredError",
+            Reaction::Fatal(_) => "Fatal",
+        }
     }
 
     /// A structured terminal GET failure: the API names the contract in a key
@@ -762,6 +803,54 @@ mod tests {
                 Reaction::Fatal(_) => {}
                 _ => panic!("a related-contract key must not be read as the error's subject"),
             }
+        }
+    }
+
+    #[test]
+    fn a_notfound_for_this_contract_fails_the_get_immediately() {
+        // The dominant production failure shape. Before this arm existed it
+        // fell through to `Ok(other) => Ignore`, so netcheck discarded the
+        // node's terminal answer and burned the full op timeout — reporting
+        // `latency_ms: 120000` for the most common failure there is, which is
+        // exactly the constant-latency defect this PR set out to remove.
+        let id = id_of(3);
+        match classify_get(
+            id,
+            "0h small-0",
+            Ok(HostResponse::ContractResponse(ContractResponse::NotFound {
+                instance_id: id,
+            })),
+        ) {
+            Reaction::Fatal(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("NotFound"),
+                    "the reported cause must say the node answered NotFound, got: {msg}"
+                );
+            }
+            other => panic!(
+                "a NotFound naming this contract is a terminal answer and must fail the GET                  fast, not be ignored into a synthetic timeout: {}",
+                reaction_name(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn a_notfound_for_another_contract_is_ignored() {
+        // Key-filtered exactly like every other terminal reply: a NotFound
+        // answering an op that already gave up must not kill this one.
+        match classify_get(
+            id_of(3),
+            "0h small-0",
+            Ok(HostResponse::ContractResponse(ContractResponse::NotFound {
+                instance_id: id_of(9),
+            })),
+        ) {
+            Reaction::Ignore(_) => {}
+            other => panic!(
+                "a NotFound naming a different contract must be ignored: {}",
+                reaction_name(&other)
+            ),
         }
     }
 
