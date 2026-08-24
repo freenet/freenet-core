@@ -138,6 +138,62 @@ fn check_signing_precedes_upload(yml: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The Windows job must keep declaring `environment: release` and
+/// `permissions: id-token: write` (plus `contents: read`).
+///
+/// These are the authentication contract, not decoration. The Entra federated
+/// credential is pinned to the subject
+/// `repo:freenet/freenet-core:environment:release`, so a job that does not
+/// declare the environment cannot mint an Azure token at all. And because
+/// naming ANY permission drops the rest to none, `contents: read` has to be
+/// restated or `actions/checkout` loses repository access.
+///
+/// Dropping either would not fail here — it would fail on the next TAG push,
+/// as an opaque Azure auth error, at exactly the moment a release is being
+/// cut. Windows auto-update has no canary (#5341) and signing is fail-closed,
+/// so that error arrives as a stuck draft release rather than as anything
+/// diagnosable. Pin it where the mistake is made instead.
+fn check_oidc_wiring_intact(yml: &str) -> Result<(), String> {
+    let range = job_range(yml, "build-x86_64-windows")?;
+    let lines: Vec<&str> = yml.lines().collect();
+
+    let has = |needle: &str| {
+        (range.0..range.1)
+            .any(|i| lines[i].trim() == needle && !lines[i].trim_start().starts_with('#'))
+    };
+
+    if !has("environment: release") {
+        return Err(
+            "build-x86_64-windows no longer declares `environment: release`.\n\
+             The Entra federated credential is pinned to the subject \
+             `repo:freenet/freenet-core:environment:release`, so without this line the job \
+             cannot obtain an Azure token and signing fails — as an opaque auth error on the \
+             next tag push, blocking the release as a draft. This is not a simplification."
+                .to_string(),
+        );
+    }
+
+    if !has("id-token: write") {
+        return Err(
+            "build-x86_64-windows no longer requests `id-token: write`.\n\
+             OIDC federation to Azure cannot work without it; azure/login will fail to mint a \
+             token and Windows signing will fail on the next tag push."
+                .to_string(),
+        );
+    }
+
+    if !has("contents: read") {
+        return Err(
+            "build-x86_64-windows names permissions but no longer restates `contents: read`.\n\
+             Naming ANY permission drops the rest to none, so actions/checkout loses repository \
+             access and the job fails before it ever reaches the signing steps."
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
 /// Every binary the Windows job UPLOADS must also be named in the
 /// `Get-AuthenticodeSignature` verification loop.
 ///
@@ -275,6 +331,14 @@ fn windows_checksums_cover_the_signed_artifacts() {
 }
 
 #[test]
+fn windows_job_keeps_its_oidc_wiring() {
+    let yml = cross_compile_yml();
+    if let Err(e) = check_oidc_wiring_intact(&yml) {
+        panic!("{e}");
+    }
+}
+
+#[test]
 fn every_uploaded_windows_binary_is_signature_verified() {
     let yml = cross_compile_yml();
     if let Err(e) = check_every_uploaded_binary_is_verified(&yml) {
@@ -404,7 +468,7 @@ fn synthetic_workflow(sign_first: bool, checksums_last: bool) -> String {
     };
 
     format!(
-        "jobs:\n  build-x86_64-windows:\n    runs-on: windows-latest\n    steps:\n{windows_steps}\
+        "jobs:\n  build-x86_64-windows:\n    runs-on: windows-latest\n    environment: release\n    permissions:\n      id-token: write\n      contents: read\n    steps:\n{windows_steps}\
          \n  attach-to-release:\n    needs: [build-x86_64-windows]\n    steps:\n{attach_steps}"
     )
 }
@@ -488,6 +552,37 @@ fn guard_rejects_a_removed_verification_loop() {
     let bad = synthetic_workflow(true, true).replace("foreach", "noop");
     check_every_uploaded_binary_is_verified(&bad)
         .expect_err("a removed verification loop MUST fail closed");
+}
+
+#[test]
+fn guard_accepts_intact_oidc_wiring() {
+    let good = synthetic_workflow(true, true);
+    check_oidc_wiring_intact(&good).expect("intact OIDC wiring must pass");
+}
+
+#[test]
+fn guard_rejects_a_dropped_release_environment() {
+    let bad = synthetic_workflow(true, true).replace("    environment: release\n", "");
+    let err = check_oidc_wiring_intact(&bad)
+        .expect_err("dropping `environment: release` MUST be rejected — it breaks Azure auth");
+    assert!(err.contains("environment: release"), "unexpected: {err}");
+}
+
+#[test]
+fn guard_rejects_a_dropped_id_token_permission() {
+    let bad = synthetic_workflow(true, true).replace("      id-token: write\n", "");
+    let err = check_oidc_wiring_intact(&bad)
+        .expect_err("dropping `id-token: write` MUST be rejected — OIDC cannot work without it");
+    assert!(err.contains("id-token: write"), "unexpected: {err}");
+}
+
+#[test]
+fn guard_rejects_a_dropped_contents_read_permission() {
+    let bad = synthetic_workflow(true, true).replace("      contents: read\n", "");
+    let err = check_oidc_wiring_intact(&bad).expect_err(
+        "dropping `contents: read` MUST be rejected — naming any permission zeroes the rest",
+    );
+    assert!(err.contains("contents: read"), "unexpected: {err}");
 }
 
 #[test]
