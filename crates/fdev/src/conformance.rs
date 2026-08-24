@@ -790,6 +790,12 @@ fn write_evidence<O: ConformanceOracle + ?Sized>(
     let mut local_only = 0usize;
     let mut shrunk_from = 0usize;
     let mut shrunk_to = 0usize;
+    // Grouped, not per-case. Both of these fire once per VIOLATED CASE, and a corpus
+    // routinely produces dozens of cases breaking the same law — `group_findings`
+    // exists for exactly that reason on the report side. Printing one identical line
+    // per case buries the report the note is telling the reader to go and look at.
+    let mut local_only_notes: Vec<UnwritableNote> = Vec::new();
+    let mut oversized_notes: Vec<UnwritableNote> = Vec::new();
     for (case, outcome) in outcomes {
         if !outcome.is_enforceable_violation() {
             continue;
@@ -808,14 +814,7 @@ fn write_evidence<O: ConformanceOracle + ?Sized>(
         // puts a number in the denominator that the ratio is not about.
         if !case.property.is_self_verifying() {
             local_only += 1;
-            eprintln!(
-                "note: a {} finding cannot be carried as evidence at all ({}); it is \
-                 reported above and no evidence file is written for it",
-                case.property,
-                EvidenceRejected::NotSelfVerifying {
-                    property: case.property
-                }
-            );
+            note_unwritable(&mut local_only_notes, case.property, None);
             continue;
         }
 
@@ -840,10 +839,10 @@ fn write_evidence<O: ConformanceOracle + ?Sized>(
         // cannot report having written evidence that no peer would accept.
         if let Err(rejected) = evidence.check_bounds() {
             oversized += 1;
-            eprintln!(
-                "warning: a {} finding could not be reduced to a shippable size ({rejected}); \
-                 no evidence file written for it",
-                minimized.property
+            note_unwritable(
+                &mut oversized_notes,
+                minimized.property,
+                Some(rejected.to_string()),
             );
             continue;
         }
@@ -859,6 +858,14 @@ fn write_evidence<O: ConformanceOracle + ?Sized>(
             .with_context(|| format!("writing evidence to {}", path.display()))?;
     }
 
+    // Stderr, never stdout: `--json` promises one JSON document on stdout and these
+    // notes would corrupt it. See the `stdout_purity_pin` module.
+    let _ = write_unwritable_notes(
+        &mut std::io::stderr().lock(),
+        &local_only_notes,
+        &oversized_notes,
+    );
+
     Ok(EvidenceSummary {
         directory: dir.display().to_string(),
         files_written: written.len(),
@@ -867,6 +874,72 @@ fn write_evidence<O: ConformanceOracle + ?Sized>(
         input_bytes_before_shrinking: shrunk_from,
         input_bytes_after_shrinking: shrunk_to,
     })
+}
+
+/// One "no evidence file was written" note, accumulated per property rather than
+/// emitted per case.
+struct UnwritableNote {
+    property: ConformanceProperty,
+    cases: usize,
+    /// A representative rejection, where the reason varies per case (the byte counts
+    /// in an over-size rejection do). The count is what the reader acts on; the
+    /// example is what tells them which knob it is about.
+    example: Option<String>,
+}
+
+/// Bump this property's note, keeping the FIRST example seen.
+///
+/// First rather than last so the line is stable across a re-run that produces the
+/// same findings in the same order — a note whose numbers move between identical runs
+/// reads as new information.
+fn note_unwritable(
+    notes: &mut Vec<UnwritableNote>,
+    property: ConformanceProperty,
+    example: Option<String>,
+) {
+    match notes.iter_mut().find(|n| n.property == property) {
+        Some(note) => note.cases += 1,
+        None => notes.push(UnwritableNote {
+            property,
+            cases: 1,
+            example,
+        }),
+    }
+}
+
+/// Emit the grouped notes, one line per property rather than one per case.
+///
+/// Split out from `write_evidence` so the grouping can be asserted: `write_evidence`
+/// needs a WASM oracle and a temp directory, and its notes go to stderr, which a test
+/// cannot capture.
+fn write_unwritable_notes(
+    out: &mut impl std::io::Write,
+    local_only: &[UnwritableNote],
+    oversized: &[UnwritableNote],
+) -> std::io::Result<()> {
+    for note in local_only {
+        writeln!(
+            out,
+            "note: {} {} finding(s) cannot be carried as evidence at all ({}); they \
+             are reported above and no evidence file is written for them",
+            note.cases,
+            note.property,
+            EvidenceRejected::NotSelfVerifying {
+                property: note.property
+            }
+        )?;
+    }
+    for note in oversized {
+        writeln!(
+            out,
+            "warning: {} {} finding(s) stayed over the evidence size limit even after \
+             shrinking, so no evidence file was written for them — example: {}",
+            note.cases,
+            note.property,
+            note.example.as_deref().unwrap_or("(no detail)")
+        )?;
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -1759,6 +1832,62 @@ mod tests {
             "an over-size finding drew no explanation, so the report says \
              'wrote 0 evidence file(s)' and nothing else — which reads exactly \
              like a clean run:\n{rendered}"
+        );
+    }
+
+    /// Twenty-four cases breaking one law are ONE note, not twenty-four.
+    ///
+    /// Both notes fired once per violated CASE, and a corpus routinely produces dozens
+    /// of cases of the same defect — `group_findings` exists for that reason on the
+    /// report side. The identical lines then bury the report the note points at.
+    #[test]
+    fn the_unwritable_notes_are_one_line_per_property_not_one_per_case() {
+        let mut local_only = Vec::new();
+        for _ in 0..24 {
+            note_unwritable(
+                &mut local_only,
+                ConformanceProperty::TransitionPathAgreement,
+                None,
+            );
+        }
+        note_unwritable(
+            &mut local_only,
+            ConformanceProperty::DeltaPermutationInvariance,
+            None,
+        );
+
+        let mut oversized = Vec::new();
+        for found in [900usize, 800, 700] {
+            note_unwritable(
+                &mut oversized,
+                ConformanceProperty::StateCommutativity,
+                Some(format!("{found} bytes over")),
+            );
+        }
+
+        let mut rendered = Vec::new();
+        write_unwritable_notes(&mut rendered, &local_only, &oversized)
+            .expect("writing to a Vec cannot fail");
+        let rendered = String::from_utf8(rendered).expect("notes are utf-8");
+
+        assert_eq!(
+            rendered.lines().count(),
+            3,
+            "28 unwritable findings across 3 properties should print 3 lines:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("24 transition_path_agreement finding(s)"),
+            "the note does not say how many cases it stands for:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("1 delta_permutation_invariance finding(s)"),
+            "a second property's findings were folded into the first's note:\n{rendered}"
+        );
+        // The FIRST example, so a re-run producing the same findings prints the same
+        // line rather than whichever case happened to land last.
+        assert!(
+            rendered.contains("example: 900 bytes over"),
+            "the over-size note lost its representative rejection:\n{rendered}"
         );
     }
 

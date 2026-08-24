@@ -241,6 +241,28 @@ impl ConformanceEvidence {
                 got_deltas: self.deltas.len(),
             });
         }
+        // `summary` deliberately gets neither an arity nor a nullity constraint, and
+        // the reason is that the two hazards the exact-arity check closes do not both
+        // reach it.
+        //
+        // It is one `Option`, not a `Vec`, so "arbitrarily many trailing entries" has
+        // no analogue. Its bytes DO count in `input_bytes`, so unlike an empty
+        // trailing state — which weighs nothing and is therefore free — padding here
+        // is paid for against `MAX_EVIDENCE_INPUT_BYTES`. And it buys no execution:
+        // `DeltaDeterminism` is the only property that reads it, and a supplied
+        // summary REPLACES a `summarize_state` call the verifier would otherwise
+        // make, so it removes WASM work rather than adding it. Every other property
+        // ignores the field entirely.
+        //
+        // What does reach it is the deduplication half: `id()` hashes the summary,
+        // so toggling `Some`/`None` or varying its bytes yields a distinct id for the
+        // same underlying finding. That is a real residual, and it is left open
+        // because it costs the sender bandwidth per copy where the arity padding cost
+        // nothing — a rate, not a hole. Two things should change the answer: a second
+        // property starting to consume `summary`, or evidence acquiring a gossip
+        // receive path where dedup carries weight against a hostile sender. Either
+        // one makes "must be `None` unless the property consumes it" worth its own
+        // rejection variant.
         Ok(())
     }
 
@@ -295,6 +317,19 @@ impl ConformanceEvidence {
     /// was a `pub fn` returning the case unconditionally with a "call `check_bounds`
     /// first" doc comment, which is a convention rather than a gate, and conventions
     /// are what the untrusted front door cannot be built out of.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Self::check_bounds`] rejects, and nothing else — the
+    /// rebuild itself cannot fail. So an [`EvidenceRejected`] here means the evidence
+    /// carries an unsupported [`EVIDENCE_SCHEMA_VERSION`], rests on provenance the
+    /// bytes cannot carry ([`EvidenceRejected::NotSelfVerifying`]), exceeds
+    /// [`MAX_EVIDENCE_INPUT_BYTES`] or [`MAX_EVIDENCE_RELATED`], or does not carry
+    /// exactly the state and delta counts its property requires.
+    ///
+    /// Note for callers upgrading past the signature change: this returned
+    /// `ConformanceCase` directly until the gate moved inside, so a caller that
+    /// previously ignored `check_bounds` now gets the refusal it was skipping.
     pub fn to_case(&self) -> Result<ConformanceCase, EvidenceRejected> {
         self.check_bounds()?;
         let related: HashMap<ContractInstanceId, Option<State<'static>>> = self

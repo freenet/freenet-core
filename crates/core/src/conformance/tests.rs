@@ -2065,14 +2065,79 @@ fn evidence_for_delta_permutation_invariance_is_refused() {
     );
 }
 
+/// Does `verify_case` hand this property the SUPPLIED `ConformanceCase::summary`?
+///
+/// Summary bytes are unvalidated in exactly the way delta bytes are: `check_bounds`
+/// constrains their size and nothing else, and no `require_valid` analogue exists for
+/// a summary. So a property that reads a supplied summary is in the same hazard class
+/// as one that reads a delta, and
+/// [`no_shippable_removal_eligible_property_consumes_unvalidated_bytes`] must see it.
+///
+/// A local exhaustive match rather than a method on `ConformanceProperty`: this is a
+/// fact about `verify_case`'s branches, not part of the type's public contract, and
+/// matching exhaustively inside the crate still makes a new variant fail to compile.
+fn consumes_supplied_summary(property: ConformanceProperty) -> bool {
+    match property {
+        // `verifier.rs`'s `DeltaDeterminism` arm uses `case.summary` when present and
+        // falls back to `summarize_state` only when it is `None`.
+        ConformanceProperty::DeltaDeterminism => true,
+        ConformanceProperty::StateIdempotence
+        | ConformanceProperty::StateCommutativity
+        | ConformanceProperty::StateAssociativity
+        | ConformanceProperty::EmittedStateValidity
+        | ConformanceProperty::UpdateDeterminism
+        | ConformanceProperty::SummaryDeterminism
+        | ConformanceProperty::DeltaIdempotence
+        | ConformanceProperty::DeltaPermutationInvariance
+        | ConformanceProperty::SelfDeltaEmpty
+        | ConformanceProperty::WholeStateSelfDelta
+        | ConformanceProperty::ReconciliationCycle
+        | ConformanceProperty::PathAgreement
+        | ConformanceProperty::TransitionPathAgreement => false,
+    }
+}
+
+/// Can choosing the unvalidated bytes MANUFACTURE a verdict against a contract that
+/// is in fact conforming?
+///
+/// This is the question the hazard is actually about, and for one shape of law the
+/// answer is no by construction: a determinism law compares the contract against
+/// ITSELF on byte-identical inputs, so the verdict is "the same call returned
+/// different bytes twice". No choice of input makes a deterministic implementation
+/// nondeterministic, so a fabricated input buys an attacker nothing an honest one
+/// does not — it can only surface a real defect sooner.
+///
+/// That is NOT true of the comparison laws. `DeltaIdempotence` compares two
+/// DIFFERENT executions, and `DeltaPermutationInvariance` two different orders, so
+/// whether the comparison means anything depends on the bytes being ones the
+/// protocol could have produced. Those stay in the hazard class.
+fn verdict_survives_fabricated_bytes(property: ConformanceProperty) -> bool {
+    match property {
+        ConformanceProperty::UpdateDeterminism
+        | ConformanceProperty::SummaryDeterminism
+        | ConformanceProperty::DeltaDeterminism => true,
+        ConformanceProperty::StateIdempotence
+        | ConformanceProperty::StateCommutativity
+        | ConformanceProperty::StateAssociativity
+        | ConformanceProperty::EmittedStateValidity
+        | ConformanceProperty::DeltaIdempotence
+        | ConformanceProperty::DeltaPermutationInvariance
+        | ConformanceProperty::SelfDeltaEmpty
+        | ConformanceProperty::WholeStateSelfDelta
+        | ConformanceProperty::ReconciliationCycle
+        | ConformanceProperty::PathAgreement
+        | ConformanceProperty::TransitionPathAgreement => false,
+    }
+}
+
 /// The hazard class, stated once so a new property cannot re-enter it.
 ///
 /// `verify_case` validates every STATE in a case through `require_valid`, and never
-/// validates a delta — there is no `require_valid` analogue for delta bytes, because
-/// a contract exposes no "is this delta well-formed" entry point. So a property that
-/// (a) travels as evidence, (b) consumes delta bytes, and (c) is removal-eligible
-/// would let an attacker choose bytes that go straight into another peer's WASM and
-/// come back out as a removal verdict.
+/// validates a delta or a supplied summary — there is no `require_valid` analogue for
+/// either, because a contract exposes no "is this delta/summary well-formed" entry
+/// point. So a property that (a) travels as evidence, (b) consumes delta or supplied
+/// summary bytes, and (c) is removal-eligible would let an attacker choose bytes that
+/// go straight into another peer's WASM and come back out as a removal verdict.
 ///
 /// Two properties carry deltas. `DeltaPermutationInvariance` is `Violation` and is
 /// kept off the wire by `premise_source`. `DeltaIdempotence` ships, and is safe only
@@ -2080,32 +2145,69 @@ fn evidence_for_delta_permutation_invariance_is_refused() {
 /// so its severity is not independently adjustable, and its own documentation says
 /// so. This test is what makes that a rule rather than a note: promoting it without
 /// revisiting `premise_source` in the same change fails here.
+///
+/// One property consumes a supplied SUMMARY: `DeltaDeterminism`, which both ships and
+/// is `Violation`. It is in scope here — the earlier version of this test filtered on
+/// `delta_arity() > 0` and so could not see it at all, which left the guard narrower
+/// than the class its own docstring names. It is exempt by
+/// [`verdict_survives_fabricated_bytes`], and only by that: a fabricated summary
+/// cannot make a deterministic contract return two different answers to the same
+/// call, so it buys an attacker nothing. The exemption is a predicate rather than a
+/// name in a list precisely so a NEW summary-consuming property has to answer the
+/// question rather than inherit the answer.
 #[test]
-fn no_shippable_removal_eligible_property_consumes_unvalidated_deltas() {
+fn no_shippable_removal_eligible_property_consumes_unvalidated_bytes() {
+    let consumes_unvalidated =
+        |p: ConformanceProperty| p.delta_arity() > 0 || consumes_supplied_summary(p);
+
     let hazardous: Vec<ConformanceProperty> = ConformanceProperty::ALL
         .iter()
         .copied()
         .filter(|p| {
-            p.delta_arity() > 0 && p.is_self_verifying() && p.severity() == Severity::Violation
+            consumes_unvalidated(*p)
+                && p.is_self_verifying()
+                && p.severity() == Severity::Violation
+                && !verdict_survives_fabricated_bytes(*p)
         })
         .collect();
     assert!(
         hazardous.is_empty(),
         "{hazardous:?}: a property that ships as evidence, runs attacker-chosen \
-         delta bytes through the WASM, and is removal-eligible is the combination \
-         the evidence gate exists to prevent. Either mark it \
+         delta or summary bytes through the WASM, and is removal-eligible is the \
+         combination the evidence gate exists to prevent. Either mark it \
          `PremiseSource::LocalProvenance`, or drop it to `Severity::Diagnostic`, or \
-         give deltas a validity check first — do not simply update this test"
+         give those bytes a validity check first — do not simply update this test"
     );
 
     // The fixture must be able to fail: at least one property really does carry
-    // deltas, so the filter above is not vacuously empty.
+    // deltas, so the delta half of the filter is not vacuously empty.
     assert!(
         ConformanceProperty::ALL
             .iter()
             .any(|p| p.delta_arity() > 0 && p.is_self_verifying()),
         "no property carries deltas as evidence any more, so the assertion above \
          proves nothing; delete it or re-aim it"
+    );
+
+    // And the SUMMARY half must reach something, or widening the filter was
+    // decoration. Everything the widened filter catches before the determinism
+    // exemption is applied, so this fails both when the summary arm goes dead and
+    // when a SECOND property starts leaning on that exemption.
+    let carried_only_by_the_exemption: Vec<ConformanceProperty> = ConformanceProperty::ALL
+        .iter()
+        .copied()
+        .filter(|p| {
+            consumes_unvalidated(*p) && p.is_self_verifying() && p.severity() == Severity::Violation
+        })
+        .collect();
+    assert_eq!(
+        carried_only_by_the_exemption,
+        vec![ConformanceProperty::DeltaDeterminism],
+        "the set of shippable removal-eligible properties consuming unvalidated \
+         bytes has changed. `DeltaDeterminism` is here because a fabricated summary \
+         cannot manufacture a nondeterminism verdict; anything joining it needs that \
+         argument made for it in `verdict_survives_fabricated_bytes`, and anything \
+         leaving means the summary arm of the filter above now tests nothing"
     );
 }
 

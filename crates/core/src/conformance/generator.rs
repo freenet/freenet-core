@@ -13,6 +13,20 @@ use super::verifier::{Bytes, ConformanceCase};
 
 /// The material a generator works from: states and deltas actually observed, plus
 /// whatever related-contract state is needed to make them validate.
+///
+/// # The two provenance fields
+///
+/// `delta_bases` and `transitions` are the ONLY fields here that carry provenance —
+/// facts about how the bytes were observed rather than the bytes themselves. Evidence
+/// files carry bare `states`, `deltas` and `summaries` and nothing else, so provenance
+/// is precisely what a recipient re-executing a case cannot reconstruct. Hence the
+/// structural rule, stated in full on
+/// [`ConformanceProperty::premise_source`](super::property::ConformanceProperty::premise_source):
+///
+/// > **A property whose generator branch reads `delta_bases` or `transitions` must be
+/// > [`PremiseSource::LocalProvenance`](super::property::PremiseSource::LocalProvenance).**
+///
+/// Adding a third provenance field means extending that rule, not just this struct.
 #[derive(Debug, Default, Clone)]
 pub struct Corpus {
     pub states: Vec<Bytes>,

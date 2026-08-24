@@ -58,13 +58,27 @@ pub enum ConformanceProperty {
     /// case re-establishes the whole premise. There is no "how it was observed" fact
     /// left over.
     ///
+    /// **That unrestricted pairing is what the classification rests on, and nothing
+    /// pins it.** The plausible edit that breaks it is a refinement aimed at cutting
+    /// inconclusives — "only pair a delta with the state it was observed against",
+    /// which would raise the acceptance rate by dropping pairs the contract rejects.
+    /// Making the generator branch read `Corpus::delta_bases` turns this into a
+    /// provenance-dependent property, exactly like
+    /// [`ConformanceProperty::DeltaPermutationInvariance`], and it must move to
+    /// [`PremiseSource::LocalProvenance`] in the same change — see the structural
+    /// rule on [`ConformanceProperty::premise_source`]. Neither existing guard would
+    /// notice: the partition pin asserts the classification the code states rather
+    /// than deriving it from the generator, and
+    /// `no_shippable_removal_eligible_property_consumes_unvalidated_bytes` only
+    /// fires on a SEVERITY change, which such a refinement does not make.
+    ///
     /// What keeps the unvalidated bytes harmless is the [`Severity::Diagnostic`]
     /// tier, which `policy::decide` never maps to a removal: a fabricated delta buys
     /// an attacker a report and nothing else. That coupling is NOT incidental. This
     /// is the only property that both travels as evidence and consumes delta bytes,
     /// so promoting it to [`Severity::Violation`] — which the contested empirical
     /// question above may one day justify — must revisit this classification in the
-    /// same change. `no_shippable_removal_eligible_property_consumes_unvalidated_deltas`
+    /// same change. `no_shippable_removal_eligible_property_consumes_unvalidated_bytes`
     /// is the test that forces it to.
     DeltaIdempotence,
     /// Deltas applied in any order reach the same canonical state.
@@ -489,7 +503,7 @@ impl ConformanceProperty {
             // validates, there being no `require_valid` for a delta. Promoting it to
             // `Violation` without revisiting `premise_source` in the same change
             // would make attacker-chosen delta bytes removal-eligible. The test
-            // `no_shippable_removal_eligible_property_consumes_unvalidated_deltas`
+            // `no_shippable_removal_eligible_property_consumes_unvalidated_bytes`
             // fails if that happens.
             ConformanceProperty::DeltaIdempotence => Severity::Diagnostic,
             ConformanceProperty::StateIdempotence
@@ -513,6 +527,29 @@ impl ConformanceProperty {
     /// pinned by a test, so lumping a new provenance-dependent property in with the
     /// self-verifying ones fails CI rather than silently widening the untrusted
     /// path.
+    ///
+    /// # How to answer it for a new property
+    ///
+    /// The question is structural, not a judgement call. [`Corpus`] has exactly two
+    /// provenance fields — `delta_bases` and `transitions` — and provenance is the
+    /// only thing evidence bytes cannot carry. So:
+    ///
+    /// > **A property whose generator branch reads `Corpus::delta_bases` or
+    /// > `Corpus::transitions` MUST be [`PremiseSource::LocalProvenance`].**
+    ///
+    /// Everything else builds its cases from `states`, `deltas` and `summaries`,
+    /// which travel in the evidence file intact, so re-executing the case
+    /// re-establishes the whole premise.
+    ///
+    /// Follow the rule rather than the list. The arms below record which properties
+    /// happen to read those fields TODAY; a pin records a wrong answer exactly as
+    /// firmly as a right one, and it is the rule, not the list, that produces the
+    /// answer for the property that does not exist yet. The direction to watch is a
+    /// refinement that makes an existing `EvidenceBytes` property START reading one
+    /// of the two fields — see [`ConformanceProperty::DeltaIdempotence`], whose
+    /// classification depends on its generator branch NOT consulting `delta_bases`.
+    ///
+    /// [`Corpus`]: crate::conformance::generator::Corpus
     pub fn premise_source(self) -> PremiseSource {
         match self {
             // Each of these is an identity required of every conforming contract
