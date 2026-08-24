@@ -554,10 +554,7 @@ impl Stream for StreamingInboundStream {
         // keeps waiting when `is_complete()` is true but the assembled length is
         // short). Keep the two paths in agreement — they consume the same buffer
         // and must reach the same conclusion about when a stream has ended.
-        if self.handle.buffer.is_complete()
-            && self.handle.buffer.get(next_idx).is_none()
-            && self.bytes_read >= self.handle.buffer.total_bytes()
-        {
+        if self.handle.buffer.is_complete() && self.handle.buffer.get(next_idx).is_none() {
             return Poll::Ready(None);
         }
 
