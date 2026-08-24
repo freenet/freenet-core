@@ -23,34 +23,23 @@
 //!
 //! ## First-viable-target signal set (issue #4359 re-review, MUST-FIX 1)
 //!
-//! Since #4642 step 9, `get_broadcast_targets_update` resolves targets from a
-//! SINGLE source — the proximity cache of advertised co-hosts (Source 1). So
-//! the meaningful flush signal is:
+//! `get_broadcast_targets_update` resolves targets from two sources, so the
+//! flush must fire from BOTH:
 //!
+//! * **Source 2 — interest manager**: every `register_peer_interest` call that
+//!   returns "new" (downstream subscriber, originator upstream, GET-piggyback,
+//!   remote GET `subscribe=false`, and the Interests/ChangeInterests sync
+//!   handlers) calls [`OpManager::flush_pending_broadcast_on_interest`].
 //! * **Source 1 — proximity cache**: when a neighbor newly announces it hosts a
 //!   contract we also host (`NeighborHosting` overlap path), it becomes a
-//!   `neighbors_with_contract` target and the flush fires, re-emitting the
-//!   stashed broadcast so it now reaches the freshly-advertised co-host.
-//!
-//! The interest-triggered flush call sites
-//! ([`OpManager::flush_pending_broadcast_on_interest`], invoked from every
-//! `register_peer_interest` that returns "new" — downstream subscriber,
-//! originator upstream, GET-piggyback, remote GET `subscribe=false`, and the
-//! Interests/ChangeInterests sync handlers) are LEFT IN PLACE but are now only
-//! an eager nudge: an interested-but-not-yet-advertised peer is NOT a broadcast
-//! target anymore (Source 2 was removed), so such a flush re-emits, finds no
-//! target, and simply re-stashes (or lets the entry expire at its TTL). It is
-//! harmless and cheap; a re-emit only actually propagates once the peer
-//! advertises (Source 1) — live, or reconciled by the anti-entropy heartbeat.
+//!   `neighbors_with_contract` target and the same flush fires.
 //!
 //! That set is complete: a never-seen id can only gain a broadcast target by a
-//! connected neighbor advertising it hosts the id (Source 1), whether that
-//! advertisement arrives live or is reconciled by the ~5-min InterestSync
-//! anti-entropy heartbeat (`ring.rs::interest_heartbeat`, #4722). The give-up
-//! path additionally re-checks targets immediately after stashing to close the
-//! stash-after-flush lost-wakeup race. The flush re-reads the *current* local
-//! state (not the stale give-up-time bytes) so a newer locally-applied UPDATE
-//! is never clobbered.
+//! peer expressing interest (Source 2) or a connected neighbor announcing it
+//! hosts the id (Source 1). The give-up path additionally re-checks targets
+//! immediately after stashing to close the stash-after-flush lost-wakeup race.
+//! The flush re-reads the *current* local state (not the stale give-up-time
+//! bytes) so a newer locally-applied UPDATE is never clobbered.
 //!
 //! ## Bounding (per `.claude/rules/code-style.md` per-key-collection rule and
 //! the AGENTS.md "cleanup exemptions must be time-bounded" rule)

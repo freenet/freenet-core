@@ -14,11 +14,10 @@
 //! floor bounds), not any real-time controller — nothing reads them back on
 //! the production data path. An offline distribution does not need every raw
 //! 1 Hz sample transmitted individually: the node can fold a window of samples
-//! into one rollup carrying the summary statistics (`mean` / `min` / `max` /
-//! `p50`) and emit that once per window. The window's `max`/`p50` preserve the
-//! burst peak and the median that the floor analysis actually consumes (`p50`
-//! is a more robust central-tendency signal than `mean` for the bursty,
-//! skewed byte-rate streams), while the record count drops by
+//! into one rollup carrying the summary statistics (`mean` / `min` / `max`,
+//! plus `p50` for the latency streams) and emit that once per window. The
+//! window's `max`/`p50` preserve the burst peak and the median that the floor
+//! analysis actually consumes, while the record count drops by
 //! [`SHADOW_ROLLUP_WINDOW_SECS`]x on the shadow slice.
 //!
 //! Backwards compatibility: each rollup keeps every original top-level field
@@ -87,8 +86,7 @@ impl WindowedStat {
         self.samples.iter().copied().max()
     }
 
-    /// Arithmetic mean, floored to an integer (integer division truncates
-    /// toward zero), or `None`.
+    /// Arithmetic mean, rounded to the nearest integer, or `None`.
     ///
     /// Summed in `u128` so a full window of large `u64` byte counters cannot
     /// overflow before the divide.
@@ -100,14 +98,11 @@ impl WindowedStat {
         Some((sum / self.samples.len() as u128) as u64)
     }
 
-    /// Median (upper-middle value for an even sample count), or `None`.
+    /// Median (lower-median for an even sample count), or `None`.
     ///
-    /// For an even sample count this returns `sorted[len / 2]`, the
-    /// upper-middle of the two central values. Matches the upper-middle-median
-    /// convention the existing per-connection RTT aggregate uses
-    /// (`rolling_rtt_stats::cross_connection_median_inflation`, and the recent
-    /// median in `RollingRttStats::snapshot`) so the two medians stay directly
-    /// comparable in the offline analysis.
+    /// Matches the lower-median convention the existing per-connection RTT
+    /// aggregate uses (`rolling_rtt_stats::cross_connection_median_inflation`)
+    /// so the two medians stay directly comparable in the offline analysis.
     pub(crate) fn p50(&self) -> Option<u64> {
         if self.samples.is_empty() {
             return None;
@@ -171,13 +166,12 @@ mod tests {
     }
 
     #[test]
-    fn p50_uses_upper_middle_median_for_even_counts() {
+    fn p50_uses_lower_median_for_even_counts() {
         let mut stat = WindowedStat::default();
         for v in [1u64, 2, 3, 4] {
             stat.record(v);
         }
-        // sorted [1,2,3,4], len/2 == 2 → 3 (upper-middle of the two central
-        // values 2 and 3; matches the RTT aggregate's median convention).
+        // sorted [1,2,3,4], len/2 == 2 → 3 (lower-median convention).
         assert_eq!(stat.p50(), Some(3));
     }
 }
