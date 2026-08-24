@@ -1860,7 +1860,9 @@ mod tests {
                     assert_eq!(data.len(), expected);
                     yielded += data.len();
                 }
-                other => panic!("expected fragment of {expected} bytes, got {other:?}"),
+                other @ (Poll::Ready(_) | Poll::Pending) => {
+                    panic!("expected fragment of {expected} bytes, got {other:?}")
+                }
             }
         }
 
@@ -1889,7 +1891,9 @@ mod tests {
                 assert_eq!(data.len(), overflow_size);
                 yielded += data.len();
             }
-            other => panic!("expected the overflow fragment, got {other:?}"),
+            other @ (Poll::Ready(_) | Poll::Pending) => {
+                panic!("expected the overflow fragment, got {other:?}")
+            }
         }
 
         assert_eq!(
@@ -1928,7 +1932,9 @@ mod tests {
         for _ in 0..2 {
             match stream.poll_next_unpin(&mut cx) {
                 Poll::Ready(Some(Ok(data))) => yielded += data.len(),
-                other => panic!("expected a fragment, got {other:?}"),
+                other @ (Poll::Ready(_) | Poll::Pending) => {
+                    panic!("expected a fragment, got {other:?}")
+                }
             }
         }
         assert_eq!(yielded, total as usize);

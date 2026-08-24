@@ -1602,11 +1602,26 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     /// ```ignore
     /// if let Some(handle) = peer_conn.recv_stream_handle(stream_id) {
     ///     let mut stream = handle.stream();
-    ///     while let Some(chunk) = stream.next().await {
+    ///     loop {
+    ///         // Bound the wait. See the note below on why `stream.next()`
+    ///         // must never be awaited unbounded.
+    ///         let next = tokio::select! {
+    ///             r = stream.next() => r,
+    ///             _ = time_source.sleep(STREAM_INACTIVITY_TIMEOUT) => break,
+    ///         };
+    ///         let Some(chunk) = next else { break };
     ///         process_chunk(chunk?);
     ///     }
     /// }
     /// ```
+    ///
+    /// **Always bound the wait.** `StreamingInboundStream::poll_next` yields
+    /// `Pending` until every advertised byte has been delivered, so a peer that
+    /// advertises a `total_length_bytes` it never sends, or a lost final
+    /// fragment, leaves an unbounded `stream.next().await` hanging forever. The
+    /// one production consumer, `pipe_stream`, wraps it in exactly this
+    /// `select!` against `STREAM_INACTIVITY_TIMEOUT` and reports a diagnostic
+    /// failure; anything new must do the same.
     #[allow(dead_code)]
     pub(crate) fn recv_stream_handle(
         &self,
