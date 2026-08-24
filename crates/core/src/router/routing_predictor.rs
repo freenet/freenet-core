@@ -739,7 +739,282 @@ fn wall_clock_hours() -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::isotonic_estimator::{EstimatorType, IsotonicEstimator, IsotonicEvent};
+    use crate::config::GlobalRng;
+
     use super::*;
+
+    const RESIDUAL_EXPERIMENT_EVENTS: usize = 3_000;
+    const RESIDUAL_EXPERIMENT_PEERS: usize = 10;
+
+    #[derive(Default)]
+    struct BrierScores {
+        isotonic: f64,
+        current_blend: f64,
+        residual: f64,
+        shrunk_residual: f64,
+        replace_peer_ewma: f64,
+        evaluated: usize,
+    }
+
+    impl BrierScores {
+        fn record(
+            &mut self,
+            actual: f64,
+            isotonic: f64,
+            current_blend: f64,
+            residual: f64,
+            shrunk_residual: f64,
+            replace_peer_ewma: f64,
+        ) {
+            self.isotonic += (isotonic - actual).powi(2);
+            self.current_blend += (current_blend - actual).powi(2);
+            self.residual += (residual - actual).powi(2);
+            self.shrunk_residual += (shrunk_residual - actual).powi(2);
+            self.replace_peer_ewma += (replace_peer_ewma - actual).powi(2);
+            self.evaluated += 1;
+        }
+
+        fn means(&self) -> [f64; 5] {
+            let n = self.evaluated as f64;
+            [
+                self.isotonic / n,
+                self.current_blend / n,
+                self.residual / n,
+                self.shrunk_residual / n,
+                self.replace_peer_ewma / n,
+            ]
+        }
+
+        fn merge(&mut self, other: Self) {
+            self.isotonic += other.isotonic;
+            self.current_blend += other.current_blend;
+            self.residual += other.residual;
+            self.shrunk_residual += other.shrunk_residual;
+            self.replace_peer_ewma += other.replace_peer_ewma;
+            self.evaluated += other.evaluated;
+        }
+    }
+
+    struct ResidualExperimentResult {
+        all: BrierScores,
+        targeted: BrierScores,
+    }
+
+    /// Compare the current raw-target blend with Renegade trained on the error of
+    /// the full peer-adjusted isotonic estimate. Every prediction is scored before
+    /// that event is added to either learner (prequential evaluation), which avoids
+    /// leaking the answer into its own prediction.
+    fn run_residual_experiment(targeted_penalty: f64) -> ResidualExperimentResult {
+        let peers: Vec<PeerKeyLocation> = (0..RESIDUAL_EXPERIMENT_PEERS)
+            .map(|_| PeerKeyLocation::random())
+            .collect();
+        let mut isotonic = IsotonicEstimator::new(Vec::new(), EstimatorType::Positive);
+        let mut raw_stage = PredictionStage::new(RENEGADE_MAX_OBSERVATIONS_FOR_TEST);
+        let mut residual_stage = PredictionStage::new(RENEGADE_MAX_OBSERVATIONS_FOR_TEST);
+        let mut global_residual_stage = PredictionStage::new(RENEGADE_MAX_OBSERVATIONS_FOR_TEST);
+        let mut all = BrierScores::default();
+        let mut targeted = BrierScores::default();
+
+        for event_index in 0..RESIDUAL_EXPERIMENT_EVENTS {
+            // Sample the interaction often enough to measure it while keeping it
+            // sparse enough that a peer-wide EWMA cannot absorb most of the signal.
+            // The remaining 95% spans all peers and
+            // the whole ring. The control uses the identical feature stream with
+            // targeted_penalty=0, changing only the ground-truth interaction.
+            let is_targeted = event_index % 20 == 0;
+            let peer_index = if is_targeted {
+                0
+            } else {
+                GlobalRng::random_range(0..RESIDUAL_EXPERIMENT_PEERS)
+            };
+            let contract_value = if is_targeted {
+                0.28 + GlobalRng::random_range(0.0..0.04)
+            } else {
+                GlobalRng::random_range(0.0..1.0)
+            };
+            let contract = Location::try_from(contract_value).expect("contract in ring range");
+            let peer = &peers[peer_index];
+            let distance = contract
+                .distance(peer.location().expect("generated peer has a location"))
+                .as_f64();
+            let time = event_index as f64 / 60.0;
+            let query = RoutingObservation {
+                peer_id: peer_index as f64,
+                contract_location: contract_value,
+                distance,
+                time,
+            };
+
+            let base_failure_probability = 0.05 + 1.4 * distance;
+            let actual_probability = (base_failure_probability
+                + if is_targeted { targeted_penalty } else { 0.0 })
+            .clamp(0.01, 0.99);
+            let actual = if GlobalRng::random_range(0.0..1.0) < actual_probability {
+                1.0
+            } else {
+                0.0
+            };
+
+            let isotonic_prediction = isotonic
+                .estimate_retrieval_time(peer, contract)
+                .ok()
+                .map(|prediction| prediction.clamp(0.0, 1.0));
+            let global_prediction = if isotonic.len() >= 5 {
+                isotonic
+                    .global_regression
+                    .interpolate(distance)
+                    .map(|prediction| prediction.clamp(0.0, 1.0))
+            } else {
+                None
+            };
+            let raw_prediction = raw_stage.predict(&query);
+            let residual_prediction = residual_stage.predict(&query);
+            let global_residual_prediction = global_residual_stage.predict(&query);
+
+            if let (Some(base), Some(global), Some(raw), Some(residual), Some(global_residual)) = (
+                isotonic_prediction,
+                global_prediction,
+                raw_prediction,
+                residual_prediction,
+                global_residual_prediction,
+            ) {
+                let current_weight =
+                    (raw_stage.len() as f64 / FAILURE_WEIGHT_RAMP_EVENTS).min(MAX_RENEGADE_WEIGHT);
+                let current_blend = (base * (1.0 - current_weight)
+                    + raw.clamp(0.0, 1.0) * current_weight)
+                    .clamp(0.0, 1.0);
+                let residual_prediction = (base + residual).clamp(0.0, 1.0);
+                // Unlike the current blend, this reaches the full correction.
+                // The ramp only protects the warm-up period; it does not impose a
+                // permanent 50% ceiling after the residual model matures.
+                let residual_weight =
+                    (residual_stage.len() as f64 / FAILURE_WEIGHT_RAMP_EVENTS).min(1.0);
+                let shrunk_residual = (base + residual * residual_weight).clamp(0.0, 1.0);
+                let replace_peer_ewma = (global + global_residual).clamp(0.0, 1.0);
+
+                all.record(
+                    actual,
+                    base,
+                    current_blend,
+                    residual_prediction,
+                    shrunk_residual,
+                    replace_peer_ewma,
+                );
+                if is_targeted {
+                    targeted.record(
+                        actual,
+                        base,
+                        current_blend,
+                        residual_prediction,
+                        shrunk_residual,
+                        replace_peer_ewma,
+                    );
+                }
+            }
+
+            // The residual target must use the estimate made above, before the
+            // current outcome changes the isotonic fit. Events from the initial
+            // isotonic warm-up are deliberately absent from the residual corpus.
+            if let Some(base) = isotonic_prediction {
+                residual_stage.add(query.clone(), actual - base);
+                if residual_stage.should_train() {
+                    residual_stage.train();
+                }
+            }
+            if let Some(global) = global_prediction {
+                global_residual_stage.add(query.clone(), actual - global);
+                if global_residual_stage.should_train() {
+                    global_residual_stage.train();
+                }
+            }
+            raw_stage.add(query, actual);
+            if raw_stage.should_train() {
+                raw_stage.train();
+            }
+            isotonic.add_event(IsotonicEvent {
+                peer: peer.clone(),
+                contract_location: contract,
+                result: actual,
+            });
+        }
+
+        ResidualExperimentResult { all, targeted }
+    }
+
+    const RENEGADE_MAX_OBSERVATIONS_FOR_TEST: usize = 5_000;
+
+    #[test]
+    #[ignore = "manual prequential experiment for issue #4485"]
+    fn residual_correction_prequential_experiment() {
+        let seeds = [
+            0x4485_5EED,
+            0x4485_5EEE,
+            0x4485_5EEF,
+            0x4485_5EF0,
+            0x4485_5EF1,
+        ];
+        let mut control_all_scores = BrierScores::default();
+        let mut attack_all_scores = BrierScores::default();
+        let mut attack_targeted_scores = BrierScores::default();
+
+        for seed in seeds {
+            let guard = GlobalRng::seed_guard(seed);
+            let control = run_residual_experiment(0.0);
+
+            // Rewind so the targeted run sees exactly the same peers, contracts,
+            // and random draws as the control. Only the outcome probability differs.
+            drop(guard);
+            let guard = GlobalRng::seed_guard(seed);
+            let selective_failure = run_residual_experiment(0.55);
+            drop(guard);
+
+            control_all_scores.merge(control.all);
+            attack_all_scores.merge(selective_failure.all);
+            attack_targeted_scores.merge(selective_failure.targeted);
+        }
+
+        let control_all = control_all_scores.means();
+        let attack_all = attack_all_scores.means();
+        let attack_targeted = attack_targeted_scores.means();
+        eprintln!(
+            "distance-only all: iso={:.4} blend={:.4} residual={:.4} shrunk={:.4} replace-ewma={:.4}; \
+             selective all: iso={:.4} blend={:.4} residual={:.4} shrunk={:.4} replace-ewma={:.4}; \
+             selective targeted: iso={:.4} blend={:.4} residual={:.4} shrunk={:.4} replace-ewma={:.4}",
+            control_all[0],
+            control_all[1],
+            control_all[2],
+            control_all[3],
+            control_all[4],
+            attack_all[0],
+            attack_all[1],
+            attack_all[2],
+            attack_all[3],
+            attack_all[4],
+            attack_targeted[0],
+            attack_targeted[1],
+            attack_targeted[2],
+            attack_targeted[3],
+            attack_targeted[4],
+        );
+
+        assert!(
+            attack_all_scores.evaluated > 12_500,
+            "experiment must score the mature prequential regime"
+        );
+        assert!(
+            attack_targeted_scores.evaluated > 650,
+            "experiment must include enough selective-failure observations"
+        );
+        assert!(
+            control_all
+                .into_iter()
+                .chain(attack_all)
+                .chain(attack_targeted)
+                .all(f64::is_finite),
+            "all experiment scores must be finite"
+        );
+    }
 
     fn make_peer() -> PeerKeyLocation {
         PeerKeyLocation::random()
