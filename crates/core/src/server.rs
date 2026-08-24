@@ -809,11 +809,14 @@ async fn serve_dual_stack(
         }
     }
     // The primary client-API socket is now bound (a primary bind failure is
-    // fatal above, so reaching here means we own the port). That is the
-    // authoritative "node recovered the port" signal: clear any stuck-wrapper
-    // banner a now-dead supervising wrapper left behind so a freshly-recovered
-    // node does not keep showing it (#4288).
-    crate::service_status::clear_stuck_status_on_startup();
+    // fatal above, so reaching here means we own the port). If this is the
+    // supervised service's dashboard port, that is the authoritative "node
+    // recovered the port" signal: clear any stuck-wrapper banner a now-dead
+    // supervising wrapper left behind so a freshly-recovered service does not
+    // keep showing it. Gated on the port inside the helper so an unrelated node
+    // (a test listener, or a manual node on a different `--ws-api-port`) cannot
+    // wipe an active service's banner (#4288).
+    crate::service_status::clear_stuck_status_on_startup(primary.port());
     Ok(())
 }
 

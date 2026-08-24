@@ -1550,8 +1550,10 @@ fn handle_persistent_stuck_relaunch(log_dir: &Path, exit_code: i32, is_port_conf
 }
 
 /// Surface the stuck condition as a desktop notification. macOS uses
-/// `osascript display notification`; other platforms rely on the status file +
-/// log line (the banner half of #4382), so this is a no-op there.
+/// `osascript display notification`; on other platforms the operator-facing
+/// surface is the homepage stuck banner (which reads the status file written
+/// just above, see `freenet::service_status`) plus the log line, so a desktop
+/// notification here would be redundant and this is a no-op.
 fn notify_stuck_wrapper(status: &StuckWrapperStatus) {
     #[cfg(target_os = "macos")]
     {

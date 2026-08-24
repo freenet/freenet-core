@@ -2198,7 +2198,7 @@ const fn default_local_address() -> IpAddr {
 }
 
 #[inline]
-const fn default_ws_api_port() -> u16 {
+pub(crate) const fn default_ws_api_port() -> u16 {
     7509
 }
 

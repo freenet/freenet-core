@@ -123,18 +123,41 @@ pub fn read_stuck_status_file(log_dir: &Path) -> Option<StuckWrapperStatus> {
     serde_json::from_str(&json).ok()
 }
 
-/// Clear any stuck-status file in the default platform log directory, called
-/// once the node has successfully bound its client-API port at startup.
+/// Whether a node binding `bound_port` is the supervised service whose stuck
+/// banner this status file is about (#4288).
 ///
-/// A successful bind proves the port-holding stuck condition is resolved, so
-/// this is the authoritative "recovered" signal: it clears a banner a now-dead
-/// wrapper left behind (the wrapper's own recovery clear only fires while the
-/// wrapper is still iterating, which it may not be once launchd has stopped
-/// relaunching it). Best-effort and idempotent; a missing file or unknown log
-/// directory is a no-op. The stale orphan that wedged the node never reaches
-/// this path — it bound the port long ago and is not restarting — so the orphan
-/// keeps showing the banner while the freshly-recovered node clears it.
-pub fn clear_stuck_status_on_startup() {
+/// The stuck status file is global per user (it lives in the shared log dir),
+/// but the wrapper only ever supervises the service on the default dashboard /
+/// WS-API port: `freenet service install` never threads a custom
+/// `--ws-api-port` into the launchd plist / systemd unit (the dashboard URL is
+/// hard-wired to `127.0.0.1:7509`). So only a node that bound THAT port is the
+/// recovered service. A test/pre-bound listener on an ephemeral port, or a
+/// manually started node on a different `--ws-api-port`, is unrelated and must
+/// NOT clear the banner while the real service is still wedged on its port
+/// (Codex review of #4288).
+fn is_supervised_service_port(bound_port: u16) -> bool {
+    bound_port == crate::config::default_ws_api_port()
+}
+
+/// Clear any stuck-status file in the default platform log directory, called
+/// once the node has successfully bound its client-API port (`bound_port`) at
+/// startup.
+///
+/// A successful bind of the supervised dashboard port proves the port-holding
+/// stuck condition is resolved, so this is the authoritative "recovered"
+/// signal: it clears a banner a now-dead wrapper left behind (the wrapper's own
+/// recovery clear only fires while the wrapper is still iterating, which it may
+/// not be once launchd has stopped relaunching it). Gated on
+/// [`is_supervised_service_port`] so an unrelated node (test listener, or a
+/// manual node on a different port) cannot wipe an active service's banner.
+/// Best-effort and idempotent; a missing file or unknown log directory is a
+/// no-op. The stale orphan that wedged the node never reaches this path — it
+/// bound the port long ago and is not restarting — so the orphan keeps showing
+/// the banner while the freshly-recovered service clears it.
+pub fn clear_stuck_status_on_startup(bound_port: u16) {
+    if !is_supervised_service_port(bound_port) {
+        return;
+    }
     if let Some(log_dir) = crate::tracing::tracer::get_log_dir() {
         clear_stuck_status_file(&log_dir);
     }
@@ -178,6 +201,23 @@ mod tests {
             read_stuck_status_file(tmp.path()).is_none(),
             "malformed JSON must not panic or surface a partial status"
         );
+    }
+
+    #[test]
+    fn only_supervised_dashboard_port_clears_on_bind() {
+        // The supervised service always binds the default dashboard port, so a
+        // node on that port is the recovered service and may clear the banner.
+        assert!(is_supervised_service_port(
+            crate::config::default_ws_api_port()
+        ));
+        // A manually started node on a different `--ws-api-port`, or a
+        // test/pre-bound listener on an ephemeral port (incl. port 0), is
+        // unrelated and must NOT clear an active service's banner (Codex #4288).
+        assert!(!is_supervised_service_port(0));
+        assert!(!is_supervised_service_port(
+            crate::config::default_ws_api_port() + 1
+        ));
+        assert!(!is_supervised_service_port(8080));
     }
 
     #[test]
