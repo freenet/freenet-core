@@ -328,6 +328,14 @@ mod tests {
     /// `debug_assert` walks the whole command tree, so this guards every fdev
     /// subcommand rather than just `wasm-runtime`: a malformed clap definition
     /// anywhere in the CLI fails here instead of at a user's terminal.
+    ///
+    /// Note what this test depends on: the checks inside `debug_assert` are
+    /// `#[cfg(debug_assertions)]`-gated, but `debug_assert` itself is not, so
+    /// with assertions off it becomes a silently-passing no-op rather than a
+    /// build error. It is live today because CI runs `cargo nextest` in the test
+    /// profile and the workspace sets no `[profile.test] debug-assertions`
+    /// override. If that ever changes, this test stops checking anything and
+    /// `wasm_runtime_help_does_not_panic` below becomes the only guard.
     #[test]
     fn cli_definition_is_internally_consistent() {
         use clap::CommandFactory as _;
@@ -351,11 +359,23 @@ mod tests {
     /// reached it, so render `wasm-runtime --help` for real.
     #[test]
     fn wasm_runtime_help_does_not_panic() {
-        // clap reports --help as an error rather than a parsed config.
+        // clap reports --help as an error rather than a parsed config. Reaching
+        // this line at all is the load-bearing half: the group walk happens
+        // inside `try_parse_from`, so a regression panics before we get here.
         let err = expect_rejected(&["fdev", "wasm-runtime", "--help"]);
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
-        // Rendering is a second opportunity to walk the group.
-        assert!(err.render().to_string().contains("--terminal-output"));
+
+        // `render()` does NOT re-walk the group — for `DisplayHelp` the text is
+        // already built during parse and stored as `Message::Formatted`, which
+        // `render()` hands back verbatim. So assert something the flag list
+        // alone cannot satisfy: that the usage line still presents the two sinks
+        // as one required either/or group. A bare `--terminal-output` substring
+        // would match the per-flag "Options:" listing even with the group gone.
+        let rendered = err.render().to_string();
+        assert!(
+            rendered.contains("<--output-file <OUTPUT_FILE>|--terminal-output>"),
+            "usage line should show the output group; got:\n{rendered}"
+        );
     }
 
     /// While the group's members were misspelled the constraint it exists to
