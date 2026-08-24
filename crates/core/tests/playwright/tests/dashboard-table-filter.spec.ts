@@ -51,9 +51,12 @@ import { test, expect, type Page } from "@playwright/test";
 // delegated listeners on `document` and operates on whatever rows are in the
 // DOM, so the fixture drives exactly the production path.
 //
-// One thing must NOT be built inside `<main>`: page height. The refresh
-// replaces `<main>`, so anything added there vanishes and the resulting shrink
-// clamps the scroll position — see the comment on the spacer below.
+// The page must be TALL, or the offsets these tests scroll to are clamped and
+// every measurement below is taken against a page that never went where it was
+// asked to. The fixture supplies that height itself (see the spacer in
+// `fixtureCardHtml`) rather than relying on what the node happens to be
+// reporting. It does NOT need to survive the `<main>` swap: see the note in
+// the first test for what was actually measured across that swap.
 
 const shellUrl = process.env.FREENET_SHELL_URL;
 
@@ -66,6 +69,11 @@ const dashboardUrl = shellUrl ? new URL("/", shellUrl).toString() : undefined;
 // success — the tests assert a refresh ACTUALLY happened before drawing any
 // conclusion from it.
 const REFRESH_TIMEOUT_MS = 25_000;
+
+/* Attribute stamped on the fixture's status element before a refresh, so the
+   wait for that refresh can require a REBUILT one rather than accepting the
+   one already on the page. See waitForRefresh. */
+const PRE_REFRESH_MARK = "data-pre-refresh";
 
 test.skip(
   !shellUrl,
@@ -101,12 +109,12 @@ function fixtureCardHtml(rows: number): string {
 
        The row count cannot supply this: the collapse hides all but 25 rows, so
        150 rows render as ~25 rows tall. On a CI node with no peers and no
-       contracts the rest of <main> is short too, so the page was barely
-       taller than the viewport — the scroll offset clamped, and any height
-       change then moved the anchor row hundreds of pixels. Locally it passed
-       only because that node has 210 peers and supplied the height by
-       accident. This makes the height a property of the fixture rather than of
-       whatever the node happens to be doing. */
+       contracts the rest of <main> is short too, so the page was barely taller
+       than the viewport and the offsets these tests scroll to were clamped —
+       `window.scrollTo` is a request, and a short page grants only part of it.
+       Locally it passed only because that node has 210 peers and supplied the
+       height by accident. This makes the height a property of the fixture
+       rather than of whatever the node happens to be doing. */
     '<div style="height:4000px" aria-hidden="true"></div>' +
     "</div>"
   );
@@ -150,10 +158,49 @@ async function routeFixture(page: Page, rows: number): Promise<void> {
       throw new Error("dashboard HTML has no <main> to inject the fixture into");
     }
     const at = openEnd + 1;
-    await route.fulfill({
-      response,
-      body: body.slice(0, at) + html + body.slice(at),
-    });
+    let out = body.slice(0, at) + html + body.slice(at);
+    /* Mutation hook, for checking that these assertions can actually go red.
+       `dashboard.js` is inlined into this response, so setting
+       FREENET_DASHBOARD_MUTATION to a `from=>to` pair serves a deliberately
+       broken copy of it without rebuilding the node. Unset in CI and in any
+       normal run; it throws rather than silently doing nothing if the text it
+       is told to replace is not there, because a mutation that does not apply
+       reads exactly like an assertion that cannot fail. See the mutation
+       results recorded above the viewport assertion in the first test. */
+    const mutation = process.env.FREENET_DASHBOARD_MUTATION;
+    if (mutation) {
+      /* Split on the FIRST "=>" only, and require it: `to` is very often an
+         arrow function, and a plain `split("=>")` would truncate it at the
+         arrow. A missing separator would silently mean "delete", which the
+         did-it-apply guard below cannot catch because a deletion does change
+         the string. */
+      const sep = mutation.indexOf("=>");
+      if (sep < 0) {
+        throw new Error(
+          'FREENET_DASHBOARD_MUTATION must be "from=>to" — no "=>" found, and ' +
+            "a bare `from` would silently delete rather than replace",
+        );
+      }
+      const from = mutation.slice(0, sep);
+      const to = mutation.slice(sep + 2);
+      if (!from) {
+        throw new Error(
+          "FREENET_DASHBOARD_MUTATION has an empty `from`, which prepends " +
+            "rather than replaces",
+        );
+      }
+      /* A FUNCTION replacement, so `$&`, `$1` and friends in `to` are literal
+         text rather than String.replace substitution patterns. */
+      const mutated = out.replace(from, () => to);
+      if (mutated === out) {
+        throw new Error(
+          `FREENET_DASHBOARD_MUTATION found no "${from}" to replace — the ` +
+            "mutation did not apply, so a green run proves nothing",
+        );
+      }
+      out = mutated;
+    }
+    await route.fulfill({ response, body: out });
   });
 }
 
@@ -207,22 +254,248 @@ async function anchorRowTop(page: Page): Promise<number> {
   return r!.top;
 }
 
-/** Wait for one auto-refresh, detected by the uptime text changing. */
-async function waitForRefresh(page: Page): Promise<boolean> {
-  const before = await page.locator(".uptime").textContent();
-  return page
-    .waitForFunction(
-      (prev) => {
-        const el = document.querySelector(".uptime");
-        return !!el && el.textContent !== prev;
+/* Wait for `count` RENDERING FRAMES.
+ *
+ * Use this, never a millisecond sleep, whenever the test needs an
+ * engine-deferred scroll to have landed. That distinction is the whole of
+ * #5390 and is worth stating precisely, because a sleep looks like it does the
+ * same job and does not.
+ *
+ * WebKit reveals the caret of a newly-focused text field on a later RENDERING
+ * FRAME, not synchronously inside `focus()`. On an idle machine the next frame
+ * is ~16ms away, so any sleep at all covers it and the reveal lands while the
+ * box is still where it was focused — a no-op. On a loaded CI runner frames are
+ * produced far more slowly: measured here, with the machine running 24 busy
+ * loops, `requestAnimationFrame` fired 15 times in 12.3 SECONDS, about 0.8s
+ * apart. A 400ms sleep then spans zero frames or one, so the reveal is
+ * routinely still pending when the test scrolls the box off screen, and it
+ * lands on the next frame — measured 1.7s later — dragging the page back to
+ * the caret with no refresh anywhere near it.
+ *
+ * The test then measured that movement and blamed the code under test. The
+ * giveaway is that the reported jump was always exactly
+ * `scrollY_before - (boxTop + 6)`, a constant of the SETUP and not of anything
+ * the refresh did: two CI failures a day apart, on different branches, both
+ * reported a delta of exactly 1314px. See the note above the swap assertion in
+ * the first test for what was measured across the swap itself.
+ *
+ * A frame count is the barrier that corresponds to the event; a duration is a
+ * guess about how long a frame takes on a machine you are not running on.
+ *
+ * TWO frames by default, and the two is load-bearing rather than round: a rAF
+ * callback runs at the START of a rendering update, before layout, so a reveal
+ * flushed during frame N is only observable to a callback registered for frame
+ * N+1. One frame does not prove the reveal has been through. Do not "simplify"
+ * this to 1 — nothing would fail, until a loaded runner made it matter.
+ *
+ * The bail inside is not decoration. `page.evaluate` carries no timeout of its
+ * own, so a page that stops producing frames would otherwise hang until the
+ * 60s test timeout and report "Test timeout exceeded" — the generic message
+ * this file exists to stop handing the next person. Every frame wait in this
+ * file goes through here for that reason; do not open-code
+ * `requestAnimationFrame` in another evaluate. */
+async function waitForFrames(page: Page, count = 2): Promise<void> {
+  await page.evaluate(async (n) => {
+    for (let i = 0; i < n; i++) {
+      await new Promise<void>((resolve, reject) => {
+        const bail = setTimeout(
+          () =>
+            reject(
+              new Error(
+                "no rendering frame arrived within 15s — the page is not being " +
+                  "rendered, so nothing here can wait for an engine-deferred scroll",
+              ),
+            ),
+          15_000,
+        );
+        requestAnimationFrame(() => {
+          clearTimeout(bail);
+          resolve();
+        });
+      });
+    }
+  }, count);
+}
+
+/* Where to park the filter box relative to the viewport. */
+type ParkPosition = "above the viewport" | "straddling the top edge";
+
+/* Scroll the filter box to `where`, and return only once the ENGINE has
+ * stopped moving the page.
+ *
+ * Scrolling is a request, not a result: WebKit can still have a deferred caret
+ * reveal queued (see waitForFrames), and it will undo the scroll on whatever
+ * frame it happens to run on. Rather than assume that cannot happen, park the
+ * box and then WATCH: hold the position across three rendering frames, and if
+ * the engine moves it, re-park from the box's new position and watch again.
+ * The reveal is one-shot, so this converges — it does not paper over a page
+ * that keeps moving, it just refuses to hand a moving page to an assertion.
+ *
+ * The convergence and the hold loop are both MEASURED, not assumed, because an
+ * unexercised recovery path is not a recovery path. Deleting the
+ * `waitForFrames` above the first call — restoring the exact race #5390 was
+ * about — makes this report `attempts: 2` on every one of six loaded runs and
+ * the test still pass: the reveal fires during the first hold, the re-park
+ * sticks, and it never needs a third. With that barrier back in place it is
+ * usually 1 and occasionally still 2, so the loop is live code rather than
+ * decoration even in the shipped configuration.
+ *
+ * `settled: false` means the page never held still, which is a real failure of
+ * the precondition and must be surfaced as one rather than measured. `found:
+ * false` is the DIFFERENT failure of the box not being in the page at all —
+ * kept separate so a vanished fixture is not reported as a restless engine.
+ *
+ * Note what "settled" does NOT promise: `scrollY` is read back AFTER the
+ * scroll, so a page too short to grant the offset settles happily at whatever
+ * it was clamped to. The callers check where the box actually ended up. */
+async function parkFilterBox(
+  page: Page,
+  id: string,
+  where: ParkPosition,
+): Promise<{
+  settled: boolean;
+  found: boolean;
+  scrollY: number;
+  attempts: number;
+}> {
+  const HOLD_FRAMES = 3;
+  const MAX_ATTEMPTS = 8;
+  let scrollY = 0;
+  /* The frame waits are driven from HERE rather than inside one long
+     `page.evaluate`, so every one of them goes through waitForFrames and
+     inherits its bail. An evaluate that awaits 24 open-coded frames is the one
+     place in this file that could hang with no explanation. */
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const landed = await page.evaluate(
+      ({ id, where }) => {
+        const el = document.querySelector(
+          `.table-filter[data-filter-for="${id}"] .tf-input`,
+        ) as HTMLElement | null;
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        const boxTop = window.scrollY + r.top;
+        window.scrollTo(
+          0,
+          where === "above the viewport"
+            ? /* A full viewport clear of the top edge, so the box is
+                 unambiguously off screen however the page is laid out. */
+              boxTop + window.innerHeight + 600
+            : /* Lower half on screen, upper half above it. */
+              boxTop + r.height / 2,
+        );
+        return window.scrollY;
       },
-      before,
+      { id, where },
+    );
+    if (landed === null) {
+      return { settled: false, found: false, scrollY, attempts: attempt };
+    }
+    scrollY = landed;
+    let held = 0;
+    for (; held < HOLD_FRAMES; held++) {
+      await waitForFrames(page, 1);
+      const now = await page.evaluate(() => window.scrollY);
+      if (now !== landed) {
+        scrollY = now;
+        break;
+      }
+    }
+    if (held === HOLD_FRAMES) {
+      return { settled: true, found: true, scrollY: landed, attempts: attempt };
+    }
+  }
+  return { settled: false, found: true, scrollY, attempts: MAX_ATTEMPTS };
+}
+
+/* Wait for one auto-refresh, and for it to have SETTLED.
+ *
+ * Detected by the fixture's own `.tf-status` element being REBUILT and then
+ * refilled, not by the uptime text changing. Both halves are load-bearing:
+ *
+ *   - "rebuilt" is the swap. The element is stamped with PRE_REFRESH_MARK
+ *     before the wait; the refresh re-parses the fetched HTML, which never
+ *     carries that attribute, so an unmarked status can only be a new node.
+ *     This replaces watching `.uptime`, which was a proxy for the swap rather
+ *     than the swap, and a bad one: the node prints its uptime at MINUTE
+ *     granularity once it has been up an hour, so on any node older than that
+ *     the text stops changing every 5s and all three refresh tests fail with
+ *     "no auto-refresh fired". On CI the harness node is seconds old so it
+ *     never bit there — it bites exactly the person trying to reproduce a CI
+ *     failure locally against a long-running node, which is the one situation
+ *     this file most needs to support.
+ *
+ *   - "refilled" is the restore. `restoreTableFilters` runs after the swap,
+ *     and until it does the table is in its raw server-rendered state: every
+ *     row visible, so thousands of pixels taller than it is about to be, and
+ *     the filter box empty. Anything measured in that window compares two
+ *     different layouts. The fixture ships `.tf-status` EMPTY and
+ *     `applyTableView` is what fills it in, so non-empty means the restore
+ *     ran — and no test asserts anything about that text, so waiting on it
+ *     cannot make an assertion circular.
+ *
+ * Then let a frame or two pass, so a scroll the engine deferred across the
+ * swap has landed and is caught by the assertion that follows rather than
+ * missed by measuring too early.
+ *
+ * The outcome is a string rather than a boolean so a failure says WHICH half
+ * did not happen. "no-refresh" and "no-restore" are very different bugs. */
+type RefreshOutcome =
+  | "refreshed"
+  | "no-fixture"
+  | "no-refresh"
+  | "no-restore";
+
+async function waitForRefresh(page: Page): Promise<RefreshOutcome> {
+  const marked = await page.evaluate(
+    ({ id, mark }) => {
+      const status = document.querySelector(
+        `.table-filter[data-filter-for="${id}"] .tf-status`,
+      );
+      if (!status) return false;
+      status.setAttribute(mark, "1");
+      return true;
+    },
+    { id: FIXTURE_TABLE_ID, mark: PRE_REFRESH_MARK },
+  );
+  if (!marked) return "no-fixture";
+
+  const settled = await page
+    .waitForFunction(
+      ({ id, mark }) => {
+        const status = document.querySelector(
+          `.table-filter[data-filter-for="${id}"] .tf-status`,
+        );
+        return (
+          !!status &&
+          !status.hasAttribute(mark) &&
+          (status.textContent || "").trim().length > 0
+        );
+      },
+      { id: FIXTURE_TABLE_ID, mark: PRE_REFRESH_MARK },
       { timeout: REFRESH_TIMEOUT_MS },
     )
     .then(
       () => true,
       () => false,
     );
+  if (settled) {
+    await waitForFrames(page);
+    return "refreshed";
+  }
+
+  /* Say which half is missing rather than reporting one for the other. */
+  return page.evaluate(
+    ({ id, mark }) => {
+      const status = document.querySelector(
+        `.table-filter[data-filter-for="${id}"] .tf-status`,
+      );
+      if (!status) return "no-fixture" as const;
+      return status.hasAttribute(mark)
+        ? ("no-refresh" as const)
+        : ("no-restore" as const);
+    },
+    { id: FIXTURE_TABLE_ID, mark: PRE_REFRESH_MARK },
+  );
 }
 
 test.describe("dashboard long-table filter", () => {
@@ -237,63 +510,73 @@ test.describe("dashboard long-table filter", () => {
     );
     await expect(filter).toBeAttached();
 
-    /* Page height must come from OUTSIDE <main>, and the fixture's own spacer
-       is not enough. The refresh assigns `main.innerHTML`, which momentarily
-       empties it — including any spacer inside the fixture — so the document
-       collapses to about viewport height for an instant. WebKit clamps
-       scrollY to ~0 during that window and does not restore it when the new
-       content lands; Chromium and Firefox anchor through it. On a CI node
-       with no peers and no contracts, <main> supplies almost no height of its
-       own, so the collapse is total and the anchor row jumped -428 -> 886
-       with the viewport never having been touched by the code under test.
-       A body-level spacer keeps the document tall THROUGHOUT the swap. */
-    await page.evaluate(() => {
-      const spacer = document.createElement("div");
-      spacer.id = "outside-main-spacer";
-      spacer.style.height = "5000px";
-      document.body.appendChild(spacer);
-    });
-
+    /* A body-level 5000px spacer used to live here, to keep the document tall
+       "THROUGHOUT the swap" because `main.innerHTML = ...` supposedly emptied
+       <main> for an instant and let WebKit clamp the scroll to ~0. It is gone,
+       and the reason is worth recording so it is not re-added: that mechanism
+       cannot happen. `innerHTML =` replaces the subtree inside one task with
+       no intervening layout, so there is no observable moment at which the
+       document is short. Instrumented across the real swap on WebKit — a probe
+       wrapped around the assignment itself — the document went 11645 ->
+       15916 -> 11645. It GROWS: the fresh HTML arrives with all 150 rows
+       showing, and comes back down only when the collapse is re-applied. At no
+       point is it short, and `window.scrollY` is unchanged across the whole
+       sequence. The spacer was
+       protecting against a collapse that never occurred, which is exactly why
+       it did not stop the failure it was added for (#5390). */
     const input = filter.locator(".tf-input");
-    /* Order matters, and getting it wrong made this test fail 1 run in 8.
-       WebKit scrolls a newly-focused element into view ASYNCHRONOUSLY, after
-       focus() has returned, so focusing and then immediately scrolling lets
-       that deferred scroll land AFTER the baseline is taken — which reads as
-       the refresh having moved the page when it did not. Focus first, let the
-       deferred scroll happen, and only then scroll to the offset under test. */
+    /* Order matters, and getting it wrong made this test fail 1 run in 8 —
+       then 18 runs in 20 once the machine was loaded enough to expose it
+       properly (#5390). WebKit scrolls a newly-focused element into view on a
+       later rendering FRAME, after focus() has returned, so focusing and then
+       scrolling elsewhere lets that deferred scroll land AFTER the baseline is
+       taken, which reads as the refresh having moved the page when it did not.
+       Focus first, let a frame go by so the reveal resolves against a box that
+       is still on screen (a no-op), and only then scroll to the offset under
+       test. Frames, not milliseconds: see waitForFrames. */
     await input.focus();
-    await page.waitForTimeout(400);
+    await waitForFrames(page);
     /* Scroll relative to the BOX, not to a fixed offset. The fixture is
-       appended after <main>, whose height varies with how much the node has to
-       report, so a hardcoded offset can land right on the filter box and leave
-       it visible — in which case focus IS restored, correctly, and the test
-       fails for the wrong reason. Put the box a full viewport above the top
-       edge so it is unambiguously off screen. */
-    await input.evaluate((el) => {
-      const y = window.scrollY + el.getBoundingClientRect().top;
-      window.scrollTo(0, y + window.innerHeight + 600);
-    });
-    /* POLL until the box is actually off screen rather than assuming a fixed
-       wait was enough. WebKit does not settle `scrollTo` synchronously, so a
-       150ms sleep here was a coin flip: it passed locally and on the merged
-       branch, then failed on CI at this precondition in 1.5s. A timing
-       assumption in a precondition is worse than one in an assertion, because
-       it fails the test for a reason unrelated to the behaviour under test. */
-    const boxOffScreen = await page
-      .waitForFunction(
-        (id) => {
-          const el = document.querySelector(
-            `.table-filter[data-filter-for="${id}"] .tf-input`,
-          );
-          return !!el && el.getBoundingClientRect().bottom < 0;
-        },
-        FIXTURE_TABLE_ID,
-        { timeout: 5000 },
-      )
-      .then(
-        () => true,
-        () => false,
-      );
+       injected at the top of <main>, whose height varies with how much the
+       node has to report, so a hardcoded offset can land right on the filter
+       box and leave it visible — in which case focus IS restored, correctly,
+       and the test fails for the wrong reason.
+
+       parkFilterBox also refuses to return until the page has HELD the
+       position across several frames, so a late engine scroll is caught here,
+       as the precondition failure it is, instead of downstream as a phantom
+       viewport jump. */
+    const parked = await parkFilterBox(
+      page,
+      FIXTURE_TABLE_ID,
+      "above the viewport",
+    );
+    expect(
+      parked.found,
+      "the fixture's filter box was not in the page to scroll to",
+    ).toBe(true);
+    expect(
+      parked.settled,
+      "the page would not hold still after being scrolled — the engine kept " +
+        `moving it (${parked.attempts} attempts, last at ${Math.round(parked.scrollY)})`,
+    ).toBe(true);
+
+    /* A single read, deliberately, where this used to be a 5s poll. Once
+       parkFilterBox has held the position for three frames the page is not
+       expected to move again, so a box that is NOT off screen here is a real
+       failure and should be loud rather than waited out. The tolerance for a
+       late engine scroll is now stated (2 frames after focus, 3 more after the
+       park) instead of being an unbounded poll that hid how much slack there
+       actually was. */
+    const boxOffScreen = await page.evaluate(
+      (id) => {
+        const el = document.querySelector(
+          `.table-filter[data-filter-for="${id}"] .tf-input`,
+        );
+        return !!el && el.getBoundingClientRect().bottom < 0;
+      },
+      FIXTURE_TABLE_ID,
+    );
     expect(
       boxOffScreen,
       "the filter box must be off screen, or declining to refocus is wrong",
@@ -305,57 +588,71 @@ test.describe("dashboard long-table filter", () => {
       "the page must actually be scrolled, or this test cannot observe a jump",
     ).toBeGreaterThan(200);
 
-    /* Assert the DECISION, not the scroll that follows from it.
+    /* Measuring the anchor row's viewport position across the refresh has a
+     * long history of false diagnoses, listed here so none of them is
+     * proposed again: a hidden-row anchor (comparing 0 with 0), a page-height
+     * collapse, a WebKit scroll clamp, an anchor whose identity changed
+     * mid-test, and an assertion matching ANY filter box rather than the
+     * fixture's own. Each produced a change that stands on its own merits and
+     * none of them was the failure — and the second and third were not even
+     * real: the document never collapses across the swap (measured; see the
+     * spacer note above) and so nothing was ever clamped.
      *
-     * This test used to measure the anchor row's viewport position across the
-     * refresh, and that proxy cost more than it was worth: it went through a
-     * hidden-row anchor (comparing 0 with 0), a page-height collapse, a
-     * WebKit scroll clamp, and an anchor whose identity changed mid-test —
-     * four distinct false diagnoses, three of which produced changes that
-     * were correct in themselves but were never this failure. It kept passing
-     * locally in every configuration I could build and failing on CI.
+     * The cause, finally, was the test's own setup: WebKit's deferred caret
+     * reveal landing after the baseline was taken. That is fixed at its
+     * source now (waitForFrames, parkFilterBox) rather than tolerated here, so
+     * the measurement below is once again about the refresh and nothing else.
      *
-     * The product rule is one line: do not restore focus to a filter box that
-     * is off screen. The viewport jump is a CONSEQUENCE of breaking it —
-     * `focus()` scrolls the element into view, which is the whole mechanism.
-     * So assert the rule. It is deterministic, it does not depend on scroll
-     * anchoring, page height, engine timing or which element the anchor
-     * resolves to, and it fails for exactly one reason.
+     * The product rule this all protects is one line: do not restore focus to
+     * a filter box that is off screen. `focus()` scrolls the element into
+     * view, which is the whole mechanism. */
+    /* TWO assertions, guarding TWO different things.
      *
-     * This is not a weaker test. Mutating the gate to restore focus
-     * unconditionally fails it in all three engines, which is the same
-     * mutation the position assertion caught — with none of the machinery. */
-    /* TWO assertions, guarding TWO different failures — and review caught that
-       only having the second left the first unguarded.
+     * The viewport measurement below is the END-TO-END statement: whatever the
+     * refresh does internally, the page under the reader must not move. The
+     * refocus assertion further down is the RULE that the current
+     * implementation keeps in order to satisfy it: do not restore focus to a
+     * box that is off screen. Keep both — the rule is what a reader can act
+     * on, the measurement is what stays true if the implementation changes.
      *
-     * The viewport measurement below catches the WebKit auto-scroll: WebKit
-     * scrolls a still-FOCUSED element into view when layout changes, and the
-     * `<main>` swap is a layout change, so the page moved before any of our
-     * logic ran. The fix is to blur before the swap. Removing that blur is
-     * INVISIBLE to a `document.activeElement` check, because the swap destroys
-     * the focused input either way — so `refocused` reads false whether or not
-     * the fix is present. Measured: with the blur reverted, all six
-     * focus-based assertions still passed.
+     * What each one actually detects, mutation-tested rather than assumed
+     * (#5390). Reproduce with FREENET_DASHBOARD_MUTATION="from=>to" (see
+     * routeFixture), which serves a broken `dashboard.js` with no rebuild:
      *
-     * The refocus assertion further down catches the other failure: the
-     * visibility gate deciding to restore focus to a box that is off screen.
-     *
-     * Note on evidence: the blur mutation cannot be reproduced on a local
-     * node — a sparse local gateway passes this assertion with the blur
-     * removed. The proof it detects the regression comes from CI, which failed
-     * exactly here at -599 -> 715 on the runs before the blur landed and has
-     * passed since. If this assertion is ever weakened, that is the signal it
-     * was protecting.
-     *
-     * Neither substitutes for the other. Reverting the blur fails the first;
-     * removing the gate fails the second. */
+     *   - "restoreTableFilters(focusBeforeSwap);=>restoreTableFilters(focusBeforeSwap);
+     *     window.scrollTo(0, 0);" — a refresh that really does move the page.
+     *     Fails the measurement below at ~1446px in all three engines, so it
+     *     is a live assertion and not a vacuous one.
+     *   - "&& focusState.visible)=>)" — the visibility gate removed, focus
+     *     restored unconditionally. Fails this test and the straddle test in
+     *     all three engines. Chromium and Firefox fail on the named refocus
+     *     assertion. WebKit fails on the measurement below, at 1314px, or —
+     *     if the refocus lands before the off-screen check is read — on that
+     *     precondition instead; both were observed. Note that 1314 figure: a
+     *     real regression here produces the same magnitude as the setup
+     *     artifact did, so the NUMBER never distinguished them. Only when the
+     *     movement happens does.
+     *   - "active.blur();=>0;" — the pre-swap blur removed. Fails NOTHING, in
+     *     any of the three engines. That contradicts what this comment used to
+     *     claim, so the correction is recorded rather than quietly dropped:
+     *     the claim was that CI failing at `-599 -> 715` proved it caught
+     *     a missing blur. It did not. That delta was this test's own setup
+     *     racing WebKit's deferred caret reveal (see waitForFrames), which is
+     *     why it reproduced identically AFTER the blur landed, and why it is
+     *     always exactly `scrollY_before - (boxTop + 6)` rather than anything
+     *     to do with a refresh. The blur is left in place — the swap destroys
+     *     the focused input anyway, so it is harmless — but nothing here
+     *     guards it, and the next person should not believe otherwise. */
     const rowTopBefore = await anchorRowTop(page);
 
     expect(
       await waitForRefresh(page),
-      "no auto-refresh fired — the assertions below would pass vacuously",
-    ).toBe(true);
-    await page.waitForTimeout(500);
+      "the refresh did not complete: \"no-refresh\" means <main> was never " +
+        "swapped, \"no-restore\" means it was but restoreTableFilters did " +
+        "not run, \"no-fixture\" means the route intercept stopped " +
+        "matching. The assertions below would be measuring the wrong " +
+        "page in every case",
+    ).toBe("refreshed");
 
     const rowTopAfter = await anchorRowTop(page);
     expect(
@@ -426,25 +723,48 @@ test.describe("dashboard long-table filter", () => {
     );
     await expect(input).toBeAttached();
     await input.focus();
-    await page.waitForTimeout(400);
+    /* Frames, not milliseconds — same reason as the sibling test, and the same
+       failure if you get it wrong: the deferred caret reveal lands late under
+       load and pulls the box fully into view, so the straddle precondition
+       below fails for a reason that has nothing to do with the refresh. */
+    await waitForFrames(page);
 
     // Park the box straddling the TOP edge: its lower half on screen, its
-    // upper half above it.
-    await input.evaluate((el) => {
-      const r = el.getBoundingClientRect();
-      window.scrollTo(0, window.scrollY + r.top + r.height / 2);
-    });
-    await page.waitForTimeout(200);
+    // upper half above it, and hold it there across several frames.
+    const parked = await parkFilterBox(
+      page,
+      FIXTURE_TABLE_ID,
+      "straddling the top edge",
+    );
+    expect(
+      parked.found,
+      "the fixture's filter box was not in the page to scroll to",
+    ).toBe(true);
+    expect(
+      parked.settled,
+      "the page would not hold still after being scrolled — the engine kept " +
+        `moving it (${parked.attempts} attempts, last at ${Math.round(parked.scrollY)})`,
+    ).toBe(true);
 
-    const straddles = await input.evaluate((el) => {
+    /* Query FRESH rather than measuring through the locator resolved earlier:
+       a refresh may have replaced the input between the two, and a detached
+       element reports `top: 0, bottom: 0` — which reads as "not straddling"
+       and points the failure at the wrong thing. Observed exactly that while
+       mutation-testing this file. */
+    const straddles = await page.evaluate((id) => {
+      const el = document.querySelector(
+        `.table-filter[data-filter-for="${id}"] .tf-input`,
+      );
+      if (!el) return null;
       const r = el.getBoundingClientRect();
       const h = window.innerHeight || document.documentElement.clientHeight;
       return { top: r.top, bottom: r.bottom, h, partial: r.top < 0 && r.bottom > 0 };
-    });
+    }, FIXTURE_TABLE_ID);
+    expect(straddles, "the fixture's filter box is not in the page").not.toBeNull();
     expect(
-      straddles.partial,
+      straddles!.partial,
       `the box must straddle the viewport edge for this test to mean anything \
-       (top ${Math.round(straddles.top)}, bottom ${Math.round(straddles.bottom)})`,
+       (top ${Math.round(straddles!.top)}, bottom ${Math.round(straddles!.bottom)})`,
     ).toBe(true);
 
     /* Assert the DECISION, as the sibling test does. `isInViewport` requires
@@ -460,9 +780,12 @@ test.describe("dashboard long-table filter", () => {
      * The rule it exists to protect is binary, so test it as binary. */
     expect(
       await waitForRefresh(page),
-      "no auto-refresh fired — the assertion below would pass vacuously",
-    ).toBe(true);
-    await page.waitForTimeout(500);
+      "the refresh did not complete: \"no-refresh\" means <main> was never " +
+        "swapped, \"no-restore\" means it was but restoreTableFilters did " +
+        "not run, \"no-fixture\" means the route intercept stopped " +
+        "matching. The assertions below would be measuring the wrong " +
+        "page in every case",
+    ).toBe("refreshed");
 
     /* Ask whether THE FIXTURE'S box was refocused, not whether any filter box
        was. The dashboard renders its own filter controls for the peers and
@@ -498,18 +821,40 @@ test.describe("dashboard long-table filter", () => {
     await expect(input).toBeAttached();
 
     await input.fill("10.9");
-    await input.focus();
-    await page.evaluate(() => {
-      const el = document.activeElement as HTMLInputElement;
-      el.setSelectionRange(2, 2);
-    });
 
-    /* Pin the precondition. Focus is restored only when the box is ON SCREEN
-       (see the sibling test), and the page can drift as it settles, which
-       pushed the box out of view on ~2 runs in 12 and made this look flaky
-       when the product was doing exactly the right thing. */
-    await input.scrollIntoViewIfNeeded();
-    await page.waitForTimeout(150);
+    /* Focus, caret and scroll-into-view in ONE task, on a freshly queried
+       element.
+
+       The refresh destroys this input every five seconds, so a sequence of
+       separate Playwright calls has a window between each pair in which the
+       element it resolved no longer exists. Under load that window is wide
+       enough to hit: measured as
+       `locator.scrollIntoViewIfNeeded: Element is not attached to the DOM`,
+       and `document.activeElement` is `<body>` in the same situation, which
+       would have thrown on setSelectionRange. Doing all three in one evaluate
+       removes the window rather than widening the wait around it. */
+    const prepared = await page.evaluate((id) => {
+      const el = document.querySelector(
+        `.table-filter[data-filter-for="${id}"] .tf-input`,
+      ) as HTMLInputElement | null;
+      if (!el) return false;
+      el.focus();
+      el.setSelectionRange(2, 2);
+      /* Pin the precondition. Focus is restored only when the box is ON SCREEN
+         (see the sibling test), and the page can drift as it settles, which
+         pushed the box out of view on ~2 runs in 12 and made this look flaky
+         when the product was doing exactly the right thing. */
+      el.scrollIntoView({ block: "center" });
+      return true;
+    }, FIXTURE_TABLE_ID);
+    expect(
+      prepared,
+      "the fixture's filter box was not in the page to focus",
+    ).toBe(true);
+    /* Frames, not milliseconds: WebKit's caret reveal is deferred to a
+       rendering frame, and on a loaded machine a frame can be a second away.
+       See waitForFrames. */
+    await waitForFrames(page);
     /* Assert the SAME predicate the product uses — full containment with a
        pixel of slack, not mere intersection. Checking intersection here while
        the product checks containment is how this test started failing for a
@@ -527,9 +872,12 @@ test.describe("dashboard long-table filter", () => {
 
     expect(
       await waitForRefresh(page),
-      "no auto-refresh fired — the assertions below would pass vacuously",
-    ).toBe(true);
-    await page.waitForTimeout(500);
+      "the refresh did not complete: \"no-refresh\" means <main> was never " +
+        "swapped, \"no-restore\" means it was but restoreTableFilters did " +
+        "not run, \"no-fixture\" means the route intercept stopped " +
+        "matching. The assertions below would be measuring the wrong " +
+        "page in every case",
+    ).toBe("refreshed");
 
     /* Scoped to the fixture's own box, like the two tests above. The page can
        render several `.tf-input` elements once the peers and contracts cards

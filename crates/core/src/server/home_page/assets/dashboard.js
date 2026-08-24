@@ -1163,13 +1163,25 @@ document.addEventListener('DOMContentLoaded', function () {
         /* Read the caret position BEFORE the innerHTML write on the next line
            destroys the element holding it. */
         var focusBeforeSwap = captureFilterFocus();
-        /* Blur BEFORE the swap. WebKit re-scrolls a focused element into view
-           when layout changes, and the swap is a layout change — so with the
-           filter box still focused and off screen, WebKit scrolled the page
-           back to it before our own visibility gate below was ever consulted.
-           The gate cannot prevent a scroll that has already happened.
-           Dropping focus first leaves WebKit nothing to scroll to; the gate
-           then decides whether to give it back. */
+        /* Blur BEFORE the swap, so nothing is focused while <main> is being
+           replaced.
+
+           Note on where this came from, corrected in #5390. It was added on
+           the theory that WebKit re-scrolls a still-focused element into view
+           when layout changes, and that this was moving the page before the
+           visibility gate below was consulted. The evidence cited for that was
+           a CI failure in dashboard-table-filter.spec.ts reporting a jump of
+           `-599 -> 715`. That jump turned out to be the TEST's own setup
+           racing WebKit's deferred caret reveal, not anything the refresh did:
+           it reproduced identically after this blur shipped, and instrumenting
+           the swap itself shows `window.scrollY` unchanged across it either
+           way.
+
+           So this line is not known to fix anything, and no test detects its
+           removal. It is kept because it is harmless and states the intent
+           plainly — the swap destroys the focused input a line later anyway —
+           but do not treat it as load-bearing, and do not re-add the claim
+           that CI proved it was. */
         if (focusBeforeSwap) {
           var active = document.activeElement;
           if (active && typeof active.blur === 'function') active.blur();
