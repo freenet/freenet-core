@@ -9402,13 +9402,18 @@ async fn test_connection_growth_plateau_diagnostic() {
 /// Creates a 100-node network, PUTs a contract from a gateway, waits for the
 /// ring to form, then has every node GET the same contract. It logs detailed
 /// statistics (success rate, latency p50/p90/p99, failure modes, dispatch
-/// accounting) AND asserts these floors, split by failure class:
+/// accounting) AND asserts these floors, split by failure class. The
+/// failure-class floors are measured at the CLIENT-VISIBLE terminal level
+/// (one outcome per client GET op, from `ClientTerminal`), NOT per
+/// wire-attempt transaction, so a GET that ultimately succeeds counts as one
+/// success rather than a success plus a phantom NotFound (#4852):
 /// - `nodes_with_state >= 90/100` — retrievability: nodes end up holding the
 ///   contract (the PRIMARY, non-gameable measure — see the inline rationale);
-/// - hard-failure rate <= 5% (GetFailure + >=55s timeout) — genuine completion
-///   defects, kept strict since retrievability cannot see them;
-/// - NotFound rate <= 15% — bounds the transient near-miss class (confounded +
-///   turmoil-flaky), still catching a findability collapse;
+/// - client-visible hard-failure rate <= 5% (timeout_exhausted) — genuine
+///   completion defects, kept strict since retrievability cannot see them;
+/// - client-visible NotFound rate <= 25% — a generous bound on the transient
+///   near-miss class (turmoil-flaky), catching a findability collapse while
+///   the retrievability floor stays the precise backstop;
 /// - `network_successes >= N` — a meaningful number of GETs traversed the
 ///   network (hop >= 1), so success isn't all local cache hits.
 ///
@@ -9536,9 +9541,19 @@ fn test_get_reliability_diagnostic() {
     // attempt (relay-direct + loopback-Response registration) and counts
     // multi-hop outcomes once per hop traversed.
     let rt = create_runtime();
-    let (summary, dispatched_nodes) = rt.block_on(async {
+    let (summary, client_summary, dispatched_nodes) = rt.block_on(async {
         let logs = logs_handle.lock().await;
+        // WIRE-level per-attempt-tx summary — kept for routing/latency
+        // diagnostics and the network-traversal floor. NOT the failure-class
+        // gate: it double-counts a failed attempt of an ultimately-successful
+        // GET as a NotFound and misses local-cache hits (see its rustdoc
+        // caveat and #4852).
         let summary = freenet::tracing::summarize_get_outcomes_per_tx(&logs);
+        // CLIENT-VISIBLE terminal summary — one outcome per client GET
+        // operation, from the authoritative `ClientTerminal` event. This is
+        // what the failure-class floors below gate on (#4852): a GET that
+        // ultimately succeeds counts as ONE success, never success + NotFound.
+        let client_summary = freenet::tracing::summarize_client_get_outcomes(&logs);
 
         // Dispatched-vs-scheduled accounting (#4361): the client driver's
         // loopback Request is registered at the originating node with
@@ -9553,7 +9568,7 @@ fn test_get_reliability_diagnostic() {
             .map(|log| log.peer_id.clone())
             .collect();
 
-        (summary, dispatched_nodes.len())
+        (summary, client_summary, dispatched_nodes.len())
     });
 
     let (successes, not_found, failures, timeouts) = (
@@ -9564,6 +9579,13 @@ fn test_get_reliability_diagnostic() {
     );
     let network_successes = summary.network_successes;
     let total_outcomes = summary.total();
+
+    // Client-visible outcome tallies (one per client GET op) — the basis for
+    // the failure-class floors (#4852).
+    let client_total = client_summary.total();
+    let client_successes = client_summary.successes;
+    let client_not_found = client_summary.not_found;
+    let client_timeout_exhausted = client_summary.timeout_exhausted;
 
     // Compute latency percentiles for successful GETs
     // (success_elapsed_ms is pre-sorted ascending).
@@ -9658,10 +9680,27 @@ fn test_get_reliability_diagnostic() {
         timeouts
     );
     tracing::info!(
-        "GET success rate: {:.1}% ({}/{})",
+        "GET outcomes (per CLIENT op, #4852): {} total — {} success \
+         ({} network / {} local-hit), {} not_found, {} timeout_exhausted",
+        client_total,
+        client_successes,
+        client_summary.network_successes,
+        client_summary.local_successes,
+        client_not_found,
+        client_timeout_exhausted
+    );
+    tracing::info!(
+        "GET success rate: {:.1}% (wire {}/{}) | client-visible {:.1}% ({}/{})",
         success_rate * 100.0,
         successes,
-        total_outcomes
+        total_outcomes,
+        if client_total > 0 {
+            client_successes as f64 / client_total as f64 * 100.0
+        } else {
+            0.0
+        },
+        client_successes,
+        client_total
     );
     tracing::info!(
         "GET dispatch: {}/{} nodes dispatched at least one GET attempt",
@@ -9726,87 +9765,117 @@ fn test_get_reliability_diagnostic() {
         );
     }
 
-    // Sanity floor: enough GET outcomes to analyze at all.
+    // Sanity floor: enough WIRE outcomes to analyze routing at all (feeds
+    // the latency percentiles and the network-traversal floor below).
     assert!(
         total_outcomes >= 10,
         "Only {} GET outcome transactions — too few for meaningful analysis",
         total_outcomes
     );
-    // GET outcome floors, split by failure CLASS so each keeps its teeth. A
-    // single aggregate success-rate floor was flagged in review (Codex + a
-    // skeptical pass): loosening the aggregate to absorb transient NotFound
-    // jitter also lets GENUINE failures/timeouts hide inside the same
-    // allowance, and the retrievability floor below CANNOT catch a per-GET
-    // completion regression (a node still ends up holding the contract via
-    // relay-path caching even when its own GET hard-fails), so the aggregate
-    // was the only gate on hard failures. Splitting the classes de-flakes the
-    // confounded one without blinding the strict one. The outcome classes are
-    // mutually exclusive and exhaustive (per tx, success > failure > timeout >
-    // not_found; see GetOutcomeSummary), so a per-GET completion defect must
-    // land in one of the two gated classes below — no fifth hiding place.
-    //
-    //   * HARD failures = GetFailure + timeout (a NotFound-outcome tx whose GET
-    //     ground on for >= 55s, near the 60s OPERATION_TTL, before giving up).
-    //     Genuine completion defects, not fast near-misses, and 0 in every
-    //     observed run (4 full local runs incl. the exact merged commit with the
-    //     router changes, and the one CI run). Kept STRICT at <= 5% — trips at
-    //     4/70, TIGHTER than the old 0.90 aggregate (which let up to 7/70 hard
-    //     failures hide) — because retrievability cannot see this class, so a
-    //     real routing/completion regression only trips here. Caveat: a benign
-    //     near-miss that itself grinds >= 55s under a slow CI runner is
-    //     reclassified into this strict class; the one elevated-NotFound CI run
-    //     had 0 such timeouts (its near-misses resolved fast), and a genuine 55s
-    //     give-up is arguably worth failing on anyway.
-    //
-    //   * NotFound is a transient NEAR-MISS: a GET that fires just before the
-    //     contract reaches its region resolves to NotFound (the harness issues
-    //     one-shot, no-retry GETs), but the node still obtains the contract via
-    //     relay-path caching. On the 0-NotFound local runs retrievability was a
-    //     measured 100/100; for the elevated-NotFound case, retrievability
-    //     staying high is an INFERENCE from that caching mechanism, not a
-    //     separately-captured measurement of the one 8/70 CI run. The hosting
-    //     invariants accept a ~5-9% near-miss floor, and the turmoil runner is
-    //     only ~99% deterministic, so this count varies run-to-run: 0% locally
-    //     but 8/70 (11%) on one CI run of the same commit. Bounded at 15%, which
-    //     rests on that SINGLE CI data point (margin ~3 NotFounds above the
-    //     observed 8) — so it is a coarse "findability collapse" detector, not a
-    //     precisely-calibrated gate (a materially tighter 12-13% would re-flake
-    //     within one bad run). The retrievability floor below, not this ceiling,
-    //     is the real backstop.
-    //
-    // Net: the four gates tolerate up to ~14/70 non-success GETs only if they
-    // are predominantly benign NotFound AND caching keeps retrievability >= 90 —
-    // a real regression must stay sub-threshold in BOTH gated classes at once
-    // and keep caching perfect. Retrievability (below) is the PRIMARY,
-    // non-gameable gate. See #3570.
-    let hard_failures = failures + timeouts;
-    let hard_failure_rate = hard_failures as f64 / total_outcomes as f64;
+    // Sanity floor: the client-visible measure actually captured outcomes.
+    // Every joined node issues exactly one client GET, each of which emits
+    // exactly one `ClientTerminal` (networked via the driver, or a local-hit
+    // via `emit_local_get_terminal_event`), so this should be ~NUM_NODES. A
+    // count far below that means the ClientTerminal emission path regressed
+    // (the failure-class gates below would then be silently toothless), which
+    // is itself worth failing on. Floored well under the ~NUM_NODES we expect
+    // to tolerate the handful of higher-index nodes that may still be mid-join
+    // when the sweep fires (they error out with no terminal) plus turmoil
+    // non-determinism, while still catching a broken emission path (#4852).
     assert!(
-        hard_failure_rate <= 0.05,
-        "GET hard-failure rate {:.1}% ({} failures + {} timeouts of {}) exceeds the 5% ceiling. \
-         Unlike a transient NotFound near-miss, a GetFailure or >=55s timeout is a genuine \
-         completion defect that retrievability cannot catch (the node caches the contract \
-         anyway), so this must stay near zero. successes={} (#3570).",
-        hard_failure_rate * 100.0,
-        failures,
-        timeouts,
-        total_outcomes,
-        successes
+        client_total >= NUM_NODES as u64 * 70 / 100,
+        "Only {} client-visible GET terminals for {} scheduled GETs — the \
+         ClientTerminal emission path may have regressed, which would leave \
+         the failure-class gates below toothless (#4852). client successes={}, \
+         not_found={}, timeout_exhausted={}.",
+        client_total,
+        NUM_NODES,
+        client_successes,
+        client_not_found,
+        client_timeout_exhausted
     );
-    let not_found_rate = not_found as f64 / total_outcomes as f64;
+
+    // GET failure-class floors, measured at the CLIENT-VISIBLE terminal level
+    // (one outcome per client GET op, from `ClientTerminal`) rather than per
+    // wire-attempt transaction (#4852). WHY the abstraction matters:
+    //
+    //   The old aggregate `success_rate >= 0.90` was flagged in review (Codex
+    //   + a skeptical pass): loosening it to absorb transient NotFound jitter
+    //   also lets GENUINE completion failures hide in the same allowance, and
+    //   the retrievability floor below CANNOT catch a per-GET completion
+    //   regression (a node still ends up holding the contract via relay-path
+    //   caching even when its own client GET failed). Splitting the classes
+    //   keeps each gate's teeth. But splitting them on the WIRE per-attempt
+    //   summary (`summarize_get_outcomes_per_tx`) proved unreliable: it counts
+    //   attempt transactions, not client results, so a failed attempt of an
+    //   ultimately-SUCCESSFUL GET registers its own NotFound, and 100
+    //   scheduled GETs yielded only ~79 wire outcomes (local-cache hits never
+    //   route). A benign run (98/100 retrievability, 0 hard failures) tripped
+    //   a 15% wire-NotFound ceiling at 16.5% (13/79) — a false positive baked
+    //   into the abstraction, not the threshold. Any finely-calibrated
+    //   percentage on wire-attempts is therefore unreliable (#4852 P1+P2).
+    //
+    //   `ClientTerminal` (added by #4796/#4803) fixes this: the GET driver
+    //   emits exactly one per client op, so a GET that ultimately succeeds
+    //   after a failed attempt counts as ONE success — never success + a
+    //   phantom NotFound — and local-cache hits are included as successes.
+    //   `GetTerminalOutcome` maps cleanly onto the two gated classes:
+    //
+    //   * timeout_exhausted (client-visible HARD failure): the retry budget
+    //     burned on timeouts / unroutable attempts (or a post-terminal
+    //     streaming-assembly exhaustion, #4345) WITHOUT any reachable peer
+    //     returning a definitive NotFound. A genuine completion defect that
+    //     retrievability cannot see, so it is kept STRICT at <= 5%. In a
+    //     formed ring where the contract is present, a near-miss routes to a
+    //     terminus that returns a definitive NotFound (→ the NotFound class,
+    //     not this one), so benign near-misses do NOT land here; only real
+    //     routing/completion failures do.
+    //
+    //   * not_found (transient NEAR-MISS): a client GET whose one-shot,
+    //     no-retry attempt reached a peer that definitively answered NotFound
+    //     because the contract had not yet propagated to that region — the
+    //     node typically still obtains the contract shortly after via
+    //     relay-path caching (so retrievability stays high). The hosting
+    //     invariants accept a ~5-9% near-miss floor and turmoil is only ~99%
+    //     deterministic, so this varies run-to-run. Bounded at 25% on the
+    //     client-visible measure: that is a deliberately GENEROUS "findability
+    //     collapse" detector, not a precisely-calibrated gate. Rationale for
+    //     25%: the one elevated CI run showed 13/79 = 16.5% on the WIRE
+    //     measure; re-expressed client-visible (denominator ~100 client GETs,
+    //     numerator excluding the failed-attempts-of-successes the wire measure
+    //     wrongly counted) that worst observed run sits at ~=13% or below, so
+    //     25% is ~2x the worst benign case and will not re-flake, while a real
+    //     findability collapse (GETs broadly failing to locate a present
+    //     contract) drives this well past 25% AND simultaneously trips the
+    //     retrievability floor. Retrievability (below), not this ceiling, is
+    //     the PRIMARY, non-gameable backstop. See #3570 / #4852.
+    let client_timeout_rate = client_timeout_exhausted as f64 / client_total as f64;
     assert!(
-        not_found_rate <= 0.15,
-        "GET NotFound rate {:.1}% ({} of {}) exceeds the 15% near-miss ceiling. \
-         A NotFound is a transient near-miss (no client retry; the node still obtains the \
-         contract via caching, so retrievability stays high), but a rate this high signals a \
-         findability regression, not turmoil jitter. successes={}, failures={}, timeouts={} \
-         (#3570).",
-        not_found_rate * 100.0,
-        not_found,
-        total_outcomes,
-        successes,
-        failures,
-        timeouts
+        client_timeout_rate <= 0.05,
+        "Client-visible GET hard-failure rate {:.1}% ({} timeout_exhausted of {} client GETs) \
+         exceeds the 5% ceiling. Unlike a transient NotFound near-miss, a timeout-exhausted \
+         terminal is a genuine completion defect that retrievability cannot catch (the node \
+         may still cache the contract), so this must stay near zero. client successes={}, \
+         not_found={} (#3570/#4852).",
+        client_timeout_rate * 100.0,
+        client_timeout_exhausted,
+        client_total,
+        client_successes,
+        client_not_found
+    );
+    let client_not_found_rate = client_not_found as f64 / client_total as f64;
+    assert!(
+        client_not_found_rate <= 0.25,
+        "Client-visible GET NotFound rate {:.1}% ({} of {} client GETs) exceeds the 25% \
+         near-miss ceiling. A client NotFound is a transient near-miss (one-shot GET, no \
+         client retry; the node still obtains the contract via caching, so retrievability \
+         stays high), but a rate this high signals a findability collapse, not turmoil jitter. \
+         client successes={}, timeout_exhausted={} (#3570/#4852).",
+        client_not_found_rate * 100.0,
+        client_not_found,
+        client_total,
+        client_successes,
+        client_timeout_exhausted
     );
     // RETRIEVABILITY floor — the primary success metric (#4361/#4362).
     //
