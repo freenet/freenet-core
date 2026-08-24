@@ -259,11 +259,24 @@ jobs:
       # the attach-to-release job after downloading them -- cover the SIGNED
       # bytes. Do not move these steps.
       #
-      # Gated to release tags and manual dispatch, mirroring build-macos-dmg,
-      # so routine main-push builds don't burn signing quota (Basic tier:
-      # 5,000 signatures/month).
+      # Gated to release tags and manual dispatch so routine main-push builds
+      # don't burn signing quota (Basic tier: 5,000 signatures/month).
+      #
+      # NOTE the gating SCOPE differs from build-macos-dmg: that job puts the
+      # same `if:` expression at JOB level, so it does not run at all on a main
+      # push. Here the condition is per-STEP, because build-x86_64-windows must
+      # still run on main pushes to produce artifacts -- which means the job,
+      # and therefore its `environment: release` declaration, is entered on
+      # every main push. That is currently harmless (the environment has no
+      # protection rules and no branch policy), but adding required reviewers
+      # to it would pause every Build and Cross-Compile run. See
+      # docs/RELEASING.md.
       - name: Azure login (OIDC)
         if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        # Bounded so a hung Azure endpoint surfaces in minutes instead of
+        # consuming the job's 60-minute budget, which during a release reads
+        # as "the build is stuck" rather than "Azure is down".
+        timeout-minutes: 10
         uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -272,6 +285,11 @@ jobs:
 
       - name: Sign Windows binaries (Azure Artifact Signing)
         if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        # Same reasoning as the login step above; this one also reaches the
+        # RFC3161 timestamp server, which is a second external dependency that
+        # can hang. Observed real duration is a few seconds per file plus
+        # tooling download, so 15 minutes is generous.
+        timeout-minutes: 15
         uses: azure/artifact-signing-action@v2
         with:
           endpoint: https://eus.codesigning.azure.net/
