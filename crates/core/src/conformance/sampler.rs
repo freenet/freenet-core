@@ -454,9 +454,15 @@ impl ContractSampler {
             // Only deltas that have no step to travel on. Every other delta rides on
             // its `Transition`, which is the ONLY place a bundle can record what a
             // delta was applied to — `ReplayBundle::to_corpus` gives bundle-level
-            // deltas no base at all, by design. Emitting a delta in both places used
-            // to leave the replayed corpus holding the unprovenanced copy, so the
-            // export of a corpus covered less than the corpus itself.
+            // deltas no base at all, by design.
+            //
+            // This is a SIZE fix, not the correctness one: emitting a delta in both
+            // places serializes it twice into a bundle that is meant to stay small
+            // enough to pass around. Provenance survives either way, because
+            // `Corpus::deduplicated` upgrades a kept entry from no-base to a base
+            // rather than discarding it — which is where the guard belongs, since a
+            // bundle can arrive from anywhere and this export is only one source.
+            // Do not read the filter as the thing keeping `delta_bases` populated.
             deltas: corpus
                 .deltas
                 .iter()

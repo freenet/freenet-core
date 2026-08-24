@@ -84,6 +84,22 @@ fn the_in_memory_corpus_carries_transition_provenance() {
     );
     assert_eq!(replayed.delta_bases, corpus.delta_bases);
     assert_eq!(replayed.deltas, corpus.deltas);
+
+    // A delta rides on its step OR loose, never both. Serializing it twice does not
+    // cost provenance — `Corpus::deduplicated` upgrades the kept entry either way,
+    // which is pinned separately — but it does cost bytes in an artifact whose whole
+    // purpose is to stay small enough to pass around.
+    assert!(
+        bundle.deltas.is_empty(),
+        "a delta carried by a transition must not also be emitted loose: {:?}",
+        bundle.deltas
+    );
+    assert_eq!(
+        bundle.transitions[0].delta.as_deref(),
+        Some(&[9u8][..]),
+        "...and it must actually be on the transition, or the assertion above \
+         passes because the delta was dropped entirely"
+    );
 }
 
 // ------------------------------------------------------------------ deduplication

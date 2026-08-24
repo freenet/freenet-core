@@ -1519,14 +1519,22 @@ fn a_canonicalizing_contract_is_not_accused_by_the_transition_law() {
 /// right contract under the wrong law.
 #[test]
 fn a_merge_that_emits_an_invalid_state_is_not_reported_under_the_transition_law() {
-    // Merging anything into the base emits a state the contract rejects. The
-    // marker never appears in a state the delta path produces, so `result` and its
-    // fixpoint stay valid and only `merge(base, settled)` trips the check.
+    // Merging two DIFFERENT states emits a state the contract rejects; merging a
+    // state with itself does not.
+    //
+    // That asymmetry is the whole fixture. The transition branch already validated
+    // `settled`, so a contract whose SELF-merge emits an invalid state trips that
+    // older check and would make this test pass whether or not the new one exists —
+    // which is exactly how the first version of this test was vacuous. Here `result`
+    // reaches its fixpoint immediately and validates, so `merge(base, settled)` is
+    // the only call that can produce an invalid state, and only the new check can
+    // see it. Verified by mutation: deleting `require_valid(&merged)` makes this
+    // report a `TransitionPathAgreement` violation instead.
     const MARKER: u8 = 0xFE;
     let mut fake = Fake::conforming()
         .merging(|a, b| {
             let mut out = union(a, b);
-            if !out.is_empty() {
+            if a != b {
                 out.push(MARKER);
             }
             Ok(out)
@@ -1571,6 +1579,46 @@ fn a_result_state_that_never_settles_is_inconclusive_not_a_violation() {
         ),
         Inconclusive::StateNotSettled,
     );
+}
+
+/// Deduplication must never trade a provenanced delta for an unprovenanced twin.
+///
+/// A delta can legitimately arrive twice: once loose and once attached to the step
+/// it was observed on. `ReplayBundle::to_corpus` builds exactly that shape, giving
+/// bundle-level deltas no base by design and the transition's copy the base it was
+/// applied to. First-seen-wins then keeps whichever the caller happened to push
+/// first, and an unprovenanced delta is never paired at all — so
+/// `delta_permutation_invariance` silently checks nothing while the corpus still
+/// reports the same delta count.
+///
+/// Both orders are asserted. Only checking the order that happens to be broken today
+/// would leave the invariant hostage to which list a future caller fills first.
+#[test]
+fn deduplicating_deltas_keeps_the_base_whichever_copy_arrives_first() {
+    let delta = bytes(&[9]);
+    let base = bytes(&[1, 2]);
+
+    for (label, bases) in [
+        ("unprovenanced copy first", vec![None, Some(base.clone())]),
+        ("provenanced copy first", vec![Some(base.clone()), None]),
+    ] {
+        let corpus = Corpus {
+            deltas: vec![delta.clone(), delta.clone()],
+            delta_bases: bases,
+            ..Corpus::from_states(vec![vec![1, 2]])
+        }
+        .deduplicated();
+        assert_eq!(
+            corpus.deltas.len(),
+            1,
+            "{label}: the duplicate must collapse"
+        );
+        assert_eq!(
+            corpus.delta_base(0),
+            Some(&base),
+            "{label}: the surviving delta must keep the state it was applied to"
+        );
+    }
 }
 
 /// A corpus holding steps and no loose states is not empty.
