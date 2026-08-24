@@ -372,8 +372,58 @@ fn signing_steps_share_one_gating_condition() {
     );
 }
 
+/// The verification step must assert WHO signed the binaries, not merely that
+/// they are signed.
+///
+/// `Get-AuthenticodeSignature`'s `Valid` status means "chains to a trusted root
+/// and carries a timestamp" — it says nothing about the signer's identity. A
+/// binary signed by a different but validly-issued certificate profile (a test
+/// profile, or another identity inside the same Azure signing account) would
+/// pass a status-only gate.
+///
+/// This is pinned mainly because the DOCS claim it: both `docs/RELEASING.md`
+/// and `scripts/RELEASE_RECOVERY.md` tell an operator to expect
+/// `CN=Freenet Project Inc`, which reads as though CI enforces it. Someone
+/// diagnosing a signing failure at speed will assume a passing gate already
+/// ruled the signer out. Documentation implying an enforcement that does not
+/// exist is worse than documenting nothing.
+fn check_signer_identity_is_asserted(yml: &str) -> Result<(), String> {
+    let range = job_range(yml, "build-x86_64-windows")?;
+    let lines: Vec<&str> = yml.lines().collect();
+
+    let asserts_signer = (range.0..range.1).any(|i| {
+        let l = lines[i];
+        l.contains("SignerCertificate.Subject")
+            && l.contains("CN=Freenet Project Inc")
+            && !l.trim_start().starts_with('#')
+    });
+
+    if !asserts_signer {
+        return Err(
+            "the Verify signatures step no longer asserts the SIGNER IDENTITY.\n\
+             `Get-AuthenticodeSignature` reporting `Valid` only means the binary chains to a \
+             trusted root and is timestamped — it does NOT mean we signed it. Without a check \
+             on `SignerCertificate.Subject` containing `CN=Freenet Project Inc`, a binary \
+             signed by a different certificate profile passes the gate, while RELEASING.md and \
+             RELEASE_RECOVERY.md both tell operators to expect that subject as though CI had \
+             already verified it."
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
 /// The timestamp is not optional: Artifact Signing certificates are short-lived
 /// (~3 days), so an untimestamped signature stops validating almost at once.
+#[test]
+fn verification_asserts_the_signer_is_freenet() {
+    let yml = cross_compile_yml();
+    if let Err(e) = check_signer_identity_is_asserted(&yml) {
+        panic!("{e}");
+    }
+}
+
 #[test]
 fn signing_requests_an_rfc3161_timestamp() {
     let yml = cross_compile_yml();
@@ -421,6 +471,7 @@ fn synthetic_workflow(sign_first: bool, checksums_last: bool) -> String {
           foreach ($f in @('target\\release\\freenet.exe','target\\release\\fdev.exe')) {
             $sig = Get-AuthenticodeSignature $f
             if (-not $sig.TimeStamperCertificate) { throw \"x\" }
+            if ($sig.SignerCertificate.Subject -notlike '*CN=Freenet Project Inc*') { throw \"y\" }
           }
 ";
     let upload_block = "\
@@ -583,6 +634,32 @@ fn guard_rejects_a_dropped_contents_read_permission() {
         "dropping `contents: read` MUST be rejected — naming any permission zeroes the rest",
     );
     assert!(err.contains("contents: read"), "unexpected: {err}");
+}
+
+#[test]
+fn guard_accepts_an_asserted_signer_identity() {
+    let good = synthetic_workflow(true, true);
+    check_signer_identity_is_asserted(&good).expect("an asserted signer identity must pass");
+}
+
+#[test]
+fn guard_rejects_a_dropped_signer_identity_assertion() {
+    // Status + timestamp still checked, but nobody checks WHO signed it.
+    let bad = synthetic_workflow(true, true).replace(
+        "if ($sig.SignerCertificate.Subject -notlike '*CN=Freenet Project Inc*') { throw \"y\" }",
+        "",
+    );
+    let err = check_signer_identity_is_asserted(&bad)
+        .expect_err("dropping the signer-identity assertion MUST be rejected");
+    assert!(err.contains("SIGNER IDENTITY"), "unexpected: {err}");
+}
+
+#[test]
+fn guard_rejects_a_signer_assertion_naming_someone_else() {
+    let bad = synthetic_workflow(true, true)
+        .replace("CN=Freenet Project Inc", "CN=Someone Else Entirely");
+    check_signer_identity_is_asserted(&bad)
+        .expect_err("an assertion naming a different publisher MUST be rejected");
 }
 
 #[test]
