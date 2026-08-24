@@ -138,6 +138,70 @@ fn check_signing_precedes_upload(yml: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Every binary the Windows job UPLOADS must also be named in the
+/// `Get-AuthenticodeSignature` verification loop.
+///
+/// Without this, dropping one entry from that loop ships an unsigned binary
+/// while the gate still passes. `fdev.exe` is the live risk: the setup wizard
+/// downloads it from the release at install time, so an unsigned `fdev.exe`
+/// lands next to a signed `freenet.exe` — the exact "unsigned binary beside a
+/// signed one" case the signing work exists to prevent.
+fn check_every_uploaded_binary_is_verified(yml: &str) -> Result<(), String> {
+    let range = job_range(yml, "build-x86_64-windows")?;
+    let lines: Vec<&str> = yml.lines().collect();
+
+    // Basenames of everything the job uploads, e.g. `freenet.exe`.
+    let uploaded: Vec<String> = (range.0..range.1)
+        .filter(|i| {
+            let t = lines[*i].trim();
+            t.starts_with("path:") && !t.starts_with('#')
+        })
+        .filter_map(|i| {
+            lines[i]
+                .trim()
+                .trim_start_matches("path:")
+                .trim()
+                .rsplit(['/', '\\'])
+                .next()
+                .map(str::to_string)
+        })
+        .collect();
+
+    if uploaded.is_empty() {
+        return Err(
+            "no `path:` upload targets found in build-x86_64-windows — this guard can no longer \
+             tell which binaries ship, so it cannot confirm they are all verified."
+                .to_string(),
+        );
+    }
+
+    // The single `foreach` line listing the paths the verification loop walks.
+    let verify_list = (range.0..range.1)
+        .map(|i| lines[i])
+        .find(|l| l.contains("foreach") && l.contains("release"))
+        .ok_or_else(|| {
+            "could not find the `foreach` line of the Verify signatures step. If the verification \
+             was restructured, update this guard so it still proves every uploaded binary is \
+             checked."
+                .to_string()
+        })?;
+
+    for bin in &uploaded {
+        if !verify_list.contains(bin.as_str()) {
+            return Err(format!(
+                "build-x86_64-windows uploads `{bin}` but the Verify signatures loop does not \
+                 check it:\n  {}\n\
+                 That binary would ship unsigned while the gate still passed. `fdev.exe` in \
+                 particular is downloaded by the installer at install time, so it lands next to \
+                 a signed freenet.exe.",
+                verify_list.trim()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// The checksum manifest must be produced from the artifacts the signing job
 /// uploaded: `attach-to-release` must depend on the Windows job, download both
 /// Windows artifacts, stage them, and only THEN run `sha256sum`.
@@ -206,6 +270,14 @@ fn windows_signing_precedes_artifact_upload() {
 fn windows_checksums_cover_the_signed_artifacts() {
     let yml = cross_compile_yml();
     if let Err(e) = check_checksums_cover_signed_artifacts(&yml) {
+        panic!("{e}");
+    }
+}
+
+#[test]
+fn every_uploaded_windows_binary_is_signature_verified() {
+    let yml = cross_compile_yml();
+    if let Err(e) = check_every_uploaded_binary_is_verified(&yml) {
         panic!("{e}");
     }
 }
@@ -282,18 +354,22 @@ fn synthetic_workflow(sign_first: bool, checksums_last: bool) -> String {
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
       - name: Verify signatures
         run: |
-          $sig = Get-AuthenticodeSignature $f
-          if (-not $sig.TimeStamperCertificate) { throw \"x\" }
+          foreach ($f in @('target\\release\\freenet.exe','target\\release\\fdev.exe')) {
+            $sig = Get-AuthenticodeSignature $f
+            if (-not $sig.TimeStamperCertificate) { throw \"x\" }
+          }
 ";
     let upload_block = "\
       - name: Upload freenet binary
         uses: actions/upload-artifact@v7
         with:
           name: binaries-x86_64-windows-freenet
+          path: target/release/freenet.exe
       - name: Upload fdev binary
         uses: actions/upload-artifact@v7
         with:
           name: binaries-x86_64-windows-fdev
+          path: target/release/fdev.exe
 ";
     let windows_steps = if sign_first {
         format!("{sign_block}{upload_block}")
@@ -382,6 +458,36 @@ fn guard_rejects_a_dropped_windows_dependency() {
     let err = check_checksums_cover_signed_artifacts(&bad)
         .expect_err("dropping the windows dependency MUST be rejected");
     assert!(err.contains("build-x86_64-windows"), "unexpected: {err}");
+}
+
+#[test]
+fn guard_accepts_a_workflow_that_verifies_every_upload() {
+    let good = synthetic_workflow(true, true);
+    check_every_uploaded_binary_is_verified(&good)
+        .expect("a workflow verifying both uploaded binaries must pass");
+}
+
+#[test]
+fn guard_rejects_an_unverified_uploaded_binary() {
+    // Drop fdev.exe from the verification loop but keep uploading it.
+    let bad = synthetic_workflow(true, true).replace(
+        "@('target\\release\\freenet.exe','target\\release\\fdev.exe')",
+        "@('target\\release\\freenet.exe')",
+    );
+    let err = check_every_uploaded_binary_is_verified(&bad).expect_err(
+        "an uploaded-but-unverified binary MUST be rejected — this is the fdev.exe case",
+    );
+    assert!(
+        err.contains("fdev.exe"),
+        "unexpected rejection reason: {err}"
+    );
+}
+
+#[test]
+fn guard_rejects_a_removed_verification_loop() {
+    let bad = synthetic_workflow(true, true).replace("foreach", "noop");
+    check_every_uploaded_binary_is_verified(&bad)
+        .expect_err("a removed verification loop MUST fail closed");
 }
 
 #[test]
