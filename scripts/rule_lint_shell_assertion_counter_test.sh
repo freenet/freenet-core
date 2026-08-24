@@ -377,7 +377,7 @@ fi
 #    COVERAGE IS DECIDED BY GIT, NOT BY A MODEL OF GIT. The first version of
 #    this check compared `basename` against `${spec##*/}` -- a hand-written
 #    imitation of pathspec matching -- and review demonstrated it wrong three
-#    ways, each by mutation: `':(exclude)**/test-*.sh'` (the pathspec whose job
+#    ways, each by mutation: `':(exclude)scripts/test-*.sh'` (the pathspec whose job
 #    is to make git SKIP the file) read as coverage OF it, a directory-scoped
 #    `'scripts/**/*_test.sh'` read as covering all 13 files where git matches 4,
 #    and `'crates/**/*_test.sh'` read as full coverage where git matches none.
@@ -493,8 +493,9 @@ else
     echo "       reached: those assertions score zero. Add a printf pattern to the" >&2
     echo "       alternation and a MUST-COUNT row above, then update ci.yml's list." >&2
     echo "       (scripts/test-install-sh.sh and scripts/test-uninstall-sh.sh are" >&2
-    echo "       no longer out of scope -- ci.yml's diff glob now includes" >&2
-    echo "       '**/test-*.sh'. They are excluded from THIS grep on purpose: only" >&2
+    echo "       no longer out of scope -- ci.yml's diff pathspec now includes" >&2
+    echo "       'scripts/test-*.sh'. They are excluded from THIS grep on purpose:" >&2
+    echo "       only" >&2
     echo "       their 'pass() { printf ... }' DEFINITION is unmatched, while their" >&2
     echo "       'pass \"...\"' and 'check_eq \"...\"' call sites both score. A helper" >&2
     echo "       definition scoring zero is correct, not a blind spot.)" >&2
