@@ -514,18 +514,28 @@ jobs:
             #
             # KNOWN FALSE NEGATIVES, left in rather than chased. All three are
             # real in this repo today:
-            #   1. `printf`-style success reporting. An earlier version of this
-            #      comment DELETED this entry, on the stated ground that
+            #   1. `printf`-style success reporting -- but ONLY the reporter's
+            #      DEFINITION line. An earlier version of this comment DELETED
+            #      this entry, on the stated ground that
             #      `grep -rnE "printf .*['\"](ok|PASS)"` over scripts/ returned
             #      nothing. It returns two:
             #      `scripts/test-install-sh.sh` and `scripts/test-uninstall-sh.sh`,
-            #      both `pass() { printf 'PASS  %s\\n' "$1"; }`. They escape this
-            #      counter only because the diff above is scoped to
-            #      `**/*_test.sh` and those are named `test-*.sh` -- a naming
-            #      accident, not the absence of the convention. The moment
-            #      someone writes that reporter in a `*_test.sh`, it scores zero.
-            #      `rule_lint_shell_assertion_counter_test.sh` now RECOMPUTES
-            #      this rather than trusting the sentence.
+            #      both `pass() { printf 'PASS  %s\\n' "$1"; }`.
+            #      Those two files used to escape this counter entirely, because
+            #      the diff above was scoped to `**/*_test.sh` and they are named
+            #      `test-*.sh` -- a naming accident, not the absence of the
+            #      convention. `'**/test-*.sh'` above closes that; PR #4958 was
+            #      rejected by this gate for having no test while adding ten
+            #      `check_eq` assertions to `test-install-sh.sh`, which this job
+            #      RUNS.
+            #      What remains a blind spot is narrower than it looks, and was
+            #      measured rather than assumed: their `pass "..."` and
+            #      `check_eq "..."` CALL SITES both score (via the `pass` and
+            #      `check_`-prefix alternatives), so neither file is invisible.
+            #      Only `pass() { printf ... }` itself scores zero -- which is
+            #      correct, since declaring a helper is not adding a test.
+            #      `rule_lint_shell_assertion_counter_test.sh` RECOMPUTES this
+            #      rather than trusting the sentence.
             #   2. An assertion whose only added line is its FAIL branch.
             #      Deliberate: counting FAIL would let a PR score by adding an
             #      error message alone.
@@ -534,7 +544,7 @@ jobs:
             #      live instance. Adding a file there genuinely extends what is
             #      audited, and the added line is a bare string.
             # The error text below tells the contributor all three.
-            NEW_SHELL_TESTS=$(git diff "$BASE"..."$HEAD" -- '**/*_test.sh' \
+            NEW_SHELL_TESTS=$(git diff "$BASE"..."$HEAD" -- '**/*_test.sh' '**/test-*.sh' \
               | grep -E '^\+' | grep -vF '+++' \
               | grep -cE '^\+[[:space:]]*(check|ok|pass|expect)[[:space:]]|^\+[[:space:]]*echo[[:space:]]+["'"'"'](ok[[:space:]]+-|PASS[[:space:]])|^\+[[:space:]]*(check|pin|assert|expect|test)_[a-z0-9_]*([[:space:]]|$)|^\+[[:space:]]*[a-z_][a-z0-9_]*_case[[:space:]]' || true)
             # Browser-asset fixes have the SAME problem the shell escape hatch
