@@ -9,6 +9,20 @@
 //! Consequently everything needed to re-run the check must be *in* the evidence,
 //! and the whole thing must stay small enough that verifying one is cheaper than
 //! being asked to.
+//!
+//! The sharper form of that first requirement is what [`ConformanceEvidence::check_bounds`]
+//! enforces first: a law whose PREMISE cannot be carried in the bytes is not
+//! shippable at all, however small it is. Re-execution re-establishes a universally
+//! quantified identity over valid states no matter where the states came from, but
+//! it cannot re-establish a fact about how the sender OBSERVED them - and the sender
+//! is precisely the party this design refuses to trust. Such a property is marked
+//! [`PremiseSource::LocalProvenance`] and refused at the door.
+//!
+//! That check is not advisory. [`ConformanceEvidence::to_case`] - the only way to
+//! turn evidence into something runnable - performs it itself and returns a
+//! `Result`, so there is no path from a byte string to the WASM that skips it. A doc
+//! comment saying "call `check_bounds` first" would be the only thing standing
+//! between a future receive path and the runtime, and a doc comment is not a gate.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,7 +30,7 @@ use std::sync::Arc;
 use freenet_stdlib::prelude::{ContractInstanceId, RelatedContracts, State};
 use serde::{Deserialize, Serialize};
 
-use super::property::{ConformanceProperty, Violation};
+use super::property::{ConformanceProperty, PremiseSource, Violation};
 use super::verifier::ConformanceCase;
 
 /// Bump when the meaning of a field changes. A peer that does not understand a
@@ -81,6 +95,13 @@ pub enum EvidenceRejected {
     TooLarge { found: usize, limit: usize },
     #[error("evidence carries {found} related contracts, limit is {limit}")]
     TooManyRelated { found: usize, limit: usize },
+    /// The property is not self-verifying, so no amount of re-execution could
+    /// establish its premise. See [`PremiseSource`].
+    #[error(
+        "{property} rests on provenance the evidence bytes cannot carry, so it is \
+         local-only and never shippable as evidence"
+    )]
+    NotSelfVerifying { property: ConformanceProperty },
     #[error(
         "{property} needs {want} states and {want_deltas} deltas, evidence has {got} and {got_deltas}"
     )]
@@ -151,6 +172,43 @@ impl ConformanceEvidence {
                 supported: EVIDENCE_SCHEMA_VERSION,
             });
         }
+        // Refuse a property whose premise the recipient could not re-establish even
+        // by running every byte of this evidence through its own copy of the
+        // contract.
+        //
+        // This is the front door's most important check, and it is not a size or a
+        // schema question: it is the one place the ship-inputs-not-verdicts design
+        // can be subverted. Every other property here is a universally quantified
+        // identity over valid states, so re-execution re-establishes the whole
+        // premise and a fabricated case can only surface a real defect sooner. A
+        // property that is a law only because the SENDER observed something hands
+        // the recipient an accusation it can confirm but cannot check, because the
+        // witness is not in the bytes and cannot be put there.
+        //
+        // Two properties are in that position, for the same reason applied to
+        // different provenance. `TransitionPathAgreement` needs the witness that
+        // `result` was reached from `base`; a fabricated pair from a conforming
+        // grow-only contract is structurally indistinguishable from a genuine
+        // information-losing update. `DeltaPermutationInvariance` needs the witness
+        // that both deltas were observed against the SAME base; a causally-sequenced
+        // pair permutes to two different states on contracts that are perfectly
+        // sound, because production would never apply them in the other order.
+        // Either way, every peer receiving the fabrication would independently reach
+        // a removal-eligible verdict against a correct contract.
+        //
+        // Refused rather than deprioritised: a lower rank still lets it in, and the
+        // whole point of the front door is that unsound input never reaches the
+        // WASM. The property keeps its full value where provenance is observed
+        // directly (shadow mode, `fdev`); it simply never travels.
+        if !self.property.is_self_verifying() {
+            debug_assert_eq!(
+                self.property.premise_source(),
+                PremiseSource::LocalProvenance
+            );
+            return Err(EvidenceRejected::NotSelfVerifying {
+                property: self.property,
+            });
+        }
         let bytes = self.input_bytes();
         if bytes > MAX_EVIDENCE_INPUT_BYTES {
             return Err(EvidenceRejected::TooLarge {
@@ -183,6 +241,28 @@ impl ConformanceEvidence {
                 got_deltas: self.deltas.len(),
             });
         }
+        // `summary` deliberately gets neither an arity nor a nullity constraint, and
+        // the reason is that the two hazards the exact-arity check closes do not both
+        // reach it.
+        //
+        // It is one `Option`, not a `Vec`, so "arbitrarily many trailing entries" has
+        // no analogue. Its bytes DO count in `input_bytes`, so unlike an empty
+        // trailing state — which weighs nothing and is therefore free — padding here
+        // is paid for against `MAX_EVIDENCE_INPUT_BYTES`. And it buys no execution:
+        // `DeltaDeterminism` is the only property that reads it, and a supplied
+        // summary REPLACES a `summarize_state` call the verifier would otherwise
+        // make, so it removes WASM work rather than adding it. Every other property
+        // ignores the field entirely.
+        //
+        // What does reach it is the deduplication half: `id()` hashes the summary,
+        // so toggling `Some`/`None` or varying its bytes yields a distinct id for the
+        // same underlying finding. That is a real residual, and it is left open
+        // because it costs the sender bandwidth per copy where the arity padding cost
+        // nothing — a rate, not a hole. Two things should change the answer: a second
+        // property starting to consume `summary`, or evidence acquiring a gossip
+        // receive path where dedup carries weight against a hostile sender. Either
+        // one makes "must be `None` unless the property consumes it" worth its own
+        // rejection variant.
         Ok(())
     }
 
@@ -227,15 +307,38 @@ impl ConformanceEvidence {
         EvidenceId(*hasher.finalize().as_bytes())
     }
 
-    /// Rebuild the runnable case. Call [`Self::check_bounds`] first.
-    pub fn to_case(&self) -> ConformanceCase {
+    /// Rebuild the runnable case, refusing anything [`Self::check_bounds`] rejects.
+    ///
+    /// The check is folded in here rather than left to the caller on purpose. This is
+    /// the only way to turn an evidence object into something the WASM runtime will
+    /// execute, so making it the enforcement point means no caller — including a
+    /// future gossip receive path that does not exist yet — can reach the runtime
+    /// with unbounded, wrong-arity, or non-self-verifying input. The previous shape
+    /// was a `pub fn` returning the case unconditionally with a "call `check_bounds`
+    /// first" doc comment, which is a convention rather than a gate, and conventions
+    /// are what the untrusted front door cannot be built out of.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Self::check_bounds`] rejects, and nothing else — the
+    /// rebuild itself cannot fail. So an [`EvidenceRejected`] here means the evidence
+    /// carries an unsupported [`EVIDENCE_SCHEMA_VERSION`], rests on provenance the
+    /// bytes cannot carry ([`EvidenceRejected::NotSelfVerifying`]), exceeds
+    /// [`MAX_EVIDENCE_INPUT_BYTES`] or [`MAX_EVIDENCE_RELATED`], or does not carry
+    /// exactly the state and delta counts its property requires.
+    ///
+    /// Note for callers upgrading past the signature change: this returned
+    /// `ConformanceCase` directly until the gate moved inside, so a caller that
+    /// previously ignored `check_bounds` now gets the refusal it was skipping.
+    pub fn to_case(&self) -> Result<ConformanceCase, EvidenceRejected> {
+        self.check_bounds()?;
         let related: HashMap<ContractInstanceId, Option<State<'static>>> = self
             .related
             .iter()
             .map(|(id, state)| (*id, Some(State::from(state.clone()))))
             .collect();
         let related = RelatedContracts::from(related);
-        ConformanceCase {
+        Ok(ConformanceCase {
             property: self.property,
             states: self
                 .states
@@ -249,7 +352,7 @@ impl ConformanceEvidence {
                 .collect(),
             summary: self.summary.as_ref().map(|s| Arc::from(s.as_slice())),
             related,
-        }
+        })
     }
 }
 

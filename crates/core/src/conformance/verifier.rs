@@ -212,7 +212,9 @@ fn reproduced_identically(first: &Violation, second: &Violation) -> bool {
         | ConformanceProperty::DeltaPermutationInvariance
         | ConformanceProperty::SelfDeltaEmpty
         | ConformanceProperty::WholeStateSelfDelta
-        | ConformanceProperty::ReconciliationCycle => {
+        | ConformanceProperty::ReconciliationCycle
+        | ConformanceProperty::PathAgreement
+        | ConformanceProperty::TransitionPathAgreement => {
             first.left == second.left && first.right == second.right
         }
     }
@@ -489,7 +491,170 @@ fn run<O: ConformanceOracle + ?Sized>(
         ConformanceProperty::ReconciliationCycle => {
             reconciliation_cycle(oracle, &case.states[0], &case.states[1], &case.related)
         }
+
+        ConformanceProperty::PathAgreement => {
+            // Both directions, because which state is "base" and which is "other" is
+            // an artifact of the order the corpus happened to be listed in, not of
+            // anything the contract does. The generator emits each unordered pair
+            // once (`i < j`), so checking one direction would make catching a defect
+            // depend on file order — the shape of a test that passes for the wrong
+            // reason.
+            let (a, b) = (&case.states[0], &case.states[1]);
+            let forward = path_agreement(oracle, a, b, &case.related);
+            if matches!(forward, Ok(PropertyOutcome::Violated(_))) {
+                return forward;
+            }
+            let reverse = path_agreement(oracle, b, a, &case.related);
+            if matches!(reverse, Ok(PropertyOutcome::Violated(_))) {
+                return reverse;
+            }
+            // Neither direction found anything. One usable verdict is a verdict;
+            // only refuse if neither direction could be evaluated at all.
+            match (forward, reverse) {
+                (Ok(outcome), _) => Ok(outcome),
+                (Err(_), Ok(outcome)) => Ok(outcome),
+                (Err(reason), Err(_)) => Err(reason),
+            }
+        }
+
+        ConformanceProperty::TransitionPathAgreement => {
+            // `states[0]` is the base a peer held, `states[1]` the result it
+            // actually reached. The generator only ever builds this case from a
+            // recorded transition, which is what makes the order meaningful: for an
+            // arbitrary pair, "merging B into A yields B" is last-write-wins.
+            let (base, result) = (&case.states[0], &case.states[1]);
+
+            // Drive `result` to a fixpoint of its own merge before comparing.
+            //
+            // A canonicalizing contract legitimately rewrites a stored state the
+            // first time it is merged — the PUT install path stores the client's raw
+            // bytes without ever running `update_state` — so the state a peer holds
+            // may not be canonical yet. Comparing against the raw bytes would report
+            // that rewrite as a merge-law break. `StateIdempotence` iterates for the
+            // same reason and to the same budget.
+            let mut settled = result.to_vec();
+            let mut reached_fixpoint = false;
+            for _ in 0..MAX_CANONICALIZATION_APPLIES {
+                let again = merge(oracle, &settled, &settled)?;
+                if again == settled {
+                    reached_fixpoint = true;
+                    break;
+                }
+                settled = again;
+            }
+            if !reached_fixpoint {
+                // A state that rewrites itself on every re-apply cannot be asked
+                // whether some OTHER state absorbs into it, and the defect already
+                // has a name. Accusing it here would name the wrong law.
+                return Err(Inconclusive::StateNotSettled);
+            }
+            require_valid(oracle, &settled, &case.related)?;
+
+            let merged = merge(oracle, base, &settled)?;
+            // Both sides of the comparison get the same validity precondition, for
+            // the same reason `path_agreement` validates both of its outputs: a
+            // state the contract itself rejects never reaches another peer, so
+            // reasoning about it is reasoning about a history that cannot happen.
+            //
+            // Without this, a merge that EMITS an invalid state is reported under
+            // this property rather than under `EmittedStateValidity`, which is the
+            // law that actually names that defect. One law per property is the rule
+            // this module follows everywhere else.
+            require_valid(oracle, &merged, &case.related)?;
+            Ok(compare(
+                case.property,
+                &merged,
+                &settled,
+                "merging the settled form of a state a peer actually REACHED back \
+                 into the state it came from did not reproduce that settled form, so \
+                 the merge path cannot reach what the update path reached: every \
+                 peer that receives this state merges it into something else, and \
+                 the two can never agree",
+            ))
+        }
     }
+}
+
+/// One direction of [`ConformanceProperty::PathAgreement`]: does `base` reach the
+/// same state whether it receives `other`'s information as a delta or whole?
+///
+/// The two calls mirror the two things production actually does with the same
+/// update. `get_state_delta(other, summarize(base))` is the delta the SENDER
+/// computes against the RECIPIENT's summary — the same orientation
+/// [`reconciliation_cycle`] uses, and getting it backwards would be checking a call
+/// the network never makes.
+fn path_agreement<O: ConformanceOracle + ?Sized>(
+    oracle: &mut O,
+    base: &Bytes,
+    other: &Bytes,
+    related: &RelatedContracts<'static>,
+) -> Result<PropertyOutcome, Inconclusive> {
+    let base_summary = oracle.summarize_state(base).map_err(inconclusive_from)?;
+    let delta = oracle
+        .get_state_delta(other, &base_summary)
+        .map_err(inconclusive_from)?;
+
+    // No delta path exists to compare against, in either of the two ways production
+    // can decline to take one.
+    //
+    // An empty delta is the protocol's "nothing to send", and a summary too coarse
+    // to express the divergence produces one legitimately — the same contract shape
+    // `reconciliation_cycle` models the full-state fallback for. An oversized delta
+    // is refused by production's own gate and replaced with a whole-state send, so
+    // the delta path is not the path this update would take. Checking either one
+    // would be checking a call that never happens.
+    if delta.is_empty() || delta_would_be_refused(&delta, other) {
+        return Err(Inconclusive::NoDeltaPath);
+    }
+
+    let delta_path = apply_delta_bytes(oracle, base, &delta)?;
+    let merge_path = merge(oracle, base, other)?;
+    if delta_path == merge_path {
+        return Ok(PropertyOutcome::Holds);
+    }
+
+    // Same validity precondition the inputs get, for the same reason: a state the
+    // contract rejects never reaches another peer, so reasoning about it is
+    // reasoning about a history that cannot happen.
+    require_valid(oracle, &delta_path, related)?;
+    require_valid(oracle, &merge_path, related)?;
+
+    // Distinguish "the delta carried less than the whole state" from "the two paths
+    // computed different things". This is the guard that keeps this property off a
+    // large and legitimate class of contract, and without it the check is a
+    // false-positive generator.
+    //
+    // A contract whose summary cannot express a particular divergence ships a delta
+    // carrying only PART of what `other` holds. Its delta path lands short of the
+    // merged state on this round and catches up on the next one — a weak delta
+    // encoding, not a broken merge, and this module already declines to accuse it
+    // under `ReconciliationCycle` for exactly this reason.
+    //
+    // Merging the whole state on top separates the two. For any merge that is a
+    // genuine join, a delta derived from `other` can only move `base` somewhere
+    // between `base` and `base ⊔ other`, so joining `other` back on top lands on
+    // `base ⊔ other` either way and a partial delta heals. A delta path that
+    // computed something the merge path cannot reach does not heal.
+    //
+    // The guard errs toward silence in every direction, which is the right direction
+    // for a removal-eligible property. That includes when the merge itself is
+    // unsound: a last-write-wins merge heals trivially, so this declines to pile a
+    // second accusation onto a defect `StateCommutativity` already names.
+    let healed = merge(oracle, &delta_path, other)?;
+    if healed == merge_path {
+        return Ok(PropertyOutcome::Holds);
+    }
+
+    Ok(compare(
+        ConformanceProperty::PathAgreement,
+        &delta_path,
+        &merge_path,
+        "the delta path and the merge path disagree: applying the delta the network \
+         would have sent reached a different state from merging the sender's whole \
+         state, and re-merging the whole state does not repair the difference, so a \
+         peer that received this update as a delta can never agree with one that \
+         received it as a state",
+    ))
 }
 
 /// Simulate two peers exchanging summaries and deltas until they agree.

@@ -5,6 +5,8 @@
 //! bytes once, byte budgets, large states, restart reconstruction, and focus
 //! rotation.
 
+use std::sync::Arc;
+
 use freenet_stdlib::prelude::ContractInstanceId;
 
 use super::focus::FocusSelector;
@@ -28,6 +30,83 @@ fn state(tag: u8, len: usize) -> Vec<u8> {
     let mut out = vec![tag];
     out.resize(len.max(1), tag);
     out
+}
+
+/// The node's own corpus must carry the ORDERED step, not just the two states.
+///
+/// `TransitionPathAgreement` is a law only because the corpus witnesses that one
+/// state was reached from the other; for an arbitrary pair, "merging B into A yields
+/// B" is last-write-wins and false for every conforming contract. So the generator
+/// builds no case for it at all without provenance.
+///
+/// This pins the in-memory path specifically. `to_bundle` already exported
+/// transitions, but `corpus()` pulled only `delta` and `summary` out of them and
+/// dropped the pairing.
+///
+/// Be precise about what that cost, because the obvious story is wrong: shadow mode
+/// does not run cases off `corpus()` at all. It calls `to_bundle` and then
+/// `ReplayBundle::to_corpus`, so the live path never depended on this. What the gap
+/// did mean is that the sampler's own view of its observations and the bundle it
+/// exports disagreed about what a transition is, which is how a later in-memory
+/// consumer would inherit a corpus that silently checks the provenance-dependent
+/// laws against nothing. The second half of this test — comparing the in-memory
+/// corpus against the replayed bundle — is the part that pins the agreement.
+#[test]
+fn the_in_memory_corpus_carries_transition_provenance() {
+    let mut sampler = ContractSampler::new(config());
+    let base = state(1, 32);
+    let result = state(2, 48);
+    assert_eq!(
+        sampler.observe_transition(&base, None, Some(&[9]), None, &result),
+        Admission::Stored
+    );
+
+    let corpus = sampler.corpus();
+    assert_eq!(
+        corpus.transitions.len(),
+        1,
+        "the ordered base -> result step is what the transition law needs, and a \
+         corpus without it checks that law on nothing"
+    );
+    assert_eq!(corpus.transitions[0].0.as_ref(), base.as_slice());
+    assert_eq!(corpus.transitions[0].1.as_ref(), result.as_slice());
+
+    // The exported bundle and the in-memory corpus must agree about what a
+    // transition is, or a finding on a live node would vanish on replay.
+    let bundle = sampler.to_bundle(None, Some([0u8; 32]), Vec::new());
+    assert_eq!(bundle.transitions.len(), 1);
+    let replayed = bundle.to_corpus();
+    assert_eq!(replayed.transitions, corpus.transitions);
+
+    // ...and about what a delta was applied TO. `delta_bases` is the second thing a
+    // transition carries, and the only thing that pairs deltas for
+    // `delta_permutation_invariance` — which pairs only deltas observed against the
+    // SAME base. Comparing transitions alone lets an export drop every base while
+    // this pin stays green, and a replay that quietly covers less than the run it
+    // replays is the worst shape an export can have.
+    assert_eq!(
+        corpus.delta_bases,
+        vec![Some(Arc::from(base.as_slice()))],
+        "the observed delta must be recorded against the state it was applied to"
+    );
+    assert_eq!(replayed.delta_bases, corpus.delta_bases);
+    assert_eq!(replayed.deltas, corpus.deltas);
+
+    // A delta rides on its step OR loose, never both. Serializing it twice does not
+    // cost provenance — `Corpus::deduplicated` upgrades the kept entry either way,
+    // which is pinned separately — but it does cost bytes in an artifact whose whole
+    // purpose is to stay small enough to pass around.
+    assert!(
+        bundle.deltas.is_empty(),
+        "a delta carried by a transition must not also be emitted loose: {:?}",
+        bundle.deltas
+    );
+    assert_eq!(
+        bundle.transitions[0].delta.as_deref(),
+        Some(&[9u8][..]),
+        "...and it must actually be on the transition, or the assertion above \
+         passes because the delta was dropped entirely"
+    );
 }
 
 // ------------------------------------------------------------------ deduplication

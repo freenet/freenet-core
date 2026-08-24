@@ -1930,9 +1930,28 @@ mod doc_attachment_pin {
 
 #[cfg(test)]
 mod contract_store_registration_pin {
-    /// Slice `get_runtime_stores`' body, from its signature to the next item. A
-    /// missing anchor panics rather than silently widening the region to the rest of
-    /// the file, which is how a source pin quietly stops testing anything.
+    /// Strip whole-line comments, so a comment naming the call cannot stand in for the
+    /// call.
+    ///
+    /// Both regions this module slices have a multi-line comment sitting directly on
+    /// top of the call being pinned, explaining the registration in prose. Neither
+    /// comment happens to spell the identifier today, which is the only reason these
+    /// pins work — one ordinary reword ("`set_contract_store` is a no-op when capture
+    /// is off") disarms them with nothing failing. That is not hypothetical: the pin
+    /// on `fdev`'s report was defeated by exactly such a comment, added by the same
+    /// commit, and `probe_wiring_pins::run_writer_code_only` in this file records the
+    /// same thing happening to the one-probe-at-a-time pin.
+    ///
+    /// Whole-line only: a real call's identifier cannot sit on a line whose
+    /// `trim_start()` begins with `//`, so this can produce a false FAILURE but never
+    /// a false pass.
+    fn code_only(body: &str) -> String {
+        body.lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Slice `get_runtime_stores`' body by counting braces to its own closing one.
     ///
     /// The first version of this ended the region at the next `pub(crate) fn` / `fn`
@@ -2003,7 +2022,7 @@ mod contract_store_registration_pin {
     /// the registration going away, because no unit test builds a `Ring`.
     #[test]
     fn the_ring_registers_its_hosted_contracts_for_conformance() {
-        let body = ring_new_body();
+        let body = code_only(ring_new_body());
         assert!(
             body.contains("set_hosted_contracts_source("),
             "the ring no longer tells conformance how to list hosted contracts, so \
@@ -2018,7 +2037,7 @@ mod contract_store_registration_pin {
     /// past teardown - and in the simulation harness, one per simulated peer.
     #[test]
     fn the_hosted_contracts_source_holds_only_a_weak_reference() {
-        let body = ring_new_body();
+        let body = code_only(ring_new_body());
         let start = body
             .find("set_hosted_contracts_source(")
             .expect("registration missing; the sibling pin covers that");
@@ -2032,7 +2051,7 @@ mod contract_store_registration_pin {
 
     #[test]
     fn the_executor_registers_the_contract_store_for_conformance() {
-        let body = get_runtime_stores_body();
+        let body = code_only(get_runtime_stores_body());
         assert!(
             body.contains("set_contract_store("),
             "the executor no longer registers its contract store with conformance, so \
@@ -3976,7 +3995,15 @@ mod tests {
         let end = after
             .find("struct TrackedContract")
             .expect("run_writer no longer precedes TrackedContract");
-        let body = &after[..end];
+        // Whole-line comments stripped, for the reason
+        // `contract_store_registration_pin::code_only` gives: the region is production
+        // code with prose in it, and a comment naming the call would satisfy this
+        // assertion just as well as the call does.
+        let body = after[..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             body.contains("reload(&dir)"),
             "run_writer no longer reloads existing bundles on startup, so a node \

@@ -17,20 +17,25 @@
 //!
 //! # Replay a bundle captured from the network (or an earlier `fdev` run)
 //! fdev verify-merge --bundle observed.bin
+//!
+//! # Supply an observed step by hand: the state held, then the state reached
+//! fdev verify-merge --wasm contract.wasm --transition before.bin after.bin
 //! ```
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use freenet::conformance::ConformanceOracle;
 use freenet::conformance::generator::Corpus;
 use freenet::conformance::verifier::Bytes;
 use freenet::conformance::{
     ConformanceCase, ConformanceEvidence, ConformanceProperty, EVIDENCE_SCHEMA_VERSION,
-    GeneratorConfig, Inconclusive, MinimizeConfig, OracleBuildError, PropertyOutcome, ReplayBundle,
-    RuntimeOracle, Severity, generate_cases, minimize, verify_case,
+    EvidenceRejected, GeneratorConfig, Inconclusive, MinimizeConfig, OracleBuildError,
+    PropertyOutcome, ReplayBundle, RuntimeOracle, Severity, Transition, generate_cases, minimize,
+    verify_case,
 };
-use freenet_stdlib::prelude::{CodeHash, ContractCode, ContractInstanceId};
+use freenet_stdlib::prelude::{CodeHash, ContractCode, ContractInstanceId, State, UpdateData};
 use serde::Serialize;
 
 /// Run the contract conformance verifier (RFC #5320) against a contract's WASM.
@@ -56,6 +61,27 @@ pub struct ConformanceConfig {
     /// Required unless `--bundle` is given.
     #[arg(long = "state")]
     pub(crate) states: Vec<PathBuf>,
+
+    /// An observed step: the state a peer held, and the state it reached after
+    /// applying an update. Takes two paths. Repeat for multiple steps.
+    ///
+    /// This is PROVENANCE, and `transition_path_agreement` cannot be checked
+    /// without it. Loose `--state` files say only that both states existed; a
+    /// transition says the second was reached FROM the first, which is what makes
+    /// "merging it back must reproduce it" a law rather than an accusation of
+    /// last-write-wins against every conforming contract.
+    ///
+    /// ARGUMENT ORDER IS LOAD-BEARING AND CANNOT BE VERIFIED. BASE is the state
+    /// the peer HELD; RESULT is the state it REACHED. Supplied the other way
+    /// round, a perfectly conforming contract is reported as violating the law,
+    /// and nothing distinguishes that from a real finding — you are the witness
+    /// this property rests on. A likely-reversed pair is warned about, but the
+    /// check is a heuristic and cannot be conclusive.
+    ///
+    /// A capture bundle already carries these (`ReplayBundle::transitions`); this
+    /// is how a developer supplies one by hand from two state files.
+    #[arg(long = "transition", num_args = 2, value_names = ["BASE", "RESULT"])]
+    pub(crate) transitions: Vec<PathBuf>,
 
     /// Replay a corpus captured earlier (see `freenet::conformance::bundle`)
     /// instead of building one from `--state`.
@@ -122,7 +148,12 @@ pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
         return verify_evidence(&config, &path).await;
     }
     let properties = parse_properties(&config.properties)?;
-    let (wasm, parameters, corpus) = load_inputs(&config)?;
+    let LoadedInputs {
+        wasm,
+        parameters,
+        corpus,
+        hand_supplied_steps,
+    } = load_inputs(&config)?;
 
     if corpus.is_empty() {
         anyhow::bail!("no states to check: the corpus is empty");
@@ -146,8 +177,8 @@ pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
             "no cases could be generated from this corpus: {} state(s), {} delta(s), \
              {} summary/summaries for the selected properties. Nothing was checked, \
              so this is not a pass — supply more states (commutativity and \
-             reconciliation need at least two), or captured deltas for the \
-             delta properties.",
+             reconciliation need at least two), captured deltas for the delta \
+             properties, or --transition BASE RESULT for transition_path_agreement.",
             corpus.states.len(),
             corpus.deltas.len(),
             corpus.summaries.len(),
@@ -162,6 +193,7 @@ pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
         .await
         .map_err(describe_oracle_build_error)?;
     let instance = oracle.instance_id();
+    let _ = warn_on_reversed_transitions(&mut oracle, &hand_supplied_steps);
 
     let outcomes: Vec<(ConformanceCase, PropertyOutcome)> = cases
         .into_iter()
@@ -210,6 +242,57 @@ pub async fn conformance(config: ConformanceConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Warn when a hand-supplied `--transition BASE RESULT` pair looks reversed.
+///
+/// Argument order is load-bearing here and unverifiable. Every other malformed input
+/// to this command produces an error: an unreadable file, a WASM that will not load,
+/// a property name that does not exist. A REVERSED pair is the single exception,
+/// because it is structurally indistinguishable from a genuine finding - the whole
+/// reason `transition_path_agreement` is a law is that the corpus witnesses which
+/// state came first, and when a human types the two paths there is no witness but
+/// the order they typed them in.
+///
+/// The tell is that the law holds in the OTHER direction: if `merge(result, base)`
+/// reproduces `base`, then `base` sits above `result` in the merge's own order, so
+/// whatever was typed as `RESULT` is the earlier state. For a grow-only contract
+/// given the pair backwards this is exactly what happens, and the forward check then
+/// reports a violation against a perfectly conforming contract.
+///
+/// A warning rather than an error: a contract that genuinely disagrees in both
+/// directions is possible, and refusing to run would make a real finding
+/// unreportable. Stderr for the same reason `write_bundle` uses it - `--json` owns
+/// stdout.
+/// Returns how many pairs looked reversed, so a test can assert on the decision
+/// rather than on whether a line reached stderr.
+fn warn_on_reversed_transitions<O: ConformanceOracle + ?Sized>(
+    oracle: &mut O,
+    steps: &[(Bytes, Bytes)],
+) -> usize {
+    let mut suspicious = 0;
+    for (base, result) in steps {
+        let reversed =
+            oracle.update_state(result, &[UpdateData::State(State::from(base.to_vec()))]);
+        let Ok(modification) = reversed else {
+            continue;
+        };
+        let Some(state) = modification.new_state else {
+            continue;
+        };
+        if state.as_ref() == base.as_ref() {
+            suspicious += 1;
+            eprintln!(
+                "warning: for one --transition pair, merging BASE into RESULT \
+                 reproduces BASE, which is what a reversed pair looks like. \
+                 --transition takes the state the peer HELD first and the state it \
+                 REACHED second; supplied the other way round, a conforming \
+                 contract is reported as violating transition_path_agreement and \
+                 nothing can tell that apart from a real finding."
+            );
+        }
+    }
+    suspicious
+}
+
 /// Save the corpus under check as a replay bundle.
 ///
 /// Embeds the contract code, so the bundle names the contract it came from and
@@ -224,8 +307,65 @@ fn write_bundle(
 ) -> anyhow::Result<()> {
     let mut bundle = ReplayBundle::new(wasm.to_vec(), parameters.to_vec());
     bundle.states = corpus.states.iter().map(|s| s.to_vec()).collect();
-    bundle.deltas = corpus.deltas.iter().map(|d| d.to_vec()).collect();
     bundle.summaries = corpus.summaries.iter().map(|s| s.to_vec()).collect();
+    // Carry the steps through, or `--bundle-out` would silently drop the one input
+    // `transition_path_agreement` needs and the replayed bundle would report a clean
+    // run where the original found something.
+    //
+    // Each step also reclaims the delta observed against its base. A `Transition` is
+    // the ONLY place a bundle can record what a delta was applied to:
+    // `ReplayBundle::to_corpus` fills `Corpus::delta_bases` from
+    // `transition.delta` + `transition.base_state`, and bundle-level `deltas` are
+    // explicitly given no base. Exporting the deltas loose therefore silently drops
+    // every pairing, and `delta_permutation_invariance` - which only pairs deltas
+    // observed against the SAME base - checks nothing on the re-exported bundle
+    // while the original run checked plenty. A replay that quietly covers less than
+    // the run it replays is the worst shape this command can have.
+    let (with_bases, loose): (Vec<usize>, Vec<usize>) =
+        (0..corpus.deltas.len()).partition(|i| corpus.delta_base(*i).is_some());
+    let mut unassigned = with_bases;
+    // Take one delta recorded against this exact base, removing it from the pool.
+    let take_for = |base: &Bytes, unassigned: &mut Vec<usize>| -> Option<usize> {
+        unassigned
+            .iter()
+            .position(|i| corpus.delta_base(*i).map(|b| b.as_ref()) == Some(base.as_ref()))
+            .map(|slot| unassigned.remove(slot))
+    };
+    let mut steps: Vec<Transition> = Vec::with_capacity(corpus.transitions.len());
+    for (base, result) in &corpus.transitions {
+        let step = |delta: Option<usize>| Transition {
+            base_state: base.to_vec(),
+            result_state: result.to_vec(),
+            delta: delta.map(|i| corpus.deltas[i].to_vec()),
+            ..Default::default()
+        };
+        steps.push(step(take_for(base, &mut unassigned)));
+        // A `Transition` holds at most ONE delta, and a base can legitimately own
+        // several. `Corpus::deduplicated` collapses steps by `(base, result)`, so a
+        // contract that took two different updates from the same state and landed on
+        // the same result arrives here as one step and two same-base deltas — the
+        // exact shape `delta_permutation_invariance` is FOR. Stopping at one delta
+        // per step therefore sent the second out loose, where `to_corpus` gives it no
+        // base and it is never paired: the re-exported bundle checks the property on
+        // nothing while the original run checked the pair.
+        //
+        // So repeat the step, once per further delta against the same base. The
+        // duplicate `(base, result)` pairs cost their two states in the encoding but
+        // collapse again in `to_corpus`'s own `deduplicated`, leaving one step and
+        // every delta still holding its base.
+        while let Some(extra) = take_for(base, &mut unassigned) {
+            steps.push(step(Some(extra)));
+        }
+    }
+    bundle.transitions = steps;
+    // Whatever no step claimed still travels, just without provenance - which is
+    // exactly what it had. `unassigned` can still hold deltas here: a corpus may
+    // record a base for a delta without holding any step that starts from it.
+    bundle.deltas = loose
+        .into_iter()
+        .chain(unassigned)
+        .map(|i| corpus.deltas[i].to_vec())
+        .collect();
     bundle.note = Some(format!(
         "captured by fdev verify-merge {}",
         env!("CARGO_PKG_VERSION")
@@ -234,11 +374,13 @@ fn write_bundle(
         .write_to(path)
         .with_context(|| format!("writing bundle to {}", path.display()))?;
     eprintln!(
-        "wrote replay bundle to {} ({} state(s), {} delta(s), {} summary/summaries)",
+        "wrote replay bundle to {} ({} state(s), {} delta(s), {} summary/summaries, \
+         {} transition(s))",
         path.display(),
         bundle.states.len(),
         bundle.deltas.len(),
         bundle.summaries.len(),
+        bundle.transitions.len(),
     );
     Ok(())
 }
@@ -323,7 +465,11 @@ async fn verify_evidence(config: &ConformanceConfig, path: &PathBuf) -> anyhow::
     }
 
     // Bounds-check with the same function a receiving peer uses, so this command
-    // never accepts evidence the network itself would reject.
+    // never accepts evidence the network itself would reject, and do it BEFORE
+    // building the runtime — the point of the check is that nothing unbounded or
+    // unsound reaches the WASM. `to_case` re-runs it below; that is deliberate
+    // belt-and-braces, since `to_case` is the enforcement point and this call is the
+    // one that produces a good error message early.
     evidence
         .check_bounds()
         .map_err(|rejected| anyhow::anyhow!("evidence is not shippable: {rejected}"))?;
@@ -352,7 +498,9 @@ async fn verify_evidence(config: &ConformanceConfig, path: &PathBuf) -> anyhow::
         );
     }
 
-    let case = evidence.to_case();
+    let case = evidence
+        .to_case()
+        .map_err(|rejected| anyhow::anyhow!("evidence is not shippable: {rejected}"))?;
     let outcome = verify_case(&mut oracle, &case);
 
     println!("evidence {}", evidence.id());
@@ -475,7 +623,7 @@ fn find_code_in_store(store: &Path, bundle: &ReplayBundle) -> anyhow::Result<Vec
 
 /// Load the WASM, parameters and corpus, either from `--bundle` or from
 /// `--wasm` / `--params` / `--state`.
-fn load_inputs(config: &ConformanceConfig) -> anyhow::Result<(Vec<u8>, Vec<u8>, Corpus)> {
+fn load_inputs(config: &ConformanceConfig) -> anyhow::Result<LoadedInputs> {
     if let Some(bundle_path) = &config.bundle {
         let bundle = ReplayBundle::read_from(bundle_path)
             .with_context(|| format!("reading bundle {}", bundle_path.display()))?;
@@ -518,7 +666,14 @@ fn load_inputs(config: &ConformanceConfig) -> anyhow::Result<(Vec<u8>, Vec<u8>, 
         }
 
         let corpus = bundle.to_corpus();
-        Ok((wasm, parameters, corpus))
+        // A bundle's steps carry real provenance from the capture path, so they are
+        // not hand-supplied and are not order-checked below.
+        Ok(LoadedInputs {
+            wasm,
+            parameters,
+            corpus,
+            hand_supplied_steps: Vec::new(),
+        })
     } else {
         let wasm_path = config
             .wasm
@@ -529,16 +684,64 @@ fn load_inputs(config: &ConformanceConfig) -> anyhow::Result<(Vec<u8>, Vec<u8>, 
             Some(path) => read_file(path)?,
             None => Vec::new(),
         };
-        if config.states.is_empty() {
-            anyhow::bail!("at least one --state is required unless --bundle is given");
+        if config.states.is_empty() && config.transitions.is_empty() {
+            anyhow::bail!(
+                "at least one --state or --transition is required unless --bundle is given"
+            );
         }
         let mut states = Vec::with_capacity(config.states.len());
         for path in &config.states {
             states.push(read_file(path)?);
         }
-        let corpus = Corpus::from_states(states).deduplicated();
-        Ok((wasm, parameters, corpus))
+        // `num_args = 2` guarantees an even count, so the chunks are always whole
+        // pairs; this states that rather than leaving a lone path to be silently
+        // dropped if the arg definition is ever loosened. An error rather than a
+        // panic: this is a CLI invariant, and a user who somehow reaches it deserves
+        // a message rather than a backtrace.
+        if config.transitions.len() % 2 != 0 {
+            anyhow::bail!(
+                "--transition takes two paths per occurrence, got {}",
+                config.transitions.len()
+            );
+        }
+        let mut steps: Vec<(Bytes, Bytes)> = Vec::with_capacity(config.transitions.len() / 2);
+        for pair in config.transitions.chunks(2) {
+            let base = read_file(&pair[0])?;
+            let result = read_file(&pair[1])?;
+            // Both endpoints are ordinary observed states too, so the other
+            // properties get to use them rather than the transition being a
+            // dead-end input.
+            states.push(base.clone());
+            states.push(result.clone());
+            steps.push((Bytes::from(base), Bytes::from(result)));
+        }
+        let corpus = Corpus {
+            transitions: steps.clone(),
+            ..Corpus::from_states(states)
+        }
+        .deduplicated();
+        Ok(LoadedInputs {
+            wasm,
+            parameters,
+            corpus,
+            hand_supplied_steps: steps,
+        })
     }
+}
+
+/// What a run was given: the contract, its parameters, the corpus, and separately
+/// the steps a human typed.
+///
+/// The last field exists only so [`warn_on_reversed_transitions`] can tell a
+/// hand-supplied pair from one a capture recorded. A bundle's steps are witnessed by
+/// the node that observed them; a `--transition BASE RESULT` pair is witnessed by
+/// nothing but argument order.
+#[derive(Debug)]
+struct LoadedInputs {
+    wasm: Vec<u8>,
+    parameters: Vec<u8>,
+    corpus: Corpus,
+    hand_supplied_steps: Vec<(Bytes, Bytes)>,
 }
 
 fn read_file(path: &PathBuf) -> anyhow::Result<Vec<u8>> {
@@ -565,12 +768,17 @@ fn describe_oracle_build_error(err: OracleBuildError) -> anyhow::Error {
 /// "Distinct" is by [`ConformanceEvidence::id`] (a content hash of the
 /// inputs), so cases whose inputs coincide overwrite the same filename
 /// instead of piling up duplicate files for one finding.
-fn write_evidence(
+///
+/// Generic over the oracle purely so this function is testable: `minimize` and
+/// `verify_case` already are, and pinning this one to `RuntimeOracle` would have made
+/// "did minimisation run?" answerable only by scraping the source. A fake oracle that
+/// counts its calls answers it directly.
+fn write_evidence<O: ConformanceOracle + ?Sized>(
     dir: &PathBuf,
     instance: ContractInstanceId,
     parameters: &[u8],
     outcomes: &[(ConformanceCase, PropertyOutcome)],
-    oracle: &mut RuntimeOracle,
+    oracle: &mut O,
     state_candidates: &[Bytes],
     delta_candidates: &[Bytes],
 ) -> anyhow::Result<EvidenceSummary> {
@@ -579,10 +787,34 @@ fn write_evidence(
 
     let mut written = HashSet::new();
     let mut oversized = 0usize;
+    let mut local_only = 0usize;
     let mut shrunk_from = 0usize;
     let mut shrunk_to = 0usize;
+    // Grouped, not per-case. Both of these fire once per VIOLATED CASE, and a corpus
+    // routinely produces dozens of cases breaking the same law — `group_findings`
+    // exists for exactly that reason on the report side. Printing one identical line
+    // per case buries the report the note is telling the reader to go and look at.
+    let mut local_only_notes: Vec<UnwritableNote> = Vec::new();
+    let mut oversized_notes: Vec<UnwritableNote> = Vec::new();
     for (case, outcome) in outcomes {
         if !outcome.is_enforceable_violation() {
+            continue;
+        }
+
+        // A property whose premise the bytes cannot carry is not evidence at all,
+        // and saying "could not be reduced to a shippable size" about one would be a
+        // false explanation of a permanent condition. It is not a failure either:
+        // the finding is real and this command reported it, it simply never travels.
+        //
+        // Checked BEFORE minimising, not after. Minimisation is the expensive part of
+        // this loop — repeated `verify_case` calls through the WASM runtime — and
+        // spending all of it on a case that is then discarded is pure waste. It also
+        // keeps the byte counters honest: they are documented as summed over the
+        // findings written, and accumulating for a finding shrinking could never help
+        // puts a number in the denominator that the ratio is not about.
+        if !case.property.is_self_verifying() {
+            local_only += 1;
+            note_unwritable(&mut local_only_notes, case.property, None);
             continue;
         }
 
@@ -607,10 +839,10 @@ fn write_evidence(
         // cannot report having written evidence that no peer would accept.
         if let Err(rejected) = evidence.check_bounds() {
             oversized += 1;
-            eprintln!(
-                "warning: a {} finding could not be reduced to a shippable size ({rejected}); \
-                 no evidence file written for it",
-                minimized.property
+            note_unwritable(
+                &mut oversized_notes,
+                minimized.property,
+                Some(rejected.to_string()),
             );
             continue;
         }
@@ -626,27 +858,123 @@ fn write_evidence(
             .with_context(|| format!("writing evidence to {}", path.display()))?;
     }
 
+    // Stderr, never stdout: `--json` promises one JSON document on stdout and these
+    // notes would corrupt it. See the `stdout_purity_pin` module.
+    let _ = write_unwritable_notes(
+        &mut std::io::stderr().lock(),
+        &local_only_notes,
+        &oversized_notes,
+    );
+
     Ok(EvidenceSummary {
         directory: dir.display().to_string(),
         files_written: written.len(),
+        findings_local_only: local_only,
         findings_too_large: oversized,
         input_bytes_before_shrinking: shrunk_from,
         input_bytes_after_shrinking: shrunk_to,
     })
 }
 
+/// One "no evidence file was written" note, accumulated per property rather than
+/// emitted per case.
+struct UnwritableNote {
+    property: ConformanceProperty,
+    cases: usize,
+    /// A representative rejection, where the reason varies per case (the byte counts
+    /// in an over-size rejection do). The count is what the reader acts on; the
+    /// example is what tells them which knob it is about.
+    example: Option<String>,
+}
+
+/// Bump this property's note, keeping the FIRST example seen.
+///
+/// First rather than last so the line is stable across a re-run that produces the
+/// same findings in the same order — a note whose numbers move between identical runs
+/// reads as new information.
+fn note_unwritable(
+    notes: &mut Vec<UnwritableNote>,
+    property: ConformanceProperty,
+    example: Option<String>,
+) {
+    match notes.iter_mut().find(|n| n.property == property) {
+        Some(note) => note.cases += 1,
+        None => notes.push(UnwritableNote {
+            property,
+            cases: 1,
+            example,
+        }),
+    }
+}
+
+/// Emit the grouped notes, one line per property rather than one per case.
+///
+/// Split out from `write_evidence` so the grouping can be asserted: `write_evidence`
+/// needs a WASM oracle and a temp directory, and its notes go to stderr, which a test
+/// cannot capture.
+fn write_unwritable_notes(
+    out: &mut impl std::io::Write,
+    local_only: &[UnwritableNote],
+    oversized: &[UnwritableNote],
+) -> std::io::Result<()> {
+    for note in local_only {
+        writeln!(
+            out,
+            "note: {} {} finding(s) cannot be carried as evidence at all ({}); they \
+             appear in the report's findings list and no evidence file is written \
+             for them",
+            note.cases,
+            note.property,
+            EvidenceRejected::NotSelfVerifying {
+                property: note.property
+            }
+        )?;
+    }
+    for note in oversized {
+        writeln!(
+            out,
+            "warning: {} {} finding(s) stayed over the evidence size limit even after \
+             shrinking, so no evidence file was written for them — example: {}",
+            note.cases,
+            note.property,
+            note.example.as_deref().unwrap_or("(no detail)")
+        )?;
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct EvidenceSummary {
     directory: String,
     files_written: usize,
+    /// Findings from a property that is not self-verifying, so no evidence can be
+    /// built for it at all. Reported rather than swallowed, and deliberately NOT
+    /// counted as "too large": the reason is permanent and has nothing to do with
+    /// size. See `ConformanceProperty::premise_source`.
+    findings_local_only: usize,
     /// Findings that stayed over the evidence size bound even after shrinking.
     /// Reported rather than swallowed: they are real findings that simply cannot be
     /// propagated, and silently writing nothing would look like there were none.
     findings_too_large: usize,
-    /// Total case input bytes before and after minimisation, summed over the
-    /// findings written. The ratio is the honest measure of whether shrinking is
-    /// earning its keep, and it is what decides whether a finding fits in evidence
-    /// at all.
+    /// Total case input bytes before and after minimisation, summed over every
+    /// finding minimisation was actually RUN on — which is not the same set as the
+    /// files written, and the difference is deliberate in both directions.
+    ///
+    /// A finding counted by `findings_too_large` is included: shrinking ran, and
+    /// failed to get it under the bound. Excluding it would drop exactly the cases
+    /// where shrinking did least and overstate the ratio.
+    ///
+    /// A finding counted by `findings_local_only` is excluded, because minimisation
+    /// never runs for one: the property cannot travel as evidence whatever its size,
+    /// so shrinking it could not have helped and its bytes are not a measure of
+    /// anything. That exclusion is structural — the check sits above the `minimize`
+    /// call — rather than a subtraction someone has to remember.
+    ///
+    /// Duplicates are included too: a second case with the same evidence id had
+    /// minimisation run on it before the id was known.
+    ///
+    /// So the ratio is the honest measure of whether shrinking is earning its keep on
+    /// the work it is actually asked to do.
     input_bytes_before_shrinking: usize,
     input_bytes_after_shrinking: usize,
 }
@@ -766,12 +1094,30 @@ impl Report {
         }
     }
 
+    /// Print the human report to stdout.
+    ///
+    /// A thin wrapper over [`Report::write_human`] so the report's TEXT can be
+    /// rendered into a buffer and asserted on. The pin that used to guard the
+    /// no-evidence explanations scraped this function's source for two field
+    /// names, and `fn_body` returns raw source INCLUDING comments — so the
+    /// comment above those two blocks satisfied the pin on its own, and deleting
+    /// both `println!` blocks left the test green. Rendering to a sink lets the
+    /// test assert the lines actually appear.
+    ///
+    /// Write errors are dropped: a closed stdout (`| head`) is not a run failure,
+    /// and there is nowhere left to report it to anyway.
     fn print_human(&self) {
-        println!(
+        let _ = self.write_human(&mut std::io::stdout().lock());
+    }
+
+    fn write_human(&self, out: &mut impl std::io::Write) -> std::io::Result<()> {
+        writeln!(
+            out,
             "merge check: {} state(s), {} delta(s), {} summary/summaries in the corpus",
             self.corpus_states, self.corpus_deltas, self.corpus_summaries
-        );
-        println!(
+        )?;
+        writeln!(
+            out,
             "merge check: {} case(s) run \u{2014} {} held, {} violation(s) ({} enforceable, {} diagnostic-only), {} inconclusive",
             self.cases_run,
             self.holds,
@@ -779,20 +1125,21 @@ impl Report {
             self.enforceable_violations,
             self.diagnostic_violations,
             self.inconclusive
-        );
+        )?;
 
         if !self.findings.is_empty() {
-            println!("\nfindings:");
+            writeln!(out, "\nfindings:")?;
             for (f, count) in group_findings(&self.findings) {
                 let cases = if count == 1 {
                     "1 case".to_string()
                 } else {
                     format!("{count} cases")
                 };
-                println!(
+                writeln!(
+                    out,
                     "  [{}] {} ({cases}): {}\n      example \u{2014} left: {}; right: {}",
                     f.severity, f.property, f.detail, f.left, f.right
-                );
+                )?;
             }
         }
 
@@ -801,31 +1148,63 @@ impl Report {
         // and printing them as errors would train an author to "fix" working
         // code.
         if !self.inconclusive_reasons.is_empty() {
-            println!(
+            writeln!(
+                out,
                 "\ninconclusive ({} total \u{2014} NOT passes: these cases reached no verdict, so they say nothing about the contract):",
                 self.inconclusive
-            );
+            )?;
             for r in &self.inconclusive_reasons {
-                println!("  {}: {}", r.reason, r.occurrences);
+                writeln!(out, "  {}: {}", r.reason, r.occurrences)?;
             }
         }
 
         if let Some(evidence) = &self.evidence {
-            println!(
+            writeln!(
+                out,
                 "\nwrote {} evidence file(s) to {}",
                 evidence.files_written, evidence.directory
-            );
+            )?;
+            // Never let that line stand alone when it says zero.
+            //
+            // `findings_local_only` and `findings_too_large` are the only two ways a
+            // real finding produces no file, and the default human output printed
+            // neither — so "wrote 0 evidence file(s)" read exactly like a clean run,
+            // which is the failure mode `findings_too_large`'s own doc comment warns
+            // about ("silently writing nothing would look like there were none").
+            // Only `--json` carried the reason, and the person who most needs it is
+            // the one who did not ask for JSON.
+            if evidence.findings_local_only > 0 {
+                writeln!(
+                    out,
+                    "  {} finding(s) came from a property whose premise the evidence \
+                     bytes cannot carry, so no evidence exists to write; they are \
+                     listed above and are local-only by design",
+                    evidence.findings_local_only
+                )?;
+            }
+            if evidence.findings_too_large > 0 {
+                writeln!(
+                    out,
+                    "  {} finding(s) stayed over the evidence size limit even after \
+                     shrinking; they are listed above and simply cannot be \
+                     propagated",
+                    evidence.findings_too_large
+                )?;
+            }
         }
 
         if self.enforceable_violations == 0 {
-            println!("\nno enforceable violations found.");
+            writeln!(out, "\nno enforceable violations found.")?;
             if self.diagnostic_violations > 0 {
-                println!(
+                writeln!(
+                    out,
                     "({} diagnostic finding(s) above are efficiency notes, not merge-law breaks, and do not fail this command.)",
                     self.diagnostic_violations
-                );
+                )?;
             }
         }
+
+        Ok(())
     }
 }
 
@@ -869,6 +1248,9 @@ fn inconclusive_label(reason: &Inconclusive) -> &'static str {
         Inconclusive::ResourceLimit(_) => "resource limit hit",
         Inconclusive::RoundLimit => "reconciliation round budget exhausted",
         Inconclusive::MalformedCase(_) => "malformed case",
+        Inconclusive::NoDeltaPath => "no delta path to compare against",
+        Inconclusive::StateNotSettled => "observed result state never settles",
+        Inconclusive::NotReproducible => "finding did not reproduce",
         _ => "other",
     }
 }
@@ -891,19 +1273,37 @@ fn inconclusive_label(reason: &Inconclusive) -> &'static str {
 /// one-token property. This asserts the property at the only place it can regress.
 #[cfg(test)]
 mod stdout_purity_pin {
-    /// Slice `load_inputs`' body by counting braces to its own closing one.
+    /// Slice a function's body by counting braces to its own closing one.
     ///
     /// Brace-counting rather than "up to the next `fn`": a region ended on a guessed
     /// anchor silently widens when the following item is not the shape assumed, and a
     /// widened region here would swallow the human-report code — which prints to stdout
     /// legitimately — and pass vacuously.
-    fn load_inputs_body() -> &'static str {
+    ///
+    /// Private on purpose, and reached only through [`code_only`]: the raw body it
+    /// returns INCLUDES comments, so a scrape built directly on it is satisfied by a
+    /// comment naming the token it searches for. That is not hypothetical — the pin
+    /// on the report's no-evidence explanations was written against `fn_body`, and a
+    /// comment added by the same commit kept it green after both `println!` blocks it
+    /// guarded were deleted. Every scrape in this file now goes through `code_only`,
+    /// so the footgun cannot be picked up by reaching for the obvious helper.
+    fn fn_body(signature: &str) -> &'static str {
         let src = include_str!("conformance.rs");
         let start = src
-            .find("fn load_inputs(")
-            .expect("load_inputs not found in conformance.rs");
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} not found in conformance.rs"));
+        // A signature that only matches inside a test module means the real function
+        // was renamed or removed: the region would then be some test's body, where the
+        // searched-for token is as likely to appear as not. Fail loudly instead.
+        if let Some(tests) = src.find("\n#[cfg(test)]") {
+            assert!(
+                start < tests,
+                "{signature} matched only inside a test module, so this pin would be \
+                 scoped to a test rather than to production code"
+            );
+        }
         let after = &src[start..];
-        let open = after.find('{').expect("load_inputs has no body");
+        let open = after.find('{').expect("signature has no body");
         let mut depth = 0usize;
         for (offset, ch) in after[open..].char_indices() {
             match ch {
@@ -917,13 +1317,18 @@ mod stdout_purity_pin {
                 _ => {}
             }
         }
-        panic!("load_inputs' body is not brace-balanced");
+        panic!("{signature}'s body is not brace-balanced");
     }
 
-    /// Strip whole-line comments, so a comment mentioning `println!` cannot satisfy or
-    /// defeat the assertion. The comment above the `eprintln!` call names both.
-    fn code_only() -> String {
-        load_inputs_body()
+    /// A function's body with whole-line comments stripped, so a comment mentioning
+    /// the searched-for token can neither satisfy nor defeat the assertion. The
+    /// comment above the `eprintln!` call names both macros; the comment above the
+    /// report's no-evidence blocks named both fields the old pin looked for.
+    ///
+    /// Takes the signature rather than hard-coding one, so that the comment-stripping
+    /// version is the ONLY way to scrape a body in this file.
+    fn code_only(signature: &str) -> String {
+        fn_body(signature)
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
@@ -938,7 +1343,9 @@ mod stdout_purity_pin {
     /// code, which is the harmless direction; the same trap the other way is how a pin
     /// passes vacuously forever.
     fn stdout_macros_only() -> String {
-        code_only().replace("eprintln!", "").replace("eprint!", "")
+        code_only("fn load_inputs(")
+            .replace("eprintln!", "")
+            .replace("eprint!", "")
     }
 
     #[test]
@@ -953,7 +1360,7 @@ mod stdout_purity_pin {
 
     #[test]
     fn the_bundle_note_still_reaches_the_reader() {
-        let body = code_only();
+        let body = code_only("fn load_inputs(");
         assert!(
             body.contains("eprintln!"),
             "the bundle note is no longer surfaced at all; a corpus whose related \
@@ -965,7 +1372,564 @@ mod stdout_purity_pin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use freenet::conformance::Violation;
+    use freenet::conformance::{OracleError, Violation};
+    use freenet_stdlib::prelude::{RelatedContracts, UpdateModification, ValidateResult};
+
+    /// Render the human report to a string.
+    ///
+    /// The report's text is what these tests assert on, rather than its source: a
+    /// source scrape of `print_human` is satisfied by a comment naming the same
+    /// tokens, which is exactly how the previous version of
+    /// `the_human_report_says_why_no_evidence_was_written` survived the deletion of
+    /// both blocks it existed to guard.
+    fn render_human(report: &Report) -> String {
+        let mut rendered = Vec::new();
+        report
+            .write_human(&mut rendered)
+            .expect("writing to a Vec cannot fail");
+        String::from_utf8(rendered).expect("the report is utf-8")
+    }
+
+    /// A grow-only union contract, enough to exercise the reversed-pair heuristic
+    /// without a WASM runtime.
+    struct GrowOnly;
+
+    impl ConformanceOracle for GrowOnly {
+        fn validate_state(
+            &mut self,
+            _state: &[u8],
+            _related: &freenet_stdlib::prelude::RelatedContracts<'_>,
+        ) -> Result<freenet_stdlib::prelude::ValidateResult, freenet::conformance::OracleError>
+        {
+            Ok(freenet_stdlib::prelude::ValidateResult::Valid)
+        }
+
+        fn update_state(
+            &mut self,
+            state: &[u8],
+            updates: &[UpdateData<'_>],
+        ) -> Result<
+            freenet_stdlib::prelude::UpdateModification<'static>,
+            freenet::conformance::OracleError,
+        > {
+            let mut out = state.to_vec();
+            for update in updates {
+                match update {
+                    UpdateData::State(incoming) => out.extend_from_slice(incoming.as_ref()),
+                    UpdateData::Delta(delta) => out.extend_from_slice(delta.as_ref()),
+                    _ => {}
+                }
+            }
+            out.sort_unstable();
+            out.dedup();
+            Ok(freenet_stdlib::prelude::UpdateModification::valid(
+                State::from(out),
+            ))
+        }
+
+        fn summarize_state(
+            &mut self,
+            state: &[u8],
+        ) -> Result<Vec<u8>, freenet::conformance::OracleError> {
+            Ok(state.to_vec())
+        }
+
+        fn get_state_delta(
+            &mut self,
+            state: &[u8],
+            summary: &[u8],
+        ) -> Result<Vec<u8>, freenet::conformance::OracleError> {
+            Ok(state
+                .iter()
+                .copied()
+                .filter(|b| !summary.contains(b))
+                .collect())
+        }
+    }
+
+    /// A reversed `--transition BASE RESULT` pair is the one malformed input this
+    /// command cannot turn into an error, so it must at least be warned about.
+    ///
+    /// Argument order is the entire provenance `transition_path_agreement` rests on
+    /// when a human supplies the pair. Given the two paths the wrong way round, a
+    /// perfectly conforming grow-only contract is reported as violating the law and
+    /// nothing distinguishes that from a real finding — the failure is silent and
+    /// confident, which is the worst combination.
+    #[test]
+    fn a_reversed_transition_pair_is_warned_about_and_a_correct_one_is_not() {
+        let earlier = Bytes::from(vec![1u8, 2]);
+        let later = Bytes::from(vec![1u8, 2, 3]);
+
+        assert_eq!(
+            warn_on_reversed_transitions(&mut GrowOnly, &[(earlier.clone(), later.clone())]),
+            0,
+            "a correctly ordered pair must not be warned about, or the warning is \
+             noise on every run and stops being read"
+        );
+        assert_eq!(
+            warn_on_reversed_transitions(&mut GrowOnly, &[(later, earlier)]),
+            1,
+            "merging BASE into RESULT reproducing BASE is what a reversed pair \
+             looks like, and it is the only tell there is"
+        );
+    }
+
+    /// The `--transition` arity invariant is an error, not a panic.
+    ///
+    /// `num_args = 2` makes it unreachable through clap today; the point is that
+    /// loosening the arg definition later must not turn a user's mistake into a
+    /// backtrace, and must not silently drop a lone path either.
+    #[test]
+    fn an_odd_number_of_transition_paths_is_an_error_not_a_panic() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let wasm = dir.path().join("c.wasm");
+        // Never loaded: the arity check is reached long before any runtime exists.
+        std::fs::write(&wasm, b"\0asm-stand-in").expect("write wasm");
+        let config = ConformanceConfig {
+            wasm: Some(wasm),
+            params: None,
+            states: Vec::new(),
+            transitions: vec![PathBuf::from("only-one.bin")],
+            bundle: None,
+            contract_store: None,
+            max_cases: None,
+            properties: Vec::new(),
+            json: false,
+            evidence_out: None,
+            evidence_in: None,
+            bundle_out: None,
+        };
+        let err = load_inputs(&config).expect_err("an odd count must be rejected");
+        assert!(
+            err.to_string().contains("--transition takes two paths"),
+            "the error must name the argument, got: {err}"
+        );
+    }
+
+    /// `--bundle-out` must re-export a corpus that replays to the SAME corpus.
+    ///
+    /// Not just the same states and steps: the same `delta_bases`. A `Transition` is
+    /// the only place a bundle can record what a delta was applied to, because
+    /// `ReplayBundle::to_corpus` deliberately gives bundle-level deltas no base at
+    /// all — pairing causally sequenced deltas asks about a situation the protocol
+    /// never produces. So re-exporting a transition without its `delta` drops every
+    /// pairing, and `delta_permutation_invariance` — which pairs only deltas
+    /// observed against the SAME base — checks nothing on the replayed bundle while
+    /// the original run checked plenty.
+    ///
+    /// That is the worst shape this command can have: the replay reports a clean run
+    /// and reads as a reproduction of the original.
+    #[test]
+    fn a_re_exported_bundle_keeps_what_each_delta_was_applied_to() {
+        let code = b"\0asm-stand-in".to_vec();
+        let base = vec![1u8, 2];
+        // Two deltas against the SAME base: the pairing this exists to preserve.
+        let bundle_in = ReplayBundle {
+            transitions: vec![
+                Transition {
+                    base_state: base.clone(),
+                    result_state: vec![1, 2, 3],
+                    delta: Some(vec![3]),
+                    ..Default::default()
+                },
+                Transition {
+                    base_state: base.clone(),
+                    result_state: vec![1, 2, 4],
+                    delta: Some(vec![4]),
+                    ..Default::default()
+                },
+            ],
+            ..ReplayBundle::new(code.clone(), Vec::new())
+        };
+
+        let original = bundle_in.to_corpus();
+        assert_eq!(
+            original.delta_bases,
+            vec![
+                Some(Bytes::from(base.clone())),
+                Some(Bytes::from(base.clone()))
+            ],
+            "the fixture must actually carry provenance, or the round trip below \
+             has nothing to lose"
+        );
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("out.bin");
+        write_bundle(&path, &code, &[], &original).expect("write bundle");
+        let round_tripped = ReplayBundle::read_from(&path)
+            .expect("read bundle")
+            .to_corpus();
+
+        assert_eq!(round_tripped.transitions, original.transitions);
+        assert_eq!(round_tripped.deltas, original.deltas);
+        assert_eq!(
+            round_tripped.delta_bases, original.delta_bases,
+            "a re-exported bundle must pair each delta with the state it was \
+             applied to, exactly as the corpus it was written from did"
+        );
+        assert_eq!(round_tripped.states, original.states);
+    }
+
+    /// The same shape again, where the two steps COLLAPSE into one.
+    ///
+    /// The test above pairs two same-base deltas that arrive on two distinct steps,
+    /// so one delta per step is enough to carry them. `Corpus::deduplicated` keys
+    /// steps on `(base, result)`, so two updates taken from the same state that land
+    /// on the same result become ONE step holding two same-base deltas — and a
+    /// `Transition` holds at most one delta. Assigning one and chaining the rest onto
+    /// `bundle.deltas` sent the second out loose, where `to_corpus` gives it no base
+    /// and `delta_permutation_invariance` never pairs it.
+    ///
+    /// A same-base pair is exactly what that property is FOR, so the re-export
+    /// silently checked less than the run it replayed while reporting a clean bill of
+    /// health. The fix repeats the step once per further delta; the duplicate
+    /// `(base, result)` pairs collapse again on the way back in.
+    #[test]
+    fn a_re_exported_bundle_keeps_every_delta_of_a_collapsed_step() {
+        let code = b"\0asm-stand-in".to_vec();
+        let base = vec![1u8, 2];
+        let result = vec![1u8, 2, 3];
+        // Same base AND same result, two different deltas: one step after dedup.
+        let bundle_in = ReplayBundle {
+            transitions: vec![
+                Transition {
+                    base_state: base.clone(),
+                    result_state: result.clone(),
+                    delta: Some(vec![3]),
+                    ..Default::default()
+                },
+                Transition {
+                    base_state: base.clone(),
+                    result_state: result.clone(),
+                    delta: Some(vec![4]),
+                    ..Default::default()
+                },
+            ],
+            ..ReplayBundle::new(code.clone(), Vec::new())
+        };
+
+        let original = bundle_in.to_corpus();
+        assert_eq!(
+            original.transitions.len(),
+            1,
+            "the fixture must actually collapse to one step, or it is the test above"
+        );
+        assert_eq!(
+            original.delta_bases,
+            vec![
+                Some(Bytes::from(base.clone())),
+                Some(Bytes::from(base.clone()))
+            ],
+            "and both deltas must start out provenanced, or the round trip below has \
+             nothing to lose"
+        );
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("out.bin");
+        write_bundle(&path, &code, &[], &original).expect("write bundle");
+        let round_tripped = ReplayBundle::read_from(&path)
+            .expect("read bundle")
+            .to_corpus();
+
+        assert_eq!(round_tripped.transitions, original.transitions);
+        assert_eq!(round_tripped.deltas, original.deltas);
+        assert_eq!(
+            round_tripped.delta_bases, original.delta_bases,
+            "the second delta of a collapsed step must keep its base too, or the \
+             one pairing this corpus can support is gone from the replay"
+        );
+        assert_eq!(round_tripped.states, original.states);
+    }
+
+    /// An oracle that records every call, so a test can ask whether the WASM path
+    /// was entered at all.
+    ///
+    /// Deliberately trivial otherwise: nothing here is checking merge behaviour, only
+    /// whether `write_evidence` decided to spend WASM calls on a case it was going to
+    /// discard.
+    #[derive(Default)]
+    struct CountingOracle {
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl freenet::conformance::ConformanceOracle for CountingOracle {
+        fn validate_state(
+            &mut self,
+            _state: &[u8],
+            _related: &RelatedContracts<'_>,
+        ) -> Result<ValidateResult, OracleError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(ValidateResult::Valid)
+        }
+
+        fn update_state(
+            &mut self,
+            state: &[u8],
+            _updates: &[UpdateData<'_>],
+        ) -> Result<UpdateModification<'static>, OracleError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(UpdateModification::valid(State::from(state.to_vec())))
+        }
+
+        fn summarize_state(&mut self, _state: &[u8]) -> Result<Vec<u8>, OracleError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(Vec::new())
+        }
+
+        fn get_state_delta(
+            &mut self,
+            _state: &[u8],
+            _summary: &[u8],
+        ) -> Result<Vec<u8>, OracleError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(Vec::new())
+        }
+    }
+
+    /// A finding that can never become evidence must be discarded BEFORE minimisation.
+    ///
+    /// Two things go wrong when the check sits after `minimize`, and they are not the
+    /// same defect. The cheap one is waste: minimisation is the expensive part of this
+    /// loop, and every byte of it is spent on a case that is then thrown away. The
+    /// one that misleads a reader is `input_bytes_before_shrinking`, documented as the
+    /// measure of "whether shrinking is earning its keep" — accumulating for a finding
+    /// shrinking could not have helped puts a number in the denominator the ratio is
+    /// not about. Measured on a real run before the fix: `files_written: 0` alongside
+    /// `input_bytes_before_shrinking: 32335`.
+    #[test]
+    fn a_local_only_finding_costs_no_minimisation_and_no_shrink_bytes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let out = dir.path().join("evidence");
+        let mut oracle = CountingOracle::default();
+
+        // `TransitionPathAgreement` is `Violation` (so it reaches the loop body) and
+        // `LocalProvenance` (so it can never be written).
+        let property = ConformanceProperty::TransitionPathAgreement;
+        assert!(
+            !property.is_self_verifying() && property.severity() == Severity::Violation,
+            "the fixture depends on this property being enforceable AND local-only"
+        );
+        let case = ConformanceCase::new(
+            property,
+            vec![Bytes::from(vec![7u8; 64]), Bytes::from(vec![8u8; 64])],
+        );
+        assert!(
+            case.input_bytes() > 0,
+            "the case must carry bytes, or the counter assertion below is vacuous"
+        );
+
+        let summary = write_evidence(
+            &out,
+            ContractInstanceId::new([3u8; 32]),
+            &[],
+            &[(case, PropertyOutcome::Violated(violation_of(property)))],
+            &mut oracle,
+            &[],
+            &[],
+        )
+        .expect("write evidence");
+
+        assert_eq!(summary.files_written, 0);
+        assert_eq!(summary.findings_local_only, 1);
+        assert_eq!(summary.findings_too_large, 0);
+        assert_eq!(
+            oracle.calls.get(),
+            0,
+            "minimisation and re-verification must not run for a finding that cannot \
+             travel; they are the expensive part of this loop"
+        );
+        assert_eq!(
+            (
+                summary.input_bytes_before_shrinking,
+                summary.input_bytes_after_shrinking
+            ),
+            (0, 0),
+            "and its bytes must not land in the shrink ratio, whose denominator is \
+             supposed to be work shrinking was asked to do"
+        );
+    }
+
+    /// The counterpart: a shippable finding DOES pay for minimisation and IS counted.
+    ///
+    /// Without this, moving the local-only check to the top of the loop body — or
+    /// deleting `minimize` outright — would satisfy the test above.
+    #[test]
+    fn a_shippable_finding_is_minimised_and_counted() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let out = dir.path().join("evidence");
+        let mut oracle = CountingOracle::default();
+
+        let property = ConformanceProperty::StateCommutativity;
+        assert!(property.is_self_verifying() && property.severity() == Severity::Violation);
+        let case = ConformanceCase::new(
+            property,
+            vec![Bytes::from(vec![7u8; 64]), Bytes::from(vec![8u8; 64])],
+        );
+
+        let summary = write_evidence(
+            &out,
+            ContractInstanceId::new([3u8; 32]),
+            &[],
+            &[(case, PropertyOutcome::Violated(violation_of(property)))],
+            &mut oracle,
+            &[],
+            &[],
+        )
+        .expect("write evidence");
+
+        assert_eq!(summary.files_written, 1);
+        assert_eq!(summary.findings_local_only, 0);
+        assert!(
+            oracle.calls.get() > 0,
+            "a shippable finding must actually go through minimisation"
+        );
+        assert_eq!(summary.input_bytes_before_shrinking, 128);
+    }
+
+    /// "wrote 0 evidence file(s)" must never stand alone.
+    ///
+    /// `findings_too_large`'s own doc comment says silently writing nothing would look
+    /// like there were none — and that is precisely what the DEFAULT (non-`--json`)
+    /// output did for both no-file reasons. The person who most needs the explanation
+    /// is the one who did not ask for JSON.
+    #[test]
+    fn the_human_report_says_why_no_evidence_was_written() {
+        let report = Report {
+            corpus_states: 1,
+            corpus_deltas: 1,
+            corpus_summaries: 0,
+            cases_run: 2,
+            holds: 0,
+            violations: 2,
+            enforceable_violations: 2,
+            diagnostic_violations: 0,
+            inconclusive: 0,
+            findings: Vec::new(),
+            inconclusive_reasons: Vec::new(),
+            evidence: Some(EvidenceSummary {
+                directory: "/tmp/evidence".to_string(),
+                files_written: 0,
+                findings_local_only: 1,
+                findings_too_large: 1,
+                input_bytes_before_shrinking: 0,
+                input_bytes_after_shrinking: 0,
+            }),
+        };
+
+        let rendered = render_human(&report);
+
+        assert!(
+            rendered.contains("wrote 0 evidence file(s)"),
+            "the fixture no longer produces the line this pin is about:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("the evidence bytes cannot carry"),
+            "a local-only finding drew no explanation, so the report says \
+             'wrote 0 evidence file(s)' and nothing else — which reads exactly \
+             like a clean run:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("stayed over the evidence size limit"),
+            "an over-size finding drew no explanation, so the report says \
+             'wrote 0 evidence file(s)' and nothing else — which reads exactly \
+             like a clean run:\n{rendered}"
+        );
+    }
+
+    /// Twenty-four cases breaking one law are ONE note, not twenty-four.
+    ///
+    /// Both notes fired once per violated CASE, and a corpus routinely produces dozens
+    /// of cases of the same defect — `group_findings` exists for that reason on the
+    /// report side. The identical lines then bury the report the note points at.
+    #[test]
+    fn the_unwritable_notes_are_one_line_per_property_not_one_per_case() {
+        let mut local_only = Vec::new();
+        for _ in 0..24 {
+            note_unwritable(
+                &mut local_only,
+                ConformanceProperty::TransitionPathAgreement,
+                None,
+            );
+        }
+        note_unwritable(
+            &mut local_only,
+            ConformanceProperty::DeltaPermutationInvariance,
+            None,
+        );
+
+        let mut oversized = Vec::new();
+        for found in [900usize, 800, 700] {
+            note_unwritable(
+                &mut oversized,
+                ConformanceProperty::StateCommutativity,
+                Some(format!("{found} bytes over")),
+            );
+        }
+
+        let mut rendered = Vec::new();
+        write_unwritable_notes(&mut rendered, &local_only, &oversized)
+            .expect("writing to a Vec cannot fail");
+        let rendered = String::from_utf8(rendered).expect("notes are utf-8");
+
+        assert_eq!(
+            rendered.lines().count(),
+            3,
+            "28 unwritable findings across 3 properties should print 3 lines:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("24 transition_path_agreement finding(s)"),
+            "the note does not say how many cases it stands for:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("1 delta_permutation_invariance finding(s)"),
+            "a second property's findings were folded into the first's note:\n{rendered}"
+        );
+        // The FIRST example, so a re-run producing the same findings prints the same
+        // line rather than whichever case happened to land last.
+        assert!(
+            rendered.contains("example: 900 bytes over"),
+            "the over-size note lost its representative rejection:\n{rendered}"
+        );
+    }
+
+    /// The counterpart: a run with no unwritable findings must print NEITHER line.
+    ///
+    /// Without this, the pin above is satisfied by emitting both explanations
+    /// unconditionally, which would tell every clean run that findings it does not
+    /// have could not be written.
+    #[test]
+    fn the_no_evidence_explanations_are_conditional() {
+        let report = Report {
+            corpus_states: 1,
+            corpus_deltas: 1,
+            corpus_summaries: 0,
+            cases_run: 1,
+            holds: 1,
+            violations: 0,
+            enforceable_violations: 0,
+            diagnostic_violations: 0,
+            inconclusive: 0,
+            findings: Vec::new(),
+            inconclusive_reasons: Vec::new(),
+            evidence: Some(EvidenceSummary {
+                directory: "/tmp/evidence".to_string(),
+                files_written: 0,
+                findings_local_only: 0,
+                findings_too_large: 0,
+                input_bytes_before_shrinking: 0,
+                input_bytes_after_shrinking: 0,
+            }),
+        };
+
+        let rendered = render_human(&report);
+
+        assert!(
+            !rendered.contains("the evidence bytes cannot carry")
+                && !rendered.contains("stayed over the evidence size limit"),
+            "a run with zero unwritable findings explained away findings it does \
+             not have:\n{rendered}"
+        );
+    }
 
     /// Evidence is resolved by deriving each candidate's instance id, not by name.
     ///

@@ -363,12 +363,40 @@ impl ContractSampler {
             .filter_map(|h| self.blobs.get(h))
             .map(|b| Arc::from(b.as_slice()))
             .collect();
-        let deltas: Vec<Bytes> = self
-            .transitions
-            .iter()
-            .filter_map(|t| t.delta.as_ref())
-            .map(|d| Arc::from(d.as_slice()))
-            .collect();
+        // Each delta travels WITH the state it was applied to.
+        //
+        // `delta_bases` is the only thing that pairs deltas for
+        // `DeltaPermutationInvariance`, which pairs only deltas observed against the
+        // SAME base — deltas with no recorded base are not paired at all, on purpose,
+        // because permuting causally sequenced deltas asks about a situation the
+        // protocol never produces.
+        //
+        // Be precise about what filling this in fixes, because the obvious story is
+        // wrong. Leaving the bases behind did NOT disable the property on a live
+        // node: shadow mode never reads this function. It calls `to_bundle` and then
+        // `ReplayBundle::to_corpus`, which recovers each base from
+        // `transition.base_state`. Before this change `to_bundle` did not read
+        // `delta_bases` either, so the value was consumed by nothing at all and could
+        // not disable anything. What actually cost a live node its pairs was the
+        // duplicate-delta defect in `to_bundle` combined with first-seen-wins dedup.
+        //
+        // It is load-bearing NOW, which is why it stays: `to_bundle`'s filter below
+        // reads `delta_base(i)` to decide which deltas still need to travel loose, so
+        // an unpopulated `delta_bases` would serialize every delta twice.
+        let mut deltas: Vec<Bytes> = Vec::new();
+        let mut delta_bases: Vec<Option<Bytes>> = Vec::new();
+        for record in &self.transitions {
+            let Some(delta) = record.delta.as_ref() else {
+                continue;
+            };
+            deltas.push(Arc::from(delta.as_slice()));
+            // The same resolver the steps below use, so a delta and the step it came
+            // from cannot disagree about what the base was.
+            delta_bases.push(
+                self.materialize(record)
+                    .map(|m| Arc::from(m.base_state.as_slice())),
+            );
+        }
         let summaries: Vec<Bytes> = self
             .transitions
             .iter()
@@ -376,10 +404,35 @@ impl ContractSampler {
             .map(|s| Arc::from(s.as_slice()))
             .collect();
 
+        // Carry the ORDERED base -> result steps, not just the states either end.
+        //
+        // Same correction as the `delta_bases` comment above, and for the same
+        // reason: shadow mode does not run cases off this `Corpus`, it exports a
+        // bundle and reads the steps back out of `ReplayBundle::to_corpus`. So this
+        // is not what keeps `TransitionPathAgreement` alive on a live node.
+        //
+        // It is here so the in-memory corpus and the exported bundle mean the same
+        // thing by "a transition" — `materialize` is the same resolver `to_bundle`
+        // uses — and so any in-memory consumer added later inherits the provenance
+        // instead of silently checking that property against nothing.
+        let transitions: Vec<(Bytes, Bytes)> = self
+            .transitions
+            .iter()
+            .filter_map(|record| {
+                let materialized = self.materialize(record)?;
+                Some((
+                    Arc::from(materialized.base_state.as_slice()),
+                    Arc::from(materialized.result_state.as_slice()),
+                ))
+            })
+            .collect();
+
         Corpus {
             states,
             deltas,
+            delta_bases,
             summaries,
+            transitions,
             ..Default::default()
         }
         .deduplicated()
@@ -411,7 +464,25 @@ impl ContractSampler {
             parameters,
             instance: None,
             states: corpus.states.iter().map(|s| s.to_vec()).collect(),
-            deltas: corpus.deltas.iter().map(|d| d.to_vec()).collect(),
+            // Only deltas that have no step to travel on. Every other delta rides on
+            // its `Transition`, which is the ONLY place a bundle can record what a
+            // delta was applied to — `ReplayBundle::to_corpus` gives bundle-level
+            // deltas no base at all, by design.
+            //
+            // This is a SIZE fix, not the correctness one: emitting a delta in both
+            // places serializes it twice into a bundle that is meant to stay small
+            // enough to pass around. Provenance survives either way, because
+            // `Corpus::deduplicated` upgrades a kept entry from no-base to a base
+            // rather than discarding it — which is where the guard belongs, since a
+            // bundle can arrive from anywhere and this export is only one source.
+            // Do not read the filter as the thing keeping `delta_bases` populated.
+            deltas: corpus
+                .deltas
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| corpus.delta_base(*i).is_none())
+                .map(|(_, d)| d.to_vec())
+                .collect(),
             summaries: corpus.summaries.iter().map(|s| s.to_vec()).collect(),
             transitions: self
                 .transitions

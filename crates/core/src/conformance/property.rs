@@ -45,6 +45,41 @@ pub enum ConformanceProperty {
     /// it must be answered by running `fdev verify-merge` against deployed WASM
     /// before this property is ever allowed to influence anything on the network.
     /// Until then it is a reporting signal for contract authors.
+    ///
+    /// # Why this one stays [`PremiseSource::EvidenceBytes`], and what makes that safe
+    ///
+    /// It shares the unvalidated-delta-bytes weakness of
+    /// [`ConformanceProperty::DeltaPermutationInvariance`] — `verify_case` runs
+    /// whatever delta bytes it is handed straight into the contract, and there is no
+    /// `require_valid` analogue for a delta the way there is for a state — but not
+    /// that property's provenance dependency. The generator puts no restriction at
+    /// all on which delta it pairs with which state, so the law as checked is
+    /// universally quantified over (valid state, accepted delta) and re-executing the
+    /// case re-establishes the whole premise. There is no "how it was observed" fact
+    /// left over.
+    ///
+    /// **That unrestricted pairing is what the classification rests on, and nothing
+    /// pins it.** The plausible edit that breaks it is a refinement aimed at cutting
+    /// inconclusives — "only pair a delta with the state it was observed against",
+    /// which would raise the acceptance rate by dropping pairs the contract rejects.
+    /// Making the generator branch read `Corpus::delta_bases` turns this into a
+    /// provenance-dependent property, exactly like
+    /// [`ConformanceProperty::DeltaPermutationInvariance`], and it must move to
+    /// [`PremiseSource::LocalProvenance`] in the same change — see the structural
+    /// rule on [`ConformanceProperty::premise_source`]. Neither existing guard would
+    /// notice: the partition pin asserts the classification the code states rather
+    /// than deriving it from the generator, and
+    /// `no_shippable_removal_eligible_property_consumes_unvalidated_bytes` only
+    /// fires on a SEVERITY change, which such a refinement does not make.
+    ///
+    /// What keeps the unvalidated bytes harmless is the [`Severity::Diagnostic`]
+    /// tier, which `policy::decide` never maps to a removal: a fabricated delta buys
+    /// an attacker a report and nothing else. That coupling is NOT incidental. This
+    /// is the only property that both travels as evidence and consumes delta bytes,
+    /// so promoting it to [`Severity::Violation`] — which the contested empirical
+    /// question above may one day justify — must revisit this classification in the
+    /// same change. `no_shippable_removal_eligible_property_consumes_unvalidated_bytes`
+    /// is the test that forces it to.
     DeltaIdempotence,
     /// Deltas applied in any order reach the same canonical state.
     ///
@@ -71,6 +106,33 @@ pub enum ConformanceProperty {
     /// [`ConformanceProperty::DeltaIdempotence`], which is contested and reports at
     /// a lower severity. Folding it in would accuse a counter-style contract under
     /// this property's name and severity regardless of that.
+    ///
+    /// # Local provenance only: this property is NOT self-verifying
+    ///
+    /// Everything the same-base paragraph above rests on is a fact about how the two
+    /// deltas were OBSERVED, and nothing carries it into the evidence bytes.
+    /// [`ConformanceEvidence`] holds bare `states` and `deltas` with no base
+    /// association, and `verify_case` applies whatever bytes it is handed in both
+    /// orders and compares. Delta bytes are in fact LESS constrained than states,
+    /// which at least go through `require_valid`.
+    ///
+    /// So a recipient that re-executes the case reproduces the comparison but not the
+    /// premise, and the gap is not academic. Take an add-wins OR-set whose delta
+    /// encodes tag adds and removes and which does not tombstone a tag it has never
+    /// seen — sound in production, because a delta is always
+    /// `get_state_delta(sender, recipient_summary)`. Hand it the causally-sequenced
+    /// pair `D1 = add A^t`, `D2 = remove t`: the two orders diverge, and every
+    /// recipient independently confirms a removal-eligible violation against a
+    /// correct contract. That contract's own same-base pairs are concurrent and
+    /// permute fine, so nothing observed locally ever fires.
+    ///
+    /// Marking it [`PremiseSource::LocalProvenance`] costs nothing today — no gossip
+    /// receive path exists — and keeps its full value where provenance is observed
+    /// directly, in shadow mode and `fdev`. The alternative, dropping the same-base
+    /// restriction so the law becomes genuinely universal, would not close the gap;
+    /// it would break the property, for the reason the paragraph above gives.
+    ///
+    /// [`ConformanceEvidence`]: super::evidence::ConformanceEvidence
     DeltaPermutationInvariance,
     /// A delta against an exact summary of the same state should be empty (#5072).
     SelfDeltaEmpty,
@@ -109,6 +171,280 @@ pub enum ConformanceProperty {
     /// - Any shadow finding from this property that turns out to converge in
     ///   production is a model bug, and should drop the severity immediately.
     ReconciliationCycle,
+    /// The delta path and the merge path must reach the same state.
+    ///
+    /// A contract has two write paths into the same logical state: `update_state`
+    /// handed a `Delta`, and `update_state` handed another peer's whole `State`.
+    /// Which one a peer takes is decided by the *protocol* — `gate_delta_size`
+    /// refuses an oversized delta and sends the whole state instead — not by the
+    /// application. So two peers given the same information by different routes must
+    /// end up with the same bytes, or they can never agree.
+    ///
+    /// Every other property here compares merge-to-merge or delta-to-delta.
+    /// `StateCommutativity`, `StateAssociativity`, `DeltaPermutationInvariance` and
+    /// `DeltaIdempotence` are all satisfiable by a contract whose two paths use
+    /// *different combinators*, because none of them ever puts one path beside the
+    /// other. The defect that motivated this (#5394) did exactly that: `insert`
+    /// (last write wins) when handed a delta, `entry().or_insert()` (first write
+    /// wins) when handed a state, on a map keyed by a client-chosen sequence number.
+    /// A retraction applied as a delta is silently resurrected when a replica
+    /// re-merges the same op as a state.
+    ///
+    /// # What is checked
+    ///
+    /// For a pair of observed states, in both orders:
+    ///
+    /// ```text
+    /// delta  = get_state_delta(other, summarize(base))   // what the sender ships
+    /// apply(base, delta)  ==  update_state(base, State(other))
+    /// ```
+    ///
+    /// # Why this is `Severity::Violation` and not a false-positive generator
+    ///
+    /// A plain inequality here would accuse a large and legitimate class of
+    /// contract: one whose summary is too coarse to express a particular divergence,
+    /// so its delta carries only *part* of what the other state holds. Such a
+    /// contract lands short of the merged state on this round and converges on the
+    /// next one, and this module already refuses to accuse it under
+    /// `ReconciliationCycle` for the same reason.
+    ///
+    /// So a disagreement is only reported when re-merging the whole state fails to
+    /// repair it:
+    ///
+    /// ```text
+    /// merge(apply(base, delta), other)  !=  merge(base, other)
+    /// ```
+    ///
+    /// For any contract whose merge is a genuine join, that condition is
+    /// unreachable: a delta derived from `other` can only move `base` somewhere
+    /// between `base` and `base ⊔ other`, and joining `other` back on top lands on
+    /// `base ⊔ other` either way. A partial delta therefore heals and is never
+    /// reported; a delta path that computed something the merge path cannot reach
+    /// does not heal and is. That is the same practical consequence as a
+    /// non-commutative merge — two peers with the same information, permanently
+    /// disagreeing — which is why the severity matches `StateCommutativity`.
+    ///
+    /// The guard errs toward silence in every direction, including when the merge
+    /// itself is unsound: a last-write-wins merge heals trivially, so this property
+    /// declines to pile a second accusation onto a defect `StateCommutativity`
+    /// already names. One law per property.
+    ///
+    /// # What this does NOT establish, and what would settle it
+    ///
+    /// Like `ReconciliationCycle`, and unlike the pure algebra above it, this rests
+    /// on a model of the protocol: that the sender computes its delta against the
+    /// recipient's summary, and that production would actually take the delta path.
+    /// The second is checked directly (`delta_would_be_refused`, production's own
+    /// gate); the first is the same assumption `reconciliation_cycle` makes. Unlike
+    /// `ReconciliationCycle` this is a single step with no schedule to get wrong,
+    /// which is the narrower assumption of the two.
+    ///
+    /// Shadow-mode counts are what should settle whether the severity is right:
+    /// contracts flagged by THIS property and by no other removal-eligible one. If
+    /// that number stays at zero the property earns nothing at this severity; if it
+    /// is the sole finding for real contracts, it is carrying signal the algebraic
+    /// checks miss.
+    ///
+    /// # Two measured limits, both of them misses rather than false accusations
+    ///
+    /// **The guard is direction-sensitive.** Re-merging repairs the difference for
+    /// one ordering of a pair and not the other — for the fixture in
+    /// `tests/test-contract-conformance` (mode 8) it silences exactly one of
+    /// `(A, B)` and `(B, A)`. Both directions are therefore checked for every pair.
+    /// A corpus holding only one state of such a pair still misses the defect.
+    ///
+    /// **A contract whose delta IS its state is invisible to this check.** The delta
+    /// is synthesized from the contract's own `get_state_delta`, so only a
+    /// disagreement that the contract's own delta encoding can express can be seen.
+    /// Measured against the #5394 artifacts on 2026-08-23: that contract's
+    /// `get_state_delta` returns the whole sender state for every non-trivial pair
+    /// in the corpus, and its `update_state` then treats a whole-state `Delta`
+    /// exactly as it treats a `State`, so both paths agree on every pair and this
+    /// property stays silent on the very defect it was written from. The
+    /// disagreement there lives on an APPLICATION-level delta — a client `UPDATE`
+    /// carrying one op — which `get_state_delta` never produces and which a
+    /// states-only corpus does not carry.
+    ///
+    /// Closing that needs a second, transition-shaped form of the same law, over the
+    /// captured deltas in `ReplayBundle::transitions`: for an observed
+    /// `base + delta -> result`, `merge(base, result)` must equal `result`. It is
+    /// deliberately NOT folded in here — it has a different arity and a different
+    /// false-positive profile (a capped collection trips it), and one law per
+    /// property is the rule this module follows everywhere else.
+    PathAgreement,
+    /// A state a peer actually REACHED must be reachable by the merge path too.
+    ///
+    /// The transition-shaped half of [`ConformanceProperty::PathAgreement`], and the
+    /// half that reaches the defect #5394 was written from. Where the corpus records
+    /// a transition `base -> result` — a peer that held `base`, applied an update,
+    /// and ended up at `result` — merging `result` back into `base` must reproduce
+    /// `result`:
+    ///
+    /// ```text
+    /// update_state(base, State(result))  ==  result
+    /// ```
+    ///
+    /// # Why this needs provenance, and why the pairwise form cannot substitute
+    ///
+    /// `PathAgreement` synthesizes its delta from the contract's own
+    /// `get_state_delta`, so it can only see a disagreement that the contract's own
+    /// delta ENCODING can express. Measured against the #5394 artifacts on
+    /// 2026-08-23, that contract returns the whole sender state for every
+    /// non-trivial pair in the corpus and then treats a whole-state `Delta` exactly
+    /// as a `State` — so both paths agree on every pair and the pairwise form is
+    /// silent on it. The disagreement lives on an APPLICATION-level delta, a client
+    /// `UPDATE` carrying one op, which `get_state_delta` never produces.
+    ///
+    /// A transition carries that op's effect as the `result` state, so no delta
+    /// encoding is needed to see it. What cannot be substituted is the ORDERING:
+    /// `merge(A, B) == B` is last-write-wins for an arbitrary pair and would accuse
+    /// every conforming contract. It is a law only because the corpus witnesses that
+    /// `result` came FROM `base`, which is what makes `base` the earlier state.
+    ///
+    /// # What a real capture must carry
+    ///
+    /// `ReplayBundle::transitions` (`base_state` + `result_state`), which the node's
+    /// capture path records for every merge — `Observation` owns both. Loose
+    /// `--state` files carry no provenance and produce no cases for this property at
+    /// all, which is not a clean run but an absence of evidence; `fdev --transition
+    /// BASE RESULT` is how a developer supplies it by hand.
+    ///
+    /// # Why this is `Severity::Violation`
+    ///
+    /// The argument is algebraic, and the measurement below only corroborates it.
+    ///
+    /// Suppose the contract satisfies [`ConformanceProperty::StateCommutativity`],
+    /// [`ConformanceProperty::StateAssociativity`] and
+    /// [`ConformanceProperty::StateIdempotence`] — the three laws that are already
+    /// removal-eligible on their own. Then `merge` is a semilattice join, and it
+    /// induces a partial order on states:
+    ///
+    /// ```text
+    /// x <= y   iff   merge(x, y) == y
+    /// ```
+    ///
+    /// Under that order `merge(base, result)` *is* `base ⊔ result`, the least upper
+    /// bound. So this property's comparison
+    ///
+    /// ```text
+    /// merge(base, result) == result      i.e.      base ⊔ result == result
+    /// ```
+    ///
+    /// holds **iff** `base <= result` in the merge's own order. A firing therefore
+    /// says precisely: the update path moved the peer to a state that is not above
+    /// the state it started from, in the order its own merge defines. That is
+    /// non-convergence by construction — the peer at `result` gossips it, every peer
+    /// that merges it lands on the strictly larger `base ⊔ result`, and the two never
+    /// agree — and it needs no carve-out for bounded collections or any other
+    /// contract shape.
+    ///
+    /// If the contract does NOT satisfy those three laws, it is already
+    /// removal-eligible under whichever of them it breaks, so a firing here costs it
+    /// nothing it had not already lost. Either way there is no contract that this
+    /// property alone condemns while the settled algebra would have acquitted it.
+    ///
+    /// Two guards keep it from firing on a contract that is merely doing bookkeeping
+    /// rather than losing information:
+    ///
+    /// 1. `result` is first driven to a fixpoint of its own merge, and the case is
+    ///    declined if it never settles. A canonicalizing contract legitimately
+    ///    rewrites a stored state on first merge (the PUT install path stores the
+    ///    client's raw bytes without running `update_state` at all), and a contract
+    ///    that never settles is [`ConformanceProperty::StateIdempotence`]'s defect,
+    ///    not this one.
+    /// 2. The comparison is against that settled form, so canonicalization alone can
+    ///    never produce a finding.
+    ///
+    /// ## Corroboration: the bounded-collection shapes, measured
+    ///
+    /// A bounded collection is the shape most likely to look like a false positive,
+    /// and each variant was run rather than argued.
+    ///
+    /// - A cap that evicts by the merge's OWN ordering (keep the largest N) is a
+    ///   genuine bounded semilattice and passes: the entries `base` would re-add are
+    ///   exactly the ones the cap drops again.
+    /// - A cap that evicts by something independent of that ordering — arrival
+    ///   order, a hash, `CAPPED_SET` in the fixture contract — does fire, and that
+    ///   contract is already removal-eligible under
+    ///   [`ConformanceProperty::StateAssociativity`] for the same underlying reason.
+    /// - The **partially-ordered** cap is the case the first version of this
+    ///   property could not rule out: keep the at-most-N *maximal* elements under a
+    ///   causal partial order, breaking ties among mutually incomparable survivors
+    ///   by a total order. It looks like a legitimate bounded join, and the pairwise
+    ///   laws do not immediately dispose of it. Brute-forced over its full state
+    ///   space on 2026-08-23 (universe of five elements, `1` causally after `5`,
+    ///   N = 2, ties by keeping the largest: 15 valid states) it is commutative and
+    ///   idempotent with zero failures — and **not associative**, 532 failing
+    ///   triples, the smallest being
+    ///   `(({1} ⊔ {2}) ⊔ {3,5}) = {2,3}` against `({1} ⊔ ({2} ⊔ {3,5})) = {1,3}`.
+    ///   So it is already removal-eligible under `StateAssociativity` before this
+    ///   property is consulted, which closes the gap: the transition law condemns no
+    ///   contract the settled algebra acquits. It does also fire here — base
+    ///   `{2,5}`, an op reaching `{2,3}`, `merge(base, result) = {3,5}` — which is
+    ///   the consistency the algebra above predicts, not a second accusation.
+    ///
+    /// All of these are pinned by tests.
+    ///
+    /// # Local provenance only: this property is NOT self-verifying
+    ///
+    /// This is one of the two properties here whose premise is not re-establishable
+    /// from the evidence bytes; [`ConformanceProperty::DeltaPermutationInvariance`]
+    /// is the other, for the same reason applied to delta bases rather than to the
+    /// ordering of a pair of states. See [`PremiseSource`], which is what enforces
+    /// it.
+    ///
+    /// Every other law is a universally quantified identity over valid states, so a
+    /// receiving peer that re-executes the case against its own copy of the contract
+    /// re-establishes the whole premise: if `merge(A, B) != merge(B, A)` for states
+    /// the contract itself validates, that is true no matter where `A` and `B` came
+    /// from. This one is a law only because the corpus WITNESSES that `result` was
+    /// reached from `base`. That witness is not in the bytes and cannot be put
+    /// there: no signature or attestation would help, because the sending peer is
+    /// exactly the party not being trusted.
+    ///
+    /// So a fabricated pair from a perfectly conforming grow-only contract — any two
+    /// valid states with `base ⊄ result` — is structurally indistinguishable from a
+    /// genuine information-losing update, and every receiving peer would
+    /// independently confirm a removal-eligible violation against a correct
+    /// contract. `check_bounds` therefore REFUSES evidence carrying this property
+    /// outright rather than merely deprioritising it.
+    ///
+    /// The property keeps its full value where it runs today — shadow mode and
+    /// `fdev`, both of which observe provenance directly. Evidence gossip (#5377,
+    /// unbuilt) may revisit it if a verifiable form of provenance ever exists.
+    TransitionPathAgreement,
+}
+
+/// Whether a property's premise can be re-established from the evidence bytes alone.
+///
+/// This is the attribute the whole evidence model rests on, stated once so a new
+/// property cannot inherit the hazard by omission. `evidence.rs` explains the rule:
+/// a receiving peer does not trust the sender, it re-executes the case against its
+/// own copy of the contract and reaches its own conclusion. That is only safe when
+/// re-execution re-establishes the *entire* premise of the law.
+///
+/// For a universally quantified identity over valid states it does. `merge(A, B) ==
+/// merge(B, A)` is required of every conforming contract for every pair of states it
+/// validates, so where `A` and `B` came from is irrelevant: a peer that re-runs the
+/// case has checked everything the law asserts. A fabricated pair can only make the
+/// recipient discover a real defect sooner.
+///
+/// A property whose premise includes a fact about how the inputs were OBSERVED is a
+/// different thing entirely, and shipping it would be unsafe in a way no amount of
+/// re-execution repairs: the witness is not in the bytes, so the recipient confirms
+/// an accusation it cannot check. [`ConformanceEvidence::check_bounds`] refuses such
+/// evidence outright rather than ranking it lower.
+///
+/// [`ConformanceEvidence::check_bounds`]: super::evidence::ConformanceEvidence::check_bounds
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PremiseSource {
+    /// Everything the law asserts is re-checkable from the evidence's own bytes.
+    /// Safe to ship: this is what the RFC's propagate-evidence-not-verdicts design
+    /// assumes of every property it carries.
+    EvidenceBytes,
+    /// The law additionally rests on provenance the observing peer had and the
+    /// bytes cannot carry. Usable locally, never shippable as evidence.
+    LocalProvenance,
 }
 
 /// How seriously a failed property should be taken.
@@ -142,6 +478,8 @@ impl ConformanceProperty {
         ConformanceProperty::SelfDeltaEmpty,
         ConformanceProperty::WholeStateSelfDelta,
         ConformanceProperty::ReconciliationCycle,
+        ConformanceProperty::PathAgreement,
+        ConformanceProperty::TransitionPathAgreement,
     ];
 
     pub fn severity(self) -> Severity {
@@ -157,6 +495,16 @@ impl ConformanceProperty {
             // rather than a rule — and it is exactly the kind of gap that closes
             // itself the day someone enables enforcement for the settled properties
             // and this one rides along unnoticed.
+            //
+            // This tier is also load-bearing for the evidence gate, and NOT
+            // independently adjustable. After `DeltaPermutationInvariance` moved to
+            // `LocalProvenance`, this is the only property that both ships as
+            // evidence and consumes delta bytes — which `verify_case` never
+            // validates, there being no `require_valid` for a delta. Promoting it to
+            // `Violation` without revisiting `premise_source` in the same change
+            // would make attacker-chosen delta bytes removal-eligible. The test
+            // `no_shippable_removal_eligible_property_consumes_unvalidated_bytes`
+            // fails if that happens.
             ConformanceProperty::DeltaIdempotence => Severity::Diagnostic,
             ConformanceProperty::StateIdempotence
             | ConformanceProperty::StateCommutativity
@@ -166,8 +514,85 @@ impl ConformanceProperty {
             | ConformanceProperty::SummaryDeterminism
             | ConformanceProperty::DeltaDeterminism
             | ConformanceProperty::DeltaPermutationInvariance
-            | ConformanceProperty::ReconciliationCycle => Severity::Violation,
+            | ConformanceProperty::ReconciliationCycle
+            | ConformanceProperty::PathAgreement
+            | ConformanceProperty::TransitionPathAgreement => Severity::Violation,
         }
+    }
+
+    /// Where this property's premise comes from - see [`PremiseSource`].
+    ///
+    /// Deliberately an exhaustive match with no wildcard arm: adding a property
+    /// without answering this question must not compile. The partition is also
+    /// pinned by a test, so lumping a new provenance-dependent property in with the
+    /// self-verifying ones fails CI rather than silently widening the untrusted
+    /// path.
+    ///
+    /// # How to answer it for a new property
+    ///
+    /// The question is structural, not a judgement call. [`Corpus`] has exactly two
+    /// provenance fields — `delta_bases` and `transitions` — and provenance is the
+    /// only thing evidence bytes cannot carry. So:
+    ///
+    /// > **A property whose generator branch reads `Corpus::delta_bases` or
+    /// > `Corpus::transitions` MUST be [`PremiseSource::LocalProvenance`].**
+    ///
+    /// Everything else builds its cases from `states`, `deltas` and `summaries`,
+    /// which travel in the evidence file intact, so re-executing the case
+    /// re-establishes the whole premise.
+    ///
+    /// Follow the rule rather than the list. The arms below record which properties
+    /// happen to read those fields TODAY; a pin records a wrong answer exactly as
+    /// firmly as a right one, and it is the rule, not the list, that produces the
+    /// answer for the property that does not exist yet. The direction to watch is a
+    /// refinement that makes an existing `EvidenceBytes` property START reading one
+    /// of the two fields — see [`ConformanceProperty::DeltaIdempotence`], whose
+    /// classification depends on its generator branch NOT consulting `delta_bases`.
+    ///
+    /// [`Corpus`]: crate::conformance::generator::Corpus
+    pub fn premise_source(self) -> PremiseSource {
+        match self {
+            // Each of these is an identity required of every conforming contract
+            // over every pair (or triple, or state-and-delta) of inputs it
+            // validates. Re-executing the case re-establishes all of it.
+            ConformanceProperty::StateIdempotence
+            | ConformanceProperty::StateCommutativity
+            | ConformanceProperty::StateAssociativity
+            | ConformanceProperty::EmittedStateValidity
+            | ConformanceProperty::UpdateDeterminism
+            | ConformanceProperty::SummaryDeterminism
+            | ConformanceProperty::DeltaDeterminism
+            | ConformanceProperty::DeltaIdempotence
+            | ConformanceProperty::SelfDeltaEmpty
+            | ConformanceProperty::WholeStateSelfDelta
+            | ConformanceProperty::ReconciliationCycle
+            | ConformanceProperty::PathAgreement => PremiseSource::EvidenceBytes,
+            // The exceptions, and the reason this method exists. Both are laws only
+            // because of something the OBSERVER knew and the bytes cannot carry, so
+            // both hand a recipient an accusation it can confirm but cannot check.
+            //
+            // `TransitionPathAgreement`: `merge(base, result) == result` is
+            // last-write-wins for an arbitrary pair, and a law only because the
+            // corpus witnessed that `result` was reached FROM `base`. A fabricated
+            // pair from a conforming grow-only contract would have every recipient
+            // independently confirm a removal-eligible violation against a correct
+            // contract.
+            //
+            // `DeltaPermutationInvariance`: the generator pairs only deltas observed
+            // against the SAME base, because deltas observed against different bases
+            // can be causally sequenced and permuting those asks about a situation
+            // the protocol never produces. That restriction is the whole reason a
+            // finding means anything, and evidence records no base for a delta — so
+            // a causally-sequenced pair fabricated against a conforming contract is
+            // structurally indistinguishable from a genuine concurrent one.
+            ConformanceProperty::TransitionPathAgreement
+            | ConformanceProperty::DeltaPermutationInvariance => PremiseSource::LocalProvenance,
+        }
+    }
+
+    /// Shorthand for [`Self::premise_source`] being [`PremiseSource::EvidenceBytes`].
+    pub fn is_self_verifying(self) -> bool {
+        matches!(self.premise_source(), PremiseSource::EvidenceBytes)
     }
 
     /// How many distinct input states a case for this property must carry.
@@ -183,7 +608,9 @@ impl ConformanceProperty {
             ConformanceProperty::StateCommutativity
             | ConformanceProperty::EmittedStateValidity
             | ConformanceProperty::UpdateDeterminism
-            | ConformanceProperty::ReconciliationCycle => 2,
+            | ConformanceProperty::ReconciliationCycle
+            | ConformanceProperty::PathAgreement
+            | ConformanceProperty::TransitionPathAgreement => 2,
             ConformanceProperty::StateAssociativity => 3,
         }
     }
@@ -202,7 +629,9 @@ impl ConformanceProperty {
             | ConformanceProperty::DeltaDeterminism
             | ConformanceProperty::SelfDeltaEmpty
             | ConformanceProperty::WholeStateSelfDelta
-            | ConformanceProperty::ReconciliationCycle => 0,
+            | ConformanceProperty::ReconciliationCycle
+            | ConformanceProperty::PathAgreement
+            | ConformanceProperty::TransitionPathAgreement => 0,
         }
     }
 
@@ -220,6 +649,8 @@ impl ConformanceProperty {
             ConformanceProperty::SelfDeltaEmpty => "self_delta_empty",
             ConformanceProperty::WholeStateSelfDelta => "whole_state_self_delta",
             ConformanceProperty::ReconciliationCycle => "reconciliation_cycle",
+            ConformanceProperty::PathAgreement => "path_agreement",
+            ConformanceProperty::TransitionPathAgreement => "transition_path_agreement",
         }
     }
 }
@@ -310,6 +741,23 @@ pub enum Inconclusive {
     RoundLimit,
     /// The case was malformed for the property (wrong arity, missing delta).
     MalformedCase(String),
+    /// There is no delta path for these inputs, so there is nothing to compare the
+    /// merge path against.
+    ///
+    /// Either the contract produced an empty delta — the protocol's "nothing to
+    /// send", which a summary too coarse to express the divergence produces
+    /// legitimately — or the delta was large enough that production's own size gate
+    /// would refuse it and send the whole state instead. In both cases the delta
+    /// path is not the path this update would take on the network, and checking it
+    /// would be checking a call that never happens.
+    NoDeltaPath,
+    /// An observed result state is not a fixpoint of its own merge.
+    ///
+    /// A contract whose state keeps changing every time it is re-merged cannot be
+    /// judged on whether some OTHER state absorbs into it, and the defect already
+    /// has a name: [`ConformanceProperty::StateIdempotence`]. Reporting it here
+    /// would accuse the right contract under the wrong law.
+    StateNotSettled,
     /// The check failed once and then did not fail the same way again.
     ///
     /// Something outside the inputs moved between the two runs — the host clock is
@@ -329,6 +777,12 @@ impl std::fmt::Display for Inconclusive {
             Inconclusive::ResourceLimit(e) => write!(f, "resource limit: {e}"),
             Inconclusive::RoundLimit => f.write_str("reconciliation round budget exhausted"),
             Inconclusive::MalformedCase(e) => write!(f, "malformed case: {e}"),
+            Inconclusive::NoDeltaPath => {
+                f.write_str("no delta path exists for these inputs to compare against")
+            }
+            Inconclusive::StateNotSettled => {
+                f.write_str("an observed result state is not a fixpoint of its own merge")
+            }
             Inconclusive::NotReproducible => {
                 f.write_str("the finding did not reproduce on a second run")
             }

@@ -26,10 +26,43 @@ const NONDETERMINISTIC_SUMMARY: u8 = 4;
 const CAPPED_SET: u8 = 5;
 const NEVER_SETTLES: u8 = 6;
 const REQUIRES_RELATED: u8 = 7;
+const PATH_DISAGREEMENT: u8 = 8;
 const RELATED_ID: [u8; 32] = [7; 32];
 
 fn bytes(values: &[u8]) -> Bytes {
     Arc::from(values)
+}
+
+/// Build the `(base, result)` step a peer would have recorded, by driving the
+/// contract's own delta path through the real runtime.
+///
+/// Computed rather than hard-coded so the case cannot drift into asserting against
+/// a result this contract would never actually produce.
+fn transition_case(
+    oracle: &mut RuntimeOracle,
+    base: &[u8],
+    delta: &[u8],
+) -> Result<ConformanceCase, Box<dyn std::error::Error>> {
+    use super::oracle::ConformanceOracle;
+    let result = oracle
+        .update_state(
+            base,
+            &[freenet_stdlib::prelude::UpdateData::Delta(
+                freenet_stdlib::prelude::StateDelta::from(delta.to_vec()),
+            )],
+        )?
+        .new_state
+        .ok_or("contract produced no state")?
+        .into_bytes();
+    assert_ne!(
+        base,
+        result.as_slice(),
+        "a transition that changed nothing proves nothing"
+    );
+    Ok(ConformanceCase::new(
+        ConformanceProperty::TransitionPathAgreement,
+        vec![bytes(base), bytes(&result)],
+    ))
 }
 
 #[track_caller]
@@ -180,11 +213,17 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
 
     // ------------------------------------------------- mode 5: capped collection
     //
-    // The only planted defect that the pairwise laws cannot see. Asserting the
+    // The only planted defect that the PAIRWISE state laws cannot see. Asserting the
     // associativity violation alone would not show that: a mode that also broke
     // commutativity would satisfy that assertion while proving nothing about the
     // three-state check. So assert the pairwise laws still HOLD here — that is
     // what makes this a test of associativity specifically.
+    //
+    // "Pairwise" is doing real work in that sentence: the transition law sees this
+    // mode too, from the same information loss, and that is asserted deliberately
+    // further down rather than being an exception this loop must dodge. The claim
+    // is that associativity is the law that NAMES the defect and no pairwise state
+    // law fires, not that nothing else in the module can see it.
     let mut capped = RuntimeOracle::standalone(wasm.clone(), vec![CAPPED_SET]).await?;
     let associativity_case = ConformanceCase::new(
         ConformanceProperty::StateAssociativity,
@@ -204,14 +243,55 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
             vec![bytes(&[1, 2]), bytes(&[3, 4])],
         ),
     ] {
-        let outcome = verify_case(&mut capped, &pairwise);
-        assert!(
-            !outcome.is_violation(),
-            "the capped-collection mode should break associativity ALONE, but {} \
-             also reported a violation: {outcome:?}",
-            pairwise.property
+        let property = pairwise.property;
+        assert_eq!(
+            verify_case(&mut capped, &pairwise),
+            PropertyOutcome::Holds,
+            "among the PAIRWISE state laws the capped-collection mode should break \
+             none — associativity is the one that names it — but {property} did not \
+             hold"
         );
     }
+
+    // The transition law and a bounded collection.
+    //
+    // This is the false-positive boundary the `transition_path_agreement` severity
+    // rests on, so it is measured here against real WASM rather than argued. This
+    // cap evicts by an index derived from the set's own contents — independent of
+    // the merge's ordering — and merging the reached state back into its base
+    // genuinely does not reproduce it. That is the same information loss
+    // `StateAssociativity` already reports for this mode, so the contract is
+    // removal-eligible either way; what matters is that it is a real divergence and
+    // not an artifact of capping.
+    //
+    // The cap applies to the mode's DELTA path as well as its merge path, which is
+    // what makes that true. Without it the recorded `result` would carry more than
+    // CAP entries — a state the merge path can never emit — and the assertion below
+    // would land on the right verdict for the wrong reason: it would be reporting
+    // the missing cap, not the eviction rule.
+    //
+    // The contrasting SOUND cap (keep the largest N, evicting BY the merge order) is
+    // pinned silent in `tests.rs::a_sound_bounded_collection_is_not_accused` — the
+    // two together are what show the property discriminates rather than flagging
+    // every bounded collection.
+    let capped_transition = transition_case(&mut capped, &[1, 2], &[3, 4, 5])?;
+    // The recorded result must be a state the MERGE path could also have emitted.
+    //
+    // Without the cap on the delta path this is a five-entry state against a cap of
+    // three — something `merge_state` can never produce — and the violation below
+    // would be reporting the missing cap rather than the eviction rule. The
+    // assertion would land on the right verdict for the wrong reason, which is the
+    // failure shape this whole module is built to avoid.
+    assert!(
+        capped_transition.states[1].len() <= 3,
+        "the delta path must respect the cap, or this case is about a state the \
+         merge path can never reach: {:?}",
+        capped_transition.states[1]
+    );
+    assert_violates(
+        verify_case(&mut capped, &capped_transition),
+        ConformanceProperty::TransitionPathAgreement,
+    );
 
     // ------------------------------------------------ mode 6: never settles
     //
@@ -297,6 +377,102 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
         verify_case(&mut needs_related, &with_related),
         PropertyOutcome::Holds,
         "with the related state supplied the contract must become judgeable"
+    );
+
+    // ------------------------------------------- mode 8: disagreeing write paths
+    //
+    // The #5394 shape, and the one mode whose defect NO pre-existing property can
+    // see: the delta path takes the last write on a key collision, the merge path
+    // the first. Each rule is a sound semilattice on its own, so every law that
+    // compares merge-to-merge or delta-to-delta holds.
+    //
+    // `0x51` and `0x52` are two writes to key 5 with different values — two ops
+    // carrying the same client-chosen sequence number, which is exactly the
+    // collision the real defect resolved two different ways.
+    let mut disagreeing = RuntimeOracle::standalone(wasm.clone(), vec![PATH_DISAGREEMENT]).await?;
+    let colliding: Vec<Bytes> = vec![bytes(&[0x10, 0x51]), bytes(&[0x10, 0x52])];
+    assert_violates(
+        verify_case(
+            &mut disagreeing,
+            &ConformanceCase::new(ConformanceProperty::PathAgreement, colliding.clone()),
+        ),
+        ConformanceProperty::PathAgreement,
+    );
+
+    // Every OTHER property must stay silent on the same inputs. Without this the
+    // mode would prove nothing about the gap #5394 describes, which is precisely a
+    // contract that satisfies the entire existing property set and still diverges.
+    for property in ConformanceProperty::ALL {
+        // Both halves of the path-agreement family see this defect, which is the
+        // point of the mode; they are asserted positively above and below instead.
+        if matches!(
+            property,
+            ConformanceProperty::PathAgreement | ConformanceProperty::TransitionPathAgreement
+        ) {
+            continue;
+        }
+        let states: Vec<Bytes> = match property.state_arity() {
+            3 => vec![
+                colliding[0].clone(),
+                colliding[1].clone(),
+                bytes(&[0x23, 0x51]),
+            ],
+            _ => colliding.clone(),
+        };
+        let deltas: Vec<Bytes> = match property.delta_arity() {
+            0 => Vec::new(),
+            1 => vec![bytes(&[0x52])],
+            _ => vec![bytes(&[0x52]), bytes(&[0x63])],
+        };
+        // `Holds`, not merely "not a violation": `Inconclusive` also satisfies
+        // `!is_violation()`, and the claim this loop supports is that every other
+        // law HOLDS on this mode. A case that stopped being evaluated at all would
+        // keep the loop green while the #5394 gap argument quietly lost its
+        // evidence.
+        assert_eq!(
+            verify_case(
+                &mut disagreeing,
+                &ConformanceCase::new(*property, states).with_deltas(deltas),
+            ),
+            PropertyOutcome::Holds,
+            "{property} did not HOLD on the disagreeing-paths mode, so it no longer \
+             isolates the one defect only path_agreement can see"
+        );
+    }
+
+    // The transition-shaped half of the same law, on the same mode. This is the form
+    // that reaches the #5394 artifacts, where the contract's own `get_state_delta`
+    // ships whole states and the pairwise form is therefore blind.
+    let disagreeing_transition = transition_case(&mut disagreeing, &[0x10, 0x51], &[0x52])?;
+    assert_violates(
+        verify_case(&mut disagreeing, &disagreeing_transition),
+        ConformanceProperty::TransitionPathAgreement,
+    );
+
+    // Its matched negative: the same contract, an op whose key collides with nothing.
+    let harmless_transition = transition_case(&mut disagreeing, &[0x10, 0x51], &[0x62])?;
+    assert_eq!(
+        verify_case(&mut disagreeing, &harmless_transition),
+        PropertyOutcome::Holds,
+        "a transition whose op collides with nothing must not be flagged, or the \
+         property is a blanket accusation against every contract with a delta path"
+    );
+
+    // The matched negative #5394's acceptance test asks for: the SAME contract with
+    // the SAME two write paths, on states whose keys do not collide. A property that
+    // flagged every contract with both a delta and a merge path would pass the
+    // assertion above while being worse than no property at all.
+    assert_eq!(
+        verify_case(
+            &mut disagreeing,
+            &ConformanceCase::new(
+                ConformanceProperty::PathAgreement,
+                vec![bytes(&[0x10, 0x51]), bytes(&[0x10, 0x62])],
+            ),
+        ),
+        PropertyOutcome::Holds,
+        "the two write paths only disagree on a key COLLISION; flagging a pair that \
+         has none makes this a blanket accusation rather than a finding"
     );
 
     // ---------------------------------- same code, different params, different instance

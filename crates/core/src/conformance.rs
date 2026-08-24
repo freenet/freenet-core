@@ -118,7 +118,7 @@ mod tests;
 #[cfg(test)]
 mod wasm_tests;
 
-pub use bundle::ReplayBundle;
+pub use bundle::{ReplayBundle, Transition};
 pub use capture::{CaptureHandle, Observation};
 pub use evidence::{ConformanceEvidence, EVIDENCE_SCHEMA_VERSION, EvidenceId, EvidenceRejected};
 pub use focus::FocusSelector;
@@ -127,7 +127,8 @@ pub use minimize::{MinimizeConfig, MinimizeReport, minimize};
 pub use oracle::{ConformanceOracle, OracleError, OracleErrorKind};
 pub use policy::{ConformanceAction, EnforcementMode, decide};
 pub use property::{
-    ConformanceProperty, Inconclusive, OutputDigest, PropertyOutcome, Severity, Violation,
+    ConformanceProperty, Inconclusive, OutputDigest, PremiseSource, PropertyOutcome, Severity,
+    Violation,
 };
 pub use runtime_oracle::{OracleBuildError, RuntimeOracle};
 pub use sampler::{Admission, ContractSampler, SamplerConfig, Stratum};
