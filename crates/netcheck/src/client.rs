@@ -707,7 +707,8 @@ mod tests {
         assert_eq!(
             contract_ids_in_text(&format!("failed for {encoded}x after retries")),
             Vec::new(),
-            "a token that is one character longer than the id is not the id"
+            "a 44-character token that does not round-trip is not an id (this case is caught \
+             by the round-trip check, NOT by the length bound: it is inside 32..=44)"
         );
         assert_eq!(
             contract_ids_in_text("failed for 11111111111111111111111111111112 after"),
@@ -722,6 +723,26 @@ mod tests {
             contract_ids_in_text("1111111111111111111111111111111"),
             Vec::new(),
             "31 characters cannot encode a 32-byte id"
+        );
+
+        // The upper end of CONTRACT_ID_B58_LEN, which nothing else reaches:
+        // every other id in this module is [n; 32] for a small n and encodes
+        // to 43 characters, so narrowing the range to `32..=43` would leave
+        // the whole suite green while silently dropping every id at or above
+        // 58^43 (~6% of the id space) out of attribution. Those errors would
+        // then be charged to whichever op happened to be waiting, which is
+        // precisely the defect this filter exists to fix.
+        let widest = id_of(255);
+        let encoded = widest.to_string();
+        assert_eq!(
+            encoded.len(),
+            44,
+            "the all-ones id must exercise the upper bound"
+        );
+        assert_eq!(
+            contract_ids_in_text(&format!("assembly failed for {encoded} after retries")),
+            vec![widest],
+            "the longest id a contract key can have must still be found"
         );
     }
 

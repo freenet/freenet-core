@@ -76,9 +76,16 @@ pub struct OpReport {
     pub latency_ms: u128,
     pub size: usize,
     /// How many incoming errors this operation attributed to another contract
-    /// and skipped. Always emitted, including as zero: "no stale error arrived
-    /// during this op" is a measurement, and a missing field would be
-    /// indistinguishable from a run that never counted.
+    /// and skipped. Always emitted, including as zero, because a missing field
+    /// would be indistinguishable from a run that never counted.
+    ///
+    /// Precisely: errors the key filter skipped inside this op's own wait
+    /// window. Errors that arrive in the gap BETWEEN ops are discarded by
+    /// `client::drain_stray_responses` before the window opens; those are
+    /// logged to stderr and are deliberately not counted here, because they
+    /// are a different event (an unfiltered pre-op drain, not a filtering
+    /// decision this op made). So a zero means "the filter did not fire
+    /// during this op", not "no stale error existed anywhere near it".
     #[serde(default)]
     pub errors_ignored: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]

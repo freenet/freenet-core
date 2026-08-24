@@ -383,4 +383,42 @@ mod tests {
         assert_eq!(dimension_secs("hop-1"), None);
         assert_eq!(dimension_secs(""), None);
     }
+
+    /// The OTLP half of the report is hand-mirrored from `OpReport` into
+    /// `CheckOp`, field by field, inside `run`. Nothing type-checks that the
+    /// mirror is faithful: replacing `seq: op.seq` with `seq: 0` compiles,
+    /// clippy-passes, and leaves every other test in this crate green, because
+    /// the only round-trip test covers the jsonl artifact and not the
+    /// published record.
+    ///
+    /// That is the "manually-mirrored telemetry field" shape in
+    /// `.claude/rules/bug-prevention-patterns.md`, whose prescribed remedy is a
+    /// source-scrape pin in the emitting module. `seq` in particular has no
+    /// second source: every record of a run is published with the same
+    /// timestamp, so a zeroed `seq` loses the run's order with no error
+    /// anywhere.
+    #[test]
+    fn the_published_record_mirrors_the_reports_seq_and_errors_ignored() {
+        let src = include_str!("emit.rs");
+        let tests_at = src
+            .find("\n#[cfg(test)]\nmod ")
+            .map(|i| i + 1)
+            .expect("test module not located — this guard cannot verify anything");
+        let at = src
+            .find("pub async fn run(args: EmitArgs) -> Result<bool> {")
+            .expect("emit::run not found");
+        assert!(
+            at < tests_at,
+            "anchor matched inside the test module — this pin would scrape its own source"
+        );
+        let body = &src[at..tests_at];
+        for mirror in ["seq: op.seq,", "errors_ignored: op.errors_ignored,"] {
+            assert!(
+                body.contains(mirror),
+                "`{mirror}` is gone from the CheckOp built in `run`. The published record no \
+                 longer carries what the report recorded, and no other test in this crate can \
+                 tell: substituting a literal for either field is invisible to all of them."
+            );
+        }
+    }
 }

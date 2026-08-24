@@ -20,7 +20,11 @@ Each `put-get` run:
    contract is" and "how late in the run the GET was issued" were the same
    variable, so an age effect could not be told apart from a
    within-run session effect. The order is shuffled from a seed derived
-   from the run id, and that seed is logged, so a run stays reproducible.
+   from the run id, and that seed is logged next to the order it produced,
+   so a run's order can be read back from its own report. (The seed alone
+   does not regenerate it: the permutation also depends on how many ops
+   the run had, which varies with which retention windows the manifest
+   had populated.)
 4. Prints one JSON line per operation on stdout and exits non-zero if
    anything failed. No retries by design: an operation that only succeeds
    on retry is the regression netcheck exists to surface.
@@ -69,7 +73,7 @@ One `"event":"run"` line with the conditions of the run, then one
  "freenet_version":"Freenet version: 0.2.106 (c707af0f786e)",
  "pinned_gateways":["100.27.151.80:31337,c28123df…"],
  "ephemeral_peers":["100.27.151.80:31337"]}
-{"event":"op","op":"get","age":"24h","label":"20260725-030000/small-0",…,"ok":true,"latency_ms":412}
+{"event":"op","seq":7,"op":"get","age":"24h","label":"20260725-030000/small-0",…,"ok":true,"latency_ms":412,"errors_ignored":0}
 ```
 
 `freenet_version` is what separates "the network broke" from "the release
@@ -81,6 +85,31 @@ long it actually took, not the configured `--op-timeout-secs`: reporting
 the deadline for every failure hid the difference between a fast terminal
 error from the node and the client giving up waiting, which is the
 distinction the field exists to draw.
+
+`seq` is the operation's 0-based position in the order the run actually
+executed. It has to be recorded because nothing else preserves it: every
+record of a run is published with the same timestamp, and line order is
+lost once the report is parsed. Before the GET order was shuffled,
+position could be recovered from `age`; now it cannot, so without `seq`
+the shuffle would destroy the very information it was introduced to
+disentangle.
+
+`errors_ignored` counts incoming errors this operation attributed to
+another contract and skipped. A server-side error for an op that already
+hit its own deadline arrives during the *next* op's wait window; charging
+it to that op stamps the wrong contract's key into the reported error.
+Zero is emitted too — "no stale error arrived during this op" is a
+measurement, and an absent field would be indistinguishable from a run
+that never counted. Errors that name no contract stay unattributable and
+still fail whichever op is waiting, so this can never swallow a real
+failure silently.
+
+Both fields reach the jsonl report. Neither reaches the telemetry
+dashboard yet: `insert_check_op` writes a fixed column list that has no
+`seq` or `errors_ignored` column, so `netcheck emit` publishes them and
+the ingest drops them without erroring. Read run order and skipped-error
+counts from the jsonl artifact until that table gains the columns
+(freenet/freenet-telemetry-dashboard#21).
 
 ## Production use (nova)
 
