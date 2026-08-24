@@ -1020,12 +1020,30 @@ impl Report {
         }
     }
 
+    /// Print the human report to stdout.
+    ///
+    /// A thin wrapper over [`Report::write_human`] so the report's TEXT can be
+    /// rendered into a buffer and asserted on. The pin that used to guard the
+    /// no-evidence explanations scraped this function's source for two field
+    /// names, and `fn_body` returns raw source INCLUDING comments — so the
+    /// comment above those two blocks satisfied the pin on its own, and deleting
+    /// both `println!` blocks left the test green. Rendering to a sink lets the
+    /// test assert the lines actually appear.
+    ///
+    /// Write errors are dropped: a closed stdout (`| head`) is not a run failure,
+    /// and there is nowhere left to report it to anyway.
     fn print_human(&self) {
-        println!(
+        let _ = self.write_human(&mut std::io::stdout().lock());
+    }
+
+    fn write_human(&self, out: &mut impl std::io::Write) -> std::io::Result<()> {
+        writeln!(
+            out,
             "merge check: {} state(s), {} delta(s), {} summary/summaries in the corpus",
             self.corpus_states, self.corpus_deltas, self.corpus_summaries
-        );
-        println!(
+        )?;
+        writeln!(
+            out,
             "merge check: {} case(s) run \u{2014} {} held, {} violation(s) ({} enforceable, {} diagnostic-only), {} inconclusive",
             self.cases_run,
             self.holds,
@@ -1033,20 +1051,21 @@ impl Report {
             self.enforceable_violations,
             self.diagnostic_violations,
             self.inconclusive
-        );
+        )?;
 
         if !self.findings.is_empty() {
-            println!("\nfindings:");
+            writeln!(out, "\nfindings:")?;
             for (f, count) in group_findings(&self.findings) {
                 let cases = if count == 1 {
                     "1 case".to_string()
                 } else {
                     format!("{count} cases")
                 };
-                println!(
+                writeln!(
+                    out,
                     "  [{}] {} ({cases}): {}\n      example \u{2014} left: {}; right: {}",
                     f.severity, f.property, f.detail, f.left, f.right
-                );
+                )?;
             }
         }
 
@@ -1055,20 +1074,22 @@ impl Report {
         // and printing them as errors would train an author to "fix" working
         // code.
         if !self.inconclusive_reasons.is_empty() {
-            println!(
+            writeln!(
+                out,
                 "\ninconclusive ({} total \u{2014} NOT passes: these cases reached no verdict, so they say nothing about the contract):",
                 self.inconclusive
-            );
+            )?;
             for r in &self.inconclusive_reasons {
-                println!("  {}: {}", r.reason, r.occurrences);
+                writeln!(out, "  {}: {}", r.reason, r.occurrences)?;
             }
         }
 
         if let Some(evidence) = &self.evidence {
-            println!(
+            writeln!(
+                out,
                 "\nwrote {} evidence file(s) to {}",
                 evidence.files_written, evidence.directory
-            );
+            )?;
             // Never let that line stand alone when it says zero.
             //
             // `findings_local_only` and `findings_too_large` are the only two ways a
@@ -1079,32 +1100,37 @@ impl Report {
             // Only `--json` carried the reason, and the person who most needs it is
             // the one who did not ask for JSON.
             if evidence.findings_local_only > 0 {
-                println!(
+                writeln!(
+                    out,
                     "  {} finding(s) came from a property whose premise the evidence \
                      bytes cannot carry, so no evidence exists to write; they are \
                      listed above and are local-only by design",
                     evidence.findings_local_only
-                );
+                )?;
             }
             if evidence.findings_too_large > 0 {
-                println!(
+                writeln!(
+                    out,
                     "  {} finding(s) stayed over the evidence size limit even after \
                      shrinking; they are listed above and simply cannot be \
                      propagated",
                     evidence.findings_too_large
-                );
+                )?;
             }
         }
 
         if self.enforceable_violations == 0 {
-            println!("\nno enforceable violations found.");
+            writeln!(out, "\nno enforceable violations found.")?;
             if self.diagnostic_violations > 0 {
-                println!(
+                writeln!(
+                    out,
                     "({} diagnostic finding(s) above are efficiency notes, not merge-law breaks, and do not fail this command.)",
                     self.diagnostic_violations
-                );
+                )?;
             }
         }
+
+        Ok(())
     }
 }
 
@@ -1180,10 +1206,14 @@ mod stdout_purity_pin {
     /// widened region here would swallow the human-report code — which prints to stdout
     /// legitimately — and pass vacuously.
     ///
-    /// Shared with `tests`, which pins other functions the same way, so that a second
-    /// source pin cannot hand-roll a `split_once` and inherit the self-satisfying
-    /// failure mode the project rules describe.
-    pub(super) fn fn_body(signature: &str) -> &'static str {
+    /// Private on purpose, and reached only through [`code_only`]: the raw body it
+    /// returns INCLUDES comments, so a scrape built directly on it is satisfied by a
+    /// comment naming the token it searches for. That is not hypothetical — the pin
+    /// on the report's no-evidence explanations was written against `fn_body`, and a
+    /// comment added by the same commit kept it green after both `println!` blocks it
+    /// guarded were deleted. Every scrape in this file now goes through `code_only`,
+    /// so the footgun cannot be picked up by reaching for the obvious helper.
+    fn fn_body(signature: &str) -> &'static str {
         let src = include_str!("conformance.rs");
         let start = src
             .find(signature)
@@ -1216,10 +1246,15 @@ mod stdout_purity_pin {
         panic!("{signature}'s body is not brace-balanced");
     }
 
-    /// Strip whole-line comments, so a comment mentioning `println!` cannot satisfy or
-    /// defeat the assertion. The comment above the `eprintln!` call names both.
-    fn code_only() -> String {
-        fn_body("fn load_inputs(")
+    /// A function's body with whole-line comments stripped, so a comment mentioning
+    /// the searched-for token can neither satisfy nor defeat the assertion. The
+    /// comment above the `eprintln!` call names both macros; the comment above the
+    /// report's no-evidence blocks named both fields the old pin looked for.
+    ///
+    /// Takes the signature rather than hard-coding one, so that the comment-stripping
+    /// version is the ONLY way to scrape a body in this file.
+    fn code_only(signature: &str) -> String {
+        fn_body(signature)
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
@@ -1234,7 +1269,9 @@ mod stdout_purity_pin {
     /// code, which is the harmless direction; the same trap the other way is how a pin
     /// passes vacuously forever.
     fn stdout_macros_only() -> String {
-        code_only().replace("eprintln!", "").replace("eprint!", "")
+        code_only("fn load_inputs(")
+            .replace("eprintln!", "")
+            .replace("eprint!", "")
     }
 
     #[test]
@@ -1249,7 +1286,7 @@ mod stdout_purity_pin {
 
     #[test]
     fn the_bundle_note_still_reaches_the_reader() {
-        let body = code_only();
+        let body = code_only("fn load_inputs(");
         assert!(
             body.contains("eprintln!"),
             "the bundle note is no longer surfaced at all; a corpus whose related \
@@ -1260,10 +1297,24 @@ mod stdout_purity_pin {
 
 #[cfg(test)]
 mod tests {
-    use super::stdout_purity_pin::fn_body;
     use super::*;
     use freenet::conformance::{OracleError, Violation};
     use freenet_stdlib::prelude::{RelatedContracts, UpdateModification, ValidateResult};
+
+    /// Render the human report to a string.
+    ///
+    /// The report's text is what these tests assert on, rather than its source: a
+    /// source scrape of `print_human` is satisfied by a comment naming the same
+    /// tokens, which is exactly how the previous version of
+    /// `the_human_report_says_why_no_evidence_was_written` survived the deletion of
+    /// both blocks it existed to guard.
+    fn render_human(report: &Report) -> String {
+        let mut rendered = Vec::new();
+        report
+            .write_human(&mut rendered)
+            .expect("writing to a Vec cannot fail");
+        String::from_utf8(rendered).expect("the report is utf-8")
+    }
 
     /// A grow-only union contract, enough to exercise the reversed-pair heuristic
     /// without a WASM runtime.
@@ -1669,15 +1720,85 @@ mod tests {
     /// is the one who did not ask for JSON.
     #[test]
     fn the_human_report_says_why_no_evidence_was_written() {
-        let body = fn_body("fn print_human(");
-        for field in ["findings_local_only", "findings_too_large"] {
-            assert!(
-                body.contains(field),
-                "print_human never mentions {field}, so a run with such findings \
-                 prints 'wrote 0 evidence file(s)' and nothing else — which reads \
-                 exactly like a clean run"
-            );
-        }
+        let report = Report {
+            corpus_states: 1,
+            corpus_deltas: 1,
+            corpus_summaries: 0,
+            cases_run: 2,
+            holds: 0,
+            violations: 2,
+            enforceable_violations: 2,
+            diagnostic_violations: 0,
+            inconclusive: 0,
+            findings: Vec::new(),
+            inconclusive_reasons: Vec::new(),
+            evidence: Some(EvidenceSummary {
+                directory: "/tmp/evidence".to_string(),
+                files_written: 0,
+                findings_local_only: 1,
+                findings_too_large: 1,
+                input_bytes_before_shrinking: 0,
+                input_bytes_after_shrinking: 0,
+            }),
+        };
+
+        let rendered = render_human(&report);
+
+        assert!(
+            rendered.contains("wrote 0 evidence file(s)"),
+            "the fixture no longer produces the line this pin is about:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("the evidence bytes cannot carry"),
+            "a local-only finding drew no explanation, so the report says \
+             'wrote 0 evidence file(s)' and nothing else — which reads exactly \
+             like a clean run:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("stayed over the evidence size limit"),
+            "an over-size finding drew no explanation, so the report says \
+             'wrote 0 evidence file(s)' and nothing else — which reads exactly \
+             like a clean run:\n{rendered}"
+        );
+    }
+
+    /// The counterpart: a run with no unwritable findings must print NEITHER line.
+    ///
+    /// Without this, the pin above is satisfied by emitting both explanations
+    /// unconditionally, which would tell every clean run that findings it does not
+    /// have could not be written.
+    #[test]
+    fn the_no_evidence_explanations_are_conditional() {
+        let report = Report {
+            corpus_states: 1,
+            corpus_deltas: 1,
+            corpus_summaries: 0,
+            cases_run: 1,
+            holds: 1,
+            violations: 0,
+            enforceable_violations: 0,
+            diagnostic_violations: 0,
+            inconclusive: 0,
+            findings: Vec::new(),
+            inconclusive_reasons: Vec::new(),
+            evidence: Some(EvidenceSummary {
+                directory: "/tmp/evidence".to_string(),
+                files_written: 0,
+                findings_local_only: 0,
+                findings_too_large: 0,
+                input_bytes_before_shrinking: 0,
+                input_bytes_after_shrinking: 0,
+            }),
+        };
+
+        let rendered = render_human(&report);
+
+        assert!(
+            !rendered.contains("the evidence bytes cannot carry")
+                && !rendered.contains("stayed over the evidence size limit"),
+            "a run with zero unwritable findings explained away findings it does \
+             not have:\n{rendered}"
+        );
     }
 
     /// Evidence is resolved by deriving each candidate's instance id, not by name.
