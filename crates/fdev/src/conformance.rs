@@ -921,7 +921,8 @@ fn write_unwritable_notes(
         writeln!(
             out,
             "note: {} {} finding(s) cannot be carried as evidence at all ({}); they \
-             are reported above and no evidence file is written for them",
+             appear in the report's findings list and no evidence file is written \
+             for them",
             note.cases,
             note.property,
             EvidenceRejected::NotSelfVerifying {
