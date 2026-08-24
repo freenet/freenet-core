@@ -431,6 +431,7 @@ const NEW_PAIR_LOG_INTERVAL: Duration = EVICTION_LOG_INTERVAL;
 /// not, and slots are about to exist. The only terminal condition is a
 /// cap of zero, which is a property of the configuration and is read
 /// from it directly rather than inferred.
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 enum EvictionOutcome {
     /// This pass freed slots and kept one of them for the caller, which
     /// therefore does not have to win the cap check again — it inserts
@@ -852,6 +853,32 @@ impl UpdateRateLimiter {
     /// entries stamped within the same clock tick (and, in tests, from a
     /// mock clock that has not advanced) share an `Instant`, and a
     /// cutoff comparison would take every tied entry with it.
+    /// Remove `victims`, returning how many were ACTUALLY removed.
+    ///
+    /// The distinction is the whole point, and it is load-bearing rather
+    /// than defensive. `cleanup` removes from `last_accepted` without
+    /// taking `eviction_lock`, and the Ring reaper runs it once a minute
+    /// on every node, so a victim selected by the scan above can be gone
+    /// by the time this runs. The caller decrements `size` by
+    /// `removed - 1`; counting the selected batch instead would
+    /// over-decrement, drive `size` BELOW the map's true length, and let
+    /// the map grow past `max_tracked_pairs` by the drift — defeating
+    /// the one bound this module exists to enforce.
+    ///
+    /// Split out of `evict_oldest` so that property is reachable by a
+    /// deterministic test: inside `evict_oldest` the victim list is
+    /// collected and consumed in the same breath, so no fixture can put
+    /// an absent key in it without racing a real reaper (#4997 review).
+    fn remove_victims<'a, I>(&self, victims: I) -> usize
+    where
+        I: IntoIterator<Item = &'a (SocketAddr, ContractInstanceId)>,
+    {
+        victims
+            .into_iter()
+            .filter(|victim| self.last_accepted.remove(*victim).is_some())
+            .count()
+    }
+
     fn evict_oldest(&self, now: Instant) -> EvictionOutcome {
         // The one terminal condition, read from the configuration rather
         // than inferred from an empty map — see `EvictionOutcome`.
@@ -909,15 +936,7 @@ impl UpdateRateLimiter {
         let batch = batch.min(entries.len());
         entries.select_nth_unstable_by_key(batch - 1, |(stamped, _)| *stamped);
 
-        let mut removed = 0usize;
-        for (_, victim) in &entries[..batch] {
-            // A concurrent caller may have removed it already; only
-            // count what this call actually took out, so `size` stays
-            // in step with the map.
-            if self.last_accepted.remove(victim).is_some() {
-                removed += 1;
-            }
-        }
+        let removed = self.remove_victims(entries[..batch].iter().map(|(_, k)| k));
         if removed > 0 {
             // Return `removed - 1` slots and KEEP one for the caller.
             //
@@ -1424,50 +1443,44 @@ mod tests {
                 limiter.check_and_record(mk_sender(i as u8 + 1), mk_contract(i as u8 + 1)),
                 RateLimitDecision::Allowed
             );
-            // Stagger the stamps so victim selection is well-defined.
+            // Stagger the stamps so the entries are distinguishable.
             ts.advance(Duration::from_millis(1));
         }
         assert_eq!(limiter.len(), CAP);
         assert_eq!(limiter.size.load(Ordering::Relaxed), CAP);
 
-        // Simulate the concurrent reaper: take the OLDEST entry out from
-        // under the eviction pass, leaving `size` untouched. That is
-        // exactly the state a caller sees when `cleanup` removed an entry
-        // after `evict_oldest` collected it but before it removed it.
-        assert!(
-            limiter
-                .last_accepted
-                .remove(&(mk_sender(1), mk_contract(1)))
-                .is_some()
-        );
-        assert_eq!(limiter.len(), CAP - 1);
-        assert_eq!(
-            limiter.size.load(Ordering::Relaxed),
-            CAP,
-            "the fixture must leave `size` stale, which is the whole point"
-        );
+        // Three victims, only two of which are still present: the third
+        // is what a concurrent `cleanup` took between the scan's collect
+        // and its removal loop.
+        let present_a = (mk_sender(1), mk_contract(1));
+        let present_b = (mk_sender(2), mk_contract(2));
+        let already_gone = (mk_sender(3), mk_contract(3));
+        assert!(limiter.last_accepted.remove(&already_gone).is_some());
 
-        // A batch of 1 at this cap, and the single victim it selects is
-        // the entry that just vanished — so a correct pass removes ZERO.
-        let before = limiter.capacity_evicted_total();
-        let outcome = limiter.evict_oldest(ts.now());
-        let counted = limiter.capacity_evicted_total() - before;
+        let victims = [present_a, already_gone, present_b];
+        let removed = limiter.remove_victims(victims.iter());
 
         assert_eq!(
-            counted, 0,
-            "the pass removed nothing (its victim was already gone), so it must \
-             count nothing; counting the selected batch instead reports {counted}"
+            removed,
+            2,
+            "two of the three victims were still present, so the pass removed \
+             two; returning the selected batch size ({}) instead over-decrements \
+             `size` and lets the map grow past the cap",
+            victims.len()
         );
         assert_eq!(
-            outcome,
-            EvictionOutcome::Retry,
-            "removing nothing is a reason to retry, not to reserve a slot"
+            limiter.len(),
+            CAP - 3,
+            "all three victims are gone from the map either way"
         );
+
+        // The consequence the count protects: `size` is decremented by
+        // `removed - 1`, so an over-count drives the strict-cap gate below
+        // the map's true length.
+        limiter.size.fetch_sub(removed - 1, Ordering::Relaxed);
         assert!(
             limiter.size.load(Ordering::Relaxed) >= limiter.len(),
-            "`size` must never fall below the map's true length: size={} len={}. \
-             It is the strict-cap gate, so drift below `len` lets the map grow \
-             past max_tracked_pairs.",
+            "`size` must never fall below the map's true length: size={} len={}",
             limiter.size.load(Ordering::Relaxed),
             limiter.len()
         );
@@ -1487,7 +1500,10 @@ mod tests {
     #[test]
     fn a_throttled_sender_cannot_evict_other_peers_entries() {
         const CAP: usize = 8;
-        const BURST: usize = 4;
+        // The burst is charged PER SENDER, so it has to cover the
+        // incumbent's fill as well as the attacker's run; equal to the cap
+        // gives each exactly enough to fill the map once.
+        const BURST: usize = 8;
         let ts = SharedMockTimeSource::new();
         let limiter = UpdateRateLimiter::with_new_pair_budget(
             Arc::new(ts.clone()),
