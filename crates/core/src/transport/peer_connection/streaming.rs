@@ -552,8 +552,20 @@ impl Stream for StreamingInboundStream {
         //
         // The byte count is the discriminator, exactly as in `assemble()` (which
         // keeps waiting when `is_complete()` is true but the assembled length is
-        // short). Keep the two paths in agreement — they consume the same buffer
-        // and must reach the same conclusion about when a stream has ended.
+        // short). They consume the same buffer and must reach the same
+        // conclusion about when a stream has ended.
+        //
+        // Scope, precisely: this brings the two paths into agreement at THIS
+        // exit. The `next_idx > total_fragments` exit above is still unguarded,
+        // and a sender that filled every `base + 1` slot with short payloads
+        // would leave through it with `bytes_read < total_bytes` — where
+        // `assemble()` returns `None` (a failure) but this returns
+        // `Ready(None)` (a success), and `pipe_stream` reports a successful
+        // transfer with a short byte count. No conforming sender does that:
+        // `send_stream` fragments `stream_to_send` exactly. Tracked as #5445,
+        // which is where the guard that would make the agreement universal
+        // belongs — it is a production behaviour change and wants its own
+        // review rather than a late addition here.
         if self.handle.buffer.is_complete()
             && self.handle.buffer.get(next_idx).is_none()
             && self.bytes_read >= self.handle.buffer.total_bytes()
@@ -912,20 +924,34 @@ mod tests {
 
     #[tokio::test]
     async fn test_streaming_inbound_stream_basic() {
-        let handle = StreamHandle::new(make_stream_id(), 15);
+        // The advertised total must equal the bytes actually pushed. This said
+        // 15 while pushing 5, which no sender ever does -- `send_stream` sets
+        // `total_length_bytes` from `stream_to_send.len()` and `pipe_stream`
+        // forwards `inbound_handle.total_bytes()`, so both are exact. The
+        // inconsistency was invisible while `poll_next` ended a stream on
+        // `is_complete()` alone, and it is worth noting that `assemble()`
+        // already rejected this same buffer (its length check fails at 5 of
+        // 15 bytes): the two paths disagreed, which is the defect the
+        // `bytes_read >= total_bytes()` conjunct fixes.
+        let payload = Bytes::from_static(b"hello");
+        let handle = StreamHandle::new(make_stream_id(), payload.len() as u64);
 
-        // Push all fragments
-        handle
-            .push_fragment(1, Bytes::from_static(b"hello"))
-            .unwrap();
+        handle.push_fragment(1, payload.clone()).unwrap();
 
         let mut stream = handle.stream();
         let chunk = stream.next().await;
         assert!(chunk.is_some());
-        assert_eq!(chunk.unwrap().unwrap(), Bytes::from_static(b"hello"));
+        assert_eq!(chunk.unwrap().unwrap(), payload);
 
-        // Stream should be exhausted
-        let chunk = stream.next().await;
+        // Stream should be exhausted. Bounded so a regression that stops the
+        // stream ending reports THAT, rather than hanging until nextest's
+        // 240 s slow-timeout kills the process with no diagnosis.
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect(
+                "stream never ended: every advertised byte was delivered, so `poll_next` must \
+                 return Ready(None) rather than waiting for the unused overflow slot",
+            );
         assert!(chunk.is_none());
     }
 
@@ -1329,10 +1355,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_bytes_read_tracking() {
-        let handle = StreamHandle::new(make_stream_id(), 15);
-        handle
-            .push_fragment(1, Bytes::from_static(b"hello world!!!"))
-            .unwrap();
+        // Advertised total must equal the bytes pushed, as at
+        // `test_streaming_inbound_stream_basic`. This said 15 while pushing 14.
+        // It does not hang today only because it polls once and never reaches
+        // the terminal poll -- so it is a landmine rather than a failure: the
+        // next person to add an end-of-stream assertion here rediscovers the
+        // hang instead of the bug they were chasing.
+        let payload = Bytes::from_static(b"hello world!!!");
+        let handle = StreamHandle::new(make_stream_id(), payload.len() as u64);
+        handle.push_fragment(1, payload).unwrap();
 
         let mut stream = handle.stream();
         assert_eq!(stream.bytes_read(), 0);
