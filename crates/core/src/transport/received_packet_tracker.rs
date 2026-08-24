@@ -70,28 +70,47 @@ impl<T: TimeSource> ReceivedPacketTracker<T> {
                 // is asking for.
                 //
                 // A receipt is normally recoverable: receipts ride on noop packets,
-                // which are themselves tracked and retransmitted, so a single lost
-                // noop is repaired by its own resend. But there are paths where a
-                // receipt is destroyed outright with no recovery -- notably the
-                // flush sites in `peer_connection`'s recv loop, which have already
-                // `mem::take`n the pending list into `noop()` when the send fails.
-                // They log "will retry"; there is nothing left to retry with. When
-                // that happens the sender is left retransmitting into silence, its
-                // packet pinned in flight until the retransmit budget runs out, and
-                // if the congestion window fills first the stream aborts at
-                // CWND_WAIT_TIMEOUT (3s) -- which the receiver sees as a transfer
-                // that simply stopped mid-stream. Answering the retransmit is the
-                // only signal that can repair it.
+                // which are themselves tracked and retransmitted (the resend
+                // replays the stored bytes, receipts included), so a single lost
+                // noop is repaired by its own resend. But there are four paths
+                // where a receipt is destroyed outright with no recovery, all of
+                // them `get_receipts()` -- a `mem::take` -- moving the list into a
+                // send that then fails: the two recv-loop flush sites
+                // (`peer_connection::recv`, which logs "the pending receipts were
+                // consumed by the failed send", and the background ACK tick), plus
+                // `outbound_short_message` and the fragment send, which propagate
+                // with `?` and log nothing at all. A noop that exhausts all
+                // MAX_PACKET_RETRANSMITS attempts loses its receipts the same way.
+                //
+                // When that happens the sender is left retransmitting into silence
+                // and its packet stays pinned in flight. It is not pinned forever
+                // -- the #4345 `Abandon` path releases it once the retransmit
+                // budget runs out -- but if the congestion window fills before
+                // then, the stream aborts at CWND_WAIT_TIMEOUT (3s), which the
+                // receiver sees as a transfer that simply stopped mid-stream.
+                // Answering the retransmit is the only signal that repairs it
+                // before the budget is spent.
                 //
                 // Bounded and deduplicated. `MAX_PENDING_RECEIPTS` is a real
-                // capacity, not a hint: `send_packet`'s receipt chunker only
-                // splits a list once, so an oversized list serializes past
-                // MAX_DATA_SIZE and fails the connection. The `Vacant` arm enforces
-                // the cap by returning `QueueFull`, and this arm must not be a way
-                // around it -- a peer replaying old ids must not be able to grow
-                // the list. Dropping the re-ack at capacity is safe: the list is
-                // about to be flushed, and an unrepaired receipt draws another
+                // capacity, not a hint: `packet_sending`'s receipt chunker calls
+                // `split_off(max_num)`, which yields the *tail*, and serializes
+                // that whole tail into one packet -- so a list longer than
+                // 2 x max_num (max_num ~= 288) serializes past MAX_DATA_SIZE. That
+                // error is not a transient send failure, so it tears the
+                // connection down. The `Vacant` arm signals the cap by returning
+                // `QueueFull` for the caller to drain on, and this arm must not be
+                // a way around it -- a peer replaying old ids must not be able to
+                // grow the list. Dropping the re-ack at capacity is safe: the list
+                // is about to be flushed, and an unrepaired receipt draws another
                 // retransmit.
+                //
+                // Note the ceiling is MAX_PENDING_RECEIPTS + 1, not
+                // MAX_PENDING_RECEIPTS: this arm may fill the list to exactly the
+                // cap without returning `QueueFull`, and the `Vacant` arm's push
+                // below is unconditional, so one fresh packet arriving on a full
+                // list reaches cap + 1 before `QueueFull` triggers the drain. That
+                // is 21 against a serialization limit of ~576, so it is slack, not
+                // a bound to rely on.
                 if self.pending_receipts.len() < MAX_PENDING_RECEIPTS
                     && !self.pending_receipts.contains(&packet_id)
                 {
@@ -101,13 +120,24 @@ impl<T: TimeSource> ReceivedPacketTracker<T> {
                 // the caller can tell a duplicate from a fresh packet. Note this
                 // does not by itself guarantee the payload is skipped: the caller's
                 // `(_, true)` arm wins over `(AlreadyReceived, _)` when its receipt
-                // timer trips. The re-queued receipt goes out on the next
-                // background ACK tick or the next packet that flushes receipts.
+                // timer trips (#5277). The re-queued receipt goes out on whichever
+                // comes first of the 100ms background ACK tick, the 600ms
+                // `should_send_receipts` path, or the next outbound packet that
+                // flushes receipts. The ACK tick is not a standalone bound -- it is
+                // rebuilt inside every `recv()` call, so a connection returning
+                // messages faster than the interval never reaches it -- which puts
+                // the real worst case at the 600ms path.
                 ReportResult::AlreadyReceived
             }
             std::collections::hash_map::Entry::Vacant(e) => {
                 e.insert(current_time);
                 self.packet_id_time.push_back((packet_id, current_time));
+                // No `contains` check needed here: a `Vacant` id was not known to
+                // `cleanup()`'s retention window, and the list is flushed far more
+                // often than RETAIN_TIME (60s), so it cannot already be pending.
+                // A duplicate copy would in any case be harmless -- the sender's
+                // `report_received_receipts` removes the id on the first hit and
+                // ignores the second.
                 self.pending_receipts.push(packet_id);
 
                 if self.pending_receipts.len() < MAX_PENDING_RECEIPTS {
@@ -224,14 +254,20 @@ pub(in crate::transport) mod tests {
     /// payload is ignored.
     ///
     /// This is the production scenario, not a synthetic one. The sender only
-    /// retransmits because it saw no receipt, and the overwhelmingly likely
-    /// reason is that the receipt itself was lost -- receipts travel on noop /
-    /// piggybacked packets, which are never retransmitted. If the duplicate is
-    /// met with silence, that packet's bytes stay in the sender's flight
-    /// accounting with no remaining way to clear them. Once flight reaches the
-    /// congestion window the sender blocks, and `CWND_WAIT_TIMEOUT` (3s) aborts
-    /// the whole stream. Downstream this surfaces as a multi-fragment GET dying
-    /// partway through with a stream-assembly inactivity timeout.
+    /// retransmits because it saw no receipt, and the case this pins is that the
+    /// receipt itself was destroyed with no way to regenerate it: a flush site
+    /// `mem::take`s the pending list into a send that then fails, or the carrier
+    /// noop exhausts `MAX_PACKET_RETRANSMITS`. (Receipts do ride on noop and
+    /// piggybacked packets, and those *are* tracked and retransmitted, so an
+    /// ordinary lost noop repairs itself -- see the `Occupied` arm.)
+    ///
+    /// If the duplicate is met with silence, that packet's bytes stay in the
+    /// sender's flight accounting until the #4345 `Abandon` path releases them at
+    /// the end of the retransmit budget. That is a bound, not a fix: once flight
+    /// reaches the congestion window the sender blocks, and `CWND_WAIT_TIMEOUT`
+    /// (3s) aborts the whole stream well before the budget runs out. Downstream
+    /// this surfaces as a multi-fragment GET dying partway through with a
+    /// stream-assembly inactivity timeout.
     ///
     /// Note the drain between the two reports: that is what makes this test
     /// discriminating. Without it the receipt from the *first* report is still
@@ -319,15 +355,37 @@ pub(in crate::transport) mod tests {
             );
         }
 
-        assert!(
-            tracker.pending_receipts.len() <= MAX_PENDING_RECEIPTS,
+        // Asserted as equality, not `<=`: `<=` would also pass if the
+        // `Occupied` arm stopped re-acknowledging altogether, which is the
+        // regression the other two tests exist to catch. Pinning the exact
+        // value pins "capped" and "still re-acknowledging at scale" at once.
+        assert_eq!(
+            tracker.pending_receipts.len(),
+            MAX_PENDING_RECEIPTS,
             "duplicate re-acks grew the receipt list to {}, past the {} cap that \
              keeps it serializable",
             tracker.pending_receipts.len(),
             MAX_PENDING_RECEIPTS
         );
+
+        // The ceiling on the MIXED path is cap + 1, not cap: this arm fills the
+        // list to exactly the cap without returning `QueueFull`, and the
+        // `Vacant` arm's push is unconditional, so the next fresh packet lands
+        // on top before `QueueFull` triggers the caller's drain. Pinned here so
+        // the equality above is not mistaken for a hard invariant, and so that
+        // raising `MAX_PENDING_RECEIPTS` toward the ~576-receipt serialization
+        // limit has to come past this test.
+        assert_eq!(
+            tracker.report_received_packet(REPLAYED + 1),
+            ReportResult::QueueFull
+        );
+        assert_eq!(tracker.pending_receipts.len(), MAX_PENDING_RECEIPTS + 1);
     }
 
+    /// Note the reported id is deliberately outside the `0..19` range filled
+    /// above: since #5276 an already-received id takes the `Occupied` arm and
+    /// returns `AlreadyReceived`, so reusing one here would silently stop
+    /// testing the `Vacant` arm's cap.
     #[test]
     fn test_report_receipt_queue_full() {
         let mut tracker = ReceivedPacketTracker {

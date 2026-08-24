@@ -1105,9 +1105,18 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             if !receipts.is_empty() {
                                 if let Err(e) = self.noop(receipts).await {
                                     if e.is_transient_send_failure() {
+                                        // NOT "will retry": `get_receipts()` is a
+                                        // `mem::take`, so these receipts are already
+                                        // gone and nothing retains a copy. Repair
+                                        // depends on the sender retransmitting and
+                                        // being re-acknowledged (#5276), which costs
+                                        // one of its MAX_PACKET_RETRANSMITS.
                                         tracing::warn!(
                                             peer_addr = %self.remote_conn.remote_addr,
-                                            "ACK noop send failed, will retry"
+                                            "ACK noop send failed; the pending receipts \
+                                             were consumed by the failed send and are \
+                                             lost, recoverable only by the sender's \
+                                             retransmit"
                                         );
                                     } else {
                                         return Err(e);
@@ -1483,9 +1492,13 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         );
                         if let Err(e) = self.noop(receipts).await {
                             if e.is_transient_send_failure() {
+                                // NOT "will retry next tick": the next tick starts
+                                // from an empty list. See the recv-loop flush site.
                                 tracing::warn!(
                                     peer_addr = %self.remote_conn.remote_addr,
-                                    "Background ACK send failed, will retry next tick"
+                                    "Background ACK send failed; the pending receipts \
+                                     were consumed by the failed send and are lost, \
+                                     recoverable only by the sender's retransmit"
                                 );
                             } else {
                                 return Err(e);
@@ -4070,6 +4083,152 @@ mod tests {
              so the recv loop calls release_flightsize().",
             congestion.flightsize(),
             congestion.flightsize() / packet_size,
+        );
+    }
+
+    /// A re-acknowledged retransmit must actually drain the sender's congestion
+    /// window, and must drain it EXACTLY ONCE (#5276).
+    ///
+    /// The unit tests in `received_packet_tracker` pin the mechanism inside that
+    /// one struct: a duplicate re-queues its receipt. This pins the *effect* the
+    /// fix exists to produce, by composing the three pieces the recv loop
+    /// composes -- `ReceivedPacketTracker`, `SentPacketTracker`, and the
+    /// congestion controller -- and driving the exact production sequence:
+    ///
+    ///   1. the receiver acknowledges a packet,
+    ///   2. the receipt is destroyed with no way to regenerate it (a flush site
+    ///      `mem::take`s the list into a send that then fails),
+    ///   3. the sender, having heard nothing, retransmits,
+    ///   4. the receiver re-acknowledges,
+    ///   5. the sender releases the packet from flight.
+    ///
+    /// Without the fix, step 4 yields an empty receipt list and step 5 never
+    /// happens: flight size stays pinned until the #4345 `Abandon` backstop, by
+    /// which time `CWND_WAIT_TIMEOUT` has aborted the stream.
+    ///
+    /// The second half is the higher-risk half. This change makes duplicate
+    /// receipts for an already-released packet a routine, deliberate wire event
+    /// rather than an accident, and duplicate ACK ids feed straight into the
+    /// release-exactly-once invariant that `.claude/rules/transport.md` records
+    /// as the cause of #4345. That invariant held only by prose review; it is
+    /// pinned here.
+    #[test]
+    fn reacknowledged_retransmit_drains_flightsize_exactly_once() {
+        use crate::simulation::VirtualTime;
+        use crate::transport::bbr::{BbrConfig, BbrController};
+        use crate::transport::received_packet_tracker::ReportResult;
+        use crate::transport::received_packet_tracker::tests::mock_received_packet_tracker;
+        use crate::transport::sent_packet_tracker::{ResendAction, SentPacketTracker};
+        use std::sync::Arc;
+
+        let time = VirtualTime::new();
+        let congestion = Arc::new(BbrController::new_with_time_source(
+            BbrConfig {
+                initial_cwnd: 60_000,
+                min_cwnd: 2_000,
+                max_cwnd: 10_000_000,
+                ..Default::default()
+            },
+            time.clone(),
+        ));
+        let mut sent = SentPacketTracker::new_with_time_source(time.clone());
+        let mut received = mock_received_packet_tracker();
+
+        let packet_size = 1424usize;
+        let packet_id = 0u32;
+
+        // 1. Sender sends; receiver acknowledges.
+        let payload: Box<[u8]> = vec![0u8; packet_size].into_boxed_slice();
+        sent.report_sent_packet(packet_id, payload);
+        congestion.on_send(packet_size);
+        assert_eq!(congestion.flightsize(), packet_size);
+        assert_eq!(received.report_received_packet(packet_id), ReportResult::Ok);
+
+        // 2. The receipt is destroyed with no way to regenerate it. This is the
+        //    `get_receipts()` (a `mem::take`) followed by a send that fails --
+        //    the list is gone and nothing retains a copy. Dropping the returned
+        //    vec is exactly what the production flush sites do on failure.
+        let lost = received.get_receipts();
+        assert_eq!(lost, vec![packet_id], "the receiver did acknowledge once");
+        drop(lost);
+
+        // 3. The sender, having heard nothing, retransmits.
+        let mut resends = 0u32;
+        let retransmitted = loop {
+            match sent.get_resend() {
+                ResendAction::Resend(id, packet) => {
+                    // `refresh_sent_packet`, not `report_sent_packet`: that is
+                    // what the recv loop uses (peer_connection.rs:1435, :1463)
+                    // and the difference is load-bearing per
+                    // `.claude/rules/transport.md` -- the insert-capable path
+                    // would resurrect a packet a concurrent drop_stream had
+                    // already released.
+                    congestion.on_timeout();
+                    sent.refresh_sent_packet(id, packet, None);
+                    resends += 1;
+                    break true;
+                }
+                ResendAction::TlpProbe(..) => {}
+                ResendAction::Abandon { .. } => break false,
+                ResendAction::WaitUntil(_) => {
+                    time.advance(std::time::Duration::from_secs(2));
+                }
+            }
+        };
+        assert!(
+            retransmitted && resends == 1,
+            "the test must exercise a real retransmit before the abandon backstop"
+        );
+
+        // 4. The receiver re-acknowledges the duplicate. This is the fix.
+        assert_eq!(
+            received.report_received_packet(packet_id),
+            ReportResult::AlreadyReceived
+        );
+        let reack = received.get_receipts();
+        assert_eq!(
+            reack,
+            vec![packet_id],
+            "#5276: a retransmit must be re-acknowledged; without this the \
+             sender has no remaining way to drain the packet before its \
+             retransmit budget runs out"
+        );
+
+        // 5. The sender releases it from flight, well short of the abandon
+        //    backstop. `MAX_PACKET_RETRANSMITS` is 12; we spent one.
+        let (ack_info, _loss) = sent.report_received_receipts(&reack);
+        let mut released = 0usize;
+        for (rtt, size, token) in ack_info {
+            match rtt {
+                Some(rtt) => congestion.on_ack_with_token(rtt, size, token),
+                None => congestion.on_ack_without_rtt(size),
+            }
+            released += 1;
+        }
+        assert_eq!(released, 1, "the re-ack must release exactly one packet");
+        assert_eq!(
+            congestion.flightsize(),
+            0,
+            "#5276: the re-acknowledged packet must leave the congestion window"
+        );
+
+        // The double-release pin. A duplicate receipt for an already-released
+        // packet must produce nothing at all -- no ack tuple, no second
+        // decrement, no RTT sample from a stale packet. `report_received_receipts`
+        // only emits a tuple while the id is still in `pending_receipts`, and it
+        // removes the id on the first hit; if that ever changes, this fails.
+        let (ack_info_again, _loss) = sent.report_received_receipts(&[packet_id]);
+        assert!(
+            ack_info_again.is_empty(),
+            "#4345 invariant: a repeated receipt for an already-released packet \
+             must not produce a second release (got {} tuples)",
+            ack_info_again.len()
+        );
+        assert_eq!(
+            congestion.flightsize(),
+            0,
+            "#4345 invariant: flight size must not go negative or wrap on a \
+             duplicate receipt"
         );
     }
 
