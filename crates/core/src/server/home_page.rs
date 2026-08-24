@@ -2592,6 +2592,7 @@ mod tests {
             contracts: vec![mk_hosted_entry("A", 1.0, false)],
             disk_state_bytes: None,
             disk_db_bytes: None,
+            disk_db_in_use_bytes: None,
             disk_wasm_bytes: None,
             disk_compile_cache_bytes: None,
             disk_webapp_cache_bytes: None,
@@ -2638,6 +2639,11 @@ mod tests {
             // (100 MB), not the rows (40 MB).
             disk_state_bytes: Some(40 * 1024 * 1024),
             disk_db_bytes: Some(100 * 1024 * 1024),
+            // Of the 100 MB file, redb's allocator holds 70 MB live — so 30 MB
+            // is what a restart's compaction would actually return. NOT the 60
+            // MB `db − state` suggests: that span also covers every live
+            // non-state row and all B-tree overhead.
+            disk_db_in_use_bytes: Some(70 * 1024 * 1024),
             disk_wasm_bytes: Some(20 * 1024 * 1024),
             disk_compile_cache_bytes: Some(5 * 1024 * 1024),
             disk_webapp_cache_bytes: Some(7 * 1024 * 1024),
@@ -2671,9 +2677,31 @@ mod tests {
         // an operator seeing only "state: 40 MB" against 125 MB of disk used
         // has no way to tell where the rest went, or that a restart (startup
         // compaction) is what reclaims it.
+        //
+        // The reclaimable figure comes from the backend's allocator (100 − 70 =
+        // 30 MB), NOT from `db − state` (100 − 40 = 60 MB). The latter counts
+        // every live non-state row and all B-tree overhead as reclaimable, which
+        // would overstate what a restart returns by 2x here and attach restart
+        // advice to bytes no restart frees.
         assert!(
-            html.contains("Database file: 100.0 MB (dead space: 60.0 MB)"),
-            "tooltip must show the measured database size and its dead space — got:\n{html}"
+            html.contains(
+                "Database file: 100.0 MB (live pages: 70.0 MB, not in live pages: 30.0 MB"
+            ),
+            "tooltip must show the measured database size and the ALLOCATOR-derived \
+             figure — got:\n{html}"
+        );
+        assert!(
+            !html.contains("60.0 MB"),
+            "the tooltip must not present `db − state` as reclaimable — got:\n{html}"
+        );
+        // The allocator figure is an UPPER bound: the shallow directory walk
+        // counts an orphaned `db.backup.*` from a schema migration inside it,
+        // and no compaction ever reclaims that file. The tooltip must not
+        // promise the whole figure back from a restart.
+        assert!(
+            html.contains("db.backup.*") && html.contains("deleted by hand"),
+            "tooltip must send an operator with a migration backup to deletion, \
+             not to a restart — got:\n{html}"
         );
         // And the webapp cache must be visible AND marked as excluded, so "disk
         // used" not moving when it grows reads as deliberate.
@@ -2684,6 +2712,42 @@ mod tests {
         assert!(
             html.contains("min(RAM budget, disk budget)"),
             "explanatory paragraph must mention the #4702 min(ram, disk) eviction floor — got:\n{html}"
+        );
+    }
+
+    /// When the backend's in-use figure is unknown (never probed, or a backend
+    /// that cannot report it) the tooltip must SAY so rather than substituting
+    /// `db − state`. That substitution is what made the old label wrong: it
+    /// counts live non-state rows and B-tree overhead as reclaimable and tells
+    /// the operator a restart will return them.
+    #[test]
+    fn hosting_card_tooltip_admits_unknown_reclaimable_space() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 256 * 1024 * 1024,
+            used_bytes: 64 * 1024 * 1024,
+            contract_count: 1,
+            budget_evictions_total: 0,
+            evictions_of_recently_read_total: 0,
+            contracts: vec![mk_hosted_entry("A", 1.0, false)],
+            disk_state_bytes: Some(40 * 1024 * 1024),
+            disk_db_bytes: Some(100 * 1024 * 1024),
+            disk_db_in_use_bytes: None,
+            disk_wasm_bytes: Some(20 * 1024 * 1024),
+            disk_compile_cache_bytes: Some(5 * 1024 * 1024),
+            disk_webapp_cache_bytes: Some(7 * 1024 * 1024),
+            disk_total_bytes: Some(125 * 1024 * 1024),
+            disk_budget_bytes: Some(500 * 1024 * 1024),
+        };
+        let html = build_hosting_card(&Some(snap));
+        assert!(
+            html.contains("Database file: 100.0 MB (reclaimable space not yet measured)"),
+            "an unmeasured allocator must be admitted, not papered over — got:\n{html}"
+        );
+        assert!(
+            !html.contains("dead space") && !html.contains("reclaimable by restart"),
+            "no reclaimable claim may be made without the allocator figure — got:\n{html}"
         );
     }
 

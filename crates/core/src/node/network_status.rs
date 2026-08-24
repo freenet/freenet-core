@@ -1622,10 +1622,18 @@ pub struct HostingSnapshot {
     /// `Some(0)`, which means seeded-and-empty.
     pub disk_state_bytes: Option<u64>,
     /// Measured byte size of the storage backend's database directory (#5007).
-    /// `disk_db_bytes − disk_state_bytes` is the database's dead space: bytes
-    /// the file holds that no live row accounts for, reclaimable only by the
-    /// startup compaction. Same seeded-gate semantics as `disk_state_bytes`.
+    /// Same seeded-gate semantics as `disk_state_bytes`.
     pub disk_db_bytes: Option<u64>,
+    /// Bytes the storage backend's page allocator reports as actually IN USE
+    /// (#5007 follow-up). `disk_db_bytes − disk_db_in_use_bytes` is the
+    /// database's true dead space: the part the startup compaction reclaims.
+    ///
+    /// `None` until the first probe succeeds, and permanently on a backend that
+    /// cannot report it. The panel must NOT fall back to `disk_db_bytes −
+    /// disk_state_bytes` for this: that difference also covers every live
+    /// non-state row and all B-tree overhead, so presenting it as reclaimable
+    /// (with restart advice attached) is wrong for the live portion.
+    pub disk_db_in_use_bytes: Option<u64>,
     /// Aggregate on-disk bytes used by `*.wasm` code blobs. Same
     /// seeded-gate semantics as `disk_state_bytes`.
     pub disk_wasm_bytes: Option<u64>,

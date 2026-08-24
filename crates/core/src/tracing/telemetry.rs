@@ -2317,6 +2317,17 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "hosting_disk_db_bytes".to_string(),
                     serde_json::json!(snapshot.hosting_disk_db_bytes),
                 );
+                // `db − db_in_use` is the part of the database directory no
+                // live page occupies — an upper bound on what a restart's
+                // compaction returns (the shallow walk also counts an orphaned
+                // `db.backup.<timestamp>`, which only `rm` clears). Without the
+                // in-use term the collector can only compute `db − state`, which
+                // additionally covers every live non-state row and all B-tree
+                // overhead, and is not a dead-space figure at all.
+                obj.insert(
+                    "hosting_disk_db_in_use_bytes".to_string(),
+                    serde_json::json!(snapshot.hosting_disk_db_in_use_bytes),
+                );
                 obj.insert(
                     "hosting_disk_wasm_bytes".to_string(),
                     serde_json::json!(snapshot.hosting_disk_wasm_bytes),
@@ -2836,6 +2847,7 @@ mod tests {
             .expect("construct RouterSnapshotInfo for test");
         info.hosting_disk_state_bytes = Some(401);
         info.hosting_disk_db_bytes = Some(431);
+        info.hosting_disk_db_in_use_bytes = Some(457);
         info.hosting_disk_wasm_bytes = Some(409);
         info.hosting_disk_compile_cache_bytes = Some(419);
         info.hosting_disk_webapp_cache_bytes = Some(433);
@@ -2847,6 +2859,11 @@ mod tests {
             // gauges that were entirely absent. Without them in the OTLP body
             // there is no way to see the dead-space gap from central telemetry.
             ("hosting_disk_db_bytes", 431),
+            // The allocator's in-use figure: without it `db − state` is the only
+            // derivable "dead space", and that figure structurally includes live
+            // non-state rows, so it cannot support the restart advice the node
+            // gives its operator.
+            ("hosting_disk_db_in_use_bytes", 457),
             ("hosting_disk_wasm_bytes", 409),
             ("hosting_disk_compile_cache_bytes", 419),
             ("hosting_disk_webapp_cache_bytes", 433),

@@ -807,51 +807,68 @@ impl ReDb {
         }
     }
 
-    /// Bytes held by pages the btrees actually occupy, or `None` if it could not
-    /// be determined (in which case the caller skips compaction).
+    /// Bytes held by pages the btrees actually occupy, or the reason it could
+    /// not be determined.
     ///
     /// `stats` lives on the write transaction, so one is opened purely to read
     /// it and explicitly aborted. `WriteTransaction::new` performs no disk
     /// writes and `abort` consumes the transaction, so nothing is left behind;
     /// redb's own `Database::new` uses the same begin/read/abort shape.
-    fn pages_in_use_bytes(db: &Database, db_path: &Path) -> Option<u64> {
-        let txn = match db.begin_write() {
-            Ok(txn) => txn,
-            Err(e) => {
-                tracing::warn!(
-                    db_path = ?db_path,
-                    error = %e,
-                    "Could not open a transaction to size the contract database; skipping compaction"
-                );
-                return None;
-            }
-        };
+    ///
+    /// The failure reason is returned rather than logged so each caller can
+    /// phrase its own message: the startup compaction says "skipping
+    /// compaction", the periodic disk-accounting probe says "keeping the
+    /// previous measurement". A shared log line would be wrong for one of them.
+    fn allocator_in_use_bytes(db: &Database) -> Result<u64, String> {
+        let txn = db
+            .begin_write()
+            .map_err(|e| format!("could not open a sizing transaction: {e}"))?;
         let stats = txn.stats();
         // Abort regardless of the stats outcome so no transaction is left live
-        // to block the compaction below.
-        if let Err(e) = txn.abort() {
-            tracing::warn!(
-                db_path = ?db_path,
-                error = %e,
-                "Could not abort the sizing transaction; skipping compaction"
-            );
-            return None;
-        }
-        match stats {
-            Ok(stats) => Some(
-                stats
-                    .allocated_pages()
-                    .saturating_mul(stats.page_size() as u64),
-            ),
-            Err(e) => {
+        // to block a compaction that may follow. The abort's own failure takes
+        // precedence: a live transaction is the more serious condition.
+        txn.abort()
+            .map_err(|e| format!("could not abort the sizing transaction: {e}"))?;
+        let stats = stats.map_err(|e| format!("could not read database stats: {e}"))?;
+        Ok(stats
+            .allocated_pages()
+            .saturating_mul(stats.page_size() as u64))
+    }
+
+    /// Bytes held by pages the btrees actually occupy, or `None` if it could not
+    /// be determined (in which case the caller skips compaction).
+    fn pages_in_use_bytes(db: &Database, db_path: &Path) -> Option<u64> {
+        match Self::allocator_in_use_bytes(db) {
+            Ok(bytes) => Some(bytes),
+            Err(reason) => {
                 tracing::warn!(
                     db_path = ?db_path,
-                    error = %e,
-                    "Could not read contract database stats; skipping compaction"
+                    %reason,
+                    "Could not size the contract database; skipping compaction"
                 );
                 None
             }
         }
+    }
+
+    /// Live in-use byte count for the running database, for the periodic
+    /// disk-accounting probe (#5007 follow-up).
+    ///
+    /// This is what makes the reported "dead space" figure true. The measured
+    /// file size minus the *logical state* total is not dead space: it also
+    /// holds every live non-state row (`contract_params`, `hosting_metadata`,
+    /// the contract/delegate indices, `broken_invariants`, the secrets indices,
+    /// the delegate-origin and reserved-marker tables, the compaction marker)
+    /// plus B-tree overhead, none of which a compaction reclaims. `file −
+    /// in_use` is the part compaction actually can return, which is the figure
+    /// an operator is being told to restart for.
+    ///
+    /// Costs one aborted write transaction, taken on the 60s sweep from inside
+    /// the sweep's `spawn_blocking`, so the brief serialization against a
+    /// concurrent writer cannot stall the async reactor. The error is returned,
+    /// not logged, so the caller's fail-loud gauge handling owns the warning.
+    pub(crate) fn in_use_bytes(&self) -> Result<u64, String> {
+        Self::allocator_in_use_bytes(&self.db)
     }
 
     fn initialize_database(db: Database) -> Result<Self, redb::Error> {

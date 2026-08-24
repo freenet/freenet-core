@@ -727,34 +727,61 @@ impl HostingManager {
         if self.over_disk_budget.swap(over, Ordering::Relaxed) == over {
             return false;
         }
-        // `db_file_bytes − state_bytes` is the database directory's dead space:
-        // bytes the shallow walk found that no live state row accounts for.
-        // Mostly interior redb free pages, but it also covers live non-state
-        // rows and, importantly for the advice below, an orphaned
-        // `db.backup.<timestamp>` from a schema migration
-        // (`redb.rs::backup_and_remove_database`), which nothing in the tree ever
-        // deletes and which the startup compaction cannot touch.
-        let db_dead_space = stats.db_file_bytes.saturating_sub(stats.state_bytes);
+        // THREE figures, each answering a different operator question. The
+        // previous message reported only the middle one and attached the restart
+        // advice to it, which is wrong for most of its bytes.
+        //
+        // `db_non_state_bytes` = measured directory − logical state. NOT dead
+        // space, and no longer described as such. It also covers every live
+        // non-state row (params, hosting metadata, the indices,
+        // broken-invariants, the secrets tables) and all B-tree overhead. It is
+        // still reported because it is the span the UPDATE gate works from: the
+        // room inside the already-allocated file that state growth can expand
+        // into without the file moving (see
+        // `DiskUsageTracker::admit_state_update`).
+        //
+        // `db_reclaimable_bytes` = measured directory − allocator-in-use. The
+        // bytes no live database page occupies. `None` until the in-use probe
+        // succeeds (or forever on a backend that cannot answer).
+        //
+        // It is an UPPER BOUND on what a restart returns, not an equality, and
+        // the gap matters: `db_file_bytes` is a shallow walk of the whole
+        // directory, so an orphaned `db.backup.<timestamp>` left by a schema
+        // migration (`redb.rs::backup_and_remove_database`) is counted in it,
+        // is not part of the live database's in-use pages, and therefore lands
+        // INSIDE `db_reclaimable_bytes` — while being exactly the thing a
+        // compaction can never touch. Nothing in the tree deletes it. So the
+        // message has to route two different operators to two different actions:
+        // a backup file to `rm`, genuine live dead space to a restart.
+        let db_reclaimable = disk_usage::reclaimable_db_bytes(stats);
+        let db_non_state = stats.db_file_bytes.saturating_sub(stats.state_bytes);
         if over {
             tracing::warn!(
                 total_bytes = stats.total_bytes,
                 disk_budget_bytes = disk_budget,
                 state_bytes = stats.state_bytes,
                 db_file_bytes = stats.db_file_bytes,
-                db_dead_space_bytes = db_dead_space,
+                db_in_use_bytes = ?stats.db_in_use_bytes,
+                db_reclaimable_bytes = ?db_reclaimable,
+                db_non_state_bytes = db_non_state,
                 wasm_bytes = stats.wasm_bytes,
                 compile_cache_bytes = stats.compile_cache_bytes,
                 "aggregate on-disk usage is over the disk budget; fresh PUTs \
                  will be refused until it comes back under, and an UPDATE whose \
-                 growth exceeds db_dead_space_bytes is refused while this node \
+                 growth exceeds db_non_state_bytes is refused while this node \
                  keeps serving and advertising that contract at its last \
-                 accepted state. Database dead space is reclaimed only by the \
-                 startup compaction, so a large db_dead_space_bytes here needs a \
-                 node restart, not eviction. One exception: if the database \
-                 directory still holds a db.backup.<timestamp> left by a schema \
-                 migration, those bytes are counted here, are never removed \
-                 automatically, and no restart reclaims them; delete that file \
-                 once the current database is known good"
+                 accepted state. Eviction cannot shrink the database directory at \
+                 all. db_reclaimable_bytes (db_file_bytes minus the bytes the \
+                 database's own allocator reports in use) is what is not held by \
+                 a live page — an upper bound on what a restart's compaction \
+                 returns, NOT the larger db_non_state_bytes, which also counts \
+                 live non-state rows and B-tree overhead. Check FIRST for an \
+                 orphaned db.backup.<timestamp> left by a schema migration: the \
+                 shallow walk counts it in db_file_bytes and it is not a live \
+                 page, so its bytes sit inside db_reclaimable_bytes, yet nothing \
+                 ever deletes it and no restart reclaims them — delete that file \
+                 once the current database is known good, then restart to compact \
+                 whatever genuine dead space remains"
             );
         } else {
             tracing::info!(
@@ -974,11 +1001,49 @@ impl HostingManager {
     /// which is why `refresh_disk_usage_measures_database_and_webapp_cache`
     /// pins this call site rather than only the tracker internals.
     pub(crate) fn refresh_disk_usage(&self) {
+        // Probed BEFORE the tracker lock is taken: this opens (and immediately
+        // aborts) a backend write transaction, so it can block briefly behind a
+        // concurrent writer, and no other reader of the tracker should queue
+        // behind that. Safe to block at all only because the whole sweep step
+        // runs inside `spawn_blocking` (see `Ring::hosting_sweep`).
+        let db_in_use = self.probe_db_in_use_bytes();
         if let Some(tracker) = self.disk_tracker.read().as_ref() {
             tracker.refresh_wasm();
             tracker.refresh_compile_cache();
             tracker.refresh_db_file();
             tracker.refresh_webapp_cache();
+            if let Some(measured) = db_in_use {
+                tracker.store_db_in_use_bytes(measured);
+            }
+        }
+    }
+
+    /// Ask the storage backend how many bytes its allocator has in use (#5007
+    /// follow-up), or `None` when there is nothing to ask.
+    ///
+    /// The outer `None` means "this backend cannot answer" — no storage handle
+    /// installed yet (early startup), or a build without redb — and is NOT a
+    /// failure: the tracker keeps reporting the figure as unknown rather than
+    /// warning once per node about a question that was never askable. The inner
+    /// `Err` is a genuine probe failure and gets the tracker's fail-loud
+    /// treatment.
+    ///
+    /// This is what makes the reported dead space true. `db_file_bytes −
+    /// state_bytes` is "everything in the file that is not state payload",
+    /// which includes every live non-state row and all B-tree overhead — a
+    /// restart does not reclaim that, so advising one on the strength of it is
+    /// wrong.
+    fn probe_db_in_use_bytes(&self) -> Option<Result<u64, String>> {
+        #[cfg(feature = "redb")]
+        {
+            // Clone the handle out rather than holding the storage read lock
+            // across the transaction, mirroring `contract_state_present`.
+            let storage = self.storage.read().as_ref().cloned();
+            storage.map(|storage| storage.in_use_bytes())
+        }
+        #[cfg(not(feature = "redb"))]
+        {
+            None
         }
     }
 
@@ -1033,6 +1098,15 @@ impl HostingManager {
     pub(crate) fn set_db_file_bytes_for_test(&self, bytes: u64) {
         if let Some(tracker) = self.disk_tracker.read().as_ref() {
             tracker.set_db_file_bytes_for_test(bytes);
+        }
+    }
+
+    /// Test-only: install an allocator in-use figure on the configured tracker.
+    /// See `DiskUsageTracker::set_db_in_use_bytes_for_test`.
+    #[cfg(test)]
+    pub(crate) fn set_db_in_use_bytes_for_test(&self, bytes: u64) {
+        if let Some(tracker) = self.disk_tracker.read().as_ref() {
+            tracker.set_db_in_use_bytes_for_test(bytes);
         }
     }
 
@@ -7403,6 +7477,7 @@ mod tests {
         let over = DiskUsageStats {
             state_bytes: 100,
             db_file_bytes: 900,
+            db_in_use_bytes: Some(300),
             wasm_bytes: 0,
             compile_cache_bytes: 0,
             webapp_cache_bytes: 0,
@@ -7991,6 +8066,107 @@ mod tests {
         assert!(
             manager.admit_state_write(&make_contract_key(2), 1).is_ok(),
             "and fresh PUTs must be accepted again"
+        );
+    }
+    // --- Allocator in-use probe → tracker wiring (#5007 follow-up) -----------
+
+    /// End-to-end: `refresh_disk_usage` must ask the REAL storage backend for
+    /// its in-use byte count and store the answer on the tracker.
+    ///
+    /// This is what makes the operator-facing dead-space figure true. Without
+    /// it the only derivable figure is `db_file_bytes − state_bytes`, which is
+    /// "everything in the file that is not state payload" — structurally
+    /// including every live non-state row (`contract_params`,
+    /// `hosting_metadata`, the contract/delegate indices, `broken_invariants`,
+    /// the secrets indices, delegate origins, reserved marker hashes, the
+    /// compaction marker) plus all B-tree overhead. The node tells its operator
+    /// that figure "needs a node restart", and a restart's compaction does not
+    /// return the live portion.
+    ///
+    /// Driven against a real `ReDb` rather than a stub so the probe's actual
+    /// mechanics (an aborted write transaction, `allocated_pages × page_size`)
+    /// are the thing under test.
+    #[cfg(feature = "redb")]
+    #[tokio::test]
+    async fn refresh_disk_usage_probes_the_real_backend_for_in_use_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = crate::contract::storages::ReDb::new(dir.path())
+            .await
+            .expect("open redb");
+
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        manager.configure_disk_tracker(HostingDiskPaths {
+            contracts_dir: dir.path().join("contracts"),
+            wasmtime_cache_dir: dir.path().join("cache"),
+            db_dir: dir.path().to_path_buf(),
+            webapp_cache_dir: dir.path().join("webapp"),
+        });
+        manager.seed_configured_disk_tracker_for_test(std::iter::empty());
+
+        // Before a storage handle exists there is nothing to ask, and the gauge
+        // must stay UNKNOWN rather than reading 0 — a zero would render the
+        // entire file as reclaimable dead space.
+        manager.refresh_disk_usage();
+        assert_eq!(
+            manager.disk_usage_stats().unwrap().db_in_use_bytes,
+            None,
+            "with no storage handle the in-use figure must be unknown, not zero"
+        );
+
+        manager.set_storage(storage);
+        manager.refresh_disk_usage();
+
+        let stats = manager.disk_usage_stats().expect("seeded");
+        let in_use = stats
+            .db_in_use_bytes
+            .expect("a real backend must answer the in-use probe");
+        assert!(
+            in_use > 0,
+            "an open redb database always has allocated pages; got {in_use}"
+        );
+        assert_eq!(
+            disk_usage::reclaimable_db_bytes(&stats),
+            Some(stats.db_file_bytes.saturating_sub(in_use)),
+            "reclaimable dead space is file − in_use"
+        );
+
+        // Drop the ring-side handle so the database file lock is released
+        // (#4401) before the tempdir is removed.
+        manager.clear_storage();
+    }
+
+    /// A failed probe must keep the previous value and warn, never publish a
+    /// number. Same fail-loud discipline as the `du`-walk gauges: a plausible
+    /// wrong figure in front of an operator deciding whether to restart is worse
+    /// than an admitted gap.
+    #[test]
+    fn a_failed_in_use_probe_keeps_the_previous_value() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        manager.configure_disk_tracker(HostingDiskPaths {
+            contracts_dir: std::path::PathBuf::from("/nonexistent/contracts"),
+            wasmtime_cache_dir: std::path::PathBuf::from("/nonexistent/cache"),
+            db_dir: std::path::PathBuf::from("/nonexistent/db"),
+            webapp_cache_dir: std::path::PathBuf::from("/nonexistent/webapp"),
+        });
+        manager.seed_configured_disk_tracker_for_test(std::iter::empty());
+
+        let tracker_guard = manager.disk_tracker.read();
+        let tracker = tracker_guard.as_ref().expect("configured");
+        tracker.store_db_in_use_bytes(Ok(4096));
+        assert_eq!(tracker.db_in_use_bytes(), Some(4096));
+
+        tracker.store_db_in_use_bytes(Err("transaction lock poisoned".to_string()));
+        assert_eq!(
+            tracker.db_in_use_bytes(),
+            Some(4096),
+            "a failed probe must retain the last good reading, not reset it"
+        );
+
+        tracker.store_db_in_use_bytes(Ok(8192));
+        assert_eq!(
+            tracker.db_in_use_bytes(),
+            Some(8192),
+            "recovery must take effect"
         );
     }
 }

@@ -1777,15 +1777,21 @@ impl Ring {
             snapshot.hosting_local_misses_total = Some(ring.hosting_manager.local_get_forwards());
 
             // Aggregate on-disk usage gauges (#4683, #5007): logical state
-            // (delta-tracked) + the measured database file + WASM blobs +
-            // wasmtime compile cache + the measured webapp cache. `state` vs
-            // `db` is the pair that makes the #5007 under-count legible in
-            // central telemetry: their difference is the database's dead space.
-            // `None` until the tracker is configured and seeded (early startup),
-            // in which case the fields stay unset.
+            // (delta-tracked) + the measured database file + the backend's own
+            // in-use figure + WASM blobs + wasmtime compile cache + the measured
+            // webapp cache. `db` vs `db_in_use` is the pair that makes the
+            // database's TRUE dead space legible in central telemetry — `db` vs
+            // `state` is NOT that figure, it also covers every live non-state
+            // row and all B-tree overhead. `None` until the tracker is
+            // configured and seeded (early startup), in which case the fields
+            // stay unset.
             if let Some(disk) = ring.hosting_manager.disk_usage_stats() {
                 snapshot.hosting_disk_state_bytes = Some(disk.state_bytes);
                 snapshot.hosting_disk_db_bytes = Some(disk.db_file_bytes);
+                // Already an `Option` at the source (unknown on a backend that
+                // cannot report it), so it passes through rather than being
+                // wrapped.
+                snapshot.hosting_disk_db_in_use_bytes = disk.db_in_use_bytes;
                 snapshot.hosting_disk_wasm_bytes = Some(disk.wasm_bytes);
                 snapshot.hosting_disk_compile_cache_bytes = Some(disk.compile_cache_bytes);
                 snapshot.hosting_disk_webapp_cache_bytes = Some(disk.webapp_cache_bytes);
@@ -4230,6 +4236,10 @@ impl Ring {
         let disk = self.hosting_manager.disk_usage_stats();
         let disk_state_bytes = disk.map(|d| d.state_bytes);
         let disk_db_bytes = disk.map(|d| d.db_file_bytes);
+        // Doubly-optional: `None` when the tracker is unseeded OR when the
+        // backend's in-use probe has not succeeded, and both mean the same thing
+        // to the panel (do not claim a reclaimable figure).
+        let disk_db_in_use_bytes = disk.and_then(|d| d.db_in_use_bytes);
         let disk_wasm_bytes = disk.map(|d| d.wasm_bytes);
         let disk_compile_cache_bytes = disk.map(|d| d.compile_cache_bytes);
         let disk_webapp_cache_bytes = disk.map(|d| d.webapp_cache_bytes);
@@ -4250,6 +4260,7 @@ impl Ring {
             contracts,
             disk_state_bytes,
             disk_db_bytes,
+            disk_db_in_use_bytes,
             disk_wasm_bytes,
             disk_compile_cache_bytes,
             disk_webapp_cache_bytes,

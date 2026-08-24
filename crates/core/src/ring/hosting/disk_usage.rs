@@ -86,13 +86,26 @@
 //! live `state_bytes` delta already captures the marginal cost of an in-flight
 //! write; the sweep reconciles it against ground truth once a minute.
 //!
-//! The gap between the two — `db_file_bytes − state_bytes` — is the database's
-//! dead space, and it is not merely a reporting curiosity: growth that fits
-//! inside it costs no disk at all, which is why
-//! [`DiskUsageTracker::admit_state_update`] admits such an UPDATE even on an
-//! over-budget node. Refusing it would freeze a hosted contract's state while
-//! the node kept serving and advertising it (invariant 1's stale host) in
-//! exchange for zero bytes saved.
+//! The gap between the two — `db_file_bytes − state_bytes` — is the span of the
+//! already-allocated file that contract state does not occupy. It is not merely
+//! a reporting curiosity: growth that fits inside it costs no disk at all,
+//! which is why [`DiskUsageTracker::admit_state_update`] admits such an UPDATE
+//! even on an over-budget node. Refusing it would freeze a hosted contract's
+//! state while the node kept serving and advertising it (invariant 1's stale
+//! host) in exchange for zero bytes saved.
+//!
+//! That span is **not** the database's dead space, and this module is careful
+//! not to call it that. It also holds every live non-state row — contract
+//! params, hosting metadata, the contract and delegate indices,
+//! broken-invariants, the two secrets indices, delegate origins, reserved
+//! marker hashes, the compaction marker — plus all B-tree overhead. None of
+//! that is reclaimable. The reclaimable figure needs the backend's own
+//! allocator: [`DiskUsageStats::db_in_use_bytes`] is probed on the same sweep
+//! and [`reclaimable_db_bytes`] is `file − in_use`, which is what a compaction
+//! actually returns. Everything operator-facing (the over-budget warning's
+//! restart advice, the home-page tooltip, the dashboard snapshot) reports the
+//! reclaimable figure; only the UPDATE gate, which needs "room inside the
+//! current file" rather than "room a restart frees", uses the wider span.
 //!
 //! # How a file is measured (allocated, not apparent)
 //!
@@ -200,6 +213,13 @@ pub(crate) struct HostingDiskPaths {
     pub webapp_cache_dir: PathBuf,
 }
 
+/// Not-yet-measured sentinel for the database's in-use byte count (#5007
+/// follow-up). Same idiom as `HostingManager::disk_budget_bytes`'s `u64::MAX`
+/// start: 16 EiB is not a size any database reaches, so the sentinel cannot
+/// collide with a real reading, and it keeps "never probed" distinguishable
+/// from a genuine 0 (which would render the entire file as reclaimable).
+const DB_IN_USE_UNMEASURED: u64 = u64::MAX;
+
 /// Point-in-time on-disk usage gauges, one snapshot for telemetry.
 ///
 /// Aggregate scalars only, emitted on the existing `RouterSnapshot` cadence
@@ -208,12 +228,25 @@ pub(crate) struct HostingDiskPaths {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct DiskUsageStats {
     /// Persisted contract-state bytes (delta-tracked, seeded from redb rows).
-    /// The *logical* total: `db_file_bytes − state_bytes` is the database's dead
-    /// space, which is why both are reported separately (#5007).
+    /// The *logical* total: `db_file_bytes − state_bytes` is the span of the
+    /// file that state does not occupy, which is why both are reported
+    /// separately (#5007). That span is NOT the reclaimable dead space — see
+    /// [`Self::db_in_use_bytes`] and [`reclaimable_db_bytes`].
     pub state_bytes: u64,
     /// Measured byte size of the storage backend's database directory (#5007).
     /// 0 before the first sweep measurement.
     pub db_file_bytes: u64,
+    /// Bytes the storage backend's page allocator reports as actually IN USE
+    /// (#5007 follow-up). `db_file_bytes − db_in_use_bytes` is the database's
+    /// true dead space: the part a compaction can reclaim.
+    ///
+    /// `None` until the first successful probe, and permanently on a backend
+    /// that cannot report it (sqlite). Callers must not substitute
+    /// `state_bytes` for it: `db_file_bytes − state_bytes` is "everything in
+    /// the file that is not state payload", which structurally includes every
+    /// live non-state row and all B-tree overhead, and is therefore NOT what a
+    /// restart reclaims.
+    pub db_in_use_bytes: Option<u64>,
     /// On-disk WASM code blob bytes (`du` of `contracts_dir/*.wasm`).
     pub wasm_bytes: u64,
     /// Wasmtime compile-cache bytes (`du` of the relocated cache dir).
@@ -260,6 +293,20 @@ pub(crate) struct DiskUsageTracker {
     /// measurement, which makes [`Self::total_bytes`] degrade exactly to the
     /// pre-#5007 logical-state sum.
     db_file_bytes: AtomicU64,
+    /// Bytes the storage backend's page allocator reports as actually in use
+    /// (#5007 follow-up), probed on the same 60s sweep. `u64::MAX` is the
+    /// not-yet-measured sentinel — the same idiom `disk_budget_bytes` uses, and
+    /// safe because no database can be 16 EiB. Stays at the sentinel forever on
+    /// a backend that cannot report it.
+    ///
+    /// REPORTED ONLY: it is deliberately not an input to [`Self::total_bytes`]
+    /// or to any admission gate. The budget bounds the node's real FOOTPRINT,
+    /// which is the file, not the part of the file that is live — a database
+    /// with 2 GB of dead space occupies 2 GB of the operator's disk whether or
+    /// not a compaction could give it back. This gauge exists so the dead-space
+    /// figure the operator is shown, and the restart advice attached to it, are
+    /// true.
+    db_in_use_bytes: AtomicU64,
     /// Measured byte size of the unpacked-webapp cache (#5007). Refreshed on the
     /// same sweep. REPORTED ONLY — never part of [`Self::total_bytes`]; see the
     /// module docs for why double-bounding it would be wrong.
@@ -273,6 +320,7 @@ pub(crate) struct DiskUsageTracker {
     wasm_measure_failed: AtomicBool,
     compile_cache_measure_failed: AtomicBool,
     db_file_measure_failed: AtomicBool,
+    db_in_use_measure_failed: AtomicBool,
     webapp_cache_measure_failed: AtomicBool,
     /// The directories all of the above are measured from.
     paths: HostingDiskPaths,
@@ -289,10 +337,12 @@ impl DiskUsageTracker {
             seeded: AtomicBool::new(false),
             state_sizes: Mutex::new(HashMap::new()),
             db_file_bytes: AtomicU64::new(0),
+            db_in_use_bytes: AtomicU64::new(DB_IN_USE_UNMEASURED),
             webapp_cache_bytes: AtomicU64::new(0),
             wasm_measure_failed: AtomicBool::new(false),
             compile_cache_measure_failed: AtomicBool::new(false),
             db_file_measure_failed: AtomicBool::new(false),
+            db_in_use_measure_failed: AtomicBool::new(false),
             webapp_cache_measure_failed: AtomicBool::new(false),
             paths,
         }
@@ -346,6 +396,7 @@ impl DiskUsageTracker {
         DiskUsageStats {
             state_bytes: self.state_bytes.load(Ordering::Relaxed),
             db_file_bytes: self.db_file_bytes.load(Ordering::Relaxed),
+            db_in_use_bytes: self.db_in_use_bytes(),
             wasm_bytes: self.wasm_bytes.load(Ordering::Relaxed),
             compile_cache_bytes: self.compile_cache_bytes.load(Ordering::Relaxed),
             webapp_cache_bytes: self.webapp_cache_bytes.load(Ordering::Relaxed),
@@ -649,12 +700,18 @@ impl DiskUsageTracker {
     /// (the delta is non-positive) it admits unconditionally, even when the
     /// aggregate is already over budget.
     ///
-    /// # Growth absorbed by the database's dead space is also admitted (#5007)
+    /// # Growth absorbed inside the existing file is also admitted (#5007)
     ///
     /// Genuine growth still is not automatically a *disk* cost. redb reuses
-    /// freed pages rather than truncating, so a node carrying dead space
-    /// (`db_file_bytes − state_bytes`, the gap #5007 made visible) absorbs
-    /// growth up to that gap without the file growing by a single byte. The
+    /// freed pages rather than truncating, so a node whose file already exceeds
+    /// its live state (`db_file_bytes − state_bytes`, the gap #5007 made
+    /// visible) absorbs growth up to that gap without the file growing by a
+    /// single byte. This gate deliberately uses that WIDER span rather than the
+    /// narrower reclaimable dead space ([`reclaimable_db_bytes`]): the question
+    /// here is "does the file have to move", not "what would a compaction give
+    /// back", and the file does not move for growth into any already-allocated
+    /// page. The operator-facing reports use the narrower figure, because a
+    /// restart claim can only be made about that one. The
     /// honest projection of the storage term is therefore
     /// `max(db_file_bytes, state_bytes − old + new)` — NOT
     /// `max(db_file_bytes, state_bytes) − old + new`, which charges the delta on
@@ -874,6 +931,49 @@ impl DiskUsageTracker {
         );
     }
 
+    /// Bytes the storage backend's allocator reports as actually in use, or
+    /// `None` while the sentinel is still in place (never probed, or a backend
+    /// that cannot report it).
+    pub(crate) fn db_in_use_bytes(&self) -> Option<u64> {
+        let raw = self.db_in_use_bytes.load(Ordering::Relaxed);
+        (raw != DB_IN_USE_UNMEASURED).then_some(raw)
+    }
+
+    /// Record the result of one in-use probe (#5007 follow-up).
+    ///
+    /// Same fail-loud discipline as [`Self::store_measurement`]: a failed probe
+    /// keeps the previous value and warns once (edge-triggered), rather than
+    /// recording something that reads as a plausible measurement. Here the
+    /// stakes are lower than for `db_file_bytes` — nothing budgets on this
+    /// gauge — but a wrong value still puts a wrong number in front of an
+    /// operator being told to restart their node, so it gets the same
+    /// treatment.
+    ///
+    /// A backend that cannot report in-use bytes simply never calls this, and
+    /// the sentinel keeps the figure reported as unknown instead of as zero
+    /// (which would render the whole file as reclaimable dead space).
+    pub(crate) fn store_db_in_use_bytes(&self, measured: Result<u64, String>) {
+        match measured {
+            Ok(bytes) => {
+                self.db_in_use_bytes.store(bytes, Ordering::Relaxed);
+                self.db_in_use_measure_failed
+                    .store(false, Ordering::Relaxed);
+            }
+            Err(reason) => {
+                if !self.db_in_use_measure_failed.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        measurement = "database_in_use",
+                        %reason,
+                        retained_bytes = ?self.db_in_use_bytes(),
+                        "could not read the storage backend's in-use byte count; \
+                         keeping the previous value. The reported database dead \
+                         space is stale until this recovers"
+                    );
+                }
+            }
+        }
+    }
+
     /// Re-measure the unpacked-webapp cache (#5007).
     ///
     /// Recursive: the cache is a tree of unpacked bundles. REPORTED ONLY — the
@@ -912,6 +1012,48 @@ impl DiskUsageTracker {
     pub(crate) fn set_db_file_bytes_for_test(&self, bytes: u64) {
         self.db_file_bytes.store(bytes, Ordering::Relaxed);
     }
+
+    /// Test-only: install an allocator in-use figure directly, so the reporting
+    /// mappings can be driven with a value distinct from every other gauge. The
+    /// real probe (backend → tracker) is covered end-to-end against a real
+    /// database in `hosting.rs`.
+    #[cfg(test)]
+    pub(crate) fn set_db_in_use_bytes_for_test(&self, bytes: u64) {
+        self.db_in_use_bytes.store(bytes, Ordering::Relaxed);
+    }
+}
+
+/// The bytes of the database directory that no live page occupies: the measured
+/// size minus what the backend's allocator reports as in use (#5007 follow-up).
+///
+/// This is an UPPER BOUND on what a restart's compaction returns, not an
+/// equality. `db_file_bytes` is a shallow walk of the whole directory, so an
+/// orphaned `db.backup.<timestamp>` left by a schema migration
+/// (`redb.rs::backup_and_remove_database`) is counted in it, is not a live page
+/// of the current database, and therefore lands inside this figure — while
+/// being precisely what a compaction can never touch. Nothing in the tree
+/// deletes that file; only `rm` does. Reporting sites must route an operator
+/// with a backup file to deletion and one with genuine live dead space to a
+/// restart, rather than promising the whole figure back from either.
+///
+/// `None` when the in-use figure is unknown (never probed, or a backend that
+/// cannot report it). The tempting substitute — `db_file_bytes − state_bytes` —
+/// is NOT this figure: `state_bytes` counts contract-state payload only, so the
+/// difference structurally includes every live non-state row (`contract_params`,
+/// `hosting_metadata`, the contract/delegate indices, `broken_invariants`, the
+/// secrets indices, delegate origins, reserved-marker hashes, the compaction
+/// marker) plus all B-tree overhead. Telling an operator that whole span is
+/// reclaimable — and that a restart will reclaim it — is wrong for the live
+/// portion, which is why this helper exists and why the reporting sites use it
+/// rather than the subtraction.
+///
+/// Free function rather than a method so the reporting sites (`hosting.rs`'s
+/// over-budget warning, the home-page card, the dashboard snapshot) all derive
+/// it the same way from a plain [`DiskUsageStats`].
+pub(crate) fn reclaimable_db_bytes(stats: &DiskUsageStats) -> Option<u64> {
+    stats
+        .db_in_use_bytes
+        .map(|in_use| stats.db_file_bytes.saturating_sub(in_use))
 }
 
 /// The disk a single file actually consumes: its **allocated blocks**, not its
@@ -2154,5 +2296,95 @@ mod tests {
         );
         #[cfg(not(unix))]
         let _ = missing;
+    }
+    // --- Reclaimable dead space vs the file-minus-state span (#5007 follow-up)
+
+    /// The two spans are DIFFERENT numbers, and only one of them is dead space.
+    ///
+    /// `db_file − state` is "everything in the file that is not contract-state
+    /// payload": interior free pages, yes, but also every live non-state row
+    /// (params, hosting metadata, the contract/delegate indices,
+    /// broken-invariants, the two secrets indices, delegate origins, reserved
+    /// marker hashes, the compaction marker) and all B-tree overhead. Reporting
+    /// that as dead space, with "needs a node restart" attached, tells the
+    /// operator a compaction will return bytes it cannot.
+    ///
+    /// `db_file − in_use` is what the allocator says is free, which is what a
+    /// compaction actually returns.
+    #[test]
+    fn reclaimable_is_allocator_derived_not_file_minus_state() {
+        let stats = DiskUsageStats {
+            state_bytes: 100,
+            db_file_bytes: 1000,
+            // 700 of the file is LIVE — most of it non-state rows and overhead.
+            db_in_use_bytes: Some(700),
+            wasm_bytes: 0,
+            compile_cache_bytes: 0,
+            webapp_cache_bytes: 0,
+            total_bytes: 1000,
+        };
+        assert_eq!(
+            reclaimable_db_bytes(&stats),
+            Some(300),
+            "reclaimable dead space is file − in_use"
+        );
+        assert_ne!(
+            reclaimable_db_bytes(&stats),
+            Some(stats.db_file_bytes - stats.state_bytes),
+            "and it is NOT file − state, which here would overstate it 3x"
+        );
+    }
+
+    /// With no in-use reading there is no reclaimable figure — callers must
+    /// report the gap rather than silently substituting `file − state`.
+    #[test]
+    fn reclaimable_is_unknown_without_an_in_use_reading() {
+        let stats = DiskUsageStats {
+            state_bytes: 100,
+            db_file_bytes: 1000,
+            db_in_use_bytes: None,
+            wasm_bytes: 0,
+            compile_cache_bytes: 0,
+            webapp_cache_bytes: 0,
+            total_bytes: 1000,
+        };
+        assert_eq!(reclaimable_db_bytes(&stats), None);
+    }
+
+    /// An in-use reading larger than the measured file (the walks charge
+    /// ALLOCATED blocks, so a sparse database file can measure smaller than the
+    /// allocator's logical page count) saturates to zero rather than wrapping.
+    #[test]
+    fn reclaimable_saturates_when_in_use_exceeds_the_measured_file() {
+        let stats = DiskUsageStats {
+            state_bytes: 10,
+            db_file_bytes: 500,
+            db_in_use_bytes: Some(900),
+            wasm_bytes: 0,
+            compile_cache_bytes: 0,
+            webapp_cache_bytes: 0,
+            total_bytes: 500,
+        };
+        assert_eq!(reclaimable_db_bytes(&stats), Some(0));
+    }
+
+    /// The in-use gauge is REPORTED, never budgeted: installing one must not
+    /// move `total_bytes` or any admission decision. The budget bounds the
+    /// node's real footprint (the file), and a database with dead space occupies
+    /// that disk whether or not a compaction could give it back.
+    #[test]
+    fn in_use_bytes_does_not_enter_the_budgeted_aggregate() {
+        let t = tracker();
+        t.seed(std::iter::empty());
+        t.set_db_file_bytes_for_test(1000);
+        let before = t.total_bytes();
+        t.set_db_in_use_bytes_for_test(1);
+        assert_eq!(
+            t.total_bytes(),
+            before,
+            "the in-use figure is reporting-only; it must not change the \
+             aggregate the disk budget bounds"
+        );
+        assert_eq!(t.stats().db_in_use_bytes, Some(1), "but it IS reported");
     }
 }

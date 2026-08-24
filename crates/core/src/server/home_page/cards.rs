@@ -1314,11 +1314,27 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
         None => MEASURING.to_string(),
     };
     // #5007: the breakdown shows the LOGICAL state total next to the MEASURED
-    // database size, because their difference is the database's dead space —
-    // the term that made the old accounting under-count ~10x and the one an
-    // operator can only clear with a restart (startup compaction, #5005). The
-    // webapp cache is shown too, marked as excluded, so "disk used" not moving
-    // when it grows reads as deliberate rather than as another blind spot.
+    // database size — the term that made the old accounting under-count ~10x.
+    // The webapp cache is shown too, marked as excluded, so "disk used" not
+    // moving when it grows reads as deliberate rather than as another blind
+    // spot.
+    //
+    // The dead-space figure comes from the backend's own allocator, NOT from
+    // `db − state`. That subtraction is "everything in the file that is not
+    // state payload", which structurally includes every live non-state row
+    // (params, hosting metadata, the indices, broken-invariants, the secrets
+    // tables) and all B-tree overhead — none of which a restart's compaction
+    // reclaims. Reporting it as dead space next to restart advice would tell the
+    // operator to restart for bytes a restart cannot return. When the allocator
+    // has not been probed (or cannot answer) the tooltip says so rather than
+    // substituting the subtraction.
+    //
+    // Even the allocator-derived figure is an upper bound, and the tooltip says
+    // so: `disk_db_bytes` is a shallow walk of the whole database DIRECTORY, so
+    // an orphaned `db.backup.<timestamp>` from a schema migration is counted in
+    // it and is not a live page, which puts its bytes inside "not in live pages"
+    // — while being the one thing compaction can never reclaim. That file only
+    // goes away by hand.
     //
     // The parts deliberately do NOT sum to the tile above them: state bytes live
     // INSIDE the database file, so the aggregate takes the larger of the two
@@ -1336,11 +1352,20 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
             "Disk used counts the LARGER of state and database file (state lives \
              inside the file), plus WASM and compile cache — so these parts do not \
              sum to it. State (logical): {state} · Database file: {db} \
-             (dead space: {dead}) · WASM: {wasm} · Compile cache: {cache} · \
+             ({dead}) · WASM: {wasm} · Compile cache: {cache} · \
              Webapp cache: {webapp} (not budgeted)",
             state = format_bytes(state),
             db = format_bytes(db),
-            dead = format_bytes(db.saturating_sub(state)),
+            dead = match h.disk_db_in_use_bytes {
+                Some(in_use) => format!(
+                    "live pages: {}, not in live pages: {} — a restart compacts \
+                     that, except for any orphaned db.backup.* left by a schema \
+                     migration, which is counted here and must be deleted by hand",
+                    format_bytes(in_use),
+                    format_bytes(db.saturating_sub(in_use)),
+                ),
+                None => "reclaimable space not yet measured".to_string(),
+            },
             wasm = format_bytes(wasm),
             cache = format_bytes(cache),
             webapp = format_bytes(webapp),

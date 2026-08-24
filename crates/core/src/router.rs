@@ -235,8 +235,14 @@ pub(crate) struct RouterSnapshotInfo {
     /// the `HostingManager`'s `DiskUsageTracker` on the snapshot cadence.
     /// `hosting_disk_state_bytes` is the delta-tracked *logical* state total;
     /// `hosting_disk_db_bytes` is the measured size of the storage backend's
-    /// database directory (their difference is the database's dead space, the
-    /// ~10x under-count #5007 fixed); `hosting_disk_wasm_bytes` is the
+    /// database directory (the term whose absence was the ~10x under-count
+    /// #5007 fixed); `hosting_disk_db_in_use_bytes` is what the backend's own
+    /// page allocator reports as live, so `db − db_in_use` is the part of the
+    /// directory no live page occupies — an upper bound on what a restart's
+    /// compaction returns, since the shallow walk also counts an orphaned
+    /// `db.backup.<timestamp>` that only `rm` clears. Do NOT use `db − state`
+    /// for dead space: it additionally covers every live non-state row and all
+    /// B-tree overhead; `hosting_disk_wasm_bytes` is the
     /// `du`-measured WASM-blob total; `hosting_disk_compile_cache_bytes` is the
     /// relocated wasmtime compile-cache total; `hosting_disk_total_bytes` is
     /// `max(state, db) + wasm + compile_cache` — the aggregate the disk budget
@@ -246,6 +252,9 @@ pub(crate) struct RouterSnapshotInfo {
     /// is configured and seeded (early startup). Per-node aggregate scalars.
     pub hosting_disk_state_bytes: Option<u64>,
     pub hosting_disk_db_bytes: Option<u64>,
+    /// `None` also when the backend cannot report in-use bytes at all (sqlite),
+    /// not just before the tracker is seeded.
+    pub hosting_disk_db_in_use_bytes: Option<u64>,
     pub hosting_disk_wasm_bytes: Option<u64>,
     pub hosting_disk_compile_cache_bytes: Option<u64>,
     pub hosting_disk_webapp_cache_bytes: Option<u64>,
@@ -1357,6 +1366,7 @@ impl Router {
             // DiskUsageTracker on the snapshot cadence (#4683).
             hosting_disk_state_bytes: None,
             hosting_disk_db_bytes: None,
+            hosting_disk_db_in_use_bytes: None,
             hosting_disk_wasm_bytes: None,
             hosting_disk_compile_cache_bytes: None,
             hosting_disk_webapp_cache_bytes: None,
