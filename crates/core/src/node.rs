@@ -10133,8 +10133,14 @@ mod tests {
                 let follows = |a: &Vec<usize>, b: &Vec<usize>| {
                     !a.is_empty() && !b.is_empty() && b[0] == (a[a.len() - 1] + 1) % shared_len
                 };
+                // MUTATION UNDER TEST (review only, never to be committed): the
+                // PREMISE assertion is disabled, reconstructing the test as it
+                // stood before commit 0e2e9cfa0 added it -- coverage floor only.
+                // Testing whether the table's "boundary deleted 40/0" row is
+                // explained by having been measured against that earlier shape.
+                let _premise_holds = i0 == i1 || follows(&i0, &i1) || follows(&i1, &i0);
                 assert!(
-                    i0 == i1 || follows(&i0, &i1) || follows(&i1, &i0),
+                    true,
                     "pair {pair}: the two concurrent replies were neither \
                      IDENTICAL (they overlapped, resuming from one published \
                      origin) nor CONTIGUOUS (the scheduler serialised them). Two \

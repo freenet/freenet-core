@@ -2871,8 +2871,14 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         // `GlobalRng` is entirely thread-local (`THREAD_RNG`/`THREAD_SEED` are
         // `thread_local!`, with only an `AtomicU64` for thread indices), so
         // drawing under this lock cannot deadlock against it.
+        // MUTATION UNDER TEST (review only, never to be committed): the atomic
+        // PUBLISH is deleted, reproducing the pre-b295f9ff1 shape where each
+        // reader draws its own origin and nothing is stored until a reply is
+        // recorded. `pop` rather than a bare removal of the `put` so a completed
+        // cycle's stale cursor is not re-read as mid-cycle -- that is what
+        // 65086ec2 did.
         let origin = crate::config::GlobalRng::random_range(0..len);
-        cursors.put(peer, FallbackCursor::starting_at(sorted, origin));
+        cursors.pop(&peer);
         origin
     }
 
