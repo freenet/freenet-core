@@ -123,8 +123,45 @@ die() {
     exit 1
 }
 
-FIELDS='number,title,author,createdAt,updatedAt,mergeable,isDraft,url,headRefName,statusCheckRollup'
-RUN_FIELDS='databaseId,headBranch,workflowName,createdAt'
+FIELDS='number,title,author,createdAt,updatedAt,mergeable,isDraft,url,headRefName,headRefOid,statusCheckRollup'
+RUN_FIELDS='databaseId,headBranch,headSha,workflowName,createdAt'
+
+# stderr is captured to a FILE, never merged into the JSON capture. `gh` writes
+# upgrade notices and warnings to stderr while exiting 0, and folding those into
+# `$PRS` on the success path poisons the JSON: the array gate below then dies
+# with "auth or API problem", a false red X naming the wrong cause. Same defect
+# shape the repo's SIGPIPE rule calls out -- it corrupts the diagnosis, not just
+# the verdict. stderr is surfaced only when the command actually failed.
+#
+# The result goes into a GLOBAL rather than to stdout on purpose: with
+# `OUT="$(gh_json ...)"` the `die` would run inside the command substitution's
+# subshell, so its `exit 1` would end the SUBSHELL and the script would sail on
+# with an empty variable -- a broken query reporting a clean backlog, which is
+# the one outcome this script exists to make impossible.
+ERRLOG="$(mktemp)" || die "could not create a temp file for gh's stderr"
+trap 'rm -f "$ERRLOG"' EXIT
+GH_JSON_OUT=""
+# Every call site adds `|| exit 1` even though `die` already exits, so that the
+# callers do not silently depend on an invisible property of a function defined
+# elsewhere (that its failure path exits rather than returns).
+#
+# What that buys, stated precisely rather than generously, because it was
+# measured: if `die` were ever replaced by a `return`, the run would STILL abort
+# non-zero -- the array gate below rejects the empty variable. What would be
+# lost is the DIAGNOSIS. Measured with that exact mutation and a failing stub:
+# without `|| exit 1` the run dies saying "the PR query did not return a JSON
+# array (auth or API problem)" instead of naming `gh pr list` and the 401. Same
+# class the SIGPIPE rule calls out -- it corrupts the diagnosis, not the
+# verdict, and a gate that blames the wrong subsystem sends the next reader to
+# the wrong place. Not a silent-success hole; do not describe it as one.
+gh_json() {
+    # gh_json <label> <cmd...>  -> sets GH_JSON_OUT, or dies naming <label>.
+    local what="$1"
+    shift
+    if ! GH_JSON_OUT="$("$@" 2>"$ERRLOG")"; then
+        die "$what failed for $REPO: $(tr '\n' ' ' <"$ERRLOG")"
+    fi
+}
 
 if [ -n "$RUNS_INPUT" ]; then
     [ -f "$RUNS_INPUT" ] || die "--runs-input file not found: $RUNS_INPUT"
@@ -141,29 +178,25 @@ else
     command -v gh >/dev/null 2>&1 || die "the 'gh' CLI is not on PATH"
     command -v jq >/dev/null 2>&1 || die "'jq' is not on PATH"
 
-    if ! PRS="$(gh pr list --repo "$REPO" --state open --limit "$LIMIT" --json "$FIELDS" 2>&1)"; then
-        die "gh pr list failed for $REPO: $PRS"
-    fi
+    gh_json "gh pr list" gh pr list --repo "$REPO" --state open --limit "$LIMIT" --json "$FIELDS" || exit 1
+    PRS="$GH_JSON_OUT"
 
     # GitHub computes mergeability lazily: the first query after a push returns
     # UNKNOWN. One cheap refetch resolves most of them; whatever is still
     # UNKNOWN is REPORTED as unknown below rather than quietly counted as clean,
     # so the conflict count is never silently understated.
     if printf '%s' "$PRS" | jq -e 'type == "array" and (map(select(.mergeable == "UNKNOWN")) | length > 0)' >/dev/null 2>&1; then
-        sleep 10
-        if ! REFETCH="$(gh pr list --repo "$REPO" --state open --limit "$LIMIT" --json "$FIELDS" 2>&1)"; then
-            die "gh pr list (mergeability refetch) failed for $REPO: $REFETCH"
-        fi
-        PRS="$REFETCH"
+        sleep "${SWEEP_REFETCH_SLEEP:-10}"
+        gh_json "gh pr list (mergeability refetch)" gh pr list --repo "$REPO" --state open --limit "$LIMIT" --json "$FIELDS" || exit 1
+        PRS="$GH_JSON_OUT"
     fi
 
     # The second unwatched queue: workflow runs held for maintainer approval.
     # Same instrument rule as above -- if this query fails we abort rather than
     # report "no runs are waiting", which is what a broken query looks like.
     if [ -z "$RUNS" ]; then
-        if ! RUNS="$(gh run list --repo "$REPO" --status action_required --limit "$LIMIT" --json "$RUN_FIELDS" 2>&1)"; then
-            die "gh run list (action_required) failed for $REPO: $RUNS"
-        fi
+        gh_json "gh run list (action_required)" gh run list --repo "$REPO" --status action_required --limit "$LIMIT" --json "$RUN_FIELDS" || exit 1
+        RUNS="$GH_JSON_OUT"
     fi
 fi
 
@@ -174,6 +207,33 @@ printf '%s' "$RUNS" | jq -e 'type == "array"' >/dev/null 2>&1 \
 
 COUNT="$(printf '%s' "$PRS" | jq 'length')"
 RUN_COUNT="$(printf '%s' "$RUNS" | jq 'length')"
+
+# THE SECOND HALF OF THE SAME PRINCIPLE, and the one that was missing. The REST
+# probe above corroborates that the LISTING is real. Nothing corroborated the
+# FIELDS inside it -- and the green bucket, the section this whole sweep exists
+# for, is computed entirely from `statusCheckRollup`. If that field came back
+# empty for every PR (a missing `checks: read` / `statuses: read` grant, a
+# GraphQL partial response, which `gh` can return alongside exit 0, or a future
+# field rename), the report would say "0 green" and exit 0. "Nothing is stalled"
+# and "the rollup never arrived" would be byte-identical -- the exact confusion
+# the probe above exists to prevent, one level in.
+#
+# Same for `mergeable`, which is the sole input to the conflict count.
+#
+# Both checks are ALL-or-nothing on purpose: an individual PR legitimately has
+# no checks (nothing matched its paths) or an unresolved mergeability. What
+# cannot legitimately happen on a repo with open PRs and CI is that NOT ONE of
+# them carries the field. A repo with genuinely no CI at all would need this
+# relaxed -- freenet-core is not that repo, and a sweep that stayed silent there
+# would be reporting on a repo it cannot see.
+if [ "$COUNT" -gt 0 ]; then
+    if ! printf '%s' "$PRS" | jq -e '[.[] | .statusCheckRollup // [] | length] | add > 0' >/dev/null 2>&1; then
+        die "fetched $COUNT open PRs and NOT ONE carries a statusCheckRollup entry. The green-and-unmerged count is computed from that field, so it would read 0 for every PR. Check the workflow's 'checks: read' and 'statuses: read' permissions, and whether gh returned a partial GraphQL response."
+    fi
+    if ! printf '%s' "$PRS" | jq -e '[.[] | select(.mergeable != null and .mergeable != "")] | length > 0' >/dev/null 2>&1; then
+        die "fetched $COUNT open PRs and NOT ONE carries a mergeable value. The conflict count is computed from that field, so it would read 0. The listing is incomplete; refusing to report a conflict-free backlog."
+    fi
+fi
 
 if [ -z "$INPUT" ]; then
     [ "$COUNT" -lt "$LIMIT" ] \
@@ -192,9 +252,8 @@ if [ -z "$INPUT" ]; then
     # because `gh` surfaces a mid-pagination API error as a non-zero exit, which
     # the check above already turns into a `die` -- but if that ever stops being
     # true, this probe will not be the thing that catches it.
-    if ! PROBE="$(gh api "repos/$REPO/pulls?state=open&per_page=1" --jq 'length' 2>&1)"; then
-        die "corroborating REST probe failed for $REPO: $PROBE"
-    fi
+    gh_json "corroborating REST probe" gh api "repos/$REPO/pulls?state=open&per_page=1" --jq "length" || exit 1
+    PROBE="$GH_JSON_OUT"
     case "$PROBE" in
         ''|*[!0-9]*) die "corroborating REST probe returned a non-number: $PROBE" ;;
     esac
@@ -242,16 +301,35 @@ RESULT="$(printf '%s' "$PRS" | jq -c \
 
     # "Green since" is when the LAST check finished, not when the PR was last
     # touched: a comment on a green PR must not reset its green age.
+    #
+    # A CheckRun has `completedAt`; a legacy StatusContext has only `startedAt`
+    # (verified against live `gh` output -- it carries no completedAt at all).
+    # Both are folded in, because a StatusContext-only PR would otherwise fall
+    # back to `updatedAt` and a comment WOULD reset its green age there -- the
+    # single case the "a comment does not reset the green age" pin cannot see.
+    # A status context is instantaneous, so its start is its finish.
     def green_since:
-      ([.statusCheckRollup[]? | .completedAt? | epoch
-        | select(. != null and . > 0)] | max) // (.updatedAt | epoch);
+      ([ (.statusCheckRollup[]? | select(.__typename == "CheckRun") | .completedAt? | epoch),
+         (.statusCheckRollup[]? | select(.__typename == "StatusContext") | .startedAt? | epoch)
+    # The `> 0` filter drops the "0001-01-01T00:00:00Z" placeholder that GitHub
+    # emits for an unfinished check, which parses to a large negative epoch. It
+    # is DEFENSIVE and deliberately not pinned: no reachable input exercises it.
+    # A PR carrying that sentinel has an incomplete check, so it is already not
+    # green, and `max` would ignore the negative anyway. Kept because the
+    # placeholder is a real value in real output and a future caller of
+    # green_since might not be gated on greenness; recorded as untested rather
+    # than left to look covered.
+    #
+    # (No apostrophes in this block on purpose: the whole jq program is a
+    # single-quoted shell word, so one would terminate it. Caught here twice.)
+       ] | map(select(. != null and . > 0)) | max) // (.updatedAt | epoch);
 
     def fmt_age($t): if $t == null then "?"
                      else (((($now - $t) / 86400) * 10 | floor) / 10 | tostring) end;
 
     def render($prs; $agefield):
       ($prs | group_by(.author.login) | sort_by(.[0] | .[$agefield]))
-      | map("- **@" + (.[0].author.login) + "** (" + (length | tostring) + ")\n"
+      | map("- **@" + (.[0].author.login | tostring | md) + "** (" + (length | tostring) + ")\n"
             + (map("  - [#" + (.number | tostring) + "](" + .url + ") "
                    + (if .isDraft then "_(draft)_ " else "" end)
                    + fmt_age(.[$agefield]) + "d — "
@@ -270,7 +348,13 @@ RESULT="$(printf '%s' "$PRS" | jq -c \
     | map(. + { is_green: ((.states | length) > 0 and (.states | all(. == "PASS"))) })
     | . as $all
 
+    # CONFLICTING is excluded here even when every check is green. The section
+    # is headed "Nothing is blocking these" and a conflicting PR is blocked, so
+    # listing it in both sections made the report contradict itself -- and it
+    # misdirects the action the sweep exists to prompt (merge it vs rebase it).
+    # It still appears, under CONFLICTING, where the useful verb is.
     | ($all | map(select(.is_green and (.isDraft | not)
+          and .mergeable != "CONFLICTING"
           and .green_epoch != null
           and ($now - .green_epoch) > ($green_hours * 3600)))
         | sort_by(.green_epoch)) as $stale_green
@@ -281,19 +365,32 @@ RESULT="$(printf '%s' "$PRS" | jq -c \
     | ($all | map(select(.mergeable == "UNKNOWN")) | length) as $unknown_mergeable
 
     # (d) Runs held for maintainer approval. Grouped BY BRANCH, not by run: 22
-    # pending runs on one branch is ONE stuck PR, and reporting the raw run
-    # count would overstate the problem by an order of magnitude. The PR number
-    # is resolved by matching headRefName; a branch with no open PR (a stale
-    # run, or a closed PR) is still listed, because a queue nobody drains is
-    # the finding regardless of what is in it.
+    # pending runs on one branch is usually ONE stuck PR, and reporting the raw
+    # run count would overstate the problem by an order of magnitude.
+    #
+    # "Usually", not "always", and the difference is a fork problem: neither
+    # `gh run list --json headBranch` nor `gh pr list --json headRefName` carries
+    # the OWNER, so two forks that both use `patch-1` (or both push from their
+    # own `main`) collapse into one group and `awaiting_approval` undercounts.
+    # Section (d) exists for the outside-contributor population, which is exactly
+    # the one that collides. Two mitigations, since the owner is not available:
+    # a run is also matched to a PR by exact head SHA, which cannot collide; and
+    # a group resolving to more than one open PR is LABELLED ambiguous rather
+    # than silently presented as one stuck PR.
     | ($runs
         | group_by(.headBranch)
         | map({
             branch: .[0].headBranch,
             pending: length,
             oldest: ([.[] | .createdAt | epoch | select(. != null)] | min),
+            shas: [.[] | .headSha? | select(. != null)],
           })
-        | map(. as $g | $g + { prs: [$all[] | select(.headRefName == $g.branch) | .number] })
+        | map(. as $g | $g + {
+            prs: ([$all[]
+                   | select(.headRefName == $g.branch
+                            or (.headRefOid != null and (.headRefOid | IN($g.shas[]))))
+                   | .number] | unique),
+          })
         | sort_by(.oldest // 0)) as $awaiting
 
     | {
@@ -348,11 +445,21 @@ RESULT="$(printf '%s' "$PRS" | jq -c \
                          + fmt_age(.oldest) + "d"
                          + (if (.prs | length) > 0
                             then " — " + (.prs | map("#" + tostring) | join(", "))
-                            else " — no open PR (stale runs)" end))
+                            else " — no open PR (stale runs)" end)
+                         + (if (.prs | length) > 1
+                            then " — ⚠ AMBIGUOUS: "
+                                 + (.prs | length | tostring)
+                                 + " open PRs share this branch name, so this"
+                                 + " group may merge distinct PRs and the"
+                                 + " branch count below understates them"
+                            else "" end))
                    | join("\n"))
              end) + "\n"
           + "\n_\($runs | length) pending run(s) across \($awaiting | length) branch(es). "
-          + "Counted per BRANCH: many pending runs on one branch is one stuck PR, not many._\n"
+          + "Counted per BRANCH, because many pending runs on one branch is "
+          + "normally one stuck PR rather than many. Branch names carry no "
+          + "owner, so two forks using the same name group together — any such "
+          + "group is marked AMBIGUOUS above._\n"
         ),
       }
     ')"

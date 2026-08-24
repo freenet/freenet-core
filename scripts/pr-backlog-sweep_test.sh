@@ -88,9 +88,17 @@ section() {
 }
 
 sweep_counts() {
-    # Prints "<green> <idle> <conflicting> <awaiting>" pulled back out of the rendered
-    # headline, so the test reads the same numbers a human would.
-    printf '%s\n' "$1" | grep -m1 'open PRs\.' \
+    # Prints "<green> <idle> <conflicting> <awaiting>" pulled back out of the
+    # rendered headline, so the test reads the same numbers a human would.
+    #
+    # `awk NR==1{...;exit}` rather than `grep -m1`: `-m1` is a short-circuiting
+    # consumer, and the repo's SIGPIPE-under-pipefail audit grep looks for
+    # `grep -[a-z]*q`, `head` and `read` -- it would not have SEEN this one. It
+    # was benign here (the status is discarded), but a form the project's own
+    # audit cannot find is the wrong form to leave lying around in a file whose
+    # subject is instruments that fail invisibly.
+    printf '%s\n' "$1" \
+        | awk '/open PRs\./ { print; exit }' \
         | grep -oE '\*\*[0-9]+\*\*' | tr -d '*' | paste -sd' ' -
 }
 
@@ -229,6 +237,174 @@ check_contains "the report says not to loosen the approval policy" "$RUNS_REPORT
 NO_RUNS_REPORT="$(SWEEP_NOW_EPOCH="$NOW" "$BASH_BIN" "$SWEEP" --input "$WORK/mixed.json" 2>/dev/null)"
 check_contains "an empty approval queue renders as none" "$NO_RUNS_REPORT" "**0** branch(es) awaiting CI approval" yes
 
+# --- Gaps found by review (each of these mutations previously SURVIVED) ------
+
+# A PENDING legacy StatusContext must not read as green. Every open PR on this
+# repo carries StatusContexts (license/cla, rule-review/warnings, snyk), so a
+# mutation making a pending one read as PASS would ship a wrong green list
+# silently -- and `check_state` is the function this file's header says it
+# exists to protect. Only SUCCESS was ever fed to that branch before.
+cat > "$WORK/pending-status.json" <<EOF
+[
+  {
+    "number": 11, "title": "pending legacy status is NOT green", "author": {"login": "alice"},
+    "createdAt": "$OLD", "updatedAt": "$OLD", "mergeable": "MERGEABLE",
+    "isDraft": false, "url": "https://example.invalid/11", "headRefName": "b",
+    "statusCheckRollup": [
+      {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "$OLD"},
+      {"__typename": "StatusContext", "state": "PENDING", "startedAt": "$OLD"}
+    ]
+  },
+  {
+    "number": 12, "title": "expected legacy status is NOT green", "author": {"login": "alice"},
+    "createdAt": "$OLD", "updatedAt": "$OLD", "mergeable": "MERGEABLE",
+    "isDraft": false, "url": "https://example.invalid/12", "headRefName": "b",
+    "statusCheckRollup": [
+      {"__typename": "StatusContext", "state": "EXPECTED", "startedAt": "$OLD"}
+    ]
+  }
+]
+EOF
+PENDING_REPORT="$(SWEEP_NOW_EPOCH="$NOW" "$BASH_BIN" "$SWEEP" --input "$WORK/pending-status.json" 2>/dev/null)"
+check "a pending or expected StatusContext is not green" "0 2 0 0" "$(sweep_counts "$PENDING_REPORT")"
+
+# A StatusContext carries startedAt and no completedAt, so a
+# StatusContext-only PR used to fall back to updatedAt -- meaning a comment DID
+# reset its green age, the one case the CheckRun-based pin cannot see.
+cat > "$WORK/status-only.json" <<EOF
+[
+  {
+    "number": 13, "title": "green via StatusContext, freshly commented", "author": {"login": "alice"},
+    "createdAt": "$OLD", "updatedAt": "$FRESH", "mergeable": "MERGEABLE",
+    "isDraft": false, "url": "https://example.invalid/13", "headRefName": "b",
+    "statusCheckRollup": [
+      {"__typename": "StatusContext", "state": "SUCCESS", "startedAt": "$OLD"}
+    ]
+  }
+]
+EOF
+STATUS_ONLY="$(SWEEP_NOW_EPOCH="$NOW" "$BASH_BIN" "$SWEEP" --input "$WORK/status-only.json" 2>/dev/null)"
+check_contains "a StatusContext-only PR dates its green age from the status, not a comment" \
+    "$(section "$STATUS_ONLY" "Green and unmerged")" "/13) 20d" yes
+
+# A green PR that is ALSO conflicting must not be listed under "Nothing is
+# blocking these" -- it is blocked, and the report contradicted itself by
+# putting the same PR in both sections. Live run at the time: 3 of 8.
+cat > "$WORK/green-conflicting.json" <<EOF
+[
+  {
+    "number": 14, "title": "green checks but conflicting", "author": {"login": "alice"},
+    "createdAt": "$OLD", "updatedAt": "$OLD", "mergeable": "CONFLICTING",
+    "isDraft": false, "url": "https://example.invalid/14", "headRefName": "b",
+    "statusCheckRollup": [
+      {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "$OLD"}
+    ]
+  }
+]
+EOF
+GC_REPORT="$(SWEEP_NOW_EPOCH="$NOW" "$BASH_BIN" "$SWEEP" --input "$WORK/green-conflicting.json" 2>/dev/null)"
+check "a conflicting PR is not counted as green-and-unblocked" "0 1 1 0" "$(sweep_counts "$GC_REPORT")"
+check_contains "the conflicting PR is absent from the green section" \
+    "$(section "$GC_REPORT" "Green and unmerged")" "example.invalid/14" no
+check_contains "the conflicting PR is present in the conflicting section" \
+    "$(section "$GC_REPORT" "Decayed to CONFLICTING")" "example.invalid/14" yes
+
+# The UNKNOWN-mergeability note is the honesty mechanism for the conflict count
+# -- it says the number is a LOWER BOUND. It fired on live data the day this
+# landed (3 PRs), and deleting it previously left the suite green.
+cat > "$WORK/unknown-mergeable.json" <<EOF
+[
+  {
+    "number": 15, "title": "mergeability not yet computed", "author": {"login": "alice"},
+    "createdAt": "$OLD", "updatedAt": "$OLD", "mergeable": "UNKNOWN",
+    "isDraft": false, "url": "https://example.invalid/15", "headRefName": "b",
+    "statusCheckRollup": [
+      {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "$OLD"}
+    ]
+  }
+]
+EOF
+UNK_REPORT="$(SWEEP_NOW_EPOCH="$NOW" "$BASH_BIN" "$SWEEP" --input "$WORK/unknown-mergeable.json" 2>/dev/null)"
+check_contains "an UNKNOWN mergeability is declared a LOWER BOUND" "$UNK_REPORT" "LOWER BOUND" yes
+check_contains "a fully-resolved listing carries no lower-bound note" "$REPORT" "LOWER BOUND" no
+
+# Branch-to-PR resolution needs headRefName. mixed.json deliberately has none,
+# so combining it with the runs fixture exercises the warning that says so --
+# without it, every branch would silently read "no open PR", a wrong answer
+# that looks like a finding.
+NO_REF="$(SWEEP_NOW_EPOCH="$NOW" "$BASH_BIN" "$SWEEP" \
+    --input "$WORK/mixed.json" --runs-input "$WORK/runs.json" 2>/dev/null)"
+check_contains "a listing with no headRefName says branches could not be resolved" \
+    "$NO_REF" "carries no \`headRefName\`" yes
+check_contains "a listing WITH headRefName carries no such warning" \
+    "$RUNS_REPORT" "carries no \`headRefName\`" no
+
+# Two forks can use the same branch name, and neither gh field carries the
+# owner, so such a group merges distinct PRs and the branch count understates
+# them. It must be labelled rather than presented as one stuck PR.
+cat > "$WORK/fork-collision.json" <<EOF
+[
+  {"number": 100, "title": "fork A", "author": {"login": "a"}, "createdAt": "$OLD",
+   "updatedAt": "$OLD", "mergeable": "MERGEABLE", "isDraft": false,
+   "url": "https://example.invalid/100", "headRefName": "patch-1",
+   "statusCheckRollup": [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "$OLD"}]},
+  {"number": 101, "title": "fork B", "author": {"login": "b"}, "createdAt": "$OLD",
+   "updatedAt": "$OLD", "mergeable": "MERGEABLE", "isDraft": false,
+   "url": "https://example.invalid/101", "headRefName": "patch-1",
+   "statusCheckRollup": [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "$OLD"}]}
+]
+EOF
+cat > "$WORK/fork-runs.json" <<EOF
+[{"databaseId": 9, "headBranch": "patch-1", "headSha": "deadbeef", "workflowName": "CI", "createdAt": "$OLD"}]
+EOF
+FORK_REPORT="$(SWEEP_NOW_EPOCH="$NOW" "$BASH_BIN" "$SWEEP" \
+    --input "$WORK/fork-collision.json" --runs-input "$WORK/fork-runs.json" 2>/dev/null)"
+# Needle is the ROW marker "⚠ AMBIGUOUS:", not the bare word: the footer prose
+# explains that such groups are "marked AMBIGUOUS above", so a bare-word search
+# matches the explanation and the negative case can never fail. Same anchor trap
+# as the workflow pins above, hit twice in one file.
+check_contains "a branch name shared by two open PRs is flagged ambiguous" "$FORK_REPORT" "⚠ AMBIGUOUS:" yes
+check_contains "an unambiguous branch is not flagged" "$RUNS_REPORT" "⚠ AMBIGUOUS:" no
+
+# A run whose branch matches nothing is still resolved when its head SHA does.
+# SHA cannot collide across forks, so this is the resolution that survives the
+# ambiguity above.
+cat > "$WORK/sha-runs.json" <<EOF
+[{"databaseId": 10, "headBranch": "renamed-since", "headSha": "cafe1234", "workflowName": "CI", "createdAt": "$OLD"}]
+EOF
+cat > "$WORK/sha-prs.json" <<EOF
+[{"number": 200, "title": "matched by sha", "author": {"login": "a"}, "createdAt": "$OLD",
+  "updatedAt": "$OLD", "mergeable": "MERGEABLE", "isDraft": false,
+  "url": "https://example.invalid/200", "headRefName": "other-name", "headRefOid": "cafe1234",
+  "statusCheckRollup": [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "$OLD"}]}]
+EOF
+SHA_REPORT="$(SWEEP_NOW_EPOCH="$NOW" "$BASH_BIN" "$SWEEP" \
+    --input "$WORK/sha-prs.json" --runs-input "$WORK/sha-runs.json" 2>/dev/null)"
+check_contains "a run is resolved to its PR by head SHA when the branch name does not match" \
+    "$SHA_REPORT" "oldest 20d — #200" yes
+
+# The field-blindness gates: the REST probe corroborates that the LISTING is
+# real, these corroborate that the FIELDS inside it arrived. A rollup that came
+# back empty for every PR would report "0 green" and exit 0 -- indistinguishable
+# from a clean backlog, and the green bucket is what the sweep is FOR.
+BLIND_ROLLUP="$WORK/blind-rollup.json"
+jq -c 'map(. + {statusCheckRollup: []})' "$WORK/mixed.json" > "$BLIND_ROLLUP"
+BLIND_RC=0
+SWEEP_NOW_EPOCH="$NOW" "$BASH_BIN" "$SWEEP" --input "$BLIND_ROLLUP" >/dev/null 2>&1 || BLIND_RC=$?
+check "a listing whose every rollup is empty aborts non-zero" "1" "$BLIND_RC"
+
+BLIND_MERGE="$WORK/blind-mergeable.json"
+jq -c 'map(. + {mergeable: null})' "$WORK/mixed.json" > "$BLIND_MERGE"
+BLIND_M_RC=0
+SWEEP_NOW_EPOCH="$NOW" "$BASH_BIN" "$SWEEP" --input "$BLIND_MERGE" >/dev/null 2>&1 || BLIND_M_RC=$?
+check "a listing whose every mergeable is null aborts non-zero" "1" "$BLIND_M_RC"
+
+# ...but a SINGLE PR legitimately having no checks must NOT abort, or the sweep
+# cries wolf on a normal repo. mixed.json's #6 is exactly that case and the
+# suite above already runs it clean; assert it explicitly so a future tightening
+# of the gate to per-PR is caught here rather than in production.
+check_contains "a single PR with no checks does not abort the sweep" "$REPORT" "PR backlog sweep" yes
+
 # --- An author-controlled title must not be able to run anything -------------
 CANARY="$WORK/pwned"
 cat > "$WORK/inject.json" <<EOF
@@ -334,6 +510,63 @@ check "a listing truncated at the fetch limit aborts non-zero" "1" "$(sweep_rc)"
 # prints, so it aborts rather than reporting a clean CI-approval queue.
 write_stub_gh runs-fail 1
 check "a failed action_required query aborts non-zero" "1" "$(sweep_rc)"
+
+# The mergeability refetch is a live-network path that nothing exercised:
+# deleting it whole (sleep included) previously left the suite green. The stub
+# below returns UNKNOWN on the first `pr list` and CONFLICTING on the second, so
+# only a sweep that actually refetches reports the conflict. SWEEP_REFETCH_SLEEP
+# exists so this costs no wall-clock; it defaults to the real 10s.
+cat > "$STUB/gh" <<STUBEOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = "api" ]; then echo 1; exit 0; fi
+if [ "\${1:-}" = "run" ]; then echo "[]"; exit 0; fi
+CALLS="$WORK/prlist-calls"
+n=\$(( \$(cat "\$CALLS" 2>/dev/null || echo 0) + 1 ))
+echo "\$n" > "\$CALLS"
+if [ "\$n" -eq 1 ]; then M=UNKNOWN; else M=CONFLICTING; fi
+jq -cn --arg m "\$M" '[{number: 1, title: "x", author: {login: "a"}, createdAt: "$OLD", updatedAt: "$OLD", mergeable: \$m, isDraft: false, url: "https://example.invalid/1", headRefName: "b", headRefOid: "abc", statusCheckRollup: [{__typename: "CheckRun", status: "COMPLETED", conclusion: "SUCCESS", completedAt: "$OLD"}]}]'
+STUBEOF
+chmod +x "$STUB/gh"
+rm -f "$WORK/prlist-calls"
+REFETCH_OUT="$(SWEEP_NOW_EPOCH="$NOW" SWEEP_LIMIT=5 SWEEP_REFETCH_SLEEP=0 PATH="$STUB:$PATH" \
+    "$BASH_BIN" "$SWEEP" 2>/dev/null)"
+check "an UNKNOWN mergeability triggers exactly one refetch" "2" "$(cat "$WORK/prlist-calls")"
+check "the refetched mergeability is the one reported" "0 1 1 0" "$(sweep_counts "$REFETCH_OUT")"
+
+# The action_required listing gets the same truncation guard as the PR listing.
+# Its PR-side twin was covered and this one was not -- an asymmetry that would
+# have let a truncated approval queue report a short, confident number.
+cat > "$STUB/gh" <<STUBEOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = "api" ]; then echo 1; exit 0; fi
+if [ "\${1:-}" = "run" ]; then
+  jq -cn --argjson n 5 '[range(\$n) | {databaseId: ., headBranch: "b", headSha: "s", workflowName: "CI", createdAt: "$OLD"}]'
+  exit 0
+fi
+jq -cn '[{number: 1, title: "x", author: {login: "a"}, createdAt: "$OLD", updatedAt: "$OLD", mergeable: "MERGEABLE", isDraft: false, url: "https://example.invalid/1", headRefName: "b", headRefOid: "abc", statusCheckRollup: [{__typename: "CheckRun", status: "COMPLETED", conclusion: "SUCCESS", completedAt: "$OLD"}]}]'
+STUBEOF
+chmod +x "$STUB/gh"
+RUNS_TRUNC_RC=0
+SWEEP_NOW_EPOCH="$NOW" SWEEP_LIMIT=5 SWEEP_REFETCH_SLEEP=0 PATH="$STUB:$PATH" \
+    "$BASH_BIN" "$SWEEP" >/dev/null 2>&1 || RUNS_TRUNC_RC=$?
+check "an action_required listing truncated at the fetch limit aborts non-zero" "1" "$RUNS_TRUNC_RC"
+
+# gh writes upgrade notices to stderr while exiting 0. Merging stderr into the
+# JSON capture poisoned $PRS and produced a false red X blaming "auth or API
+# problem" -- the wrong cause, which is worse than the wrong verdict.
+cat > "$STUB/gh" <<STUBEOF
+#!/usr/bin/env bash
+echo "A new release of gh is available: 2.86.0 -> 2.87.0" >&2
+if [ "\${1:-}" = "api" ]; then echo 1; exit 0; fi
+if [ "\${1:-}" = "run" ]; then echo "[]"; exit 0; fi
+jq -cn '[{number: 1, title: "x", author: {login: "a"}, createdAt: "$OLD", updatedAt: "$OLD", mergeable: "MERGEABLE", isDraft: false, url: "https://example.invalid/1", headRefName: "b", headRefOid: "abc", statusCheckRollup: [{__typename: "CheckRun", status: "COMPLETED", conclusion: "SUCCESS", completedAt: "$OLD"}]}]'
+STUBEOF
+chmod +x "$STUB/gh"
+NOISY_RC=0
+NOISY_OUT="$(SWEEP_NOW_EPOCH="$NOW" SWEEP_LIMIT=5 SWEEP_REFETCH_SLEEP=0 PATH="$STUB:$PATH" \
+    "$BASH_BIN" "$SWEEP" 2>/dev/null)" || NOISY_RC=$?
+check "a gh that warns on stderr but succeeds does not poison the listing" "0" "$NOISY_RC"
+check "the noisy-gh run still classifies correctly" "1 1 0 0" "$(sweep_counts "$NOISY_OUT")"
 
 # The one case that legitimately reports nothing: both paths agree the repo has
 # no open PRs. This must SUCCEED, or the sweep cries wolf forever.
