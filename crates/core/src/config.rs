@@ -534,41 +534,124 @@ fn parse_gateways_toml(content: &str, source: &str) -> Result<Gateways, toml::de
     }
 }
 
+/// Which file [`ConfigArgs::pick_config_file`] chose out of a directory's
+/// `config*` candidates.
+#[derive(Debug, PartialEq, Eq)]
+struct ConfigFilePick {
+    filename: String,
+    /// `toml` or `json`.
+    ext: String,
+    /// The name was exactly `config.<ext>` rather than a looser `config*`
+    /// match such as `config.bak.toml`.
+    exact: bool,
+}
+
 impl ConfigArgs {
     pub fn current_version(&self) -> &str {
         PCK_VERSION
     }
 
+    /// Choose the config file to load from a directory's file names.
+    ///
+    /// Order-independent by construction, which is the whole point — see the
+    /// rustdoc on [`Self::read_config`] for why picking by `read_dir` order was
+    /// a hazard. Preference: exact `config.toml`, then exact `config.json`,
+    /// then any other `config*.{toml,json}`. Within that last group the choice
+    /// is still arbitrary (there is no principled way to rank `config.bak.toml`
+    /// against `config.old.toml`), so it is reported as inexact and the caller
+    /// warns.
+    fn pick_config_file<I: IntoIterator<Item = String>>(names: I) -> Option<ConfigFilePick> {
+        let mut exact_toml = None;
+        let mut exact_json = None;
+        let mut fallback = None;
+        for filename in names {
+            if !filename.starts_with("config") {
+                continue;
+            }
+            let Some(ext) = filename.rsplit('.').next().map(|s| s.to_owned()) else {
+                continue;
+            };
+            if !matches!(ext.as_str(), "toml" | "json") {
+                continue;
+            }
+            let exact = filename == format!("config.{ext}");
+            let pick = ConfigFilePick {
+                filename,
+                ext,
+                exact,
+            };
+            match (exact, pick.ext.as_str()) {
+                (true, "toml") => exact_toml = Some(pick),
+                (true, _) => exact_json = Some(pick),
+                (false, _) if fallback.is_none() => fallback = Some(pick),
+                (false, _) => {}
+            }
+        }
+        exact_toml.or(exact_json).or(fallback)
+    }
+
+    /// Locate this node's config file in `dir` and parse it.
+    ///
+    /// # Why the exact-name preference exists
+    ///
+    /// The scan accepts any file whose name starts with `config` and whose
+    /// extension is `toml`/`json`, which means `config.bak.toml`,
+    /// `config.old.toml` or `config.2026-07-29.json` all match. Without an
+    /// exact-name preference the winner is whichever `read_dir` happens to
+    /// yield first — **filesystem iteration order**, which is not sorted and
+    /// not stable across machines or across writes to the directory. So an
+    /// operator who runs `cp config.toml config.bak.toml` and then edits
+    /// `config.toml` can have the node silently read the BACKUP on some boots
+    /// and the real file on others, with every setting they changed reverting
+    /// to whatever the stale copy said (or, for a key the backup predates, to
+    /// its mode-dependent default).
+    ///
+    /// That has always been wrong for every setting. It became destructive with
+    /// #5035: `enable_event_log` read from a stale backup resolves to `None`,
+    /// the network-mode default makes it `false`, and the startup reclaim then
+    /// DELETES the segments the operator turned the log on to collect.
+    /// "Silently not written" was recoverable; "silently deleted" is not.
+    ///
+    /// Preferring the exact `config.toml` / `config.json` keeps the loose scan
+    /// (nothing that worked stops working) while making the common case
+    /// deterministic. Two exactly-named files cannot both exist for one
+    /// extension, so the preference is unambiguous; TOML wins over JSON, as it
+    /// did before whenever both were yielded in that order.
+    ///
+    /// The selection is [`Self::pick_config_file`], a pure function over the
+    /// candidate names, so the order-independence can be tested by feeding it
+    /// the same names in different orders — which a test against a real
+    /// directory cannot do, since `read_dir` order is the filesystem's to
+    /// choose.
     fn read_config(dir: &PathBuf) -> std::io::Result<Option<Config>> {
         if !dir.exists() {
             return Ok(None);
         }
-        let mut read_dir = std::fs::read_dir(dir)?;
-        let config_args: Option<(String, String)> = read_dir.find_map(|e| {
-            if let Ok(e) = e {
-                if e.path().is_dir() {
-                    return None;
-                }
-                let filename = e.file_name().to_string_lossy().into_owned();
-                let ext = filename.rsplit('.').next().map(|s| s.to_owned());
-                if let Some(ext) = ext {
-                    if filename.starts_with("config") {
-                        match ext.as_str() {
-                            "toml" => {
-                                tracing::debug!(filename = %filename, "Found configuration file");
-                                return Some((filename, ext));
-                            }
-                            "json" => {
-                                return Some((filename, ext));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+        let names = std::fs::read_dir(dir)?.filter_map(|e| {
+            let e = e.ok()?;
+            if e.path().is_dir() {
+                return None;
             }
-
-            None
+            Some(e.file_name().to_string_lossy().into_owned())
         });
+        let pick = Self::pick_config_file(names);
+        if let Some(pick) = &pick {
+            if pick.exact {
+                tracing::debug!(filename = %pick.filename, "Found configuration file");
+            } else {
+                // Loud on purpose: the node is about to configure itself from a
+                // file the operator probably thinks is inert, and a wrong answer
+                // here can now cost them their event log (#5035).
+                tracing::warn!(
+                    filename = %pick.filename,
+                    dir = %dir.display(),
+                    "No exactly-named config.toml/config.json; falling back to this \
+                     `config*` file. Rename it to config.toml (or remove it) — which \
+                     `config*` file wins is otherwise filesystem iteration order."
+                );
+            }
+        }
+        let config_args = pick.map(|pick| (pick.filename, pick.ext));
 
         match config_args {
             Some((filename, ext)) => {
@@ -5618,6 +5701,150 @@ shutdown-drain-secs = 42
         );
     }
 
+    fn pick(names: &[&str]) -> Option<ConfigFilePick> {
+        ConfigArgs::pick_config_file(names.iter().map(|n| n.to_string()))
+    }
+
+    /// A backup sitting beside the real config must never win, in EITHER
+    /// direction of iteration.
+    ///
+    /// This is the property a directory-based test cannot assert: `read_dir`
+    /// order is the filesystem's to choose, so a test that seeds both files and
+    /// gets the right answer may simply have been lucky, and would have been
+    /// equally green before the fix. Feeding the names in both orders to the
+    /// pure selector pins it deterministically.
+    ///
+    /// Before this fix, whichever name `read_dir` yielded first won. An
+    /// operator who ran `cp config.toml config.bak.toml` and then set
+    /// `enable-event-log = true` could have the node read the BACKUP, resolve
+    /// the key to `None`, take the network-mode default of `false` — and, with
+    /// the #5035 startup reclaim, delete the segments they had turned the log
+    /// on to collect.
+    #[test]
+    fn an_exactly_named_config_beats_a_config_prefixed_backup_in_any_order() {
+        let expected = ConfigFilePick {
+            filename: "config.toml".to_string(),
+            ext: "toml".to_string(),
+            exact: true,
+        };
+        assert_eq!(pick(&["config.bak.toml", "config.toml"]), Some(expected));
+
+        // Same set, opposite order, same answer. A `read_dir`-order-dependent
+        // implementation passes one of these two and fails the other.
+        assert_eq!(
+            pick(&["config.toml", "config.bak.toml"])
+                .expect("a config file must be found")
+                .filename,
+            "config.toml"
+        );
+
+        // And with several decoys, whatever order they arrive in.
+        for order in [
+            vec!["config.bak.toml", "config.old.json", "config.toml"],
+            vec!["config.toml", "config.bak.toml", "config.old.json"],
+            vec!["config.old.json", "config.toml", "config.bak.toml"],
+        ] {
+            assert_eq!(
+                pick(&order).expect("a config file must be found").filename,
+                "config.toml",
+                "order {order:?} picked the wrong file"
+            );
+        }
+    }
+
+    /// The loose `config*` scan still works when there is no exactly-named
+    /// file — nothing that loaded before stops loading — but the pick reports
+    /// itself as inexact so the caller can warn.
+    #[test]
+    fn a_config_prefixed_file_is_still_accepted_when_nothing_is_exactly_named() {
+        let picked = pick(&["config.bak.toml"]).expect("the loose scan must still match");
+        assert_eq!(picked.filename, "config.bak.toml");
+        assert_eq!(picked.ext, "toml");
+        assert!(
+            !picked.exact,
+            "a fallback pick must report itself inexact so the caller warns"
+        );
+    }
+
+    /// Exact TOML outranks exact JSON, and names that are not config files are
+    /// ignored regardless of order.
+    #[test]
+    fn config_file_selection_prefers_toml_and_ignores_non_config_names() {
+        assert_eq!(
+            pick(&["config.json", "config.toml"])
+                .expect("found")
+                .filename,
+            "config.toml"
+        );
+        assert_eq!(
+            pick(&["config.toml", "config.json"])
+                .expect("found")
+                .filename,
+            "config.toml"
+        );
+        assert_eq!(
+            pick(&["config.json"]).expect("found").filename,
+            "config.json"
+        );
+        assert_eq!(pick(&["notconfig.toml", "config.yaml", "config"]), None);
+    }
+
+    /// End-to-end through `read_config` against a real directory: the value the
+    /// node ends up with comes from `config.toml`, not from the backup.
+    ///
+    /// Order-dependent on its own (hence the pure-selector test above), but it
+    /// is what proves `read_config` actually routes through the selector rather
+    /// than the selector being dead code.
+    #[tokio::test]
+    async fn read_config_loads_the_exactly_named_file_not_a_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        // Produce a real, complete `config.toml` the way a node does, then
+        // reproduce the operator's `cp config.toml config.bak.toml` with the
+        // key flipped. The backup says the event log is OFF; the real config
+        // says ON. Only the real one may be honored.
+        let mut args = event_log_args(dir.path(), OperationMode::Network);
+        args.enable_event_log = Some(true);
+        args.build().await.expect("build must persist config.toml");
+        let real = std::fs::read_to_string(dir.path().join("config.toml"))
+            .expect("build must have written config.toml");
+        assert!(
+            real.contains("enable-event-log = true"),
+            "precondition: the persisted config must carry the key, else this \
+             test compares nothing. Contents:\n{real}"
+        );
+        std::fs::write(
+            dir.path().join("config.bak.toml"),
+            real.replace("enable-event-log = true", "enable-event-log = false"),
+        )
+        .unwrap();
+
+        let config = ConfigArgs::read_config(&dir.path().to_path_buf())
+            .expect("read_config must succeed")
+            .expect("a config file must be found");
+
+        assert_eq!(
+            config.enable_event_log,
+            Some(true),
+            "the value must come from config.toml, not config.bak.toml"
+        );
+    }
+
+    /// #4968: a network-mode node (what end users run) must NOT write the local
+    /// diagnostic event log by default. On a live 0.2.111 peer that log was
+    /// ~61 MiB/hour of appends and 95% of every fsync the process issued.
+    #[tokio::test]
+    async fn event_log_defaults_off_in_network_mode() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cfg = event_log_args(temp_dir.path(), OperationMode::Network)
+            .build()
+            .await
+            .unwrap();
+        assert!(
+            !cfg.event_log_enabled(),
+            "network mode must default to event log OFF"
+        );
+    }
+
     /// `public-port` is accepted alongside `public-network-port`: the file's
     /// released key is `public_port`, so that is the spelling an operator
     /// hyphenating what they see will reach for, while the flag they read in
@@ -6653,22 +6880,6 @@ shutdown-drain-secs = 42
     /// #4968 event-log default tests so each case differs only in what it sets.
     fn event_log_args(dir: &std::path::Path, mode: OperationMode) -> ConfigArgs {
         super::event_log_test_args(dir, mode)
-    }
-
-    /// #4968: a network-mode node (what end users run) must NOT write the local
-    /// diagnostic event log by default. On a live 0.2.111 peer that log was
-    /// ~61 MiB/hour of appends and 95% of every fsync the process issued.
-    #[tokio::test]
-    async fn event_log_defaults_off_in_network_mode() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let cfg = event_log_args(temp_dir.path(), OperationMode::Network)
-            .build()
-            .await
-            .unwrap();
-        assert!(
-            !cfg.event_log_enabled(),
-            "network mode must default to event log OFF"
-        );
     }
 
     /// #4968: local mode is a single-node dev mode where the log is the point,
