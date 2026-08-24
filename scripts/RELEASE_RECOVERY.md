@@ -185,6 +185,43 @@ gh run list --repo freenet/freenet-core --workflow=cross-compile.yml \
 gh workflow run cross-compile.yml --repo freenet/freenet-core --ref v0.1.X
 ```
 
+**Each dispatch re-signs the Windows binaries.** `build-x86_64-windows`
+Authenticode-signs `freenet.exe` and `fdev.exe` on every tag build and every
+manual dispatch, against an Azure Artifact Signing quota of 5,000 signatures
+per month (Basic tier) — 2 per run. That is a large budget and ordinary
+recovery will not dent it, but a dispatch loop is not free, which is one more
+reason to check for a running job before firing another.
+
+**What a signing failure looks like from the outside: a draft release with NO
+Windows assets at all.** The `Verify signatures` step runs BEFORE the two
+`upload-artifact` steps, so when it throws they are *skipped* — the unsigned
+binaries never become artifacts, and there is nothing for `attach-to-release`
+to attach. Do not go debugging artifact upload; an empty Windows slot is the
+expected shape of a signing failure. Go straight to the `Verify signatures`
+step output. (Verified by deliberately failing the gate: `Verify signatures =>
+failure`, `Upload freenet binary => skipped`, `Upload fdev binary => skipped`.)
+
+**If this job fails at signing, the failure is Azure-side and cannot be fixed
+from the repo.** Unlike every other release secret, Windows signing is
+fail-closed: the `Verify signatures` step throws if either binary is unsigned,
+invalid, or missing its RFC3161 timestamp, and `attach-to-release` needs this
+job, so the release stops as a draft rather than shipping unsigned binaries.
+Read the `Verify signatures` step output first — it prints each binary's status
+and signer subject. Expect:
+
+```
+CN=Freenet Project Inc, O=Freenet Project Inc, L=Austin, S=Texas, C=US
+```
+
+Common causes, in the order worth checking: the `release` environment or the
+`AZURE_*` secrets were changed (the Entra federated credential is pinned to the
+subject `repo:freenet/freenet-core:environment:release`, so removing
+`environment: release` from the job breaks authentication); the certificate
+profile was rotated or disabled in Azure; or a genuine Artifact Signing
+outage. There is no repo-side workaround — do NOT strip the signing steps to
+force a release through, because that ships unsigned binaries to users whose
+Windows auto-update has no canary to catch the regression (#5341).
+
 ### Step 4: Binaries Attached but Crates Not Published
 
 **Symptoms:**

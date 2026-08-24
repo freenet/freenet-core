@@ -208,6 +208,19 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
 
+    # Gates the OIDC token behind the `release` environment; the federated
+    # credential in Entra is pinned to exactly this subject
+    # (repo:freenet/freenet-core:environment:release), so a job that does not
+    # declare it cannot obtain an Azure token and signing fails closed.
+    # A fork PR or an unrelated workflow cannot borrow the signing identity.
+    environment: release
+
+    # Required for OIDC federation to Azure. `contents: read` must be restated
+    # because naming any permission drops the rest to none.
+    permissions:
+      id-token: write
+      contents: read
+
     steps:
       - uses: actions/checkout@v7
 
@@ -231,6 +244,84 @@ jobs:
         run: |
           target/release/freenet.exe --version
           target/release/freenet.exe service --help
+
+      # --- Authenticode signing (Azure Artifact Signing) -------------------
+      # freenet.exe IS the Windows installer, uninstaller, tray, service
+      # wrapper and updater -- they are all the same self-contained binary
+      # (crates/core/src/bin/commands/setup_wizard/, service/, tray.rs), so
+      # signing it covers every one of those roles. fdev.exe is downloaded
+      # from the GitHub release by `installer::run_install`, so it must be
+      # signed as a release artifact too or the installer drops an unsigned
+      # binary next to a signed one.
+      #
+      # Signing runs AFTER the smoke test and BEFORE both upload-artifact
+      # steps, so the artifacts -- and therefore SHA256SUMS.txt, generated in
+      # the attach-to-release job after downloading them -- cover the SIGNED
+      # bytes. Do not move these steps.
+      #
+      # Gated to release tags and manual dispatch so routine main-push builds
+      # don't burn signing quota (Basic tier: 5,000 signatures/month).
+      #
+      # NOTE the gating SCOPE differs from build-macos-dmg: that job puts the
+      # same `if:` expression at JOB level, so it does not run at all on a main
+      # push. Here the condition is per-STEP, because build-x86_64-windows must
+      # still run on main pushes to produce artifacts -- which means the job,
+      # and therefore its `environment: release` declaration, is entered on
+      # every main push. That is currently harmless (the environment has no
+      # protection rules and no branch policy), but adding required reviewers
+      # to it would pause every Build and Cross-Compile run. See
+      # docs/RELEASING.md.
+      - name: Azure login (OIDC)
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        # Bounded so a hung Azure endpoint surfaces in minutes instead of
+        # consuming the job's 60-minute budget, which during a release reads
+        # as "the build is stuck" rather than "Azure is down".
+        timeout-minutes: 10
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign Windows binaries (Azure Artifact Signing)
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        # Same reasoning as the login step above; this one also reaches the
+        # RFC3161 timestamp server, which is a second external dependency that
+        # can hang. Observed real duration is a few seconds per file plus
+        # tooling download, so 15 minutes is generous.
+        timeout-minutes: 15
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: https://eus.codesigning.azure.net/
+          signing-account-name: freenetsigning
+          certificate-profile-name: freenet-public-trust
+          # files-folder + filter picks up anything else that lands in
+          # target\release and needs signing, without maintaining a list.
+          # recurse stays false so it does not descend into build/ and deps/
+          # and burn signature quota on intermediate artifacts.
+          files-folder: ${{ github.workspace }}\target\release
+          files-folder-filter: exe,dll
+          files-folder-recurse: false
+          file-digest: SHA256
+          # Not optional: Artifact Signing certificates are short-lived
+          # (~3 days). Without a countersigned timestamp, every release binary
+          # stops validating almost immediately.
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # The gate. Runs on a real Windows machine and fails the build rather
+      # than shipping something unsigned -- this is what stands in for the
+      # Windows box the project doesn't have.
+      - name: Verify signatures
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        run: |
+          foreach ($f in @('target\release\freenet.exe','target\release\fdev.exe')) {
+            $sig = Get-AuthenticodeSignature $f
+            Write-Host "$f => $($sig.Status) / $($sig.SignerCertificate.Subject)"
+            if ($sig.Status -ne 'Valid') { throw "Unsigned or invalid: $f" }
+            if (-not $sig.TimeStamperCertificate) { throw "Missing timestamp: $f" }
+          }
 
       - name: Upload freenet binary
         uses: actions/upload-artifact@v7
