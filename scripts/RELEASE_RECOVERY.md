@@ -214,6 +214,17 @@ and signer subject. Expect:
 CN=Freenet Project Inc, O=Freenet Project Inc, L=Austin, S=Texas, C=US
 ```
 
+**If the failure is `Unexpected signer`** rather than unsigned/untimestamped,
+the binary WAS signed, just not by us. Three possibilities, in the order worth
+checking: the Azure certificate profile was repointed (misconfiguration); the
+certificate was legitimately reissued under a changed name (e.g. the company
+name changed) — in which case update the expected CN in the `Verify signatures`
+step and its pin in `crates/core/tests/windows_signing_order.rs`, deliberately
+and in a reviewed PR; or, least likely and most serious, someone else signed
+it. Never delete the check to get a release out: that is the one action that
+converts a blocked release into an unsigned one shipped to users whose Windows
+auto-update has no canary (#5341).
+
 Common causes, in the order worth checking: the `release` environment or the
 `AZURE_*` secrets were changed (the Entra federated credential is pinned to the
 subject `repo:freenet/freenet-core:environment:release`, so removing

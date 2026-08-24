@@ -325,11 +325,17 @@ jobs:
             # root and is timestamped" -- it does not mean "signed by us". Both
             # RELEASING.md and RELEASE_RECOVERY.md tell an operator to expect
             # the subject below, which reads as though CI enforces it; without
-            # this line it did not. Matched on the CN substring rather than the
-            # whole DN so attribute order or an added attribute on reissue does
-            # not fail a release spuriously.
+            # this line it did not.
+            #
+            # DO NOT "tighten" this to match the whole DN. The two tools that
+            # render this subject disagree on the state attribute: PowerShell
+            # emits `S=Texas` where osslsigncode emits `ST=Texas`. A full-string
+            # match looks more rigorous, passes every test you would think to
+            # write against one tool, and breaks against the other. Attribute
+            # order and extra attributes added on certificate reissue are the
+            # second and third reasons. Match the CN substring.
             if ($sig.SignerCertificate.Subject -notlike '*CN=Freenet Project Inc*') {
-              throw "Unexpected signer for ${f}: $($sig.SignerCertificate.Subject)"
+              throw "Unexpected signer for ${f}: expected a subject containing 'CN=Freenet Project Inc', got '$($sig.SignerCertificate.Subject)'. Either the Azure certificate profile was repointed, or the certificate was legitimately reissued under a new name. See scripts/RELEASE_RECOVERY.md, 'Windows code signing'. Do NOT delete this check to unblock a release."
             }
           }
 
