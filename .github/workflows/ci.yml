@@ -524,10 +524,17 @@ jobs:
             #      Those two files used to escape this counter entirely, because
             #      the diff above was scoped to `**/*_test.sh` and they are named
             #      `test-*.sh` -- a naming accident, not the absence of the
-            #      convention. `'**/test-*.sh'` above closes that; PR #4958 was
-            #      rejected by this gate for having no test while adding ten
+            #      convention. `'scripts/test-*.sh'` above closes that; PR #4958
+            #      was rejected by this gate for having no test while adding ten
             #      `check_eq` assertions to `test-install-sh.sh`, which this job
             #      RUNS.
+            #      SCOPED to `scripts/` rather than `'**/test-*.sh'`: `*` crosses
+            #      `/` in a git pathspec, so the unscoped form ALSO matches
+            #      `docker/test-runner/entrypoint.sh` and `.../run.sh` -- docker
+            #      plumbing, not tests, and outside the self-test's `find`, so
+            #      nothing would audit them. A `fix:` PR adding a plausible
+            #      `check_image_exists` line to a docker wrapper would then
+            #      satisfy this gate with no test at all.
             #      What remains a blind spot is narrower than it looks, and was
             #      measured rather than assumed: their `pass "..."` and
             #      `check_eq "..."` CALL SITES both score (via the `pass` and
@@ -544,7 +551,7 @@ jobs:
             #      live instance. Adding a file there genuinely extends what is
             #      audited, and the added line is a bare string.
             # The error text below tells the contributor all three.
-            NEW_SHELL_TESTS=$(git diff "$BASE"..."$HEAD" -- '**/*_test.sh' '**/test-*.sh' \
+            NEW_SHELL_TESTS=$(git diff "$BASE"..."$HEAD" -- '**/*_test.sh' 'scripts/test-*.sh' \
               | grep -E '^\+' | grep -vF '+++' \
               | grep -cE '^\+[[:space:]]*(check|ok|pass|expect)[[:space:]]|^\+[[:space:]]*echo[[:space:]]+["'"'"'](ok[[:space:]]+-|PASS[[:space:]])|^\+[[:space:]]*(check|pin|assert|expect|test)_[a-z0-9_]*([[:space:]]|$)|^\+[[:space:]]*[a-z_][a-z0-9_]*_case[[:space:]]' || true)
             # Browser-asset fixes have the SAME problem the shell escape hatch
