@@ -400,6 +400,22 @@ SWEEP_NOW_EPOCH="$NOW" SWEEP_LIMIT=5 GITHUB_OUTPUT="$OUTPUTS" PATH="$STUB:$PATH"
     "$BASH_BIN" "$SWEEP" >/dev/null 2>&1
 check_contains "a clean sweep does NOT notify" "$(cat "$OUTPUTS")" "notify=false" yes
 
+# An unwritable $GITHUB_STEP_SUMMARY / $GITHUB_OUTPUT is the same defect one
+# level down: the queries all worked, and the run would still go green with the
+# report attached nowhere and the notify step's trigger never written. Both
+# appends are therefore fatal, and these two cases are the only thing that
+# exercises them.
+UNWRITABLE="$WORK/no-such-dir/summary.md"
+SUMMARY_FAIL_RC=0
+SWEEP_NOW_EPOCH="$NOW" GITHUB_STEP_SUMMARY="$UNWRITABLE" \
+    "$BASH_BIN" "$SWEEP" --input "$WORK/mixed.json" >/dev/null 2>&1 || SUMMARY_FAIL_RC=$?
+check "an unwritable step summary aborts non-zero" "1" "$SUMMARY_FAIL_RC"
+
+OUTPUT_FAIL_RC=0
+SWEEP_NOW_EPOCH="$NOW" GITHUB_OUTPUT="$WORK/no-such-dir/outputs.txt" \
+    "$BASH_BIN" "$SWEEP" --input "$WORK/mixed.json" >/dev/null 2>&1 || OUTPUT_FAIL_RC=$?
+check "an unwritable output file aborts non-zero" "1" "$OUTPUT_FAIL_RC"
+
 # --- The workflow must actually run this script ------------------------------
 # A self-test nothing invokes is coverage in a listing and a gate on nothing;
 # the same is true of a sweep no workflow runs.

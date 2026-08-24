@@ -44,6 +44,33 @@
 #
 # Self-test: bash scripts/pr-backlog-sweep_test.sh
 
+# NO `set -e`, deliberately. Every failure here needs a DIAGNOSIS, not just a
+# non-zero exit: "the sweep is broken" and "the backlog is clean" must not look
+# alike, and `set -e` would abort with no `::error::` line saying which query
+# died. `-e` also interacts badly with the `$(...)`-in-a-conditional form used
+# throughout. So the contract is: every command whose failure could change the
+# REPORT is checked explicitly and routed through `die`.
+#
+# That contract was audited site by site (2026-08-24), not assumed:
+#   - `gh pr list` x2, `gh run list`, `gh api`  -> `if ! VAR="$(...)"; then die`
+#   - `command -v gh` / `command -v jq`         -> `|| die`
+#   - the two `jq -e 'type == "array"'` gates   -> `|| die`
+#   - `cat` of an --input file                  -> preceded by `[ -f ]`, and an
+#     empty read still fails the array gate above
+#   - `date +%s` (unchecked)                    -> an empty NOW reaches jq as
+#     `--argjson now ""`, which jq rejects, which empties RESULT, which is
+#     fatal at the `[ -z "$RESULT" ]` check. Verified by running the script
+#     with a non-numeric SWEEP_NOW_EPOCH.
+#   - `jq 'length'` for COUNT/RUN_COUNT         -> unreachable failure (the
+#     array gate already parsed the same input); an empty value would still
+#     fail the `-lt` comparison, which is `|| die`
+#   - the report renderer + the four count reads -> `[ -z "$RESULT" ]`, an
+#     explicit `|| die`, and a numeric `case` over every count
+#   - the `$GITHUB_STEP_SUMMARY` / `$GITHUB_OUTPUT` appends -> `|| die`
+#
+# Nothing here pipes a producer into a short-circuiting consumer (`grep -q`,
+# `head`, `read`), so the repo's SIGPIPE-under-pipefail hazard does not apply;
+# `jq` must read its input to EOF before it can answer. Keep it that way.
 set -uo pipefail
 
 REPO="${SWEEP_REPO:-freenet/freenet-core}"
@@ -339,14 +366,19 @@ done
 printf '%s\n' "$BODY"
 
 # Always write the summary, including when everything is clean: a run that
-# reports "0 / 0 / 0" is evidence the sweep RAN. A run that writes nothing is
-# indistinguishable from a run that never happened.
+# reports "0 / 0 / 0 / 0" is evidence the sweep RAN. A run that writes nothing is
+# indistinguishable from a run that never happened -- so a FAILED write is fatal
+# rather than a silent skip, for the same reason.
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-    printf '%s\n' "$BODY" >> "$GITHUB_STEP_SUMMARY"
+    printf '%s\n' "$BODY" >> "$GITHUB_STEP_SUMMARY" \
+        || die "could not write \$GITHUB_STEP_SUMMARY ($GITHUB_STEP_SUMMARY); the run would have looked successful with no report attached"
 fi
 
 TOTAL=$((STALE_GREEN + IDLE + CONFLICTING + AWAITING))
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
+    # Also fatal on failure: the notify step keys off `notify`, so a silently
+    # unwritten output file turns a backlog with findings into a green run that
+    # tells nobody -- which is this script's whole failure mode, one level down.
     {
         echo "stale_green=$STALE_GREEN"
         echo "idle=$IDLE"
@@ -359,7 +391,8 @@ if [ -n "${GITHUB_OUTPUT:-}" ]; then
         # branch names, so no repository-controlled string is ever forwarded to
         # the notifier. Pinned by the self-test.
         echo "headline=${STALE_GREEN} PR(s) green >${GREEN_HOURS}h unmerged, ${IDLE} idle >${IDLE_DAYS}d, ${CONFLICTING} conflicting, ${AWAITING} branch(es) awaiting CI approval"
-    } >> "$GITHUB_OUTPUT"
+    } >> "$GITHUB_OUTPUT" \
+        || die "could not write \$GITHUB_OUTPUT ($GITHUB_OUTPUT); the notification step reads its trigger from there"
 fi
 
 echo "sweep ok: stale_green=$STALE_GREEN idle=$IDLE conflicting=$CONFLICTING awaiting_approval=$AWAITING" >&2
