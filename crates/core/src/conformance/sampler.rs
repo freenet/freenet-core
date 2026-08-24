@@ -369,11 +369,20 @@ impl ContractSampler {
         // `DeltaPermutationInvariance`, which pairs only deltas observed against the
         // SAME base — deltas with no recorded base are not paired at all, on purpose,
         // because permuting causally sequenced deltas asks about a situation the
-        // protocol never produces. Leaving the bases behind therefore did not
-        // degrade that check on a live node, it disabled it: every delta arrived
-        // unprovenanced and no pair was ever built, while `ReplayBundle::to_corpus`
-        // — the offline path — filled them in and checked plenty. The two must
-        // agree, or shadow mode covers less than the replay of its own export.
+        // protocol never produces.
+        //
+        // Be precise about what filling this in fixes, because the obvious story is
+        // wrong. Leaving the bases behind did NOT disable the property on a live
+        // node: shadow mode never reads this function. It calls `to_bundle` and then
+        // `ReplayBundle::to_corpus`, which recovers each base from
+        // `transition.base_state`. Before this change `to_bundle` did not read
+        // `delta_bases` either, so the value was consumed by nothing at all and could
+        // not disable anything. What actually cost a live node its pairs was the
+        // duplicate-delta defect in `to_bundle` combined with first-seen-wins dedup.
+        //
+        // It is load-bearing NOW, which is why it stays: `to_bundle`'s filter below
+        // reads `delta_base(i)` to decide which deltas still need to travel loose, so
+        // an unpopulated `delta_bases` would serialize every delta twice.
         let mut deltas: Vec<Bytes> = Vec::new();
         let mut delta_bases: Vec<Option<Bytes>> = Vec::new();
         for record in &self.transitions {
@@ -397,11 +406,15 @@ impl ContractSampler {
 
         // Carry the ORDERED base -> result steps, not just the states either end.
         //
-        // Without this the node's own shadow-mode corpus produces no
-        // `TransitionPathAgreement` cases at all, and a property that only works on
-        // a hand-built `fdev --bundle` corpus is a check nothing on the network ever
-        // runs. `materialize` is the same resolver `to_bundle` uses, so the in-memory
-        // corpus and the exported bundle agree about what a transition is.
+        // Same correction as the `delta_bases` comment above, and for the same
+        // reason: shadow mode does not run cases off this `Corpus`, it exports a
+        // bundle and reads the steps back out of `ReplayBundle::to_corpus`. So this
+        // is not what keeps `TransitionPathAgreement` alive on a live node.
+        //
+        // It is here so the in-memory corpus and the exported bundle mean the same
+        // thing by "a transition" — `materialize` is the same resolver `to_bundle`
+        // uses — and so any in-memory consumer added later inherits the provenance
+        // instead of silently checking that property against nothing.
         let transitions: Vec<(Bytes, Bytes)> = self
             .transitions
             .iter()

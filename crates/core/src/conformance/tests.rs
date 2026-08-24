@@ -1677,10 +1677,20 @@ fn the_transition_branch_is_bounded_and_strided() {
     };
     let cases = generate_cases(&corpus, &config);
     assert_eq!(cases.len(), 4, "the cap must bind");
-    // Strided over the whole history rather than the first four: the last step is
-    // reachable, which truncation could never manage.
+    // Strided over the whole history rather than the first four.
+    //
+    // Say what this actually pins: the four selected steps are spread across the
+    // range, not the first four. Index 39 is NOT selected — a stride of 10 from 0
+    // reaches 30 — so this is not a claim that the newest step is reachable. What it
+    // rules out is truncation, under which the bases would be `[0, 1, 2, 3]` and a
+    // contract would only ever be checked against its own oldest few minutes.
     let bases: Vec<u8> = cases.iter().map(|c| c.states[0][0]).collect();
     assert_eq!(bases, vec![0, 10, 20, 30]);
+    assert_ne!(
+        bases,
+        vec![0, 1, 2, 3],
+        "truncation is the thing this test exists to exclude, so name it"
+    );
 }
 
 /// The generator must build transition cases ONLY from recorded provenance.
@@ -1751,7 +1761,7 @@ fn evidence_round_trips_through_a_case() {
     let evidence = ConformanceEvidence::new(instance(7), vec![9, 9], &original, None);
     evidence.check_bounds().expect("bounds");
 
-    let rebuilt = evidence.to_case();
+    let rebuilt = evidence.to_case().expect("to_case");
     assert_eq!(rebuilt.property, original.property);
     assert_eq!(rebuilt.states, original.states);
 
@@ -1940,6 +1950,14 @@ fn evidence_for_a_self_verifying_property_is_accepted() {
 /// lumped in with the self-verifying ones fails here instead of silently widening
 /// the untrusted path — the exact hazard `TransitionPathAgreement` introduced.
 ///
+/// The list below has two entries rather than one because the first version of this
+/// pin recorded the wrong answer for a property that already existed:
+/// `DeltaPermutationInvariance` was classified `EvidenceBytes`, and the loop at the
+/// bottom of this test therefore asserted that a fabricated 1-state/2-delta case for
+/// it must be ACCEPTED. That is a caution about the shape of this pin, not just its
+/// contents — it records the answer given, and a wrong answer is pinned exactly as
+/// firmly as a right one. Read the property's own documentation before adding to it.
+///
 /// If you are here because you added a property: decide whether re-executing the
 /// case against a local copy of the contract re-establishes EVERYTHING the law
 /// asserts. If any part of it rests on how the inputs were observed, it is
@@ -1953,7 +1971,10 @@ fn every_property_declares_whether_it_is_self_verifying() {
         .collect();
     assert_eq!(
         local,
-        vec![ConformanceProperty::TransitionPathAgreement],
+        vec![
+            ConformanceProperty::DeltaPermutationInvariance,
+            ConformanceProperty::TransitionPathAgreement,
+        ],
         "the set of properties that cannot travel as evidence changed; if that is \
          deliberate, update this pin, and make sure `check_bounds` still refuses \
          every one of them"
@@ -1983,6 +2004,146 @@ fn every_property_declares_whether_it_is_self_verifying() {
              properties"
         );
     }
+}
+
+/// `DeltaPermutationInvariance` is refused as evidence, with its own test rather
+/// than only as a row in the pin above.
+///
+/// The pin above records the classification; this records WHY, so a future reader
+/// weighing "surely a delta pair is just bytes" has the counterexample in front of
+/// them. The generator pairs only deltas observed against the SAME base
+/// (`generator::delta_pairs`), because deltas observed against different bases can be
+/// causally sequenced. Evidence carries no base for a delta at all — `states` and
+/// `deltas` and nothing else — so a recipient re-running the case reproduces the
+/// comparison without the premise.
+///
+/// The concrete victim: an add-wins OR-set whose delta encodes tag adds and removes
+/// and which does not tombstone a tag it has never seen. Sound in production, because
+/// a delta is always `get_state_delta(sender, recipient_summary)`. Fed the
+/// causally-sequenced pair `D1 = add A^t`, `D2 = remove t`, the two orders diverge —
+/// and this property is `Severity::Violation`, which `policy::decide` maps to
+/// `ConformanceAction::Remove` in Enforce mode. Every recipient would independently
+/// confirm a removal against a correct contract.
+#[test]
+fn evidence_for_delta_permutation_invariance_is_refused() {
+    let built = ConformanceCase::new(
+        ConformanceProperty::DeltaPermutationInvariance,
+        vec![bytes(&[1])],
+    )
+    .with_deltas(vec![bytes(&[0x80]), bytes(&[0x81])]);
+    let evidence = ConformanceEvidence::new(instance(1), vec![], &built, None);
+    assert!(
+        evidence.input_bytes() < MAX_EVIDENCE_INPUT_BYTES,
+        "the fixture must be well within every OTHER bound, or this could pass for \
+         the wrong reason"
+    );
+    assert_eq!(
+        evidence.states.len(),
+        ConformanceProperty::DeltaPermutationInvariance.state_arity(),
+        "the fixture must satisfy the arity check, or this could pass for the wrong \
+         reason"
+    );
+    assert_eq!(
+        evidence.deltas.len(),
+        ConformanceProperty::DeltaPermutationInvariance.delta_arity(),
+        "the fixture must satisfy the arity check, or this could pass for the wrong \
+         reason"
+    );
+    assert_eq!(
+        evidence.check_bounds(),
+        Err(EvidenceRejected::NotSelfVerifying {
+            property: ConformanceProperty::DeltaPermutationInvariance,
+        })
+    );
+    assert_eq!(
+        evidence.to_case().err(),
+        Some(EvidenceRejected::NotSelfVerifying {
+            property: ConformanceProperty::DeltaPermutationInvariance,
+        }),
+        "and the gate must hold at the point where a case is built, not only where \
+         someone remembered to call `check_bounds`"
+    );
+}
+
+/// The hazard class, stated once so a new property cannot re-enter it.
+///
+/// `verify_case` validates every STATE in a case through `require_valid`, and never
+/// validates a delta — there is no `require_valid` analogue for delta bytes, because
+/// a contract exposes no "is this delta well-formed" entry point. So a property that
+/// (a) travels as evidence, (b) consumes delta bytes, and (c) is removal-eligible
+/// would let an attacker choose bytes that go straight into another peer's WASM and
+/// come back out as a removal verdict.
+///
+/// Two properties carry deltas. `DeltaPermutationInvariance` is `Violation` and is
+/// kept off the wire by `premise_source`. `DeltaIdempotence` ships, and is safe only
+/// because it is `Diagnostic`, which `policy::decide` never turns into a removal —
+/// so its severity is not independently adjustable, and its own documentation says
+/// so. This test is what makes that a rule rather than a note: promoting it without
+/// revisiting `premise_source` in the same change fails here.
+#[test]
+fn no_shippable_removal_eligible_property_consumes_unvalidated_deltas() {
+    let hazardous: Vec<ConformanceProperty> = ConformanceProperty::ALL
+        .iter()
+        .copied()
+        .filter(|p| {
+            p.delta_arity() > 0 && p.is_self_verifying() && p.severity() == Severity::Violation
+        })
+        .collect();
+    assert!(
+        hazardous.is_empty(),
+        "{hazardous:?}: a property that ships as evidence, runs attacker-chosen \
+         delta bytes through the WASM, and is removal-eligible is the combination \
+         the evidence gate exists to prevent. Either mark it \
+         `PremiseSource::LocalProvenance`, or drop it to `Severity::Diagnostic`, or \
+         give deltas a validity check first — do not simply update this test"
+    );
+
+    // The fixture must be able to fail: at least one property really does carry
+    // deltas, so the filter above is not vacuously empty.
+    assert!(
+        ConformanceProperty::ALL
+            .iter()
+            .any(|p| p.delta_arity() > 0 && p.is_self_verifying()),
+        "no property carries deltas as evidence any more, so the assertion above \
+         proves nothing; delete it or re-aim it"
+    );
+}
+
+/// `to_case` is the gate, not the doc comment above it.
+///
+/// It used to hand back a runnable case unconditionally, with a rustdoc line asking
+/// the caller to have run `check_bounds`. Every caller today does; the hazard is the
+/// caller that does not exist yet, because the receive path (#5377) is unbuilt. When
+/// it lands, a convention is what stands between an arbitrary byte string and the
+/// WASM runtime — so the check moved inside.
+#[test]
+fn to_case_refuses_what_check_bounds_refuses() {
+    let big = vec![0u8; MAX_EVIDENCE_INPUT_BYTES + 1];
+    let oversized = ConformanceCase::new(
+        ConformanceProperty::StateIdempotence,
+        vec![Arc::from(big.as_slice())],
+    );
+    let evidence = ConformanceEvidence::new(instance(1), vec![], &oversized, None);
+    assert!(matches!(
+        evidence.to_case(),
+        Err(EvidenceRejected::TooLarge { .. })
+    ));
+
+    // Arity too, so this is not a test about size alone.
+    let wrong_arity = ConformanceCase::new(
+        ConformanceProperty::StateAssociativity,
+        vec![bytes(&[1]), bytes(&[2])],
+    );
+    let evidence = ConformanceEvidence::new(instance(1), vec![], &wrong_arity, None);
+    assert!(matches!(
+        evidence.to_case(),
+        Err(EvidenceRejected::Arity { .. })
+    ));
+
+    // And the counterpart, so a `to_case` that refused everything would fail here.
+    let fine = case(ConformanceProperty::StateCommutativity, &[&[1], &[1, 2]]);
+    let evidence = ConformanceEvidence::new(instance(1), vec![], &fine, None);
+    assert!(evidence.to_case().is_ok());
 }
 
 #[test]

@@ -17,6 +17,12 @@
 //! it cannot re-establish a fact about how the sender OBSERVED them - and the sender
 //! is precisely the party this design refuses to trust. Such a property is marked
 //! [`PremiseSource::LocalProvenance`] and refused at the door.
+//!
+//! That check is not advisory. [`ConformanceEvidence::to_case`] - the only way to
+//! turn evidence into something runnable - performs it itself and returns a
+//! `Result`, so there is no path from a byte string to the WASM that skips it. A doc
+//! comment saying "call `check_bounds` first" would be the only thing standing
+//! between a future receive path and the runtime, and a doc comment is not a gate.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -175,14 +181,20 @@ impl ConformanceEvidence {
         // can be subverted. Every other property here is a universally quantified
         // identity over valid states, so re-execution re-establishes the whole
         // premise and a fabricated case can only surface a real defect sooner. A
-        // property that is a law only because the SENDER observed something — that
-        // `result` was reached from `base`, in `TransitionPathAgreement`'s case —
-        // hands the recipient an accusation it can confirm but cannot check, because
-        // the witness is not in the bytes and cannot be put there. A fabricated pair
-        // from a conforming grow-only contract is structurally indistinguishable
-        // from a genuine information-losing update, so every peer that received it
-        // would independently reach a removal-eligible verdict against a correct
-        // contract.
+        // property that is a law only because the SENDER observed something hands
+        // the recipient an accusation it can confirm but cannot check, because the
+        // witness is not in the bytes and cannot be put there.
+        //
+        // Two properties are in that position, for the same reason applied to
+        // different provenance. `TransitionPathAgreement` needs the witness that
+        // `result` was reached from `base`; a fabricated pair from a conforming
+        // grow-only contract is structurally indistinguishable from a genuine
+        // information-losing update. `DeltaPermutationInvariance` needs the witness
+        // that both deltas were observed against the SAME base; a causally-sequenced
+        // pair permutes to two different states on contracts that are perfectly
+        // sound, because production would never apply them in the other order.
+        // Either way, every peer receiving the fabrication would independently reach
+        // a removal-eligible verdict against a correct contract.
         //
         // Refused rather than deprioritised: a lower rank still lets it in, and the
         // whole point of the front door is that unsound input never reaches the
@@ -273,15 +285,25 @@ impl ConformanceEvidence {
         EvidenceId(*hasher.finalize().as_bytes())
     }
 
-    /// Rebuild the runnable case. Call [`Self::check_bounds`] first.
-    pub fn to_case(&self) -> ConformanceCase {
+    /// Rebuild the runnable case, refusing anything [`Self::check_bounds`] rejects.
+    ///
+    /// The check is folded in here rather than left to the caller on purpose. This is
+    /// the only way to turn an evidence object into something the WASM runtime will
+    /// execute, so making it the enforcement point means no caller — including a
+    /// future gossip receive path that does not exist yet — can reach the runtime
+    /// with unbounded, wrong-arity, or non-self-verifying input. The previous shape
+    /// was a `pub fn` returning the case unconditionally with a "call `check_bounds`
+    /// first" doc comment, which is a convention rather than a gate, and conventions
+    /// are what the untrusted front door cannot be built out of.
+    pub fn to_case(&self) -> Result<ConformanceCase, EvidenceRejected> {
+        self.check_bounds()?;
         let related: HashMap<ContractInstanceId, Option<State<'static>>> = self
             .related
             .iter()
             .map(|(id, state)| (*id, Some(State::from(state.clone()))))
             .collect();
         let related = RelatedContracts::from(related);
-        ConformanceCase {
+        Ok(ConformanceCase {
             property: self.property,
             states: self
                 .states
@@ -295,7 +317,7 @@ impl ConformanceEvidence {
                 .collect(),
             summary: self.summary.as_ref().map(|s| Arc::from(s.as_slice())),
             related,
-        }
+        })
     }
 }
 

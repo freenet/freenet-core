@@ -31,8 +31,9 @@ use freenet::conformance::generator::Corpus;
 use freenet::conformance::verifier::Bytes;
 use freenet::conformance::{
     ConformanceCase, ConformanceEvidence, ConformanceProperty, EVIDENCE_SCHEMA_VERSION,
-    GeneratorConfig, Inconclusive, MinimizeConfig, OracleBuildError, PropertyOutcome, ReplayBundle,
-    RuntimeOracle, Severity, Transition, generate_cases, minimize, verify_case,
+    EvidenceRejected, GeneratorConfig, Inconclusive, MinimizeConfig, OracleBuildError,
+    PropertyOutcome, ReplayBundle, RuntimeOracle, Severity, Transition, generate_cases, minimize,
+    verify_case,
 };
 use freenet_stdlib::prelude::{CodeHash, ContractCode, ContractInstanceId, State, UpdateData};
 use serde::Serialize;
@@ -323,27 +324,43 @@ fn write_bundle(
     let (with_bases, loose): (Vec<usize>, Vec<usize>) =
         (0..corpus.deltas.len()).partition(|i| corpus.delta_base(*i).is_some());
     let mut unassigned = with_bases;
-    bundle.transitions = corpus
-        .transitions
-        .iter()
-        .map(|(base, result)| {
-            // Take one delta recorded against this exact base, at most one per step:
-            // that is the shape `to_corpus` produced them in, so re-pairing this way
-            // reconstructs the same `delta_bases` it built.
-            let taken = unassigned
-                .iter()
-                .position(|i| corpus.delta_base(*i).map(|b| b.as_ref()) == Some(base.as_ref()))
-                .map(|slot| unassigned.remove(slot));
-            Transition {
-                base_state: base.to_vec(),
-                result_state: result.to_vec(),
-                delta: taken.map(|i| corpus.deltas[i].to_vec()),
-                ..Default::default()
-            }
-        })
-        .collect();
+    // Take one delta recorded against this exact base, removing it from the pool.
+    let take_for = |base: &Bytes, unassigned: &mut Vec<usize>| -> Option<usize> {
+        unassigned
+            .iter()
+            .position(|i| corpus.delta_base(*i).map(|b| b.as_ref()) == Some(base.as_ref()))
+            .map(|slot| unassigned.remove(slot))
+    };
+    let mut steps: Vec<Transition> = Vec::with_capacity(corpus.transitions.len());
+    for (base, result) in &corpus.transitions {
+        let step = |delta: Option<usize>| Transition {
+            base_state: base.to_vec(),
+            result_state: result.to_vec(),
+            delta: delta.map(|i| corpus.deltas[i].to_vec()),
+            ..Default::default()
+        };
+        steps.push(step(take_for(base, &mut unassigned)));
+        // A `Transition` holds at most ONE delta, and a base can legitimately own
+        // several. `Corpus::deduplicated` collapses steps by `(base, result)`, so a
+        // contract that took two different updates from the same state and landed on
+        // the same result arrives here as one step and two same-base deltas — the
+        // exact shape `delta_permutation_invariance` is FOR. Stopping at one delta
+        // per step therefore sent the second out loose, where `to_corpus` gives it no
+        // base and it is never paired: the re-exported bundle checks the property on
+        // nothing while the original run checked the pair.
+        //
+        // So repeat the step, once per further delta against the same base. The
+        // duplicate `(base, result)` pairs cost their two states in the encoding but
+        // collapse again in `to_corpus`'s own `deduplicated`, leaving one step and
+        // every delta still holding its base.
+        while let Some(extra) = take_for(base, &mut unassigned) {
+            steps.push(step(Some(extra)));
+        }
+    }
+    bundle.transitions = steps;
     // Whatever no step claimed still travels, just without provenance - which is
-    // exactly what it had.
+    // exactly what it had. `unassigned` can still hold deltas here: a corpus may
+    // record a base for a delta without holding any step that starts from it.
     bundle.deltas = loose
         .into_iter()
         .chain(unassigned)
@@ -448,7 +465,11 @@ async fn verify_evidence(config: &ConformanceConfig, path: &PathBuf) -> anyhow::
     }
 
     // Bounds-check with the same function a receiving peer uses, so this command
-    // never accepts evidence the network itself would reject.
+    // never accepts evidence the network itself would reject, and do it BEFORE
+    // building the runtime — the point of the check is that nothing unbounded or
+    // unsound reaches the WASM. `to_case` re-runs it below; that is deliberate
+    // belt-and-braces, since `to_case` is the enforcement point and this call is the
+    // one that produces a good error message early.
     evidence
         .check_bounds()
         .map_err(|rejected| anyhow::anyhow!("evidence is not shippable: {rejected}"))?;
@@ -477,7 +498,9 @@ async fn verify_evidence(config: &ConformanceConfig, path: &PathBuf) -> anyhow::
         );
     }
 
-    let case = evidence.to_case();
+    let case = evidence
+        .to_case()
+        .map_err(|rejected| anyhow::anyhow!("evidence is not shippable: {rejected}"))?;
     let outcome = verify_case(&mut oracle, &case);
 
     println!("evidence {}", evidence.id());
@@ -767,6 +790,30 @@ fn write_evidence(
             continue;
         }
 
+        // A property whose premise the bytes cannot carry is not evidence at all,
+        // and saying "could not be reduced to a shippable size" about one would be a
+        // false explanation of a permanent condition. It is not a failure either:
+        // the finding is real and this command reported it, it simply never travels.
+        //
+        // Checked BEFORE minimising, not after. Minimisation is the expensive part of
+        // this loop — repeated `verify_case` calls through the WASM runtime — and
+        // spending all of it on a case that is then discarded is pure waste. It also
+        // keeps the byte counters honest: they are documented as summed over the
+        // findings written, and accumulating for a finding shrinking could never help
+        // puts a number in the denominator that the ratio is not about.
+        if !case.property.is_self_verifying() {
+            local_only += 1;
+            eprintln!(
+                "note: a {} finding cannot be carried as evidence at all ({}); it is \
+                 reported above and no evidence file is written for it",
+                case.property,
+                EvidenceRejected::NotSelfVerifying {
+                    property: case.property
+                }
+            );
+            continue;
+        }
+
         // Shrink before serializing. A case generated from large states can carry
         // several MB, well over the evidence size bound, and evidence that every
         // recipient rejects is not evidence. Shrinking also makes the file a usable
@@ -783,15 +830,6 @@ fn write_evidence(
         let observed = verify_case(oracle, &minimized).violation().cloned();
         let evidence =
             ConformanceEvidence::new(instance, parameters.to_vec(), &minimized, observed);
-
-        // A property whose premise the bytes cannot carry is not evidence at all,
-        // and saying "could not be reduced to a shippable size" about one would be a
-        // false explanation of a permanent condition. It is not a failure either:
-        // the finding is real and this command reported it, it simply never travels.
-        if !minimized.property.is_self_verifying() {
-            local_only += 1;
-            continue;
-        }
 
         // Bounds-check with the same function a receiving peer uses, so this command
         // cannot report having written evidence that no peer would accept.
@@ -839,10 +877,25 @@ struct EvidenceSummary {
     /// Reported rather than swallowed: they are real findings that simply cannot be
     /// propagated, and silently writing nothing would look like there were none.
     findings_too_large: usize,
-    /// Total case input bytes before and after minimisation, summed over the
-    /// findings written. The ratio is the honest measure of whether shrinking is
-    /// earning its keep, and it is what decides whether a finding fits in evidence
-    /// at all.
+    /// Total case input bytes before and after minimisation, summed over every
+    /// finding minimisation was actually RUN on — which is not the same set as the
+    /// files written, and the difference is deliberate in both directions.
+    ///
+    /// A finding counted by `findings_too_large` is included: shrinking ran, and
+    /// failed to get it under the bound. Excluding it would drop exactly the cases
+    /// where shrinking did least and overstate the ratio.
+    ///
+    /// A finding counted by `findings_local_only` is excluded, because minimisation
+    /// never runs for one: the property cannot travel as evidence whatever its size,
+    /// so shrinking it could not have helped and its bytes are not a measure of
+    /// anything. That exclusion is structural — the check sits above the `minimize`
+    /// call — rather than a subtraction someone has to remember.
+    ///
+    /// Duplicates are included too: a second case with the same evidence id had
+    /// minimisation run on it before the id was known.
+    ///
+    /// So the ratio is the honest measure of whether shrinking is earning its keep on
+    /// the work it is actually asked to do.
     input_bytes_before_shrinking: usize,
     input_bytes_after_shrinking: usize,
 }
@@ -1011,6 +1064,31 @@ impl Report {
                 "\nwrote {} evidence file(s) to {}",
                 evidence.files_written, evidence.directory
             );
+            // Never let that line stand alone when it says zero.
+            //
+            // `findings_local_only` and `findings_too_large` are the only two ways a
+            // real finding produces no file, and the default human output printed
+            // neither — so "wrote 0 evidence file(s)" read exactly like a clean run,
+            // which is the failure mode `findings_too_large`'s own doc comment warns
+            // about ("silently writing nothing would look like there were none").
+            // Only `--json` carried the reason, and the person who most needs it is
+            // the one who did not ask for JSON.
+            if evidence.findings_local_only > 0 {
+                println!(
+                    "  {} finding(s) came from a property whose premise the evidence \
+                     bytes cannot carry, so no evidence exists to write; they are \
+                     listed above and are local-only by design",
+                    evidence.findings_local_only
+                );
+            }
+            if evidence.findings_too_large > 0 {
+                println!(
+                    "  {} finding(s) stayed over the evidence size limit even after \
+                     shrinking; they are listed above and simply cannot be \
+                     propagated",
+                    evidence.findings_too_large
+                );
+            }
         }
 
         if self.enforceable_violations == 0 {
@@ -1342,6 +1420,77 @@ mod tests {
             round_tripped.delta_bases, original.delta_bases,
             "a re-exported bundle must pair each delta with the state it was \
              applied to, exactly as the corpus it was written from did"
+        );
+        assert_eq!(round_tripped.states, original.states);
+    }
+
+    /// The same shape again, where the two steps COLLAPSE into one.
+    ///
+    /// The test above pairs two same-base deltas that arrive on two distinct steps,
+    /// so one delta per step is enough to carry them. `Corpus::deduplicated` keys
+    /// steps on `(base, result)`, so two updates taken from the same state that land
+    /// on the same result become ONE step holding two same-base deltas — and a
+    /// `Transition` holds at most one delta. Assigning one and chaining the rest onto
+    /// `bundle.deltas` sent the second out loose, where `to_corpus` gives it no base
+    /// and `delta_permutation_invariance` never pairs it.
+    ///
+    /// A same-base pair is exactly what that property is FOR, so the re-export
+    /// silently checked less than the run it replayed while reporting a clean bill of
+    /// health. The fix repeats the step once per further delta; the duplicate
+    /// `(base, result)` pairs collapse again on the way back in.
+    #[test]
+    fn a_re_exported_bundle_keeps_every_delta_of_a_collapsed_step() {
+        let code = b"\0asm-stand-in".to_vec();
+        let base = vec![1u8, 2];
+        let result = vec![1u8, 2, 3];
+        // Same base AND same result, two different deltas: one step after dedup.
+        let bundle_in = ReplayBundle {
+            transitions: vec![
+                Transition {
+                    base_state: base.clone(),
+                    result_state: result.clone(),
+                    delta: Some(vec![3]),
+                    ..Default::default()
+                },
+                Transition {
+                    base_state: base.clone(),
+                    result_state: result.clone(),
+                    delta: Some(vec![4]),
+                    ..Default::default()
+                },
+            ],
+            ..ReplayBundle::new(code.clone(), Vec::new())
+        };
+
+        let original = bundle_in.to_corpus();
+        assert_eq!(
+            original.transitions.len(),
+            1,
+            "the fixture must actually collapse to one step, or it is the test above"
+        );
+        assert_eq!(
+            original.delta_bases,
+            vec![
+                Some(Bytes::from(base.clone())),
+                Some(Bytes::from(base.clone()))
+            ],
+            "and both deltas must start out provenanced, or the round trip below has \
+             nothing to lose"
+        );
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("out.bin");
+        write_bundle(&path, &code, &[], &original).expect("write bundle");
+        let round_tripped = ReplayBundle::read_from(&path)
+            .expect("read bundle")
+            .to_corpus();
+
+        assert_eq!(round_tripped.transitions, original.transitions);
+        assert_eq!(round_tripped.deltas, original.deltas);
+        assert_eq!(
+            round_tripped.delta_bases, original.delta_bases,
+            "the second delta of a collapsed step must keep its base too, or the \
+             one pairing this corpus can support is gone from the replay"
         );
         assert_eq!(round_tripped.states, original.states);
     }

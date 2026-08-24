@@ -45,6 +45,27 @@ pub enum ConformanceProperty {
     /// it must be answered by running `fdev verify-merge` against deployed WASM
     /// before this property is ever allowed to influence anything on the network.
     /// Until then it is a reporting signal for contract authors.
+    ///
+    /// # Why this one stays [`PremiseSource::EvidenceBytes`], and what makes that safe
+    ///
+    /// It shares the unvalidated-delta-bytes weakness of
+    /// [`ConformanceProperty::DeltaPermutationInvariance`] — `verify_case` runs
+    /// whatever delta bytes it is handed straight into the contract, and there is no
+    /// `require_valid` analogue for a delta the way there is for a state — but not
+    /// that property's provenance dependency. The generator puts no restriction at
+    /// all on which delta it pairs with which state, so the law as checked is
+    /// universally quantified over (valid state, accepted delta) and re-executing the
+    /// case re-establishes the whole premise. There is no "how it was observed" fact
+    /// left over.
+    ///
+    /// What keeps the unvalidated bytes harmless is the [`Severity::Diagnostic`]
+    /// tier, which `policy::decide` never maps to a removal: a fabricated delta buys
+    /// an attacker a report and nothing else. That coupling is NOT incidental. This
+    /// is the only property that both travels as evidence and consumes delta bytes,
+    /// so promoting it to [`Severity::Violation`] — which the contested empirical
+    /// question above may one day justify — must revisit this classification in the
+    /// same change. `no_shippable_removal_eligible_property_consumes_unvalidated_deltas`
+    /// is the test that forces it to.
     DeltaIdempotence,
     /// Deltas applied in any order reach the same canonical state.
     ///
@@ -71,6 +92,33 @@ pub enum ConformanceProperty {
     /// [`ConformanceProperty::DeltaIdempotence`], which is contested and reports at
     /// a lower severity. Folding it in would accuse a counter-style contract under
     /// this property's name and severity regardless of that.
+    ///
+    /// # Local provenance only: this property is NOT self-verifying
+    ///
+    /// Everything the same-base paragraph above rests on is a fact about how the two
+    /// deltas were OBSERVED, and nothing carries it into the evidence bytes.
+    /// [`ConformanceEvidence`] holds bare `states` and `deltas` with no base
+    /// association, and `verify_case` applies whatever bytes it is handed in both
+    /// orders and compares. Delta bytes are in fact LESS constrained than states,
+    /// which at least go through `require_valid`.
+    ///
+    /// So a recipient that re-executes the case reproduces the comparison but not the
+    /// premise, and the gap is not academic. Take an add-wins OR-set whose delta
+    /// encodes tag adds and removes and which does not tombstone a tag it has never
+    /// seen — sound in production, because a delta is always
+    /// `get_state_delta(sender, recipient_summary)`. Hand it the causally-sequenced
+    /// pair `D1 = add A^t`, `D2 = remove t`: the two orders diverge, and every
+    /// recipient independently confirms a removal-eligible violation against a
+    /// correct contract. That contract's own same-base pairs are concurrent and
+    /// permute fine, so nothing observed locally ever fires.
+    ///
+    /// Marking it [`PremiseSource::LocalProvenance`] costs nothing today — no gossip
+    /// receive path exists — and keeps its full value where provenance is observed
+    /// directly, in shadow mode and `fdev`. The alternative, dropping the same-base
+    /// restriction so the law becomes genuinely universal, would not close the gap;
+    /// it would break the property, for the reason the paragraph above gives.
+    ///
+    /// [`ConformanceEvidence`]: super::evidence::ConformanceEvidence
     DeltaPermutationInvariance,
     /// A delta against an exact summary of the same state should be empty (#5072).
     SelfDeltaEmpty,
@@ -325,8 +373,11 @@ pub enum ConformanceProperty {
     ///
     /// # Local provenance only: this property is NOT self-verifying
     ///
-    /// This is the one property in this module whose premise is not re-establishable
-    /// from the evidence bytes. See [`PremiseSource`], which is what enforces it.
+    /// This is one of the two properties here whose premise is not re-establishable
+    /// from the evidence bytes; [`ConformanceProperty::DeltaPermutationInvariance`]
+    /// is the other, for the same reason applied to delta bases rather than to the
+    /// ordering of a pair of states. See [`PremiseSource`], which is what enforces
+    /// it.
     ///
     /// Every other law is a universally quantified identity over valid states, so a
     /// receiving peer that re-executes the case against its own copy of the contract
@@ -430,6 +481,16 @@ impl ConformanceProperty {
             // rather than a rule — and it is exactly the kind of gap that closes
             // itself the day someone enables enforcement for the settled properties
             // and this one rides along unnoticed.
+            //
+            // This tier is also load-bearing for the evidence gate, and NOT
+            // independently adjustable. After `DeltaPermutationInvariance` moved to
+            // `LocalProvenance`, this is the only property that both ships as
+            // evidence and consumes delta bytes — which `verify_case` never
+            // validates, there being no `require_valid` for a delta. Promoting it to
+            // `Violation` without revisiting `premise_source` in the same change
+            // would make attacker-chosen delta bytes removal-eligible. The test
+            // `no_shippable_removal_eligible_property_consumes_unvalidated_deltas`
+            // fails if that happens.
             ConformanceProperty::DeltaIdempotence => Severity::Diagnostic,
             ConformanceProperty::StateIdempotence
             | ConformanceProperty::StateCommutativity
@@ -465,19 +526,30 @@ impl ConformanceProperty {
             | ConformanceProperty::SummaryDeterminism
             | ConformanceProperty::DeltaDeterminism
             | ConformanceProperty::DeltaIdempotence
-            | ConformanceProperty::DeltaPermutationInvariance
             | ConformanceProperty::SelfDeltaEmpty
             | ConformanceProperty::WholeStateSelfDelta
             | ConformanceProperty::ReconciliationCycle
             | ConformanceProperty::PathAgreement => PremiseSource::EvidenceBytes,
-            // The one exception, and the reason this method exists. See the
-            // variant's own documentation: `merge(base, result) == result` is
-            // last-write-wins for an arbitrary pair and a law only because the
-            // corpus witnessed that `result` was reached FROM `base`. Nothing in the
-            // bytes carries that witness, so a fabricated pair from a conforming
-            // grow-only contract would have every recipient independently confirm a
-            // removal-eligible violation against a correct contract.
-            ConformanceProperty::TransitionPathAgreement => PremiseSource::LocalProvenance,
+            // The exceptions, and the reason this method exists. Both are laws only
+            // because of something the OBSERVER knew and the bytes cannot carry, so
+            // both hand a recipient an accusation it can confirm but cannot check.
+            //
+            // `TransitionPathAgreement`: `merge(base, result) == result` is
+            // last-write-wins for an arbitrary pair, and a law only because the
+            // corpus witnessed that `result` was reached FROM `base`. A fabricated
+            // pair from a conforming grow-only contract would have every recipient
+            // independently confirm a removal-eligible violation against a correct
+            // contract.
+            //
+            // `DeltaPermutationInvariance`: the generator pairs only deltas observed
+            // against the SAME base, because deltas observed against different bases
+            // can be causally sequenced and permuting those asks about a situation
+            // the protocol never produces. That restriction is the whole reason a
+            // finding means anything, and evidence records no base for a delta — so
+            // a causally-sequenced pair fabricated against a conforming contract is
+            // structurally indistinguishable from a genuine concurrent one.
+            ConformanceProperty::TransitionPathAgreement
+            | ConformanceProperty::DeltaPermutationInvariance => PremiseSource::LocalProvenance,
         }
     }
 

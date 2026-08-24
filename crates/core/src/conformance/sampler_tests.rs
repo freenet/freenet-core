@@ -40,10 +40,17 @@ fn state(tag: u8, len: usize) -> Vec<u8> {
 /// builds no case for it at all without provenance.
 ///
 /// This pins the in-memory path specifically. `to_bundle` already exported
-/// transitions, but `corpus()` — which is what shadow mode on a live node actually
-/// checks — pulled only `delta` and `summary` out of them and dropped the pairing.
-/// A property that ran on a hand-built `fdev --bundle` corpus and never once on the
-/// network would be the most expensive kind of miss: it reads as coverage.
+/// transitions, but `corpus()` pulled only `delta` and `summary` out of them and
+/// dropped the pairing.
+///
+/// Be precise about what that cost, because the obvious story is wrong: shadow mode
+/// does not run cases off `corpus()` at all. It calls `to_bundle` and then
+/// `ReplayBundle::to_corpus`, so the live path never depended on this. What the gap
+/// did mean is that the sampler's own view of its observations and the bundle it
+/// exports disagreed about what a transition is, which is how a later in-memory
+/// consumer would inherit a corpus that silently checks the provenance-dependent
+/// laws against nothing. The second half of this test — comparing the in-memory
+/// corpus against the replayed bundle — is the part that pins the agreement.
 #[test]
 fn the_in_memory_corpus_carries_transition_provenance() {
     let mut sampler = ContractSampler::new(config());
@@ -58,8 +65,8 @@ fn the_in_memory_corpus_carries_transition_provenance() {
     assert_eq!(
         corpus.transitions.len(),
         1,
-        "the ordered base -> result step is what the transition law needs, and \
-         without it shadow mode checks that law on nothing"
+        "the ordered base -> result step is what the transition law needs, and a \
+         corpus without it checks that law on nothing"
     );
     assert_eq!(corpus.transitions[0].0.as_ref(), base.as_slice());
     assert_eq!(corpus.transitions[0].1.as_ref(), result.as_slice());
