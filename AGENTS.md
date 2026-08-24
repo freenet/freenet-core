@@ -46,7 +46,7 @@ When unsure which bucket a change is in, open an issue first.
 3. Check .claude/rules/git-workflow.md for PR requirements
 ```
 
-### AFTER opening a PR
+### AFTER opening a PR — and before you stop
 
 **Do not open a PR you are not going to drive to a terminal state.** A terminal
 state is merged, or closed with a reason. "Opened, CI green, walked away" is not
