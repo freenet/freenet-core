@@ -5,9 +5,41 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 50
+    # Grouping exists to stop the PR backlog refilling faster than it drains.
+    #
+    # Ungrouped, a weekly run opened ~20 separate lockfile PRs. Every one of them
+    # touches Cargo.lock, so they cannot merge in parallel — they serialise through
+    # the merge queue regardless — and each one left open raises the conflict cost
+    # of every hand-written PR that also touches Cargo.lock. Measured 2026-08-24:
+    # 59 open PRs, 25 from dependabot, 20 of those green and simply never merged.
+    #
+    # Minor/patch bumps collapse into ONE PR because they are Skip-tier review
+    # (green CI is the entire gate) and reviewing them individually buys nothing.
+    #
+    # Major bumps are deliberately left UNGROUPED, one per PR: they are real work,
+    # not chores. `ed25519-dalek 2 -> 3` is the library that verifies release
+    # signatures, and a break there strands the fleet with no recovery path. That
+    # must never arrive buried in a 30-crate group PR where it can be neither
+    # reviewed nor reverted on its own.
+    groups:
+      cargo-minor-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
 
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       # Check for updates to GitHub Actions every weekday
       interval: "daily"
+    groups:
+      github-actions:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
